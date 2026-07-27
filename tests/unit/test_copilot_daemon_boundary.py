@@ -129,5 +129,63 @@ def test_prompt_states_the_boundary_to_the_agent():
     low = p.lower()
     assert 'fix the paint watchdog' in p
     assert 'never commit to main' in low
-    assert 'branch' in low
-    assert 'a human reviews' in low
+    assert 'a human merges' in low
+    # It must be told how to verify on THIS machine, and told not to change what
+    # the machine boots into: `test` activates now, `switch`/`boot` do not.
+    assert 'nixos-rebuild test' in low
+    assert 'never use `switch` or `boot`' in low
+    # And it must know a local branch is a dead end.
+    assert 'open a pr' in low
+
+
+def test_no_pr_when_the_branch_has_no_commits(monkeypatch, limiter):
+    """An empty PR is noise a human has to close. A run that changed nothing must
+    not open one."""
+    monkeypatch.setattr(d, 'next_task', lambda: {'id': 't1', 'title': 'x'})
+    monkeypatch.setattr(d, 'run_claude', lambda *a, **k: {'ok': True})
+    monkeypatch.setattr(d, 'has_commits_ahead', lambda: False)
+    monkeypatch.setattr(d, 'open_pr', lambda *a, **k: pytest.fail('opened an empty PR'))
+    out = d.tick(limiter)
+    assert out['action'] == 'ran' and 'pr' not in out
+
+
+def test_no_pr_when_the_run_failed(monkeypatch, limiter):
+    """A failed run must not be proposed for merge."""
+    monkeypatch.setattr(d, 'next_task', lambda: {'id': 't1', 'title': 'x'})
+    monkeypatch.setattr(d, 'run_claude', lambda *a, **k: {'ok': False, 'error': 'boom'})
+    monkeypatch.setattr(d, 'has_commits_ahead', lambda: True)
+    monkeypatch.setattr(d, 'open_pr', lambda *a, **k: pytest.fail('proposed a failed run'))
+    out = d.tick(limiter)
+    assert out['ok'] is False and 'pr' not in out
+
+
+def test_successful_verified_work_becomes_a_pr(monkeypatch, limiter):
+    """The point of the loop: work that succeeded and has commits is carried into
+    the build as a PR against main. A branch on one node reaches no image."""
+    seen = {}
+
+    def fake_pr(branch, title, body):
+        seen.update(branch=branch, title=title, body=body)
+        return {'ok': True, 'url': 'https://github.com/x/y/pull/1'}
+
+    monkeypatch.setattr(d, 'next_task', lambda: {'id': 't1', 'title': 'fix the meter'})
+    monkeypatch.setattr(d, 'run_claude', lambda *a, **k: {'ok': True})
+    monkeypatch.setattr(d, 'has_commits_ahead', lambda: True)
+    monkeypatch.setattr(d, 'current_branch', lambda: 'copilot/20260727-010203')
+    monkeypatch.setattr(d, 'open_pr', fake_pr)
+    out = d.tick(limiter)
+    assert out['pr'] == 'https://github.com/x/y/pull/1'
+    assert seen['branch'].startswith('copilot/')
+    assert 'fix the meter' in seen['title']
+
+
+def test_never_opens_a_pr_from_main(monkeypatch, limiter):
+    """Defence in depth: if the clone somehow sits on main, do not open a PR from
+    it. main is the base, never the head."""
+    monkeypatch.setattr(d, 'next_task', lambda: {'id': 't1', 'title': 'x'})
+    monkeypatch.setattr(d, 'run_claude', lambda *a, **k: {'ok': True})
+    monkeypatch.setattr(d, 'has_commits_ahead', lambda: True)
+    monkeypatch.setattr(d, 'current_branch', lambda: 'main')
+    monkeypatch.setattr(d, 'open_pr', lambda *a, **k: pytest.fail('opened a PR from main'))
+    out = d.tick(limiter)
+    assert out['action'] == 'ran'

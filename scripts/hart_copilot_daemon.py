@@ -24,10 +24,23 @@ authority at the boundaries. Enforced here, mechanically, in this order:
   3. BRANCH ONLY    every run happens on a copilot/* branch in a writable clone.
                     It cannot commit to main, and it cannot touch the read-only
                     /nix/store the running system boots from.
-  4. NO MERGE       merge, OTA publish and master-key signing are human. The worst
-                    case of an unattended run is a branch nobody merges.
+  4. NO MERGE       verified work is carried into the build as a PR against main,
+                    because a branch on one node is a dead end: it is not in main,
+                    so no nightly contains it, so the next flashed image cannot be
+                    tested against it. Merge, OTA publish and master-key signing
+                    stay human. The worst case of an unattended run is a PR nobody
+                    merges.
   5. BOUNDED        one task per tick, a hard wall-clock timeout, and a cap on runs
                     per hour, so a wedged or looping agent cannot burn the node.
+
+VERIFYING ON THE NODE
+  The agent tests OS-level changes with `nixos-rebuild test --flake`, which
+  activates on the running machine in minutes instead of a ~90 minute ISO build
+  plus a reflash, and does NOT change what the machine boots into: a power cycle
+  reverts it. `switch` and `boot` are deliberately never used, because changing
+  what the machine comes up as is the human's call. This needs the INSTALLED
+  writable-root image; on the live ISO the store is a RAM-backed overlay and a
+  rebuild will usually fail there.
 
 Run:  hart-copilot-daemon            (systemd: hart.copilot.daemon.enable = true)
       hart-copilot-daemon --once     (one tick, for testing)
@@ -43,15 +56,29 @@ import time
 
 logger = logging.getLogger('hart.copilot.daemon')
 
-# Bounds. Deliberately conservative: this shares an 8 GB node with the OS it fixes.
-DEFAULT_INTERVAL_S = int(os.environ.get('HART_COPILOT_INTERVAL', '300'))
-DEFAULT_TASK_TIMEOUT_S = int(os.environ.get('HART_COPILOT_TASK_TIMEOUT', '1800'))
-MAX_RUNS_PER_HOUR = int(os.environ.get('HART_COPILOT_MAX_RUNS_PER_HOUR', '4'))
-REPO = os.environ.get('HART_COPILOT_REPO', os.path.expanduser('~/HARTOS'))
-BACKEND = os.environ.get('HART_COPILOT_BACKEND', 'http://127.0.0.1:6777')
-CLAUDE_BIN = os.environ.get('HART_COPILOT_CLAUDE', 'claude')
-# A file the steward can drop to stop the daemon without touching systemd.
-STOP_FILE = os.environ.get('HART_COPILOT_STOP', '/run/hart/copilot-stop')
+# Constants, not configuration. Every one of these has exactly one correct value
+# for this daemon, so it is written down rather than made a knob: a flag is a
+# decision deferred, and each one doubles the states nobody tests. Tests patch the
+# module attribute directly; they do not need an env var to exist.
+INTERVAL_S = 300               # tick cadence
+TASK_TIMEOUT_S = 1800          # hard wall-clock on one Claude run
+NIXOS_REBUILD_TIMEOUT_S = 2700 # hard wall-clock on one activation
+MAX_RUNS_PER_HOUR = 4          # it shares an 8 GB node with the OS it fixes
+REPO = '/var/lib/hart/copilot/HARTOS'   # the daemon's own writable clone
+CLAUDE_BIN = 'claude'
+STOP_FILE = '/run/hart/copilot-stop'    # drop this file to halt it, no systemd needed
+FLAKE_ATTR = 'hart-desktop'    # the system this node IS
+PR_BASE = 'main'               # CLAUDE.md: main branch only. Never a variable.
+
+
+def backend():
+    """The node's own backend, from the ONE canonical port source rather than a
+    hardcoded port or an env override that can drift from what is listening."""
+    try:
+        from core.port_registry import get_port
+        return f'http://127.0.0.1:{get_port("backend")}'
+    except Exception:
+        return 'http://127.0.0.1:6777'
 
 
 # ─── Gate 1: the constitution ────────────────────────────────────────────────
@@ -112,7 +139,7 @@ def next_task():
     """
     try:
         import requests
-        r = requests.get(f'{BACKEND}/api/hive/session/tasks', timeout=10)
+        r = requests.get(f'{backend()}/api/hive/session/tasks', timeout=10)
         if r.status_code != 200:
             return None
         tasks = (r.json() or {}).get('tasks') or []
@@ -140,14 +167,108 @@ def build_prompt(task):
         "- Never commit to main, never push to main, never force-push.\n"
         "- Verify with the repo's own tests before you commit. Do not claim a fix "
         "you have not run.\n"
-        f"- This node's live backend is {BACKEND}; use it to observe real behaviour "
+        f"- This node's live backend is {backend()}; use it to observe real behaviour "
         "rather than guessing.\n"
+        "- To test an OS-level change on THIS RUNNING MACHINE, use:\n"
+        f"      sudo nixos-rebuild test --flake {REPO}/nixos#{FLAKE_ATTR}\n"
+        "  `test` activates the change now but does NOT change what the machine\n"
+        "  boots into, so a power cycle undoes it. Never use `switch` or `boot`:\n"
+        "  changing the boot default is a human decision, not yours.\n"
+        "- After activating, check the journal for what you changed and confirm the\n"
+        "  behaviour actually differs. An unverified fix is not a fix.\n"
         "- If the task is unclear or unsafe, stop and say so instead of improvising.\n"
-        "- Leave the work on the branch. A human reviews and merges.\n"
+        "- When the fix is verified, commit to this branch, push it, and open a PR\n"
+        f"  against `{PR_BASE}`. A local branch never becomes a build, so it never\n"
+        "  reaches the flashed image; the PR is how the work gets somewhere.\n"
+        "  Say in the PR body what you changed, how you verified it on this node,\n"
+        "  and what you did NOT verify. A human merges.\n"
     )
 
 
-def run_claude(prompt, timeout_s=DEFAULT_TASK_TIMEOUT_S, cwd=REPO):
+def open_pr(branch, title, body):
+    """Push the working branch and open a PR against the branch the nightlies build.
+
+    This is the point of the whole loop. A commit on a local branch on one node
+    changes nothing: it is not in `main`, so no nightly contains it, so the next
+    flashed image does not have it, so it can never be tested on the installed
+    device. The PR is what carries the work into the build.
+
+    The boundary is unchanged and is in fact sharpened by this: the daemon can
+    PROPOSE into the pipeline, and only a human merge puts it into what the machine
+    becomes. Opening a PR is reversible with one click; merging is the decision.
+    """
+    try:
+        push = subprocess.run(['git', 'push', '-u', 'origin', branch],
+                              cwd=REPO, capture_output=True, text=True, timeout=180)
+        if push.returncode != 0:
+            return {'ok': False, 'error': 'push failed: ' + (push.stderr or '')[-500:]}
+        pr = subprocess.run(
+            ['gh', 'pr', 'create', '--base', PR_BASE, '--head', branch,
+             '--title', title, '--body', body],
+            cwd=REPO, capture_output=True, text=True, timeout=180)
+        if pr.returncode != 0:
+            return {'ok': False, 'error': 'gh pr create failed: ' + (pr.stderr or '')[-500:]}
+        return {'ok': True, 'url': (pr.stdout or '').strip()}
+    except FileNotFoundError as e:
+        return {'ok': False, 'error': f'missing tool: {e}'}
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'error': 'push/PR timed out'}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
+
+
+def current_branch():
+    """The branch the clone is on, so a PR targets what was actually worked on."""
+    try:
+        r = subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                           cwd=REPO, capture_output=True, text=True, timeout=30)
+        return (r.stdout or '').strip() or None
+    except Exception:
+        return None
+
+
+def has_commits_ahead():
+    """True when the branch actually has work on it. Prevents an empty PR, which is
+    noise a human then has to close."""
+    try:
+        r = subprocess.run(['git', 'log', '--oneline', f'origin/{PR_BASE}..HEAD'],
+                           cwd=REPO, capture_output=True, text=True, timeout=30)
+        return bool((r.stdout or '').strip())
+    except Exception:
+        return False
+
+
+def nixos_rebuild_test(timeout_s=NIXOS_REBUILD_TIMEOUT_S):
+    """Activate the working clone's config on the RUNNING node, without touching
+    the boot default.
+
+    `nixos-rebuild test` is the whole reason a co-pilot on a NixOS box can verify
+    its own work: it applies to the live system in minutes instead of a ~90 minute
+    ISO build plus a reflash, and it is self-limiting, because the boot generation
+    is unchanged and a reboot reverts it. `switch` and `boot` are deliberately NOT
+    offered here: changing what the machine comes up as is a boundary crossing, and
+    those stay with the human (and with OTA, which is master-key signed).
+
+    Requires the INSTALLED writable-root image. On the live ISO the store is a
+    RAM-backed overlay on an 8GB box, so a rebuild will usually fail there; that is
+    a real limitation and it is reported, not hidden.
+    """
+    cmd = ['sudo', '-n', 'nixos-rebuild', 'test', '--flake',
+           f'{REPO}/nixos#{FLAKE_ATTR}']
+    try:
+        p = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True,
+                           timeout=timeout_s)
+        return {'ok': p.returncode == 0, 'returncode': p.returncode,
+                'stderr': (p.stderr or '')[-2000:]}
+    except FileNotFoundError:
+        return {'ok': False, 'error': 'nixos-rebuild not on PATH (not a NixOS host?)'}
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'error': f'nixos-rebuild test timed out after {timeout_s}s'}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
+
+
+def run_claude(prompt, timeout_s=TASK_TIMEOUT_S, cwd=REPO):
     """One bounded, headless Claude Code run. -p is print/non-interactive mode.
 
     A hard timeout is the point: an agent that wedges must not hold the node. The
@@ -196,12 +317,32 @@ def tick(limiter, dry_run=False):
 
     limiter.record()
     result = run_claude(build_prompt(task))
-    return {
+    out = {
         'action': 'ran',
         'task': task.get('id') or task.get('title'),
         'ok': result.get('ok'),
         'error': result.get('error'),
     }
+
+    # Carry the work into the build. Without this the run is a no-op in practice:
+    # a commit sitting on a branch on one node is not in main, so no nightly has
+    # it, so the next flashed image cannot be tested against it. Only opened when
+    # the run succeeded AND there is actually something to review.
+    if result.get('ok') and has_commits_ahead():
+        branch = current_branch()
+        if branch and branch != PR_BASE:
+            title = f"copilot: {task.get('title') or task.get('id') or 'node fix'}"
+            body = (
+                "Opened by the resident co-pilot daemon on a HART OS node.\n\n"
+                f"Task: {task.get('id') or ''} {task.get('title') or ''}\n\n"
+                "Verified on the node it was written on, to the extent stated in the "
+                "commits. Merge is a human decision; nothing here has changed what "
+                "any machine boots into.\n"
+            )
+            pr = open_pr(branch, title, body)
+            out['pr'] = pr.get('url') if pr.get('ok') else None
+            out['pr_error'] = pr.get('error')
+    return out
 
 
 def main(argv=None):
@@ -212,7 +353,7 @@ def main(argv=None):
     limiter = RateLimiter()
 
     logger.info('co-pilot daemon starting. repo=%s backend=%s interval=%ss '
-                'max_runs/h=%s', REPO, BACKEND, args.interval, MAX_RUNS_PER_HOUR)
+                'max_runs/h=%s', REPO, backend(), args.interval, MAX_RUNS_PER_HOUR)
     logger.info('boundary: branch-only, no merge, halts with the hive, yields to '
                 'the user. stop file: %s', STOP_FILE)
 
@@ -233,7 +374,7 @@ def _parse(argv):
     p.add_argument('--once', action='store_true', help='run a single tick and exit')
     p.add_argument('--dry-run', action='store_true',
                    help='decide and report, never invoke Claude')
-    p.add_argument('--interval', type=int, default=DEFAULT_INTERVAL_S,
+    p.add_argument('--interval', type=int, default=INTERVAL_S,
                    help='seconds between ticks')
     p.add_argument('--verbose', action='store_true')
     return p.parse_args(argv)
