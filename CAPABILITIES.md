@@ -20,7 +20,7 @@ Back to the [README](README.md).
 | Channel adapters out of the box | 31 | 1 (webhook) | custom | custom |
 | One codebase, multiple topologies | flat / regional / central | hosted only | library | library |
 | OpenAI-compatible endpoint | yes | yes | bring your own | bring your own |
-| Recipe replay (cached LLM steps) | yes (90% faster) | no | no | no |
+| Recipe replay (cached LLM steps) | yes (~90% latency cut on cache-equivalent inputs) | no | no | no |
 | Native source protection (HevolveArmor) | yes | n/a | n/a | n/a |
 
 ---
@@ -31,7 +31,7 @@ Back to the [README](README.md).
 
 | | What it does | Where |
 |---|---|---|
-| **CREATE / REUSE recipe pattern** | Run a task once via LLM, save the trace, replay 90% faster with no LLM calls on cached steps | `create_recipe.py`, `reuse_recipe.py` |
+| **CREATE / REUSE recipe pattern** | Run a task once via LLM, save the trace, then replay it with no LLM calls on cached steps. The source claim is a ~90% latency cut on cache-equivalent inputs (`_persist_loop_catalog.py:428`) | `create_recipe.py`, `reuse_recipe.py` |
 | **GoalManager** | Unified goal lifecycle, guardrail-gated state machine, escalation hooks | `integrations/agent_engine/goal_manager.py` |
 | **AgentDaemon** | Autonomous tick loop, circuit breaker, frozen-thread detection | `integrations/agent_engine/agent_daemon.py` |
 | **SpeculativeDispatcher** | Fast draft model answers first, expert agent takes over if confidence drops | `speculative_dispatcher.py` |
@@ -105,7 +105,7 @@ Back to the [README](README.md).
 | **16 LLM providers** | Local llama.cpp and Ollama, plus OpenAI, Anthropic, Google Gemini, Groq, Mistral, DeepSeek, Cohere, OpenRouter, Together, Fireworks, DeepInfra, Cerebras, SambaNova and HuggingFace, plus any custom OpenAI-compatible endpoint | `integrations/providers/`, `integrations/agent_engine/model_bus_service.py` |
 | **Compute + media marketplace** | Separate catalog from the LLM list above: 10 API providers, 1 local, and 8 affiliate services (RunwayML, ElevenLabs, Midjourney, Pika, Kling, Luma, Seedance, Sora) with pricing, auth method and health per entry | `integrations/providers/registry.py` |
 | **Universal gateway** | One router, cost / latency / capability scoring. Key storage is not in this module: secrets live in a Fernet vault (AES-128-CBC + HMAC-SHA256) keyed by PBKDF2-HMAC-SHA256 at 480,000 iterations | `model_registry.py`, `model_bus_service.py`, vault at `security/secrets_manager.py` |
-| **Speculative decoding** | Qwen3-0.8B draft + Qwen3-4B main, ~300 ms TTFT on consumer hardware | `speculative_dispatcher.py` |
+| **Speculative decoding** | Qwen3-0.8B draft + Qwen3-4B main. The draft tier replies in ~300 ms per `speculative_dispatcher.py:9`. Needs ~10 GB VRAM to run at all (`core/gpu_tier.py`), so an 8 GB laptop does not get this path | `speculative_dispatcher.py` |
 | **Faster-Whisper STT** | Local STT, multi-lang, GPU-accelerated when available | `integrations/service_tools/whisper_tool.py` |
 | **MiniCPM VLM** | Vision-language model for camera + screenshot reasoning | `integrations/vision/minicpm_server.py` |
 | **6 TTS engines** | Indic Parler (22 Indic + EU), Chatterbox Turbo (English expressive), Kokoro (English neural), CosyVoice3 (en/zh), F5 (zero-shot voice clone), Piper (CPU fallback) | `integrations/channels/media/`, `tts.py` |
@@ -280,7 +280,7 @@ Custom tools, channel bindings, agent plugins: [docs.hevolve.ai/agent-plugin](ht
 
 ```
 HART OS  (port 6777)
-|-- Engine            CREATE -> save Recipe -> REUSE (90% faster replay)
+|-- Engine            CREATE -> save Recipe -> REUSE (~90% latency cut, cache-equivalent input)
 |-- Agent runtime     GoalManager . AgentDaemon . SpeculativeDispatch . ParallelDispatch . AutoEvolve
 |-- Auto-evolve       Hypothesis -> 33-rule filter -> hive vote -> sandbox -> RSI-2 gate -> federate
 |-- Baselining        agent_baseline_service . benchmark_registry . benchmark_tracker . hive_benchmark_prover
