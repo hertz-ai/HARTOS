@@ -134,7 +134,7 @@ is what `GET /api/social/channels/catalog` serves.
 | **AgentPersonality** | 8-dim personality dataclass (warmth, formality, verbosity, ...), generates per-agent system prompt | `core/agent_personality.py` |
 | **UserResonanceProfile** | 8-dim continuous floats (0-1), stored at `agent_data/resonance/<user_id>.json` | `core/resonance_profile.py` |
 | **ResonanceTuner** | EMA tuning (alpha 0.15) from dialogue signals, federated-delta export, oscillation detector | `core/resonance_tuner.py` |
-| **ResonanceIdentifier** | Thin proxy that dispatches biometric ops (face, voice) to HevolveAI sibling. No ML in HART OS. | `core/resonance_identifier.py` |
+| **ResonanceIdentifier** | Thin proxy dispatching biometric ops (face, voice) to the HevolveAI sibling, which is where the embedding extraction and matching live. Falls back to channel identity when HevolveAI is absent | `core/resonance_identifier.py` |
 
 ### Memory + knowledge
 

@@ -207,8 +207,10 @@ agent engine, the escalation ladder, all of it. The learning is not. Hebbian,
 Bayesian, probabilistic and gradient work lives in HevolveAI, a sibling repo
 that is not public, loaded here at runtime as a signature-verified binary via
 `security/native_hive_loader.py`, with a stub fallback when it is missing.
-`core/resonance_tuner.py` and `core/resonance_identifier.py` say so in their
-own docstrings: no ML in HART OS.
+`core/resonance_tuner.py` and `core/resonance_identifier.py` both say as much
+in their own docstrings, in those words: "All actual learning (Hebbian,
+Bayesian, probabilistic, gradient descent) lives in the HevolveAI sibling
+repo", and "All biometric ML ... lives in the HevolveAI sibling repo".
 
 **Why that is unsatisfying:** the case this project makes is that
 concentration of intelligence is a choice rather than a necessity, and that
