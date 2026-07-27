@@ -263,6 +263,16 @@ in
 
         serviceConfig = {
           Type = "notify";
+          # systemd-notify is a FORKED CHILD of the ExecStart shell, and the
+          # default NotifyAccess=main only accepts readiness from the main PID,
+          # so systemd discarded the notification and timed the unit out after
+          # 90s even though the script had finished its work in 61ms. Observed
+          # on hart-node 2026-07-27: the three "[HART OS GPU] ..." lines are all
+          # in the journal at 18:46:47, then "start operation timed out" at
+          # 18:48:17, twice. Every other Type=notify unit here notifies from its
+          # own main process (sdnotify in Python), which is why this is the only
+          # one that needed it.
+          NotifyAccess = "all";
           User = "hart";
           Group = "hart";
           SupplementaryGroups = [ "video" "render" ];
