@@ -193,7 +193,19 @@ in
         # systemd is here for `systemctl start --wait hart-copilot-verify`, which is
         # the daemon's only route to activating a config. There is deliberately no
         # sudo: NoNewPrivileges below would block it anyway.
-        path = [ claudePkg pkgs.git pkgs.gh pkgs.coreutils pkgs.openssh pkgs.systemd ];
+        # systemd is here for `systemctl start --wait hart-copilot-verify`, the
+        # daemon's only route to activating a config. There is deliberately no sudo:
+        # NoNewPrivileges below would block it anyway.
+        #
+        # The python is the node's own interpreter, with the node's own dependencies.
+        # Without it the agent had no python on PATH at all, while its prompt told it
+        # to "verify with the repo's own tests before you commit" and not to claim a
+        # fix it had not run. It could not run anything. Same shape as the sudo bug:
+        # an instruction the environment could not carry out.
+        path = [
+          claudePkg pkgs.git pkgs.gh pkgs.coreutils pkgs.openssh pkgs.systemd
+          config.hart.package.python
+        ];
         serviceConfig = {
           Type = "simple";
           User = "hart";
