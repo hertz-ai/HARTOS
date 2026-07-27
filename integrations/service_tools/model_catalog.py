@@ -521,6 +521,7 @@ class ModelCatalog:
             except Exception as e:
                 logger.debug(f"Populator '{name}' failed: {e}")
         # Built-in entries that don't depend on application modules
+        added += self._populate_llm_models()
         added += self._populate_tts_models()
         added += self._populate_stt_models()
         added += self._populate_vlm_models()
@@ -610,6 +611,71 @@ class ModelCatalog:
                 tags=['local', 'stt', 'cpu-friendly'],
             )
             self.register(entry, persist=False)
+            added += 1
+        return added
+
+    def _populate_llm_models(self) -> int:
+        """Chat/LLM entries — the ladder every hardware-based recommendation reads.
+
+        This catalog is the SINGLE SOURCE OF TRUTH for which chat models exist.
+        Before this existed the LLM rung was missing (populate_from_subsystems
+        seeded tts/stt/vlm/embodied/videogen/audiogen and skipped llm), so three
+        ad-hoc lists grew to fill the gap and drifted apart: model_onboarding's
+        MODEL_TIERS still named Qwen2.5 while agent_engine/model_registry.py had
+        moved to Qwen3.5, and Nunba kept a fourth list of its own. Anything that
+        needs "which chat model suits this box" reads THIS, and nothing else
+        hardcodes a ladder.
+
+        Sizing carries BOTH budgets on purpose. vram_gb gates the GPU path and
+        ram_gb gates the CPU path, because a box with no GPU but plenty of RAM
+        can still run a mid-size model -- the VRAM-only ladder this replaces
+        collapsed every CPU-only machine to the smallest entry regardless of how
+        much RAM it had.
+
+        repo_id values are taken from core/hub_allowlist.py, so every entry here
+        is already download-allowlisted; adding a model means adding it there
+        too, and the allowlist stays the security boundary.
+
+        Extending: append an entry. Selection is data-driven (budget vs
+        vram_gb/ram_gb, ranked by priority) so no code changes to add a family.
+        """
+        # (id, name, repo_id, quant, vram_gb, ram_gb, disk_gb, tier, priority,
+        #  quality, speed, purposes, min_build, tags)
+        _llms = [
+            ('llm-qwen3.5-0.8b', 'Qwen3.5 0.8B', 'unsloth/Qwen3.5-0.8B-GGUF',
+             'Q4_K_M', 1.0, 2.0, 0.7, 'lite', 30, 0.45, 0.95,
+             ['draft'], None, ['local', 'chat', 'draft', 'qwen']),
+            ('llm-qwen3.5-2b', 'Qwen3.5 2B', 'unsloth/Qwen3.5-2B-GGUF',
+             'Q4_K_M', 2.5, 4.0, 1.6, 'lite', 40, 0.52, 0.85,
+             ['main'], None, ['local', 'chat', 'qwen']),
+            ('llm-qwen3.5-4b', 'Qwen3.5 4B', 'unsloth/Qwen3.5-4B-GGUF',
+             'Q4_K_M', 4.0, 8.0, 2.8, 'standard', 60, 0.60, 0.70,
+             ['main'], 8148, ['local', 'chat', 'qwen', 'default']),
+            ('llm-gemma-2b-it', 'Gemma 2B Instruct', 'google/gemma-2b-it',
+             'Q4_K_M', 2.5, 4.0, 1.7, 'lite', 35, 0.50, 0.85,
+             ['main'], None, ['local', 'chat', 'gemma']),
+            ('llm-gemma-7b-it', 'Gemma 7B Instruct', 'google/gemma-7b-it',
+             'Q4_K_M', 6.0, 12.0, 5.0, 'standard', 55, 0.62, 0.55,
+             ['main'], None, ['local', 'chat', 'gemma']),
+        ]
+        added = 0
+        for (mid, name, repo, quant, vram, ram, disk, tier, prio,
+             quality, speed, purposes, min_build, tags) in _llms:
+            if mid in self._entries:
+                continue
+            self.register(ModelEntry(
+                id=mid, name=name, model_type=ModelType.LLM,
+                source='huggingface', repo_id=repo,
+                vram_gb=vram, ram_gb=ram, disk_gb=disk,
+                min_capability_tier=tier,
+                backend='llama_cpp',
+                supports_gpu=True, supports_cpu=True,
+                supports_cpu_offload=True, cpu_offload_method='restart_cpu',
+                min_build=min_build,
+                capabilities={'chat': True, 'quant': quant},
+                quality_score=quality, speed_score=speed, priority=prio,
+                purposes=list(purposes), tags=list(tags),
+            ), persist=False)
             added += 1
         return added
 
