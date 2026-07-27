@@ -149,7 +149,13 @@ jobs:
           set -o pipefail
           echo "Building: nix build .#${{ matrix.target }}"
           echo ""
-          time nix build .#${{ matrix.target }} --no-link --print-out-paths | tee /tmp/build-output.txt
+          # -L / --print-build-logs: stream the FULL builder output instead of the
+          # 25-line tail nix prints on failure. raw-desktop failed after 54 minutes
+          # (2026-07-27, run 30263310599) having built the whole closure, the UKI and
+          # both filesystems, and the only thing nix showed was 25 lines of trailing
+          # mke2fs progress -- the actual error had scrolled out of that window. A
+          # build worth 54 minutes deserves a readable failure the first time.
+          time nix build .#${{ matrix.target }} -L --no-link --print-out-paths | tee /tmp/build-output.txt
           echo ""
           echo "Build successful!"
 
