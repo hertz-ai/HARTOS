@@ -10,7 +10,7 @@ says what "real" means and whether it's proven.
 > that were "erected" turned out not to hold load — the glass shell (booted
 > GNOME), the branding (README placeholder), in-process armor (raw key as
 > passphrase, never ran), the app installer (killed by a route collision), the
-> hive skill relay (#66), the flywheel (starvation-override only). So we prove,
+> hive skill relay (#66), the flywheel (starvation-override only). We prove;
 > we don't assert.
 
 ## Thesis
@@ -47,7 +47,7 @@ Run: `pytest tests/probes/test_os_pillars.py tests/unit/test_shell_route_no_coll
 
 **Score:** 5 load-bearing (P1,P3,P4,P5 + P8 primitives), 2 contract-proven/runtime-gated (P2,P6), 1 scaffolding/runtime-gated (P7), **1 known-broken wire (P8 transport, #66).**
 
-## What "proven" does NOT yet mean (the honest last-mile)
+## What "proven" does NOT yet mean (the last mile)
 - **Runtime-gated (need the target, not this dev box):** P2 (real mic/camera + VLM action), P6 (actually installing a Win/Android app in the booted subsystems — needs the CI ISO + boot), P7 (a real robot + HevolveAI perceive→act loop).
 - **P1 nuance:** the probe now proves the AGENTIC framework contract is load-bearing — an agent extends the component set at runtime, recomposes the whole home into Aura, and every handle is spec-introspectable, all through the ONE governed transport. What is still **flash-gated** is the *rendered pixels* of that recompose on real HW (the shell actually painting Aura at speed) — verified by booting the ISO, not on this dev box.
 - **Broken wire — the one in-repo gap that fails a pillar outright:** **#66** — Direction-B cross-process skill relay. The data primitives exist (P8), but a skill learned on node A does not reach node B across processes. Until #66 is built, "hive learning compounds" is aspirational.
@@ -63,5 +63,5 @@ Run: `pytest tests/probes/test_os_pillars.py tests/unit/test_shell_route_no_coll
 A pillar is **real** only when its probe is green AND load-bearing (not merely
 contract/scaffolding). To promote a 🟡 to ✅: build the missing wire/runtime, then
 upgrade its probe from contract-level to a behavioral round-trip on the real
-target. Keep the ledger honest — a 🟡 that's quietly relabeled ✅ is how "erected"
-became a trap in the first place.
+target. A 🟡 that's quietly relabeled ✅ is how "erected" became a trap in the
+first place.

@@ -11,7 +11,7 @@
 | **E** | Retire `hartOnboarding.js` + `native_onboarding.py` | ⏸ **DEFERRED** — only after the daemon is proven serving Nunba's `LightYourHART` on real HW. Retiring the fallback before the replacement is verified = onboarding regression. |
 | **F** | CI: pin `nunbaHash`/`npmDepsHash`, build `.#packages.nunba`, flip `hart.nunba.enable` | 🟡 **WIRED** — HARTOS `2b3fc629` exposes `packages.nunba` + the LiquidUI `HART_NUNBA_SOCKET` wiring + the desktop single-flip marker. **CI** still runs the build + hash-pin + flip (no Nix on the authoring box). |
 
-**What the authoring box cannot do.** This box has **no Nix, no Node, no Docker, no WSL distro** — so it cannot *realise* the Nix build, compute the FOD hashes, or run the webpack/pytest. Everything else is done here: all edits (A–D + wiring + F) are written into the real files, Nunba's import surface was static-analyzed to seed the curated python env, and the eval-level zero-regression is verified by inspection (the `mkIf` gates keep the fakeHash build unforced while `hart.nunba.enable=false`). The Python env is still a **starting** curated set (hart-app.nix's proven pattern, NOT `requirements.txt`; langchain/autogen/torch/chromadb omitted, guarded by try/except); the remaining **import-domino discovery** ("bs4 → pytz → redis …") genuinely needs a real `nix build`+boot to finalize — that is the CI step, with pinning the two FOD hashes and flipping `hart.nunba.enable`. B/C were edited **in place** (not a parallel file) under the steward's explicit "finish end to end" direction, building on the concurrent session's landed `0a338951` (its React-static build + serving test both preserved).
+**What the authoring box cannot do.** This box has **no Nix, no Node, no Docker, no WSL distro** — so it cannot *realise* the Nix build, compute the FOD hashes, or run the webpack/pytest. Everything else is done here: all edits (A–D + wiring + F) are written into the real files, Nunba's import surface was static-analyzed to seed the curated python env, and the eval-level zero-regression is verified by inspection (the `mkIf` gates keep the fakeHash build unforced while `hart.nunba.enable=false`). The Python env is still a **starting** curated set (hart-app.nix's proven pattern, NOT `requirements.txt`; langchain/autogen/torch/chromadb omitted, guarded by try/except); the remaining **import-domino discovery** ("bs4 → pytz → redis …") needs a real `nix build`+boot to finalize — that is the CI step, with pinning the two FOD hashes and flipping `hart.nunba.enable`. B/C were edited **in place** (not a parallel file) under the steward's explicit "finish end to end" direction, building on the concurrent session's landed `0a338951` (its React-static build + serving test both preserved).
 
 ## Nix-free import-domino walk (2026-07-10, de-risking the CI build)
 
@@ -20,9 +20,9 @@ first-party packages; `scratchpad/import_domino_walk.py`) — the nix-free way t
 the same work with no build:
 - ✅ **The drop-ML decision HOLDS.** ZERO ML/TTS/LLM packages (torch, transformers,
   langchain, autogen, chromadb, faiss, onnxruntime, piper…) are imported *unguarded* at
-  module load — all lazy. Only `pyautogui` (GUI) appears and it is *guarded*. So the daemon
-  boots without the dropped stack; those imports only fire on code paths HART OS serves
-  server-side.
+  module load — all lazy. Only `pyautogui` (GUI) appears and it is *guarded*. The daemon
+  therefore boots without the dropped stack; those imports only fire on code paths HART OS
+  serves server-side.
 - ⚠️ **Fixed a real boot blocker (`3635ef77`):** Nunba's `models/catalog.py` +
   `models/orchestrator.py` do an unguarded `import integrations.service_tools.model_catalog`
   (→ `integrations/__init__` → `core/__init__`). Nunba has **no** `core/`/`integrations/` of
@@ -275,8 +275,8 @@ reproduces the old two-route structure; both env unset → the 404 floor-lock ho
 - **CONFIRMED: `nunba.nix` + `hart-nunba.nix` are the concurrent sharded-inference session's
   files** — `0a338951` ("bulk landing of the sharded-model inference session's in-flight tree")
   rewrote `nunba.nix` (±199 lines), `hart-nunba.nix` (±77), and added
-  `tests/unit/test_liquid_ui_nunba_serving.py`. So B/C MUST be applied in coordination with that
-  session (not blind-overwritten). The A+D seams touch only MY files (Nunba `main.py`, HARTOS
+  `tests/unit/test_liquid_ui_nunba_serving.py`. B/C MUST therefore be applied in coordination
+  with that session (not blind-overwritten). The A+D seams touch only MY files (Nunba `main.py`, HARTOS
   `liquid_ui_service.py`) and are verified compatible with their serving test — no collision.
 - **Import-domino discovery needs a real Nix build+boot** (hart-app.nix's curated-set history
   proves it) → B's `pythonEnv` cannot be finalized on a box without Nix. The skeleton above is the

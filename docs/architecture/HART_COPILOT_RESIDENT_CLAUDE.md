@@ -83,7 +83,7 @@ threads through for Rust:
   (`buildNpmPackage`, `mainProgram = "claude"`, `license = unfree`)
 - the flake already sets `allowUnfree = true` (`flake.nix:363`)
 
-So it is instantiated with the **same pattern as `hart-comp`'s `rust_1_88`**, one
+It is instantiated with the **same pattern as `hart-comp`'s `rust_1_88`**, one
 way this repo reaches the newer nixpkgs, no third nixpkgs, nothing vendored.
 
 **Boundary made mechanical, not advisory.** `hart-copilot`:
@@ -136,7 +136,7 @@ does to a human one.
 
 ---
 
-## 6. Known caveats (honest)
+## 6. Known caveats
 
 1. **The login does not survive a reboot on the live ISO.** The ISO's home is
    **tmpfs**. Persistence requires the **installed writable-root image**, which
@@ -155,7 +155,7 @@ does to a human one.
 
 ## 7. Remaining work
 
-| # | Item | Why it matters |
+| # | Item | Why |
 |---|---|---|
 | 1 | ~~**`hart hive connect` CLI**~~ **DONE** | Built. `hart_cli.py` gained a `hive` group (connect, status, tasks, scope, pause, resume, disconnect) that calls the routes `claude_hive_session.get_blueprint()` already served. What remains is not code: run it against a live dispatcher and confirm a task actually arrives, executes and reports. |
 | 2 | **Installed writable-root image** | Makes the credential (and any state) persist. Prerequisite for unattended operation. |
@@ -188,5 +188,5 @@ does to a human one.
   parsed, it ran, it gave a clean error against no server, and it was wrong.
 
   Still not done: a live dispatcher actually sending this session a task. That
-  is the test that matters and it has not been run.
+  test has not been run.
 - Full `iso-desktop` build: **pending**.

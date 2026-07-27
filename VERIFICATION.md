@@ -1,8 +1,11 @@
 # Verified and unverified
 
 Every claim this project makes is in one of two tables. The top table has
-evidence you can check today. The bottom table does not, and moving a row from
-the bottom to the top is the most useful contribution available here.
+evidence you can check today. The bottom table does not.
+
+Two ways to help here. Run an unverified row on hardware we do not have and move
+it up. Or, if you have built systems like this before, tell us where the design
+is wrong.
 
 Most of the unverified rows need one thing: hardware that is not a developer
 laptop. A Raspberry Pi, a board with no GPU, a machine with 4 GB. We do not have
@@ -14,8 +17,6 @@ the top table as a verified negative, with the failure recorded, which is worth
 as much as a pass.
 
 ## If you have built an OS before
-
-There is a third kind of contribution and it is the one we want most.
 
 Read the code as an engineer, not as an auditor. The scheduler, the model bus,
 the session supervisor, the peer transport, the tier ladder: these were built by

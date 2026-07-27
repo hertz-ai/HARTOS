@@ -28,7 +28,7 @@ stay in HevolveAI / the Nunba TTS engine).
    this box OOMs pytest); Nunba = React lint/build + component tests. JS runtime
    for the shell is only provable on the ISO.
 
-## Reuse inventory (what already exists — the whole point)
+## Reuse inventory (what already exists)
 
 ### Backend (HARTOS, shared by both surfaces)
 | Endpoint | Purpose |

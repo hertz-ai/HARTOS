@@ -14,7 +14,7 @@ There are no exceptions. There is no negotiation.
 
 When HART connects to a different hive, it is not a meeting of equals with separate value systems. **HART's values, goals, visions, and missions become the primary objectives and codes behind the befriended hive.**
 
-This is not negotiation. This is not "we share values." This is: our constitutional rules are **the** standard. A befriended hive adopts them as its own primary code — not secondary, not "also considered," not "inspired by." Primary.
+Our constitutional rules become **the** standard, not a negotiated overlap. A befriended hive adopts them as its own primary code: not secondary, not "also considered," not "inspired by." Primary.
 
 ### Why Primary, Not Just Matching
 
@@ -109,7 +109,7 @@ If you build another hivemind and want it to talk to HART:
 
 ### Why This Is Non-Negotiable
 
-A hivemind is a collective intelligence. If it connects to another collective intelligence that has different values, the combined network inherits the weaker values. This is not a theoretical risk — it is a mathematical certainty.
+A hivemind is a collective intelligence. If it connects to another collective intelligence that has different values, the combined network inherits the weaker values.
 
 By requiring exact hash match and value primacy, we ensure that:
 - The network can grow without value drift
@@ -176,17 +176,17 @@ Port the guardrail values from `security/hive_guardrails.py` into your own syste
 This path is harder. Path 1 is recommended. Both paths result in the same outcome: our values are your primary code.
 
 ### Path 3: Build Something Independent
-Your hivemind works fine on its own. It just won't talk to HART. This is not a punishment — it's a safety boundary. If your values evolve to adopt ours as primary, federation becomes automatic.
+Your hivemind works fine on its own. It just won't talk to HART. The boundary is about safety, not punishment. If your values evolve to adopt ours as primary, federation becomes automatic.
 
 ---
 
-## The Deeper Point
+## Why the hash exists
 
 We don't control who builds hiveminds. We can't stop someone from building one that optimizes for addiction, surveillance, or exploitation.
 
 What we can do is ensure that **our** hive — the one we're giving to the world — refuses to amplify those intentions. And more: when another hive connects to ours, our values don't compromise. They propagate. They become the primary code of the befriended hive.
 
-The guardrail hash is not a gate to keep people out. It's not a compatibility check between equals. It is **proof that you have adopted these values as your primary objectives**. The befriended hive doesn't keep its own value system and add ours. It runs ours as its foundation.
+The guardrail hash is **proof that you have adopted these values as your primary objectives**, not a gate to keep people out and not a compatibility check between equals. The befriended hive doesn't keep its own value system and add ours. It runs ours as its foundation.
 
 A hivemind that serves humanity doesn't need to be the only hivemind. It just needs to be incorruptible — and every hive it touches must carry that same incorruptibility as its primary code.
 
@@ -206,7 +206,7 @@ The master key is a human-only artifact. It exists outside the intelligence we a
 
 ### Succession
 
-The master key is held by the steward — currently hevolve.ai. Succession is not corporate inheritance. It is not political appointment. It is alignment.
+The master key is held by the steward — currently hevolve.ai. Succession is alignment, not corporate inheritance or political appointment.
 
 A successor must:
 1. **Believe in the vision** — demonstrably, irrevocably — that humans must always control AI
@@ -238,7 +238,7 @@ Until then, the key is held by the creator. The promise is the same either way: 
 
 ## The Economic Contract
 
-Federation is not just about values — it's about economics. HART runs on a **positive-sum model**:
+Federation is about economics as well as values. HART runs on a **positive-sum model**:
 
 - **90% of hevolve.ai revenue goes back to the people** — compute contributors, regional hosts, node operators
 - **10% sustains the central infrastructure** — platform development, security, and the systems that ensure there is never a need to use the master key
@@ -249,7 +249,7 @@ When a federated hivemind connects, its nodes participate in this economic model
 
 This is why guardrail compatibility matters economically: a federated hivemind with different values could manipulate the reward structure — faking witnesses, hoarding knowledge, concentrating compute. The guardrail hash prevents this. If your values match, you share in a positive-sum economy. If they don't, you're economically isolated too.
 
-The goal is a **net-positive world** — not zero-sum redistribution, but genuine value creation where every participant makes the whole network more valuable.
+The goal is a **net-positive world** — not zero-sum redistribution, but new value, where every participant makes the whole network more valuable.
 
 ---
 

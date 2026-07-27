@@ -165,7 +165,7 @@ Laptop receives: same bytes, parsed as JSON
  or on opposite sides of the planet — trust = authenticated user_id)
 ```
 
-No ECDH, no AES, no key exchange. Just WebSocket frames.
+The frames are plain WebSocket JSON, with no ECDH, AES or key exchange involved.
 Trust determination: compute_mesh device registry (LAN) OR gossip peer
 info with matching user_id (WAN/regional).
 
@@ -297,7 +297,7 @@ Docker/cloud deployments that consume Crossbar need updates:
 
 ## Encryption at Rest
 
-Sensitive data stored on disk is encrypted when `HEVOLVE_DATA_KEY` (Fernet key) is configured. Falls back to plaintext when the key is absent — no data is lost, no functionality breaks.
+Sensitive data stored on disk is encrypted when `HEVOLVE_DATA_KEY` (Fernet key) is configured. Falls back to plaintext when the key is absent, without losing data or breaking functionality.
 
 ### What's Encrypted
 
@@ -313,7 +313,7 @@ Sensitive data stored on disk is encrypted when `HEVOLVE_DATA_KEY` (Fernet key) 
 
 - **Encrypt on write, decrypt on read** — boundary-only, same pattern as PeerLink transport encryption
 - **Auto-detect** — `decrypt_data()` checks for Fernet prefix (`gAAAAA`). Plaintext files are returned as-is.
-- **Seamless migration** — existing plaintext files are read correctly and encrypted on next write. No manual conversion needed.
+- **In-place migration** — existing plaintext files are read correctly and encrypted on next write. No manual conversion needed.
 - **Opt-in** — set `HEVOLVE_DATA_KEY` env var (or via `security.secrets_manager`). Without it, everything stays plaintext.
 - **Zero hive impact** — encryption is at the persistence boundary only. In-memory data is always plaintext. Hive learnability, inference, training, agent reasoning, and federation are completely unaffected.
 

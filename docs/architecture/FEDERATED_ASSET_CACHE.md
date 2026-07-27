@@ -35,8 +35,8 @@ This document is the SYNTHESIS, and it is layered on purpose:
   ONLY ADD warm CIDs to a node. Remove it entirely and Layer 1 still resolves
   every asset.
 
-The decentralization-first lens (`memory/decentralization_first_lens.md`) is what
-forces the split: Layer 2 introduces the one place this design could drift toward
+The decentralization-first lens (`memory/decentralization_first_lens.md`) forces
+the split: Layer 2 introduces the one place this design could drift toward
 a gatekeeper (a regional seed origin), so Layer 2 is fenced as an accelerant that
 degrades to nothing. The operational test "does this feature REQUIRE a central
 authority?" answers NO for the whole design, because Layer 1 alone is complete.
@@ -56,7 +56,7 @@ same thing, over P2P first and central as an optional accelerant.
 Read at its strongest, "generation should NOT cost per-node" means the common
 assets (the alive-home posters, the orb textures, the popular agent art) should
 already be SITTING in a node's local cache the first time the home wants to paint
-them: no first-hit latency, no cold generate, no WANT round-trip on the hot path.
+them, with no first-hit latency, cold generate, or WANT round-trip on the hot path.
 That strongest reading is Layer 2. The floor (Layer 1) is: an asset is generated
 or fetched at most once per node and, network-wide, the bytes are shared so the
 SECOND node never regenerates.
@@ -91,8 +91,8 @@ Cost model: a deterministic asset is generated AT MOST ONCE per CID across the
 whole hive in the steady state. The first node to want it pays the generate, then
 announces; every later node gets the bytes over P2P (or central) and verifies by
 hash. Long-tail assets only one node ever needs are generated exactly once on that
-node and never shared. This is the complete answer to "create centrally OR by any
-node, then reuse" with central OFF.
+node and never shared. That covers "create centrally OR by any node, then reuse"
+with central OFF.
 
 ## 3. Layer 2 (ACCELERANT): proactive seeding
 
@@ -640,8 +640,8 @@ above it absent.
    - tasks #140, #143). Each card/texture is a spec; the home calls
    `get_or_create(spec, generate_fn)`. Under proactive seeding the regional host
    pre-generates the popular ones and pushes them, so the FIRST paint on a fresh
-   node is a local hit. This is the direct, strongest answer to "generation should
-   not cost per-node".
+   node is a local hit, which is what "generation should not cost per-node" asks
+   for.
 3. Generated images / TTS clips. Any deterministic generate becomes a spec; the
    network makes it once and seeds the hot ones.
 
