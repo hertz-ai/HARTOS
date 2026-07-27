@@ -51,10 +51,44 @@ jobs:
         working-directory: nixos
         run: nix flake check --no-build
 
+  # ─── Resolve which targets to build ────────────────────────
+  # The `targets` dispatch input existed but was NEVER READ: the matrix below was a
+  # hardcoded list, so choosing targets by hand did nothing and the only way to
+  # build something outside that list was to edit this file. This job makes the
+  # input real. A push still builds exactly the same default set, so push behaviour
+  # is unchanged.
+  targets:
+    name: Resolve targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      list: ${{ steps.pick.outputs.list }}
+    steps:
+      - id: pick
+        run: |
+          set -euo pipefail
+          # The default set: what a push to nixos/** has always built.
+          DEFAULT='hart-rust-precedent,hart-comp,iso-server,iso-desktop,iso-edge,qcow2-server,docker-server'
+          # Everything the flake can build on demand, including the raw INSTALLED
+          # images, which are deliberately NOT in the default set: they are only
+          # needed when someone is actually shipping an installed system.
+          ALL="$DEFAULT,raw-desktop,raw-server,raw-edge"
+          REQ='${{ inputs.targets }}'
+          if [ '${{ github.event_name }}' != 'workflow_dispatch' ] || [ -z "$REQ" ]; then
+            REQ="$DEFAULT"
+          elif [ "$REQ" = 'all' ]; then
+            REQ="$ALL"
+          fi
+          LIST=$(printf '%s' "$REQ" | tr -d '[:space:]' | jq -Rc 'split(",") | map(select(length > 0))')
+          echo "resolved: $LIST"
+          echo "list=$LIST" >> "$GITHUB_OUTPUT"
+
   # ─── Build Matrix ──────────────────────────────────────────
   build:
     name: Build ${{ matrix.target }}
-    needs: evaluate
+    # `targets` as well as `evaluate`: the matrix is now computed, so the build
+    # cannot start before the list exists.
+    needs: [evaluate, targets]
     runs-on: ubuntu-latest
     # Bumped 90 -> 150: with the throttling magic-nix-cache removed (see the Install
     # Nix step), HART's own derivations build from source each run instead of being
@@ -63,16 +97,12 @@ jobs:
     timeout-minutes: 150
     strategy:
       fail-fast: false
+      # Resolved by the `targets` job above. On a push this is the same default set
+      # as before (hart-rust-precedent, hart-comp, the three ISOs, qcow2-server,
+      # docker-server); a workflow_dispatch can name any flake target, including the
+      # raw INSTALLED images which are too expensive to build on every push.
       matrix:
-        target:
-          # ── Rust-in-Nix crate compiles (M9) — actually BUILD the crates, not eval ──
-          - hart-rust-precedent  # FIRST Rust-in-Nix compile (claw-cli) — isolate toolchain resolution
-          - hart-comp            # the Smithay compositor crate (buildFeatures=["smithay"]) — THE M9 gate
-          - iso-server      # x86_64 headless — core variant
-          - iso-desktop     # x86_64 GNOME + native subsystems
-          - iso-edge        # x86_64 minimal observer
-          - qcow2-server    # VM format for QEMU testing
-          - docker-server   # OCI container image (fastest build)
+        target: ${{ fromJSON(needs.targets.outputs.list) }}
 
     steps:
       - name: Checkout code
