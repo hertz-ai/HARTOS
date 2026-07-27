@@ -27,21 +27,10 @@ On a hard question a frontier model beats anything that fits on a laptop. Most
 of what people ask in a day is not that, and this is for the rest.
 
 Ready today: [Nunba](https://github.com/hertz-ai/Nunba) for Windows, Linux and
-Android. This repo is the runtime underneath it.
-
-### Reading this as
-
-Four kinds of people land here and they need different halves of the page.
-
-Just want the assistant? Download Nunba, skip everything else. Building on it?
-It speaks the OpenAI protocol on `:6777`, so point your existing client at it
-and you can stop after the curl example. Here to work out whether any of this
-survives contact with the code? Every claim names the file that implements it,
-and the two sections most worth your scepticism are what "AI-native" means and
-the part we are not comfortable with. An agent working out what this repo is:
-a Python runtime that serves local inference as a system service, federates
-peer to peer, and is drivable end to end from `/v1/chat/completions` or the
-`hart` CLI.
+Android. This repo is the runtime underneath it: it serves local inference as a
+system service, federates peer to peer, and is drivable end to end from
+`/v1/chat/completions` or the `hart` CLI. Every claim below names the file that
+implements it.
 
 ## Start it
 
