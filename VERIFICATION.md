@@ -49,6 +49,28 @@ Ordered by how much a contributor with modest hardware can settle in an evening.
 | 14 | **Intelligence compounds between two robots** | Robot A learns a skill by doing. Robot B performs it without having done it. Measure B before and after | 2 Reachy Minis |
 | 15 | A co-pilot's work on one node improves another | Seed a goal on node A only. Show node B starting ahead of where it was | 2 nodes |
 
+| 16 | **Three nodes beat one node** | Same benchmark, one node then three, same models. The crossover the whole design rests on | 3 machines |
+
+### Row 16 is the threshold
+
+`hive_benchmark_prover.py` carries a seven-stage convergence ladder, from one
+node at roughly 62% MMLU to a hundred thousand nodes past any single model.
+Stage 2, three nodes ensembling, is where it claims the sum first exceeds the
+single. That is the threshold: below it the hive is a nice idea, above it the
+approach works and the rest is scale.
+
+**Every number in that ladder is a projection.** Not one has been measured. They
+are now marked as such in the source, because a percentage that looks like a
+result and is not is the fastest way to lose a reader who checks.
+
+Three laptops answer this. It does not need a robot, a Pi or a GPU rack, and it
+is the single cheapest experiment that could refute the project.
+
+**How the node count gets there:** crowdsourced compute, from users and
+developers lending what is idle. `compute_borrowing.py` advertises and settles,
+`revenue_aggregator.py` splits 90/9/1 and tracks payouts. That is the bootstrap
+path, and it only starts paying for itself past this row.
+
 ### Rows 14 and 15 are the thesis
 
 Everything else here is plumbing. These two are the claim the project exists to

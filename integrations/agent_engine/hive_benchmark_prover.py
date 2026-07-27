@@ -257,6 +257,16 @@ KNOWN_BASELINES = {
 
 # ── The Convergence Strategy (updated Apr 2026 with Mythos baselines) ──
 #
+# EVERY NUMBER IN THE LADDER BELOW IS A PROJECTION. None has been measured.
+# They are a hypothesis about how ensembling should scale, written down so it can
+# be falsified, not results. Do not quote them anywhere public as findings, and
+# do not let them into the README: a reader who checks and finds no measurement
+# behind a percentage stops believing the numbers that are real.
+#
+# Stage 2 is the one that matters and the cheapest to settle: three nodes beating
+# one node is the threshold where the whole approach either works or does not.
+# Three laptops can answer it. VERIFICATION.md row 16 tracks it.
+#
 # The target: Mythos Preview scores 93.9% SWE-bench, 92.7% MMLU, 97.6% USAMO.
 # But Mythos is ONE model, proprietary, not public.
 # The hive's path: many small open models → ensemble → converge → exceed.
