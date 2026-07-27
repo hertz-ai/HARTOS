@@ -79,7 +79,7 @@ behavior; it makes *"never blank screen"* a tested invariant from line 1.
 - No `WatchdogSec` added to serve_forever units (LiquidUI/ModelBus/AppBridge) —
   `Restart=on-failure` + `sd_notify` `READY=1` once only.
 - Guardrail kernel + master-key boot verification gate the session; never weakened.
-- `/shell/static` `static_url_path` route (f294f52) load-bearing and untouched.
+- `/shell/static` `static_url_path` route (f294f52) still relied on, and untouched.
 
 **verifyVia:** CI `nixosTest` VM (llvmpipe software-GL) + local QEMU-KVM boot runbook.
 

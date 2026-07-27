@@ -220,7 +220,7 @@ MISSING ~31 - PARTIAL ~43 - STUB ~7 - bug ~4 - unknown ~2.
 
 These are the items that do NOT work as the steward intended, grouped and sorted
 by user impact (most-visible / most-promised first). Each is concrete and
-actionable. PARTIAL items whose missing half is load-bearing are flagged at the
+actionable. PARTIAL items whose missing half is the part that matters are flagged at the
 end of this section so nothing hides.
 
 ### Home / desktop visual soul (highest impact - the "Netflix, agentic, real-money" promise)
@@ -319,7 +319,7 @@ end of this section so nothing hides.
    **To close:** build one Settings hub that groups the existing SYSTEM_PANELS +
    Nunba settings iframes into categories.
 
-### PARTIAL items whose missing half is load-bearing (do not let these hide)
+### PARTIAL items where the missing half is the part that matters
 
 8. **App Store is a glyph-card grid, not a Netflix image listing.**
    *(PARTIAL · d4 / W7)* `hartMarketplace.appCard` (`hartMarketplace.js:187`)

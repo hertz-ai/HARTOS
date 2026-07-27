@@ -22,7 +22,7 @@ The self-review graded the compositor-first v1 at **4.5/10** with a precise verd
 `intent → decompose → compose` loop is **real** (`hart_intelligence_entry.py:8213` `/chat`
 runs a draft intent classifier routing free-form prompts to CREATE / REUSE / tool / vision /
 casual) — but **it never reaches the glass**, for two structural reasons this document now
-treats as the load-bearing fix, ahead of any compositor:
+treats as the fix that comes first, ahead of any compositor:
 
 1. **The surface is still a chatbot-launcher, not an intent composer.** `acSend`
    (`liquid_ui_service.py:3751`) string-matches `open X` → `openPanel` (launcher is the
@@ -103,7 +103,7 @@ place a window**.
 
 This architecture was written against the tree, not against optimism. Several earlier
 "preserved" / "enhanced" claims were **verified false in code** and are corrected here
-rather than shipped on assumption. The corrections are load-bearing:
+rather than shipped on assumption. Each correction changed what got built:
 
 - The A2UI push path is **already broken cross-process** — `agent_ui_update`
   (`integrations/agent_engine/liquid_ui_service.py:394`) does only an allowlist check +
@@ -330,7 +330,7 @@ behavior preserved) · **E** = enhanced (gains capability, never loses).
 | HART Design System (MD3 tokens, `ds-*` primitives, `dsBtn`/`dsModal`/`showToast`) | **P** | L2 inline `_CSS_DESIGN_SYSTEM` + `ThemeService` | Verbatim; same WebKitGTK engine renders it identically. |
 | Generative & adaptive UI (`ContextEngine` + `generate_ui`, `/api/ui`) | **P** | L3 — terminal/Conky degraded surface only | **NOT resurrected** as a boot path (zero desktop frontends fetch `/api/ui`). Remains the static/Conky fallback for headless/edge. A labeled source-guard (Phase 0) freezes this. |
 | Multi-surface render + kiosk compositor (WebKitGTK + cage, software-GL hardening, health-wait, Nunba fallback) | **M** | L1 HART-comp primary; cage = Tier-3 floor | cage moves from PRIMARY to the never-fail Tier-3 floor — its software-GL/DMABUF-off/health-wait/Nunba-fallback hardening preserved **verbatim** as the bottom tier. HART-comp reproduces the same guarantee at Tier-1. Browser + Nunba-desktop surfaces untouched. |
-| `/shell/static` static asset route (`static_url_path` fix, the dead-husk lesson) | **P** | L2/L3 `LiquidUIService._create_flask_app` | Unchanged and load-bearing. The "verify served assets with a real `test_client` fetch — inline-render is blind" lesson is carried into the compositor smoke test. |
+| `/shell/static` static asset route (`static_url_path` fix, the dead-husk lesson) | **P** | L2/L3 `LiquidUIService._create_flask_app` | Unchanged, and still what serves the assets. The "verify served assets with a real `test_client` fetch — inline-render is blind" lesson is carried into the compositor smoke test. |
 
 ### 4.2 The brain (recipe pipeline, FSM, daemon, A2A, MCP)
 

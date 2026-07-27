@@ -131,7 +131,7 @@ AI-native grade.
 no:capture` (avoids the OOM-prone full suite + the `TestMediaAgent` tempfile-handle
 corruption). **6 targeted foundation suites, all RAN TO COMPLETION and PASSED. Green
 423 / Red 0. Zero import-skips** — every file imported cleanly (none hit the missing-
-autogen skip path), so the green is load-bearing, not a skip.
+autogen skip path), so the green means the test ran, not that it skipped.
 
 | Suite | Result | What it proves |
 |---|---|---|

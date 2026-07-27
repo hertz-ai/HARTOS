@@ -82,7 +82,7 @@ fully reskinnable. Real-HW verify each design renders + all components work.
 Two parallel read-only audits (impl + tests) against these requirements. Server spine is
 solid + governed (one allowlist gate: kill-switch/rate-cap/XSS/audit, reused by
 agent_ui_update + register_component_type + compose_home; HART-agents-only; both presets
-shipped; theme-var quad load-bearing on CSS; compose_home hero/rows works end-to-end via
+shipped; theme-var quad depends on CSS; compose_home hero/rows works end-to-end via
 `/api/home/compose`). But the AGENTIC promise is only half-wired to the client:
 
 ### P0 — a steward ask that is presently dead end-to-end

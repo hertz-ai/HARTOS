@@ -253,7 +253,7 @@ Emitted to subscribers. Same envelope minus `id`/`method`; `event` names the typ
 | `window.moved` | geometry changed | lets agents re-pin A2UI overlays beside the window |
 | `window.unresponsive` | no frame/ping within threshold | the self-healing daemon may offer to close+relaunch via the same IPC, audited |
 
-**Foreground rule (load-bearing):** `window.focused` + a last-input timestamp **augment**
+**Foreground rule (this one is relied on):** `window.focused` + a last-input timestamp **augment**
 `should_yield_to_user`. They do **not** become the source of truth — the HTTP-request-driven
 `is_genuine_user_request` writer remains canonical and must function with **zero compositor
 present** (headless central Docker `:6777`, `server.nix`, `edge.nix`).
