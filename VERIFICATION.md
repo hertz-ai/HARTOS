@@ -87,28 +87,6 @@ calls it the part we are not comfortable with.
 So the accurate split is: HevolveAI learns, this repo carries what it derives
 between nodes over four channels, and node-to-node weight sync is Phase 2.
 
-### How to describe the closed core in public
-
-HevolveAI is closed. Every property anyone claims about it is unverifiable by
-construction. So a sentence like "plastic, continual, grounded, encoder-free,
-Hebbian forward-pass learning with causal attribution and epistemic awareness"
-is a dozen assertions about a binary nobody can open. Every word can be true and
-it still reads as invented, because there is no way for a reader to find out.
-The HN thread parodied exactly this.
-
-The README already does the opposite and it is the better model:
-
-> "The learning is not open. Hebbian, Bayesian and gradient code lives in a
-> private repo called HevolveAI, and this runtime loads it as a signed binary
-> and falls back to a stub when it is missing. You can see the seam in
-> `security/native_hive_loader.py`."
-
-It names the mechanism, states the discomfort, and points at the seam, which is
-the one checkable thing about a closed binary.
-
-**Describe open parts by what they do and where the file is. Describe the closed
-part by its boundary.**
-
 ### Row 16 is the threshold
 
 `hive_benchmark_prover.py` carries a seven-stage convergence ladder, from one
