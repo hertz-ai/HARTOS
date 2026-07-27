@@ -64,13 +64,16 @@ where nobody has opted in it falls through to local. A modest machine is a
 small model plus a route to a larger one, not a small model on its own.
 
 The server starts in seconds. The install does not. `requirements.txt` pins
-192 packages and pulls torch, torchvision, transformers, onnxruntime and
+191 packages and pulls torch, torchvision, transformers, onnxruntime and
 scipy, so budget a few minutes and a few GB on a first run.
 
-**Use Python 3.10 or 3.11, not a newer one.** `faiss-cpu==1.7.4` publishes
-wheels for cp37 through cp311 only, so on 3.12 the install stops with "No
-matching distribution found for faiss-cpu==1.7.4", which reads like a broken
-repository rather than a version mismatch.
+**Use Python 3.10 or 3.11, not a newer one.** Twenty-four pins have no
+cp312 wheel, among them pandas, scipy, PyYAML, onnxruntime, grpcio and
+tokenizers, so on 3.12 the install stops with "No matching distribution
+found", which reads like a broken repository rather than a version mismatch.
+Every one of them has a current release that would work;
+[issue #92](https://github.com/hertz-ai/HARTOS/issues/92) carries the lowest
+compatible version for each.
 
 ```bash
 git clone https://github.com/hertz-ai/HARTOS.git && cd HARTOS

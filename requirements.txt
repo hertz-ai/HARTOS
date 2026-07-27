@@ -32,7 +32,6 @@ dill==0.3.7
 distro==1.8.0
 duckdb==0.8.1
 exceptiongroup==1.1.1
-faiss-cpu==1.7.4
 fastapi==0.115.6
 filelock==3.12.2
 Flask==2.3.2
