@@ -116,6 +116,75 @@ def _resolve_nvidia_smi() -> str:
     return _NVIDIA_SMI_PATH
 
 
+def _win_gpu_vram_gb_from_registry() -> float:
+    """Best-effort TRUE VRAM (GB) for the largest display adapter, read from the
+    Windows registry ``HardwareInformation.qwMemorySize``.
+
+    This exists because WMI's ``Win32_VideoController.AdapterRAM`` is a 32-bit
+    value that WRAPS at 4 GB, so an 8 GB card can report ~0. The registry value
+    is 64-bit and does not wrap, so it is used as a FLOOR under the WMI reading
+    below. Without it the WMI path silently under-reports every card >= 4 GB and
+    recommend_for_hardware() then picks a model smaller than the box can run.
+
+    Ported from Nunba's desktop/ai_installer.py so there is ONE implementation.
+    HARTOS cannot import Nunba (the dependency runs the other way: Nunba bundles
+    core/, integrations/ and security/), so the canonical home is here and
+    ai_installer delegates to it.
+
+    Returns the largest adapter memory found, or 0.0 when unavailable. Pure
+    read, never raises.
+    """
+    if sys.platform != "win32":
+        return 0.0
+    try:
+        import winreg
+    except Exception:
+        return 0.0
+    best_bytes = 0
+    roots = (
+        r"SYSTEM\CurrentControlSet\Control\Video",
+        r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}",
+    )
+    for root in roots:
+        try:
+            base = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, root)
+        except OSError:
+            continue
+        try:
+            i = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(base, i)
+                except OSError:
+                    break
+                i += 1
+                for leaf in (sub + r"\0000", sub):
+                    try:
+                        k = winreg.OpenKey(base, leaf)
+                    except OSError:
+                        continue
+                    try:
+                        for val_name in ("HardwareInformation.qwMemorySize",
+                                         "HardwareInformation.MemorySize"):
+                            try:
+                                v, _t = winreg.QueryValueEx(k, val_name)
+                            except OSError:
+                                continue
+                            if isinstance(v, bytes):
+                                v = int.from_bytes(v, "little") if v else 0
+                            try:
+                                v = int(v)
+                            except (TypeError, ValueError):
+                                v = 0
+                            if v > best_bytes:
+                                best_bytes = v
+                    finally:
+                        k.Close()
+        finally:
+            base.Close()
+    return round(best_bytes / (1024 ** 3), 1) if best_bytes else 0.0
+
+
 class VRAMManager:
     """GPU memory tracking and allocation decisions."""
 
@@ -451,6 +520,17 @@ class VRAMManager:
                                 total_gb = round(float(parts[2]) / (1024 ** 3), 2)
                         except (ValueError, TypeError):
                             pass
+                        # AdapterRAM is 32-bit and WRAPS at 4 GB, so an 8 GB
+                        # card can arrive here as ~0. The registry's 64-bit
+                        # qwMemorySize does not wrap; take it as a floor.
+                        _reg_gb = _win_gpu_vram_gb_from_registry()
+                        if _reg_gb > total_gb:
+                            logger.debug(
+                                "WMI AdapterRAM reported %.2fGB; registry says "
+                                "%.1fGB (AdapterRAM wraps at 4GB) — using registry",
+                                total_gb, _reg_gb,
+                            )
+                            total_gb = _reg_gb
                         info.update({
                             "name": parts[0],
                             "total_gb": total_gb,
