@@ -186,6 +186,28 @@ jobs:
           echo ""
           echo "Build successful!"
 
+      # Five raw-desktop builds died silently after ~50 minutes, each time straight
+      # after the filesystem was written, with the builder printing NOTHING even
+      # under -L. Silence is not evidence, and guessing a cause per 50-minute
+      # iteration is the expensive way to debug. This captures the machine state at
+      # the moment of failure so the next run says which resource ran out rather
+      # than leaving it to inference: disk (the ENOSPC theory), memory (an OOM kill
+      # leaves no message in the build log, only in dmesg), or neither.
+      - name: Why did it fail (resources at failure time)
+        if: failure()
+        run: |
+          echo "── disk ──"
+          df -h / /mnt /tmp 2>/dev/null || true
+          echo ""
+          echo "── largest consumers ──"
+          sudo du -xh --max-depth=1 /nix 2>/dev/null | sort -rh | head -5 || true
+          echo ""
+          echo "── memory ──"
+          free -m || true
+          echo ""
+          echo "── OOM kills / IO errors (dmesg) ──"
+          sudo dmesg 2>/dev/null | grep -iE "out of memory|oom-kill|killed process|No space|I/O error" | tail -20 || echo "  none found"
+
       - name: Compute checksum
         run: |
           BUILD_PATH=$(cat /tmp/build-output.txt | head -1)
