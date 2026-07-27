@@ -138,6 +138,47 @@ unchanged on a laptop and on a robot.
 That is the claim in the name. Not that it orchestrates models, but that
 inference is a system service instead of something every app carries itself.
 
+## 6. It runs a coding agent as a system service, and bounds it like one
+
+Everything above answers "this does what an OS does". This section is the one
+that is worth arguing about, because it is a thing an OS could do and none of
+them do, and it only works because this is a distribution.
+
+`nixos/modules/hart-copilot.nix:173` defines `hart-copilot-daemon`, wanted by
+`multi-user.target`, running as the unprivileged `hart` user. It keeps a Claude
+Code session resident on the node and hands it bounded work from the hive. What
+makes that an OS feature rather than an app is what it is allowed to do: it can
+activate a new system configuration on the machine it is running on.
+
+You cannot do that in a container. There is no system to rebuild.
+
+The engineering worth reading is the bounding, not the autonomy. An agent with
+that reach needs a boundary, and the question is where you put it. The answer
+this repo arrived at, the second time:
+
+| Boundary | Where it lives |
+|---|---|
+| It cannot escalate at all | `NoNewPrivileges = true`, hart-copilot.nix:210 |
+| It cannot change what the machine boots into | root oneshot with `nixos-rebuild test` written into ExecStart; no argument comes from the daemon |
+| It can reach that one unit and nothing else | polkit rule matching a single unit name |
+| A human outranks it mid-task | `yield_to_user()`, daemon:106, the same gate every other loop uses |
+| A human can stop it dead | `hive_halted()` daemon:92, plus a stop file at daemon:70 |
+| Its work cannot land unreviewed | branch, then PR. Merge, OTA publish and master-key signing stay human |
+
+19 tests in `tests/unit/test_copilot_daemon_boundary.py`.
+
+The second time, because the first version put the important half in the prompt.
+It asked the agent not to run `nixos-rebuild switch`, and asking is the weakest
+place to put a boundary. Worse, the verification step had never once run: the
+daemon shelled out to `sudo`, which a `NoNewPrivileges` unit cannot use, so every
+attempt on a real node failed while reporting "not a NixOS host?" on a NixOS
+host. Fixed in `21acfecb` by moving activation into the root unit above.
+
+That is the argument for doing this in an OS rather than in an agent framework.
+Privilege separation for untrusted workers is a solved problem, and the solution
+is sudoers, polkit and systemd. An agent framework has to invent a worse version
+of it. Here it was already sitting in the system configuration.
+
 ## CI status
 
 | Workflow | Trigger | Last result |
@@ -156,8 +197,8 @@ green run of them to point at.
 Nineteen nixosTests covering initrd, paint watchdogs and recovery TTYs do not
 get written by someone wrapping Docker, whatever state CI is in. But "we wrote
 the tests" and "the tests pass" are different claims, and only the first is
-supported today. The four failing shards on every push are the honest headline:
-the gate that would prove the OS boots is red, and has been long enough that it
+supported today. The four failing shards on every push are the headline: the
+gate that would prove the OS boots is red, and has been red long enough that it
 gets read as noise.
 
 If you want to be useful, `nixos-vm-tests.yml` is manual-dispatch. Running it
@@ -183,6 +224,15 @@ Held to the same standard as everything above.
   with `hart.gpudiag` on the kernel command line to capture it.
 - **Boot and session behaviour.** See CI status. The tests are written and not
   passing.
+- **The co-pilot end to end on a node.** Its verification step could not run
+  until `21acfecb`, so no machine has completed the loop of picking up a task,
+  activating a config on itself and opening a PR. The boundary has tests, the
+  loop has not been round once. If you have a node, this is the thing to try.
+- **What the agent edits inside its own clone.** The boundary above bounds
+  privilege: it cannot escalate, cannot change the boot default, cannot merge.
+  It does not sandbox the agent within its writable checkout, where Claude Code
+  runs with its ordinary tools. The blast radius is a branch nobody has merged,
+  which is the right size, but it is bounded by review rather than by the OS.
 - **Daily-driver readiness.** Nothing here says this replaces your OS today.
   It says the work is OS work.
 
