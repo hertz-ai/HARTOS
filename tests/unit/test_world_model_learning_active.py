@@ -1,6 +1,6 @@
 """check_health.learning_active reflects real throughput, not a live pointer.
 
-2026-07-24 audit (docs/audit/ux_degrading_design_choices_2026-07-24.md #1.3): the
+2026-07-24 audit (docs/internal/ux_degrading_design_choices_2026-07-24.md #1.3): the
 product-core learning pipeline reported ``learning_active: True`` whenever the
 in-process provider object was non-null, or on any HTTP 200 -- a hardcoded literal.
 The 50-batch flush buffer and the local-model 0-spark trap both left the bridge

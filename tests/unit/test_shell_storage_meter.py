@@ -1,6 +1,6 @@
 """The disk/storage meter counts only real writable storage, not the squashfs.
 
-2026-07-24 audit (docs/audit/ux_degrading_design_choices_2026-07-24.md #0.4):
+2026-07-24 audit (docs/internal/ux_degrading_design_choices_2026-07-24.md #0.4):
 /api/shell/storage aggregated EVERY psutil partition with no filter, so on the live
 ISO the read-only squashfs Nix store (/nix/.ro-store, always 100% full by nature)
 and the ISO mount were counted -- the Storage panel alarmed at ~100% used for no

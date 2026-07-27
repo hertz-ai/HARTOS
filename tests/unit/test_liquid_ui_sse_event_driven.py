@@ -1,6 +1,6 @@
 """The /api/notifications/stream SSE producer is EVENT-DRIVEN, not a 2s poll.
 
-2026-07-24 audit (docs/audit/ux_degrading_design_choices_2026-07-24.md #2.1): the
+2026-07-24 audit (docs/internal/ux_degrading_design_choices_2026-07-24.md #2.1): the
 producer used ``while True: time.sleep(2)``, so every A2UI card / notification /
 desktop-compose (the "Liquid UI is the heart" path) landed up to 2s late and every
 open stream re-scanned all agents every 2s even when idle. The fix wakes the

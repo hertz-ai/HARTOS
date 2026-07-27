@@ -1,6 +1,6 @@
 """The node watchdog reports its OWN health from the thread, not an intent flag.
 
-2026-07-24 audit (docs/audit/ux_degrading_design_choices_2026-07-24.md #1.2): the
+2026-07-24 audit (docs/internal/ux_degrading_design_choices_2026-07-24.md #1.2): the
 monitor at the root of the whole recovery tree reported ``watchdog: 'healthy'``
 straight from ``self._running`` (only ever toggled in start()/stop()), and its
 ``_check_loop`` ran ``_check_all()`` with no guard. So any exception escaping a
