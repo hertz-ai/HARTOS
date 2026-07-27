@@ -29,6 +29,20 @@ of what people ask in a day is not that, and this is for the rest.
 Ready today: [Nunba](https://github.com/hertz-ai/Nunba) for Windows, Linux and
 Android. This repo is the runtime underneath it.
 
+### Reading this as
+
+Four kinds of people land here and they need different halves of the page.
+
+Just want the assistant? Download Nunba, skip everything else. Building on it?
+It speaks the OpenAI protocol on `:6777`, so point your existing client at it
+and you can stop after the curl example. Here to work out whether any of this
+survives contact with the code? Every claim names the file that implements it,
+and the two sections most worth your scepticism are what "AI-native" means and
+the part we are not comfortable with. An agent working out what this repo is:
+a Python runtime that serves local inference as a system service, federates
+peer to peer, and is drivable end to end from `/v1/chat/completions` or the
+`hart` CLI.
+
 ## Start it
 
 **Just want to use it?** Download
@@ -126,6 +140,28 @@ signing, keep humans in control. Nodes improve themselves from their own use,
 locally, and that is a toggle you can switch off, because an operating system
 that describes itself as alive should come with an off switch.
 
+### Then why does it ship a Dockerfile
+
+Because it is one source tree packaged three ways, and the topology mode picks
+which. In `flat` it rides inside the Nunba bundle and runs as an ordinary app
+on Windows, macOS or Linux. As `regional` or `central` it runs standalone in
+Docker, which is how the nodes that other nodes federate with get deployed. As
+HART OS it is built with Nix and boots on the metal, hosting the same runtime
+the other two forms run. Nothing is reimplemented per form, and only the last
+one is the OS claim.
+
+Nix is worth naming because most of what people mean by "immutable OS" comes
+from there rather than from us. Generations, one-command rollback, a read-only
+store: all NixOS, and plain NixOS gives you all three today if that is the only
+thing you want. What sits on top here is the update pipeline, BUILD through
+TEST, AUDIT, BENCHMARK, SIGN, CANARY and DEPLOY, where the canary reverts the
+generation by itself when health regresses and the signing step needs a master
+key that a human holds and the AI cannot reach
+(`nixos/modules/hart-ota.nix`). The inheritance is also why the copilot
+boundary below is structural instead of a promise. The store is read only, so
+a coding agent cannot rewrite the running system in place however much it
+would like to.
+
 If you think "OS" is doing more work in that name than the code earns, that is
 a reasonable suspicion and **[Is it an OS?](docs/IS_IT_AN_OS.md)** takes it
 seriously. The compositor does build with Smithay linked, green in CI on
@@ -155,76 +191,42 @@ the session can register with the hive dispatcher and take work. What is
 still missing: no live dispatcher has handed it a task yet, and the login
 does not survive a reboot on the live ISO.
 
+### Where it differs from the OS you are running now
+
+Windows and macOS both run models on-device now, so this is not the old story
+about local versus cloud. Copilot+ uses the NPU and Apple Intelligence uses the
+Neural Engine. What differs is who the model belongs to and what an application
+is allowed to ask for.
+
+| | HART OS | Windows | macOS | Linux |
+|---|---|---|---|---|
+| Any app can ask the OS for inference | yes, Model Bus on `:6777` | vendor assistant only | Apple Intelligence is Apple's | no, each app brings its own |
+| Model chosen from the hardware | `core/gpu_tier.py`, `vram_manager.py` | fixed | fixed | manual |
+| Runs Windows, macOS, Linux and Android apps | Wine, Darling, Flatpak/Snap/AppImage/Nix, Waydroid (`app_installer.py`) | Windows, Linux via WSL | macOS, others need a VM | Linux, Windows via Wine |
+| Finds your other devices and hands over a turn | `compute_mesh_service.py`, LAN beacon `:6780` | no | Continuity moves tasks, not inference | no |
+| Federates with other people's nodes | PeerLink, no broker | no | no | no |
+| Consent is a system primitive | append-only, JWT-authed, fanned out to your devices (`consent_api.py`) | per-app prompts | per-app prompts | per-app |
+| Learns a task once and replays it | `create_recipe.py` / `reuse_recipe.py` | no | no | no |
+| Updates are generations you can roll back | NixOS underneath | in-place, System Restore is partial | sealed volume, no generation rollback | NixOS and Silverblue yes, most distros no |
+
+Three of those rows are more flattering than they should be. The mesh hands a
+peer a whole turn, it does not split one model across machines, so if you came
+here looking for parallax-style layer sharding it is not that. A hive of nodes
+coordinating on a goal is not the same thing as one larger model, and a
+question that genuinely needs frontier capability still wants a frontier model.
+And a recipe is learned from a real run, which means a wrong recipe replays
+wrongly until a person corrects it. The human in that loop is load-bearing.
+
 **[Full capability map →](CAPABILITIES.md)** covers every subsystem with the
 file that implements it: agent runtime, auto-evolve, federation, 31 channel
 adapters, 16 providers, security, economics, the API surface, and how it
-compares to the alternatives.
+compares to the agent frameworks rather than to operating systems.
 
 > **HART** is the bare engine in this repo, listening on `:6777`. There is no
 > PyPI package yet, so install from source as above. **HART OS** is the full
 > AI-native OS that boots on a laptop, server, phone or edge node.
 > **[Nunba](https://github.com/hertz-ai/Nunba)** is the consumer app, one
 > signed client across Windows, macOS and Linux.
-
----
-
-## Against the OS you are running now
-
-Windows and macOS both ship on-device AI now, so the honest comparison is not
-"they are cloud, we are local". Copilot+ runs models on the NPU and Apple
-Intelligence runs them on the Neural Engine. The difference is who the model
-belongs to and what an application is allowed to ask for.
-
-| | HART OS | Windows | macOS | Linux |
-|---|---|---|---|---|
-| Inference is a system service any app can call | yes, Model Bus on `:6777`, OpenAI-compatible | vendor assistant, no general app-facing local inference API | same, Apple Intelligence is Apple's | no, each app brings its own |
-| Model picked from the hardware, automatically | yes (`core/gpu_tier.py`, `vram_manager.py`) | fixed to the shipped model | fixed to the shipped model | manual |
-| Runs Windows, macOS, Linux and Android apps on one box | Wine, Darling, Flatpak/Snap/AppImage/Nix, Waydroid (`app_installer.py`) | Windows plus Linux via WSL, Android partial | macOS, others need a VM | Linux plus Windows via Wine |
-| Finds your other devices and hands a turn to the bigger one | yes (`compute_mesh_service.py`, LAN beacon `:6780`, WireGuard off-LAN) | no | Continuity relays tasks, not inference | no |
-| Federates with other people's nodes | yes, PeerLink, no broker | no | no | no |
-| Consent is a system primitive, not a per-app prompt | append-only, JWT-authed, fanned out to your devices (`consent_api.py`) | per-app permission prompts | per-app permission prompts | per-app |
-| Learns a task once, replays it without re-asking the model | yes (`create_recipe.py` / `reuse_recipe.py`) | no | no | no |
-| Improves itself from its own use, with an off switch | yes, auto-evolve plus `world_model_bridge.py` | no | no | no |
-| An update is a new generation you can roll back in one command | yes, NixOS underneath (`nixos/flake.nix`, 67 modules) | in-place servicing, System Restore is partial | sealed system volume, but no generation rollback | NixOS and Silverblue yes, most distros in-place |
-| Whole thing still works with the network off | yes | assistant degrades | assistant degrades | depends on the app |
-
-Four of those want a caveat, because the table is the flattering version.
-
-**The mesh offloads requests, it does not shard a model.** Peer discovery and
-relay are real and shipped, but `POST /mesh/infer` hands over a whole turn to a
-device that can answer it better. It is not parallax-style layer sharding, and
-nothing here splits one model across machines. The unit of work is a request.
-
-**The hive is orchestration, not a bigger brain.** Many nodes coordinating on
-a goal is not the same as one larger model, and a hard question that needs
-frontier capability still wants a frontier model. What the hive buys you is
-throughput, redundancy and reach across devices you already own.
-
-**Human in the loop is load-bearing, not decoration.** A recipe is learned from
-a real run and replayed, so a wrong recipe replays wrongly until someone
-corrects it. Merging, OTA publishing and release signing stay human by design,
-and the master key is deliberately outside anything the AI can reach.
-
-**Cross-OS app support is per-runtime, not a guarantee.** Wine and Darling
-carry the usual compatibility caveats of Wine and Darling. Darling in
-particular is early, and a macOS app that leans on recent frameworks may not
-run at all.
-
-**The atomic part is Nix's, not ours.** HART OS is built on NixOS, so
-generations, one-command rollback and a read-only store come from underneath
-rather than from anything in this repo. Plain NixOS gives you all three today
-and is the honest recommendation if that is the only thing you want. What sits
-on top here is the update pipeline: BUILD, TEST, AUDIT, BENCHMARK, SIGN,
-CANARY, DEPLOY, where the canary reverts the generation automatically on a
-health regression and the signing step needs the master key, which is held by a
-human and is not reachable by the AI (`nixos/modules/hart-ota.nix`). That
-inheritance is also what makes the copilot boundary above structural rather
-than a promise: the store is read only, so a coding agent cannot modify the
-running system in place even if it tries.
-
-Every claim above names the file that implements it, and
-[CAPABILITIES.md](CAPABILITIES.md) compares against the agent frameworks
-(OpenAI Agents, LangChain, AutoGen) rather than against operating systems.
 
 ---
 
