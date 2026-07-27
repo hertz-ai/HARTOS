@@ -145,6 +145,32 @@ def build_remote_desktop_tools(ctx) -> List[Tuple[str, str, Any]]:
         remote_screenshot,
     ))
 
+    # ── record_screen ─────────────────────────────────────────
+
+    def record_screen(
+        duration_s: Annotated[float, "Seconds to record (default 10)"] = 10.0,
+        fps: Annotated[int, "Frames per second (default 10)"] = 10,
+    ) -> str:
+        """Record the screen to a shareable video file on this machine."""
+        try:
+            from integrations.remote_desktop.frame_capture import FrameCapture
+            result = FrameCapture().record_to_video(
+                duration_s=float(duration_s), fps=int(fps))
+            if result.get('ok'):
+                return (f"Recorded {result['duration_s']}s "
+                        f"({result['frames']} frames, {result['format']}) "
+                        f"to {result['path']}")
+            return f"Recording failed: {result.get('error', 'unknown')}"
+        except Exception as e:
+            return f"Recording failed: {e}"
+
+    tools.append((
+        "record_screen",
+        "Record the screen for a few seconds and save a shareable video "
+        "(mp4, or GIF where no encoder is present) on this machine.",
+        record_screen,
+    ))
+
     # ── remote_transfer_file ──────────────────────────────────
 
     def remote_transfer_file(

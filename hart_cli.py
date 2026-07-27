@@ -478,6 +478,44 @@ def desktop_screenshot(ctx, save):
         _error_exit(f'Screenshot not available: {e}', json_output)
 
 
+# ── Record ──
+
+@desktop.command('record')
+@click.option('--duration', default=10.0, type=float, help='Seconds to record')
+@click.option('--fps', default=10, type=int, help='Frames per second')
+@click.option('--save', default='', help='Output path (default: <data dir>/demos/)')
+@click.pass_context
+def desktop_record(ctx, duration, fps, save):
+    """Record the screen to an mp4 (or GIF if no ffmpeg plugin).
+
+    Uses the same tiered capture as the remote desktop: dxcam where it is
+    available, mss otherwise, pyautogui last. Recording happens on the machine,
+    which is the point of demoing this node with itself.
+    """
+    json_output = ctx.obj['json_output']
+
+    try:
+        from integrations.remote_desktop.frame_capture import FrameCapture
+    except ImportError as e:
+        _error_exit(f'Recording not available: {e}', json_output)
+        return
+
+    if not json_output:
+        click.echo(f'Recording {duration:g}s at {fps} fps. Ctrl-C stops early.')
+
+    result = FrameCapture().record_to_video(
+        duration_s=duration, fps=fps, output_path=save or None)
+
+    if json_output:
+        click.echo(json.dumps(result))
+    elif result.get('ok'):
+        click.echo(f"Saved {result['path']} "
+                   f"({result['format']}, {result['frames']} frames, "
+                   f"{result['duration_s']:g}s)")
+    else:
+        _error_exit(result.get('error', 'recording failed'), json_output)
+
+
 # ── Wait ──
 
 @desktop.command('wait')
