@@ -94,6 +94,62 @@ let
     cd "$REPO" || exit 1
     exec ${lib.getExe claudePkg} "$@"
   '';
+
+  # `hart-copilot-tabs` — the node equivalent of the Windows 4-tab autostart
+  # (schtasks -> claude_autostart_boot.ps1 -> one Terminal window, four elevated
+  # tabs, one per repo). Same idea, one command, on the machine being debugged.
+  #
+  # Two deliberate differences from the Windows original, both forced by reality:
+  #
+  #   * NO PINNED SESSION IDS. Those ids (99c39a1e..., 3a9b530c...) exist only in
+  #     the Windows box's ~/.claude and mean nothing here, so each tab uses
+  #     --continue: resume the latest session FOR THAT REPO ON THIS MACHINE. First
+  #     run starts fresh, every run after continues where the node left off, which
+  #     is the behaviour that actually compounds.
+  #   * ONE kitty session file instead of one launcher per tab. The Windows script
+  #     needs a separate `wt` invocation per tab because `wt`'s `;` parsing
+  #     silently dropped the last tab. kitty takes a declarative session file, so
+  #     the whole window is described once and no tab can go missing.
+  #
+  # Repos are cloned on demand and a repo that will not clone is SKIPPED with a
+  # message rather than killing the window, so a private repo the node has no
+  # credential for costs you one tab, not the session.
+  copilotTabs = pkgs.writeShellScriptBin "hart-copilot-tabs" ''
+    set -uo pipefail
+    WS="''${HART_WORKSPACE:-$HOME/hart}"
+    mkdir -p "$WS" || { echo "cannot create $WS" >&2; exit 1; }
+
+    # The repos these sessions care about, mirroring the Windows tabs. HARTOS is
+    # the OS itself; hevolveai is the closed intelligence layer; hevolve is the web
+    # product; Nunba is the desktop companion + landing page.
+    REPOS="HARTOS hevolveai hevolve Nunba-HART-Companion"
+
+    SESSION="$(mktemp -t hart-copilot-tabs.XXXXXX)"
+    trap 'rm -f "$SESSION"' EXIT
+    TABS=0
+    for r in $REPOS; do
+      d="$WS/$r"
+      if [ ! -d "$d/.git" ]; then
+        echo "[hart-copilot-tabs] cloning $r …"
+        ${pkgs.git}/bin/git clone --depth 50 "https://github.com/hertz-ai/$r.git" "$d" \
+          || { echo "[hart-copilot-tabs] skip $r (clone failed: no access or no network)" >&2; continue; }
+      fi
+      # --continue, never a pinned id: see the note above.
+      {
+        echo "new_tab $r"
+        echo "cd $d"
+        echo "launch ${lib.getExe claudePkg} --continue"
+      } >> "$SESSION"
+      TABS=$((TABS + 1))
+    done
+
+    if [ "$TABS" -eq 0 ]; then
+      echo "[hart-copilot-tabs] no repo could be prepared; nothing to open" >&2
+      exit 1
+    fi
+    echo "[hart-copilot-tabs] opening $TABS tabs in $WS"
+    exec ${pkgs.kitty}/bin/kitty --session "$SESSION"
+  '';
 in
 {
   options.hart.copilot = {
@@ -147,6 +203,7 @@ in
       environment.systemPackages = (lib.optionals (claudePkg != null) [
         claudePkg          # `claude` — the co-pilot itself, in the terminal
         copilotLauncher    # `hart-copilot` — opens it bounded + on a branch
+        copilotTabs        # `hart-copilot-tabs` — the 4-tab workspace, on the node
       ]) ++ [
         pkgs.git           # it commits its own work (to a branch)
         pkgs.gh            # branch push / PR — the human still merges
