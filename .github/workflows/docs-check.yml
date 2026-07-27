@@ -1,0 +1,53 @@
+name: Docs Claims Check
+
+# Guards the six documents a stranger actually lands on against the mistakes
+# we made in them on 2026-07-27: paths that pointed nowhere, percentages with
+# their qualifying condition removed, and the specific phrases that got this
+# project's README identified as machine-written on Hacker News.
+#
+# Deliberately shaped like security-scan.yml rather than the nix workflows.
+# That one is green every push; nixos-vm-tests.yml is workflow_dispatch only
+# and has never passed (see issue #93). A check nobody runs is not a check, so
+# this one triggers on push and on pull_request, needs no runner beyond
+# ubuntu + python, and finishes in seconds.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.md'
+      - 'scripts/check_docs_claims.py'
+      - '.github/workflows/docs-check.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '**.md'
+      - 'scripts/check_docs_claims.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  claims:
+    name: Public docs claims
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Check public docs
+        # Exits non-zero only on a broken path, which is the one finding that
+        # is always a defect. Dashes, tells and unsourced percentages are
+        # reported for a human to judge rather than used to block a merge,
+        # because a legitimate quote of source can contain any of them.
+        run: python scripts/check_docs_claims.py
