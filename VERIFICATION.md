@@ -13,6 +13,26 @@ steps, and paste the output. Pass or fail both help. A row that fails moves to
 the top table as a verified negative, with the failure recorded, which is worth
 as much as a pass.
 
+## If you have built an OS before
+
+There is a third kind of contribution and it is the one we want most.
+
+Read the code as an engineer, not as an auditor. The scheduler, the model bus,
+the session supervisor, the peer transport, the tier ladder: these were built by
+people solving the problem in front of them, and an experienced eye will see
+better designs than the ones we reached for. Faster paths, simpler contracts,
+allocation and IPC choices we got wrong, a primitive that should exist and does
+not.
+
+Say so. Open an issue, argue for the design, point at the file. You do not need
+a benchmark to start the conversation and you do not need our agreement to
+disagree in public.
+
+Good design decisions compound in an OS the way they do nowhere else, because
+everything above them inherits the choice. That makes design review a pillar
+here rather than a courtesy, and it is worth more to this project than another
+feature.
+
 ---
 
 ## Verified
