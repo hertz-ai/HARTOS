@@ -157,7 +157,7 @@ is what `GET /api/social/channels/catalog` serves.
 | **BudgetGate** | Local models (llama / mistral / phi / qwen / groq) cost 0 Spark; cloud models per-1k-token cost | `budget_gate.py` |
 | **MeteredAPIUsage** | Per-call metering for cost recovery on metered providers | `models.py: MeteredAPIUsage` |
 | **NodeComputeConfig** | Per-node policy: GPU hours served, total inferences, energy contributed, electricity rate, cause alignment | `models.py: NodeComputeConfig` |
-| **AdService** | Peer-witnessed impressions (70% witnessed payout, 50% unwitnessed) | `ad_service.py` |
+| **AdService** | Peer-witnessed impressions. Hoster gets 90% when the impression is witnessed by a peer, 50% when it is not, the lower rate being a fraud penalty (`HOSTER_REVENUE_SHARE`, `HOSTER_UNWITNESSED_SHARE`) | `integrations/social/ad_service.py` |
 | **HostingRewardService** | Reward score weighted by gpu_hours / inferences / energy / api_costs | `hosting_reward_service.py` |
 | **RevenueAggregator** | 90 / 9 / 1 split (users / infra / central). Single source of truth for all revenue queries | `revenue_aggregator.py` |
 | **Compute democracy** | Logarithmic reward scaling, max 5% influence per entity, +20% diversity bonus | (constitutional rule, enforced) |
@@ -293,8 +293,8 @@ HART OS  (port 6777)
 |-- Idea Engine       Thought experiments . ComputePledge . type-aware agents . Hive View
 |-- Compute           Topology mode (flat default, regional/central cert-gated) . SmartLedger
 |                     ComputeMesh . ComputeEscrow
-|-- Economics         AdService (70/50) . RevenueAggregator (90/9/1) . log-scaled compute democracy
-|-- Security          33 guardrails . Ed25519 master key . 3-tier cert chain . RuntimeMonitor
+|-- Economics         AdService (90/50) . RevenueAggregator (90/9/1) . log-scaled compute democracy
+|-- Security          33 rules / 9 classes . Ed25519 master key . 3-tier cert chain
 |                     ImmutableAuditLog . tool allowlist . ActionClassifier . DLP . rate limiter
 |-- HevolveArmor      AES-256-GCM modules . BCC compile-to-C . RFT AST renaming . anti-debug
 |-- Platform          ServiceRegistry . AppRegistry . AppManifest . Bootstrap . EnvironmentManager
@@ -464,7 +464,7 @@ Front it with `/v1/chat/completions` (any OpenAI client), the [`hart` CLI](docs/
 Advertisers pay for witnessed impressions
    |
    v
-Ad service           70% witnessed view, 50% unwitnessed
+Ad service           90% witnessed view, 50% unwitnessed (ad_service.py)
    |
    v
 Compute democracy    log scaling, max 5% influence per entity, +20% diversity bonus

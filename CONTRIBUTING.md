@@ -31,8 +31,8 @@ Areas of the codebase where help is wanted, ranked by how much rather than by
 difficulty. If you would rather take on something unsolved than something
 unfinished, [OPEN_PROBLEMS.md](OPEN_PROBLEMS.md) is the other list: ten
 questions we do not have good answers to, each with the code implementing
-today's inadequate one. Arguing that a framing there is wrong is a genuinely
-welcome contribution and needs no setup at all.
+today's inadequate one. Arguing that a framing there is wrong is a welcome
+contribution and needs no setup at all.
 
 - **Channel adapters** (31 of them, `integrations/channels/`), the most
   self-contained entry point. Each is an inbound → agent → outbound loop and
