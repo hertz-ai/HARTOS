@@ -272,6 +272,14 @@ measurement that found the bug, and one names a hypothesis we already ruled
 out so nobody spends a Saturday re-testing it. Setup is in
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
+The gap we cannot close ourselves is hardware. Twelve claims in
+[VERIFICATION.md](VERIFICATION.md) are written and never run on the metal:
+whether the Pi image boots, whether GPIO toggles from the agent, what
+tokens/sec the 2B actually manages on a Pi 4, whether two machines owned by two
+people can borrow compute from each other and settle what they owe. CI has no
+boards. If you have one, an evening with it settles a row, and a failure is as
+useful as a pass.
+
 If you would rather argue than patch, start at
 **[Open problems](OPEN_PROBLEMS.md)**. Ten things we have not solved, each
 with the code implementing today's inadequate answer: what convergence can
@@ -289,6 +297,7 @@ us than a patch.
 |---|---|
 | [Capabilities](CAPABILITIES.md) | Every subsystem, with the file that implements it |
 | [Open problems](OPEN_PROBLEMS.md) | Ten things we have not solved |
+| [Verification](VERIFICATION.md) | What is proven, what is not, and how to settle a row |
 | [Contributing](CONTRIBUTING.md) | Setup, where help is wanted, what we will not merge |
 | [Quickstart](https://docs.hevolve.ai/getting-started/quickstart/) | Install to first agent |
 | [Architecture](https://docs.hevolve.ai/architecture/overview/) | Topology, PeerLink, draft-first dispatch, federation |
