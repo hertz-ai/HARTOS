@@ -31,7 +31,7 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # The docs a stranger actually lands on. Internal notes are out of scope on
-# purpose: docs/STEWARD_INSTRUCTION_LOG.md alone holds 8,272 em dashes and
+# purpose: the removed instruction log alone held 8,272 em dashes and
 # nobody arrives through it.
 PUBLIC_DOCS = [
     'README.md',
