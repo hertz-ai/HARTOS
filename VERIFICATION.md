@@ -45,6 +45,8 @@ Ordered by how much a contributor with modest hardware can settle in an evening.
 | 10 | The co-pilot completes one loop on a node | Task picked up, config activated, PR opened. Its verification step was broken until `21acfecb` | installed node |
 | 11 | PinePhone boots | `nixos/hardware/pinephone.nix` | PinePhone |
 | 12 | RISC-V boots | `nixos/hardware/riscv-generic.nix` | RISC-V board |
+| 13 | A Reachy Mini runs an agent locally | Drive it through `gpio_adapter.py` / `serial_adapter.py` / `ros_bridge.py`, whichever its stack exposes | Reachy Mini |
+| 14 | Two Reachy Minis share one hive | Both on `hart hive connect`, one asks a question the other's model answers | 2 Reachy Minis |
 
 ### The honest state of these
 
