@@ -6,3 +6,9 @@ contact_links:
   - name: Documentation
     url: https://docs.hevolve.ai
     about: Setup guides, API reference, and the model catalog.
+  - name: Have a Pi or a board with no GPU?
+    url: https://github.com/hertz-ai/HARTOS/labels/needs%20hardware
+    about: Twelve claims are written and never run on real hardware. CI has no boards. An evening settles one, and a failure helps as much as a pass.
+  - name: What is proven and what is not
+    url: https://github.com/hertz-ai/HARTOS/blob/main/VERIFICATION.md
+    about: Both tables in one file, with the steps that would settle each unverified row.
