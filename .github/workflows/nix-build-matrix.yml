@@ -118,6 +118,23 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # raw-* only: put the ENTIRE nix store on the runner's second, nearly empty
+      # ~65 GB data disk (/mnt), BEFORE the Nix installer runs. A raw image build
+      # peaks at the closure PLUS the disk-image output, both in the store, which
+      # does not fit the root disk however much preinstalled bloat is stripped.
+      # release.yml learned this on 2026-07-16 (run 29522446118: ENOSPC crashed the
+      # nix daemon itself at 50 min, after the hostedtoolcache purge) and carries
+      # the same step; this workflow never got it, so raw-desktop reproduced the
+      # identical failure here, dying silently at 50 minutes in runs 30287421697
+      # and 30296001550. The ISO legs stay on the root disk unchanged: their
+      # squashfs peak fits and their cache behaviour is proven.
+      - name: Move /nix to the /mnt data disk (raw only)
+        if: startsWith(matrix.target, 'raw-')
+        run: |
+          sudo mkdir -p /mnt/nix /nix
+          sudo mount --bind /mnt/nix /nix
+          df -h / /mnt
+
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v12
         with:
