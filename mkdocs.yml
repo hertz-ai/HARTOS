@@ -37,6 +37,11 @@ markdown_extensions:
       permalink: true
   - tables
 
+# Working material lives under docs/internal/. mkdocs builds and indexes every
+# file under docs_dir whether or not the nav links it, so without this the
+# internal tree was being served on the public docs site.
+exclude_docs: |
+  internal/
 nav:
   - Home: index.md
   - Downloads: downloads.md
