@@ -60,7 +60,14 @@ PATHY = re.compile(r'\.(py|rs|toml|nix|sh|json|md|txt|db|yml|yaml)$')
 NUMBER_RE = re.compile(r'\b(\d+(?:\.\d+)?%)\s+(\w+)')
 NO_X_NO_Y = re.compile(r'\bno [a-z]+.{0,40}?,\s*no [a-z]+', re.I | re.S)
 TELLS = ('load-bearing', 'load bearing')
-FILLER = ('honest', 'genuine')
+# Words and phrases that read as machine writing. honest/genuine/load-bearing
+# were literally counted by name in our HN thread; the rest are the stock
+# vocabulary those same readers grep for. Reported, not build-failing, since a
+# quote or a technical use ("robust to noise") can be legitimate.
+FILLER = ('honest', 'genuine', 'earns its keep', 'earned its keep',
+          'delve', 'seamless', 'leverage', 'empower', 'unleash', 'elevate',
+          'revolutioniz', 'game-chang', 'cutting-edge', 'supercharge',
+          'effortless', 'testament to', 'tapestry', 'dive into')
 
 
 def resolve(token: str) -> bool:

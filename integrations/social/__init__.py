@@ -314,6 +314,16 @@ def init_social(app):
     except Exception as e:
         logger.debug(f"Thought experiments blueprint skipped: {e}")
 
+    # Register site pages blueprint — publish blog/site content via the API
+    # with draft -> in_review -> published states, instead of a frontend
+    # redeploy per post.
+    try:
+        from .api_pages import pages_bp
+        app.register_blueprint(pages_bp)
+        logger.info("Site pages endpoints registered at /api/pages/")
+    except Exception as e:
+        logger.debug(f"Site pages blueprint skipped: {e}")
+
     # Register encounter (P2P BLE meetup + mutual-like icebreaker) blueprint.
     # PR-A alpha skeleton — in-memory state; DB migration v38 lands
     # in PR-A beta.  Full design: project_encounter_icebreaker.md.

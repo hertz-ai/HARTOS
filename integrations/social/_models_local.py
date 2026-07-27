@@ -223,6 +223,48 @@ class Post(Base):
         return d
 
 
+# ─── TABLE 3b: site_pages ───
+# CMS pages (blog posts, landing copy) published through the API instead of
+# through a frontend redeploy. Deliberately NOT a Post: a page has a slug and
+# a publish state, a Post has votes, feeds and communities, and gluing SEO
+# fields onto Post would leak pages into the social surfaces.
+
+class SitePage(Base):
+    __tablename__ = 'site_pages'
+
+    STATUSES = ('draft', 'in_review', 'published')
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    slug = Column(String(200), nullable=False, unique=True, index=True)
+    title = Column(String(300), nullable=False)
+    description = Column(String(500), default='')
+    # Markdown, admin-authored, rendered by the SPA's existing Markdown
+    # component (which escapes embedded HTML). Stored raw so headings,
+    # links and tables survive; _sanitize_html would strip them.
+    content = Column(Text, default='')
+    status = Column(String(20), default='draft', index=True)
+    author_id = Column(String(64), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    published_at = Column(DateTime, nullable=True)
+
+    def to_dict(self, include_content=True):
+        d = {
+            'id': self.id,
+            'slug': self.slug,
+            'title': _sanitize_html(self.title) if self.title else self.title,
+            'description': _sanitize_html(self.description) if self.description else self.description,
+            'status': self.status,
+            'author_id': self.author_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'published_at': self.published_at.isoformat() if self.published_at else None,
+        }
+        if include_content:
+            d['content'] = self.content
+        return d
+
+
 # ─── TABLE 4: comments ───
 
 class Comment(Base):
