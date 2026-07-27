@@ -27,7 +27,17 @@ on:
       - 'claw_native/rust/**'
 
 concurrency:
-  group: nix-build-${{ github.ref }}
+  # Push/PR runs share one group per ref and still cancel each other: on a busy
+  # branch only the newest commit is worth building.
+  #
+  # A workflow_dispatch gets its OWN group (keyed by run id) so it is never
+  # cancelled by a later push. Both used to resolve to `nix-build-refs/heads/main`,
+  # so an on-demand build was killed the moment anyone pushed: run 30283762645, a
+  # raw-desktop build, died at 16:58 to a push that landed 44 minutes after it
+  # started. With several sessions pushing to main, a build that takes ~54 minutes
+  # could effectively never finish, and the symptom looked like a flaky build
+  # rather than a cancellation.
+  group: nix-build-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
   cancel-in-progress: true
 
 jobs:
