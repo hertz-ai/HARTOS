@@ -14,11 +14,10 @@ you can go read, and the last section is the part that is not proven yet.
 It is built to boot, it has its own compositor, and it has a session
 supervisor. Those are three things a wrapper does not have.
 
-**Read the CI status section at the bottom before you take any of it as
-proven.** The compositor build is green as of 2026-07-26. The VM suite that
-would demonstrate the boot and session behaviour is manual-dispatch only and
-has no recorded passing run. That distinction matters and an earlier version
-of this page blurred it.
+Two of those are demonstrated by green CI: the compositor builds with Smithay
+linked, and the desktop ISO builds. The third is not. The VM suite that would
+demonstrate the boot and session behaviour is manual-dispatch only and has no
+passing run. The CI table below says which is which.
 
 ## 1. It is a distribution, not a container
 
@@ -41,8 +40,8 @@ There are nixosTest definitions covering the boot path itself:
 | `hart-boot-log` | Boot logging is present and correct. |
 
 Nobody writes an initrd test for a Docker wrapper. That tells you what this
-is trying to be. It does not tell you the tests pass, and right now they are
-not being run. See CI status below.
+is trying to be. It does not tell you the tests pass; they are defined and not
+currently run.
 
 ## 2. It has its own Wayland compositor
 
@@ -103,7 +102,7 @@ Plus `hart-floor-lock`, `hart-desktop-shell-boot`, `hart-layer-shell-host`,
 `hart-layer-shell-host-paint` and `hart-hartlog-create`. Nineteen VM checks
 defined in total, wired to KVM by `nixos-vm-tests.yml`.
 
-**Defined is not passing.** See below.
+Defined is not passing. The CI table records which.
 
 ## 4. It can see and drive its own desktop
 
@@ -139,29 +138,27 @@ unchanged on a laptop and on a robot.
 That is the claim in the name. Not that it orchestrates models, but that
 inference is a system service instead of something every app carries itself.
 
-## CI status, checked rather than assumed
-
-An earlier version of this page cited the VM suite as evidence without
-checking whether it runs. It does not, and saying so here is cheaper than
-having someone else find it.
+## CI status
 
 | Workflow | Trigger | Last result |
 |---|---|---|
 | `nix-build-matrix.yml` (builds `hart-comp` with Smithay) | push to `nixos/**`, compositor sources | **success, 2026-07-26** |
 | `nix-check.yml` (flake evaluation) | push / PR on `nixos/**` | **success, 2026-07-26** |
-| `flake-checks.yml` (heavy checks) | `workflow_call`, dispatch, PR on `nixos/**` | **failure, 2026-07-23** |
-| `nixos-vm-tests.yml` (the 19 VM checks) | **`workflow_dispatch` only** | **no passing run. Last five, all 2026-06-17, every one failed or cancelled** |
+| `release.yml` → `build-iso (iso-desktop)` | push to `main` | **success, 2026-07-27.** Nightlies publish the desktop ISO in four parts and it boots on real hardware |
+| `release.yml` → `gate-checks / nixosTests` (4 shards) | push to `main` | **all four shards fail, every run** |
+| `nixos-vm-tests.yml` (the 19 VM checks) | **`workflow_dispatch` only** | **no passing run.** Last five, all 2026-06-17, every one failed or cancelled |
 
-So the compositor building with Smithay linked is current and verifiable. The
-boot and session-supervisor behaviour is **not** currently demonstrated. The
-tests exist, they describe the right things, and nobody has a green run of
-them to point at.
+The compositor building with Smithay linked is current and verifiable, and so
+is the full desktop ISO. The boot and session-supervisor behaviour is not
+demonstrated: the tests exist, they describe the right things, and there is no
+green run of them to point at.
 
-That weakens the argument on this page and it is still the argument. Nineteen
-nixosTests covering initrd, paint watchdogs and recovery TTYs do not get
-written by someone wrapping Docker, whatever state CI is in. But "we wrote
-the tests" and "the tests pass" are different claims and only the first one
-is supported today.
+Nineteen nixosTests covering initrd, paint watchdogs and recovery TTYs do not
+get written by someone wrapping Docker, whatever state CI is in. But "we wrote
+the tests" and "the tests pass" are different claims, and only the first is
+supported today. The four failing shards on every push are the honest headline:
+the gate that would prove the OS boots is red, and has been long enough that it
+gets read as noise.
 
 If you want to be useful, `nixos-vm-tests.yml` is manual-dispatch. Running it
 and reporting what breaks would be worth more than a star.
@@ -170,17 +167,22 @@ and reporting what breaks would be worth more than a star.
 
 Held to the same standard as everything above.
 
-- **Hardware paint on the target GPU.** Worth stating precisely, because
-  there are two renderers and they are at different stages. The winit backend
-  renders through `GlesRenderer`, which is GPU accelerated, and is the
+- **Hardware paint on the target GPU.** Two renderers, at different stages.
+  The winit backend renders through `GlesRenderer`, GPU accelerated, and is the
   development and WSLg path. The DRM/udev backend does KMS scanout through
   `PixmanRenderer`, which is software, and that path is VM-proven with a real
-  virgl-QEMU scanout PNG. What the compositor's own header at `main.rs:11`
-  still marks as being verified is real-hardware paint on the target GPU. So
-  there is a GPU path and there is proven KMS scanout, and the two have not
-  yet been demonstrated together on the target device.
-- **The full ISO build.** Flake evaluation is green. The complete
-  `iso-desktop` build is the real gate for closure size and it is pending.
+  virgl-QEMU scanout PNG. The compositor's own header at `main.rs:11` still
+  marks real-hardware paint on the target GPU as unverified. There is a GPU
+  path and there is proven KMS scanout; the two have not been demonstrated
+  together on the target device.
+- **Frosted glass on the shell.** The desktop runs the `webkit-cairo` rung,
+  where GSK is cairo and WebKit's `backdrop-filter` never composites, so window
+  glass is rendered opaque instead. Only the `vulkan` rung composites blur, and
+  it is demoted for a swapchain-recreate failure
+  (`VK_ERROR_SURFACE_LOST_KHR`) on hover that has not been root-caused. Boot
+  with `hart.gpudiag` on the kernel command line to capture it.
+- **Boot and session behaviour.** See CI status. The tests are written and not
+  passing.
 - **Daily-driver readiness.** Nothing here says this replaces your OS today.
   It says the work is OS work.
 
