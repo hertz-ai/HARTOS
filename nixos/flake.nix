@@ -503,6 +503,28 @@
   in
   {
     # ═════════════════════════════════════════════════════════════
+    # The HART module set, as a composable flake output
+    # ═════════════════════════════════════════════════════════════
+    #
+    # `hartModules` was a let-binding, reachable only from inside this file. Every
+    # image the flake builds is "hartModules + a variant config", so a system built
+    # ANYWHERE ELSE -- most importantly one installed onto a user's disk by an
+    # installer -- had no way to be HART. It could only be stock NixOS.
+    #
+    # That is the whole point (steward, 2026-07-28): "nothing shd be shipped nix
+    # only, there is no point of that without our os customisations ... union of
+    # features". An installer is allowed to borrow NixOS's hardware layer -- the
+    # `nixos-generate-config` hardware-configuration.nix that makes it work on any
+    # substrate -- but the system it installs must carry THESE modules on top. The
+    # union, not one instead of the other.
+    #
+    # Exposed under both conventional names: `nixosModules.hart` is what a flake
+    # consumer expects to import, `lib.hartModules` is the raw list for code that
+    # needs to splice it (the installer writes it into the target's configuration).
+    nixosModules.hart = { imports = hartModules; };
+    lib.hartModules = hartModules;
+
+    # ═════════════════════════════════════════════════════════════
     # NixOS Configurations (nixos-rebuild build --flake .#name)
     # ═════════════════════════════════════════════════════════════
     nixosConfigurations = {
