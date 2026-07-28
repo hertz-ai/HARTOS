@@ -43,7 +43,7 @@
   // The list above is only the instant-first-paint SEED. The real source is
   // /api/apps/catalog -> app_catalog.py -> nixos/modules/hart-app-catalog.json,
   // the ONE list that also feeds hart-apps.nix's preinstall set, and it annotates
-  // each entry with a LOCAL `installed` flag decided by shutil.which(exec) -- no
+  // each entry with a LOCAL 'installed' flag decided by shutil.which(exec) -- no
   // network. Without this the store showed a plain "Install" for apps that are
   // BAKED INTO THE IMAGE (Firefox, VLC, GIMP...), so clicking it ran a Flathub
   // install that failed offline and flipped to "Retry" -- the real-HW report.
@@ -404,7 +404,7 @@
 
     renderFeatured();         // instant first paint from the seed list
     // ...then upgrade to the CANONICAL catalog, which carries the local
-    // `installed` flag, so a baked-in app (Firefox, VLC, GIMP...) renders
+    // 'installed' flag, so a baked-in app (Firefox, VLC, GIMP...) renders
     // "Installed" instead of an Install button that fails offline.
     loadCatalog(renderFeatured);
     loadInstalled();          // surface already-installed / pre-bundled apps
