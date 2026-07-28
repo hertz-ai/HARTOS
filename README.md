@@ -301,6 +301,32 @@ model automatically but can never decide on its own that a problem deserves an
 hour and three machines. Telling us a framing there is wrong is worth more to
 us than a patch.
 
+## If you lend it compute
+
+A node with spare capacity can serve turns for nodes that do not have it. What
+the lender gets, in code rather than in principle:
+
+`integrations/agent_engine/revenue_aggregator.py:26` splits gross revenue
+90/9/1. Ninety percent to the pool that pays the people who ran the work, nine
+to infrastructure, one to central. Revenue comes from the API and from ads, so a
+provider is paid out of what the network earns rather than out of a subscription
+someone else pays.
+
+`compute_borrowing.py` is the mechanism: peers advertise idle capacity, a node
+under pressure borrows, and the work is accounted against the lender.
+Contribution is scored by participation, not by hardware. A Pi and a GPU rack
+carry the same vote weight at equal participation, `log1p(interactions)` with no
+tier multiplier (`federated_aggregator.py:642`), so lending a small machine is
+not a rounding error.
+
+**What has not happened yet.** No payment has settled end to end. The split is
+constants in a file, the borrowing path is written, and nobody has been paid
+through it. Anyone lending compute today is helping prove the mechanism works,
+not collecting on it. That is [row 8](VERIFICATION.md) and it wants two machines
+owned by two people.
+
+Details at [provider join](https://docs.hevolve.ai/provider/joining/).
+
 ---
 
 ## Documentation
