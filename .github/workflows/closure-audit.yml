@@ -31,6 +31,10 @@ on:
         description: 'Dotted option path to force OFF (e.g. hart.subsystems.windows.gaming)'
         default: 'hart.subsystems.windows.gaming'
         required: false
+      explain:
+        description: 'Optional store-path substring to trace with nix why-depends (e.g. clang)'
+        default: ''
+        required: false
 
 concurrency:
   group: closure-audit-${{ github.ref }}-${{ github.run_id }}
@@ -113,6 +117,31 @@ jobs:
                    -L --no-link --print-out-paths)
           echo "base: $BASE"
           echo ""
+
+          # WHY is a path in the closure? A size number says what to cut; this says
+          # what to cut it FROM. Runs against the base closure, before the variant,
+          # so the chain reflects the shipped system.
+          #
+          # Reads the path list from a FILE rather than piping into grep -m1 / head:
+          # those exit early, the writer takes EPIPE, and `set -o pipefail` turns a
+          # successful lookup into a failed step.
+          EXPLAIN='${{ inputs.explain }}'
+          if [ -n "$EXPLAIN" ]; then
+            nix path-info -r "$BASE" > /tmp/allpaths.txt
+            matches=$(grep -- "$EXPLAIN" /tmp/allpaths.txt | sed -n '1,4p')
+            if [ -z "$matches" ]; then
+              echo "── why-depends: no closure path matching '$EXPLAIN' ──"
+            else
+              for m in $matches; do
+                echo ""
+                echo "── why does the closure contain $(basename "$m")? ─────────"
+                # Default (shortest chain), not --all: the shortest path names the
+                # package actually responsible, where --all buries it in every route.
+                nix why-depends "$BASE" "$m" 2>&1 | sed -n '1,40p' || true
+              done
+            fi
+            echo ""
+          fi
 
           echo "── building WITHOUT the feature ───────────────────────────"
           VARIANT=$(nix build --impure --no-link --print-out-paths --expr "$VARIANT_EXPR")
