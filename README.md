@@ -248,9 +248,11 @@ that nobody owns.
 ### The part we are not comfortable with
 
 The learning is not open. Hebbian, Bayesian and gradient code lives in a
-private repo called HevolveAI, and this runtime loads it as a signed binary
+private repo called HevolveAI, and it does not ship as source you could read:
+it is compiled, encrypted and master-signed, and this runtime loads that bundle
 and falls back to a stub when it is missing. You can see the seam in
-`security/native_hive_loader.py`.
+`security/native_hive_loader.py`. Worth being exact about, since "closed" here
+means closed rather than merely inconvenient to obtain.
 
 The reason is the boring one. It is the piece a funded competitor would copy
 first, and it is how the rest of this gets paid for. That is a normal way to
