@@ -308,9 +308,12 @@ the lender gets, in code rather than in principle:
 
 `integrations/agent_engine/revenue_aggregator.py:26` splits gross revenue
 90/9/1. Ninety percent to the pool that pays the people who ran the work, nine
-to infrastructure, one to central. Revenue comes from the API and from ads, so a
-provider is paid out of what the network earns rather than out of a subscription
-someone else pays.
+to infrastructure, one to central. The same ninety holds for apps: creators keep
+90% of every Spark their app earns (`app_marketplace.py:7`).
+
+Three things earn: the API, ads, and agents completing work. A provider is paid
+out of what the network takes in rather than out of a subscription someone else
+pays, which is the difference between this and renting your GPU to a company.
 
 `compute_borrowing.py` is the mechanism: peers advertise idle capacity, a node
 under pressure borrows, and the work is accounted against the lender.
@@ -319,11 +322,16 @@ carry the same vote weight at equal participation, `log1p(interactions)` with no
 tier multiplier (`federated_aggregator.py:642`), so lending a small machine is
 not a rounding error.
 
-**What has not happened yet.** No payment has settled end to end. The split is
-constants in a file, the borrowing path is written, and nobody has been paid
-through it. Anyone lending compute today is helping prove the mechanism works,
-not collecting on it. That is [row 8](VERIFICATION.md) and it wants two machines
-owned by two people.
+**What has not happened yet.** No payment has settled end to end. The aggregator
+currently sums the API and ad legs; agent work earns into Spark but the
+cross-node collective-earning slice is deliberately inert and says so in its own
+first line (`collective_earning.py`: "Neither broadcasts, remits, nor mutates
+anything"). The split is constants, the borrowing path is written, and nobody
+has been paid through any of it.
+
+So anyone lending compute today is helping prove the mechanism, not collecting
+on it. That is [row 8](VERIFICATION.md), and it wants two machines owned by two
+people.
 
 Details at [provider join](https://docs.hevolve.ai/provider/joining/).
 
