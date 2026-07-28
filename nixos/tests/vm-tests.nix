@@ -384,8 +384,36 @@ in
       # budget was borrowed from a single-VM world. A readiness budget can be
       # generous without weakening the test: if the backend never binds, this
       # still fails, just honestly.
-      server.wait_for_open_port(6777, timeout=300)
-      edge.wait_for_open_port(6777, timeout=300)
+      # On timeout, dump the facts that DISTINGUISH the failure causes before
+      # re-raising. The backend dies with "can't start new thread" here, and
+      # CPython raises that for EVERY pthread_create failure, hiding the errno --
+      # which is the one fact that separates a task limit (EAGAIN: TasksMax /
+      # RLIMIT_NPROC / kernel threads-max) from memory pressure (ENOMEM). Two
+      # theories have already been disproven from the outside (an app thread
+      # storm: the real import measures 11 threads / 275 MB RSS on the dev box;
+      # node memorySize defaults: these nodes set 2048/1024 explicitly), so this
+      # dump makes the next failure name its own cause instead of inviting a
+      # third guess.
+      def _dump_backend_state(m, tag):
+          for cmd in [
+              "systemctl show hart-backend -p TasksCurrent,TasksMax,MemoryCurrent,MemoryPeak,Result,ExecMainStatus,NRestarts",
+              "cat /sys/fs/cgroup/system.slice/hart-backend.service/pids.current /sys/fs/cgroup/system.slice/hart-backend.service/pids.max 2>/dev/null || true",
+              "free -m",
+              "cat /proc/sys/kernel/threads-max /proc/sys/kernel/pid_max /proc/sys/vm/overcommit_memory",
+              "su -s /bin/sh hart -c 'ulimit -u -v -m' 2>/dev/null || true",
+              "ps -eLf | wc -l",
+              "journalctl -u hart-backend --no-pager -n 30 | tail -30",
+          ]:
+              print(f"── [{tag}] $ {cmd}")
+              print(m.execute(cmd)[1])
+
+      try:
+          server.wait_for_open_port(6777, timeout=300)
+          edge.wait_for_open_port(6777, timeout=300)
+      except Exception:
+          _dump_backend_state(server, "server")
+          _dump_backend_state(edge, "edge")
+          raise
 
       with subtest("Server backend accessible from edge"):
           edge.succeed("curl -sf http://192.168.1.1:6777/status")
