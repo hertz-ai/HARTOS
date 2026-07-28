@@ -94,29 +94,35 @@
           # with 103GB free and 42GB already used, and it dies without printing an
           # error (runs 30263310599 and 30287421697, ~54 minutes each).
           #
-          # 40G, not 44G, and the difference is CI disk, not the target disk. Inside
-          # the Nix sandbox systemd-repart has no loop device, so it mkfs's into a
-          # temp file and then COPIES that file into the .raw. The temp file stays
-          # sparse (mke2fs punches holes for the unused blocks) but the copy does
+          # 28G, and the difference from the old 44G is CI disk, not target disk.
+          # Inside the Nix sandbox systemd-repart has no loop device, so it mkfs's
+          # into a temp file and then COPIES that file into the .raw. The temp file
+          # stays sparse (mke2fs punches holes for unused blocks) but the copy does
           # not -- `copy_bytes` after mkfs writes the partition out dense -- so this
-          # number is very nearly the peak disk the build costs, on top of the ~42GB
-          # the closure already occupies in /nix/store. Run 30312462459 died exactly
-          # there: 61GB free, 37GB temp filesystem written, then ENOSPC ~24GB into
-          # the copy, silently, because the copy loop never reaches a log statement.
+          # number is very nearly the peak disk the build costs, on top of what the
+          # closure already occupies in /nix/store. Run 30312462459 died exactly
+          # there: 61GB free, temp filesystem written, then ENOSPC partway into the
+          # copy, silently, because the copy loop never reaches a log statement.
           #
-          # repart's own minimize pass measured this closure at 9627552 4k blocks
-          # (36.7 GiB); plus ext4 metadata and journal that is ~37.7 GiB, so 40G
-          # leaves ~2.3 GiB of slack. If the closure outgrows that, mke2fs fails
-          # LOUDLY with a "does not fit" error -- a different and clearly readable
-          # failure from the silent ENOSPC above, which is why this is safe to
-          # tighten. The workflow's "Closure budget" step prints the exact closure
-          # size every run, so the next adjustment is made from a number.
+          # 28G is sized from the MEASURED closure: 23531757072 bytes = 21.9 GiB
+          # (run 30334471869's "Closure budget" step). Plus ext4 metadata and the
+          # journal that is ~23 GiB, so this leaves ~5 GiB of headroom.
+          #
+          # The 44G and 40G that came before were sized off repart's `Minimize`
+          # probe, which reported 9627552 4k blocks (36.7 GiB) -- inflated by the
+          # inode tables of the 1 TiB filesystem the probe itself creates, and
+          # therefore never a measurement of this closure at all. Do not size this
+          # partition from a Minimize block count; size it from `nix path-info -S`
+          # on the toplevel, which CI now prints before every image build.
+          #
+          # If the closure ever outgrows this, mke2fs fails LOUDLY with a "does not
+          # fit" error -- clearly distinguishable from the silent ENOSPC above.
           #
           # None of this constrains the installed system: the image ships
           # xz-compressed and growPartition + autoResize expand the root to fill the
           # real disk on first boot, so the on-disk size is the target's, not this.
-          SizeMinBytes = "40G";
-          SizeMaxBytes = "40G";
+          SizeMinBytes = "28G";
+          SizeMaxBytes = "28G";
         };
       };
     };

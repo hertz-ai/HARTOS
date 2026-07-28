@@ -281,9 +281,20 @@ jobs:
           echo "repart peak needs ~2x that free, plus the store copy."
           echo "free now : $(df -h --output=avail / | tail -1 | tr -d ' ')"
           echo ""
-          echo "── 25 largest paths in the closure ────────────────────────"
-          nix path-info -rS "$top" | sort -k2 -n -r | head -25 \
-            | while read -r p s; do printf '%10s  %s\n' "$(numfmt --to=iec-i --suffix=B "$s")" "$p"; done
+          echo "── 25 largest paths in the closure (SELF size) ────────────"
+          # -s (self/NAR size), NOT -S (closure size). With -S every path near the
+          # root reports ~the whole system -- the first fifteen lines came back as
+          # "21GiB etc", "21GiB dbus-1", "21GiB system-units", which is true and
+          # completely useless for finding what to cut. Self size names the actual
+          # heavy packages.
+          #
+          # awk 'NR<=25', NOT `head -25`: `head` exits after 25 lines, `sort` gets
+          # EPIPE, and under the `set -o pipefail` at the top of this step the whole
+          # pipeline reports failure -- which failed this step and SKIPPED the image
+          # build in run 30334471869 after the budget had already printed correctly.
+          # awk reads its input to the end, so there is no early close to trip on.
+          nix path-info -rs "$top" | sort -k2 -n -r \
+            | awk 'NR<=25 { printf "%9.2f MiB  %s\n", $2/1048576, $1 }'
 
       - name: Build ${{ matrix.target }}
         working-directory: nixos
