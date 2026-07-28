@@ -595,6 +595,50 @@
       # via mkRepartSystem, so the two can never drift apart.
       hart-desktop-raw = mkRepartSystem { system = "x86_64-linux"; variant = "desktop"; };
 
+      # The INSTALLED desktop (hartImageKind = "installed"): the composition the
+      # hardware-agnostic installer writes to a disk the user owns (#17) — variant
+      # profile + a hardware-configuration.nix, never a whole-disk image module.
+      # The hardware here is a STUB standing in for nixos-generate-config output
+      # (UUID-addressed root + ESP), because the real one only exists on the
+      # target machine at install time.
+      #
+      # This exists FIRST as regression coverage: mkHartSystem's "installed"
+      # branch had no consumer, so nothing evaluated it — the eval gate now
+      # exercises the exact composition the installer will emit, on every push,
+      # before the installer itself exists. It is also the template: hart-install
+      # generates precisely this, with the stub replaced by the generated file.
+      #
+      # canTouchEfiVariables = true is the DELIBERATE inversion of the raw image's
+      # false: the portable image must not write NVRAM and boots via the
+      # removable-media path, while an installed dual-boot system must register
+      # its own NVRAM entry BESIDE Windows Boot Manager — overwriting
+      # EFI/BOOT/BOOTX64.EFI (Windows' fallback loader) is exactly what it must
+      # never do.
+      hart-desktop-installed = mkHartSystem {
+        system = "x86_64-linux";
+        variant = "desktop";
+        # imageKind defaults to "installed"
+        modules = [
+          ./profiles/desktop.nix
+          ({ pkgs, hartSrc, ... }: {
+            hart.package = pkgs.callPackage ./packages/hart-app.nix { inherit hartSrc; };
+          })
+          {
+            # stand-in for nixos-generate-config's hardware-configuration.nix
+            fileSystems."/" = {
+              device = "/dev/disk/by-uuid/00000000-0000-0000-0000-000000000000";
+              fsType = "ext4";
+            };
+            fileSystems."/boot" = {
+              device = "/dev/disk/by-uuid/0000-0000";
+              fsType = "vfat";
+            };
+            boot.loader.systemd-boot.enable = true;
+            boot.loader.efi.canTouchEfiVariables = true;
+          }
+        ];
+      };
+
       # ─── aarch64 (ARM: Raspberry Pi, edge, phones) ───
       hart-server-arm  = mkSystem { system = "aarch64-linux"; variant = "server"; };
       hart-desktop-arm = mkSystem { system = "aarch64-linux"; variant = "desktop"; };
