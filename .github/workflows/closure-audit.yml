@@ -73,27 +73,49 @@ jobs:
           echo "disable : $OPT"
           echo ""
 
+          # extendModules on the SAME config, so the only difference is this option.
+          #
+          # The flake ref is `git+file://<repo>?dir=nixos`, ROOTED AT THE REPO, not
+          # `path:$PWD`. path: copies only the nixos/ directory into the store, and
+          # the flake reaches OUTSIDE it for ../compositor (hart-comp's crate source)
+          # -- which fails deep in evaluation with the memorable "'compositor' is too
+          # short to be a valid store path" (run 30347017963, 35 minutes in, after the
+          # base closure had already built). This is the same ref `nix build .#…`
+          # resolves for itself; shallow=1 because actions/checkout clones shallow.
+          #
+          # mkForce is REQUIRED, not defensive: desktop.nix assigns `gaming = true`
+          # as a plain value, and a second plain definition of the same option is a
+          # conflict error, not an override. setAttrByPath keeps this generic for any
+          # dotted option path passed in.
+          VARIANT_EXPR="
+            let
+              flake = builtins.getFlake \"git+file://${GITHUB_WORKSPACE}?dir=nixos&shallow=1\";
+              base  = flake.nixosConfigurations.${CFG};
+            in (base.extendModules {
+                 modules = [ ({ lib, ... }:
+                   lib.setAttrByPath (lib.splitString \".\" \"${OPT}\") (lib.mkForce false)) ];
+               }).config.system.build.toplevel
+          "
+
+          # EVALUATE the variant before BUILDING the base. Evaluation catches every
+          # way this expression can be wrong -- bad flake ref, missing attr, option
+          # conflict, typo in the dotted path -- in ~3 minutes. Building the base
+          # first meant the previous failure surfaced 35 minutes in, having spent the
+          # entire closure build before the expression was ever exercised.
+          echo "── validating the variant expression (eval only) ──────────"
+          nix eval --impure --raw --expr "($VARIANT_EXPR).drvPath"
+          echo ""
+          echo "  expression is valid; building both closures now."
+          echo ""
+
           echo "── building WITH the feature ──────────────────────────────"
           BASE=$(nix build ".#nixosConfigurations.${CFG}.config.system.build.toplevel" \
                    -L --no-link --print-out-paths)
           echo "base: $BASE"
           echo ""
 
-          # extendModules on the SAME config, so the only difference is this option.
-          # mkForce is REQUIRED, not defensive: desktop.nix assigns `gaming = true`
-          # as a plain value, and a second plain definition of the same option is a
-          # conflict error, not an override. setAttrByPath keeps this generic for any
-          # dotted option path passed in.
           echo "── building WITHOUT the feature ───────────────────────────"
-          VARIANT=$(nix build --impure --no-link --print-out-paths --expr "
-            let
-              flake = builtins.getFlake \"path:$PWD\";
-              base  = flake.nixosConfigurations.${CFG};
-            in (base.extendModules {
-                 modules = [ ({ lib, ... }:
-                   lib.setAttrByPath (lib.splitString \".\" \"${OPT}\") (lib.mkForce false)) ];
-               }).config.system.build.toplevel
-          ")
+          VARIANT=$(nix build --impure --no-link --print-out-paths --expr "$VARIANT_EXPR")
           echo "variant: $VARIANT"
           echo ""
 
