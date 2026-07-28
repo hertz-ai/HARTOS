@@ -165,7 +165,16 @@ def test_static_js_is_webkitgtk_safe():
         raw_total += n
         if name != 'hartSession.js':
             assert n == 0, name + ' calls AbortSignal.timeout() directly (use window.HartTimeoutSignal)'
-        assert '`' not in src, name + ' uses a template literal (avoid for old WebKitGTK)'
+        # Plain substring check ON PURPOSE, so it also trips on backticks inside
+        # comments. Parsing JS well enough to skip comments is how a safety test
+        # acquires its own bugs (a naive `//` strip eats the rest of any line
+        # holding an https:// URL), and "no backticks at all in shipped shell
+        # JS" is a rule a reader can apply without running anything.
+        assert '`' not in src, (
+            name + ' contains a backtick. Old WebKitGTK cannot parse template '
+            'literals, and this guard greps raw source, so comments count too: '
+            "quote with 'single quotes' instead."
+        )
         assert '?.' not in src, name + ' uses optional chaining'
         assert '??' not in src, name + ' uses nullish coalescing'
     assert raw_total <= 1, 'AbortSignal.timeout() should exist only in the HartTimeoutSignal wrapper'

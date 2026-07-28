@@ -26,7 +26,10 @@
     } catch (e) { return ''; }
   }
 
-  // Open the floating assistant (reusing the canonical toggle) and prefill `text`.
+  // Open the floating assistant (reusing the canonical toggle) and prefill
+  // the given text. No backticks anywhere in this file, including comments:
+  // tests/test_orb_webkit_safety.py greps the raw source for them, because
+  // old WebKitGTK cannot parse template literals.
   // toggleAssistantChat TOGGLES, so only call it while the chat is closed, else a
   // second right-click-Ask would close an already-open chat.
   function askOpen(text) {
