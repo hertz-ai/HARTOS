@@ -90,6 +90,27 @@ jobs:
             REQ="$ALL"
           fi
           LIST=$(printf '%s' "$REQ" | tr -d '[:space:]' | jq -Rc 'split(",") | map(select(length > 0))')
+
+          # Reject unknown targets HERE, in a job that costs seconds, instead of
+          # letting them reach the matrix. The input is comma-separated BARE NAMES
+          # and `jq -Rc split(",")` array-ifies them, so passing a JSON array by
+          # mistake (targets='["raw-desktop"]') yields a one-element list whose
+          # element is the literal string `["raw-desktop"]`. That is not an error to
+          # any later step: it produces a job cheerfully named `Build [raw-desktop]`
+          # in which every `startsWith(matrix.target, 'raw-')` guard is FALSE, so the
+          # disk purge and the closure budget silently skip and `nix build` fails on
+          # a nonexistent attribute ~90 seconds later (run 30333633950). A wrong
+          # dispatch should say so immediately and say what the right one looks like.
+          INVALID=$(printf '%s' "$LIST" | jq -r --arg all "$ALL" \
+            '($all | split(",")) as $ok | map(select(IN($ok[]) | not)) | join(", ")')
+          if [ -n "$INVALID" ]; then
+            echo "::error::Unknown build target(s): $INVALID"
+            echo "Valid targets: $ALL  (or 'all')"
+            echo "Input is COMMA-SEPARATED BARE NAMES, e.g.  targets=raw-desktop"
+            echo "                                  NOT JSON, e.g. '[\"raw-desktop\"]'"
+            exit 1
+          fi
+
           echo "resolved: $LIST"
           echo "list=$LIST" >> "$GITHUB_OUTPUT"
 
