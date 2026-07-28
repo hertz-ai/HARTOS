@@ -320,6 +320,18 @@ in
           server.wait_for_unit("hart-discovery.service", timeout=60)
           edge.wait_for_unit("hart-discovery.service", timeout=60)
 
+      # A unit going ACTIVE is not a readiness signal: hart-backend is not
+      # Type=notify, so systemd calls it active the moment the process execs,
+      # while the backend then spends ~20s running SQLAlchemy migrations before
+      # it binds anything. Curling straight after wait_for_unit therefore raced
+      # the socket and failed with curl exit 7 (connection refused) on every run
+      # since at least 2026-07-26. Wait for the PORT, which is the real signal --
+      # the same file already does exactly this for the single-node case
+      # ("Backend responds on port 6777" above). Both nodes, because the second
+      # subtest reverses the direction.
+      server.wait_for_open_port(6777, timeout=120)
+      edge.wait_for_open_port(6777, timeout=120)
+
       with subtest("Server backend accessible from edge"):
           edge.succeed("curl -sf http://192.168.1.1:6777/status")
 
