@@ -441,8 +441,34 @@ in
         gamemode                       # Performance optimizer
         mangohud                       # FPS/performance overlay
         lutris                         # Multi-platform game launcher
-        heroic                         # Epic Games / GOG launcher
         gamescope                      # SteamOS session compositor
+
+        # heroic (Epic/GOG launcher) is NOT preinstalled — it is in the App Store
+        # catalog (hart-app-catalog.json, Games) and installs in one click.
+        #
+        # It cost 1.4 GiB of every image and every OTA, and most of that was not
+        # Heroic. `nix why-depends` on the shipped closure (run 30356487925):
+        #
+        #   system-path -> heroic -> heroic-bwrap -> heroic-fhsenv-rootfs
+        #     -> kdialog -> kinit-dev -> kiconthemes-dev -> qttools-dev
+        #       -> clang-18.1.8-lib          (775 MiB)
+        #
+        # Three -dev outputs in a RUNTIME closure, ending at libclang — which is
+        # there because Qt's qdoc links it to build documentation. Nothing on this
+        # machine will ever run qdoc. buildFHSEnv is not at fault (it installs only
+        # out/lib/bin); kdialog's own out output carries the reference, an upstream
+        # KDE packaging bug HART OS was silently inheriting. On top of that came
+        # Electron (261 MiB) and a whole KDE/Qt5 widget stack (~300 MiB) pulled into
+        # a desktop that ships no KDE.
+        #
+        # Dropping kdialog from the FHS would mean vendoring nixpkgs' fhsenv.nix,
+        # which is a parallel path that drifts on every nixpkgs bump (Gate 4). And
+        # Heroic loses nothing here: its targetPkgs already carry `zenity`, the GTK
+        # dialog helper it uses on a GTK desktop like this one.
+        #
+        # Steam, Lutris, gamescope, gamemode, mangohud and the whole Wine/DXVK/
+        # Bottles layer are UNCHANGED — this removes one launcher from the base
+        # image, not gaming support.
       ];
 
       # Vulkan + 32-bit graphics (required for DXVK/Proton)

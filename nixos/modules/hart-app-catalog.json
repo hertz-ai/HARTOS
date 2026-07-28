@@ -1,47 +1,356 @@
 {
   "schemaVersion": 1,
   "_comment": "HART OS canonical curated FOSS app catalog — the SINGLE source of truth read by BOTH nixos/modules/hart-apps.nix (bakes the preinstall set into environment.systemPackages) AND integrations/agent_engine/app_catalog.py (serves the offline App Store + appearance dedup). JSON is the only format both Nix (builtins.fromJSON) and Python (json.load) parse natively, so there is ONE list, no parallel copy. Each entry: id = Flathub reverse-DNS id (store identity + OPTIONAL Flathub poster source, never a gatekeeper); name/category/icon/description = display; preinstall = true means shipped in the base image (Open, not Install); package = nixpkgs attr the module bakes when preinstall=true (attr-guarded, a wrong/renamed attr can never break eval); exec = binary name the backend probes with shutil.which() to dedup installed-vs-catalog with the network OFF. No em dashes in any user-facing string.",
-  "categories": ["Web", "Media", "Creative", "Productivity", "Develop", "Chat", "Games", "System"],
+  "categories": [
+    "Web",
+    "Media",
+    "Creative",
+    "Productivity",
+    "Develop",
+    "Chat",
+    "Games",
+    "System"
+  ],
   "apps": [
-    { "id": "org.mozilla.firefox", "name": "Firefox", "category": "Web", "icon": "public", "description": "Fast, private web browser", "preinstall": true, "package": "firefox", "exec": "firefox" },
-    { "id": "org.gnome.Epiphany", "name": "GNOME Web", "category": "Web", "icon": "public", "description": "Lightweight browser and web-app host", "preinstall": true, "package": "epiphany", "exec": "epiphany" },
-    { "id": "org.chromium.Chromium", "name": "Chromium", "category": "Web", "icon": "public", "description": "Open-source browser engine", "preinstall": false, "package": "chromium", "exec": "chromium" },
-
-    { "id": "io.github.celluloid_player.Celluloid", "name": "Celluloid", "category": "Media", "icon": "movie", "description": "Plays virtually every video format", "preinstall": true, "package": "celluloid", "exec": "celluloid" },
-    { "id": "org.videolan.VLC", "name": "VLC", "category": "Media", "icon": "movie", "description": "Plays virtually everything, anywhere", "preinstall": true, "package": "vlc", "exec": "vlc" },
-    { "id": "io.bassi.Amberol", "name": "Amberol", "category": "Media", "icon": "music_note", "description": "Clean local-first music player", "preinstall": true, "package": "amberol", "exec": "amberol" },
-    { "id": "com.obsproject.Studio", "name": "OBS Studio", "category": "Media", "icon": "videocam", "description": "Stream and record your screen", "preinstall": true, "package": "obs-studio", "exec": "obs" },
-    { "id": "org.audacityteam.Audacity", "name": "Audacity", "category": "Media", "icon": "graphic_eq", "description": "Multitrack audio editor", "preinstall": true, "package": "audacity", "exec": "audacity" },
-
-    { "id": "org.gimp.GIMP", "name": "GIMP", "category": "Creative", "icon": "brush", "description": "Powerful image editor", "preinstall": true, "package": "gimp", "exec": "gimp" },
-    { "id": "org.inkscape.Inkscape", "name": "Inkscape", "category": "Creative", "icon": "gesture", "description": "Vector graphics editor", "preinstall": true, "package": "inkscape", "exec": "inkscape" },
-    { "id": "org.pitivi.Pitivi", "name": "Pitivi", "category": "Creative", "icon": "movie_edit", "description": "Free and intuitive video editor", "preinstall": true, "package": "pitivi", "exec": "pitivi" },
-    { "id": "org.kde.krita", "name": "Krita", "category": "Creative", "icon": "palette", "description": "Digital painting studio", "preinstall": false, "package": "krita", "exec": "krita" },
-    { "id": "org.kde.kdenlive", "name": "Kdenlive", "category": "Creative", "icon": "video_settings", "description": "Pro-grade video editor", "preinstall": false, "package": "kdenlive", "exec": "kdenlive" },
-    { "id": "org.blender.Blender", "name": "Blender", "category": "Creative", "icon": "view_in_ar", "description": "3D creation suite", "preinstall": false, "package": "blender", "exec": "blender" },
-
-    { "id": "org.libreoffice.LibreOffice", "name": "LibreOffice", "category": "Productivity", "icon": "description", "description": "Full office suite", "preinstall": true, "package": "libreoffice", "exec": "libreoffice" },
-    { "id": "org.gnome.TextEditor", "name": "Text Editor", "category": "Productivity", "icon": "edit_note", "description": "Simple, fast text editor", "preinstall": true, "package": "gnome-text-editor", "exec": "gnome-text-editor" },
-    { "id": "org.gnome.Nautilus", "name": "Files", "category": "Productivity", "icon": "folder", "description": "Browse and manage your files", "preinstall": true, "package": "nautilus", "exec": "nautilus" },
-    { "id": "org.gnome.Calculator", "name": "Calculator", "category": "Productivity", "icon": "calculate", "description": "Everyday and scientific calculator", "preinstall": true, "package": "gnome-calculator", "exec": "gnome-calculator" },
-    { "id": "md.obsidian.Obsidian", "name": "Obsidian", "category": "Productivity", "icon": "hub", "description": "Local-first knowledge base", "preinstall": false, "package": "obsidian", "exec": "obsidian" },
-
-    { "id": "org.gnome.Console", "name": "Console", "category": "Develop", "icon": "terminal", "description": "Modern GTK4 terminal", "preinstall": true, "package": "gnome-console", "exec": "kgx" },
-    { "id": "dev.helix.Helix", "name": "Helix", "category": "Develop", "icon": "code", "description": "Modal code editor", "preinstall": true, "package": "helix", "exec": "hx" },
-    { "id": "com.visualstudio.code", "name": "VS Code", "category": "Develop", "icon": "code", "description": "Extensible code editor", "preinstall": false, "package": "vscode", "exec": "code" },
-
-    { "id": "org.gnome.Fractal", "name": "Fractal", "category": "Chat", "icon": "forum", "description": "Matrix messaging client", "preinstall": true, "package": "fractal", "exec": "fractal" },
-    { "id": "org.signal.Signal", "name": "Signal", "category": "Chat", "icon": "lock", "description": "Private encrypted messaging", "preinstall": false, "package": "signal-desktop", "exec": "signal-desktop" },
-    { "id": "org.telegram.desktop", "name": "Telegram", "category": "Chat", "icon": "send", "description": "Cloud messaging", "preinstall": false, "package": "telegram-desktop", "exec": "telegram-desktop" },
-
-    { "id": "net.lutris.Lutris", "name": "Lutris", "category": "Games", "icon": "videogame_asset", "description": "Open gaming platform", "preinstall": false, "package": "lutris", "exec": "lutris" },
-    { "id": "org.prismlauncher.PrismLauncher", "name": "Prism Launcher", "category": "Games", "icon": "casino", "description": "Open Minecraft launcher", "preinstall": false, "package": "prismlauncher", "exec": "prismlauncher" },
-    { "id": "net.supertuxkart.SuperTuxKart", "name": "SuperTuxKart", "category": "Games", "icon": "sports_esports", "description": "3D kart racing", "preinstall": false, "package": "superTuxKart", "exec": "supertuxkart" },
-    { "id": "com.play0ad.zeroad", "name": "0 A.D.", "category": "Games", "icon": "sports_esports", "description": "Real-time strategy", "preinstall": false, "package": "zeroad", "exec": "0ad" },
-    { "id": "com.github.Anuken.Mindustry", "name": "Mindustry", "category": "Games", "icon": "videogame_asset", "description": "Tower-defense factory builder", "preinstall": false, "package": "mindustry", "exec": "mindustry" },
-
-    { "id": "org.gnome.SystemMonitor", "name": "System Monitor", "category": "System", "icon": "monitor_heart", "description": "Processes, resources, and file systems", "preinstall": true, "package": "gnome-system-monitor", "exec": "gnome-system-monitor" },
-    { "id": "org.gnome.DiskUtility", "name": "Disks", "category": "System", "icon": "storage", "description": "Partition, format, and inspect drives", "preinstall": true, "package": "gnome-disk-utility", "exec": "gnome-disks" },
-    { "id": "com.rustdesk.RustDesk", "name": "RustDesk", "category": "System", "icon": "desktop_windows", "description": "Open-source remote desktop", "preinstall": true, "package": "rustdesk", "exec": "rustdesk" }
+    {
+      "id": "org.mozilla.firefox",
+      "name": "Firefox",
+      "category": "Web",
+      "icon": "public",
+      "description": "Fast, private web browser",
+      "preinstall": true,
+      "package": "firefox",
+      "exec": "firefox"
+    },
+    {
+      "id": "org.gnome.Epiphany",
+      "name": "GNOME Web",
+      "category": "Web",
+      "icon": "public",
+      "description": "Lightweight browser and web-app host",
+      "preinstall": true,
+      "package": "epiphany",
+      "exec": "epiphany"
+    },
+    {
+      "id": "org.chromium.Chromium",
+      "name": "Chromium",
+      "category": "Web",
+      "icon": "public",
+      "description": "Open-source browser engine",
+      "preinstall": false,
+      "package": "chromium",
+      "exec": "chromium"
+    },
+    {
+      "id": "io.github.celluloid_player.Celluloid",
+      "name": "Celluloid",
+      "category": "Media",
+      "icon": "movie",
+      "description": "Plays virtually every video format",
+      "preinstall": true,
+      "package": "celluloid",
+      "exec": "celluloid"
+    },
+    {
+      "id": "org.videolan.VLC",
+      "name": "VLC",
+      "category": "Media",
+      "icon": "movie",
+      "description": "Plays virtually everything, anywhere",
+      "preinstall": true,
+      "package": "vlc",
+      "exec": "vlc"
+    },
+    {
+      "id": "io.bassi.Amberol",
+      "name": "Amberol",
+      "category": "Media",
+      "icon": "music_note",
+      "description": "Clean local-first music player",
+      "preinstall": true,
+      "package": "amberol",
+      "exec": "amberol"
+    },
+    {
+      "id": "com.obsproject.Studio",
+      "name": "OBS Studio",
+      "category": "Media",
+      "icon": "videocam",
+      "description": "Stream and record your screen",
+      "preinstall": true,
+      "package": "obs-studio",
+      "exec": "obs"
+    },
+    {
+      "id": "org.audacityteam.Audacity",
+      "name": "Audacity",
+      "category": "Media",
+      "icon": "graphic_eq",
+      "description": "Multitrack audio editor",
+      "preinstall": true,
+      "package": "audacity",
+      "exec": "audacity"
+    },
+    {
+      "id": "org.gimp.GIMP",
+      "name": "GIMP",
+      "category": "Creative",
+      "icon": "brush",
+      "description": "Powerful image editor",
+      "preinstall": true,
+      "package": "gimp",
+      "exec": "gimp"
+    },
+    {
+      "id": "org.inkscape.Inkscape",
+      "name": "Inkscape",
+      "category": "Creative",
+      "icon": "gesture",
+      "description": "Vector graphics editor",
+      "preinstall": true,
+      "package": "inkscape",
+      "exec": "inkscape"
+    },
+    {
+      "id": "org.pitivi.Pitivi",
+      "name": "Pitivi",
+      "category": "Creative",
+      "icon": "movie_edit",
+      "description": "Free and intuitive video editor",
+      "preinstall": true,
+      "package": "pitivi",
+      "exec": "pitivi"
+    },
+    {
+      "id": "org.kde.krita",
+      "name": "Krita",
+      "category": "Creative",
+      "icon": "palette",
+      "description": "Digital painting studio",
+      "preinstall": false,
+      "package": "krita",
+      "exec": "krita"
+    },
+    {
+      "id": "org.kde.kdenlive",
+      "name": "Kdenlive",
+      "category": "Creative",
+      "icon": "video_settings",
+      "description": "Pro-grade video editor",
+      "preinstall": false,
+      "package": "kdenlive",
+      "exec": "kdenlive"
+    },
+    {
+      "id": "org.blender.Blender",
+      "name": "Blender",
+      "category": "Creative",
+      "icon": "view_in_ar",
+      "description": "3D creation suite",
+      "preinstall": false,
+      "package": "blender",
+      "exec": "blender"
+    },
+    {
+      "id": "org.libreoffice.LibreOffice",
+      "name": "LibreOffice",
+      "category": "Productivity",
+      "icon": "description",
+      "description": "Full office suite",
+      "preinstall": true,
+      "package": "libreoffice",
+      "exec": "libreoffice"
+    },
+    {
+      "id": "org.gnome.TextEditor",
+      "name": "Text Editor",
+      "category": "Productivity",
+      "icon": "edit_note",
+      "description": "Simple, fast text editor",
+      "preinstall": true,
+      "package": "gnome-text-editor",
+      "exec": "gnome-text-editor"
+    },
+    {
+      "id": "org.gnome.Nautilus",
+      "name": "Files",
+      "category": "Productivity",
+      "icon": "folder",
+      "description": "Browse and manage your files",
+      "preinstall": true,
+      "package": "nautilus",
+      "exec": "nautilus"
+    },
+    {
+      "id": "org.gnome.Calculator",
+      "name": "Calculator",
+      "category": "Productivity",
+      "icon": "calculate",
+      "description": "Everyday and scientific calculator",
+      "preinstall": true,
+      "package": "gnome-calculator",
+      "exec": "gnome-calculator"
+    },
+    {
+      "id": "md.obsidian.Obsidian",
+      "name": "Obsidian",
+      "category": "Productivity",
+      "icon": "hub",
+      "description": "Local-first knowledge base",
+      "preinstall": false,
+      "package": "obsidian",
+      "exec": "obsidian"
+    },
+    {
+      "id": "org.gnome.Console",
+      "name": "Console",
+      "category": "Develop",
+      "icon": "terminal",
+      "description": "Modern GTK4 terminal",
+      "preinstall": true,
+      "package": "gnome-console",
+      "exec": "kgx"
+    },
+    {
+      "id": "dev.helix.Helix",
+      "name": "Helix",
+      "category": "Develop",
+      "icon": "code",
+      "description": "Modal code editor",
+      "preinstall": true,
+      "package": "helix",
+      "exec": "hx"
+    },
+    {
+      "id": "com.visualstudio.code",
+      "name": "VS Code",
+      "category": "Develop",
+      "icon": "code",
+      "description": "Extensible code editor",
+      "preinstall": false,
+      "package": "vscode",
+      "exec": "code"
+    },
+    {
+      "id": "org.gnome.Fractal",
+      "name": "Fractal",
+      "category": "Chat",
+      "icon": "forum",
+      "description": "Matrix messaging client",
+      "preinstall": true,
+      "package": "fractal",
+      "exec": "fractal"
+    },
+    {
+      "id": "org.signal.Signal",
+      "name": "Signal",
+      "category": "Chat",
+      "icon": "lock",
+      "description": "Private encrypted messaging",
+      "preinstall": false,
+      "package": "signal-desktop",
+      "exec": "signal-desktop"
+    },
+    {
+      "id": "org.telegram.desktop",
+      "name": "Telegram",
+      "category": "Chat",
+      "icon": "send",
+      "description": "Cloud messaging",
+      "preinstall": false,
+      "package": "telegram-desktop",
+      "exec": "telegram-desktop"
+    },
+    {
+      "id": "net.lutris.Lutris",
+      "name": "Lutris",
+      "category": "Games",
+      "icon": "videogame_asset",
+      "description": "Open gaming platform",
+      "preinstall": false,
+      "package": "lutris",
+      "exec": "lutris"
+    },
+    {
+      "id": "org.prismlauncher.PrismLauncher",
+      "name": "Prism Launcher",
+      "category": "Games",
+      "icon": "casino",
+      "description": "Open Minecraft launcher",
+      "preinstall": false,
+      "package": "prismlauncher",
+      "exec": "prismlauncher"
+    },
+    {
+      "id": "net.supertuxkart.SuperTuxKart",
+      "name": "SuperTuxKart",
+      "category": "Games",
+      "icon": "sports_esports",
+      "description": "3D kart racing",
+      "preinstall": false,
+      "package": "superTuxKart",
+      "exec": "supertuxkart"
+    },
+    {
+      "id": "com.play0ad.zeroad",
+      "name": "0 A.D.",
+      "category": "Games",
+      "icon": "sports_esports",
+      "description": "Real-time strategy",
+      "preinstall": false,
+      "package": "zeroad",
+      "exec": "0ad"
+    },
+    {
+      "id": "com.github.Anuken.Mindustry",
+      "name": "Mindustry",
+      "category": "Games",
+      "icon": "videogame_asset",
+      "description": "Tower-defense factory builder",
+      "preinstall": false,
+      "package": "mindustry",
+      "exec": "mindustry"
+    },
+    {
+      "id": "com.heroicgameslauncher.hgl",
+      "name": "Heroic Games Launcher",
+      "category": "Games",
+      "icon": "sports_esports",
+      "description": "Epic Games and GOG launcher",
+      "preinstall": false,
+      "package": "heroic",
+      "exec": "heroic"
+    },
+    {
+      "id": "org.gnome.SystemMonitor",
+      "name": "System Monitor",
+      "category": "System",
+      "icon": "monitor_heart",
+      "description": "Processes, resources, and file systems",
+      "preinstall": true,
+      "package": "gnome-system-monitor",
+      "exec": "gnome-system-monitor"
+    },
+    {
+      "id": "org.gnome.DiskUtility",
+      "name": "Disks",
+      "category": "System",
+      "icon": "storage",
+      "description": "Partition, format, and inspect drives",
+      "preinstall": true,
+      "package": "gnome-disk-utility",
+      "exec": "gnome-disks"
+    },
+    {
+      "id": "com.rustdesk.RustDesk",
+      "name": "RustDesk",
+      "category": "System",
+      "icon": "desktop_windows",
+      "description": "Open-source remote desktop",
+      "preinstall": true,
+      "package": "rustdesk",
+      "exec": "rustdesk"
+    }
   ]
 }
