@@ -14,101 +14,13 @@
 # For: PinePhone, PinePhone Pro, future ARM phones
 
 {
-  # ─── HART OS Core Services ───
-  hart = {
-    enable = true;
-    variant = "phone";
+  imports = [ ../profiles/phone.nix ];  # variant feature profile (hart.* block)
 
-    # Backend + discovery + agent (brain of the node)
-    agent.enable = true;
-    llm.enable = false;      # Offload to peer nodes
-    vision.enable = false;
-
-    # Phone UI
-    conky.enable = true;
-    nunba.enable = true;
-
-    # ── Kernel Extensions ──
-    kernel = {
-      enable = true;
-      androidNative.enable = true;     # binder + ashmem (Android apps)
-      windowsNative.enable = false;    # No Windows on phone
-      aiCompute.enable = false;        # No local GPU compute
-      agentSandbox.enable = true;      # Isolate agents
-    };
-
-    # ── Native Subsystems ──
-    subsystems = {
-      enable = true;
-
-      linux.flatpak = true;            # Adaptive Linux apps from Flathub
-
-      # Android: native ART (the killer feature — run any Android app)
-      android = {
-        enable = true;
-        playStore = true;              # Most phone users need Google Play
-      };
-
-      windows.enable = false;          # Not applicable on phone
-      web.enable = true;               # PWA for lightweight apps
-    };
-
-    # ── AI Runtime (lightweight for phone) ──
-    aiRuntime = {
-      enable = true;
-      gpu.enable = false;
-      agents = {
-        maxConcurrent = 3;             # Phone has limited resources
-        maxMemoryPerAgent = "512M";
-      };
-      # Semantic: service healing + prefetch (no smartFS — storage limited)
-      semantic = {
-        enable = true;
-        serviceIntelligence = true;
-        predictivePrefetch = true;
-        smartFS = false;
-      };
-    };
-
-    # ── AI-Native Everything OS ──
-    # Model Bus: Android apps + Linux apps get native AI
-    modelBus = {
-      enable = true;
-      enableAndroidBridge = true;      # Android apps call AI via content provider
-    };
-
-    # Compute Mesh: offload heavy inference to desktop/server
-    computeMesh = {
-      enable = true;
-      allowWAN = true;                 # Phone needs WAN to reach desktop
-    };
-
-    # LiquidUI: adaptive interface with voice + haptic
-    liquidUI = {
-      enable = true;
-      voiceEnabled = true;
-      hapticEnabled = true;
-      renderer = "webkit";
-    };
-
-    # App Bridge: Android ↔ Linux cross-subsystem (no Windows on phone)
-    appBridge = {
-      enable = true;
-      intentRouter = true;             # Route Android Intents to Linux services
-      clipboardSync = true;
-    };
-
-    # ── On-Screen Keyboard ──
-    osk = {
-      enable = true;
-      backend = "squeekboard";
-      autoShow = true;
-      hapticFeedback = true;
-    };
-
-    # ── Sandbox ──
-    sandbox.enable = true;
-  };
+  # ─── HART OS Core Services: moved to ../profiles/phone.nix ───
+  # The hart.* feature block (what makes the phone a phone) now lives in
+  # profiles/phone.nix, imported above, so the SAME block can also drive the
+  # nixosTest nodes (#15) and the installer (#17) without duplicating it here.
+  # This file keeps only what is image/media-specific plus hart.package below.
 
   # HART application package
   hart.package = pkgs.callPackage ../packages/hart-app.nix { inherit hartSrc; };

@@ -52,7 +52,10 @@ def test_source_guard_gles_init_is_catch_unwind_wrapped():
 
 
 def test_source_guard_desktop_dns_opportunistic_fallback():
-    src = _read('nixos/configurations/desktop.nix')
+    # profiles/, not configurations/: the hart.* feature block (where hart.dns
+    # lives) moved to the variant profile on 2026-07-28 so images, nixosTest
+    # nodes and the installer share it.
+    src = _read('nixos/profiles/desktop.nix')
     assert re.search(r'dns\.fallbackToPlaintext\s*=\s*true', src), (
         "the roaming desktop must set dns.fallbackToPlaintext = true (opportunistic DoT) "
         "so a captive / port-853-blocked network still resolves names")
