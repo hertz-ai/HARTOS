@@ -1,0 +1,126 @@
+name: Closure Audit — what does a feature actually cost?
+
+# Answers "how many GB would we save by turning X off?" with a MEASUREMENT.
+#
+# WHY THIS EXISTS (2026-07-28): the desktop closure is 21.9 GiB and the obvious way
+# to find the expensive parts -- `nix path-info -rS`, closure size per path -- is a
+# trap. Closure size counts every dependency, so heroic, lutris, bottles and wine
+# each reported 4-6 GiB while overwhelmingly counting the SAME shared Mesa / Vulkan
+# / X / GStreamer paths, most of which the desktop needs for Firefox and the shell
+# anyway. Reading those as separate costs overstated the gaming stack by several GB.
+# Self size (-s) fixes the double counting but answers a different question: it says
+# what a package contributes ALONE, not what disappears if you remove it, because
+# removing it also drops dependencies nothing else needs.
+#
+# The only honest answer is a differential: build the system twice, once with the
+# feature and once without, and diff the closures. That is what this does. The
+# second build reuses the store, so it costs ~2 minutes on top of the first.
+#
+# The variant is derived with `extendModules` from the SAME nixosConfiguration the
+# real image is built from -- never a hand-copied config -- so the diff cannot be
+# contaminated by an unrelated difference between two hand-maintained variants.
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: 'nixosConfigurations attr to audit'
+        default: 'hart-desktop-raw'
+        required: false
+      disable:
+        description: 'Dotted option path to force OFF (e.g. hart.subsystems.windows.gaming)'
+        default: 'hart.subsystems.windows.gaming'
+        required: false
+
+concurrency:
+  group: closure-audit-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Closure diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            fallback = true
+
+      # Two full system closures share nearly every path, so this is not double the
+      # disk -- but the base closure alone is ~42 GB in the store and the runner
+      # ships ~57 GB of preinstalled toolchains. Same purge the raw image build uses.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache /usr/local/.ghcup /usr/share/swift \
+                      /usr/local/share/powershell /usr/share/miniconda \
+                      /usr/local/share/boost /opt/az /usr/local/lib/node_modules || true
+          sudo docker image prune --all --force 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Build both closures and diff them
+        working-directory: nixos
+        run: |
+          set -euo pipefail
+          CFG='${{ inputs.config }}'
+          OPT='${{ inputs.disable }}'
+          echo "config  : $CFG"
+          echo "disable : $OPT"
+          echo ""
+
+          echo "── building WITH the feature ──────────────────────────────"
+          BASE=$(nix build ".#nixosConfigurations.${CFG}.config.system.build.toplevel" \
+                   -L --no-link --print-out-paths)
+          echo "base: $BASE"
+          echo ""
+
+          # extendModules on the SAME config, so the only difference is this option.
+          # mkForce is REQUIRED, not defensive: desktop.nix assigns `gaming = true`
+          # as a plain value, and a second plain definition of the same option is a
+          # conflict error, not an override. setAttrByPath keeps this generic for any
+          # dotted option path passed in.
+          echo "── building WITHOUT the feature ───────────────────────────"
+          VARIANT=$(nix build --impure --no-link --print-out-paths --expr "
+            let
+              flake = builtins.getFlake \"path:$PWD\";
+              base  = flake.nixosConfigurations.${CFG};
+            in (base.extendModules {
+                 modules = [ ({ lib, ... }:
+                   lib.setAttrByPath (lib.splitString \".\" \"${OPT}\") (lib.mkForce false)) ];
+               }).config.system.build.toplevel
+          ")
+          echo "variant: $VARIANT"
+          echo ""
+
+          A=$(nix path-info -S "$BASE"    | awk '{print $2}')
+          B=$(nix path-info -S "$VARIANT" | awk '{print $2}')
+
+          echo "══ RESULT ═════════════════════════════════════════════════"
+          printf 'with %s ON  : %s\n' "$OPT" "$(numfmt --to=iec-i --suffix=B "$A")"
+          printf 'with %s OFF : %s\n' "$OPT" "$(numfmt --to=iec-i --suffix=B "$B")"
+          printf 'MARGINAL COST: %s  (%.2f%% of the closure)\n' \
+            "$(numfmt --to=iec-i --suffix=B "$((A-B))")" \
+            "$(awk -v a="$A" -v b="$B" 'BEGIN{printf "%.2f", (a-b)*100/a}')"
+          echo ""
+
+          # Paths present ONLY with the feature on -- what actually disappears.
+          nix path-info -r "$BASE"    | sort -u > /tmp/base.txt
+          nix path-info -r "$VARIANT" | sort -u > /tmp/variant.txt
+          comm -23 /tmp/base.txt /tmp/variant.txt > /tmp/only-base.txt
+          echo "paths dropped: $(wc -l < /tmp/only-base.txt)"
+          echo ""
+          echo "── 30 largest paths that disappear (self size) ────────────"
+          # awk 'NR<=30', never `head`: head exits early, sort gets EPIPE, and under
+          # `set -o pipefail` that fails the step (it already cost run 30334471869).
+          if [ -s /tmp/only-base.txt ]; then
+            xargs -a /tmp/only-base.txt nix path-info -s \
+              | sort -k2 -n -r \
+              | awk 'NR<=30 { printf "%9.2f MiB  %s\n", $2/1048576, $1 }'
+          else
+            echo "  (none -- the option changed nothing in the closure)"
+          fi
