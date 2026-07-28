@@ -392,21 +392,44 @@
       hartCrane = crane;
     };
 
-    # Build a full NixOS system configuration
-    mkSystem = { system, variant, extraModules ? [] }:
+    # ── THE one recipe for composing a HART system ─────────────────────────────
+    # Every way of building a HART system funnels through here: the ISO images
+    # (mkSystem), the repart raw image (mkRepartSystem), and — exported as
+    # lib.mkHartSystem — the installer's installed systems and any third-party
+    # flake putting HART on its own hardware. The parts list (hartModules) was
+    # already exported, but a parts list without the recipe produced stock NixOS
+    # or an eval error: the modules need mkSpecialArgs (hartSrc, hartVariant,
+    # llama-cpp, hartRustNixpkgs, crane) and the nixpkgs config, and the FEATURES
+    # live in profiles/<variant>.nix — none of which a consumer can be expected
+    # to reassemble by hand. One recipe, so the union (NixOS hardware layer +
+    # HART OS layer) is composed the same way everywhere and cannot drift.
+    #
+    # hartImageKind MUST be a specialArg (not left to the desktop.nix
+    # destructuring default): a module argument absent from specialArgs is
+    # resolved through the config fixpoint (_module.args), and desktop.nix
+    # uses it in `imports` -- which shape that same fixpoint -> "infinite
+    # recursion encountered" (run 29508017463). specialArgs are
+    # fixpoint-free, so imports may branch on them.
+    #
+    #   imageKind: "iso" (live media) | "raw" (whole-disk image) | "installed"
+    #   (a disk the user owns: fileSystems come from a generated
+    #   hardware-configuration.nix passed in `modules`, never from an image
+    #   module — the hardware-agnostic installer case, task #17).
+    mkHartSystem = { system, variant, imageKind ? "installed", modules ? [] }:
       nixpkgs.lib.nixosSystem {
         inherit system;
-        # hartImageKind MUST be a specialArg (not left to the desktop.nix
-        # destructuring default): a module argument absent from specialArgs is
-        # resolved through the config fixpoint (_module.args), and desktop.nix
-        # uses it in `imports` -- which shape that same fixpoint -> "infinite
-        # recursion encountered" (run 29508017463). specialArgs are
-        # fixpoint-free, so imports may branch on them.
-        specialArgs = mkSpecialArgs variant // { hartImageKind = "iso"; };
+        specialArgs = mkSpecialArgs variant // { hartImageKind = imageKind; };
         modules = hartModules ++ [
           { nixpkgs.config = nixpkgsConfig; }  # single source — #70
-          ./configurations/${variant}.nix
-        ] ++ extraModules;
+        ] ++ modules;
+      };
+
+    # Build a full NixOS system configuration (live-ISO shape)
+    mkSystem = { system, variant, extraModules ? [] }:
+      mkHartSystem {
+        inherit system variant;
+        imageKind = "iso";
+        modules = [ ./configurations/${variant}.nix ] ++ extraModules;
       };
 
     # Build a bootable UEFI raw disk image WITHOUT qemu, via systemd-repart.
@@ -426,11 +449,10 @@
     # Note this is NOT the same closure as nixosConfigurations.hart-desktop: that one
     # carries hartImageKind = "iso", which changes what desktop.nix imports.
     mkRepartSystem = { system, variant, extraModules ? [] }:
-      nixpkgs.lib.nixosSystem {
-        inherit system;
-        specialArgs = mkSpecialArgs variant // { hartImageKind = "raw"; };
-        modules = hartModules ++ [
-          { nixpkgs.config = nixpkgsConfig; }  # single source — #70
+      mkHartSystem {
+        inherit system variant;
+        imageKind = "raw";
+        modules = [
           ./configurations/${variant}.nix
           ./modules/hart-repart-image.nix      # repart + systemd-boot/UKI + fs + growth
         ] ++ extraModules;
@@ -521,8 +543,31 @@
     # Exposed under both conventional names: `nixosModules.hart` is what a flake
     # consumer expects to import, `lib.hartModules` is the raw list for code that
     # needs to splice it (the installer writes it into the target's configuration).
+    #
+    # nixosModules.hart alone is the MACHINERY, not the OS: importing it yields a
+    # system with every hart.* feature at its default (mostly off) and hart.package
+    # unset — the exact defect that kept 25 nixosTests red (#15). What makes a
+    # desktop a desktop lives in the variant PROFILES, exported alongside so no
+    # consumer has to reach into this repo's directory layout for them.
     nixosModules.hart = { imports = hartModules; };
+    nixosModules.profile-desktop = ./profiles/desktop.nix;
+    nixosModules.profile-server  = ./profiles/server.nix;
+    nixosModules.profile-edge    = ./profiles/edge.nix;
+    nixosModules.profile-phone   = ./profiles/phone.nix;
     lib.hartModules = hartModules;
+
+    # THE recipe (see its definition above): machinery + specialArgs + nixpkgs
+    # config, with the caller supplying profile/hardware/config modules. This is
+    # how an installed system or a third-party flake composes the union — e.g.
+    #   hart.lib.mkHartSystem {
+    #     system = "x86_64-linux"; variant = "desktop";   # imageKind defaults
+    #     modules = [ hart.nixosModules.profile-desktop   # to "installed"
+    #                 ./hardware-configuration.nix        # nixos-generate-config
+    #                 { hart.package = ...; } ];
+    #   }
+    # The flake's own images build through the same function (mkSystem /
+    # mkRepartSystem above delegate to it), so it can never drift from what ships.
+    lib.mkHartSystem = mkHartSystem;
 
     # ═════════════════════════════════════════════════════════════
     # NixOS Configurations (nixos-rebuild build --flake .#name)
