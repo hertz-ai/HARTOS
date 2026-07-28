@@ -144,7 +144,14 @@ in
 
       # ── 1. The module is ENABLEABLE (Fix B): ppd live, TLP NOT co-enabled ──
       with subtest("hart.power is enableable — power-profiles-daemon is live and TLP is NOT co-enabled"):
-          node.wait_for_unit("power-profiles-daemon.service", timeout=60)
+          # ppd is D-BUS ACTIVATED, never enabled: nixpkgs' module sets only
+          # services.dbus.packages + systemd.packages -- no wantedBy -- so the unit
+          # sits inactive until a client calls it, and wait_for_unit timed out on
+          # every run since 2026-07-26 while the module was configured perfectly.
+          # Drive the REAL client path instead: powerprofilesctl is the same D-Bus
+          # surface the shell's /api/shell/power/set uses. The call both proves the
+          # daemon serves AND activates the unit, which can then be asserted.
+          node.succeed("powerprofilesctl get")
           assert node.succeed("systemctl is-active power-profiles-daemon.service").strip() == "active"
           # TLP must NOT be enabled (the mutual-exclusion that used to brick eval).
           # is-active on a disabled/absent unit returns non-zero -> fail() passes.

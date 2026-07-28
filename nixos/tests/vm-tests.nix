@@ -153,6 +153,12 @@ in
         memorySize = 4096;
         cores = 2;
       };
+      # The shipped desktop's session owner (desktop.nix enables it via the
+      # profile; mkNode's minimal machinery does not). Defaults are the shipped
+      # ones: compCommand stays null (no hart-comp closure cost -- "null until
+      # Phase 3"), the cage GTK3 floor is the session. Same enablement the
+      # display-tiers-neverblack nodes already run in these shards.
+      hart.sessionSupervisor.enable = true;
     };
 
     testScript = ''
@@ -162,8 +168,17 @@ in
       with subtest("Backend service starts"):
           desktop.wait_for_unit("hart-backend.service", timeout=120)
 
-      with subtest("Display manager starts (GNOME)"):
-          desktop.wait_for_unit("display-manager.service", timeout=180)
+      # greetd, NOT display-manager.service, and NOT GNOME. The shipped desktop's
+      # session is owned by greetd (hart-session-supervisor.nix; desktop.nix:
+      # "greetd REPLACES GDM and runs the tier-drop SELECTOR"), and greetd never
+      # registers the display-manager.service alias -- that unit simply does not
+      # exist on a HART node, so the old assertion timed out after 180s on every
+      # run since 2026-07-26 regardless of whether the session was healthy. The
+      # supervisor is enabled on this node (the `extra` module below) exactly the
+      # way display-tiers-neverblack's nodes already do, so this asserts the REAL
+      # boot contract: the tier-drop supervisor comes up.
+      with subtest("Session supervisor (greetd) starts -- the shipped DM"):
+          desktop.wait_for_unit("greetd.service", timeout=180)
 
       # ── AI-native session services (regression guard for #99) ──
       # These are all Type="notify" units whose ExecStart python does
