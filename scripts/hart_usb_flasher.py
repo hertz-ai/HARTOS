@@ -100,6 +100,7 @@ def _list_disks_windows():
     ps = (
         "Get-Disk | ForEach-Object { [pscustomobject]@{ "
         "Number=$_.Number; Model=$_.FriendlyName; Size=[int64]$_.Size; "
+        "Serial=[string]$_.SerialNumber; "
         "Bus=[string]$_.BusType; Boot=[bool]$_.IsBoot; System=[bool]$_.IsSystem } } "
         "| ConvertTo-Json -Compress"
     )
@@ -123,6 +124,12 @@ def _list_disks_windows():
             "number": n,
             "model": (d.get("Model") or "?").strip(),
             "size": int(d.get("Size") or 0),
+            # Stable identity. "number"/"dev"/"physdrive" are POSITIONAL: unplug
+            # and replug a stick, or swap its port, and PhysicalDriveN can name a
+            # different disk. assert_device_identity() re-checks this before any
+            # write so a re-enumeration between choosing and writing cannot send
+            # an image to the wrong device.
+            "serial": (d.get("Serial") or "").strip(),
             "bus": bus,
             "removable": bus == "USB",
             "system": bool(d.get("System") or d.get("Boot")),
@@ -557,8 +564,78 @@ class _WinExclusiveWriter:
             pass
 
 
+class DeviceIdentityChanged(RuntimeError):
+    """The disk at the chosen index is no longer the disk that was chosen."""
+
+
+def assert_device_identity(disk, log=None):
+    """Re-enumerate and refuse to write if the target is no longer the same disk.
+
+    The device handles this script writes to -- PhysicalDriveN on Windows,
+    /dev/sdX on Linux -- are POSITIONAL. They name a slot in an enumeration
+    order, not a physical stick. Unplug and replug a device, or move it to
+    another port, and the same handle can resolve to a completely different
+    disk, including one holding data.
+
+    Selection and writing are separated by download time, a confirmation
+    prompt, and sometimes minutes of a human walking to the machine, so the
+    binding made at selection is exactly the kind of stale reference that gets
+    acted on. An agent driving this is worse off than a person: it cannot see
+    the user swap the stick, so nothing tells it the handle went stale.
+
+    So the identity is re-checked at the last moment, against fields that
+    survive re-enumeration (serial where the platform gives one, otherwise
+    size + model). A mismatch raises rather than writes, because the failure
+    mode being prevented is destroying the wrong disk.
+
+    Best-effort by design: if re-enumeration itself fails, that is logged and
+    the write proceeds, since refusing every write because an enumeration
+    command was slow would be its own outage.
+    """
+    want_n = disk.get("number")
+    if want_n is None:
+        return
+    try:
+        current = {d.get("number"): d for d in list_disks()}
+    except Exception as e:                      # enumeration unavailable
+        if log:
+            log(f"  identity re-check SKIPPED (enumeration failed: {e})")
+        return
+    now = current.get(want_n)
+    if now is None:
+        raise DeviceIdentityChanged(
+            f"disk {want_n} ({disk.get('model')}, {disk.get('size')} bytes) is "
+            f"GONE from the device list. It was unplugged or re-enumerated. "
+            f"Refusing to write; re-select the target."
+        )
+    # Serial is the real identity. Fall back to size+model only where the
+    # platform reports no serial, which is weaker but still catches the common
+    # swap (two different sticks are rarely byte-identical in capacity).
+    was_serial, now_serial = (disk.get("serial") or ""), (now.get("serial") or "")
+    if was_serial and now_serial:
+        if was_serial != now_serial:
+            raise DeviceIdentityChanged(
+                f"disk {want_n} is now serial {now_serial!r}, not {was_serial!r}. "
+                f"A different device is in that slot. Refusing to write."
+            )
+    elif (now.get("size"), now.get("model")) != (disk.get("size"), disk.get("model")):
+        raise DeviceIdentityChanged(
+            f"disk {want_n} is now {now.get('model')!r} at {now.get('size')} bytes, "
+            f"was {disk.get('model')!r} at {disk.get('size')} bytes. "
+            f"Refusing to write."
+        )
+    if now.get("system") and not disk.get("system"):
+        raise DeviceIdentityChanged(
+            f"disk {want_n} now reports as a SYSTEM disk. Refusing to write."
+        )
+    if log:
+        log(f"  identity re-checked: disk {want_n} is still "
+            f"{now.get('model')} ({now_serial or 'no serial'})")
+
+
 def write_source_to_device(disk, src_path, byte_offset, dd, log, writer=None):
     """Write a local file to the device at byte_offset (download mode)."""
+    assert_device_identity(disk, log)
     if writer is not None:                          # Windows exclusive-handle path
         with open(src_path, "rb") as fobj:
             return writer.write_at(byte_offset, fobj)
@@ -573,6 +650,7 @@ def write_source_to_device(disk, src_path, byte_offset, dd, log, writer=None):
 
 def stream_to_device(disk, byte_offset, producer_cmd, dd, log, writer=None):
     """Stream a producer (curl/gh) straight to the device (stream mode)."""
+    assert_device_identity(disk, log)
     if writer is not None:                          # Windows exclusive-handle path
         p = subprocess.Popen(producer_cmd, stdout=subprocess.PIPE)
         try:
