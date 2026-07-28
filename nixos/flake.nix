@@ -417,8 +417,16 @@
     # the CD profile + adds first-boot growth exactly as the generators path did;
     # the extra module (hart-repart-image) owns the fileSystems + bootloader the
     # generators format used to provide.
-    mkRepartImage = { system, variant, extraModules ? [] }:
-      (nixpkgs.lib.nixosSystem {
+    # The SYSTEM and the IMAGE are split so the raw closure is addressable on its
+    # own. The image build is closure-bound and, because systemd-repart gets no loop
+    # device in the Nix sandbox, it needs roughly TWICE the closure free on disk (it
+    # mkfs's into a temp file, then copies that file into the .raw). That makes the
+    # closure size the build's disk budget — and with only the image exposed there
+    # was no way to ask for the number without building the whole 40 GB artifact.
+    # Note this is NOT the same closure as nixosConfigurations.hart-desktop: that one
+    # carries hartImageKind = "iso", which changes what desktop.nix imports.
+    mkRepartSystem = { system, variant, extraModules ? [] }:
+      nixpkgs.lib.nixosSystem {
         inherit system;
         specialArgs = mkSpecialArgs variant // { hartImageKind = "raw"; };
         modules = hartModules ++ [
@@ -426,7 +434,9 @@
           ./configurations/${variant}.nix
           ./modules/hart-repart-image.nix      # repart + systemd-boot/UKI + fs + growth
         ] ++ extraModules;
-      }).config.system.build.image;
+      };
+
+    mkRepartImage = args: (mkRepartSystem args).config.system.build.image;
 
     # Build an image via nixos-generators (for non-ISO formats).
     #
@@ -508,6 +518,15 @@
         extraModules = [ { hart.liquidUI.gpuDiagnostic = true; } ];
       };
       hart-edge    = mkSystem { system = "x86_64-linux"; variant = "edge"; };
+
+      # The INSTALLED desktop (hartImageKind = "raw"), i.e. exactly the system that
+      # `.#raw-desktop` writes into the image — a different closure from hart-desktop
+      # above, which is the live-ISO one. Exposed so the raw closure can be built and
+      # measured on its own (`…hart-desktop-raw.config.system.build.toplevel`) without
+      # producing the 40 GB image; CI reports its size before every image build, since
+      # that size IS the build's disk budget. Same nixosSystem the image is made from,
+      # via mkRepartSystem, so the two can never drift apart.
+      hart-desktop-raw = mkRepartSystem { system = "x86_64-linux"; variant = "desktop"; };
 
       # ─── aarch64 (ARM: Raspberry Pi, edge, phones) ───
       hart-server-arm  = mkSystem { system = "aarch64-linux"; variant = "server"; };

@@ -118,22 +118,34 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # raw-* only: put the ENTIRE nix store on the runner's second, nearly empty
-      # ~65 GB data disk (/mnt), BEFORE the Nix installer runs. A raw image build
-      # peaks at the closure PLUS the disk-image output, both in the store, which
-      # does not fit the root disk however much preinstalled bloat is stripped.
-      # release.yml learned this on 2026-07-16 (run 29522446118: ENOSPC crashed the
-      # nix daemon itself at 50 min, after the hostedtoolcache purge) and carries
-      # the same step; this workflow never got it, so raw-desktop reproduced the
-      # identical failure here, dying silently at 50 minutes in runs 30287421697
-      # and 30296001550. The ISO legs stay on the root disk unchanged: their
-      # squashfs peak fits and their cache behaviour is proven.
-      - name: Move /nix to the /mnt data disk (raw only)
+      # raw-* only: put the ENTIRE nix store on the runner's second data disk (/mnt)
+      # when there IS one, BEFORE the Nix installer runs.
+      #
+      # SELF-VERIFYING ON PURPOSE. This step was added on the assumption that every
+      # Actions runner has a separate ~65 GB /mnt data disk (release.yml carries the
+      # same step). On the image backing THIS workflow it is a lie: run 30308494154's
+      # failure diagnostics printed `/` and `/mnt` as the SAME `/dev/root` (145G), so
+      # the bind moved the store from one directory to another on one filesystem and
+      # bought exactly zero bytes -- while reading, in the log, like a fix had been
+      # applied. A no-op that looks like a mitigation is worse than no step at all,
+      # because it makes the next person rule out the very thing that is still wrong.
+      # So: compare the backing devices and only bind when they actually differ, and
+      # say plainly which branch was taken.
+      - name: Move /nix to the /mnt data disk (raw only, if a real second disk exists)
         if: startsWith(matrix.target, 'raw-')
         run: |
-          sudo mkdir -p /mnt/nix /nix
-          sudo mount --bind /mnt/nix /nix
-          df -h / /mnt
+          root_dev=$(findmnt -no SOURCE --target / || echo unknown)
+          mnt_dev=$(findmnt -no SOURCE --target /mnt || echo none)
+          echo "root=$root_dev  /mnt=$mnt_dev"
+          if [ "$mnt_dev" != "none" ] && [ "$mnt_dev" != "$root_dev" ]; then
+            echo "Separate data disk found -> moving /nix onto it."
+            sudo mkdir -p /mnt/nix /nix
+            sudo mount --bind /mnt/nix /nix
+          else
+            echo "NO separate data disk on this runner image -- /mnt shares $root_dev."
+            echo "Leaving /nix on the root disk; the budget comes from the purge below."
+          fi
+          df -h / /mnt 2>/dev/null || true
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v12
@@ -158,12 +170,99 @@ jobs:
       # RELIABLE, no throttling proxy to abort the Rust compiles. Re-add only once the
       # org has working FlakeHub/cache auth.
 
+      # The baseline purge (dotnet + android SDK + ghc) frees ~15 GB: 57G used -> 42G,
+      # measured in run 30312462459. That is enough for every ISO leg and NOT enough
+      # for a raw image, which needs the closure resident TWICE at peak -- see the
+      # raw-only block below for the arithmetic.
       - name: Free disk space
         run: |
+          before=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo apt-get autoremove -y
           sudo apt-get clean
           df -h /
+          echo "freed $(( $(df --output=avail -BG / | tail -1 | tr -dc '0-9') - before )) GB (baseline purge)"
+
+      # raw-* only: strip the rest of the preinstalled toolchains.
+      #
+      # WHY, with the numbers, because six builds died guessing at this. The desktop
+      # closure is ~37 GiB (repart's own minimize pass measured 9627552 4k blocks).
+      # systemd-repart gets NO loop device inside the Nix sandbox, so it cannot mkfs
+      # straight into the image: it builds the ext4 in a TEMP FILE, then copies that
+      # file into the .raw at the partition offset. Both exist at once, so the peak is
+      # roughly 2x the closure (~78 GB) on top of the ~42 GB the closure occupies in
+      # /nix/store. Run 30312462459 reached repart with 61 GB free, wrote the 37 GB
+      # temp filesystem, started the copy and hit ENOSPC ~24 GB in -- which is exactly
+      # the unexplained 2-minute gap between "Writing superblocks ... done" (00:42:22)
+      # and the failure (00:44:31), and exactly why nothing was printed: the copy loop
+      # dies without reaching any of repart's own log statements.
+      #
+      # This purge frees ~25 GB more (hostedtoolcache alone is ~10 GB), taking the
+      # free space at repart time from ~61 GB to ~86 GB against a ~78 GB worst-case
+      # need. Scoped to raw-* so the green ISO legs keep the exact environment they
+      # are proven on; hostedtoolcache in particular holds the Python/Node the ISO
+      # jobs' actions may reach for. Nothing after this step needs it: the remaining
+      # steps are bash + nix, and the post-job hooks use the runner's own bundled
+      # node under /home/runner/runners/*/externals.
+      - name: Free MORE disk space (raw only)
+        if: startsWith(matrix.target, 'raw-')
+        run: |
+          before=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          sudo rm -rf \
+            /opt/hostedtoolcache \
+            /usr/local/.ghcup \
+            /usr/share/swift \
+            /usr/local/share/powershell \
+            /usr/share/miniconda \
+            /usr/local/share/boost \
+            /opt/az \
+            /usr/local/lib/node_modules || true
+          sudo docker image prune --all --force 2>/dev/null || true
+          df -h /
+          echo "freed $(( $(df --output=avail -BG / | tail -1 | tr -dc '0-9') - before )) GB (raw purge)"
+
+      # raw-* only: build the system closure on its own FIRST and print its size.
+      # The image build is closure-bound and, per the note above, needs ~2x the
+      # closure free at repart time -- so the closure size IS the disk budget, and
+      # it has been the one number nobody had while six builds failed. Splitting it
+      # out costs no extra time (the image build needs the same closure and picks it
+      # straight out of the store) and it reports even when the image step later
+      # fails, which is the point. The per-path listing turns "the image is too big"
+      # into a named list of what to shrink.
+      - name: Closure budget (raw only)
+        if: startsWith(matrix.target, 'raw-')
+        working-directory: nixos
+        run: |
+          set -o pipefail
+          # -raw, NOT the bare variant: nixosConfigurations.hart-desktop carries
+          # hartImageKind = "iso" and is a DIFFERENT closure. hart-desktop-raw is
+          # built from the same mkRepartSystem the image itself is made from.
+          variant="${{ matrix.target }}"
+          cfg="hart-${variant#raw-}-raw"
+          # Only the variants on the repart path have a -raw config; raw-server and
+          # raw-edge still go through nixos-generators, where this budget does not
+          # apply. Skip rather than red-fail their dispatch. hasAttr tests the KEY, so
+          # it does not force the config and costs a flake-outputs eval, not a system
+          # eval — checking by building the attr would evaluate the whole system twice.
+          if [ "$(nix eval --json ".#nixosConfigurations" \
+                    --apply "c: builtins.hasAttr \"$cfg\" c")" != "true" ]; then
+            echo "No nixosConfigurations.$cfg -- ${{ matrix.target }} is not on the"
+            echo "repart path, so the 2x-closure disk budget does not apply. Skipping."
+            exit 0
+          fi
+          top=$(nix build ".#nixosConfigurations.$cfg.config.system.build.toplevel" \
+                  -L --no-link --print-out-paths)
+          bytes=$(nix path-info -S "$top" | awk '{print $2}')
+          echo ""
+          echo "── closure budget ─────────────────────────────────────────"
+          echo "toplevel : $top"
+          echo "closure  : $(numfmt --to=iec-i --suffix=B "$bytes")  ($bytes bytes)"
+          echo "repart peak needs ~2x that free, plus the store copy."
+          echo "free now : $(df -h --output=avail / | tail -1 | tr -d ' ')"
+          echo ""
+          echo "── 25 largest paths in the closure ────────────────────────"
+          nix path-info -rS "$top" | sort -k2 -n -r | head -25 \
+            | while read -r p s; do printf '%10s  %s\n' "$(numfmt --to=iec-i --suffix=B "$s")" "$p"; done
 
       - name: Build ${{ matrix.target }}
         working-directory: nixos

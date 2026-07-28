@@ -94,13 +94,29 @@
           # with 103GB free and 42GB already used, and it dies without printing an
           # error (runs 30263310599 and 30287421697, ~54 minutes each).
           #
-          # 40G is repart's OWN measured answer for this closure (it minimized to
-          # 9627552 4k blocks = 39.4GB); the extra is slack for closure growth. One
-          # mkfs, no probe, deterministic size. The image ships xz-compressed and
-          # growPartition + autoResize expand the root to fill the real disk on
-          # first boot, so the on-disk size is the target's, not this number.
-          SizeMinBytes = "44G";
-          SizeMaxBytes = "44G";
+          # 40G, not 44G, and the difference is CI disk, not the target disk. Inside
+          # the Nix sandbox systemd-repart has no loop device, so it mkfs's into a
+          # temp file and then COPIES that file into the .raw. The temp file stays
+          # sparse (mke2fs punches holes for the unused blocks) but the copy does
+          # not -- `copy_bytes` after mkfs writes the partition out dense -- so this
+          # number is very nearly the peak disk the build costs, on top of the ~42GB
+          # the closure already occupies in /nix/store. Run 30312462459 died exactly
+          # there: 61GB free, 37GB temp filesystem written, then ENOSPC ~24GB into
+          # the copy, silently, because the copy loop never reaches a log statement.
+          #
+          # repart's own minimize pass measured this closure at 9627552 4k blocks
+          # (36.7 GiB); plus ext4 metadata and journal that is ~37.7 GiB, so 40G
+          # leaves ~2.3 GiB of slack. If the closure outgrows that, mke2fs fails
+          # LOUDLY with a "does not fit" error -- a different and clearly readable
+          # failure from the silent ENOSPC above, which is why this is safe to
+          # tighten. The workflow's "Closure budget" step prints the exact closure
+          # size every run, so the next adjustment is made from a number.
+          #
+          # None of this constrains the installed system: the image ships
+          # xz-compressed and growPartition + autoResize expand the root to fill the
+          # real disk on first boot, so the on-disk size is the target's, not this.
+          SizeMinBytes = "40G";
+          SizeMaxBytes = "40G";
         };
       };
     };
