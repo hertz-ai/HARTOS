@@ -1634,7 +1634,7 @@ Exception collection, recipe experience recording, notifications — never block
 |----------|---------|---------|
 | `HEVOLVE_LLM_ENDPOINT_URL` | | Custom LLM endpoint |
 | `HEVOLVE_LLM_MODEL_NAME` | `gpt-4.1-mini` | Primary model |
-| `HEVOLVE_LOCAL_LLM_URL` | `http://localhost:8000/v1` | Local LLM endpoint |
+| `HEVOLVE_LOCAL_LLM_URL` | `http://localhost:8080/v1` | Local LLM endpoint. Resolved by `core/port_registry.py` (`llm` = 8080; 808 in OS mode), so prefer `get_local_llm_url()` over hardcoding. |
 | `HEVOLVE_ACTIVE_CLOUD_PROVIDER` | | Cloud provider name |
 
 ### Networking
