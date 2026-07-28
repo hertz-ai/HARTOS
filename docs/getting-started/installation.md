@@ -184,7 +184,7 @@ cp .env.example .env
 docker-compose up -d
 
 # Verify
-curl http://localhost:8000/status
+curl http://localhost:6777/status
 docker-compose logs -f backend
 ```
 

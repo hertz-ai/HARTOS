@@ -18,9 +18,12 @@ Runtime compute settings can also be updated via the **Settings API** (`PUT /api
 
 ## Core
 
+**No key is required to run.** With none set, chat is served by a local model
+through llama.cpp. Every key below only adds a cloud route.
+
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `OPENAI_API_KEY` | OpenAI API key for GPT models | (required) |
+| `OPENAI_API_KEY` | OpenAI API key for GPT models | (optional) |
 | `GROQ_API_KEY` | Groq API key for fast inference | (optional) |
 | `GLM_API_KEY` | GLM 5.2 (Zhipu/Z.ai) key, OpenAI-compatible (`ZHIPUAI_API_KEY` also accepted; `GLM_BASE_URL`/`GLM_MODEL` override endpoint/model) | (optional) |
 | `LANGCHAIN_API_KEY` | LangChain API key for tracing | (optional) |
