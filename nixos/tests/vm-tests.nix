@@ -410,16 +410,37 @@ in
       # dump makes the next failure name its own cause instead of inviting a
       # third guess.
       def _dump_backend_state(m, tag):
+          # The python the backend actually runs (waitress env), for the probes.
+          py = m.execute(
+              "systemctl cat hart-backend | grep ExecStart= | grep -oE '/nix/store/[a-z0-9]+-[^ ]+/bin/python'"
+          )[1].strip()
           for cmd in [
+              # What did the unit ACTUALLY render? (Verifies overrides landed --
+              # run 30407872610's A/B is uninterpretable without this.)
+              "systemctl cat hart-backend | grep -E 'SystemCallFilter|MemoryMax|TasksMax|ExecStart' || true",
               "systemctl show hart-backend -p TasksCurrent,TasksMax,MemoryCurrent,MemoryPeak,Result,ExecMainStatus,NRestarts",
-              "cat /sys/fs/cgroup/system.slice/hart-backend.service/pids.current /sys/fs/cgroup/system.slice/hart-backend.service/pids.max 2>/dev/null || true",
               "free -m",
-              "cat /proc/sys/kernel/threads-max /proc/sys/kernel/pid_max /proc/sys/vm/overcommit_memory",
-              "su -s /bin/sh hart -c 'ulimit -u -v -m' 2>/dev/null || true",
-              "ps -eLf | wc -l",
-              "journalctl -u hart-backend --no-pager -n 30 | tail -30",
+              "journalctl -u hart-backend --no-pager -n 12 | tail -12",
+              # ── THEORY-FREE PROBES: can THIS python start ONE thread... ──
+              # (a) bare, as root, no sandbox:
+              f"{py} -c 'import threading; t=threading.Thread(target=lambda: None); t.start(); t.join(); print(\"BARE-ROOT THREAD OK\")' 2>&1 || true",
+              # (b) as the hart user, no sandbox:
+              f"su -s /bin/sh hart -c \"{py} -c 'import threading; t=threading.Thread(target=lambda: None); t.start(); t.join(); print(\\\"HART-USER THREAD OK\\\")'\" 2>&1 || true",
+              # (c) under the unit's FULL context: clone the real unit's sandbox by
+              # running inside the actual service cgroup + properties via
+              # systemd-run with the same hardening set as hart-backend.nix:
+              f"systemd-run --wait --pipe --collect -p User=hart -p NoNewPrivileges=yes "
+              f"-p ProtectSystem=strict -p ProtectHome=yes -p PrivateTmp=yes "
+              f"-p SystemCallFilter=@system-service -p LockPersonality=yes "
+              f"-p RestrictRealtime=yes -p RestrictSUIDSGID=yes -p MemoryDenyWriteExecute=no "
+              f"-p RestrictAddressFamilies='AF_INET AF_INET6 AF_UNIX' "
+              f"{py} -c 'import threading; t=threading.Thread(target=lambda: None); t.start(); t.join(); print(\"SANDBOXED THREAD OK\")' 2>&1 || true",
+              # (d) the minimal IMPORT under the same sandbox -- does the module
+              # scope reach the thread, or does an earlier step poison it?
+              f"systemd-run --wait --pipe --collect -p User=hart -p SystemCallFilter=@system-service "
+              f"{py} -c 'import ctypes; print(\"CTYPES OK\"); import threading; threading.Thread(target=lambda: None).start(); print(\"FILTERED THREAD OK\")' 2>&1 || true",
           ]:
-              print(f"── [{tag}] $ {cmd}")
+              print(f"── [{tag}] $ {cmd[:120]}")
               print(m.execute(cmd)[1])
 
       try:
