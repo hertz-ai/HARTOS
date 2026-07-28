@@ -121,8 +121,29 @@
           # None of this constrains the installed system: the image ships
           # xz-compressed and growPartition + autoResize expand the root to fill the
           # real disk on first boot, so the on-disk size is the target's, not this.
-          SizeMinBytes = "28G";
-          SizeMaxBytes = "28G";
+          #
+          # ── 26G, and THIS bound comes from the TARGET DEVICE, not from CI ──
+          # Every earlier number here (44G, 40G, 28G) was chosen against GitHub
+          # runner disk pressure. That is the BUILD constraint. The image also has to
+          # land on a real stick, which is the SHIP constraint, and it is smaller:
+          #
+          #   1 GiB ESP + 28 GiB root = 29.0 GiB image
+          #   SanDisk Cruzer Blade    = 28.7 GiB usable  -> DOES NOT FIT, by ~0.3 GiB
+          #
+          # It would have failed at write time, after a 7.4 GB download, having built
+          # and published cleanly -- neither constraint is discoverable from the other,
+          # so both belong in this comment. 1 GiB ESP + 26 GiB root = 27 GiB leaves
+          # ~1.7 GiB spare on a nominal "32 GB" stick.
+          #
+          # 26G still clears the payload: the built image measured 25 GiB allocated
+          # (du on hart-os.raw, run 30336832563), of which ~24 GiB is the root
+          # filesystem -- 21.9 GiB of closure plus ext4 metadata, journal and the UKI.
+          # That leaves ~2 GiB of slack for closure growth.
+          #
+          # Too big for the runner fails as a SILENT ENOSPC mid-copy (six builds, see
+          # above). Too big for the stick fails at flash time. Check both.
+          SizeMinBytes = "26G";
+          SizeMaxBytes = "26G";
         };
       };
     };
