@@ -184,8 +184,18 @@ does not survive a reboot on the live ISO.
 
 Windows and macOS both run models on-device now, so this is not the old story
 about local versus cloud. Copilot+ uses the NPU and Apple Intelligence uses the
-Neural Engine. What differs is who the model belongs to and what an application
-is allowed to ask for.
+Neural Engine. What differs is who the model belongs to, what an application is
+allowed to ask for, and whether the thing keeps learning.
+
+Those two ship a finished artifact. It runs on your silicon, but it was trained
+somewhere you had no part in, it arrives the same for everyone, and your use of
+it improves the vendor's next release rather than your machine. Here a node
+improves from its own use, and what it learns is gossiped to peers and
+aggregated periodically (`federated_aggregator.py`) instead of flowing to one
+owner, so the intelligence is built by the machines running it. That is the
+democratic part, and it is a direction rather than a finished claim: what
+aggregates today is real, but the learning code itself is not open, which
+[Why it exists](#why-it-exists) and the section after it deal with squarely.
 
 | | HART OS | Windows | macOS | Linux |
 |---|---|---|---|---|
