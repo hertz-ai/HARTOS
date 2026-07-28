@@ -29,16 +29,16 @@ of what people ask in a day is not that, and this is for the rest.
 Ready today: [Nunba](https://github.com/hertz-ai/Nunba) for Windows, Linux and
 Android. This repo is the runtime underneath it: it serves local inference as a
 system service, federates peer to peer, and is drivable end to end from
-`/v1/chat/completions` or the `hart` CLI. Every claim below names the file that
-implements it.
+`/v1/chat/completions` or the `hart` CLI.
 
 ## Start it
 
 **Just want to use it?** Download
 [Nunba](https://github.com/hertz-ai/Nunba/releases/latest): one signed
-installer, no Python, and a setup wizard that picks a model for your
-hardware. Everything below this line is for running the runtime itself from
-source.
+installer, no Python, and a setup wizard that picks a model for your hardware.
+Read the next section anyway, because it is what that wizard is deciding; the
+clone-and-pip part further down is the only bit that assumes you are running
+from source.
 
 **What your machine gets you.** Two components decide. `core/gpu_tier.py`
 classifies the hardware into a tier, and the frontend badge quotes its words
