@@ -280,6 +280,46 @@ Smaller, well-specified, and still open:
 
 ---
 
+## 11. Only some of what the intelligence gives is paid for
+
+**Now:** `revenue_aggregator.py:26` splits gross 90/9/1 and sums two legs, the
+API and ads. `app_marketplace.py` pays creators 90% of the Spark an app earns.
+`compute_borrowing.py` accounts a borrowed turn against the lender. So serving
+tokens and shipping an app can earn. Several other things a node gives the hive
+cannot.
+
+**Why that is unsatisfying:** an economy gets what it pays for, and the unpaid
+work here is the work that makes the paid work trustworthy.
+
+- **Attestation.** `integrity_service.py` has nodes challenging peers with
+  nonces, verifying Ed25519 signatures, comparing claimed figures against local
+  ones, accruing fraud scores. That is compute spent making everyone else's
+  numbers mean something, and a rational node drops it first.
+- **Recipes.** One node pays the LLM cost to learn a task once
+  (`create_recipe.py`); every node after replays it for free
+  (`reuse_recipe.py`). The provenance is tracked and nothing settles on it.
+- **Skill and world-model deltas.** A node whose experience improves routing
+  for the whole hive is the compounding claim in rows 14 and 15 of
+  VERIFICATION.md. It is also unpaid.
+- **Witnessing.** The 90%-witnessed versus 50%-unwitnessed split prices it as a
+  penalty for absence rather than a payment for presence.
+
+**What progress looks like:** the principle is that everything the intelligence
+provides as value earns, so the loop closes on itself. Compute, verification,
+curation and learning all flow back to whoever supplied them, which is what
+makes it self-sustaining rather than subsidised, and net positive rather than
+extractive.
+
+`federated_aggregator.py` already separates its channels, embedding deltas,
+model lifecycle, resonance and recipes, so per-contribution-type weighting has
+somewhere to attach without a parallel path. The open question is whether each
+kind needs its own stream or a weighted share of one pool, and how a
+contribution nobody can price gets valued without a central party deciding.
+
+The hard part is not the plumbing. It is that valuing contributions requires
+either a market or an authority, and an authority is the thing this design
+exists to avoid.
+
 ## Working here
 
 Disagreement is the point. If a framing above is wrong, saying so is worth more
