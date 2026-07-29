@@ -86,6 +86,7 @@
       ./modules/hart-nunba.nix
       ./modules/hart-kernel.nix
       ./modules/hart-subsystems.nix
+      ./modules/hart-installer.nix
       # Cross-OS runtime smoke-test: a post-boot oneshot (IN PARALLEL with the
       # desktop, NOT before greetd) that actually EXECUTES a tiny test command
       # inside each ENABLED foreign-OS runtime (Windows/Wine, Android/Waydroid,
@@ -390,6 +391,20 @@
       # pattern as hartRustNixpkgs above). Passed as the raw flake input; the module
       # calls crane.mkLib with its own instantiated 25.05 (rust_1_88) pkgs.
       hartCrane = crane;
+      # The flake INPUT SOURCES, for the installer's offline story
+      # (hart-installer.nix). An installed system's /etc/nixos/flake.nix pins the
+      # HART flake by path; evaluating it needs the hart flake's OWN locked
+      # inputs. Their lock entries carry narHashes, and nix resolves a
+      # narHash-pinned input from the LOCAL STORE when the source path is already
+      # present — so the installer module references these outPaths to bake the
+      # sources into the ISO closure, and `nixos-install` then evaluates with the
+      # network cable unplugged (offline-first is a product principle, and a
+      # robot in a field has no github). Only hart-installer.nix consumes this;
+      # every other module ignores it.
+      hartFlakeInputs = {
+        inherit nixpkgs nixpkgs-rust crane llama-cpp
+                nixos-generators nixos-hardware mobile-nixos;
+      };
     };
 
     # ── THE one recipe for composing a HART system ─────────────────────────────
@@ -430,6 +445,42 @@
         inherit system variant;
         imageKind = "iso";
         modules = [ ./configurations/${variant}.nix ] ++ extraModules;
+      };
+
+    # ── The INSTALLED-system composition: profile + hart.package + caller's
+    # hardware modules. THE one generator for a system that lands on a disk the
+    # user owns: hart-desktop-installed (the eval-gated fixture), the flake that
+    # `hart-install` writes to /mnt/etc/nixos, and (later) the Calamares config
+    # module all call THIS — one writer for "what an installed HART system is",
+    # so the CLI and the GUI can never produce different systems (the plan's
+    # step-5 invariant). hardwareModules is nixos-generate-config's output plus
+    # whatever the machine needs (bootloader choice included: the installer
+    # writes systemd-boot + canTouchEfiVariables=true on EFI, grub+osProber on
+    # BIOS — see hart-installer.nix).
+    mkInstalledSystem = { system, variant, hardwareModules ? [], extraModules ? [] }:
+      mkHartSystem {
+        inherit system variant;
+        imageKind = "installed";
+        modules = [
+          ./profiles/${variant}.nix
+          ({ pkgs, hartSrc, ... }: {
+            hart.package = pkgs.callPackage ./packages/hart-app.nix { inherit hartSrc; };
+          })
+          {
+            # Offline-rebuild promise (review C:C4): the written flake pins hart
+            # by path, and hart's OWN lock resolves its inputs by narHash from
+            # the LOCAL store — but only if the sources are actually retained
+            # there. The ISO carries them via the installer module; the
+            # INSTALLED system must carry them too, or its first offline
+            # `nixos-rebuild` reaches for github (a robot in a field has none).
+            # extraDependencies pins them into the system closure, GC-proof.
+            system.extraDependencies = [
+              nixpkgs.outPath nixpkgs-rust.outPath crane.outPath
+              llama-cpp.outPath nixos-generators.outPath
+              nixos-hardware.outPath mobile-nixos.outPath
+            ];
+          }
+        ] ++ hardwareModules ++ extraModules;
       };
 
     # Build a bootable UEFI raw disk image WITHOUT qemu, via systemd-repart.
@@ -569,6 +620,15 @@
     # mkRepartSystem above delegate to it), so it can never drift from what ships.
     lib.mkHartSystem = mkHartSystem;
 
+    # The installed-system composition (profile + hart.package + your hardware).
+    # This is what the flake WRITTEN BY hart-install calls:
+    #   hart.lib.mkInstalledSystem {
+    #     system = "x86_64-linux"; variant = "desktop";
+    #     hardwareModules = [ ./hardware-configuration.nix ./boot.nix ];
+    #   }
+    # hart-desktop-installed above is the eval-gated fixture of exactly this.
+    lib.mkInstalledSystem = mkInstalledSystem;
+
     # ═════════════════════════════════════════════════════════════
     # NixOS Configurations (nixos-rebuild build --flake .#name)
     # ═════════════════════════════════════════════════════════════
@@ -614,29 +674,22 @@
       # its own NVRAM entry BESIDE Windows Boot Manager — overwriting
       # EFI/BOOT/BOOTX64.EFI (Windows' fallback loader) is exactly what it must
       # never do.
-      hart-desktop-installed = mkHartSystem {
+      hart-desktop-installed = mkInstalledSystem {
         system = "x86_64-linux";
         variant = "desktop";
-        # imageKind defaults to "installed"
-        modules = [
-          ./profiles/desktop.nix
-          ({ pkgs, hartSrc, ... }: {
-            hart.package = pkgs.callPackage ./packages/hart-app.nix { inherit hartSrc; };
-          })
-          {
-            # stand-in for nixos-generate-config's hardware-configuration.nix
-            fileSystems."/" = {
-              device = "/dev/disk/by-uuid/00000000-0000-0000-0000-000000000000";
-              fsType = "ext4";
-            };
-            fileSystems."/boot" = {
-              device = "/dev/disk/by-uuid/0000-0000";
-              fsType = "vfat";
-            };
-            boot.loader.systemd-boot.enable = true;
-            boot.loader.efi.canTouchEfiVariables = true;
-          }
-        ];
+        hardwareModules = [{
+          # stand-in for nixos-generate-config's hardware-configuration.nix
+          fileSystems."/" = {
+            device = "/dev/disk/by-uuid/00000000-0000-0000-0000-000000000000";
+            fsType = "ext4";
+          };
+          fileSystems."/boot" = {
+            device = "/dev/disk/by-uuid/0000-0000";
+            fsType = "vfat";
+          };
+          boot.loader.systemd-boot.enable = true;
+          boot.loader.efi.canTouchEfiVariables = true;
+        }];
       };
 
       # ─── aarch64 (ARM: Raspberry Pi, edge, phones) ───
@@ -1002,6 +1055,13 @@
       # rescue's decision logic is additionally covered by a portable unit test
       # (tests/unit/test_hart_audio_unmute.py). Distinct attr -> clean //; desktop node.
       audio = import ./tests/audio.nix desktopTestArgs;
+      # hart-install dual-boot survival (plan step 6): a fake-Windows ESP disk
+      # gets HART composed beside it via the REAL hart-install (--no-install
+      # seam: everything except the closure build, which is eval-gated upstream
+      # by hart-desktop-installed). Asserts the Windows boot files survive
+      # byte-identical + the target composes mkInstalledSystem (the union),
+      # never stock NixOS. Distinct attr -> clean //; desktop-variant node.
+      hartInstaller = import ./tests/hart-installer.nix desktopTestArgs;
       # network-wifi degrade-not-die: a desktop node turns NetworkManager +
       # redistributable firmware ON, then drives the REAL _ConnectivityCache wifi
       # probe against the LIVE kernel rfkill subsystem + LIVE nmcli inside the VM
@@ -1069,7 +1129,7 @@
       # 'screen' kill-switch is cut OR the authority is down, and ALLOWS when on.
       # Distinct attr -> clean //; desktop-variant node (mkNode).
       notify = import ./tests/notify.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify;
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify // hartInstaller;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)

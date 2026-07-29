@@ -72,6 +72,10 @@ in
       # options exist only while the CD profile above is imported -- setting
       # them unconditionally breaks the raw eval ("option does not exist").
       ({ config, lib, pkgs, ... }: {
+        # The installer ships ON THE ISO ONLY (live medium = the thing you
+        # install FROM). Installed systems and the raw image carry no installer.
+        hart.installer.enable = true;
+
         # ─── ISO Branding ───
         isoImage = {
           isoName = lib.mkForce "hart-os-${config.hart.version}-desktop-${pkgs.system}.iso";
