@@ -132,12 +132,26 @@ in
 
       # ── 3. Ports PRESERVED: shell + SSH + netdiag all survive in the ruleset ──
       with subtest("(3) hardening keeps the shell/SSH/netdiag ports open"):
+          import re
           rules = sec.succeed("nft list ruleset 2>/dev/null || true")
-          # The shell/backend port and SSH are opened by hart-base (allowedTCPPorts)
-          # -> they must be present in the rendered nftables ruleset.
-          assert SHELL_PORT in rules, \
+
+          # NixOS's nftables firewall renders allowedTCPPorts as a brace SET on
+          # one accept rule — `tcp dport { 22, 6777 } accept` (nixpkgs
+          # firewall-nftables.nix:160) — so the old matchers were wrong in BOTH
+          # directions: "dport 22"/" 22 " can never match a set element (this
+          # test failed on every run against a CORRECT firewall since at least
+          # 2026-07-26), while the bare SHELL_PORT substring could false-PASS on
+          # any unrelated occurrence. Match per accept line: dport present, the
+          # port as a whole word.
+          def port_accepted(port):
+              return any(
+                  "dport" in ln and "accept" in ln
+                  and re.search(r"\b" + re.escape(str(port)) + r"\b", ln)
+                  for ln in rules.splitlines())
+
+          assert port_accepted(SHELL_PORT), \
               f"the shell/backend port {SHELL_PORT} was stripped from the ruleset"
-          assert "dport 22" in rules or "dport ssh" in rules or " 22 " in rules, \
+          assert port_accepted(22) or port_accepted("ssh"), \
               "SSH (22) was stripped from the firewall ruleset"
           # The LAN netdiag port is opened by hart-net-diag (RFC1918-scoped) -> it
           # must still be reachable on the LAN, source-scoped (carries saddr).
