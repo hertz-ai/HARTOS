@@ -26,8 +26,13 @@ from flask import Blueprint, jsonify
 
 logger = logging.getLogger('hevolve_social')
 
+# Mounted under /api/social because that is the only prefix Kong routes to this
+# backend. /api/hive/* returns 404 at the gateway, including the older contest
+# endpoints, so anything served there is unreachable from a browser. Same
+# reasoning as the pages API: pick the route that already works rather than
+# asking for a gateway change that has to be remembered on every redeploy.
 hive_census_bp = Blueprint(
-    'hive_census', __name__, url_prefix='/api/hive/census',
+    'hive_census', __name__, url_prefix='/api/social/hive-census',
 )
 
 
