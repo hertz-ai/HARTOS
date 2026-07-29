@@ -5,9 +5,10 @@
 # Proves the NODE-side autonomous OTA wiring (hart-ota.nix): an installed
 # node auto-polls CENTRAL (not github) for the approved {flake_ref, commit}
 # of its channel, stages it through the EXISTING UpgradeOrchestrator pipeline,
-# and — with autoApply=true — applies via the EXISTING `nixos-rebuild switch
-# --flake` path with the EXISTING `|| nixos-rebuild switch --rollback`
-# auto-rollback, ALL with zero manual approval.
+# and — with autoApply=true — applies ACROSS THE PRIVILEGE BOUNDARY (task
+# #22): the unprivileged check unit writes an apply request; the root
+# hart-ota-apply path unit runs `nixos-rebuild switch --flake` with
+# rollback-on-failure, ALL with zero manual approval.
 #
 # What it asserts (the task's four required behaviours):
 #   1. The check service HITS hart.ota.centralEndpoint and parses the approved
@@ -102,11 +103,12 @@ let
     exec ${pkgs.python3}/bin/python3 ${mockCentralPy}
   '';
 
-  # Recording stubs for the privileged switch path. `.path` prepends these so
-  # they win over the system `sudo`/`nixos-rebuild`. Each records its full argv
-  # to ota/rebuild.log; `nixos-rebuild switch --flake …` exits non-zero IFF the
-  # FAIL_SWITCH sentinel exists (drives the rollback subtest) — `--rollback`
-  # always succeeds so the recovery path completes.
+  # Recording stub for the privileged switch path, prepended (mkBefore) on the
+  # ROOT hart-ota-apply unit's path so it wins over the module's own
+  # `path = [ pkgs.nixos-rebuild ]`. Records its full argv to ota/rebuild.log;
+  # `nixos-rebuild switch --flake …` exits non-zero IFF the FAIL_SWITCH
+  # sentinel exists (drives the rollback subtest) — `--rollback` always
+  # succeeds so the recovery path completes.
   rebuildStubs = pkgs.writeShellScriptBin "nixos-rebuild" ''
     echo "nixos-rebuild $*" >> /var/lib/hart/ota/rebuild.log
     if [[ "$*" == *"switch --flake"* ]]; then
@@ -118,14 +120,9 @@ let
     exit 0
   '';
 
-  # `sudo` stub: record + exec the rest (so `sudo nixos-rebuild …` hits the
-  # nixos-rebuild stub above). Keeps the module's exact `sudo nixos-rebuild`
-  # call shape — we shadow privilege, not the command structure.
-  sudoStub = pkgs.writeShellScriptBin "sudo" ''
-    # Skip any leading sudo flags, then exec the target command.
-    while [[ "''${1:-}" == -* ]]; do shift; done
-    exec "$@"
-  '';
+  # (The old `sudo` stub is gone with the sudo call itself: the unprivileged
+  # units never invoke sudo any more — the privilege boundary is the root
+  # hart-ota-apply path unit, task #22.)
 
   # `nixos-version` stub so the check service's `CURRENT=$(nixos-version)` is
   # deterministic under `set -euo pipefail` on the minimal node.
@@ -219,16 +216,14 @@ in
         # SUPERSEDE it as the switch target (asserted below).
       };
 
-      # Shadow the privileged switch + version binaries on the check service's
-      # PATH only (`.path` prepends). The production unit calls bare
-      # `sudo`/`nixos-rebuild`/`nixos-version`; these recording stubs intercept
-      # them so the test observes the switch/rollback argv without a real
-      # system rebuild.
-      systemd.services.hart-ota-check.path = [
-        sudoStub
-        rebuildStubs
-        nixosVersionStub
-      ];
+      # Shadow the privileged switch on the ROOT APPLY unit's PATH (task #22:
+      # the check unit no longer runs `sudo nixos-rebuild` — it writes an
+      # apply request and the root hart-ota-apply unit performs the switch).
+      # mkBefore so the recording stub wins over the module's own
+      # `path = [ pkgs.nixos-rebuild ]`.  The check unit still needs the
+      # deterministic `nixos-version` for CURRENT=$(nixos-version).
+      systemd.services.hart-ota-apply.path = pkgs.lib.mkBefore [ rebuildStubs ];
+      systemd.services.hart-ota-check.path = [ nixosVersionStub ];
 
       # The push driver (drives the real ota_push_listener) is available on the
       # node; the push subtest runs it with `systemctlStub` prepended on PATH so
@@ -269,7 +264,9 @@ in
 
       # The orchestrator must start IDLE for the staging run. tmpfiles already
       # created OTA + agent_data; ensure no stale state from a prior boot.
-      node.succeed("rm -f " + STATE + " " + PENDING + " " + REBUILD_LOG)
+      node.succeed("rm -f " + STATE + " " + PENDING + " " + REBUILD_LOG
+                   + " " + OTA + "/apply-request.json"
+                   + " " + OTA + "/last_apply.json")
 
       # ── 1+2. Check service HITS central, parses the approved rev, STAGES it ──
       with subtest("check service polls CENTRAL and parses the approved {flake_ref, commit}"):
@@ -324,15 +321,44 @@ in
           out = node.succeed("systemctl start hart-ota-check.service; "
                              "journalctl -u hart-ota-check -n 60 --no-pager")
           assert "Auto-apply enabled" in out, f"autoApply branch did not run:\n{out}"
+          # The switch is now ASYNC across the privilege boundary (task #22):
+          # the unprivileged check unit writes the apply request; the root
+          # hart-ota-apply path unit consumes it and runs the (stubbed)
+          # nixos-rebuild. Wait for the engine's final act, the result file.
           node.wait_for_file(REBUILD_LOG, timeout=30)
+          node.wait_until_succeeds(
+              "test -e " + OTA + "/last_apply.json", timeout=30)
+          # The request was CONSUMED (no path-unit retrigger loop).
+          node.succeed("test ! -e " + OTA + "/apply-request.json")
+          last = json.loads(node.succeed("cat " + OTA + "/last_apply.json"))
+          assert last["status"] == "applied", f"apply result not 'applied': {last}"
+          assert last["flake"] == "${approvedFlake}", \
+              f"apply result flake is not central's pin: {last}"
           log = node.succeed("cat " + REBUILD_LOG)
           # The switch target is central's flake#hart-<variant>, applied with NO
-          # manual step (oneshot/timer-driven) — the autonomy requirement.
+          # manual step (oneshot/timer/path-driven) — the autonomy requirement.
           assert "switch --flake ${approvedFlake}#hart-server" in log, \
               f"did not switch to the central-approved flake:\n{log}"
           # A successful switch must NOT roll back.
           assert "switch --rollback" not in log, \
               f"unexpected rollback on a successful switch:\n{log}"
+
+      # ── 3b. The privilege boundary itself (task #22 regression) ──
+      with subtest("check stays unprivileged; only the root apply unit switches"):
+          # The check unit is User=hart + NoNewPrivileges — under NNP sudo can
+          # never elevate, which is exactly why the old in-unit `sudo
+          # nixos-rebuild` was structurally broken. Pin both halves so neither
+          # regresses: the sandbox stays, and the switch lives in a root unit.
+          props = node.succeed(
+              "systemctl show hart-ota-check.service -p User -p NoNewPrivileges")
+          assert "User=hart" in props, f"check unit must stay User=hart:\n{props}"
+          assert "NoNewPrivileges=yes" in props, \
+              f"check unit must keep NoNewPrivileges:\n{props}"
+          apply_user = node.succeed(
+              "systemctl show hart-ota-apply.service -p User").strip()
+          assert apply_user in ("User=", "User=root"), \
+              f"apply unit must run as root: {apply_user!r}"
+          node.succeed("systemctl is-active hart-ota-apply.path")
 
       # ── 4. A failed apply ROLLS BACK (canary/rollback safety must-not-regress) ──
       with subtest("a failed switch triggers `nixos-rebuild switch --rollback`"):
@@ -348,19 +374,27 @@ in
                   "started_at": 0,
                   "stage_history": [],
               }) + "\nEOF")
-          node.succeed("rm -f " + REBUILD_LOG)
+          node.succeed("rm -f " + REBUILD_LOG + " " + OTA + "/last_apply.json")
           node.succeed("touch " + OTA + "/FAIL_SWITCH")
 
-          out = node.succeed("systemctl start hart-ota-check.service; "
-                             "journalctl -u hart-ota-check -n 60 --no-pager")
-          node.wait_for_file(REBUILD_LOG, timeout=30)
+          node.succeed("systemctl start hart-ota-check.service")
+          # Async boundary again: rollback happens in hart-ota-apply. The
+          # rollback argv lands in rebuild.log only after the failed switch,
+          # so wait for the rollback line itself, not just the file.
+          node.wait_until_succeeds(
+              "grep -q 'switch --rollback' " + REBUILD_LOG, timeout=30)
           log = node.succeed("cat " + REBUILD_LOG)
           assert "switch --flake ${approvedFlake}#hart-server" in log, \
               f"failed-switch attempt not recorded:\n{log}"
-          assert "switch --rollback" in log, \
-              f"auto-rollback did NOT fire after a failed switch:\n{log}"
-          assert "rolling back" in out.lower(), \
-              f"check service did not log the rollback path:\n{out}"
+          node.wait_until_succeeds(
+              "test -e " + OTA + "/last_apply.json", timeout=30)
+          last = json.loads(node.succeed("cat " + OTA + "/last_apply.json"))
+          assert last["status"] == "rolled_back", \
+              f"apply result not 'rolled_back' after failed switch: {last}"
+          apply_out = node.succeed(
+              "journalctl -u hart-ota-apply -n 40 --no-pager")
+          assert "rolling back" in apply_out.lower(), \
+              f"apply unit did not log the rollback path:\n{apply_out}"
 
       # ── 1(timer). The check timer is BOOT-ONLY — no periodic interval poll ──
       with subtest("hart-ota-check timer fires on boot only (no OnUnitActiveSec)"):

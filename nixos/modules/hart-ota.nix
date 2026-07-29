@@ -28,8 +28,8 @@ let
   # `nixos-rebuild` offline forever; OTA switches generations from pinned refs.
   # Without this refresh those two truths DIVERGE after the first applied update,
   # and a user's ordinary `nixos-rebuild switch` silently REVERTS the machine to
-  # install-time HART. One writer for the refresh, called from BOTH apply sites
-  # (the check service's autoApply branch and the `hart-ota apply` CLI verb).
+  # install-time HART. One writer for the refresh, called from the ONE apply
+  # site (the root hart-ota-apply engine, success-gated after its switch).
   #
   # NEVER-FAIL by design: a sync miss must not fail an already-successful switch
   # — but every exit path LOGS (the no-silent-gulping rule). Image systems have
@@ -68,6 +68,141 @@ let
         echo "[HART OTA] source swap failed — check /etc/hart/src{,.old,.new} by hand"
         exit 0
       fi
+    '';
+  };
+
+  # ── Privileged apply: systemd-native boundary, NO sudo (task #22) ──
+  # VERIFIED BROKEN 2026-07-29: hart-ota-check and hart-ota-canary run as
+  # User=hart with NoNewPrivileges=true, and NNP makes the kernel ignore
+  # sudo's setuid bit — `sudo nixos-rebuild` inside those units failed
+  # unconditionally, so autoApply could never switch and the canary's
+  # NixOS-level rollback was a silent no-op (its `|| true` hid it).  The
+  # fix keeps the unprivileged pipeline exactly as hardened as before and
+  # moves ONLY the generation change behind a root path-unit boundary:
+  #
+  #   unprivileged unit ──writes──▶ /var/lib/hart/ota/apply-request.json
+  #   hart-ota-apply.path (root) ──PathExists──▶ hart-ota-apply.service (root)
+  #     └─ consumes the request, nixos-rebuild switch/rollback, success-gated
+  #        source sync, result → /var/lib/hart/ota/last_apply.json
+  #
+  # Trust model UNCHANGED: hart-written OTA state (pending_update.json)
+  # already drove the intended sudo switch — the pipeline's SIGN/CANARY
+  # gates remain the authorization; the request only names WHICH staged
+  # flake to apply.  Follow-up hardening (tracked, not done here): the
+  # apply unit independently re-verifying the central signature over the
+  # pinned commit before switching.
+  otaRequestApply = pkgs.writeShellApplication {
+    name = "hart-ota-request-apply";
+    runtimeInputs = [ pkgs.jq pkgs.coreutils ];
+    text = ''
+      # The ONE writer for apply requests (check autoApply, canary rollback,
+      # CLI verbs).  usage: hart-ota-request-apply switch|rollback [flake-ref]
+      KIND="''${1:?usage: hart-ota-request-apply switch|rollback [flake-ref]}"
+      FLAKE="''${2:-}"
+      OTA_DIR="/var/lib/hart/ota"
+      case "$KIND" in
+        switch)
+          if [ -z "$FLAKE" ]; then
+            # One resolution home: the central-approved pin in
+            # pending_update.json supersedes the configured channel ref
+            # (closes the 2026-07-29 CLI-applies-flakeRef inconsistency).
+            FLAKE="$(jq -r '.switch_flake // empty' "$OTA_DIR/pending_update.json" 2>/dev/null || true)"
+            if [ -z "$FLAKE" ]; then
+              FLAKE="${ota.flakeRef}"
+            fi
+          fi
+          ;;
+        rollback) ;;
+        *) echo "[HART OTA] unknown request kind: $KIND" >&2; exit 2 ;;
+      esac
+      TMP="$OTA_DIR/.apply-request.json.tmp"
+      jq -n --arg kind "$KIND" --arg flake "$FLAKE" \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{kind: $kind, flake: $flake, requested_at: $ts}' > "$TMP"
+      mv -f "$TMP" "$OTA_DIR/apply-request.json"
+      echo "[HART OTA] $KIND requested (flake: ''${FLAKE:-n/a}) — the root hart-ota-apply unit takes it from here; follow with: journalctl -u hart-ota-apply -f"
+    '';
+  };
+
+  otaApplyRun = pkgs.writeShellApplication {
+    name = "hart-ota-apply-run";
+    # nixos-rebuild comes from the UNIT's path (not runtimeInputs) on purpose:
+    # runtimeInputs would pin the store path inside the script, making the
+    # binary unshadowable — the ota-central nixosTest observes the switch argv
+    # through a unit-path recording stub, exactly as it did for the old shape.
+    runtimeInputs = [ pkgs.jq pkgs.coreutils ];
+    text = ''
+      # Root engine behind hart-ota-apply.path — the ONLY privileged step in
+      # the OTA story.  Everything else (poll, pipeline, canary watch) stays
+      # User=hart + NoNewPrivileges.
+      OTA_DIR="/var/lib/hart/ota"
+      REQ="$OTA_DIR/apply-request.json"
+      if [ ! -e "$REQ" ]; then
+        echo "[HART OTA apply] no request file — nothing to do"
+        exit 0
+      fi
+      KIND="$(jq -r '.kind // empty' "$REQ" 2>/dev/null || true)"
+      FLAKE="$(jq -r '.flake // empty' "$REQ" 2>/dev/null || true)"
+      REQUESTED_AT="$(jq -r '.requested_at // empty' "$REQ" 2>/dev/null || true)"
+      # Consume BEFORE acting: a malformed or finished request must never
+      # retrigger the path unit into a loop (PathExists re-fires as long as
+      # the file exists after the service exits).
+      rm -f "$REQ"
+
+      STATUS="invalid_request"
+      case "$KIND" in
+        switch)
+          if [ -z "$FLAKE" ]; then
+            echo "[HART OTA apply] switch request without a flake ref — ignored"
+          else
+            ${lib.optionalString (ota.preUpdateHook != "") ''
+              echo "[HART OTA apply] running pre-update hook..."
+              ${ota.preUpdateHook}
+            ''}
+            echo "[HART OTA apply] switching to $FLAKE#hart-${cfg.variant} ..."
+            # if-form on purpose: the source sync runs on SUCCESS alone — a
+            # rolled-back switch must not advance /etc/hart/src (task #20).
+            if nixos-rebuild switch --flake "$FLAKE#hart-${cfg.variant}"; then
+              STATUS="applied"
+              ${otaSyncSrc}/bin/hart-ota-sync-src "$FLAKE" \
+                || echo "[HART OTA apply] source sync failed unexpectedly — /etc/hart/src may be stale"
+            else
+              echo "[HART OTA apply] switch FAILED — rolling back..."
+              STATUS="rolled_back"
+              nixos-rebuild switch --rollback \
+                || { STATUS="rollback_failed"; echo "[HART OTA apply] ROLLBACK FAILED — manual intervention needed"; }
+            fi
+            ${lib.optionalString (ota.postUpdateHook != "") ''
+              echo "[HART OTA apply] running post-update hook..."
+              ${ota.postUpdateHook}
+            ''}
+          fi
+          ;;
+        rollback)
+          echo "[HART OTA apply] rollback requested — switching to previous generation..."
+          if nixos-rebuild switch --rollback; then
+            STATUS="rolled_back"
+          else
+            STATUS="rollback_failed"
+            echo "[HART OTA apply] ROLLBACK FAILED — manual intervention needed"
+          fi
+          ;;
+        *)
+          echo "[HART OTA apply] unknown request kind: ''${KIND:-<empty>} — ignored"
+          ;;
+      esac
+
+      # Result surface for `hart-ota status` + the pipeline (hart-owned dir,
+      # root-written file must stay readable by the hart-side readers).
+      TMP="$OTA_DIR/.last_apply.json.tmp"
+      jq -n --arg kind "$KIND" --arg flake "$FLAKE" --arg status "$STATUS" \
+        --arg requested_at "$REQUESTED_AT" \
+        --arg finished_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{kind: $kind, flake: $flake, status: $status,
+          requested_at: $requested_at, finished_at: $finished_at}' > "$TMP"
+      chmod 0644 "$TMP"
+      mv -f "$TMP" "$OTA_DIR/last_apply.json"
+      echo "[HART OTA apply] done: $STATUS"
     '';
   };
 in
@@ -331,34 +466,18 @@ in
               echo "[HART OTA] System is up to date"
             fi
           elif [[ "$STAGE" == "completed" ]]; then
-            echo "[HART OTA] Update completed, applying NixOS switch..."
-            ${lib.optionalString (ota.preUpdateHook != "") ''
-              echo "[HART OTA] Running pre-update hook..."
-              ${ota.preUpdateHook}
-            ''}
-
-            # Switch to exactly the flake CENTRAL approved at pipeline start
-            # (persisted in pending_update.json). Fall back to the configured
-            # flakeRef if the metadata is missing/older.
-            SWITCH_FLAKE=$(${pkgs.jq}/bin/jq -r '.switch_flake // empty' \
-              "$OTA_DIR/pending_update.json" 2>/dev/null || true)
-            [[ -z "$SWITCH_FLAKE" ]] && SWITCH_FLAKE="${ota.flakeRef}"
-
+            echo "[HART OTA] Update completed."
             if [[ "${if ota.autoApply then "1" else "0"}" == "1" ]]; then
-              echo "[HART OTA] Auto-apply enabled, switching to $SWITCH_FLAKE ..."
-              # Same switch/rollback semantics as before; the if-form (vs the old
-              # `|| { }`) exists ONLY so the source sync runs on SUCCESS alone —
-              # a rolled-back switch must not advance /etc/hart/src (task #20).
-              if sudo nixos-rebuild switch --flake "$SWITCH_FLAKE#hart-${cfg.variant}" 2>&1; then
-                sudo ${otaSyncSrc}/bin/hart-ota-sync-src "$SWITCH_FLAKE" 2>&1                   || echo "[HART OTA] source sync failed unexpectedly — /etc/hart/src may be stale"
-              else
-                echo "[HART OTA] Switch failed, rolling back..."
-                sudo nixos-rebuild switch --rollback 2>&1
-              fi
-              ${lib.optionalString (ota.postUpdateHook != "") ''
-                echo "[HART OTA] Running post-update hook..."
-                ${ota.postUpdateHook}
-              ''}
+              # This unit is User=hart + NoNewPrivileges — it CANNOT switch
+              # generations itself (NNP makes the kernel ignore sudo's setuid
+              # bit; the old `sudo nixos-rebuild` here failed on every run,
+              # task #22).  The request writer resolves the central-approved
+              # switch_flake from pending_update.json and the root
+              # hart-ota-apply unit performs the switch + rollback + source
+              # sync + pre/post hooks.
+              echo "[HART OTA] Auto-apply enabled — requesting privileged switch"
+              ${otaRequestApply}/bin/hart-ota-request-apply switch \
+                || echo "[HART OTA] apply request failed — update stays staged"
             else
               echo "[HART OTA] Update staged. Run 'hart-ota apply' to switch."
             fi
@@ -399,6 +518,37 @@ in
     };
 
     # ─────────────────────────────────────────────────────────
+    # OTA Privileged Apply — root path-unit boundary (task #22)
+    # ─────────────────────────────────────────────────────────
+    # The ONLY privileged step in the OTA story.  Unprivileged units and the
+    # CLI write /var/lib/hart/ota/apply-request.json via hart-ota-request-apply
+    # (the one writer); this pair consumes it.  See the otaApplyRun comment in
+    # the let-block for the full trust-model rationale.
+    systemd.paths.hart-ota-apply = {
+      description = "HART OS OTA apply-request watcher";
+      wantedBy = [ "multi-user.target" ];
+      pathConfig = {
+        PathExists = "/var/lib/hart/ota/apply-request.json";
+        Unit = "hart-ota-apply.service";
+      };
+    };
+
+    systemd.services.hart-ota-apply = {
+      description = "HART OS OTA Privileged Apply (generation switch/rollback)";
+      # Root on purpose (no User=): nixos-rebuild switch changes the system
+      # generation.  The engine consumes the request file FIRST so the path
+      # unit cannot retrigger into a loop.
+      path = [ pkgs.nixos-rebuild ];
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${otaApplyRun}/bin/hart-ota-apply-run";
+        StandardOutput = "journal";
+        StandardError = "journal";
+        SyslogIdentifier = "hart-ota-apply";
+      };
+    };
+
+    # ─────────────────────────────────────────────────────────
     # OTA Push Receiver — CENTRAL push → SAME apply (no new transport)
     # ─────────────────────────────────────────────────────────
     # The other half of the trigger model: between a boot poll and a user
@@ -428,9 +578,9 @@ in
     #     embedded_main's boot drain — one node-side fleet-receive shape, reused.
     #
     # Runs as root (no User=) like hart-self-build-watch so it can start the
-    # privileged hart-ota-check unit directly — no new sudo/polkit rule, and the
-    # actual privileged switch still happens inside hart-ota-check's own
-    # hardened, audited context.
+    # hart-ota-check unit directly — no new sudo/polkit rule.  hart-ota-check
+    # itself is UNPRIVILEGED (User=hart + NoNewPrivileges); the privileged
+    # switch happens in the root hart-ota-apply unit it requests (task #22).
     systemd.services.hart-ota-push = {
       description = "HART OS OTA Push Receiver — durable drain (central push → staged apply)";
       after = [ "network-online.target" "hart-backend.service" ];
@@ -527,9 +677,13 @@ in
             orch.rollback('canary_health_failed')
             " || true
 
-            # NixOS-level rollback
-            sudo nixos-rebuild switch --rollback 2>&1 || true
-            echo "[HART OTA] Rolled back to previous generation"
+            # NixOS-level rollback via the root apply unit — this unit is
+            # User=hart + NoNewPrivileges, so the old `sudo nixos-rebuild
+            # switch --rollback || true` here was a SILENT NO-OP (NNP blocks
+            # sudo's setuid; the || true hid the failure): the canary safety
+            # net never actually reverted the generation (task #22).
+            ${otaRequestApply}/bin/hart-ota-request-apply rollback \
+              || echo "[HART OTA] rollback request failed — generation NOT reverted"
           else
             echo "[HART OTA] Canary healthy"
           fi
@@ -537,7 +691,8 @@ in
 
         NoNewPrivileges = true;
         ProtectSystem = "strict";
-        ReadWritePaths = [ cfg.dataDir cfg.logDir ];
+        # /var/lib/hart/ota: the rollback request file lives there.
+        ReadWritePaths = [ cfg.dataDir cfg.logDir "/var/lib/hart/ota" ];
         StandardOutput = "journal";
         StandardError = "journal";
         SyslogIdentifier = "hart-ota-canary";
@@ -613,6 +768,11 @@ in
             echo ""
             echo "NixOS generation:"
             nixos-version 2>/dev/null || echo "unknown"
+            if [ -e /var/lib/hart/ota/last_apply.json ]; then
+              echo ""
+              echo "Last privileged apply:"
+              ${pkgs.jq}/bin/jq . /var/lib/hart/ota/last_apply.json 2>/dev/null || true
+            fi
             ;;
           check)
             # User-initiated poll — one of the two poll triggers (the other is
@@ -624,19 +784,17 @@ in
             ;;
           apply)
             echo "Applying staged update..."
-            # NOTE (pre-existing, observed 2026-07-29, deliberately unchanged
-            # here): this verb applies ota.flakeRef while the check service
-            # applies the persisted switch_flake from pending_update.json — a
-            # central-approved pin can differ from the configured ref.
-            if sudo nixos-rebuild switch --flake "${ota.flakeRef}#hart-${cfg.variant}"; then
-              # Success-gated source sync (task #20) — same helper the
-              # autoApply branch calls; see its definition for the semantics.
-              sudo ${otaSyncSrc}/bin/hart-ota-sync-src "${ota.flakeRef}"                 || echo "[HART OTA] source sync failed unexpectedly — /etc/hart/src may be stale"
-            fi
+            # ONE apply path (task #22): the request writer resolves the
+            # central-approved switch_flake from pending_update.json exactly
+            # like autoApply does (closing the 2026-07-29 flakeRef-vs-
+            # switch_flake inconsistency); the root hart-ota-apply unit does
+            # the switch + rollback-on-failure + success-gated source sync.
+            # sudo here is fine — an interactive shell has no NoNewPrivileges.
+            sudo ${otaRequestApply}/bin/hart-ota-request-apply switch
             ;;
           rollback)
             echo "Rolling back to previous generation..."
-            sudo nixos-rebuild switch --rollback
+            sudo ${otaRequestApply}/bin/hart-ota-request-apply rollback
             ;;
           self-build|build)
             echo "Rebuilding HART OS from current configuration..."
