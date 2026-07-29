@@ -157,14 +157,21 @@ def test_capability_mesh_surface_matches_prompt():
         assert callable(getattr(pr, fn, None)), 'peer_reuse.%s (mesh function) is gone' % fn
 
 
-def test_standalone_entry_gap_still_holds():
-    """The prompt's 'know who starts the daemon' claim: init_agent_engine must
-    NOT be called from hart_intelligence_entry's own source (only Nunba
-    bootstrap, the NixOS unit, and run_flywheel_dev start the AgentDaemon).
-    If someone wires it in, the prompt's instruction is stale -- update it."""
+def test_standalone_entry_starts_the_engine():
+    """The prompt's 'know who starts the daemon' claim.
+
+    This used to assert the OPPOSITE -- that hart_intelligence_entry does NOT
+    start the engine -- and named that a 'gap'.  The gap was real and load
+    bearing: `init_social` delegates engine init to its caller, Nunba's
+    bootstrap picked it up, and this standalone launcher never did.  Every
+    Docker / OS deployment therefore booted with no daemon supervisor and no
+    Phase-2 goal bootstrap, so seeded goals sat `active` and nothing ever
+    dispatched.  Wired in 2026-07-21; this test now guards the fix.
+    """
     src = open(os.path.join(ROOT, 'hart_intelligence_entry.py'), encoding='utf-8').read()
-    assert 'init_agent_engine(' not in src, \
-        'hart_intelligence_entry now starts the agent engine -- update HIVE_COLLAB_BOOTSTRAP.md'
+    assert 'init_agent_engine(app)' in src, \
+        ('hart_intelligence_entry no longer starts the agent engine -- Docker '
+         'and OS nodes will seed goals that never dispatch')
     fly = open(os.path.join(ROOT, 'scripts/run_flywheel_dev.py'), encoding='utf-8').read()
     assert 'init_agent_engine' in fly, \
         'run_flywheel_dev no longer starts the engine -- update HIVE_COLLAB_BOOTSTRAP.md'

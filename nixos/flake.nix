@@ -148,6 +148,8 @@
       # Leak attribution for a desktop that degrades OVER TIME (the 2026-07-20
       # drag hang). Read-only /proc sampling on a timer; opt-in, default OFF.
       ./modules/hart-shell-memwatch.nix
+      # Local-2B agent baseline capture on the node (potato-machine profile).
+      ./modules/hart-agent-baseline.nix
       # Display management (#158): resolution / per-output scale / font scaling
       # (GDK_DPI_SCALE + fontconfig dpi from hart.display.fontScale, mkDefault so the
       # a11y magnifier wins) + multi-monitor via wlr-randr + a never-fail kanshi USER

@@ -130,23 +130,31 @@ def test_collect_targets_filters_to_announce_chat_id_set(monkeypatch):
         'telegram': {'announce_chat_id': '', 'enabled': True},
         'slack': {'announce_chat_id': '   ', 'enabled': True},
         'whatsapp': {'enabled': True},  # no announce_chat_id key
-        'imessage': {'announce_chat_id': '999', 'enabled': True},
+        # google_chat, not imessage: this test is about announce_chat_id
+        # being set. One-to-one channels need a subscription record (see the
+        # dedicated test below), which would otherwise make the example
+        # channel do two jobs at once.
+        'google_chat': {'announce_chat_id': '999', 'enabled': True},
     })
     from integrations.channels.announcement_broadcaster import (
         _collect_announcement_targets)
     targets = _collect_announcement_targets()
-    # Only discord + imessage qualify.
-    assert sorted(targets) == [('discord', '123456'), ('imessage', '999')]
+    # Only discord + google_chat qualify.
+    assert sorted(targets) == [('discord', '123456'), ('google_chat', '999')]
 
 
 def test_collect_targets_skips_disabled_channels(monkeypatch):
     _patch_admin_channels(monkeypatch, {
         'discord': {'announce_chat_id': '123', 'enabled': False},
-        'telegram': {'announce_chat_id': '456', 'enabled': True},
+        # Negative id = a Telegram group/channel. The original fixture used
+        # '456', which is a *private chat* id and is now refused on that
+        # basis — this test is about `enabled`, so give it a destination
+        # that is actually broadcastable.
+        'telegram': {'announce_chat_id': '-456', 'enabled': True},
     })
     from integrations.channels.announcement_broadcaster import (
         _collect_announcement_targets)
-    assert _collect_announcement_targets() == [('telegram', '456')]
+    assert _collect_announcement_targets() == [('telegram', '-456')]
 
 
 def test_collect_targets_empty_when_no_admin_api(monkeypatch):
@@ -276,3 +284,217 @@ def test_event_published_triggers_broadcast(monkeypatch):
     # Cleanup so we don't leak state to other tests.
     ab.reset_for_tests()
     inst.shutdown()
+
+
+# ── new-content announcements ───────────────────────────────────────────
+#
+# The broadcaster used to fire on exactly one event, so only benchmark
+# proofs ever left the building. These cover the content path and the
+# four ways it could do real damage: posting without consent, posting to
+# somebody's private messenger, posting the same page twice, and flooding.
+
+_PAGES = [
+    {'url': 'https://hevolve.ai/a', 'title': 'Page A',
+     'share_urls': {'discord': 'https://hevolve.ai/a?ref=discord'}},
+    {'url': 'https://hevolve.ai/b', 'title': 'Page B',
+     'share_urls': {'discord': 'https://hevolve.ai/b?ref=discord'}},
+]
+
+
+def test_selection_is_ordered_deduped_and_capped():
+    import integrations.channels.announcement_broadcaster as ab
+    assert [p['url'] for p in ab.select_unannounced(_PAGES, [], 1)] == \
+        ['https://hevolve.ai/a']
+    assert [p['url'] for p in ab.select_unannounced(
+        _PAGES, ['https://hevolve.ai/a'], 1)] == ['https://hevolve.ai/b']
+    assert ab.select_unannounced(_PAGES, [p['url'] for p in _PAGES], 5) == []
+    # One page per pass: a community notices a steady contributor and
+    # mutes a firehose.
+    assert ab.CONTENT_ANNOUNCE_LIMIT == 1
+
+
+def test_announcement_text_uses_ref_url_and_states_who_is_posting():
+    import integrations.channels.announcement_broadcaster as ab
+    text = ab.format_content_announcement(_PAGES[0], 'discord')
+    assert 'ref=discord' in text          # funnel attribution survives
+    assert 'Hevolve AI agent' in text     # not passing as a person
+    assert 'Page A' in text
+
+
+def test_no_post_without_public_exposure_consent():
+    import integrations.channels.announcement_broadcaster as ab
+    sent = ab.announce_new_content(
+        consent_check=lambda: False, pages=_PAGES, already_announced=[])
+    assert sent == []
+
+
+def test_consented_pass_sends_one_page_then_does_not_repeat_it(monkeypatch):
+    import integrations.channels.announcement_broadcaster as ab
+    calls = []
+    monkeypatch.setattr(ab, '_collect_announcement_targets',
+                        lambda: [('discord', '123')])
+    monkeypatch.setattr(ab, '_dispatch_to_target',
+                        lambda c, i, t: calls.append((c, i, t)))
+
+    first = ab.announce_new_content(
+        consent_check=lambda: True, pages=_PAGES, already_announced=[])
+    assert first == ['https://hevolve.ai/a']
+    assert len(calls) == 1
+
+    second = ab.announce_new_content(
+        consent_check=lambda: True, pages=_PAGES, already_announced=first)
+    assert second == ['https://hevolve.ai/b']
+
+
+def test_one_to_one_channels_need_a_real_subscription_record():
+    """People do subscribe to WhatsApp Channels and Signal groups, so
+    refusing by app name is naive. But an operator flag saying "they opted
+    in" is not evidence either -- it reports what it was told. The gate is a
+    subscription RECORD, which has a source and can be revoked."""
+    import integrations.channels.announcement_broadcaster as ab
+    fake_api = MagicMock()
+    fake_api._channels = {
+        'discord':  {'enabled': True, 'announce_chat_id': 'd1'},
+        'whatsapp': {'enabled': True, 'announce_chat_id': 'w1'},
+        'imessage': {'enabled': True, 'announce_chat_id': 'i1'},
+    }
+    subscribed = {('whatsapp', 'w1')}
+    with patch('integrations.channels.admin.api.get_api', return_value=fake_api):
+        targets = dict(ab._collect_announcement_targets(
+            subscribed_check=lambda c, i: (c, i) in subscribed))
+    assert set(targets) == {'discord', 'whatsapp'}
+    assert 'imessage' not in targets   # nobody subscribed
+
+
+def test_subscription_check_is_fail_closed(monkeypatch):
+    """No consent service, no DB, an exception mid-query -- all mean NOT
+    subscribed. A check that could not run must never read as permission."""
+    import integrations.channels.announcement_broadcaster as ab
+    monkeypatch.setattr(ab, '_consent_session', lambda: (None, None))
+    assert ab.is_subscribed('whatsapp', 'w1') is False
+
+    class _Boom:
+        @staticmethod
+        def check_consent(*a, **k):
+            raise RuntimeError('db gone')
+    monkeypatch.setattr(ab, '_consent_session', lambda: (_Boom, MagicMock()))
+    assert ab.is_subscribed('whatsapp', 'w1') is False
+
+
+def test_subscription_key_identifies_the_destination_not_a_person():
+    import integrations.channels.announcement_broadcaster as ab
+    assert ab.subscription_key('telegram', ' -100123 ') == 'telegram:-100123'
+
+
+@pytest.mark.parametrize('text', [
+    'unsubscribe', 'STOP', ' stop ', '/stop', 'opt out', 'leave', 'unfollow'])
+def test_unsubscribe_words_are_recognised(text):
+    import integrations.channels.announcement_broadcaster as ab
+    assert ab.looks_like_unsubscribe(text) is True
+
+
+@pytest.mark.parametrize('text', [
+    'please stop the build', 'I want to leave a comment', '', None,
+    'can you stop by later'])
+def test_ordinary_prose_does_not_unsubscribe_someone_mid_conversation(text):
+    """Matched on the whole trimmed message, not a substring -- otherwise
+    'please stop the build' silently drops somebody from the list."""
+    import integrations.channels.announcement_broadcaster as ab
+    assert ab.looks_like_unsubscribe(text) is False
+
+
+def test_unsubscribe_revokes_and_reports_handled(monkeypatch):
+    import integrations.channels.announcement_broadcaster as ab
+    revoked = []
+    monkeypatch.setattr(ab, 'revoke_subscription',
+                        lambda c, i: revoked.append((c, i)) or True)
+    assert ab.handle_unsubscribe_command('whatsapp', 'w1', 'stop') is True
+    assert revoked == [('whatsapp', 'w1')]
+    assert ab.handle_unsubscribe_command('whatsapp', 'w1', 'hello there') is False
+    assert len(revoked) == 1
+
+
+def test_a_revoked_destination_stops_receiving(monkeypatch):
+    """The whole point of a record over a flag: it can be taken back."""
+    import integrations.channels.announcement_broadcaster as ab
+    fake_api = MagicMock()
+    fake_api._channels = {'whatsapp': {'enabled': True, 'announce_chat_id': 'w1'}}
+    live = {('whatsapp', 'w1')}
+    with patch('integrations.channels.admin.api.get_api', return_value=fake_api):
+        before = ab._collect_announcement_targets(
+            subscribed_check=lambda c, i: (c, i) in live)
+        live.clear()                      # they unsubscribed
+        after = ab._collect_announcement_targets(
+            subscribed_check=lambda c, i: (c, i) in live)
+    assert before == [('whatsapp', 'w1')]
+    assert after == []
+
+
+def test_ordinary_agent_to_human_messaging_is_not_gated_by_any_of_this(monkeypatch):
+    """The opt-in gate exists on the BROADCAST path only. Replies,
+    notifications a user asked for, and an agent messaging its own owner go
+    through registry.send_to_channel and must stay untouched -- including
+    on WhatsApp, Signal and iMessage, which is what those adapters are for.
+
+    Asserted behaviourally: dispatching directly to a one-to-one channel
+    still sends. (An earlier version of this test counted occurrences of a
+    constant in the module source, which broke the moment a comment
+    mentioned it -- a check coupled to prose rather than behaviour.)"""
+    scheduled = []
+    inst = _patch_integration_loop(monkeypatch, scheduled)
+    from integrations.channels.announcement_broadcaster import (
+        _dispatch_to_target)
+    _dispatch_to_target('whatsapp', 'user-123', 'your build finished')
+    assert scheduled == [('whatsapp', 'user-123', 'your build finished')]
+    inst.shutdown()
+
+
+def test_unreachable_feed_yields_no_posts_rather_than_a_guess():
+    import integrations.channels.announcement_broadcaster as ab
+    assert ab.fetch_own_pages('http://127.0.0.1:9/nope.json', timeout=2) == []
+
+
+# ── destination shape: fact beats assertion ─────────────────────────────
+
+def test_telegram_private_chat_ids_are_recognised_as_one_to_one():
+    """Telegram private chats have positive ids; groups, supergroups and
+    channels have negative ones. That is a property of the destination, not
+    a claim about it — which is the whole point, since announce_audience is
+    only ever an operator assertion."""
+    import integrations.channels.announcement_broadcaster as ab
+    assert ab.destination_shape('telegram', '123456') == 'one_to_one'
+    assert ab.destination_shape('telegram', '-1001234567890') == 'multi_person'
+    assert ab.destination_shape('telegram', ' -42 ') == 'multi_person'
+
+
+def test_undecidable_destinations_return_none_not_permission():
+    """None means 'cannot determine', never 'safe'. Discord/Slack channel
+    type needs an API call that is not wired yet; @channelname is not
+    decidable from the id."""
+    import integrations.channels.announcement_broadcaster as ab
+    assert ab.destination_shape('telegram', '@somechannel') is None
+    assert ab.destination_shape('discord', '123') is None
+    assert ab.destination_shape('slack', 'C123') is None
+
+
+def test_a_private_telegram_id_is_refused_even_when_marked_opt_in(monkeypatch):
+    """The operator can be wrong about which chat an id points at. Where a
+    fact contradicts the assertion, the fact wins."""
+    _patch_admin_channels(monkeypatch, {
+        'telegram': {'enabled': True, 'announce_chat_id': '987654',
+                     'announce_audience': 'opt_in'},
+    })
+    from integrations.channels.announcement_broadcaster import (
+        _collect_announcement_targets)
+    assert _collect_announcement_targets() == []
+
+
+def test_a_telegram_group_id_is_accepted_without_any_flag(monkeypatch):
+    """A negative id is structurally a group/channel: people had to join it,
+    and the platform enforces that. No operator claim required."""
+    _patch_admin_channels(monkeypatch, {
+        'telegram': {'enabled': True, 'announce_chat_id': '-1001234567890'},
+    })
+    from integrations.channels.announcement_broadcaster import (
+        _collect_announcement_targets)
+    assert _collect_announcement_targets() == [('telegram', '-1001234567890')]

@@ -2297,20 +2297,33 @@ def history(user_id,prompt_id,role,message):
 
 # Mode-aware config_list: cloud/regional use external LLM, flat uses local llama.cpp
 _node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+
+# The endpoint comes from ONE place regardless of tier. Previously the
+# regional/central branch read HEVOLVE_LLM_ENDPOINT_URL raw while every
+# resolver-based caller read HEVOLVE_LOCAL_LLM_URL, so the two paths could
+# disagree; on deepbox they only agreed because both vars were set to the same
+# gateway. get_local_llm_url() now includes HEVOLVE_LLM_ENDPOINT_URL among its
+# candidates, so it resolves correctly on a cloud tier with no local model AND
+# on a device where Nunba wrote ~/.nunba/llama_config.json.
+#
+# The tier branch remains, because model name and price genuinely differ: a
+# cloud model bills per token, the bundled local model does not. Only the
+# endpoint is unified.
+from core.port_registry import get_local_llm_url
+_llm_base = get_local_llm_url()
 if _node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
     config_list = [{
         "model": os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4.1-mini'),
         "api_key": os.environ.get('HEVOLVE_LLM_API_KEY', 'dummy'),
-        "base_url": os.environ['HEVOLVE_LLM_ENDPOINT_URL'],
+        "base_url": _llm_base,
         "price": [0.0025, 0.01]
     }]
 else:
-    from core.port_registry import get_local_llm_url
     # get_local_llm_url() returns a "/v1"-suffixed URL for direct HTTP
     # callers, but autogen 0.2.x's client wrapper appends its own "/v1"
     # internally — passing the already-suffixed URL through doubles it,
     # 404ing every request at ".../v1/v1/chat/completions".
-    _local_llm_url = get_local_llm_url().rstrip('/')
+    _local_llm_url = _llm_base.rstrip('/')
     if _local_llm_url.endswith('/v1'):
         _local_llm_url = _local_llm_url[: -len('/v1')]
     config_list = [{

@@ -1419,11 +1419,31 @@ try:
         """
         import requests as _req
         data = request.get_json(silent=True) or {}
-        hevolve_url = os.environ.get('HEVOLVE_API_URL', 'http://localhost:8000')
+        # Resolve the LLM the same way every other consumer does, instead of a
+        # private HEVOLVE_API_URL that defaulted to localhost:8000. That default
+        # is correct for an on-device install (llama.cpp on :8000 is the whole
+        # point of local Nunba), but on the central tier nothing runs there, so
+        # this proxy 502'd while Langchain/Autogen worked off the gateway. The
+        # resolver probes candidates and picks the first reachable one — the
+        # local model on a device, the gateway on central — so a single source
+        # of truth is correct in both topologies. Explicit HEVOLVE_API_URL still
+        # wins if set, for operators who want to pin it.
+        base = os.environ.get('HEVOLVE_API_URL')
+        if not base:
+            try:
+                from core.port_registry import get_local_llm_url
+                base = get_local_llm_url()
+            except Exception:
+                base = 'http://localhost:8000'
+        base = base.rstrip('/')
+        # The resolver returns a base already ending in /v1; a bare host does
+        # not. Build the completions path without doubling /v1.
+        target = base + ('/chat/completions' if base.endswith('/v1')
+                         else '/v1/chat/completions')
         headers = {'Content-Type': 'application/json'}
         try:
             resp = _req.post(
-                f'{hevolve_url}/v1/chat/completions',
+                target,
                 json=data,
                 headers=headers,
                 timeout=120
@@ -11999,6 +12019,34 @@ def main():
     # Initialize HART skill registry (load persisted + discover local)
     skills_thread = threading.Thread(target=_init_skills, daemon=True)
     skills_thread.start()
+
+    # Agent engine: daemon supervisor, Phase-2 goal bootstrap, dispatch.
+    #
+    # `init_social` used to do this and deliberately stopped — see
+    # integrations/social/__init__.py ("agent engine init delegated to
+    # caller ... ONE caller, ONE call site").  Nunba's main.py picked the
+    # responsibility up; this standalone launcher never did.  So every
+    # Docker / OS deployment booted with no daemon supervisor and no
+    # Phase-2 bootstrap at all: seeded goals sat `active` forever, nothing
+    # was ever dispatched, and no bootstrap line appeared in the logs to
+    # say so.  (Verified on the central node: 72 goals, all `active`, zero
+    # dispatched, no engine log lines.)
+    #
+    # Called here at the tail of main() on purpose:
+    #   - the module is fully imported by now, so the deferred thread's
+    #     heavy imports cannot race top-level ones — that race is the
+    #     documented deadlock in integrations/agent_engine/__init__.py;
+    #   - Flask has not served a request yet, so Phase-1's
+    #     register_blueprint() calls are still legal.
+    # init_agent_engine is idempotent, so a launcher that already called it
+    # (Nunba) is unaffected.
+    try:
+        from integrations.agent_engine import init_agent_engine
+        init_agent_engine(app)
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            "Agent engine init failed — no seeded goal will ever execute on "
+            "this node: %s", e, exc_info=True)
 
     from core.port_registry import get_port
     _serve_app(app, host='0.0.0.0', port=get_port('backend'))

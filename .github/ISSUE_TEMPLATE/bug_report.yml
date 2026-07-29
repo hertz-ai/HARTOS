@@ -1,34 +1,73 @@
-name: Bug Report
-description: Something isn't working
+name: Bug report
+description: Something behaves differently from how it is documented
 labels: ["bug"]
 body:
-  - type: textarea
-    id: what-happened
+  - type: markdown
     attributes:
-      label: What happened?
-      placeholder: Tell us what went wrong
+      value: |
+        Security issues do **not** belong here — see
+        [SECURITY.md](../blob/main/SECURITY.md).
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
     validations:
       required: true
+
   - type: textarea
-    id: expected
+    id: repro
     attributes:
-      label: What did you expect?
-      placeholder: What should have happened instead
-  - type: textarea
-    id: reproduce
-    attributes:
-      label: Steps to reproduce
+      label: How to reproduce
+      description: >
+        Exact steps or commands. If it only happens sometimes, say how often —
+        an intermittent bug is a different investigation from a deterministic
+        one, and knowing which saves a reviewer a day.
       placeholder: |
-        1. Start the backend with...
-        2. Send a request to...
-        3. See error...
-  - type: input
-    id: os
+        1. Start with `python -m hart_intelligence_entry`
+        2. POST to :6777/v1/chat/completions with ...
+        3. ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: topology
     attributes:
-      label: OS
-      placeholder: e.g. Ubuntu 22.04, Windows 11, HART OS ISO
+      label: Topology
+      description: A lot of code paths branch on this.
+      options:
+        - flat (single machine, SQLite)
+        - regional (LAN/VPN cluster, MySQL)
+        - central (cloud, Docker)
+        - not sure
+    validations:
+      required: true
+
   - type: input
-    id: python
+    id: env
     attributes:
-      label: Python version
-      placeholder: e.g. 3.10.12
+      label: OS, Python version, GPU/VRAM
+      description: >
+        Engines are tiered on VRAM, so "6GB" and "8GB" are genuinely
+        different products. "CPU only" is a valid answer.
+      placeholder: "Ubuntu 24.04, Python 3.10.14, RTX 3060 12GB"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Paste the text, not a screenshot of it. Redact any API keys.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues
+          required: true
+        - label: This is not a security vulnerability
+          required: true
