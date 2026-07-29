@@ -137,14 +137,26 @@ in
         # e2e boot smoke, and it would bite real hardware too — the cap is the
         # same there). Give the ML init real headroom; edge stays minimal (no
         # heavy ML), so its small cap is correct.
-        MemoryMax = if cfg.variant == "edge" then "384M"
+        # Edge caps raised 384M/256M/32 -> 640M/512M/64 (2026-07-28, measured):
+        # a full hart_intelligence_entry import is 275 MB RSS / 11 threads ON THE
+        # DEV BOX WITH THE ML STACK ABSENT — i.e. 275 MB is the FLOOR of the
+        # module-scope import, and it is variant-independent (nothing slims it on
+        # edge). The old MemoryHigh=256M sat BELOW that floor (perpetual reclaim)
+        # and MemoryMax=384M barely above it, so a real edge device would
+        # OOM-kill its backend at boot; TasksMax=32 left ~17 for the app after
+        # waitress's 4 workers + interpreter housekeeping. The old sizing
+        # reasoned "edge stays minimal (no heavy ML)" — true of the VARIANT, not
+        # of the IMPORT. Slimming the import itself (lazy module-scope init) is
+        # the real fix and is tracked; these caps are the honest cost of the
+        # import that exists today.
+        MemoryMax = if cfg.variant == "edge" then "640M"
                     else if cfg.variant == "desktop" then "3G"
                     else "4G";
-        MemoryHigh = if cfg.variant == "edge" then "256M"
+        MemoryHigh = if cfg.variant == "edge" then "512M"
                      else if cfg.variant == "desktop" then "2560M"
                      else "3584M";
         CPUWeight = if cfg.variant == "edge" then 50 else 100;
-        TasksMax = if cfg.variant == "edge" then 32 else 512;
+        TasksMax = if cfg.variant == "edge" then 64 else 512;
         IOWeight = if cfg.variant == "edge" then 50 else 100;
 
         StandardOutput = "journal";
