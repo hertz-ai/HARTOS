@@ -32,6 +32,19 @@ def fresh_catalog() -> ModelCatalog:
     return ModelCatalog(catalog_path=tmp.name)
 
 
+def live_tts_count() -> int:
+    """One catalog entry per code-shipped TTS registry engine.
+
+    Derived from the live registry, never hardcoded: the engine ladder is
+    tuned over time and a magic number here goes stale silently (it sat at
+    12 while the registry grew to 15 — piper/makeittalk returned, the
+    European/CJK ladder landed).  Reads the module attribute at call time
+    so it also reflects the post-populate registry state.
+    """
+    from integrations.channels.media import tts_router
+    return len(tts_router.ENGINE_REGISTRY)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # TTS — populate_tts_catalog
 # ═══════════════════════════════════════════════════════════════════════════
@@ -39,12 +52,13 @@ def fresh_catalog() -> ModelCatalog:
 class TestPopulateTtsCatalog:
     """Tests for populate_tts_catalog from integrations.channels.media.tts_router."""
 
-    # ENGINE_REGISTRY currently has 12 engines after the European/CJK
-    # ladder additions (melotts + xtts_v2 + mms_tts) and the piper/
-    # makeittalk drop.  luxtts was removed earlier (poor naturalness).
-    # The exact contents of the dict change as the ladder is tuned —
-    # this assertion only pins the COUNT and the load-bearing IDs.
-    EXPECTED_COUNT = 12
+    # The exact contents of ENGINE_REGISTRY change as the ladder is tuned —
+    # the count is DERIVED from the live registry (a hardcoded 12 here went
+    # stale against a 15-engine registry, task #16) and EXPECTED_IDS pins
+    # only the load-bearing IDs as a subset check.
+    @property
+    def EXPECTED_COUNT(self):
+        return live_tts_count()
 
     EXPECTED_IDS = {
         'tts-chatterbox-turbo',
@@ -56,10 +70,12 @@ class TestPopulateTtsCatalog:
         'tts-pocket-tts',
         'tts-kokoro',
         'tts-espeak',
-        # piper / makeittalk dropped from default ENGINE_REGISTRY:
-        # piper still ships but is loaded via Nunba's tts/piper_tts.py
-        # in-process; makeittalk is cloud-only and lives outside the
-        # default catalog now.
+        # Back in the default registry since the model unification:
+        # piper (bundled in-process CPU fallback, tool_module=None) and
+        # makeittalk (cloud) — both dispatch in-process/engine-specific,
+        # not via the tool_module or reflection shapes.
+        'tts-piper',
+        'tts-makeittalk',
     }
 
     # These IDs must also appear as keys in ModelOrchestrator._CATALOG_TO_VRAM_KEY
@@ -181,6 +197,60 @@ class TestPopulateTtsCatalog:
         assert entry is not None
         # rank 0 in LANG_ENGINE_PREFERENCE['en'] → language_priority['en'] == 0
         assert entry.language_priority.get('en') == 0
+
+    # ── regression: the catalog↔registry round trip must be lossless ─────────
+
+    def test_repeated_populates_are_nondestructive(self):
+        """populate → registry-refresh → populate must not degrade module state.
+
+        Regression for task #16: `_catalog_entry_to_spec` used to (a) strip
+        'tts-' without restoring underscores, dash-mangling registry keys so
+        every LANG_ENGINE_PREFERENCE lookup missed → language_priority={} on
+        each populate after the first, (b) drop the in-process seed engines
+        (piper/makeittalk) from registry AND persisted catalog, and (c) zero
+        dispatch-identity fields populate does not persist.  Two populates
+        into fresh catalogs in ONE process is exactly the failing shape.
+        """
+        from integrations.channels.media import tts_router as tr
+
+        first_cat = fresh_catalog()
+        first_added = tr.populate_tts_catalog(first_cat)
+        first_lp = {e.id: dict(e.language_priority)
+                    for e in first_cat.list_by_type('tts')}
+        # Self-check the baseline is meaningful ({} == {} must not pass).
+        assert first_lp['tts-chatterbox-turbo'].get('en') == 0
+
+        second_cat = fresh_catalog()
+        second_added = tr.populate_tts_catalog(second_cat)
+        second_lp = {e.id: dict(e.language_priority)
+                     for e in second_cat.list_by_type('tts')}
+
+        assert second_added == first_added
+        assert second_lp == first_lp
+        # Registry keys stay underscore-canonical (they must match the
+        # names in LANG_ENGINE_PREFERENCE) and dispatch identity survives
+        # the refresh for both dispatch shapes.
+        assert all('-' not in k for k in tr.ENGINE_REGISTRY)
+        assert tr.ENGINE_REGISTRY['chatterbox_turbo'].tool_module, (
+            "refresh must not strip a seed engine's tool_module")
+        assert 'piper' in tr.ENGINE_REGISTRY, (
+            "in-process seed engine dropped by the registry refresh")
+
+    def test_populate_preserves_persisted_seed_entries(self):
+        """A second populate over the SAME catalog must not unregister seed
+        engines whose caps lack tool_module (piper/makeittalk) — the ingest
+        pre-pass used to reject + unregister them from the persisted catalog
+        on every boot (task #16)."""
+        from integrations.channels.media import tts_router as tr
+
+        cat = fresh_catalog()
+        tr.populate_tts_catalog(cat)
+        assert cat.get('tts-piper') is not None
+        again = tr.populate_tts_catalog(cat)
+        assert again == 0
+        assert cat.get('tts-piper') is not None, (
+            "ingest pre-pass unregistered a code-shipped in-process engine")
+        assert cat.get('tts-makeittalk') is not None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -517,28 +587,46 @@ class TestPopulateFromSubsystems:
 
     Expected totals from the built-in _populate_* methods (no extra
     application-registered populators):
-        TTS      : 11  (ENGINE_REGISTRY — chatterbox_turbo/ml,
-                       cosyvoice3, f5_tts, indic_parler, omnivoice,
-                       pocket_tts, kokoro, espeak, makeittalk, piper)
+        TTS      : derived from the live ENGINE_REGISTRY (see
+                   live_tts_count — a hardcoded count here went stale)
+        LLM      :  7  (qwen3.5 ladder 0.8b/2b/4b/9b/27b/35b-a3b
+                        + qwen3-2b-text; _populate_llm_models is the
+                        documented single source of truth for the ladder)
         STT      : 11  (5 faster-whisper + 6 sherpa-onnx)
         VLM      :  5  (qwen3vl, qwen08b caption, minicpm-v2, mobilevlm, clip)
+        Embodied :  3  (Qwen-RobotSuite: RobotManip/RobotWorld/RobotNav)
         VideoGen :  2  (wan2gp, ltx2)
         AudioGen :  2  (acestep, diffrhythm)
-        Total    : 31
+
+    The per-type counts are deliberate CONTRACT PINS: the populators are
+    themselves the single source of truth (nothing external to derive
+    from), so adding/removing a model must be acknowledged here — that is
+    the drift this class exists to catch (it caught the LLM + embodied
+    subsystems landing unacknowledged, task #16).
     """
 
-    EXPECTED_TTS_COUNT = 12  # see TestPopulateTtsCatalog comment
+    EXPECTED_LLM_COUNT = 7
     EXPECTED_STT_COUNT = 11
     EXPECTED_VLM_COUNT = 5  # +1 for qwen08b caption model
+    EXPECTED_EMBODIED_COUNT = 3  # Qwen-RobotSuite foundation models
     EXPECTED_VIDEOGEN_COUNT = 2
     EXPECTED_AUDIOGEN_COUNT = 2  # acestep + diffrhythm
-    EXPECTED_TOTAL = (
-        EXPECTED_TTS_COUNT
-        + EXPECTED_STT_COUNT
-        + EXPECTED_VLM_COUNT
-        + EXPECTED_VIDEOGEN_COUNT
-        + EXPECTED_AUDIOGEN_COUNT
-    )
+
+    @property
+    def EXPECTED_TTS_COUNT(self):
+        return live_tts_count()
+
+    @property
+    def EXPECTED_TOTAL(self):
+        return (
+            self.EXPECTED_TTS_COUNT
+            + self.EXPECTED_LLM_COUNT
+            + self.EXPECTED_STT_COUNT
+            + self.EXPECTED_VLM_COUNT
+            + self.EXPECTED_EMBODIED_COUNT
+            + self.EXPECTED_VIDEOGEN_COUNT
+            + self.EXPECTED_AUDIOGEN_COUNT
+        )
 
     @pytest.fixture
     def populated_catalog(self):
@@ -562,6 +650,18 @@ class TestPopulateFromSubsystems:
         vlm = populated_catalog.list_by_type('vlm')
         assert len(vlm) == self.EXPECTED_VLM_COUNT, (
             f"Expected {self.EXPECTED_VLM_COUNT} VLM entries, got {len(vlm)}"
+        )
+
+    def test_llm_entries_present(self, populated_catalog):
+        llm = populated_catalog.list_by_type('llm')
+        assert len(llm) == self.EXPECTED_LLM_COUNT, (
+            f"Expected {self.EXPECTED_LLM_COUNT} LLM entries, got {len(llm)}"
+        )
+
+    def test_embodied_entries_present(self, populated_catalog):
+        emb = populated_catalog.list_by_type('embodied')
+        assert len(emb) == self.EXPECTED_EMBODIED_COUNT, (
+            f"Expected {self.EXPECTED_EMBODIED_COUNT} embodied entries, got {len(emb)}"
         )
 
     def test_videogen_entries_present(self, populated_catalog):

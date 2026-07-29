@@ -335,16 +335,23 @@ class TestEngineRegistrySnapshot:
         populate_tts_catalog(fresh_catalog)
         # Every spec in ENGINE_REGISTRY corresponds to a 'tts-<id>' entry
         # in the catalog (the post-upsert state).
+        from integrations.channels.media.tts_router import (
+            _SEED_SPECS, _engine_id_to_catalog_id,
+        )
         for engine_id, spec in ENGINE_REGISTRY.items():
-            cat_id = f'tts-{engine_id.replace("_", "-")}'
+            cat_id = _engine_id_to_catalog_id(engine_id)
             assert fresh_catalog.get(cat_id) is not None, (
                 f'engine {engine_id!r} in ENGINE_REGISTRY but not in catalog'
             )
-            assert spec.tool_module is not None, (
-                f'ENGINE_REGISTRY only stores spec-shaped entries; '
-                f'{engine_id!r} has tool_module=None which means a '
-                f'reflection-only entry slipped through'
-            )
+            # tool_module=None is legitimate ONLY for code-shipped seed
+            # engines (piper/makeittalk dispatch in-process, task #16);
+            # a FOREIGN entry without tool_module in the snapshot means a
+            # reflection-only entry slipped through the refresh.
+            if spec.tool_module is None:
+                assert engine_id in _SEED_SPECS, (
+                    f'foreign reflection-only entry {engine_id!r} slipped '
+                    f'into the ENGINE_REGISTRY snapshot'
+                )
 
     def test_refresh_excludes_reflection_only_entries(self, fresh_catalog,
                                                        restore_engine_registry):
