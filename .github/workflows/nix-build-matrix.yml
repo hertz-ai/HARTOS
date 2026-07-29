@@ -45,7 +45,15 @@ jobs:
   evaluate:
     name: Flake Evaluation Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 25 (was 10): the eval outgrew the old budget on 2026-07-29 — attempt 3 of
+    # run 30435280105 ran a MEASURED 15 minutes before enforcement cancelled it,
+    # where the gate took ~2.5 min the day before. The two earlier "runner has
+    # received a shutdown signal" deaths at 2-4 min were slow runners dying
+    # inside the same overrun, not infra flake. The ~6x eval-time growth landed
+    # with the installer/Calamares/dev-tools commits and is tracked as its own
+    # regression (a gate this slow taxes every push) — this bump un-bricks the
+    # gate while that hunt happens, it does not excuse it.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v12
