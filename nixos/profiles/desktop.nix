@@ -23,7 +23,7 @@
 # hart.package is NOT here on purpose: it captures pkgs+hartSrc, so each consumer
 # wires it (configurations use packages/hart-app.nix; mkNode builds its own).
 
-{ ... }:
+_:   # module fn, no args used ({ ... } trips statix W10 — the lint gate is fatal)
 {
   # ─── HART OS Core Services ───
   hart = {

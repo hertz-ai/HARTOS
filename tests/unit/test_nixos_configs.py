@@ -25,6 +25,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 NIXOS_DIR = os.path.join(REPO_ROOT, "nixos")
 MODULES_DIR = os.path.join(NIXOS_DIR, "modules")
 CONFIGS_DIR = os.path.join(NIXOS_DIR, "configurations")
+PROFILES_DIR = os.path.join(NIXOS_DIR, "profiles")
 PACKAGES_DIR = os.path.join(NIXOS_DIR, "packages")
 HARDWARE_DIR = os.path.join(NIXOS_DIR, "hardware")
 ASSETS_DIR = os.path.join(NIXOS_DIR, "assets")
@@ -37,6 +38,21 @@ def read_nix(path):
     full = os.path.join(REPO_ROOT, path) if not os.path.isabs(path) else path
     with open(full, "r", encoding="utf-8") as f:
         return f.read()
+
+
+def read_variant(variant):
+    """The variant's COMPOSED text surface: configuration + feature profile.
+
+    The 2026-07-28 extraction (5975c519) moved the hart.* feature block
+    VERBATIM from configurations/<v>.nix into profiles/<v>.nix, and
+    mkHartSystem imports BOTH.  A test asserting the variant's feature
+    surface must therefore read the union — reading the configuration
+    alone re-broke every variant-feature assertion in this file the day
+    the profiles landed.
+    """
+    name = variant if variant.endswith(".nix") else variant + ".nix"
+    return (read_nix(os.path.join(CONFIGS_DIR, name))
+            + read_nix(os.path.join(PROFILES_DIR, name)))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -117,6 +133,13 @@ class TestFileExistence:
     def test_configuration_exists(self, config):
         path = os.path.join(CONFIGS_DIR, config)
         assert os.path.isfile(path), f"Config missing: nixos/configurations/{config}"
+
+    @pytest.mark.parametrize("config", EXPECTED_CONFIGS)
+    def test_profile_exists(self, config):
+        # Every variant has a feature profile (the 2026-07-28 extraction):
+        # read_variant() composes configuration + profile, so both must exist.
+        path = os.path.join(PROFILES_DIR, config)
+        assert os.path.isfile(path), f"Feature profile missing: nixos/profiles/{config}"
 
     @pytest.mark.parametrize("pkg", EXPECTED_PACKAGES)
     def test_package_exists(self, pkg):
@@ -247,7 +270,7 @@ class TestServerVariant:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "server.nix"))
+        self.config = read_variant("server")
 
     def test_variant_is_server(self):
         assert 'variant = "server"' in self.config
@@ -281,7 +304,7 @@ class TestDesktopVariant:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        self.config = read_variant("desktop")
 
     def test_variant_is_desktop(self):
         assert 'variant = "desktop"' in self.config
@@ -330,7 +353,7 @@ class TestEdgeVariant:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "edge.nix"))
+        self.config = read_variant("edge")
 
     def test_variant_is_edge(self):
         assert 'variant = "edge"' in self.config
@@ -369,7 +392,7 @@ class TestPhoneVariant:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "phone.nix"))
+        self.config = read_variant("phone")
 
     def test_variant_is_phone(self):
         assert 'variant = "phone"' in self.config
@@ -689,7 +712,7 @@ class TestNixSyntaxPatterns:
     @pytest.mark.parametrize("config", EXPECTED_CONFIGS)
     def test_config_sets_variant(self, config):
         """Each configuration must set hart.variant."""
-        content = read_nix(os.path.join(CONFIGS_DIR, config))
+        content = read_variant(config)
         assert "variant" in content, \
             f"{config} doesn't set hart.variant"
 
@@ -1046,7 +1069,7 @@ class TestServerAINativeModules:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "server.nix"))
+        self.config = read_variant("server")
 
     def test_model_bus_enabled(self):
         assert "modelBus" in self.config
@@ -1085,7 +1108,7 @@ class TestDesktopAINativeModules:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        self.config = read_variant("desktop")
 
     def test_model_bus_enabled(self):
         assert "modelBus" in self.config
@@ -1132,7 +1155,7 @@ class TestEdgeAINativeModules:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "edge.nix"))
+        self.config = read_variant("edge")
 
     def test_compute_mesh_enabled(self):
         assert "computeMesh" in self.config
@@ -1167,7 +1190,7 @@ class TestPhoneAINativeModules:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "phone.nix"))
+        self.config = read_variant("phone")
 
     def test_model_bus_enabled(self):
         assert "modelBus" in self.config
@@ -1547,7 +1570,7 @@ class TestOSKModule:
         assert "hart-osk.nix" in flake
 
     def test_phone_enables_osk(self):
-        phone = read_nix(os.path.join(CONFIGS_DIR, "phone.nix"))
+        phone = read_variant("phone")
         assert "osk" in phone
 
 
@@ -1649,7 +1672,7 @@ class TestHartlogCreateModule:
     def test_desktop_enables_it(self):
         """Cross-config wiring the nixosTest (which enables it via mkNode, not the
         desktop closure) does NOT cover: the shipped desktop must opt it on."""
-        desktop = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        desktop = read_variant("desktop")
         assert "hartlogCreate.enable = true" in desktop
 
 
@@ -1716,7 +1739,7 @@ class TestBootContinuityModule:
 
     def test_desktop_enables_it(self):
         """Cross-config wiring the nixosTest (mkNode enable) does not cover."""
-        desktop = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        desktop = read_variant("desktop")
         assert "bootContinuity.enable = true" in desktop
 
 
@@ -1767,7 +1790,7 @@ class TestBootLogModule:
 
     def test_desktop_enables_it(self):
         """Cross-config wiring the nixosTest (mkNode enable) does not cover."""
-        desktop = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        desktop = read_variant("desktop")
         assert "bootLog.enable = true" in desktop
 
 
@@ -1833,7 +1856,7 @@ class TestBootRootInitrdModule:
     def test_desktop_enables_it(self):
         """Cross-config wiring the nixosTest (mkNode enable) does not cover: the real
         USB-boot ISO config turns the guard ON."""
-        desktop = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        desktop = read_variant("desktop")
         assert "bootRootInitrd.enable = true" in desktop
 
 
@@ -2123,7 +2146,7 @@ class TestSessionSupervisorDesktopWiring:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        self.config = read_variant("desktop")
 
     def test_desktop_enables_supervisor(self):
         assert "sessionSupervisor" in self.config
