@@ -211,24 +211,48 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
                         "moved to %s — skipping invalid transition (authoritative "
                         "FSM is ActionState).", task_id, task.status, state.value)
                 else:
+                    _apply = True
                     if _recover_failed:
                         if _is_possible_masked_failure(_recover_failed, state):
-                            _MASKED_FAILURE_STATE['count'] += 1
-                            _n = _MASKED_FAILURE_STATE['count']
-                            # Warn ONCE per process, then debug — #56 de-spammed
-                            # this exact path; the counter is the aggregate signal.
-                            (logger.warning if _n == 1 else logger.debug)(
-                                "#139 possible MASKED FAILURE (#%d this run): ledger "
-                                "FAILED → COMPLETED for %s via TERMINATED (a forced/"
-                                "give-up terminal, NOT a verified success) — audit "
-                                "the completed count. Behaviour unchanged; preventing "
-                                "this is a policy call (#139).", _n, task_id)
+                            # #139 policy, finally made (task #6): disambiguate
+                            # the forced terminal by the BANKED ARTIFACT.
+                            _artifact = _banked_artifact_exists(task)
+                            if _artifact is False:
+                                # No proof-of-work → the force-terminate masked a
+                                # genuine failure. The ledger stays FAILED (the
+                                # honest signal the daemon's retry loop acts on)
+                                # instead of inflating the completed count.
+                                _apply = False
+                                _MASKED_FAILURE_STATE['prevented'] += 1
+                                _n = _MASKED_FAILURE_STATE['prevented']
+                                (logger.warning if _n == 1 else logger.debug)(
+                                    "#139 masked failure PREVENTED (#%d this run): "
+                                    "%s reached TERMINATED with NO banked artifact "
+                                    "— ledger stays FAILED (was: silently flipped "
+                                    "to COMPLETED).", _n, task_id)
+                            else:
+                                # True → genuine recovery (artifact banked);
+                                # None → coordinates unknown, FAIL OPEN to the
+                                # historical reconcile (never block the flywheel
+                                # on a heuristic that couldn't run).
+                                _MASKED_FAILURE_STATE['count'] += 1
+                                _n = _MASKED_FAILURE_STATE['count']
+                                # Warn ONCE per process, then debug — #56
+                                # de-spammed this exact path; the counter is the
+                                # aggregate signal.
+                                (logger.warning if _n == 1 else logger.debug)(
+                                    "#139 possible MASKED FAILURE (#%d this run): "
+                                    "ledger FAILED → COMPLETED for %s via "
+                                    "TERMINATED (banked artifact: %s).",
+                                    _n, task_id,
+                                    'present' if _artifact else 'unknown')
                         else:
                             logger.info(
                                 "Reconciled stale ledger FAILED → COMPLETED for %s "
                                 "(ActionState %s authoritative — recovered work).",
                                 task_id, state.value)
-                    ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
+                    if _apply:
+                        ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
 
             # === BLOCKED REASON: set specific reason based on ActionState source ===
             if ledger_status == LedgerTaskStatus.BLOCKED:
@@ -410,7 +434,39 @@ _TERMINAL_STATES = (ActionState.COMPLETED, ActionState.TERMINATED, ActionState.E
 # reconcile logs a WARNING only ONCE per process (then debug), because #56
 # deliberately de-spammed this path (it WARN-spammed ~100/run) — a per-event
 # warning here would re-introduce that.
-_MASKED_FAILURE_STATE = {'count': 0}
+# 'prevented' (task #6, the #139 policy call finally made): masked failures
+# the reconcile now REFUSES to flip — TERMINATED over a FAILED ledger with
+# no banked artifact stays FAILED (see _banked_artifact_exists).
+_MASKED_FAILURE_STATE = {'count': 0, 'prevented': 0}
+
+
+def _banked_artifact_exists(task):
+    """The action's banked recipe on disk — the PROOF-OF-WORK disambiguator
+    for the #139 masked-failure policy (task #6).
+
+    TERMINATED does not carry WHY it terminated (success cleanup vs
+    force-kill of a stalled/failed action). The banked action recipe
+    (prompts/{prompt_id}_{flow_id}_{action_id}.json, the spark-economy
+    ground truth: recipe-existence proves the work happened) does:
+
+      True  -> the recipe was banked; a FAILED->COMPLETED reconcile is a
+               GENUINE recovery (the #128 un-trap).
+      False -> no artifact; the forced terminal masked a real failure and
+               COMPLETED would be a lie.
+      None  -> unknown (task lacks recipe coordinates, or the path check
+               errored) — callers FAIL OPEN to the historical reconcile
+               behaviour, never blocking the flywheel on this heuristic.
+    """
+    try:
+        p = getattr(task, 'recipe_prompt_id', None)
+        f = getattr(task, 'recipe_flow_id', None)
+        a = getattr(task, 'recipe_action_id', None)
+        if p is None or f is None or a is None:
+            return None
+        from helper import safe_prompt_path
+        return os.path.exists(safe_prompt_path(str(p), str(f), str(a)))
+    except Exception:
+        return None
 
 
 def _is_possible_masked_failure(recover_failed, action_state):
