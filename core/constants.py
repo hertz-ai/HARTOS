@@ -183,6 +183,48 @@ assert NON_LATIN_SCRIPT_LANGS <= set(SUPPORTED_LANG_DICT), (
 )
 
 
+# Script display names (with a native-script sample) for the non-Latin
+# languages — used by the regional-tone prompt builder's SCRIPT:
+# monoscript directive ("Reply entirely in Devanagari (हिन्दी) ...").
+#
+# Single source of truth — previously an inline _NON_LATIN_SCRIPTS dict
+# in core/agent_personality.py, a SECOND enumeration of "which languages
+# are non-Latin" that drifted: ur/as/sa/sd/bg had regional-tone entries
+# AND are in NON_LATIN_SCRIPT_LANGS, but were missing from the inline
+# dict, so their prompts got the Latin-script rules and the LLM emitted
+# romanized text the TTS backends cannot synthesize (task #10).
+#
+# Keys must stay a subset of NON_LATIN_SCRIPT_LANGS (asserted below);
+# agent_personality asserts the other direction at import — every
+# non-Latin language it carries tone data for must have a name here.
+NON_LATIN_SCRIPT_NAMES = {
+    'ta': 'Tamil (தமிழ்)', 'hi': 'Devanagari (हिन्दी)', 'bn': 'Bengali (বাংলা)',
+    'te': 'Telugu (తెలుగు)', 'mr': 'Devanagari (मराठी)', 'gu': 'Gujarati (ગુજરાતી)',
+    'kn': 'Kannada (ಕನ್ನಡ)', 'ml': 'Malayalam (മലയാളം)', 'pa': 'Gurmukhi (ਪੰਜਾਬੀ)',
+    'or': 'Odia (ଓଡ଼ିଆ)', 'ar': 'Arabic (العربية)', 'he': 'Hebrew (עברית)',
+    'th': 'Thai (ไทย)', 'ko': 'Hangul (한국어)', 'ja': 'Japanese (日本語)',
+    'zh': 'Chinese (中文)', 'ru': 'Cyrillic (Русский)', 'uk': 'Cyrillic (Українська)',
+    'el': 'Greek (Ελληνικά)', 'ne': 'Devanagari (नेपाली)',
+    # The drifted twelve (see docstring above; the import-time lockstep
+    # assert in agent_personality surfaced the six scheduled-Indic ones):
+    'ur': 'Perso-Arabic (اردو)', 'as': 'Bengali-Assamese (অসমীয়া)',
+    'sa': 'Devanagari (संस्कृतम्)', 'sd': 'Perso-Arabic (سنڌي)',
+    'bg': 'Cyrillic (Български)',
+    'kok': 'Devanagari (कोंकणी)', 'mai': 'Devanagari (मैथिली)',
+    'doi': 'Devanagari (डोगरी)', 'brx': 'Devanagari (बड़ो)',
+    'sat': 'Ol Chiki (ᱥᱟᱱᱛᱟᱲᱤ)', 'mni': 'Meitei Mayek (ꯃꯤꯇꯩꯂꯣꯟ)',
+    # In NON_LATIN_SCRIPT_LANGS with no tone entry yet — named ahead so a
+    # future tone entry cannot re-open the gap:
+    'fa': 'Perso-Arabic (فارسی)', 'lo': 'Lao (ລາວ)',
+    'km': 'Khmer (ខ្មែរ)', 'my': 'Burmese (မြန်မာ)', 'sr': 'Cyrillic (Српски)',
+}
+
+assert set(NON_LATIN_SCRIPT_NAMES) <= NON_LATIN_SCRIPT_LANGS, (
+    f"NON_LATIN_SCRIPT_NAMES has codes outside NON_LATIN_SCRIPT_LANGS: "
+    f"{set(NON_LATIN_SCRIPT_NAMES) - NON_LATIN_SCRIPT_LANGS}"
+)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # GREETINGS — canonical, localized "first-run handshake" phrase per
 # language.  Used by the TTS first-run handshake smoke test

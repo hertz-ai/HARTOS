@@ -20,6 +20,8 @@ import os
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
+from core.constants import NON_LATIN_SCRIPT_LANGS, NON_LATIN_SCRIPT_NAMES
+
 logger = logging.getLogger(__name__)
 
 
@@ -374,6 +376,18 @@ _REGIONAL_TONE_DATA = {
         '"inshallah" (god willing), "khalas" (done), "mashi" (alright)')),
 }
 
+# Lockstep invariant (task #10): every non-Latin language this table
+# carries tone data for MUST have a script display name, or its prompt
+# silently gets the Latin-script rules and the LLM emits romanized text
+# the TTS backends cannot synthesize (how ur/as/sa/sd/bg/fa broke).
+# Loud at import — adding a tone entry without a script name is a
+# build-time error, not a runtime mystery.
+assert (set(_REGIONAL_TONE_DATA) & NON_LATIN_SCRIPT_LANGS) <= set(NON_LATIN_SCRIPT_NAMES), (
+    "regional-tone languages missing from NON_LATIN_SCRIPT_NAMES "
+    "(core/constants.py): "
+    f"{(set(_REGIONAL_TONE_DATA) & NON_LATIN_SCRIPT_LANGS) - set(NON_LATIN_SCRIPT_NAMES)}"
+)
+
 # Map common language names, locale strings, and Android codes to base codes
 _LANGUAGE_CODE_MAP = {
     # Indic
@@ -446,16 +460,14 @@ def _build_tone_prompt(lang_code: str) -> str:
     lang_name, tier, phrases = entry
 
     # Compact rules — injected into all tiers
-    # Languages with non-Latin scripts must use native script, not romanization
-    _NON_LATIN_SCRIPTS = {
-        'ta': 'Tamil (தமிழ்)', 'hi': 'Devanagari (हिन्दी)', 'bn': 'Bengali (বাংলা)',
-        'te': 'Telugu (తెలుగు)', 'mr': 'Devanagari (मराठी)', 'gu': 'Gujarati (ગુજરાતી)',
-        'kn': 'Kannada (ಕನ್ನಡ)', 'ml': 'Malayalam (മലയാളം)', 'pa': 'Gurmukhi (ਪੰਜਾਬੀ)',
-        'or': 'Odia (ଓଡ଼ିଆ)', 'ar': 'Arabic (العربية)', 'he': 'Hebrew (עברית)',
-        'th': 'Thai (ไทย)', 'ko': 'Hangul (한국어)', 'ja': 'Japanese (日本語)',
-        'zh': 'Chinese (中文)', 'ru': 'Cyrillic (Русский)', 'uk': 'Cyrillic (Українська)',
-        'el': 'Greek (Ελληνικά)', 'ne': 'Devanagari (नेपाली)',
-    }
+    # Languages with non-Latin scripts must use native script, not romanization.
+    # Canonical map lives in core.constants (task #10): the inline dict this
+    # replaced was a second enumeration of "which languages are non-Latin" and
+    # drifted — ur/as/sa/sd/bg had tone entries but no script name, so their
+    # prompts got the Latin-script rules and the LLM emitted romanized text
+    # the TTS backends cannot synthesize. The import-time assert below the
+    # tone table keeps the two tables in lockstep permanently.
+    _NON_LATIN_SCRIPTS = NON_LATIN_SCRIPT_NAMES
     _script_note = ''
     if lang_code in _NON_LATIN_SCRIPTS:
         # Monoscript rule: when the UI-selected language is a non-Latin

@@ -401,3 +401,57 @@ class TestTraitsForRole:
         """Count is clamped to [3, 5] regardless of input."""
         assert len(get_traits_for_role('coder', count=1)) == 3   # min 3
         assert len(get_traits_for_role('coder', count=10)) == 5  # max 5
+
+
+class TestNonLatinScriptDirective:
+    """Regression for task #10: the script-name map is canonical in
+    core.constants and locked to the tone table at import.
+
+    The inline _NON_LATIN_SCRIPTS dict this replaced was a second
+    enumeration of "which languages are non-Latin" and drifted:
+    ur/as/sa/sd/bg/fa had regional-tone entries and are in
+    NON_LATIN_SCRIPT_LANGS, but had no script name — their prompts got
+    the Latin-script rules and the LLM emitted romanized text the TTS
+    backends cannot synthesize.
+    """
+
+    DRIFTED = ['ur', 'as', 'sa', 'sd', 'bg', 'fa']
+
+    def test_drifted_languages_get_monoscript_directive(self):
+        from core.agent_personality import get_regional_tone_prompt
+        from core.constants import NON_LATIN_SCRIPT_NAMES
+        for lang in self.DRIFTED:
+            prompt = get_regional_tone_prompt(lang)
+            assert prompt, f"{lang} lost its tone prompt entirely"
+            assert 'SCRIPT: Reply entirely in' in prompt, (
+                f"{lang} is non-Latin with tone data but its prompt has no "
+                f"monoscript SCRIPT: directive — romanized output reaches TTS"
+            )
+            assert NON_LATIN_SCRIPT_NAMES[lang] in prompt, (
+                f"{lang} directive does not name its script"
+            )
+
+    def test_every_nonlatin_tone_language_gets_the_directive(self):
+        """The full invariant, behaviourally: every tone-table language in
+        NON_LATIN_SCRIPT_LANGS produces a prompt with the monoscript
+        directive — no future tone entry can silently reopen the gap."""
+        from core import agent_personality as ap
+        from core.constants import NON_LATIN_SCRIPT_LANGS
+        for lang in sorted(set(ap._REGIONAL_TONE_DATA) & NON_LATIN_SCRIPT_LANGS):
+            prompt = ap.get_regional_tone_prompt(lang)
+            assert 'SCRIPT: Reply entirely in' in prompt, (
+                f"{lang}: non-Latin tone language without monoscript directive"
+            )
+
+    def test_latin_script_languages_unaffected(self):
+        from core.agent_personality import get_regional_tone_prompt
+        for lang in ['es', 'fr', 'de', 'sw']:
+            prompt = get_regional_tone_prompt(lang)
+            assert prompt, f"{lang} lost its tone prompt"
+            assert 'SCRIPT: Reply entirely in' not in prompt, (
+                f"{lang} is Latin-script but got the monoscript directive"
+            )
+
+    def test_english_still_empty(self):
+        from core.agent_personality import get_regional_tone_prompt
+        assert get_regional_tone_prompt('en') == ''
