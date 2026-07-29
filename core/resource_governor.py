@@ -405,7 +405,27 @@ class ResourceEnforcer:
             logger.debug("ResourceEnforcer: Windows memory limit failed: %s", e)
 
     def _enforce_ram_linux(self, max_bytes: int):
-        """Linux: cgroup v2 memory.max."""
+        """Linux: cgroup v2 memory.max — and NOTHING else on failure.
+
+        The RLIMIT_AS fallback that used to live here crash-looped hart-backend
+        in every nixosTest VM (2026-07-28, task #15): inside the systemd unit
+        the hart user has no cgroup delegation, so the memory.max write fails
+        and the fallback set RLIMIT_AS = 0.75 x total RAM — an ADDRESS-SPACE
+        cap, which on a 2 GB VM is ~1.5 GB of virtual space. A fully imported
+        CPython exhausts that before RSS reaches 110 MB (shared-library maps,
+        arenas, guard pages all count), so the next mmap — the 8 MB thread
+        stack at hart_intelligence_entry.py:1909 — failed EAGAIN and surfaced
+        as "can't start new thread", deterministically, five restarts to
+        start-limit. Address space is not RAM; that mismatch is exactly why
+        cgroup memory.max exists.
+
+        Not enforcing is CORRECT here, not a gap: on HART OS the systemd unit
+        already owns memory enforcement (hart-backend.nix MemoryMax/MemoryHigh
+        at the cgroup level). An in-process second enforcer is a parallel path
+        that can only agree (redundant) or disagree (this incident). macOS,
+        which has no systemd, keeps its direct _enforce_ram_rlimit dispatch arm
+        in _enforce_ram — only this Linux fallback is removed.
+        """
         if self._cgroup_path:
             try:
                 with open(os.path.join(self._cgroup_path, 'memory.max'), 'w') as f:
@@ -415,8 +435,9 @@ class ResourceEnforcer:
                 return
             except Exception as e:
                 logger.debug("ResourceEnforcer: cgroup memory failed: %s", e)
-
-        self._enforce_ram_rlimit(max_bytes)
+        logger.info(
+            "ResourceEnforcer: no writable cgroup — leaving memory enforcement "
+            "to the service manager (systemd MemoryMax owns it on HART OS)")
 
     def _enforce_ram_rlimit(self, max_bytes: int):
         """POSIX: RLIMIT_AS (soft cap — process gets MemoryError on exceed)."""
