@@ -123,8 +123,20 @@ Full classification of the remaining configuration (line refs at audit time):
 - nouveau blacklist + Intel-iGPU pin + `hardware.graphics` extras — generic-ISO
   choices; an installed machine's GPU policy belongs to its hardware config
 
-**Non-desktop variants:** same audit owed for server/edge/phone (smaller
-surface; phone keeps its own pipewire block).
+**Non-desktop variants (✅ audited + migrated, same commit family):**
+- **server**: hart-cli, `services.openssh.enable` (secure defaults), serial
+  console, headless, getty autologin → profile. The LIVE-MEDIUM access story
+  deliberately STAYS in the configuration and must never reach an installed
+  system: PermitRootLogin=yes + password-auth mkForces, the PAM sshd
+  override, baked root/nixos password hashes, authorized keys,
+  mutableUsers=false, the ssh-diag :8888 server, loader timeout.
+- **edge**: hart-cli, headless, swappiness=60, documentation off, getty
+  autologin, journald caps → profile. Stays: ZFS force-off, isoImage.
+- **phone**: the ENTIRE experience (apps, Phosh/greetd + phoc.ini, cellular/
+  NetworkManager + hart-ports firewall, upower/tlp, pipewire, bluetooth/
+  iio/geoclue, autologin, vm tuning, journald caps) → profile — phone.nix
+  had no live-CD machinery and is now just profile import + hart.package.
+  Profile takes `{ config, pkgs, hartSrc, ... }:` (config for hart.ports).
 
 Closure-cost note: `mkNode` (nixosTest VMs) does NOT import profiles, so test
 shards are unaffected by profile growth; images already carried this surface

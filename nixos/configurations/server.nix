@@ -42,10 +42,11 @@
   # HART application package
   hart.package = pkgs.callPackage ../packages/hart-app.nix { inherit hartSrc; };
 
-  # CLI tool
-  environment.systemPackages = [
-    (pkgs.callPackage ../packages/hart-cli.nix { inherit hartSrc; })
-  ];
+  # ─── Server experience: moved to ../profiles/server.nix (task #21) ───
+  # hart-cli, sshd enable, serial console, headless, getty autologin — an
+  # installed server composes the same surface. THIS file keeps the
+  # LIVE-MEDIUM access story below (permissive SSH + baked passwords +
+  # ssh-diag), which must NEVER reach an installed system.
 
   # ISO branding
   isoImage = {
@@ -59,12 +60,10 @@
   # Boot configuration
   boot.loader.timeout = lib.mkForce 5;
 
-  # Serial console for headless/QEMU boot
-  boot.kernelParams = [ "console=ttyS0,115200n8" ];
-
-  # SSH for remote access (NixOS live env)
+  # SSH relaxations for remote access to the LIVE MEDIUM only — sshd itself
+  # is enabled by the profile with the module's secure defaults; an installed
+  # server never gets these mkForces (it doesn't import this file).
   services.openssh = {
-    enable = true;
     settings.PermitRootLogin = lib.mkForce "yes";
     settings.PasswordAuthentication = lib.mkForce true;
     settings.UsePAM = lib.mkForce true;
@@ -166,10 +165,4 @@ SHEOF
     '';
   };
   networking.firewall.allowedTCPPorts = [ 8888 ];
-
-  # Headless: no desktop
-  services.xserver.enable = false;
-
-  # Auto-login on console (first-time setup)
-  services.getty.autologinUser = lib.mkDefault "hart-admin";
 }

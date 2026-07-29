@@ -30,10 +30,9 @@
   # HART application package
   hart.package = pkgs.callPackage ../packages/hart-app.nix { inherit hartSrc; };
 
-  # CLI only
-  environment.systemPackages = [
-    (pkgs.callPackage ../packages/hart-cli.nix { inherit hartSrc; })
-  ];
+  # ─── Edge experience: moved to ../profiles/edge.nix (task #21) ───
+  # hart-cli, headless, swappiness, docs-off, getty autologin, journald
+  # caps — an installed edge node composes the same surface.
 
   # ISO branding
   isoImage = {
@@ -41,22 +40,4 @@
     volumeID = lib.mkForce "HART_OS";
     appendToMenuLabel = " HART OS Edge";
   };
-
-  # Headless
-  services.xserver.enable = false;
-
-  # Minimal footprint
-  boot.kernel.sysctl."vm.swappiness" = lib.mkForce 60;
-
-  # environment.noXlibs removed in nixpkgs — headless by not including X/GNOME
-  documentation.enable = false;
-  documentation.man.enable = false;
-  documentation.nixos.enable = false;
-
-  services.getty.autologinUser = lib.mkDefault "hart-admin";
-
-  services.journald.extraConfig = ''
-    SystemMaxUse=50M
-    MaxRetentionSec=7day
-  '';
 }

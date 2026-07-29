@@ -23,7 +23,7 @@
 # hart.package is NOT here on purpose: it captures pkgs+hartSrc, so each consumer
 # wires it (configurations use packages/hart-app.nix; mkNode builds its own).
 
-_:   # module fn, no args used ({ ... } trips statix W10 — the lint gate is fatal)
+{ lib, pkgs, hartSrc, ... }:   # pkgs+hartSrc for hart-cli; lib for mkDefault (parity slice)
 {
   # ─── HART OS Core Services ───
   hart = {
@@ -82,4 +82,27 @@ _:   # module fn, no args used ({ ... } trips statix W10 — the lint gate is fa
     # ── Sandbox ──
     sandbox.enable = true;
   };
+
+  # ─── Server experience (parity slice, task #21) ───
+  # Variant surface an INSTALLED server must share with the image. The
+  # LIVE-MEDIUM access story (PermitRootLogin=yes, password auth, the PAM
+  # override, baked hashed passwords, authorized keys, the ssh-diag server)
+  # deliberately STAYS in configurations/server.nix — baking those into an
+  # installed server would be a security hole; sshd here ships with the
+  # module's secure defaults and the medium relaxes them for itself only.
+  environment.systemPackages = [
+    (pkgs.callPackage ../packages/hart-cli.nix { inherit hartSrc; })
+  ];
+
+  # SSH for remote access — what a headless server IS.
+  services.openssh.enable = true;
+
+  # Serial console for headless/QEMU boot
+  boot.kernelParams = [ "console=ttyS0,115200n8" ];
+
+  # Headless: no desktop
+  services.xserver.enable = false;
+
+  # Auto-login on console (first-time setup)
+  services.getty.autologinUser = lib.mkDefault "hart-admin";
 }

@@ -23,7 +23,7 @@
 # hart.package is NOT here on purpose: it captures pkgs+hartSrc, so each consumer
 # wires it (configurations use packages/hart-app.nix; mkNode builds its own).
 
-_:   # module fn, no args used ({ ... } trips statix W10 — the lint gate is fatal)
+{ lib, pkgs, hartSrc, ... }:   # pkgs+hartSrc for hart-cli; lib for mkForce/mkDefault (parity slice)
 {
   # ─── HART OS (minimal) ───
   hart = {
@@ -59,4 +59,29 @@ _:   # module fn, no args used ({ ... } trips statix W10 — the lint gate is fa
     # No liquidUI (edge has no display)
     # No appBridge (edge has no subsystems)
   };
+
+  # ─── Edge experience (parity slice, task #21) ───
+  # Variant surface an INSTALLED edge node must share with the image:
+  # headless, swap-tolerant, doc-free, tiny persistent logs.
+  environment.systemPackages = [
+    (pkgs.callPackage ../packages/hart-cli.nix { inherit hartSrc; })
+  ];
+
+  # Headless
+  services.xserver.enable = false;
+
+  # Minimal footprint — low-RAM boards lean on swap
+  boot.kernel.sysctl."vm.swappiness" = lib.mkForce 60;
+
+  # environment.noXlibs removed in nixpkgs — headless by not including X/GNOME
+  documentation.enable = false;
+  documentation.man.enable = false;
+  documentation.nixos.enable = false;
+
+  services.getty.autologinUser = lib.mkDefault "hart-admin";
+
+  services.journald.extraConfig = ''
+    SystemMaxUse=50M
+    MaxRetentionSec=7day
+  '';
 }
