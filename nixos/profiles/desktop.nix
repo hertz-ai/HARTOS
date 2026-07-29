@@ -443,5 +443,73 @@ _:   # module fn, no args used ({ ... } trips statix W10 — the lint gate is fa
     # - if the bake overflows ISO9660, flip bakeMissing off; zstd-22 gives headroom.
     apps.bakeMissing = true;
     apps.wallpapers = true;
+
+    # ─── Boot session = the SUPERVISOR-MANAGED TIER LADDER (not a fixed default) ───
+    # (Moved VERBATIM from configurations/desktop.nix, parity slice 2 — an
+    # INSTALLED desktop must run the same ladder as the image.)
+    # The crude fixed cage-pin (68ce3c3: `services.displayManager.defaultSession =
+    # lib.mkForce "hart-shell"`) is REMOVED in favour of the real tiered design the
+    # architecture mandates. With sessionSupervisor.enable = true (above), greetd
+    # REPLACES GDM and runs the tier-drop SELECTOR as the boot session — so the
+    # supervisor, not a fixed defaultSession, owns which tier boots:
+    #
+    #   Tier-1 hart-comp (Smithay/Rust, --backend drm; the START tier)
+    #     → Tier-2 sway   (the hart-glass-gtk4 layer-shell session)
+    #       → Tier-3 cage (hart-shell, the audited never-fail paint floor — the
+    #                       supervisor can NEVER drop below it).
+    #
+    # The ladder tries the BEST tier first and DROPS one rung on a real failure —
+    # a crash OR the shell-paint watchdog firing (compositor up but no first frame
+    # within shellPaintTimeoutSeconds; the "only-a-pointer" hang ff02e48 exposed).
+    # A drop LATCHES across boot; `hartctl session reset-tier` re-arms Tier-1. The
+    # supervisor's config sets `defaultSession = "hart-shell"` for the floor, which
+    # is moot under greetd's command model — greetd runs the selector, not a named
+    # session. So we do NOT (and must not) ALSO mkForce defaultSession here (two
+    # equal-priority mkForces would collide); the supervisor block owns it.
+    #
+    # Tier-2 = the GTK4 layer-shell glass host UNDER sway (the `hart-glass-gtk4`
+    # session), not bare sway. The layer-shell-host module repoints the supervisor's
+    # swayCommand to its `hart-glass-shell-gtk4-session` launcher (mkOverride, so it
+    # wins over both the bare-sway option default and swayTier1's mkDefault). This
+    # gives Tier-2 a TRUE layer-shell desktop running the same glass host as Tier-1.
+    layerShellHost.enable = true;
+
+    # ── Claude Code as the resident co-pilot, in the node's OWN terminal ─────────
+    # The steward's ask (2026-07-26): the co-pilot should live INSIDE HART OS,
+    # debugging and bootstrapping the OS from within and working the 71 seeded goals
+    # as its own — through the guardrails the OS already has.
+    #
+    # Bounded by design ("trust is a boundary"): full autonomy INSIDE the work, zero
+    # authority AT the boundaries. `hart-copilot` opens it on a writable checkout on a
+    # FRESH BRANCH; merge, OTA publish and master-key signing stay human/democratic,
+    # so the worst case of an unattended run is a branch nobody merges.
+    #
+    # No API key ships in the image — authenticate interactively (`claude` -> /login).
+    # On the live ISO that login is tmpfs (lost on reboot); it persists only on the
+    # INSTALLED writable-root image.
+    copilot.enable = true;
+
+    # ── Boot-time audio rescue (never boot silent) ──
+    # A real-HW "no audio out" the steward hit: the default sink existed but was
+    # MUTED / at volume 0 on boot (WirePlumber persists per-user mute/volume state
+    # across reboots, so a once-muted sink stays silent forever). hart.audio runs a
+    # graphical-session USER oneshot that UNMUTES the default sink and rescues its
+    # level to 60% ONLY when it reads 0 (a deliberate non-zero level is left as-is).
+    # Best-effort + a pure no-op when there is no sink / no wpctl/pactl, so it can
+    # never block or fail the session. Default-ON wherever PipeWire is on; set
+    # explicit here for clarity. Privacy-first LOCAL capability (nothing leaves).
+    audio.bootUnmute = {
+      enable = true;
+      bootVolumePercent = 60;
+    };
+  };
+
+  # Audio: PipeWire bridges all subsystems (Linux, Android, Wine).
+  # Variant surface (hart.audio.bootUnmute rides on it) — moved with slice 2.
+  services.pipewire = {
+    enable = true;
+    alsa.enable = true;
+    pulse.enable = true;
+    jack.enable = true;
   };
 }

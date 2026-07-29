@@ -79,3 +79,43 @@ Tracked as session task #17. This document is the durable home.
 Both internal disks are GPT — there is no MBR to preserve; the things to preserve
 are the GPT tables and Disk 0's ESP entries. Storage controller: PCI `8086:282A`
 class 0104, handled generically by `ahci`.
+
+## Installed-desktop parity audit (task #21, 2026-07-29)
+
+The installed system = `mkInstalledSystem` = profile + hart.package + hardware
+modules. Every block still in `configurations/desktop.nix` that is NOT
+image-specific is parity debt: the image gets it, an installed desktop does not.
+Full classification of the remaining configuration (line refs at audit time):
+
+**PROFILE (variant surface → migrate, in slices, each eval-gated via CI):**
+- ✅ slice 1 (`b954f5f1`): `hart.devTools` (dev toolchain one-writer)
+- ✅ slice 2 (this commit): tier-ladder host (`hart.layerShellHost`),
+  `hart.copilot`, `hart.audio.bootUnmute`, `services.pipewire`
+- slice 3 (pure options, low risk): recovery TTYs (autovt tty2–6 + console),
+  display-manager autoLogin, ZFS force-off (nixpkgs 24.11 + kernel 6.15
+  workaround — an installed rebuild hits the same bug), the systemd-hwdb
+  build-host workaround
+- slice 4 (needs `pkgs` — profile signature becomes `{ pkgs, ... }:`; sub-slice
+  and watch the eval gate): desktop app set (`environment.systemPackages`),
+  GNOME/xserver + libinput, GDM/dconf branding, fonts + i18n, XDG MIME
+  defaults, dbus com.hart.Agent, bluetooth, NetworkManager + redistributable
+  firmware, printing/scanning/avahi, geoclue, at-spi2, upower/thermald,
+  branding etc + plymouth splash, remote-desktop block
+
+**IMAGE-ONLY (stays in the configuration):**
+- image-kind switch + CD-profile wrap + `isoImage` branding + `hart.installer`
+  (ISO branch only), repart/raw margins, hide-the-`nixos`-live-user block
+  (the live user exists only on the ISO), first-boot growth
+
+**HARDWARE-LEANING (stays; installed systems derive their own from
+`nixos-generate-config` + local.nix):**
+- nouveau blacklist + Intel-iGPU pin + `hardware.graphics` extras — generic-ISO
+  choices; an installed machine's GPU policy belongs to its hardware config
+
+**Non-desktop variants:** same audit owed for server/edge/phone (smaller
+surface; phone keeps its own pipewire block).
+
+Closure-cost note: `mkNode` (nixosTest VMs) does NOT import profiles, so test
+shards are unaffected by profile growth; images already carried this surface
+via the configuration, so image closures do not change. Only the installed
+target grows — which is the point.

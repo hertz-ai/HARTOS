@@ -556,79 +556,16 @@ in
   #    uses, merely started eagerly. (tty3..tty6 stay on-demand via NAutoVTs.)
   systemd.services."autovt@tty2".wantedBy = [ "multi-user.target" ];
 
-  # ─── Boot session = the SUPERVISOR-MANAGED TIER LADDER (not a fixed default) ───
-  # The crude fixed cage-pin (68ce3c3: `services.displayManager.defaultSession =
-  # lib.mkForce "hart-shell"`) is REMOVED in favour of the real tiered design the
-  # architecture mandates. With hart.sessionSupervisor.enable = true (set in the
-  # hart block above), greetd REPLACES GDM and runs the tier-drop SELECTOR as the
-  # boot session — so the supervisor, not a fixed defaultSession, owns which tier
-  # boots:
-  #
-  #   Tier-1 hart-comp (Smithay/Rust, --backend drm; the START tier)
-  #     → Tier-2 sway   (the hart-glass-gtk4 layer-shell session, wired below)
-  #       → Tier-3 cage (hart-shell, the audited never-fail paint floor — the
-  #                       supervisor can NEVER drop below it).
-  #
-  # The ladder tries the BEST tier first and DROPS one rung on a real failure —
-  # a crash OR the shell-paint watchdog firing (compositor up but no first frame
-  # within shellPaintTimeoutSeconds; the "only-a-pointer" hang ff02e48 exposed).
-  # A drop LATCHES across boot; `hartctl session reset-tier` re-arms Tier-1. The
-  # supervisor's config sets `defaultSession = "hart-shell"` for the floor, which
-  # is moot under greetd's command model — greetd runs the selector, not a named
-  # session. So we do NOT (and must not) ALSO mkForce defaultSession here (two
-  # equal-priority mkForces would collide); the supervisor block owns it.
-  #
-  # HONEST HW CAVEAT: the GTK4 glass-shell host that Tier-1 + Tier-2 share still
-  # HANGS on real hardware (the pointer-only first-paint bug). Until that is
-  # fixed, a real boot will TRY Tier-1 (hart-comp), likely hang ~shellPaint
-  # seconds, DROP to Tier-2 (sway, same host, hang again), then DROP to Tier-3
-  # cage (the GTK3 host that paints). The ladder degrades safely to the proven
-  # floor — it is never a blank screen — but Tier-1/Tier-2 only become the live
-  # session once the GTK4 host's on-HW paint is fixed (needs the on-HW journal,
-  # now reachable via the recovery TTY added in b97f1ae).
-  hart.layerShellHost.enable = true;
-
-  # ── Claude Code as the resident co-pilot, in the node's OWN terminal ─────────
-  # The steward's ask (2026-07-26): the co-pilot should live INSIDE HART OS,
-  # debugging and bootstrapping the OS from within and working the 71 seeded goals
-  # as its own — through the guardrails the OS already has.
-  #
-  # Bounded by design ("trust is a boundary"): full autonomy INSIDE the work, zero
-  # authority AT the boundaries. `hart-copilot` opens it on a writable checkout on a
-  # FRESH BRANCH; merge, OTA publish and master-key signing stay human/democratic,
-  # so the worst case of an unattended run is a branch nobody merges.
-  #
-  # No API key ships in the image — authenticate interactively (`claude` -> /login).
-  # On the live ISO that login is tmpfs (lost on reboot); it persists only on the
-  # INSTALLED writable-root image.
-  hart.copilot.enable = true;
-  # Tier-2 = the GTK4 layer-shell glass host UNDER sway (the `hart-glass-gtk4`
-  # session), not bare sway. The layer-shell-host module repoints the supervisor's
-  # swayCommand to its `hart-glass-shell-gtk4-session` launcher (mkOverride, so it
-  # wins over both the bare-sway option default and swayTier1's mkDefault). This
-  # gives Tier-2 a TRUE layer-shell desktop running the same glass host as Tier-1.
-
-  # Audio: PipeWire bridges all subsystems (Linux, Android, Wine)
-  services.pipewire = {
-    enable = true;
-    alsa.enable = true;
-    pulse.enable = true;
-    jack.enable = true;
-  };
-
-  # ── Boot-time audio rescue (never boot silent) ──
-  # A real-HW "no audio out" the steward hit: the default sink existed but was
-  # MUTED / at volume 0 on boot (WirePlumber persists per-user mute/volume state
-  # across reboots, so a once-muted sink stays silent forever). hart.audio runs a
-  # graphical-session USER oneshot that UNMUTES the default sink and rescues its
-  # level to 60% ONLY when it reads 0 (a deliberate non-zero level is left as-is).
-  # Best-effort + a pure no-op when there is no sink / no wpctl/pactl, so it can
-  # never block or fail the session. Default-ON wherever PipeWire is on; set
-  # explicit here for clarity. Privacy-first LOCAL capability (nothing leaves).
-  hart.audio.bootUnmute = {
-    enable = true;
-    bootVolumePercent = 60;
-  };
+  # ─── Tier ladder host + copilot + audio: moved to ../profiles/desktop.nix ───
+  # (Parity slice 2, task #21.) hart.layerShellHost, hart.copilot,
+  # hart.audio.bootUnmute and services.pipewire are VARIANT surface — an
+  # installed desktop (mkInstalledSystem = profile + hardware) must run the
+  # same tier ladder, co-pilot and audio stack as the image. Their load-bearing
+  # comments moved verbatim with them; only the HONEST HW CAVEAT about the
+  # GTK4 first-paint hang stays here, because it describes THIS image's boot on
+  # real hardware: a real boot TRIES Tier-1 (hart-comp), may hang ~shellPaint
+  # seconds, drops to Tier-2 (sway, same host), then to the Tier-3 cage floor —
+  # never a blank screen (on-HW journal reachable via the recovery TTY, b97f1ae).
 
   # Bluetooth
   hardware.bluetooth = {
