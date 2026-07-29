@@ -330,7 +330,12 @@ in
     name = "hart-peer-discovery";
     node.specialArgs = specialArgs;
 
-    nodes.server = mkNode "server" ({ lib, ... }: {
+    # (2026-07-28) This node briefly carried an A/B that emptied the backend's
+    # SystemCallFilter — the unit text rendered, both arms crashed identically,
+    # seccomp exonerated. The real cause was the Resource Governor's RLIMIT_AS
+    # fallback (core/resource_governor.py — see its comment and
+    # tests/unit/test_resource_governor_no_rlimit_as.py). Filter restored.
+    nodes.server = mkNode "server" {
       virtualisation = {
         memorySize = 2048;
         cores = 1;
@@ -339,22 +344,7 @@ in
       networking.interfaces.eth1.ipv4.addresses = [
         { address = "192.168.1.1"; prefixLength = 24; }
       ];
-
-      # ── A/B EXPERIMENT (server node ONLY — edge below keeps the filter) ──
-      # The backend's FIRST pthread_create fails deterministically in every VM
-      # ("can't start new thread" at hart_intelligence_entry.py:1909, 23 tests,
-      # every restart) while the diagnostic dump shows nothing else is scarce:
-      # 1.7G free RAM, 89 tasks system-wide, nproc 7824, overcommit=1,
-      # TasksMax=512 untouched. First-thread + same-line + roomy-limits is the
-      # seccomp shape: SystemCallFilter=@system-service is an ALLOWLIST whose
-      # unlisted syscalls return EPERM, and glibc's pthread_create only falls
-      # back from clone3 to clone on ENOSYS — an EPERM kills it. This node drops
-      # the filter; edge keeps it. If server's backend boots and edge's still
-      # dies, the mechanism is PROVEN and the fix is adding the missing syscall
-      # to the unit's filter (never deleting the hardening) — if both still die,
-      # the seccomp theory joins the two already disproven.
-      systemd.services.hart-backend.serviceConfig.SystemCallFilter = lib.mkForce [ ];
-    });
+    };
 
     nodes.edge = mkNode "edge" {
       virtualisation = {
