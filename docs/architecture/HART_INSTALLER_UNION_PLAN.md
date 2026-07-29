@@ -91,10 +91,14 @@ Full classification of the remaining configuration (line refs at audit time):
 - ✅ slice 1 (`b954f5f1`): `hart.devTools` (dev toolchain one-writer)
 - ✅ slice 2 (this commit): tier-ladder host (`hart.layerShellHost`),
   `hart.copilot`, `hart.audio.bootUnmute`, `services.pipewire`
-- slice 3 (pure options, low risk): recovery TTYs (autovt tty2–6 + console),
-  display-manager autoLogin, ZFS force-off (nixpkgs 24.11 + kernel 6.15
-  workaround — an installed rebuild hits the same bug), the systemd-hwdb
-  build-host workaround
+- ✅ slice 3: recovery TTYs (console + eager autovt@tty2) and display-manager
+  autoLogin → profile (needs `lib`; signature is now `{ lib, ... }:`).
+  RECLASSIFIED on caller-trace, both stay in the configuration: the ZFS
+  force-off counters the CD profile's zfs enable (installed systems never
+  import the CD profile), and the systemd-hwdb stub is a CI/WSL2 BUILD-HOST
+  workaround (installed rebuilds run on real Linux). The hide-the-nixos-user
+  block also stays (its getty autologinUser=null is part of hiding the CD
+  profile's live user, not of the recovery guarantee).
 - slice 4 (needs `pkgs` — profile signature becomes `{ pkgs, ... }:`; sub-slice
   and watch the eval gate): desktop app set (`environment.systemPackages`),
   GNOME/xserver + libinput, GDM/dconf branding, fonts + i18n, XDG MIME

@@ -503,58 +503,27 @@ in
       (builtins.readFile ../dbus/com.hart.Agent.conf))
   ];
 
-  # Auto-login
-  services.displayManager.autoLogin = {
-    enable = true;
-    user = lib.mkForce "hart-admin";
-  };
+  # ─── Auto-login + recovery consoles: moved to ../profiles/desktop.nix ───
+  # (Parity slice 3, task #21.) The hart-admin auto-login and the
+  # Ctrl+Alt+F2..F6 recovery-TTY guarantee are VARIANT surface — an installed
+  # desktop needs the same appliance login and the same escape hatch from a
+  # wedged compositor. Load-bearing comments moved with them.
 
   # ─── Hide the NixOS live-installer user (NixOS must be invisible) ───
-  # installation-cd-graphical-gnome.nix (imported above) injects a NORMAL
-  # `nixos` user (uid 1000) plus its own auto-login. We auto-login to
-  # hart-admin (above); here we demote `nixos` to a hidden SYSTEM account
-  # (uid < 1000) so GDM never lists it in the greeter, and we drop the TTY
-  # auto-login so a Ctrl+Alt+F-key never lands on "nixos" either. Android
-  # hides Linux from its users; HART OS hides NixOS the same way.
+  # IMAGE-ONLY (stays here): installation-cd-graphical-gnome.nix (imported
+  # above) injects a NORMAL `nixos` user (uid 1000) plus its own auto-login.
+  # The profile auto-logs-in hart-admin; here we demote `nixos` to a hidden
+  # SYSTEM account (uid < 1000) so GDM never lists it in the greeter, and we
+  # drop the TTY auto-login so a Ctrl+Alt+F-key never lands on "nixos" either
+  # (the recovery-TTY block in the profile keeps getty itself running).
+  # Android hides Linux from its users; HART OS hides NixOS the same way.
+  # Installed systems never import the CD profile, so there is nothing to hide.
   users.users.nixos = lib.mkForce {
     isSystemUser = true;
     group = "nixos";
   };
   users.groups.nixos = lib.mkForce {};
   services.getty.autologinUser = lib.mkForce null;
-
-  # ─── Recovery consoles: Ctrl+Alt+F2..F6 ALWAYS reach a TTY ───────────────────
-  # The "only a mouse pointer, no desktop, and Ctrl+Alt+F2 does nothing" boot
-  # regression had no recovery path: the graphical session held VT1 with a hung
-  # shell host and the user could not reach a console. This block guarantees a
-  # login console is ALWAYS reachable, independent of the graphical session's
-  # health, so a stuck compositor can never trap the machine.
-  #
-  # 1. Keep getty ENABLED (NixOS default). We only nulled the TTY AUTOLOGIN above
-  #    so a Ctrl+Alt+F-key never lands on the hidden `nixos` user — getty itself
-  #    still runs on tty1..tty6. We assert the default `console` framework stays on
-  #    so a future kiosk tweak can't silently disable the virtual terminals.
-  #    `quiet`/`splash` in boot.kernelParams do NOT affect VT switching.
-  console.enable = lib.mkDefault true;
-  #
-  # 2. VT switching is a kernel + systemd-logind seat function: Ctrl+Alt+Fn asks
-  #    logind to activate the target VT (logind spawns autovt@ttyN on demand).
-  #    We rely on the stock NAutoVTs=6 (NixOS/logind default) so the seat can
-  #    switch to tty2..tty6 — we do NOT override it (writing the same default via
-  #    extraConfig/settings only risks an option-name mismatch for zero gain). The
-  #    hung GRAPHICAL session cannot veto a kernel VT switch — logind owns the
-  #    seat, not the compositor — so this is the reliable escape when tier-2 hangs.
-  #    Nothing in this config sets a logind option that would refuse VT switching.
-  #
-  # 3. Belt-and-suspenders: pre-spawn a getty on tty2 from boot so a recovery
-  #    console is ALREADY alive (not summoned lazily) the instant the user
-  #    switches to it — recovery never depends on logind's on-demand autovt spawn
-  #    working while the graphical session is wedged. `autovt@tty2` is the exact
-  #    unit logind would itself start on a switch to VT2 (NixOS aliases autovt@ to
-  #    the getty@ template), so pinning THIS one instance to multi-user.target
-  #    cannot collide with logind's seat management — it is the same unit logind
-  #    uses, merely started eagerly. (tty3..tty6 stay on-demand via NAutoVTs.)
-  systemd.services."autovt@tty2".wantedBy = [ "multi-user.target" ];
 
   # ─── Tier ladder host + copilot + audio: moved to ../profiles/desktop.nix ───
   # (Parity slice 2, task #21.) hart.layerShellHost, hart.copilot,

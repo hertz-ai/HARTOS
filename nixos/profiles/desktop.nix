@@ -23,7 +23,7 @@
 # hart.package is NOT here on purpose: it captures pkgs+hartSrc, so each consumer
 # wires it (configurations use packages/hart-app.nix; mkNode builds its own).
 
-_:   # module fn, no args used ({ ... } trips statix W10 — the lint gate is fatal)
+{ lib, ... }:   # lib for the mkForce/mkDefault below (slice 3); still no pkgs
 {
   # ─── HART OS Core Services ───
   hart = {
@@ -512,4 +512,50 @@ _:   # module fn, no args used ({ ... } trips statix W10 — the lint gate is fa
     pulse.enable = true;
     jack.enable = true;
   };
+
+  # ─── Auto-login (parity slice 3) ───
+  # The appliance experience: boot straight into hart-admin's session.
+  # hart-admin is created by hart-base.nix (a hartModule), so it exists on
+  # installed systems too. mkForce beats the live-CD profile's own
+  # autologin ("nixos") when this profile composes into the ISO; on an
+  # installed system there is no competitor and the force is inert.
+  services.displayManager.autoLogin = {
+    enable = true;
+    user = lib.mkForce "hart-admin";
+  };
+
+  # ─── Recovery consoles: Ctrl+Alt+F2..F6 ALWAYS reach a TTY (slice 3) ───
+  # The "only a mouse pointer, no desktop, and Ctrl+Alt+F2 does nothing" boot
+  # regression had no recovery path: the graphical session held VT1 with a hung
+  # shell host and the user could not reach a console. This block guarantees a
+  # login console is ALWAYS reachable, independent of the graphical session's
+  # health, so a stuck compositor can never trap the machine — on the image AND
+  # on an installed system alike.
+  #
+  # 1. Keep getty ENABLED (NixOS default). The ISO branch additionally nulls the
+  #    TTY AUTOLOGIN (configurations/desktop.nix, hide-the-nixos-user block) so a
+  #    Ctrl+Alt+F-key never lands on the hidden `nixos` live user — getty itself
+  #    still runs on tty1..tty6. We assert the default `console` framework stays on
+  #    so a future kiosk tweak can't silently disable the virtual terminals.
+  #    `quiet`/`splash` in boot.kernelParams do NOT affect VT switching.
+  console.enable = lib.mkDefault true;
+  #
+  # 2. VT switching is a kernel + systemd-logind seat function: Ctrl+Alt+Fn asks
+  #    logind to activate the target VT (logind spawns autovt@ttyN on demand).
+  #    We rely on the stock NAutoVTs=6 (NixOS/logind default) so the seat can
+  #    switch to tty2..tty6 — we do NOT override it (writing the same default via
+  #    extraConfig/settings only risks an option-name mismatch for zero gain). The
+  #    hung GRAPHICAL session cannot veto a kernel VT switch — logind owns the
+  #    seat, not the compositor — so this is the reliable escape when tier-2 hangs.
+  #    Nothing in this profile sets a logind option that would refuse VT switching.
+  #
+  # 3. Belt-and-suspenders: pre-spawn a getty on tty2 from boot so a recovery
+  #    console is ALREADY alive (not summoned lazily) the instant the user
+  #    switches to it — recovery never depends on logind's on-demand autovt spawn
+  #    working while the graphical session is wedged. `autovt@tty2` is the exact
+  #    unit logind would itself start on a switch to VT2 (NixOS aliases autovt@ to
+  #    the getty@ template), so pinning THIS one instance to multi-user.target
+  #    cannot collide with logind's seat management — it is the same unit logind
+  #    uses, merely started eagerly. (tty3..tty6 stay on-demand via NAutoVTs.)
+  systemd.services."autovt@tty2".wantedBy = [ "multi-user.target" ];
 }
