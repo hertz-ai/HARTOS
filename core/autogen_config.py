@@ -33,10 +33,18 @@ def get_autogen_config_list() -> list:
             _cloud_cfg["base_url"] = os.environ['HEVOLVE_LLM_ENDPOINT_URL']
         cfgs = [_cloud_cfg]
     else:
+        # get_local_llm_url() returns a "/v1"-suffixed URL for direct HTTP
+        # callers, but autogen 0.2.x's client wrapper appends its own
+        # "/v1" internally (its docs example base_url has no "/v1") —
+        # passing the already-suffixed URL through doubles it, 404ing
+        # every request at ".../v1/v1/chat/completions".
+        _local_llm_url = get_local_llm_url().rstrip('/')
+        if _local_llm_url.endswith('/v1'):
+            _local_llm_url = _local_llm_url[: -len('/v1')]
         cfgs = [{
             "model": os.environ.get('HEVOLVE_LOCAL_LLM_MODEL', 'local'),
             "api_key": 'dummy',
-            "base_url": get_local_llm_url(),
+            "base_url": _local_llm_url,
             "price": [0, 0],
         }]
 

@@ -34,17 +34,24 @@ if TYPE_CHECKING:  # avoid runtime import cycle
 logger = logging.getLogger(__name__)
 
 
-# E.164 digits only. Strips "+", "@c.us", "@s.whatsapp.net", spaces, dashes.
-_PHONE_STRIP = re.compile(r"[+\-\s]|@[a-z.]+$", re.IGNORECASE)
+# E.164 digits only. Strips "+", "@c.us", "@s.whatsapp.net", spaces, dashes,
+# and a trailing ":<device_id>" before the domain (own_jid/own_lid from the
+# gateway's own-identity lookup include it, e.g. "...:25@lid" /
+# "...:25@s.whatsapp.net", but a message's own chat/sender id usually
+# doesn't — so both forms must reduce to the same bare id to compare).
+_PHONE_STRIP = re.compile(r"[+\-\s]|:\d+@[a-z.]+$|@[a-z.]+$", re.IGNORECASE)
 
 
 def normalize_phone(s: Optional[str]) -> str:
-    """Reduce a phone / JID to its pure digit form for equality checks.
+    """Reduce a phone / JID / LID to its pure digit form for equality checks.
 
     Examples:
         "+1 555 123 4567"            -> "15551234567"
         "15551234567@c.us"           -> "15551234567"
         "15551234567@s.whatsapp.net" -> "15551234567"
+        "15551234567:25@s.whatsapp.net" -> "15551234567"
+        "73203573633275@lid"         -> "73203573633275"
+        "73203573633275:25@lid"      -> "73203573633275"
     """
     if not s:
         return ""
@@ -89,9 +96,15 @@ class SelfChatHandler:
 
     # ── Detection ─────────────────────────────────────────────────
     def is_self_message(self, message: "Message") -> bool:
-        """True iff this message's sender matches the owner's phone as
+        """True iff this message's sender matches the owner's identity as
         configured on the adapter *and* the feature is enabled on that
         adapter (``config.extra['enable_self_chat_agent']`` default True).
+
+        Checked against BOTH the owner's phone-based JID and their LID
+        (WhatsApp's newer privacy-ID scheme) — for LID-enabled accounts, a
+        self-chat's sender/chat id shows up as "<digits>@lid", which will
+        never match a phone number no matter how it's normalized, so
+        matching phone alone silently never fires for those accounts.
         """
         adapter = self.registry.get(message.channel)
         if adapter is None:
@@ -99,13 +112,14 @@ class SelfChatHandler:
         extra = getattr(adapter.config, "extra", None) or {}
         if extra.get("enable_self_chat_agent", True) is False:
             return False
-        owner = extra.get("owner_phone") or extra.get("phone_number")
-        if not owner:
+        owners = [
+            extra.get("owner_phone") or extra.get("phone_number"),
+            extra.get("owner_lid"),
+        ]
+        owners = [normalize_phone(o) for o in owners if o]
+        if not owners or not message.sender_id:
             return False
-        return (
-            bool(message.sender_id)
-            and normalize_phone(message.sender_id) == normalize_phone(owner)
-        )
+        return normalize_phone(message.sender_id) in owners
 
     # ── Handling ──────────────────────────────────────────────────
     def handle(self, message: "Message", session) -> Optional[str]:

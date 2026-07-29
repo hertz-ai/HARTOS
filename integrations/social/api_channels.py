@@ -101,6 +101,7 @@ def _wire_live_adapter(channel_type: str, credential) -> dict:
         return {'success': True, 'message': 'no credential to wire (binding-only channel)'}
     try:
         import asyncio as _aio
+        import time as _time
         from integrations.channels.flask_integration import get_channel_integration
         integration = get_channel_integration()
 
@@ -112,8 +113,25 @@ def _wire_live_adapter(channel_type: str, credential) -> dict:
 
         adapter = integration.registry.get(channel_type)
         loop = integration._loop
-        if adapter is None or not (loop and loop.is_running()):
-            return {'success': False, 'error': 'registered but event loop not running'}
+        if not (loop and loop.is_running()):
+            # Same gap as WhatsApp's _ensure_whatsapp_live_adapter (see
+            # hart_intelligence_entry.py): entrypoints that skip
+            # hartos_bootstrap's full sequence never call
+            # FlaskChannelIntegration.start(), so _loop stays None and
+            # register_channel() above sits registered-but-never-started
+            # forever — confirmed live 2026-07-28 for Telegram, same as
+            # WhatsApp the night before. start() is idempotent and cheap,
+            # safe to trigger on-demand here.
+            integration.start()
+            for _ in range(50):  # ~5s for the background thread to spin up
+                loop = integration._loop
+                if loop and loop.is_running():
+                    break
+                _time.sleep(0.1)
+            else:
+                return {'success': False, 'error': 'channel event loop failed to start'}
+        if adapter is None:
+            return {'success': False, 'error': 'adapter missing after registration'}
         _aio.run_coroutine_threadsafe(adapter.start(), loop)
         return {'success': True, 'message': f'{channel_type} adapter registration scheduled'}
     except Exception as e:
@@ -362,6 +380,55 @@ def _proxy_gateway(method: str, path: str, **kwargs):
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         logger.warning("whatsapp gateway unreachable at %s: %s", url, e)
         return None, 503
+
+
+@channel_user_bp.route('/whatsapp/_debug_adapter', methods=['GET'])
+@require_auth
+def whatsapp_debug_adapter():
+    """TEMP DEBUG (2026-07-27) — introspect the registered live WhatsApp
+    adapter's extra config to confirm owner_phone/owner_lid actually got
+    set. Remove once the self-chat LID fix is confirmed working."""
+    from integrations.channels.flask_integration import get_channel_integration
+    integration = get_channel_integration()
+    adapter = integration.registry.get('whatsapp')
+    loop = integration._loop
+    loop_info = {
+        'loop_exists': loop is not None,
+        'loop_running': bool(loop and loop.is_running()),
+    }
+    if adapter is None:
+        return jsonify({'success': True, 'data': {'registered': False, **loop_info}})
+    extra = getattr(adapter.config, 'extra', None) or {}
+    return jsonify({'success': True, 'data': {
+        'registered': True, 'extra': extra,
+        'adapter_running': adapter.is_running(),
+        'adapter_status': str(adapter.get_status()),
+        **loop_info,
+    }})
+
+
+@channel_user_bp.route('/_debug_adapter/<channel_type>', methods=['GET'])
+@require_auth
+def generic_debug_adapter(channel_type):
+    """TEMP DEBUG (2026-07-28) — same as whatsapp_debug_adapter above but
+    for any channel type, to confirm the live-adapter-wiring fix applied
+    to _wire_live_adapter() (Telegram/Discord/Slack/...) actually worked."""
+    from integrations.channels.flask_integration import get_channel_integration
+    integration = get_channel_integration()
+    adapter = integration.registry.get(channel_type)
+    loop = integration._loop
+    loop_info = {
+        'loop_exists': loop is not None,
+        'loop_running': bool(loop and loop.is_running()),
+    }
+    if adapter is None:
+        return jsonify({'success': True, 'data': {'registered': False, **loop_info}})
+    return jsonify({'success': True, 'data': {
+        'registered': True,
+        'adapter_running': adapter.is_running(),
+        'adapter_status': str(adapter.get_status()),
+        **loop_info,
+    }})
 
 
 @channel_user_bp.route('/whatsapp/qr', methods=['GET'])

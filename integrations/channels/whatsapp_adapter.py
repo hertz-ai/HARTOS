@@ -275,8 +275,17 @@ class WhatsAppAdapter(ChannelAdapter, RoomCapableAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            # gateway.js's /messages/send route reads req.body.to (see
+            # integrations/social/api_channels.py's separate manual-send
+            # proxy, which already uses "to" correctly) — "chatId" is not
+            # a field it recognizes, so `to` was always undefined and the
+            # gateway 400'd with "to + text required" on every real send
+            # through this adapter. Never caught before because this is
+            # the live ChannelRegistry/self-chat send path, only reachable
+            # once a real inbound self-chat message round-trips all the
+            # way through — first exercised 2026-07-28.
             payload: Dict[str, Any] = {
-                "chatId": chat_id,
+                "to": chat_id,
                 "text": text,
             }
 

@@ -3594,6 +3594,9 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
     ).start()
 
 
+_whatsapp_adapter_lock = threading.Lock()
+
+
 def _ensure_whatsapp_live_adapter(
     user_id, sid: str = None, base: str = None,
 ) -> dict:
@@ -3629,41 +3632,100 @@ def _ensure_whatsapp_live_adapter(
         )
         integration = get_channel_integration()
 
-        existing = integration.registry.get('whatsapp')
-        if existing is not None:
+        # This function is called on every /whatsapp/qr poll (the mobile
+        # app's QRScannerScreen polls every ~3s) plus the chat-based
+        # Connect_Channel path — under concurrent requests, the
+        # check-then-register below was NOT atomic: two threads could
+        # both see "not registered yet" before either finished
+        # registering, each construct + register their OWN adapter with
+        # its OWN WebSocket connection to the gateway. The gateway then
+        # broadcasts every inbound message to ALL connected sockets, so
+        # N racing registrations meant N independent self_chat.handle()
+        # calls (and N separate /chat + LLM calls) for the SAME message —
+        # confirmed live 2026-07-28 as repeated near-duplicate replies
+        # sent to a real WhatsApp self-chat a few seconds apart. The lock
+        # makes the whole check+register sequence atomic so only ONE
+        # adapter (and one WebSocket connection) is ever created per
+        # process, no matter how many requests race here.
+        with _whatsapp_adapter_lock:
+            existing = integration.registry.get('whatsapp')
+            if existing is not None:
+                return {
+                    'success': True,
+                    'message': f'whatsapp adapter already registered '
+                               f'(account_id={getattr(existing, "_account_id", "?")})',
+                }
+
+            from integrations.channels.whatsapp_adapter import (
+                create_whatsapp_adapter,
+            )
+            gw_base = base or _os.environ.get(
+                'WHATSAPP_GATEWAY_URL',
+                f"http://127.0.0.1:"
+                f"{_os.environ.get('WHATSAPP_GATEWAY_PORT', '3000')}",
+            )
+            # Fetch the gateway's own-identity lookup so self-chat detection
+            # (SelfChatHandler.is_self_message) has something to match against
+            # — without this, owner_phone/owner_lid are never set and a
+            # self-chat message can never be recognized, regardless of which
+            # JID scheme WhatsApp uses for that account (own_jid for
+            # phone-based accounts, own_lid for LID/privacy-ID accounts).
+            own_jid = own_lid = None
+            try:
+                import json as _json
+                import urllib.request as _urlreq
+                with _urlreq.urlopen(
+                    f"{gw_base.rstrip('/')}/api/sessions/{sid}/status",
+                    timeout=5.0,
+                ) as _resp:
+                    _status = _json.loads(_resp.read().decode('utf-8', errors='replace'))
+                own_jid = _status.get('own_jid')
+                own_lid = _status.get('own_lid')
+            except Exception as _status_err:
+                log.warning(
+                    "_ensure_whatsapp_live_adapter: could not fetch own "
+                    "identity from gateway (self-chat detection will be "
+                    "unavailable until it succeeds): %s", _status_err)
+
+            adapter = create_whatsapp_adapter(
+                api_url=gw_base, account_id=sid,
+                phone_number=own_jid, owner_lid=own_lid,
+            )
+            integration.registry.register(adapter)
+
+            loop = integration._loop
+            if not (loop and loop.is_running()):
+                # Entrypoints that skip hartos_bootstrap's full sequence (e.g.
+                # the standalone hart_intelligence_entry.py used for local/dev
+                # testing) never call FlaskChannelIntegration.start() at all,
+                # so _loop stays None forever and every adapter sits
+                # registered-but-never-started — messages reach the gateway
+                # but nothing is listening. start() is idempotent (no-ops if
+                # already running) and cheap (an empty registry.start_all()
+                # the first time), so it's safe to trigger on-demand here
+                # rather than requiring the full boot sequence to have run.
+                integration.start()
+                for _ in range(50):  # ~5s for the background thread to spin up
+                    loop = integration._loop
+                    if loop and loop.is_running():
+                        break
+                    time.sleep(0.1)
+                else:
+                    return {
+                        'success': False,
+                        'error': 'channel event loop failed to start '
+                                 '(FlaskChannelIntegration.start() ran but '
+                                 '_loop never became live)',
+                    }
+            _aio.run_coroutine_threadsafe(adapter.start(), loop)
+            log.info(
+                "whatsapp live adapter registration scheduled "
+                "(account_id=%s, base=%s)", sid, gw_base,
+            )
             return {
                 'success': True,
-                'message': f'whatsapp adapter already registered '
-                           f'(account_id={getattr(existing, "_account_id", "?")})',
+                'message': f'whatsapp adapter registration scheduled for {sid}',
             }
-
-        from integrations.channels.whatsapp_adapter import (
-            create_whatsapp_adapter,
-        )
-        gw_base = base or _os.environ.get(
-            'WHATSAPP_GATEWAY_URL',
-            f"http://127.0.0.1:"
-            f"{_os.environ.get('WHATSAPP_GATEWAY_PORT', '3000')}",
-        )
-        adapter = create_whatsapp_adapter(api_url=gw_base, account_id=sid)
-        integration.registry.register(adapter)
-
-        loop = integration._loop
-        if not (loop and loop.is_running()):
-            return {
-                'success': False,
-                'error': 'channel event loop not running '
-                         '(FlaskChannelIntegration.start() never called)',
-            }
-        _aio.run_coroutine_threadsafe(adapter.start(), loop)
-        log.info(
-            "whatsapp live adapter registration scheduled "
-            "(account_id=%s, base=%s)", sid, gw_base,
-        )
-        return {
-            'success': True,
-            'message': f'whatsapp adapter registration scheduled for {sid}',
-        }
     except Exception as e:
         log.warning("_ensure_whatsapp_live_adapter failed: %r", e)
         return {'success': False, 'error': repr(e)[:300]}

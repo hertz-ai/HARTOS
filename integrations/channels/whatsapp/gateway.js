@@ -80,6 +80,11 @@ async function ensureSession(accountId) {
     wsClients: new Set(),
     accountId,
     messages: [],
+    // Dedup for messages.upsert — see the handler below for why this
+    // exists (2026-07-28: reconnects re-delivered entire chat history
+    // as if new, spamming the real self-chat with a fresh LLM reply per
+    // historical message on every restart).
+    seenMessageIds: new Set(),
   };
   sessions.set(accountId, ctx);
 
@@ -190,13 +195,32 @@ async function connectSocket(ctx) {
     }
   });
 
-  sock.ev.on('messages.upsert', ({ messages }) => {
+  sock.ev.on('messages.upsert', ({ messages, type }) => {
+    // Baileys fires this on every reconnect too, with `type: 'append'`
+    // (history resync) delivering recently-seen messages again, not just
+    // `type: 'notify'` (genuinely new). Broadcasting 'append' as if it
+    // were a fresh inbound message meant every HARTOS restart replayed
+    // the WHOLE recent chat history to any live self-chat adapter,
+    // spamming a real WhatsApp thread with a duplicate LLM reply per old
+    // message (confirmed live 2026-07-28). Message-id dedup on top is
+    // belt-and-suspenders in case 'notify' itself ever repeats on a
+    // flaky reconnect.
+    if (type !== 'notify') return;
     for (const m of messages || []) {
       const wahaMessage = toWahaShape(m);
-      if (wahaMessage) {
-        bufferMessage(ctx, wahaMessage);
-        broadcast(ctx, { type: 'message', data: wahaMessage });
+      if (!wahaMessage) continue;
+      const msgId = wahaMessage.id && wahaMessage.id._serialized;
+      if (msgId) {
+        if (ctx.seenMessageIds.has(msgId)) continue;
+        ctx.seenMessageIds.add(msgId);
+        if (ctx.seenMessageIds.size > 500) {
+          // Bound growth — drop the oldest half (insertion-ordered Set).
+          const it = ctx.seenMessageIds.values();
+          for (let i = 0; i < 250; i++) ctx.seenMessageIds.delete(it.next().value);
+        }
       }
+      bufferMessage(ctx, wahaMessage);
+      broadcast(ctx, { type: 'message', data: wahaMessage });
     }
   });
 
@@ -302,6 +326,13 @@ app.get('/api/sessions/:id/status', (req, res) => {
     // Baileys' own-identity lookup — sock.user is populated once
     // 'connection.update' has fired connection:'open'.
     own_jid: (ctx && ctx.sock && ctx.sock.user && ctx.sock.user.id) || null,
+    // WhatsApp's newer LID (privacy ID) scheme: for LID-enabled accounts,
+    // a self-chat's message.sender/chat id shows up as "<digits>@lid",
+    // NOT the phone-based "<phone>@s.whatsapp.net" own_jid above — so
+    // self-chat detection needs this too, or it can never match. Baileys
+    // populates sock.user.lid once WhatsApp sends the lid-mapping creds
+    // update (may be null briefly right after connecting).
+    own_lid: (ctx && ctx.sock && ctx.sock.user && ctx.sock.user.lid) || null,
   });
 });
 

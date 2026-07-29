@@ -2306,10 +2306,17 @@ if _node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOIN
     }]
 else:
     from core.port_registry import get_local_llm_url
+    # get_local_llm_url() returns a "/v1"-suffixed URL for direct HTTP
+    # callers, but autogen 0.2.x's client wrapper appends its own "/v1"
+    # internally — passing the already-suffixed URL through doubles it,
+    # 404ing every request at ".../v1/v1/chat/completions".
+    _local_llm_url = get_local_llm_url().rstrip('/')
+    if _local_llm_url.endswith('/v1'):
+        _local_llm_url = _local_llm_url[: -len('/v1')]
     config_list = [{
         "model": 'Qwen3-VL-4B-Instruct',
         "api_key": 'dummy',
-        "base_url": get_local_llm_url(),
+        "base_url": _local_llm_url,
         "price": [0, 0]
     }]
 
