@@ -74,10 +74,22 @@ jobs:
         run: |
           echo "── memory ──"; free -m || true
           echo "── disk ──"; df -h / /tmp 2>/dev/null || true
-          echo "── OOM / kills (dmesg) ──"
-          sudo dmesg 2>/dev/null | grep -iE "out of memory|oom|killed process" | tail -15 || echo "  none found"
+          echo "── OOM / kills (dmesg — KERNEL oom only) ──"
+          sudo dmesg 2>/dev/null | grep -iE "out of memory|oom|killed process" | tail -15; true
+          # Round-2 addition: the kernel dmesg came back EMPTY while the job was
+          # SIGTERMed at ~3min with 15G free post-mortem and no timeout (3m37s /
+          # 2m37s vs the 10min cap). The remaining suspect is systemd-oomd —
+          # Ubuntu 24's USERSPACE killer: acts on memory-pressure stalls (PSI),
+          # not exhaustion, and logs to the JOURNAL, which round 1 never read.
+          echo "── systemd-oomd (journal — the userspace killer dmesg misses) ──"
+          sudo journalctl --no-pager -q 2>/dev/null | grep -iE "oomd|out of memory|killed" | tail -20; true
+          echo "── oomd status + pressure config ──"
+          systemctl is-active systemd-oomd 2>/dev/null; true
+          oomctl 2>/dev/null | head -30; true
+          echo "── job cgroup pressure ──"
+          cat /proc/pressure/memory 2>/dev/null; true
           echo "── biggest processes at death ──"
-          ps aux --sort=-%mem 2>/dev/null | head -8 || true
+          ps aux --sort=-%mem 2>/dev/null | head -8; true
 
   # ─── Resolve which targets to build ────────────────────────
   # The `targets` dispatch input existed but was NEVER READ: the matrix below was a
