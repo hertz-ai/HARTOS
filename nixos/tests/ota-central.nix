@@ -228,7 +228,17 @@ in
       # The push driver (drives the real ota_push_listener) is available on the
       # node; the push subtest runs it with `systemctlStub` prepended on PATH so
       # the listener's `systemctl start hart-ota-check` is recorded, not real.
-      environment.systemPackages = [ pushDriver systemctlStub ];
+      #
+      # systemctlStub must NOT be in systemPackages: its bin/systemctl COLLIDES
+      # with systemd's in the system profile and (having won the merge) shadowed
+      # the REAL systemctl for everything — including the test driver's own
+      # backdoor, whose very first `wait_for_unit("multi-user.target")` then
+      # died on the stub's empty output ("produced invalid output"). That one
+      # collision was the whole hart-ota-central red since the push subtests
+      # landed. The stub stays a plain store path (additionalPaths keeps it in
+      # the VM's store) and is prepended per-invocation via STUB_PATH only.
+      environment.systemPackages = [ pushDriver ];
+      virtualisation.additionalPaths = [ systemctlStub ];
 
       # The localhost mock CENTRAL endpoint (stands in for etime's
       # /api/ota/latest). Up before the check service polls it.
