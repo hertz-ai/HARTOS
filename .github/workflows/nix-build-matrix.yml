@@ -61,6 +61,24 @@ jobs:
         working-directory: nixos
         run: nix flake check --no-build
 
+      # The gate died twice on ab6825cc with SIGTERM ("runner has received a
+      # shutdown signal") after ~80s of silence, at a DIFFERENT eval position
+      # each time — the shape of a single eval process crossing the 16 GB runner
+      # ceiling, not of a broken expression (every output that evaluated passed,
+      # both runs). Same instrument-don't-guess step that cornered the repart
+      # ENOSPC and the governor RLIMIT_AS bug: capture what the machine looked
+      # like at death so the next failure names its resource. dmesg is the only
+      # place an OOM kill leaves a trace.
+      - name: Why did the gate die (resources at failure time)
+        if: failure()
+        run: |
+          echo "── memory ──"; free -m || true
+          echo "── disk ──"; df -h / /tmp 2>/dev/null || true
+          echo "── OOM / kills (dmesg) ──"
+          sudo dmesg 2>/dev/null | grep -iE "out of memory|oom|killed process" | tail -15 || echo "  none found"
+          echo "── biggest processes at death ──"
+          ps aux --sort=-%mem 2>/dev/null | head -8 || true
+
   # ─── Resolve which targets to build ────────────────────────
   # The `targets` dispatch input existed but was NEVER READ: the matrix below was a
   # hardcoded list, so choosing targets by hand did nothing and the only way to
