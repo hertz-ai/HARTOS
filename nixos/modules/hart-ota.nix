@@ -22,6 +22,54 @@ let
   cfg = config.hart;
   ota = config.hart.ota;
   hartApp = config.hart.package;
+
+  # ── Keep the installed system's /etc/hart/src in step with what OTA applied ──
+  # (task #20). hart-install freezes the repo at /etc/hart/src so the machine can
+  # `nixos-rebuild` offline forever; OTA switches generations from pinned refs.
+  # Without this refresh those two truths DIVERGE after the first applied update,
+  # and a user's ordinary `nixos-rebuild switch` silently REVERTS the machine to
+  # install-time HART. One writer for the refresh, called from BOTH apply sites
+  # (the check service's autoApply branch and the `hart-ota apply` CLI verb).
+  #
+  # NEVER-FAIL by design: a sync miss must not fail an already-successful switch
+  # — but every exit path LOGS (the no-silent-gulping rule). Image systems have
+  # no /etc/hart/src and no-op; an unresolvable flake ref (offline apply of a
+  # ref whose source was GC'd) keeps the previous copy and says so.
+  otaSyncSrc = pkgs.writeShellApplication {
+    name = "hart-ota-sync-src";
+    runtimeInputs = [ pkgs.nix pkgs.jq ];
+    text = ''
+      FLAKE="''${1:?usage: hart-ota-sync-src <flake-ref-just-applied>}"
+      if [ ! -e /etc/hart/src ]; then
+        echo "[HART OTA] no /etc/hart/src (image system) — source sync skipped"
+        exit 0
+      fi
+      SRC_PATH="$(nix flake metadata "$FLAKE" --json 2>/dev/null | jq -r '.path // empty')" || SRC_PATH=""
+      if [ -z "$SRC_PATH" ] || [ ! -e "$SRC_PATH" ]; then
+        echo "[HART OTA] cannot resolve source of $FLAKE — /etc/hart/src kept at previous rev"
+        exit 0
+      fi
+      # Our refs carry ?dir=nixos, so metadata's .path is the nixos/ SUBDIR;
+      # the installed copy is the REPO ROOT (the flake references ../compositor).
+      ROOT="$SRC_PATH"
+      if [ "$(basename "$SRC_PATH")" = "nixos" ] && [ -e "$(dirname "$SRC_PATH")/nixos/flake.nix" ]; then
+        ROOT="$(dirname "$SRC_PATH")"
+      fi
+      rm -rf /etc/hart/src.new /etc/hart/src.old
+      if ! cp -a "$ROOT" /etc/hart/src.new || ! chmod -R u+w /etc/hart/src.new; then
+        echo "[HART OTA] source copy failed — /etc/hart/src kept at previous rev"
+        rm -rf /etc/hart/src.new
+        exit 0
+      fi
+      if mv /etc/hart/src /etc/hart/src.old && mv /etc/hart/src.new /etc/hart/src; then
+        rm -rf /etc/hart/src.old
+        echo "[HART OTA] /etc/hart/src synced to $FLAKE"
+      else
+        echo "[HART OTA] source swap failed — check /etc/hart/src{,.old,.new} by hand"
+        exit 0
+      fi
+    '';
+  };
 in
 {
   # ═══════════════════════════════════════════════════════════
@@ -298,10 +346,15 @@ in
 
             if [[ "${if ota.autoApply then "1" else "0"}" == "1" ]]; then
               echo "[HART OTA] Auto-apply enabled, switching to $SWITCH_FLAKE ..."
-              sudo nixos-rebuild switch --flake "$SWITCH_FLAKE#hart-${cfg.variant}" 2>&1 || {
+              # Same switch/rollback semantics as before; the if-form (vs the old
+              # `|| { }`) exists ONLY so the source sync runs on SUCCESS alone —
+              # a rolled-back switch must not advance /etc/hart/src (task #20).
+              if sudo nixos-rebuild switch --flake "$SWITCH_FLAKE#hart-${cfg.variant}" 2>&1; then
+                sudo ${otaSyncSrc}/bin/hart-ota-sync-src "$SWITCH_FLAKE" 2>&1                   || echo "[HART OTA] source sync failed unexpectedly — /etc/hart/src may be stale"
+              else
                 echo "[HART OTA] Switch failed, rolling back..."
                 sudo nixos-rebuild switch --rollback 2>&1
-              }
+              fi
               ${lib.optionalString (ota.postUpdateHook != "") ''
                 echo "[HART OTA] Running post-update hook..."
                 ${ota.postUpdateHook}
@@ -332,6 +385,10 @@ in
           cfg.dataDir
           cfg.logDir
           "/var/lib/hart/ota"
+          # The installed-source refresh (task #20) writes /etc/hart/src after a
+          # successful switch; ProtectSystem=strict would otherwise leave /etc
+          # read-only. "-" = ignore when absent (image systems have no /etc/hart).
+          "-/etc/hart"
         ];
         PrivateTmp = true;
 
@@ -532,6 +589,9 @@ in
     # CLI tool
     # ─────────────────────────────────────────────────────────
     environment.systemPackages = [
+      # The installed-source refresh verb (task #20) — on PATH so operators can
+      # run it by hand and the ota-central nixosTest can drive it directly.
+      otaSyncSrc
       (pkgs.writeShellScriptBin "hart-ota" ''
         #!/usr/bin/env bash
         # HART OS Over-The-Air Update CLI
@@ -564,7 +624,15 @@ in
             ;;
           apply)
             echo "Applying staged update..."
-            sudo nixos-rebuild switch --flake "${ota.flakeRef}#hart-${cfg.variant}"
+            # NOTE (pre-existing, observed 2026-07-29, deliberately unchanged
+            # here): this verb applies ota.flakeRef while the check service
+            # applies the persisted switch_flake from pending_update.json — a
+            # central-approved pin can differ from the configured ref.
+            if sudo nixos-rebuild switch --flake "${ota.flakeRef}#hart-${cfg.variant}"; then
+              # Success-gated source sync (task #20) — same helper the
+              # autoApply branch calls; see its definition for the semantics.
+              sudo ${otaSyncSrc}/bin/hart-ota-sync-src "${ota.flakeRef}"                 || echo "[HART OTA] source sync failed unexpectedly — /etc/hart/src may be stale"
+            fi
             ;;
           rollback)
             echo "Rolling back to previous generation..."

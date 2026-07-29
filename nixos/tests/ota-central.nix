@@ -424,6 +424,42 @@ in
               f"forged push was NOT refused:\n{out}"
           # The apply unit must NOT have been kicked by an unauthorized push.
           node.succeed("test ! -e " + KICK)
+
+      # ── /etc/hart/src stays in step with what OTA applied (task #20) ──
+      # hart-install freezes the repo at /etc/hart/src for offline rebuilds;
+      # without the refresh, a user's `nixos-rebuild` after any applied OTA
+      # silently REVERTS to install-time HART. Drives the REAL shipped binary
+      # (hart-ota-sync-src, the same one both apply sites call) through all
+      # three behaviours: resolvable ref syncs, unresolvable ref keeps the
+      # previous copy and says so, image systems no-op.
+      with subtest("source sync: a resolvable flake ref replaces /etc/hart/src"):
+          # An installed-system stand-in: old source with a marker...
+          node.succeed(
+              "mkdir -p /etc/hart/src && echo OLD-REV > /etc/hart/src/REV")
+          # ...and a fake NEW repo shaped like ours (flake at <root>/nixos, so
+          # the ?dir=nixos root-derivation logic is exercised too).
+          node.succeed(
+              "mkdir -p /tmp/newrepo/nixos",
+              "echo '{ outputs = _: { }; }' > /tmp/newrepo/nixos/flake.nix",
+              "echo NEW-REV > /tmp/newrepo/REV",
+          )
+          out = node.succeed("hart-ota-sync-src 'path:/tmp/newrepo?dir=nixos' 2>&1")
+          assert "synced to" in out, f"sync did not report success: {out}"
+          rev = node.succeed("cat /etc/hart/src/REV").strip()
+          assert rev == "NEW-REV", f"/etc/hart/src not refreshed (REV={rev!r})"
+
+      with subtest("source sync: an unresolvable ref KEEPS the previous copy, loudly"):
+          out = node.succeed(
+              "hart-ota-sync-src 'path:/does-not-exist-anywhere' 2>&1")
+          assert "kept at previous rev" in out, f"degrade not reported: {out}"
+          rev = node.succeed("cat /etc/hart/src/REV").strip()
+          assert rev == "NEW-REV", f"a failed sync must not touch the copy (REV={rev!r})"
+
+      with subtest("source sync: image systems (no /etc/hart/src) are a clean no-op"):
+          node.succeed("rm -rf /etc/hart/src")
+          out = node.succeed("hart-ota-sync-src 'path:/tmp/newrepo?dir=nixos' 2>&1")
+          assert "skipped" in out, f"image no-op not reported: {out}"
+          node.succeed("test ! -e /etc/hart/src")
     '';
   };
 }
