@@ -247,9 +247,10 @@ in
     # ── Security ──
     seahorse                    # Password & key manager (like Keychain Access)
 
-    # ── Development (all major languages, native) ──
-    git gcc gnumake cmake
-    python310 nodejs_20 rustup go jdk21
+    # ── Development ──
+    # Moved to modules/hart-dev-tools.nix (hart.devTools.enable, set in the
+    # variant profile) so the INSTALLED desktop gets the same toolchain as the
+    # images and the test can assert it without duplicating the list.
 
     # ── System Utilities ──
     htop btop                   # System monitors (CLI)

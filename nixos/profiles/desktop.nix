@@ -37,6 +37,10 @@
 
     # Desktop UI
     conky.enable = true;
+
+    # Preinstalled developer toolchain (modules/hart-dev-tools.nix — one writer;
+    # see its header for the four consumers and the closure-cost note for #14).
+    devTools.enable = true;
     # NATIVE NUNBA DAEMON — the single flip that wires the FULL Nunba (Python +
     # React) into HART OS: `nunba.enable = true` starts hart-nunba.service (binds
     # unix:/run/hart/nunba.sock, no host port) AND auto-enables liquidUI.embedNunba

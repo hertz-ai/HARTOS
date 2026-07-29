@@ -87,6 +87,7 @@
       ./modules/hart-kernel.nix
       ./modules/hart-subsystems.nix
       ./modules/hart-installer.nix
+      ./modules/hart-dev-tools.nix
       # Cross-OS runtime smoke-test: a post-boot oneshot (IN PARALLEL with the
       # desktop, NOT before greetd) that actually EXECUTES a tiny test command
       # inside each ENABLED foreign-OS runtime (Windows/Wine, Android/Waydroid,

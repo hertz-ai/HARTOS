@@ -175,6 +175,7 @@ in
       hart.appBridge.enable = true;                   # hart-app-bridge.service
       hart.conky.enable = true;                       # conkyrc deployed
       hart.gaming.enable = true;                      # vulkan-tools (vulkaninfo)
+      hart.devTools.enable = true;                    # gcc/python3/node/git
       hart.subsystems = {
         enable = true;
         linux = { flatpak = true; appimage = true; }; # flatpak + appimage-run
