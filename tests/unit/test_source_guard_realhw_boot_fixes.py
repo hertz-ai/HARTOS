@@ -28,11 +28,21 @@ def _read(rel):
         return f.read()
 
 
-def test_source_guard_hart_comp_exports_opengl_driver_lib():
+def test_source_guard_hart_comp_exports_glvnd_then_vendor_lib():
+    # The invariant EVOLVED on 2026-07-12 (real HW): /run/opengl-driver/lib alone
+    # was NOT enough — it holds only the Mesa VENDOR (libEGL_mesa) + DRI + libgbm,
+    # while the GLVND DISPATCHER hart-comp dlopens FIRST (libEGL.so.1) lives in
+    # ${pkgs.libglvnd}/lib. The guard therefore asserts BOTH dirs IN THAT ORDER
+    # (dispatcher first, vendor second); the old exact-string check for the
+    # one-dir export failed against the CORRECT fix from 2026-07-12 onward.
     src = _read('nixos/modules/hart-comp.nix')
-    assert 'LD_LIBRARY_PATH=/run/opengl-driver/lib' in src, (
-        "hart-comp session wrapper must export LD_LIBRARY_PATH=/run/opengl-driver/lib "
-        "so the smithay EGL/GLES backend can dlopen libEGL.so.1 (else rc=134 → drop to sway)")
+    assert re.search(
+        r'export LD_LIBRARY_PATH=\$\{pkgs\.libglvnd\}/lib:/run/opengl-driver/lib',
+        src), (
+        "hart-comp's launcher must export LD_LIBRARY_PATH with the GLVND dispatcher "
+        "(${pkgs.libglvnd}/lib) FIRST and the Mesa vendor dir (/run/opengl-driver/lib) "
+        "SECOND — dropping either (or swapping the order) re-breaks the very first "
+        "dlopen(\"libEGL.so.1\") and Tier-1 falls to the pixman floor (2026-07-12 RCA)")
 
 
 def test_source_guard_compositor_panics_unwind_not_abort():
