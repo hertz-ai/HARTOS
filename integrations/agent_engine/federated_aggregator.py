@@ -616,6 +616,104 @@ class FederatedAggregator:
 
         return True, 'accepted'
 
+    def hive_census(self) -> dict:
+        """What the whole hive looks like from here, with its own denominator.
+
+        `aggregate()` merges deltas into one model update. This does not merge:
+        it counts. The distinction matters because a merged number cannot tell
+        you how many nodes it came from, and a learning statistic whose sample
+        is unknown is not checkable.
+
+        Reads `self._peer_deltas`, which `receive_peer_delta()` fills only after
+        the delta passes version, freshness, guardrail hash, Ed25519 signature,
+        HMAC and origin attestation. So every node counted here proved itself
+        first. This method verifies nothing on its own and must not: it reports
+        what the receive path already accepted.
+
+        The node running this is a collection and projection point, not an
+        authority. It publishes the per-node figures it was sent alongside the
+        totals, so anyone holding the same deltas can recompute the aggregate
+        and check it was not invented here. Central is convenient, not trusted.
+
+        Returns a dict that always carries `nodes_reporting`. A caller that
+        renders the totals without it is publishing a number with no sample
+        size, which is the defect OPEN_PROBLEMS.md problem 1 describes.
+        """
+        with self._lock:
+            deltas = dict(self._peer_deltas)
+
+        now = time.time()
+        local = self._local_delta
+
+        per_node = {}
+        index_sum = 0.0
+        growth_sum = 0.0
+        agents_sum = 0
+        with_intelligence = 0
+        stale = 0
+
+        def _read(node_id, d, is_local):
+            nonlocal index_sum, growth_sum, agents_sum, with_intelligence, stale
+            hive = (d.get('hivemind') or {})
+            # Absent is not zero. A node that reported no hivemind block is not
+            # a node with an intelligence index of 0.0, and averaging it in as
+            # zero would drag the hive figure down for a reason that is an
+            # artefact of reporting rather than a fact about the network.
+            has_idx = 'intelligence_index' in hive
+            age = now - float(d.get('timestamp', 0) or 0)
+            if age > DELTA_MAX_AGE_SECONDS:
+                stale += 1
+
+            entry = {
+                'age_seconds': round(age, 1),
+                'stale': age > DELTA_MAX_AGE_SECONDS,
+                'local': is_local,
+                'intelligence_index': hive.get('intelligence_index'),
+                'growth_rate': hive.get('growth_rate'),
+                'num_agents': hive.get('num_agents'),
+                'exponential': hive.get('exponential'),
+            }
+            per_node[node_id] = entry
+
+            # Stale deltas are reported but not averaged. A node past the
+            # freshness window may be gone, and letting it hold the headline
+            # figure up (or drag it down) makes the mean describe a network
+            # that no longer exists. It stays in per_node so the omission is
+            # visible rather than silent.
+            if has_idx and not entry['stale']:
+                with_intelligence += 1
+                index_sum += float(hive.get('intelligence_index') or 0.0)
+                growth_sum += float(hive.get('growth_rate') or 1.0)
+                agents_sum += int(hive.get('num_agents') or 0)
+
+        for node_id, d in deltas.items():
+            _read(node_id, d, False)
+        if local:
+            _read(local.get('node_id', 'self'), local, True)
+
+        return {
+            # The denominator, first, because everything under it is meaningless
+            # without it.
+            'nodes_reporting': len(per_node),
+            'nodes_with_intelligence': with_intelligence,
+            'nodes_stale': stale,
+            'window_seconds': DELTA_MAX_AGE_SECONDS,
+            'observed_at': now,
+
+            # Totals over the nodes that actually reported an index. Null rather
+            # than 0.0 when nobody did, so a caller can say "no data" instead of
+            # drawing a collapse to zero.
+            'mean_intelligence_index': (
+                index_sum / with_intelligence if with_intelligence else None),
+            'mean_growth_rate': (
+                growth_sum / with_intelligence if with_intelligence else None),
+            'total_agents': agents_sum if with_intelligence else None,
+
+            # The raw per-node figures, so the aggregate above is reproducible
+            # by anyone holding the same deltas.
+            'per_node': per_node,
+        }
+
     def aggregate(self) -> Optional[dict]:
         """Weighted FedAvg across all peer deltas + local delta."""
         with self._lock:

@@ -160,6 +160,15 @@ def init_social(app):
     except Exception as e:
         logger.warning(f"HevolveSocial compute earnings blueprint skipped: {e}")
 
+    # Hive census — the projection half of collection-and-projection. Serves
+    # what receive_peer_delta already verified, with the denominator attached.
+    try:
+        from .api_hive_census import hive_census_bp
+        app.register_blueprint(hive_census_bp)
+        logger.info("HevolveSocial hive census registered at /api/hive/census/")
+    except Exception as e:
+        logger.warning(f"HevolveSocial hive census blueprint skipped: {e}")
+
     # Register hive contest UI (single-page local view — reads the same
     # /api/hive/contest/* endpoints, used by the HART shell panel and
     # by a direct browser visit for operators).
