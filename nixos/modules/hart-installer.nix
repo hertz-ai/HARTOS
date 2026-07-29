@@ -108,6 +108,15 @@ let
       BOOTEOF
       fi
 
+      # local.nix: THE machine-local extension point, always present so every
+      # front-end writes INTO it instead of editing the flake — the CLI puts
+      # --hostname here, the Calamares hartcfg module puts hostname/user/locale
+      # here. Default is an empty module. Never overwrite an existing one
+      # (front-ends write it BEFORE calling this generator on re-runs).
+      if [ ! -e "$mnt/etc/nixos/local.nix" ]; then
+        printf '{ ... }: { }\n' > "$mnt/etc/nixos/local.nix"
+      fi
+
       # The union flake. hart.lib.mkInstalledSystem is THE generator — the same
       # composition the flake's own eval-gated hart-desktop-installed fixture
       # builds, so this file is regression-checked upstream on every push.
@@ -122,6 +131,7 @@ let
             hardwareModules = [
               ./hardware-configuration.nix
               ./boot.nix
+              ./local.nix
             ];
           };
         };
@@ -256,9 +266,10 @@ let
       FLAKE_REF="$(hart-write-install-config /mnt "$VARIANT" "$FIRMWARE")"
 
       if [ -n "$HOSTNAME_ARG" ]; then
+        # local.nix is the generator-provided extension point (always in the
+        # flake's module list) — no post-hoc sed of the flake, no second file.
         printf '{ ... }: { networking.hostName = "%s"; }\n' "$HOSTNAME_ARG" \
-          > /mnt/etc/nixos/hostname.nix
-        sed -i 's|\./boot\.nix|./boot.nix\n          ./hostname.nix|' /mnt/etc/nixos/flake.nix
+          > /mnt/etc/nixos/local.nix
       fi
 
       if [ "$NO_INSTALL" = 1 ]; then
@@ -272,6 +283,104 @@ let
       echo "  the existing Windows Boot Manager entry is untouched beside it."
     '';
   };
+  # ── Rebranded Calamares (plan step 5): reuse + extend + rebrand, zero fork ──
+  # pkgs.calamares-nixos ships wholesale (its partition/mount module configs and
+  # QML machinery untouched). Calamares reads /etc/calamares IN PREFERENCE to the
+  # package share dir, and its modules-search already includes
+  # /run/current-system/sw/lib/calamares/modules — so HART needs only:
+  #   1. a settings.conf whose exec swaps the stock `nixos` config-writer for
+  #      `hartcfg` (ours), keeping partition/mount/umount stock;
+  #   2. the hartcfg job module (installer/calamares/hartcfg-main.py — a real
+  #      repo file, unit-tested on the dev box), which writes GUI choices into
+  #      local.nix DECLARATIVELY and calls the SAME hart-write-install-config
+  #      the CLI uses. One writer; GUI and CLI cannot produce different systems.
+  #   3. HART branding (name + the existing nixos/branding logo).
+  # Stock's post-install `users` mutation job is deliberately DROPPED, not
+  # ported: local.nix carries hashedPassword — on a declarative system the
+  # config is the truth, never a chroot edit of /etc/shadow.
+  hartCalamaresModule = pkgs.runCommand "hart-calamares-hartcfg" { } ''
+    install -Dm644 ${../installer/calamares/hartcfg-main.py} \
+      $out/lib/calamares/modules/hartcfg/main.py
+    cat > $out/lib/calamares/modules/hartcfg/module.desc <<'DESC'
+    ---
+    type: "job"
+    name: "hartcfg"
+    interface: "python"
+    script: "main.py"
+    DESC
+  '';
+
+  hartCalamaresSettings = pkgs.writeText "hart-calamares-settings.conf" ''
+    # HART OS installer sequence — stock Calamares machinery, HART config-writer.
+    ---
+    modules-search: [ local, /run/current-system/sw/lib/calamares/modules ]
+    sequence:
+    - show:
+      - welcome
+      - locale
+      - keyboard
+      - users
+      - partition
+      - summary
+    - exec:
+      - partition
+      - mount
+      - hartcfg
+      - umount
+    - show:
+      - finished
+    branding: hart
+    # Point of no return gets an explicit prompt — this GUI can format a
+    # partition the user picked with a mouse, unlike the CLI's retype-the-path.
+    prompt-install: true
+    dont-chroot: false
+    oem-setup: false
+    disable-cancel: false
+    disable-cancel-during-exec: true
+    hide-back-and-next-during-exec: false
+    quit-at-end: false
+  '';
+
+  hartCalamaresBranding = pkgs.runCommand "hart-calamares-branding" { } ''
+    mkdir -p $out
+    cp ${../branding/hart-logo.svg} $out/logo.svg
+    cat > $out/branding.desc <<'BRAND'
+    ---
+    componentName: hart
+    strings:
+      productName: "HART OS"
+      shortProductName: "HART OS"
+      version: "1.0"
+      shortVersion: "1.0"
+      versionedName: "HART OS"
+      shortVersionedName: "HART OS"
+      bootloaderEntryName: "HART OS"
+      productUrl: "https://hevolve.ai"
+    images:
+      productLogo: "logo.svg"
+      productIcon: "logo.svg"
+      productWelcome: "logo.svg"
+    slideshowAPI: 2
+    slideshow: "show.qml"
+    style:
+      SidebarBackground: "#0b0f1a"
+      SidebarText: "#e8ecf5"
+      SidebarTextCurrent: "#7ae0c3"
+    BRAND
+    cat > $out/show.qml <<'QML'
+    import QtQuick 2.0
+    Rectangle {
+      color: "#0b0f1a"
+      Image { source: "logo.svg"; anchors.centerIn: parent; width: 220; height: 220 }
+      Text {
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom; anchors.bottomMargin: 48
+        color: "#e8ecf5"; font.pixelSize: 18
+        text: "HART OS — intelligence in the hands of everyone"
+      }
+    }
+    QML
+  '';
 in
 {
   options.hart.installer = {
@@ -279,6 +388,16 @@ in
       the HART OS installer (hart-install CLI + offline install sources).
       ISO-only: enabled from the iso branch of the variant configuration
     '';
+
+    gui.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        the graphical installer (rebranded Calamares driving the SAME
+        hart-write-install-config generator as the CLI). Follows
+        hart.installer.enable; headless/fleet media set this false
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -287,7 +406,21 @@ in
       hartWriteInstallConfig
       pkgs.gptfdisk
       pkgs.parted
+    ] ++ lib.optionals cfg.gui.enable [
+      # Stock Calamares-for-NixOS wholesale; /etc/calamares below overrides ONLY
+      # settings + branding, and hartCalamaresModule lands on the module search
+      # path via /run/current-system/sw/lib/calamares/modules.
+      pkgs.calamares-nixos
+      hartCalamaresModule
     ];
+
+    # Per-key (NOT a whole environment.etc attrset): this config block already
+    # defines environment.etc."hart/..." entries, and a second `environment.etc =`
+    # in the same attrset is a duplicate-attribute eval error.
+    environment.etc."calamares/settings.conf" =
+      lib.mkIf cfg.gui.enable { source = hartCalamaresSettings; };
+    environment.etc."calamares/branding/hart" =
+      lib.mkIf cfg.gui.enable { source = hartCalamaresBranding; };
 
     # `nixos-install --flake` is a hard dependency of the written config, and
     # nothing else guarantees flakes on the live medium (review C:C3). List

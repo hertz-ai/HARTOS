@@ -37,7 +37,7 @@ in
         emptyDiskImages = [ 2048 ];
       };
       hart.installer.enable = true;
-      environment.systemPackages = [ pkgs.gptfdisk pkgs.dosfstools ];
+      environment.systemPackages = [ pkgs.gptfdisk pkgs.dosfstools pkgs.python3 ];
     };
 
     testScript = ''
@@ -109,7 +109,10 @@ in
           assert "hardware-configuration.nix" in flake, "NixOS hardware layer missing"
           machine.succeed("test -s /mnt/etc/nixos/hardware-configuration.nix")
           machine.succeed("test -s /mnt/etc/nixos/boot.nix")
-          machine.succeed("test -s /mnt/etc/nixos/hostname.nix")
+          # --hostname lands in local.nix, the generator's ALWAYS-referenced
+          # extension point (no post-hoc flake edits; Calamares writes the same file).
+          machine.succeed("grep -q 'dualboot-test' /mnt/etc/nixos/local.nix")
+          assert "local.nix" in flake, "flake must reference the local.nix extension point"
           # Offline forever: the source tree travelled to the target.
           machine.succeed("test -e /mnt/etc/hart/src/nixos/flake.nix")
           # BIOS VM -> grub path with the DISK substituted in (never @GRUB_DEVICE@).
@@ -120,6 +123,37 @@ in
           machine.succeed("umount -R /mnt")
           machine.succeed(
               "hart-install --root /dev/vdb2 --esp /dev/vdb1 --yes --no-install")
+
+      # ── Plan step 5: the GUI is the SAME installer, rebranded ──
+      # Full GUI interaction needs a display; what a headless VM CAN prove is
+      # the wiring the GUI depends on: the swapped exec sequence (hartcfg where
+      # stock had nixos — the union writer, never the stock one), the hartcfg
+      # job on Calamares' module search path, and HART branding served from
+      # /etc/calamares (which Calamares reads in preference to the package).
+      with subtest("Calamares ships with the HART sequence, module, and branding"):
+          machine.succeed("command -v calamares")
+          settings = machine.succeed("cat /etc/calamares/settings.conf")
+          assert "hartcfg" in settings, "exec sequence must run the union writer"
+          assert "\n  - nixos\n" not in settings, \
+              "the STOCK nixos config-writer must not be in the sequence"
+          assert "branding: hart" in settings
+          machine.succeed(
+              "test -f /run/current-system/sw/lib/calamares/modules/hartcfg/module.desc")
+          machine.succeed(
+              "test -f /run/current-system/sw/lib/calamares/modules/hartcfg/main.py")
+          brand = machine.succeed("cat /etc/calamares/branding/hart/branding.desc")
+          assert 'productName: "HART OS"' in brand
+          machine.succeed("test -f /etc/calamares/branding/hart/logo.svg")
+
+      with subtest("the GUI's config-writer imports clean with Calamares' python"):
+          # The module runs inside Calamares' embedded python; prove the file
+          # at least parses + its pure helpers work with A python on the node.
+          machine.succeed(
+              "python3 -c \"import importlib.util as u; "
+              "s=u.spec_from_file_location('m','/run/current-system/sw/lib/calamares/modules/hartcfg/main.py'); "
+              "m=u.module_from_spec(s); s.loader.exec_module(m); "
+              "out=m.render_local_nix(hostname='gui-host'); "
+              "assert 'gui-host' in out\"")
     '';
   };
 }
