@@ -2,11 +2,15 @@
 # HART OS DESKTOP — the variant FEATURE PROFILE (canonical home)
 # ═══════════════════════════════════════════════════════════════
 #
-# This is "what a desktop IS": the hart.* feature block, MOVED VERBATIM out of
-# configurations/desktop.nix (2026-07-28). It is a pure option-set — deliberately no
-# `config`/`lib`/`pkgs` captures (verified 0 non-comment scope refs at move time),
-# no media/image concerns (ISO branding, repart sizing, growPartition stay in the
-# configuration), no hardware assumptions.
+# This is "what a desktop IS": the hart.* feature block plus the full desktop
+# EXPERIENCE (apps, GNOME/GDM, fonts/i18n, audio, networking, printing,
+# branding, boot splash), MOVED VERBATIM out of configurations/desktop.nix
+# (hart.* 2026-07-28; the experience in parity slices 2-4, task #21). Takes
+# lib/pkgs/hartSrc since slice 4 (app set + branding drvs need them) — still no
+# `config` capture. No media/image concerns (ISO branding, repart sizing,
+# growPartition, live-CD countermeasures stay in the configuration), no
+# hardware assumptions (GPU driver policy, 32-bit GL, nouveau blacklist stay
+# with the configuration/hardware layer).
 #
 # WHY A SEPARATE FILE: three consumers need exactly this block and nothing else,
 # and until now it lived entangled with image concerns so only the images got it:
@@ -23,7 +27,44 @@
 # hart.package is NOT here on purpose: it captures pkgs+hartSrc, so each consumer
 # wires it (configurations use packages/hart-app.nix; mkNode builds its own).
 
-{ lib, ... }:   # lib for the mkForce/mkDefault below (slice 3); still no pkgs
+{ lib, pkgs, hartSrc, ... }:
+
+let
+  # Rasterize the HART logo (SVG source in nixos/branding/) → PNG for Plymouth
+  # and the GDM greeter, which need raster.  GNOME renders the SVG wallpaper
+  # directly (dconf below).
+  hartLogoPng = pkgs.runCommand "hart-logo-png" { nativeBuildInputs = [ pkgs.librsvg ]; } ''
+    mkdir -p $out
+    rsvg-convert -w 320 -h 320 ${../branding/hart-logo.svg} -o $out/logo.png
+  '';
+
+  # ─── Premium boot splash (opt-in) ──────────────────────────────────────
+  # DEFAULT FALSE — boot stays on NixOS's stock Plymouth theme with the HART
+  # logo swapped in (boot.plymouth.logo below), the combination proven on the
+  # #99-103 boot path. Flip to true for the custom HART theme (dark gradient +
+  # centered logo + LUKS message/password support) AFTER verifying it paints on
+  # a real ISO boot. The theme uses Plymouth's `script` plugin (framebuffer/KMS,
+  # no GL — safe on the same broken-GPU path the glass shell hardens for), so a
+  # bad GPU can't text-downgrade it. Off = byte-identical to the current boot.
+  useCustomBootSplash = false;
+
+  hartPlymouth = pkgs.runCommand "hart-plymouth-theme" { } ''
+    d=$out/share/plymouth/themes/hart
+    mkdir -p "$d"
+    cp ${hartLogoPng}/logo.png "$d/logo.png"
+    cp ${../branding/plymouth/hart.script} "$d/hart.script"
+    {
+      echo "[Plymouth Theme]"
+      echo "Name=HART OS"
+      echo "Description=HART OS boot splash"
+      echo "ModuleName=script"
+      echo ""
+      echo "[script]"
+      echo "ImageDir=$d"
+      echo "ScriptFile=$d/hart.script"
+    } > "$d/hart.plymouth"
+  '';
+in
 {
   # ─── HART OS Core Services ───
   hart = {
@@ -558,4 +599,409 @@
   #    cannot collide with logind's seat management — it is the same unit logind
   #    uses, merely started eagerly. (tty3..tty6 stay on-demand via NAutoVTs.)
   systemd.services."autovt@tty2".wantedBy = [ "multi-user.target" ];
+
+  # ═══════════════════════════════════════════════════════════════
+  # Prebundled Apps — best-in-class from ALL OS ecosystems (slice 4)
+  # ═══════════════════════════════════════════════════════════════
+  #
+  # Philosophy: every app a real OS ships, HART OS ships better.
+  # GTK4/libadwaita preferred for native GNOME 50 experience.
+  # Users can install Android/Windows apps via subsystems.
+  #
+  environment.systemPackages = with pkgs; [
+    (pkgs.callPackage ../packages/hart-cli.nix { inherit hartSrc; })
+
+    # ── Browser & Web ──
+    firefox                     # Primary browser (privacy-first)
+    epiphany                    # GNOME Web — lightweight secondary / PWA host
+
+    # ── Terminal ──
+    gnome-console               # GNOME Console — GTK4/libadwaita native
+    kitty                       # GPU-accelerated power terminal
+    # OpenTerminal: gnome-console IS the modern open terminal for GNOME 50
+    # (replaces legacy gnome-terminal with native GTK4/Adwaita)
+
+    # ── Text & Code Editors ──
+    gnome-text-editor           # Simple text editor (like Notepad/TextEdit)
+    helix                       # Modal editor (like Vim, but modern — Rust)
+
+    # ── File Management ──
+    nautilus                    # GNOME Files (like Explorer/Finder)
+    file-roller                 # Archive manager (ZIP/RAR/7z/tar)
+    baobab                      # Disk usage analyzer (like WinDirStat/Storage Sense)
+
+    # ── Image & Photo ──
+    loupe                       # GNOME image viewer (like Photos/Preview) — GTK4
+    shotwell                    # Photo manager (like Photos/Gallery) — import/organize
+    drawing                     # Simple drawing/paint app (like Paint/Markup)
+
+    # ── Video & Music ──
+    celluloid                   # Video player (mpv frontend, GTK4 — like Media Player/QuickTime)
+    amberol                     # Music player (GTK4/libadwaita — clean, local-first)
+
+    # ── Documents & PDF ──
+    papers                      # Document/PDF viewer (like Preview/Edge PDF — GTK4)
+    libreoffice                 # Full office suite (like Microsoft 365/iWork)
+
+    # ── Communication ──
+    thunderbird                 # Email client (like Mail/Gmail/Outlook)
+    gnome-contacts              # Contacts manager
+    fractal                     # Matrix chat client (GTK4/libadwaita — federated messaging)
+
+    # ── Productivity ──
+    gnome-calculator            # Calculator
+    gnome-calendar              # Calendar (CalDAV sync)
+    gnome-clocks                # World clock, timer, stopwatch, alarms
+    gnome-weather               # Weather (like Weather app on every OS)
+    gnome-maps                  # Maps (OpenStreetMap — like Maps on every OS)
+    iotas                       # Notes app (GTK4/libadwaita — like Notes/Samsung Notes)
+
+    # ── Camera & Recording ──
+    snapshot                    # Camera app (GTK4/libadwaita — like Camera)
+    gnome-sound-recorder        # Voice recorder (like Voice Memos/Sound Recorder)
+    obs-studio                  # Screen recording & streaming (like Game Bar/screen recorder)
+
+    # ── System Tools ──
+    gnome-system-monitor        # Task/process manager (like Task Manager/Activity Monitor)
+    gnome-disk-utility          # Disk management (partitioning, formatting, SMART)
+    gnome-font-viewer           # Font viewer/installer (like Font Book)
+    gnome-connections           # Remote desktop viewer (RDP/VNC)
+    dconf-editor                # System configuration editor (advanced)
+
+    # ── Media Creation ──
+    pitivi                      # Video editor (like iMovie/Clipchamp — GTK/GStreamer)
+    gimp                        # Image editor (like Photoshop — advanced)
+
+    # ── Security ──
+    seahorse                    # Password & key manager (like Keychain Access)
+
+    # ── Development ──
+    # Moved to modules/hart-dev-tools.nix (hart.devTools.enable, set in the
+    # hart block above) so every consumer gets the same toolchain and the
+    # test can assert it without duplicating the list.
+
+    # ── System Utilities ──
+    htop btop                   # System monitors (CLI)
+    fastfetch                   # System info (neofetch successor)
+    file unzip p7zip            # File tools
+    wget curl                   # Network tools
+    ripgrep fd bat              # Modern CLI tools (better grep/find/cat)
+    tree jq                     # Directory tree / JSON processor
+    mpv                         # Media backend (used by celluloid, also standalone)
+
+    # ── GNOME Shell Extensions ──
+    gnomeExtensions.dash-to-dock       # Taskbar (dock) at bottom
+    gnomeExtensions.appindicator       # System tray support
+    jetbrains-mono                     # Default monospace font
+  ]
+  # ── Remote Desktop (open-source TeamViewer equivalent) ──
+  # RustDesk: ID-based P2P remote control + file transfer. gnome-connections
+  # above is only an RDP/VNC *viewer*; RustDesk is the TeamViewer-style remote-
+  # control client+server the OS was missing. Attr-guarded so a nixpkgs rev that
+  # names it differently (rustdesk vs rustdesk-flutter) or lacks it cannot break
+  # evaluation; CI's Nix Build Matrix validates the package itself builds.
+  ++ lib.optional (pkgs ? rustdesk) pkgs.rustdesk
+  ++ lib.optional (pkgs ? "rustdesk-flutter") pkgs."rustdesk-flutter";
+
+  # ═══════════════════════════════════════════════════════════════
+  # GNOME 50 Desktop — full desktop environment
+  # ═══════════════════════════════════════════════════════════════
+  services.xserver = {
+    enable = true;
+    displayManager.gdm.enable = true;
+    desktopManager.gnome.enable = true;
+    # Keyboard layout — user-selectable via Settings > Keyboard
+    xkb = {
+      layout = "us";
+      options = "ctrl:nocaps";  # Caps Lock → Ctrl (power user default)
+    };
+  };
+
+  # ─── Touchpad: libinput tap-to-click (session-agnostic) ───
+  # The dconf "org/gnome/desktop/peripherals/touchpad" tap-to-click below ONLY
+  # applies to a GNOME Shell session. The shipped defaultSession is the cage
+  # glass shell (services.displayManager.defaultSession = "hart-shell"),
+  # which reads its pointer config straight from libinput at the seat level — so
+  # tapping the touch SURFACE did nothing on the live OS while the physical
+  # button still clicked (pointer + button work; Tapping was simply never
+  # enabled for non-GNOME sessions). Enabling services.libinput.touchpad here
+  # turns tap-to-click on for EVERY session (cage glass shell + GTK4 host + GNOME
+  # fallback), not just GNOME's dconf path.
+  services.libinput = {
+    enable = true;
+    touchpad = {
+      tapping = true;            # single-finger tap = left click (THE fix)
+      tappingDragLock = true;    # tap-drag stays engaged across a lift
+      naturalScrolling = true;   # match the GNOME dconf natural-scroll above
+      clickMethod = "clickfinger";  # 2-finger tap = right, 3 = middle
+      disableWhileTyping = true; # ignore palm/stray taps while typing
+    };
+  };
+
+  # GNOME Shell extensions + theming
+  environment.gnome.excludePackages = with pkgs; [
+    gnome-tour  # Disable first-run tour (HART has its own onboarding)
+  ];
+  # ─── GDM greeter branding ───
+  # The login screen (first thing after Plymouth) was stock GNOME. Brand it: HART
+  # logo (raster PNG — the greeter doesn't render SVG reliably) + a banner + dark
+  # scheme. GDM reads its OWN dconf profile, separate from the user one below.
+  # disable-user-list is intentionally NOT set: the ISO's installer 'nixos' user
+  # is already hidden via uid<1000 (configurations/desktop.nix), and forcing the
+  # list off would also hide hart-admin. Additive — does not touch autologin or
+  # the kiosk session.
+  programs.dconf.profiles.gdm.databases = [{
+    settings = {
+      "org/gnome/login-screen" = {
+        logo = "${hartLogoPng}/logo.png";
+        banner-message-enable = true;
+        banner-message-text = "HART OS — Humans are always in control";
+      };
+      "org/gnome/desktop/interface" = {
+        color-scheme = "prefer-dark";
+        gtk-theme = "Adwaita-dark";
+      };
+    };
+  }];
+
+  programs.dconf.profiles.user.databases = [{
+    settings = {
+      # ─── HART OS Branding ───
+      "org/gnome/desktop/interface" = {
+        gtk-theme = "Adwaita-dark";
+        color-scheme = "prefer-dark";
+        monospace-font-name = "JetBrains Mono 11";
+        document-font-name = "Cantarell 11";
+      };
+      "org/gnome/desktop/background" = {
+        picture-uri = "file:///etc/hart/branding/wallpaper.svg";
+        picture-uri-dark = "file:///etc/hart/branding/wallpaper.svg";
+        primary-color = "#080808";
+      };
+      "org/gnome/desktop/screensaver" = {
+        picture-uri = "file:///etc/hart/branding/lock-screen.svg";
+        primary-color = "#080808";
+      };
+      # ─── Taskbar / Dash / Top Bar customization ───
+      "org/gnome/shell" = {
+        favorite-apps = [
+          "firefox.desktop"
+          "org.gnome.Nautilus.desktop"
+          "org.gnome.Console.desktop"
+          "org.gnome.TextEditor.desktop"
+          "org.libreoffice.LibreOffice.Writer.desktop"
+          "org.gnome.Calculator.desktop"
+          "hart-identity.desktop"
+        ];
+        # GNOME 50: dynamic workspaces + app grid
+        enabled-extensions = [
+          "dash-to-dock@micxgx.gmail.com"
+          "appindicatorsupport@rgcjonas.gmail.com"
+        ];
+      };
+      "org/gnome/shell/extensions/dash-to-dock" = {
+        dock-position = "BOTTOM";
+        dash-max-icon-size = lib.gvariant.mkInt32 48;
+        extend-height = false;
+        transparency-mode = "DYNAMIC";
+        running-indicator-style = "DOTS";
+        show-trash = true;
+        show-mounts = false;
+      };
+      # ─── Keyboard Shortcuts (Windows-style defaults) ───
+      # User can switch to Mac profile via keyboard_shortcuts panel
+      "org/gnome/desktop/wm/keybindings" = {
+        close = ["<Alt>F4"];                    # Win: Alt+F4, Mac: Cmd+W
+        minimize = ["<Super>h"];                # Minimize window
+        toggle-maximized = ["<Super>Up"];        # Win: Win+Up
+        switch-applications = ["<Alt>Tab"];      # App switching
+        switch-windows = ["<Alt>grave"];         # Window cycling within app
+        move-to-workspace-left = ["<Super><Shift>Left"];
+        move-to-workspace-right = ["<Super><Shift>Right"];
+        switch-to-workspace-left = ["<Super><Ctrl>Left"];
+        switch-to-workspace-right = ["<Super><Ctrl>Right"];
+      };
+      "org/gnome/shell/keybindings" = {
+        toggle-overview = ["<Super>space"];      # Activities / Spotlight
+        toggle-application-grid = ["<Super>a"];  # App grid
+        screenshot = ["Print"];
+        show-screenshot-ui = ["<Shift>Print"];
+        screenshot-window = ["<Alt>Print"];
+      };
+      "org/gnome/settings-daemon/plugins/media-keys" = {
+        home = ["<Super>e"];                     # File manager (Win: Win+E)
+        terminal = ["<Ctrl><Alt>t"];              # Terminal
+        www = ["<Super>b"];                       # Browser
+        search = ["<Super>s"];                    # Search
+        screensaver = ["<Super>l"];               # Lock screen (Win: Win+L)
+        calculator = ["<Super>c"];                # Calculator
+      };
+      # ─── Multi-monitor & Window snapping ───
+      "org/gnome/mutter" = {
+        edge-tiling = true;           # Snap windows to edges
+        dynamic-workspaces = true;    # Auto create/remove workspaces
+        workspaces-only-on-primary = true;
+      };
+      # ─── Touchpad gestures (3-finger swipe = workspace switch) ───
+      "org/gnome/desktop/peripherals/touchpad" = {
+        tap-to-click = true;
+        two-finger-scrolling-enabled = true;
+        natural-scroll = true;
+      };
+    };
+  }];
+
+  # ─── i18n / Language Support ───
+  # Install fonts for ALL major writing systems
+  fonts = {
+    packages = with pkgs; [
+      noto-fonts                   # Pan-Unicode coverage
+      noto-fonts-cjk-sans          # Chinese, Japanese, Korean
+      noto-fonts-color-emoji       # Emoji
+      liberation_ttf               # Metric-compatible with Arial/Times
+      jetbrains-mono               # Monospace for code
+      fira-code                    # Alternative monospace with ligatures
+      material-icons               # Material Icons (offline icons for LiquidUI shell)
+    ];
+    fontconfig.defaultFonts = {
+      serif = [ "Noto Serif" "Liberation Serif" ];
+      sansSerif = [ "Noto Sans" "Liberation Sans" ];
+      monospace = [ "JetBrains Mono" "Fira Code" "Noto Sans Mono" ];
+      emoji = [ "Noto Color Emoji" ];
+    };
+  };
+
+  # Input methods (CJK + multilingual)
+  i18n = {
+    defaultLocale = "en_US.UTF-8";
+    supportedLocales = [
+      "en_US.UTF-8/UTF-8" "en_GB.UTF-8/UTF-8"
+      "de_DE.UTF-8/UTF-8" "fr_FR.UTF-8/UTF-8" "es_ES.UTF-8/UTF-8"
+      "pt_BR.UTF-8/UTF-8" "it_IT.UTF-8/UTF-8" "nl_NL.UTF-8/UTF-8"
+      "ja_JP.UTF-8/UTF-8" "ko_KR.UTF-8/UTF-8"
+      "zh_CN.UTF-8/UTF-8" "zh_TW.UTF-8/UTF-8"
+      # hi_IN / vi_VN have no `.UTF-8` variant in nixpkgs glibcLocales
+      "hi_IN/UTF-8" "ar_SA.UTF-8/UTF-8" "ru_RU.UTF-8/UTF-8"
+      "tr_TR.UTF-8/UTF-8" "th_TH.UTF-8/UTF-8" "vi_VN/UTF-8"
+    ];
+    inputMethod = {
+      enable = true;
+      type = "ibus";
+      ibus.engines = with pkgs.ibus-engines; [
+        libpinyin       # Chinese (Pinyin)
+        anthy           # Japanese
+        hangul          # Korean
+        m17n            # Multilingual (Hindi, Arabic, Thai, etc.)
+      ];
+    };
+  };
+
+  # ─── Default Apps (XDG MIME associations) ───
+  xdg.mime.defaultApplications = {
+    "text/html" = "firefox.desktop";
+    "x-scheme-handler/http" = "firefox.desktop";
+    "x-scheme-handler/https" = "firefox.desktop";
+    "text/plain" = "org.gnome.TextEditor.desktop";
+    "application/pdf" = "org.gnome.Papers.desktop";
+    "image/png" = "org.gnome.Loupe.desktop";
+    "image/jpeg" = "org.gnome.Loupe.desktop";
+    "image/gif" = "org.gnome.Loupe.desktop";
+    "image/webp" = "org.gnome.Loupe.desktop";
+    "video/mp4" = "io.github.celluloid_player.Celluloid.desktop";
+    "video/webm" = "io.github.celluloid_player.Celluloid.desktop";
+    "audio/mpeg" = "io.bassi.Amberol.desktop";
+    "audio/flac" = "io.bassi.Amberol.desktop";
+    "inode/directory" = "org.gnome.Nautilus.desktop";
+    # x-scheme-handler/mailto is OWNED by hart-email.nix (hart.email.enable above),
+    # which registers thunderbird.desktop as the mailto handler. Setting it here
+    # too would be a second, conflicting attrsOf-str definition (different value)
+    # and fail eval, so the email module is the single source of truth for it.
+  };
+
+  # D-Bus policy for HART agent bridge
+  services.dbus.packages = lib.mkIf (builtins.pathExists ../dbus/com.hart.Agent.conf) [
+    (pkgs.writeTextDir "share/dbus-1/system.d/com.hart.Agent.conf"
+      (builtins.readFile ../dbus/com.hart.Agent.conf))
+  ];
+
+  # Bluetooth
+  hardware.bluetooth = {
+    enable = true;
+    powerOnBoot = true;
+  };
+
+  # ─── Wi-Fi: NetworkManager + redistributable firmware (privacy-first) ───
+  # On real HW the glass shell's connectivity indicator showed "Wi-Fi not
+  # available" even though the Intel wifi was present. The PRIMARY cause was the
+  # shell server unit being unable to exec `nmcli` (fixed in hart-liquid-ui.nix's
+  # unit PATH). These two settings are the defense-in-depth half — both were only
+  # TRANSITIVELY satisfied before, and a desktop OS's core radio must not depend
+  # on a side effect:
+  #   1. NetworkManager OWNS wifi and provides the `nmcli` the shell calls. It was
+  #      enabled only as a side effect of the GNOME desktopManager default
+  #      (mkDefault true). greetd REPLACES gdm as the boot session, but NM is a
+  #      system service and keeps running regardless — still, enable it outright
+  #      so the wifi stack never rides on the GNOME fallback's default.
+  #   2. The Intel/Realtek wifi DRIVER needs redistributable firmware (iwlwifi,
+  #      rtw/rtl) to bring the radio up and clear soft-rfkill. On the ISO it is
+  #      in the closure via the all-hardware installation-CD profile; explicit
+  #      here so EVERY consumer (installed systems included) carries it and a
+  #      future profile change can't silently drop it.
+  # PRIVACY-FIRST: wifi is ON by default (a LOCAL capability, no opt-in friction),
+  # but NetworkManager NEVER auto-connects to an unknown SSID — it only activates a
+  # saved connection profile, and joining a new network is an explicit user action.
+  # No opportunistic / auto-join behaviour, so "wifi ON" does not mean "leaks onto
+  # any open network". (wifi.powersave is left at the NM default — unset — so the
+  # desktop/laptop radio is not throttled the way the phone variant chooses to.)
+  networking.networkmanager.enable = true;
+  hardware.enableRedistributableFirmware = true;
+
+  # ─── Printing & Scanning ───
+  services.printing.enable = true;
+  services.avahi = {
+    enable = true;
+    nssmdns4 = true;  # mDNS for network printer discovery
+  };
+  hardware.sane = {
+    enable = true;    # Scanner support (SANE backends)
+    extraBackends = [ pkgs.sane-airscan ];  # eSCL/AirScan wireless scanners
+  };
+
+  # ─── Location Services (for weather, timezone auto-detect) ───
+  services.geoclue2.enable = true;
+
+  # ─── Accessibility ───
+  services.gnome.at-spi2-core.enable = true;  # Screen reader support
+
+  # ─── Power Management ───
+  services.upower.enable = true;
+  services.thermald.enable = true;
+
+  # ─── HART OS Branding (real assets, not placeholders) ───
+  # SVG sources live in nixos/branding/.  GNOME renders SVG wallpapers directly
+  # (dconf above points here); Plymouth gets the rasterized logo (hartLogoPng).
+  # The mark: a geometric heart with circuit-board traces — human compassion +
+  # machine intelligence — in #00D4AA (HART teal) on dark #080808.
+  environment.etc = {
+    "hart/branding/wallpaper.svg".source = ../branding/hart-wallpaper.svg;
+    "hart/branding/lock-screen.svg".source = ../branding/hart-wallpaper.svg;
+    "hart/branding/logo.svg".source = ../branding/hart-logo.svg;
+  };
+
+  # ─── Boot splash: HART logo, not the NixOS lizard ───
+  # Uses NixOS's default Plymouth theme but swaps in our logo via
+  # boot.plymouth.logo (low-risk — no custom theme module).  quiet+splash hide
+  # the kernel/systemd text boot behind the graphical splash.
+  boot.plymouth = {
+    enable = lib.mkForce true;  # base installer-CD profile may also set this
+    logo = lib.mkForce "${hartLogoPng}/logo.png";
+  } // lib.optionalAttrs useCustomBootSplash {
+    # Opt-in only (useCustomBootSplash above). Off ⇒ {} ⇒ this merge is a no-op
+    # and boot.plymouth is byte-identical to the proven stock-theme-plus-logo.
+    themePackages = [ hartPlymouth ];
+    theme = lib.mkForce "hart";
+  };
+  # (nouveau.modeset=0 stays with the nouveau blacklist in the configuration —
+  # a hardware-policy choice, not variant surface; kernelParams lists merge.)
+  boot.kernelParams = [ "quiet" "splash" ];
 }

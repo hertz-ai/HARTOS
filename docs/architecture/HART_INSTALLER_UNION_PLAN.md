@@ -99,12 +99,19 @@ Full classification of the remaining configuration (line refs at audit time):
   workaround (installed rebuilds run on real Linux). The hide-the-nixos-user
   block also stays (its getty autologinUser=null is part of hiding the CD
   profile's live user, not of the recovery guarantee).
-- slice 4 (needs `pkgs` — profile signature becomes `{ pkgs, ... }:`; sub-slice
-  and watch the eval gate): desktop app set (`environment.systemPackages`),
-  GNOME/xserver + libinput, GDM/dconf branding, fonts + i18n, XDG MIME
-  defaults, dbus com.hart.Agent, bluetooth, NetworkManager + redistributable
-  firmware, printing/scanning/avahi, geoclue, at-spi2, upower/thermald,
-  branding etc + plymouth splash, remote-desktop block
+- ✅ slice 4: desktop app set (`environment.systemPackages` incl. hart-cli —
+  the profile now takes `{ lib, pkgs, hartSrc, ... }:`), GNOME/xserver +
+  libinput, GDM/dconf branding, fonts + i18n, XDG MIME defaults, dbus
+  com.hart.Agent, bluetooth, NetworkManager + redistributable firmware,
+  printing/scanning/avahi, geoclue, at-spi2, upower/thermald, /etc branding
+  assets + plymouth splash (hartLogoPng/hartPlymouth let-bindings moved with
+  it; `quiet splash` kernel params moved, `nouveau.modeset=0` stays with the
+  hardware policy), remote-desktop rustdesk optionals. configurations/
+  desktop.nix shrank 728 → ~210 lines: image-kind switch, ISO branding,
+  live-CD countermeasures, build-host workarounds, GPU hardware policy,
+  hart.package. RAW nixosModules.profile-desktop imports now need
+  `specialArgs.hartSrc` (documented at the flake export; mkHartSystem /
+  mkInstalledSystem wire it automatically).
 
 **IMAGE-ONLY (stays in the configuration):**
 - image-kind switch + CD-profile wrap + `isoImage` branding + `hart.installer`

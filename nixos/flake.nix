@@ -601,6 +601,12 @@
     # unset — the exact defect that kept 25 nixosTests red (#15). What makes a
     # desktop a desktop lives in the variant PROFILES, exported alongside so no
     # consumer has to reach into this repo's directory layout for them.
+    # NOTE (since parity slice 4): profile-desktop takes the `hartSrc`
+    # specialArg (its app set builds hart-cli from source). mkHartSystem /
+    # mkInstalledSystem wire it automatically; only a RAW import of
+    # profile-desktop into a foreign nixosSystem must add
+    # `specialArgs.hartSrc = hart.outPath;` (or compose via lib.mkHartSystem,
+    # the documented path).
     nixosModules.hart = { imports = hartModules; };
     nixosModules.profile-desktop = ./profiles/desktop.nix;
     nixosModules.profile-server  = ./profiles/server.nix;
