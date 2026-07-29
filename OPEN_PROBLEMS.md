@@ -28,10 +28,49 @@ that says 1.000 without a global view is measuring agreement among whoever
 showed up, which is not the same thing and can be trivially high precisely when
 participation is worst.
 
-**What progress looks like:** a convergence statistic that is truthful about its
-own sample. Something a node can compute locally that degrades visibly when
-its view of the network is partial, rather than looking perfect. Bonus if it
-survives an adversarial peer that reports whatever makes convergence look good.
+**There are two convergences here and one number.** They are different
+mathematics and the single reported figure conflates them.
+
+*Structural, discrete.* The concept graph. Countable: concepts, deterministic
+paths, hierarchy depth, agents merged. Merging two graphs creates combinatorial
+new paths, so this grows compositionally and moves in steps, on joins. It is
+what `intelligence_index()` measures in the learning core, a product of
+`log2(paths + 1)`, a hierarchy-depth term and the ratio of nodes that have
+actually been learned rather than declared.
+
+*Latent, continuous.* Alignment between rotated latent spaces. Real-valued:
+rotation error, coalignment residual, prediction error, packing energy between
+neighbouring cells. It moves every step, and it is what says the shared space is
+genuinely shared rather than nominally shared.
+
+**They can diverge, and the divergence is the diagnostic.** Structure rising
+while latent alignment degrades means the graph is accumulating concepts the
+agents no longer agree on: the hive looks like it is learning and is actually
+fragmenting. Alignment tight while structure is flat means the hive is coherent
+and learning nothing new. A single scalar cannot express either state, and
+`convergence=1.000` is reported in a way that would look identical in both.
+
+**What progress looks like:**
+
+- A convergence statistic that is truthful about its own sample. Something a
+  node computes locally that degrades visibly when its view of the network is
+  partial, rather than looking perfect. It should survive an adversarial peer
+  reporting whatever makes the number look good.
+- Two figures rather than one, structural and latent, never summed. Their gap is
+  more informative than either alone.
+- A stated denominator. Convergence among whom, over what window, seen by which
+  node. A figure whose sample is unnamed is not checkable, and the audience for
+  this project checks.
+- Divergence detection: an alert when structure and alignment move apart, since
+  that is the failure this design is most exposed to and the one that would
+  otherwise read as success.
+
+**Where the pieces already are.** `HoneycombTopology` computes neighbour overlap
+and packing energy. `HiveMind._coalign_delta` and `_peer_latent_rotation` handle
+the rotation between peer spaces. `BootstrappedIntelligence.get_stats()` exposes
+`intelligence_index` and a growth rate over joins. What does not exist is a
+statistic that combines them honestly, or any accounting for who was actually
+visible when the number was taken.
 
 ---
 
