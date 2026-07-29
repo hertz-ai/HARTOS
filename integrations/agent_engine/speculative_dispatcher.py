@@ -1877,13 +1877,19 @@ class SpeculativeDispatcher:
                             _port = int(_m.group(1)) if _m else 8081
                     except Exception:
                         _port = 8081  # draft default
-                import requests as _req
-                # Manual log_outbound call here because the
-                # ``requests`` library bypasses the global httpx hook
-                # installed in ``core.llm_outbound_logger.install()``.
-                # The draft port (typically :8081) isn't even in the
-                # httpx hook's scope, so this is the only place that
-                # draft-classifier prompts get a record.
+                # ONE transport (task #10): pooled_post is port-scoped — a
+                # true draft-port call passes straight through (the draft
+                # server has its own slots), but when no draft server exists
+                # and _port fell back to the MAIN llama port, the call is
+                # admitted through the slot-aware scheduler like every other
+                # main-server call. The old raw requests.post here hit the
+                # main server UNSCHEDULED on draft-less boxes — invisible to
+                # inflight() and unpreemptable by a user turn (#162 hazard).
+                from core.http_pool import pooled_post as _pooled_post
+                # Manual log_outbound call here because the requests
+                # transport bypasses the global httpx hook installed in
+                # ``core.llm_outbound_logger.install()``; this is the only
+                # place draft-classifier prompts get a record.
                 _draft_body = {
                     'model': 'llama',
                     'messages': [{'role': 'user', 'content': prompt}],
@@ -1891,7 +1897,7 @@ class SpeculativeDispatcher:
                     'temperature': 0.7,
                 }
                 _draft_start = time.time()
-                resp = _req.post(
+                resp = _pooled_post(
                     f'http://127.0.0.1:{_port}/v1/chat/completions',
                     json=_draft_body,
                     timeout=15,
