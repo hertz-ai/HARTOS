@@ -175,9 +175,15 @@ in
           # The SOFTWARE radio switch answers 'enabled' even with ZERO wifi
           # devices — which is exactly why rfkill (NOT this) must decide presence.
           assert radio in ("enabled", "disabled"), f"unexpected nmcli radio: {radio!r}"
-          # This VM has no wifi chip: `nmcli device wifi` reports no device (rc!=0
-          # / "No Wi-Fi device found") — the FM1 hardware reality the probe faces.
-          wifi.fail("nmcli -t -f ACTIVE,SSID,SIGNAL device wifi")
+          # This VM has no wifi chip. The OLD assertion demanded rc!=0 from
+          # `nmcli device wifi` — but NetworkManager on the pinned nixpkgs
+          # exits 0 with an EMPTY list when no wifi device exists, so the
+          # test failed against a CORRECT stack on every run ("unexpectedly
+          # succeeded", run 30485906966). Assert the hardware reality itself:
+          # zero wifi scan results, however nmcli spells it.
+          scan = wifi.execute("nmcli -t -f ACTIVE,SSID,SIGNAL device wifi")[1].strip()
+          assert scan == "" or "No Wi-Fi device" in scan, \
+              f"VM has no wifi chip yet nmcli returned scan rows: {scan!r}"
 
       # ── 2. The REAL probe degrades + the rfkill parser reads a real fs tree ──
       with subtest("the real wifi probe degrades (no crash/hang) + rfkill parses a real fs"):
