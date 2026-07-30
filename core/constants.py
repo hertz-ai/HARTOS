@@ -782,6 +782,17 @@ LATENCY_BUDGETS = {
     # Dedup/coordination decisions are pure-compute; sub-second or the
     # coordinator becomes the bottleneck it exists to remove.
     'coordinator_dedup_s': 0.5,
+
+    # ── Never-block guarantees (an async call that blocks is a hang) ──
+    # A fire-and-forget capture must RETURN, not wait for its own work.
+    'async_dispatch_return_s': 1.0,
+    # Telemetry object construction, 10k iterations. Telemetry that costs
+    # measurable time stops being telemetry and becomes the workload.
+    'telemetry_build_10k_ms': 1000.0,
+    # Cold import of the Flask entry module. Not "fast", but bounded: the
+    # learning pipeline must stay in the background rather than being
+    # dragged onto the import path.
+    'entry_module_import_s': 5.0,
 }
 
 

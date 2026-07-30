@@ -1,4 +1,5 @@
 """Tests for AgentBaselineService - unified performance snapshots."""
+from core.constants import latency_budget
 import json
 import os
 import shutil
@@ -423,4 +424,4 @@ class TestHelpers:
         start = time.time()
         capture_baseline_async('async_test', 0, 'creation')
         elapsed = time.time() - start
-        assert elapsed < 1.0  # Should return near-instantly
+        assert elapsed < latency_budget('async_dispatch_return_s')  # returns, never waits
