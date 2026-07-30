@@ -72,8 +72,9 @@ in
     };
 
     testScript = ''
-      import json
-
+      # (no json import: the driver's pyflakes lint is FATAL — an unused
+      # import fails the DRIVER BUILD and the test never boots, which was
+      # hart-server-boot's entire red since 2026-07-26; run 30485906966.)
       server.start()
       server.wait_for_unit("multi-user.target")
 
