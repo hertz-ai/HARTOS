@@ -428,11 +428,32 @@ in
           _dump_backend_state(edge, "edge")
           raise
 
+      # Cross-host reachability. `-f` makes curl exit 22 on ANY HTTP >= 400,
+      # which is indistinguishable from "unreachable" and hid WHY this failed
+      # for four days (run 30485906966: exit 22 — the peer ANSWERED, so the
+      # route and the firewall were fine; the response was an error). Capture
+      # the code and the body so a future failure names itself, and assert
+      # the reachability contract explicitly: an HTTP response arrived AND it
+      # is 2xx. A non-2xx now fails with the peer's own status + body.
+      def peer_status(node, ip):
+          rc, out = node.execute(
+              "curl -s -o /tmp/peerbody -w '%{http_code}' --max-time 20 "
+              f"http://{ip}:6777/status")
+          assert rc == 0, (
+              f"no HTTP response from {ip}:6777 (curl rc={rc}) — route/firewall "
+              f"level failure, not an application error")
+          body = node.succeed("head -c 300 /tmp/peerbody || true")
+          return out.strip(), body
+
       with subtest("Server backend accessible from edge"):
-          edge.succeed("curl -sf http://192.168.1.1:6777/status")
+          code, body = peer_status(edge, "192.168.1.1")
+          assert code.startswith("2"), \
+              f"server /status answered HTTP {code} cross-host, body: {body!r}"
 
       with subtest("Edge backend accessible from server"):
-          server.succeed("curl -sf http://192.168.1.2:6777/status")
+          code, body = peer_status(server, "192.168.1.2")
+          assert code.startswith("2"), \
+              f"edge /status answered HTTP {code} cross-host, body: {body!r}"
     '';
   };
 }
