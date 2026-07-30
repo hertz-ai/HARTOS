@@ -100,6 +100,18 @@ in
       with subtest("a vfat HARTSTATE fail-secure skips the wifi bind, state still persists"):
           sp.succeed(f"mkfs.vfat -n HARTSTATE {disk}")
           sp.succeed("udevadm settle || true")
+          # The module REFORMATS an EMPTY vfat to ext4 by design (the
+          # Windows-flash path: mkfs.ext4 is impossible from Windows, so an
+          # empty vfat HARTSTATE is upgraded in place) — and then the wifi
+          # bind proceeds legitimately on the resulting POSIX fs, which is
+          # exactly how this subtest failed against a CORRECT module
+          # (run 30485906966: mountpoint unexpectedly succeeded). Seed a
+          # file so the fs is NON-empty, the reformat correctly refuses,
+          # and the true fail-secure skip is what gets exercised.
+          sp.succeed(f"mkdir -p /tmp/vfseed && mount {disk} /tmp/vfseed "
+                     "&& touch /tmp/vfseed/existing-user-data.txt "
+                     "&& umount /tmp/vfseed")
+          sp.succeed("udevadm settle || true")
           out = sp.succeed("hart-state-persist 2>&1; echo RC=$?")
           assert "RC=0" in out, f"vfat persist must exit 0, got: {out!r}"
           # HART state DID persist (bind works on any fs; only perms differ).
@@ -118,6 +130,28 @@ in
               sp.succeed(f"umount -l {p} 2>/dev/null || true")
           # Best-effort signature wipe (a just-lazy-unmounted device can briefly
           # report busy); the ext4 mkfs -F below overwrites regardless.
+          sp.succeed(f"wipefs -a {disk} 2>/dev/null || true")
+          sp.succeed("udevadm settle || true")
+
+      # ── 3b. An EMPTY vfat HARTSTATE is upgraded to ext4 (the Windows-flash path) ──
+      # The reformat feature the old subtest 3 tripped over, covered on purpose:
+      # a Windows flash can only lay down vfat, so an EMPTY vfat HARTSTATE is
+      # mkfs.ext4'd in place and the wifi bind then proceeds on the POSIX fs.
+      with subtest("an EMPTY vfat HARTSTATE is upgraded to ext4 and wifi persists securely"):
+          sp.succeed(f"mkfs.vfat -n HARTSTATE {disk}")
+          sp.succeed("udevadm settle || true")
+          out_e = sp.succeed("hart-state-persist 2>&1; echo RC=$?")
+          assert "RC=0" in out_e, f"empty-vfat upgrade must exit 0, got: {out_e!r}"
+          fstype = sp.succeed(f"blkid -o value -s TYPE {disk}").strip()
+          assert fstype == "ext4", \
+              f"empty vfat HARTSTATE must be upgraded to ext4 (Windows-flash path), got {fstype!r}"
+          sp.succeed("mountpoint -q /etc/NetworkManager/system-connections")
+          perms = sp.succeed("stat -c '%a %U' /etc/NetworkManager/system-connections").strip()
+          assert perms == "700 root", \
+              f"upgraded wifi persist must be 0700 root, got {perms!r}"
+          for p in ["/etc/NetworkManager/system-connections", "/var/lib/hart",
+                    "/home/hart-admin", "/run/hart/hartstate"]:
+              sp.succeed(f"umount -l {p} 2>/dev/null || true")
           sp.succeed(f"wipefs -a {disk} 2>/dev/null || true")
           sp.succeed("udevadm settle || true")
 
