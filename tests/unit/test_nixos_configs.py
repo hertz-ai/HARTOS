@@ -2546,3 +2546,88 @@ class TestEnabledOptionsExist:
         assert not unloaded, (
             f"module files present but never imported into hartModules "
             f"(their hart.* options do not exist): {sorted(unloaded)}")
+
+
+class TestNoRequiredOptionTraps:
+    """A module option with a type but NO default is REQUIRED — and the
+    instant its module is imported and enabled, eval ABORTS.
+
+    THE CASCADE THIS ENDS (2026-07-30, three CI rounds, one per error
+    because nix stops at the first):
+      round 1  error: The option `hart.openclaw' does not exist
+      round 2  (three modules unwired — two hidden behind the first)
+      round 3  error: The option `hart.sso.domain' was accessed but has
+               no value defined      ... with ldapUri and ldapBaseDn each
+               queued behind it as rounds 4 and 5.
+
+    Every one of those cost a full CI cycle to learn ONE fact. This
+    asserts the whole class locally in milliseconds.
+
+    The rule: a required option is only acceptable when EVERY consumer is
+    guaranteed to set it. `hart.package` qualifies — mkNode, every
+    configuration and mkInstalledSystem all set it explicitly, and a
+    default would silently ship the wrong closure. Anything else must
+    carry a default and, if it needs real configuration, an assertion
+    that says so in a sentence.
+    """
+
+    # Options allowed to stay required, with the reason they are safe.
+    ALLOWED_REQUIRED = {
+        # (module, option): why
+        ("hart-base", "package"): "every consumer sets it; a default would ship the wrong app",
+        ("hart-comp", "package"): "compositor package is wired per-consumer",
+        ("hart-rust-precedent", "package"): "package is wired per-consumer",
+    }
+
+    def _required_options(self):
+        """(module, option, type) for every mkOption with a type and no
+        default — the exact shape that aborts eval when enabled."""
+        found = []
+        for path in sorted(glob.glob(os.path.join(MODULES_DIR, "hart-*.nix"))):
+            src = read_nix(path)
+            mod = os.path.basename(path)[:-4]
+            for m in re.finditer(
+                    r'(\w+)\s*=\s*lib\.mkOption\s*\{(.*?)\n\s*\};', src, re.S):
+                name, body = m.group(1), m.group(2)
+                if "default" in body or "mkEnableOption" in body:
+                    continue
+                if "type" not in body:
+                    continue
+                found.append((mod, name))
+        return found
+
+    def test_no_module_declares_an_unguarded_required_option(self):
+        offenders = [f"hart.{opt} (in {mod}.nix)"
+                     for mod, opt in self._required_options()
+                     if (mod, opt) not in self.ALLOWED_REQUIRED]
+        assert not offenders, (
+            "these options have a type but NO default, so enabling their "
+            "module aborts the WHOLE flake eval with 'was accessed but has "
+            "no value defined' — give each a default plus an assertion, or "
+            "add it to ALLOWED_REQUIRED with the reason it is safe: "
+            f"{offenders}")
+
+    def test_sso_is_configured_or_disabled_never_half(self):
+        """SSO is the case that proved the rule: an LDAP client needs
+        site-specific values HART cannot invent. Either a profile sets all
+        three alongside enable, or it does not enable it at all."""
+        for variant in ("desktop", "server", "edge", "phone"):
+            prof = read_nix(os.path.join(PROFILES_DIR, variant + ".nix"))
+            if re.search(r'^\s+sso\.enable\s*=\s*true', prof, re.M):
+                for opt in ("domain", "ldapUri", "ldapBaseDn"):
+                    assert re.search(r'sso\.' + opt + r'\s*=|' + opt + r'\s*=',
+                                     prof), (
+                        f"{variant} enables hart.sso without setting {opt} — "
+                        f"an SSO client with no directory does nothing and "
+                        f"trips the module's assertion")
+
+    def test_sso_module_has_defaults_and_an_assertion(self):
+        """The consumer-protecting half: defaults so eval survives, an
+        assertion so an unconfigured enable fails readably."""
+        src = read_nix(os.path.join(MODULES_DIR, "hart-sso.nix"))
+        assert "assertions" in src, "hart-sso must assert on unconfigured enable"
+        for opt in ("domain", "ldapUri", "ldapBaseDn"):
+            block = re.search(opt + r'\s*=\s*lib\.mkOption\s*\{(.*?)\n\s*\};',
+                              src, re.S)
+            assert block and "default" in block.group(1), (
+                f"hart.sso.{opt} still has no default — it will abort eval")
