@@ -42,6 +42,30 @@ permissions:
   pages: write
   id-token: write
 
+# ── RUNNER STARVATION FIX (2026-07-30) ────────────────────────────────────
+# This workflow had NO concurrency block at all, while every OTHER heavy
+# workflow has one. Each push therefore started a full Release run — 3x
+# build-iso, 4 nixosTest shards, installers, docs — and NONE ever stood down.
+# Measured on main: 13 runs alive with zero progress across a 20-minute window
+# with no commits in between, while light workflows (Docker, Security Scan)
+# passed fine on the same SHAs. So it was not the GitHub outage; the pool was
+# simply held by superseded Release runs.
+#
+# Chronic, not a bad afternoon. Nix Build Matrix push runs, 07-27..07-30:
+# 38 cancelled / 16 failed / 11 succeeded = a 17% success rate, and the last
+# successful run on main was 07-28 — two days of zero runtime verification
+# while commit volume climbed 3 -> 20 a day. sso (bf69b952) and ptrace
+# (b83c7591) are permanently unverified at runtime on their own SHAs because
+# of it.
+#
+# Same idiom as nix-build-matrix.yml:40. The workflow_dispatch carve-out is
+# MANDATORY here specifically: tag-and-sign is dispatch-only and gates
+# master-key signing, so a signing run must never be cancellable by someone
+# else's push — hence run_id (unique per dispatch) instead of a shared key.
+concurrency:
+  group: release-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
+  cancel-in-progress: true
+
 jobs:
   # ═══════════════════════════════════════════════════════════
   # 1. Comprehensive gate — the release-blocking checks (PARALLEL to build-iso)

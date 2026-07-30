@@ -78,7 +78,13 @@ jobs:
       # like at death so the next failure names its resource. dmesg is the only
       # place an OOM kill leaves a trace.
       - name: Why did the gate die (resources at failure time)
-        if: failure()
+        # failure() is FALSE when the previous step was CANCELLED, and both
+        # runner shutdown and concurrency supersession CANCEL rather than fail —
+        # so this fired for the ENOSPC/OOM case it was written for and NEVER for
+        # the dominant one (38 of 65 runs this week ended cancelled). On a
+        # concurrency-cancelled run the runner is still alive and can still
+        # capture state, which is exactly when we most want it.
+        if: failure() || cancelled()
         run: |
           echo "── memory ──"; free -m || true
           echo "── disk ──"; df -h / /tmp 2>/dev/null || true
@@ -363,7 +369,13 @@ jobs:
       # than leaving it to inference: disk (the ENOSPC theory), memory (an OOM kill
       # leaves no message in the build log, only in dmesg), or neither.
       - name: Why did it fail (resources at failure time)
-        if: failure()
+        # failure() is FALSE when the previous step was CANCELLED, and both
+        # runner shutdown and concurrency supersession CANCEL rather than fail —
+        # so this fired for the ENOSPC/OOM case it was written for and NEVER for
+        # the dominant one (38 of 65 runs this week ended cancelled). On a
+        # concurrency-cancelled run the runner is still alive and can still
+        # capture state, which is exactly when we most want it.
+        if: failure() || cancelled()
         run: |
           echo "── disk ──"
           df -h / /mnt /tmp 2>/dev/null || true

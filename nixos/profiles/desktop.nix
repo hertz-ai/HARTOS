@@ -502,11 +502,24 @@ in
     # them naively is an eval conflict, not a feature. Those duplicates are
     # DELETED below and the modules take ownership (one writer per concern).
     accessibility.enable = true;   # a11y beyond the at-spi2 bus
-    devtools.enable = true;        # LSP servers, debuggers, linters, container tools
-                                   # (NOT hart.devTools — that is the language
-                                   # TOOLCHAIN module, already on above. Two
-                                   # near-identical names, genuinely different
-                                   # concerns; renaming one is owed.)
+    # devtools: OFF on the desktop image, and this one is MEASURED, not judged.
+    # Closure audit 30570492265 on hart-desktop-raw — the real config with
+    # exactly this option flipped:
+    #     hart.devtools.enable ON  : 24 GiB
+    #     hart.devtools.enable OFF : 21 GiB
+    # +3 GiB. hart-repart-image.nix sizes the root at 26 GiB against a ~24 GiB
+    # image (~2 GiB slack), and that 26 GiB is itself bounded by the 28.7 GiB
+    # stick — its comment records that 1 GiB ESP + 28 GiB root already did NOT
+    # fit. 3 into 2 does not go: enabling this does not merely bloat the image,
+    # it stops the raw image fitting the device it ships on.
+    #
+    # NOT a silent narrowing of "enable all": the feature stays fully available
+    # (hart.devtools.enable = true on any workstation), and the desktop still
+    # ships the language TOOLCHAINS via hart.devTools above — the confusingly
+    # near-identical sibling — so compilers are present either way. What is
+    # deferred is the LSP/debugger/linter layer, pending a sub-bundle audit
+    # (run 30573861911, hart.devtools.lsp) so whatever fits the real slack can
+    # be re-enabled at the granularity the numbers support rather than by guess.
     nightlight.enable = true;      # blue-light schedule
     openclaw.enable = true;        # ClawHub skill surface
     osk.enable = true;             # on-screen keyboard (touch)

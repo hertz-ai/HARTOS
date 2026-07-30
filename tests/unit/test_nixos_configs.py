@@ -2589,7 +2589,15 @@ class TestNoRequiredOptionTraps:
             for m in re.finditer(
                     r'(\w+)\s*=\s*lib\.mkOption\s*\{(.*?)\n\s*\};', src, re.S):
                 name, body = m.group(1), m.group(2)
-                if "default" in body or "mkEnableOption" in body:
+                # `default` must be an ASSIGNMENT, not the word appearing in
+                # prose. `"default" in body` also matched description/example
+                # text, so any option documented as "there is no default; ..."
+                # or "defaults to X" was skipped UNCHECKED — a latent hole in
+                # the guard everyone now trusts INSTEAD of a CI round (found
+                # by the reviewing session against a synthetic module; no live
+                # instance among 69 modules / 257 real `default =`).
+                if re.search(r'^\s*default\s*=', body, re.M) \
+                        or "mkEnableOption" in body:
                     continue
                 if "type" not in body:
                     continue
@@ -2728,3 +2736,59 @@ class TestDriverFirmwareBreadth:
                 r'hardware\.cpu\.' + vendor + r'\.updateMicrocode\s*=\s*\n?\s*'
                 r'lib\.mkDefault config\.hardware\.enableRedistributableFirmware',
                 base), f"{vendor} microcode must ride the firmware consent"
+
+
+class TestImageFitsItsTargetDevice:
+    """A feature enable must not push the raw image past the device it ships on.
+
+    MEASURED, not judged (closure audit 30570492265, hart-desktop-raw, the real
+    config with exactly one option flipped):
+
+        hart.devtools.enable ON  : 24 GiB
+        hart.devtools.enable OFF : 21 GiB
+
+    hart-repart-image.nix sizes the root at 26 GiB against a ~24 GiB image —
+    about 2 GiB of slack — and that 26 GiB is itself bounded by the 28.7 GiB
+    stick (its comment records that 1 GiB ESP + 28 GiB root did NOT fit). So
+    +3 GiB does not merely bloat the image, it stops the raw image fitting the
+    target device.
+
+    This is the guard the everything-on sweep needed and did not have: the
+    size-ceiling failure mode is one where the BUILD can pass and the ARTIFACT
+    is unusable, so a test that fails in seconds is worth more than finding out
+    after a multi-hour ISO job.
+    """
+
+    #: Features whose measured closure cost exceeds the raw image's slack.
+    #: (option path, measured GiB delta, audit run) — extend as audits land.
+    TOO_BIG_FOR_THE_DESKTOP_IMAGE = [
+        ("devtools", 3, "30570492265"),
+    ]
+
+    def test_oversized_features_stay_off_the_desktop_profile(self):
+        prof = read_nix(os.path.join(PROFILES_DIR, "desktop.nix"))
+        for feat, cost, run in self.TOO_BIG_FOR_THE_DESKTOP_IMAGE:
+            assert not re.search(r'^\s+' + feat + r'\.enable\s*=\s*true',
+                                 prof, re.M), (
+                f"hart.{feat} is enabled on the desktop image but measured "
+                f"+{cost} GiB (audit {run}) against ~2 GiB of slack — the raw "
+                f"image would no longer fit the 28.7 GiB stick")
+
+    def test_the_root_size_and_its_reasoning_stay_documented(self):
+        """The 26 GiB is derived from the TARGET DEVICE, not from CI. If that
+        derivation is ever dropped, the next person sizes against the build
+        host again and reintroduces the ship-time failure."""
+        src = read_nix(os.path.join(MODULES_DIR, "hart-repart-image.nix"))
+        assert 'SizeMinBytes = "26G"' in src, "root size changed — re-measure"
+        assert "28.7" in src, (
+            "the stick-size derivation must stay in the comment; without it "
+            "the next change sizes against the runner, not the device")
+
+    def test_language_toolchains_still_ship(self):
+        """Dropping devtools must NOT cost the desktop its compilers —
+        hart.devTools (the near-identically-named sibling) is the toolchain
+        module and stays on."""
+        prof = read_nix(os.path.join(PROFILES_DIR, "desktop.nix"))
+        assert re.search(r'^\s+devTools\.enable\s*=\s*true', prof, re.M), (
+            "hart.devTools (language toolchains) must stay enabled — it is a "
+            "different module from hart.devtools despite the name")
