@@ -107,7 +107,7 @@ in
       hart.liquidUI = {
         enable = true;
         renderer = "webkit";
-        voiceEnabled = false;
+        voiceEnabled = pkgs.lib.mkForce false;
       };
 
       # ── A real display manager (the whole point) ──

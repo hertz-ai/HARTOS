@@ -80,7 +80,7 @@ in
       # NO variant turns it on (desktop-boot.nix:94) -> enable it explicitly.
       # defaultSession is NOT touched here — the GTK4 path is additive, cage stays
       # the floor (the never-break gate).
-      hart.liquidUI = { enable = true; renderer = "webkit"; voiceEnabled = false; };
+      hart.liquidUI = { enable = true; renderer = "webkit"; voiceEnabled = pkgs.lib.mkForce false; };
       hart.layerShellHost.enable = true;
       # gst-inspect-1.0 on PATH so the #150 mic subtest can resolve a real capture
       # element against the host's exported GST_PLUGIN_SYSTEM_PATH_1_0. Test-only —
@@ -351,7 +351,7 @@ in
       # left at the desktop default; it is irrelevant to the paint/crash gates.
       # hart.layerShellHost asserts hart.liquidUI.enable=true + renderer="webkit"
       # (it re-hosts the served glass shell); liquidUI defaults OFF, so enable it.
-      hart.liquidUI = { enable = true; renderer = "webkit"; voiceEnabled = false; };
+      hart.liquidUI = { enable = true; renderer = "webkit"; voiceEnabled = pkgs.lib.mkForce false; };
       hart.layerShellHost.enable = true;
 
       # ── A real display manager that autologins the GTK4 layer-shell session ──

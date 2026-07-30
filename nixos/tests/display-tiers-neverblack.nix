@@ -123,7 +123,7 @@ in
         # Short paint budget so the VM test is fast (real default is 20s). A hang
         # drops on the FIRST timeout (deterministic), so 3s is the whole per-rung
         # cost.
-        shellPaintTimeoutSeconds = 3;
+        shellPaintTimeoutSeconds = pkgs.lib.mkForce 3;
         # Exercise the SIGTERM grace (sleep dies on TERM immediately, so 2s is the
         # ceiling) but zero the post-kill DRM settle (no real DRM master in the VM)
         # so the walk stays fast.
@@ -229,7 +229,7 @@ in
       # PROBE, not the paint ladder (covered above).
       hart.sessionSupervisor = {
         enable = true;
-        shellPaintTimeoutSeconds = 0;
+        shellPaintTimeoutSeconds = pkgs.lib.mkForce 0;
         drmMasterSettleSeconds = 0;
         tierTermGraceSeconds = 0;
       };
@@ -378,7 +378,7 @@ in
         cageCommand = "${pkgs.coreutils}/bin/sleep infinity";
         crashLoopCount = 3;
         crashLoopWindowSeconds = 300;
-        shellPaintTimeoutSeconds = 2;        # short paint budget -> fast hang detection
+        shellPaintTimeoutSeconds = pkgs.lib.mkForce 2;        # short paint budget -> fast hang detection
         # NON-ZERO grace + settle (the real-HW EBUSY-handoff window): SIGTERM, wait
         # this grace, then SIGKILL. With a TERM-ignoring fake the FULL grace elapses
         # before the SIGKILL — proving the bounded escalation, not a fast SIGKILL.
@@ -482,7 +482,7 @@ in
         cageCommand = "${pkgs.coreutils}/bin/sleep infinity";
         crashLoopCount = 3;
         crashLoopWindowSeconds = 300;
-        shellPaintTimeoutSeconds = 3;
+        shellPaintTimeoutSeconds = pkgs.lib.mkForce 3;
         tierTermGraceSeconds = 2;
         drmMasterSettleSeconds = 0;
       };

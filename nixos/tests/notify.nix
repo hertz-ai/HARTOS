@@ -63,7 +63,7 @@ in
       # hart.portal pins HART_AI_SENSING_SOCK on the hart-liquid-ui unit AND grants
       # it ReadWritePaths=/run/hart (hart-portal.nix) — so enable BOTH, exactly the
       # proven portal-screencast.nix node, to drive the gate on/off.
-      hart.liquidUI = { enable = true; renderer = "webkit"; voiceEnabled = false; };
+      hart.liquidUI = { enable = true; renderer = "webkit"; voiceEnabled = pkgs.lib.mkForce false; };
       hart.portal.enable = true;
 
       # The daemon under test (default-ON on desktop; set explicit for clarity).

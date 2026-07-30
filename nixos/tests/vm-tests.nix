@@ -29,28 +29,13 @@
 { pkgs, hartModules, specialArgs }:
 
 let
-  # Minimal node: hart modules + variant, NO ../configurations/X.nix (and thus
-  # no installer-CD overlay collision).  `extra` carries per-test virtualisation
-  # / networking overrides.
-  # `extra` is imported as a module (NOT merged with //) so its nested attrs
-  # (e.g. networking.interfaces on the peer-discovery nodes) recursively merge
-  # with the base instead of clobbering networking.hostName.
-  mkNode = variant: extra: { pkgs, lib, hartSrc, ... }: {
-    imports = hartModules ++ [ extra ];
-    hart.enable = true;
-    hart.variant = variant;
-    hart.version = "0.0.0-test";
-    # hart.package has NO default (mkOption type=package, "set in variant
-    # config").  The full configs set it via callPackage hart-app.nix; the
-    # minimal node must too, else system.build.toplevel can't evaluate the
-    # hart-agent/backend/discovery services that read config.hart.package.
-    # `--no-build` only evaluates this derivation (it is not built here).
-    hart.package = pkgs.callPackage ../packages/hart-app.nix { inherit hartSrc; };
-    # hart-base sets networking.hostName = mkDefault "hart-node"; runNixOSTest
-    # also sets a default (the node name) -> two same-priority defaults conflict.
-    # Force a deterministic per-node value (tests address by IP, not hostname).
-    networking.hostName = lib.mkForce variant;
-  };
+  # ONE mkNode (DRY): this file used to re-paste its own local copy of the
+  # node builder — the exact parallel path ./lib.nix exists to prevent, and
+  # the reason the profile wiring (steward decision 2026-07-30, no flags)
+  # would have silently missed every node in THIS file. lib.nix's mkNode is
+  # identical (hart.package wiring, hostname mkForce) plus the variant
+  # feature profile import.
+  inherit (import ./lib.nix { inherit hartModules; }) mkNode;
 
 in
 {
@@ -171,7 +156,7 @@ in
       hart.liquidUI = {                               # hart-liquid-ui.service +
         enable = true;                                # the GTK3 shell typelibs +
         renderer = "webkit";                          # the hart-shell session pkg
-        voiceEnabled = false;                         # (no TTS closure in a VM)
+        voiceEnabled = pkgs.lib.mkForce false;                         # (no TTS closure in a VM)
       };
       hart.appBridge.enable = true;                   # hart-app-bridge.service
       hart.conky.enable = true;                       # conkyrc deployed

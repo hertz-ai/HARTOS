@@ -65,7 +65,7 @@ in
       # node about the PROBE, not the paint ladder (covered elsewhere).
       hart.sessionSupervisor = {
         enable = true;
-        shellPaintTimeoutSeconds = 0;
+        shellPaintTimeoutSeconds = pkgs.lib.mkForce 0;
         drmMasterSettleSeconds = 0;
         tierTermGraceSeconds = 0;
       };

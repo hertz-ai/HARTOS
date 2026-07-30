@@ -247,7 +247,7 @@ in
         crashLoopCount = 3;
         crashLoopWindowSeconds = 300;
         # Short paint budget so the VM test is fast (real default is 20s).
-        shellPaintTimeoutSeconds = 3;
+        shellPaintTimeoutSeconds = pkgs.lib.mkForce 3;
         # Exercise the SIGTERM grace (sleep dies on TERM immediately, so 2s is the
         # ceiling, not a real wait) but zero the post-kill settle (no real DRM
         # master in the VM) so the 8× hung-kill loop stays fast.
@@ -342,7 +342,7 @@ in
           swayCommand = "${paintThenStay}";         # Tier-2 PAINTS then stays alive
           crashLoopCount = 3;
           crashLoopWindowSeconds = 300;
-          shellPaintTimeoutSeconds = 5;             # ample for the immediate touch
+          shellPaintTimeoutSeconds = pkgs.lib.mkForce 5;             # ample for the immediate touch
           drmMasterSettleSeconds = 0;               # no real DRM master in the VM
         };
       };
@@ -414,7 +414,7 @@ in
           drmMasterSettleSeconds = 0;  # no real DRM master in the VM — stay fast
           # Disable the paint watchdog: this test only exercises the un-latched
           # START resolution, not the hang path.
-          shellPaintTimeoutSeconds = 0;
+          shellPaintTimeoutSeconds = pkgs.lib.mkForce 0;
         };
       };
     in
@@ -499,7 +499,7 @@ in
         swayCommand = "${pkgs.coreutils}/bin/false";    # Tier-2 crashes instantly
         crashLoopCount = 3;
         crashLoopWindowSeconds = 300;
-        shellPaintTimeoutSeconds = 0;   # crash-only path for this test
+        shellPaintTimeoutSeconds = pkgs.lib.mkForce 0;   # crash-only path for this test
         drmMasterSettleSeconds = 0;     # no real DRM master in the VM — stay fast
       };
     };
@@ -592,7 +592,7 @@ in
         # NOT killed — we want VT1 held for the duration of the probes).
         compCommand = null;
         swayCommand = "${pkgs.coreutils}/bin/sleep infinity";
-        shellPaintTimeoutSeconds = 0;   # don't let the watchdog tear down VT1
+        shellPaintTimeoutSeconds = pkgs.lib.mkForce 0;   # don't let the watchdog tear down VT1
       };
       # The desktop config pre-spawns autovt@tty2; the minimal mkNode node does not
       # import desktop.nix, so wire the SAME recovery contract here so the test
@@ -700,7 +700,7 @@ in
         drmMasterSettleSeconds = 0;  # no real DRM master in the VM — stay fast
         # Irrelevant here (no launch happens in an unhealthy run) but pin it off so
         # nothing about the paint path can interfere with the assertion.
-        shellPaintTimeoutSeconds = 0;
+        shellPaintTimeoutSeconds = pkgs.lib.mkForce 0;
       };
     };
 
@@ -825,7 +825,7 @@ in
           swayCommand = "${paintNoInput}";          # Tier-2 PAINTS but never input
           crashLoopCount = 3;
           crashLoopWindowSeconds = 300;
-          shellPaintTimeoutSeconds = 3;             # ample for the immediate paint touch
+          shellPaintTimeoutSeconds = pkgs.lib.mkForce 3;             # ample for the immediate paint touch
           inputAliveTimeoutSeconds = 3;             # OPT IN: short input budget for the VM
           tierTermGraceSeconds = 2;
           drmMasterSettleSeconds = 0;               # no real DRM master in the VM
@@ -905,7 +905,7 @@ in
           swayCommand = "${paintAndInput}";         # Tier-2 PAINTS + signals input
           crashLoopCount = 3;
           crashLoopWindowSeconds = 300;
-          shellPaintTimeoutSeconds = 5;
+          shellPaintTimeoutSeconds = pkgs.lib.mkForce 5;
           inputAliveTimeoutSeconds = 5;             # OPT IN: input watchdog active
           drmMasterSettleSeconds = 0;
         };
@@ -974,7 +974,7 @@ in
           swayCommand = "${paintNoInput}";          # PAINTS, never signals input
           crashLoopCount = 3;
           crashLoopWindowSeconds = 300;
-          shellPaintTimeoutSeconds = 5;
+          shellPaintTimeoutSeconds = pkgs.lib.mkForce 5;
           # inputAliveTimeoutSeconds omitted -> DEFAULT 0 (input watchdog disabled).
           drmMasterSettleSeconds = 0;
         };
@@ -1055,7 +1055,7 @@ in
           swayCommand = "${paintNoInput}";          # PAINTS, never signals input
           crashLoopCount = 3;
           crashLoopWindowSeconds = 300;
-          shellPaintTimeoutSeconds = 5;
+          shellPaintTimeoutSeconds = pkgs.lib.mkForce 5;
           inputAliveTimeoutSeconds = 3;             # ARMED — but the seat is touch-only
           # Inject the touch-only seat enumeration (the VM really has a keyboard, so
           # this is the only deterministic way to exercise the touch-only branch).
@@ -1139,7 +1139,7 @@ in
           swayCommand = "${pkgs.coreutils}/bin/false";   # Tier-2 fake crash
           crashLoopCount = 3;              # ONE run records 1 crash (< 3) → no drop
           crashLoopWindowSeconds = 300;
-          shellPaintTimeoutSeconds = 0;    # crash-only path — no paint wait
+          shellPaintTimeoutSeconds = pkgs.lib.mkForce 0;    # crash-only path — no paint wait
           drmMasterSettleSeconds = 0;      # no real DRM master in the VM — stay fast
           tierTermGraceSeconds = 0;
         };
