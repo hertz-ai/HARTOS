@@ -163,7 +163,13 @@ in
           fs.succeed(f"wipefs -a {disk} || true")
           # A typical USB stick: one whole-disk FAT32 filesystem.
           fs.succeed(f"mkfs.vfat -F 32 -n HARTUSB {disk}")
-          fs.succeed("udevadm settle || true")
+          # `udevadm settle` alone is NOT enough here: mkfs on a WHOLE disk
+          # emits no uevent (udev's inotify `watch` option covers partitions,
+          # not whole-disk nodes), so settle no-ops and udisks keeps the
+          # blank-disk probe from boot — "Object ... is not a mountable
+          # filesystem" against a correctly formatted disk (run 30485906966).
+          # Trigger an explicit change event so udisks re-probes the new fs.
+          fs.succeed(f"udevadm trigger --action=change {disk} && udevadm settle")
           # The udisks2 daemon must SEE the disk...
           fs.succeed(f"udisksctl info -b {disk} >/dev/null")
           # ...and MOUNT it on demand (under /run/media/<user>/...).

@@ -93,6 +93,13 @@ let
   screencastGate = pkgs.writeShellScriptBin "hart-screencast-gate" ''
     set -u
     export HART_AI_SENSING_SOCK="${senseSock}"
+    # Put the HART app root on PYTHONPATH so `from core.ai_sensing import
+    # query_authority` resolves — the hart-notify.nix / hart-onboarding.nix
+    # idiom. THIS LINE WAS MISSING: the import always raised, the except
+    # branch fail-closed every call to 77, and screen capture was refused
+    # even with the sense ON — the exact "false lockout" the portal test
+    # guards (run 30485906966). Fail-closed made it safe-but-broken.
+    export PYTHONPATH="${hartApp}:''${PYTHONPATH:-}"
     # Single supreme gate: core.ai_sensing.query_authority('screen'), fail-closed.
     if ${hartApp.python}/bin/python - <<'PY'
 import sys
