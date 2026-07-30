@@ -132,7 +132,11 @@ in
       # ── 3 (regression / privacy core). Screen CUT ⇒ emitter SUPPRESSES (77) ──
       with subtest("screen cut ⇒ hart-notify-send suppresses the native AI toast fail-closed"):
           set_screen(True)
-          rc, out = notifynode.execute("hart-notify-send 'HART' 'a private message body'")
+          # 2>&1: the suppression message goes to STDERR by design, and the
+          # test driver's execute() captures STDOUT only — without the
+          # redirect the rc==77 assert passed while this one read an empty
+          # string against a correctly-suppressing gate (run 30485906966).
+          rc, out = notifynode.execute("hart-notify-send 'HART' 'a private message body' 2>&1")
           assert rc == 77, \
               f"AI emitter must refuse with 77 when the human cut 'screen', got rc={rc}: {out}"
           assert "SUPPRESSED" in out, \
