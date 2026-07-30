@@ -547,6 +547,14 @@ in
               "post-reboot crash-loop dropped below the floor — NEVER allowed"
 
       with subtest("reset-tier re-arms Tier-1 and that ALSO survives a reboot"):
+          # RACE-FREE isolation (run 30485906966): with both tiers = /bin/false,
+          # greetd's own loop crash-drops the freshly reset latch within
+          # seconds — before shutdown AND again right after the reboot, ahead
+          # of the assert. The subtest proves the DISK persistence of a
+          # reset-armed latch, so greetd (already proven the supervisor above)
+          # is masked across this reboot: the mask symlink lives in /etc on
+          # the VM's persistent disk, so the next boot cannot race the read.
+          sup.succeed("systemctl mask --now greetd.service")
           sup.succeed("hartctl session reset-tier")
           assert sup.succeed(f"cat {LATCH}").strip() == "hart-comp"
           sup.shutdown()
