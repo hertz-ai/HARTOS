@@ -132,8 +132,15 @@ in
           rootsrc = br.succeed("findmnt -n -o SOURCE / ").strip()
           assert rootsrc, "root (/) has no backing source — root never mounted"
           br.log(f"root mounted from: {rootsrc}")
+          # NO root= cmdline assertion here: the nixos-test driver boots its
+          # VMs with a host-shared store root and NO root= param BY FRAMEWORK
+          # DESIGN — the old assert failed every run against a correctly
+          # booted VM (run 30485906966). The "kernel root= matches the boot
+          # medium" link is real-HW-only, probed by hart-boot-log's
+          # root/boot-device+cmdline section exactly as this file's header
+          # already documents. Log it for the record instead.
           cmdline = br.succeed("cat /proc/cmdline").strip()
-          assert "root=" in cmdline, f"kernel cmdline carries no root= param: {cmdline!r}"
+          br.log(f"kernel cmdline (driver-booted, root= absent by design): {cmdline}")
 
       # ── 2. The BUILT initrd carries usb_storage / xhci / sd_mod (PACKED, not just
       #       listed). This is the link a virtio-root VM never exercises — the guard

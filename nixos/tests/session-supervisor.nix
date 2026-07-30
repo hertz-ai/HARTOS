@@ -123,7 +123,14 @@ in
           # uses the logind seat manager (the canonical greetd-on-systemd path), and
           # must NOT force seatd-over-logind (the dual-seat-manager regression that
           # froze input + EBUSY-looped the boot on real hardware).
-          greetd_cmd = sup.succeed("systemctl cat greetd.service")
+          # The forced backend lives in greetd's SESSION COMMAND (the module
+          # wraps the selector: `env LIBSEAT_BACKEND=logind ...`), which greetd
+          # reads from its config.toml — it is NOT in the systemd unit file, so
+          # the old `systemctl cat greetd.service` grep failed against a
+          # CORRECT config on every run (run 30485906966). Assert the config
+          # greetd actually consumes.
+          greetd_cmd = sup.succeed(
+              "cat /etc/greetd/config.toml 2>/dev/null || cat /etc/greetd/greetd.toml")
           assert "LIBSEAT_BACKEND=logind" in greetd_cmd, \
               "greetd session must force the logind libseat backend (canonical greetd-on-systemd)"
           assert "LIBSEAT_BACKEND=seatd" not in greetd_cmd, \
