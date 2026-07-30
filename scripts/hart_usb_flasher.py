@@ -496,9 +496,21 @@ class _WinExclusiveWriter:
     grants exclusive access; holding it stops Windows from re-scanning and
     re-protecting the isohybrid partition table written mid-flash — which is what
     walls a *shared* dd write at ~12 MB. Writes are sector-aligned: the part
-    offsets are MiB-aligned and the part sizes are 512 B multiples."""
+    offsets are MiB-aligned and the part sizes are 512 B multiples.
 
-    def __init__(self, disk_number):
+    RAW-IMAGE CAVEAT (2026-07-30): the exclusive handle is NOT sufficient for a
+    raw-efi image. An isohybrid ISO's first chunk lays down a partition table
+    Windows does not mount, but the raw image's first chunk is a VALID GPT with
+    a FAT32 ESP — the volume manager claims it in kernel (the exclusive handle
+    only blocks user-mode opens), and the very next 4 MiB write into that
+    partition's span is denied with ERROR_ACCESS_DENIED (5). Measured: write at
+    exactly 4194304 = CHUNK, i.e. the second WriteFile, every time. `write_at`
+    therefore RE-ARMS on err 5 — drop the handle, dismount the volume Windows
+    just created, keep automount off, reopen, re-seek — and retries the same
+    buffer. Idempotent: the retry rewrites the identical bytes at the identical
+    offset."""
+
+    def __init__(self, disk_number, disk=None):
         import ctypes
         from ctypes import wintypes
         self.ctypes, self.wintypes = ctypes, wintypes
@@ -513,6 +525,14 @@ class _WinExclusiveWriter:
                                        ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD]
         k.CloseHandle.argtypes = [wintypes.HANDLE]
         self.invalid = wintypes.HANDLE(-1).value
+        self._disk_number = disk_number
+        self._disk = disk if disk is not None else {"number": disk_number}
+        self.h = self._open()
+
+    def _open(self):
+        """Open the exclusive handle, retrying the transient volume-manager grip."""
+        import ctypes
+        ctypes, k, disk_number = self.ctypes, self.k, self._disk_number
         # GENERIC_READ|WRITE, FILE_SHARE_NONE (exclusive), OPEN_EXISTING.
         # Right after diskpart `clean` (or when a clean FAILED and Windows is
         # mid-rescan of the partition table) the volume manager briefly holds
@@ -525,25 +545,43 @@ class _WinExclusiveWriter:
         _TRANSIENT = (32, 21, 5)        # SHARING_VIOLATION, NOT_READY, ACCESS_DENIED
         last_err = 0
         for attempt in range(6):
-            self.h = k.CreateFileW(r"\\.\PhysicalDrive%d" % disk_number,
-                                   0xC0000000, 0, None, 3, 0, None)
-            if self.h != self.invalid:
-                break
+            h = k.CreateFileW(r"\\.\PhysicalDrive%d" % disk_number,
+                              0xC0000000, 0, None, 3, 0, None)
+            if h != self.invalid:
+                return h
             last_err = ctypes.get_last_error()
             if last_err not in _TRANSIENT:
                 break
             time.sleep(2 + attempt)     # 2,3,4,5,6s — let the volume manager release
-        if self.h == self.invalid:
-            raise RuntimeError("exclusive open of PhysicalDrive%d failed (err %d) — "
-                               "is the disk still mounted? (a re-plug or reboot "
-                               "resets a stick whose controller refuses writes)"
-                               % (disk_number, last_err))
+        raise RuntimeError("exclusive open of PhysicalDrive%d failed (err %d) — "
+                           "is the disk still mounted? (a re-plug or reboot "
+                           "resets a stick whose controller refuses writes)"
+                           % (disk_number, last_err))
+
+    def _rearm(self):
+        """Windows mounted a volume from the partition table we just wrote.
+        Drop the handle (diskpart/mountvol cannot touch the disk while we hold
+        it exclusively), dismount that volume, re-assert automount-off, reopen."""
+        try:
+            self.close()
+        except Exception:
+            pass
+        _win_automount(False)
+        try:
+            _dismount_windows(self._disk)
+        except Exception:
+            pass                        # best-effort: the reopen is the real test
+        self.h = self._open()
 
     def write_at(self, byte_offset, fobj):
         ctypes, wintypes, k = self.ctypes, self.wintypes, self.k
-        if not k.SetFilePointerEx(self.h, byte_offset, None, 0):       # FILE_BEGIN
-            raise RuntimeError("seek to %d failed (err %d)"
-                               % (byte_offset, ctypes.get_last_error()))
+
+        def _seek(off):
+            if not k.SetFilePointerEx(self.h, off, None, 0):            # FILE_BEGIN
+                raise RuntimeError("seek to %d failed (err %d)"
+                                   % (off, ctypes.get_last_error()))
+
+        _seek(byte_offset)
         total, written = 0, wintypes.DWORD()
         while True:
             buf = fobj.read(CHUNK)
@@ -551,9 +589,19 @@ class _WinExclusiveWriter:
                 break
             if len(buf) % SECTOR:                          # pad a final partial sector
                 buf += b"\x00" * (SECTOR - len(buf) % SECTOR)
-            if not k.WriteFile(self.h, buf, len(buf), ctypes.byref(written), None):
-                raise RuntimeError("write at %d failed (err %d)"
-                                   % (byte_offset + total, ctypes.get_last_error()))
+            # Re-arm + retry on the volume-manager claim (see the class docstring):
+            # a raw GPT+FAT32 image gets its ESP mounted the moment the table
+            # lands, and the next write into that span returns ACCESS_DENIED.
+            for attempt in range(5):
+                if k.WriteFile(self.h, buf, len(buf), ctypes.byref(written), None):
+                    break
+                err = ctypes.get_last_error()
+                if err != 5 or attempt == 4:               # ACCESS_DENIED only
+                    raise RuntimeError("write at %d failed (err %d)"
+                                       % (byte_offset + total, err))
+                time.sleep(1 + attempt)
+                self._rearm()
+                _seek(byte_offset + total)                 # absolute — handle is new
             total += written.value
         return total
 
@@ -1661,7 +1709,7 @@ def flash_raw(tag, variant, disk, tmp, progress=None, log=None, verify=True):
     writer = None
     if IS_WIN:
         _prepare_windows_device(disk, dd, log, clean=True)
-        writer = _WinExclusiveWriter(disk["number"])
+        writer = _WinExclusiveWriter(disk["number"], disk)
     reader = _XZPartsReader(srcs, log, progress=progress, total_compressed=total_comp)
     try:
         if writer is not None:
@@ -1762,7 +1810,7 @@ def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
         # RESUME (start_part>0): keep the disk's already-written parts — skip the
         # destructive diskpart clean, only automount-off + dismount.
         _prepare_windows_device(disk, dd, log, clean=(start_part <= 0))
-        writer = _WinExclusiveWriter(disk["number"])   # held exclusive for all parts
+        writer = _WinExclusiveWriter(disk["number"], disk)   # held exclusive for all parts
     try:
         for idx, (p, off) in enumerate(zip(parts, offs)):
             if idx < start_part:
