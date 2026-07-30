@@ -151,6 +151,14 @@ in
           status_j = hc.succeed("cat /run/hart/hartlog-create.status")
           assert "DECISION=NOOP" in status_j, \
               f"the skip must be recorded LOUDLY as a NOOP verdict, got: {status_j!r}"
+          # TEAR DOWN the HARTJRNL sink this subtest stood up: the loop device
+          # otherwise outlives us and subtest 6's full-disk run short-circuits
+          # on guard 1 (journal-sink-exists) before ever reaching the
+          # free-space gate under test — which is exactly how subtest 6 failed
+          # (DECISION=NOOP reason=HARTJRNL-already-exists, run 30485906966).
+          hc.succeed("losetup -j /tmp/jrnl.img | cut -d: -f1 | xargs -r losetup -d")
+          hc.succeed("rm -f /tmp/jrnl.img && udevadm settle || true")
+          hc.fail("blkid -L HARTJRNL")
 
       # ── 6. A FULL disk (no trailing free space) is a clean no-op ──
       # Wipe the stand-in + fill it with a single partition that consumes ALL the
