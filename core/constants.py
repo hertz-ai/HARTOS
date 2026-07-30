@@ -738,3 +738,73 @@ def generic_tool_label(name: str) -> str:
     labeled_autogen_function.generic_autogen_label, and the tool_logging emit
     site all delegate here instead of pasting the template."""
     return f'Running {name}…'
+
+
+# ──────────────────────────────────────────────────────────────────────
+# LATENCY BUDGETS — the ONE place a performance ceiling is written down.
+#
+# CLAUDE.md's review checklist names the hot-path budgets (chat 1.5s,
+# draft 300ms, cache <1ms) but NOTHING enforced them, while six test
+# files each carried their own unrelated inline literal (`< 1.0`,
+# `< 0.5`, `< 2.0`, `< 6.0`, `< 5.0`, `< 0.4`) with no shared definition
+# and no way to tell a deliberate ceiling from a number someone typed.
+#
+# These are CEILINGS, not targets: a test asserts the measured value is
+# UNDER the budget. Keys are stable; a caller imports the name, never a
+# literal, so tightening a budget is one edit and every enforcement
+# point moves with it.
+#
+# Adding a budget is cheap and expected. Changing one is a product
+# decision — the number is the contract, so state WHY in the comment.
+# ──────────────────────────────────────────────────────────────────────
+LATENCY_BUDGETS = {
+    # ── Hot path (CLAUDE.md review checklist) ──
+    # A user chat turn's non-LLM overhead. core.user_context enforces the
+    # same 1.5s as its own DEFAULT_BUDGET_SECONDS wall-clock fetch cap.
+    'chat_turn_overhead_s': 1.5,
+    # Draft/speculative classify: must stay an order under the main model
+    # or the speculation costs more than it saves.
+    'draft_classify_s': 0.3,
+    # An in-process cache lookup. Anything slower is not a cache.
+    'cache_lookup_ms': 1.0,
+
+    # ── Shell / desktop responsiveness ──
+    # The metrics poll must never block the shell's paint loop.
+    'shell_metrics_poll_s': 0.4,
+    # Cross-process authority check (ai_sensing gate) on the toast path.
+    'sense_gate_s': 0.5,
+
+    # ── Failure detection (fast-fail is a feature) ──
+    # A crashed GPU worker must be noticed before the user retries.
+    'gpu_worker_crash_detect_s': 2.0,
+    # Startup failure of a model server, incl. its retry window.
+    'gpu_worker_startup_fail_s': 6.0,
+    # Dedup/coordination decisions are pure-compute; sub-second or the
+    # coordinator becomes the bottleneck it exists to remove.
+    'coordinator_dedup_s': 0.5,
+}
+
+
+def latency_budget(name: str) -> float:
+    """The ceiling for ``name``. Raises on an unknown key ON PURPOSE.
+
+    A typo'd budget name must fail the test loudly rather than silently
+    returning a default that asserts nothing — an enforcement point that
+    quietly stops enforcing is worse than no enforcement at all.
+    """
+    try:
+        return LATENCY_BUDGETS[name]
+    except KeyError:
+        raise KeyError(
+            f"unknown latency budget {name!r}; known: "
+            f"{sorted(LATENCY_BUDGETS)}") from None
+
+
+# Every budget must be a POSITIVE, FINITE number — a zero or negative
+# ceiling can never be satisfied, and an infinite one silently disables
+# the check. Loud at import, like the language-registry invariants above.
+assert all(isinstance(v, (int, float)) and 0 < v < 3600
+           for v in LATENCY_BUDGETS.values()), (
+    "LATENCY_BUDGETS values must be positive finite seconds/ms: "
+    f"{ {k: v for k, v in LATENCY_BUDGETS.items() if not (isinstance(v, (int, float)) and 0 < v < 3600)} }"
+)

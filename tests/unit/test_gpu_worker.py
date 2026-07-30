@@ -19,6 +19,7 @@ Categories:
   Thread safety:     concurrent calls serialize cleanly
 """
 
+from core.constants import latency_budget
 import json
 import os
 import sys
@@ -160,7 +161,8 @@ def test_ft07_crash_detection_is_fast(echo_worker):
     with pytest.raises(WorkerCrash):
         echo_worker.call({'op': 'crash'})
     elapsed = time.time() - t0
-    assert elapsed < 2.0, f'Crash detection took {elapsed:.2f}s (should be <2s)'
+    _budget = latency_budget('gpu_worker_crash_detect_s')
+    assert elapsed < _budget, f'Crash detection took {elapsed:.2f}s (budget {_budget}s)'
 
 
 def test_ft08_respawn_after_crash(echo_worker):
@@ -221,7 +223,8 @@ def test_nft02_startup_timeout_on_missing_module():
     with pytest.raises((WorkerCrash, WorkerTimeout)):
         w.start()
     elapsed = time.time() - t0
-    assert elapsed < 6.0, f'Startup failure detection took {elapsed:.2f}s'
+    _budget = latency_budget('gpu_worker_startup_fail_s')
+    assert elapsed < _budget, f'Startup failure detection took {elapsed:.2f}s (budget {_budget}s)'
 
 
 # ═══════════════════════════════════════════════════════════════════

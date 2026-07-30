@@ -15,6 +15,7 @@ Two behavioural contracts, exercised through the REAL LiquidUIService:
    psutil.cpu_percent(interval=0.5), pinning a worker 0.5s out of every 4s). The
    route must return fast and still carry cpu_percent.
 """
+from core.constants import latency_budget
 import time
 
 import pytest
@@ -85,4 +86,5 @@ def test_metrics_route_is_non_blocking_and_carries_cpu(client):
     assert 'cpu_percent' in body
     # A 0.5s blocking sample would put this at >=0.5s; a non-blocking read is
     # microseconds. Allow generous slack for slow CI without re-admitting 0.5s.
-    assert elapsed < 0.4, f'metrics poll took {elapsed:.3f}s — still blocking?'
+    _budget = latency_budget('shell_metrics_poll_s')
+    assert elapsed < _budget, f'metrics poll took {elapsed:.3f}s (budget {_budget}s) — still blocking?'
