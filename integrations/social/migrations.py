@@ -113,9 +113,21 @@ def run_migrations():
     engine = get_engine()
     current = get_schema_version(engine)
 
+    # NEW TABLES land on EXISTING databases too (real-HW 2026-07-30).
+    # create_all was gated on `current < 1`, so it ran ONLY against a virgin
+    # DB. Every model added after that DB was first stamped never got its
+    # table — the ladder below only ALTERs columns, it never creates. On the
+    # steward's flashed node that meant `no such table: agent_goals`, thrown
+    # by BOTH the dashboard query and the agent-daemon tick, which is why the
+    # "continue agents" cards vanished from the shell.
+    # create_all is idempotent (checkfirst=True: it emits CREATE only for
+    # tables that are missing), so running it every pass is safe and is the
+    # canonical SQLAlchemy answer for additive schema. Column-level changes
+    # still need an explicit versioned step below — create_all never ALTERs.
+    Base.metadata.create_all(engine)
+
     if current < 1:
         logger.info("HevolveSocial: creating initial schema (v1)")
-        Base.metadata.create_all(engine)
         set_schema_version(engine, 1)
 
     if current < 2:
