@@ -485,6 +485,58 @@ in
     apps.bakeMissing = true;
     apps.wallpapers = true;
 
+    # ═══════════════════════════════════════════════════════════════
+    # EVERYTHING ON (steward 2026-07-30: "enable all")
+    # ═══════════════════════════════════════════════════════════════
+    # Every hart.* feature that shipped OFF is now on. Audited first: these
+    # were the 9 with an enable option that no consumer ever set, so the
+    # modules were dead weight in the tree. (luks/nvidia/power already
+    # default-ON in their own modules; `installer` stays ISO-only in
+    # configurations/desktop.nix by design — an installed system carries no
+    # installer.)
+    #
+    # HISTORY THIS RESPECTS: an earlier everything-on sweep broke iso-desktop
+    # FOUR times (memory: hartos_everything_on_feature_enables_2026-06-24),
+    # which is why two of these are NOT bare flips — hart.ime and hart.scanner
+    # each own options this profile was hand-rolling beside them, and enabling
+    # them naively is an eval conflict, not a feature. Those duplicates are
+    # DELETED below and the modules take ownership (one writer per concern).
+    accessibility.enable = true;   # a11y beyond the at-spi2 bus
+    devtools.enable = true;        # LSP servers, debuggers, linters, container tools
+                                   # (NOT hart.devTools — that is the language
+                                   # TOOLCHAIN module, already on above. Two
+                                   # near-identical names, genuinely different
+                                   # concerns; renaming one is owed.)
+    nightlight.enable = true;      # blue-light schedule
+    openclaw.enable = true;        # ClawHub skill surface
+    osk.enable = true;             # on-screen keyboard (touch)
+    portal.enable = true;          # xdg-desktop-portal: screencast/file-picker.
+                                   # Also the home of hart-screencast-gate, whose
+                                   # PYTHONPATH false-lockout was fixed in ab83489f
+                                   # — the gate ships dead weight unless this is on.
+    scanner.enable = true;         # SANE + simple-scan + hart-scanner CLI
+    sso.enable = true;             # single sign-on
+
+    # The IME module OWNS i18n.inputMethod + xkb (duplicates deleted below).
+    # ibus, not the module default fcitx5: the profile's shipped stack was
+    # ibus and switching frameworks is a UX change, not an enable.
+    ime = {
+      enable = true;
+      engine = "ibus";
+      inputMethods = [ "pinyin" "anthy" "hangul" ];   # m17n is unconditional
+      # Preserve the deliberate power-user mapping the profile used to set
+      # directly; composed with the module's layout toggle rather than
+      # either side silently winning.
+      xkbOptions = "ctrl:nocaps,grp:alt_shift_toggle";
+    };
+
+    # The resident co-pilot DAEMON — the reason "copilot.enable = true" alone
+    # did nothing on the flashed node (2026-07-30): enable installs only the
+    # `hart-copilot` launcher; the bounded Claude Code worker is this second,
+    # separate opt-in and no consumer set it. Still gated in-module on
+    # claude-code being present in the closure.
+    copilot.daemon.enable = true;
+
     # ─── Boot session = the SUPERVISOR-MANAGED TIER LADDER (not a fixed default) ───
     # (Moved VERBATIM from configurations/desktop.nix, parity slice 2 — an
     # INSTALLED desktop must run the same ladder as the image.)
@@ -710,11 +762,10 @@ in
     enable = true;
     displayManager.gdm.enable = true;
     desktopManager.gnome.enable = true;
-    # Keyboard layout — user-selectable via Settings > Keyboard
-    xkb = {
-      layout = "us";
-      options = "ctrl:nocaps";  # Caps Lock → Ctrl (power user default)
-    };
+    # (xkb layout/options: OWNED by hart.ime — see hart.ime.xkbOptions above.
+    # This profile used to set them here beside the module, which is a
+    # conflicting second definition of one scalar option the moment hart.ime
+    # is enabled. One writer.)
   };
 
   # ─── Touchpad: libinput tap-to-click (session-agnostic) ───
@@ -884,16 +935,10 @@ in
       "hi_IN/UTF-8" "ar_SA.UTF-8/UTF-8" "ru_RU.UTF-8/UTF-8"
       "tr_TR.UTF-8/UTF-8" "th_TH.UTF-8/UTF-8" "vi_VN/UTF-8"
     ];
-    inputMethod = {
-      enable = true;
-      type = "ibus";
-      ibus.engines = with pkgs.ibus-engines; [
-        libpinyin       # Chinese (Pinyin)
-        anthy           # Japanese
-        hangul          # Korean
-        m17n            # Multilingual (Hindi, Arabic, Thai, etc.)
-      ];
-    };
+    # (inputMethod: OWNED by hart.ime — enabled above with engine="ibus" and
+    # the same pinyin/anthy/hangul set; m17n is unconditional in the module.
+    # Defining it here too is a second writer for one option, which is an
+    # eval conflict the moment the module is on.)
   };
 
   # ─── Default Apps (XDG MIME associations) ───
@@ -962,10 +1007,10 @@ in
     enable = true;
     nssmdns4 = true;  # mDNS for network printer discovery
   };
-  hardware.sane = {
-    enable = true;    # Scanner support (SANE backends)
-    extraBackends = [ pkgs.sane-airscan ];  # eSCL/AirScan wireless scanners
-  };
+  # (hardware.sane: OWNED by hart.scanner — enabled above. The module already
+  # appends pkgs.sane-airscan unconditionally AND adds simple-scan + the
+  # hart-scanner CLI, so this hand-rolled block was a strictly smaller
+  # duplicate and a conflicting second writer.)
 
   # ─── Location Services (for weather, timezone auto-detect) ───
   services.geoclue2.enable = true;
