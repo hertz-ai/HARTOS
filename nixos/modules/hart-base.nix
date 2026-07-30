@@ -312,6 +312,44 @@ in
       };
     };
 
+    # ── Runs-anywhere: hypervisor guest integration + CPU microcode ──
+    # PARITY GAP (2026-07-30): HART had ZERO guest integration for ANY
+    # hypervisor, so a node booted in Hyper-V / VMware / QEMU / VirtualBox
+    # got no dynamic display resize, no clipboard, no graceful host-initiated
+    # shutdown, no host time sync — all of which Windows and macOS guests get
+    # out of the box. Every option below is stock NixOS; nothing here is a
+    # HART mechanism, only HART choosing to ship what nixpkgs already has.
+    #
+    # SAFE ON BARE METAL BY CONSTRUCTION: each guest agent binds a
+    # hypervisor-specific transport (hv_vmbus / virtio-serial / vmw vsock).
+    # With no host present the units simply do not activate, so this is
+    # additive breadth, not a bare-metal cost beyond closure.
+    #
+    # mkDefault throughout: a variant that must NOT carry a guest agent (a
+    # size-bound edge image) overrides without touching this module.
+    virtualisation.hypervGuest.enable = lib.mkDefault true;   # Hyper-V: KVP, VSS,
+                                                              # fcopy, and hv_utils
+                                                              # HOST TIME SYNC — the
+                                                              # VM-side answer to the
+                                                              # RTC skew in task #24.
+    services.qemuGuest.enable = lib.mkDefault true;           # QEMU/KVM/Proxmox:
+                                                              # guest agent (freeze,
+                                                              # shutdown, IP report)
+    services.spice-vdagentd.enable = lib.mkDefault true;      # SPICE: clipboard +
+                                                              # auto display resize
+    virtualisation.vmware.guest.enable =
+      lib.mkDefault pkgs.stdenv.hostPlatform.isx86;           # open-vm-tools (x86 only:
+                                                              # unavailable on aarch64)
+
+    # CPU microcode — shipped by Windows and macOS as a matter of course; a
+    # missing microcode update is a silent correctness/security exposure, not
+    # a nicety. Gated on the SAME redistributable-firmware consent the wifi
+    # firmware already rides, so this adds no new licensing decision.
+    hardware.cpu.intel.updateMicrocode =
+      lib.mkDefault config.hardware.enableRedistributableFirmware;
+    hardware.cpu.amd.updateMicrocode =
+      lib.mkDefault config.hardware.enableRedistributableFirmware;
+
     # ── Kernel tuning (P2P gossip + compute workloads) ──
     boot.kernel.sysctl = {
       # Networking: optimize for P2P gossip

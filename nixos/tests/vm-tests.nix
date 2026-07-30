@@ -124,6 +124,40 @@ in
 
       with subtest("No desktop environment on server"):
           server.fail("systemctl is-active display-manager.service")
+
+      # ── RUNS-ANYWHERE: hypervisor guest integration + CPU microcode ──
+      # Parity with what Windows/macOS guests get for free. HART shipped NONE
+      # of this: a node in Hyper-V/VMware/QEMU had no display resize, no
+      # clipboard, no graceful host shutdown, no host time sync.
+      # Units are asserted GENERATED, not active — same honest contract the
+      # ClamAV subtest documents: each agent binds a hypervisor-specific
+      # transport (hv_vmbus / virtio-serial / vmw vsock) that is absent under
+      # this test's plain QEMU, so "configured and ready" is the provable
+      # claim, and it is exactly the claim that regressed to false.
+      with subtest("hypervisor guest agents are configured for every host"):
+          server.succeed("systemctl cat hv-kvp.service")           # Hyper-V KVP
+          server.succeed("systemctl cat qemu-guest-agent.service") # QEMU/KVM/Proxmox
+          server.succeed("systemctl cat spice-vdagentd.service")   # SPICE clip+resize
+
+      with subtest("Hyper-V host TIME SYNC is available (the VM half of the RTC skew)"):
+          # hv_utils carries the host-time source. Task #24: a dual-boot node
+          # read the RTC as UTC and NTP yanked the clock backwards 5.5h on
+          # connect; inside Hyper-V the host is the authority and this is the
+          # path that supplies it.
+          server.succeed("systemctl cat hv-vss.service")
+          kvp = server.succeed("systemctl show hv-kvp.service -p LoadState --value").strip()
+          assert kvp == "loaded", f"hv-kvp must be loaded, got {kvp!r}"
+
+      with subtest("CPU microcode is prepended to the initrd (not just an option)"):
+          # NixOS emits early microcode as an UNCOMPRESSED cpio concatenated
+          # in front of the real initrd, so the archive's own path strings sit
+          # in the first few KiB of the file. Reading them back proves the
+          # artifact was actually built — an eval-level option check could not.
+          head = server.succeed(
+              "head -c 4096 /run/current-system/initrd | strings || true")
+          assert "kernel/x86/microcode" in head, (
+              "no early-microcode cpio at the head of the initrd — "
+              "hardware.cpu.{intel,amd}.updateMicrocode did not take effect")
     '';
   };
 
