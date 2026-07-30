@@ -615,12 +615,21 @@ in
           # units logind would and confirm each comes up as a real getty login —
           # i.e. a VT switch would land on a console, not a void. tty2 is already
           # pre-spawned (below); start tty3..tty6 to prove the whole range works.
+          # NOTE the instance NAME: autovt@.service is a symlink to the getty@
+          # TEMPLATE, but starting autovt@ttyN instantiates the unit AS
+          # autovt@ttyN — getty@ttyN is a separate, never-started instance of
+          # the same template. The old wait on getty@ttyN therefore failed
+          # against a WORKING recovery console on every run ("unit
+          # getty@tty2.service is inactive", run 30485906966). Assert the
+          # instance we actually start, and that it is a real agetty.
           for n in range(2, 7):
               sup.succeed(f"systemctl start autovt@tty{n}.service")
-              sup.wait_for_unit(f"getty@tty{n}.service", timeout=30)
+              sup.wait_for_unit(f"autovt@tty{n}.service", timeout=30)
               # The unit must be a getty (agetty) login prompt, not a stub.
-              active = sup.succeed(f"systemctl is-active getty@tty{n}.service").strip()
-              assert active == "active", f"getty@tty{n} not active ({active}) — recovery void"
+              execstart = sup.succeed(
+                  f"systemctl show -p ExecStart --value autovt@tty{n}.service")
+              assert "agetty" in execstart, \
+                  f"autovt@tty{n} is not a real agetty login ({execstart!r}) — recovery void"
 
       with subtest("autovt@tty2 is PRE-SPAWNED from boot (recovery console already alive)"):
           # The belt-and-suspenders pin: tty2's getty must be active WITHOUT us
@@ -632,13 +641,13 @@ in
           assert "multi-user.target" in sup.succeed(
               "systemctl show -p WantedBy autovt@tty2.service"
           ), "autovt@tty2 is not wantedBy multi-user.target — not pre-spawned"
-          assert sup.succeed("systemctl is-active getty@tty2.service").strip() == "active", \
+          assert sup.succeed("systemctl is-active autovt@tty2.service").strip() == "active", \
               "tty2 getty is not active from boot — recovery console not pre-spawned"
 
       with subtest("the TTY autologin is nulled so a recovery F-key never lands on a hidden user"):
           # getty.autologinUser is null → the F-key reaches a real LOGIN PROMPT,
           # not an auto-session on the hidden `nixos`/kiosk user.
-          al = sup.succeed("systemctl cat getty@tty2.service || true")
+          al = sup.succeed("systemctl cat autovt@tty2.service || true")
           assert "--autologin" not in al, \
               "getty has --autologin wired — a recovery F-key would skip the login prompt"
 
