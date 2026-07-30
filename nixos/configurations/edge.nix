@@ -39,5 +39,9 @@
     isoName = lib.mkForce "hart-os-${config.hart.version}-edge-${pkgs.system}.iso";
     volumeID = lib.mkForce "HART_OS";
     appendToMenuLabel = " HART OS Edge";
+    # BIOS/CSM boot as well as UEFI — same gap the desktop ISO had. Edge
+    # targets old industrial boards, which are the MOST likely to be
+    # BIOS-only, so an EFI-only edge ISO was the worst fit of the three.
+    makeBiosBootable = lib.mkDefault true;
   };
 }

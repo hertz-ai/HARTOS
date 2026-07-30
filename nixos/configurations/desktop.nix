@@ -46,6 +46,18 @@
           isoName = lib.mkForce "hart-os-${config.hart.version}-desktop-${pkgs.system}.iso";
           volumeID = lib.mkForce "HART_OS";
           appendToMenuLabel = " HART OS Desktop";
+          # BIOS/CSM boot, not just UEFI. Without this nixpkgs builds an
+          # EFI-ONLY ISO: no El Torito BIOS boot image, no isolinux. The
+          # server ISO has always set it; desktop and edge never did, so a
+          # legacy-BIOS machine — including a Hyper-V GENERATION 1 VM, which
+          # has no UEFI at all — could not boot the desktop installer to even
+          # reach the install. (The raw image stays UEFI-only: that is
+          # systemd-repart's Discoverable-Partitions + UKI model, not an
+          # oversight, and BIOS users install from THIS medium instead, after
+          # which hart-install already writes GRUB when /sys/firmware/efi is
+          # absent.) Stock NixOS option; the cost is isolinux in the image,
+          # which is why the size ceiling is watched on iso-desktop.
+          makeBiosBootable = lib.mkDefault true;
           # The desktop closure (GNOME + HART + every subsystem + the compositor) sits at
           # the ISO9660 size ceiling. The dd841b65 build FAILED at xorriso:
           #   "Image size 3419136s exceeds free space on media 2742704s" (exit 32)

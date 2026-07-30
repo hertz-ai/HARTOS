@@ -2381,3 +2381,101 @@ class TestSeatDrmBringUp:
         assert "tierTermGraceSeconds" in self.sup
         assert "drmMasterSettleSeconds" in self.sup
         assert "drm_master_settle" in self.sup
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Firmware-support matrix: which medium boots which firmware
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestFirmwareSupportMatrix:
+    """Every shipped medium's firmware support is PINNED, not assumed.
+
+    The goal says "All Bios compatibility like hyper v etc" and this is the
+    file that can hold the whole matrix in one place. The gap it caught
+    (2026-07-30): only the SERVER iso set isoImage.makeBiosBootable, so the
+    desktop and edge ISOs were built EFI-ONLY — no El Torito BIOS image, no
+    isolinux — and a legacy-BIOS machine, including a Hyper-V GENERATION 1
+    VM which has no UEFI at all, could not boot them even to reach the
+    installer.
+
+    Structural by necessity (these are Nix build-time options; the
+    behavioural half is the ISO build itself in CI plus a real Gen-1 boot),
+    and deliberately NOT the only coverage: the guest-agent and microcode
+    claims from the same parity pass are asserted on a booted VM in
+    nixos/tests/vm-tests.nix.
+    """
+
+    ISO_VARIANTS = ["desktop.nix", "server.nix", "edge.nix"]
+
+    @pytest.mark.parametrize("cfg", ISO_VARIANTS)
+    def test_every_iso_is_bios_bootable(self, cfg):
+        src = read_nix(os.path.join(CONFIGS_DIR, cfg))
+        assert "makeBiosBootable" in src, (
+            f"{cfg}'s ISO is EFI-ONLY — a BIOS/CSM machine (or a Hyper-V "
+            f"Gen 1 VM, which has no UEFI) cannot boot it at all")
+
+    def test_raw_image_is_uefi_only_by_design(self):
+        """The raw image is UEFI-only ON PURPOSE — pin the design choice so a
+        later 'fix' does not quietly bolt GRUB onto systemd-repart's
+        Discoverable-Partitions + UKI model. BIOS users install from the ISO."""
+        src = read_nix(os.path.join(MODULES_DIR, "hart-repart-image.nix"))
+        assert "boot.loader.systemd-boot.enable = true" in src
+        assert "boot.loader.grub.enable = false" in src
+        assert "UEFI-only" in src, "the UEFI-only decision must stay documented"
+
+    def test_installer_picks_the_bootloader_from_firmware(self):
+        """An INSTALLED system supports both firmwares: the installer probes
+        /sys/firmware/efi and writes systemd-boot or GRUB accordingly."""
+        src = read_nix(os.path.join(MODULES_DIR, "hart-installer.nix"))
+        assert "/sys/firmware/efi" in src, "installer must probe the firmware"
+        assert "boot.loader.grub.enable = true" in src, "no BIOS path in the installer"
+        assert "boot.loader.systemd-boot.enable = true" in src, "no EFI path"
+
+    def test_installed_bios_path_keeps_os_prober(self):
+        """Dual-boot on BIOS needs os-prober or Windows vanishes from the menu."""
+        src = read_nix(os.path.join(MODULES_DIR, "hart-installer.nix"))
+        assert "useOSProber = true" in src
+
+
+class TestHypervisorGuestParity:
+    """Guest integration is configured for EVERY hypervisor, not just QEMU.
+
+    Windows and macOS guests get display resize, clipboard, graceful
+    host-initiated shutdown and host time sync out of the box; HART shipped
+    none of it. All stock NixOS options, so this pins that they stay wired.
+    Behavioural counterpart: the 'hypervisor guest agents are configured'
+    subtest in nixos/tests/vm-tests.nix asserts the units on a real boot.
+    """
+
+    def setup_method(self):
+        self.base = read_nix(os.path.join(MODULES_DIR, "hart-base.nix"))
+
+    @pytest.mark.parametrize("opt", [
+        "virtualisation.hypervGuest.enable",   # Hyper-V (incl. hv_utils time sync)
+        "services.qemuGuest.enable",           # QEMU / KVM / Proxmox
+        "services.spice-vdagentd.enable",      # SPICE clipboard + auto-resize
+        "virtualisation.vmware.guest.enable",  # open-vm-tools
+    ])
+    def test_guest_agent_is_configured(self, opt):
+        assert opt in self.base, (
+            f"{opt} missing — a HART guest on that hypervisor loses display "
+            f"resize / clipboard / graceful shutdown that Windows guests have")
+
+    def test_vmware_guest_is_x86_gated(self):
+        """open-vm-tools does not exist on aarch64; an ungated enable breaks
+        every ARM variant's eval."""
+        assert "isx86" in self.base
+
+    @pytest.mark.parametrize("opt", [
+        "hardware.cpu.intel.updateMicrocode",
+        "hardware.cpu.amd.updateMicrocode",
+    ])
+    def test_cpu_microcode_is_applied(self, opt):
+        """Both closed OSes ship microcode; missing it is a silent
+        correctness/security exposure."""
+        assert opt in self.base
+
+    def test_microcode_rides_existing_firmware_consent(self):
+        """No NEW licensing decision: microcode is gated on the same
+        redistributable-firmware consent the wifi firmware already uses."""
+        assert "enableRedistributableFirmware" in self.base
