@@ -709,6 +709,13 @@ in
           ).strip())
 
       with subtest("a clean start state: arm Tier-1, clear the window + the flag"):
+          # ISOLATE from greetd first: in this GPU-less VM every tier crashes
+          # instantly, so greetd re-runs the crashing selector continuously in
+          # the background — polluting the crash window and dropping the latch
+          # UNDERNEATH the exact-count assertions below (the family-wide red,
+          # run 30485906966). greetd's supervisor role was already asserted in
+          # subtest 1; from here the test IS the session runner.
+          sup.succeed("systemctl stop greetd.service")
           sup.succeed("hartctl session reset-tier")  # latch = hart-comp, window cleared
           sup.succeed(f"rm -f {WINDOW} {UNHEALTHY}")
           assert sup.succeed(f"cat {LATCH}").strip() == "hart-comp"
@@ -1127,6 +1134,17 @@ in
         sup.wait_for_unit("multi-user.target")
         sup.wait_for_unit("greetd.service", timeout=120)
 
+        # ISOLATE from greetd's own loop before driving the selector manually:
+        # in this GPU-less VM every tier crashes instantly, so greetd re-runs
+        # the crashing selector continuously in the background, racking the
+        # crash window past crashLoopCount and dropping the latch underneath
+        # the single-run assertions (run 30485906966: the "one sub-threshold
+        # crash" check read a latch the BACKGROUND loop had already dropped —
+        # the wrap's accounting was never at fault). greetd's supervisor role
+        # is already asserted above by wait_for_unit; from here the test IS
+        # the session runner.
+        sup.succeed("systemctl stop greetd.service")
+
         selector = sup.succeed(
             "find /nix/store -maxdepth 3 -name '*-hart-session-selector' -type f -print -quit"
         ).strip()
@@ -1134,6 +1152,7 @@ in
 
         with subtest("the launched tier's stdout+stderr are captured under journalctl -t hart-tier-hart-comp"):
             sup.succeed("hartctl session reset-tier")  # arm Tier-1 (hart-comp)
+            sup.succeed("rm -f /var/lib/hart/session-tier.window")  # clean crash budget
             sup.succeed(f"runuser -u hart -- {selector} || true")
             # The tier's OWN output (BOTH streams) reached the journal under the
             # per-tier identifier — the exact diagnosability the real-HW boot lacked.
