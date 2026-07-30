@@ -205,6 +205,43 @@ let
       echo "[HART OTA apply] done: $STATUS"
     '';
   };
+
+  # ── The ONE orchestrator driver (writeText + exec — the no-heredoc rule) ──
+  # DIAGNOSED from the first surviving shard run (2026-07-30, job 90691374922):
+  # every inline `python -c "` block in this module hit the documented Nix
+  # indentation-collapse class — the body's lines keep their leading spaces
+  # inside the shell string, so python dies `IndentationError: unexpected
+  # indent` on line 2.  The damage was MASKED at three of five sites by
+  # `2>/dev/null ||` fallbacks (a silent-gulp violation): the stage query
+  # always "returned" idle, advance never advanced, and the canary health
+  # check silently exited 0 — the canary net never checked health, ever.
+  # One column-0 script (the same writeText+exec pattern ota-central's mock
+  # uses for exactly this reason), one verb per pipeline action.
+  otaOrchestratorDrive = pkgs.writeText "hart-ota-orchestrator-drive.py" ''
+    import json
+    import os
+    import sys
+
+    sys.path.insert(0, "${hartApp}")
+    os.environ.setdefault("HEVOLVE_DB_PATH", "${cfg.dataDir}/hevolve_database.db")
+
+    from integrations.agent_engine.upgrade_orchestrator import UpgradeOrchestrator
+
+    verb = sys.argv[1] if len(sys.argv) > 1 else "status"
+    orch = UpgradeOrchestrator()
+    if verb == "status":
+        print(json.dumps(orch.get_status()))
+    elif verb == "stage":
+        print("[HART OTA] Pipeline started: %s" % (orch.start_upgrade(sys.argv[2], sys.argv[2]),))
+    elif verb == "advance":
+        print("[HART OTA] Advanced: %s" % (orch.advance_pipeline(),))
+    elif verb == "canary-health":
+        print(json.dumps(orch.check_canary_health_status()))
+    elif verb == "canary-rollback":
+        orch.rollback("canary_health_failed")
+    else:
+        raise SystemExit("unknown verb: %s" % verb)
+  '';
 in
 {
   # ═══════════════════════════════════════════════════════════
@@ -380,16 +417,11 @@ in
           echo "[HART OTA] Current: $CURRENT"
 
           # ── Check upstream via Python orchestrator ──
-          RESULT=$(${hartApp.python}/bin/python -c "
-          import sys, json, os
-          sys.path.insert(0, '${hartApp}')
-          os.environ.setdefault('HEVOLVE_DB_PATH', '${cfg.dataDir}/hevolve_database.db')
-
-          from integrations.agent_engine.upgrade_orchestrator import UpgradeOrchestrator
-          orch = UpgradeOrchestrator()
-          status = orch.get_status()
-          print(json.dumps(status))
-          " 2>/dev/null) || RESULT='{"stage":"idle"}'
+          # Fallback still floors to idle (an orchestrator error must not kill
+          # the boot poll) but LOGS the failure — no more silent 2>/dev/null
+          # gulp, which hid the IndentationError that kept this query dead.
+          RESULT=$(${hartApp.python}/bin/python ${otaOrchestratorDrive} status) \
+            || { echo "[HART OTA] orchestrator status query FAILED — treating as idle"; RESULT='{"stage":"idle"}'; }
 
           STAGE=$(echo "$RESULT" | ${pkgs.jq}/bin/jq -r '.stage // "idle"')
           echo "[HART OTA] Pipeline stage: $STAGE"
@@ -452,16 +484,8 @@ in
               # Start the 7-stage pipeline via orchestrator (SIGN/CANARY gates
               # still run locally — central only chooses WHICH commit, it never
               # skips the local sign-verify + canary safety gates).
-              ${hartApp.python}/bin/python -c "
-              import sys, os
-              sys.path.insert(0, '${hartApp}')
-              os.environ.setdefault('HEVOLVE_DB_PATH', '${cfg.dataDir}/hevolve_database.db')
-
-              from integrations.agent_engine.upgrade_orchestrator import UpgradeOrchestrator
-              orch = UpgradeOrchestrator()
-              result = orch.start_upgrade('$REMOTE_REV', '$REMOTE_REV')
-              print(f'[HART OTA] Pipeline started: {result}')
-              " || echo "[HART OTA] Pipeline start failed"
+              ${hartApp.python}/bin/python ${otaOrchestratorDrive} stage "$REMOTE_REV" \
+                || echo "[HART OTA] Pipeline start failed"
             else
               echo "[HART OTA] System is up to date"
             fi
@@ -483,16 +507,8 @@ in
             fi
           else
             echo "[HART OTA] Pipeline in progress ($STAGE), advancing..."
-            ${hartApp.python}/bin/python -c "
-            import sys, os
-            sys.path.insert(0, '${hartApp}')
-            os.environ.setdefault('HEVOLVE_DB_PATH', '${cfg.dataDir}/hevolve_database.db')
-
-            from integrations.agent_engine.upgrade_orchestrator import UpgradeOrchestrator
-            orch = UpgradeOrchestrator()
-            result = orch.advance_pipeline()
-            print(f'[HART OTA] Advanced: {result}')
-            " || echo "[HART OTA] Advance failed"
+            ${hartApp.python}/bin/python ${otaOrchestratorDrive} advance \
+              || echo "[HART OTA] Advance failed"
           fi
         '';
 
@@ -645,17 +661,13 @@ in
         ExecStart = pkgs.writeShellScript "hart-ota-canary" ''
           set -euo pipefail
 
-          # Check if canary stage is active
-          RESULT=$(${hartApp.python}/bin/python -c "
-          import sys, json, os
-          sys.path.insert(0, '${hartApp}')
-          os.environ.setdefault('HEVOLVE_DB_PATH', '${cfg.dataDir}/hevolve_database.db')
-
-          from integrations.agent_engine.upgrade_orchestrator import UpgradeOrchestrator
-          orch = UpgradeOrchestrator()
-          health = orch.check_canary_health_status()
-          print(json.dumps(health))
-          " 2>/dev/null) || exit 0
+          # Check if canary stage is active.  The old inline python here died
+          # on the Nix indentation collapse and the `2>/dev/null || exit 0`
+          # SILENTLY swallowed it — the canary health monitor never actually
+          # checked health.  Failure still exits 0 (the monitor must never
+          # crash-loop the timer) but now LOGS.
+          RESULT=$(${hartApp.python}/bin/python ${otaOrchestratorDrive} canary-health) \
+            || { echo "[HART OTA] canary health query FAILED — skipping this tick"; exit 0; }
 
           IS_CANARY=$(echo "$RESULT" | ${pkgs.jq}/bin/jq -r '.is_canary // false')
           HEALTHY=$(echo "$RESULT" | ${pkgs.jq}/bin/jq -r '.healthy // true')
@@ -667,15 +679,8 @@ in
           if [[ "$HEALTHY" != "true" ]]; then
             echo "[HART OTA] Canary UNHEALTHY — triggering rollback"
 
-            ${hartApp.python}/bin/python -c "
-            import sys, os
-            sys.path.insert(0, '${hartApp}')
-            os.environ.setdefault('HEVOLVE_DB_PATH', '${cfg.dataDir}/hevolve_database.db')
-
-            from integrations.agent_engine.upgrade_orchestrator import UpgradeOrchestrator
-            orch = UpgradeOrchestrator()
-            orch.rollback('canary_health_failed')
-            " || true
+            ${hartApp.python}/bin/python ${otaOrchestratorDrive} canary-rollback \
+              || echo "[HART OTA] orchestrator-level rollback failed (NixOS-level rollback still requested below)"
 
             # NixOS-level rollback via the root apply unit — this unit is
             # User=hart + NoNewPrivileges, so the old `sudo nixos-rebuild
