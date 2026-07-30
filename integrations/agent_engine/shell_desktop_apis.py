@@ -948,6 +948,34 @@ def register_shell_desktop_routes(app):
             return jsonify({'set': True, 'timezone': tz})
         return jsonify({'set': False, 'error': r.stderr.strip() if r else 'timedatectl not available'}), 500
 
+    @app.route('/api/shell/datetime/set-local-rtc', methods=['POST'])
+    def shell_datetime_set_local_rtc():
+        """Whether the hardware clock holds LOCAL time instead of UTC.
+
+        Packaging systemd's own `timedatectl set-local-rtc` — the sibling of
+        the `rtc_in_local_time` field GET /api/shell/datetime already reports,
+        which until now could be READ but never ACTED ON.
+
+        Why an agent needs this (real-HW 2026-07-30, task #24): Windows keeps
+        the RTC in local time, HART assumed UTC, so a dual-boot node ran hours
+        wrong until NTP connected and then yanked the wall clock BACKWARDS by
+        the whole timezone offset. The declarative half is NixOS's own
+        `time.hardwareClockInLocalTime` (written into local.nix at install);
+        this is the live half, so an agent that detects the skew can correct
+        the running system without a rebuild.
+
+        `--adjust-system-clock` re-interprets the RTC under the new mode
+        instead of letting the wall clock jump — the whole point here.
+        """
+        data = request.get_json(force=True)
+        enabled = bool(data.get('enabled', True))
+        val = 'true' if enabled else 'false'
+        r = _run(['timedatectl', 'set-local-rtc', val, '--adjust-system-clock'])
+        if r and r.returncode == 0:
+            return jsonify({'set': True, 'rtc_in_local_time': enabled})
+        return jsonify({'set': False,
+                        'error': r.stderr.strip() if r else 'timedatectl not available'}), 500
+
     @app.route('/api/shell/datetime/set-ntp', methods=['POST'])
     def shell_datetime_set_ntp():
         data = request.get_json(force=True)
