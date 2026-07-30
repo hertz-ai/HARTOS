@@ -2631,3 +2631,55 @@ class TestNoRequiredOptionTraps:
                               src, re.S)
             assert block and "default" in block.group(1), (
                 f"hart.sso.{opt} still has no default — it will abort eval")
+
+
+class TestHardeningSurvivesFeatureEnables:
+    """A security hardening must never be undone as a SIDE EFFECT of enabling
+    an unrelated feature.
+
+    THE REGRESSION (2026-07-30, introduced then caught in the same session):
+    hart-devtools set `kernel.yama.ptrace_scope = 0` with NO priority inside
+    its debugger bundle. hart-security sets it to `mkDefault 1`, and in the
+    NixOS module system a plain definition BEATS mkDefault — so the moment
+    the desktop profile enabled devtools, every shipped machine silently got
+    unrestricted ptrace (any process may read any other of the same user)
+    while nixos/tests/security.nix still asserted it was 1.
+
+    Neither Windows (SeDebugPrivilege) nor macOS (SIP + entitlements) ships
+    that open, so restricted is also the parity-correct default.
+    """
+
+    def test_ptrace_is_only_opened_by_an_explicit_opt_in(self):
+        src = read_nix(os.path.join(MODULES_DIR, "hart-devtools.nix"))
+        assert "ptraceUnrestricted" in src, (
+            "opening ptrace must be its own opt-in, not a side effect of "
+            "installing a debugger")
+        # The debugger bundle must no longer touch ptrace at all.
+        debug_block = re.search(
+            r'\(lib\.mkIf cfg\.debug \{(.*?)\n    \}\)', src, re.S)
+        assert debug_block, "could not locate the cfg.debug block"
+        assert "ptrace_scope" not in debug_block.group(1), (
+            "the debug bundle still changes ptrace_scope — installing gdb "
+            "must not change the machine's security posture")
+
+    def test_opening_ptrace_is_loud_when_it_happens(self):
+        """An override of a hardening must be mkForce — visible in source,
+        not an accident of merge priority."""
+        src = read_nix(os.path.join(MODULES_DIR, "hart-devtools.nix"))
+        block = re.search(
+            r'lib\.mkIf cfg\.ptraceUnrestricted \{(.*?)\}\)', src, re.S)
+        assert block and "mkForce" in block.group(1), (
+            "ptrace opt-in must mkForce so it deliberately (and visibly) "
+            "overrides hart-security's default")
+
+    def test_security_hardening_still_defaults_restricted(self):
+        src = read_nix(os.path.join(MODULES_DIR, "hart-security.nix"))
+        assert re.search(r'"kernel\.yama\.ptrace_scope"\s*=\s*lib\.mkDefault 1',
+                         src), "hart-security must still default ptrace to 1"
+
+    def test_no_profile_silently_opens_ptrace(self):
+        for variant in ("desktop", "server", "edge", "phone"):
+            prof = read_nix(os.path.join(PROFILES_DIR, variant + ".nix"))
+            assert "ptraceUnrestricted" not in prof, (
+                f"{variant} opts into unrestricted ptrace — that is a "
+                f"deliberate developer-box choice, not a shipped default")

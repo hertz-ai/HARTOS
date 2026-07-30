@@ -44,6 +44,33 @@ in
       default = false;
       description = "Terminal editors with LSP (neovim, helix).";
     };
+
+    ptraceUnrestricted = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Let ANY process ptrace any other process of the same user
+        (kernel.yama.ptrace_scope = 0) instead of direct children only.
+
+        SPLIT OUT OF `debug` (2026-07-30). The debugger BUNDLE used to open
+        ptrace unconditionally, and hart-security documents that as correct
+        for "a debug box". It stopped being correct the moment the desktop
+        PROFILE enabled devtools for every shipped machine: an OS-wide
+        posture change arrived as a side effect of installing gdb, silently
+        overriding hart-security's `mkDefault 1` (a plain definition beats
+        mkDefault) and quietly contradicting the assertion in
+        nixos/tests/security.nix that ptrace_scope is 1.
+
+        Neither Windows nor macOS ships this open — Windows gates it behind
+        SeDebugPrivilege, macOS behind SIP and entitlements — so restricted
+        IS the parity-correct default.
+
+        Nothing is lost by defaulting it off: gdb/lldb/delve still debug
+        processes they LAUNCH, which is the overwhelmingly common case.
+        Attaching to an ALREADY-RUNNING unrelated process is what needs
+        this, and that is a deliberate choice a developer box opts into.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
@@ -68,7 +95,15 @@ in
         python310Packages.debugpy
         strace ltrace valgrind
       ];
-      boot.kernel.sysctl."kernel.yama.ptrace_scope" = 0;
+    })
+
+    # Opening ptrace is now its OWN opt-in, never a side effect of having a
+    # debugger installed. mkForce because it must deliberately beat
+    # hart-security's mkDefault 1 — an explicit override of a hardening is
+    # exactly the thing that should be loud in the source, not implicit in a
+    # bundle. See the ptraceUnrestricted option for why the default flipped.
+    (lib.mkIf cfg.ptraceUnrestricted {
+      boot.kernel.sysctl."kernel.yama.ptrace_scope" = lib.mkForce 0;
     })
 
     # Linters / formatters
