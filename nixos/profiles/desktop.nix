@@ -515,7 +515,15 @@ in
                                    # PYTHONPATH false-lockout was fixed in ab83489f
                                    # — the gate ships dead weight unless this is on.
     scanner.enable = true;         # SANE + simple-scan + hart-scanner CLI
-    sso.enable = true;             # single sign-on
+    # sso: deliberately NOT enabled here, and this is the one exception to
+    # "enable all". hart.sso is an LDAP/Kerberos CLIENT: it needs a domain,
+    # an ldapUri and a base DN that only the SITE can supply, so there is no
+    # value HART could default them to. Enabling it blind is what took the
+    # eval red (`hart.sso.domain was accessed but has no value defined`) —
+    # and an SSO client pointed at no directory does nothing anyway. The
+    # module now defaults those three to "" and ASSERTS with an actionable
+    # message, so a site that wants SSO turns it on WITH its own values and
+    # gets a sentence rather than a crash if it forgets one.
 
     # The IME module OWNS i18n.inputMethod + xkb (duplicates deleted below).
     # ibus, not the module default fcitx5: the profile's shipped stack was

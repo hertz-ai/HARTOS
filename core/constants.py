@@ -793,6 +793,9 @@ LATENCY_BUDGETS = {
     # learning pipeline must stay in the background rather than being
     # dragged onto the import path.
     'entry_module_import_s': 5.0,
+    # First cross-device state sync after a cold start. Bounded so a new
+    # device feels joined rather than pending.
+    'multidevice_cold_sync_s': 5.0,
 }
 
 

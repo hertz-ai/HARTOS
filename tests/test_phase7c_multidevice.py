@@ -37,6 +37,8 @@ import sys
 import time
 import uuid
 
+from core.constants import latency_budget
+
 import pytest
 
 
@@ -499,7 +501,8 @@ def test_cold_sync_budget_50_convs_x_20_msgs(fresh_db, monkeypatch):
     res = SyncService.deltas(db, user_id=a.id, since=None,
                               limit_per_kind=2000)
     elapsed = time.time() - t0
-    assert elapsed < 5.0, f"cold sync exceeded 5s budget: {elapsed:.2f}s"
+    _budget = latency_budget('multidevice_cold_sync_s')
+    assert elapsed < _budget, f"cold sync exceeded {_budget}s budget: {elapsed:.2f}s"
     assert len(res['deltas']['conversations']) == 50
     assert len(res['deltas']['messages']) == 1000
 
