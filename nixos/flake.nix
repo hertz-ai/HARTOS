@@ -226,6 +226,18 @@
       ./modules/hart-gaming.nix
       ./modules/hart-devtools.nix
       ./modules/hart-osk.nix
+      # ── Written, never wired (found 2026-07-30 by the everything-on sweep) ──
+      # These three module FILES have been in the tree with full option sets
+      # and config, but were never added to this list — so `hart.openclaw`,
+      # `hart.scanner` and `hart.sso` did not EXIST as options and nothing
+      # could ever turn them on. A file on disk is not a loaded module; the
+      # eval gate proved it the moment the desktop profile set them
+      # (`error: The option 'hart.openclaw' does not exist`, run 30567029164).
+      # Importing them here only makes the options exist — each stays gated
+      # on its own enable, so this alone changes no system.
+      ./modules/hart-openclaw.nix
+      ./modules/hart-scanner.nix
+      ./modules/hart-sso.nix
       # Onboarding ceremony (GTK4/libadwaita native)
       ./modules/hart-onboarding.nix
       # Runtime self-build (OS rebuilds itself live)

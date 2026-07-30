@@ -15,6 +15,7 @@ Usage:
     pytest tests/test_nixos_configs.py -v
 """
 
+import glob
 import os
 import re
 import pytest
@@ -2479,3 +2480,69 @@ class TestHypervisorGuestParity:
         """No NEW licensing decision: microcode is gated on the same
         redistributable-firmware consent the wifi firmware already uses."""
         assert "enableRedistributableFirmware" in self.base
+
+
+class TestEnabledOptionsExist:
+    """Every hart.<feature> a profile enables must come from a module that is
+    actually in hartModules.
+
+    THE BUG THIS CATCHES (2026-07-30, run 30567029164): three module FILES —
+    hart-openclaw.nix, hart-scanner.nix, hart-sso.nix — sat in the tree with
+    complete option sets and config but were never added to the flake's
+    hartModules list. Their options therefore did not EXIST, so nothing could
+    turn them on, and the moment a profile did the WHOLE flake eval aborted:
+
+        error: The option `hart.openclaw' does not exist.
+
+    A file on disk is not a loaded module. Local + instant; the eval gate
+    catches it too, but only after a CI round trip that took every unrelated
+    target red with it.
+    """
+
+    FLAKE = os.path.join(NIXOS_DIR, "flake.nix")
+
+    def _loaded_modules(self):
+        src = read_nix(self.FLAKE)
+        return set(re.findall(r'\./modules/(hart-[\w-]+)\.nix', src))
+
+    def _module_defining(self, feature):
+        """The module file whose options block defines hart.<feature>."""
+        for path in glob.glob(os.path.join(MODULES_DIR, "hart-*.nix")):
+            src = read_nix(path)
+            if re.search(r'config\.hart\.' + re.escape(feature) + r'\b', src) or \
+               re.search(r'options\.hart\.' + re.escape(feature) + r'\b', src):
+                return os.path.basename(path)[:-4]
+        return None
+
+    @pytest.mark.parametrize("variant", ["desktop", "server", "edge", "phone"])
+    def test_every_enabled_feature_has_a_loaded_module(self, variant):
+        prof = read_nix(os.path.join(PROFILES_DIR, variant + ".nix"))
+        loaded = self._loaded_modules()
+        # Features the profile turns on, as `<name>.enable = true` or
+        # `<name> = { ... enable = true; ... }` inside the hart block.
+        enabled = set(re.findall(r'^\s{4}([a-zA-Z][\w]*)\.enable\s*=\s*true',
+                                 prof, re.M))
+        enabled |= set(re.findall(r'^\s{4}([a-zA-Z][\w]*)\s*=\s*\{', prof, re.M))
+        missing = []
+        for feat in sorted(enabled):
+            mod = self._module_defining(feat)
+            if mod is not None and mod not in loaded:
+                missing.append(f"hart.{feat} (defined in {mod}.nix)")
+        assert not missing, (
+            f"{variant}.nix enables options whose modules are NOT in the "
+            f"flake's hartModules — the option does not exist and the WHOLE "
+            f"eval aborts: {missing}")
+
+    def test_every_module_file_is_loaded(self):
+        """A module file nobody imports is dead code that looks live — the
+        exact shape of the openclaw/scanner/sso gap. Deliberate exclusions
+        are listed here so the reason is written down, not implied."""
+        # hart-app / package helpers are not NixOS modules; ARM/board files
+        # live under hardware/ and are imported per-machine.
+        EXPECTED_UNLOADED = set()
+        on_disk = {os.path.basename(p)[:-4]
+                   for p in glob.glob(os.path.join(MODULES_DIR, "hart-*.nix"))}
+        unloaded = on_disk - self._loaded_modules() - EXPECTED_UNLOADED
+        assert not unloaded, (
+            f"module files present but never imported into hartModules "
+            f"(their hart.* options do not exist): {sorted(unloaded)}")
