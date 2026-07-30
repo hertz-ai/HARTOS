@@ -1007,7 +1007,9 @@ in
   # any open network". (wifi.powersave is left at the NM default — unset — so the
   # desktop/laptop radio is not throttled the way the phone variant chooses to.)
   networking.networkmanager.enable = true;
-  hardware.enableRedistributableFirmware = true;
+  # (hardware.enableRedistributableFirmware moved to hart-base: EVERY variant
+  # needs device firmware, and having it only here meant a headless server
+  # could boot with no working NIC. One writer, all variants.)
 
   # ─── Printing & Scanning ───
   services.printing.enable = true;

@@ -2683,3 +2683,48 @@ class TestHardeningSurvivesFeatureEnables:
             assert "ptraceUnrestricted" not in prof, (
                 f"{variant} opts into unrestricted ptrace — that is a "
                 f"deliberate developer-box choice, not a shipped default")
+
+
+class TestDriverFirmwareBreadth:
+    """Device firmware and microcode reach EVERY variant.
+
+    THE GAP (2026-07-30): hardware.enableRedistributableFirmware was set only
+    in profiles/desktop.nix. Server and edge therefore shipped with no
+    redistributable firmware, and a large share of Intel/Realtek wifi and
+    ethernet parts need a firmware blob to bring the link up — so a HEADLESS
+    server could boot with no network and no screen to diagnose it from.
+    Windows and macOS both ship device firmware as standard.
+    """
+
+    def test_firmware_is_enabled_for_every_variant_from_one_writer(self):
+        base = read_nix(os.path.join(MODULES_DIR, "hart-base.nix"))
+        assert "hardware.enableRedistributableFirmware" in base, (
+            "firmware must be enabled in hart-base so EVERY variant gets it, "
+            "not per-profile where a variant can silently miss out")
+
+    def test_no_profile_re_declares_firmware(self):
+        """Two writers for one option is the drift this consolidation removes;
+        the profile's copy is why the gap was invisible."""
+        for variant in ("desktop", "server", "edge", "phone"):
+            prof = read_nix(os.path.join(PROFILES_DIR, variant + ".nix"))
+            assert not re.search(
+                r'^\s*hardware\.enableRedistributableFirmware\s*=', prof, re.M), (
+                f"{variant}.nix re-declares firmware — hart-base owns it")
+
+    def test_firmware_stays_overridable_for_size_bound_variants(self):
+        """mkDefault, not a hard true: an edge image on a tiny board must be
+        able to drop ~1GiB of firmware without editing hart-base."""
+        base = read_nix(os.path.join(MODULES_DIR, "hart-base.nix"))
+        assert re.search(
+            r'hardware\.enableRedistributableFirmware\s*=\s*lib\.mkDefault',
+            base), "firmware must be mkDefault so a size-bound variant can opt out"
+
+    def test_microcode_rides_the_same_consent(self):
+        """Microcode is gated on the firmware consent, so enabling firmware
+        per-variant cannot leave a variant silently without microcode."""
+        base = read_nix(os.path.join(MODULES_DIR, "hart-base.nix"))
+        for vendor in ("intel", "amd"):
+            assert re.search(
+                r'hardware\.cpu\.' + vendor + r'\.updateMicrocode\s*=\s*\n?\s*'
+                r'lib\.mkDefault config\.hardware\.enableRedistributableFirmware',
+                base), f"{vendor} microcode must ride the firmware consent"

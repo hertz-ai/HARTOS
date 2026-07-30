@@ -341,6 +341,21 @@ in
       lib.mkDefault pkgs.stdenv.hostPlatform.isx86;           # open-vm-tools (x86 only:
                                                               # unavailable on aarch64)
 
+    # ── Device firmware for EVERY variant, not just desktop ──
+    # Was set ONLY in profiles/desktop.nix, so server and edge shipped with no
+    # redistributable firmware at all: a large share of Intel and Realtek
+    # wifi/ethernet parts need a firmware blob to bring the link up, which
+    # means a HEADLESS SERVER could boot with no working network and no screen
+    # to diagnose it from. Windows and macOS both ship device firmware as a
+    # matter of course; this is the same union rule as the guest agents above.
+    #
+    # mkDefault, and deliberately the REDISTRIBUTABLE set rather than
+    # enableAllFirmware: a size-bound edge image can still opt out, and the
+    # desktop ISO is at its ISO9660 ceiling, so the broader non-redistributable
+    # set is a decision to make WITH a measured closure number (task #14), not
+    # while the ceiling is unverified.
+    hardware.enableRedistributableFirmware = lib.mkDefault true;
+
     # CPU microcode — shipped by Windows and macOS as a matter of course; a
     # missing microcode update is a silent correctness/security exposure, not
     # a nicety. Gated on the SAME redistributable-firmware consent the wifi
