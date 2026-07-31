@@ -3095,21 +3095,22 @@ class TestParityMatrix:
         assert "core/agent_tools.py" in text, (
             "the header must name the tool-registry channel concretely")
 
-    def test_remote_desktop_agent_tools_are_really_registered(self):
+    def test_remote_desktop_tools_reach_the_agent_registry(self):
         """Behavioural backing for the 🟡 remote-desktop row.
 
-        The row claims an agent can drive remote desktop via tools. Assert
-        the registration path actually exists and is callable rather than
-        trusting the note — the row was wrong once already.
+        Scope is deliberately narrow: the BUILDER is already covered in
+        depth by tests/unit/test_remote_desktop_agent_tools.py (tool set,
+        tuple shape, session flows), so asserting it again here would be a
+        duplicate. What no test covered — and what this row actually
+        claims — is the WIRING: that core.agent_tools exposes the hook that
+        pulls those tools into the agent's registry. Tools nobody registers
+        are not an agent channel.
         """
-        from integrations.remote_desktop.agent_tools import (
-            build_remote_desktop_tools,
-        )
-        assert callable(build_remote_desktop_tools)
         import core.agent_tools as ct
         assert hasattr(ct, "register_remote_desktop_tools_if_available"), (
             "core.agent_tools must expose the remote-desktop registration "
-            "hook the matrix row cites")
+            "hook the matrix row cites — without it the tools exist but no "
+            "agent ever sees them, and the row's 🟡 would be false")
 
     def test_the_dual_boot_clock_fix_is_actually_wired(self):
         """The row that matters most on real hardware: the installer must
