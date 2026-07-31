@@ -87,3 +87,34 @@ def test_password_hash_is_sha512_crypt():
     except ImportError:
         pytest.skip("crypt module unavailable on this OS (Windows dev box)")
     assert h.startswith("$6$")
+
+
+def test_render_local_nix_emits_local_rtc_when_windows_present():
+    """Dual-boot clock through the GUI installer (task #24).
+
+    The GUI is an ALTERNATIVE install path that writes local.nix itself, so a
+    fix living only in the CLI installer left the DEFAULT desktop install
+    hitting the +5:30 backwards clock jump.
+    """
+    out = hartcfg.render_local_nix(hostname="h", windows_present=True)
+    assert "time.hardwareClockInLocalTime = true;" in out
+
+
+def test_render_local_nix_omits_local_rtc_on_a_single_os_machine():
+    """Blanket-setting it is wrong in the other direction: a single-OS
+    machine's RTC really is UTC."""
+    out = hartcfg.render_local_nix(hostname="h", windows_present=False)
+    assert "hardwareClockInLocalTime" not in out
+    # Default must be the safe one for callers that predate the parameter.
+    assert "hardwareClockInLocalTime" not in hartcfg.render_local_nix(hostname="h")
+
+
+def test_windows_probe_checks_both_esp_mount_points(tmp_path):
+    """The same two paths the CLI probes — an ESP can be mounted at /boot or
+    /boot/efi, and checking only one silently misses half the machines."""
+    m = hartcfg
+    assert m.windows_bootloader_present(str(tmp_path)) is False
+    esp = tmp_path / "boot" / "efi" / "EFI" / "Microsoft" / "Boot"
+    esp.mkdir(parents=True)
+    (esp / "bootmgfw.efi").write_text("x")
+    assert m.windows_bootloader_present(str(tmp_path)) is True

@@ -453,6 +453,63 @@ def register_shell_system_routes(app):
     """Register all system management API routes."""
     from flask import jsonify, request
 
+    # ─── 0. Firewall status ────────────────────────────────
+    # PARITY GAP the matrix named (docs/architecture/OS_PARITY_MATRIX.md):
+    # HART has a real firewall (networking.firewall / hart.firewall, nftables)
+    # but NO way to see it. Worse, shell_manifest.py declares a
+    # "Firewall & Firmware" PANEL whose api list points at
+    # /api/shell/power/profiles — a POWER endpoint, borrowed "for system
+    # status". A panel that cannot show firewall state is a false surface: it
+    # looks like the OS has a firewall control and it does not.
+    #
+    # READ-ONLY on purpose. Opening or closing a port from an unauthenticated
+    # local HTTP API is a security decision, not a convenience, and this file
+    # already treats destructive process actions with a protected-name list.
+    # The declarative half stays the source of truth (networking.firewall in
+    # the profile) and the OTA/rebuild path applies changes; this route makes
+    # the state VISIBLE and agent-readable, which is what the panel needs and
+    # what an agent needs to reason about connectivity.
+    #
+    # Packaging only: nft/iptables/systemctl are the existing mechanisms.
+    @app.route('/api/shell/firewall', methods=['GET'])
+    def shell_firewall_status():
+        info = {'available': False, 'active': False, 'backend': None,
+                'tcp_ports': [], 'udp_ports': [], 'source': None}
+        # Which unit is actually running — nftables and iptables are both
+        # possible NixOS backends; report the one that is live rather than
+        # assuming the configured one took effect.
+        for unit, backend in (('nftables.service', 'nftables'),
+                              ('firewall.service', 'iptables')):
+            r = _run(['systemctl', 'is-active', unit])
+            if r and (r.stdout or '').strip() == 'active':
+                info.update(available=True, active=True, backend=backend)
+                break
+        else:
+            r = _run(['systemctl', 'is-enabled', 'firewall.service'])
+            if r and r.returncode == 0:
+                info.update(available=True, backend='iptables')
+
+        # Parse the LIVE ruleset, not the config: what is enforced can differ
+        # from what was declared (a failed reload leaves the old ruleset up).
+        rules = _run(['nft', 'list', 'ruleset'], timeout=8)
+        if rules and rules.returncode == 0 and (rules.stdout or '').strip():
+            info['source'] = 'nft'
+            # NixOS renders allowed ports as a brace SET on one accept rule
+            # ("tcp dport { 22, 6777 } accept"); a single port has no braces.
+            # Both shapes, or the ports silently read as empty — the exact
+            # mistake that made tests/security.nix red against a CORRECT
+            # firewall for weeks.
+            for proto, key in (('tcp', 'tcp_ports'), ('udp', 'udp_ports')):
+                found = set()
+                for line in rules.stdout.splitlines():
+                    if f'{proto} dport' not in line or 'accept' not in line:
+                        continue
+                    seg = line.split(f'{proto} dport', 1)[1]
+                    for num in re.findall(r'\d+', seg.split('accept')[0]):
+                        found.add(int(num))
+                info[key] = sorted(found)
+        return jsonify(info)
+
     # ─── 10. Task / Process Manager ────────────────────────
 
     _PROTECTED_NAMES = {'init', 'systemd', 'hart-backend', 'hart-agent',

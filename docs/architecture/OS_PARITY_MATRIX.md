@@ -41,7 +41,7 @@ CPU microcode at runtime).
 | Screen capture / portal | `xdg.portal` (`hart.portal`) | ❌ | gate exists; no `/api/shell` action |
 | Remote desktop | RustDesk / Sunshine (`integrations/remote_desktop`) | ❌ | routes not on the shell API |
 | Antivirus | ClamAV (`hart.security`) | ❌ | `hart-security` CLI only |
-| Firewall | `networking.firewall` (`hart.firewall`) | ❌ | no live port-management route |
+| Firewall | `networking.firewall` (`hart.firewall`) | 🟡 | `/api/shell/firewall` reads live backend + open ports; changing ports stays declarative on purpose |
 
 ## Where HART is ahead of both
 
@@ -52,9 +52,13 @@ tier-drop compositor ladder (`hart.sessionSupervisor`) with a cage floor.
 
 ## Honest gaps
 
-1. **Five capabilities are declarative-only** (last five rows): the OS does the
-   thing, but no agent can change it live. That is the second half of task #25
-   and the concrete remaining parity work.
+1. **Four capabilities are declarative-only** (disk encryption, screen capture,
+   remote desktop, antivirus): the OS does the thing, but no agent can see or
+   change it live. That is the second half of task #25 and the concrete
+   remaining parity work. Firewall is now 🟡 — readable but deliberately not
+   writable, since opening a port from an unauthenticated local HTTP API is a
+   security decision rather than a convenience; the declarative side stays the
+   source of truth.
 2. **`hart.devtools` does not fit the desktop image** — measured +3 GiB against
    ~2 GiB of slack (audits 30570492265 / 30573861911).
 3. **Runtime verification** of the current tree is still owed: CI runner

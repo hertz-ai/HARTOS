@@ -2913,6 +2913,31 @@ class TestParityMatrix:
             "it must be conditioned on an ACTUAL Windows bootloader — a "
             "blanket setting is wrong for single-OS machines whose RTC is UTC")
 
+    def test_the_clock_fix_reaches_BOTH_installers(self):
+        """There are TWO installers, and this guard originally read one file.
+
+        nixos/installer/calamares/hartcfg-main.py calls itself "the GUI twin of
+        hart-install --mounted" — an ALTERNATIVE path that writes local.nix
+        itself, not a step inside the CLI. The CLI got the clock fix and the
+        GUI did not, so a user installing beside Windows through the GRAPHICAL
+        installer (the default for a desktop OS) still hit the +5:30 jump —
+        while this test passed and the matrix row read ✅.
+
+        That is the vacuous-guard shape one level up: the assertion held, the
+        claim it was read as supporting did not. Both paths are checked now.
+        """
+        gui = read_nix(os.path.join(
+            REPO_ROOT, "nixos", "installer", "calamares", "hartcfg-main.py"))
+        assert re.search(r'time\.hardwareClockInLocalTime\s*=\s*true\s*;', gui), (
+            "the Calamares installer must also write the dual-boot clock "
+            "setting — it writes local.nix on its own path")
+        assert "bootmgfw.efi" in gui, (
+            "the GUI must use the SAME Windows probe as the CLI, not a "
+            "different or absent condition")
+        assert "windows_present" in gui, (
+            "the decision belongs to the shared render_local_nix so both "
+            "installers ask one question — not two copies that can drift")
+
     def test_declared_gaps_are_not_silently_upgraded(self):
         """The five declarative-only capabilities are listed as ❌ on purpose.
         Turning one into ✅ requires the route to exist; this keeps the claim

@@ -483,7 +483,13 @@ SYSTEM_PANELS = {
     'firewall': {
         'title': 'Firewall & Firmware', 'icon': 'security',
         'group': 'System', 'default_size': [600, 500],
-        'apis': ['/api/shell/power/profiles'],  # Uses power API for system status
+        # Was pointed at /api/shell/power/profiles — a POWER endpoint borrowed
+        # "for system status", so the Firewall panel could never show firewall
+        # state. A real read-only status route now exists (shell_system_apis,
+        # backend + live nft ruleset + open ports); fwupd stays on the power
+        # side, which is why both are listed rather than one replacing the
+        # other.
+        'apis': ['/api/shell/firewall', '/api/shell/power/profiles'],
     },
 
     # ─── Desktop Experience ───
