@@ -16,7 +16,22 @@ on:
       - 'deploy/distro/**'
 
 concurrency:
-  group: nix-check-${{ github.ref }}
+  # Push/PR runs share one group per ref and still cancel each other: on a busy
+  # branch only the newest commit is worth checking.
+  #
+  # A workflow_dispatch gets its OWN group (keyed by run id) so a MANUAL,
+  # on-demand run is never cancelled by a later push. Same fix already applied
+  # to nix-build-matrix.yml; this workflow was missed, and it is the one that
+  # produces the diagnostic output.
+  #
+  # Why it matters (2026-07-31): six attempts to get an attributed result for
+  # ❌ hart-desktop-shell-boot / hart-layer-shell-host-paint produced FIVE
+  # cancellations. Determinate Nix prints its error summary at the END of a
+  # run, so a cancelled run shows the ❌ with no cause — which is exactly why
+  # task #15 has read "red every run, NOT flake" since 07-26. Several sessions
+  # push to main; any push killed the run mid-flight. The symptom looked like
+  # a persistent failure rather than a cancellation.
+  group: nix-check-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
   cancel-in-progress: true
 
 jobs:
