@@ -517,9 +517,23 @@ in
     # (hart.devtools.enable = true on any workstation), and the desktop still
     # ships the language TOOLCHAINS via hart.devTools above — the confusingly
     # near-identical sibling — so compilers are present either way. What is
-    # deferred is the LSP/debugger/linter layer, pending a sub-bundle audit
-    # (run 30573861911, hart.devtools.lsp) so whatever fits the real slack can
-    # be re-enabled at the granularity the numbers support rather than by guess.
+    # deferred is the LSP/debugger/linter layer.
+    #
+    # SUB-BUNDLE MEASUREMENT — and it REFUTED the obvious hypothesis. I assumed
+    # the LSP servers were the bulk (rust-analyzer, clang-tools, gopls, the
+    # TypeScript stack) and said so. Audit 30573861911 flipping ONLY
+    # hart.devtools.lsp:
+    #     lsp ON  : 24 GiB
+    #     lsp OFF : 24 GiB
+    # i.e. under the rounding — LSP is NOT the cost, so turning it off would
+    # have bought nothing while feeling like a fix. The remaining candidates
+    # are `debug` (lldb drags a full LLVM; plus gdb/delve/valgrind) and `lint`
+    # (audit 30602854187 measures debug). containers/editors are already
+    # default-off, so they were never in play.
+    #
+    # Keep this comment updated with each measured number: the point of the
+    # instrument is that the next person inherits evidence instead of my
+    # plausible-sounding guess.
     nightlight.enable = true;      # blue-light schedule
     openclaw.enable = true;        # ClawHub skill surface
     osk.enable = true;             # on-screen keyboard (touch)
