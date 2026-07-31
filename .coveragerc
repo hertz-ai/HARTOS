@@ -23,6 +23,26 @@ source =
     reuse_recipe
 data_file = test-reports/coverage/.coverage
 
+# Record WHICH TEST executed each line. This answers "what tests exercise
+# shell_system_apis.py?" — the question whose absence let a regression ship
+# on 2026-07-31: `_run` was changed in shell_system_apis.py, but the suite
+# that caught it is named test_shell_os_apis.py (WiFi/VPN routes live in the
+# former, are tested from the latter), so the obvious "run the same-named
+# test file" reflex missed it entirely.
+#
+# With contexts recorded, the impacted-test set is derivable from coverage
+# data instead of guessed from filenames. `coverage report` has no context
+# flag (only `coverage html --show-contexts` does), so to answer it directly:
+#
+#   python -c "import coverage; d=coverage.CoverageData('test-reports/coverage/.coverage'); \
+#     d.read(); f=[x for x in d.measured_files() if 'shell_system_apis' in x][0]; \
+#     print(sorted({c for c in d.contexts_by_lineno(f).values() for c in c if c}))"
+#
+# ...which lists every test that executed a line of that file. Verified
+# working 2026-07-31 (23 contexts recorded); do not swap in a flag that
+# does not exist.
+dynamic_context = test_function
+
 omit =
     tests/*
     venv*/*
