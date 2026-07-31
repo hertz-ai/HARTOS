@@ -44,7 +44,7 @@ CPU microcode at runtime).
 | Disk encryption | `hart.luks` | ❌ | **gap: no live agent route** |
 | Screen capture / portal | `xdg.portal` (`hart.portal`) | ✅ | `/api/shell/screenshot` + `/api/shell/recording/{start,stop}` (`shell_os_apis.py`) — this row previously read ❌ from a name-only search that missed all three |
 | Remote desktop | RustDesk / Sunshine (`integrations/remote_desktop`) | ❌ | routes not on the shell API |
-| Antivirus | ClamAV (`hart.security`) | ❌ | `hart-security` CLI only |
+| Antivirus | ClamAV (`hart.security`) | ✅ | `/api/shell/antivirus/{status,scan}` — daemon liveness **plus `signatures_stale`** (a live clamd with an old DB looks healthy and catches nothing); scan is async-bounded (202, never holds a pool thread). Enable/disable stays declarative on purpose |
 | Firewall | `networking.firewall` (`hart.firewall`) | 🟡 | `/api/shell/firewall` reads live backend + open ports; changing ports stays declarative on purpose |
 
 ## Where HART is ahead of both
@@ -56,8 +56,8 @@ tier-drop compositor ladder (`hart.sessionSupervisor`) with a cage floor.
 
 ## Honest gaps
 
-1. **Three capabilities are declarative-only** (disk encryption, remote
-   desktop, antivirus): the OS does the thing, but no agent can see or
+1. **Two capabilities are declarative-only** (disk encryption, remote
+   desktop): the OS does the thing, but no agent can see or
    change it live. That is the second half of task #25 and the concrete
    remaining parity work. Each was re-checked against real `@app.route`
    registrations on 2026-07-31, not a name search — screen capture had been

@@ -2985,7 +2985,10 @@ class TestParityMatrix:
     CLAIMED_NO_ROUTE = {
         "disk encryption": r"luks|/encrypt",
         "remote desktop": r"/remote[-_]?desktop|/rustdesk|/sunshine",
-        "antivirus": r"clamav|antivirus|/malware",
+        # "antivirus" left this list on 2026-07-31 — /api/shell/antivirus/
+        # {status,scan} now exist, so the matrix row is ✅ and the paths are
+        # checked by test_every_api_path_named_in_the_matrix_is_registered
+        # instead. Keeping it here would fail exactly as designed.
     }
 
     def _registered_routes(self):

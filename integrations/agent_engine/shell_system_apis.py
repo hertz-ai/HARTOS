@@ -617,6 +617,96 @@ def register_shell_system_routes(app):
         except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
             return jsonify({'error': str(e)}), 400
 
+    # ── Antivirus (ClamAV) ──────────────────────────────────────────────
+    # hart-security.nix has run clamd + freshclam since it landed, but there
+    # was NO agent-visible surface: the OS scanned, and nothing could ask it
+    # what it found. That is the declarative-only gap the parity matrix
+    # tracked as ❌ (task #25/#26) — a capability the node HAS but no agent
+    # can see or drive. Read + scan only; enable/disable stays declarative,
+    # because turning the scanner OFF from an unauthenticated local HTTP API
+    # is a security decision, not a convenience (same line the firewall row
+    # draws).
+    @app.route('/api/shell/antivirus/status', methods=['GET'])
+    def shell_antivirus_status():
+        """Is the scanner live, and are its signatures current?
+
+        Signature AGE is the load-bearing field. A running clamd with a
+        6-month-old database looks healthy and catches nothing, which is the
+        failure mode worth surfacing — same shape as the `unclaimed` flag on
+        the device tree.
+        """
+        r = _run(['systemctl', 'is-active', 'clamav-daemon'], timeout=5)
+        running = bool(r and (r.stdout or '').strip() == 'active')
+
+        # freshclam writes the signature DB here; mtime is its freshness.
+        db_age_days, db_present = None, False
+        for db_dir in ('/var/lib/clamav',):
+            try:
+                newest = max(
+                    (os.path.getmtime(os.path.join(db_dir, f))
+                     for f in os.listdir(db_dir)
+                     if f.endswith(('.cvd', '.cld'))),
+                    default=None)
+            except OSError:
+                # Absent on a non-NixOS dev box / before first freshclam run.
+                newest = None
+            if newest:
+                db_present = True
+                db_age_days = round((time.time() - newest) / 86400, 1)
+        return jsonify({
+            'running': running,
+            'signatures_present': db_present,
+            'signature_age_days': db_age_days,
+            # Explicitly stale rather than making every caller re-derive it.
+            'signatures_stale': (db_age_days is not None and db_age_days > 7),
+        })
+
+    @app.route('/api/shell/antivirus/scan', methods=['POST'])
+    def shell_antivirus_scan():
+        """Scan a path with clamdscan (the DAEMON client, not clamscan).
+
+        clamdscan hands the work to the already-running clamd, so the
+        signature DB is not re-loaded per invocation — clamscan would spend
+        ~30s and hundreds of MB doing exactly that every call.
+
+        Bounded via _run_async_bounded: a scan of a large tree runs for
+        minutes, and a synchronous call would pin a pool thread and queue
+        every other shell fetch behind it (the click-to-freeze class this
+        module already documents). The caller gets `finished: false` and the
+        scan continues out-of-band rather than the request hanging.
+        """
+        data = request.get_json(silent=True) or {}
+        target = (data.get('path') or '').strip()
+        if not target:
+            return jsonify({'error': 'path required'}), 400
+        # Reject traversal + relative paths outright: this endpoint chooses
+        # what clamd reads, so it must never accept a caller-composed path
+        # it has not resolved.
+        target = os.path.abspath(target)
+        if not os.path.exists(target):
+            return jsonify({'error': 'path not found', 'path': target}), 404
+
+        finished, r = _run_async_bounded(
+            ['clamdscan', '--fdpass', '--no-summary', target],
+            run_timeout=900, wait=8, name='hart-av-scan')
+        if not finished:
+            return jsonify({'scanning': True, 'finished': False, 'path': target,
+                            'note': 'scan continues in background'}), 202
+        if r is None:
+            return jsonify({'ok': False, 'error': 'clamdscan not available'}), 503
+        # clamdscan exit codes: 0 = clean, 1 = infected, 2 = error.
+        infected = [ln for ln in (r.stdout or '').splitlines()
+                    if ln.strip().endswith('FOUND')]
+        return jsonify({
+            'ok': r.returncode in (0, 1),
+            'finished': True,
+            'path': target,
+            'clean': r.returncode == 0,
+            'infected_count': len(infected),
+            'infected': infected[:100],
+            'error': (r.stderr or '').strip() if r.returncode == 2 else None,
+        }), (200 if r.returncode in (0, 1) else 503)
+
     @app.route('/api/shell/tasks/resources', methods=['GET'])
     def shell_tasks_resources():
         res = {'cpu': {}, 'ram': {}, 'gpu': None, 'disk_io': {}, 'network_io': {}}

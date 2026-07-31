@@ -1127,3 +1127,126 @@ class TestScreenRotation(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestShellAntivirus(unittest.TestCase):
+    """ClamAV agent surface — closing a declarative-only parity gap.
+
+    hart-security.nix had run clamd + freshclam for a long time with NO
+    agent-visible surface: the OS scanned, and nothing could ask it what it
+    found. These routes are the read/scan half (enable/disable stays
+    declarative on purpose — turning the scanner OFF from an unauthenticated
+    local API is a security decision, not a convenience).
+    """
+
+    def test_status_reports_running_daemon(self):
+        with patch('integrations.agent_engine.shell_system_apis._run') as run:
+            run.return_value = MagicMock(returncode=0, stdout='active\n', stderr='')
+            r = _make_system_app().get('/api/shell/antivirus/status')
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(json.loads(r.data)['running'])
+
+    def test_status_reports_stopped_daemon(self):
+        with patch('integrations.agent_engine.shell_system_apis._run') as run:
+            run.return_value = MagicMock(returncode=3, stdout='inactive\n', stderr='')
+            r = _make_system_app().get('/api/shell/antivirus/status')
+        self.assertFalse(json.loads(r.data)['running'])
+
+    def test_status_survives_missing_systemctl(self):
+        """Dev boxes and containers have no systemctl — must degrade, not 500."""
+        with patch('integrations.agent_engine.shell_system_apis._run',
+                   return_value=None):
+            r = _make_system_app().get('/api/shell/antivirus/status')
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(json.loads(r.data)['running'])
+
+    def test_stale_signatures_are_flagged(self):
+        """A live daemon with an ancient DB looks healthy and catches nothing.
+
+        This is THE field worth having: `signatures_stale` is derived once
+        here rather than left for every caller to recompute from a raw age.
+        """
+        import time as _t
+        with tempfile.TemporaryDirectory() as d:
+            old = os.path.join(d, 'daily.cvd')
+            with open(old, 'w') as fh:
+                fh.write('x')
+            os.utime(old, (_t.time() - 30 * 86400, _t.time() - 30 * 86400))
+            with patch('integrations.agent_engine.shell_system_apis.os.listdir',
+                       return_value=['daily.cvd']), \
+                 patch('integrations.agent_engine.shell_system_apis.os.path.getmtime',
+                       return_value=_t.time() - 30 * 86400), \
+                 patch('integrations.agent_engine.shell_system_apis._run',
+                       return_value=MagicMock(returncode=0, stdout='active\n')):
+                r = _make_system_app().get('/api/shell/antivirus/status')
+        data = json.loads(r.data)
+        self.assertTrue(data['signatures_present'])
+        self.assertTrue(data['signatures_stale'])
+        self.assertGreater(data['signature_age_days'], 7)
+
+    def test_scan_requires_a_path(self):
+        r = _make_system_app().post('/api/shell/antivirus/scan',
+                                    data=json.dumps({}),
+                                    content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_scan_rejects_a_nonexistent_path(self):
+        r = _make_system_app().post(
+            '/api/shell/antivirus/scan',
+            data=json.dumps({'path': '/definitely/not/here/9f3a'}),
+            content_type='application/json')
+        self.assertEqual(r.status_code, 404)
+
+    def test_scan_reports_clean(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch('integrations.agent_engine.shell_system_apis._run_async_bounded',
+                       return_value=(True, MagicMock(returncode=0, stdout='', stderr=''))):
+                r = _make_system_app().post(
+                    '/api/shell/antivirus/scan',
+                    data=json.dumps({'path': d}),
+                    content_type='application/json')
+        data = json.loads(r.data)
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(data['clean'])
+        self.assertEqual(data['infected_count'], 0)
+
+    def test_scan_reports_infected_without_erroring(self):
+        """clamdscan exits 1 for 'infected'. That is a SUCCESSFUL scan with a
+        finding — collapsing it into an error would hide the detection."""
+        out = '/tmp/x/evil.bin: Eicar-Test-Signature FOUND\n'
+        with tempfile.TemporaryDirectory() as d:
+            with patch('integrations.agent_engine.shell_system_apis._run_async_bounded',
+                       return_value=(True, MagicMock(returncode=1, stdout=out, stderr=''))):
+                r = _make_system_app().post(
+                    '/api/shell/antivirus/scan',
+                    data=json.dumps({'path': d}),
+                    content_type='application/json')
+        data = json.loads(r.data)
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(data['ok'])
+        self.assertFalse(data['clean'])
+        self.assertEqual(data['infected_count'], 1)
+        self.assertIn('Eicar-Test-Signature', data['infected'][0])
+
+    def test_long_scan_returns_202_instead_of_hanging(self):
+        """A big tree scans for minutes. The request must NOT hold a pool
+        thread — that is the click-to-freeze class this module documents."""
+        with tempfile.TemporaryDirectory() as d:
+            with patch('integrations.agent_engine.shell_system_apis._run_async_bounded',
+                       return_value=(False, None)):
+                r = _make_system_app().post(
+                    '/api/shell/antivirus/scan',
+                    data=json.dumps({'path': d}),
+                    content_type='application/json')
+        self.assertEqual(r.status_code, 202)
+        self.assertFalse(json.loads(r.data)['finished'])
+
+    def test_scan_503_when_clamdscan_absent(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch('integrations.agent_engine.shell_system_apis._run_async_bounded',
+                       return_value=(True, None)):
+                r = _make_system_app().post(
+                    '/api/shell/antivirus/scan',
+                    data=json.dumps({'path': d}),
+                    content_type='application/json')
+        self.assertEqual(r.status_code, 503)
