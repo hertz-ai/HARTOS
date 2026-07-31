@@ -1,5 +1,12 @@
 [run]
 source =
+    # core/ was MISSING from this list until 2026-07-31, so the package that
+    # holds the canonical single-sources — constants.py (LATENCY_BUDGETS),
+    # subprocess_safe.py (the one bounded probe, 139 callers), port_registry,
+    # llama_scheduler, platform/, peer_link/ — reported no coverage at all.
+    # Not low coverage: NO DATA, which reads identically to "nothing to see"
+    # on a report and is how the gap stayed invisible.
+    core
     integrations/agent_engine
     integrations/social
     integrations/coding_agent

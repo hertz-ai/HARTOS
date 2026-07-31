@@ -208,6 +208,71 @@ class TestNoWindowFlagsOnWindows:
         else:
             assert kw == {}
 
+    def test_posix_branch_returns_empty(self, monkeypatch):
+        """The non-Windows branch, exercised ON Windows.
+
+        Whichever box runs this suite, one of the two branches is dead code
+        to it — so the OTHER one is never covered and a mistake there ships
+        unseen to the platform that does run it. HART targets NixOS while
+        this repo is developed on Windows, making that the normal case, not
+        an edge one. Patching the platform check covers both directions from
+        either host.
+        """
+        monkeypatch.setattr(sys, "platform", "linux")
+        assert hidden_popen_kwargs() == {}
+
+    def test_windows_branch_sets_no_window_flags(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        kw = hidden_popen_kwargs()
+        assert kw.get("creationflags") == subprocess.CREATE_NO_WINDOW
+        assert kw["startupinfo"].wShowWindow == 0
+
+
+class TestKillCleanupIsUnkillable:
+    """`_safe_kill_and_close` must never raise — it runs on the timeout path.
+
+    If cleanup itself threw, a timed-out probe would surface as an exception
+    from run_probe instead of the documented None, and every caller's
+    "tool missing or hung" branch would be bypassed.
+    """
+
+    def test_zombie_child_does_not_raise(self, monkeypatch):
+        """Child ignores kill() and never reaps: bounded, logged, no raise."""
+        class _Stubborn:
+            returncode = None
+            stdout = stderr = None
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired("cmd", timeout or 0)
+
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired("cmd", timeout or 0)
+
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: _Stubborn())
+        # Must still honour the contract: None, not an escaping exception.
+        assert run_probe(["anything"], timeout=0.01) is None
+
+    def test_kill_that_raises_is_swallowed(self, monkeypatch):
+        """A kill() that itself throws (already-reaped race) must not escape."""
+        class _Nasty:
+            returncode = None
+            stdout = stderr = None
+
+            def kill(self):
+                raise OSError("no such process")
+
+            def wait(self, timeout=None):
+                return 0
+
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired("cmd", timeout or 0)
+
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: _Nasty())
+        assert run_probe(["anything"], timeout=0.01) is None
+
 
 class TestShellApiConsolidation:
     """DRY: both shell API modules resolve to the ONE implementation.
