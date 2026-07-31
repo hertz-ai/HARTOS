@@ -1059,7 +1059,7 @@ class TestShellWiFi(unittest.TestCase):
     `{enabled, connected, ssid, signal, frequency, ip}`.
     """
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_wifi_scan_returns_networks(self, mock_sub):
         client = _make_system_app()
         proc = MagicMock()
@@ -1068,8 +1068,7 @@ class TestShellWiFi(unittest.TestCase):
         proc.stdout = ('MyNet:85:WPA2:5180 MHz:AA:BB:CC\n'
                        'OpenNet:60::2412 MHz:DD:EE:FF\n')
         proc.stderr = ''
-        mock_sub.run.return_value = proc
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.return_value = proc
         r = client.get('/api/shell/wifi/networks')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
@@ -1080,42 +1079,39 @@ class TestShellWiFi(unittest.TestCase):
         self.assertEqual(data['networks'][0]['signal'], 85)
         self.assertEqual(data['networks'][0]['security'], 'WPA2')
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_wifi_scan_empty(self, mock_sub):
         client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
         proc.stdout = ''
         proc.stderr = ''
-        mock_sub.run.return_value = proc
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.return_value = proc
         r = client.get('/api/shell/wifi/networks')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertEqual(data['networks'], [])
         self.assertEqual(data['count'], 0)
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_wifi_scan_nmcli_not_found(self, mock_sub):
         client = _make_system_app()
         # _run swallows FileNotFoundError → None → empty network list.
-        mock_sub.run.side_effect = FileNotFoundError
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.return_value = None  # _run swallows ENOENT → None
         r = client.get('/api/shell/wifi/networks')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertEqual(data['networks'], [])
         self.assertEqual(data['count'], 0)
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_wifi_connect_success(self, mock_sub):
         client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
         proc.stdout = 'successfully activated'
         proc.stderr = ''
-        mock_sub.run.return_value = proc
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.return_value = proc
         r = client.post('/api/shell/wifi/connect',
                         json={'ssid': 'MyNet', 'password': '1234'})
         self.assertEqual(r.status_code, 200)
@@ -1123,7 +1119,7 @@ class TestShellWiFi(unittest.TestCase):
         self.assertTrue(data['connected'])
         self.assertEqual(data['ssid'], 'MyNet')
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_wifi_connect_missing_ssid(self, mock_sub):
         client = _make_system_app()
         r = client.post('/api/shell/wifi/connect', json={})
@@ -1131,7 +1127,7 @@ class TestShellWiFi(unittest.TestCase):
         data = json.loads(r.data)
         self.assertIn('error', data)
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_wifi_status(self, mock_sub):
         client = _make_system_app()
         proc = MagicMock()
@@ -1152,8 +1148,7 @@ class TestShellWiFi(unittest.TestCase):
                 p.stdout = 'IP4.ADDRESS[1]:192.168.1.5/24\n'
             return p
 
-        mock_sub.run.side_effect = run_side_effect
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.side_effect = run_side_effect
         r = client.get('/api/shell/wifi/status')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
@@ -1178,7 +1173,7 @@ class TestShellVPN(unittest.TestCase):
     `os.path.isfile`, and returns `{'imported': True, 'name': ...}`.
     """
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_vpn_list(self, mock_sub):
         client = _make_system_app()
         proc = MagicMock()
@@ -1186,8 +1181,7 @@ class TestShellVPN(unittest.TestCase):
         # nmcli -t -f NAME,TYPE,ACTIVE connection show
         proc.stdout = 'MyVPN:vpn:yes\nWork:vpn:no\nEth:ethernet:no\n'
         proc.stderr = ''
-        mock_sub.run.return_value = proc
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.return_value = proc
         r = client.get('/api/shell/vpn/list')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
@@ -1196,22 +1190,21 @@ class TestShellVPN(unittest.TestCase):
         self.assertEqual(data['connections'][0]['name'], 'MyVPN')
         self.assertTrue(data['connections'][0]['active'])
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_vpn_connect_success(self, mock_sub):
         client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
         proc.stdout = 'Connection successfully activated'
         proc.stderr = ''
-        mock_sub.run.return_value = proc
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.return_value = proc
         r = client.post('/api/shell/vpn/connect', json={'name': 'MyVPN'})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertTrue(data['connected'])
         self.assertEqual(data['name'], 'MyVPN')
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_vpn_connect_missing_name(self, mock_sub):
         client = _make_system_app()
         r = client.post('/api/shell/vpn/connect', json={})
@@ -1219,21 +1212,20 @@ class TestShellVPN(unittest.TestCase):
         data = json.loads(r.data)
         self.assertIn('error', data)
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_vpn_disconnect(self, mock_sub):
         client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
         proc.stdout = 'Connection successfully deactivated'
         proc.stderr = ''
-        mock_sub.run.return_value = proc
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.return_value = proc
         r = client.post('/api/shell/vpn/disconnect', json={'name': 'MyVPN'})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertTrue(data['disconnected'])
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     @patch('integrations.agent_engine.shell_system_apis.os.path.isfile', return_value=True)
     def test_vpn_import_wireguard(self, _mock_isfile, mock_sub):
         client = _make_system_app()
@@ -1242,8 +1234,7 @@ class TestShellVPN(unittest.TestCase):
         # nmcli echoes the new connection name in single quotes.
         proc.stdout = "Connection 'test' (uuid) successfully added."
         proc.stderr = ''
-        mock_sub.run.return_value = proc
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.return_value = proc
         r = client.post('/api/shell/vpn/import',
                         json={'config_path': '/tmp/test.conf', 'type': 'wireguard'})
         self.assertEqual(r.status_code, 200)

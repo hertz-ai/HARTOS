@@ -63,17 +63,9 @@ def _is_wayland():
     return False
 
 
-# See shell_system_apis.py for why this duplicate still exists: the alias to
-# core.subprocess_safe.run_probe broke tests that mock `subprocess` wholesale
-# in the module namespace. Reverted together with that one; the consolidation
-# lands when those tests move onto the `_run` seam (task #26).
-def _run(cmd, timeout=10, **kw):
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, **kw)
-        return r
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
+# Canonical bounded probe — same alias as shell_system_apis.py. The two
+# byte-equivalent `_run` copies are now ONE implementation (139 callers).
+from core.subprocess_safe import run_probe as _run
 
 
 # ─── About > Credits: third-party art licence ledger (#143 offline-art) ──────

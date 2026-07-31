@@ -291,6 +291,19 @@ class TestShellApiProbeContract:
     actually depend on. Consolidation tracked in task #26.
     """
 
+    def test_both_modules_resolve_to_the_one_implementation(self):
+        """DRY guard, re-armed once the consolidation re-landed.
+
+        The contract tests below hold for a duplicate too, so they cannot
+        detect re-duplication — only identity can. This failed for the
+        REVERT earlier today, which is why it was temporarily replaced
+        rather than kept; with the alias restored it is the assertion that
+        stops a third copy of `_run` appearing.
+        """
+        from integrations.agent_engine import shell_desktop_apis, shell_system_apis
+        assert shell_system_apis._run is run_probe
+        assert shell_desktop_apis._run is run_probe
+
     def _runners(self):
         from integrations.agent_engine import shell_desktop_apis, shell_system_apis
         return [("shell_system_apis", shell_system_apis._run),
