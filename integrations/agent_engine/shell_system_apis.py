@@ -617,6 +617,59 @@ def register_shell_system_routes(app):
         except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
             return jsonify({'error': str(e)}), 400
 
+    # ── Disk encryption (LUKS) ──────────────────────────────────────────
+    # hart-luks.nix sets encryption up at INSTALL time; nothing could report
+    # it afterwards. Last of the declarative-only rows (tasks #25/#26).
+    #
+    # READ ONLY, and that is the complete answer rather than half of one:
+    # you cannot turn disk encryption on at runtime. It is decided when the
+    # volume is created — an "enable" route could only ever lie, or start a
+    # destructive re-encrypt behind a GET. Windows shows BitLocker status
+    # the same way and sends you to setup for the rest.
+    @app.route('/api/shell/encryption/status', methods=['GET'])
+    def shell_encryption_status():
+        """Which block devices are LUKS-backed, and is root among them?
+
+        `root_encrypted` is the field that matters: full-disk encryption
+        that covers a data mount but not root is a common half-configured
+        state that reads as "encrypted" to a user and protects far less
+        than they think.
+        """
+        # lsblk is the enumerator udisks2/`/storage/devices` already use, so
+        # this reuses the tree rather than inventing a second view of disks.
+        r = _run(['lsblk', '-o', 'NAME,TYPE,FSTYPE,MOUNTPOINT', '-P'], timeout=6)
+        if r is None:
+            return jsonify({'available': False,
+                            'error': 'lsblk not available'}), 503
+
+        devices, root_encrypted = [], False
+        for line in (r.stdout or '').splitlines():
+            f = dict(re.findall(r'(\w+)="([^"]*)"', line))
+            if not f:
+                continue
+            is_luks = (f.get('FSTYPE') == 'crypto_LUKS')
+            is_mapper = (f.get('TYPE') == 'crypt')
+            if is_luks or is_mapper:
+                devices.append({'name': f.get('NAME', ''),
+                                'type': f.get('TYPE', ''),
+                                'fstype': f.get('FSTYPE', ''),
+                                'mountpoint': f.get('MOUNTPOINT') or None,
+                                'luks_container': is_luks})
+            # An unlocked LUKS volume presents as TYPE=crypt; if THAT is
+            # what carries /, root is genuinely on encrypted storage.
+            if is_mapper and f.get('MOUNTPOINT') == '/':
+                root_encrypted = True
+
+        return jsonify({
+            'available': True,
+            'root_encrypted': root_encrypted,
+            'encrypted_device_count': len(devices),
+            'devices': devices,
+            # Encryption is an install-time decision — say so, so no caller
+            # goes looking for a toggle that cannot exist.
+            'runtime_toggle_supported': False,
+        })
+
     # ── Antivirus (ClamAV) ──────────────────────────────────────────────
     # hart-security.nix has run clamd + freshclam since it landed, but there
     # was NO agent-visible surface: the OS scanned, and nothing could ask it

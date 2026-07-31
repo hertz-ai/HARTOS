@@ -1250,3 +1250,68 @@ class TestShellAntivirus(unittest.TestCase):
                     data=json.dumps({'path': d}),
                     content_type='application/json')
         self.assertEqual(r.status_code, 503)
+
+
+class TestShellEncryption(unittest.TestCase):
+    """LUKS status — the last declarative-only parity row.
+
+    hart-luks.nix configures encryption at INSTALL time and nothing could
+    report it afterwards. Read-only by design: encryption cannot be turned
+    on at runtime, so an "enable" route could only lie or kick off a
+    destructive re-encrypt.
+    """
+
+    LSBLK_ENCRYPTED = (
+        'NAME="nvme0n1" TYPE="disk" FSTYPE="" MOUNTPOINT=""\n'
+        'NAME="nvme0n1p2" TYPE="part" FSTYPE="crypto_LUKS" MOUNTPOINT=""\n'
+        'NAME="cryptroot" TYPE="crypt" FSTYPE="ext4" MOUNTPOINT="/"\n'
+    )
+    LSBLK_PLAIN = (
+        'NAME="sda" TYPE="disk" FSTYPE="" MOUNTPOINT=""\n'
+        'NAME="sda1" TYPE="part" FSTYPE="ext4" MOUNTPOINT="/"\n'
+    )
+
+    def _get(self, stdout):
+        with patch('integrations.agent_engine.shell_system_apis._run',
+                   return_value=MagicMock(returncode=0, stdout=stdout, stderr='')):
+            return _make_system_app().get('/api/shell/encryption/status')
+
+    def test_detects_encrypted_root(self):
+        data = json.loads(self._get(self.LSBLK_ENCRYPTED).data)
+        self.assertTrue(data['root_encrypted'])
+        self.assertEqual(data['encrypted_device_count'], 2)
+
+    def test_plain_disk_is_not_reported_encrypted(self):
+        data = json.loads(self._get(self.LSBLK_PLAIN).data)
+        self.assertFalse(data['root_encrypted'])
+        self.assertEqual(data['encrypted_device_count'], 0)
+
+    def test_encrypted_data_volume_does_not_imply_encrypted_root(self):
+        """The half-configured state worth catching.
+
+        A LUKS volume mounted at /data with a PLAINTEXT root reads as
+        "encrypted" to a user and protects far less than they think, so
+        root_encrypted must stay False while the device still appears.
+        """
+        out = ('NAME="sda1" TYPE="part" FSTYPE="ext4" MOUNTPOINT="/"\n'
+               'NAME="sdb1" TYPE="part" FSTYPE="crypto_LUKS" MOUNTPOINT=""\n'
+               'NAME="cryptdata" TYPE="crypt" FSTYPE="ext4" MOUNTPOINT="/data"\n')
+        data = json.loads(self._get(out).data)
+        self.assertFalse(data['root_encrypted'])
+        self.assertEqual(data['encrypted_device_count'], 2)
+
+    def test_reports_runtime_toggle_unsupported(self):
+        """Say it explicitly so no caller hunts for a toggle that cannot exist."""
+        data = json.loads(self._get(self.LSBLK_ENCRYPTED).data)
+        self.assertFalse(data['runtime_toggle_supported'])
+
+    def test_missing_lsblk_degrades_to_503(self):
+        with patch('integrations.agent_engine.shell_system_apis._run',
+                   return_value=None):
+            r = _make_system_app().get('/api/shell/encryption/status')
+        self.assertEqual(r.status_code, 503)
+        self.assertFalse(json.loads(r.data)['available'])
+
+    def test_malformed_lsblk_line_does_not_crash(self):
+        data = json.loads(self._get('garbage\n\nNAME="x" TYPE="crypt" FSTYPE="ext4" MOUNTPOINT="/"\n').data)
+        self.assertTrue(data['root_encrypted'])

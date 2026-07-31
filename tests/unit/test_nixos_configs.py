@@ -2983,7 +2983,8 @@ class TestParityMatrix:
 
     #: capability -> regex for routes that must NOT exist while its row says ❌.
     CLAIMED_NO_ROUTE = {
-        "disk encryption": r"luks|/encrypt",
+        # "disk encryption" left this list 2026-07-31 — /api/shell/encryption/status
+        # now exists; the row is ✅ and its path is checked by the citation test.
         # "remote desktop" left this list on 2026-07-31. Its row is 🟡, not
         # ❌: agent TOOLS are registered (core/agent_tools.py:1391), only the
         # shell route is missing. This guard only ever knew about the HTTP

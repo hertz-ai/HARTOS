@@ -53,7 +53,7 @@ place and concluding about the whole.
 | CPU microcode | `hardware.cpu.{intel,amd}.updateMicrocode` | n/a | |
 | Hypervisor guest | `hypervGuest`, `qemuGuest`, `spice-vdagentd`, `vmware.guest` | n/a | Hyper-V / KVM / SPICE / VMware |
 | BIOS + UEFI boot | `isoImage.makeBiosBootable`; systemd-boot / GRUB by probe | n/a | Hyper-V **Gen 1** boots |
-| Disk encryption | `hart.luks` | ❌ | **gap: no live agent route** |
+| Disk encryption | `hart.luks` | ✅ | `/api/shell/encryption/status` — LUKS device tree plus **`root_encrypted`** (an encrypted /data with a plaintext root reads as "encrypted" and protects far less). Read-only is the COMPLETE answer: encryption is an install-time decision, so `runtime_toggle_supported: false` is stated rather than implied |
 | Screen capture / portal | `xdg.portal` (`hart.portal`) | ✅ | `/api/shell/screenshot` + `/api/shell/recording/{start,stop}` (`shell_os_apis.py`) — this row previously read ❌ from a name-only search that missed all three |
 | Remote desktop | RustDesk / Sunshine (`integrations/remote_desktop`) | 🟡 | **agent tools ARE registered** (`core/agent_tools.py:1391` → `build_remote_desktop_tools`), so an agent can drive sessions during a turn. No `/api/shell/*` route, so the shell UI cannot — that half is the remaining work, not the whole row |
 | Antivirus | ClamAV (`hart.security`) | ✅ | `/api/shell/antivirus/{status,scan}` — daemon liveness **plus `signatures_stale`** (a live clamd with an old DB looks healthy and catches nothing); scan is async-bounded (202, never holds a pool thread). Enable/disable stays declarative on purpose |
@@ -68,15 +68,14 @@ tier-drop compositor ladder (`hart.sessionSupervisor`) with a cage floor.
 
 ## Honest gaps
 
-1. **One capability is declarative-only** (disk encryption): the OS does the
-   thing, but neither agent channel can see or change it live. Remote desktop
-   is 🟡 — reachable via agent TOOLS, missing only the shell route. That is the second half of task #25 and the concrete
-   remaining parity work. Each was re-checked against real `@app.route`
-   registrations on 2026-07-31, not a name search — screen capture had been
-   listed here wrongly and is in fact fully routed. Firewall is 🟡 — readable but deliberately not
-   writable, since opening a port from an unauthenticated local HTTP API is a
-   security decision rather than a convenience; the declarative side stays the
-   source of truth.
+1. **No capability is declarative-only any more.** The four rows that opened
+   2026-07-31 as ❌ closed as: screen capture and remote desktop were NEVER
+   gaps (wrong rows from single-channel searches), antivirus and disk
+   encryption were real and are now routed. Two rows stay 🟡 **on purpose**,
+   not as unfinished work: firewall is readable but not writable (opening a
+   port from an unauthenticated local HTTP API is a security decision), and
+   remote desktop is agent-tool-reachable but has no shell route. Disk
+   encryption is read-only because runtime enable cannot exist.
 2. **`hart.devtools` does not fit the desktop image** — measured +3 GiB against
    ~2 GiB of slack (audits 30570492265 / 30573861911).
 3. **Runtime verification** of the current tree is still owed: CI runner
