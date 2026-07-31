@@ -274,22 +274,44 @@ class TestKillCleanupIsUnkillable:
         assert run_probe(["anything"], timeout=0.01) is None
 
 
-class TestShellApiConsolidation:
-    """DRY: both shell API modules resolve to the ONE implementation.
+class TestShellApiProbeContract:
+    """The CONTRACT both shell API modules' `_run` must honour.
 
-    This is an identity assertion on the imported objects, not a source
-    grep — it fails if anyone reintroduces a local `_run`, because the
-    module attribute would stop being `run_probe`.
+    These asserted object IDENTITY (`shell_system_apis._run is run_probe`)
+    while the two modules were aliased to this module's probe. That alias is
+    reverted for now — it broke TestShellWiFi/TestShellVPN, which mock
+    `subprocess` wholesale in the module namespace and therefore stopped
+    intercepting once the real work moved into core.subprocess_safe's
+    namespace (see the note at shell_system_apis._run).
+
+    So the identity assertion would now fail for a REVERT, not for the
+    regression it was written to catch. Rewritten to assert the behavioural
+    contract instead, which holds for the duplicate today and for the
+    consolidated probe tomorrow — and which is what the 139 call sites
+    actually depend on. Consolidation tracked in task #26.
     """
 
-    def test_system_apis_uses_canonical_probe(self):
-        from integrations.agent_engine import shell_system_apis
-        assert shell_system_apis._run is run_probe
-
-    def test_desktop_apis_uses_canonical_probe(self):
-        from integrations.agent_engine import shell_desktop_apis
-        assert shell_desktop_apis._run is run_probe
-
-    def test_both_modules_share_one_implementation(self):
+    def _runners(self):
         from integrations.agent_engine import shell_desktop_apis, shell_system_apis
-        assert shell_system_apis._run is shell_desktop_apis._run
+        return [("shell_system_apis", shell_system_apis._run),
+                ("shell_desktop_apis", shell_desktop_apis._run)]
+
+    def test_missing_tool_returns_none(self):
+        for name, fn in self._runners():
+            assert fn(["hart-not-a-real-binary-9f3a"]) is None, \
+                f"{name}._run must degrade to None when the tool is absent"
+
+    def test_success_exposes_completed_process_shape(self):
+        for name, fn in self._runners():
+            r = fn(_py("print('ok')"), timeout=30)
+            assert r is not None, f"{name}._run lost a successful result"
+            assert r.returncode == 0 and "ok" in r.stdout, \
+                f"{name}._run must expose returncode/stdout"
+
+    def test_nonzero_exit_is_not_collapsed_to_none(self):
+        """A tool that ran and failed must stay distinguishable from an
+        absent one — the whole point of the None sentinel."""
+        for name, fn in self._runners():
+            r = fn(_py("import sys; sys.exit(4)"), timeout=30)
+            assert r is not None and r.returncode == 4, \
+                f"{name}._run collapsed a real failure into 'tool missing'"

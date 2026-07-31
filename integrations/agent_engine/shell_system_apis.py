@@ -22,11 +22,24 @@ logger = logging.getLogger('hevolve.shell.system')
 
 # ─── Helpers ────────────────────────────────────────────────────
 
-# The bounded probe lives in core.subprocess_safe — ONE implementation for
-# both shell API modules (this file and shell_desktop_apis.py had a
-# byte-equivalent copy each). Aliased to the historic private name so the
-# 71 call sites below, and any test that patches `_run`, are unaffected.
-from core.subprocess_safe import run_probe as _run
+# NOTE (2026-07-31): this was briefly aliased to core.subprocess_safe.run_probe
+# to kill the byte-equivalent copy in shell_desktop_apis.py. REVERTED, because
+# the caller audit missed a consumer class: tests that mock the layer BENEATH
+# `_run`. TestShellWiFi/TestShellVPN in tests/unit/test_shell_os_apis.py patch
+# `shell_system_apis.subprocess` wholesale, and run_probe drives Popen from
+# core.subprocess_safe's OWN namespace — so the mock silently stopped
+# intercepting and the routes shelled out to real nmcli (7 green tests → red).
+#
+# The consolidation is still right; it just has to land together with moving
+# those tests onto the `_run` SEAM instead of the subprocess implementation
+# detail. Tracked in task #26. Keeping the duplicate for now is the lesser
+# evil versus rewriting 9 mock semantics without room to verify them.
+def _run(cmd, timeout=10, **kw):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, **kw)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
 
 
 def _first_int(r, default=0):
