@@ -78,11 +78,26 @@ jobs:
           echo "::endgroup::"
           deadnix --no-lambda-arg --no-lambda-pattern-names nixos/
 
-  # ─── Flake Evaluation (10-30 seconds) ──────────────────────
+  # ─── Flake Evaluation ──────────────────────────────────────
+  # The old header said "10-30 seconds" and the cap was 10 minutes. Full
+  # evaluation now takes LONGER than that cap (task #23: the eval gate went
+  # from ~2.5min to >15min after the installer / Calamares / dev-tools
+  # commits), so every run was KILLED MID-EVALUATION.
+  #
+  # That is why task #15 has read "red every run, NOT flake" since 07-26:
+  # Determinate Nix prints its error summary at the END of a run, so a run
+  # killed at the cap shows a ❌ with NO cause, indistinguishable from a
+  # persistent failure. Six diagnostic attempts on 2026-07-31 produced zero
+  # attributions for exactly this reason.
+  #
+  # Raised to 45 so a run can REACH its summary. This is a diagnosis
+  # unblocker, not a fix for the slowness — task #23 owns bisecting the
+  # eval-time regression itself, and this cap should come back down once
+  # that lands.
   flake-check:
     name: Nix Flake Check (full evaluation)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
