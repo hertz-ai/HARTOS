@@ -2984,7 +2984,11 @@ class TestParityMatrix:
     #: capability -> regex for routes that must NOT exist while its row says ❌.
     CLAIMED_NO_ROUTE = {
         "disk encryption": r"luks|/encrypt",
-        "remote desktop": r"/remote[-_]?desktop|/rustdesk|/sunshine",
+        # "remote desktop" left this list on 2026-07-31. Its row is 🟡, not
+        # ❌: agent TOOLS are registered (core/agent_tools.py:1391), only the
+        # shell route is missing. This guard only ever knew about the HTTP
+        # channel, so it happily blessed a row that was wrong about the other
+        # one — see test_matrix_agent_column_covers_the_tool_channel below.
         # "antivirus" left this list on 2026-07-31 — /api/shell/antivirus/
         # {status,scan} now exist, so the matrix row is ✅ and the paths are
         # checked by test_every_api_path_named_in_the_matrix_is_registered
@@ -3038,8 +3042,11 @@ class TestParityMatrix:
         cited = set()
         for m in re.finditer(r"`(/api/[^`]+?)`", self._matrix_text()):
             raw = m.group(1).strip()
-            if "..." in raw or "…" in raw:
-                continue          # prose placeholder ("/api/shell/..."), not a claim
+            # Prose placeholders, not claims: "/api/shell/...", "/api/shell/*".
+            # A wildcard means "the family of routes", which is exactly what a
+            # row says when it is describing the ABSENCE of one.
+            if any(ch in raw for ch in ("...", "…", "*")):
+                continue
             brace = re.search(r"\{([^}]*)\}", raw)
             if brace:
                 stem = raw[:brace.start()]
@@ -3070,6 +3077,39 @@ class TestParityMatrix:
             f"no agent route, but these are registered: {live}. Upgrade the "
             f"row — an understated matrix hides finished work the same way an "
             f"overstated one invents it")
+
+    def test_matrix_agent_column_covers_the_tool_channel(self):
+        """The Agent column means BOTH channels, and the doc must say so.
+
+        HART reaches capabilities two ways: `/api/shell/*` routes (what the
+        shell UI calls) and the LLM tool registry (what an agent calls during
+        a turn). Reading the column as "has an /api/shell route" produced a
+        wrong ❌ for remote desktop, which has had registered agent tools all
+        along. The header now states both; this fails if that guidance is
+        dropped, because the next reader would repeat the mistake.
+        """
+        text = self._matrix_text()
+        assert "TWO legitimate agent channels" in text, (
+            "the matrix header must keep saying the Agent column covers both "
+            "the /api/shell routes AND the LLM tool registry")
+        assert "core/agent_tools.py" in text, (
+            "the header must name the tool-registry channel concretely")
+
+    def test_remote_desktop_agent_tools_are_really_registered(self):
+        """Behavioural backing for the 🟡 remote-desktop row.
+
+        The row claims an agent can drive remote desktop via tools. Assert
+        the registration path actually exists and is callable rather than
+        trusting the note — the row was wrong once already.
+        """
+        from integrations.remote_desktop.agent_tools import (
+            build_remote_desktop_tools,
+        )
+        assert callable(build_remote_desktop_tools)
+        import core.agent_tools as ct
+        assert hasattr(ct, "register_remote_desktop_tools_if_available"), (
+            "core.agent_tools must expose the remote-desktop registration "
+            "hook the matrix row cites")
 
     def test_the_dual_boot_clock_fix_is_actually_wired(self):
         """The row that matters most on real hardware: the installer must

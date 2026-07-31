@@ -11,10 +11,22 @@ memory. Every row below was machine-checked against the tree, and the check
 runs in CI, so the answer is computed.
 
 **How to read a row.** *Nix* = the declarative half (the option that makes it
-true on a booted system). *Agent* = the live half (`/api/shell/...` so an agent
-can change it without a rebuild) — the two halves of the rule in task #25.
-`n/a` means the capability has no meaningful runtime action (you cannot toggle
-CPU microcode at runtime).
+true on a booted system). *Agent* = the live half — the two halves of the rule
+in task #25. `n/a` means the capability has no meaningful runtime action (you
+cannot toggle CPU microcode at runtime).
+
+**HART has TWO legitimate agent channels, and this column means both:**
+
+1. **`/api/shell/...` HTTP routes** — what the shell UI calls.
+2. **The LLM tool registry** (`core/agent_tools.py` → `integrations/*/agent_tools.py`)
+   — what an agent calls during a turn. For an agentic OS this is arguably the
+   MORE native path.
+
+Reading this column as "does it have an /api/shell route" understates the tree
+and produced a wrong ❌ for remote desktop, which has had registered agent
+tools all along (`core/agent_tools.py:1391`). Before marking any row ❌, check
+BOTH channels — the third such error on 2026-07-31, each from searching one
+place and concluding about the whole.
 
 | Capability | Nix (declarative) | Agent (live) | Notes |
 |---|---|---|---|
@@ -43,7 +55,7 @@ CPU microcode at runtime).
 | BIOS + UEFI boot | `isoImage.makeBiosBootable`; systemd-boot / GRUB by probe | n/a | Hyper-V **Gen 1** boots |
 | Disk encryption | `hart.luks` | ❌ | **gap: no live agent route** |
 | Screen capture / portal | `xdg.portal` (`hart.portal`) | ✅ | `/api/shell/screenshot` + `/api/shell/recording/{start,stop}` (`shell_os_apis.py`) — this row previously read ❌ from a name-only search that missed all three |
-| Remote desktop | RustDesk / Sunshine (`integrations/remote_desktop`) | ❌ | routes not on the shell API |
+| Remote desktop | RustDesk / Sunshine (`integrations/remote_desktop`) | 🟡 | **agent tools ARE registered** (`core/agent_tools.py:1391` → `build_remote_desktop_tools`), so an agent can drive sessions during a turn. No `/api/shell/*` route, so the shell UI cannot — that half is the remaining work, not the whole row |
 | Antivirus | ClamAV (`hart.security`) | ✅ | `/api/shell/antivirus/{status,scan}` — daemon liveness **plus `signatures_stale`** (a live clamd with an old DB looks healthy and catches nothing); scan is async-bounded (202, never holds a pool thread). Enable/disable stays declarative on purpose |
 | Firewall | `networking.firewall` (`hart.firewall`) | 🟡 | `/api/shell/firewall` reads live backend + open ports; changing ports stays declarative on purpose |
 
@@ -56,9 +68,9 @@ tier-drop compositor ladder (`hart.sessionSupervisor`) with a cage floor.
 
 ## Honest gaps
 
-1. **Two capabilities are declarative-only** (disk encryption, remote
-   desktop): the OS does the thing, but no agent can see or
-   change it live. That is the second half of task #25 and the concrete
+1. **One capability is declarative-only** (disk encryption): the OS does the
+   thing, but neither agent channel can see or change it live. Remote desktop
+   is 🟡 — reachable via agent TOOLS, missing only the shell route. That is the second half of task #25 and the concrete
    remaining parity work. Each was re-checked against real `@app.route`
    registrations on 2026-07-31, not a name search — screen capture had been
    listed here wrongly and is in fact fully routed. Firewall is 🟡 — readable but deliberately not
