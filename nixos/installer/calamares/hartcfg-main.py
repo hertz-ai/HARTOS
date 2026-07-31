@@ -44,32 +44,17 @@ def render_local_nix(
     autologin: bool = False,
     lang: str = "",
     keyboard_layout: str = "",
-    windows_present: bool = False,
 ) -> str:
-    """The machine-local module from GUI choices. Declarative-only: the user is
-    created by NixOS from this file, never by mutating the target's /etc.
+    """The machine-local module from GUI choices.
 
-    ``windows_present`` carries the dual-boot clock decision (task #24). There
-    are TWO installers writing this file — the CLI (hart-installer.nix) and
-    this GUI, which its own docstring calls "the GUI twin of hart-install
-    --mounted", i.e. an ALTERNATIVE path, not a step inside the other. The CLI
-    got the fix first and this one did not, so a user installing beside
-    Windows through the GRAPHICAL installer — the default path for a desktop
-    OS — still got the +5:30 backwards clock jump. Passing it as a parameter
-    of the shared renderer keeps ONE writer for the file's contents instead of
-    duplicating the decision into two languages.
+    USER CHOICES ONLY. Facts probed off the machine (the dual-boot clock)
+    are written by hart-write-install-config into hardware-local.nix — the
+    ONE generator both installers already call — so a probe cannot land in
+    one front-end and miss the other, which is exactly what happened with
+    time.hardwareClockInLocalTime (task #24). Declarative-only: the user is
+    created by NixOS from this file, never by mutating the target's /etc.
     """
     lines = ["{ ... }:", "{"]
-    if windows_present:
-        lines.append(
-            "  # A Windows bootloader was found on this machine. Windows keeps")
-        lines.append(
-            "  # the hardware clock in LOCAL time, so HART must read it the same")
-        lines.append(
-            "  # way or NTP steps the wall clock by the timezone offset on the")
-        lines.append(
-            "  # first sync (task #24 — the real-hardware hang).")
-        lines.append("  time.hardwareClockInLocalTime = true;")
     if hostname:
         lines.append(f"  networking.hostName = {_nix_str(hostname)};")
     if lang:
@@ -91,21 +76,6 @@ def render_local_nix(
             )
     lines.append("}")
     return "\n".join(lines) + "\n"
-
-
-def windows_bootloader_present(root: str) -> bool:
-    """True when a Windows bootloader sits on the target's ESP.
-
-    The SAME probe the CLI installer uses (bootmgfw.efi at either ESP mount
-    point), kept as a pure, import-safe helper so both installers ask the
-    question identically and it is unit-testable without a running Calamares.
-    """
-    import os
-
-    return any(os.path.exists(os.path.join(root, p)) for p in (
-        "boot/EFI/Microsoft/Boot/bootmgfw.efi",
-        "boot/efi/EFI/Microsoft/Boot/bootmgfw.efi",
-    ))
 
 
 def hash_password(plaintext: str) -> str:
@@ -137,8 +107,6 @@ def run():  # pragma: no cover - integration path, exercised on the live ISO
         autologin=bool(_gs("autoLoginUser")),
         lang=(_gs("localeConf", {}) or {}).get("LANG", ""),
         keyboard_layout=_gs("keyboardLayout"),
-        # Dual-boot clock: same probe, same decision as the CLI installer.
-        windows_present=windows_bootloader_present(root),
     )
     os.makedirs(f"{root}/etc/nixos", exist_ok=True)
     with open(f"{root}/etc/nixos/local.nix", "w") as f:

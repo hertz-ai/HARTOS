@@ -89,32 +89,14 @@ def test_password_hash_is_sha512_crypt():
     assert h.startswith("$6$")
 
 
-def test_render_local_nix_emits_local_rtc_when_windows_present():
-    """Dual-boot clock through the GUI installer (task #24).
+def test_render_local_nix_carries_USER_choices_only():
+    """The dual-boot clock is NOT rendered here any more, and that is the fix.
 
-    The GUI is an ALTERNATIVE install path that writes local.nix itself, so a
-    fix living only in the CLI installer left the DEFAULT desktop install
-    hitting the +5:30 backwards clock jump.
+    Facts probed off the machine belong to hart-write-install-config, the ONE
+    generator BOTH installers call, which writes them to hardware-local.nix.
+    While the clock lived in this per-front-end renderer it reached the CLI
+    and missed the GUI (task #24) — the parallel path the steward called out.
     """
-    out = hartcfg.render_local_nix(hostname="h", windows_present=True)
-    assert "time.hardwareClockInLocalTime = true;" in out
-
-
-def test_render_local_nix_omits_local_rtc_on_a_single_os_machine():
-    """Blanket-setting it is wrong in the other direction: a single-OS
-    machine's RTC really is UTC."""
-    out = hartcfg.render_local_nix(hostname="h", windows_present=False)
-    assert "hardwareClockInLocalTime" not in out
-    # Default must be the safe one for callers that predate the parameter.
-    assert "hardwareClockInLocalTime" not in hartcfg.render_local_nix(hostname="h")
-
-
-def test_windows_probe_checks_both_esp_mount_points(tmp_path):
-    """The same two paths the CLI probes — an ESP can be mounted at /boot or
-    /boot/efi, and checking only one silently misses half the machines."""
-    m = hartcfg
-    assert m.windows_bootloader_present(str(tmp_path)) is False
-    esp = tmp_path / "boot" / "efi" / "EFI" / "Microsoft" / "Boot"
-    esp.mkdir(parents=True)
-    (esp / "bootmgfw.efi").write_text("x")
-    assert m.windows_bootloader_present(str(tmp_path)) is True
+    out = hartcfg.render_local_nix(hostname="h", username="u")
+    assert "networking.hostName" in out          # user choice: still here
+    assert "hardwareClockInLocalTime" not in out  # probed fact: not our job

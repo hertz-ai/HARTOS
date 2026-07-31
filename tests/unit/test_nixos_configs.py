@@ -2926,17 +2926,30 @@ class TestParityMatrix:
         That is the vacuous-guard shape one level up: the assertion held, the
         claim it was read as supporting did not. Both paths are checked now.
         """
+        # CONSOLIDATED (steward: "why are they not canonicalised?"). Two
+        # installer FRONT-ENDS is legitimate — a CLI for headless/scripted
+        # installs, a GUI for the desktop — and they already drive ONE
+        # generator (Calamares shells out to hart-write-install-config). What
+        # was not legitimate: local.nix had three renderers in two languages,
+        # so the clock probe landed in the CLI and missed the GUI. Probed
+        # facts now live in hardware-local.nix with the generator as their
+        # only writer; local.nix stays the front-end's user-choice file, and
+        # NixOS module imports compose them.
+        gen = read_nix(os.path.join(MODULES_DIR, "hart-installer.nix"))
+        assert "hardware-local.nix" in gen, (
+            "the shared generator must write the probed-facts file")
+        assert re.search(r'\./hardware-local\.nix', gen), (
+            "hardware-local.nix must be in the written flake's module list, "
+            "or it is generated and never imported")
         gui = read_nix(os.path.join(
             REPO_ROOT, "nixos", "installer", "calamares", "hartcfg-main.py"))
-        assert re.search(r'time\.hardwareClockInLocalTime\s*=\s*true\s*;', gui), (
-            "the Calamares installer must also write the dual-boot clock "
-            "setting — it writes local.nix on its own path")
-        assert "bootmgfw.efi" in gui, (
-            "the GUI must use the SAME Windows probe as the CLI, not a "
-            "different or absent condition")
-        assert "windows_present" in gui, (
-            "the decision belongs to the shared render_local_nix so both "
-            "installers ask one question — not two copies that can drift")
+        # No ASSIGNMENT, not no mention: the GUI's docstring legitimately names
+        # the option to explain why it is NOT rendered there. Asserting on the
+        # bare word would forbid the documentation of the very decision — the
+        # mirror image of the vacuity bug where a comment SATISFIED a check.
+        assert not re.search(r'hardwareClockInLocalTime\s*=', gui), (
+            "the GUI must NOT re-render a probed fact — that duplication is "
+            "exactly what let the two installers drift")
 
     def test_declared_gaps_are_not_silently_upgraded(self):
         """The five declarative-only capabilities are listed as ❌ on purpose.
