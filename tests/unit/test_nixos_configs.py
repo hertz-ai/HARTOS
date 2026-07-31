@@ -2840,3 +2840,93 @@ class TestNoInheritShadowedProfileOptions:
             "profile's own plain definition unless the values are equal — the "
             "node fails to EVALUATE. Use `X = lib.mkForce ...;` to say the "
             "override is deliberate: " + "; ".join(sorted(set(offenders))))
+
+
+class TestParityMatrix:
+    """The Windows/macOS parity matrix is CHECKED, not asserted in prose.
+
+    docs/architecture/OS_PARITY_MATRIX.md answers "does HART have parity" with
+    a row per capability instead of a judgement call. A doc alone rots the
+    moment an option moves, so every row claiming a Nix option must name one
+    the tree actually has, and the honest-gap rows must STAY honest — a row
+    silently upgraded from ❌ to ✅ without the route existing would be exactly
+    the false-parity claim the matrix exists to prevent.
+    """
+
+    MATRIX = os.path.join(REPO_ROOT, "docs", "architecture", "OS_PARITY_MATRIX.md")
+
+    #: capability -> a regex that must match somewhere under nixos/ for the
+    #: matrix's Nix column to be truthful.
+    CLAIMED_NIX = {
+        "networking.networkmanager": r'networking\.networkmanager\.enable',
+        "pipewire": r'services\.pipewire',
+        "printing": r'services\.printing\.enable',
+        "sane": r'hardware\.sane',
+        "bluetooth": r'hardware\.bluetooth',
+        "udisks2": r'services\.udisks2|hart\.storage',
+        "firmware": r'hardware\.enableRedistributableFirmware',
+        "microcode": r'hardware\.cpu\.(intel|amd)\.updateMicrocode',
+        "hypervGuest": r'virtualisation\.hypervGuest\.enable',
+        "qemuGuest": r'services\.qemuGuest\.enable',
+        "spice": r'services\.spice-vdagentd\.enable',
+        "biosBootable": r'makeBiosBootable',
+        "localRtc": r'time\.hardwareClockInLocalTime',
+        "inputMethod": r'i18n\.inputMethod',
+    }
+
+    def _nix_tree(self):
+        parts = []
+        for pat in ("nixos/modules/*.nix", "nixos/profiles/*.nix",
+                    "nixos/configurations/*.nix", "nixos/*.nix"):
+            for p in glob.glob(os.path.join(REPO_ROOT, pat)):
+                parts.append(read_nix(p))
+        return "\n".join(parts)
+
+    def test_matrix_exists(self):
+        assert os.path.isfile(self.MATRIX), (
+            "the parity matrix is the artifact that turns 'do we have parity' "
+            "from a judgement call into a checked table")
+
+    @pytest.mark.parametrize("name", sorted(CLAIMED_NIX))
+    def test_every_claimed_nix_option_is_real(self, name):
+        """A row may not claim an option the tree does not have."""
+        assert re.search(self.CLAIMED_NIX[name], self._nix_tree()), (
+            f"OS_PARITY_MATRIX.md claims {name} but no nixos/ file defines it "
+            f"— the matrix would be advertising parity HART does not have")
+
+    def test_the_dual_boot_clock_fix_is_actually_wired(self):
+        """The row that matters most on real hardware: the installer must
+        WRITE time.hardwareClockInLocalTime when it finds Windows, or a
+        dual-boot node's clock jumps by the timezone offset on first NTP sync
+        (task #24, the steward's hang)."""
+        src = read_nix(os.path.join(MODULES_DIR, "hart-installer.nix"))
+        # The ASSIGNMENT, not the mention. Written as a substring check first,
+        # this passed against the explanatory COMMENT that merely names the
+        # option — vacuous, and the same shape as the `"default" in body` hole
+        # the reviewing session found in the required-option guard. Proof by
+        # revert is what exposed it: deleting the real assignment left the test
+        # green.
+        assert re.search(r'time\.hardwareClockInLocalTime\s*=\s*true\s*;', src), (
+            "hart-install must WRITE time.hardwareClockInLocalTime = true into "
+            "local.nix, not merely mention it")
+        assert "bootmgfw.efi" in src, (
+            "it must be conditioned on an ACTUAL Windows bootloader — a "
+            "blanket setting is wrong for single-OS machines whose RTC is UTC")
+
+    def test_declared_gaps_are_not_silently_upgraded(self):
+        """The five declarative-only capabilities are listed as ❌ on purpose.
+        Turning one into ✅ requires the route to exist; this keeps the claim
+        and the code in step rather than letting the doc drift optimistic."""
+        doc = open(self.MATRIX, encoding="utf-8").read()
+        api = "\n".join(
+            open(p, encoding="utf-8").read()
+            for p in glob.glob(os.path.join(
+                REPO_ROOT, "integrations", "agent_engine", "shell_*apis*.py")))
+        for cap, route in [("Disk encryption", r'/api/shell/(luks|encrypt)'),
+                           ("Firewall", r'/api/shell/firewall')]:
+            row = [l for l in doc.splitlines() if l.startswith(f"| {cap} ")]
+            assert row, f"matrix lost its {cap} row"
+            if "❌" in row[0]:
+                assert not re.search(route, api), (
+                    f"{cap} now HAS a live route — update the matrix row to ✅ "
+                    f"rather than leaving a stale gap claim")

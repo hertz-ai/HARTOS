@@ -114,7 +114,40 @@ let
       # here. Default is an empty module. Never overwrite an existing one
       # (front-ends write it BEFORE calling this generator on re-runs).
       if [ ! -e "$mnt/etc/nixos/local.nix" ]; then
-        printf '{ ... }: { }\n' > "$mnt/etc/nixos/local.nix"
+        # DUAL-BOOT CLOCK (real-HW 2026-07-30, task #24). Windows keeps the RTC
+        # in LOCAL time; NixOS assumes UTC. On the steward's machine the node
+        # therefore ran +5:30 wrong for 23 minutes and, the instant wifi
+        # connected, NTP yanked the wall clock BACKWARDS by the whole offset —
+        # immediately before the desktop hung. A large backwards step breaks
+        # anything computing `deadline - now` (paint watchdog, resource
+        # governor, canary duration, SSE keepalives).
+        #
+        # NOT a blanket setting: on a single-OS machine the RTC really is UTC
+        # and forcing local time would be wrong in the other direction. So it
+        # is written ONLY when a Windows bootloader is actually present, using
+        # the SAME probe the dual-boot install path already relies on
+        # (bootmgfw.efi on the ESP we are about to share). NixOS's own
+        # time.hardwareClockInLocalTime is the mechanism — nothing invented.
+        _win=""
+        for _p in "$mnt/boot/EFI/Microsoft/Boot/bootmgfw.efi" \
+                  "$mnt/boot/efi/EFI/Microsoft/Boot/bootmgfw.efi"; do
+          [ -e "$_p" ] && _win=1 && break
+        done
+        if [ -n "$_win" ]; then
+          echo "[hart-install] Windows bootloader detected — RTC will be read as LOCAL time"
+          cat > "$mnt/etc/nixos/local.nix" <<'LOCALEOF'
+{ ... }:
+{
+  # Written by hart-install: a Windows bootloader was found on this machine.
+  # Windows keeps the hardware clock in local time, so HART must read it the
+  # same way or the two OSes fight over the clock and NTP steps the wall clock
+  # by the timezone offset on first sync (task #24).
+  time.hardwareClockInLocalTime = true;
+}
+LOCALEOF
+        else
+          printf '{ ... }: { }\n' > "$mnt/etc/nixos/local.nix"
+        fi
       fi
 
       # The union flake. hart.lib.mkInstalledSystem is THE generator — the same
