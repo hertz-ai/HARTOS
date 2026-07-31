@@ -27,6 +27,8 @@ CPU microcode at runtime).
 | Bluetooth | `hardware.bluetooth` | ✅ | |
 | Power / battery | `services.upower`, `tlp`, `thermald` | ✅ | |
 | Disks / mount / format | `services.udisks2` (`hart.storage`) | ✅ | |
+| Defrag / TRIM / chkdsk | `hart.storage` tooling | ✅ | `/storage/{defrag,trim,fsck}`; defrag correctly returns *nothing* for f2fs/ntfs/vfat/exfat — Windows offers it anyway |
+| Device Manager (tree) | kernel + udev | 🟡 | `/api/shell/drivers` = `lspci`+`lsusb`, **capped at 50**, and shows no driver binding or unclaimed-device status — the signal that says "this NIC needs firmware" |
 | App install / store | flatpak, appimage, `hart.apps` | ✅ | offline catalog |
 | Updates + rollback | `hart.ota` → `nixos-rebuild` generations | ✅ | atomic; rollback is a generation switch |
 | Accessibility | `at-spi2`, `hart.accessibility` | ✅ | |

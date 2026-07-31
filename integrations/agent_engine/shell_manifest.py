@@ -461,7 +461,13 @@ SYSTEM_PANELS = {
         'apis': ['/api/shell/backup/list', '/api/shell/backup/restore'],
     },
     'devices': {
-        'title': 'Devices & Mesh', 'icon': 'devices_other',
+        # "Devices & Mesh" collided with the 'drivers' panel's "Drivers &
+        # Devices": one lists HARDWARE (lspci/lsusb), this one lists PAIRED
+        # COMPUTE-MESH PEERS. Two panels a user reads as the same thing is a
+        # discoverability bug — the title is the searched field (see the
+        # schema note at the top of this file), so ambiguity here means the
+        # omnibox "open devices" lands on a coin flip.
+        'title': 'Paired Devices (Mesh)', 'icon': 'devices_other',
         'group': 'System', 'default_size': [700, 500],
         'apis': ['/api/shell/devices'],
     },
