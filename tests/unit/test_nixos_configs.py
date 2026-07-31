@@ -2792,3 +2792,51 @@ class TestImageFitsItsTargetDevice:
         assert re.search(r'^\s+devTools\.enable\s*=\s*true', prof, re.M), (
             "hart.devTools (language toolchains) must stay enabled — it is a "
             "different module from hart.devtools despite the name")
+
+
+class TestNoInheritShadowedProfileOptions:
+    """`inherit X;` inside a test node is a PLAIN definition of X.
+
+    THE BLIND SPOT (2026-07-30 -> caught 07-31): when mkNode began composing
+    the real variant profile, I swept every test for leaves that would now
+    collide and migrated the two I found to mkForce. The sweep was a regex for
+    `name = value`, so it could not see
+
+        hart.sessionSupervisor = { inherit startTier; }
+
+    which is exactly as much a plain definition as `startTier = "sway"`. The
+    desktop profile sets startTier = "hart-comp"; the test's sway and cage
+    nodes therefore conflicted and FAILED TO EVALUATE — ❌
+    hart-session-supervisor-start-tier in run 30574137255, where 69 other
+    targets were green.
+
+    An enum/str merges only when definitions are EQUAL, so this class is
+    invisible for the value that happens to match the profile and fatal for
+    every other — the worst possible failure shape to leave to a regex.
+    """
+
+    def _profile_leaves(self, variant):
+        src = read_nix(os.path.join(PROFILES_DIR, variant + ".nix"))
+        return {m.group(1) for m in
+                re.finditer(r'^\s{4,6}([a-zA-Z][\w]*)\s*=\s*[^;{]+;\s*$',
+                            src, re.M)}
+
+    def test_no_test_inherits_an_option_the_profile_also_sets(self):
+        offenders = []
+        for path in sorted(glob.glob(os.path.join(TESTS_DIR, "*.nix"))):
+            src = read_nix(path)
+            for variant in ("desktop", "server", "edge", "phone"):
+                if f'mkNode "{variant}"' not in src:
+                    continue
+                leaves = self._profile_leaves(variant)
+                for m in re.finditer(r'inherit\s+([\w\s]+);', src):
+                    for name in m.group(1).split():
+                        if name in leaves:
+                            offenders.append(
+                                f"{os.path.basename(path)}: inherit {name} "
+                                f"(profiles/{variant}.nix also sets it)")
+        assert not offenders, (
+            "`inherit X` is a PLAIN definition and collides with the variant "
+            "profile's own plain definition unless the values are equal — the "
+            "node fails to EVALUATE. Use `X = lib.mkForce ...;` to say the "
+            "override is deliberate: " + "; ".join(sorted(set(offenders))))

@@ -403,7 +403,14 @@ in
         virtualisation = { memorySize = 2048; cores = 2; };
         hart.sessionSupervisor = {
           enable = true;
-          inherit startTier;
+          # mkForce, NOT `inherit startTier`: since mkNode composes the real
+          # variant profile, the desktop profile ALSO sets startTier (its
+          # shipped value "hart-comp"). Two plain definitions of one enum
+          # conflict unless equal — so the `sway` and `cage` nodes failed to
+          # EVALUATE (run 30574137255, ❌ hart-session-supervisor-start-tier).
+          # This test's whole point is overriding the shipped start tier, so
+          # saying so explicitly is also the honest expression of intent.
+          startTier = pkgs.lib.mkForce startTier;
           # Make ALL tiers available so startTier is honored verbatim (an
           # unavailable tier would legitimately skip down — tested elsewhere).
           compCommand = "${pkgs.coreutils}/bin/true";
