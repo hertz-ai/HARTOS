@@ -289,10 +289,31 @@ in
           # not hot-loop either: back off hard between restarts.
           Restart = "on-failure";
           RestartSec = 60;
-          # It shares an 8GB node with the OS it is fixing. Hard caps + the lowest
-          # scheduling priority mean a wedged agent degrades itself, never the
-          # desktop. (The daemon also yields to the user in software every tick.)
+          # It shares an 8GB node with the OS it is fixing. A wedged agent must
+          # degrade ITSELF, never the desktop.
+          #
+          # CPUWeight / Nice / IOWeight are RELATIVE shares, not caps: they only
+          # bite when something else is contending. A busy-looping agent on an
+          # otherwise idle box still takes every core at Nice=19 — the machine
+          # heats, the fans spin, the battery drains, and an interactive app
+          # that wakes up must first preempt it. Memory was the only dimension
+          # actually bounded here.
+          #
+          # So: hard bounds on EVERY dimension, which is Android's model — a
+          # background app gets a restricted cpuset + bandwidth control, not
+          # just a lower priority. systemd expresses the same thing natively:
+          #   CPUQuota  — hard bandwidth ceiling (bandwidth control)
+          #   TasksMax  — fork-storm containment (no unbounded thread/proc fan-out)
+          #   MemoryHigh— reclaim pressure BEFORE the MemoryMax kill, so the
+          #               agent is throttled and trimmed rather than shot
           MemoryMax = "2G";
+          MemoryHigh = "1536M";
+          # One core's worth, wherever it runs. On any multi-core node every
+          # other core stays free for the user; on a single-core node the
+          # weight + nice below still deprioritise it. Portable, unlike
+          # pinning to an AllowedCPUs set whose validity depends on core count.
+          CPUQuota = "100%";
+          TasksMax = 64;
           CPUWeight = 5;
           Nice = 19;
           IOWeight = 10;

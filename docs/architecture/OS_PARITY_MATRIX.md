@@ -29,6 +29,8 @@ CPU microcode at runtime).
 | Disks / mount / format | `services.udisks2` (`hart.storage`) | ✅ | |
 | Defrag / TRIM / chkdsk | `hart.storage` tooling | ✅ | `/storage/{defrag,trim,fsck}`; defrag correctly returns *nothing* for f2fs/ntfs/vfat/exfat — Windows offers it anyway |
 | Device Manager (tree) | kernel + udev | ✅ | `/api/shell/drivers` = `lspci -mm -k` + `lsusb`, reporting **driver binding + `unclaimed`** (the yellow-bang: driver available but not attached ⇒ firmware missing) and an honest `truncated` flag instead of the old silent 50-cap |
+| Task Manager (processes) | psutil + systemd | ✅ | `/api/shell/tasks/{processes,kill,priority,resources}` — per-process CPU/mem/threads, kill behind a protected-name guard, renice, live resource totals |
+| Process isolation / containment | systemd cgroups (`CPUQuota`, `MemoryMax`/`MemoryHigh`, `TasksMax`) + `systemd.oomd` via `hart.memory.oomProtect` | n/a | Android's model, not just a lower priority: background agents are HARD-bounded on cpu, memory and task count, so a wedged agent degrades itself rather than the node. `Nice`/`CPUWeight` alone were the trap — they only bite under contention |
 | App install / store | flatpak, appimage, `hart.apps` | ✅ | offline catalog |
 | Updates + rollback | `hart.ota` → `nixos-rebuild` generations | ✅ | atomic; rollback is a generation switch |
 | Accessibility | `at-spi2`, `hart.accessibility` | ✅ | |

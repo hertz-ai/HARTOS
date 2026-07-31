@@ -74,6 +74,14 @@ in
 
       # Resource limits — Conky should be invisible on the scheduler
       serviceConfig.MemoryMax = "48M";
+      # A desktop widget redraws forever by design, so a stuck update loop
+      # looks exactly like normal work. CPUWeight/Nice only bite under
+      # contention — on an idle node a spinning conky takes a whole core and
+      # the user pays in fan noise and battery. 10% of one core is far above
+      # what a text overlay needs and bounds the failure absolutely.
+      serviceConfig.CPUQuota = "10%";
+      # It draws one window; it never forks a tree.
+      serviceConfig.TasksMax = 16;
       serviceConfig.CPUWeight = 5;
       serviceConfig.Nice = 19;
       serviceConfig.IOWeight = 5;

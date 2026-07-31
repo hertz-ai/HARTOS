@@ -2842,6 +2842,83 @@ class TestNoInheritShadowedProfileOptions:
             "override is deliberate: " + "; ".join(sorted(set(offenders))))
 
 
+class TestBackgroundAgentBlastRadius:
+    """A wedged background agent must degrade ITSELF, never the machine.
+
+    The steward's rule (2026-07-31): "reviewer hangs shd be isolated to
+    process and not hanging whole computer, use android's way of handling
+    isolation" — and "blast radius shd be minimised always".
+
+    The trap this guards is that `CPUWeight`, `Nice` and `IOWeight` LOOK like
+    caps and are not: they are relative shares that only bite under
+    contention. hart-copilot.nix carried a comment claiming "hard caps + the
+    lowest scheduling priority mean a wedged agent degrades itself" while
+    only MemoryMax was actually a bound — a busy-looping agent on an idle box
+    still took every core, and with no TasksMax a fork storm was unbounded.
+
+    Android's answer is bandwidth control + a restricted cpuset for
+    background apps, not merely a lower priority. systemd expresses the same
+    natively (CPUQuota / TasksMax), so this is composition, not reinvention.
+    """
+
+    #: `Nice = 19` is the codebase's marker for "lowest-priority background
+    #: work". Any unit wearing it is by definition the kind that must not be
+    #: able to saturate the box.
+    NICE_MARKER = re.compile(r"Nice\s*=\s*(1[5-9])\s*;")
+
+    def _module_files(self):
+        return sorted(glob.glob(os.path.join(MODULES_DIR, "*.nix")))
+
+    def test_lowest_priority_units_have_a_hard_cpu_bound(self):
+        """Deprioritised is not bounded — such a unit needs CPUQuota too.
+
+        File-level rather than block-level: coarse, but a module that
+        deprioritises a unit and hard-bounds nothing is exactly the shape
+        being outlawed, and the coarseness fails SAFE (it can only ask for
+        more containment, never less).
+        """
+        offenders = []
+        for path in self._module_files():
+            src = read_nix(path)
+            if self.NICE_MARKER.search(src) and "CPUQuota" not in src:
+                offenders.append(os.path.basename(path))
+        assert not offenders, (
+            f"{offenders} deprioritise a unit (Nice>=15) but set no CPUQuota. "
+            f"Nice only bites under contention — on an idle node the unit "
+            f"still takes every core (heat, battery, and an interactive app "
+            f"must preempt it). Add a hard bandwidth ceiling.")
+
+    def test_copilot_is_bounded_on_every_dimension(self):
+        """The autonomous agent — the one that edits the repo unattended —
+        must be bounded in cpu, memory, AND task count.
+
+        Memory alone was bounded before; a runaway could still pin the CPU
+        or fork without limit.
+        """
+        src = read_nix(os.path.join(MODULES_DIR, "hart-copilot.nix"))
+        for knob in ("MemoryMax", "MemoryHigh", "CPUQuota", "TasksMax"):
+            assert re.search(rf"{knob}\s*=", src), (
+                f"hart-copilot.nix sets no {knob}: an unattended agent with "
+                f"an unbounded {knob} can take the node down with it")
+
+    def test_memory_high_sits_below_memory_max(self):
+        """MemoryHigh must be the SOFT step before the hard kill.
+
+        Set at or above MemoryMax it is inert, and the agent goes straight
+        from fine to killed with no reclaim in between (the same inversion
+        hart-backend.nix documents having got wrong for edge).
+        """
+        src = read_nix(os.path.join(MODULES_DIR, "hart-copilot.nix"))
+
+        def _mb(knob):
+            m = re.search(rf'{knob}\s*=\s*"(\d+)([MG])"', src)
+            assert m, f"{knob} not found as a literal size in hart-copilot.nix"
+            return int(m.group(1)) * (1024 if m.group(2) == "G" else 1)
+
+        assert _mb("MemoryHigh") < _mb("MemoryMax"), (
+            "MemoryHigh >= MemoryMax makes the soft reclaim step inert")
+
+
 class TestParityMatrix:
     """The Windows/macOS parity matrix is CHECKED, not asserted in prose.
 
