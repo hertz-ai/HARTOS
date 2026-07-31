@@ -37,7 +37,56 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from core.subprocess_safe import run_probe
+
 logger = logging.getLogger('hevolve.liquid_ui')
+
+# Device Manager: cap is high enough that a real machine is never silently
+# truncated (a loaded workstation lists ~100 PCI + USB entries), while still
+# bounding the JSON a hostile/looping enumerator could produce.
+SHELL_DEVICE_CAP = 500
+
+
+def parse_lspci_k(text):
+    """`lspci -mm -k` output → device dicts carrying DRIVER BINDING.
+
+    Pure parse, no I/O, so the Device Manager's actual contract is testable
+    without a PCI bus (the dev box is Windows; the target is NixOS).
+
+    `-k` appends indented continuation lines to each device:
+
+        02:00.0 "Network controller" "Intel" "Wireless 3165" ...
+                Kernel driver in use: iwlwifi
+                Kernel modules: iwlwifi
+
+    A device with NO "Kernel driver in use" line is UNCLAIMED — nothing is
+    driving it. That is the yellow-bang Windows shows and the single most
+    useful fact in the panel: it distinguishes "wifi is off" from "this NIC
+    has no driver/firmware". Default `unclaimed=True` and clear it only on
+    a real binding, so a parse miss fails toward "flag it", never toward a
+    false all-clear.
+    """
+    devices, cur = [], None
+    for raw in (text or '').splitlines():
+        if not raw.strip():
+            continue
+        if raw[0].isspace():                      # continuation → attributes
+            if cur is None:                       # stray indent before any slot
+                continue
+            key, sep, val = raw.strip().partition(':')
+            if not sep:
+                continue
+            if key == 'Kernel driver in use':
+                cur['driver'] = val.strip()
+                cur['unclaimed'] = False
+            elif key == 'Kernel modules':
+                cur['modules'] = [m.strip() for m in val.split(',') if m.strip()]
+        else:                                     # new device line
+            cur = {'type': 'pci', 'info': raw.strip(),
+                   'driver': None, 'modules': [], 'unclaimed': True}
+            devices.append(cur)
+    return devices
+
 
 # Verbs that MUTATE the desktop (window.close, fullscreen takeover, …) — added
 # in Phase 6.  These pass a fail-CLOSED guardrail; benign display cards do not
@@ -7106,16 +7155,79 @@ function renderAgentOverlay(ev) {{
         # ── Shell APIs: Drivers ──
         @app.route('/api/shell/drivers', methods=['GET'])
         def shell_drivers():
-            devices = []
-            for cmd, dev_type in [(['lspci', '-mm'], 'pci'), (['lsusb'], 'usb')]:
+            """Device tree with DRIVER BINDING — the Device Manager contract.
+
+            Was: `lspci -mm` + `lsusb`, joined as opaque strings and truncated
+            at 50. Two problems the steward's Windows Device Manager
+            screenshots made obvious (2026-07-31):
+
+              1. The CAP silently hid devices — a normal laptop tree is well
+                 past 50 entries, so the panel showed a prefix and said
+                 nothing about the rest.
+              2. No DRIVER and no STATUS. Windows' whole value here is the
+                 yellow bang: which device has no working driver. Listing
+                 hardware without saying whether the kernel claimed it hides
+                 exactly the failure worth seeing — the Intel AC 3165 that
+                 needs a firmware blob looks identical to a working NIC.
+
+            `lspci -mm -k` is the same tool with the binding already in it
+            (-k appends "Kernel driver in use" / "Kernel modules"), so this
+            is parsing what we already ran, not a new mechanism. `unclaimed`
+            is the yellow-bang equivalent; the shell can surface it and an
+            agent can reason about it ("wifi down AND unclaimed → firmware").
+            """
+            truncated = False
+            errors = []
+
+            def _probe(argv):
+                """Probe one enumerator; never let it blank the whole tree.
+
+                `run_probe` returns None for the two EXPECTED degrades (tool
+                absent, tool hung) and deliberately propagates anything else,
+                so a broken install is not disguised as a missing tool. That
+                is right for a library, but for a device PANEL one unusable
+                binary must not take out the other source — a machine with a
+                bad lspci should still show its USB tree.
+
+                So: logged loudly (never silent) AND reported in `errors`, so
+                the panel can say "PCI enumeration failed" instead of showing
+                a confident, silently-partial list.
+                """
                 try:
-                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-                    for line in r.stdout.strip().split('\n'):
-                        if line.strip():
-                            devices.append({'type': dev_type, 'info': line.strip()})
-                except Exception:
-                    logger.exception("shell_drivers: swallowed Exception")
-            return jsonify({'devices': devices[:50]})
+                    return run_probe(argv, timeout=6)
+                except OSError as e:
+                    logger.warning("shell_drivers: %s failed: %s", argv[0], e)
+                    errors.append({'source': argv[0], 'error': str(e)})
+                    return None
+
+            r = _probe(['lspci', '-mm', '-k'])
+            devices = parse_lspci_k(r.stdout if r else '')
+
+            r = _probe(['lsusb'])
+            if r:
+                for line in (r.stdout or '').splitlines():
+                    if line.strip():
+                        # lsusb has no binding column; a USB device's driver
+                        # lives per-interface in sysfs. Reported as unknown
+                        # rather than guessed — an invented "claimed" would be
+                        # worse than an honest gap.
+                        devices.append({'type': 'usb', 'info': line.strip(),
+                                        'driver': None, 'modules': [],
+                                        'unclaimed': None})
+
+            if len(devices) > SHELL_DEVICE_CAP:
+                devices, truncated = devices[:SHELL_DEVICE_CAP], True
+            return jsonify({
+                'devices': devices,
+                'count': len(devices),
+                'truncated': truncated,
+                # The signal a user acts on: PCI devices the kernel did not
+                # claim. None-valued (USB) are excluded — unknown is not a
+                # problem report.
+                'unclaimed_count': sum(1 for d in devices if d.get('unclaimed') is True),
+                # Non-empty ⇒ the list is INCOMPLETE for a reason worth showing.
+                'errors': errors,
+            })
 
         # ── Shell APIs: WiFi (CACHED) ──
         # Returns the wifi network list the background _connectivity_cache prober

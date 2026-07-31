@@ -2894,6 +2894,103 @@ class TestParityMatrix:
             f"OS_PARITY_MATRIX.md claims {name} but no nixos/ file defines it "
             f"— the matrix would be advertising parity HART does not have")
 
+    # ── Agent column ────────────────────────────────────────────────────
+    # The Nix column was guarded from the start; the AGENT column was not,
+    # and on 2026-07-31 that let a row sit at ❌ ("no /api/shell action") for
+    # screen capture while /api/shell/screenshot and /api/shell/recording/
+    # {start,stop} had been registered all along. The row was wrong because
+    # it came from a name-only search, and no test could contradict it.
+    #
+    # Both directions are now checked: a ✅/🟡 row may not name a route that
+    # does not exist, and a ❌ row may not be hiding one that does.
+
+    #: capability -> regex for routes that must NOT exist while its row says ❌.
+    CLAIMED_NO_ROUTE = {
+        "disk encryption": r"luks|/encrypt",
+        "remote desktop": r"/remote[-_]?desktop|/rustdesk|/sunshine",
+        "antivirus": r"clamav|antivirus|/malware",
+    }
+
+    def _registered_routes(self):
+        """Every route path registered anywhere under integrations/.
+
+        Reads the decorators rather than importing the app: importing pulls
+        in autogen/chromadb and is exactly the kind of heavyweight import
+        this suite avoids. The decorator IS the registration, so a path that
+        appears here is genuinely served.
+        """
+        cached = getattr(TestParityMatrix, "_route_cache", None)
+        if cached is not None:
+            return cached
+        pat = re.compile(r"""@(?:\w+)\.(?:route|get|post|put|delete)\(\s*['"]([^'"]+)""")
+        found = set()
+        for root, _dirs, files in os.walk(os.path.join(REPO_ROOT, "integrations")):
+            if "__pycache__" in root:
+                continue
+            for fn in files:
+                if not fn.endswith(".py"):
+                    continue
+                try:
+                    with open(os.path.join(root, fn), encoding="utf-8",
+                              errors="replace") as fh:
+                        found.update(pat.findall(fh.read()))
+                except OSError:
+                    continue
+        # Scanning the tree is the slow part and it cannot change mid-run;
+        # without this the parametrized gap tests re-walk integrations/ once
+        # each (measured 3m39s for the class).
+        TestParityMatrix._route_cache = found
+        return found
+
+    def _matrix_text(self):
+        with open(self.MATRIX, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_every_api_path_named_in_the_matrix_is_registered(self):
+        """A row may not advertise a route the code does not serve.
+
+        Catches the inverse of the screen-capture error: a row upgraded to ✅
+        citing an endpoint nobody wired.
+        """
+        routes = self._registered_routes()
+        # Paths as written in the matrix, incl. brace-expanded forms like
+        # /api/shell/storage/{defrag,trim,fsck} and /recording/{start,stop}.
+        cited = set()
+        for m in re.finditer(r"`(/api/[^`]+?)`", self._matrix_text()):
+            raw = m.group(1).strip()
+            if "..." in raw or "…" in raw:
+                continue          # prose placeholder ("/api/shell/..."), not a claim
+            brace = re.search(r"\{([^}]*)\}", raw)
+            if brace:
+                stem = raw[:brace.start()]
+                for alt in brace.group(1).split(","):
+                    alt = alt.strip()
+                    if alt:
+                        cited.add(stem + alt)
+            else:
+                cited.add(raw)
+        missing = sorted(p for p in cited if p not in routes)
+        assert not missing, (
+            f"OS_PARITY_MATRIX.md cites {missing} but no @route registers "
+            f"them — the matrix would advertise parity that does not exist")
+
+    @pytest.mark.parametrize("capability", sorted(CLAIMED_NO_ROUTE))
+    def test_honest_gap_rows_are_still_gaps(self, capability):
+        """A ❌ row must be a REAL gap, not a stale search result.
+
+        This is the test that would have caught the screen-capture row: it
+        fails the moment someone wires the route without upgrading the row,
+        which turns "we still owe this" into a checked fact instead of a
+        claim nobody re-verified.
+        """
+        pat = re.compile(self.CLAIMED_NO_ROUTE[capability], re.I)
+        live = sorted(r for r in self._registered_routes() if pat.search(r))
+        assert not live, (
+            f"OS_PARITY_MATRIX.md lists '{capability}' as an honest gap with "
+            f"no agent route, but these are registered: {live}. Upgrade the "
+            f"row — an understated matrix hides finished work the same way an "
+            f"overstated one invents it")
+
     def test_the_dual_boot_clock_fix_is_actually_wired(self):
         """The row that matters most on real hardware: the installer must
         WRITE time.hardwareClockInLocalTime when it finds Windows, or a

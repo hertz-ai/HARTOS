@@ -22,12 +22,11 @@ logger = logging.getLogger('hevolve.shell.system')
 
 # ─── Helpers ────────────────────────────────────────────────────
 
-def _run(cmd, timeout=10, **kw):
-    try:
-        return subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout, **kw)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
+# The bounded probe lives in core.subprocess_safe — ONE implementation for
+# both shell API modules (this file and shell_desktop_apis.py had a
+# byte-equivalent copy each). Aliased to the historic private name so the
+# 71 call sites below, and any test that patches `_run`, are unaffected.
+from core.subprocess_safe import run_probe as _run
 
 
 def _first_int(r, default=0):

@@ -28,7 +28,7 @@ CPU microcode at runtime).
 | Power / battery | `services.upower`, `tlp`, `thermald` | ✅ | |
 | Disks / mount / format | `services.udisks2` (`hart.storage`) | ✅ | |
 | Defrag / TRIM / chkdsk | `hart.storage` tooling | ✅ | `/storage/{defrag,trim,fsck}`; defrag correctly returns *nothing* for f2fs/ntfs/vfat/exfat — Windows offers it anyway |
-| Device Manager (tree) | kernel + udev | 🟡 | `/api/shell/drivers` = `lspci`+`lsusb`, **capped at 50**, and shows no driver binding or unclaimed-device status — the signal that says "this NIC needs firmware" |
+| Device Manager (tree) | kernel + udev | ✅ | `/api/shell/drivers` = `lspci -mm -k` + `lsusb`, reporting **driver binding + `unclaimed`** (the yellow-bang: driver available but not attached ⇒ firmware missing) and an honest `truncated` flag instead of the old silent 50-cap |
 | App install / store | flatpak, appimage, `hart.apps` | ✅ | offline catalog |
 | Updates + rollback | `hart.ota` → `nixos-rebuild` generations | ✅ | atomic; rollback is a generation switch |
 | Accessibility | `at-spi2`, `hart.accessibility` | ✅ | |
@@ -40,7 +40,7 @@ CPU microcode at runtime).
 | Hypervisor guest | `hypervGuest`, `qemuGuest`, `spice-vdagentd`, `vmware.guest` | n/a | Hyper-V / KVM / SPICE / VMware |
 | BIOS + UEFI boot | `isoImage.makeBiosBootable`; systemd-boot / GRUB by probe | n/a | Hyper-V **Gen 1** boots |
 | Disk encryption | `hart.luks` | ❌ | **gap: no live agent route** |
-| Screen capture / portal | `xdg.portal` (`hart.portal`) | ❌ | gate exists; no `/api/shell` action |
+| Screen capture / portal | `xdg.portal` (`hart.portal`) | ✅ | `/api/shell/screenshot` + `/api/shell/recording/{start,stop}` (`shell_os_apis.py`) — this row previously read ❌ from a name-only search that missed all three |
 | Remote desktop | RustDesk / Sunshine (`integrations/remote_desktop`) | ❌ | routes not on the shell API |
 | Antivirus | ClamAV (`hart.security`) | ❌ | `hart-security` CLI only |
 | Firewall | `networking.firewall` (`hart.firewall`) | 🟡 | `/api/shell/firewall` reads live backend + open ports; changing ports stays declarative on purpose |
@@ -54,10 +54,12 @@ tier-drop compositor ladder (`hart.sessionSupervisor`) with a cage floor.
 
 ## Honest gaps
 
-1. **Four capabilities are declarative-only** (disk encryption, screen capture,
-   remote desktop, antivirus): the OS does the thing, but no agent can see or
+1. **Three capabilities are declarative-only** (disk encryption, remote
+   desktop, antivirus): the OS does the thing, but no agent can see or
    change it live. That is the second half of task #25 and the concrete
-   remaining parity work. Firewall is now 🟡 — readable but deliberately not
+   remaining parity work. Each was re-checked against real `@app.route`
+   registrations on 2026-07-31, not a name search — screen capture had been
+   listed here wrongly and is in fact fully routed. Firewall is 🟡 — readable but deliberately not
    writable, since opening a port from an unauthenticated local HTTP API is a
    security decision rather than a convenience; the declarative side stays the
    source of truth.

@@ -111,6 +111,7 @@ def run_bounded(
     timeout: float = 5.0,
     *,
     wait_after_kill: float = 2.0,
+    **popen_kwargs,
 ) -> BoundedResult:
     """Run `cmd` with a hard timeout and reader-thread-safe cleanup.
 
@@ -125,6 +126,10 @@ def run_bounded(
         timeout: seconds to wait for the child's natural exit.
         wait_after_kill: seconds to wait for proc cleanup after kill()
             before giving up and letting the OS reap a zombie.
+        **popen_kwargs: extra Popen kwargs (``cwd``, ``env``, …) merged
+            over the defaults. Do NOT pass ``capture_output`` — that is a
+            ``subprocess.run`` argument and Popen rejects it; stdout and
+            stderr are already piped here.
 
     Returns:
         BoundedResult with .returncode, .stdout, .stderr, .timed_out.
@@ -134,7 +139,7 @@ def run_bounded(
         FileNotFoundError: cmd[0] not on PATH (caller handles).
         OSError: other Popen spawn failure (caller handles).
     """
-    popen_kwargs = {
+    popen_kwargs_base = {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "stdin": subprocess.DEVNULL,
@@ -144,12 +149,16 @@ def run_bounded(
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         si.wShowWindow = 0
-        popen_kwargs["startupinfo"] = si
-        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        popen_kwargs_base["startupinfo"] = si
+        popen_kwargs_base["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+    # Caller overrides win over the defaults (cwd/env/stdin), but they
+    # cannot silently drop the piping this function's contract depends on.
+    popen_kwargs_base.update(popen_kwargs)
 
     # FileNotFoundError / OSError from Popen propagate — callers that
     # already do `except FileNotFoundError: pass` still work unchanged.
-    proc = subprocess.Popen(list(cmd), **popen_kwargs)
+    proc = subprocess.Popen(list(cmd), **popen_kwargs_base)
 
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
@@ -165,6 +174,57 @@ def run_bounded(
         return BoundedResult(
             returncode=-1, stdout="", stderr="", timed_out=True,
         )
+
+
+def run_probe(
+    cmd: Sequence[str],
+    timeout: float = 10.0,
+    **popen_kwargs,
+) -> Optional[BoundedResult]:
+    """Probe an external tool; ``None`` means "no answer available".
+
+    THE CANONICAL SHELL-API PROBE. `integrations/agent_engine/
+    shell_system_apis.py` and `shell_desktop_apis.py` each carried a
+    byte-equivalent private `_run()` — 139 call sites across the two —
+    and both were the exact `subprocess.run(capture_output=True,
+    text=True, timeout=N)` shape this module's docstring tells new
+    callers not to write. So the OS's two biggest hardware-probing
+    surfaces (the ones running lspci / nmcli / bluetoothctl / upower on
+    a booted node) were the most exposed to the reader-thread orphan
+    hang, which on a desktop shell shows up as a frozen panel.
+
+    Consolidated here rather than into a third `shell_common.py`,
+    because a bounded-subprocess helper already had a canonical home.
+
+    Semantics are preserved EXACTLY as the two `_run`s had them, since
+    the call sites were left untouched:
+      * tool missing (FileNotFoundError)  → None
+      * tool exceeded `timeout`           → None
+      * otherwise → a result exposing .returncode / .stdout / .stderr
+
+    The single behavioural CHANGE is the fix itself: a timed-out child
+    now gets its parent-side pipes closed, so the reader threads unblock
+    instead of wedging the request. `stdin` is also DEVNULL, so a tool
+    that unexpectedly reads stdin returns EOF rather than hanging
+    forever — both strictly reduce ways the shell can freeze.
+
+    Other OSErrors (PermissionError on a non-executable, ENOEXEC) still
+    propagate, exactly as before — they are real faults, not a missing
+    optional tool, and swallowing them here would hide a broken install.
+    """
+    try:
+        result = run_bounded(cmd, timeout=timeout, **popen_kwargs)
+    except FileNotFoundError:
+        # Expected: optional tooling absent on this build (no lspci in a
+        # container, no nmcli on a headless server). Debug, not warning —
+        # callers degrade by design and this is a hot path.
+        logger.debug("run_probe: %s not present on PATH",
+                     cmd[0] if cmd else "<empty>")
+        return None
+    if result.timed_out:
+        # run_bounded already logged a warning with the command name.
+        return None
+    return result
 
 
 def _safe_kill_and_close(
@@ -206,4 +266,4 @@ def _safe_kill_and_close(
         pass
 
 
-__all__ = ["BoundedResult", "run_bounded"]
+__all__ = ["BoundedResult", "run_bounded", "run_probe", "hidden_popen_kwargs"]

@@ -63,13 +63,10 @@ def _is_wayland():
     return False
 
 
-def _run(cmd, timeout=10, **kw):
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, **kw)
-        return r
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
+# Canonical bounded probe — see shell_system_apis.py for the same alias.
+# This module's own copy of `_run` was byte-equivalent to that one; both now
+# resolve to core.subprocess_safe.run_probe (one implementation, 139 callers).
+from core.subprocess_safe import run_probe as _run
 
 
 # ─── About > Credits: third-party art licence ledger (#143 offline-art) ──────

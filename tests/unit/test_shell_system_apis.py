@@ -614,13 +614,25 @@ class TestShellWebcam(unittest.TestCase):
 
     @patch('integrations.agent_engine.shell_system_apis._run', return_value=None)
     def test_webcam_capture_ffmpeg_not_found(self, mock_run):
+        """A missing capture tool is 503 UNAVAILABLE, not 500 SERVER ERROR.
+
+        Was asserting 500 and had been red since 2b2be57f, which changed the
+        handler on purpose ("a missing/failed capture tool is an UNAVAILABLE
+        peripheral") without updating this test. The distinction is not
+        cosmetic: 500 tells the shell the backend is broken and trips retry
+        /error UI, while 503 tells it this node simply has no ffmpeg — a
+        permanent, honest degrade the panel should render as such.
+        """
         client = _make_system_app()
         r = client.post('/api/shell/webcam/capture',
                         data=json.dumps({'device': '/dev/video0'}),
                         content_type='application/json')
-        self.assertEqual(r.status_code, 500)
+        self.assertEqual(r.status_code, 503)
         data = json.loads(r.data)
         self.assertIn('error', data)
+        self.assertFalse(data.get('ok', False))
+        # Names the absent tool, so the panel can say WHAT is missing.
+        self.assertIn('ffmpeg', data['error'])
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -650,12 +662,21 @@ class TestShellScanner(unittest.TestCase):
 
     @patch('integrations.agent_engine.shell_system_apis._run')
     def test_scanner_scan_error(self, mock_run):
+        """A scanner that reports no devices is 503 UNAVAILABLE (see the
+        webcam sibling above for why this is not 500).
+
+        Also asserts the tool's own stderr reaches the caller — "no SANE
+        devices found" is the actionable half; a bare status code leaves
+        the user with nothing to act on.
+        """
         mock_run.return_value = MagicMock(returncode=1, stderr='scanimage: no SANE devices found')
         client = _make_system_app()
         r = client.post('/api/shell/scanner/scan',
                         data=json.dumps({'format': 'png'}),
                         content_type='application/json')
-        self.assertEqual(r.status_code, 500)
+        self.assertEqual(r.status_code, 503)
+        data = json.loads(r.data)
+        self.assertIn('no SANE devices found', data['error'])
 
 
 # ═══════════════════════════════════════════════════════════════
