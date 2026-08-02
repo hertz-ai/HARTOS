@@ -114,10 +114,56 @@ jobs:
       - name: Evaluate all flake outputs
         working-directory: nixos
         run: |
+          # INSTRUMENTED 2026-08-02 (task #23). This step has been dying with
+          # `Process completed with exit code 143` (SIGTERM) roughly six
+          # minutes in, WELL inside the 45-minute job cap and with no timeout
+          # wrapper of its own. Because Determinate Nix prints its error
+          # summary at the END of a run, every death left the two real
+          # failures (hart-desktop-shell-boot, hart-layer-shell-host-paint)
+          # showing ❌ with no cause — which is the whole reason task #15 read
+          # "red every run" for a week.
+          #
+          # Ruled out already: concurrency cancellation (3f5ee290, log shows
+          # zero cancels) and the job timeout (dee36039, raised to 45min).
+          # Leading hypothesis is RUNNER MEMORY: `nix flake check` evaluates
+          # dozens of full nixosConfigurations in one process. Note the
+          # classic OOM signal is 137/SIGKILL, not 143, so this must be
+          # MEASURED rather than assumed — hence the sampler instead of a
+          # speculative `--max-jobs` tweak.
+          set +e
+          echo "::group::Runner capacity"
+          free -m; nproc; df -h /
+          echo "::endgroup::"
+
+          # Sample memory every 10s so the peak is visible even if the
+          # process is killed without a chance to report.
+          ( while true; do
+              printf '[mem] %s %s\n' "$(date -u +%H:%M:%S)" \
+                "$(free -m | awk '/^Mem:/{printf "used=%sMB avail=%sMB", $3, $7}')"
+              sleep 10
+            done ) > /tmp/memsample.log 2>&1 &
+          SAMPLER=$!
+
           echo "Evaluating all nixosConfigurations, packages, and apps..."
           nix flake check --no-build 2>&1
-          echo ""
-          echo "All flake outputs evaluate successfully."
+          RC=$?
+
+          kill "$SAMPLER" 2>/dev/null || true
+          echo "::group::Memory during evaluation (peak last)"
+          sort -t= -k2 -n /tmp/memsample.log 2>/dev/null | tail -5
+          echo "--- final ---"
+          free -m
+          echo "::endgroup::"
+
+          # 143 = 128+15 (SIGTERM), 137 = 128+9 (SIGKILL/OOM). Naming them
+          # means the NEXT failure is self-describing instead of a bare code.
+          case "$RC" in
+            0)   echo "All flake outputs evaluate successfully." ;;
+            137) echo "::error::eval SIGKILLed (137) — OOM killer. Confirms the memory hypothesis; split the check or raise the runner." ;;
+            143) echo "::error::eval SIGTERMed (143) — NOT the job cap and NOT concurrency. If memory above looks healthy, suspect the Nix daemon or the installer post-hook." ;;
+            *)   echo "::error::eval failed rc=$RC — a real evaluation failure; the summary above names the outputs." ;;
+          esac
+          exit "$RC"
 
       - name: Show flake metadata
         working-directory: nixos
