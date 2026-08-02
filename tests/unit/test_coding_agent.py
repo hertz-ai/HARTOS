@@ -808,3 +808,41 @@ class TestCodingDaemonIdleGate:
             '— ordering by created_at or id misses the goal-rotation '
             'fairness this pin protects.'
         )
+
+
+class TestCodingDaemonStopsPromptly:
+    """stop() must WAKE the worker, not wait out its nap.
+
+    Regression guard for the degraded-path defect found 2026-08-02.
+    `_wd_sleep` delegates to NodeWatchdog.sleep_with_heartbeat with
+    `stop_check=lambda: not self._running` — properly interruptible. But its
+    FALLBACK, taken whenever get_watchdog() returns None or raises, was a bare
+    `time.sleep(seconds)`, which cannot be woken. So on exactly the degraded
+    node the fallback exists for, stop() blocked for the whole poll interval
+    and `self._thread.join(timeout=10)` expired in full.
+
+    The giveaway was the constant: test_start_stop and test_double_start took
+    10.01s and 10.00s — a hardcoded ceiling, not variable work.
+
+    Asserts WALL-CLOCK, because a stop() that eventually returns is not the
+    same as one that returns promptly, and only the clock distinguishes them.
+    """
+
+    def test_stop_returns_promptly_without_a_watchdog(self):
+        import time as _t
+        from integrations.coding_agent.coding_daemon import CodingAgentDaemon
+
+        daemon = CodingAgentDaemon()
+        daemon._interval = 30          # a nap far longer than we will wait
+        # Force the FALLBACK path — the one that was broken.
+        from unittest.mock import patch
+        with patch('security.node_watchdog.get_watchdog', return_value=None):
+            daemon.start()
+            _t.sleep(0.2)              # let the worker reach its sleep
+            start = _t.monotonic()
+            daemon.stop()
+            elapsed = _t.monotonic() - start
+
+        assert elapsed < 5.0, (
+            f"stop() took {elapsed:.1f}s — the worker was not woken, so it "
+            f"slept out its interval and join(timeout=10) expired in full")
