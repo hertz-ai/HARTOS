@@ -377,11 +377,13 @@ in
       };
       services.displayManager.defaultSession = "hart-glass-gtk4";
 
-      # GDM pulls graphical-desktop's fs.inotify.max_user_watches mkDefault while
-      # hart-base.nix also mkDefaults it -> two equal-priority mkDefaults collide
-      # ("defined multiple times"). mkForce wins over both (same fix as
-      # desktop-boot.nix + the b86aa93 session-supervisor DM path).
-      boot.kernel.sysctl."fs.inotify.max_user_watches" = pkgs.lib.mkForce 524288;
+      # NO fs.inotify.max_user_watches override here — see the matching note in
+      # desktop-boot.nix. Briefly: this mkForce 524288 was written to break a
+      # two-mkDefault collision, but hart-kernel.nix now mkForces the same
+      # option to 1048576 and the profile enables hart.kernel, so this line
+      # became a SECOND equal-priority mkForce with a different value — the
+      # very "defined multiple times" error it was meant to prevent.
+      # hart-kernel's mkForce already beats both mkDefaults.
     };
 
     testScript = ''

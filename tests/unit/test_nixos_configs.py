@@ -2842,6 +2842,64 @@ class TestNoInheritShadowedProfileOptions:
             "override is deliberate: " + "; ".join(sorted(set(offenders))))
 
 
+class TestSysctlPriorityCollisions:
+    """No test may re-declare a sysctl that hart-kernel.nix already mkForces.
+
+    THE BUG THIS EXISTS FOR (found 2026-08-02, red since 07-26):
+    `nixosTests` hart-desktop-shell-boot and hart-layer-shell-host-paint both
+    failed with
+
+        The option `nodes.<n>.boot.kernel.sysctl."fs.inotify.max_user_watches"'
+        is defined multiple times while it's expected to be unique.
+
+    Both tests carried `mkForce 524288` to break a collision between two
+    mkDefaults (graphical-desktop's and hart-base's). That was CORRECT when
+    written. Then hart-kernel.nix started mkForce-ing the same option to
+    1048576, and the desktop profile enables hart.kernel — so the test-local
+    line became a SECOND mkForce at EQUAL priority with a DIFFERENT value,
+    which is exactly the error it was written to prevent. The workaround
+    became the bug, and stayed invisible for a week because the eval never
+    ran long enough to print why.
+
+    mkForce is priority 50 for everyone; two of them never merge. So the rule
+    is structural: if hart-kernel owns an option with mkForce, a test must not
+    also mkForce it. Source-shape guard by necessity — the failure is an
+    EVAL-time module-system merge, which no runtime assertion can reach, and
+    `nix` cannot run on the dev box.
+    """
+
+    KERNEL_MODULE = os.path.join(MODULES_DIR, "hart-kernel.nix")
+    TESTS_DIR = os.path.join(REPO_ROOT, "nixos", "tests")
+
+    def _kernel_forced_sysctls(self):
+        src = read_nix(self.KERNEL_MODULE)
+        return set(re.findall(r'"([a-z0-9_.]+)"\s*=\s*lib\.mkForce', src))
+
+    def test_hart_kernel_still_owns_sysctls(self):
+        """Guard the guard: if this set empties, the check below goes vacuous."""
+        forced = self._kernel_forced_sysctls()
+        assert "fs.inotify.max_user_watches" in forced, (
+            "hart-kernel.nix no longer mkForces max_user_watches — the "
+            "collision guard below would silently stop protecting anything")
+
+    def test_no_test_mkforces_a_kernel_owned_sysctl(self):
+        forced = self._kernel_forced_sysctls()
+        offenders = []
+        for path in sorted(glob.glob(os.path.join(self.TESTS_DIR, "*.nix"))):
+            src = read_nix(path)
+            for key in re.findall(
+                    r'sysctl\."([a-z0-9_.]+)"\s*=\s*(?:pkgs\.)?lib\.mkForce', src):
+                if key in forced:
+                    offenders.append(f"{os.path.basename(path)}:{key}")
+        assert not offenders, (
+            f"{offenders} mkForce a sysctl hart-kernel.nix already mkForces. "
+            f"Two mkForce definitions are the SAME priority (50), so they do "
+            f"not merge — this is the 'defined multiple times' eval error that "
+            f"kept hart-desktop-shell-boot and hart-layer-shell-host-paint red "
+            f"for a week. Drop the test-local line: hart-kernel's mkForce "
+            f"already beats the mkDefaults you are working around.")
+
+
 class TestBackgroundAgentBlastRadius:
     """A wedged background agent must degrade ITSELF, never the machine.
 

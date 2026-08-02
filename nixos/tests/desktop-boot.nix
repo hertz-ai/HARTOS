@@ -129,12 +129,20 @@ in
         wayland = true;
       };
 
-      # GDM pulls nixpkgs' graphical-desktop module, which mkDefaults
-      # fs.inotify.max_user_watches; hart-base.nix ALSO mkDefaults it -> two
-      # equal-priority mkDefaults collide ("defined multiple times"). mkForce
-      # wins over both (same class as the b86aa93 session-supervisor fix for its
-      # DM path). The CI eval gate caught this; verified-by-CI on re-push.
-      boot.kernel.sysctl."fs.inotify.max_user_watches" = pkgs.lib.mkForce 524288;
+      # NO fs.inotify.max_user_watches override here — deliberately.
+      #
+      # This test used to mkForce 524288 to break a collision between
+      # graphical-desktop's mkDefault (pulled in by GDM) and hart-base.nix's
+      # mkDefault. That reasoning was correct WHEN WRITTEN, but hart-kernel.nix
+      # later began mkForce-ing the same option to 1048576, and the profile
+      # enables hart.kernel — so this line became a SECOND mkForce at equal
+      # priority with a DIFFERENT value, which is itself the "defined multiple
+      # times" error. The workaround became the bug.
+      #
+      # hart-kernel's mkForce already beats both mkDefaults, so the original
+      # collision cannot recur; keeping a test-local copy would just be a
+      # parallel path that drifts from production tuning. Verified 2026-08-02
+      # against the eval error naming `nodes.shell...max_user_watches`.
 
       # Autologin hart-admin straight into the cage floor — exactly the pin
       # desktop.nix ships (defaultSession = "hart-shell"), but without importing
