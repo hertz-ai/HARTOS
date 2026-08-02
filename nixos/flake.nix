@@ -1000,6 +1000,12 @@
       # parity matrix's 'Hyper-V Gen 1 boots' row was a CONFIG assertion until
       # now; nothing had ever booted the legacy-BIOS path.
       firmwareBootMatrix = import ./tests/firmware-boot-matrix.nix desktopTestArgs;
+      # BOOT LATENCY (#29): enforces core.constants.LATENCY_BUDGETS on a REAL
+      # booted node. Every other budget is enforced only by a python suite,
+      # which is how userspace startup reached 6min36s with nothing failing.
+      # The budgets are PARSED from core/constants.py at build time, never
+      # re-typed, so this cannot drift from the python suites.
+      bootLatency = import ./tests/boot-latency.nix desktopTestArgs;
       # External-USB journal export: a desktop node enables hart.journalExport +
       # attaches a spare disk the test formats vfat (the stand-in for a user's
       # SECOND FAT32 stick). It runs the REAL export script via the documented
@@ -1154,7 +1160,7 @@
       # 'screen' kill-switch is cut OR the authority is down, and ALLOWS when on.
       # Distinct attr -> clean //; desktop-variant node (mkNode).
       notify = import ./tests/notify.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // firmwareBootMatrix // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify // hartInstaller;
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // firmwareBootMatrix // bootLatency // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify // hartInstaller;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)

@@ -796,6 +796,31 @@ LATENCY_BUDGETS = {
     # First cross-device state sync after a cold start. Bounded so a new
     # device feels joined rather than pending.
     'multidevice_cold_sync_s': 5.0,
+
+    # ── Boot, enforced IN THE VM on a real booted node (task #29) ──
+    # Every budget above is enforced by a PYTHON suite. Nothing enforced
+    # anything on the booted OS, which is how userspace startup reached
+    # 6min36s with no test failing on it.
+    #
+    # `boot_userspace_s` is a REGRESSION CEILING, not the product target.
+    # Measured across nixosTest desktop nodes on 2026-08-02:
+    #   3min30s, 3min56s, 4min22s, 4min50s, 6min48s  (210s - 408s)
+    # The spread itself says the pole is load-dependent, and no single unit
+    # explains it: hart-sandbox-firstboot, the last unit before "Startup
+    # finished", takes ~2.7s and only STARTS at t=280s. So the ceiling is set
+    # above the observed max deliberately — a budget nobody can pass gets
+    # disabled, and then nothing is measured at all. It catches a
+    # catastrophic regression today; tightening it needs `systemd-analyze
+    # blame` to name the pole, which the VM test now captures on EVERY run
+    # (pass or fail) precisely so the next tightening is evidence-led.
+    'boot_userspace_s': 600.0,
+    # Kernel-side boot. Observed 6.5s-12.5s, so this one is already near
+    # where it should be and is a genuine gate rather than a placeholder.
+    'boot_kernel_s': 30.0,
+    # /status must answer fast even on a busy node: it is what every health
+    # check and the shell's own boot-wait poll. A slow /status is
+    # indistinguishable from a hung one to the caller.
+    'status_endpoint_ms': 2000.0,
 }
 
 
