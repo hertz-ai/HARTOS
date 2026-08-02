@@ -111,6 +111,34 @@ jobs:
       - name: Cache Nix store
         uses: DeterminateSystems/magic-nix-cache-action@v7
 
+      - name: Diagnose the known-failing checks (fast, targeted, never gates)
+        working-directory: nixos
+        run: |
+          # WHY THIS RUNS BEFORE THE FULL CHECK (task #23 -> #15):
+          # `nix flake check` evaluates every output in one process and no
+          # longer finishes inside 45 minutes, and Determinate Nix prints its
+          # error summary only at the END. So the two checks that actually
+          # fail have never had their CAUSE reported — six diagnostic attempts
+          # produced a bare ❌ each time.
+          #
+          # Evaluating them by NAME takes seconds and cannot be starved by the
+          # other ~40 outputs. `.drvPath` forces full evaluation of the
+          # derivation without building it, so an eval error surfaces here.
+          #
+          # `exit 0` deliberately: this step exists to REPORT, never to gate.
+          # The real pass/fail verdict stays with the full check below, so a
+          # diagnostic aid can never mask or invent a build result.
+          set +e
+          FAILED_CHECKS="hart-desktop-shell-boot hart-layer-shell-host-paint"
+          for c in $FAILED_CHECKS; do
+            echo "::group::eval checks.x86_64-linux.$c"
+            nix eval ".#checks.x86_64-linux.$c.drvPath" --raw 2>&1 | tail -60
+            echo ""
+            echo "(rc above is from the eval of $c)"
+            echo "::endgroup::"
+          done
+          exit 0
+
       - name: Evaluate all flake outputs
         working-directory: nixos
         run: |
