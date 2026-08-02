@@ -111,34 +111,6 @@ jobs:
       - name: Cache Nix store
         uses: DeterminateSystems/magic-nix-cache-action@v7
 
-      - name: Diagnose the known-failing checks (fast, targeted, never gates)
-        working-directory: nixos
-        run: |
-          # WHY THIS RUNS BEFORE THE FULL CHECK (task #23 -> #15):
-          # `nix flake check` evaluates every output in one process and no
-          # longer finishes inside 45 minutes, and Determinate Nix prints its
-          # error summary only at the END. So the two checks that actually
-          # fail have never had their CAUSE reported — six diagnostic attempts
-          # produced a bare ❌ each time.
-          #
-          # Evaluating them by NAME takes seconds and cannot be starved by the
-          # other ~40 outputs. `.drvPath` forces full evaluation of the
-          # derivation without building it, so an eval error surfaces here.
-          #
-          # `exit 0` deliberately: this step exists to REPORT, never to gate.
-          # The real pass/fail verdict stays with the full check below, so a
-          # diagnostic aid can never mask or invent a build result.
-          set +e
-          FAILED_CHECKS="hart-desktop-shell-boot hart-layer-shell-host-paint"
-          for c in $FAILED_CHECKS; do
-            echo "::group::eval checks.x86_64-linux.$c"
-            nix eval ".#checks.x86_64-linux.$c.drvPath" --raw 2>&1 | tail -60
-            echo ""
-            echo "(rc above is from the eval of $c)"
-            echo "::endgroup::"
-          done
-          exit 0
-
       - name: Evaluate all flake outputs
         working-directory: nixos
         run: |
@@ -199,6 +171,58 @@ jobs:
           echo "::group::Flake outputs"
           nix flake show 2>&1
           echo "::endgroup::"
+
+  # ─── Targeted failure diagnosis (own job, on purpose) ──────
+  # This lives in a SEPARATE job from flake-check, not as a step inside it.
+  # As a step it was useless in practice: GitHub only serves a job's log blob
+  # after the JOB finishes, so a 2-minute diagnostic sat unreadable behind a
+  # 45-minute full evaluation. Its whole value is being readable FAST.
+  # It also never gates — see exit 0 below.
+  diagnose-failing-checks:
+    name: Diagnose known-failing checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Cache Nix store
+        uses: DeterminateSystems/magic-nix-cache-action@v7
+
+      - name: Evaluate each failing check by name
+        working-directory: nixos
+        run: |
+          # WHY THIS RUNS BEFORE THE FULL CHECK (task #23 -> #15):
+          # `nix flake check` evaluates every output in one process and no
+          # longer finishes inside 45 minutes, and Determinate Nix prints its
+          # error summary only at the END. So the two checks that actually
+          # fail have never had their CAUSE reported — six diagnostic attempts
+          # produced a bare ❌ each time.
+          #
+          # Evaluating them by NAME takes seconds and cannot be starved by the
+          # other ~40 outputs. `.drvPath` forces full evaluation of the
+          # derivation without building it, so an eval error surfaces here.
+          #
+          # `exit 0` deliberately: this step exists to REPORT, never to gate.
+          # The real pass/fail verdict stays with the full check below, so a
+          # diagnostic aid can never mask or invent a build result.
+          set +e
+          FAILED_CHECKS="hart-desktop-shell-boot hart-layer-shell-host-paint"
+          for c in $FAILED_CHECKS; do
+            echo "::group::eval checks.x86_64-linux.$c"
+            nix eval ".#checks.x86_64-linux.$c.drvPath" --raw 2>&1 | tail -60
+            echo ""
+            echo "(rc above is from the eval of $c)"
+            echo "::endgroup::"
+          done
+          exit 0
+
 
   # ─── Python Structural Validation ──────────────────────────
   python-tests:
