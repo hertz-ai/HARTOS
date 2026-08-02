@@ -232,10 +232,47 @@ in
           hc.succeed(f"sgdisk --new=1:2048:+64M --change-name=1:ISO {disk}")
           hc.succeed(f"sgdisk --largest-new=2 --change-name=2:HARTLOG --typecode=2:0700 {disk}")
           hc.succeed("udevadm settle || true")
+          # Clear any filesystem signature INSIDE the new partition.
+          #
+          # `sgdisk --zap-all` + a whole-DISK `wipefs -a` above erase the partition
+          # TABLE and disk-level signatures — they do NOT erase bytes sitting inside
+          # a region that a LATER partition happens to re-expose. The preceding MBR
+          # subtest leaves a real FAT32 HARTLOG (it asserts `blkid -L HARTLOG` and
+          # TYPE=vfat) in the tail after its 1MiB-65MiB primary, i.e. at ~65MiB. The
+          # two sgdisk lines above then lay part1 over 1MiB-65MiB and start part2 at
+          # ~65MiB — exactly on top of that old superblock. blkid probes the start of
+          # vdb2, finds the stale FAT32, and the precondition below fails with
+          # "command `blkid -L HARTLOG` unexpectedly succeeded" (run 30758875130).
+          #
+          # The sibling full-disk subtest survives the same wipe only because its
+          # `--largest-new=1` starts partition 1 at 1MiB, so it never re-exposes the
+          # tail — which is why that identical `hc.fail` passes and this one did not.
+          #
+          # Wiping the PARTITION preserves the state under test: the GPT name lives in
+          # the table, not the partition contents, so part2 stays HARTLOG-named and
+          # unformatted — the prior-boot remnant this subtest exists to self-heal.
+          hc.succeed(f"wipefs -a {disk}2 || true")
+          hc.succeed("udevadm settle || true")
           # Precondition: HARTLOG does NOT resolve by FS label yet (it has no FS), and
           # there is no trailing free space (part2 consumed it) — so the ONLY way it
           # becomes valid is the self-heal path, never a fresh carve.
-          hc.fail("blkid -L HARTLOG")
+          # Self-describing on failure: a bare `hc.fail` says only "unexpectedly
+          # succeeded", which cost a full CI round trip to attribute. Report WHAT
+          # resolved and where, so the next failure explains itself.
+          stale = hc.execute("blkid -L HARTLOG")[1].strip()
+          if stale:
+              probe = hc.succeed(
+                  f"echo '--- blkid -L HARTLOG -> {stale} ---'; "
+                  f"blkid {stale} || true; "
+                  f"echo '--- partition table ---'; sgdisk -p {disk} || true; "
+                  f"echo '--- all signatures on {disk} ---'; wipefs {disk} || true; "
+                  f"wipefs {disk}2 || true"
+              )
+              raise AssertionError(
+                  "HARTLOG resolved BEFORE the self-heal ran, so this subtest was "
+                  "not testing the unformatted-remnant path at all.\n"
+                  f"resolved to: {stale}\n{probe}"
+              )
           out_heal = hc.succeed(f"HART_HARTLOG_TEST_DISK={disk} hart-hartlog-create 2>&1; echo RC=$?")
           assert "RC=0" in out_heal, f"self-heal must exit 0, got: {out_heal!r}"
           assert "self-heal" in out_heal, f"must take the self-heal path, got: {out_heal!r}"
