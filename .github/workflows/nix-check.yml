@@ -221,6 +221,34 @@ jobs:
             echo "(rc above is from the eval of $c)"
             echo "::endgroup::"
           done
+
+          # ── Per-check TIMING (task #23) ───────────────────────────────
+          # #23 needs to know WHICH output made full evaluation outgrow every
+          # cap we set. `nix flake check` is one opaque process, so it can
+          # only be timed as a whole — which tells you nothing actionable.
+          # Timing each check separately localises the cost, and that IS the
+          # bisect #23 has been asking for since it was filed.
+          #
+          # Printed INCREMENTALLY and unsorted-as-we-go: if this job hits its
+          # own 20min cap, the lines already emitted still name the expensive
+          # attributes. A sort-at-the-end would lose exactly the data we came
+          # for, which is the same "summary only at the END" trap that hid
+          # #15 for a week.
+          echo "::group::Per-check evaluation time (incremental; slowest matter)"
+          ATTRS=$(nix eval --impure --raw --expr \
+            'builtins.concatStringsSep " " (builtins.attrNames (builtins.getFlake (toString ./.)).checks.x86_64-linux)' \
+            2>/dev/null)
+          if [ -z "$ATTRS" ]; then
+            echo "(could not enumerate checks — skipping timing, not failing)"
+          else
+            for a in $ATTRS; do
+              s=$(date +%s)
+              nix eval ".#checks.x86_64-linux.$a.drvPath" --raw >/dev/null 2>&1
+              rc=$?
+              printf '%5ss  rc=%s  %s\n' "$(( $(date +%s) - s ))" "$rc" "$a"
+            done
+          fi
+          echo "::endgroup::"
           exit 0
 
 
