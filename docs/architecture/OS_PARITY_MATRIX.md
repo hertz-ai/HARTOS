@@ -52,7 +52,7 @@ place and concluding about the whole.
 | Device firmware | `hardware.enableRedistributableFirmware` | n/a | all variants (was desktop-only) |
 | CPU microcode | `hardware.cpu.{intel,amd}.updateMicrocode` | n/a | |
 | Hypervisor guest | `hypervGuest`, `qemuGuest`, `spice-vdagentd`, `vmware.guest` | n/a | Hyper-V / KVM / SPICE / VMware |
-| BIOS + UEFI boot | `isoImage.makeBiosBootable`; systemd-boot / GRUB by probe | n/a | Hyper-V **Gen 1** boots |
+| BIOS + UEFI boot | `isoImage.makeBiosBootable`; systemd-boot / GRUB by probe | n/a | **BOOTED, not asserted**: `hart-firmware-boot-matrix` boots the desktop variant on OVMF/UEFI (Hyper-V **Gen 2** shape) AND on legacy SeaBIOS (**Gen 1** shape), and checks each node is really on the path its config claims — `/sys/firmware/efi` must exist on one and be ABSENT on the other, so a mis-set flag cannot boot UEFI twice and pass |
 | Disk encryption | `hart.luks` | ✅ | `/api/shell/encryption/status` — LUKS device tree plus **`root_encrypted`** (an encrypted /data with a plaintext root reads as "encrypted" and protects far less). Read-only is the COMPLETE answer: encryption is an install-time decision, so `runtime_toggle_supported: false` is stated rather than implied |
 | Screen capture / portal | `xdg.portal` (`hart.portal`) | ✅ | `/api/shell/screenshot` + `/api/shell/recording/{start,stop}` (`shell_os_apis.py`) — this row previously read ❌ from a name-only search that missed all three |
 | Remote desktop | RustDesk / Sunshine (`integrations/remote_desktop`) | 🟡 | **agent tools ARE registered** (`core/agent_tools.py:1391` → `build_remote_desktop_tools`), so an agent can drive sessions during a turn. No `/api/shell/*` route, so the shell UI cannot — that half is the remaining work, not the whole row |

@@ -994,6 +994,12 @@
       # Windows invariant), and running it on a non-UEFI VM is a clean no-op
       # exit 0. The live BootNext write needs real UEFI HW. Distinct attr -> //.
       bootContinuity = import ./tests/boot-continuity.nix desktopTestArgs;
+      # FIRMWARE BOOT MATRIX (#28): boots the desktop variant on BOTH firmware
+      # paths — OVMF/UEFI (Hyper-V Gen 2 shape) and legacy SeaBIOS (Gen 1) —
+      # and asserts each node is REALLY on the path its config claims. The
+      # parity matrix's 'Hyper-V Gen 1 boots' row was a CONFIG assertion until
+      # now; nothing had ever booted the legacy-BIOS path.
+      firmwareBootMatrix = import ./tests/firmware-boot-matrix.nix desktopTestArgs;
       # External-USB journal export: a desktop node enables hart.journalExport +
       # attaches a spare disk the test formats vfat (the stand-in for a user's
       # SECOND FAT32 stick). It runs the REAL export script via the documented
@@ -1148,7 +1154,7 @@
       # 'screen' kill-switch is cut OR the authority is down, and ALLOWS when on.
       # Distinct attr -> clean //; desktop-variant node (mkNode).
       notify = import ./tests/notify.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify // hartInstaller;
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // firmwareBootMatrix // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify // hartInstaller;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)
