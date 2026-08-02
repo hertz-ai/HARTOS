@@ -166,8 +166,41 @@ in
               )
               return "HIT" in br.succeed(script)
 
-          assert initrd_has("usb.storage"), \
-              "initrd does NOT carry usb_storage — a USB root cannot enumerate (VFS panic)"
+          def builtin_has(pattern):
+              # A module compiled INTO the kernel (=y) has no .ko to pack, so a
+              # MISS in the initrd is then CORRECT, not a brick. modules.builtin
+              # lists exactly those. Without this distinction the failure below
+              # is ambiguous and the two possible fixes are OPPOSITE ones:
+              # force-include into the initrd, vs. teach this test about builtins.
+              script = (
+                  'b="/run/booted-system/kernel-modules/lib/modules/$(uname -r)/modules.builtin"; '
+                  f'[ -f "$b" ] && grep -Eq "{pattern}" "$b" && echo HIT || echo MISS'
+              )
+              return "HIT" in br.succeed(script)
+
+          if not initrd_has("usb.storage"):
+              # SELF-DESCRIBING FAILURE. This assertion fired on 2026-08-02
+              # (run 30746514730) with no way to tell WHICH cause it was, so the
+              # next run must answer that itself instead of costing another
+              # round trip. Dump the discriminators into the failure message.
+              builtin = builtin_has("usb.storage")
+              avail = br.succeed(
+                  "cat /proc/cmdline; echo ---; "
+                  "ls /run/booted-system/initrd 2>/dev/null; echo ---; "
+                  "zcat /proc/config.gz 2>/dev/null | grep -E '^CONFIG_USB_STORAGE=' "
+                  "|| echo 'CONFIG_USB_STORAGE unknown (/proc/config.gz absent)'"
+              ).strip()
+              assert False, (
+                  "initrd does NOT carry usb_storage — a USB root cannot "
+                  "enumerate (VFS panic).\n"
+                  f"  usb_storage BUILT INTO kernel (modules.builtin): {builtin}\n"
+                  "  -> if True, this test is wrong (a builtin has no .ko to pack) "
+                  "and should accept the builtin case.\n"
+                  "  -> if False, the initrd packing is genuinely broken and "
+                  "hart-boot-root-initrd.nix must force-include via "
+                  "boot.initrd.kernelModules, not only availableKernelModules.\n"
+                  f"  kernel/config probe:\n{avail}"
+              )
           assert initrd_has("xhci"), \
               "initrd does NOT carry an xhci host-controller module — a USB3 port can't enumerate the stick"
           assert initrd_has("sd_mod"), \
