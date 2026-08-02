@@ -184,9 +184,28 @@ in
               # next run must answer that itself instead of costing another
               # round trip. Dump the discriminators into the failure message.
               builtin = builtin_has("usb.storage")
+              # THIRD possibility, and the one that mimics the other two most
+              # closely: the unpack itself silently produced nothing. A NixOS
+              # initrd can be CONCATENATED segments (an uncompressed firmware
+              # cpio followed by the compressed main cpio). `zstd -dc` stops at
+              # the first frame, and the `cat` fallback greps raw COMPRESSED
+              # bytes where no filename can ever appear — so "module absent"
+              # and "we never actually read the archive" look identical.
+              # Count what the unpack yields: a healthy initrd lists thousands
+              # of entries, so a near-zero count indicts the TEST, not the OS.
               avail = br.succeed(
-                  "cat /proc/cmdline; echo ---; "
-                  "ls /run/booted-system/initrd 2>/dev/null; echo ---; "
+                  "cat /proc/cmdline; echo '--- initrd ---'; "
+                  "ls -l /run/current-system/initrd; "
+                  "file -L /run/current-system/initrd 2>/dev/null || true; "
+                  "echo '--- entries seen per decompressor ---'; "
+                  'for dc in "zstd -dc" "gzip -dc" "xz -dc" "lz4 -dc" "cat"; do '
+                  '  n=$($dc /run/current-system/initrd 2>/dev/null | cpio -t 2>/dev/null | wc -l); '
+                  '  echo "$dc -> $n entries"; done; '
+                  "echo '--- any .ko at all? ---'; "
+                  'for dc in "zstd -dc" "gzip -dc" "xz -dc" "lz4 -dc" "cat"; do '
+                  '  k=$($dc /run/current-system/initrd 2>/dev/null | cpio -t 2>/dev/null | grep -c "\\.ko"); '
+                  '  echo "$dc -> $k .ko files"; done; '
+                  "echo '--- kernel config ---'; "
                   "zcat /proc/config.gz 2>/dev/null | grep -E '^CONFIG_USB_STORAGE=' "
                   "|| echo 'CONFIG_USB_STORAGE unknown (/proc/config.gz absent)'"
               ).strip()
@@ -194,12 +213,17 @@ in
                   "initrd does NOT carry usb_storage — a USB root cannot "
                   "enumerate (VFS panic).\n"
                   f"  usb_storage BUILT INTO kernel (modules.builtin): {builtin}\n"
-                  "  -> if True, this test is wrong (a builtin has no .ko to pack) "
-                  "and should accept the builtin case.\n"
-                  "  -> if False, the initrd packing is genuinely broken and "
-                  "hart-boot-root-initrd.nix must force-include via "
-                  "boot.initrd.kernelModules, not only availableKernelModules.\n"
-                  f"  kernel/config probe:\n{avail}"
+                  "  THREE causes, THREE DIFFERENT fixes — read the probe below:\n"
+                  "   (A) builtin True  -> the OS is FINE; this test must accept "
+                  "a kernel builtin (no .ko exists to pack).\n"
+                  "   (B) '.ko files' ~0 for every decompressor -> the UNPACK "
+                  "failed (concatenated/multi-segment initrd); this test must "
+                  "unpack properly before it may claim anything.\n"
+                  "   (C) thousands of .ko but no usb_storage -> the packing is "
+                  "genuinely broken; hart-boot-root-initrd.nix must force-include "
+                  "via boot.initrd.kernelModules, not only availableKernelModules. "
+                  "THIS is the only case that means a real USB-boot brick.\n"
+                  f"  probe:\n{avail}"
               )
           assert initrd_has("xhci"), \
               "initrd does NOT carry an xhci host-controller module — a USB3 port can't enumerate the stick"
