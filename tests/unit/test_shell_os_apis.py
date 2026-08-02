@@ -1605,10 +1605,18 @@ class TestAppStore(unittest.TestCase):
 class TestCloudSync(unittest.TestCase):
     """Tests for cloud file sync (rclone wrapper) endpoints."""
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess.run',
-           side_effect=FileNotFoundError)
+    @patch('integrations.agent_engine.shell_os_apis.run_probe',
+           return_value=None)
     def test_remotes_rclone_not_installed(self, mock_run):
-        """When rclone not installed, returns empty list."""
+        """When rclone not installed, returns empty list.
+
+        Patches the `run_probe` SEAM, not `subprocess.run` beneath it. The
+        old target broke the moment cloud-sync moved onto the canonical
+        probe, because the real work then happened in core.subprocess_safe's
+        namespace and the mock silently stopped intercepting -- the same
+        trap that took out the WiFi/VPN suites. run_probe swallows ENOENT
+        into None, so None IS the "tool absent" contract here.
+        """
         client = _make_os_app()
         r = client.get('/api/shell/cloud-sync/remotes')
         self.assertEqual(r.status_code, 200)
@@ -1616,7 +1624,7 @@ class TestCloudSync(unittest.TestCase):
         self.assertEqual(data['remotes'], [])
         self.assertFalse(data['rclone_available'])
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess.run')
+    @patch('integrations.agent_engine.shell_os_apis.run_probe')
     def test_remotes_with_rclone(self, mock_run):
         """rclone listremotes returns configured remotes."""
         mock_run.return_value = MagicMock(
@@ -1645,7 +1653,7 @@ class TestCloudSync(unittest.TestCase):
                         content_type='application/json')
         self.assertEqual(r.status_code, 400)
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess.run')
+    @patch('integrations.agent_engine.shell_os_apis.run_probe')
     def test_sync_status(self, mock_run):
         """Sync status shows rclone availability."""
         mock_run.return_value = MagicMock(

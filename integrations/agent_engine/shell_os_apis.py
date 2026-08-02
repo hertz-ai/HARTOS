@@ -30,6 +30,8 @@ import os
 import shlex
 import shutil
 import subprocess
+
+from core.subprocess_safe import run_probe
 import tempfile
 import time
 from functools import wraps
@@ -1688,18 +1690,10 @@ def register_shell_os_routes(app):
         with open(_SYNC_CONFIG, 'w') as f:
             json.dump(data, f, indent=2)
 
-    def _sync_run(cmd, timeout=10):
-        """Run a subprocess for cloud sync, returning result or None."""
-        try:
-            return subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=timeout)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return None
-
     @app.route('/api/shell/cloud-sync/remotes', methods=['GET'])
     def shell_sync_remotes():
         """List configured rclone remotes."""
-        r = _sync_run(['rclone', 'listremotes'], timeout=10)
+        r = run_probe(['rclone', 'listremotes'], timeout=10)
         remotes = []
         if r and r.returncode == 0:
             for line in r.stdout.strip().split('\n'):
@@ -1761,7 +1755,7 @@ def register_shell_os_routes(app):
 
     @app.route('/api/shell/cloud-sync/run', methods=['POST'])
     @_require_shell_auth
-    def shell_sync_run():
+    def shellrun_probe():
         """Trigger sync for a specific pair or all pairs."""
         body = request.get_json(silent=True) or {}
         pair_id = body.get('pair_id')
@@ -1784,7 +1778,7 @@ def register_shell_os_routes(app):
             if direction == 'bisync':
                 cmd = ['rclone', 'bisync', local, remote, '--resync']
 
-            r = _sync_run(cmd, timeout=300)
+            r = run_probe(cmd, timeout=300)
             success = r is not None and r.returncode == 0
             results.append({
                 'pair_id': pair.get('id'),
@@ -1805,7 +1799,7 @@ def register_shell_os_routes(app):
         """Get sync status for all pairs."""
         cfg = _load_sync_config()
         # Check if rclone is available
-        r = _sync_run(['rclone', 'version'], timeout=5)
+        r = run_probe(['rclone', 'version'], timeout=5)
         return jsonify({
             'rclone_installed': r is not None and r.returncode == 0,
             'rclone_version': r.stdout.split('\n')[0] if r and r.returncode == 0 else None,
