@@ -39,8 +39,25 @@ jobs:
     name: Floor-lock + session-supervisor (build + run VM)
     runs-on: ubuntu-latest
     # Cold build of the HART desktop closure (not in cache.nixos.org) + the VM
-    # run; mirrors e2e-os-test.yml's 100-min ISO budget with headroom.
-    timeout-minutes: 120
+    # run for 19 checks.
+    #
+    # MEASURED 2026-08-02 (run 30742390816): 120 minutes is NOT enough. The job
+    # emitted 266,590 build/copy lines — i.e. it was genuinely building the
+    # whole time, not stalled — and was then killed by this cap mid-build. So
+    # the nixosTests have never once RUN; the closure never finished.
+    #
+    # The 120 was justified as "mirrors e2e-os-test.yml's 100-min ISO budget
+    # with headroom", but that comparison under-budgeted: e2e already uses 160
+    # for its heavy job, and THIS job builds more (19 test closures, each a
+    # full desktop system).
+    #
+    # 330 is a diagnostic ceiling, not a target. The REAL problem is that
+    # magic-nix-cache is deliberately omitted here (CDN-throttling note below),
+    # so every run rebuilds the entire closure from scratch. Restoring a shared
+    # binary cache — or sharding across a matrix that shares one — is the
+    # structural fix; this cap only buys a first green run to prove the tests
+    # themselves pass.
+    timeout-minutes: 330
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
