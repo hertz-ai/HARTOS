@@ -251,7 +251,26 @@ in
           # Wiping the PARTITION preserves the state under test: the GPT name lives in
           # the table, not the partition contents, so part2 stays HARTLOG-named and
           # unformatted — the prior-boot remnant this subtest exists to self-heal.
-          hc.succeed(f"wipefs -a {disk}2 || true")
+          # `wipefs -a` needs an EXCLUSIVE (O_EXCL) open, and run 30763599339
+          # showed it lose that race:
+          #     wipefs: error: /dev/vdb2: probing initialization failed:
+          #     Device or resource busy
+          # vdb2 is NOT mounted anywhere in that log, so the holder is a
+          # concurrent prober — udev settling the just-created partition, or one
+          # of the periodic HART units that scan block devices for a HARTLOG /
+          # vfat partition (hart-boot-log-periodic, hart-journal-export both run
+          # on timers in this VM).
+          #
+          # The `|| true` written here first SWALLOWED that error, so the subtest
+          # carried on with the stale signature intact and failed one line later
+          # for a reason its message could not name. Never again in this file.
+          #
+          # dd takes no O_EXCL, so it clears the superblock whoever is probing.
+          # All three FAT signatures the probe reported (0x0, 0x52, 0x1fe) live
+          # inside the first sector, so one zeroed MiB is more than enough — and
+          # this is NOT swallowed: if it fails, the subtest fails here, at the
+          # cause, instead of one line later at a symptom.
+          hc.succeed(f"dd if=/dev/zero of={disk}2 bs=1M count=1 conv=fsync status=none")
           hc.succeed("udevadm settle || true")
           # Precondition: HARTLOG does NOT resolve by FS label yet (it has no FS), and
           # there is no trailing free space (part2 consumed it) — so the ONLY way it
