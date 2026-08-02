@@ -712,3 +712,66 @@ class TestRestartIdempotence:
         assert manager._models['llm'].device == ModelDevice.CPU, (
             "device stamped GPU when CUDA unavailable — v1 wrong-direction bug regressed"
         )
+
+
+class TestVramPressureWarningUsesTheRealAPI:
+    """The VRAM-pressure warning must actually be computable.
+
+    LIVE INCIDENT 2026-08-02 (frozen_debug.log 22:13:28):
+        AttributeError: 'VRAMManager' object has no attribute 'total_vram_gb'
+    raised from ModelLifecycleManager.start(). VRAMManager exposes
+    get_total_vram() as a METHOD (vram_manager.py:617); there has never been a
+    `total_vram_gb` attribute — `total_vram_gb` exists only as a DICT KEY in
+    model_onboarding's payloads, which is what made the wrong name look
+    plausible.
+
+    The failure was quiet in the worst way: an outer handler swallowed it, the
+    manager started anyway, and the over-subscription warning this block exists
+    to emit was simply never computed on any boot. So a node whose pinned
+    models exceed its VRAM never told the user.
+    """
+
+    def test_vram_manager_has_no_total_vram_gb_attribute(self):
+        """Pin the API shape that made the bug possible."""
+        from integrations.service_tools.vram_manager import get_vram_manager
+        vm = get_vram_manager()
+        assert not hasattr(vm, 'total_vram_gb'), (
+            "VRAMManager grew a total_vram_gb attribute — if that is now the "
+            "canonical accessor, model_lifecycle should use it deliberately, "
+            "not by accident")
+        assert callable(getattr(vm, 'get_total_vram', None)), (
+            "get_total_vram() is the canonical total-VRAM accessor")
+
+    def test_start_computes_total_vram_without_raising(self):
+        """The real call path: start() must reach its VRAM check.
+
+        Drives ModelLifecycleManager.start() with a stubbed manager so the
+        assertion is about OUR call, not about the host having a GPU.
+        """
+        from unittest.mock import patch, MagicMock
+        from integrations.service_tools import model_lifecycle as ml
+
+        fake_vm = MagicMock()
+        fake_vm.get_total_vram.return_value = 8.0
+        # A MagicMock answers ANY attribute, so an accidental `vm.total_vram_gb`
+        # would silently return a Mock and compare falsely instead of raising.
+        # Delete it so the old spelling fails loudly here.
+        del fake_vm.total_vram_gb
+
+        mgr = ml.ModelLifecycleManager()
+        with patch.object(ml, 'get_vram_manager', return_value=fake_vm,
+                          create=True), \
+             patch('integrations.service_tools.vram_manager.get_vram_manager',
+                   return_value=fake_vm):
+            try:
+                mgr.start()
+            finally:
+                stop = getattr(mgr, 'stop', None)
+                if callable(stop):
+                    try:
+                        stop()
+                    except Exception:
+                        pass
+
+        fake_vm.get_total_vram.assert_called(), (
+            "start() never asked for total VRAM — the pressure check is dead")

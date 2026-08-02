@@ -328,7 +328,13 @@ class ModelLifecycleManager:
         try:
             from .vram_manager import get_vram_manager
             vm = get_vram_manager()
-            total_vram = vm.total_vram_gb if vm else 0
+            # get_total_vram() is a METHOD (vram_manager.py:617) — there is no
+            # `total_vram_gb` attribute, so the old access raised AttributeError
+            # and killed ModelLifecycleManager.start() on every boot
+            # (frozen_debug.log 2026-08-02 22:13:28). The manager then started
+            # anyway via the outer handler, so the VRAM-pressure warning this
+            # block exists to emit was silently never computed.
+            total_vram = vm.get_total_vram() if vm else 0
             pinned_vram = sum(
                 s.vram_gb for s in self._models.values()
                 if s.pinned and s.vram_gb > 0
