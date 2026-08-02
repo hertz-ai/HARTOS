@@ -157,11 +157,57 @@ in
               # we also try `cpio -t` for a clean listing. The module FILE name uses
               # '-' (usb-storage.ko) while the module NAME uses '_' (usb_storage), so
               # the pattern uses '.' to match either.
+              # PASS 1 — a plain, single-segment initrd: decompress the whole
+              # file and list it.
+              #
+              # PASS 2 — a CONCATENATED initrd, which is what this node now
+              # builds. `hardware.cpu.{intel,amd}.updateMicrocode` (enabled in
+              # hart-base.nix for runs-anywhere parity) sets
+              # `boot.initrd.prepend`, and early-microcode MUST be an
+              # UNCOMPRESSED cpio at offset 0 for the kernel to read it before
+              # decompression. The image is therefore
+              #     uncompressed-microcode-cpio || compressed-main-cpio
+              # and every pass-1 strategy fails on it for a different reason:
+              #   * `zstd -dc <file>` sees the wrong magic at offset 0,
+              #   * `cat | cpio -t` lists ONLY the microcode archive and stops
+              #     at its trailer (so: no modules),
+              #   * `cat | grep -a` scans bytes that are still compressed, so
+              #     no filename can ever match.
+              # The result is a confident MISS for a module that IS packed.
+              # So: find the compressor magic and decompress FROM that offset.
+              #
+              # Strictly additive — pass 1 runs first and is unchanged, and
+              # pass 2 still requires the name in a real `cpio -t` listing, so
+              # this can only ever turn a false MISS into a true HIT, never
+              # manufacture a false HIT.
               script = (
                   f'i="{initrd}"; '
                   'for dc in "zstd -dc" "gzip -dc" "xz -dc" "lz4 -dc" "cat"; do '
                   f'  if $dc "$i" 2>/dev/null | cpio -t 2>/dev/null | grep -Eq "{pattern}"; then echo HIT; exit 0; fi; '
                   f'  if $dc "$i" 2>/dev/null | grep -aEq "{pattern}"; then echo HIT; exit 0; fi; '
+                  'done; '
+                  # OCTAL escapes through `printf`, not `grep -P "\xNN"`:
+                  # -P is locale-fragile ("supports only unibyte and UTF-8
+                  # locales") and refused outright when this was dry-run, and
+                  # it does not interpret \x from a shell variable anyway — the
+                  # first version of this block silently found NO offset and
+                  # would have shipped a fix that fixed nothing. `printf` with
+                  # POSIX octal produces the real bytes and `grep -F` matches
+                  # them literally. None of the four magics contains a NUL, so
+                  # command substitution carries them intact.
+                  'for spec in '
+                  r'"zstd -dc:\050\265\057\375" '
+                  r'"gzip -dc:\037\213\010" '
+                  r'"xz -dc:\375\067\172\130\132" '
+                  r'"lz4 -dc:\004\042\115\030"; do '
+                  '  dc=$(echo "$spec" | cut -d: -f1); '
+                  '  esc=$(echo "$spec" | cut -d: -f2); '
+                  '  mg=$(printf "$esc"); '
+                  '  off=$(LC_ALL=C grep -abo -F "$mg" "$i" 2>/dev/null | head -1 | cut -d: -f1); '
+                  '  if [ -n "$off" ]; then '
+                  '    n=$(expr "$off" + 1); '
+                  f'    if tail -c +$n "$i" 2>/dev/null | $dc 2>/dev/null | cpio -t 2>/dev/null | grep -Eq "{pattern}"; then echo HIT; exit 0; fi; '
+                  '  fi; '
                   'done; echo MISS'
               )
               return "HIT" in br.succeed(script)
