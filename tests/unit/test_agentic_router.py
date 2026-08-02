@@ -130,10 +130,54 @@ class TestBuildAgentCatalog:
 # 3. LLM-Powered Agent Matching
 # ══════════════════════════════════════════════════════════════════
 
+
+def patch_get_llm(fn):
+    """Patch the SEAM `agentic_router` actually calls, not the heavy facade.
+
+    Was: `@patch('hart_intelligence.get_llm', create=True)` on 10 tests.
+    That target forced mock.patch to IMPORT `hart_intelligence` just to patch
+    it — measured at 38s, and the import even starts a VisionService. The first
+    test to resolve it paid the cost (60.3s of this file's 61.2s); the other 27
+    hit sys.modules and ran in under a second combined. `create=True` was the
+    tell: the attribute does not exist on that module, so the patch fabricated
+    one.
+
+    The router does not read the facade directly (agentic_router.py:38):
+        from core.safe_hartos_attr import safe_hartos_attr
+        get_llm = safe_hartos_attr('get_llm')
+    and safe_hartos_attr only consults sys.modules IF ALREADY LOADED — it
+    returns `default` otherwise, which is the whole point of the helper. So
+    patching it intercepts the real seam and never imports the facade at all.
+
+    The injected mock IS the get_llm callable, so every test body is unchanged:
+    `.return_value = mock_llm` and `.side_effect = RuntimeError(...)` both keep
+    their original meaning.
+    """
+    # NO functools.wraps here, deliberately. wraps() sets __wrapped__, and
+    # pytest introspects THAT to decide what to inject — so it saw the inner
+    # `mock_get_llm` parameter and demanded a fixture by that name
+    # ("fixture 'mock_get_llm' not found", 10 errors). Copying only __name__
+    # and __doc__ keeps readable test IDs while letting pytest see the
+    # wrapper's real `(self)` signature.
+    def wrapper(self):
+        mock_get_llm = MagicMock()
+
+        def _fake_attr(name, default=None):
+            return mock_get_llm if name == 'get_llm' else default
+
+        with patch('core.safe_hartos_attr.safe_hartos_attr',
+                   side_effect=_fake_attr):
+            return fn(self, mock_get_llm)
+
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
+
 class TestFindMatchingAgent:
     """Tests for find_matching_agent — LLM semantic matching."""
 
-    @patch('hart_intelligence.get_llm', create=True)
+    @patch_get_llm
     def test_returns_matched_agent_when_llm_selects(self, mock_get_llm):
         """When LLM returns an agent ID, should return the match dict."""
         from integrations.agentic_router import find_matching_agent
@@ -154,7 +198,7 @@ class TestFindMatchingAgent:
             assert result['source'] == 'recipe'
             assert result['score'] == 15  # LLM-selected = high confidence
 
-    @patch('hart_intelligence.get_llm', create=True)
+    @patch_get_llm
     def test_returns_none_when_llm_says_none(self, mock_get_llm):
         """When LLM says NONE, should return None."""
         from integrations.agentic_router import find_matching_agent
@@ -166,7 +210,7 @@ class TestFindMatchingAgent:
         result = find_matching_agent('hello how are you', '/tmp/empty')
         assert result is None
 
-    @patch('hart_intelligence.get_llm', create=True)
+    @patch_get_llm
     def test_returns_none_on_llm_exception(self, mock_get_llm):
         """LLM failure should return None gracefully."""
         from integrations.agentic_router import find_matching_agent
@@ -182,7 +226,7 @@ class TestFindMatchingAgent:
         # May have expert agents, so just check it doesn't crash
         assert result is None or isinstance(result, dict)
 
-    @patch('hart_intelligence.get_llm', create=True)
+    @patch_get_llm
     def test_case_insensitive_none_response(self, mock_get_llm):
         """LLM may return 'none' lowercase — should still return None."""
         from integrations.agentic_router import find_matching_agent
@@ -194,7 +238,7 @@ class TestFindMatchingAgent:
         result = find_matching_agent('greetings', '/tmp')
         assert result is None
 
-    @patch('hart_intelligence.get_llm', create=True)
+    @patch_get_llm
     def test_llm_invoked_with_catalog_context(self, mock_get_llm):
         """LLM should receive agent catalog in prompt."""
         from integrations.agentic_router import find_matching_agent
@@ -224,7 +268,7 @@ class TestFindMatchingAgent:
 class TestGeneratePlanSteps:
     """Tests for generate_plan_steps — LLM plan generation."""
 
-    @patch('hart_intelligence.get_llm', create=True)
+    @patch_get_llm
     def test_returns_llm_generated_steps(self, mock_get_llm):
         """When LLM returns valid JSON, should use those steps."""
         from integrations.agentic_router import generate_plan_steps
@@ -243,7 +287,7 @@ class TestGeneratePlanSteps:
         assert steps[0]['step_num'] == 1
         assert steps[1]['description'] == 'Design UI mockups'
 
-    @patch('hart_intelligence.get_llm', create=True)
+    @patch_get_llm
     def test_fallback_on_llm_failure(self, mock_get_llm):
         """When LLM fails, should return generic 4-step fallback."""
         from integrations.agentic_router import generate_plan_steps
@@ -254,7 +298,7 @@ class TestGeneratePlanSteps:
         assert steps[0]['description'] == 'Analyze requirements and gather context'
         assert steps[3]['description'] == 'Deliver results and get feedback'
 
-    @patch('hart_intelligence.get_llm', create=True)
+    @patch_get_llm
     def test_fallback_on_invalid_json(self, mock_get_llm):
         """When LLM returns non-JSON, should use fallback."""
         from integrations.agentic_router import generate_plan_steps
@@ -266,7 +310,7 @@ class TestGeneratePlanSteps:
         steps = generate_plan_steps('do something')
         assert len(steps) == 4  # fallback
 
-    @patch('hart_intelligence.get_llm', create=True)
+    @patch_get_llm
     def test_fallback_uses_agent_name(self, mock_get_llm):
         """Fallback step 3 should use matched agent name."""
         from integrations.agentic_router import generate_plan_steps
@@ -276,7 +320,7 @@ class TestGeneratePlanSteps:
         steps = generate_plan_steps('test', matched_agent=agent)
         assert steps[2]['tool_or_agent'] == 'Portfolio Builder'
 
-    @patch('hart_intelligence.get_llm', create=True)
+    @patch_get_llm
     def test_single_step_triggers_fallback(self, mock_get_llm):
         """LLM returning < 2 steps should trigger fallback."""
         from integrations.agentic_router import generate_plan_steps
