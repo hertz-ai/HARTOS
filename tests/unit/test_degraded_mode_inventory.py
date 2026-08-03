@@ -163,3 +163,65 @@ def test_the_reference_degrades_are_still_present():
     assert "'unclaimed'" in liquid and "'truncated'" in liquid, (
         "the device tree lost `unclaimed`/`truncated` — the yellow-bang and "
         "the honest-truncation signals that replaced a silent 50-device cap")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Silent `except: pass` — the shape the tasks/kill defect lived in
+# ═══════════════════════════════════════════════════════════════
+# A handler whose ENTIRE body is `pass` discards the one signal that says
+# something went wrong. That is banned outright by
+# memory/feedback_no_silent_exception_gulping_2026-07-15.md, and it is
+# exactly where the /api/shell/tasks/kill guard failed OPEN: the
+# protected-process check sat inside `except Exception: pass`, so whenever
+# psutil was absent or Process(pid) raised, the check was skipped and the
+# kill proceeded (fixed 0b05949b).
+#
+# MEASURED 2026-08-03 by AST walk (not grep — a comment or a string
+# containing "except: pass" would fool a text search):
+#     shell_os_apis      28
+#     shell_system_apis  18
+#     shell_desktop_apis 10
+#     liquid_ui_service   0
+#
+# These are CEILINGS: the count may only go DOWN. Not every one is a defect —
+# best-effort cleanup on a teardown path is legitimate — so this does not
+# demand zero. It demands that the number never grows while #31 walks the
+# 246-route surface, and it makes the remaining count VISIBLE instead of
+# invisible.
+SILENT_GULP_CEILING = {
+    "shell_os_apis.py": 28,
+    "shell_system_apis.py": 18,
+    "shell_desktop_apis.py": 10,
+    "liquid_ui_service.py": 0,
+}
+
+
+def _silent_gulp_count(src):
+    import ast
+    tree = ast.parse(src)
+    return sum(
+        1 for node in ast.walk(tree)
+        if isinstance(node, ast.ExceptHandler)
+        and len(node.body) == 1
+        and isinstance(node.body[0], ast.Pass)
+    )
+
+
+@pytest.mark.parametrize("mod", SHELL_MODULES)
+def test_source_guard_silent_exception_gulps_never_increase(mod):
+    """RATCHET DOWN: no new `except: pass` on the shell surface.
+
+    AST-based, so a comment or a docstring mentioning the pattern cannot
+    move the number either way. Lower the ceiling in the SAME commit that
+    removes one — that is how #31 gets tracked to zero rather than drifting.
+    """
+    count = _silent_gulp_count(_read(mod))
+    ceiling = SILENT_GULP_CEILING[mod]
+    assert count <= ceiling, (
+        f"{mod} grew a silent `except: pass`: {count} > ceiling {ceiling}.\n"
+        f"A handler whose whole body is `pass` throws away the signal that "
+        f"something failed. That is how /api/shell/tasks/kill's "
+        f"protected-process guard failed OPEN — psutil absent meant the "
+        f"check was skipped and the kill went ahead (0b05949b).\n"
+        f"Log it, degrade honestly, or fail closed — but do not swallow it."
+    )
