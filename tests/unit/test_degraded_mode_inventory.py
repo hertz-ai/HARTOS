@@ -210,6 +210,75 @@ def _silent_gulp_count(src):
     )
 
 
+# ── BREADTH MATTERS AS MUCH AS COUNT ──────────────────────────────
+# The count above lumps together two very different things, which was making
+# the ratchet a blunt instrument. Measured 2026-08-03 across all 53:
+#
+#     BARE `except:`             0
+#     BROAD `except Exception:`  20   <- where the risk actually lives
+#     NARROW typed               33
+#
+# A narrow handler names the failure it expects. `except (OSError,
+# ProcessLookupError): pass` around `os.kill(stale_pid, SIGTERM)` is not a
+# swallowed bug — it IS the correct handling of a process that already exited,
+# and anything unexpected still propagates. A broad `except Exception: pass`
+# catches the bug too.
+#
+# Blast-radius audit of the same 53, by AST (try-body contains a `return`, or
+# names/calls that shape a decision): THREE flagged, all three false positives
+# on inspection — "root" matched the `roots` allow-list variable (and that gulp
+# fails CLOSED: no psutil means FEWER allowed roots), "sign" matched
+# `signal.SIGTERM` twice. Zero of the 53 currently carry real blast radius; the
+# dangerous ones were the tasks/kill fail-open (0b05949b) and the three
+# control-flow gulps already converted to logging.
+#
+# So the broad count gets its own, tighter ceiling. Same rule as above: lower
+# it in the SAME commit that removes one.
+BROAD_GULP_CEILING = {
+    "shell_os_apis.py": 14,
+    "shell_system_apis.py": 5,
+    "shell_desktop_apis.py": 1,
+    "liquid_ui_service.py": 0,
+}
+
+
+def _broad_gulp_count(src):
+    """Count only handlers that swallow EVERYTHING silently."""
+    import ast
+    tree = ast.parse(src)
+    n = 0
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.ExceptHandler)
+                and len(node.body) == 1
+                and isinstance(node.body[0], ast.Pass)):
+            continue
+        t = node.type
+        if t is None or (isinstance(t, ast.Name)
+                         and t.id in ("Exception", "BaseException")):
+            n += 1
+    return n
+
+
+@pytest.mark.parametrize("mod", SHELL_MODULES)
+def test_source_guard_broad_silent_gulps_never_increase(mod):
+    """RATCHET DOWN, tighter: no new bare/`except Exception:` + pass.
+
+    Separate from the total because the two are not equally dangerous, and a
+    single number let a narrow, correct handler pay for a broad, risky one.
+    Narrowing a broad handler to the exception it actually expects is a real
+    improvement, and this is the ratchet that records it.
+    """
+    count = _broad_gulp_count(_read(mod))
+    ceiling = BROAD_GULP_CEILING[mod]
+    assert count <= ceiling, (
+        f"{mod} grew a catch-everything silent handler: {count} > ceiling "
+        f"{ceiling}.\n"
+        f"`except Exception: pass` swallows the bug along with the expected "
+        f"failure. Name the exception you actually expect, log it, or fail "
+        f"closed."
+    )
+
+
 @pytest.mark.parametrize("mod", SHELL_MODULES)
 def test_source_guard_silent_exception_gulps_never_increase(mod):
     """RATCHET DOWN: no new `except: pass` on the shell surface.
