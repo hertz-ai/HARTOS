@@ -227,6 +227,55 @@ in
           else:
               drv.log("kernel endpoint not reachable on this node")
 
+      with subtest("#25: /api/shell/services AGREES with systemctl"):
+          # Same cross-check shape again: ask the endpoint, then ask systemd
+          # directly, and require them to match. The interesting unit is one
+          # this VM does NOT have — the route used to run `is-active`, which
+          # reports a missing unit as "inactive", making "not installed"
+          # indistinguishable from "installed but stopped". An agent told the
+          # second will try to start it forever.
+          out = drv.succeed(
+              "curl -s -m 10 'http://127.0.0.1:6777/api/shell/services?group=all' || true"
+          ).strip()
+          if out.startswith("{"):
+              import json
+              data = json.loads(out)
+              assert data.get("available") is True, (
+                  f"systemd is PID 1 here, yet the endpoint could not ask it: {out[:300]}")
+              by = {s["name"]: s for s in data.get("services", [])}
+              assert by, f"services endpoint returned nothing: {out[:300]}"
+              drv.log("services: " + ", ".join(
+                  f"{n}={s.get('status')}/{'inst' if s.get('installed') else 'MISSING'}"
+                  for n, s in sorted(by.items())))
+
+              # Cross-check every reported unit against systemd itself.
+              for name, svc in sorted(by.items()):
+                  unit = svc["unit"]
+                  truth_load = drv.succeed(
+                      f"systemctl show {unit} --property=LoadState --value "
+                      f"2>/dev/null || echo unknown").strip()
+                  truth_active = drv.succeed(
+                      f"systemctl show {unit} --property=ActiveState --value "
+                      f"2>/dev/null || echo unknown").strip()
+                  assert svc["load_state"] == truth_load, (
+                      f"{unit}: endpoint says load_state={svc['load_state']!r}, "
+                      f"systemd says {truth_load!r}")
+                  assert svc["status"] == truth_active, (
+                      f"{unit}: endpoint says status={svc['status']!r}, "
+                      f"systemd says {truth_active!r}")
+                  assert svc["installed"] == (truth_load not in ("not-found", "masked")), (
+                      f"{unit}: installed={svc['installed']} contradicts "
+                      f"LoadState={truth_load!r}")
+
+              # hart-backend is answering this very request, so anything other
+              # than active would mean the endpoint cannot see its own host.
+              if "hart-backend" in by:
+                  assert by["hart-backend"]["status"] == "active", (
+                      "hart-backend served this request yet reports "
+                      f"{by['hart-backend']['status']!r}")
+          else:
+              drv.log("services endpoint not reachable on this node")
+
       with subtest("#25: a GPU-less VM is told it has NO GPU, not an error"):
           # The branch that is hardest to get right and was, until 9fd06117,
           # impossible to express: this VM genuinely has no GPU, so the

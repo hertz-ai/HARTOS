@@ -7147,21 +7147,38 @@ function renderAgentOverlay(ev) {{
         # ── Shell APIs: Services ──
         @app.route('/api/shell/services', methods=['GET'])
         def shell_services():
-            services = []
-            svc_names = [
-                'hart-backend', 'hart-agent-daemon', 'hart-vision',
-                'hart-llm', 'hart-discovery', 'hart-liquid-ui', 'hart-conky']
-            for name in svc_names:
-                status = 'unknown'
-                try:
-                    result = subprocess.run(
-                        ['systemctl', 'is-active', name],
-                        capture_output=True, text=True, timeout=3)
-                    status = result.stdout.strip()
-                except Exception:
-                    logger.exception("shell_services: swallowed Exception")
-                services.append({'name': name, 'status': status})
-            return jsonify({'services': services})
+            """Systemd unit state (task #25).
+
+            Was: seven hardcoded hart-* names, each costing its OWN
+            `systemctl is-active` subprocess — seven processes per request to
+            answer something systemd answers in one — and no way to ask about
+            any other unit. That made the OS's own subsystems unreachable:
+            "is sshd up", "is Samba sharing", "is podman running" had no
+            surface at all, on an OS whose premise is that agents drive it.
+
+            Now backed by service_status(), which is one systemctl call for
+            every unit asked about and distinguishes NOT INSTALLED from
+            stopped (see parse_systemctl_show). The hart-* group is still the
+            default view, so existing callers see the same names with the same
+            {'name','status'} keys; `?units=` and `?group=` open it up.
+            """
+            from integrations.agent_engine.shell_system_apis import (
+                SERVICE_CATALOG, service_status)
+
+            want = (request.args.get('units') or '').strip()
+            group = (request.args.get('group') or '').strip()
+            if want:
+                names = [n.strip() for n in want.split(',') if n.strip()]
+            elif group == 'all':
+                names = [n for g in SERVICE_CATALOG.values() for n in g]
+            elif group in SERVICE_CATALOG:
+                names = list(SERVICE_CATALOG[group])
+            else:
+                names = list(SERVICE_CATALOG['hart'])
+
+            body = service_status(names)
+            body['groups'] = sorted(SERVICE_CATALOG)
+            return jsonify(body), (200 if body['available'] else 503)
 
         # ── Shell APIs: Session state persistence ──
         @app.route('/api/shell/session-state', methods=['GET'])

@@ -452,6 +452,69 @@ def _audit_system_op(action, detail=None):
 
 
 
+# The default view of "what services does this OS run". NOT a limit — the
+# /api/shell/services route takes ?units= for anything else — and deliberately
+# grouped, because the point of task #25 is that an agent can ask about the
+# common OS subsystems by name instead of knowing HART's own unit names.
+#
+# Units that are not installed are reported as such rather than omitted: on a
+# desktop that never enabled sharing, "nfs-server is not installed" is the
+# useful answer, and dropping the row would make it indistinguishable from a
+# unit we forgot to ask about.
+SERVICE_CATALOG = {
+    'hart': ['hart-backend', 'hart-agent-daemon', 'hart-vision',
+             'hart-llm', 'hart-discovery', 'hart-liquid-ui', 'hart-conky'],
+    'remote-access': ['sshd'],
+    'file-sharing': ['nfs-server', 'smbd', 'nmbd'],
+    'containers': ['podman', 'docker', 'libvirtd'],
+    'core': ['NetworkManager', 'systemd-timesyncd', 'systemd-resolved'],
+}
+
+
+def parse_systemctl_show(text: str) -> list:
+    """`systemctl show <units> -p Id,LoadState,...` output -> unit dicts.
+
+    Pure parse, no I/O, so the contract is testable without systemd — same
+    reason parse_lspci_k and parse_proc_modules are pure.
+
+    systemd emits one KEY=VALUE block per unit, blocks separated by a blank
+    line. The key field is LoadState: `not-found` means the unit does not
+    exist on this system, which is a DIFFERENT fact from `inactive` (it
+    exists and is stopped). `systemctl is-active` collapses both to
+    "inactive", which is why this uses `show` — reporting an uninstalled
+    Samba as merely "stopped" invites an agent to try starting it forever.
+    """
+    units, cur = [], {}
+    for raw in (text or '').splitlines():
+        line = raw.strip()
+        if not line:
+            if cur:
+                units.append(cur)
+                cur = {}
+            continue
+        key, sep, val = line.partition('=')
+        if sep:
+            cur[key] = val
+    if cur:
+        units.append(cur)
+
+    out = []
+    for u in units:
+        if not u.get('Id'):
+            continue
+        load = u.get('LoadState')
+        out.append({
+            'name': u['Id'].rsplit('.service', 1)[0],
+            'unit': u['Id'],
+            'installed': load not in ('not-found', 'masked', None),
+            'load_state': load,
+            'status': u.get('ActiveState'),      # active/inactive/failed
+            'sub_state': u.get('SubState'),      # running/dead/exited
+            'enabled': u.get('UnitFileState'),   # enabled/disabled/static
+        })
+    return out
+
+
 def parse_proc_modules(text: str) -> list:
     """`/proc/modules` text -> loaded-module dicts.
 
@@ -488,6 +551,53 @@ def parse_proc_modules(text: str) -> list:
             'state': parts[4] if len(parts) > 4 else None,
         })
     return mods
+
+
+def service_status(names) -> dict:
+    """State of the named systemd units — ONE systemctl call for all of them.
+
+    The previous implementation ran `systemctl is-active` once PER unit: seven
+    subprocesses on every request to answer a question systemd will answer in
+    one. `systemctl show` accepts every unit at once, so this is 1 process
+    regardless of how many are asked for, and it returns LoadState, which
+    is-active cannot express (see parse_systemctl_show).
+
+    Uses the canonical bounded probe (`_run` -> core.subprocess_safe.run_probe)
+    rather than a fresh subprocess.run, which is the repo-wide rule.
+
+    Never raises. Same three answers as the other #25 surfaces: available
+    False means systemd could not be consulted at all, which is NOT the same
+    as "no services are running".
+    """
+    names = [n for n in (names or []) if n and re.fullmatch(r'[A-Za-z0-9@:_.\-]+', n)]
+    if not names:
+        return {'available': True, 'services': []}
+
+    # A bare name means the .service unit; an explicit type is left alone, so
+    # a caller can ask about sshd.socket or hart-ota.timer without having it
+    # rewritten into a unit that does not exist.
+    _UNIT_TYPES = ('.service', '.socket', '.timer', '.target', '.mount',
+                   '.path', '.slice', '.scope', '.device', '.swap')
+    units = [n if n.endswith(_UNIT_TYPES) else f'{n}.service' for n in names]
+
+    try:
+        r = _run(['systemctl', 'show', *units,
+                  '--property=Id,LoadState,ActiveState,SubState,UnitFileState'],
+                 timeout=8)
+    except OSError as exc:
+        logger.warning("service_status: systemctl failed (%s: %s)",
+                       type(exc).__name__, exc)
+        return {'available': False, 'services': [],
+                'error': f'systemctl unavailable: {exc}'}
+
+    if r is None:
+        # run_probe returns None for the two EXPECTED degrades: tool absent
+        # or tool hung. Either way we did not get to look.
+        logger.warning("service_status: systemctl absent or timed out")
+        return {'available': False, 'services': [],
+                'error': 'systemctl is absent or did not answer in time'}
+
+    return {'available': True, 'services': parse_systemctl_show(r.stdout or '')}
 
 
 def kernel_status() -> dict:
