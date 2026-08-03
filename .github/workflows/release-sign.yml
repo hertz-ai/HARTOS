@@ -8,6 +8,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  # NEVER cancel a signing run mid-flight.
+  # Same shape as nix-check/coverage-baseline (3f5ee290): a manual
+  # workflow_dispatch gets its OWN group keyed by run id, so an
+  # on-demand run is never cancelled by an unrelated later push.
+  group: release-sign-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
+  cancel-in-progress: false
+
 jobs:
   sign-release:
     runs-on: ubuntu-latest

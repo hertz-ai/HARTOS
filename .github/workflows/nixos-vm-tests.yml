@@ -41,6 +41,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # delegates to flake-checks; two callers = two VM fleets at once.
+  # Same shape as nix-check/coverage-baseline (3f5ee290): a manual
+  # workflow_dispatch gets its OWN group keyed by run id, so an
+  # on-demand run is never cancelled by an unrelated later push.
+  group: nixos-vm-tests-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
+  cancel-in-progress: true
+
 jobs:
   # No concurrency group here, and none in flake-checks.yml either: a manual
   # dispatch must not be cancelled by the nightly, nor the nightly by a

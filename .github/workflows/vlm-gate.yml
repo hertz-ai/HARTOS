@@ -53,6 +53,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # cheap gate, supersede freely.
+  # Same shape as nix-check/coverage-baseline (3f5ee290): a manual
+  # workflow_dispatch gets its OWN group keyed by run id, so an
+  # on-demand run is never cancelled by an unrelated later push.
+  group: vlm-gate-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
+  cancel-in-progress: true
+
 jobs:
   gate-lib-tests:
     name: Gate Library Unit Tests

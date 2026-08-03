@@ -84,6 +84,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # the release gate: a superseded 3h VM fleet is pure runner waste.
+  # Same shape as nix-check/coverage-baseline (3f5ee290): a manual
+  # workflow_dispatch gets its OWN group keyed by run id, so an
+  # on-demand run is never cancelled by an unrelated later push.
+  group: flake-checks-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
+  cancel-in-progress: true
+
 jobs:
   # ─── Python: unit + functional (the runtime gate) ──────────────────────────
   unit-tests:

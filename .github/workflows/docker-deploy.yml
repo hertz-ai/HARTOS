@@ -30,6 +30,14 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  # NEVER cancel a deploy mid-flight.
+  # Same shape as nix-check/coverage-baseline (3f5ee290): a manual
+  # workflow_dispatch gets its OWN group keyed by run id, so an
+  # on-demand run is never cancelled by an unrelated later push.
+  group: docker-deploy-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
+  cancel-in-progress: false
+
 jobs:
   # ── 1. Quick lint + import check ──────────────────────────────
   validate:
