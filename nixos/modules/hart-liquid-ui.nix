@@ -667,6 +667,27 @@ in
       environment.systemPackages = with pkgs; [
         sox          # Audio manipulation (record, play, convert)
         alsa-utils   # arecord, aplay
+
+        # OFFLINE VOICE FLOOR (task #7, item 0.5). Everything else in the TTS
+        # ladder needs something the box may not have on first boot: Model Bus
+        # needs a model, and the model needs a download. On a no-network box
+        # the narrated onboarding and the orb were therefore SILENT — the
+        # first-run experience that is supposed to introduce the OS by
+        # speaking simply did not.
+        #
+        # espeak-ng is small, has no model to fetch, and speaks immediately.
+        # It is not the voice we want — it is the voice that always works, so
+        # first boot is never mute while the good voice is still downloading.
+        #
+        # WHY HERE and not the desktop profile: this module already owns the
+        # voice pipeline (ui.voiceEnabled gates the listener, the Model Bus
+        # wiring and LIQUID_UI_VOICE), so the offline fallback belongs with
+        # it — one writer for "what voice needs". It exists in the tree only
+        # in hart-accessibility.nix, gated behind screenReader.enable, which
+        # defaults FALSE and also drags in Orca auto-starting at login. That
+        # is a screen reader, not a fallback synthesizer; enabling it to get
+        # espeak would have made every desktop start talking over itself.
+        espeak-ng
       ];
 
       # Voice input listener (background, activated by wake word or push-to-talk)
