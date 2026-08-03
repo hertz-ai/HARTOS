@@ -292,6 +292,40 @@ in
           assert "WEBKIT_DISABLE_COMPOSITING_MODE=1" in glass, \
               "glass shell missing WEBKIT_DISABLE_COMPOSITING_MODE — compositing crashes GL-less"
 
+          # ── MIC ON THE CAGE FLOOR (task #3a) ──────────────────────────
+          # The real-HW 2026-07-18 incident: "clicking the mic hung the entire
+          # cage". WebKit2 routes getUserMedia capture through GStreamer, and a
+          # bare cage session sets NO GST_PLUGIN_SYSTEM_PATH_1_0 — so pulsesrc
+          # and valve were invisible and WebKitWebProcess SIGSEGV'd. The fix
+          # back-ported the GTK4 host's plugin path to this never-fail floor.
+          #
+          # ASSERT THE PATH RESOLVES TO REAL PLUGINS, not merely that the
+          # variable is exported. The original bug was exactly an exported
+          # path that resolved to an EMPTY directory: makeSearchPath was used
+          # where makeSearchPathOutput "out" was needed, because gstreamer
+          # core's default output is `bin`. A present-but-empty path looks
+          # identical to a correct one in the script text, and is what made the
+          # mic hang while everything appeared configured.
+          gst_path = shell.succeed(
+              f"awk -F= '/GST_PLUGIN_SYSTEM_PATH_1_0=/{{print $2; exit}}' {glass_path}"
+          ).strip().strip('"')
+          assert gst_path, (
+              "the cage floor's launcher exports no GST_PLUGIN_SYSTEM_PATH_1_0 "
+              "— a mic click SIGSEGVs WebKitWebProcess and takes the cage with "
+              "it (the 2026-07-18 real-HW hang)")
+          # pulsesrc is the capture SOURCE; coreelements holds `valve`. Their
+          # absence is the exact shape of the incident.
+          for element_so in ("libgstpulseaudio.so", "libgstcoreelements.so"):
+              hits = shell.succeed(
+                  f"found=0; for d in $(echo '{gst_path}' | tr ':' ' '); do "
+                  f"  [ -e \"$d/{element_so}\" ] && found=1; "
+                  f"done; echo $found").strip()
+              assert hits == "1", (
+                  f"{element_so} is not on GST_PLUGIN_SYSTEM_PATH_1_0 "
+                  f"({gst_path!r}) — the path is exported but does not resolve "
+                  f"to the capture plugins, which is the empty-search-path bug "
+                  f"that made the mic hang look like a configured system")
+
       # ════════════════════════════════════════════════════════════════
       # 3. FIRST WEBVIEW FRAME PAINTS ON llvmpipe (the broken-GPU floor)
       # ════════════════════════════════════════════════════════════════

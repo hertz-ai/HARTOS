@@ -26,7 +26,7 @@ reason; "needs physical hardware" or "needs a human to look at it" is.
 
 | # | Task | VM verification | Status |
 |---|---|---|---|
-| 3 | Shell hang + false-healthy signals | `session-supervisor.nix` (`hart-session-supervisor-unhealthy-flag`, `-paint-watchdog`, `-tier-drop`) + `display-tiers-neverblack.nix` + `vm-tests.nix` (`hart-edge-boot` asserts `/status` reports learning_active=false, keeps learning_mode, and names the reason) | EXISTS for the learning_active + response-shape half; the mic-on-cage-floor assertion is still TO WRITE |
+| 3 | Shell hang + false-healthy signals | `session-supervisor.nix` (`hart-session-supervisor-unhealthy-flag`, `-paint-watchdog`, `-tier-drop`) + `display-tiers-neverblack.nix` + `vm-tests.nix` (`/status` truth) + `desktop-boot.nix` (cage-floor mic: GST_PLUGIN_SYSTEM_PATH_1_0 resolves to real capture plugins) | EXISTS — one deliberate gap: `/status` still returns HTTP 200 when degraded. `/ready` already 503s honestly, and flipping /status's code has three consumers, so that is its own decision. |
 | 4 | Onboarding onto Nunba LightYourHART | `desktop-boot.nix` — first-run surface reached with `hart.nunba.enable` on | TO WRITE — and BLOCKED: enabling nunba does not evaluate (`hypercorn-0.16.0 not supported for interpreter python3.10`, run 30785511463) |
 | 7 | Honest first-run / offline UI | `hart-app-install-verify.nix` (shipped python speaks a number) + `desktop-boot.nix` (espeak-ng SYNTHESISES a WAV with no network) | EXISTS |
 | 8 | Event-driven shell | `desktop-boot.nix` boot-to-paint; the bounded-`curl` fix needs a node where the backend accepts TCP and never answers | TO WRITE |
@@ -57,7 +57,7 @@ reason; "needs physical hardware" or "needs a human to look at it" is.
 
 ## What this matrix is honest about
 
-**Six rows are `TO WRITE`** (was nine; #7, #24 and #31's unit half landed). That is the real state of "100% VM verification":
+**Five rows are `TO WRITE`** (was nine; #7, #24, #31's unit half and #3's mic half landed). That is the real state of "100% VM verification":
 the parity program's own matrices exist and run, and the older feature tasks
 mostly do not have a VM assertion yet. Writing those nine is the remaining work
 of the goal, and naming them is what makes it finite rather than a feeling.
