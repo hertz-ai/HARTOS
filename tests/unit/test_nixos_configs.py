@@ -3488,3 +3488,80 @@ class TestEveryTestScriptIsValidPython:
             "nixosTest testScript(s) are not valid python. Nix will build "
             "these happily and the VM will boot; the driver then dies on the "
             "SyntaxError with EVERY subtest lost.\n  " + "\n  ".join(broken))
+
+
+class TestHartOptionNamesDoNotCollideOnlyByCase:
+    """Two hart options may not differ ONLY in capitalisation.
+
+    HOW THIS WAS FOUND (2026-08-03): reading closure-audit run 30570492265,
+    which reported `hart.devtools.enable` costing 3 GiB. The desktop profile
+    sets `devTools.enable = true`, so the obvious reading is "the audit
+    disabled the toolchain the desktop enables". It did not. There are TWO
+    modules, both wired into flake.nix, whose options differ by ONE CAPITAL:
+
+        hart-dev-tools.nix -> options.hart.devTools   gcc/go/jdk21/rustup
+                                                      desktop: ON
+        hart-devtools.nix  -> options.hart.devtools   LSP, debuggers, linters,
+                                                      container tools
+                                                      desktop: OFF (measured)
+
+    Both are legitimate and separately justified. The hazard is the NAME: nix
+    reports no conflict, `hart.devtools.enable = true` silently configures the
+    other module, and an audit attributes GB to the wrong feature. It very
+    nearly did exactly that here.
+
+    The pair below is GRANDFATHERED, not endorsed — renaming a declared option
+    is a product decision (and needs mkRenamedOptionModule so existing configs
+    keep evaluating), so it is tracked rather than done silently. What this
+    test prevents is a SECOND one.
+    """
+
+    #: Known case-collision, tracked for rename. Do NOT add to this list to
+    #: make a failure go away — that is the ratchet slipping.
+    GRANDFATHERED = {("devTools", "devtools")}
+
+    def _option_roots(self):
+        roots = set()
+        for path in glob.glob(os.path.join(MODULES_DIR, "*.nix")):
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for m in re.finditer(r"options\.hart\.([A-Za-z0-9_]+)", fh.read()):
+                    roots.add(m.group(1))
+        return roots
+
+    def test_the_probe_finds_the_option_declarations(self):
+        """Guard the guard: an empty scan would pass every assertion below."""
+        roots = self._option_roots()
+        assert len(roots) >= 40, (
+            f"only {len(roots)} `options.hart.<name>` declarations found across "
+            f"{MODULES_DIR} — the pattern no longer matches how modules declare "
+            f"options, so a green result here would prove nothing")
+
+    def test_no_new_case_only_option_collisions(self):
+        roots = self._option_roots()
+        buckets = {}
+        for r in roots:
+            buckets.setdefault(r.lower(), set()).add(r)
+        collisions = {
+            tuple(sorted(v)) for v in buckets.values() if len(v) > 1}
+        new = collisions - self.GRANDFATHERED
+        assert not new, (
+            f"hart options differing only by case: {sorted(new)}.\n"
+            f"Nix treats these as unrelated options and reports no conflict, so "
+            f"setting one silently configures the other — and a closure audit "
+            f"or a profile flip lands on the wrong feature. Give one of them a "
+            f"distinct name (with mkRenamedOptionModule so existing configs "
+            f"still evaluate).")
+
+    def test_grandfathered_collisions_are_still_real(self):
+        """When the rename lands, this list must shrink with it.
+
+        Without this, the exception outlives the problem and quietly permits a
+        future collision that happens to reuse the same names.
+        """
+        roots = self._option_roots()
+        for pair in self.GRANDFATHERED:
+            missing = [p for p in pair if p not in roots]
+            assert not missing, (
+                f"{missing} no longer declared, so the grandfathered pair "
+                f"{pair} is stale — delete it from GRANDFATHERED in the same "
+                f"commit that renamed the option")
