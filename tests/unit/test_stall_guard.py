@@ -23,14 +23,13 @@ from __future__ import annotations
 import os
 import sys
 
-import pytest
-
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from lifecycle_hooks import (
     stall_guard_step, STALL_GUARD_MAX_ITERS, STALL_GUARD_INPROGRESS_ITERS,
+    cycle_guard_step, CYCLE_GUARD_MAX_REVISITS,
     ActionState, recipe_correction_directive,
 )
 
@@ -173,54 +172,121 @@ _LIVE_CYCLE_2026_08_04 = [
 ]
 
 
-def _replay(sequence, action_id=2, rounds=20):
-    """Drive the tracker over a repeating state sequence, as the loop does.
+def _replay(sequence, action_id=2, rounds=20, both=True):
+    """Drive the trackers over a repeating state sequence, as the loop does.
+
+    ``both=True`` mirrors production: the CREATE loop breaks if EITHER detector
+    trips — one break decision, two signals.  ``both=False`` drives only
+    stall_guard_step, to show what that one can and cannot see on its own.
 
     Returns (broke, total_steps). recipe_exists stays False throughout: in the
     live incident action 2's own recipe never landed, which is exactly why
     AUTO-ADVANCE kept re-requesting it.
     """
     key, it, steps = None, 0, 0
+    ckey, centries = None, {}
     for _ in range(rounds):
         for state, repeat in sequence:
             for _ in range(repeat):
                 steps += 1
                 key, it, brk = stall_guard_step(key, it, action_id, state, False)
+                if both:
+                    ckey, centries, cbrk = cycle_guard_step(
+                        ckey, centries, action_id, state, False)
+                    brk = brk or cbrk
                 if brk:
                     return True, steps
     return False, steps
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "#485 KNOWN GAP: stall_guard_step detects an action STUCK IN ONE STATE, not "
-    "one CYCLING through states. Two independent resets defeat it here — the "
-    "(action_id, state) key changes on every transition so `iters` restarts at "
-    "1, and the cycle revisits COMPLETED/TERMINATED which hard-reset to 0. "
-    "Measured live 2026-08-04: action 2 churned these 7 states while the loop "
-    "burned toward max_iterations=300, emitting ~321 log lines in a single "
-    "second and starving the chat hot path (58s for a one-word reply). "
-    "STALL-GUARD did fire twice elsewhere in that window, so the guard is live "
-    "— it simply cannot see this shape. "
-    "xfail(strict) NOT skip: this must flip to a hard failure the moment the "
-    "gap is closed, so the marker gets removed rather than quietly rotting. "
-    "Fix by EXTENDING stall_guard_step (revisited-state detection) — do NOT add "
-    "a second cap; test_terminal_state_resets and "
-    "test_counter_resets_on_state_advance encode deliberate behaviour that must "
-    "keep passing."))
 def test_cycling_action_is_eventually_caught():
+    """#485: the composed decision must catch a non-progressing cycle."""
     broke, steps = _replay(_LIVE_CYCLE_2026_08_04)
     assert broke is True, (
-        f"guard never fired across {steps} iterations of a non-progressing "
+        f"neither detector fired across {steps} iterations of a non-progressing "
         f"cycle — an action that never finishes must be caught, not just one "
         f"that sits still")
+    # It must also be caught FAST — well inside max_iterations=300, or the loop
+    # has already done the damage (the live incident emitted ~321 log lines in
+    # one second while burning toward that cap).
+    assert steps < 300
+
+
+def test_stall_guard_alone_still_cannot_see_the_cycle():
+    """Pins WHY cycle_guard_step has to exist — this is the #485 gap itself.
+
+    stall_guard_step's scope is deliberately narrow: it treats every state
+    change as progress and every terminal state as a reset, which is right for
+    a machine that advances monotonically. Driven alone over the live cycle it
+    never fires. If someone later widens stall_guard_step to catch cycling too,
+    this test fails and forces the duplication question to be answered rather
+    than drifting into two overlapping detectors.
+    """
+    broke, _ = _replay(_LIVE_CYCLE_2026_08_04, both=False)
+    assert broke is False
 
 
 def test_replay_harness_is_not_vacuous():
-    """The xfail above must fail for the RIGHT reason.
+    """The cycle tests must pass/fail for the RIGHT reason.
 
-    A single unchanging state from the same sequence still trips the guard, so
-    the harness itself drives the tracker correctly and the xfail is about
-    cycling specifically — not a broken replay helper.
+    A single unchanging state still trips stall_guard_step through the very
+    same helper, so the harness drives the trackers correctly and the cycling
+    results are about cycling — not a broken replay helper.
     """
-    broke, _ = _replay([(ActionState.RECIPE_REQUESTED, 1)], rounds=STALL_GUARD_MAX_ITERS + 5)
+    broke, _ = _replay([(ActionState.RECIPE_REQUESTED, 1)],
+                       rounds=STALL_GUARD_MAX_ITERS + 5, both=False)
     assert broke is True
+
+
+def test_cycle_guard_spares_a_long_single_state_occupancy():
+    """THE regression risk of counting wrong.
+
+    An action legitimately working in IN_PROGRESS for the whole
+    STALL_GUARD_INPROGRESS_ITERS window is ONE entry, not N. If cycle_guard_step
+    counted iterations instead of entries it would kill working actions at
+    CYCLE_GUARD_MAX_REVISITS+1 — long before stall_guard_step's own 120 cap and
+    contradicting test_in_progress_spared_within_working_zone.
+    """
+    key, entries = None, {}
+    for _ in range(STALL_GUARD_INPROGRESS_ITERS + 50):
+        key, entries, brk = cycle_guard_step(key, entries, 2, ActionState.IN_PROGRESS, False)
+        assert brk is False
+    assert entries == {ActionState.IN_PROGRESS: 1}
+
+
+def test_cycle_guard_counts_entries_not_iterations():
+    seq = [(ActionState.RECIPE_REQUESTED, 4), (ActionState.TERMINATED, 4)]
+    key, entries = None, {}
+    for _ in range(3):                      # 3 laps = 3 entries per state
+        for state, repeat in seq:
+            for _ in range(repeat):
+                key, entries, _ = cycle_guard_step(key, entries, 2, state, False)
+    assert entries == {ActionState.RECIPE_REQUESTED: 3, ActionState.TERMINATED: 3}
+
+
+def test_cycle_guard_resets_when_the_action_advances():
+    """current_action moving on is real progress — the pipeline did something."""
+    key, entries = None, {}
+    for _ in range(CYCLE_GUARD_MAX_REVISITS * 3):
+        for state in (ActionState.RECIPE_REQUESTED, ActionState.TERMINATED):
+            key, entries, _ = cycle_guard_step(key, entries, 2, state, False)
+    key, entries, brk = cycle_guard_step(key, entries, 3, ActionState.ASSIGNED, False)
+    assert brk is False and entries == {ActionState.ASSIGNED: 1}
+
+
+def test_cycle_guard_resets_when_the_recipe_lands():
+    """The action's OWN recipe on disk is the canonical progress signal, and it
+    means the same thing here as it does in stall_guard_step."""
+    key, entries, brk = cycle_guard_step(
+        (2, ActionState.RECIPE_REQUESTED),
+        {ActionState.RECIPE_REQUESTED: CYCLE_GUARD_MAX_REVISITS + 5},
+        2, ActionState.RECIPE_REQUESTED, recipe_exists=True)
+    assert (key, entries, brk) == (None, {}, False)
+
+
+def test_cycle_guard_is_pure():
+    """Callers thread state back in; the tracker must not mutate what it got."""
+    passed_in = {ActionState.RECIPE_REQUESTED: 2}
+    cycle_guard_step((2, ActionState.TERMINATED), passed_in,
+                     2, ActionState.RECIPE_REQUESTED, False)
+    assert passed_in == {ActionState.RECIPE_REQUESTED: 2}

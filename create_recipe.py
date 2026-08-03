@@ -226,6 +226,7 @@ from lifecycle_hooks import (
     sync_action_state_to_ledger,  # Sync ActionState to SmartLedger
     register_ledger_for_session,  # Register ledger for auto-sync
     stall_guard_step,             # No-progress stall tracker (reachable guard)
+    cycle_guard_step,             # No-NET-progress tracker: cycling action (#485)
     recipe_correction_directive,  # Escalating "emit ONLY JSON" recipe fix (#89)
     is_recipe_creation_request,   # Deterministic recipe-prompt detector (speaker routing)
     RECIPE_CREATE_PROMPT_PREFIX,  # canonical recipe-prompt prefix (single source)
@@ -4181,6 +4182,31 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     f"[STALL-GUARD] action {current_action_id} stuck in "
                     f"{current_state.value} for {_sg_iters} iterations with no "
                     f"recipe — breaking clean (was spinning to max_iterations)")
+                break
+
+            # Second no-progress SIGNAL feeding the SAME break decision above —
+            # not a second guard.  stall_guard_step counts consecutive iterations
+            # in ONE state and resets on every transition and every terminal
+            # state, so it cannot see an action going round in a circle: live
+            # 2026-08-04 action 2 churned assigned -> in_progress ->
+            # status_verification_requested -> completed -> terminated ->
+            # recipe_requested -> terminated -> recipe_requested ->
+            # recipe_received, resetting the stall counter the whole way while
+            # the loop ran toward max_iterations and starved the chat hot path.
+            _cg_key, _cg_entries, _cg_break = cycle_guard_step(
+                getattr(_ut, '_cycle_key', None),
+                getattr(_ut, '_cycle_entries', None),
+                current_action_id, current_state,
+                os.path.exists(helper_fun.safe_prompt_path(
+                    prompt_id, get_current_flow(user_prompt), current_action_id)),
+            )
+            _ut._cycle_key, _ut._cycle_entries = _cg_key, _cg_entries
+            if _cg_break:
+                current_app.logger.warning(
+                    f"[CYCLE-GUARD] action {current_action_id} re-entered the "
+                    f"same states without finishing "
+                    f"({dict((s.value, n) for s, n in _cg_entries.items())}) — "
+                    f"breaking clean instead of draining max_iterations")
                 break
 
             if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':

@@ -522,6 +522,62 @@ def stall_guard_step(prev_stuck_key, prev_iters, action_id, state,
     return key, iters, iters > cap
 
 
+# How many times one action may RE-ENTER a state it has already been in before
+# the CREATE loop gives up.  6 leaves room for the legitimate retry rounds the
+# recipe phase already does (request -> parse fail -> re-request) while still
+# catching a cycle long before the 300-iteration hard cap.
+CYCLE_GUARD_MAX_REVISITS = 6
+
+
+def cycle_guard_step(prev_key, prev_entries, action_id, state, recipe_exists):
+    """Pure no-NET-progress tracker: catches an action CYCLING through states.
+
+    Complement to ``stall_guard_step``, which catches an action STUCK IN ONE
+    state and by design treats every state change as progress and every terminal
+    state as a reset.  Those are the right semantics for a state machine that
+    advances monotonically — and exactly why an action that goes round in a
+    circle escapes it: the key changes on each transition so the counter
+    restarts, and revisiting COMPLETED/TERMINATED hard-resets it to 0.
+
+    Live 2026-08-04, one 40s window, action 2:
+        assigned -> in_progress -> status_verification_requested -> completed
+        -> terminated -> recipe_requested -> terminated -> recipe_requested
+        -> recipe_received
+    Seven states, no net progress, guard never fired, loop ran toward
+    max_iterations=300 and starved the chat hot path.
+
+    Counts ENTRIES into a state, not iterations spent in it.  That distinction
+    is load-bearing: an action legitimately working in IN_PROGRESS for the full
+    ``STALL_GUARD_INPROGRESS_ITERS`` window is ONE entry and must never trip
+    this, while an action bouncing back into RECIPE_REQUESTED again and again
+    accrues one count per bounce.
+
+    Returns ``(key, entries, should_break)``:
+      * ``key``     — opaque ``(action_id, state)`` the caller threads back, used
+                      to spot the next real transition.
+      * ``entries`` — opaque ``{state: entry_count}`` for the CURRENT action.
+      * resets whenever the current action changes (the pipeline genuinely moved
+        on) or that action's OWN recipe lands on disk.
+
+    Terminal states are deliberately NOT special-cased here: re-entering
+    COMPLETED/TERMINATED is the cycle's signature, not evidence of progress.  A
+    genuinely finished action still resets, because ``current_action`` advances
+    and ``action_id`` therefore changes.
+
+    Pure — no I/O, no logging.  Guarded by tests/unit/test_stall_guard.py.
+    """
+    if recipe_exists:
+        return None, {}, False
+    prev_action, prev_state = prev_key if prev_key else (None, None)
+    if prev_action != action_id:
+        return (action_id, state), {state: 1}, False
+    entries = dict(prev_entries or {})
+    if state != prev_state:                      # a real transition INTO `state`
+        entries[state] = entries.get(state, 0) + 1
+    return ((action_id, state), entries,
+            max(entries.values(), default=0) > CYCLE_GUARD_MAX_REVISITS)
+
+
 # Minimal valid recipe the model is told to emit as a last resort so a wedged
 # action TERMINATES cleanly (status:done + empty recipe) instead of grinding.
 _RECIPE_FALLBACK_OBJECT = (
