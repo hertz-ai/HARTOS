@@ -1444,9 +1444,54 @@ class LiquidUIService:
             if resp.status_code == 200:
                 return {'text': text, 'response': resp.json().get('response', ''),
                         'source': 'voice'}
+            logger.warning("_process_voice_command: model bus returned HTTP %s",
+                           resp.status_code)
         except Exception:
-            logger.exception("_process_voice_command: swallowed Exception")
+            logger.exception("_process_voice_command: model bus call failed")
+
+        # HONEST FIRST-RUN (task #7, item 0.5). "Could not process" reads as
+        # "I did not understand you" — the user's fault, their microphone,
+        # their accent. On a fresh offline box the truth is the opposite: the
+        # words arrived fine and there is no model to answer them yet, because
+        # provisioning needs the network once. Two opposite problems wearing
+        # the same sentence is how a working machine feels broken.
+        #
+        # The probe is deliberately conservative: it claims "setup pending"
+        # ONLY when the Model Bus reports NO models at all, which is
+        # unambiguous. A bus with models that still failed this request is a
+        # real processing failure and keeps the original message.
+        if not self._model_bus_has_any_model():
+            return {'text': text, 'response': self._SETUP_PENDING_MSG,
+                    'source': 'voice', 'setup_pending': True}
         return {'text': text, 'response': 'Could not process', 'source': 'voice'}
+
+    #: Shown when the box has no local model yet. Names the ONE thing the user
+    #: must do, and says it is temporary — neither of which "Could not
+    #: process" managed.
+    _SETUP_PENDING_MSG = ("Still finishing AI setup — it needs the internet "
+                          "once. Voice will work after that.")
+
+    def _model_bus_has_any_model(self) -> bool:
+        """True iff the Model Bus reports at least one model.
+
+        Runs ONLY on an already-failing path, so it is bounded (2s) and
+        best-effort: it must never turn one failure into two, or make a failed
+        voice command take longer to fail. Any error here means "cannot tell",
+        and cannot-tell is reported as no-model — the message it produces is
+        the accurate one for a box that cannot reach its own model bus.
+        """
+        from core.http_pool import pooled_get
+        try:
+            resp = pooled_get(
+                f'http://localhost:{self.model_bus_port}/v1/models', timeout=2)
+            if resp.status_code != 200:
+                logger.debug("model-bus /v1/models returned HTTP %s",
+                             resp.status_code)
+                return False
+            return bool((resp.json() or {}).get('models') or [])
+        except Exception as exc:
+            logger.debug("model-bus readiness probe failed: %s", exc)
+            return False
 
     # ─── Glass Desktop Shell Render ───────────────────────────
 
