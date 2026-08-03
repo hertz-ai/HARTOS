@@ -29,7 +29,7 @@ reason; "needs physical hardware" or "needs a human to look at it" is.
 | 3 | Shell hang + false-healthy signals | `session-supervisor.nix` (`hart-session-supervisor-unhealthy-flag`, `-paint-watchdog`, `-tier-drop`) + `display-tiers-neverblack.nix` + `vm-tests.nix` (`/status` truth) + `desktop-boot.nix` (cage-floor mic: GST_PLUGIN_SYSTEM_PATH_1_0 resolves to real capture plugins) | EXISTS — one deliberate gap: `/status` still returns HTTP 200 when degraded. `/ready` already 503s honestly, and flipping /status's code has three consumers, so that is its own decision. |
 | 4 | Onboarding onto Nunba LightYourHART | `desktop-boot.nix` — first-run surface reached with `hart.nunba.enable` on | TO WRITE — and BLOCKED: enabling nunba does not evaluate (`hypercorn-0.16.0 not supported for interpreter python3.10`, run 30785511463) |
 | 7 | Honest first-run / offline UI | `hart-app-install-verify.nix` (shipped python speaks a number) + `desktop-boot.nix` (espeak-ng SYNTHESISES a WAV with no network) | EXISTS |
-| 8 | Event-driven shell | `desktop-boot.nix` boot-to-paint; the bounded-`curl` fix needs a node where the backend accepts TCP and never answers | TO WRITE |
+| 8 | Event-driven shell | `desktop-boot.nix` — the SHIPPED health probe's own flags, exercised against a real half-up backend (listen without accept), must return bounded | EXISTS for 2.2 (boot health-wait); 2.1 (SSE producer) landed earlier with a behavioural test; 2.3 (connectivity double-poll) is TO WRITE |
 | 9 | Shell ↔ Nunba drift | `layer-shell-host.nix` paint + a theme round-trip across both surfaces | TO WRITE |
 | 10 | Backend forks (TTS / draft-LLM / constants) | `hart-app-install-verify.nix` for the shipped-python half; the ENGINE fork needs a listening test | NOT VM for the voice-identity half — a human must hear which engine spoke |
 | 11 | Right-click "Ask <Product>" | `desktop-boot.nix` — context menu entry present and wired | TO WRITE |
@@ -57,7 +57,7 @@ reason; "needs physical hardware" or "needs a human to look at it" is.
 
 ## What this matrix is honest about
 
-**Five rows are `TO WRITE`** (was nine; #7, #24, #31's unit half and #3's mic half landed). That is the real state of "100% VM verification":
+**Four rows are `TO WRITE`** (was nine; #7, #24, #31's unit half, #3's mic half and #8's boot-wait landed). That is the real state of "100% VM verification":
 the parity program's own matrices exist and run, and the older feature tasks
 mostly do not have a VM assertion yet. Writing those nine is the remaining work
 of the goal, and naming them is what makes it finite rather than a feeling.

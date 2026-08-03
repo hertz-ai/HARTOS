@@ -326,6 +326,49 @@ in
                   f"to the capture plugins, which is the empty-search-path bug "
                   f"that made the mic hang look like a configured system")
 
+          # ── THE BOOT HEALTH-WAIT CANNOT HANG (task #8, item 2.2) ──────
+          # A backend that ACCEPTS the TCP connection and then never answers is
+          # the half-up case — a still-initialising Flask app looks exactly
+          # like this. `curl -sf` has NO total timeout, so the wait loop
+          #     for i in $(seq 1 30); do curl -sf "$URL/health" && break; sleep 1; done
+          # blocked forever on iteration 1: there was never an iteration 2, and
+          # "wait up to 30 seconds" was really "wait forever" on the single
+          # failure the loop exists to survive.
+          #
+          # EXERCISE THE FLAGS THE SHIPPED LAUNCHER ACTUALLY USES, pulled out
+          # of the script itself, against a REAL black hole. Asserting that
+          # curl supports --max-time would prove nothing about our invocation.
+          flags = shell.succeed(
+              "grep -oE -- '--connect-timeout [0-9]+ --max-time [0-9]+' "
+              f"{glass_path} | head -1").strip()
+          assert flags, (
+              "the glass shell's health probe carries no timeout flags — a "
+              "half-up backend blocks the boot wait forever and the shell "
+              "never appears")
+
+          # listen() WITHOUT accept(): the kernel completes the handshake from
+          # the backlog, so curl connects and then waits for a reply that never
+          # comes. That is the half-up shape exactly, and it is what
+          # --connect-timeout alone would NOT catch.
+          shell.succeed(
+              "nohup python3 -c \"import socket, time; "
+              "s = socket.socket(); "
+              "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); "
+              "s.bind(('127.0.0.1', 9911)); s.listen(8); time.sleep(600)\" "
+              ">/dev/null 2>&1 & sleep 2")
+
+          # Timed INSIDE the guest — driver round-trip latency would blur a
+          # bound this tight.
+          waited = int(shell.succeed(
+              "start=$(date +%s); "
+              f"curl -sf {flags} http://127.0.0.1:9911/health >/dev/null 2>&1 || true; "
+              "echo $(( $(date +%s) - start ))").strip())
+          assert waited <= 15, (
+              f"the shipped health probe took {waited}s against a backend that "
+              f"accepts and never answers — it is not bounded, so the boot "
+              f"wait can still hang (flags were {flags!r})")
+          shell.log(f"health probe bounded: returned in {waited}s using {flags}")
+
       # ════════════════════════════════════════════════════════════════
       # 3. FIRST WEBVIEW FRAME PAINTS ON llvmpipe (the broken-GPU floor)
       # ════════════════════════════════════════════════════════════════
