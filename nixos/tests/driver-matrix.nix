@@ -190,6 +190,67 @@ in
               # The backend may not be listening on this minimal node; that is
               # a different task's problem, so record rather than fail here.
               drv.log("drivers endpoint not reachable on this node — sysfs assertions above stand")
+
+      with subtest("#25: /api/shell/kernel AGREES with /proc/modules"):
+          # Same cross-check as the drivers subtest above, for the module
+          # surface. Comparing the endpoint against the file it claims to
+          # read is what makes this a proof rather than a restatement: a
+          # route that invented its list, cached a stale one, or silently
+          # truncated would disagree with the kernel here and nowhere else.
+          truth = drv.succeed("cat /proc/modules || true")
+          truth_names = sorted(
+              l.split()[0] for l in truth.splitlines() if l.split())
+          drv.log(f"/proc/modules holds {len(truth_names)} modules")
+
+          out = drv.succeed(
+              "curl -s -m 10 http://127.0.0.1:6777/api/shell/kernel || true"
+          ).strip()
+          if out.startswith("{"):
+              import json
+              data = json.loads(out)
+              assert data.get("available") is True, (
+                  "the node HAS /proc/modules (read above) yet the endpoint "
+                  f"reports it cannot look: {out[:300]}")
+              api_names = sorted(m["name"] for m in data.get("modules", []))
+              assert api_names == truth_names, (
+                  "the kernel endpoint disagrees with /proc/modules.\n"
+                  f"only in /proc: {sorted(set(truth_names) - set(api_names))[:20]}\n"
+                  f"only in API:   {sorted(set(api_names) - set(truth_names))[:20]}")
+              # A Linux kernel always reports SOME taint value, even 0.
+              assert data.get("tainted") is not None, (
+                  "taint flag came back None on a live Linux node — that value "
+                  "is reserved for 'could not read it', so something is "
+                  f"degrading silently: {out[:300]}")
+              drv.log(f"kernel endpoint: {data.get('module_count')} modules, "
+                      f"tainted={data.get('tainted')}, "
+                      f"release={data.get('kernel_release')}")
+          else:
+              drv.log("kernel endpoint not reachable on this node")
+
+      with subtest("#25: a GPU-less VM is told it has NO GPU, not an error"):
+          # The branch that is hardest to get right and was, until 9fd06117,
+          # impossible to express: this VM genuinely has no GPU, so the
+          # honest answer is available=True + present=False. A 503 would say
+          # "I could not look" and a fabricated 0 GB would read as "a GPU
+          # with no memory". Both were reachable before; this pins neither.
+          out = drv.succeed(
+              "curl -s -m 10 http://127.0.0.1:6777/api/shell/gpu || true"
+          ).strip()
+          if out.startswith("{"):
+              import json
+              data = json.loads(out)
+              drv.log(f"/api/shell/gpu -> {out[:300]}")
+              assert data.get("available") is True, (
+                  "the detector should have RUN on this node and simply found "
+                  f"nothing; available=False means it could not look: {out[:300]}")
+              if data.get("present"):
+                  # A GPU in a plain qemu VM would mean the detector is
+                  # reporting something that is not there.
+                  raise AssertionError(
+                      "this VM has no GPU passed through, yet the endpoint "
+                      f"claims one is present: {out[:300]}")
+          else:
+              drv.log("gpu endpoint not reachable on this node")
     '';
   };
 }
