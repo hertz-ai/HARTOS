@@ -816,15 +816,39 @@ formatter = logging.Formatter(
 handler.setFormatter(formatter)
 stream_handler.setFormatter(formatter)
 
-# Configure root logger: clear any default handlers first to prevent duplicates,
-# then attach our handlers once.  In bundled mode the root logger gets both
-# stream + file so that ALL module loggers are captured.  In standalone mode
-# only Flask's app.logger gets the handlers.
+# Configure root logger: drop OUR OWN previously-installed handlers to prevent
+# duplicates on re-import, then attach them once.  In bundled mode the root
+# logger gets both stream + file so that ALL module loggers are captured.  In
+# standalone mode only Flask's app.logger gets the handlers.
+#
+# NEVER call `_root.handlers.clear()` here.  This module runs at IMPORT time,
+# and when a host application has already configured root logging, a blanket
+# clear() silently steals it.
+#
+# Incident 2026-08-03 (task #489): Nunba attaches gui_app.log + server.log to
+# the ROOT logger at startup.  Nunba imports hart_intelligence_entry lazily,
+# ~140s into every run — at which point this block detached both handlers.
+# Measured on a live frozen build: gui_app.log and server.log both stopped
+# dead at boot+140s and stayed silent for the next 134 minutes of uptime,
+# while named-logger files (agent_system.log) kept writing.  Every Nunba root
+# log line was silently relocated into langchain.log.  The two files CLAUDE.md
+# documents as THE diagnostic logs were dark for ~98% of each session, which
+# is why several investigations "found nothing in the logs".
+#
+# Tagging our handlers keeps the original de-duplication intent (a second
+# import removes exactly what the first import added) without touching
+# handlers owned by anyone else.
+_HARTOS_HANDLER_TAG = '_hartos_root_handler'
+
 _root = logging.getLogger()
-_root.handlers.clear()
+for _existing in list(_root.handlers):
+    if getattr(_existing, _HARTOS_HANDLER_TAG, False):
+        _root.removeHandler(_existing)
 _root.setLevel(logging.INFO)
 
 if _is_bundled:
+    setattr(handler, _HARTOS_HANDLER_TAG, True)
+    setattr(stream_handler, _HARTOS_HANDLER_TAG, True)
     _root.addHandler(handler)
     _root.addHandler(stream_handler)
 
