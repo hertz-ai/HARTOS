@@ -3546,9 +3546,19 @@ class TestHartOptionNamesDoNotCollideOnlyByCase:
     test prevents is a SECOND one.
     """
 
-    #: Known case-collision, tracked for rename. Do NOT add to this list to
+    #: Known case-collisions, tracked for rename. Do NOT add to this list to
     #: make a failure go away — that is the ratchet slipping.
-    GRANDFATHERED = {("devTools", "devtools")}
+    #:
+    #: EMPTY as of 2026-08-04. It held ("devTools", "devtools") until
+    #: hart.devtools was renamed to hart.ideTools; the sweep now finds ZERO
+    #: case-collisions across all 61 `options.hart.<root>` declarations.
+    #:
+    #: The removal was not optional housekeeping — test_grandfathered_
+    #: collisions_are_still_real went RED the moment the rename landed,
+    #: because the pair it excused no longer existed. That is the guard
+    #: working: an exception that outlives its problem would silently permit a
+    #: FUTURE collision reusing those exact names.
+    GRANDFATHERED = set()
 
     def _option_roots(self):
         roots = set()

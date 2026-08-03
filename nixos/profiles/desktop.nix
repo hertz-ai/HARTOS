@@ -505,8 +505,8 @@ in
     # devtools: OFF on the desktop image, and this one is MEASURED, not judged.
     # Closure audit 30570492265 on hart-desktop-raw — the real config with
     # exactly this option flipped:
-    #     hart.devtools.enable ON  : 24 GiB
-    #     hart.devtools.enable OFF : 21 GiB
+    #     hart.ideTools.enable ON  : 24 GiB
+    #     hart.ideTools.enable OFF : 21 GiB
     # +3 GiB. hart-repart-image.nix sizes the root at 26 GiB against a ~24 GiB
     # image (~2 GiB slack), and that 26 GiB is itself bounded by the 28.7 GiB
     # stick — its comment records that 1 GiB ESP + 28 GiB root already did NOT
@@ -514,7 +514,7 @@ in
     # it stops the raw image fitting the device it ships on.
     #
     # NOT a silent narrowing of "enable all": the feature stays fully available
-    # (hart.devtools.enable = true on any workstation), and the desktop still
+    # (hart.ideTools.enable = true on any workstation), and the desktop still
     # ships the language TOOLCHAINS via hart.devTools above — the confusingly
     # near-identical sibling — so compilers are present either way. What is
     # deferred is the LSP/debugger/linter layer.
@@ -522,7 +522,7 @@ in
     # SUB-BUNDLE MEASUREMENT — and it REFUTED the obvious hypothesis. I assumed
     # the LSP servers were the bulk (rust-analyzer, clang-tools, gopls, the
     # TypeScript stack) and said so. Audit 30573861911 flipping ONLY
-    # hart.devtools.lsp:
+    # hart.ideTools.lsp:
     #     lsp ON  : 24 GiB
     #     lsp OFF : 24 GiB
     # i.e. under the rounding — LSP is NOT the cost, so turning it off would

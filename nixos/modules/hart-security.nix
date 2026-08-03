@@ -166,7 +166,7 @@ in
       # PROFILE enabled devtools for every shipped machine it silently became an
       # OS-wide posture change and contradicted the ptrace assertion in
       # nixos/tests/security.nix. It is now gated behind the explicit
-      # hart.devtools.ptraceUnrestricted, which mkForces it — so this hardening
+      # hart.ideTools.ptraceUnrestricted, which mkForces it — so this hardening
       # holds unless a box deliberately opts out.) Every value here only
       # tightens the network stack; none opens a port or changes routing the LAN
       # needs.

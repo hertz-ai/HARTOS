@@ -1,18 +1,49 @@
-# HART OS — Developer Tools
+# HART OS — IDE / editor tooling
 #
-# LSP servers, debuggers, linters/formatters, container tools.
+# LSP servers, debuggers, linters/formatters, container tools, editors.
 # Category-based: each feature set independently toggleable.
-# Base languages (Python, Node, Rust, Go, Java) are in hart-desktop.nix.
+# Base languages (Python, Node, Rust, Go, Java) are hart.devTools, a DIFFERENT
+# option owned by modules/hart-dev-tools.nix — see the rename note below.
 #
 # CLI: hart-dev status|lsp|help
+#
+# ═══ RENAMED 2026-08-04: hart.devtools -> hart.ideTools ═══
+# The old name differed from hart.devTools by ONE CAPITAL. Nix treats those as
+# two unrelated options and reports no conflict, so `hart.devtools.enable =
+# true` silently configured whichever module the author did not mean, and a
+# closure audit attributed gigabytes to the wrong feature — which nearly
+# happened: the measured 2.8 GiB was one step from being recorded against the
+# module that ships gcc and jdk21.
+#
+# The two are genuinely different things and both are justified, so merging was
+# never the answer; the NAME was the defect. `ideTools` says what this module
+# actually is — the editing environment (LSP, debuggers, linters, containers,
+# editors) — as opposed to the compilers in hart.devTools.
+#
+# Every leaf gets a mkRenamedOptionModule alias, so an existing config setting
+# hart.devtools.* keeps evaluating and gets a deprecation warning naming the
+# new path, rather than the silent-wrong-module behaviour it has today.
 
 { config, lib, pkgs, ... }:
 
 let
-  cfg = config.hart.devtools;
+  cfg = config.hart.ideTools;
 in
 {
-  options.hart.devtools = {
+  imports = [
+    # One alias per leaf: mkRenamedOptionModule renames a single option, not a
+    # subtree, so a bare [ "hart" "devtools" ] would leave every child
+    # unaliased and silently undefined.
+    (lib.mkRenamedOptionModule [ "hart" "devtools" "enable" ]             [ "hart" "ideTools" "enable" ])
+    (lib.mkRenamedOptionModule [ "hart" "devtools" "lsp" ]                [ "hart" "ideTools" "lsp" ])
+    (lib.mkRenamedOptionModule [ "hart" "devtools" "debug" ]              [ "hart" "ideTools" "debug" ])
+    (lib.mkRenamedOptionModule [ "hart" "devtools" "lint" ]               [ "hart" "ideTools" "lint" ])
+    (lib.mkRenamedOptionModule [ "hart" "devtools" "containers" ]         [ "hart" "ideTools" "containers" ])
+    (lib.mkRenamedOptionModule [ "hart" "devtools" "editors" ]            [ "hart" "ideTools" "editors" ])
+    (lib.mkRenamedOptionModule [ "hart" "devtools" "ptraceUnrestricted" ] [ "hart" "ideTools" "ptraceUnrestricted" ])
+  ];
+
+  options.hart.ideTools = {
     enable = lib.mkEnableOption "HART OS developer tools";
 
     lsp = lib.mkOption {
