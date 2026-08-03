@@ -2013,3 +2013,65 @@ class TestEmailLauncher(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestDestructiveClassifierFailsClosed(unittest.TestCase):
+    """The terminal-exec gate must DENY when it cannot decide.
+
+    #31 degraded-mode review. `_classify_destructive` is the guard on
+    /api/shell/terminal/exec — arbitrary command execution, the highest
+    blast radius on the whole shell surface. Its code is CORRECT: the
+    `except` returns False and logs "fail-closed".
+
+    But nothing PROVED it. Every existing terminal test patches
+    `_classify_destructive` to return True, i.e. mocks the guard away.
+    Measured 2026-08-03: flipping `return False` to `return True` in the
+    except — silently turning arbitrary command execution from deny-by-
+    default into ALLOW-by-default — left all 148 tests in this file GREEN.
+
+    These call the real function with the classifier broken, so the
+    fail-closed property is a tested property rather than a comment.
+    """
+
+    def _classify(self):
+        from integrations.agent_engine.shell_os_apis import _classify_destructive
+        return _classify_destructive
+
+    def test_denies_when_the_classifier_raises(self):
+        """Classifier blows up => DENY. The failure mode that matters: a
+        busy or crashed local LLM must never widen what may run."""
+        with patch('security.action_classifier.classify_action',
+                   side_effect=RuntimeError('classifier down')):
+            self.assertFalse(
+                self._classify()('terminal exec: rm -rf /'),
+                "a raising classifier must DENY — returning True here turns "
+                "the exec gate into allow-by-default")
+
+    def test_denies_when_the_classifier_module_is_absent(self):
+        """ImportError => DENY. On a stripped build security.action_classifier
+        may not be present at all; absence must not mean permission."""
+        with patch.dict('sys.modules', {'security.action_classifier': None}):
+            self.assertFalse(
+                self._classify()('terminal exec: dd if=/dev/zero of=/dev/sda'),
+                "an absent classifier must DENY, never default to allow")
+
+    def test_denies_on_an_unknown_verdict(self):
+        """Only the literal 'safe' may pass.
+
+        'unknown' is the classifier saying it could not decide, which is a
+        refusal, not an endorsement — and any future verdict string must
+        default to denied rather than silently passing.
+        """
+        for verdict in ('unknown', 'destructive', '', 'SAFE', 'probably-safe'):
+            with patch('security.action_classifier.classify_action',
+                       return_value=verdict):
+                self.assertFalse(
+                    self._classify()('terminal exec: mkfs.ext4 /dev/sda1'),
+                    f"verdict {verdict!r} must NOT be treated as permission")
+
+    def test_allows_only_the_explicit_safe_verdict(self):
+        """The positive case — a guard that denies everything gets removed,
+        which would be worse than the leak it prevents."""
+        with patch('security.action_classifier.classify_action',
+                   return_value='safe'):
+            self.assertTrue(self._classify()('terminal exec: ls -l'))
