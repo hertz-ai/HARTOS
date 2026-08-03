@@ -31,6 +31,10 @@ on:
         description: 'Dotted option path to force OFF (e.g. hart.subsystems.windows.gaming)'
         default: 'hart.subsystems.windows.gaming'
         required: false
+      enable:
+        description: 'Dotted option path to force ON — measures what turning a currently-OFF feature would COST. Mutually exclusive with `disable`.'
+        default: ''
+        required: false
       explain:
         description: 'Optional store-path substring to trace with nix why-depends (e.g. clang)'
         default: ''
@@ -72,9 +76,33 @@ jobs:
         run: |
           set -euo pipefail
           CFG='${{ inputs.config }}'
-          OPT='${{ inputs.disable }}'
-          echo "config  : $CFG"
-          echo "disable : $OPT"
+          OPT_OFF='${{ inputs.disable }}'
+          OPT_ON='${{ inputs.enable }}'
+
+          # WHY BOTH DIRECTIONS (2026-08-03): this tool could only answer "what
+          # would we SAVE by turning X off?". The question task #4 has to answer
+          # before flipping hart.nunba.enable is the mirror image — "what would
+          # it COST to turn X on?" — and that is not askable by forcing an
+          # already-false option false. #14 made it urgent: the raw image sizes
+          # root at 26 GiB against a ~24 GiB closure, so a feature is affordable
+          # or it is not, and guessing is how the devtools 3 GiB nearly shipped
+          # into 2 GiB of slack.
+          if [ -n "$OPT_ON" ] && [ -n "$OPT_OFF" ]; then
+            echo "::error::pass EITHER disable OR enable, not both — the diff has one axis"
+            exit 2
+          fi
+          if [ -n "$OPT_ON" ]; then
+            OPT="$OPT_ON"; FORCE=true;  DIRECTION="enable"
+          else
+            OPT="$OPT_OFF"; FORCE=false; DIRECTION="disable"
+          fi
+          if [ -z "$OPT" ]; then
+            echo '::error::no option given — set the disable OR the enable input'
+            exit 2
+          fi
+          echo "config   : $CFG"
+          echo "option   : $OPT"
+          echo "direction: force $DIRECTION (variant is built with the option $FORCE)"
           echo ""
 
           # extendModules on the SAME config, so the only difference is this option.
@@ -97,7 +125,7 @@ jobs:
               base  = flake.nixosConfigurations.${CFG};
             in (base.extendModules {
                  modules = [ ({ lib, ... }:
-                   lib.setAttrByPath (lib.splitString \".\" \"${OPT}\") (lib.mkForce false)) ];
+                   lib.setAttrByPath (lib.splitString \".\" \"${OPT}\") (lib.mkForce ${FORCE})) ];
                }).config.system.build.toplevel
           "
 
@@ -151,21 +179,36 @@ jobs:
           A=$(nix path-info -S "$BASE"    | awk '{print $2}')
           B=$(nix path-info -S "$VARIANT" | awk '{print $2}')
 
+          # A is always the config AS SHIPPED, B the forced variant. Which of
+          # them is the feature-ON side depends on the direction, so name them
+          # before subtracting — reporting a negative "cost" would be worse
+          # than useless, it would read as a saving.
+          if [ "$FORCE" = true ]; then
+            ON=$B; OFF=$A; VERB="appear"; NOUN="added"
+          else
+            ON=$A; OFF=$B; VERB="disappear"; NOUN="dropped"
+          fi
+
           echo "══ RESULT ═════════════════════════════════════════════════"
-          printf 'with %s ON  : %s\n' "$OPT" "$(numfmt --to=iec-i --suffix=B "$A")"
-          printf 'with %s OFF : %s\n' "$OPT" "$(numfmt --to=iec-i --suffix=B "$B")"
-          printf 'MARGINAL COST: %s  (%.2f%% of the closure)\n' \
-            "$(numfmt --to=iec-i --suffix=B "$((A-B))")" \
-            "$(awk -v a="$A" -v b="$B" 'BEGIN{printf "%.2f", (a-b)*100/a}')"
+          printf 'with %s ON  : %s\n' "$OPT" "$(numfmt --to=iec-i --suffix=B "$ON")"
+          printf 'with %s OFF : %s\n' "$OPT" "$(numfmt --to=iec-i --suffix=B "$OFF")"
+          printf 'MARGINAL COST: %s  (%.2f%% of the feature-ON closure)\n' \
+            "$(numfmt --to=iec-i --suffix=B "$((ON-OFF))")" \
+            "$(awk -v on="$ON" -v off="$OFF" 'BEGIN{printf "%.2f", (on-off)*100/on}')"
           echo ""
 
-          # Paths present ONLY with the feature on -- what actually disappears.
+          # Paths present ONLY with the feature ON — what the option actually
+          # brings in (or takes away). Direction-aware for the same reason.
           nix path-info -r "$BASE"    | sort -u > /tmp/base.txt
           nix path-info -r "$VARIANT" | sort -u > /tmp/variant.txt
-          comm -23 /tmp/base.txt /tmp/variant.txt > /tmp/only-base.txt
-          echo "paths dropped: $(wc -l < /tmp/only-base.txt)"
+          if [ "$FORCE" = true ]; then
+            comm -13 /tmp/base.txt /tmp/variant.txt > /tmp/only-base.txt
+          else
+            comm -23 /tmp/base.txt /tmp/variant.txt > /tmp/only-base.txt
+          fi
+          echo "paths $NOUN: $(wc -l < /tmp/only-base.txt)"
           echo ""
-          echo "── 30 largest paths that disappear (self size) ────────────"
+          echo "── 30 largest paths that $VERB (self size) ────────────"
           # awk 'NR<=30', never `head`: head exits early, sort gets EPIPE, and under
           # `set -o pipefail` that fails the step (it already cost run 30334471869).
           if [ -s /tmp/only-base.txt ]; then
