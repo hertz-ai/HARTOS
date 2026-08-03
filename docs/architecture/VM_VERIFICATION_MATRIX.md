@@ -16,9 +16,15 @@ the whole point: a matrix nobody checks drifts into fiction within a week.
 | `EXISTS-RED` | the test exists and currently FAILS — the failure is the task's next step, not a reason to distrust the row |
 | `TO WRITE` | no VM test yet; the row names what it must assert |
 | `NOT VM` | the task genuinely cannot be settled in a VM, with the reason stated |
+| `BLOCKED` | a VM test is possible, but writing it is NOT what is missing — a decision or an upstream fix is. The blocker is named. |
 
 `NOT VM` is deliberately rare and must justify itself. "Hard to test" is not a
 reason; "needs physical hardware" or "needs a human to look at it" is.
+
+`BLOCKED` is not a softer `TO WRITE`. It means the honest next action belongs
+to someone else — usually the steward — and writing a test first would either
+be red on purpose or test a component that is about to be deleted. A row that
+sits BLOCKED for long is a decision going stale, which is worth seeing.
 
 ---
 
@@ -49,15 +55,15 @@ reason; "needs physical hardware" or "needs a human to look at it" is.
 | 31 | Degraded-mode review | `tests/unit/test_degraded_mode_inventory.py` ratchets + `vm-tests.nix` (`hart-edge-boot` SIGKILLs each critical unit and proves it recovers, with NRestarts and a new MainPID as evidence) | EXISTS for the inventory and the unit failure paths; per-route behavioural tests continue in python |
 | 33 | num2words missing from hart-app.nix | `hart-app-install-verify.nix` — the SHIPPED python must expand "Rs.200" to words | EXISTS (the file was an ORPHAN until 2026-08-04 — flake.nix never imported it, so this assertion had never run) |
 | 34 | Rename `hart.devtools` | flake eval must stay green through the rename | NOT VM — an option rename is settled by evaluation, not by booting |
-| 35 | PXE server is Ubuntu-era | a netboot node served by the hart-pxe-server-go **package** (a flake package, not a check — it has no nixosTest at all) | TO WRITE — and possibly never: the component may be deleted instead |
-| 36 | nouveau blacklist is machine-specific | `driver-matrix.nix` with an NVIDIA-class device — the display path must still bind a KMS driver | TO WRITE |
+| 35 | PXE server is Ubuntu-era | a netboot node served by the hart-pxe-server-go **package** (a flake package, not a check — it has no nixosTest at all) | BLOCKED (decision) — the component extracts Ubuntu `casper/` paths and writes a Subiquity `autoinstall` boot line, so it cannot provision a NixOS machine at ALL. A test today would assert failure, and the open question is delete-or-rewrite, not test-or-not. |
+| 36 | nouveau blacklist is machine-specific | none possible for the hazard itself | NOT VM — qemu emulates no NVIDIA GPU, and the hazard IS "an NVIDIA-only machine gets no display because nouveau is blacklisted". That needs real hardware. The separable half — image and installed system must AGREE on the blacklist — is an eval/source parity check, not a boot. |
 | 37 | 3 pre-existing unit failures | none — these are unit tests | NOT VM — they are `tests/unit/*`, and the gate that must report them is `flake-checks.yml`'s sharded python job |
 
 ---
 
 ## What this matrix is honest about
 
-**Three rows are `TO WRITE`** (was nine; #7, #24, #31's unit half, #3's mic half, #8's boot-wait and #11's desktop half landed). That is the real state of "100% VM verification":
+**One row is `TO WRITE`** (was nine). #7, #24, #31's unit half, #3's mic half, #8's boot-wait and #11's desktop half were written; #35 and #36 were RECLASSIFIED after looking at them properly — see below. That is the real state of "100% VM verification":
 the parity program's own matrices exist and run, and the older feature tasks
 mostly do not have a VM assertion yet. Writing those nine is the remaining work
 of the goal, and naming them is what makes it finite rather than a feeling.

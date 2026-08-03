@@ -96,3 +96,28 @@ def test_unverifiable_rows_give_a_reason():
         + "\nSay WHY a booted machine cannot settle it (needs hardware, needs "
           "a human to look/listen, is a build measurement) — 'hard' is not a "
           "reason.")
+
+
+def test_blocked_rows_name_their_blocker():
+    """`BLOCKED` must name what is missing, or it becomes a dumping ground.
+
+    BLOCKED is the easiest status to abuse: it moves a row out of TO WRITE
+    without doing anything, and the count improves. That would be gaming the
+    matrix rather than working it. So the same rule NOT VM has applies — the
+    row must say WHAT is blocking, specifically enough that a reader can tell
+    whose decision it is.
+    """
+    offenders = []
+    for line in _matrix().splitlines():
+        if not line.startswith("|") or "BLOCKED" not in line:
+            continue
+        tail = line.rsplit("BLOCKED", 1)[1].strip(" |")
+        # A bare "BLOCKED" or "BLOCKED (decision)" with nothing after it says
+        # nothing about WHO decides or WHY writing a test now would be wrong.
+        if len(tail.lstrip("(decision)").strip()) < 40:
+            offenders.append(line.strip()[:110])
+    assert not offenders, (
+        "BLOCKED rows that do not name the blocker:\n  " + "\n  ".join(offenders)
+        + "\nBLOCKED is not a softer TO WRITE. Say what is actually missing — "
+          "a steward decision, an upstream fix, a component that may be "
+          "deleted — so the row can be un-blocked by someone reading it.")
