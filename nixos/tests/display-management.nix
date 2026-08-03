@@ -78,8 +78,9 @@ in
           # READ THE CANONICAL PATH, do not search for it (run 30783792736).
           # This was `grep -rl 'hart.display.fontScale' /etc/fonts`, which
           # exited 1 while the content was PRESENT AND CORRECT. nixpkgs'
-          # fontconfig module emits localConf with
-          #     ln -s ${localConf} $dst/../local.conf
+          # fontconfig module emits localConf by symlinking the generated
+          # config into place:  ln -s <localConf-store-path> $dst/../local.conf
+          # (written WITHOUT a nix interpolation on purpose — see below)
           # so /etc/fonts/local.conf is a SYMLINK into the store (and
           # /etc/fonts is itself environment.etc.fonts.source -> a store dir).
           # `grep -r` follows symlinks given on the COMMAND LINE but never ones

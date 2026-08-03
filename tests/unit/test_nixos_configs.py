@@ -3655,3 +3655,69 @@ class TestTheVmGateEnumeratesDynamically:
             f"nixos-vm-tests.yml names {len(listed)} checks explicitly again "
             f"({listed[:5]}...). That is the parallel path this delegation "
             f"removed.")
+
+
+class TestNoNixInterpolationInTestScriptComments:
+    """A `${...}` in a testScript COMMENT is a nix interpolation, not a comment.
+
+    THE BREAKAGE (2026-08-04). Documenting how nixpkgs emits a config, I wrote
+    this inside a testScript:
+
+        # fontconfig module emits localConf with
+        #     ln -s ${localConf} $dst/../local.conf
+
+    A testScript is a nix ''-string, so `${localConf}` is INTERPOLATED — the
+    `#` means nothing to nix. `localConf` is not in scope, so:
+
+        error: undefined variable 'localConf'
+
+    That is an EVAL error, which does not fail one test — it fails the whole
+    flake. `nix eval .#checks.x86_64-linux --apply builtins.attrNames`
+    enumerated ZERO checks, and every one of the four VM shards went red
+    without running anything.
+
+    WHY THE EXISTING GUARD MISSED IT: TestEveryTestScriptIsValidPython checks
+    that the extracted script is valid PYTHON, and to do that it must replace
+    `${...}` with a placeholder. It is therefore blind to whether the
+    interpolation itself is valid nix. Different failure, different guard.
+
+    THE RULE IS NARROW ON PURPOSE: real interpolations in executable lines are
+    the whole point of a testScript (there are 23 in session-supervisor.nix
+    alone). A comment is the one place that never needs one, so flagging only
+    comments catches this mistake with no false positives — measured: 0 across
+    every nixos/tests/*.nix at the time this was written.
+
+    Escape it (''${...}) or reword, as display-management.nix now does.
+    """
+
+    def _testscript_bodies(self, path):
+        """Yield (first_line_no, body) for each testScript in a .nix file."""
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+        for m in re.finditer(r"testScript\s*=\s*''", src):
+            i = start = m.end()
+            while i < len(src):
+                if src[i] == "'" and src[i + 1:i + 2] == "'":
+                    if src[i + 2:i + 3] in ("$", "'"):
+                        i += 3
+                        continue
+                    break
+                i += 1
+            yield src[:start].count("\n") + 1, src[start:i]
+
+    def test_no_interpolation_inside_a_comment(self):
+        offenders = []
+        for path in sorted(glob.glob(os.path.join(TESTS_DIR, "*.nix"))):
+            for base, body in self._testscript_bodies(path):
+                for n, line in enumerate(body.split("\n"), 1):
+                    stripped = line.strip()
+                    # `''${` is the ESCAPED form and is correct — skip it.
+                    if stripped.startswith("#") and re.search(r"(?<!')\$\{", line):
+                        offenders.append(
+                            f"{os.path.basename(path)}:{base + n - 1}: {stripped[:90]}")
+        assert not offenders, (
+            "nix interpolation inside a testScript COMMENT — nix expands it "
+            "regardless of the '#', and an undefined name is an EVAL error "
+            "that fails the WHOLE flake, so every VM shard enumerates zero "
+            "checks and goes red without running:\n  " + "\n  ".join(offenders)
+            + "\nEscape it as ''${...} or reword the comment.")
