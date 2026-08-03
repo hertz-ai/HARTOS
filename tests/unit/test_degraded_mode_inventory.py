@@ -189,9 +189,12 @@ def test_the_reference_degrades_are_still_present():
 # 246-route surface, and it makes the remaining count VISIBLE instead of
 # invisible.
 SILENT_GULP_CEILING = {
-    "shell_os_apis.py": 28,
+    # 28 -> 26 and 10 -> 9 on 2026-08-03: the THREE control-flow-changing
+    # gulps (a try containing a return, guarded by except: pass) now LOG.
+    # Lowered in the SAME commit that removed them, per this file own rule.
+    "shell_os_apis.py": 26,
     "shell_system_apis.py": 18,
-    "shell_desktop_apis.py": 10,
+    "shell_desktop_apis.py": 9,
     "liquid_ui_service.py": 0,
 }
 

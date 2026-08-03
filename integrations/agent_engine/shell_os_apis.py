@@ -302,8 +302,16 @@ def register_shell_os_routes(app):
                     'notifications': [n.to_dict() for n in notifs],
                     'source': 'database',
                 })
-        except (ImportError, Exception):
-            pass
+        except Exception as e:
+            # LEGITIMATE fallback (the in-memory queue below), but it must not
+            # be SILENT: without this line a DB outage renders an empty
+            # notification list that looks like "you have no notifications".
+            # The response already distinguishes source=database vs the
+            # fallback, so the caller can tell WHICH path ran — this says WHY.
+            # `except (ImportError, Exception)` was redundant: ImportError IS
+            # an Exception, so the tuple caught everything anyway.
+            logger.warning("notifications: DB path unavailable (%s: %s) — "
+                           "serving the in-memory queue", type(e).__name__, e)
 
         # Fallback: in-memory queue
         items = _notification_queue[-limit:]
@@ -1258,8 +1266,12 @@ def register_shell_os_routes(app):
             resp = req.get(f'http://localhost:{mesh_port}/mesh/peers', timeout=3)
             if resp.ok:
                 return jsonify(resp.json())
-        except Exception:
-            pass
+        except Exception as e:
+            # Same shape: a real fallback, but a silent one made "no paired
+            # devices" indistinguishable from "the mesh relay is down".
+            logger.warning("devices: mesh relay unreachable (%s: %s) — "
+                           "falling back to the peer files on disk",
+                           type(e).__name__, e)
 
         # Fallback: read peer files
         peer_dir = os.environ.get(

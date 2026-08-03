@@ -58,8 +58,14 @@ def _is_wayland():
                               capture_output=True, text=True, timeout=3)
             if r.returncode == 0:
                 return True
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            # Benign: returning False is the SAFE default for a detection
+            # helper. Logged at debug because it is expected on any box
+            # without pgrep, and a warning here would be noise — but a
+            # detection that always answers "no" for an unseen reason is
+            # still worth being able to see.
+            logger.debug("wayland detect: pgrep unavailable (%s) — "
+                         "reporting not-wayland", type(e).__name__)
     return False
 
 
