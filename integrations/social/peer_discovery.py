@@ -747,15 +747,28 @@ class GossipProtocol:
         )
 
     def get_health(self):
-        """Return this node's health info for the /health endpoint."""
+        """Return this node's health info for the /health endpoint.
+
+        ``peer_count`` counts REMOTE peers only.  Task #596 follow-up: this
+        method loads straight from PeerNode and used to report ``len(peers)``,
+        which includes the node's own persisted self-row — so a single machine
+        with zero federation partners advertised ``peer_count: 1``.  Measured
+        live 2026-08-03: /api/social/peers/health returned peer_count=1 while
+        count_remote_peers() returned 0 against the same table.
+
+        That number is user-visible — liquid_ui_service renders
+        ``health.peer_count`` directly — and it is also served to other nodes
+        over /api/social/peers/health, so the lie propagates across the mesh.
+        The key name is kept (consumers depend on it); only the value is
+        corrected.
+        """
         uptime = (datetime.utcnow() - self.started_at).total_seconds()
-        peers = self._load_peers_from_db(exclude_dead=True)
         return {
             'node_id': self.node_id,
             'name': self.node_name,
             'version': self.version,
             'uptime_seconds': int(uptime),
-            'peer_count': len(peers),
+            'peer_count': self.count_remote_peers(),
             'agent_count': self._get_count('agent'),
             'post_count': self._get_count('post'),
             'status': 'healthy',

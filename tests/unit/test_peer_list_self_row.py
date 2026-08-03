@@ -131,3 +131,43 @@ def test_count_remote_peers_disagrees_with_len_on_a_lone_node():
     g = _make_gossip([STALE_SELF_ROW])
     assert len(g.get_peer_list()) == 1, "self is in the list by design"
     assert g.count_remote_peers() == 0, "but there are no REMOTE peers"
+
+
+# ── get_health must not count self either (task #596 follow-up) ───────────
+# Found live 2026-08-03: /api/social/peers/health reported peer_count=1 while
+# count_remote_peers() returned 0 against the SAME table. get_health loaded
+# from PeerNode independently, so the original fix to get_peer_list missed it.
+# It is user-visible (liquid_ui_service renders health.peer_count) and it is
+# served to other nodes, so the wrong number propagates across the mesh.
+
+def _make_gossip_for_health(db_rows):
+    import datetime as _dt
+    g = _make_gossip(db_rows)
+    g.started_at = _dt.datetime.utcnow()
+    g.node_name = "test-node"
+    g.version = "1.0.0"
+    g._get_count = lambda what: 0
+    return g
+
+
+def test_get_health_peer_count_excludes_self():
+    """The exact live failure: self-only DB must report peer_count 0."""
+    g = _make_gossip_for_health([STALE_SELF_ROW])
+    assert g.get_health()["peer_count"] == 0, (
+        "get_health counts the persisted self-row as a peer — a lone node "
+        "advertises peer_count=1 to the UI and to other nodes (task #596)"
+    )
+
+
+def test_get_health_peer_count_counts_real_remotes():
+    g = _make_gossip_for_health([REMOTE_ROW, STALE_SELF_ROW])
+    assert g.get_health()["peer_count"] == 1
+
+
+def test_get_health_agrees_with_count_remote_peers():
+    """Two ways of asking 'how many peers' must never disagree again."""
+    for rows in ([], [STALE_SELF_ROW], [REMOTE_ROW], [REMOTE_ROW, STALE_SELF_ROW]):
+        g = _make_gossip_for_health(rows)
+        assert g.get_health()["peer_count"] == g.count_remote_peers(), (
+            f"get_health disagrees with count_remote_peers for rows={rows}"
+        )
