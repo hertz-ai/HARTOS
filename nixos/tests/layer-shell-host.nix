@@ -413,9 +413,37 @@ in
       # ════════════════════════════════════════════════════════════════
       # 1. REGISTRATION — GDM materialized the GTK4 hart-glass-gtk4 session
       # ════════════════════════════════════════════════════════════════
-      session_desktop = "/run/current-system/sw/share/wayland-sessions/hart-glass-gtk4.desktop"
+      # RESOLVED, not guessed — identical treatment to desktop-boot.nix
+      # (0725adca). This hard-coded the environment.systemPackages path while
+      # the session is registered through
+      # `services.displayManager.sessionPackages`, which feeds displayManager
+      # sessionData: a different store path. The subtest name already said
+      # "sessionData materialized"; only the assertion disagreed, and its
+      # failure named just the guessed path (run 30774512407).
+      session_desktop = paint.succeed(
+          "for d in /run/current-system/sw/share/wayland-sessions "
+          "         /etc/X11/sessions "
+          "         /run/current-system/sw/share/xsessions; do "
+          "  [ -f \"$d/hart-glass-gtk4.desktop\" ] && echo \"$d/hart-glass-gtk4.desktop\" && exit 0; "
+          "done; "
+          "ls -d /nix/store/*-desktops/share/wayland-sessions/hart-glass-gtk4.desktop "
+          "  2>/dev/null | head -1"
+      ).strip()
       with subtest("GDM registered the GTK4 'hart-glass-gtk4' wayland-session (sessionData materialized)"):
-          paint.succeed(f"test -f {session_desktop}")
+          if not session_desktop:
+              dirs = paint.succeed(
+                  "echo '--- sw/share/wayland-sessions ---'; "
+                  "ls -la /run/current-system/sw/share/wayland-sessions 2>&1 | head -20; "
+                  "echo '--- any *-desktops store paths ---'; "
+                  "ls -d /nix/store/*-desktops 2>/dev/null | head -5"
+              )
+              raise AssertionError(
+                  "hart-glass-gtk4.desktop is registered NOWHERE a wayland "
+                  "session can be found — showing what IS present rather than "
+                  "only the path this test guessed.
+" + dirs
+              )
+          paint.log(f"hart-glass-gtk4 session registered at: {session_desktop}")
           entry = paint.succeed(f"cat {session_desktop}")
           # The registered session must exec the GTK4 layer-shell launcher (sway +
           # the GTK4 host), not some other compositor.
