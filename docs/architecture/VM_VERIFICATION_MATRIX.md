@@ -26,7 +26,7 @@ reason; "needs physical hardware" or "needs a human to look at it" is.
 
 | # | Task | VM verification | Status |
 |---|---|---|---|
-| 3 | Shell hang + false-healthy signals | `session-supervisor.nix` (`hart-session-supervisor-unhealthy-flag`, `-paint-watchdog`, `-tier-drop`) + `display-tiers-neverblack.nix` | EXISTS — but the three assertions the task actually needs (a request driven THROUGH `/status`; `learning_active` false when the pipeline import failed; mic on the cage floor) are still TO WRITE |
+| 3 | Shell hang + false-healthy signals | `session-supervisor.nix` (`hart-session-supervisor-unhealthy-flag`, `-paint-watchdog`, `-tier-drop`) + `display-tiers-neverblack.nix` + `vm-tests.nix` (`hart-edge-boot` asserts `/status` reports learning_active=false, keeps learning_mode, and names the reason) | EXISTS for the learning_active + response-shape half; the mic-on-cage-floor assertion is still TO WRITE |
 | 4 | Onboarding onto Nunba LightYourHART | `desktop-boot.nix` — first-run surface reached with `hart.nunba.enable` on | TO WRITE — and BLOCKED: enabling nunba does not evaluate (`hypercorn-0.16.0 not supported for interpreter python3.10`, run 30785511463) |
 | 7 | Honest first-run / offline UI | `hart-app-install-verify.nix` (shipped python speaks a number) + `desktop-boot.nix` (espeak-ng SYNTHESISES a WAV with no network) | EXISTS |
 | 8 | Event-driven shell | `desktop-boot.nix` boot-to-paint; the bounded-`curl` fix needs a node where the backend accepts TCP and never answers | TO WRITE |

@@ -452,6 +452,43 @@ in
           # disabled. The hard gates above (OOM, restart-loop, peak >=
           # MemoryMax) are the unambiguous crash-loop signals task #19 names.
 
+      with subtest("/status tells the TRUTH about learning, and says WHY (task #3d)"):
+          # THE FALSE-HEALTHY CLASS. /status is what the tray, hart_cli and
+          # deploy/linux/hart-cli all read. On this node the learning pipeline
+          # genuinely cannot start — hevolveai is a closed-source .pyd that is
+          # absent here exactly as it is on a shipped box — so the ONLY honest
+          # answers are learning_active=false and a reason.
+          #
+          # Before 7fa17f73 the bridge handler was `except Exception:` with no
+          # log and no field, so "not learning" and "learning fine, just idle"
+          # were indistinguishable from outside. VM run 30758875130 shows the
+          # real import failing (rl_ef -> "RuntimeError: Explicitly using
+          # 'asyncio' already"), which is precisely the case that used to
+          # vanish.
+          import json as _json
+          edge.wait_for_open_port(6777, timeout=300)
+          body = _json.loads(edge.succeed("curl -sf http://localhost:6777/status"))
+          edge.log(f"/status: {body}")
+
+          assert body.get("learning_active") is False, (
+              f"/status claims learning_active={body.get('learning_active')!r} "
+              f"on a node where hevolveai is absent — that is the "
+              f"false-healthy signal task #3 exists to remove")
+          # SHAPE STABILITY: learning_mode must be present either way. It used
+          # to be set only on the success path, so the field vanished from the
+          # degraded response — and hart_cli prints whatever keys it finds.
+          assert "learning_mode" in body, (
+              "learning_mode is missing from the degraded /status response; "
+              "the shape changes under failure, so the field disappears "
+              "exactly when someone is looking at it")
+          # And when the core is unhealthy, the REASON must reach the caller,
+          # not just the journal.
+          if body.get("hevolve_core_healthy") is False:
+              assert body.get("hevolve_core_error"), (
+                  "core reported unhealthy with no hevolve_core_error — the "
+                  "caller sees 'unhealthy' and cannot tell an import crash "
+                  "from a node that simply is not learning yet")
+
       with subtest("a BACKWARDS clock step does not wedge the OS (task #24)"):
           # THE REAL INCIDENT: on a Windows dual-boot node the RTC holds LOCAL
           # time while NixOS reads it as UTC, so the box ran +5:30 wrong until
