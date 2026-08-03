@@ -15,6 +15,7 @@ Usage:
     pytest tests/test_nixos_configs.py -v
 """
 
+import ast
 import glob
 import os
 import re
@@ -3351,3 +3352,106 @@ class TestEveryNixosTestIsActuallyBuilt:
         assert not missing, (
             f"nixos-vm-tests.yml builds {missing}, which no nixos/tests/*.nix "
             f"defines — that fails the entire job and blocks every other test")
+
+
+class TestEveryTestScriptIsValidPython:
+    """A nixosTest's `testScript` is Python — but nix only sees a STRING.
+
+    Nothing between writing it and the VM booting ever compiles it. `nix
+    flake check` is happy, the derivation builds, the VM starts, and only
+    THEN does the driver hand the text to python and get a SyntaxError —
+    roughly an hour into CI, with the whole script dead, not just one
+    subtest.
+
+    This caught five real ones at once (2026-08-03), all the same shape: a
+    literal newline inside a python string literal where `\n` was meant.
+    In a nix ''-string a backslash is literal, so `"...path.\n"` is exactly
+    right and easy to typo into a real line break that nix accepts happily:
+
+        "not at either /etc/greetd path.
+    "
+        "--- greetd.service ---
+    " + _unit)
+
+    Sites: desktop-boot.nix, layer-shell-host.nix, session-supervisor.nix x3
+    — every one of them written earlier in that same session, every one
+    green in `pytest`, because pytest never parsed the nix files.
+
+    NOT a grep test: it EXTRACTS the real source and hands it to ast.parse.
+    """
+
+    #: Nix indented-string escapes -> the text python actually receives.
+    _UNESCAPE = (("''${", "${"), ("'''", "''"))
+
+    @staticmethod
+    def _blocks(path):
+        """Yield (source_line, python_text) for each testScript in a file."""
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+        for m in re.finditer(r"testScript\s*=\s*''", src):
+            i = start = m.end()
+            while i < len(src):
+                if src[i] == "'" and src[i + 1:i + 2] == "'":
+                    # ''${ and ''' are escapes, not the terminator.
+                    if src[i + 2:i + 3] in ("$", "'"):
+                        i += 3
+                        continue
+                    break
+                i += 1
+            yield src[:start].count("\n") + 1, src[start:i]
+
+    @classmethod
+    def _to_python(cls, body):
+        for frm, to in cls._UNESCAPE:
+            body = body.replace(frm, to)
+        # A real ${...} interpolation becomes a BARE identifier: these often
+        # sit inside a python string ("port ${p}"), where a quoted stand-in
+        # would produce ""X"" and a false SyntaxError. A bare name parses
+        # both inside a string and as a standalone expression.
+        body = re.sub(r"\$\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", "NIXV", body)
+        lines = body.split("\n")
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        # Dedent by the FIRST line's indent, not the minimum. Nix itself uses
+        # the minimum, and for a VALID block the two are identical — the base
+        # indent IS the minimum. They diverge only when a python string
+        # literal is broken across a real newline, which parks its tail at
+        # column 0. Using min() there dedents by 0, leaves every real line
+        # indented, and reports "unexpected indent" on line 6 instead of the
+        # unterminated string 70 lines later. Same verdict, useless address.
+        pad = len(lines[0]) - len(lines[0].lstrip()) if lines else 0
+        prefix = " " * pad
+        return "\n".join(
+            ln[pad:] if ln.startswith(prefix) else ln for ln in lines)
+
+    def _all(self):
+        return sorted(glob.glob(os.path.join(TESTS_DIR, "*.nix")))
+
+    def test_there_are_testscripts_to_check(self):
+        """Guard the guard: a broken extractor must not read as 'all clean'.
+
+        If the regex ever stops matching, every assertion below passes
+        vacuously — the same silent-zero failure mode this suite keeps
+        finding elsewhere.
+        """
+        n = sum(1 for p in self._all() for _ in self._blocks(p))
+        assert n >= 40, (
+            f"only {n} testScript blocks found across {len(self._all())} "
+            f"nixos/tests/*.nix files — the extractor is broken, so a green "
+            f"run here would prove nothing")
+
+    def test_every_testscript_compiles(self):
+        """Every testScript must be parseable python."""
+        broken = []
+        for path in self._all():
+            for line, body in self._blocks(path):
+                try:
+                    ast.parse(self._to_python(body))
+                except SyntaxError as exc:
+                    broken.append(
+                        f"{os.path.basename(path)}:{line} -> testScript line "
+                        f"{exc.lineno}: {exc.msg}")
+        assert not broken, (
+            "nixosTest testScript(s) are not valid python. Nix will build "
+            "these happily and the VM will boot; the driver then dies on the "
+            "SyntaxError with EVERY subtest lost.\n  " + "\n  ".join(broken))

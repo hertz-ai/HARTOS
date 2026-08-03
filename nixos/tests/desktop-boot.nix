@@ -228,8 +228,7 @@ in
                   "services.displayManager.sessionPackages = [ kioskSession ] "
                   "under `mkIf (ui.renderer == \"webkit\")`, and the desktop "
                   "profile sets renderer = \"webkit\", so it SHOULD be "
-                  "registered.
-" + dirs
+                  "registered.\n" + dirs
               )
           shell.log(f"hart-shell session registered at: {session_desktop}")
           entry = shell.succeed(f"cat {session_desktop}")

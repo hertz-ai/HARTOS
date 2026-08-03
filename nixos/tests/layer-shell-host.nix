@@ -464,8 +464,7 @@ in
               raise AssertionError(
                   "hart-glass-gtk4.desktop is registered NOWHERE a wayland "
                   "session can be found — showing what IS present rather than "
-                  "only the path this test guessed.
-" + dirs
+                  "only the path this test guessed.\n" + dirs
               )
           paint.log(f"hart-glass-gtk4 session registered at: {session_desktop}")
           entry = paint.succeed(f"cat {session_desktop}")

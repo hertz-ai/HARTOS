@@ -158,10 +158,8 @@ in
               ).strip()
           assert _cfg, (
               "could not locate greetd's config: it is not referenced by "
-              "--config on greetd.service and not at either /etc/greetd path.
-"
-              "--- greetd.service ---
-" + _unit)
+              "--config on greetd.service and not at either /etc/greetd path.\n"
+              "--- greetd.service ---\n" + _unit)
           sup.log(f"greetd config resolved to: {_cfg}")
           greetd_cmd = sup.succeed(f"cat {_cfg}")
           assert "LIBSEAT_BACKEND=logind" in greetd_cmd, \
@@ -621,9 +619,7 @@ in
               assert _active != "active", (
                   f"greetd is still ACTIVE after mask+stop ({_active!r}); this "
                   f"subtest needs it quiet so its crash-loop cannot eat the "
-                  f"freshly reset latch.
-mask: {_out.strip()}
-"
+                  f"freshly reset latch.\nmask: {_out.strip()}\n"
                   f"fallback: {_out2.strip()}")
               sup.log("greetd quiesced via the runtime fallback")
           sup.succeed("hartctl session reset-tier")
