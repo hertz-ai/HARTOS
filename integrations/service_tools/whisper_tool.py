@@ -816,6 +816,28 @@ def _transcribe_impl(audio_path: str, language: str = None) -> str:
 
         model_name = select_whisper_model()
 
+        # select_whisper_model() answers in TWO namespaces — a sherpa key from
+        # _SHERPA_MODELS, or a faster-whisper size like "large-v3" (its own
+        # docstring says so).  Only the former means anything here: handing a
+        # faster-whisper size to _get_sherpa_recognizer evaluates
+        # _SHERPA_MODELS["large-v3"] -> KeyError, which _sherpa_transcribe
+        # swallows into a warning and returns None — silently disabling this
+        # whole engine rather than falling back inside it.
+        #
+        # Live 2026-08-04 on a shipped build: 582 such failures in 19.5 minutes,
+        # one every ~2s, while sherpa-onnx 1.12.29 was installed and healthy and
+        # BOTH neighbouring engines were unavailable (faster-whisper raised
+        # ImportError on a partially-initialised ctranslate2; openai-whisper was
+        # not installed).  The one working engine was the one this disabled, so
+        # STT returned nothing at all.
+        #
+        # This is the same membership test select_whisper_model already applies
+        # to its own sherpa branch, and "whisper-tiny" is the multilingual
+        # default this module already falls back to just below and at the
+        # transcribe-retry site.
+        if model_name not in _SHERPA_MODELS:
+            model_name = "whisper-tiny"
+
         # If a non-English language is explicitly requested and the selected
         # model is English-only (Moonshine), switch to multilingual Whisper
         cfg = _SHERPA_MODELS.get(model_name, {})
