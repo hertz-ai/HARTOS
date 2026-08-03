@@ -699,13 +699,52 @@ class GossipProtocol:
     # ─── Peer List ───
 
     def get_peer_list(self):
-        """Return all non-dead peers as dicts, including self."""
-        peers = self._load_peers_from_db(exclude_dead=True)
-        # Include self
-        self_info = self._self_info()
-        if not any(p.get('node_id') == self.node_id for p in peers):
-            peers.append(self_info)
+        """Return all non-dead REMOTE peers, plus this node's LIVE self-info.
+
+        Self is deliberately part of the list (callers render "this node"
+        alongside its peers), but it must NEVER be served from the PeerNode
+        table.
+
+        Task #596.  The previous version appended _self_info() only when the
+        DB did not already contain a row for our own node_id:
+
+            if not any(p.get('node_id') == self.node_id for p in peers):
+                peers.append(self_info)
+
+        Once a self-row exists in PeerNode, that guard is False and the fresh
+        _self_info() is silently discarded, so the node reports STALE data
+        about itself.  Nothing culls such a row either: _load_peers_from_db
+        filters on ``PeerNode.status != 'dead'`` — a status column, not a
+        last_seen age check — so it survives indefinitely.
+
+        Measured on a live node 2026-08-03: /api/social/peers returned its own
+        node_id with endpoint=None, every capability/compute field None, and
+        last_seen "2026-04-30T07:16:29" — 95 days stale while the node was
+        running and its gossip _send_loop was demonstrably alive.
+
+        Filtering self out of the DB result and unconditionally appending
+        _self_info() makes live self-state authoritative, and has the side
+        benefit that the self entry now always has ONE shape (_self_info's)
+        instead of flip-flopping with PeerNode.to_dict()'s.
+        """
+        peers = [
+            p for p in self._load_peers_from_db(exclude_dead=True)
+            if p.get('node_id') != self.node_id
+        ]
+        peers.append(self._self_info())
         return peers
+
+    def count_remote_peers(self):
+        """Number of known non-dead peers EXCLUDING self.
+
+        ``len(get_peer_list())`` is never 0 — self is always in it — so it
+        cannot answer "am I actually federated with anyone?".  Callers that
+        need that question answered must use this (task #596).
+        """
+        return sum(
+            1 for p in self._load_peers_from_db(exclude_dead=True)
+            if p.get('node_id') != self.node_id
+        )
 
     def get_health(self):
         """Return this node's health info for the /health endpoint."""

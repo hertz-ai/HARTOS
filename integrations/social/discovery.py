@@ -182,14 +182,21 @@ def peer_announce():
 
 @discovery_bp.route('/api/social/peers')
 def peer_list():
-    """Return this node's known peer list."""
+    """Return this node's known peer list.
+
+    ``count`` includes self (get_peer_list always appends this node), so it is
+    never 0 and cannot distinguish "one real peer" from "just me".  Task #596:
+    a single-node install reported count=1 and every dashboard rendered it as
+    a federated peer.  ``remote_count`` is the honest federation signal.
+    """
     from .peer_discovery import gossip
     peers = gossip.get_peer_list()
     return jsonify({
         'success': True,
         'node_id': gossip.node_id,
         'peers': peers,
-        'count': len(peers),
+        'count': len(peers),          # includes self — kept for back-compat
+        'remote_count': gossip.count_remote_peers(),
     })
 
 
