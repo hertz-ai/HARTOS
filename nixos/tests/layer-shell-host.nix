@@ -284,10 +284,34 @@ in
               host.log("hart-comp session launcher not in closure (Tier-1 disabled here) — name-parity asserted in the unit guard")
           # The Tier-2 sway host config (the layer-shell session's single client)
           # MUST exec the same binary basename — read it back off the closure.
+          # -maxdepth 6, not 3. A config installed into a package lands at
+          #     /nix/store/<hash>-name/etc/sway/hart-gtk4-layer-host.conf
+          # which is FOUR levels below /nix/store, so `-maxdepth 3` could never
+          # see it and the assertion reported "not realized" for a file that
+          # was present (run 30774512407). The sibling launcher check three
+          # lines below already used -maxdepth 4 — the two disagreed about how
+          # deep the same closure is.
+          #
+          # `|| true` on find: a permission error inside /nix/store must not
+          # abort the search and masquerade as absence.
           sway_conf = host.succeed(
-              "find /nix/store -maxdepth 3 -name 'hart-gtk4-layer-host.conf' "
-              "-print -quit").strip()
-          assert sway_conf, "Tier-2 sway host config (hart-gtk4-layer-host.conf) not realized"
+              "find /nix/store -maxdepth 6 -name 'hart-gtk4-layer-host.conf' "
+              "-print -quit 2>/dev/null || true").strip()
+          if not sway_conf:
+              # Self-describing: say what IS there. "not realized" alone cannot
+              # distinguish "never built" from "built somewhere I did not look",
+              # and those have opposite fixes.
+              probe = host.succeed(
+                  "echo '--- any hart-gtk4* in the store ---'; "
+                  "find /nix/store -maxdepth 6 -name 'hart-gtk4*' -print 2>/dev/null | head -10; "
+                  "echo '--- any *layer-host* ---'; "
+                  "find /nix/store -maxdepth 6 -name '*layer-host*' -print 2>/dev/null | head -10; "
+                  "echo '--- sway configs ---'; "
+                  "find /nix/store -maxdepth 6 -name '*.conf' -path '*sway*' -print 2>/dev/null | head -10 || true"
+              )
+              raise AssertionError(
+                  "Tier-2 sway host config (hart-gtk4-layer-host.conf) not "
+                  "found in the closure.\n" + probe)
           conf_src = host.succeed("cat " + sway_conf)
           assert "hart-glass-shell-gtk4" in conf_src, \
               "Tier-2 sway host config does not exec the hart-glass-shell-gtk4 host binary"
