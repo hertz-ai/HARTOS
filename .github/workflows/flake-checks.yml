@@ -87,11 +87,25 @@ permissions:
 jobs:
   # ─── Python: unit + functional (the runtime gate) ──────────────────────────
   unit-tests:
-    name: Python unit + functional tests
+    name: Python tests shard ${{ matrix.shard }}/4
     runs-on: ubuntu-latest
     # Hard ceiling so one hung test can never burn the 6h job cap — the per-test
     # --timeout below names the culprit; this is the backstop for a C-level block.
     timeout-minutes: 45
+    # SHARDED 2026-08-03. As a single job this DID NOT FINISH: run 30783792736
+    # ran 45m37s against the 45-minute cap and the step was killed, so the
+    # release gate's Python job could not pass at all — release.yml depends on
+    # this workflow, and a job that always times out is a gate that is always
+    # red for a reason unrelated to the code.
+    #
+    # 704 test files across tests/unit + tests/functional split 176/176/176/176.
+    # Same deterministic sorted round-robin as the nixosTests shards below and
+    # the coverage-baseline job, so shard membership is stable across runs and
+    # a failing quarter is identifiable rather than arbitrary.
+    strategy:
+      fail-fast: false   # one red shard must not hide the other three
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
 
@@ -122,9 +136,23 @@ jobs:
           # patches resolve to MagicMock objects and raise. Deselect until the VLM
           # patch targets are refactored to not require the heavy module at
           # patch-time. Tracked non-blocking.
+          set -eo pipefail
+          # Deterministic file sharding — sorted, then round-robin.
+          mapfile -t ALL < <(find tests/unit tests/functional -name 'test_*.py' | sort)
+          TOTAL=${#ALL[@]}
+          echo "discovered $TOTAL test files"
+          if [[ "$TOTAL" -eq 0 ]]; then
+            echo "::error::found 0 test files — discovery is broken, and a green"
+            echo "::error::shard here would mean this gate tested nothing"
+            exit 1
+          fi
+          SEL=()
+          for i in "${!ALL[@]}"; do
+            if (( i % 4 == ${{ matrix.shard }} )); then SEL+=( "${ALL[$i]}" ); fi
+          done
+          echo "shard ${{ matrix.shard }} runs ${#SEL[@]} files"
           python -m pytest \
-            tests/unit/ \
-            tests/functional/ \
+            "${SEL[@]}" \
             --deselect tests/unit/test_vlm_qwen3vl.py::TestFullActionLoop \
             --deselect tests/unit/test_vlm_qwen3vl.py::TestVLMDeterministicActions::test_vlm_action_list_shared_by_legacy_and_unified \
             --timeout=120 \
@@ -133,8 +161,11 @@ jobs:
       # Integration + e2e — cross-module flows. Best-effort: surfaced but
       # non-blocking (they exercise live-ish paths a hermetic runner can't fully
       # stand up), exactly as the previous release.yml `test` job had them.
+      # Shard 0 ONLY: these are best-effort cross-module smoke, not part of the
+      # sharded set. Without this they would run four times per gate for no
+      # extra signal.
       - name: Run integration tests (best-effort)
-        if: always()
+        if: always() && matrix.shard == 0
         env:
           HEVOLVE_DB_PATH: ':memory:'
           PYTHONPATH: ${{ github.workspace }}
@@ -147,7 +178,7 @@ jobs:
             -q --tb=line || echo "Integration tests had failures (non-blocking)"
 
       - name: Run e2e tests (best-effort)
-        if: always()
+        if: always() && matrix.shard == 0
         env:
           HEVOLVE_DB_PATH: ':memory:'
           PYTHONPATH: ${{ github.workspace }}
