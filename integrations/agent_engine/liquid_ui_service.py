@@ -7773,14 +7773,15 @@ function renderAgentOverlay(ev) {{
                     logger.exception("shell_system_metrics: swallowed AttributeError, Exception")
             except ImportError:
                 metrics['error'] = 'psutil not installed'
-            # GPU via VRAMManager
-            try:
-                from integrations.service_tools.vram_manager import get_vram_manager
-                gpu = get_vram_manager().detect_gpu()  # instance method — call on the singleton, not the class
-                if gpu and gpu.get('name'):
-                    metrics['gpu'] = gpu
-            except Exception:
-                logger.exception("shell_system_metrics: swallowed Exception")
+            # GPU — ONE shape, shared with /api/shell/gpu (task #25).
+            # This used to call the detector itself and attach metrics['gpu']
+            # only when a name came back, so a CPU-only box and a box whose
+            # probe FAILED were indistinguishable: the key was simply absent in
+            # both cases. gpu_status() distinguishes them (available/present)
+            # and never raises, so no try/except is needed around it and the
+            # two GPU surfaces cannot drift apart.
+            from integrations.agent_engine.shell_system_apis import gpu_status
+            metrics['gpu'] = gpu_status()
             return jsonify(metrics)
 
         @app.route('/api/shell/system/processes', methods=['GET'])
