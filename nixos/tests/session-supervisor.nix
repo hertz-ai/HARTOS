@@ -682,21 +682,56 @@ in
           # units logind would and confirm each comes up as a real getty login —
           # i.e. a VT switch would land on a console, not a void. tty2 is already
           # pre-spawned (below); start tty3..tty6 to prove the whole range works.
-          # NOTE the instance NAME: autovt@.service is a symlink to the getty@
-          # TEMPLATE, but starting autovt@ttyN instantiates the unit AS
-          # autovt@ttyN — getty@ttyN is a separate, never-started instance of
-          # the same template. The old wait on getty@ttyN therefore failed
-          # against a WORKING recovery console on every run ("unit
-          # getty@tty2.service is inactive", run 30485906966). Assert the
-          # instance we actually start, and that it is a real agetty.
+          # NOTE the instance NAME: starting autovt@ttyN instantiates the unit
+          # AS autovt@ttyN — getty@ttyN is a SEPARATE, never-started instance.
+          # The old wait on getty@ttyN therefore failed against a WORKING
+          # recovery console on every run ("unit getty@tty2.service is
+          # inactive", run 30485906966). Assert the instance we actually start.
+          #
+          # WHY THE PROCESS AND NOT ExecStart (run 30774512407): the previous
+          # version asserted `"agetty" in ExecStart` and failed on tty3 with
+          #     path=/nix/store/…-getty ; argv[]=/nix/store/…-getty
+          # while tty2 logged a plain `(agetty)`. That is not two behaviours,
+          # it is nixpkgs' two SHAPES — getty@ and autovt@ are distinct unit
+          # definitions in nixos/modules/services/ttys/getty.nix:
+          #     getty@   ExecStart = writers.writeDash "getty" autologinScript
+          #     autovt@  ExecStart = gettyCmd "--noclear %I $TERM"
+          # The first is a dash wrapper whose last line EXECs agetty, so both
+          # shapes end up as a real login — one just isn't spelled "agetty" in
+          # its ExecStart. (The comment this replaces claimed autovt@ is a
+          # symlink to the getty@ template; at this nixpkgs pin it is not, and
+          # believing that is what made the string check look sound.)
+          #
+          # So assert the REQUIREMENT — a login program is RUNNING on that VT —
+          # rather than which of the two shapes systemd resolved. Reading the
+          # main PID's comm is also STRICTLY STRONGER: it proves agetty actually
+          # started, where the string only ever proved it was configured to.
           for n in range(2, 7):
               sup.succeed(f"systemctl start autovt@tty{n}.service")
               sup.wait_for_unit(f"autovt@tty{n}.service", timeout=30)
-              # The unit must be a getty (agetty) login prompt, not a stub.
-              execstart = sup.succeed(
-                  f"systemctl show -p ExecStart --value autovt@tty{n}.service")
-              assert "agetty" in execstart, \
-                  f"autovt@tty{n} is not a real agetty login ({execstart!r}) — recovery void"
+              # Retry: the unit reports active at fork, and the wrapper shape
+              # needs one more exec before comm settles to "agetty".
+              try:
+                  sup.wait_until_succeeds(
+                      f"pid=$(systemctl show -p MainPID --value "
+                      f"autovt@tty{n}.service); "
+                      f'[ -n "$pid" ] && [ "$pid" != 0 ] && '
+                      f'grep -qx agetty "/proc/$pid/comm"',
+                      timeout=30)
+              except Exception:
+                  pid = sup.succeed(
+                      f"systemctl show -p MainPID --value "
+                      f"autovt@tty{n}.service").strip()
+                  comm = sup.succeed(
+                      f'cat "/proc/{pid}/comm" 2>/dev/null || echo "<no pid>"'
+                  ).strip()
+                  execstart = sup.succeed(
+                      f"systemctl show -p ExecStart --value "
+                      f"autovt@tty{n}.service").strip()
+                  raise AssertionError(
+                      f"autovt@tty{n} is active but its main process is "
+                      f"{comm!r} (pid {pid}), not agetty — a Ctrl+Alt+F{n} "
+                      f"switch would land on a void.\nExecStart: {execstart!r}")
 
       with subtest("autovt@tty2 is PRE-SPAWNED from boot (recovery console already alive)"):
           # The belt-and-suspenders pin: tty2's getty must be active WITHOUT us
