@@ -125,7 +125,9 @@ class TestSendAction:
 
     def test_send_action_circuit_breaker_open(self, bridge):
         bridge._circuit_breaker._failures = bridge._circuit_breaker.threshold
-        bridge._circuit_breaker._opened_at = time.time()
+        # monotonic, not wall-clock: _opened_at is now a monotonic stamp
+        # (core/circuit_breaker.py) so an NTP step cannot strand the breaker.
+        bridge._circuit_breaker._opened_at = time.monotonic()
         mock_monitor = MagicMock()
         mock_monitor.is_estopped = False
         with patch('integrations.robotics.safety_monitor.get_safety_monitor',
@@ -178,7 +180,9 @@ class TestIngestSensorBatch:
 
     def test_circuit_breaker_blocks_batch(self, bridge):
         bridge._circuit_breaker._failures = bridge._circuit_breaker.threshold
-        bridge._circuit_breaker._opened_at = time.time()
+        # monotonic, not wall-clock: _opened_at is now a monotonic stamp
+        # (core/circuit_breaker.py) so an NTP step cannot strand the breaker.
+        bridge._circuit_breaker._opened_at = time.monotonic()
         result = bridge.ingest_sensor_batch([{'sensor_id': 'x', 'data': {}}])
         assert result == 0
 
@@ -204,7 +208,9 @@ class TestGetLearningFeedback:
 
     def test_circuit_breaker_blocks_feedback(self, bridge):
         bridge._circuit_breaker._failures = bridge._circuit_breaker.threshold
-        bridge._circuit_breaker._opened_at = time.time()
+        # monotonic, not wall-clock: _opened_at is now a monotonic stamp
+        # (core/circuit_breaker.py) so an NTP step cannot strand the breaker.
+        bridge._circuit_breaker._opened_at = time.monotonic()
         result = bridge.get_learning_feedback()
         assert result is None
 
