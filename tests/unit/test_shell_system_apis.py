@@ -1315,3 +1315,82 @@ class TestShellEncryption(unittest.TestCase):
     def test_malformed_lsblk_line_does_not_crash(self):
         data = json.loads(self._get('garbage\n\nNAME="x" TYPE="crypt" FSTYPE="ext4" MOUNTPOINT="/"\n').data)
         self.assertTrue(data['root_encrypted'])
+
+
+class TestKillGuardFailsClosed(unittest.TestCase):
+    """The protected-process guard must FAIL CLOSED, not open.
+
+    Found by the #31 degraded-mode review, ranked by blast radius: an agent
+    drives /api/shell/tasks/kill unattended, so a guard that silently stops
+    guarding is the worst shape a check can take.
+
+    The original code was:
+
+        try:
+            import psutil
+            proc = psutil.Process(pid)
+            if proc.name() in _PROTECTED_NAMES:
+                return ..., 403
+        except Exception:
+            pass                    # <-- falls through to os.kill()
+
+    So whenever psutil was ABSENT, or Process(pid) raised (AccessDenied on a
+    root-owned process is the common one), the protection check was skipped
+    ENTIRELY and the kill proceeded. The system looked protected and was not.
+
+    An unverifiable guard is not a passed guard.
+    """
+
+    def test_kill_is_refused_when_the_guard_cannot_run(self):
+        """psutil unavailable => REFUSE, never 'kill anyway'."""
+        killed = []
+        with patch('integrations.agent_engine.shell_system_apis.os.kill',
+                   side_effect=lambda *a: killed.append(a)), \
+             patch.dict('sys.modules', {'psutil': None}):
+            # psutil=None makes `import psutil` raise ImportError inside the route.
+            r = _make_system_app().post(
+                '/api/shell/tasks/kill',
+                data=json.dumps({'pid': 424242}),
+                content_type='application/json')
+        self.assertNotEqual(r.status_code, 200, (
+            "kill succeeded while the protected-process guard could not run — "
+            "the guard failed OPEN"))
+        self.assertEqual(killed, [], (
+            "os.kill was CALLED despite the guard being unverifiable; a "
+            "protected process could have been killed"))
+
+    def test_kill_is_refused_when_process_lookup_raises(self):
+        """psutil present but Process() raises => still REFUSE.
+
+        AccessDenied on a root-owned process is the ordinary case, and it is
+        precisely when the target is most likely to be protected.
+        """
+        import psutil as _ps
+        killed = []
+        with patch('integrations.agent_engine.shell_system_apis.os.kill',
+                   side_effect=lambda *a: killed.append(a)), \
+             patch.object(_ps, 'Process', side_effect=_ps.AccessDenied(424242)):
+            r = _make_system_app().post(
+                '/api/shell/tasks/kill',
+                data=json.dumps({'pid': 424242}),
+                content_type='application/json')
+        self.assertNotEqual(r.status_code, 200,
+                            "kill succeeded despite an unverifiable guard")
+        self.assertEqual(killed, [], "os.kill was called with the guard bypassed")
+
+    def test_a_normal_kill_still_works(self):
+        """Failing closed must not break the ordinary path — a guard that
+        blocks everything gets removed, which is worse than one that leaks."""
+        import psutil as _ps
+        fake = MagicMock()
+        fake.name.return_value = 'some-user-process'
+        killed = []
+        with patch('integrations.agent_engine.shell_system_apis.os.kill',
+                   side_effect=lambda *a: killed.append(a)), \
+             patch.object(_ps, 'Process', return_value=fake):
+            r = _make_system_app().post(
+                '/api/shell/tasks/kill',
+                data=json.dumps({'pid': 424242}),
+                content_type='application/json')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertTrue(killed, "the ordinary kill path stopped working")

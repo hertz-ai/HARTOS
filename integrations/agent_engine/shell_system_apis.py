@@ -574,13 +574,46 @@ def register_shell_system_routes(app):
             return jsonify({'error': 'Valid pid required'}), 400
         if pid == 1:
             return jsonify({'error': 'Cannot kill PID 1 (init)'}), 403
+        # FAIL CLOSED. This was `except Exception: pass`, which fell through to
+        # os.kill() below — so whenever psutil was ABSENT, or Process(pid)
+        # raised (AccessDenied on a root-owned process being the ordinary
+        # case, i.e. exactly when the target is most likely protected), the
+        # protected-name check was skipped ENTIRELY and the kill proceeded.
+        # The system reported itself protected and was not.
+        #
+        # An unverifiable guard is not a passed guard. A caller that cannot be
+        # told "no" for the right reason must be told "no" anyway: 503 says
+        # the check could not run, which is honest and retryable, rather than
+        # 200 "killed" on a process we were never allowed to touch.
+        #
+        # NoSuchProcess is the ONE benign case — there is nothing to protect —
+        # so it falls through to os.kill(), whose ProcessLookupError handler
+        # returns the accurate 404.
         try:
             import psutil
+        except ImportError:
+            logger.warning("tasks/kill REFUSED: psutil unavailable, cannot "
+                           "verify the protected-process guard (pid=%s)", pid)
+            return jsonify({
+                'error': 'Cannot verify protected-process guard (psutil '
+                         'unavailable) — refusing to kill',
+                'killed': False,
+            }), 503
+        try:
             proc = psutil.Process(pid)
-            if proc.name() in _PROTECTED_NAMES:
-                return jsonify({'error': f'Cannot kill protected process: {proc.name()}'}), 403
-        except Exception:
-            pass
+            name = proc.name()
+        except psutil.NoSuchProcess:
+            name = None          # nothing to protect; os.kill will 404 below
+        except Exception as e:
+            logger.warning("tasks/kill REFUSED: protected-process guard could "
+                           "not run for pid=%s: %s", pid, e)
+            return jsonify({
+                'error': f'Cannot verify protected-process guard ({type(e).__name__}) '
+                         f'— refusing to kill',
+                'killed': False,
+            }), 503
+        if name is not None and name in _PROTECTED_NAMES:
+            return jsonify({'error': f'Cannot kill protected process: {name}'}), 403
         sig = getattr(signal, sig_name, signal.SIGTERM)
         try:
             os.kill(pid, sig)
