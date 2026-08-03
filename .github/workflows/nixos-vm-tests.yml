@@ -144,6 +144,33 @@ jobs:
           # lands on the cage floor (still software-GL + the served shell still
           # serves). A test that never runs guards nothing (CLAUDE.md Gate 5), so the
           # paint node is built EXPLICITLY here alongside the structural one.
+          # ── STREAMED capacity trace (2026-08-03, run 30779764495) ──
+          # That run's job lasted 1h28m but the log STOPS DEAD at 03:05:43,
+          # ~27 minutes in, and both the build step AND the `if: always()`
+          # disk report finished with an EMPTY conclusion. An always() step
+          # still runs when a step is cancelled; it does not run when the
+          # RUNNER ITSELF is gone. So the runner was lost, and every
+          # after-the-fact probe is unreachable by construction.
+          #
+          # Disk is already ruled out with numbers, not a guess: the reclaim
+          # step above reported 115G available of 145G right before this
+          # build — the ~22 GiB closure fits several times over.
+          #
+          # Which leaves memory as the live hypothesis (this build compiles
+          # rustdesk and builds several VM images at --max-jobs 2 on a 16 GB
+          # runner). The ONLY place that evidence can survive a lost runner is
+          # the log STREAM itself, so the sampler prints to stdout as it goes
+          # rather than summarising at the end. The last [mem] line before the
+          # silence is then the measurement.
+          ( while true; do
+              printf '[mem] %s %s | load%s\n' "$(date -u +%H:%M:%S)" \
+                "$(free -m | awk '/^Mem:/{printf "used=%sMB avail=%sMB", $3, $7}')" \
+                "$(cut -d" " -f1-3 /proc/loadavg)"
+              sleep 30
+            done ) &
+          CAPACITY_SAMPLER=$!
+          trap 'kill "$CAPACITY_SAMPLER" 2>/dev/null || true' EXIT
+
           nix build --keep-going --print-build-logs --max-jobs 2 --cores 2 \
             ".#checks.x86_64-linux.hart-floor-lock" \
             ".#checks.x86_64-linux.hart-firmware-boot-matrix" \
