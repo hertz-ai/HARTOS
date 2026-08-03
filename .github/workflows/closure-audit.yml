@@ -87,9 +87,19 @@ jobs:
           # root at 26 GiB against a ~24 GiB closure, so a feature is affordable
           # or it is not, and guessing is how the devtools 3 GiB nearly shipped
           # into 2 GiB of slack.
+          # PRECEDENCE, NOT A CONFLICT ERROR (fixed after run 30785149972).
+          # The first version errored when both were set — and then errored on
+          # its own first real use, because `disable` carries a non-empty
+          # DEFAULT. Passing `-f disable=` does not clear it, so EVERY enable
+          # audit collided with a value the caller never typed. A required
+          # input whose default makes the other input unusable is a trap, not
+          # a safety check.
+          #
+          # So `enable` wins, and says out loud that it is winning — a silent
+          # precedence rule would be the same trap wearing a different hat.
           if [ -n "$OPT_ON" ] && [ -n "$OPT_OFF" ]; then
-            echo "::error::pass EITHER disable OR enable, not both — the diff has one axis"
-            exit 2
+            echo "note: both inputs set; using enable=$OPT_ON and IGNORING disable=$OPT_OFF"
+            echo "      (disable has a non-empty default, so this is the normal case)"
           fi
           if [ -n "$OPT_ON" ]; then
             OPT="$OPT_ON"; FORCE=true;  DIRECTION="enable"
