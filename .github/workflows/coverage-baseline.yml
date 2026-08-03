@@ -122,11 +122,30 @@ jobs:
             echo "nothing in this shard — writing no data file."
             exit 0
           fi
+          # --continue-on-collection-errors is LOAD-BEARING (first sharded run,
+          # 30785733712): ONE file failing to import aborts pytest's whole
+          # collection ("Interrupted: 1 error during collection"), so a 171-file
+          # shard ran ZERO tests and wrote no coverage data. The offender was
+          # tests/unit/test_livekit_audio_publisher.py (KeyError on its own
+          # module name). A single bad import must cost its own file, not the
+          # other 170.
           coverage run -p -m pytest "${SEL[@]}" -q \
             --noconftest -p no:cacheprovider \
+            --continue-on-collection-errors \
             2>&1 | tail -30 || true
+          # THE `|| true` ABOVE IS WHY THIS CHECK EXISTS. It is there so a
+          # FAILING TEST cannot abort the MEASUREMENT — but it equally swallows
+          # a collection abort that measured nothing, and the first sharded run
+          # duly reported SUCCESS for a shard that produced no data at all.
+          # "Measured nothing" is a failure, exactly like "discovered 0 files".
           echo "=== data files produced ==="
-          ls -la .coverage.* 2>/dev/null || echo "NONE — this shard measured nothing"
+          if ! ls .coverage.* >/dev/null 2>&1; then
+            echo "::error::shard ${{ matrix.shard }} produced NO coverage data."
+            echo "::error::pytest ran but wrote nothing — look for a collection"
+            echo "::error::abort or an interpreter crash in the tail above."
+            exit 1
+          fi
+          ls -la .coverage.*
 
       - name: Upload this shard's coverage data
         if: always()
