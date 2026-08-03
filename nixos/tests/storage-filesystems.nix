@@ -194,11 +194,23 @@ in
           # A bounded mount MUST fail (no fs) and return FAST. timeout 20 bounds it:
           # a clean failure returns ~instantly; a hypothetical hang is killed at 20s
           # (exit 124), which is STILL a clean failure — never a wedge.
-          rc = fs.succeed(f"timeout 20 mount {disk} /mnt/bad >/dev/null 2>&1; echo RC=$?").strip()
-          assert "RC=0" not in rc, f"mounting a corrupt disk must FAIL, got {rc!r}"
-          # udisks likewise refuses cleanly (bounded, no hang).
-          udrc = fs.succeed(f"timeout 20 udisksctl mount -b {disk} >/dev/null 2>&1; echo RC=$?").strip()
-          assert "RC=0" not in udrc, f"udisks must refuse a corrupt disk, got {udrc!r}"
+          # USE execute(), NOT succeed()+`; echo RC=$?` (run 30783792736).
+          # The driver runs every command as `set -euo pipefail; <command>`
+          # (nixos/lib/test-driver/.../machine.py:521). Under `set -e` a FAILING
+          # mount aborts the shell immediately, so the trailing `echo RC=$?`
+          # never runs and succeed() raises on the very outcome this subtest is
+          # asserting. The mount was failing correctly all along — the test
+          # could not observe it.
+          #
+          # The idiom is fine elsewhere in the suite because those commands are
+          # expected to SUCCEED; it is only unusable where failure IS the
+          # expectation. execute() returns (rc, output) and does not raise.
+          rc, _out = fs.execute(f"timeout 20 mount {disk} /mnt/bad >/dev/null 2>&1")
+          assert rc != 0, "mounting a corrupt disk must FAIL, got rc=0"
+          # rc 124 (timeout killed it) is ALSO a pass here: bounded and clean is
+          # the requirement — never a wedge.
+          udrc, _uout = fs.execute(f"timeout 20 udisksctl mount -b {disk} >/dev/null 2>&1")
+          assert udrc != 0, "udisks must refuse a corrupt disk, got rc=0"
           # THE degrade assertion: the OS is still fully up + responsive, and the
           # failed mount left nothing mounted + did not drop to emergency.
           fs.succeed("echo still-alive")
