@@ -1460,7 +1460,19 @@ class LiquidUIService:
         # ONLY when the Model Bus reports NO models at all, which is
         # unambiguous. A bus with models that still failed this request is a
         # real processing failure and keeps the original message.
-        if not self._model_bus_has_any_model():
+        # REUSE the ONE Model-Bus probe this module already has —
+        # ContextEngine._get_model_context — instead of adding a second. It
+        # queries the same /v1/models on the same port, returns
+        # {'available', 'models', 'count'}, and already treats ANY failure as
+        # count 0, which is exactly the semantic wanted here: a box that cannot
+        # reach its own model bus is not a box that failed to understand you.
+        # LiquidUIService already owns an instance (self.context_engine), so
+        # this needs no new state and no second network shape.
+        #
+        # `count`, not `available`: available is True for any HTTP 200 INCLUDING
+        # an empty model list, and an empty list IS the fresh-box case this
+        # message exists for.
+        if self.context_engine._get_model_context().get('count', 0) == 0:
             return {'text': text, 'response': self._SETUP_PENDING_MSG,
                     'source': 'voice', 'setup_pending': True}
         return {'text': text, 'response': 'Could not process', 'source': 'voice'}
@@ -1470,28 +1482,6 @@ class LiquidUIService:
     #: process" managed.
     _SETUP_PENDING_MSG = ("Still finishing AI setup — it needs the internet "
                           "once. Voice will work after that.")
-
-    def _model_bus_has_any_model(self) -> bool:
-        """True iff the Model Bus reports at least one model.
-
-        Runs ONLY on an already-failing path, so it is bounded (2s) and
-        best-effort: it must never turn one failure into two, or make a failed
-        voice command take longer to fail. Any error here means "cannot tell",
-        and cannot-tell is reported as no-model — the message it produces is
-        the accurate one for a box that cannot reach its own model bus.
-        """
-        from core.http_pool import pooled_get
-        try:
-            resp = pooled_get(
-                f'http://localhost:{self.model_bus_port}/v1/models', timeout=2)
-            if resp.status_code != 200:
-                logger.debug("model-bus /v1/models returned HTTP %s",
-                             resp.status_code)
-                return False
-            return bool((resp.json() or {}).get('models') or [])
-        except Exception as exc:
-            logger.debug("model-bus readiness probe failed: %s", exc)
-            return False
 
     # ─── Glass Desktop Shell Render ───────────────────────────
 

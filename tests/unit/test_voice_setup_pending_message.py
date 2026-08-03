@@ -36,8 +36,12 @@ class _Svc:
     """
     model_bus_port = 6790
     _SETUP_PENDING_MSG = lus.LiquidUIService._SETUP_PENDING_MSG
-    _model_bus_has_any_model = lus.LiquidUIService._model_bus_has_any_model
     _process_voice_command = lus.LiquidUIService._process_voice_command
+    # A REAL ContextEngine, because that is where the ONE Model-Bus probe
+    # lives and it is what the code under test calls. Constructing the
+    # real class (it only needs two ports) keeps the probe under test
+    # instead of substituting a stand-in for the thing being reused.
+    context_engine = lus.ContextEngine(6777, 6790)
 
 
 def _resp(status, payload):
@@ -114,7 +118,7 @@ class VoiceFailureNamesTheRealCause(unittest.TestCase):
             _Svc()._process_voice_command("hi")
 
         self.assertIsNotNone(seen.get('timeout'),
-                             "readiness probe has no timeout — one failure "
+                             "model-bus probe has no timeout — one failure "
                              "could become a hang")
         self.assertLessEqual(seen['timeout'], 5)
 
