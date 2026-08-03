@@ -369,7 +369,7 @@ def hevolve_verify_boot():
 # --- End Boot Integrity Verification ---
 
 
-from core.http_pool import pooled_get, pooled_post
+from core.http_pool import LLM_COMPLETION_TIMEOUT, pooled_get, pooled_post
 from core.auth_local import (
     require_local_or_token, require_local_or_token_csrf_safe,
 )
@@ -5541,6 +5541,14 @@ def _pooled_post_with_refusal_check(api_url, json=None, app_logger=None, **kwarg
     only thing that changes is the prompt's tone.
     """
     body = json or {}
+    # This is a COMPLETION, not an ordinary API call.  Without this the call
+    # inherits http_pool.DEFAULT_TIMEOUT (3, 15) — a 15s read budget that is
+    # shorter than a local 4B generation, so it could never succeed: it timed
+    # out, the caller's `except` re-issued the whole request, and a one-word
+    # reply cost ~110s (see LLM_COMPLETION_TIMEOUT for the measured log trail).
+    # setdefault, so an explicit caller timeout still wins.  Applies to the
+    # refusal-retry POST below too — both go through **kwargs.
+    kwargs.setdefault('timeout', LLM_COMPLETION_TIMEOUT)
     response = pooled_post(api_url, json=body, **kwargs)
     # Default ON — only explicit opt-out (0/false/no/off) skips the override.
     if os.environ.get('HEVOLVE_LANGCHAIN_REFUSAL_OVERRIDE', '1').strip().lower() in ('0', 'false', 'no', 'off'):
@@ -8318,6 +8326,43 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
             _clean = _re.sub(r'\s+', ' ', _clean).strip()         # collapse whitespace
             if not _clean:
                 return  # nothing left after cleaning
+
+            # ── Converge on the ONE normalizer (task #10 / 3.5) ──
+            # The stripping above removes artifacts TTS cannot SAY. It does
+            # NOT turn "Rs.200", "12.5%" or "2:30 PM" into words — that is
+            # tts_text_normalizer.normalize_for_tts, and until now the ONLY
+            # caller was tts_router.synthesize. This path (chat reply -> WAMP
+            # audio) goes straight to tts_engine.synthesize_text and skipped
+            # it entirely, so the very same sentence was pronounced correctly
+            # through /api/voice/speak and spoken as garbage in chat. The
+            # normalizer's own docstring asserts "Single converging path:
+            # called ONCE from tts_router.synthesize() ... we do not duplicate
+            # this logic per-engine" — that was true of the ENGINES and false
+            # of the CALLERS. This makes it true of both.
+            #
+            # use_llm is DERIVED from the canonical SOURCE_URGENCY table, not
+            # hardcoded: retuning 'chat_response' there retunes this caller
+            # too. Importing tts_router costs only its own module here — its
+            # top-level imports are stdlib and `integrations` is long since
+            # loaded in this process.
+            #
+            # STILL DIVERGENT, deliberately: URLs are DELETED above, whereas
+            # the router path EXPANDS them to spoken form. Reading a URL aloud
+            # after a chat reply is not obviously wanted, and changing it
+            # changes what the user hears — that belongs with the engine
+            # unification half of 3.5, which needs a listening test.
+            try:
+                from integrations.channels.media.tts_router import SOURCE_URGENCY
+                from integrations.channels.media.tts_text_normalizer import (
+                    normalize_for_tts,
+                )
+                _urgency = SOURCE_URGENCY.get('chat_response', 'normal')
+                _clean = normalize_for_tts(
+                    _clean, language, use_llm=(_urgency != 'instant'),
+                )
+            except Exception as _ne:  # never let normalization block speech
+                app.logger.debug(f"TTS: normalization skipped ({_ne})")
+
             _raw = synthesize_text(_clean, language=language)
             app.logger.info(f"TTS async: synthesize_text returned: {_raw}")
             # synthesize_text may return a file path string OR a JSON dict/string
