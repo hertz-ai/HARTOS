@@ -146,11 +146,29 @@ const doc = {
   documentElement: { classList: { contains() { return false; } } },
 };
 
+// renderRoutePanel gates the reveal on a fetch() 2xx check, because an iframe's
+// `load` event fires for a 404 error page exactly as it does for real content —
+// unveiling on `load` alone is how a raw "Not Found" page reached real HW. The
+// sandbox had no fetch, so the panel manager threw ReferenceError the instant a
+// frame loaded and this harness died 18 assertions in, with the branch that
+// MATTERS (non-2xx must NOT unveil) never reached at all.
+//
+// fetchPlan is what the NEXT fetch answers, so each branch can be driven:
+//   {ok:true}    -> 2xx, reveal          {ok:false} -> 404, reconnecting
+//   {throws:true}-> request itself failed -> reveal (fail-open, same-origin)
+let fetchPlan = { ok: true };
+const fetchCalls = [];
+
 const sandbox = {
   window: win, document: doc, console,
   setInterval: () => 0, clearInterval: () => {},
   setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
   clearTimeout: () => {},
+  fetch: (url, opts) => {
+    fetchCalls.push({ url, opts });
+    if (fetchPlan.throws) return Promise.reject(new Error('network down'));
+    return Promise.resolve({ ok: !!fetchPlan.ok, status: fetchPlan.ok ? 200 : 404 });
+  },
 };
 sandbox.window.document = doc;
 win.openPanel = undefined;
@@ -195,6 +213,9 @@ ok(typeof openPanel === 'function', 'openPanel is callable after load');
 
 function bodyOf(id) { return byId['panel-body-' + id]; }
 function fireTimers() { const t = timers; timers = []; t.forEach(x => { try { x.fn(); } catch (e) {} }); }
+// Drain the microtask queue so a fetch().then() chain has settled. The sandbox's
+// setTimeout is a recorder, so this uses the harness's REAL one.
+const tick = () => new Promise(r => setTimeout(r, 0));
 
 // ── #20: opening a route panel ALWAYS yields a content container ─────────────
 for (const id of ['agents_browse', 'recipes', 'communities']) {
@@ -227,9 +248,55 @@ openPanel('agents2');
   const frame = body && body.querySelector('.route-frame');
   ok(!!frame, '[#20] fresh panel staged an iframe to watch');
   if (frame) {
+    fetchPlan = { ok: true };         // the route really serves 2xx
     frame.dispatch('load');           // the SPA answered
+    await tick();                     // ...and the 2xx check settles
     ok(frame.style.opacity === '1', '[#20] iframe is revealed on successful load');
     ok(!body.querySelector('.route-skeleton'), '[#20] skeleton is dropped once content loads');
+    const probe = fetchCalls[fetchCalls.length - 1];
+    ok(probe && probe.url === 'http://127.0.0.1:5000/agents',
+      '[#116] the reveal is gated on a status check of the SAME route');
+    ok(probe && probe.opts && probe.opts.cache === 'no-store',
+      '[#116] the status check is uncached — a stale 200 would unveil a dead route');
+  }
+}
+
+// ── #116: an iframe `load` is NOT proof of content ───────────────────────────
+// The load event fires for a 404 error page identically to real content. This
+// is the false-healthy branch: unveiling here shows the user a raw "Not Found"
+// where the app should be, which is exactly what was seen on real hardware.
+sandbox.MANIFEST.agents404 = { title: 'Agents', route: '/agents', default_size: [900, 700] };
+fetchPlan = { ok: false };
+openPanel('agents404');
+{
+  const body = bodyOf('agents404');
+  const frame = body && body.querySelector('.route-frame');
+  ok(!!frame, '[#116] 404-route panel staged an iframe');
+  if (frame) {
+    frame.dispatch('load');           // the 404 ERROR PAGE loaded
+    await tick();
+    ok(frame.style.opacity !== '1',
+      '[#116] a non-2xx route is NEVER unveiled (the load event lied)');
+    ok(/route-empty|Reconnecting/.test((body && body.innerHTML) || ''),
+      '[#116] a non-2xx route falls to the graceful empty state instead');
+  }
+}
+
+// ── #116: the status CHECK failing is not the same as the route being down ───
+// Same-origin fetch throwing means the probe itself failed, so the panel
+// fails OPEN and shows the frame — refusing to render on a probe error would
+// blank a working app.
+sandbox.MANIFEST.agentsNet = { title: 'Agents', route: '/agents', default_size: [900, 700] };
+fetchPlan = { throws: true };
+openPanel('agentsNet');
+{
+  const body = bodyOf('agentsNet');
+  const frame = body && body.querySelector('.route-frame');
+  if (frame) {
+    frame.dispatch('load');
+    await tick();
+    ok(frame.style.opacity === '1',
+      '[#116] a FAILED status probe fails open — a working app is not blanked');
   }
 }
 
