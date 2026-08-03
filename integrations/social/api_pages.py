@@ -40,7 +40,7 @@ class PagesService:
         status; the content updates and the page stays in whatever state it
         was. Returns the page dict.
         """
-        from ._models_local import SitePage
+        from .models import SitePage
 
         slug = (slug or '').strip().lower()
         if not slug or any(c for c in slug if not (c.isalnum() or c in '-_')):
@@ -61,7 +61,7 @@ class PagesService:
     @staticmethod
     def set_status(db, slug, status):
         """Move a page between draft, in_review and published."""
-        from ._models_local import SitePage
+        from .models import SitePage
 
         if status not in SitePage.STATUSES:
             raise ValueError('status must be one of %s' % ', '.join(SitePage.STATUSES))
@@ -76,7 +76,7 @@ class PagesService:
 
     @staticmethod
     def get(db, slug, include_unpublished=False):
-        from ._models_local import SitePage
+        from .models import SitePage
 
         page = db.query(SitePage).filter_by(slug=(slug or '').strip().lower()).first()
         if page is None:
@@ -88,7 +88,7 @@ class PagesService:
     @staticmethod
     def list(db, status='published'):
         """List pages without content bodies, newest published first."""
-        from ._models_local import SitePage
+        from .models import SitePage
 
         q = db.query(SitePage)
         if status:

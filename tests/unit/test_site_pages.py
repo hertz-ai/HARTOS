@@ -11,8 +11,11 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from integrations.social.models import Base
-from integrations.social._models_local import SitePage, User  # noqa: F401 — model registration
+from integrations.social.models import Base, SitePage, User  # noqa: F401 — model registration
+# Imported from the FACADE, never from _models_local. The fallback module
+# re-declares `users`, so importing it directly while Hevolve_Database is
+# installed raises InvalidRequestError at COLLECTION — which is exactly how
+# this defect was found (it aborted the repo-wide coverage sweep).
 from integrations.social.api_pages import PagesService
 
 
