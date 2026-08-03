@@ -3289,6 +3289,26 @@ class TestEveryNixosTestIsActuallyBuilt:
     # edge cgroup-cap check (task #19) was about to be written INTO a test that
     # CI never builds. Lowered in the same commit that built it, per this
     # class's own rule — a ceiling that only ever rises is not a ratchet.
+    #
+    # ══ READ THIS BEFORE "FIXING" THE GAP BY GROWING THE LIST ══
+    # "unbuilt" here means ABSENT FROM nixos-vm-tests.yml's HAND-WRITTEN list.
+    # It does NOT mean the test never runs anywhere, and the difference matters:
+    #
+    #   flake-checks.yml's `nixos-tests` job enumerates EVERY check
+    #   dynamically (`nix eval .#checks.x86_64-linux --apply builtins.attrNames`)
+    #   and round-robins them across 4 shards. Nothing can drift out of that
+    #   set — it is the comprehensive gate, and release.yml depends on it.
+    #
+    # So the honest statement of the gap is about WHEN, not WHETHER:
+    # flake-checks runs on pull_request / workflow_dispatch / release, and this
+    # repo works DIRECTLY ON MAIN (CLAUDE.md: main branch only, no PRs), so a
+    # push to main fires NEITHER workflow. That is the real hole.
+    #
+    # Growing the hand-written list is the WRONG fix and has already cost us:
+    # it reached 23 VM images in ONE job, and run 30779764495 lost its runner
+    # 27 minutes in with zero results (disk was ruled out — 115G free). The
+    # sharded job exists precisely so no single runner carries all of them.
+    # Prefer dispatching flake-checks.yml over adding another name here.
     UNBUILT_CEILING = 30
 
     def _defined(self):
@@ -3337,13 +3357,22 @@ class TestEveryNixosTestIsActuallyBuilt:
                 f"nothing about it")
 
     def test_the_unbuilt_gap_does_not_grow(self):
-        """RATCHET: new tests must not silently join the never-run pile."""
+        """RATCHET: the manual-dispatch subset must not fall further behind.
+
+        See the CEILING comment above for what "unbuilt" does and does not
+        mean — these tests DO run under flake-checks.yml's dynamic shards;
+        what they miss is the manual nixos-vm-tests.yml dispatch.
+        """
         unbuilt = sorted(self._defined() - self._built())
         assert len(unbuilt) <= self.UNBUILT_CEILING, (
-            f"{len(unbuilt)} nixosTests are defined but NEVER BUILT "
-            f"(ceiling {self.UNBUILT_CEILING}). A test that does not run is "
-            f"not verification — it is the appearance of it.\n"
-            f"unbuilt: {unbuilt}"
+            f"{len(unbuilt)} nixosTests are missing from nixos-vm-tests.yml's "
+            f"hand-written list (ceiling {self.UNBUILT_CEILING}).\n"
+            f"Before adding a name: that list is a manually-dispatched SUBSET, "
+            f"not the coverage gate. flake-checks.yml enumerates every check "
+            f"dynamically and shards it 4 ways; growing this list instead is "
+            f"what put 23 VM images in one job and lost its runner "
+            f"(30779764495).\n"
+            f"missing: {unbuilt}"
         )
 
     def test_every_built_check_actually_exists(self):
