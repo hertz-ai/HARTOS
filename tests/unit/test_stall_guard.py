@@ -23,6 +23,8 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -149,3 +151,76 @@ def test_correction_directive_escalates_with_fallback_object():
     assert '"status":"done"' in d2           # plus a minimal valid object to emit
     assert '"recipe":[]' in d2
     assert len(d2) > len(recipe_correction_directive(1))   # escalation grows it
+
+
+# The measured Action-2 state sequence from the live spin, in order, as taken
+# from server.log 01:42:30-01:43:10 via `grep -oE "Action 2: [a-z_]+" | uniq -c`:
+#   9 assigned | 3 in_progress | 1 status_verification_requested | 3 completed
+#   | 1 terminated | 3 recipe_requested | 3 terminated | 5 recipe_requested
+#   | 9 recipe_received
+# Kept as (state, repeat) so the shape stays readable and the run-lengths are
+# the real ones rather than invented.
+_LIVE_CYCLE_2026_08_04 = [
+    (ActionState.ASSIGNED, 9),
+    (ActionState.IN_PROGRESS, 3),
+    (ActionState.STATUS_VERIFICATION_REQUESTED, 1),
+    (ActionState.COMPLETED, 3),
+    (ActionState.TERMINATED, 1),
+    (ActionState.RECIPE_REQUESTED, 3),
+    (ActionState.TERMINATED, 3),
+    (ActionState.RECIPE_REQUESTED, 5),
+    (ActionState.RECIPE_RECEIVED, 9),
+]
+
+
+def _replay(sequence, action_id=2, rounds=20):
+    """Drive the tracker over a repeating state sequence, as the loop does.
+
+    Returns (broke, total_steps). recipe_exists stays False throughout: in the
+    live incident action 2's own recipe never landed, which is exactly why
+    AUTO-ADVANCE kept re-requesting it.
+    """
+    key, it, steps = None, 0, 0
+    for _ in range(rounds):
+        for state, repeat in sequence:
+            for _ in range(repeat):
+                steps += 1
+                key, it, brk = stall_guard_step(key, it, action_id, state, False)
+                if brk:
+                    return True, steps
+    return False, steps
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "#485 KNOWN GAP: stall_guard_step detects an action STUCK IN ONE STATE, not "
+    "one CYCLING through states. Two independent resets defeat it here — the "
+    "(action_id, state) key changes on every transition so `iters` restarts at "
+    "1, and the cycle revisits COMPLETED/TERMINATED which hard-reset to 0. "
+    "Measured live 2026-08-04: action 2 churned these 7 states while the loop "
+    "burned toward max_iterations=300, emitting ~321 log lines in a single "
+    "second and starving the chat hot path (58s for a one-word reply). "
+    "STALL-GUARD did fire twice elsewhere in that window, so the guard is live "
+    "— it simply cannot see this shape. "
+    "xfail(strict) NOT skip: this must flip to a hard failure the moment the "
+    "gap is closed, so the marker gets removed rather than quietly rotting. "
+    "Fix by EXTENDING stall_guard_step (revisited-state detection) — do NOT add "
+    "a second cap; test_terminal_state_resets and "
+    "test_counter_resets_on_state_advance encode deliberate behaviour that must "
+    "keep passing."))
+def test_cycling_action_is_eventually_caught():
+    broke, steps = _replay(_LIVE_CYCLE_2026_08_04)
+    assert broke is True, (
+        f"guard never fired across {steps} iterations of a non-progressing "
+        f"cycle — an action that never finishes must be caught, not just one "
+        f"that sits still")
+
+
+def test_replay_harness_is_not_vacuous():
+    """The xfail above must fail for the RIGHT reason.
+
+    A single unchanging state from the same sequence still trips the guard, so
+    the harness itself drives the tracker correctly and the xfail is about
+    cycling specifically — not a broken replay helper.
+    """
+    broke, _ = _replay([(ActionState.RECIPE_REQUESTED, 1)], rounds=STALL_GUARD_MAX_ITERS + 5)
+    assert broke is True
