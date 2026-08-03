@@ -3245,3 +3245,109 @@ class TestParityMatrix:
                 assert not re.search(route, api), (
                     f"{cap} now HAS a live route — update the matrix row to ✅ "
                     f"rather than leaving a stale gap claim")
+
+
+class TestEveryNixosTestIsActuallyBuilt:
+    """A check wired into flake.nix but absent from the workflow NEVER RUNS.
+
+    THE MISS THIS EXISTS TO PREVENT (2026-08-03): three new nixosTests
+    (hart-firmware-boot-matrix, hart-boot-latency, hart-driver-matrix) were
+    written, wired into flake.nix's `checks`, and dispatched to FOUR VM runs
+    — and none of them could have executed. nixos-vm-tests.yml does NOT run
+    `nix flake check`; it builds an EXPLICIT hardcoded list of check
+    attributes, and the three were not on it. The runs came back with other
+    tests' failures, which read exactly like "my tests passed".
+
+    Wiring a test into flake.nix is NECESSARY BUT NOT SUFFICIENT. The
+    workflow's list is the real gate, and nothing connected the two.
+
+    A source guard is the only shape that can catch this: the defect spans a
+    .nix file and a .yml file, so no behavioural test on either one sees it.
+    """
+
+    WORKFLOW = os.path.join(REPO_ROOT, ".github", "workflows", "nixos-vm-tests.yml")
+
+    #: Checks defined but not yet built, measured BY THIS GUARD on 2026-08-03.
+    #: A CEILING: it may only go DOWN. Building all 51 in one job would take
+    #: many hours, so this does not demand zero — it demands the gap stay
+    #: VISIBLE and shrink, instead of new tests silently joining the unrun
+    #: pile.
+    #:
+    #: NOTE — this number was wrong TWICE before it was right, and the
+    #: sequence is the argument for computing it instead of transcribing it:
+    #:   24  an ad-hoc shell diff (wrong: different extraction)
+    #:   29  a same-line regex (wrong: missed `name =` with the call on the
+    #:       next line, AND reported five real RUNNING checks as "missing")
+    #:   31  structural — split on top-level attribute boundaries and ask
+    #:       whether the chunk mentions runNixOSTest, which handles
+    #:       `= runNixOSTest`, `=\n  runNixOSTest` and `= let ... in
+    #:       runNixOSTest` alike. This found two further real checks.
+    #: A guard that miscounts is worse than none: the 29-version would have
+    #: sent someone deleting working tests from the workflow.
+    UNBUILT_CEILING = 31
+
+    def _defined(self):
+        names = set()
+        for path in glob.glob(os.path.join(REPO_ROOT, "nixos", "tests", "*.nix")):
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                # `name = pkgs.testers.runNixOSTest` appears in TWO layouts:
+                # on one line, and with the call on the NEXT line (e.g.
+                # session-supervisor.nix:396). Matching only the first form
+                # made this guard report five real, RUNNING checks as
+                # "missing" — a false positive that would have sent someone
+                # editing the workflow to remove working tests.
+                # STRUCTURAL, not pattern-guessing. A check is a TOP-LEVEL
+                # attribute of the returned set whose value mentions
+                # runNixOSTest — and the value takes at least three shapes:
+                #     name = pkgs.testers.runNixOSTest { ... }
+                #     name =
+                #       pkgs.testers.runNixOSTest { ... }
+                #     name = let ... in pkgs.testers.runNixOSTest { ... }
+                # Two earlier regexes each matched only some of these and
+                # reported five real, RUNNING checks as "missing" — a false
+                # positive that would have sent someone deleting working
+                # tests from the workflow. So: split on top-level attribute
+                # boundaries and ask whether the CHUNK mentions runNixOSTest.
+                src = fh.read()
+                starts = [(m.start(), m.group(1)) for m in
+                          re.finditer(r"^  ([a-z][a-z0-9-]*) =", src, re.M)]
+                for i, (pos, nm) in enumerate(starts):
+                    end = starts[i + 1][0] if i + 1 < len(starts) else len(src)
+                    if "runNixOSTest" in src[pos:end]:
+                        names.add(nm)
+        return names
+
+    def _built(self):
+        with open(self.WORKFLOW, encoding="utf-8", errors="replace") as fh:
+            return set(re.findall(r'"\.#checks\.x86_64-linux\.([a-z0-9-]+)"', fh.read()))
+
+    def test_the_three_parity_matrices_are_built(self):
+        """The specific tests whose absence made four VM runs meaningless."""
+        built = self._built()
+        for name in ("hart-firmware-boot-matrix", "hart-boot-latency",
+                     "hart-driver-matrix"):
+            assert name in built, (
+                f"{name} is defined in flake.nix but nixos-vm-tests.yml does "
+                f"NOT build it — so it never runs, and a green VM run says "
+                f"nothing about it")
+
+    def test_the_unbuilt_gap_does_not_grow(self):
+        """RATCHET: new tests must not silently join the never-run pile."""
+        unbuilt = sorted(self._defined() - self._built())
+        assert len(unbuilt) <= self.UNBUILT_CEILING, (
+            f"{len(unbuilt)} nixosTests are defined but NEVER BUILT "
+            f"(ceiling {self.UNBUILT_CEILING}). A test that does not run is "
+            f"not verification — it is the appearance of it.\n"
+            f"unbuilt: {unbuilt}"
+        )
+
+    def test_every_built_check_actually_exists(self):
+        """The inverse: the workflow must not name a check that is gone.
+
+        `nix build .#checks...<missing>` fails the whole job, so a renamed or
+        deleted test takes every OTHER test down with it.
+        """
+        missing = sorted(self._built() - self._defined())
+        assert not missing, (
+            f"nixos-vm-tests.yml builds {missing}, which no nixos/tests/*.nix "
+            f"defines — that fails the entire job and blocks every other test")

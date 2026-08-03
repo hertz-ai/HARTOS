@@ -146,6 +146,9 @@ jobs:
           # paint node is built EXPLICITLY here alongside the structural one.
           nix build --keep-going --print-build-logs --max-jobs 2 --cores 2 \
             ".#checks.x86_64-linux.hart-floor-lock" \
+            ".#checks.x86_64-linux.hart-firmware-boot-matrix" \
+            ".#checks.x86_64-linux.hart-boot-latency" \
+            ".#checks.x86_64-linux.hart-driver-matrix" \
             ".#checks.x86_64-linux.hart-session-supervisor-tier-drop" \
             ".#checks.x86_64-linux.hart-session-supervisor-paint-watchdog" \
             ".#checks.x86_64-linux.hart-session-supervisor-paint-watchdog-keep" \
