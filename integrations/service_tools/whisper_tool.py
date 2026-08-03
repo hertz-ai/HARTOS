@@ -23,6 +23,7 @@ import json
 import logging
 import math
 import os
+import re
 import tarfile
 import urllib.request
 from pathlib import Path
@@ -335,6 +336,41 @@ def _filter_speech_text(segments) -> str:
         if nsp <= NO_SPEECH_PROB_MAX and alp >= AVG_LOGPROB_MIN:
             kept.append((text or '').strip())
     return " ".join(t for t in kept if t).strip()
+
+
+# ── Anti-annotation gate: Whisper's own non-speech ANNOTATIONS ──────────────
+# A second, textual layer over the probabilistic gate above, and NOT redundant
+# with it: Whisper is trained to caption non-speech audio as "[Music]" /
+# "(applause)" / "♪♪", and it emits those CONFIDENTLY — no_speech_prob stays
+# low and avg_logprob stays high, so _filter_speech_text passes them through as
+# if a human had said them.
+#
+# Live 2026-08-04 on the shipped build: the composer held "(sad music)" and the
+# assistant answered a turn whose whole content was "(audience laughing)".
+# Auto-send fires 1s after a final transcript, so an annotation becomes a user
+# message with nobody in the room.
+_ANNOTATION_SPAN_RE = re.compile(r'\[[^\[\]]*\]|\([^()]*\)|♪[^♪]*♪|♪|\*[^*]*\*')
+
+
+def _drop_non_speech_text(text: str) -> str:
+    """Drop an utterance that is ENTIRELY non-speech annotation.
+
+    Conservative by construction.  Annotation spans are removed only to ASK
+    whether anything else was said; if any word character survives, the
+    ORIGINAL text is returned untouched.  So a real sentence that happens to
+    contain brackets ("I paid fifty (fifty!) dollars") can never be damaged —
+    the only utterance this drops is one with no speech outside the
+    annotations.  ``\\w`` is Unicode-aware, so CJK / Devanagari / Cyrillic
+    speech counts as words and survives.
+
+    Deliberately NOT a vocabulary list of known tags: Whisper annotates in the
+    detected language ("(音楽)"), so matching the bracket SHAPE generalises
+    where a wordlist of English tags would not.
+    """
+    if not text:
+        return ''
+    remainder = _ANNOTATION_SPAN_RE.sub(' ', text)
+    return text if re.search(r'\w', remainder) else ''
 
 
 def _faster_whisper_transcribe(audio_path: str, language: str = None) -> Optional[str]:
@@ -792,12 +828,13 @@ _stt_tool = ToolWorker(
 )
 
 
-def _transcribe_impl(audio_path: str, language: str = None) -> str:
-    """Transcribe audio — runs inside the worker subprocess.
+def _run_engine_chain(audio_path: str, language: str = None) -> str:
+    """Try each STT engine in priority order; return the first that answers.
 
     Engine priority: faster-whisper → sherpa-onnx → openai-whisper.
 
-    Returns JSON string with 'text' and 'language' keys.
+    Returns JSON string with 'text' and 'language' keys.  Callers should go
+    through _transcribe_impl, which post-filters this result.
     """
     # 1. Try faster-whisper (preferred — CTranslate2, 4x faster, multilingual)
     try:
@@ -858,6 +895,36 @@ def _transcribe_impl(audio_path: str, language: str = None) -> str:
         return result
 
     return json.dumps({"error": "No STT engine available (install faster-whisper)"})
+
+
+def _transcribe_impl(audio_path: str, language: str = None) -> str:
+    """Transcribe audio — runs inside the worker subprocess.
+
+    The ONE place every engine's result is post-filtered.  Both callers reach
+    STT through here (`whisper_transcribe` for files, `_transcribe_buffer` for
+    the realtime stream that feeds the composer), so the annotation gate covers
+    the whole surface and an engine added to the ladder later cannot skip it —
+    unlike the per-segment gate, which `_sherpa_transcribe` has never applied.
+
+    Returns JSON string with 'text' and 'language' keys.
+    """
+    raw = _run_engine_chain(audio_path, language)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if 'text' not in payload:
+        return raw                       # {"error": ...} — pass through verbatim
+
+    kept = _drop_non_speech_text(payload.get('text') or '')
+    if kept == payload.get('text'):
+        return raw                       # untouched → keep the engine's own bytes
+    payload['text'] = kept
+    if not kept:
+        # Same convention the engines already use when their own gate empties a
+        # window: don't report a language inferred from non-speech audio.
+        payload['language'] = 'unknown'
+    return json.dumps(payload)
 
 
 def whisper_transcribe(audio_path: str, language: str = None) -> str:
