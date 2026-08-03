@@ -32,7 +32,7 @@ reason; "needs physical hardware" or "needs a human to look at it" is.
 | 8 | Event-driven shell | `desktop-boot.nix` — the SHIPPED health probe's own flags, exercised against a real half-up backend (listen without accept), must return bounded | EXISTS for 2.2 (boot health-wait); 2.1 (SSE producer) landed earlier with a behavioural test; 2.3 (connectivity double-poll) is TO WRITE |
 | 9 | Shell ↔ Nunba drift | `layer-shell-host.nix` paint + a theme round-trip across both surfaces | TO WRITE |
 | 10 | Backend forks (TTS / draft-LLM / constants) | `hart-app-install-verify.nix` for the shipped-python half; the ENGINE fork needs a listening test | NOT VM for the voice-identity half — a human must hear which engine spoke |
-| 11 | Right-click "Ask <Product>" | `desktop-boot.nix` — context menu entry present and wired | TO WRITE |
+| 11 | Right-click "Ask <Product>" | `desktop-boot.nix` — the shell must REFERENCE hartAskMenu.js, the server must SERVE it non-empty, and the served copy must still compute its label from `product()` | EXISTS for the desktop half; Android + iOS are separate surfaces with no VM |
 | 12 | Layer-shell vulkan/GSK hang | `layer-shell-host.nix` (`hart-layer-shell-host-paint`) — GTK4 first frame on llvmpipe, OCR'd off the framebuffer | EXISTS-RED |
 | 13 | Collapse the two image-build paths | `firmware-boot-matrix.nix` — the raw image must BOOT, not merely build | EXISTS for the boot path; the repart-vs-generators decision is TO WRITE |
 | 14 | 22 GiB desktop closure | `.github/workflows/closure-audit.yml` — differential build, both directions | NOT VM — a closure diff is a build measurement, not a boot; measurements already recorded (gaming 2.2 GiB, devtools 2.8 GiB) |
@@ -57,7 +57,7 @@ reason; "needs physical hardware" or "needs a human to look at it" is.
 
 ## What this matrix is honest about
 
-**Four rows are `TO WRITE`** (was nine; #7, #24, #31's unit half, #3's mic half and #8's boot-wait landed). That is the real state of "100% VM verification":
+**Three rows are `TO WRITE`** (was nine; #7, #24, #31's unit half, #3's mic half, #8's boot-wait and #11's desktop half landed). That is the real state of "100% VM verification":
 the parity program's own matrices exist and run, and the older feature tasks
 mostly do not have a VM assertion yet. Writing those nine is the remaining work
 of the goal, and naming them is what makes it finite rather than a feeling.

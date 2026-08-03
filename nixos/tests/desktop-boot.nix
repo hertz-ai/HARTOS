@@ -183,6 +183,34 @@ in
           body = shell.succeed("curl -fs http://localhost:6800/shell/static/hartHero.js")
           assert body.strip(), "/shell/static/hartHero.js served EMPTY — dead-husk"
 
+      with subtest("right-click 'Ask <Product>' is SERVED and branded (task #11)"):
+          # Three separate ways this feature can be present-but-dead, so all
+          # three are checked. A file existing in the repo proves none of them:
+          #   1. the shell must REFERENCE the script,
+          #   2. the server must SERVE it non-empty (the dead-husk failure),
+          #   3. the served copy must still carry the per-product BRANDING,
+          #      which is the whole point of the task — "Ask HART" in OS mode,
+          #      "Ask Nunba" in Nunba mode, never a hardcoded product name.
+          #
+          # Written this way because the same day found two nixosTests that
+          # existed and had never run, and a shell JS module is exactly as easy
+          # to leave unreferenced.
+          page = shell.succeed("curl -fs http://localhost:6800/")
+          assert "hartAskMenu.js" in page, (
+              "the shell page does not reference hartAskMenu.js — the "
+              "right-click Ask entry is in the repo but never loaded")
+          ask = shell.succeed(
+              "curl -fs http://localhost:6800/shell/static/hartAskMenu.js")
+          assert ask.strip(), (
+              "/shell/static/hartAskMenu.js served EMPTY — referenced but not "
+              "served, which looks identical to working from the page source")
+          # The label is COMPUTED from the installed product, not literal.
+          assert "product()" in ask, (
+              "hartAskMenu.js no longer derives its label from product() — a "
+              "hardcoded name is the drift this task exists to prevent")
+          assert "'Ask '" in ask, (
+              "hartAskMenu.js no longer builds an 'Ask <Product>' label at all")
+
       # ════════════════════════════════════════════════════════════════
       # 1. REGISTRATION — GDM materialized the cage hart-shell wayland-session
       # ════════════════════════════════════════════════════════════════
