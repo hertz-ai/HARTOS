@@ -46,7 +46,7 @@ reason; "needs physical hardware" or "needs a human to look at it" is.
 | 28 | BIOS/firmware boot matrix | `firmware-boot-matrix.nix` (`hart-firmware-boot-matrix`) | EXISTS |
 | 29 | Latency SLAs in the VM | `boot-latency.nix` (`hart-boot-latency`) — budgets PARSED from `core/constants.py` at build time | EXISTS |
 | 30 | Coverage baseline | `.github/workflows/coverage-baseline.yml` — 4 shards + combine | NOT VM — measuring python coverage does not need a booted OS |
-| 31 | Degraded-mode review | per-route behavioural tests + `tests/unit/test_degraded_mode_inventory.py` ratchets | EXISTS for the inventory; the systemd-unit failure paths are TO WRITE |
+| 31 | Degraded-mode review | `tests/unit/test_degraded_mode_inventory.py` ratchets + `vm-tests.nix` (`hart-edge-boot` SIGKILLs each critical unit and proves it recovers, with NRestarts and a new MainPID as evidence) | EXISTS for the inventory and the unit failure paths; per-route behavioural tests continue in python |
 | 33 | num2words missing from hart-app.nix | `hart-app-install-verify.nix` — the SHIPPED python must expand "Rs.200" to words | EXISTS |
 | 34 | Rename `hart.devtools` | flake eval must stay green through the rename | NOT VM — an option rename is settled by evaluation, not by booting |
 | 35 | PXE server is Ubuntu-era | a netboot node served by the hart-pxe-server-go **package** (a flake package, not a check — it has no nixosTest at all) | TO WRITE — and possibly never: the component may be deleted instead |
@@ -57,7 +57,7 @@ reason; "needs physical hardware" or "needs a human to look at it" is.
 
 ## What this matrix is honest about
 
-**Seven rows are `TO WRITE`** (was nine; #7 and #24 landed). That is the real state of "100% VM verification":
+**Six rows are `TO WRITE`** (was nine; #7, #24 and #31's unit half landed). That is the real state of "100% VM verification":
 the parity program's own matrices exist and run, and the older feature tasks
 mostly do not have a VM assertion yet. Writing those nine is the remaining work
 of the goal, and naming them is what makes it finite rather than a feeling.

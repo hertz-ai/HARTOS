@@ -538,6 +538,53 @@ in
 
       with subtest("CLI tool available"):
           edge.succeed("which hart || which hart-cli")
+
+      # ── LAST ON PURPOSE: this one KILLS services ────────────────────────
+      # It must run after the clock-step subtest, which asserts NRestarts == 0.
+      with subtest("every critical hart unit RECOVERS from a kill (task #31)"):
+          # #31 asks that every shell route and systemd unit have a PROVEN
+          # failure mode. The routes are being walked in python; the UNITS had
+          # nothing at all — their Restart= lines were declared and never
+          # exercised, which is a failure mode on paper.
+          #
+          # SIGKILL, not `systemctl restart`: restart proves systemd can start
+          # the unit, which was never in doubt. Killing the process proves the
+          # unit comes BACK after dying the way it would die in the field —
+          # OOM, a segfault, an unhandled exception.
+          for unit in ("hart-backend.service", "hart-discovery.service"):
+              # SETTLE FIRST. hart-discovery declares
+              # `bindsTo = hart-backend.service`, so killing the backend takes
+              # discovery down WITH it; by the time this loop reaches
+              # discovery its MainPID may still be 0 mid-cascade. Reading it
+              # then would fail on "no MainPID" — a flake about ORDERING, not
+              # about recovery, which is the worst kind of red.
+              edge.wait_for_unit(unit, timeout=120)
+              before = int(edge.succeed(
+                  f"systemctl show -p NRestarts --value {unit}").strip() or 0)
+              pid = edge.succeed(
+                  f"systemctl show -p MainPID --value {unit}").strip()
+              assert pid and pid != "0", (
+                  f"{unit} has no MainPID, so there is nothing to kill and "
+                  f"this subtest would pass without testing anything")
+              edge.succeed(f"kill -9 {pid}")
+
+              # Bounded: a unit that never comes back is the failure, so an
+              # unbounded wait would hang the run instead of reporting it.
+              edge.wait_for_unit(unit, timeout=120)
+              after = int(edge.succeed(
+                  f"systemctl show -p NRestarts --value {unit}").strip() or 0)
+              assert after > before, (
+                  f"{unit} is active again but NRestarts did not move "
+                  f"({before} -> {after}) — systemd did not restart it, so "
+                  f"something else is holding the name and the recovery is "
+                  f"not what it looks like")
+              newpid = edge.succeed(
+                  f"systemctl show -p MainPID --value {unit}").strip()
+              assert newpid != pid, (
+                  f"{unit} reports the same MainPID {pid} after a SIGKILL — "
+                  f"the process did not actually die, so nothing was proven")
+              edge.log(f"{unit}: killed {pid}, recovered as {newpid} "
+                       f"(NRestarts {before} -> {after})")
     '';
   };
 
