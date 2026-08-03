@@ -136,6 +136,40 @@ def _cached_node_count(what: str) -> int:
 class GossipProtocol:
     """Gossip-based peer discovery for HevolveBot network."""
 
+    @property
+    def base_url(self) -> str:
+        """This node's reachable base URL, as advertised to every peer.
+
+        LAZY ON PURPOSE.  ``gossip = GossipProtocol()`` runs at module scope
+        (bottom of this file), i.e. at IMPORT time — long before Flask binds
+        its port.  Resolving in __init__ therefore always loses the port race
+        and freezes the cold-boot fallback into `_self_info()['url']` for the
+        life of the process, so every peer that discovers us dials a dead port.
+
+        Delegates to the canonical ``core.port_registry.get_local_backend_url``
+        (Gate 4 — the same resolver hartos_bootstrap, agent_engine.dispatch,
+        channels.flask_integration and mcp._tool_impls already use).  That
+        function probes which port is actually LISTENING: standalone HARTOS
+        serves on backend (6777), the bundled desktop serves HARTOS in-process
+        on the Flask port (5000).
+
+        Cached only once it returns a real answer.  While nothing is listening
+        the resolver yields its backend fallback, and caching THAT is precisely
+        the bug — so we keep re-resolving until a port actually answers.
+        """
+        if self._base_url_final:
+            return self._base_url_cached
+
+        from core.port_registry import get_local_backend_url, get_port
+        url = get_local_backend_url()
+        # An explicit env override, or any answer that is not the
+        # nothing-is-listening fallback, is final.
+        fallback = f'http://localhost:{get_port("backend")}'
+        if os.environ.get('HEVOLVE_BASE_URL') or url != fallback:
+            self._base_url_final = True
+        self._base_url_cached = url
+        return url
+
     def __init__(self):
         # Identity — persisted across restarts so the central side can
         # dedupe joins by node_id.  Without persistence, every watchdog
@@ -146,9 +180,11 @@ class GossipProtocol:
         self.node_id = _load_or_create_node_id()
         self.node_name = os.environ.get(
             'HEVOLVE_NODE_NAME', f'hevolve-{self.node_id[:8]}')
-        from core.port_registry import get_port
-        self.base_url = os.environ.get(
-            'HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}').rstrip('/')
+        # base_url is a lazy @property (see above) — do NOT resolve it here.
+        # This runs at import time, before Flask binds, so any value computed
+        # now is the cold-boot fallback.
+        self._base_url_cached = ''
+        self._base_url_final = False
         self.version = '1.0.0'
         self.started_at = datetime.utcnow()
 
