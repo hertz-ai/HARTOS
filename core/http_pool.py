@@ -70,6 +70,25 @@ _session_lock = threading.Lock()
 # Default timeout for all requests (connect, read) in seconds
 DEFAULT_TIMEOUT = (3, 15)
 
+# LLM *completion* calls need their own budget.  A 15s read timeout is right
+# for health checks and ordinary JSON APIs but is SHORTER THAN A LOCAL 4B
+# GENERATION, so any completion inheriting DEFAULT_TIMEOUT cannot succeed —
+# it times out, the caller falls into an except branch, and the same work is
+# re-issued.  Measured 2026-08-03: every chat turn logged
+#   "In except the exception is HTTPConnectionPool(host='127.0.0.1',
+#    port=8080): Read timed out. (read timeout=15)"
+# exactly 30s (2 x 15s) after "casual conv first call", then a third call
+# finally answered — ~110s wall for a one-word reply.
+#
+# 120s matches what every other LLM-completion call site already hardcodes:
+# integrations/agentic_router.py:391, integrations/channels/self_chat.py:149,
+# integrations/distributed_agent/worker_loop.py:257,
+# integrations/mcp/mcp_server.py:191.  This is the canonical home for that
+# number; those four should migrate to it (tracked, not swept into this fix).
+# Short timeouts elsewhere (5s federated delta, 10s ComfyUI enqueue) are NOT
+# completions and must stay short.
+LLM_COMPLETION_TIMEOUT = (3, 120)
+
 # Shared httpx.Client for the autogen/openai LLM path.  Separate from the
 # requests Session above (openai uses httpx, not requests).
 _llm_httpx_client = None
