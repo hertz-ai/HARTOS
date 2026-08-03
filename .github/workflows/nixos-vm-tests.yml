@@ -78,6 +78,37 @@ jobs:
       - name: KVM availability (the nixosTest driver uses /dev/kvm when present)
         run: ls -l /dev/kvm || echo "no /dev/kvm present — the test driver falls back to TCG (much slower, but still runs)"
 
+      # RECLAIM DISK BEFORE BUILDING — and make the disk state VISIBLE.
+      #
+      # Run 30771615694 died mid-build with NO error line, NO conclusion on the
+      # build step, and the log simply stopping. 82 minutes elapsed against a
+      # 330-minute cap, so it was not the timeout: the RUNNER was lost. There
+      # was no `df` anywhere in the workflow, so the failure had no cause
+      # attached and cost a 1h22m round trip to learn nothing.
+      #
+      # The prime suspect is disk. A GitHub-hosted ubuntu runner has ~14 GB
+      # free on /, and task #14 measured the HART desktop closure at ~22 GiB.
+      # This job also deliberately omits magic-nix-cache, so EVERY run rebuilds
+      # the whole closure into /nix on that same filesystem.
+      #
+      # The preinstalled toolchains below are ~10-15 GB and are useless to a
+      # nix build. Deleting them is the standard hosted-runner recipe — no new
+      # action dependency, nothing to trust, and `|| true` per line so a
+      # missing directory on a future runner image can never fail the job.
+      - name: Reclaim runner disk + record the starting state
+        run: |
+          echo "=== BEFORE reclaim ==="
+          df -h / /mnt 2>/dev/null || df -h
+          sudo rm -rf /usr/share/dotnet         || true
+          sudo rm -rf /usr/local/lib/android    || true
+          sudo rm -rf /opt/ghc                  || true
+          sudo rm -rf /usr/local/share/boost    || true
+          sudo rm -rf /usr/local/.ghcup         || true
+          sudo rm -rf /usr/share/swift          || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"   || true
+          echo "=== AFTER reclaim ==="
+          df -h / /mnt 2>/dev/null || df -h
+
       # Build each check EXPLICITLY — NOT `nix flake check`, which evaluates the
       # whole flake and is broken-for-months on the upstream sd-phone mobile-nixos
       # module-option drift (see e2e-os-test.yml). Targeting
@@ -134,3 +165,14 @@ jobs:
             ".#checks.x86_64-linux.hart-boot-continuity-poweroff-gate" \
             ".#checks.x86_64-linux.hart-boot-root-initrd" \
             && echo "VM gate PASSED: floor-lock + session-supervisor (tier-drop + paint-watchdog + paint-watchdog-keep + start-tier + reboot-latch + recovery-tty + unhealthy-flag single-crash drop) + GDM desktop-boot + GTK4 layer-shell structural + GTK4 layer-shell PAINT (cage paints, recovers, GTK4 host paints on llvmpipe + drops to cage) + boot infra (HARTLOG journal-capture + Live-OS HARTLOG self-create + efibootmgr boot-continuity + poweroff-never-arms-BootNext)."
+
+      # ALWAYS report the disk, pass or fail. If the runner dies mid-build this
+      # will not run — but when the build merely FAILS, this is what says
+      # whether space was the reason. Paired with the BEFORE/AFTER numbers from
+      # the reclaim step, a future death is attributable instead of silent.
+      - name: Disk state after the build (always)
+        if: always()
+        run: |
+          df -h / /mnt 2>/dev/null || df -h
+          echo "--- nix store size ---"
+          sudo du -sh /nix/store 2>/dev/null || true
