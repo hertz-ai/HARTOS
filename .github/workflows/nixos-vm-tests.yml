@@ -1,209 +1,51 @@
 name: NixOS VM Tests (execute)
 
-# Phase-0 floor-lock + Phase-1 session-supervisor nixosTests actually RUN here
-# (vs the eval-only `nix flake check --no-build` in nix-check.yml / nix-build-
-# matrix.yml). Each boots a real software-GL VM and runs its testScript
-# assertions — the "CI/VM gate harness" the floor-lock + supervisor tests were
-# written for (compositor/ROADMAP.md Phase 0/1).
+# ═══════════════════════════════════════════════════════════════════════════
+# RETIRED AS AN IMPLEMENTATION — this now DELEGATES to flake-checks.yml.
+# ═══════════════════════════════════════════════════════════════════════════
 #
-# MANUAL-FIRST (workflow_dispatch): the cold HART desktop closure build + the
-# 5-15-min VM run is long, and this is the FIRST CI EXECUTION of these tests
-# (until now every nix workflow used --no-build, so the testScripts had never
-# run). The first run may surface tuning needs (boot timeouts, llvmpipe perf)
-# visible only in the run log. Once it is green, add a `push: paths:` trigger on
-# nixos/tests/** + nixos/modules/hart-session-supervisor.nix so it gates changes.
+# This workflow used to carry its own HAND-WRITTEN list of check attributes
+# and build them in ONE job. That was a parallel path: flake-checks.yml's
+# `nixos-tests` job enumerates EVERY check dynamically —
+#     nix eval .#checks.x86_64-linux --apply builtins.attrNames
+# — and round-robins them across 4 shards, so nothing can drift out of the set.
+# Its own header names what it replaced: "never a hand-picked subset that
+# silently drifts out of date (the gap the old nixos-vm-tests.yml left)".
+#
+# Two implementations of "run the nixosTests" drifted exactly as you would
+# expect, and the drift was expensive:
+#
+#   * THE LIST FELL BEHIND. 31 of 53 defined checks were absent from it. The
+#     guard written to watch that gap (TestEveryNixosTestIsActuallyBuilt)
+#     measured this SUBSET and read as though it measured coverage, which
+#     pushed people toward growing the list — the exact wrong direction.
+#
+#   * GROWING IT BROKE CI. At 23 VM images in a single job the runner was LOST
+#     twice, 27 minutes in, with an EMPTY conclusion on both the build step and
+#     its `if: always()` disk report (an always() step runs on cancellation but
+#     not when the runner is gone). Disk was ruled out with numbers: 115G free
+#     of 145G, measured immediately before the build. Runs 30779764495 and
+#     30781499301.
+#
+# So there is now ONE implementation. Dispatching this runs the FULL gate —
+# every nixosTest, sharded, plus the python/cargo/compositor jobs — which is
+# strictly more than the old subset and, unlike it, actually finishes.
+#
+# The trigger stays workflow_dispatch so existing muscle memory still works.
+# flake-checks.yml also runs nightly on main (cron 03:00 UTC) and on PRs and
+# from release.yml, so main is gated whether or not anyone dispatches this.
+
 on:
   workflow_dispatch:
 
-concurrency:
-  # Push/PR runs share one group per ref and still cancel each other: on a busy
-  # branch only the newest commit is worth checking.
-  #
-  # A workflow_dispatch gets its OWN group (keyed by run id) so a MANUAL,
-  # on-demand run is never cancelled by a later push. Same fix already applied
-  # to nix-build-matrix.yml; this workflow was missed, and it is the one that
-  # produces the diagnostic output.
-  #
-  # Why it matters (2026-07-31): six attempts to get an attributed result for
-  # ❌ hart-desktop-shell-boot / hart-layer-shell-host-paint produced FIVE
-  # cancellations. Determinate Nix prints its error summary at the END of a
-  # run, so a cancelled run shows the ❌ with no cause — which is exactly why
-  # task #15 has read "red every run, NOT flake" since 07-26. Several sessions
-  # push to main; any push killed the run mid-flight. The symptom looked like
-  # a persistent failure rather than a cancellation.
-  group: nixos-vm-tests-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
-  cancel-in-progress: true
+permissions:
+  contents: read
 
 jobs:
-  vm-tests:
-    name: Floor-lock + session-supervisor (build + run VM)
-    runs-on: ubuntu-latest
-    # Cold build of the HART desktop closure (not in cache.nixos.org) + the VM
-    # run for 19 checks.
-    #
-    # MEASURED 2026-08-02 (run 30742390816): 120 minutes is NOT enough. The job
-    # emitted 266,590 build/copy lines — i.e. it was genuinely building the
-    # whole time, not stalled — and was then killed by this cap mid-build. So
-    # the nixosTests have never once RUN; the closure never finished.
-    #
-    # The 120 was justified as "mirrors e2e-os-test.yml's 100-min ISO budget
-    # with headroom", but that comparison under-budgeted: e2e already uses 160
-    # for its heavy job, and THIS job builds more (19 test closures, each a
-    # full desktop system).
-    #
-    # 330 is a diagnostic ceiling, not a target. The REAL problem is that
-    # magic-nix-cache is deliberately omitted here (CDN-throttling note below),
-    # so every run rebuilds the entire closure from scratch. Restoring a shared
-    # binary cache — or sharding across a matrix that shares one — is the
-    # structural fix; this cap only buys a first green run to prove the tests
-    # themselves pass.
-    timeout-minutes: 330
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      # Same installer + binary cache as the proven e2e-os-test.yml runner.
-      # magic-nix-cache deliberately omitted (CDN throttling note in e2e).
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v12
-        with:
-          extra-conf: |
-            experimental-features = nix-command flakes
-            substituters = https://cache.nixos.org
-            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
-            narinfo-cache-negative-ttl = 0
-            max-jobs = 2
-            cores = 2
-
-      - name: KVM availability (the nixosTest driver uses /dev/kvm when present)
-        run: ls -l /dev/kvm || echo "no /dev/kvm present — the test driver falls back to TCG (much slower, but still runs)"
-
-      # RECLAIM DISK BEFORE BUILDING — and make the disk state VISIBLE.
-      #
-      # Run 30771615694 died mid-build with NO error line, NO conclusion on the
-      # build step, and the log simply stopping. 82 minutes elapsed against a
-      # 330-minute cap, so it was not the timeout: the RUNNER was lost. There
-      # was no `df` anywhere in the workflow, so the failure had no cause
-      # attached and cost a 1h22m round trip to learn nothing.
-      #
-      # The prime suspect is disk. A GitHub-hosted ubuntu runner has ~14 GB
-      # free on /, and task #14 measured the HART desktop closure at ~22 GiB.
-      # This job also deliberately omits magic-nix-cache, so EVERY run rebuilds
-      # the whole closure into /nix on that same filesystem.
-      #
-      # The preinstalled toolchains below are ~10-15 GB and are useless to a
-      # nix build. Deleting them is the standard hosted-runner recipe — no new
-      # action dependency, nothing to trust, and `|| true` per line so a
-      # missing directory on a future runner image can never fail the job.
-      - name: Reclaim runner disk + record the starting state
-        run: |
-          echo "=== BEFORE reclaim ==="
-          df -h / /mnt 2>/dev/null || df -h
-          sudo rm -rf /usr/share/dotnet         || true
-          sudo rm -rf /usr/local/lib/android    || true
-          sudo rm -rf /opt/ghc                  || true
-          sudo rm -rf /usr/local/share/boost    || true
-          sudo rm -rf /usr/local/.ghcup         || true
-          sudo rm -rf /usr/share/swift          || true
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"   || true
-          echo "=== AFTER reclaim ==="
-          df -h / /mnt 2>/dev/null || df -h
-
-      # Build each check EXPLICITLY — NOT `nix flake check`, which evaluates the
-      # whole flake and is broken-for-months on the upstream sd-phone mobile-nixos
-      # module-option drift (see e2e-os-test.yml). Targeting
-      # checks.x86_64-linux.<name> builds + runs ONLY these two VM testScripts.
-      - name: Build + run the floor-lock + session-supervisor + GDM desktop-boot + GTK4 layer-shell nixosTests
-        working-directory: nixos
-        run: |
-          set -o pipefail
-          # --keep-going builds ALL checks even if one fails, so each test's
-          # result is visible per run — a failure in one must NOT mask or block
-          # the others (floor-lock's minimal-node assertions vs the supervisor's
-          # self-contained tier-drop vs the GDM desktop-boot's real cage-session
-          # paint vs the Phase-4 GTK4 layer-shell host). nix exits non-zero if ANY
-          # failed.
-          #
-          # hart-desktop-shell-boot is the floor-lock's DM-driven twin: it boots a
-          # node WITH GDM so sessionPackages -> sessionData materialize, autologins
-          # the cage hart-shell session, and asserts the first WebView frame paints
-          # on llvmpipe + a WebView-kill is recovered (the gates floor-lock defers).
-          #
-          # hart-layer-shell-host is the Phase-4 STRUCTURAL gate: the GTK4 +
-          # WebKitGTK-6.0 + gtk4-layer-shell host re-hosts the SAME served shell as a
-          # wlr-layer-shell BACKGROUND surface — asserts the GTK4 toolkit typelibs are
-          # in the closure + a real /shell/static fetch 200 (dead-husk-aware) + the
-          # GTK3 cage Tier-3 floor stays intact + Model-1 z-order in code.
-          #
-          # hart-layer-shell-host-paint is the Phase-4 FRESH BROKEN-GPU PAINT gate:
-          # a GDM node autologins the hart-glass-gtk4 session (sway hosting the GTK4
-          # host), the GTK4 BACKGROUND surface anchors + PAINTS a first frame on
-          # llvmpipe under NEVER-accel, the rendered brand is OCR'd off the
-          # framebuffer (un-fakeable pixels-presented proof — the GTK4 path's OWN
-          # broken-GPU floor, not an inherited GTK3 assumption), and a GTK4-host kill
-          # lands on the cage floor (still software-GL + the served shell still
-          # serves). A test that never runs guards nothing (CLAUDE.md Gate 5), so the
-          # paint node is built EXPLICITLY here alongside the structural one.
-          # ── STREAMED capacity trace (2026-08-03, run 30779764495) ──
-          # That run's job lasted 1h28m but the log STOPS DEAD at 03:05:43,
-          # ~27 minutes in, and both the build step AND the `if: always()`
-          # disk report finished with an EMPTY conclusion. An always() step
-          # still runs when a step is cancelled; it does not run when the
-          # RUNNER ITSELF is gone. So the runner was lost, and every
-          # after-the-fact probe is unreachable by construction.
-          #
-          # Disk is already ruled out with numbers, not a guess: the reclaim
-          # step above reported 115G available of 145G right before this
-          # build — the ~22 GiB closure fits several times over.
-          #
-          # Which leaves memory as the live hypothesis (this build compiles
-          # rustdesk and builds several VM images at --max-jobs 2 on a 16 GB
-          # runner). The ONLY place that evidence can survive a lost runner is
-          # the log STREAM itself, so the sampler prints to stdout as it goes
-          # rather than summarising at the end. The last [mem] line before the
-          # silence is then the measurement.
-          ( while true; do
-              printf '[mem] %s %s | load%s\n' "$(date -u +%H:%M:%S)" \
-                "$(free -m | awk '/^Mem:/{printf "used=%sMB avail=%sMB", $3, $7}')" \
-                "$(cut -d" " -f1-3 /proc/loadavg)"
-              sleep 30
-            done ) &
-          CAPACITY_SAMPLER=$!
-          trap 'kill "$CAPACITY_SAMPLER" 2>/dev/null || true' EXIT
-
-          nix build --keep-going --print-build-logs --max-jobs 2 --cores 2 \
-            ".#checks.x86_64-linux.hart-floor-lock" \
-            ".#checks.x86_64-linux.hart-firmware-boot-matrix" \
-            ".#checks.x86_64-linux.hart-boot-latency" \
-            ".#checks.x86_64-linux.hart-driver-matrix" \
-            ".#checks.x86_64-linux.hart-session-supervisor-tier-drop" \
-            ".#checks.x86_64-linux.hart-session-supervisor-paint-watchdog" \
-            ".#checks.x86_64-linux.hart-session-supervisor-paint-watchdog-keep" \
-            ".#checks.x86_64-linux.hart-session-supervisor-start-tier" \
-            ".#checks.x86_64-linux.hart-session-supervisor-reboot-latch" \
-            ".#checks.x86_64-linux.hart-session-supervisor-recovery-tty" \
-            ".#checks.x86_64-linux.hart-session-supervisor-unhealthy-flag" \
-            ".#checks.x86_64-linux.hart-session-supervisor-input-watchdog" \
-            ".#checks.x86_64-linux.hart-session-supervisor-input-watchdog-keep" \
-            ".#checks.x86_64-linux.hart-session-supervisor-input-watchdog-disabled" \
-            ".#checks.x86_64-linux.hart-desktop-shell-boot" \
-            ".#checks.x86_64-linux.hart-layer-shell-host" \
-            ".#checks.x86_64-linux.hart-layer-shell-host-paint" \
-            ".#checks.x86_64-linux.hart-boot-log" \
-            ".#checks.x86_64-linux.hart-hartlog-create" \
-            ".#checks.x86_64-linux.hart-boot-continuity" \
-            ".#checks.x86_64-linux.hart-boot-continuity-poweroff-gate" \
-            ".#checks.x86_64-linux.hart-boot-root-initrd" \
-            ".#checks.x86_64-linux.hart-edge-boot" \
-            && echo "VM gate PASSED: floor-lock + session-supervisor (tier-drop + paint-watchdog + paint-watchdog-keep + start-tier + reboot-latch + recovery-tty + unhealthy-flag single-crash drop) + GDM desktop-boot + GTK4 layer-shell structural + GTK4 layer-shell PAINT (cage paints, recovers, GTK4 host paints on llvmpipe + drops to cage) + boot infra (HARTLOG journal-capture + Live-OS HARTLOG self-create + efibootmgr boot-continuity + poweroff-never-arms-BootNext)."
-
-      # ALWAYS report the disk, pass or fail. If the runner dies mid-build this
-      # will not run — but when the build merely FAILS, this is what says
-      # whether space was the reason. Paired with the BEFORE/AFTER numbers from
-      # the reclaim step, a future death is attributable instead of silent.
-      - name: Disk state after the build (always)
-        if: always()
-        run: |
-          df -h / /mnt 2>/dev/null || df -h
-          echo "--- nix store size ---"
-          sudo du -sh /nix/store 2>/dev/null || true
+  # No concurrency group here, and none in flake-checks.yml either: a manual
+  # dispatch must not be cancelled by the nightly, nor the nightly by a
+  # dispatch. Both are answers somebody asked for. (A ref-only group is what
+  # made a week of runs unattributable — see 3f5ee290.)
+  gate:
+    name: Full gate (delegated to flake-checks.yml)
+    uses: ./.github/workflows/flake-checks.yml

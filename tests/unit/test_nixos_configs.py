@@ -1989,11 +1989,11 @@ class TestBootNixosTestsRegistered:
         assert "useEFIBoot" in content
         # It drives the poweroff via the scheduled-shutdown record + a recorder.
         assert "MODE=poweroff" in content
-        # The node must be built in the CI VM workflow (a test that never runs
-        # guards nothing — Gate 5).
-        wf = read_nix(os.path.join(REPO_ROOT, ".github", "workflows", "nixos-vm-tests.yml"))
-        assert "hart-boot-continuity-poweroff-gate" in wf, \
-            "VM workflow does not build hart-boot-continuity-poweroff-gate — it would never gate"
+        # "and it must RUN in CI" is no longer a per-check fact. The VM gate
+        # (flake-checks.yml) enumerates every check DYNAMICALLY, so DEFINING it
+        # is what makes it run. That mechanism is guarded once, by
+        # TestTheVmGateEnumeratesDynamically — asserting it here too would be
+        # three copies of one fact.
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2287,10 +2287,17 @@ class TestSessionSupervisorNixTestWiring:
         assert "HART_INPUT_ALIVE_FLAG" in self.nixtest
         assert "input-alive" in self.nixtest
 
-    def test_each_new_node_in_ci_vm_workflow(self):
-        """Every check that should RUN must be built explicitly in the VM workflow
-        (the workflow targets checks by name, not `nix flake check`)."""
-        wf = read_nix(os.path.join(REPO_ROOT, ".github", "workflows", "nixos-vm-tests.yml"))
+    def test_each_new_node_is_defined_so_the_gate_discovers_it(self):
+        """Every supervisor node must be DEFINED — which is what makes it run.
+
+        WAS: "must appear in nixos-vm-tests.yml's build list". That list is
+        gone; the workflow delegates to flake-checks.yml, whose nixos-tests job
+        enumerates checks with
+            nix eval .#checks.x86_64-linux --apply builtins.attrNames
+        and shards them. A check runs BECAUSE it is defined, so the thing worth
+        asserting here is that these nodes still exist — the enumeration
+        mechanism itself is guarded once, in TestTheVmGateEnumeratesDynamically.
+        """
         for node in [
             "hart-session-supervisor-tier-drop",
             "hart-session-supervisor-paint-watchdog",
@@ -2303,7 +2310,10 @@ class TestSessionSupervisorNixTestWiring:
             "hart-session-supervisor-input-watchdog-keep",
             "hart-session-supervisor-input-watchdog-disabled",
         ]:
-            assert node in wf, f"VM workflow does not build/run {node} — it would never gate"
+            assert node in self.nixtest, (
+                f"{node} is no longer defined in session-supervisor.nix — a "
+                f"dynamic gate runs whatever exists, so deleting the check "
+                f"deletes the verification silently")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -3346,45 +3356,65 @@ class TestEveryNixosTestIsActuallyBuilt:
         with open(self.WORKFLOW, encoding="utf-8", errors="replace") as fh:
             return set(re.findall(r'"\.#checks\.x86_64-linux\.([a-z0-9-]+)"', fh.read()))
 
-    def test_the_three_parity_matrices_are_built(self):
-        """The specific tests whose absence made four VM runs meaningless."""
-        built = self._built()
-        for name in ("hart-firmware-boot-matrix", "hart-boot-latency",
-                     "hart-driver-matrix"):
-            assert name in built, (
-                f"{name} is defined in flake.nix but nixos-vm-tests.yml does "
-                f"NOT build it — so it never runs, and a green VM run says "
-                f"nothing about it")
+    # ── THE LIST IS GONE; THESE NOW GUARD WHAT REPLACED IT ──────────────
+    # nixos-vm-tests.yml no longer carries a hand-written build list — it
+    # delegates to flake-checks.yml, whose nixos-tests job enumerates every
+    # check with `nix eval .#checks.x86_64-linux --apply builtins.attrNames`
+    # and shards it. So "defined but not built" is no longer a state that can
+    # exist, and _built()/UNBUILT_CEILING have nothing left to measure.
+    #
+    # This class's ORIGINAL MISS is still worth preventing, though. Three
+    # parity matrices were written, wired into flake.nix, dispatched to four VM
+    # runs, and could not have executed. Under dynamic enumeration the way that
+    # recurs is not "absent from a list" but "absent from the flake" — a check
+    # nix cannot see is a check that never runs, exactly as before.
 
-    def test_the_unbuilt_gap_does_not_grow(self):
-        """RATCHET: the manual-dispatch subset must not fall further behind.
+    def test_the_three_parity_matrices_are_discoverable(self):
+        """The specific tests whose absence made four VM runs meaningless.
 
-        See the CEILING comment above for what "unbuilt" does and does not
-        mean — these tests DO run under flake-checks.yml's dynamic shards;
-        what they miss is the manual nixos-vm-tests.yml dispatch.
+        Asserts they are in the flake's `checks`, which IS what makes them run
+        now — the enumeration walks that attrset.
         """
-        unbuilt = sorted(self._defined() - self._built())
-        assert len(unbuilt) <= self.UNBUILT_CEILING, (
-            f"{len(unbuilt)} nixosTests are missing from nixos-vm-tests.yml's "
-            f"hand-written list (ceiling {self.UNBUILT_CEILING}).\n"
-            f"Before adding a name: that list is a manually-dispatched SUBSET, "
-            f"not the coverage gate. flake-checks.yml enumerates every check "
-            f"dynamically and shards it 4 ways; growing this list instead is "
-            f"what put 23 VM images in one job and lost its runner "
-            f"(30779764495).\n"
-            f"missing: {unbuilt}"
-        )
+        # BOTH halves, because the name and the wiring live in different files:
+        # flake.nix imports the test FILE (./tests/driver-matrix.nix) and the
+        # CHECK NAME is set inside it (runNixOSTest { name = "hart-driver-
+        # matrix"; }). Asserting only the name against flake.nix finds nothing
+        # — which is exactly the mistake this test made on its first draft.
+        flake = read_nix(os.path.join(NIXOS_DIR, "flake.nix"))
+        for filename, check in (("firmware-boot-matrix.nix", "hart-firmware-boot-matrix"),
+                                ("boot-latency.nix", "hart-boot-latency"),
+                                ("driver-matrix.nix", "hart-driver-matrix")):
+            assert f"./tests/{filename}" in flake, (
+                f"flake.nix no longer imports tests/{filename}, so "
+                f"`nix eval .#checks.x86_64-linux` cannot enumerate it and the "
+                f"VM gate will never run it — the same silent miss this class "
+                f"was written for, one layer down")
+            path = os.path.join(TESTS_DIR, filename)
+            assert os.path.isfile(path), f"tests/{filename} is gone"
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                assert check in fh.read(), (
+                    f"tests/{filename} no longer defines the check {check!r} — "
+                    f"it would still be imported while testing nothing")
 
-    def test_every_built_check_actually_exists(self):
-        """The inverse: the workflow must not name a check that is gone.
+    def test_no_hand_written_check_list_has_come_back(self):
+        """RATCHET, inverted: the gate must keep DISCOVERING, not listing.
 
-        `nix build .#checks...<missing>` fails the whole job, so a renamed or
-        deleted test takes every OTHER test down with it.
+        The old ceiling counted how far a hand-maintained list had fallen
+        behind (31 of 53, at its worst). The durable fix was to delete the
+        list, so what needs guarding now is that nobody reintroduces one —
+        which is how the gap opened in the first place, and how the job grew
+        to 23 VM images on a single runner.
         """
-        missing = sorted(self._built() - self._defined())
-        assert not missing, (
-            f"nixos-vm-tests.yml builds {missing}, which no nixos/tests/*.nix "
-            f"defines — that fails the entire job and blocks every other test")
+        with open(self.WORKFLOW, encoding="utf-8", errors="replace") as fh:
+            wf = fh.read()
+        listed = re.findall(r'"\.#checks\.x86_64-linux\.([a-z0-9-]+)"', wf)
+        assert not listed, (
+            f"nixos-vm-tests.yml names {len(listed)} checks explicitly again "
+            f"({listed[:5]}...). That is the parallel path: a hand-written "
+            f"list silently drops whatever is not on it, and growing it is "
+            f"what lost the runner twice (30779764495, 30781499301). The "
+            f"workflow should delegate to flake-checks.yml, which enumerates "
+            f"dynamically.")
 
 
 class TestEveryTestScriptIsValidPython:
@@ -3565,3 +3595,63 @@ class TestHartOptionNamesDoNotCollideOnlyByCase:
                 f"{missing} no longer declared, so the grandfathered pair "
                 f"{pair} is stale — delete it from GRANDFATHERED in the same "
                 f"commit that renamed the option")
+
+
+class TestTheVmGateEnumeratesDynamically:
+    """The VM gate must DISCOVER checks, never carry a hand-written list.
+
+    THIS ONE CLASS REPLACES FIVE SCATTERED ASSERTIONS (2026-08-03). Five tests
+    across two files each required their own check to appear in
+    nixos-vm-tests.yml's `nix build` list — the boot-continuity poweroff gate,
+    ten session-supervisor nodes, the three parity matrices, and the GDM
+    desktop-boot check. Every one was really claiming "and therefore it RUNS in
+    CI", and every one had to be hand-edited whenever a test was added.
+
+    That list is gone. nixos-vm-tests.yml delegates to flake-checks.yml, whose
+    nixos-tests job enumerates every check with
+        nix eval .#checks.x86_64-linux --apply builtins.attrNames
+    and shards it 4 ways. A check runs because it is DEFINED, so the per-check
+    assertions had nothing left to say — and five copies of one fact is exactly
+    the duplication the standing rule forbids.
+
+    What genuinely needs guarding is that the MECHANISM stays dynamic. If a
+    list comes back, every "and therefore it runs" claim in this suite becomes
+    quietly false at once — which is how 31 of 53 checks came to be absent from
+    the old list without anyone noticing, and how the job grew to 23 VM images
+    on one runner and lost it twice (30779764495, 30781499301).
+    """
+
+    GATE = os.path.join(REPO_ROOT, ".github", "workflows", "flake-checks.yml")
+    LEGACY = os.path.join(REPO_ROOT, ".github", "workflows", "nixos-vm-tests.yml")
+
+    @staticmethod
+    def _read(path):
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+
+    def test_checks_are_enumerated_from_the_flake(self):
+        wf = self._read(self.GATE)
+        assert "builtins.attrNames" in wf and "checks.x86_64-linux" in wf, (
+            "flake-checks.yml no longer enumerates checks dynamically. Every "
+            "test in this suite that assumes 'defined => runs in CI' rests on "
+            "this; a hand-written list silently drops whatever is not on it "
+            "(31 of 53, last time it was measured).")
+
+    def test_zero_discovered_checks_is_a_hard_error(self):
+        """A gate that enumerates nothing must FAIL, not pass quietly."""
+        wf = self._read(self.GATE)
+        assert 'TOTAL" -eq 0' in wf or "TOTAL -eq 0" in wf, (
+            "the shard step no longer fails when it discovers 0 checks — an "
+            "eval hiccup would then produce a GREEN gate that ran nothing, "
+            "which is the silent-zero failure this repo keeps rediscovering")
+
+    def test_the_legacy_workflow_delegates_and_keeps_no_list(self):
+        legacy = self._read(self.LEGACY)
+        assert "flake-checks.yml" in legacy, (
+            "nixos-vm-tests.yml no longer delegates to flake-checks.yml — the "
+            "two-implementations problem is back")
+        listed = re.findall(r'"\.#checks\.x86_64-linux\.([a-z0-9-]+)"', legacy)
+        assert not listed, (
+            f"nixos-vm-tests.yml names {len(listed)} checks explicitly again "
+            f"({listed[:5]}...). That is the parallel path this delegation "
+            f"removed.")

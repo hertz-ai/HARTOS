@@ -356,13 +356,27 @@ class TestWiring:
         assert "desktopShellBoot //" in flake or "// desktopShellBoot" in flake
 
     def test_runs_in_the_vm_ci_workflow(self):
-        # The eval-only `nix flake check --no-build` never runs the testScript; the
-        # nixos-vm-tests workflow `nix build`s the check, which BOOTS the VM + runs
-        # the assertions. The GDM desktop-boot check must be in that build list.
+        # The eval-only `nix flake check --no-build` never runs the testScript;
+        # the VM gate `nix build`s the check, which BOOTS the VM and runs the
+        # assertions.
+        #
+        # WAS: "must be in nixos-vm-tests.yml's `nix build` list". That list is
+        # gone — the workflow delegates to flake-checks.yml, whose nixos-tests
+        # job enumerates checks with
+        #     nix eval .#checks.x86_64-linux --apply builtins.attrNames
+        # and shards them, so a check executes BECAUSE it is defined. The
+        # enumeration mechanism itself is guarded once, by
+        # test_nixos_configs.py::TestTheVmGateEnumeratesDynamically; here the
+        # remaining question is whether the delegation is still in place, since
+        # a hand-written list coming back would silently drop this check.
         wf = _read(VM_WORKFLOW)
-        assert "hart-desktop-shell-boot" in wf, (
-            "the GDM desktop-boot check must be in the nixos-vm-tests workflow's "
-            "`nix build` list — otherwise its testScript never executes in CI"
+        assert "flake-checks.yml" in wf, (
+            "nixos-vm-tests.yml no longer delegates to flake-checks.yml, so "
+            "hart-desktop-shell-boot's testScript may not execute in CI at all"
+        )
+        assert ".#checks.x86_64-linux." not in wf, (
+            "nixos-vm-tests.yml has grown a hand-written check list again — "
+            "whatever is not on it (this check included) stops running"
         )
 
     def test_roadmap_phase0_names_these_gates(self):
