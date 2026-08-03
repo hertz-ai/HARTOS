@@ -3721,3 +3721,80 @@ class TestNoNixInterpolationInTestScriptComments:
             "that fails the WHOLE flake, so every VM shard enumerates zero "
             "checks and goes red without running:\n  " + "\n  ".join(offenders)
             + "\nEscape it as ''${...} or reword the comment.")
+
+
+class TestNoOrphanedNixosTests:
+    """A test file the flake never imports is a test that never runs.
+
+    THE MISS (2026-08-04). Two files sat in nixos/tests/ defining real checks —
+    hart-app-install-verify and hart-llm-provision — and neither was imported
+    by flake.nix. Dynamic enumeration walks `checks`, so a test that never
+    reaches `checks` is invisible to it: `nix eval .#checks.x86_64-linux
+    --apply builtins.attrNames` cannot list what is not there.
+
+    Found by accident, which is the point. I had added a num2words assertion to
+    hart-app-install-verify.nix, recorded it in the VM verification matrix as
+    covered, and only later checked whether that file was wired in. It was not.
+    The assertion had never executed and never could have.
+
+    This is the SAME shape as "31 of 53 checks were absent from the workflow's
+    hand-written list" — but one layer down, and the layer that still matters.
+    Deleting the workflow list fixed the first; nothing was watching this one.
+
+    TWO CONDITIONS, because a file can fail either half:
+      * imported by flake.nix at all;
+      * and its binding actually reaches the `//` merge that becomes `checks`.
+    An import whose binding is never merged evaluates and then goes nowhere.
+    """
+
+    FLAKE = os.path.join(NIXOS_DIR, "flake.nix")
+
+    def _flake(self):
+        with open(self.FLAKE, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+
+    def _test_files_defining_a_check(self):
+        """Files that define a `name = "hart-..."`, i.e. a runnable check."""
+        out = set()
+        for entry in sorted(os.listdir(TESTS_DIR)):
+            if not entry.endswith(".nix") or entry == "lib.nix":
+                continue
+            with open(os.path.join(TESTS_DIR, entry), encoding="utf-8",
+                      errors="replace") as fh:
+                if re.search(r'name\s*=\s*"hart-[a-z0-9-]+"', fh.read()):
+                    out.add(entry[:-4])
+        return out
+
+    def test_there_are_test_files_to_check(self):
+        """Guard the guard: an empty scan would pass the assertions below."""
+        found = self._test_files_defining_a_check()
+        assert len(found) >= 25, (
+            f"only {len(found)} nixos/tests files define a check — the scan is "
+            f"broken, so a green result here would prove nothing")
+
+    def test_every_test_file_is_imported_by_the_flake(self):
+        imported = set(re.findall(r"import \./tests/([a-z0-9-]+)\.nix",
+                                  self._flake()))
+        orphans = sorted(self._test_files_defining_a_check() - imported)
+        assert not orphans, (
+            f"nixos/tests files defining a check that flake.nix never imports: "
+            f"{orphans}.\nDynamic enumeration walks `checks`; a test that never "
+            f"reaches `checks` is invisible to it and has NEVER run, however "
+            f"green the gate looks.")
+
+    def test_every_import_reaches_the_checks_merge(self):
+        """An imported binding that is never merged evaluates and goes nowhere."""
+        flake = self._flake()
+        chain = re.search(r"in ((?:\w+ // )+\w+);", flake)
+        assert chain, (
+            "could not find the `in a // b // ...;` merge that builds `checks` "
+            "— if its shape changed, this guard is blind and must be updated")
+        merged = set(chain.group(1).split(" // "))
+        bindings = dict(re.findall(
+            r"(\w+)\s*=\s*import \./tests/([a-z0-9-]+)\.nix", flake))
+        unmerged = sorted(f"{b} ({f}.nix)" for b, f in bindings.items()
+                          if b not in merged)
+        assert not unmerged, (
+            f"test bindings imported but never merged into `checks`: "
+            f"{unmerged}.\nThey evaluate and are then discarded, so the check "
+            f"never appears in `nix eval .#checks.x86_64-linux`.")

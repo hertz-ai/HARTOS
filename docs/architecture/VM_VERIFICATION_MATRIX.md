@@ -12,7 +12,7 @@ the whole point: a matrix nobody checks drifts into fiction within a week.
 
 | status | meaning |
 |---|---|
-| `EXISTS` | the named test is written, imported by `nixos/flake.nix`, and therefore enumerated by `flake-checks.yml`'s dynamic gate |
+| `EXISTS` | the named test is written, imported by `nixos/flake.nix`, AND merged into `checks` — all three, because a file that never reaches `checks` is invisible to the dynamic gate and has never run. Guarded by `TestNoOrphanedNixosTests`. |
 | `EXISTS-RED` | the test exists and currently FAILS — the failure is the task's next step, not a reason to distrust the row |
 | `TO WRITE` | no VM test yet; the row names what it must assert |
 | `NOT VM` | the task genuinely cannot be settled in a VM, with the reason stated |
@@ -47,7 +47,7 @@ reason; "needs physical hardware" or "needs a human to look at it" is.
 | 29 | Latency SLAs in the VM | `boot-latency.nix` (`hart-boot-latency`) — budgets PARSED from `core/constants.py` at build time | EXISTS |
 | 30 | Coverage baseline | `.github/workflows/coverage-baseline.yml` — 4 shards + combine | NOT VM — measuring python coverage does not need a booted OS |
 | 31 | Degraded-mode review | `tests/unit/test_degraded_mode_inventory.py` ratchets + `vm-tests.nix` (`hart-edge-boot` SIGKILLs each critical unit and proves it recovers, with NRestarts and a new MainPID as evidence) | EXISTS for the inventory and the unit failure paths; per-route behavioural tests continue in python |
-| 33 | num2words missing from hart-app.nix | `hart-app-install-verify.nix` — the SHIPPED python must expand "Rs.200" to words | EXISTS |
+| 33 | num2words missing from hart-app.nix | `hart-app-install-verify.nix` — the SHIPPED python must expand "Rs.200" to words | EXISTS (the file was an ORPHAN until 2026-08-04 — flake.nix never imported it, so this assertion had never run) |
 | 34 | Rename `hart.devtools` | flake eval must stay green through the rename | NOT VM — an option rename is settled by evaluation, not by booting |
 | 35 | PXE server is Ubuntu-era | a netboot node served by the hart-pxe-server-go **package** (a flake package, not a check — it has no nixosTest at all) | TO WRITE — and possibly never: the component may be deleted instead |
 | 36 | nouveau blacklist is machine-specific | `driver-matrix.nix` with an NVIDIA-class device — the display path must still bind a KMS driver | TO WRITE |

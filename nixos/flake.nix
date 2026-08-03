@@ -1013,6 +1013,23 @@
       # lets an UNCLAIMED device pass. One node, many devices: a VM job costs
       # ~2h, so per-device nodes would buy the same coverage for 6x the clock.
       driverMatrix = import ./tests/driver-matrix.nix desktopTestArgs;
+
+      # ORPHANS ADOPTED 2026-08-04. Both files existed, both defined a real
+      # check (hart-app-install-verify, hart-llm-provision), and NEITHER was
+      # imported here — so neither was ever enumerated by
+      # `nix eval .#checks.x86_64-linux --apply builtins.attrNames`, and
+      # neither had ever run. Found while verifying that the num2words
+      # assertion added to hart-app-install-verify.nix actually executes: it
+      # did not, and could not.
+      #
+      # This is the "31 of 53 never built" failure at its REAL layer. That one
+      # was about a workflow's hand-written list and is gone; this one is about
+      # the flake's own import list, which dynamic enumeration cannot rescue —
+      # enumeration walks `checks`, so a test that never reaches `checks` is
+      # invisible to it. Guarded now by
+      # tests/unit/test_nixos_configs.py::TestNoOrphanedNixosTests.
+      appInstallVerify = import ./tests/hart-app-install-verify.nix desktopTestArgs;
+      llmProvision     = import ./tests/llm-provision.nix desktopTestArgs;
       # External-USB journal export: a desktop node enables hart.journalExport +
       # attaches a spare disk the test formats vfat (the stand-in for a user's
       # SECOND FAT32 stick). It runs the REAL export script via the documented
@@ -1167,7 +1184,7 @@
       # 'screen' kill-switch is cut OR the authority is down, and ALLOWS when on.
       # Distinct attr -> clean //; desktop-variant node (mkNode).
       notify = import ./tests/notify.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // firmwareBootMatrix // bootLatency // driverMatrix // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify // hartInstaller;
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // firmwareBootMatrix // bootLatency // driverMatrix // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify // hartInstaller // appInstallVerify // llmProvision;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)
