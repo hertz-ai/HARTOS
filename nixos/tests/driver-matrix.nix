@@ -84,14 +84,28 @@ in
           The kernel symlinks each bound device under the driver's directory
           by its bus address. Anything else in there (bind/unbind/uevent
           attribute files, module symlink) is not a device, so filter to the
-          address shapes: PCI '0000:00:1f.3', USB '1-1' / '1-1.2'.
+          address shapes:
+            PCI            '0000:00:1f.3'
+            USB device     '1-1', '1-1.2'
+            USB INTERFACE  '1-1:1.0', '2-3.4:1.2'
+
+        THE INTERFACE FORM IS NOT OPTIONAL (run 30783792736, shard 3). This
+        first matched only `^\d+-[\d.]+$`, which cannot match an interface
+        address because of the COLON — and usbhid binds INTERFACES, never
+        whole devices. So the filter rejected every real entry, the list came
+        back empty, and the test reported "NO device is bound to 'usbhid'" on
+        a VM where USB HID was working perfectly (its sibling
+        input-seat-pointer.nix, same qemu options, sees both devices through
+        libinput and passes). The docstring gave the bug away: it described
+        the DEVICE shapes while the assertion targeted an INTERFACE driver.
           """
           out = drv.succeed(
               f"ls -1 /sys/bus/{bus}/drivers/{driver}/ 2>/dev/null || true"
           )
           return [
               e for e in (l.strip() for l in out.splitlines())
-              if re.match(r"^[0-9a-f]{4}:[0-9a-f]{2}:", e) or re.match(r"^\d+-[\d.]+$", e)
+              if re.match(r"^[0-9a-f]{4}:[0-9a-f]{2}:", e)
+              or re.match(r"^\d+-[\d.]+(:\d+\.\d+)?$", e)
           ]
 
       def assert_bound(bus, driver, what):
@@ -102,6 +116,18 @@ in
               f"The device was attached to the VM, so this is the "
               f"unclaimed-hardware case /api/shell/drivers reports — the "
               f"kernel saw it and could not drive it.\n"
+              # Dump BOTH sides. The drivers list alone said "usbhid exists"
+              # and left the real question — what is actually enumerated, and
+              # under what address shape — to be reasoned out offline. The raw
+              # driver dir is what distinguishes "nothing attached" from
+              # "attached but my filter rejected the name".
+              f"--- /sys/bus/{bus}/drivers/{driver}/ (raw) ---\n"
+              + drv.succeed(
+                  f"ls -1 /sys/bus/{bus}/drivers/{driver}/ 2>/dev/null || true")
+              + f"--- /sys/bus/{bus}/devices/ ---\n"
+              + drv.succeed(
+                  f"ls -1 /sys/bus/{bus}/devices/ 2>/dev/null | head -40 || true")
+              + f"--- drivers on the {bus} bus ---\n"
               + drv.succeed(f"ls -1 /sys/bus/{bus}/drivers/ 2>/dev/null | head -40 || true")
           )
 
