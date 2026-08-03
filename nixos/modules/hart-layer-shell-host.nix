@@ -243,13 +243,13 @@ let
     XDG_DATA_DIRS="$_HART_PORTAL_DATA_DIRS''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}" \
       ${pkgs.xdg-desktop-portal}/libexec/xdg-desktop-portal >/dev/null 2>&1 &
     for i in $(seq 1 30); do
-      if ${pkgs.curl}/bin/curl -sf "$URL/health" >/dev/null 2>&1; then break; fi
+      if ${pkgs.curl}/bin/curl -sf --connect-timeout 2 --max-time 5 "$URL/health" >/dev/null 2>&1; then break; fi
       sleep 1
     done
-    if ! ${pkgs.curl}/bin/curl -sf "$URL/health" >/dev/null 2>&1; then
+    if ! ${pkgs.curl}/bin/curl -sf --connect-timeout 2 --max-time 5 "$URL/health" >/dev/null 2>&1; then
       # LiquidUI down — fall back to the Nunba SPA so the surface is never blank
       # (the SAME dead-husk-avoidance the cage floor uses).
-      if ${pkgs.curl}/bin/curl -sf "http://localhost:${nunbaPort}/" >/dev/null 2>&1; then
+      if ${pkgs.curl}/bin/curl -sf --connect-timeout 2 --max-time 5 "http://localhost:${nunbaPort}/" >/dev/null 2>&1; then
         URL="http://localhost:${nunbaPort}"
       fi
     fi

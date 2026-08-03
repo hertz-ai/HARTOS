@@ -95,13 +95,24 @@ let
   glassShell = pkgs.writeShellScriptBin "hart-glass-shell" ''
     set -euo pipefail
     URL="http://localhost:${toString ui.port}"
+    # --max-time IS LOAD-BEARING (task #8, item 2.2). `curl -sf` has NO total
+    # timeout: a backend that ACCEPTS the TCP connection and then never answers
+    # — the half-up case, which is exactly what a still-initialising Flask app
+    # looks like — blocks this forever, and with it the whole boot wait. The
+    # retry loop below never gets a second iteration, so "wait up to 30s" was
+    # really "wait forever" on the one failure it exists to survive.
+    #
+    # 5s is generous for a LOCAL /health. If the loop exhausts, the fall-back
+    # below picks the Nunba SPA rather than hanging — and a premature fallback
+    # to a working surface beats a shell that never appears, which is the whole
+    # never-blank principle this script is built on.
     for i in $(seq 1 30); do
-      if ${pkgs.curl}/bin/curl -sf "$URL/health" >/dev/null 2>&1; then break; fi
+      if ${pkgs.curl}/bin/curl -sf --connect-timeout 2 --max-time 5 "$URL/health" >/dev/null 2>&1; then break; fi
       sleep 1
     done
-    if ! ${pkgs.curl}/bin/curl -sf "$URL/health" >/dev/null 2>&1; then
+    if ! ${pkgs.curl}/bin/curl -sf --connect-timeout 2 --max-time 5 "$URL/health" >/dev/null 2>&1; then
       # LiquidUI down — fall back to the Nunba SPA so the shell is never blank.
-      if ${pkgs.curl}/bin/curl -sf "http://localhost:${nunbaPort}/" >/dev/null 2>&1; then
+      if ${pkgs.curl}/bin/curl -sf --connect-timeout 2 --max-time 5 "http://localhost:${nunbaPort}/" >/dev/null 2>&1; then
         URL="http://localhost:${nunbaPort}"
       fi
     fi
@@ -546,7 +557,7 @@ in
             echo "[HART OS LiquidUI] A2UI: ${if ui.enableA2UI then "enabled" else "disabled"}"
 
             # Check if Model Bus is available (LiquidUI degrades gracefully without it)
-            if curl -sf "http://localhost:${toString (config.hart.modelBus.ports.http or 6790)}/v1/status" >/dev/null 2>&1; then
+            if curl -sf --connect-timeout 2 --max-time 5 "http://localhost:${toString (config.hart.modelBus.ports.http or 6790)}/v1/status" >/dev/null 2>&1; then
               echo "[HART OS LiquidUI] Model Bus: connected — generative UI active"
             else
               echo "[HART OS LiquidUI] Model Bus: not available — falling back to static UI"
@@ -706,7 +717,7 @@ in
             echo "[HART OS Voice] Listener active"
 
             # Check if STT model is available via Model Bus
-            STT_AVAILABLE=$(curl -sf "$MODEL_BUS/v1/models" 2>/dev/null | \
+            STT_AVAILABLE=$(curl -sf --connect-timeout 2 --max-time 5 "$MODEL_BUS/v1/models" 2>/dev/null | \
               ${pkgs.jq}/bin/jq -r '.models[]? | select(.type == "stt") | .id' || echo "")
 
             if [[ -z "$STT_AVAILABLE" ]]; then
