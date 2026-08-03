@@ -129,8 +129,41 @@ in
           # the old `systemctl cat greetd.service` grep failed against a
           # CORRECT config on every run (run 30485906966). Assert the config
           # greetd actually consumes.
-          greetd_cmd = sup.succeed(
-              "cat /etc/greetd/config.toml 2>/dev/null || cat /etc/greetd/greetd.toml")
+          # RESOLVE the config path off the unit — do not guess /etc/greetd.
+          #
+          # On NixOS `services.greetd.settings` renders the config into the
+          # STORE and passes it to greetd as `--config /nix/store/...`. There
+          # is no /etc/greetd/config.toml and no /etc/greetd/greetd.toml, so
+          # both cats failed and the subtest reported a config problem when
+          # the config was correct (run 30774512407).
+          #
+          # The comment above this block records the previous swing: the check
+          # used to grep `systemctl cat greetd.service` and was moved to
+          # /etc/greetd because the COMMAND is not in the unit. Both are half
+          # right — the command is not IN the unit, but the path to the file
+          # containing it IS. So: read the path from the unit, then read the
+          # file. That is the only place NixOS actually puts it.
+          _unit = sup.succeed("systemctl cat greetd.service 2>/dev/null || true")
+          _cfg = sup.succeed(
+              "systemctl cat greetd.service 2>/dev/null "
+              "| grep -oE '\-\-config[= ][^ ]+' | head -1 "
+              "| sed -E 's/^--config[= ]//' || true"
+          ).strip()
+          if not _cfg:
+              # Fall back to the /etc locations before failing, so a distro
+              # layout that DOES use them still works.
+              _cfg = sup.succeed(
+                  "for f in /etc/greetd/config.toml /etc/greetd/greetd.toml; do "
+                  "  [ -f \"$f\" ] && echo \"$f\" && break; done || true"
+              ).strip()
+          assert _cfg, (
+              "could not locate greetd's config: it is not referenced by "
+              "--config on greetd.service and not at either /etc/greetd path.
+"
+              "--- greetd.service ---
+" + _unit)
+          sup.log(f"greetd config resolved to: {_cfg}")
+          greetd_cmd = sup.succeed(f"cat {_cfg}")
           assert "LIBSEAT_BACKEND=logind" in greetd_cmd, \
               "greetd session must force the logind libseat backend (canonical greetd-on-systemd)"
           assert "LIBSEAT_BACKEND=seatd" not in greetd_cmd, \
