@@ -10568,9 +10568,26 @@ def status():
         result['hevolve_core_healthy'] = health.get('healthy', False)
         result['learning_active'] = health.get('learning_active', False)
         result['learning_mode'] = health.get('mode', 'unknown')
-    except Exception:
+    except Exception as exc:
+        # WHY THIS LOGS NOW (task #3d): when health is False the single fact a
+        # reader needs is WHY, and this handler was throwing it away. The
+        # failure it swallows is not hypothetical — VM run 30758875130 shows
+        # the learning pipeline failing to import (hevolveai rl_ef ->
+        # "RuntimeError: Explicitly using 'asyncio' already"), and from the
+        # outside that was indistinguishable from a healthy node that simply
+        # is not learning yet.
+        app.logger.warning(
+            "status: hevolve bridge health check failed (%s: %s) — reporting "
+            "core unhealthy + learning inactive",
+            type(exc).__name__, exc, exc_info=True)
         result['hevolve_core_healthy'] = False
         result['learning_active'] = False
+        # Keep the response SHAPE stable. The success path always sets
+        # learning_mode; omitting it here made the degraded response quietly
+        # missing a key, and hart_cli's `status` command prints whatever keys
+        # it finds — so the field simply vanished exactly when it mattered.
+        result['learning_mode'] = 'unknown'
+        result['hevolve_core_error'] = f"{type(exc).__name__}: {exc}"
 
     return jsonify(result)
 
