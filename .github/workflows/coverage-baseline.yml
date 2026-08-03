@@ -138,14 +138,24 @@ jobs:
           # a collection abort that measured nothing, and the first sharded run
           # duly reported SUCCESS for a shard that produced no data at all.
           # "Measured nothing" is a failure, exactly like "discovered 0 files".
+          # WHERE coverage ACTUALLY WROTE (run 30840295949). This step first
+          # looked for ./.coverage.* — the DEFAULT location — and found nothing
+          # even on a shard that ran 3951 tests, because .coveragerc:24 sets
+          #     data_file = test-reports/coverage/.coverage
+          # Asking coverage itself keeps .coveragerc the single source of truth
+          # instead of pasting that path into the workflow as a second copy
+          # that would silently rot if the config moved.
+          COV_DIR="$(python -c 'import coverage,os; d=os.path.dirname(coverage.Coverage().config.data_file); print(d or ".")')"
+          echo "coverage data dir (from .coveragerc): $COV_DIR"
+          echo "COV_DIR=$COV_DIR" >> "$GITHUB_ENV"
           echo "=== data files produced ==="
-          if ! ls .coverage.* >/dev/null 2>&1; then
+          if ! ls "$COV_DIR"/.coverage.* >/dev/null 2>&1; then
             echo "::error::shard ${{ matrix.shard }} produced NO coverage data."
             echo "::error::pytest ran but wrote nothing — look for a collection"
             echo "::error::abort or an interpreter crash in the tail above."
             exit 1
           fi
-          ls -la .coverage.*
+          ls -la "$COV_DIR"/.coverage.*
 
       - name: Upload this shard's coverage data
         if: always()
@@ -153,7 +163,9 @@ jobs:
         with:
           # v4 requires a unique artifact name per job.
           name: coverage-data-${{ matrix.shard }}
-          path: .coverage.*
+          # $COV_DIR is exported to GITHUB_ENV by the step above, so the upload
+          # path follows .coveragerc rather than restating it.
+          path: ${{ env.COV_DIR }}/.coverage.*
           include-hidden-files: true    # .coverage.* is dotfile-prefixed
           if-no-files-found: warn
 
@@ -187,11 +199,18 @@ jobs:
       - name: Combine + report
         run: |
           echo "=== shard data files recovered ==="
-          ls -la .coverage.* 2>/dev/null || echo "NONE"
+          # download-artifact with merge-multiple flattens every shard's files
+          # into the CWD, so they land beside coverage's CONFIGURED data_file
+          # dir rather than inside it. Move them where `coverage combine` will
+          # look, which is the path .coveragerc names.
+          COV_DIR="$(python -c 'import coverage,os; d=os.path.dirname(coverage.Coverage().config.data_file); print(d or ".")')"
+          mkdir -p "$COV_DIR"
+          mv .coverage.* "$COV_DIR"/ 2>/dev/null || true
+          ls -la "$COV_DIR"/.coverage.* 2>/dev/null || echo "NONE"
           # How many shards actually contributed. Printed because a number
           # computed from two shards is NOT the repo baseline, and nothing
           # else in this output would say so.
-          echo "shards reporting: $(ls .coverage.* 2>/dev/null | wc -l) data file(s)"
+          echo "shards reporting: $(ls "$COV_DIR"/.coverage.* 2>/dev/null | wc -l) data file(s)"
           coverage combine || true
           echo "=== PER-FILE (lowest 30 first) ==="
           coverage report --sort=cover | head -35 || true
