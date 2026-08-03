@@ -71,6 +71,25 @@ let
     # quietly-broken feature that hides without this.
     psutil
 
+    # Spoken-form number expansion for TTS (task #33). NOT optional polish:
+    # tts_text_normalizer's whole reason for existing is that diffusion-token
+    # engines (OmniVoice, F5, CosyVoice, Indic-Parler) cannot pronounce
+    # "Rs.200" or "12.5%" — they skip them or emit garbage. Without num2words
+    # `_num_to_words()` returns None, so the normalizer expands the SYMBOL but
+    # leaves the DIGITS, and the shipped OS says "200 rupees" with the number
+    # handed to the engine raw.
+    #
+    # It was pinned in requirements.txt (`num2words>=0.5.13`) and simply never
+    # mirrored here, so the dev box and the OS disagreed silently — the two
+    # canonical RulePassTest cases in tests/unit/test_tts_text_normalizer.py
+    # have been red for exactly this reason.
+    #
+    # Second cost, less obvious: with digits left in, `_has_residual_tokens()`
+    # is true on essentially every numeric utterance, so the LLM fallback fires
+    # and pays a ~2s local-model round trip per reply to do work this package
+    # does offline in under a millisecond.
+    num2words
+
     # Utilities
     python-dateutil
     pyyaml

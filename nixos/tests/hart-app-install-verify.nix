@@ -195,6 +195,30 @@ in
               "'import integrations.agent_engine.app_installer as m; "
               "print(m.InstallerPlatform.NIX.value)'")
 
+      with subtest("the SHIPPED python can actually speak a number (task #33)"):
+          # Asserts the OUTCOME, not the presence of a package. `import
+          # num2words` succeeding would prove the dependency landed; it would
+          # not prove the normalizer USES it, and the normalizer degrades
+          # SILENTLY when it cannot (_num_to_words returns None and the digits
+          # are simply left in). So drive the real rule pass and read the words.
+          #
+          # This exact gap shipped: num2words was pinned in requirements.txt
+          # and never mirrored into hart-app.nix, so the dev box expanded
+          # numbers and the OS did not — and the only symptom was the assistant
+          # pronouncing "Rs.200" as "200 rupees" with the digits handed raw to
+          # an engine that cannot say them.
+          out = host.succeed(
+              "PYTHONPATH=${hartApp} ${pyEnv}/bin/python3 -c "
+              "'from integrations.channels.media.tts_text_normalizer import "
+              "rule_normalize; print(rule_normalize(\"The fare is Rs.200\", \"en\"))'")
+          assert "two hundred" in out, (
+              f"the shipped python did not expand 200 to words: {out.strip()!r}\n"
+              f"num2words is missing from nixos/packages/hart-app.nix, or the "
+              f"normalizer stopped using it — either way the OS speaks digits "
+              f"at a TTS engine that cannot pronounce them.")
+          assert "rupees" in out, (
+              f"currency symbol not expanded either: {out.strip()!r}")
+
       with subtest("Every platform handler reaches its positive confirmation step"):
           out = host.succeed(
               "PYTHONPATH=${hartApp} ${pyEnv}/bin/python3 ${driver}")
