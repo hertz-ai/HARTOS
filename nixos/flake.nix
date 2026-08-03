@@ -1006,6 +1006,13 @@
       # The budgets are PARSED from core/constants.py at build time, never
       # re-typed, so this cannot drift from the python suites.
       bootLatency = import ./tests/boot-latency.nix desktopTestArgs;
+      # DRIVER MATRIX (#27): attaches a device from each class QEMU can present
+      # without a backing file (xhci, USB HID, intel-hda, e1000, virtio blk +
+      # balloon) and asserts the kernel actually BOUND a driver, read from
+      # sysfs. lsmod would only prove a module loaded — the weaker claim that
+      # lets an UNCLAIMED device pass. One node, many devices: a VM job costs
+      # ~2h, so per-device nodes would buy the same coverage for 6x the clock.
+      driverMatrix = import ./tests/driver-matrix.nix desktopTestArgs;
       # External-USB journal export: a desktop node enables hart.journalExport +
       # attaches a spare disk the test formats vfat (the stand-in for a user's
       # SECOND FAT32 stick). It runs the REAL export script via the documented
@@ -1160,7 +1167,7 @@
       # 'screen' kill-switch is cut OR the authority is down, and ALLOWS when on.
       # Distinct attr -> clean //; desktop-variant node (mkNode).
       notify = import ./tests/notify.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // firmwareBootMatrix // bootLatency // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify // hartInstaller;
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // firmwareBootMatrix // bootLatency // driverMatrix // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify // hartInstaller;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)

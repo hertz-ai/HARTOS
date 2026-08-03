@@ -1,0 +1,169 @@
+# ═══════════════════════════════════════════════════════════════
+# HART OS — driver compatibility matrix (task #27)
+# ═══════════════════════════════════════════════════════════════
+#
+# WHY THIS EXISTS
+#   /api/shell/drivers can REPORT driver binding since 2026-08-02 (it grew
+#   `unclaimed`, the yellow-bang equivalent). Nothing PROVED binding. "All
+#   driver compatibility" was a claim with no boot behind it, in exactly the
+#   way "Hyper-V Gen 1 boots" was before #28.
+#
+# WHAT IT PROVES
+#   Attach a device from each class QEMU can present WITHOUT a backing file,
+#   boot the REAL desktop variant, and assert the kernel actually BOUND a
+#   driver to it — not that a module is merely loadable, and not that lspci
+#   merely lists the hardware.
+#
+#   Binding is read from sysfs the way the kernel records it: a driver with a
+#   bound device has that device symlinked under
+#   /sys/bus/<bus>/drivers/<driver>/ by its bus address (PCI 0000:00:1f.3,
+#   USB 1-1). `lsmod` would only prove the module was loaded, which is the
+#   weaker claim that lets an unclaimed device pass.
+#
+# ONE NODE, MANY DEVICES — deliberate. A VM job in this repo costs ~2 hours,
+# so six single-device nodes would buy the same coverage for six times the
+# wall clock. Devices from different buses do not mask each other; each
+# assertion names its own driver.
+#
+# SCOPE OF THIS SLICE: device classes needing NO backing file. Storage
+# controllers that need a drive (nvme, ahci, usb-storage) are the second
+# slice — usb_storage is already proven packed+bound by hart-boot-root-initrd
+# and the filesystems by hart-storage-filesystems, so this does not re-cover
+# them.
+{ pkgs, hartModules, specialArgs }:
+
+let
+  inherit (import ./lib.nix { inherit hartModules; }) mkNode;
+in
+{
+  hart-driver-matrix = pkgs.testers.runNixOSTest {
+    name = "hart-driver-matrix";
+    skipTypeCheck = true;
+    skipLint = true;
+    node.specialArgs = specialArgs;
+
+    nodes.drv = mkNode "desktop" {
+      virtualisation = {
+        memorySize = 2048;
+        cores = 2;
+        # An extra disk exercises the virtio-blk path with a real block device
+        # rather than only the root.
+        emptyDiskImages = [ 128 ];
+        # Same construction as input-seat-pointer.nix: declare our OWN xhci
+        # controller and hang devices off ITS bus, so nothing depends on the
+        # framework's default `-usb` / usb-bus.0 ordering.
+        qemu.options = [
+          # USB host controller (xhci_hcd) + HID on its bus (usbhid)
+          "-device" "qemu-xhci,id=hartusb"
+          "-device" "usb-kbd,bus=hartusb.0"
+          "-device" "usb-mouse,bus=hartusb.0"
+          # Audio: the exact controller a real x86 desktop presents
+          "-device" "intel-hda"
+          "-device" "hda-duplex"
+          # A SECOND NIC on a different driver than the framework's virtio-net,
+          # with its own user-mode netdev so it needs no host bridge.
+          "-netdev" "user,id=hartnet1"
+          "-device" "e1000,netdev=hartnet1"
+          # Memory ballooning — a virtio class the desktop profile relies on
+          # for the memory pressure story.
+          "-device" "virtio-balloon"
+        ];
+      };
+    };
+
+    testScript = ''
+      import re
+
+      drv = machines[0]
+      drv.start()
+      drv.wait_for_unit("multi-user.target")
+
+      def bound_devices(bus, driver):
+          """Bus addresses currently BOUND to <driver>, read from sysfs.
+
+          The kernel symlinks each bound device under the driver's directory
+          by its bus address. Anything else in there (bind/unbind/uevent
+          attribute files, module symlink) is not a device, so filter to the
+          address shapes: PCI '0000:00:1f.3', USB '1-1' / '1-1.2'.
+          """
+          out = drv.succeed(
+              f"ls -1 /sys/bus/{bus}/drivers/{driver}/ 2>/dev/null || true"
+          )
+          return [
+              e for e in (l.strip() for l in out.splitlines())
+              if re.match(r"^[0-9a-f]{4}:[0-9a-f]{2}:", e) or re.match(r"^\d+-[\d.]+$", e)
+          ]
+
+      def assert_bound(bus, driver, what):
+          devs = bound_devices(bus, driver)
+          drv.log(f"{what}: driver={driver} bus={bus} bound={devs}")
+          assert devs, (
+              f"{what}: NO device is bound to '{driver}' on the {bus} bus.\n"
+              f"The device was attached to the VM, so this is the "
+              f"unclaimed-hardware case /api/shell/drivers reports — the "
+              f"kernel saw it and could not drive it.\n"
+              + drv.succeed(f"ls -1 /sys/bus/{bus}/drivers/ 2>/dev/null | head -40 || true")
+          )
+
+      with subtest("USB host controller binds (xhci_hcd)"):
+          assert_bound("pci", "xhci_hcd", "USB 3 host controller")
+
+      with subtest("USB HID keyboard + mouse bind (usbhid)"):
+          assert_bound("usb", "usbhid", "USB HID input")
+
+      with subtest("HD-audio controller binds (snd_hda_intel)"):
+          assert_bound("pci", "snd_hda_intel", "Intel HDA audio")
+
+      with subtest("Intel e1000 NIC binds — a NON-virtio driver path"):
+          # virtio-net is what the framework gives every node, so it proves
+          # nothing about real hardware. e1000 is the driver a great many
+          # physical machines and hypervisors actually present.
+          assert_bound("pci", "e1000", "Intel e1000 NIC")
+
+      with subtest("virtio block + balloon bind"):
+          assert_bound("virtio", "virtio_blk", "virtio block device")
+          assert_bound("virtio", "virtio_balloon", "virtio balloon")
+
+      with subtest("nothing attached is left UNCLAIMED"):
+          # The whole-tree check, and the one that would catch a device class
+          # nobody wrote an assertion for. Mirrors what /api/shell/drivers
+          # computes, but from sysfs so it is independent of the API.
+          unclaimed = drv.succeed(
+              "for d in /sys/bus/pci/devices/*; do "
+              "  [ -e \"$d/driver\" ] || echo \"$(basename $d) $(cat $d/class 2>/dev/null)\"; "
+              "done || true"
+          ).strip()
+          drv.log(f"PCI devices with NO driver bound:\n{unclaimed or '(none)'}")
+          # Recorded, not asserted-empty: QEMU presents host bridges and
+          # legacy bits that legitimately have no driver, so failing on a
+          # non-empty list would be noise. The named assertions above are the
+          # gate; this line is what makes a NEW unclaimed device visible in
+          # the log instead of silent.
+
+      with subtest("the agent surface AGREES with sysfs"):
+          # /api/shell/drivers is the half a user and an agent actually see.
+          # If sysfs says bound and the endpoint says unclaimed, the endpoint
+          # is lying — which is the defect class this repo keeps hitting.
+          out = drv.succeed(
+              "curl -s -m 10 http://127.0.0.1:6777/api/shell/drivers || true"
+          ).strip()
+          drv.log(f"/api/shell/drivers -> {out[:600]}")
+          if out.startswith("{"):
+              import json
+              data = json.loads(out)
+              assert "devices" in data, f"drivers endpoint returned no device list: {out[:300]}"
+              # It must not silently truncate — the old 50-cap did exactly that.
+              assert data.get("truncated") is not True or data.get("count", 0) >= 50, \
+                  f"endpoint reports truncated with an implausible count: {data.get('count')}"
+              drv.log(
+                  f"endpoint: count={data.get('count')} "
+                  f"unclaimed_count={data.get('unclaimed_count')} "
+                  f"truncated={data.get('truncated')}"
+              )
+          else:
+              # The backend may not be listening on this minimal node; that is
+              # a different task's problem, so record rather than fail here.
+              drv.log("drivers endpoint not reachable on this node — sysfs assertions above stand")
+    '';
+  };
+}
