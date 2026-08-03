@@ -62,7 +62,29 @@
 # backend runs, never a second copy.  Backend calls also go over :6777.  "One HARTOS."
 
 let
-  python = pkgs.python310;
+  # python310 -> python311 (2026-08-04, task #4). The 3.10 pin carried no
+  # stated reason, and it made this package UNEVALUABLE the moment anything
+  # turned it on:
+  #
+  #     error: hypercorn-0.16.0 not supported for interpreter python3.10
+  #
+  # (closure-audit run 30785511463, pricing `hart.nunba.enable`). It never
+  # surfaced because profiles/desktop.nix leaves nunba.enable = false, so the
+  # branch was never evaluated — the failure was waiting for the first person
+  # to flip it, which is exactly what task #4 step 1 does.
+  #
+  # 3.11 is the right target rather than merely the one that evaluates:
+  # HARTOS's own test env is 3.11 (CLAUDE.md), hypercorn is the DOCUMENTED
+  # primary ASGI server (waitress is only the ImportError fallback), and every
+  # package in pythonEnv below is mainstream and 3.11-supported. Dropping
+  # hypercorn instead would have been a shipped-BEHAVIOUR change dressed up as
+  # a packaging fix.
+  #
+  # hart-app.nix stays on python310 deliberately: it does NOT include hypercorn,
+  # so it is not blocked, and bumping it is an unrelated change with its own
+  # risk. The daemon reaching HARTOS over PYTHONPATH is unaffected — that tree
+  # is pure python, and a 3.11 interpreter reading it is fine.
+  python = pkgs.python311;
 
   nunbaSrc = pkgs.fetchFromGitHub {
     owner = "hertz-ai";
@@ -155,7 +177,7 @@ let
     systemd
     # NOTE (CI dominoes to resolve on first build): pydantic in the 24.11 pin is the
     # 1.10 series — Nunba pins pydantic 2.x; if a v2-only import crashes, bump the pin
-    # or add python310Packages.pydantic2. autobahn/crossbarhttp3 (WAMP) are LAZY —
+    # or add python311Packages.pydantic2. autobahn/crossbarhttp3 (WAMP) are LAZY —
     # main.py only imports them inside _wamp_is_needed()/publish helpers, and OS mode
     # is SSE-primary, so they are NOT boot-critical (left out on purpose).
   ]);
