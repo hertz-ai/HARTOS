@@ -189,9 +189,49 @@ in
       # floor-lock can only prove the launcher is in the *closure* (no DM to
       # register it); with GDM here, sessionData puts the .desktop on the runtime
       # search path. This is the real "the floor IS the session" proof.
-      session_desktop = "/run/current-system/sw/share/wayland-sessions/hart-shell.desktop"
+      # The path is RESOLVED, not assumed. This assertion hard-coded
+      # /run/current-system/sw/share/... — the environment.systemPackages
+      # path — but the session is registered through
+      # `services.displayManager.sessionPackages` (hart-liquid-ui.nix:635),
+      # which feeds displayManager **sessionData**, a separate store path.
+      # The subtest name says "sessionData materialized"; the assertion was
+      # checking somewhere else, and the failure ("test -f ... failed") named
+      # only the path it guessed, never what actually exists (run 30774512407).
+      #
+      # So: look in every place a wayland session can legitimately land, and
+      # if it is in none of them, SHOW the directories rather than asserting a
+      # path. A registration test that cannot say where it looked sends the
+      # reader hunting for a missing file that is simply elsewhere.
+      session_desktop = shell.succeed(
+          "for d in /run/current-system/sw/share/wayland-sessions "
+          "         /etc/X11/sessions "
+          "         /run/current-system/sw/share/xsessions; do "
+          "  [ -f \"$d/hart-shell.desktop\" ] && echo \"$d/hart-shell.desktop\" && exit 0; "
+          "done; "
+          # sessionData is a store path referenced by the DM unit; find it.
+          "ls -d /nix/store/*-desktops/share/wayland-sessions/hart-shell.desktop "
+          "  2>/dev/null | head -1"
+      ).strip()
       with subtest("GDM registered the cage 'hart-shell' wayland-session (sessionData materialized)"):
-          shell.succeed(f"test -f {session_desktop}")
+          if not session_desktop:
+              dirs = shell.succeed(
+                  "echo '--- sw/share/wayland-sessions ---'; "
+                  "ls -la /run/current-system/sw/share/wayland-sessions 2>&1 | head -20; "
+                  "echo '--- any *-desktops store paths ---'; "
+                  "ls -d /nix/store/*-desktops 2>/dev/null | head -5; "
+                  "echo '--- sessionPackages referenced by the DM unit ---'; "
+                  "systemctl cat display-manager.service 2>/dev/null | grep -i session | head -10 || true"
+              )
+              raise AssertionError(
+                  "hart-shell.desktop is registered NOWHERE a wayland session "
+                  "can be found. hart-liquid-ui.nix:635 sets "
+                  "services.displayManager.sessionPackages = [ kioskSession ] "
+                  "under `mkIf (ui.renderer == \"webkit\")`, and the desktop "
+                  "profile sets renderer = \"webkit\", so it SHOULD be "
+                  "registered.
+" + dirs
+              )
+          shell.log(f"hart-shell session registered at: {session_desktop}")
           entry = shell.succeed(f"cat {session_desktop}")
           # The registered session must point at the cage launcher (the floor),
           # not some other compositor — the session IS the cage floor.
