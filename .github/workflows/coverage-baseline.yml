@@ -1,0 +1,112 @@
+name: Coverage Baseline
+
+# WHY THIS EXISTS (task #30)
+#   "100% test coverage" cannot be pursued while the CURRENT number is
+#   unknown, so the first deliverable is a MEASURED number — not a target.
+#
+#   Three attempts to measure it on the dev box failed, and the third proved
+#   the method was wrong rather than unlucky:
+#     * tests/unit collects 15,538 TESTS; collection ALONE takes 240s
+#     * the full sweep died at ~3% twice, at the same point, under two
+#       different timeouts (1700s / 2400s) — so not a timeout
+#     * an 80-file shard reached only 27% in 560s
+#   Repo-wide coverage on that box is a multi-hour job with one point of
+#   failure and ZERO partial value: a kill at 99% yields the same nothing as
+#   a kill at 3%. CI has the time budget; a laptop shared with cx_Freeze
+#   builds does not. So it belongs here.
+#
+# MANUAL-FIRST, like nixos-vm-tests.yml: this is a long job and the first
+# runs exist to establish a number, not to gate anything. Once the baseline
+# is checked in, add the regression gate — a DROP fails, not "less than
+# 100%", because a gate nobody can pass gets disabled and then nothing is
+# measured at all.
+on:
+  workflow_dispatch:
+
+concurrency:
+  # A workflow_dispatch gets its OWN group (keyed by run id) so a manual,
+  # on-demand measurement is never cancelled by a later push. Same fix as
+  # 3f5ee290 applied to nix-check/nixos-vm-tests, where ref-only grouping
+  # made a week of runs unattributable.
+  group: coverage-baseline-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Measure repo-wide coverage
+    runs-on: ubuntu-latest
+    # 15.5k tests plus a 4-minute collection. Generous on purpose: the whole
+    # point is a run that FINISHES, and a cap that kills it reproduces the
+    # exact failure this job exists to escape.
+    timeout-minutes: 180
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Same setup as nix-check.yml's structural-test job — reused, not
+      # reinvented. tests/conftest.py pulls the project's runtime deps, so
+      # pytest cannot even collect without them.
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install pytest + coverage + project deps
+        run: |
+          pip install -r requirements.txt
+          pip install pytest coverage
+
+      - name: Run the suite under coverage
+        # -p writes a separate data file so a future SHARDED variant can
+        # `coverage combine` without changing this step's shape.
+        #
+        # The three exclusions are an ENV gap, not product defects: hevolveai
+        # is a closed-source Cython .pyd that is absent here exactly as it is
+        # on the dev box, and those three files fail at COLLECTION on its
+        # stub. A fourth blocker (test_site_pages) was a REAL defect and was
+        # FIXED in 804547c6 rather than excluded.
+        #
+        # `|| true`: a FAILING test must not abort the MEASUREMENT. This job
+        # answers "how much is covered", and the suite's pass/fail is gated
+        # elsewhere. Without this a single red test yields no number at all —
+        # which is the state task #30 has been stuck in.
+        run: |
+          set -o pipefail
+          coverage run -p -m pytest tests/unit/ -q \
+            --noconftest -p no:cacheprovider \
+            --ignore=tests/unit/test_simplemem_zep_parity.py \
+            --ignore=tests/unit/test_user_context.py \
+            --ignore=tests/unit/test_world_model_bridge.py \
+            2>&1 | tail -40 || true
+
+      - name: Combine + report
+        if: always()
+        run: |
+          coverage combine || true
+          echo "=== PER-FILE (lowest 30 first) ==="
+          coverage report --sort=cover | head -35 || true
+          echo "=== TOTAL ==="
+          coverage report | tail -3 || true
+          # Machine-readable, so the baseline can be checked in from the run
+          # rather than transcribed by hand.
+          coverage json -o coverage.json || true
+          python - <<'PY'
+          import json
+          try:
+              d = json.load(open('coverage.json'))
+              t = d['totals']
+              print(f"COVERAGE_PERCENT={t['percent_covered']:.2f}")
+              print(f"COVERAGE_STATEMENTS={t['num_statements']}")
+              print(f"COVERAGE_MISSING={t['missing_lines']}")
+          except Exception as e:
+              print("could not read coverage.json:", e)
+          PY
+
+      - name: Upload coverage data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-baseline
+          path: |
+            coverage.json
+          if-no-files-found: warn
