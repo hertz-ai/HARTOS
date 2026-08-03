@@ -144,8 +144,20 @@ jobs:
             done ) > /tmp/memsample.log 2>&1 &
           SAMPLER=$!
 
-          echo "Evaluating all nixosConfigurations, packages, and apps..."
-          nix flake check --no-build 2>&1
+          # WHY A timeout WRAPPER (2026-08-03, run 30781405882): the step died
+          # again, and this time the cap was NOT the cause — the job ran
+          # 14m48s against a 45-minute limit, and NO push landed in the window
+          # (checked: nothing between 72e18952 at 03:16 and f89ab63d at 03:36),
+          # so it was neither the job timeout nor concurrency. The log simply
+          # STOPS after `evaluating 'checks.x86_64-linux.hart-portal-
+          # screencast'` and says nothing for 12m13s before "The operation was
+          # canceled". Twelve minutes of total silence is a stall, and the
+          # absence of a 137 argues against a clean OOM kill; a runner
+          # thrashing itself unresponsive fits both facts.
+          #
+          # An explicit timeout turns that into a self-naming 124 instead of a
+          # mystery cancellation, and — crucially — lets the lines BELOW run.
+          timeout --signal=TERM --kill-after=60 1500 nix flake check --no-build 2>&1
           RC=$?
 
           kill "$SAMPLER" 2>/dev/null || true
@@ -160,10 +172,35 @@ jobs:
           case "$RC" in
             0)   echo "All flake outputs evaluate successfully." ;;
             137) echo "::error::eval SIGKILLed (137) — OOM killer. Confirms the memory hypothesis; split the check or raise the runner." ;;
+            124) echo "::error::eval hit OUR 25-minute wrapper (124) — it stalled rather than failed. The memory table above is now the evidence; a flat curve exonerates memory and points at the Nix daemon." ;;
             143) echo "::error::eval SIGTERMed (143) — NOT the job cap and NOT concurrency. If memory above looks healthy, suspect the Nix daemon or the installer post-hook." ;;
             *)   echo "::error::eval failed rc=$RC — a real evaluation failure; the summary above names the outputs." ;;
           esac
           exit "$RC"
+
+      # The sampler above only ever printed when `nix flake check` RETURNED.
+      # Run 30781405882 was CANCELLED mid-eval, so the kill, the sort and the
+      # whole ::group:: never ran and every sample it had faithfully collected
+      # for 12 minutes was thrown away at the moment it finally mattered.
+      # A diagnostic that dies with the thing it is diagnosing is not a
+      # diagnostic. This step runs on cancellation too.
+      - name: Memory + OOM evidence (survives cancellation)
+        if: always()
+        run: |
+          echo "::group::Memory samples (chronological — watch the trend, not the peak)"
+          tail -60 /tmp/memsample.log 2>/dev/null || echo "no samples: the step died before the sampler wrote"
+          echo "::endgroup::"
+          echo "::group::Peak sample"
+          sort -t= -k2 -n /tmp/memsample.log 2>/dev/null | tail -3 || true
+          echo "::endgroup::"
+          echo "::group::Kernel OOM verdict"
+          # The one fact that separates "thrashed itself unresponsive" from
+          # "something else killed it". dmesg needs no root on hosted runners.
+          (dmesg -T 2>/dev/null || sudo dmesg -T 2>/dev/null || true) \
+            | grep -iE "out of memory|oom-kill|killed process" | tail -20 \
+            || echo "no OOM lines in dmesg — memory did NOT kill it"
+          echo "::endgroup::"
+          free -m; df -h /
 
       - name: Show flake metadata
         working-directory: nixos
