@@ -45,6 +45,27 @@ on:
   workflow_call:
   # Manual full run (e.g. to validate a tricky branch before opening a PR).
   workflow_dispatch:
+  # NIGHTLY ON MAIN — because nothing else gates main (2026-08-03).
+  #
+  # This workflow runs on pull_request, workflow_call (from release.yml) and
+  # manual dispatch. HART OS is developed DIRECTLY ON MAIN with no PRs
+  # (CLAUDE.md: "Work directly on `main` in the main clone. Every session."),
+  # so in practice the comprehensive VM gate fired only at release time — it
+  # had run TWICE, both on PRs, most recently 2026-07-23. Between releases,
+  # main was ungated.
+  #
+  # Deliberately a SCHEDULE and not a push trigger. A push trigger with
+  # cancel-in-progress would be cancelled by the next push, and this repo sees
+  # many pushes an hour against a ~1.5h suite — the gate would almost never
+  # reach a verdict, which is worse than no gate because the red/green would
+  # depend on typing speed. (That failure is not theoretical; several sessions
+  # of "red every run" turned out to be cancellations.) A nightly always
+  # finishes and always names a commit.
+  #
+  # No concurrency group on purpose: a manual dispatch must not be killed by
+  # the nightly, nor the nightly by a dispatch — both are wanted answers.
+  schedule:
+    - cron: '0 3 * * *'   # 03:00 UTC daily
   # Standalone PR gate. Path-scoped to the trees these heavy checks validate so a
   # docs-only PR doesn't boot 30+ VMs. The release push always runs the full set
   # via the workflow_call above.
