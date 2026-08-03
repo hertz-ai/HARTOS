@@ -212,6 +212,30 @@ in
           "ls -d /nix/store/*-desktops/share/wayland-sessions/hart-shell.desktop "
           "  2>/dev/null | head -1"
       ).strip()
+      with subtest("offline voice floor: the box can SPEAK with no network (task #7)"):
+          # A nixosTest node has NO outbound network, which is exactly the
+          # fresh-box case: the Model Bus has no model and nothing can be
+          # downloaded. Before 0cd59eb1 there was no speech synthesizer in the
+          # closure AT ALL — espeak-ng existed only in hart-accessibility.nix
+          # behind screenReader.enable (default false, set by no profile) — so
+          # the narrated onboarding and the orb were simply SILENT on first
+          # boot, which is the one moment the OS is supposed to introduce
+          # itself by talking.
+          #
+          # ASSERT THE OUTCOME, NOT THE PACKAGE. `command -v espeak-ng` would
+          # prove the dependency landed; it would not prove the box can
+          # actually produce audio. So synthesise to a WAV and check the file
+          # has real content — the same reasoning as the num2words assertion
+          # in hart-app-install-verify.nix, where a silently-degrading
+          # component made presence and function two different questions.
+          shell.succeed("command -v espeak-ng")
+          size = int(shell.succeed(
+              "espeak-ng --stdout 'hart o s is ready' > /tmp/hart-voice.wav; "
+              "stat -c %s /tmp/hart-voice.wav").strip())
+          assert size > 1000, (
+              f"espeak-ng produced only {size} bytes of audio — it is present "
+              f"but cannot synthesise, so a no-network box is still mute")
+
       with subtest("GDM registered the cage 'hart-shell' wayland-session (sessionData materialized)"):
           if not session_desktop:
               dirs = shell.succeed(

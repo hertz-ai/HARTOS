@@ -28,7 +28,7 @@ reason; "needs physical hardware" or "needs a human to look at it" is.
 |---|---|---|---|
 | 3 | Shell hang + false-healthy signals | `session-supervisor.nix` (`hart-session-supervisor-unhealthy-flag`, `-paint-watchdog`, `-tier-drop`) + `display-tiers-neverblack.nix` | EXISTS — but the three assertions the task actually needs (a request driven THROUGH `/status`; `learning_active` false when the pipeline import failed; mic on the cage floor) are still TO WRITE |
 | 4 | Onboarding onto Nunba LightYourHART | `desktop-boot.nix` — first-run surface reached with `hart.nunba.enable` on | TO WRITE — and BLOCKED: enabling nunba does not evaluate (`hypercorn-0.16.0 not supported for interpreter python3.10`, run 30785511463) |
-| 7 | Honest first-run / offline UI | `hart-app-install-verify.nix` (shipped python speaks a number — landed) + an offline-voice assertion (`espeak-ng` present with no network) | EXISTS for the num2words half; TO WRITE for the espeak half |
+| 7 | Honest first-run / offline UI | `hart-app-install-verify.nix` (shipped python speaks a number) + `desktop-boot.nix` (espeak-ng SYNTHESISES a WAV with no network) | EXISTS |
 | 8 | Event-driven shell | `desktop-boot.nix` boot-to-paint; the bounded-`curl` fix needs a node where the backend accepts TCP and never answers | TO WRITE |
 | 9 | Shell ↔ Nunba drift | `layer-shell-host.nix` paint + a theme round-trip across both surfaces | TO WRITE |
 | 10 | Backend forks (TTS / draft-LLM / constants) | `hart-app-install-verify.nix` for the shipped-python half; the ENGINE fork needs a listening test | NOT VM for the voice-identity half — a human must hear which engine spoke |
@@ -40,7 +40,7 @@ reason; "needs physical hardware" or "needs a human to look at it" is.
 | 17 | Hardware-agnostic installer | `hart-installer.nix` (`hart-installer-dualboot`) | EXISTS |
 | 21 | Installed-desktop parity | `desktop-boot.nix` + `hart-app-install-verify.nix` — the installed system must carry what the image carries | EXISTS |
 | 23 | Flake eval dies mid-evaluation | `nix-check.yml`'s memory sampler + dmesg OOM verdict | NOT VM — this is a CI-runner failure, not an OS one. Instrumented; the curve is now captured (1.5 GB -> 8.9 GB in 60 s) |
-| 24 | RTC/clock jumps backwards | a node whose guest clock is stepped backwards, asserting the shell and backend recover | TO WRITE — the `core/circuit_breaker.py` half is unit-proven, the OS half is not |
+| 24 | RTC/clock jumps backwards | `vm-tests.nix` (`hart-edge-boot`) — steps the guest clock back by the exact 19800s and asserts the OS answers, multi-user stays active, and hart-backend/hart-discovery neither die nor restart | EXISTS |
 | 25 | Package every common OS feature | `native-subsystems.nix`, `power-actions.nix`, `storage-filesystems.nix`, `network-wifi.nix`, `notify.nix`, `portal-screencast.nix` | EXISTS — the surface is broad; the gap is which features are still unrepresented |
 | 27 | Driver compatibility matrix | `driver-matrix.nix` (`hart-driver-matrix`) | EXISTS-RED |
 | 28 | BIOS/firmware boot matrix | `firmware-boot-matrix.nix` (`hart-firmware-boot-matrix`) | EXISTS |
@@ -57,7 +57,7 @@ reason; "needs physical hardware" or "needs a human to look at it" is.
 
 ## What this matrix is honest about
 
-**Nine rows are `TO WRITE`.** That is the real state of "100% VM verification":
+**Seven rows are `TO WRITE`** (was nine; #7 and #24 landed). That is the real state of "100% VM verification":
 the parity program's own matrices exist and run, and the older feature tasks
 mostly do not have a VM assertion yet. Writing those nine is the remaining work
 of the goal, and naming them is what makes it finite rather than a feeling.

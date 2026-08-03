@@ -452,6 +452,53 @@ in
           # disabled. The hard gates above (OOM, restart-loop, peak >=
           # MemoryMax) are the unambiguous crash-loop signals task #19 names.
 
+      with subtest("a BACKWARDS clock step does not wedge the OS (task #24)"):
+          # THE REAL INCIDENT: on a Windows dual-boot node the RTC holds LOCAL
+          # time while NixOS reads it as UTC, so the box ran +5:30 wrong until
+          # wifi came up — then NTP yanked the wall clock BACKWARDS by 19800s,
+          # immediately before the desktop hung. hart-installer.nix:117 fixes
+          # the CAUSE where hart-install runs, by writing
+          # time.hardwareClockInLocalTime when a Windows bootloader is present.
+          #
+          # This asserts the OTHER half: that the RUNNING system survives a
+          # step regardless. The installer fix cannot help a live-USB boot on
+          # the same hardware, a dead CMOS battery, a VM restored from a
+          # snapshot, or a first NTP sync after a long power-off.
+          #
+          # 19800 seconds EXACTLY — the IST offset that actually happened, not
+          # a round number chosen for the test.
+          edge.succeed("timedatectl set-ntp false 2>/dev/null || true")
+          before = int(edge.succeed("date +%s").strip())
+          edge.succeed(f"date -s '@{before - 19800}'")
+          after = int(edge.succeed("date +%s").strip())
+          assert after < before, (
+              f"the clock did NOT move backwards ({before} -> {after}); this "
+              f"subtest would then prove nothing about surviving a step")
+
+          # The OS must still answer. Bounded, because "wedged" is precisely
+          # the failure being tested and an unbounded command would hang the
+          # whole run instead of failing it.
+          edge.succeed("timeout 30 systemctl is-system-running --wait || true")
+          edge.succeed("timeout 10 echo still-alive")
+          edge.require_unit_state("multi-user.target", "active")
+
+          # The two capped hart services must still be up, and must NOT have
+          # been restarted by the step — a restart here is the crash-loop the
+          # task is really about.
+          for unit in ("hart-backend.service", "hart-discovery.service"):
+              state = edge.succeed(f"systemctl is-active {unit}").strip()
+              assert state == "active", (
+                  f"{unit} is {state!r} after a -5h30m clock step — the "
+                  f"backwards jump took it down, which is the wedge task #24 "
+                  f"was opened for")
+              restarts = edge.succeed(
+                  f"systemctl show -p NRestarts --value {unit}").strip()
+              assert restarts in ("", "0"), (
+                  f"{unit} restarted {restarts} time(s) across the clock step; "
+                  f"something in it is doing `deadline - now` on the WALL "
+                  f"clock (core/circuit_breaker.py was one such place, fixed "
+                  f"906ee781 — find the next one)")
+
       with subtest("CLI tool available"):
           edge.succeed("which hart || which hart-cli")
     '';
