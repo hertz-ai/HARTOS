@@ -167,6 +167,7 @@ jobs:
             ".#checks.x86_64-linux.hart-boot-continuity" \
             ".#checks.x86_64-linux.hart-boot-continuity-poweroff-gate" \
             ".#checks.x86_64-linux.hart-boot-root-initrd" \
+            ".#checks.x86_64-linux.hart-edge-boot" \
             && echo "VM gate PASSED: floor-lock + session-supervisor (tier-drop + paint-watchdog + paint-watchdog-keep + start-tier + reboot-latch + recovery-tty + unhealthy-flag single-crash drop) + GDM desktop-boot + GTK4 layer-shell structural + GTK4 layer-shell PAINT (cage paints, recovers, GTK4 host paints on llvmpipe + drops to cage) + boot infra (HARTLOG journal-capture + Live-OS HARTLOG self-create + efibootmgr boot-continuity + poweroff-never-arms-BootNext)."
 
       # ALWAYS report the disk, pass or fail. If the runner dies mid-build this

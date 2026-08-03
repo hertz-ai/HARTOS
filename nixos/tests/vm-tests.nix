@@ -339,6 +339,119 @@ in
           used_mb = int(used_line.split()[2])
           assert used_mb < 768, f"Edge using {used_mb}MB (expected < 768MB)"
 
+      with subtest("capped HART units stay inside their own cgroup caps"):
+          # TASK #19. "Backend service starts" above does NOT cover this:
+          # wait_for_unit returns the moment the unit goes active, while
+          # MemoryHigh only THROTTLES (reclaim, no failure) and a MemoryMax
+          # OOM-kill is then papered over by Restart=on-failure — the unit is
+          # active again a few seconds later and the test never notices. A
+          # crash-loop and a healthy service look identical through that lens.
+          #
+          # The caps are real: hart-discovery ships MemoryMax=48M on edge,
+          # hart-backend 640M (raised from 384M in 2026-07-28 after the
+          # backend's import floor was measured at 275 MB — that fix was
+          # applied to ONE unit and never checked against the others).
+          #
+          # DISCOVERED, not hardcoded: a capped unit added tomorrow is covered
+          # the day it lands, not the day someone remembers this list.
+          units = edge.succeed(
+              "systemctl list-units --type=service --all --no-legend --plain "
+              "'hart-*' | awk '{print $1}'").split()
+          assert units, (
+              "no hart-*.service units found on the edge node — the probe is "
+              "broken, so a green result here would prove nothing")
+
+          def _num(v):
+              v = v.strip()
+              if v in ("", "[not set]", "infinity"):
+                  return None
+              try:
+                  n = int(v)
+              except ValueError:
+                  return None
+              # systemd renders "unset" as UINT64_MAX for some properties.
+              return None if n >= 2**63 else n
+
+          rows, hard, unmeasured = [], [], []
+          for u in units:
+              raw = edge.succeed(
+                  f"systemctl show {u} -p LoadState,ActiveState,Result,"
+                  f"NRestarts,MemoryMax,MemoryHigh,MemoryPeak,ControlGroup")
+              p = dict(l.split("=", 1) for l in raw.splitlines() if "=" in l)
+              if p.get("LoadState") != "loaded":
+                  continue
+              mmax, mhigh = _num(p.get("MemoryMax", "")), _num(p.get("MemoryHigh", ""))
+              if mmax is None and mhigh is None:
+                  continue                      # genuinely uncapped — nothing to check
+              peak = _num(p.get("MemoryPeak", ""))
+              if peak is None:
+                  # systemd < 253 has no MemoryPeak; read the cgroup directly
+                  # rather than skip. A skipped measurement that stays quiet is
+                  # how a cap check turns into a no-op.
+                  cg = p.get("ControlGroup", "").strip()
+                  if cg:
+                      rc, out = edge.execute(
+                          f"cat /sys/fs/cgroup{cg}/memory.peak 2>/dev/null")
+                      peak = _num(out) if rc == 0 else None
+              restarts = _num(p.get("NRestarts", "")) or 0
+              result = p.get("Result", "").strip()
+              act = p.get("ActiveState", "").strip()
+              rows.append((u, peak, mhigh, mmax, restarts, result, act))
+
+              # A peak only exists while the cgroup does. Oneshots that have
+              # already exited (hart-sandbox-firstboot and friends) legitimately
+              # have none — demanding one there would paint this red for a unit
+              # that did its job and left. Their OOM/restart signals below are
+              # still checked, which is what actually matters for #19.
+              if act != "active":
+                  pass
+              elif peak is None:
+                  unmeasured.append(u)
+              elif mmax is not None and peak >= mmax:
+                  hard.append(f"{u}: peak {peak} >= MemoryMax {mmax} (OOM-kill territory)")
+              if result == "oom-kill":
+                  hard.append(f"{u}: Result=oom-kill — the cap killed it")
+              if restarts > 0:
+                  hard.append(f"{u}: NRestarts={restarts} — it is restart-looping")
+
+          # ALWAYS print the table, pass or fail. The 2026-07-28 cap raise was
+          # sized from a DEV-BOX import measurement; these are the first real
+          # numbers from the shipped python env, and the next tightening should
+          # be led by them rather than by another estimate.
+          print("── edge cgroup caps: measured peak vs cap ──")
+          for u, peak, mhigh, mmax, restarts, result, act in rows:
+              def _mb(v):
+                  return "  n/a" if v is None else f"{v / 1048576:5.1f}M"
+              head = "" if (mhigh is None or peak is None or peak < mhigh) \
+                  else "  <-- OVER MemoryHigh (throttled: reclaim on every alloc)"
+              print(f"   {u:32s} peak={_mb(peak)} high={_mb(mhigh)} "
+                    f"max={_mb(mmax)} restarts={restarts} {act}/{result}{head}")
+
+          assert not unmeasured, (
+              f"could not measure peak memory for RUNNING unit(s) {unmeasured} "
+              f"— neither MemoryPeak nor the cgroup memory.peak was readable, "
+              f"so this check would silently pass while measuring nothing")
+          # The two units the subtests above waited for must be among the ones
+          # actually measured. Without this, a future rename makes the loop
+          # find nothing to measure and the whole check passes vacuously.
+          measured = {u for u, peak, *_ in rows if peak is not None}
+          for required in ("hart-backend.service", "hart-discovery.service"):
+              assert required in measured, (
+                  f"{required} carries a cgroup cap and is running, but no "
+                  f"peak was measured for it — this check is not covering the "
+                  f"unit task #19 is actually about")
+          assert not hard, (
+              "capped HART unit(s) exceeded their own cgroup limits on edge:\n  "
+              + "\n  ".join(hard))
+          # NOTE ON SCOPE: exceeding MemoryHigh is reported above but is NOT
+          # yet a hard failure. MemoryHigh throttles rather than kills, and no
+          # real number for the nix python env exists yet — the 275 MB figure
+          # in hart-backend.nix was measured on a dev box whose venv carries
+          # torch/transformers, which hart-app.nix does NOT ship. Promoting it
+          # to a gate on an unmeasured guess is how a gate nobody can pass gets
+          # disabled. The hard gates above (OOM, restart-loop, peak >=
+          # MemoryMax) are the unambiguous crash-loop signals task #19 names.
+
       with subtest("CLI tool available"):
           edge.succeed("which hart || which hart-cli")
     '';

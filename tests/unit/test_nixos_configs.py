@@ -3285,7 +3285,11 @@ class TestEveryNixosTestIsActuallyBuilt:
     #:       runNixOSTest` alike. This found two further real checks.
     #: A guard that miscounts is worse than none: the 29-version would have
     #: sent someone deleting working tests from the workflow.
-    UNBUILT_CEILING = 31
+    # 31 -> 30 on 2026-08-03: hart-edge-boot joined the built list, because the
+    # edge cgroup-cap check (task #19) was about to be written INTO a test that
+    # CI never builds. Lowered in the same commit that built it, per this
+    # class's own rule — a ceiling that only ever rises is not a ratchet.
+    UNBUILT_CEILING = 30
 
     def _defined(self):
         names = set()
