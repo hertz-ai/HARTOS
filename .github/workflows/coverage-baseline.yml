@@ -15,6 +15,21 @@ name: Coverage Baseline
 #   a kill at 3%. CI has the time budget; a laptop shared with cx_Freeze
 #   builds does not. So it belongs here.
 #
+# WHY IT IS NOW SHARDED (2026-08-03, after the FOURTH failure)
+#   Moving to CI did not fix it. Run 30778027342 ran the single job past its
+#   own 180-minute cap without producing a number — the same shape as the dev
+#   box, just with a bigger budget. One job measuring 15.5k tests keeps the
+#   property that made this task fail four times: no partial value.
+#
+#   Sharding gives it partial value. Four runners each measure a quarter of
+#   the test FILES, write `coverage run -p` data files, and a combine job
+#   merges them. If one shard dies the other three still produce data and the
+#   report says how many contributed, instead of the run yielding nothing.
+#   Same reasoning as flake-checks.yml's 4 nixosTest shards — and the
+#   ORIGINAL step already wrote `-p` data files "so a future SHARDED variant
+#   can `coverage combine` without changing this step's shape". This is that
+#   variant.
+#
 # MANUAL-FIRST, like nixos-vm-tests.yml: this is a long job and the first
 # runs exist to establish a number, not to gate anything. Once the baseline
 # is checked in, add the regression gate — a DROP fails, not "less than
@@ -31,14 +46,21 @@ concurrency:
   group: coverage-baseline-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
   cancel-in-progress: true
 
+env:
+  SHARD_TOTAL: 4
+
 jobs:
-  coverage:
-    name: Measure repo-wide coverage
+  measure:
+    name: Coverage shard ${{ matrix.shard }}/4
     runs-on: ubuntu-latest
-    # 15.5k tests plus a 4-minute collection. Generous on purpose: the whole
-    # point is a run that FINISHES, and a cap that kills it reproduces the
-    # exact failure this job exists to escape.
-    timeout-minutes: 180
+    # A quarter of the work, but still generous: the point is a run that
+    # FINISHES, and a cap that kills it reproduces the exact failure this job
+    # exists to escape.
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false      # one dead shard must not delete the other three
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -56,9 +78,9 @@ jobs:
           pip install -r requirements.txt
           pip install pytest coverage
 
-      - name: Run the suite under coverage
-        # -p writes a separate data file so a future SHARDED variant can
-        # `coverage combine` without changing this step's shape.
+      - name: Run this shard under coverage
+        # -p writes a separate data file per process, which is what lets the
+        # combine job below merge four runners' results.
         #
         # The three exclusions are an ENV gap, not product defects: hevolveai
         # is a closed-source Cython .pyd that is absent here exactly as it is
@@ -68,20 +90,89 @@ jobs:
         #
         # `|| true`: a FAILING test must not abort the MEASUREMENT. This job
         # answers "how much is covered", and the suite's pass/fail is gated
-        # elsewhere. Without this a single red test yields no number at all —
-        # which is the state task #30 has been stuck in.
+        # elsewhere (flake-checks.yml). Without this a single red test yields
+        # no number at all — which is the state task #30 has been stuck in.
         run: |
           set -o pipefail
-          coverage run -p -m pytest tests/unit/ -q \
+          # Deterministic file sharding: sorted, then round-robin, so shard
+          # membership is stable across runs and a missing quarter is
+          # identifiable rather than arbitrary.
+          mapfile -t ALL < <(find tests/unit -name 'test_*.py' | sort)
+          TOTAL=${#ALL[@]}
+          echo "discovered $TOTAL test files"
+          if [[ "$TOTAL" -eq 0 ]]; then
+            echo "::error::found 0 test files — discovery is broken, and a green"
+            echo "::error::shard here would report coverage of nothing"
+            exit 1
+          fi
+          SKIP='tests/unit/test_simplemem_zep_parity.py tests/unit/test_user_context.py tests/unit/test_world_model_bridge.py'
+          SEL=()
+          for i in "${!ALL[@]}"; do
+            if (( i % SHARD_TOTAL == ${{ matrix.shard }} )); then
+              case " $SKIP " in
+                *" ${ALL[$i]} "*)
+                  echo "  skipping ${ALL[$i]} (hevolveai stub: fails at COLLECTION)"
+                  continue ;;
+              esac
+              SEL+=( "${ALL[$i]}" )
+            fi
+          done
+          echo "shard ${{ matrix.shard }} measures ${#SEL[@]} files"
+          if [[ "${#SEL[@]}" -eq 0 ]]; then
+            echo "nothing in this shard — writing no data file."
+            exit 0
+          fi
+          coverage run -p -m pytest "${SEL[@]}" -q \
             --noconftest -p no:cacheprovider \
-            --ignore=tests/unit/test_simplemem_zep_parity.py \
-            --ignore=tests/unit/test_user_context.py \
-            --ignore=tests/unit/test_world_model_bridge.py \
-            2>&1 | tail -40 || true
+            2>&1 | tail -30 || true
+          echo "=== data files produced ==="
+          ls -la .coverage.* 2>/dev/null || echo "NONE — this shard measured nothing"
+
+      - name: Upload this shard's coverage data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # v4 requires a unique artifact name per job.
+          name: coverage-data-${{ matrix.shard }}
+          path: .coverage.*
+          include-hidden-files: true    # .coverage.* is dotfile-prefixed
+          if-no-files-found: warn
+
+  combine:
+    name: Combine shards + report the baseline
+    runs-on: ubuntu-latest
+    needs: measure
+    # ALWAYS: three shards' data is a real, partial answer and the report says
+    # how many contributed. Requiring all four would reproduce the
+    # all-or-nothing failure this rewrite exists to remove.
+    if: always()
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install coverage
+        run: pip install coverage
+
+      - name: Download every shard's data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-data-*
+          merge-multiple: true
 
       - name: Combine + report
-        if: always()
         run: |
+          echo "=== shard data files recovered ==="
+          ls -la .coverage.* 2>/dev/null || echo "NONE"
+          # How many shards actually contributed. Printed because a number
+          # computed from two shards is NOT the repo baseline, and nothing
+          # else in this output would say so.
+          echo "shards reporting: $(ls .coverage.* 2>/dev/null | wc -l) data file(s)"
           coverage combine || true
           echo "=== PER-FILE (lowest 30 first) ==="
           coverage report --sort=cover | head -35 || true
@@ -102,7 +193,7 @@ jobs:
               print("could not read coverage.json:", e)
           PY
 
-      - name: Upload coverage data
+      - name: Upload the combined baseline
         if: always()
         uses: actions/upload-artifact@v4
         with:
