@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from core.circuit_breaker import (
     CircuitBreaker, CircuitState, CircuitBreakerOpenError, with_circuit_breaker,
+    PeerBackoff,
 )
 
 
@@ -201,3 +202,99 @@ class TestCircuitBreakerThreadSafety:
 
         assert cb.state == CircuitState.OPEN
         assert cb.get_stats()['failures'] == 10
+
+
+# ═══════════════════════════════════════════════════════════════
+# Clock steps (task #24)
+# ═══════════════════════════════════════════════════════════════
+# THE REAL INCIDENT: on a Windows dual-boot node the RTC holds LOCAL time while
+# NixOS reads it as UTC, so the box ran +5:30 wrong until wifi came up — then
+# NTP yanked the wall clock BACKWARDS by 19800s, immediately before the desktop
+# hung. hart-installer.nix:117 fixes the CAUSE where hart-install runs; it does
+# not make the runtime survive a step, and steps have other causes (live-USB on
+# the same hardware, dead CMOS battery, VM restored from snapshot, first NTP
+# sync after a long power-off).
+#
+# WHAT BROKE: `_get_state` computed `elapsed = time.time() - self._opened_at`.
+# After -19800s, elapsed is about -19800, so `elapsed > cooldown` is False and
+# the breaker reports OPEN — and keeps reporting OPEN until the wall clock
+# climbs back. A 60-second cooldown became a 5.5-HOUR outage of whatever it
+# guards. PeerBackoff had the same bug from the other side: it stores
+# `time.time() + delay` as a deadline.
+#
+# Both are pure elapsed-time arithmetic, never displayed and never persisted
+# (get_stats does not expose them), so time.monotonic() is correct here and not
+# merely safer.
+
+#: The steward's actual offset: IST is UTC+5:30.
+IST_STEP = 5.5 * 3600
+
+
+class _FakeClock:
+    """A monotonic-looking clock the test can advance."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+class TestBackwardsClockStep:
+
+    @staticmethod
+    def _trip(breaker):
+        for _ in range(breaker.threshold):
+            breaker.record_failure()
+
+    def test_breaker_leaves_open_after_cooldown(self, monkeypatch):
+        """Cooldown is measured on a clock that cannot be stepped backwards."""
+        clock = _FakeClock()
+        monkeypatch.setattr('core.circuit_breaker.time.monotonic', clock)
+        cb = CircuitBreaker(name='t', threshold=2, cooldown=60.0)
+        self._trip(cb)
+        assert cb.state == CircuitState.OPEN
+        clock.t += 61
+        assert cb.state == CircuitState.HALF_OPEN,             "breaker did not leave OPEN after its cooldown"
+
+    def test_wall_clock_would_have_stranded_it(self):
+        """Demonstrates the ORIGINAL bug so the fix is not taken on faith."""
+        opened_at, cooldown = 1_000_000.0, 60.0
+        elapsed = (opened_at + 5 - IST_STEP) - opened_at
+        assert elapsed < 0, "precondition: the step makes elapsed negative"
+        assert not elapsed > cooldown,             "the old wall-clock check reported OPEN — this is the bug"
+        assert IST_STEP > cooldown * 300      # and stays wrong for hours
+
+    def test_backoff_deadline_expires_normally(self, monkeypatch):
+        clock = _FakeClock()
+        monkeypatch.setattr('core.circuit_breaker.time.monotonic', clock)
+        bo = PeerBackoff(initial=1.0, maximum=30.0)
+        bo.record_failure('peer-a')
+        assert bo.is_backed_off('peer-a')
+        clock.t += 2
+        assert not bo.is_backed_off('peer-a'),             "key still backed off after its delay elapsed"
+
+    def test_backoff_prune_shares_the_deadline_clock(self, monkeypatch):
+        """A prune on a different clock than the deadline would never expire."""
+        clock = _FakeClock()
+        monkeypatch.setattr('core.circuit_breaker.time.monotonic', clock)
+        bo = PeerBackoff(initial=1.0, maximum=30.0)
+        bo.record_failure('peer-b')
+        clock.t += 5
+        bo.prune_expired()
+        assert not bo.is_backed_off('peer-b')
+
+    def test_source_guard_module_uses_no_wall_clock(self):
+        """Labelled source check: the bug is an ABSENCE, across the whole file.
+
+        Paired with the behavioural tests above, per feedback_no_grep_tests —
+        no single behavioural test can prove a call does not exist anywhere.
+        """
+        import inspect
+        import core.circuit_breaker as mod
+        offenders = [ln.strip() for ln in inspect.getsource(mod).splitlines()
+                     if 'time.time()' in ln and not ln.strip().startswith('#')]
+        assert offenders == [], (
+            f"wall-clock time is back in circuit_breaker.py: {offenders}. An "
+            f"NTP step (or a misread RTC on a dual-boot box) makes elapsed "
+            f"negative and strands the breaker for the whole offset.")
