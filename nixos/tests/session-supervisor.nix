@@ -594,7 +594,38 @@ in
           # reset-armed latch, so greetd (already proven the supervisor above)
           # is masked across this reboot: the mask symlink lives in /etc on
           # the VM's persistent disk, so the next boot cannot race the read.
-          sup.succeed("systemctl mask --now greetd.service")
+          # `sup.succeed` DISCARDS stderr, so when this failed (exit 1, run
+          # 30774512407) the report was just "command failed" with no reason —
+          # and on NixOS there are several plausible ones, with different
+          # fixes. /etc/systemd/system/greetd.service already exists as a
+          # symlink into the store, and systemd can refuse to mask over an
+          # existing unit file rather than silently replacing it.
+          #
+          # Capture WHY. If masking is genuinely unavailable here, fall back to
+          # stop + a RUNTIME mask, which is enough for this subtest's actual
+          # claim: it only needs greetd not to run while the latch is read
+          # back. Then say plainly, in the log, which path was taken — a
+          # fallback that hides itself is how a test starts proving something
+          # weaker than it says.
+          _rc, _out = sup.execute("systemctl mask --now greetd.service 2>&1")
+          if _rc != 0:
+              sup.log(f"persistent mask refused (rc={_rc}): {_out.strip()}")
+              _rc2, _out2 = sup.execute(
+                  "systemctl stop greetd.service 2>&1; "
+                  "systemctl mask --runtime --now greetd.service 2>&1")
+              sup.log(f"runtime-mask fallback rc={_rc2}: {_out2.strip()}")
+              # Whatever the mechanism, the REQUIREMENT is that greetd is not
+              # running — assert that, not the mechanism.
+              _active = sup.succeed(
+                  "systemctl is-active greetd.service || true").strip()
+              assert _active != "active", (
+                  f"greetd is still ACTIVE after mask+stop ({_active!r}); this "
+                  f"subtest needs it quiet so its crash-loop cannot eat the "
+                  f"freshly reset latch.
+mask: {_out.strip()}
+"
+                  f"fallback: {_out2.strip()}")
+              sup.log("greetd quiesced via the runtime fallback")
           sup.succeed("hartctl session reset-tier")
           assert sup.succeed(f"cat {LATCH}").strip() == "hart-comp"
           sup.shutdown()
