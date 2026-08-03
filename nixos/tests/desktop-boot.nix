@@ -378,6 +378,13 @@ in
           # the backlog, so curl connects and then waits for a reply that never
           # comes. That is the half-up shape exactly, and it is what
           # --connect-timeout alone would NOT catch.
+          #
+          # `python3` resolves on THIS node: the desktop profile sets
+          # devTools.enable = true, and hart-dev-tools.nix:42 ships python310
+          # (whose bin/ carries the python3 symlink). Checked rather than
+          # assumed — hart-installer.nix and native-subsystems.nix are both
+          # mkNode "desktop" and already call bare python3, so the dependency
+          # is established, not introduced here.
           shell.succeed(
               "nohup python3 -c \"import socket, time; "
               "s = socket.socket(); "
