@@ -649,6 +649,51 @@ def register_shell_system_routes(app):
     # volume is created — an "enable" route could only ever lie, or start a
     # destructive re-encrypt behind a GET. Windows shows BitLocker status
     # the same way and sends you to setup for the rest.
+    @app.route('/api/shell/gpu', methods=['GET'])
+    def shell_gpu():
+        """What GPU does this box have, and how much VRAM is free?
+
+        TASK #25 GAP. The capability already existed — vram_manager.detect_gpu()
+        is the canonical single-source detector (nvidia-smi -> torch -> Metal,
+        cached) used by the model bus and the tier ladder — but it was reachable
+        only from INSIDE the process. An agent asking "can I load a 7B here?"
+        had no surface to ask, on an OS whose whole premise is that agents drive
+        it. So this EXPOSES the existing detector; it does not add a second one.
+
+        Degrades honestly rather than guessing: if the detector is unavailable
+        (import fails on a headless build, or the probe returns nothing) the
+        answer is available=False with the reason, not a fabricated 0 GB that
+        reads as "a GPU with no memory".
+        """
+        try:
+            from integrations.service_tools.vram_manager import detect_gpu
+        except Exception as exc:
+            logger.warning("shell_gpu: vram_manager unavailable (%s: %s)",
+                           type(exc).__name__, exc)
+            return jsonify({'available': False,
+                            'error': f'GPU detector unavailable: {exc}'}), 503
+
+        try:
+            info = detect_gpu() or {}
+        except Exception as exc:
+            logger.warning("shell_gpu: detect_gpu failed (%s: %s)",
+                           type(exc).__name__, exc)
+            return jsonify({'available': False,
+                            'error': f'GPU probe failed: {exc}'}), 503
+
+        # `name` is None when no GPU was found. That is a REAL answer — a
+        # CPU-only box — and is reported as present=False rather than as an
+        # error, so a caller can tell "no GPU" from "could not look".
+        present = bool(info.get('name'))
+        return jsonify({
+            'available': True,
+            'present': present,
+            'name': info.get('name'),
+            'total_gb': info.get('total_gb', 0.0),
+            'free_gb': info.get('free_gb', 0.0),
+            'cuda_available': bool(info.get('cuda_available')),
+        })
+
     @app.route('/api/shell/encryption/status', methods=['GET'])
     def shell_encryption_status():
         """Which block devices are LUKS-backed, and is root among them?
