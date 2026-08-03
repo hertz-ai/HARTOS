@@ -452,6 +452,105 @@ def _audit_system_op(action, detail=None):
 
 
 
+def parse_proc_modules(text: str) -> list:
+    """`/proc/modules` text -> loaded-module dicts.
+
+    Pure parse, no I/O, so the contract is testable without a Linux kernel —
+    same reason parse_lspci_k is pure (the dev box is Windows, the target is
+    NixOS). Each line is:
+
+        snd_hda_intel 57344 5 snd_hda_codec,snd_hwdep Live 0xffffffffc0a00000
+        ^name         ^size ^refs ^deps               ^state ^offset
+
+    `deps` is "-" when nothing depends on the module. `state` is Live /
+    Loading / Unloading: a module stuck in Loading or Unloading is a real
+    fault worth surfacing, which is the whole reason state is kept rather
+    than assuming Live.
+
+    A malformed line is SKIPPED rather than guessed at — a module list with
+    an invented entry is worse than one that is short.
+    """
+    mods = []
+    for raw in (text or '').splitlines():
+        parts = raw.split()
+        if len(parts) < 4:            # name size refs deps — the minimum
+            continue
+        name, size, refs, deps = parts[0], parts[1], parts[2], parts[3]
+        try:
+            size_i, refs_i = int(size), int(refs)
+        except ValueError:
+            continue                  # not a module line
+        mods.append({
+            'name': name,
+            'size_bytes': size_i,
+            'refcount': refs_i,
+            'used_by': [] if deps == '-' else [d for d in deps.split(',') if d],
+            'state': parts[4] if len(parts) > 4 else None,
+        })
+    return mods
+
+
+def kernel_status() -> dict:
+    """Running kernel + loaded modules — the "what is actually driving this
+    machine" surface (task #25).
+
+    Reads /proc/modules DIRECTLY rather than shelling out to lsmod, because
+    lsmod does nothing but format that same file. No subprocess means no
+    timeout, no missing-binary degrade, and no PATH assumption — strictly
+    fewer ways to fail for identical information.
+
+    `tainted` is the kernel's own "I am in a state nobody supports" flag
+    (proprietary module loaded, module force-unloaded, hardware reported
+    unsound). It is the OS-level counterpart of the unclaimed-device yellow
+    bang in /api/shell/drivers: the single most useful bit for an agent
+    triaging "why is this machine behaving strangely".
+
+    Honest degrade, same three answers as gpu_status(): on a machine with no
+    /proc/modules (Windows and macOS dev boxes) this is available=False with
+    a reason, NOT an empty module list — "no modules loaded" and "this OS
+    has no such concept" are different facts and an empty list asserts the
+    first.
+    """
+    import platform
+
+    info = {
+        'available': False,
+        'kernel_release': platform.release() or None,
+        'modules': [],
+        'module_count': 0,
+        'tainted': None,
+    }
+
+    try:
+        with open('/proc/modules', encoding='utf-8', errors='replace') as fh:
+            text = fh.read()
+    except (FileNotFoundError, NotADirectoryError):
+        info['error'] = ('/proc/modules is absent — this kernel does not '
+                         'expose loadable modules (non-Linux host?)')
+        return info
+    except OSError as exc:
+        logger.warning("kernel_status: /proc/modules unreadable (%s: %s)",
+                       type(exc).__name__, exc)
+        info['error'] = f'/proc/modules unreadable: {exc}'
+        return info
+
+    info['available'] = True
+    info['modules'] = parse_proc_modules(text)
+    info['module_count'] = len(info['modules'])
+
+    # Tainted is a separate file and a separate failure: a kernel that lists
+    # its modules but hides its taint flag is still a useful answer, so this
+    # degrades to None on its own rather than failing the whole call.
+    try:
+        with open('/proc/sys/kernel/tainted', encoding='utf-8') as fh:
+            info['tainted'] = int(fh.read().strip())
+    except (OSError, ValueError) as exc:
+        logger.warning("kernel_status: taint flag unreadable (%s: %s)",
+                       type(exc).__name__, exc)
+
+    return info
+
+
 def gpu_status() -> dict:
     """The ONE shape for "what GPU is present", used by every GPU surface.
 
@@ -706,6 +805,20 @@ def register_shell_system_routes(app):
         SAME shape from the SAME code — see that helper's note.
         """
         body = gpu_status()
+        return jsonify(body), (200 if body['available'] else 503)
+
+    @app.route('/api/shell/kernel', methods=['GET'])
+    def shell_kernel():
+        """Running kernel, loaded modules, and the taint flag (#25).
+
+        Thin wrapper over kernel_status(); see it for why /proc/modules is
+        read directly instead of shelling out to lsmod.
+
+        503 when the kernel exposes no module list at all, so a caller can
+        tell "this OS has no such concept" from "nothing is loaded" — an
+        empty 200 would assert the second.
+        """
+        body = kernel_status()
         return jsonify(body), (200 if body['available'] else 503)
 
     @app.route('/api/shell/encryption/status', methods=['GET'])
