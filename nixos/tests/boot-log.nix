@@ -257,8 +257,25 @@ in
           # The accepted list is deliberately NOT widened on that hypothesis:
           # guessing a marker could make this assertion vacuous. Dump the
           # section instead and let the next run say what is actually there.
+          #
+          # ANSWERED (run 30848154453). Hypothesis (b) was right, and the
+          # dump printed the verbatim proof:
+          #
+          #     ── kernel sound cards (/proc/asound/cards) ──
+          #     --- no soundcards ---
+          #     ── /dev/snd nodes ──
+          #     crw-rw----+ 1 root audio 116,  1 seq
+          #     crw-rw----+ 1 root audio 116, 33 timer
+          #
+          # /proc/asound/cards EXISTS and cat SUCCEEDS, so neither `||`
+          # fallback fires; /dev/snd exists with seq+timer but no controlC
+          # because the VM has ALSA and ZERO cards. "--- no soundcards ---" is
+          # the KERNEL's own wording for that state, so it is a fourth real
+          # verdict, not a guess — added on evidence, exactly as this comment
+          # asked the next run to provide.
           if not ("no /proc/asound/cards" in latest
                   or "no /dev/snd" in latest
+                  or "no soundcards" in latest
                   or "controlC" in latest):
               lines = latest.splitlines()
               start = next((i for i, l in enumerate(lines) if "sound card" in l.lower()), None)

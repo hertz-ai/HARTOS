@@ -145,7 +145,27 @@ in
           fstype = sp.succeed(f"blkid -o value -s TYPE {disk}").strip()
           assert fstype == "ext4", \
               f"empty vfat HARTSTATE must be upgraded to ext4 (Windows-flash path), got {fstype!r}"
-          sp.succeed("mountpoint -q /etc/NetworkManager/system-connections")
+          # SAY WHY WHEN THIS FAILS. `out_e` already holds the script's own
+          # narration — every persist_dir failure logs a reason ("bind of X
+          # failed", "cannot create backing") and marks the run PARTIAL — and
+          # this subtest was capturing it and then asserting only on RC, so a
+          # bind failure surfaced as a bare "command `mountpoint -q ...` failed
+          # (exit code 32)" with the explanation sitting unused in a local
+          # variable (run 30848154453).
+          #
+          # 32 is util-linux's MNT_EX_FAIL, i.e. "not a mountpoint" — it does
+          # NOT distinguish a missing directory from an unbound one, which is
+          # the other half of why that message said nothing.
+          if sp.execute("mountpoint -q /etc/NetworkManager/system-connections")[0] != 0:
+              raise AssertionError(
+                  "the wifi dir was not bind-persisted after the ext4 upgrade.\n"
+                  "--- hart-state-persist said ---\n" + out_e
+                  + "\n--- /run/hart/state-persist.status ---\n"
+                  + sp.succeed("cat /run/hart/state-persist.status 2>/dev/null || true")
+                  + "\n--- mounts under /etc + the backing store ---\n"
+                  + sp.succeed("findmnt -n | grep -iE 'NetworkManager|hart' || true")
+                  + "\n--- does the live dir even exist? ---\n"
+                  + sp.succeed("ls -ld /etc/NetworkManager/system-connections 2>&1 || true"))
           perms = sp.succeed("stat -c '%a %U' /etc/NetworkManager/system-connections").strip()
           assert perms == "700 root", \
               f"upgraded wifi persist must be 0700 root, got {perms!r}"
