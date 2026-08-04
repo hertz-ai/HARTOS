@@ -95,7 +95,7 @@ concurrency:
 jobs:
   # ─── Python: unit + functional (the runtime gate) ──────────────────────────
   unit-tests:
-    name: Python tests shard ${{ matrix.shard }}/4
+    name: Python tests shard ${{ matrix.shard }}/8
     runs-on: ubuntu-latest
     # Hard ceiling so one hung test can never burn the 6h job cap — the per-test
     # --timeout below names the culprit; this is the backstop for a C-level block.
@@ -127,14 +127,26 @@ jobs:
     # this workflow, and a job that always times out is a gate that is always
     # red for a reason unrelated to the code.
     #
-    # 704 test files across tests/unit + tests/functional split 176/176/176/176.
-    # Same deterministic sorted round-robin as the nixosTests shards below and
-    # the coverage-baseline job, so shard membership is stable across runs and
-    # a failing quarter is identifiable rather than arbitrary.
+    # SPLIT 4 -> 8 (2026-08-04), because at 120 minutes ALL FOUR shards still
+    # timed out (run 30876035103: 120m15s .. 120m44s, every one "cancelled").
+    # So the suite is roughly 8 HOURS of work, and 4 ways was never going to
+    # fit under any sane cap.
+    #
+    # That total was hidden until the split became insertion-stable. Under the
+    # old `i % 4`, shard 1 happened to collect the fast files and finished in
+    # 5m03s while the rest were guillotined — which read as "one slow quarter"
+    # rather than "the suite does not fit". Hashing by path spread the slow
+    # files evenly and made the real cost visible.
+    #
+    # 8 ways is a SCALING fix, and only that: ~60 min per shard buys a verdict
+    # without changing what any test does. The actual problem is that some
+    # tests wait on real network I/O (TestHttpPool made a live 15s request to
+    # localhost:8080 on every run until ab407eda). --durations=25 now prints,
+    # since the shards can finish, and that is the evidence to fix it properly.
     strategy:
-      fail-fast: false   # one red shard must not hide the other three
+      fail-fast: false   # one red shard must not hide the other seven
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v4
 
@@ -203,7 +215,7 @@ jobs:
           SEL=()
           for f in "${ALL[@]}"; do
             h=$(printf '%s' "$f" | sha256sum | cut -c1-8)
-            if (( 0x$h % 4 == ${{ matrix.shard }} )); then SEL+=( "$f" ); fi
+            if (( 0x$h % 8 == ${{ matrix.shard }} )); then SEL+=( "$f" ); fi
           done
           echo "shard ${{ matrix.shard }} runs ${#SEL[@]} files"
           if [[ "${#SEL[@]}" -eq 0 ]]; then
