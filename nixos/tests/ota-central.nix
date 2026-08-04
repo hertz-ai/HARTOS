@@ -413,13 +413,24 @@ in
           props = node.succeed(
               "systemctl show hart-ota-check.timer "
               "-p TimersMonotonic -p NextElapseUSecMonotonic")
-          # OnBootSec is present (the boot poll trigger)...
-          assert "OnBootSec" in props, \
+          # MATCH WHAT SYSTEMD PRINTS, not what the .nix writes. TimersMonotonic
+          # reports the D-Bus spelling — `OnBootUSec=5min` — so asserting the
+          # unit-file spelling `OnBootSec` failed on a node whose timer was
+          # configured correctly (hart-ota.nix sets OnBootSec = "5min").
+          #
+          # The negative below had the same bug with the opposite effect, which
+          # is why it never caught anything: "OnUnitActiveSec" could not appear
+          # in this output under ANY configuration, so the assertion that the
+          # recurring poll is gone was VACUOUS — it would have passed just as
+          # happily with an hourly poll wired up. Both spellings are accepted
+          # for the positive and rejected for the negative, so neither depends
+          # on which name systemd chooses.
+          assert ("OnBootUSec" in props or "OnBootSec" in props), \
               f"boot-poll trigger missing from timer:\n{props}"
-          # ...and OnUnitActiveSec (the interval poll) is NOT — proving we
-          # dropped the hourly/checkInterval recurring poll entirely.
-          assert "OnUnitActiveSec" not in props, \
-              f"interval poll still scheduled (OnUnitActiveSec present):\n{props}"
+          # ...and the interval poll is NOT — proving we dropped the
+          # hourly/checkInterval recurring poll entirely.
+          assert not ("OnUnitActiveUSec" in props or "OnUnitActiveSec" in props), \
+              f"interval poll still scheduled (recurring trigger present):\n{props}"
 
       # ── 3. A CENTRAL PUSH triggers the SAME apply, over the existing fabric ──
       with subtest("realtime push leg is wired into the backend (existing fabric)"):
