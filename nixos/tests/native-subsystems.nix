@@ -140,8 +140,26 @@ in
           assert "graphical.target" not in wanted_by + unit_prop("After") + unit_prop("Before"), \
               "waydroid init must NOT order against graphical.target (#ordering-cycle lesson)"
           # ConditionPathExists guard makes it skip once images exist (idempotent).
-          assert "!/var/lib/waydroid/images/system.img" in unit_prop("ConditionPathExists"), \
-              "waydroid init must guard on the system image (idempotent first-boot only)"
+          #
+          # NOT via `systemctl show -p ConditionPathExists`. Conditions are the
+          # one thing the note above does not apply to: systemd does NOT expose
+          # them as individual properties — they live in the aggregate
+          # `Conditions` property — so `show -p ConditionPathExists --value`
+          # returns EMPTY and the assertion failed against a unit that carries
+          # the guard correctly (hart-subsystems.nix sets
+          # unitConfig.ConditionPathExists). That is the same shape as the
+          # literal-grep red this subtest was already rewritten once to escape:
+          # a probe reading a field that does not exist, blamed on the OS.
+          #
+          # `systemctl cat` reads the GENERATED unit out of the store, so this
+          # is still the runtime artefact and not a source grep. Accept the
+          # aggregate form too, in case systemd starts reporting it.
+          cond = host.succeed(
+              "systemctl cat hart-waydroid-init.service 2>/dev/null | "
+              "grep -i '^Condition' || true") + unit_prop("Conditions")
+          assert "!/var/lib/waydroid/images/system.img" in cond, (
+              "waydroid init must guard on the system image (idempotent "
+              "first-boot only). Conditions seen:\n" + (cond or "(none)"))
 
       with subtest("Waydroid init does NOT block boot when its image download fails (no-net tolerant)"):
           # On this offline VM `waydroid init` cannot download images, but the

@@ -294,8 +294,20 @@ in
           #
           # `|| true` on find: a permission error inside /nix/store must not
           # abort the search and masquerade as absence.
+          # LEADING GLOB IS REQUIRED. pkgs.writeText names the store entry
+          # `<hash>-<name>`, so the basename is
+          #   ml0m2q8kd39dsfi4xcba2q9yqfvvfc7r-hart-gtk4-layer-host.conf
+          # and `-name 'hart-gtk4-layer-host.conf'` can never match it. The
+          # file was present the whole time: the diagnostic dump below printed
+          # its exact path from a `*layer-host*` pattern in the same run that
+          # reported it "not found in the closure" (run 30848154453).
+          #
+          # Same species as the driver-matrix filter and the OTA timer probe —
+          # a probe matching a name shape the system never produces, then read
+          # as evidence about the system. The self-describing dump is what made
+          # it a five-minute fix instead of another CI round.
           sway_conf = host.succeed(
-              "find /nix/store -maxdepth 6 -name 'hart-gtk4-layer-host.conf' "
+              "find /nix/store -maxdepth 6 -name '*hart-gtk4-layer-host.conf' "
               "-print -quit 2>/dev/null || true").strip()
           if not sway_conf:
               # Self-describing: say what IS there. "not realized" alone cannot
