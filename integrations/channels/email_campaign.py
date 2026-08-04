@@ -295,10 +295,12 @@ def recent_bounce_rate(campaign: str, days: int = 3) -> dict:
     """
     sent_path = _state_path(campaign, 'sent')
     if not os.path.exists(sent_path):
-        return {'sent': 0, 'bounced': 0, 'rate': 0.0, 'window_days': days}
+        return {'sent': 0, 'bounced': 0, 'rate': 0.0, 'window_days': days,
+                'stale': False, 'newest_send': None, 'bounce_log_day': None}
 
     cutoff = time.time() - days * 86400
     recent = set()
+    newest_send = None
     with open(sent_path, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
@@ -309,14 +311,46 @@ def recent_bounce_rate(campaign: str, days: int = 3) -> dict:
                 ts = time.mktime(time.strptime(day, '%Y-%m-%d'))
             except ValueError:
                 continue
+            if newest_send is None or ts > newest_send:
+                newest_send = ts
             if ts >= cutoff:
                 recent.add(addr.strip().lower())
 
     bounced = load_bounced() & recent
     n = len(recent)
+
+    # Is this rate actually measured, or merely absent?
+    #
+    # This guard reads the bounce log, and the bounce log is only written by
+    # bounce_handler.py. If that stops running, recent sends accumulate with
+    # no bounces recorded against them, the rate computes as 0/n = 0.0, and a
+    # 5% ceiling waves the next batch through. The guard reports "safe"
+    # precisely when measurement has stopped, which is the one failure mode a
+    # safety check must not have.
+    #
+    # Not hypothetical. Bounce collection stopped on 2026-07-22 and 3,161
+    # further messages went out on 07-25 and 07-26 with no bounce data at all;
+    # the only day that WAS measured bounced at 52.8% against this 5% ceiling.
+    #
+    # So report whether the bounce log has been updated since the newest send.
+    # `stale` means the rate below is unknown, not low, and the caller must
+    # treat it as a halt rather than a pass.
+    bounce_path = os.path.join(_STATE_DIR, 'bounced')
+    bounce_mtime = os.path.getmtime(bounce_path) if os.path.exists(bounce_path) else None
+    stale = False
+    if newest_send is not None and n > 0:
+        # A send is dated to the day, so allow the whole of the send's day to
+        # elapse before calling the log stale; bounces legitimately lag hours.
+        stale = bounce_mtime is None or bounce_mtime < (newest_send + 86400)
+
     return {'sent': n, 'bounced': len(bounced),
             'rate': (len(bounced) / n) if n else 0.0,
-            'window_days': days}
+            'window_days': days,
+            'stale': stale,
+            'newest_send': (time.strftime('%Y-%m-%d', time.localtime(newest_send))
+                            if newest_send else None),
+            'bounce_log_day': (time.strftime('%Y-%m-%d', time.localtime(bounce_mtime))
+                               if bounce_mtime else None)}
 
 
 # Above this, stop. Receiving systems tolerate a few percent; sustained
@@ -499,6 +533,29 @@ def send_campaign(recipients: Iterable[str],
     ceiling = MAX_BOUNCE_RATE if max_bounce_rate is None else float(max_bounce_rate)
     bounce = recent_bounce_rate(campaign)
     result['recent_bounce'] = bounce
+
+    # Halt on UNKNOWN as well as on high.
+    #
+    # The check below can only see bounces that bounce_handler.py has written
+    # down. When it is not running, recent sends carry no bounces, the rate is
+    # 0.0, and the ceiling test passes -- so the campaign runs fastest exactly
+    # when nobody is watching it. That is what happened between 2026-07-22 and
+    # 07-26: collection stopped after the first day, 3,161 more messages went
+    # out unmeasured, and the one measured day had bounced at 52.8%.
+    #
+    # An unknown rate is not a safe rate. Fail closed and say what to run.
+    if ceiling > 0 and bounce['sent'] >= 100 and bounce.get('stale'):
+        result['error'] = (
+            'HALTED: bounce data is stale, so the bounce rate is UNKNOWN, not '
+            'low. %d messages were sent up to %s but the bounce log was last '
+            'written %s. Run bounce_handler.py to collect them, then retry. '
+            'Sending now would repeat 2026-07-25/26, when 3,161 messages went '
+            'out with no bounce measurement at all.'
+            % (bounce['sent'], bounce['newest_send'],
+               bounce['bounce_log_day'] or 'never'))
+        result['candidates'] = 0
+        return result
+
     if ceiling > 0 and bounce['sent'] >= 100 and bounce['rate'] > ceiling:
         result['error'] = (
             'HALTED: %d of the %d messages sent in the last %d days '
