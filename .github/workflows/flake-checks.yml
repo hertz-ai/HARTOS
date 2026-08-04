@@ -99,7 +99,28 @@ jobs:
     runs-on: ubuntu-latest
     # Hard ceiling so one hung test can never burn the 6h job cap — the per-test
     # --timeout below names the culprit; this is the backstop for a C-level block.
-    timeout-minutes: 45
+    #
+    # RAISED 45 -> 120 (2026-08-04). At 45 this cap was silently eating the
+    # gate: measured on run 30873065760,
+    #
+    #     shard 0  02:52:30 -> 03:38:18   45m48s   cancelled
+    #     shard 1  02:52:29 -> 02:57:32    5m03s   failure   (4233 passed, 50 failed)
+    #     shard 2  02:52:36 -> 03:37:51   45m15s   cancelled
+    #     shard 3  02:52:28 -> 03:37:43   45m15s   cancelled
+    #
+    # THREE OF FOUR SHARDS NEVER REACHED A VERDICT, in every recent run. GitHub
+    # reports a timeout as "cancelled", not "failure", which is why this read
+    # for days as concurrency superseding runs or as fail-fast — it is neither
+    # (fail-fast is explicitly false, and dispatched runs get their own
+    # concurrency group). The gate has therefore never reported on 3/4 of the
+    # suite, and the only verdict anyone ever saw came from the one shard that
+    # happens to finish fast.
+    #
+    # The 9x spread between shard 1 and the rest is a RUNTIME imbalance, not a
+    # file-count one: the split is even by file, and some files are far slower.
+    # --durations below names them so the next run supplies the evidence to
+    # balance on, rather than guessing which tests are slow.
+    timeout-minutes: 120
     # SHARDED 2026-08-03. As a single job this DID NOT FINISH: run 30783792736
     # ran 45m37s against the 45-minute cap and the step was killed, so the
     # release gate's Python job could not pass at all — release.yml depends on
@@ -195,6 +216,7 @@ jobs:
             --deselect tests/unit/test_vlm_qwen3vl.py::TestFullActionLoop \
             --deselect tests/unit/test_vlm_qwen3vl.py::TestVLMDeterministicActions::test_vlm_action_list_shared_by_legacy_and_unified \
             --timeout=120 \
+            --durations=25 \
             -q --tb=line
 
       # Integration + e2e — cross-module flows. Best-effort: surfaced but
