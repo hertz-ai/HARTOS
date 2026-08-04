@@ -85,11 +85,24 @@ permissions:
   contents: read
 
 concurrency:
-  # the release gate: a superseded 3h VM fleet is pure runner waste.
-  # Same shape as nix-check/coverage-baseline (3f5ee290): a manual
-  # workflow_dispatch gets its OWN group keyed by run id, so an
-  # on-demand run is never cancelled by an unrelated later push.
-  group: flake-checks-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
+  # KEYED BY EVENT, because the first version of this group broke the very
+  # thing the header above says must not break.
+  #
+  # It keyed only dispatch by run_id and lumped EVERY other event into one
+  # 'auto' lane. release.yml calls this workflow on push, so a push-triggered
+  # workflow_call shared a group with the NIGHTLY — and killed it. Observed:
+  # run 30881593061, event=schedule, cancelled at 47 minutes having produced
+  # nothing. The header's "no concurrency group on purpose ... both are wanted
+  # answers" was a deliberate decision and adding a group contradicted it.
+  #
+  # Including event_name gives each source its own lane:
+  #   schedule         -> the nightly always finishes and always names a commit
+  #   workflow_call    -> push-triggered release gates DO supersede each other,
+  #                       which is the runner-starvation fix that motivated a
+  #                       group in the first place
+  #   workflow_dispatch-> plus run_id, so two manual runs never fight
+  #   pull_request     -> per-ref, newest push to a PR wins
+  group: flake-checks-${{ github.ref }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'shared' }}
   cancel-in-progress: true
 
 jobs:

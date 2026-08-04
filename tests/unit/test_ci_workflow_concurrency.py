@@ -156,6 +156,51 @@ class EveryWorkflowDeclaresItsShareOfThePool(unittest.TestCase):
             "target), add it to GLOBAL_GROUP_IS_DELIBERATE with the reason: "
             + ", ".join(unkeyed))
 
+    def test_a_scheduled_workflow_does_not_share_a_lane_with_other_events(self):
+        """A nightly must not be cancellable by a push-triggered run.
+
+        Found the hard way: flake-checks' first group keyed only
+        workflow_dispatch by run_id and lumped every OTHER event into one
+        'auto' lane. release.yml calls that workflow on push, so a
+        push-triggered workflow_call shared a group with the NIGHTLY and killed
+        it — run 30881593061, event=schedule, cancelled at 47 minutes having
+        produced nothing.
+
+        That is worse than having no group at all, because a nightly exists
+        precisely to be the run that always finishes and always names a commit.
+        A workflow that can be triggered BOTH on a schedule and by some
+        push-driven event must therefore key its group by event_name.
+        """
+        offenders = []
+        for name, data in self.wf.items():
+            triggers = (data or {}).get(True) or (data or {}).get('on') or {}
+            if not isinstance(triggers, dict):
+                continue
+            if 'schedule' not in triggers:
+                continue
+            # Push-driven ways in: a direct push, or being called by a workflow
+            # that itself runs on push.
+            push_driven = {'push', 'pull_request', 'workflow_call'} & set(triggers)
+            if not push_driven:
+                continue
+            conc = (data or {}).get('concurrency') or {}
+            group = str(conc.get('group', '')) if isinstance(conc, dict) else str(conc)
+            if not group:
+                continue
+            # Require the BARE interpolation, not merely the identifier. The
+            # broken group mentioned github.event_name too — inside its ternary
+            # (`github.event_name == 'workflow_dispatch'`) — so a substring test
+            # for the name passed on the very shape it was meant to catch. Only
+            # an unconditional `${{ github.event_name }}` actually puts each
+            # event in its own lane.
+            if not re.search(r'\$\{\{\s*github\.event_name\s*\}\}', group):
+                offenders.append(
+                    f"{name}: has a schedule AND {sorted(push_driven)}, but its "
+                    f"concurrency group does not interpolate "
+                    f"${{{{ github.event_name }}}} — a push-driven run shares a "
+                    f"lane with the nightly and will cancel it.\n  group: {group}")
+        self.assertEqual([], offenders, "\n".join(offenders))
+
     def test_the_global_group_exemptions_are_still_global(self):
         """A stale exemption silently un-guards a workflow."""
         for name, why in GLOBAL_GROUP_IS_DELIBERATE.items():
