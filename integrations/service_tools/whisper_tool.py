@@ -1215,6 +1215,12 @@ async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bo
     VAD gate (those are caller-local).
     """
     text, lang = _transcribe_buffer(audio_buffer, language=stt_lang)
+    # Non-speech annotations must not leave the server.  The WS streaming legs
+    # were the only STT routes that never passed through this gate — it was
+    # wired solely into the enqueue path — so "(clippers clacking)" and friends
+    # reached the SPA composer verbatim via setInputMessage (Nunba
+    # Demopage.js:3156).  Reuses the canonical filter; do not reimplement.
+    text = _drop_non_speech_text(text)
     if text:
         await websocket.send(json.dumps({
             'text': text, 'language': lang, 'is_final': True,
@@ -1514,6 +1520,13 @@ async def _stt_stream_handler(websocket):
                     audio_buffer, STREAM_INTERIM_WINDOW_BYTES)
                 text, lang = _transcribe_buffer(interim_buf, keep_buffer=True, language=stt_lang)
                 last_transcribe_size = buf_size
+                # Same gate as the final leg above.  This is the one that
+                # actually reached the user: interim chunks stream straight
+                # into the composer, so a pure-annotation window rendered as a
+                # dangling "(crashing" in the input box.  Empty result here is
+                # safe — the `if text:` below skips the send, and the SPA also
+                # guards with `if (data.text?.trim())`.
+                text = _drop_non_speech_text(text)
                 if text:
                     await websocket.send(json.dumps({
                         'text': text, 'language': lang, 'is_final': False,
