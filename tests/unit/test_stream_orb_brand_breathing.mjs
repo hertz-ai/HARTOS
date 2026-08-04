@@ -38,6 +38,20 @@ const STATIC = join(HERE, '..', '..', 'integrations', 'agent_engine', 'static');
 const read = (f) => readFileSync(join(STATIC, f), 'utf8');
 
 let failures = 0;
+
+// ── Section selector ────────────────────────────────────────────────────────
+// `node <file> [A|B|C|all]`. Sections A and B specify the STREAM-orb REDESIGN
+// (edgeless, gradient-only, full brand spectrum, a breath that rises and
+// falls). That redesign has never been built: this harness was committed on
+// 2026-06-29 and fails 11 assertions against the renderer of that very commit,
+// the same 10 against the pre-customization-hub renderer, and the same 10
+// today. It is a specification, not a regression detector — see task #37.
+//
+// Section C (the hero float) IS implemented and passes. Splitting them keeps C
+// gating for real instead of retiring four working guards alongside the
+// unbuilt spec.
+const ONLY = (process.argv[2] || 'all').toUpperCase();
+const runs = (s) => ONLY === 'ALL' || ONLY === s;
 function ok(cond, msg) { if (cond) { console.log('  OK   ' + msg); } else { failures++; console.log(' FAIL  ' + msg); } }
 
 // ── A recording 2D canvas context ───────────────────────────────────────────
@@ -95,7 +109,7 @@ function rgbaParse(s) {
 // ════════════════════════════════════════════════════════════════════════════
 // A. voiceOrbViz.js — edgeless soft glow + brand spectrum (no disc, no rings)
 // ════════════════════════════════════════════════════════════════════════════
-(function testEdgelessBrand() {
+if (runs('A')) (function testEdgelessBrand() {
   console.log('\n[A] voiceOrbViz.js  edgeless soft-glow + brand spectrum');
   const rec = runViz(false, 60);
 
@@ -142,7 +156,7 @@ function rgbaParse(s) {
 // ════════════════════════════════════════════════════════════════════════════
 // B. voiceOrbViz.js — BREATHING idle (slow oscillation) + intensifies with energy
 // ════════════════════════════════════════════════════════════════════════════
-(function testBreathing() {
+if (runs('B')) (function testBreathing() {
   console.log('\n[B] voiceOrbViz.js  breathing idle + energy-intensified breath');
   // 400 frames * 0.016s ~= 6.4s -> covers a full ~5s breath cycle.
   const idle = runViz(false, 400);
@@ -239,7 +253,7 @@ function runHero() {
 // ════════════════════════════════════════════════════════════════════════════
 // C. hartHero.js — orb FLOATS over windows (high z), reachable, never traps focus
 // ════════════════════════════════════════════════════════════════════════════
-(function testFloatOverWindows() {
+if (runs('C')) (function testFloatOverWindows() {
   console.log('\n[C] hartHero.js  float over windows (high z) + reachable + no focus trap');
   const H = runHero();
   const z = parseInt(H.hero.style.zIndex, 10);
