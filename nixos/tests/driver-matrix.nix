@@ -72,7 +72,6 @@ in
     };
 
     testScript = ''
-      import re
 
       drv = machines[0]
       drv.start()
@@ -83,30 +82,41 @@ in
 
           The kernel symlinks each bound device under the driver's directory
           by its bus address. Anything else in there (bind/unbind/uevent
-          attribute files, module symlink) is not a device, so filter to the
-          address shapes:
-            PCI            '0000:00:1f.3'
-            USB device     '1-1', '1-1.2'
-            USB INTERFACE  '1-1:1.0', '2-3.4:1.2'
+          attribute files, module symlink) is not a device.
 
-        THE INTERFACE FORM IS NOT OPTIONAL (run 30783792736, shard 3). This
-        first matched only `^\d+-[\d.]+$`, which cannot match an interface
-        address because of the COLON — and usbhid binds INTERFACES, never
-        whole devices. So the filter rejected every real entry, the list came
-        back empty, and the test reported "NO device is bound to 'usbhid'" on
-        a VM where USB HID was working perfectly (its sibling
-        input-seat-pointer.nix, same qemu options, sees both devices through
-        libinput and passes). The docstring gave the bug away: it described
-        the DEVICE shapes while the assertion targeted an INTERFACE driver.
+          THIS FILTER HAS BEEN WRONG TWICE BY GUESSING NAME SHAPES, so it no
+          longer guesses.
+
+          First it matched only `^\d+-[\d.]+$` (run 30783792736, shard 3),
+          which cannot match a USB INTERFACE address because of the COLON —
+          and usbhid binds INTERFACES, never whole devices. Every real entry
+          was rejected, the list came back empty, and the test reported "NO
+          device is bound to 'usbhid'" on a VM where USB HID worked perfectly
+          (its sibling input-seat-pointer.nix, same qemu options, sees both
+          devices through libinput and passes).
+
+          Then, with PCI and USB shapes both matched, every OTHER bus still
+          read as empty: virtio devices are named virtio0/virtio1 and match
+          neither, so "virtio block + balloon bind" failed (run 30848154453)
+          on a VM THAT HAD BOOTED FROM THE VIRTIO DISK it called unbound.
+
+          Both times the filter's silent-empty result was indistinguishable
+          from real unbound hardware — the exact false signal this file
+          exists to detect, produced by the file itself.
+
+          So: no name patterns. In sysfs a driver directory holds its bound
+          devices as SYMLINKS, alongside regular FILES for control (bind,
+          unbind, uevent, new_id, remove_id). That distinction is structural
+          and identical on every bus, so it needs no per-bus pattern and
+          cannot go stale when a new device class is added. `module` is the
+          one symlink that is not a device.
           """
           out = drv.succeed(
-              f"ls -1 /sys/bus/{bus}/drivers/{driver}/ 2>/dev/null || true"
+              f"find /sys/bus/{bus}/drivers/{driver}/ -maxdepth 1 -type l "
+              f"-printf '%f\\n' 2>/dev/null || true"
           )
-          return [
-              e for e in (l.strip() for l in out.splitlines())
-              if re.match(r"^[0-9a-f]{4}:[0-9a-f]{2}:", e)
-              or re.match(r"^\d+-[\d.]+(:\d+\.\d+)?$", e)
-          ]
+          return [e for e in (l.strip() for l in out.splitlines())
+                  if e and e != "module"]
 
       def assert_bound(bus, driver, what):
           devs = bound_devices(bus, driver)
