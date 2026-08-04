@@ -56,11 +56,90 @@ class StatusDegradesAudibly(unittest.TestCase):
         with patch.object(wmb, 'get_world_model_bridge', _boom):
             return client.get('/status')
 
+    def _get_status_with_health(self, health):
+        """Call /status with check_health returning `health` and NO exception.
+
+        This is the path the original fix missed: the bridge answers normally
+        and simply reports unhealthy.
+        """
+        import hart_intelligence_entry as hie
+        import integrations.agent_engine.world_model_bridge as wmb
+
+        hie.app.config['TESTING'] = True
+        client = hie.app.test_client()
+
+        class _Bridge:
+            def get_stats(self):
+                return {'api_url': 'http://localhost:8000', 'in_process': False}
+
+            def check_health(self):
+                return health
+
+        with patch.object(wmb, 'get_world_model_bridge', lambda: _Bridge()):
+            return client.get('/status')
+
     def test_the_route_answers_at_all(self):
         """Guard the guard — if /status 500s, everything below is vacuous."""
         resp = self._get_status()
         self.assertEqual(resp.status_code, 200)
         self.assertIn('status', resp.get_json())
+
+    # ── Unhealthy WITHOUT an exception — the case the first fix missed ──────
+    # VM run 30848154453 (hart-server-boot) returned
+    #   {"hevolve_core_healthy":false,"learning_mode":"disabled", ...}
+    # with no reason anywhere, because hevolve_core_error was only set in the
+    # `except` branch. check_health reports unhealthy through its RETURN VALUE
+    # far more often than by raising, and it already carries the reason in
+    # every such branch — /status was discarding it.
+
+    def test_a_disabled_bridge_says_so(self):
+        body = self._get_status_with_health({
+            'healthy': False, 'learning_active': False,
+            'mode': 'disabled', 'node_tier': 'flat'}).get_json()
+        self.assertIs(body['hevolve_core_healthy'], False)
+        self.assertIn('hevolve_core_error', body,
+                      "unhealthy with no reason — a deliberately-disabled "
+                      "core is indistinguishable from a crashed one")
+        self.assertIn('disabled', body['hevolve_core_error'])
+
+    def test_a_bad_http_answer_reports_its_status_code(self):
+        body = self._get_status_with_health({
+            'healthy': False, 'learning_active': False, 'mode': 'http',
+            'details': {'status_code': 503}}).get_json()
+        self.assertIn('503', body['hevolve_core_error'],
+                      "the core answered, badly — the code is the whole clue")
+
+    def test_a_transport_failure_reports_its_cause(self):
+        body = self._get_status_with_health({
+            'healthy': False, 'learning_active': False, 'mode': 'http',
+            'details': {'error': 'Connection refused'}}).get_json()
+        self.assertIn('Connection refused', body['hevolve_core_error'])
+
+    def test_a_healthy_core_carries_NO_error_field(self):
+        """The field must mean something — absent when there is nothing wrong."""
+        body = self._get_status_with_health({
+            'healthy': True, 'learning_active': True,
+            'mode': 'in_process', 'node_tier': 'flat'}).get_json()
+        self.assertIs(body['hevolve_core_healthy'], True)
+        self.assertNotIn('hevolve_core_error', body,
+                         "a healthy node reported an error string — the field "
+                         "stops being a signal if it is always present")
+
+    def test_unhealthy_ALWAYS_carries_a_reason(self):
+        """The invariant, over every unhealthy shape check_health can return."""
+        shapes = [
+            {'healthy': False, 'mode': 'disabled'},
+            {'healthy': False, 'mode': 'http', 'details': {'status_code': 500}},
+            {'healthy': False, 'mode': 'http', 'details': {'error': 'boom'}},
+            {'healthy': False, 'mode': 'http'},          # no details at all
+            {'healthy': False},                           # not even a mode
+        ]
+        for shape in shapes:
+            body = self._get_status_with_health(dict(shape)).get_json()
+            self.assertTrue(
+                body.get('hevolve_core_error'),
+                f"unhealthy with no reason for health={shape!r} — this is the "
+                "false-healthy shape the endpoint exists to avoid")
 
     def test_degraded_body_names_the_error(self):
         """The reason must reach the caller, not just the log."""

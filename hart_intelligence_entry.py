@@ -10568,6 +10568,31 @@ def status():
         result['hevolve_core_healthy'] = health.get('healthy', False)
         result['learning_active'] = health.get('learning_active', False)
         result['learning_mode'] = health.get('mode', 'unknown')
+        if not result['hevolve_core_healthy']:
+            # UNHEALTHY WITHOUT AN EXCEPTION is the common case, and the
+            # earlier fix only covered the raising one — so a VM reported
+            # hevolve_core_healthy:false, learning_mode:"disabled" and NO
+            # reason at all (run 30848154453, hart-server-boot). From outside,
+            # a deliberately-disabled core, a core answering 503, and a core
+            # that is not there look identical.
+            #
+            # check_health already carries the reason in every unhealthy
+            # branch; /status was discarding it. Read from it rather than
+            # inventing a second vocabulary: `details.error` for a transport
+            # failure, `details.status_code` for a bad answer, and mode
+            # 'disabled' for the bundled no-server case.
+            details = health.get('details') or {}
+            if details.get('error'):
+                why = f"core unreachable: {details['error']}"
+            elif details.get('status_code'):
+                why = (f"core /health answered HTTP {details['status_code']}")
+            elif result['learning_mode'] == 'disabled':
+                why = ('learning HTTP bridge is disabled — bundled with no '
+                       'core server to talk to')
+            else:
+                why = (f"core reported unhealthy (mode="
+                       f"{result['learning_mode']!r}) with no further detail")
+            result['hevolve_core_error'] = why
     except Exception as exc:
         # WHY THIS LOGS NOW (task #3d): when health is False the single fact a
         # reader needs is WHY, and this handler was throwing it away. The
