@@ -24,8 +24,10 @@ def _get_publisher():
         return _publisher
     try:
         from crossbarhttp3 import CrossbarHttpPublisher
-        import os
-        url = os.environ.get('WAMP_URL', 'http://localhost:8088/publish')
+        # WAMP_URL may hold a ws:// router URL (the run scripts set one);
+        # normalise to the HTTP publish bridge.  See core/wamp_url.py.
+        from core.wamp_url import resolve_publish_url
+        url = resolve_publish_url()
         _publisher = CrossbarHttpPublisher(url)
     except ImportError:
         logger.debug("crossbarhttp3 not available, real-time events disabled")

@@ -2167,7 +2167,14 @@ chain = None
 # URL precedence: WAMP_URL env (set by Nunba desktop / regional / central) →
 # legacy cloud default.  Flat mode (no cloud) sets WAMP_URL to localhost so
 # DNS to aws_rasa.hertzai.com is never attempted (#323).
-_wamp_url = os.environ.get('WAMP_URL') or 'http://localhost:8088/publish'
+try:
+    from core.wamp_url import resolve_publish_url as _resolve_wamp_publish
+except ImportError:  # cx_Freeze defence — never let realtime kill boot
+    def _resolve_wamp_publish():
+        return os.environ.get('WAMP_URL') or 'http://localhost:8088/publish'
+# The run scripts export ws://…:8088/ws here; this normalises that to the
+# HTTP bridge instead of POSTing at a router socket.  See core/wamp_url.py.
+_wamp_url = _resolve_wamp_publish()
 try:
     if _CrossbarPub is not None:
         client = _CrossbarPub(_wamp_url)
