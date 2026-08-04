@@ -644,7 +644,19 @@ class TestHttpPool:
         mock_session.get.assert_called_once_with('http://example.com', timeout=10)
 
     def test_pooled_post_llm_logging_no_crash(self):
-        """POST to /chat/completions triggers LLM logging — must not crash."""
+        """POST to /chat/completions triggers LLM logging — must not crash.
+
+        PATCH THE LLAMA SEAM, not the general pooled session. pooled_post
+        deliberately routes a LOCAL llama completion through
+        `_llama_session_for(kind)` rather than `get_http_session()`, so the
+        priority scheduler has a session it can close to preempt an in-flight
+        daemon call. Setting `http_pool._session` — which is the right seam for
+        pooled_get, and for any NON-llama post — therefore did not intercept
+        anything here, and this test issued a REAL request to localhost:8080 on
+        every run: a 15s read timeout on a box with something listening there,
+        a connection error on CI. A unit test doing live network I/O.
+        """
+        from unittest.mock import patch
         from core import http_pool
         mock_resp = MagicMock()
         mock_resp.json.return_value = {
@@ -653,11 +665,28 @@ class TestHttpPool:
         }
         mock_session = MagicMock()
         mock_session.post.return_value = mock_resp
-        http_pool._session = mock_session
-        resp = http_pool.pooled_post(
-            'http://localhost:8080/v1/chat/completions',
-            json={'messages': [{'role': 'user', 'content': 'hi'}]})
+        with patch.object(http_pool, '_llama_session_for',
+                          return_value=mock_session):
+            resp = http_pool.pooled_post(
+                'http://localhost:8080/v1/chat/completions',
+                json={'messages': [{'role': 'user', 'content': 'hi'}]})
         assert resp is mock_resp
+        assert mock_session.post.called, (
+            "the llama session was never used — pooled_post took a different "
+            "path and this test is again asserting nothing")
+
+    def test_a_non_llama_post_uses_the_GENERAL_pooled_session(self):
+        """The other half of the split, so the two paths stay distinguishable."""
+        from core import http_pool
+        mock_resp = MagicMock()
+        mock_session = MagicMock()
+        mock_session.post.return_value = mock_resp
+        http_pool._session = mock_session
+        resp = http_pool.pooled_post('http://example.com/api', timeout=10,
+                                     json={'a': 1})
+        assert resp is mock_resp
+        mock_session.post.assert_called_once_with(
+            'http://example.com/api', timeout=10, json={'a': 1})
 
     def test_retry_status_forcelist(self):
         from core.http_pool import get_http_session

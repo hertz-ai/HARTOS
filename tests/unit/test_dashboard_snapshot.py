@@ -32,9 +32,27 @@ def _install_fake_models(monkeypatch, goal):
                         'integrations.social.models', fake_models)
     # The dashboard_service does `from .models import ...` — install
     # a relative-path alias too via the package's __dict__.
+    #
+    # THROUGH monkeypatch, so it is UNDONE. A raw `pkg.models = fake_models`
+    # here was permanent: monkeypatch.setitem restores sys.modules, but a plain
+    # attribute assignment on the real package object is never reverted, and
+    # `from integrations.social import models` reads the package ATTRIBUTE in
+    # preference to re-importing. So every later test in the same pytest
+    # process got this SimpleNamespace instead of the real models module.
+    #
+    # That single line accounts for both dominant shapes in the shard-1 red
+    # (50 failed across unrelated modules):
+    #   - "'types.SimpleNamespace' object has no attribute '_uuid'" — the fake
+    #     defines only AgentGoal/get_db/CodingGoal/User
+    #   - "type object 'User' has no attribute '__table__'" — the fake's User is
+    #     `type('User', (), {})`, a bare class with no SQLAlchemy mapping
+    # which is why the failures looked like 50 unrelated bugs and were one.
+    #
+    # raising=False because the attribute may not exist yet on a fresh import;
+    # monkeypatch then deletes it on teardown rather than restoring a value.
     pkg = sys.modules.get('integrations.social')
     if pkg is not None:
-        pkg.models = fake_models  # type: ignore[attr-defined]
+        monkeypatch.setattr(pkg, 'models', fake_models, raising=False)
     return fake_db
 
 
