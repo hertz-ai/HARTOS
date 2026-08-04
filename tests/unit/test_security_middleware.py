@@ -281,6 +281,60 @@ class TestHostValidation:
         assert resp.status_code == 400
         assert 'Invalid host' in resp.get_json().get('error', '')
 
+    # ── The peer mesh: a node must answer to its OWN addresses ──────────────
+    # Found in a VM, not by reading: hart-peer-discovery's "Server backend
+    # accessible from edge" got HTTP 400 {"error":"Invalid host"} cross-host.
+    # NO nixos module sets ALLOWED_HOSTS, so every HART OS node shipped with
+    # the localhost,127.0.0.1 default and rejected every peer that addressed
+    # it by LAN IP. Only the cloud deploy sets it (to '*'), which is why this
+    # was invisible outside the OS.
+
+    @pytest.mark.parametrize('host', [
+        '192.168.1.42',      # RFC1918 /16 — the common home LAN
+        '10.0.0.7',          # RFC1918 /8
+        '172.16.5.9',        # RFC1918 /12
+        '169.254.10.2',      # link-local / mDNS-discovered peer
+        '127.0.0.1',         # loopback
+    ])
+    def test_a_peer_addressing_this_node_by_private_ip_is_accepted(
+            self, make_app, host):
+        client, _ = make_app({
+            'ALLOWED_HOSTS': 'hart.ai',      # deliberately does NOT list it
+            'HEVOLVE_ENV': 'production',
+        })
+        resp = client.get('/status', headers={'Host': host})
+        assert resp.status_code == 200, (
+            f'{host} is a private address that can only mean this LAN; '
+            'rejecting it breaks peer-to-peer reachability')
+
+    @pytest.mark.parametrize('host', [
+        'evil.com',          # the classic reflected-Host target
+        '8.8.8.8',           # PUBLIC literal — not ours, still rejected
+        '1.2.3.4',
+    ])
+    def test_public_addresses_and_names_are_still_rejected(self, make_app, host):
+        """The injection defence must survive the peer-mesh fix."""
+        client, _ = make_app({
+            'ALLOWED_HOSTS': 'hart.ai',
+            'HEVOLVE_ENV': 'production',
+        })
+        resp = client.get('/status', headers={'Host': host})
+        assert resp.status_code == 400, (
+            f'{host} is not this node and not this LAN — accepting it would '
+            'reopen the reflected-Host hole the validation exists to close')
+
+    def test_the_node_answers_to_its_own_hostname(self, make_app):
+        import socket
+        own = socket.gethostname().split('.')[0]
+        client, _ = make_app({
+            'ALLOWED_HOSTS': 'hart.ai',
+            'HEVOLVE_ENV': 'production',
+        })
+        resp = client.get('/status', headers={'Host': own})
+        assert resp.status_code == 200, (
+            'a node that will not answer to its own hostname cannot be '
+            'reached by name on the LAN')
+
     def test_development_mode_bypasses_host_check(self, make_app):
         client, _ = make_app({
             'ALLOWED_HOSTS': 'hart.ai',
