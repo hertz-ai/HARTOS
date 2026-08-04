@@ -352,6 +352,13 @@ def _filter_speech_text(segments) -> str:
 _ANNOTATION_SPAN_RE = re.compile(r'\[[^\[\]]*\]|\([^()]*\)|♪[^♪]*♪|♪|\*[^*]*\*')
 
 
+# How many repeats of ONE annotation span mark a decoder loop rather than
+# speech.  3 is deliberately low: repeating an identical parenthetical even
+# twice is already unnatural, and the cost of acting is only that the
+# annotations are stripped while the real words are kept.
+_REPEATED_ANNOTATION_LIMIT = 3
+
+
 def _drop_non_speech_text(text: str) -> str:
     """Drop an utterance that is ENTIRELY non-speech annotation.
 
@@ -370,7 +377,37 @@ def _drop_non_speech_text(text: str) -> str:
     if not text:
         return ''
     remainder = _ANNOTATION_SPAN_RE.sub(' ', text)
-    return text if re.search(r'\w', remainder) else ''
+    if not re.search(r'\w', remainder):
+        return ''
+
+    # HALLUCINATION LOOP (added 2026-08-04 after the all-or-nothing rule above
+    # let this reach live chat verbatim):
+    #     "(clippers clacking) (clippers clacking) ... x25 ... (c Thank you."
+    # Two real words at the end ("Thank you.") satisfied the `\w` test, so the
+    # WHOLE string — 25 repeats included — was returned untouched.  The rule
+    # was doing exactly what it says; what it says is insufficient.
+    #
+    # Rather than strip every bracket span (which would break the documented
+    # "I paid fifty (fifty!) dollars" case this function deliberately
+    # protects), key on the thing that distinguishes a decoder loop from
+    # speech: ONE span repeated many times.  Human speech does not repeat an
+    # identical parenthetical three times in a single utterance; a stuck
+    # Whisper decode does nothing else.
+    spans = [s.strip().lower() for s in _ANNOTATION_SPAN_RE.findall(text)]
+    if spans:
+        counts = {}
+        for s in spans:
+            counts[s] = counts.get(s, 0) + 1
+        if max(counts.values()) >= _REPEATED_ANNOTATION_LIMIT:
+            # Keep only the speech, collapse the whitespace the removals left,
+            # and drop a dangling unmatched opener ("(c") from a span the
+            # decoder truncated mid-emit.
+            cleaned = re.sub(r'\s+', ' ', remainder).strip()
+            cleaned = re.sub(r'[(\[{]\s*\w{0,2}\s*$', '', cleaned).strip()
+            cleaned = re.sub(r'^\s*[(\[{]\s*\w{0,2}\s+', '', cleaned).strip()
+            return cleaned
+
+    return text
 
 
 def _faster_whisper_transcribe(audio_path: str, language: str = None) -> Optional[str]:
