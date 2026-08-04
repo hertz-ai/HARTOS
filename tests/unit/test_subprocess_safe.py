@@ -221,7 +221,24 @@ class TestNoWindowFlagsOnWindows:
         monkeypatch.setattr(sys, "platform", "linux")
         assert hidden_popen_kwargs() == {}
 
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="subprocess.STARTUPINFO and subprocess.CREATE_NO_WINDOW exist "
+               "only inside CPython's `if _mswindows:` block, so this raises "
+               "AttributeError INSIDE hidden_popen_kwargs() on Linux/macOS "
+               "before any assert runs. Monkeypatching sys.platform selects "
+               "the branch but cannot conjure the Win32 API objects that "
+               "branch constructs.")
     def test_windows_branch_sets_no_window_flags(self, monkeypatch):
+        """Windows-only by necessity — see the skipif.
+
+        The POSIX half above stays portable and IS covered from either host,
+        which keeps most of the cross-platform win. Making this one honestly
+        host-dependent is better than it being falsely portable: a test added
+        to stop platform mistakes shipping unseen would otherwise have been
+        the thing that broke the Linux runner, which is where CI runs and what
+        HART actually targets.
+        """
         monkeypatch.setattr(sys, "platform", "win32")
         kw = hidden_popen_kwargs()
         assert kw.get("creationflags") == subprocess.CREATE_NO_WINDOW

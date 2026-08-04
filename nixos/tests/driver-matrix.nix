@@ -201,6 +201,38 @@ in
               # a different task's problem, so record rather than fail here.
               drv.log("drivers endpoint not reachable on this node — sysfs assertions above stand")
 
+      with subtest("lspci -k actually PRINTS driver binding (-mm -k does not)"):
+          # Settles a claim that was established from pciutils SOURCE and never
+          # from a capture, because the dev box is Windows. show_machine() calls
+          # show_kernel_machine() only inside `if (verbose)`, and -mm/-k/-v are
+          # independent flags — so `lspci -mm -k` should print NO kernel lines,
+          # which would make /api/shell/drivers report every device unclaimed.
+          #
+          # Capture all three forms verbatim so the log records the real shapes
+          # rather than anyone's belief about them.
+          mm_k = drv.succeed("lspci -mm -k 2>/dev/null || true")
+          plain_k = drv.succeed("lspci -k 2>/dev/null || true")
+          drv.log("--- lspci -mm -k ---\n" + mm_k[:1200])
+          drv.log("--- lspci -k ---\n" + plain_k[:1200])
+
+          # The endpoint reads `lspci -k`, so THAT is the one that must carry
+          # binding. Asserted only when the VM actually has a bound PCI device
+          # (it does — virtio_blk is asserted above), so this cannot pass
+          # vacuously on a machine with no PCI at all.
+          assert "Kernel driver in use" in plain_k, (
+              "`lspci -k` printed no driver binding on a node where sysfs "
+              "shows bound PCI devices — /api/shell/drivers would report the "
+              "whole tree unclaimed.\n--- lspci -k ---\n" + plain_k[:1500])
+
+          # And record whether -mm -k really is silent, which is the claim the
+          # endpoint's argv change rests on. Logged rather than asserted: if a
+          # future pciutils prints it, that is useful news, not a failure.
+          if "Kernel driver in use" in mm_k:
+              drv.log("NOTE: `lspci -mm -k` DID print binding on this pciutils "
+                      "— the argv change is now belt-and-braces, not a fix")
+          else:
+              drv.log("confirmed: `lspci -mm -k` prints NO binding (verbose==0)")
+
       with subtest("#25: /api/shell/kernel AGREES with /proc/modules"):
           # Same cross-check as the drivers subtest above, for the module
           # surface. Comparing the endpoint against the file it claims to

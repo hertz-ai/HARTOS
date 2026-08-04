@@ -78,9 +78,26 @@ def _get_allowed_roots():
 
 
 def _is_path_allowed(path):
-    """Check if a resolved path is within allowed roots."""
+    """Check if a resolved path is within allowed roots.
+
+    realpath, not abspath: abspath only NORMALISES (`../../etc/shadow` becomes
+    `/etc/shadow` and is then happily accepted) and does not follow symlinks, so
+    a link pointing out of an allowed root would pass untouched.
+
+    commonpath, not startswith: a prefix test lets `/home/hart` authorise
+    `/home/hart-evil`, because the string genuinely starts with the root. Only a
+    component-wise comparison answers "is this INSIDE the root". commonpath
+    raises ValueError across drives/mixed absolute-relative, which is a "no".
+    """
     real = os.path.realpath(path)
-    return any(real.startswith(root) for root in _get_allowed_roots())
+    for root in _get_allowed_roots():
+        root_real = os.path.realpath(root)
+        try:
+            if os.path.commonpath([real, root_real]) == root_real:
+                return True
+        except ValueError:
+            continue        # different drive / not comparable -> not inside
+    return False
 
 
 # ─── Shell Auth (local-only, no social DB dependency) ─────────────

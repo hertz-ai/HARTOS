@@ -1037,10 +1037,27 @@ def register_shell_system_routes(app):
         target = (data.get('path') or '').strip()
         if not target:
             return jsonify({'error': 'path required'}), 400
-        # Reject traversal + relative paths outright: this endpoint chooses
-        # what clamd reads, so it must never accept a caller-composed path
-        # it has not resolved.
-        target = os.path.abspath(target)
+        # CONFINE, do not merely normalise. This comment used to claim it
+        # "rejects traversal + relative paths outright" while the code was
+        # `os.path.abspath(target)` — and abspath NORMALISES: '../../etc/shadow'
+        # becomes '/etc/shadow' and was then accepted. It also does not resolve
+        # symlinks, so a link out of any intended area passed untouched. With no
+        # auth in front of this route that meant POST {"path": "/"} would launch
+        # a full-filesystem clamd scan on demand, and the 202-vs-404 split was a
+        # file-existence oracle for any path on the box.
+        #
+        # _is_path_allowed is the repo's single answer to "may this caller name
+        # this path?" (realpath + allowed roots). It already guards the file
+        # routes in shell_os_apis; this endpoint was the one that reimplemented
+        # the question and got it wrong. Same file already had the CORRECT shape
+        # ~1000 lines below in the audio route, which is what made this a
+        # parallel path rather than an oversight.
+        from integrations.agent_engine.shell_os_apis import _is_path_allowed
+        target = os.path.realpath(target)
+        if not _is_path_allowed(target):
+            logger.warning("antivirus scan refused out-of-root path: %s", target)
+            return jsonify({'error': 'Path outside allowed roots',
+                            'path': target}), 403
         if not os.path.exists(target):
             return jsonify({'error': 'path not found', 'path': target}), 404
 

@@ -7252,7 +7252,30 @@ function renderAgentOverlay(ev) {{
                     errors.append({'source': argv[0], 'error': str(e)})
                     return None
 
-            r = _probe(['lspci', '-mm', '-k'])
+            # `-k`, NOT `-mm -k`. In pciutils, show_machine() calls
+            # show_kernel_machine() only inside `if (verbose)`, and -mm/-k/-v are
+            # three INDEPENDENT flags — so `lspci -mm -k` has verbose==0 and the
+            # -k data is never printed. Every device then parses with no "Kernel
+            # driver in use" line, and the deliberate unclaimed=True default turns
+            # that into a 100% false alarm: the yellow-bang this feature exists to
+            # surface fires for everything, which is the same as firing for
+            # nothing.
+            #
+            # Adding -v does NOT fix it: in machine mode show_kernel_machine()
+            # prints "Driver:\t%s" at COLUMN 0, one line per module, so the
+            # parser's `raw[0].isspace()` continuation branch never fires and
+            # every attribute line becomes its own phantom device.
+            #
+            # Plain `lspci -k` prints unquoted device lines at column 0 with
+            # TAB-INDENTED "Kernel driver in use:" / "Kernel modules:"
+            # continuations — exactly the shape parse_lspci_k already handles,
+            # and the shape its fixtures already encode. The only loss is the
+            # quoted vendor/device split in `info`, which is cosmetic here.
+            #
+            # Mechanism established from pciutils source, not from a capture —
+            # the dev box is Windows. driver-matrix.nix now captures all three
+            # forms verbatim in a VM so the next run PROVES it.
+            r = _probe(['lspci', '-k'])
             devices = parse_lspci_k(r.stdout if r else '')
 
             r = _probe(['lsusb'])

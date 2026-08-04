@@ -1,26 +1,29 @@
 [run]
+# STOP ENUMERATING. `source = .` with the omit list below doing the excluding,
+# so new code is measured BY DEFAULT and exclusion is the deliberate act.
+#
+# core/ was missing from the old hand-written list until 2026-07-31, so the
+# package holding the canonical single-sources — constants.py
+# (LATENCY_BUDGETS), subprocess_safe.py (the one bounded probe, 139 callers),
+# port_registry, llama_scheduler, platform/, peer_link/ — reported no coverage
+# at all. Not LOW coverage: NO DATA, which reads identically to "nothing to
+# see" on a report, and is how the gap stayed invisible.
+#
+# Adding `core` fixed that one entry and left the MECHANISM in place. Counted
+# against what actually exists, the list still reached 5 of 25 integrations
+# subpackages, and missed two whole top-level packages (desktop/, hart_sdk/)
+# that both have __init__.py. Invisible: remote_desktop, internal_comm, mcp,
+# expert_agents, google_a2a, ap2, gateway, providers, openclaw, audio,
+# marketing, browser_research, distributed_agent, agent_lightning and more —
+# several of which the parity matrix cites, and any of which would answer a
+# "which tests cover this?" query with a confident EMPTY set.
+#
+# The next package added would have been invisible the same way `core` was.
+# This inverts the failure mode from "silently absent" to "explicitly
+# excluded" — the same fail-toward-visible principle as `unclaimed=True` in
+# the device panel.
 source =
-    # core/ was MISSING from this list until 2026-07-31, so the package that
-    # holds the canonical single-sources — constants.py (LATENCY_BUDGETS),
-    # subprocess_safe.py (the one bounded probe, 139 callers), port_registry,
-    # llama_scheduler, platform/, peer_link/ — reported no coverage at all.
-    # Not low coverage: NO DATA, which reads identically to "nothing to see"
-    # on a report and is how the gap stayed invisible.
-    core
-    integrations/agent_engine
-    integrations/social
-    integrations/coding_agent
-    integrations/channels
-    integrations/service_tools
-    security
-    hart_intelligence_entry
-    threadlocal
-    helper
-    helper_func
-    helper_ledger
-    lifecycle_hooks
-    create_recipe
-    reuse_recipe
+    .
 data_file = test-reports/coverage/.coverage
 
 # Record WHICH TEST executed each line. This answers "what tests exercise
@@ -43,14 +46,29 @@ data_file = test-reports/coverage/.coverage
 # does not exist.
 dynamic_context = test_function
 
+# With `source = .` these carry the whole exclusion job, so they are now
+# load-bearing rather than incidental. Anything not listed here IS measured.
 omit =
     tests/*
     venv*/*
+    .venv*/*
     .idea/*
     autogen-*/*
     docs/*
     */migrations/*
     */__pycache__/*
+    # Added with `source = .`: these were previously excluded by simply not
+    # being enumerated, and would otherwise become newly-measured noise.
+    setup.py
+    conftest.py
+    */conftest.py
+    build/*
+    dist/*
+    *.egg-info/*
+    node_modules/*
+    nixos/*
+    scripts/*
+    .github/*
 
 [report]
 show_missing = true

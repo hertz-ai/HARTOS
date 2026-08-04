@@ -351,6 +351,24 @@ in
             /run/current-system/sw/bin/nixos-rebuild test --flake ${copilotRepo}/nixos#${copilotFlakeAttr}
           '';
           TimeoutStartSec = "45min";
+
+          # BOUNDED, because this is the heavier of the module's two units and
+          # was the unbounded one. hart-copilot-daemon is capped at 1 core / 2G
+          # / 64 tasks while THIS ran a full system-closure evaluation and build
+          # — the single heaviest thing on the box — for up to 45 minutes at
+          # unlimited cores, memory and tasks. The polkit rule below exists
+          # specifically so the capped daemon may start it, so the containment
+          # was reachable around by the one path the module deliberately grants.
+          #
+          # NOT a CPU cap: throttling a 45-minute build to one core makes it a
+          # much longer one, and nix has its own levers for parallelism
+          # (max-jobs / cores). Memory and tasks are the ones that matter here —
+          # a runaway eval must not OOM the node the co-pilot is supposed to be
+          # protecting, and "degrade ITSELF, never the desktop" is this module's
+          # own stated contract.
+          MemoryHigh = "4G";     # throttle + reclaim first
+          MemoryMax = "6G";      # then kill, rather than take the box down
+          TasksMax = 512;        # nix spawns many; bound the fork storm
         };
         path = [ pkgs.nix pkgs.git pkgs.openssh pkgs.coreutils ];
       };
