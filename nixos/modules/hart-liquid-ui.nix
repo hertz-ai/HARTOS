@@ -670,6 +670,28 @@ in
     })
 
     # ─────────────────────────────────────────────────────────
+    # OFFLINE VOICE FLOOR — UNCONDITIONAL (task #7, item 0.5)
+    # ─────────────────────────────────────────────────────────
+    # Deliberately NOT behind ui.voiceEnabled. That option is one flag over
+    # two concerns — its own description says "voice input (STT) and output
+    # (TTS)" — so turning off the wake-word LISTENER also removed the ability
+    # to SPEAK. Disabling a microphone should never mute the OS.
+    #
+    # Found in a VM (run 30848154453): desktop-boot sets voiceEnabled=false to
+    # trim the listener user service, a legitimate thing to want, and the
+    # offline-voice-floor subtest then failed on `command -v espeak-ng`. The
+    # same would happen to any real node that runs the desktop without voice
+    # input — a kiosk, or a user who simply does not want a hot mic — and it
+    # would land on exactly the moment the OS is supposed to introduce itself
+    # by talking.
+    #
+    # espeak-ng is small, needs no model and no download, so there is no cost
+    # to making it always present. It is not the voice we want; it is the
+    # voice that always works, which is the whole point of a floor. The good
+    # voice still arrives via the Model Bus when a model does.
+    { environment.systemPackages = [ pkgs.espeak-ng ]; }
+
+    # ─────────────────────────────────────────────────────────
     # Voice I/O (when enabled)
     # ─────────────────────────────────────────────────────────
     (lib.mkIf ui.voiceEnabled {
@@ -679,26 +701,13 @@ in
         sox          # Audio manipulation (record, play, convert)
         alsa-utils   # arecord, aplay
 
-        # OFFLINE VOICE FLOOR (task #7, item 0.5). Everything else in the TTS
-        # ladder needs something the box may not have on first boot: Model Bus
-        # needs a model, and the model needs a download. On a no-network box
-        # the narrated onboarding and the orb were therefore SILENT — the
-        # first-run experience that is supposed to introduce the OS by
-        # speaking simply did not.
-        #
-        # espeak-ng is small, has no model to fetch, and speaks immediately.
-        # It is not the voice we want — it is the voice that always works, so
-        # first boot is never mute while the good voice is still downloading.
-        #
-        # WHY HERE and not the desktop profile: this module already owns the
-        # voice pipeline (ui.voiceEnabled gates the listener, the Model Bus
-        # wiring and LIQUID_UI_VOICE), so the offline fallback belongs with
-        # it — one writer for "what voice needs". It exists in the tree only
-        # in hart-accessibility.nix, gated behind screenReader.enable, which
-        # defaults FALSE and also drags in Orca auto-starting at login. That
-        # is a screen reader, not a fallback synthesizer; enabling it to get
-        # espeak would have made every desktop start talking over itself.
-        espeak-ng
+        # The offline voice FLOOR (espeak-ng) used to live here and has moved
+        # UP to an unconditional block — see the comment above this mkIf.
+        # It stays in this module (one writer for "what voice needs"); it just
+        # no longer depends on voice INPUT being on. The other entry in the
+        # tree is hart-accessibility.nix behind screenReader.enable, which
+        # defaults false and drags in Orca auto-starting at login — a screen
+        # reader, not a fallback synthesizer.
       ];
 
       # Voice input listener (background, activated by wake word or push-to-talk)

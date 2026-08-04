@@ -3808,3 +3808,57 @@ class TestNoOrphanedNixosTests:
             f"test bindings imported but never merged into `checks`: "
             f"{unmerged}.\nThey evaluate and are then discarded, so the check "
             f"never appears in `nix eval .#checks.x86_64-linux`.")
+
+
+class TestOfflineVoiceFloorIsUnconditional:
+    """Disabling the microphone must never mute the OS (task #7 / #15).
+
+    espeak-ng is the offline voice FLOOR: the synthesizer that needs no model
+    and no download, so a fresh no-network box can still speak its narrated
+    onboarding while the good voice is downloading.
+
+    It used to sit inside `lib.mkIf ui.voiceEnabled`, and that option covers
+    two concerns at once — its own description reads "voice input (STT) and
+    output (TTS)". So turning off the wake-word LISTENER also removed the
+    ability to SPEAK. Found in a VM (run 30848154453): desktop-boot sets
+    voiceEnabled=false purely to trim the listener user service, and the
+    offline-voice-floor subtest then failed on `command -v espeak-ng`. Any
+    real node running the desktop without voice input — a kiosk, or anyone
+    who does not want a hot mic — was mute for the same reason.
+
+    SOURCE GUARD, deliberately: nix cannot be evaluated on the Windows dev
+    box, so the behavioural proof is the desktop-boot subtest, which takes a
+    full VM boot in CI. This is the cheap local tripwire for the same
+    invariant, not a replacement for it.
+    """
+
+    def _module(self):
+        p = os.path.join(REPO_ROOT, 'nixos', 'modules', 'hart-liquid-ui.nix')
+        with open(p, encoding='utf-8') as fh:
+            return fh.read()
+
+    def test_source_guard_espeak_is_not_gated_on_voice_input(self):
+        src = self._module()
+        gate = src.index('(lib.mkIf ui.voiceEnabled {')
+        # Find where that mkIf block's package list ends, then confirm no
+        # espeak-ng DECLARATION lives inside it. Comments mentioning the name
+        # are fine and expected — the move left one behind on purpose.
+        block = src[gate:gate + 3000]
+        decls = [ln for ln in block.splitlines()
+                 if 'espeak-ng' in ln and not ln.strip().startswith('#')]
+        assert not decls, (
+            "espeak-ng is declared inside `lib.mkIf ui.voiceEnabled`, so a "
+            "node with voice INPUT off has no synthesizer and boots mute:\n"
+            + "\n".join(decls))
+
+    def test_source_guard_espeak_is_still_shipped_by_this_module(self):
+        """Un-gating must not become un-shipping."""
+        src = self._module()
+        gate = src.index('(lib.mkIf ui.voiceEnabled {')
+        before = src[:gate]
+        decls = [ln for ln in before.splitlines()
+                 if 'espeak-ng' in ln and not ln.strip().startswith('#')]
+        assert decls, (
+            "no unconditional espeak-ng declaration before the voiceEnabled "
+            "block — the offline voice floor is gone entirely, which is worse "
+            "than it being gated")
