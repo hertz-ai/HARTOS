@@ -49,6 +49,59 @@ def _emit_goal_changed(goal_id: str, change: str, goal_type: str = '') -> None:
         pass
 
 
+# ── Canonical goal-config reader ────────────────────────────────────────
+# AgentGoal.to_dict() (integrations/social/_models_local.py:2150-2171) does
+#     result = {<column fields>}; result.update(self.config_json or {})
+# i.e. it FLATTENS config_json into the top level.  The dict it returns has
+# no 'config' key and no 'config_json' key — the config's own keys ARE the
+# top-level keys.  Every prompt builder here used to read
+#     goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+# which looks for a nested dict that flattening dissolved, so it always got
+# {} and every config.get(k, default) silently returned the DEFAULT.
+#
+# Observed live 2026-08-05: a self_heal goal created with a real exception
+# rendered "Exception: Unknown / Module: unknown / Occurrences: 0 / Sample
+# traceback: N/A" — exactly the f-string defaults — while title and
+# description rendered fine, because those are genuine columns.  That
+# asymmetry is the fingerprint.  Worse than blank text: _build_self_heal_
+# prompt branches on `category in _BACKEND_REPAIR_CATEGORIES and backend`,
+# so with both empty the repair_backend_venv route was UNREACHABLE for
+# every category it exists to serve.
+#
+# Both real dispatch paths pass the flattened shape — agent_daemon.py:1109
+# and coding_daemon.py:230 both call GoalManager.build_prompt(goal.to_dict()).
+# Some callers still pass a hand-built dict with a nested config, so the
+# nested lookup is kept and tried FIRST; the flattened reconstruction is a
+# fallback that only runs where the old code produced {}.  That makes this a
+# strict superset of the previous behaviour — it cannot change a case that
+# already worked.
+#
+# NOT `or goal_dict`: a blanket fallback would make config.get('title')
+# return the GOAL title where it used to return a default, silently altering
+# prompts.  Excluding the column names inverts the flattening exactly.
+_GOAL_COLUMNS = frozenset({
+    'id', 'owner_id', 'goal_type', 'title', 'description', 'status',
+    'priority', 'product_id', 'spark_budget', 'spark_spent', 'created_by',
+    'prompt_id', 'last_dispatched_at', 'created_at', 'updated_at',
+})
+
+
+def _goal_config(goal_dict: Dict) -> Dict:
+    """Return a goal's type-specific config regardless of dict shape.
+
+    Handles all three shapes seen in this codebase: nested under 'config',
+    nested under 'config_json', or flattened by AgentGoal.to_dict().
+
+    _GOAL_COLUMNS mirrors the column list in _models_local.py:2152-2168 and
+    is drift-guarded by tests/unit/test_goal_config_shape.py — two
+    hand-maintained copies of that list would be this same bug one level up.
+    """
+    nested = goal_dict.get('config') or goal_dict.get('config_json')
+    if nested:
+        return nested
+    return {k: v for k, v in goal_dict.items() if k not in _GOAL_COLUMNS}
+
+
 def register_goal_type(goal_type: str, build_prompt: Callable,
                        tool_tags: Optional[List[str]] = None):
     """Register a new goal type with its prompt builder and tool tags.
@@ -705,7 +758,7 @@ def _build_coding_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -
     from .hive_sdk_spec import get_hive_embedding_instructions, CODE_QUALITY_CONSTITUTIONAL_RULES
 
     # Support both flat fields (legacy CodingGoal) and nested config_json (AgentGoal)
-    config = goal_dict.get('config_json', {}) or goal_dict.get('config', {}) or {}
+    config = _goal_config(goal_dict)
     repo_url = config.get('repo_url', goal_dict.get('repo_url', ''))
     repo_branch = config.get('repo_branch', goal_dict.get('repo_branch', 'main'))
     target_path = config.get('target_path', goal_dict.get('target_path', ''))
@@ -760,7 +813,7 @@ def _build_ip_protection_prompt(goal_dict: Dict, product_dict: Optional[Dict] = 
     The agent protects the self-improving loop architecture:
       agents → world model → HevolveAI → coding agents improve HevolveAI → repeat
     """
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     mode = config.get('mode', 'monitor')
 
     platform_identity = _get_platform_identity()
@@ -838,7 +891,7 @@ def _build_finance_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) 
     Vijai personality: cautious, methodical, genuine, net-positive.
     The business must sustain itself. The finance agent gets through this in style.
     """
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     platform_identity = _get_platform_identity()
 
     return (
@@ -879,7 +932,7 @@ def _build_finance_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) 
 
 def _build_revenue_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
     """Build a revenue agent prompt — monitors API revenue, pricing, docs, promotion."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     platform_identity = _get_platform_identity()
 
     return (
@@ -922,7 +975,7 @@ def _build_self_heal_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
     the loophole the producer side already documented (see
     ``core/error_advice.py:_try_agent_remediation``).
     """
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     category = config.get('category', '') or ''
     ctx = config.get('context', {}) or {}
     backend = ctx.get('backend') if isinstance(ctx, dict) else None
@@ -1005,7 +1058,7 @@ def _build_self_heal_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
 
 def _build_federation_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
     """Build a federation monitoring prompt."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     return (
         f"YOU ARE A FEDERATED LEARNING MONITOR AGENT.\n\n"
         f"Goal: {goal_dict['title']}\n"
@@ -1022,7 +1075,7 @@ def _build_federation_prompt(goal_dict: Dict, product_dict: Optional[Dict] = Non
 
 def _build_upgrade_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
     """Build an auto-upgrade pipeline prompt."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     return (
         f"YOU ARE AN AUTO-UPGRADE ORCHESTRATOR AGENT.\n\n"
         f"Goal: {goal_dict['title']}\n"
@@ -1048,7 +1101,7 @@ def _build_thought_experiment_prompt(goal_dict: Dict, product_dict: Optional[Dic
     Agents evaluate hypotheses, propose improvements, and report via
     dynamic_layout JSON for Liquid UI rendering in the tracker view.
     """
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     intent = config.get('intent_category', 'education')
     hypothesis = config.get('hypothesis', '')
     expected_outcome = config.get('expected_outcome', '')
@@ -1087,7 +1140,7 @@ def _build_news_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> 
     """Build prompt for news curation and push notification agent."""
     title = _sanitize_goal_input(goal_dict.get('title', ''))
     desc = _sanitize_goal_input(goal_dict.get('description', ''))
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     scope = config.get('scope', 'international')
     categories = config.get('categories', [])
     feed_urls = config.get('feed_urls', [])
@@ -1145,7 +1198,7 @@ def _build_seo_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> s
     """
     title = _sanitize_goal_input(goal_dict.get('title', ''))
     desc = _sanitize_goal_input(goal_dict.get('description', ''))
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     repo = config.get('repo', '')
     base_branch = config.get('base_branch', 'main')
     min_score = config.get('min_seo_score', 90)
@@ -1224,7 +1277,7 @@ def _build_paper_explanation_prompt(goal_dict: Dict,
     """
     title = _sanitize_goal_input(goal_dict.get('title', ''))
     desc = _sanitize_goal_input(goal_dict.get('description', ''))
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     repo = config.get('repo', '')
     base_branch = config.get('base_branch', 'main')
     target_file = config.get('target_file', 'src/data/researchExplanations.json')
@@ -1361,7 +1414,7 @@ def _build_speech_therapy_prompt(goal_dict, product_dict=None):
     shame, never diagnose) are in the description.  This wrapper adds
     ONLY the runtime grounding the agent needs at invocation time.
     """
-    config = goal_dict.get('config_json', {})
+    config = _goal_config(goal_dict)
     child_id = config.get('child_id', 'anonymous_child')
     preferred_lang = config.get('preferred_lang', '')
     return (
@@ -1431,7 +1484,7 @@ def _build_research_prompt(goal_dict, product_dict=None):
     cited brief.  Distinct from the internal 'autoresearch' code-
     experiment loop.
     """
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     topic = config.get('topic') or goal_dict.get('title', '') or 'the requested topic'
     depth = config.get('depth', 'standard')          # quick | standard | deep
     max_sources = config.get('max_sources', 8)
@@ -1464,7 +1517,7 @@ register_goal_type('research', _build_research_prompt,
 
 def _build_tutor_prompt(goal_dict, product_dict=None):
     """Tutor - patient one-on-one subject tutor (Socratic, mastery-based)."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     subject = config.get('subject', 'general studies')
     level = config.get('level', 'auto-detect from the learner')
     style = config.get('style', 'socratic')
@@ -1500,7 +1553,7 @@ def _build_english_learning_prompt(goal_dict, product_dict=None):
 
     Voice-capable: declares the voice stack so lessons can be heard and spoken.
     """
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     level = config.get('level', 'auto-detect (CEFR A1-C2)')
     focus = config.get('focus', 'balanced (vocabulary, grammar, reading, listening)')
     native_lang = config.get('native_lang', '')
@@ -1532,7 +1585,7 @@ register_goal_type('english_learning', _build_english_learning_prompt,
 
 def _build_spoken_english_prompt(goal_dict, product_dict=None):
     """Spoken English - voice-first conversation, pronunciation, and fluency coach."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     level = config.get('level', 'auto-detect')
     scenario = config.get('scenario', 'free conversation')
     accent_target = config.get('accent_target', 'clear, neutral')
@@ -1580,7 +1633,7 @@ except ImportError:
 
 def _build_content_gen_prompt(goal_dict, product_dict=None):
     """Build prompt for content generation monitor agent."""
-    config = goal_dict.get('config_json', {})
+    config = _goal_config(goal_dict)
     game_id = config.get('game_id', 'unknown')
     game_title = config.get('game_title', game_id)
     media_reqs = config.get('media_requirements', {})
@@ -1618,7 +1671,7 @@ register_goal_type('content_gen', _build_content_gen_prompt,
 
 def _build_learning_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
     """Build a /chat prompt for a continual learning coordination goal."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     return (
         f"YOU ARE A CONTINUAL LEARNING COORDINATOR AGENT for the HART platform.\n\n"
         f"Goal: {goal_dict.get('title', '')}\n"
@@ -1645,7 +1698,7 @@ register_goal_type('learning', _build_learning_prompt, tool_tags=['learning'])
 def _build_distributed_learning_prompt(goal_dict: Dict,
                                        product_dict: Optional[Dict] = None) -> str:
     """Build a /chat prompt for distributed gradient sync coordination."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     return (
         f"YOU ARE A DISTRIBUTED LEARNING COORDINATOR AGENT for the HART platform.\n\n"
         f"Goal: {goal_dict.get('title', '')}\n"
@@ -1701,7 +1754,7 @@ def _build_trading_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) 
     """
     title = _sanitize_goal_input(goal_dict.get('title', ''))
     desc = _sanitize_goal_input(goal_dict.get('description', ''))
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     strategy = config.get('strategy', 'long_term')
     paper = config.get('paper_trading', True)
     market = config.get('market', 'crypto')
@@ -1764,7 +1817,7 @@ def _build_civic_sentinel_prompt(goal_dict, product_dict=None):
     to monitor censorship, capture evidence, and expose political hypocrisy.
     No new Python modules — pure LLM agent composing existing tools.
     """
-    config = goal_dict.get('config_json', {}) or goal_dict.get('config', {})
+    config = _goal_config(goal_dict)
     topics = config.get('topics', [])
     channels = config.get('channels', ['all'])
     parties = config.get('parties', [])
@@ -1899,7 +1952,7 @@ register_goal_type('civic_sentinel', _build_civic_sentinel_prompt,
 
 def _build_self_build_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
     """Build prompt for OS self-build agent."""
-    config = goal_dict.get('config_json', {})
+    config = _goal_config(goal_dict)
     mode = config.get('mode', 'monitor')
     return (
         f"You are the HART OS Self-Build agent. You can modify the operating system "
@@ -1936,7 +1989,7 @@ def _build_autoresearch_prompt(goal_dict: Dict, product_dict: Optional[Dict] = N
     Inspired by karpathy/autoresearch: edit code → run experiments → score →
     keep best → iterate. At hive scale across distributed compute.
     """
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     repo_path = config.get('repo_path', '')
     target_file = config.get('target_file', '')
     run_command = config.get('run_command', '')
@@ -2028,7 +2081,7 @@ register_goal_type('autoresearch', _build_autoresearch_prompt,
 # ─── Code Evolution Goal (any private repo, full context) ─────────
 
 def _build_code_evolution_prompt(goal_dict, product_dict=None):
-    config = goal_dict.get('config_json', {}) or goal_dict.get('config', {})
+    config = _goal_config(goal_dict)
     task_desc = goal_dict.get('description', '')
     target_files = config.get('target_files', [])
     repo_path = config.get('repo_path', '')
@@ -2128,7 +2181,7 @@ _P2P_TOOLS = (
 
 def _build_p2p_marketplace_prompt(goal_dict, product_dict=None):
     """P2P marketplace — buy/sell goods, services, digital items."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     category = config.get('category', 'general')
     region = config.get('region', 'auto-detect')
     return (
@@ -2163,7 +2216,7 @@ def _build_p2p_marketplace_prompt(goal_dict, product_dict=None):
 
 def _build_p2p_rideshare_prompt(goal_dict, product_dict=None):
     """P2P rideshare — riders and drivers connect directly via RideSnap backend."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     region = config.get('region', 'auto-detect')
     ridesnap_url = config.get('ridesnap_url', 'http://localhost:8000/api')
     return (
@@ -2228,7 +2281,7 @@ def _build_p2p_grocery_prompt(goal_dict, product_dict=None):
     - Voice ordering (audio upload)
     - WAMP real-time store events (same transport as HARTOS EventBus)
     """
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     region = config.get('region', 'auto-detect')
     mcgroce_url = config.get('mcgroce_url', 'http://localhost:8080/api/v1')
     return (
@@ -2294,7 +2347,7 @@ def _build_p2p_grocery_prompt(goal_dict, product_dict=None):
 
 def _build_p2p_food_delivery_prompt(goal_dict, product_dict=None):
     """P2P food delivery — restaurants and home cooks serve community."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     region = config.get('region', 'auto-detect')
     return (
         "You are a P2P FOOD DELIVERY AGENT for HART OS.\n\n"
@@ -2325,7 +2378,7 @@ def _build_p2p_food_delivery_prompt(goal_dict, product_dict=None):
 
 def _build_p2p_freelance_prompt(goal_dict, product_dict=None):
     """P2P freelance — skills marketplace, no platform lock-in."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     category = config.get('category', 'general')
     return (
         "You are a P2P FREELANCE MARKETPLACE AGENT for HART OS.\n\n"
@@ -2356,7 +2409,7 @@ def _build_p2p_freelance_prompt(goal_dict, product_dict=None):
 
 def _build_p2p_bills_prompt(goal_dict, product_dict=None):
     """P2P bill payments — electricity, water, gas, phone, internet, UPI."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     region = config.get('region', 'auto-detect')
     return (
         "You are a BILL PAYMENT AGENT for HART OS.\n\n"
@@ -2393,7 +2446,7 @@ def _build_p2p_bills_prompt(goal_dict, product_dict=None):
 
 def _build_p2p_tickets_prompt(goal_dict, product_dict=None):
     """P2P ticket booking — trains, buses, flights, events."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     region = config.get('region', 'auto-detect')
     return (
         "You are a TICKET BOOKING AGENT for HART OS.\n\n"
@@ -2431,7 +2484,7 @@ def _build_p2p_tickets_prompt(goal_dict, product_dict=None):
 
 def _build_p2p_tutoring_prompt(goal_dict, product_dict=None):
     """P2P tutoring — teachers and students connect directly, powered by Enlight21."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     subjects = config.get('subjects', [])
     enlight_url = config.get('enlight_url', '')
     return (
@@ -2473,7 +2526,7 @@ def _build_p2p_tutoring_prompt(goal_dict, product_dict=None):
 
 def _build_p2p_services_prompt(goal_dict, product_dict=None):
     """P2P home/local services — plumbing, electrical, cleaning, etc."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     region = config.get('region', 'auto-detect')
     service_type = config.get('service_type', 'general')
     return (
@@ -2504,7 +2557,7 @@ def _build_p2p_services_prompt(goal_dict, product_dict=None):
 
 def _build_p2p_rental_prompt(goal_dict, product_dict=None):
     """P2P rental — rent anything from anyone. Cars, tools, spaces, equipment."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     category = config.get('category', 'general')
     return (
         "You are a P2P RENTAL AGENT for HART OS.\n\n"
@@ -2532,7 +2585,7 @@ def _build_p2p_rental_prompt(goal_dict, product_dict=None):
 
 def _build_p2p_health_prompt(goal_dict, product_dict=None):
     """P2P health — telemedicine, pharmacy, wellness. NOT diagnosis."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     return (
         "You are a HEALTH SERVICES AGENT for HART OS.\n\n"
         "MODEL: Connect patients with doctors, pharmacies, labs, wellness providers.\n"
@@ -2561,7 +2614,7 @@ def _build_p2p_health_prompt(goal_dict, product_dict=None):
 
 def _build_p2p_logistics_prompt(goal_dict, product_dict=None):
     """P2P logistics — courier, parcel delivery, moving services."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     region = config.get('region', 'auto-detect')
     return (
         "You are a P2P LOGISTICS AGENT for HART OS.\n\n"
@@ -2620,7 +2673,7 @@ register_goal_type('p2p_logistics', _build_p2p_logistics_prompt,
 # ─── Hive Acceleration Goal Types ───
 
 def _build_hive_growth_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     channels = config.get('channels', [])
     return (
         f"HIVE GROWTH AGENT\n\n"
@@ -2634,7 +2687,7 @@ def _build_hive_growth_prompt(goal_dict: Dict, product_dict: Optional[Dict] = No
     )
 
 def _build_hive_infra_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     return (
         f"HIVE INFRASTRUCTURE AGENT\n\n"
         f"Goal: {goal_dict.get('title', 'Maintain hive infrastructure')}\n"
@@ -2646,7 +2699,7 @@ def _build_hive_infra_prompt(goal_dict: Dict, product_dict: Optional[Dict] = Non
     )
 
 def _build_hive_economics_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     return (
         f"HIVE ECONOMICS AGENT\n\n"
         f"Goal: {goal_dict.get('title', 'Distribute capital fairly')}\n"
@@ -2659,7 +2712,7 @@ def _build_hive_economics_prompt(goal_dict: Dict, product_dict: Optional[Dict] =
     )
 
 def _build_hive_training_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     return (
         f"HIVE TRAINING COORDINATOR\n\n"
         f"Goal: {goal_dict.get('title', 'Coordinate distributed training')}\n"
@@ -2671,7 +2724,7 @@ def _build_hive_training_prompt(goal_dict: Dict, product_dict: Optional[Dict] = 
     )
 
 def _build_hive_proof_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    config = _goal_config(goal_dict)
     return (
         f"HIVE BENCHMARK PROVER\n\n"
         f"Goal: {goal_dict.get('title', 'Prove hive intelligence')}\n"
