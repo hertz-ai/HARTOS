@@ -3959,6 +3959,37 @@ def create_action_with_ledger(actions: List[Dict], user_id: int, prompt_id: int,
     action_instance.set_ledger(ledger)
     return action_instance
 
+_REMEDY_MAX_ATTEMPTS = 3
+
+
+def _remedy_replay_exceeded(attempts, key, limit=_REMEDY_MAX_ATTEMPTS):
+    """Count an attempt at `key`; True once it has been tried `limit` times.
+
+    Guards the two remedy sites in the main loop that re-issue a
+    BYTE-IDENTICAL prompt whenever their guard condition survives the
+    remedy.  Neither condition is changed by the remedy failing:
+
+      * recipe-not-banked -> ask the model for a recipe.  If the model
+        does not save one, ``os.path.exists(_recipe_file)`` is still
+        False next iteration, so the same request is sent again.
+      * completion-claim-rejected -> tell the model to keep working.  If
+        it re-claims the same task, ``_claim_valid`` is False again, so
+        the same rejection text is sent again.
+
+    Measured in llm_outbound.jsonl (1,190 records): 982 of 1088 calls
+    re-sent an already-sent payload; the worst single payload went out
+    222 times, the recipe request 170 times and the rejection 75 times.
+    That is what filled 19.3h of cumulative LLM latency, not model speed
+    -- the loop's existing bounds (max_iterations=300, 30-min pipeline
+    timeout) cap the damage but do not stop the replay.
+
+    Bounding the remedy, not the loop, is the fix: after `limit` tries
+    the caller takes its escape path instead of re-asking.
+    """
+    attempts[key] = attempts.get(key, 0) + 1
+    return attempts[key] > limit
+
+
 def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     """
     Handles the response generation process for an agent group.
@@ -4123,6 +4154,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         max_iterations = 300  # Time-based: ~5s per iteration = ~25 min max
         _pipeline_start = time.time()
         _pipeline_timeout = 1800  # 30 minutes — CREATE is the learning phase, needs time
+        # Per-run replay ledger for _remedy_replay_exceeded (see its docstring).
+        _remedy_attempts = {}
 
         while while_loop_iterations < max_iterations:
             # Hard timeout: don't let pipeline run forever
@@ -4340,17 +4373,37 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                             user_prompt, prompt_id, flow, json_action_id,
                                             group_chat)
                                     if not os.path.exists(_recipe_file):
-                                        # Trace banking failed — request it from the model
-                                        current_app.logger.info(
-                                            f"[RECIPE-NEEDED] {_claimed_task_id} completed but recipe not saved, requesting")
-                                        user_tasks[user_prompt].recipe = True
-                                        user_tasks[user_prompt].fallback = False
-                                        _recipe_msg = request_recipe_for_action(json_action_id, prompt_id, role, user_prompt)
-                                        result = chat_instructor.initiate_chat(
-                                            recipient=manager, message=_recipe_msg, clear_history=False, silent=False)
-                                        _rh = chat_instructor.chat_messages.get(manager, [])
-                                        if _rh and len(group_chat.messages) == 0:
-                                            group_chat.messages.extend(_rh)
+                                        if _remedy_replay_exceeded(
+                                                _remedy_attempts,
+                                                ('recipe', prompt_id, json_action_id)):
+                                            # Asked _REMEDY_MAX_ATTEMPTS times and the file is
+                                            # STILL absent.  os.path.exists() above is unchanged
+                                            # by the model failing to save, so re-entering this
+                                            # branch re-sends a byte-identical request forever
+                                            # (measured 170x).  Advance unbanked instead — the
+                                            # action itself did complete; only its recipe is
+                                            # missing, and _bank_action_recipe_from_trace already
+                                            # had first refusal.
+                                            current_app.logger.warning(
+                                                f"[RECIPE-GIVEUP] {_claimed_task_id} action "
+                                                f"{json_action_id}: still unbanked after "
+                                                f"{_REMEDY_MAX_ATTEMPTS} requests — advancing "
+                                                f"without a recipe rather than replaying")
+                                            if json_action_id < len(user_tasks[user_prompt].actions):
+                                                user_tasks[user_prompt].current_action = json_action_id + 1
+                                                user_tasks[user_prompt].recipe = False
+                                        else:
+                                            # Trace banking failed — request it from the model
+                                            current_app.logger.info(
+                                                f"[RECIPE-NEEDED] {_claimed_task_id} completed but recipe not saved, requesting")
+                                            user_tasks[user_prompt].recipe = True
+                                            user_tasks[user_prompt].fallback = False
+                                            _recipe_msg = request_recipe_for_action(json_action_id, prompt_id, role, user_prompt)
+                                            result = chat_instructor.initiate_chat(
+                                                recipient=manager, message=_recipe_msg, clear_history=False, silent=False)
+                                            _rh = chat_instructor.chat_messages.get(manager, [])
+                                            if _rh and len(group_chat.messages) == 0:
+                                                group_chat.messages.extend(_rh)
                                     else:
                                         current_app.logger.info(
                                             f"[ALREADY DONE] {_claimed_task_id} completed + recipe saved, advancing")
@@ -4381,6 +4434,20 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
                         if not _claim_valid:
                             current_app.logger.error(f"[CLAIM REJECTED] {_rejection_reason}")
+                            if _remedy_replay_exceeded(
+                                    _remedy_attempts,
+                                    ('claim', prompt_id, current_action_id, _rejection_reason)):
+                                # Same action rejected for the same reason
+                                # _REMEDY_MAX_ATTEMPTS times.  _claim_valid is recomputed from
+                                # whatever the model claims next, so a model that keeps
+                                # re-claiming one task keeps landing here with identical text
+                                # (measured 75x).  Stop and keep the progress already saved —
+                                # the same thing the wall-clock timeout above does.
+                                current_app.logger.error(
+                                    f"[CLAIM-GIVEUP] action {current_action_id} rejected "
+                                    f"{_REMEDY_MAX_ATTEMPTS}x for an unchanged reason — "
+                                    f"stopping instead of replaying: {_rejection_reason}")
+                                break
                             message = (f"Your completion claim was rejected: {_rejection_reason}. "
                                        f"Continue working on action {current_action_id}.")
                             result = chat_instructor.initiate_chat(
