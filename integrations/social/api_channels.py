@@ -96,29 +96,37 @@ def _wire_live_adapter(channel_type: str, credential) -> dict:
     registered but never connect. This schedules that start explicitly,
     same as the WhatsApp fix. Never raises — binding creation must
     succeed even if live wiring fails.
+
+    Re-wiring (2026-08-04): a registered-but-DEAD adapter used to
+    short-circuit this whole function ("adapter already registered"), so
+    a user whose first attempt failed — a mistyped token, a revoked bot,
+    or (Discord) privileged intents not yet enabled in the developer
+    portal — could never recover from the app: resubmitting updated the
+    UserChannelBinding row, but the dead adapter kept its original
+    credential and was never retried until the server restarted.
+    An adapter is now reused ONLY when it is both healthy AND holding
+    the same credential; otherwise it is torn down and rebuilt.
     """
     if not credential:
         return {'success': True, 'message': 'no credential to wire (binding-only channel)'}
     try:
         import asyncio as _aio
         import time as _time
+        from integrations.channels.base import ChannelStatus
         from integrations.channels.flask_integration import get_channel_integration
         integration = get_channel_integration()
 
-        if integration.registry.get(channel_type) is not None:
-            return {'success': True, 'message': 'adapter already registered'}
-
-        if not integration.register_channel(channel_type, token=credential):
-            return {'success': False, 'error': 'register_channel returned False (see server log)'}
-
-        adapter = integration.registry.get(channel_type)
+        # The background loop has to exist before EITHER path below:
+        # tearing a stale adapter down needs it (stop() is a coroutine),
+        # and so does starting the new one. Hoisted above the registry
+        # check for that reason.
         loop = integration._loop
         if not (loop and loop.is_running()):
             # Same gap as WhatsApp's _ensure_whatsapp_live_adapter (see
             # hart_intelligence_entry.py): entrypoints that skip
             # hartos_bootstrap's full sequence never call
             # FlaskChannelIntegration.start(), so _loop stays None and
-            # register_channel() above sits registered-but-never-started
+            # register_channel() below sits registered-but-never-started
             # forever — confirmed live 2026-07-28 for Telegram, same as
             # WhatsApp the night before. start() is idempotent and cheap,
             # safe to trigger on-demand here.
@@ -130,6 +138,37 @@ def _wire_live_adapter(channel_type: str, credential) -> dict:
                 _time.sleep(0.1)
             else:
                 return {'success': False, 'error': 'channel event loop failed to start'}
+
+        existing = integration.registry.get(channel_type)
+        if existing is not None:
+            status = existing.get_status()
+            # CONNECTING counts as healthy: an attempt started seconds ago
+            # is still in flight (Discord gives itself 30s), and yanking it
+            # would only restart the same wait.
+            healthy = status in (
+                ChannelStatus.CONNECTED,
+                ChannelStatus.CONNECTING,
+                ChannelStatus.RATE_LIMITED,
+            )
+            same_credential = getattr(existing.config, 'token', None) == credential
+            if healthy and same_credential:
+                return {'success': True, 'message': 'adapter already registered'}
+            logger.info(
+                "re-wiring %s adapter (status=%s, credential_changed=%s)",
+                channel_type, status, not same_credential,
+            )
+            try:
+                _aio.run_coroutine_threadsafe(existing.stop(), loop).result(timeout=5)
+            except Exception as e:
+                # An adapter that never finished connecting can fail to shut
+                # down cleanly; that must not block its replacement.
+                logger.warning("stopping stale %s adapter failed: %s", channel_type, e)
+            integration.registry.unregister(channel_type)
+
+        if not integration.register_channel(channel_type, token=credential):
+            return {'success': False, 'error': 'register_channel returned False (see server log)'}
+
+        adapter = integration.registry.get(channel_type)
         if adapter is None:
             return {'success': False, 'error': 'adapter missing after registration'}
         _aio.run_coroutine_threadsafe(adapter.start(), loop)
