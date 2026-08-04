@@ -1,5 +1,5 @@
 """
-HARTOS MCP Server — stdio-based Model Context Protocol server
+HARTOS MCP Server, the stdio Model Context Protocol transport.
 
 Exposes HARTOS agent ecosystem tools to Claude Code for orchestration.
 Run: python -m integrations.mcp.mcp_server
@@ -7,6 +7,20 @@ Run: python -m integrations.mcp.mcp_server
 Tools:
   list_agents, list_goals, create_goal, dispatch_goal, agent_status,
   remember, recall, list_recipes, system_health, social_query
+
+Requires the `mcp` package, which is deliberately NOT in requirements.txt.
+This transport is optional and the SDK is a chunky dependency to impose on
+the ~everyone who never runs a stdio MCP server. The HTTP transport in
+`mcp_http_bridge.py` serves the same tools with no extra install, so a user
+who just wants the tools has a path that always works.
+
+    pip install mcp
+
+The alternative was a bare `from mcp.server.fastmcp import FastMCP` at
+import time, which is what this used to be. Following the run line in this
+docstring on a fresh checkout gave a ModuleNotFoundError traceback naming a
+package that appears in no manifest, which reads like a broken repository
+rather than a missing optional extra.
 """
 import os
 import sys
@@ -18,7 +32,19 @@ from typing import Optional
 from core.port_registry import get_port
 from core.http_pool import pooled_get, pooled_post
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except ImportError as _exc:  # pragma: no cover - depends on optional install
+    raise ImportError(
+        "The stdio MCP server needs the 'mcp' package, which is not part of "
+        "requirements.txt because this transport is optional.\n"
+        "\n"
+        "    pip install mcp\n"
+        "\n"
+        "If you only want the tools and not this transport, the HTTP bridge "
+        "in integrations/mcp/mcp_http_bridge.py exposes the same set and "
+        "needs no extra install."
+    ) from _exc
 
 logger = logging.getLogger('hartos_mcp')
 logging.basicConfig(level=logging.INFO, format='%(name)s %(levelname)s %(message)s')

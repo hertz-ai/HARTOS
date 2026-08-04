@@ -5,9 +5,10 @@
 # Proves the NODE-side autonomous OTA wiring (hart-ota.nix): an installed
 # node auto-polls CENTRAL (not github) for the approved {flake_ref, commit}
 # of its channel, stages it through the EXISTING UpgradeOrchestrator pipeline,
-# and — with autoApply=true — applies via the EXISTING `nixos-rebuild switch
-# --flake` path with the EXISTING `|| nixos-rebuild switch --rollback`
-# auto-rollback, ALL with zero manual approval.
+# and — with autoApply=true — applies ACROSS THE PRIVILEGE BOUNDARY (task
+# #22): the unprivileged check unit writes an apply request; the root
+# hart-ota-apply path unit runs `nixos-rebuild switch --flake` with
+# rollback-on-failure, ALL with zero manual approval.
 #
 # What it asserts (the task's four required behaviours):
 #   1. The check service HITS hart.ota.centralEndpoint and parses the approved
@@ -102,11 +103,12 @@ let
     exec ${pkgs.python3}/bin/python3 ${mockCentralPy}
   '';
 
-  # Recording stubs for the privileged switch path. `.path` prepends these so
-  # they win over the system `sudo`/`nixos-rebuild`. Each records its full argv
-  # to ota/rebuild.log; `nixos-rebuild switch --flake …` exits non-zero IFF the
-  # FAIL_SWITCH sentinel exists (drives the rollback subtest) — `--rollback`
-  # always succeeds so the recovery path completes.
+  # Recording stub for the privileged switch path, prepended (mkBefore) on the
+  # ROOT hart-ota-apply unit's path so it wins over the module's own
+  # `path = [ pkgs.nixos-rebuild ]`. Records its full argv to ota/rebuild.log;
+  # `nixos-rebuild switch --flake …` exits non-zero IFF the FAIL_SWITCH
+  # sentinel exists (drives the rollback subtest) — `--rollback` always
+  # succeeds so the recovery path completes.
   rebuildStubs = pkgs.writeShellScriptBin "nixos-rebuild" ''
     echo "nixos-rebuild $*" >> /var/lib/hart/ota/rebuild.log
     if [[ "$*" == *"switch --flake"* ]]; then
@@ -118,14 +120,9 @@ let
     exit 0
   '';
 
-  # `sudo` stub: record + exec the rest (so `sudo nixos-rebuild …` hits the
-  # nixos-rebuild stub above). Keeps the module's exact `sudo nixos-rebuild`
-  # call shape — we shadow privilege, not the command structure.
-  sudoStub = pkgs.writeShellScriptBin "sudo" ''
-    # Skip any leading sudo flags, then exec the target command.
-    while [[ "''${1:-}" == -* ]]; do shift; done
-    exec "$@"
-  '';
+  # (The old `sudo` stub is gone with the sudo call itself: the unprivileged
+  # units never invoke sudo any more — the privilege boundary is the root
+  # hart-ota-apply path unit, task #22.)
 
   # `nixos-version` stub so the check service's `CURRENT=$(nixos-version)` is
   # deterministic under `set -euo pipefail` on the minimal node.
@@ -219,21 +216,29 @@ in
         # SUPERSEDE it as the switch target (asserted below).
       };
 
-      # Shadow the privileged switch + version binaries on the check service's
-      # PATH only (`.path` prepends). The production unit calls bare
-      # `sudo`/`nixos-rebuild`/`nixos-version`; these recording stubs intercept
-      # them so the test observes the switch/rollback argv without a real
-      # system rebuild.
-      systemd.services.hart-ota-check.path = [
-        sudoStub
-        rebuildStubs
-        nixosVersionStub
-      ];
+      # Shadow the privileged switch on the ROOT APPLY unit's PATH (task #22:
+      # the check unit no longer runs `sudo nixos-rebuild` — it writes an
+      # apply request and the root hart-ota-apply unit performs the switch).
+      # mkBefore so the recording stub wins over the module's own
+      # `path = [ pkgs.nixos-rebuild ]`.  The check unit still needs the
+      # deterministic `nixos-version` for CURRENT=$(nixos-version).
+      systemd.services.hart-ota-apply.path = pkgs.lib.mkBefore [ rebuildStubs ];
+      systemd.services.hart-ota-check.path = [ nixosVersionStub ];
 
       # The push driver (drives the real ota_push_listener) is available on the
       # node; the push subtest runs it with `systemctlStub` prepended on PATH so
       # the listener's `systemctl start hart-ota-check` is recorded, not real.
-      environment.systemPackages = [ pushDriver systemctlStub ];
+      #
+      # systemctlStub must NOT be in systemPackages: its bin/systemctl COLLIDES
+      # with systemd's in the system profile and (having won the merge) shadowed
+      # the REAL systemctl for everything — including the test driver's own
+      # backdoor, whose very first `wait_for_unit("multi-user.target")` then
+      # died on the stub's empty output ("produced invalid output"). That one
+      # collision was the whole hart-ota-central red since the push subtests
+      # landed. The stub stays a plain store path (additionalPaths keeps it in
+      # the VM's store) and is prepended per-invocation via STUB_PATH only.
+      environment.systemPackages = [ pushDriver ];
+      virtualisation.additionalPaths = [ systemctlStub ];
 
       # The localhost mock CENTRAL endpoint (stands in for etime's
       # /api/ota/latest). Up before the check service polls it.
@@ -269,7 +274,9 @@ in
 
       # The orchestrator must start IDLE for the staging run. tmpfiles already
       # created OTA + agent_data; ensure no stale state from a prior boot.
-      node.succeed("rm -f " + STATE + " " + PENDING + " " + REBUILD_LOG)
+      node.succeed("rm -f " + STATE + " " + PENDING + " " + REBUILD_LOG
+                   + " " + OTA + "/apply-request.json"
+                   + " " + OTA + "/last_apply.json")
 
       # ── 1+2. Check service HITS central, parses the approved rev, STAGES it ──
       with subtest("check service polls CENTRAL and parses the approved {flake_ref, commit}"):
@@ -324,15 +331,44 @@ in
           out = node.succeed("systemctl start hart-ota-check.service; "
                              "journalctl -u hart-ota-check -n 60 --no-pager")
           assert "Auto-apply enabled" in out, f"autoApply branch did not run:\n{out}"
+          # The switch is now ASYNC across the privilege boundary (task #22):
+          # the unprivileged check unit writes the apply request; the root
+          # hart-ota-apply path unit consumes it and runs the (stubbed)
+          # nixos-rebuild. Wait for the engine's final act, the result file.
           node.wait_for_file(REBUILD_LOG, timeout=30)
+          node.wait_until_succeeds(
+              "test -e " + OTA + "/last_apply.json", timeout=30)
+          # The request was CONSUMED (no path-unit retrigger loop).
+          node.succeed("test ! -e " + OTA + "/apply-request.json")
+          last = json.loads(node.succeed("cat " + OTA + "/last_apply.json"))
+          assert last["status"] == "applied", f"apply result not 'applied': {last}"
+          assert last["flake"] == "${approvedFlake}", \
+              f"apply result flake is not central's pin: {last}"
           log = node.succeed("cat " + REBUILD_LOG)
           # The switch target is central's flake#hart-<variant>, applied with NO
-          # manual step (oneshot/timer-driven) — the autonomy requirement.
+          # manual step (oneshot/timer/path-driven) — the autonomy requirement.
           assert "switch --flake ${approvedFlake}#hart-server" in log, \
               f"did not switch to the central-approved flake:\n{log}"
           # A successful switch must NOT roll back.
           assert "switch --rollback" not in log, \
               f"unexpected rollback on a successful switch:\n{log}"
+
+      # ── 3b. The privilege boundary itself (task #22 regression) ──
+      with subtest("check stays unprivileged; only the root apply unit switches"):
+          # The check unit is User=hart + NoNewPrivileges — under NNP sudo can
+          # never elevate, which is exactly why the old in-unit `sudo
+          # nixos-rebuild` was structurally broken. Pin both halves so neither
+          # regresses: the sandbox stays, and the switch lives in a root unit.
+          props = node.succeed(
+              "systemctl show hart-ota-check.service -p User -p NoNewPrivileges")
+          assert "User=hart" in props, f"check unit must stay User=hart:\n{props}"
+          assert "NoNewPrivileges=yes" in props, \
+              f"check unit must keep NoNewPrivileges:\n{props}"
+          apply_user = node.succeed(
+              "systemctl show hart-ota-apply.service -p User").strip()
+          assert apply_user in ("User=", "User=root"), \
+              f"apply unit must run as root: {apply_user!r}"
+          node.succeed("systemctl is-active hart-ota-apply.path")
 
       # ── 4. A failed apply ROLLS BACK (canary/rollback safety must-not-regress) ──
       with subtest("a failed switch triggers `nixos-rebuild switch --rollback`"):
@@ -348,19 +384,27 @@ in
                   "started_at": 0,
                   "stage_history": [],
               }) + "\nEOF")
-          node.succeed("rm -f " + REBUILD_LOG)
+          node.succeed("rm -f " + REBUILD_LOG + " " + OTA + "/last_apply.json")
           node.succeed("touch " + OTA + "/FAIL_SWITCH")
 
-          out = node.succeed("systemctl start hart-ota-check.service; "
-                             "journalctl -u hart-ota-check -n 60 --no-pager")
-          node.wait_for_file(REBUILD_LOG, timeout=30)
+          node.succeed("systemctl start hart-ota-check.service")
+          # Async boundary again: rollback happens in hart-ota-apply. The
+          # rollback argv lands in rebuild.log only after the failed switch,
+          # so wait for the rollback line itself, not just the file.
+          node.wait_until_succeeds(
+              "grep -q 'switch --rollback' " + REBUILD_LOG, timeout=30)
           log = node.succeed("cat " + REBUILD_LOG)
           assert "switch --flake ${approvedFlake}#hart-server" in log, \
               f"failed-switch attempt not recorded:\n{log}"
-          assert "switch --rollback" in log, \
-              f"auto-rollback did NOT fire after a failed switch:\n{log}"
-          assert "rolling back" in out.lower(), \
-              f"check service did not log the rollback path:\n{out}"
+          node.wait_until_succeeds(
+              "test -e " + OTA + "/last_apply.json", timeout=30)
+          last = json.loads(node.succeed("cat " + OTA + "/last_apply.json"))
+          assert last["status"] == "rolled_back", \
+              f"apply result not 'rolled_back' after failed switch: {last}"
+          apply_out = node.succeed(
+              "journalctl -u hart-ota-apply -n 40 --no-pager")
+          assert "rolling back" in apply_out.lower(), \
+              f"apply unit did not log the rollback path:\n{apply_out}"
 
       # ── 1(timer). The check timer is BOOT-ONLY — no periodic interval poll ──
       with subtest("hart-ota-check timer fires on boot only (no OnUnitActiveSec)"):
@@ -369,13 +413,24 @@ in
           props = node.succeed(
               "systemctl show hart-ota-check.timer "
               "-p TimersMonotonic -p NextElapseUSecMonotonic")
-          # OnBootSec is present (the boot poll trigger)...
-          assert "OnBootSec" in props, \
+          # MATCH WHAT SYSTEMD PRINTS, not what the .nix writes. TimersMonotonic
+          # reports the D-Bus spelling — `OnBootUSec=5min` — so asserting the
+          # unit-file spelling `OnBootSec` failed on a node whose timer was
+          # configured correctly (hart-ota.nix sets OnBootSec = "5min").
+          #
+          # The negative below had the same bug with the opposite effect, which
+          # is why it never caught anything: "OnUnitActiveSec" could not appear
+          # in this output under ANY configuration, so the assertion that the
+          # recurring poll is gone was VACUOUS — it would have passed just as
+          # happily with an hourly poll wired up. Both spellings are accepted
+          # for the positive and rejected for the negative, so neither depends
+          # on which name systemd chooses.
+          assert ("OnBootUSec" in props or "OnBootSec" in props), \
               f"boot-poll trigger missing from timer:\n{props}"
-          # ...and OnUnitActiveSec (the interval poll) is NOT — proving we
-          # dropped the hourly/checkInterval recurring poll entirely.
-          assert "OnUnitActiveSec" not in props, \
-              f"interval poll still scheduled (OnUnitActiveSec present):\n{props}"
+          # ...and the interval poll is NOT — proving we dropped the
+          # hourly/checkInterval recurring poll entirely.
+          assert not ("OnUnitActiveUSec" in props or "OnUnitActiveSec" in props), \
+              f"interval poll still scheduled (recurring trigger present):\n{props}"
 
       # ── 3. A CENTRAL PUSH triggers the SAME apply, over the existing fabric ──
       with subtest("realtime push leg is wired into the backend (existing fabric)"):
@@ -424,6 +479,42 @@ in
               f"forged push was NOT refused:\n{out}"
           # The apply unit must NOT have been kicked by an unauthorized push.
           node.succeed("test ! -e " + KICK)
+
+      # ── /etc/hart/src stays in step with what OTA applied (task #20) ──
+      # hart-install freezes the repo at /etc/hart/src for offline rebuilds;
+      # without the refresh, a user's `nixos-rebuild` after any applied OTA
+      # silently REVERTS to install-time HART. Drives the REAL shipped binary
+      # (hart-ota-sync-src, the same one both apply sites call) through all
+      # three behaviours: resolvable ref syncs, unresolvable ref keeps the
+      # previous copy and says so, image systems no-op.
+      with subtest("source sync: a resolvable flake ref replaces /etc/hart/src"):
+          # An installed-system stand-in: old source with a marker...
+          node.succeed(
+              "mkdir -p /etc/hart/src && echo OLD-REV > /etc/hart/src/REV")
+          # ...and a fake NEW repo shaped like ours (flake at <root>/nixos, so
+          # the ?dir=nixos root-derivation logic is exercised too).
+          node.succeed(
+              "mkdir -p /tmp/newrepo/nixos",
+              "echo '{ outputs = _: { }; }' > /tmp/newrepo/nixos/flake.nix",
+              "echo NEW-REV > /tmp/newrepo/REV",
+          )
+          out = node.succeed("hart-ota-sync-src 'path:/tmp/newrepo?dir=nixos' 2>&1")
+          assert "synced to" in out, f"sync did not report success: {out}"
+          rev = node.succeed("cat /etc/hart/src/REV").strip()
+          assert rev == "NEW-REV", f"/etc/hart/src not refreshed (REV={rev!r})"
+
+      with subtest("source sync: an unresolvable ref KEEPS the previous copy, loudly"):
+          out = node.succeed(
+              "hart-ota-sync-src 'path:/does-not-exist-anywhere' 2>&1")
+          assert "kept at previous rev" in out, f"degrade not reported: {out}"
+          rev = node.succeed("cat /etc/hart/src/REV").strip()
+          assert rev == "NEW-REV", f"a failed sync must not touch the copy (REV={rev!r})"
+
+      with subtest("source sync: image systems (no /etc/hart/src) are a clean no-op"):
+          node.succeed("rm -rf /etc/hart/src")
+          out = node.succeed("hart-ota-sync-src 'path:/tmp/newrepo?dir=nixos' 2>&1")
+          assert "skipped" in out, f"image no-op not reported: {out}"
+          node.succeed("test ! -e /etc/hart/src")
     '';
   };
 }

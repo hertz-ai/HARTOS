@@ -243,13 +243,13 @@ let
     XDG_DATA_DIRS="$_HART_PORTAL_DATA_DIRS''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}" \
       ${pkgs.xdg-desktop-portal}/libexec/xdg-desktop-portal >/dev/null 2>&1 &
     for i in $(seq 1 30); do
-      if ${pkgs.curl}/bin/curl -sf "$URL/health" >/dev/null 2>&1; then break; fi
+      if ${pkgs.curl}/bin/curl -sf --connect-timeout 2 --max-time 5 "$URL/health" >/dev/null 2>&1; then break; fi
       sleep 1
     done
-    if ! ${pkgs.curl}/bin/curl -sf "$URL/health" >/dev/null 2>&1; then
+    if ! ${pkgs.curl}/bin/curl -sf --connect-timeout 2 --max-time 5 "$URL/health" >/dev/null 2>&1; then
       # LiquidUI down — fall back to the Nunba SPA so the surface is never blank
       # (the SAME dead-husk-avoidance the cage floor uses).
-      if ${pkgs.curl}/bin/curl -sf "http://localhost:${nunbaPort}/" >/dev/null 2>&1; then
+      if ${pkgs.curl}/bin/curl -sf --connect-timeout 2 --max-time 5 "http://localhost:${nunbaPort}/" >/dev/null 2>&1; then
         URL="http://localhost:${nunbaPort}"
       fi
     fi
@@ -314,6 +314,34 @@ let
     # the supervisor drops to the cage GTK3 floor (no GSK at all). CANDIDATE — real-HW
     # unverified; the next boot's journal proves vulkan vs the hang.
     export GDK_GL=disable
+    ${lib.optionalString ui.gpuDiagnostic ''
+    # ── GPU-DIAG: capture the layer-shell vulkan hang (hart.liquidUI.gpuDiagnostic) ──
+    # hart-comp forced HART_SHELL_RENDER=vulkan; make the boot LOG the exact failure.
+    # GSK_DEBUG=vulkan traces GSK's vulkan renderer + swapchain; the Khronos validation
+    # layer prints the API misuse behind VK_ERROR_SURFACE_LOST_KHR; WEBKIT_DEBUG covers
+    # the blur/compositing side. Dump vulkaninfo so the journal has the device report.
+    # Reproduce: hover the orb (CSS scale -> GSK re-pass -> swapchain recreate).
+    export GSK_DEBUG=vulkan
+    export GDK_DEBUG=vulkan
+    export VK_LOADER_DEBUG=warn
+    export VK_LAYER_PATH="${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d"
+    export VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
+    export WEBKIT_DEBUG=Compositing
+    echo "[hart-glass-shell-gtk4] GPU-DIAG on: GSK_DEBUG=vulkan + Khronos validation + WEBKIT_DEBUG (hover the orb to trigger the swapchain hang)" >&2
+    echo "[hart-glass-shell-gtk4] GPU-DIAG vulkaninfo --summary:" >&2
+    ${pkgs.vulkan-tools}/bin/vulkaninfo --summary 2>&1 | head -60 >&2 || echo "[hart-glass-shell-gtk4] GPU-DIAG: vulkaninfo failed" >&2
+    ''}
+    # Runtime light diag (NO rebuild, works on ANY normal nightly): boot with
+    # `hart.gpudiag` on the kernel cmdline -> GSK/VK debug so the vulkan swapchain
+    # failure is logged to the journal (the build-time option above additionally
+    # ships vulkaninfo + validation layers). Skip if the option already set GSK_DEBUG.
+    if [ -z "''${GSK_DEBUG:-}" ] && ${pkgs.gnugrep}/bin/grep -qw hart.gpudiag /proc/cmdline 2>/dev/null; then
+      export GSK_DEBUG=vulkan
+      export GDK_DEBUG=vulkan
+      export VK_LOADER_DEBUG=warn
+      export WEBKIT_DEBUG=Compositing
+      echo "[hart-glass-shell-gtk4] GPU-DIAG (cmdline hart.gpudiag): GSK_DEBUG=vulkan + VK loader debug (hover the orb; validation layers only in iso-desktop-gpudiag)" >&2
+    fi
     # ── GSK renderer PER RUNG (the auto-fallback ladder) ──────────────────────────
     # vulkan rung -> GSK vulkan (a SEPARATE path from GL; GDK_GL stays disabled so the
     #   GL/EGL/GBM context-creation hang can never recur). This is the 2026-07-08
@@ -803,12 +831,23 @@ app.run(None)
     echo "[hart-gtk4-session] Tier-2 GL = HARDWARE (operator preferHardwareGL=true)" >&2
     '' else ''
     # GPU smoke-test gate: force software GL UNLESS the boot probe proved the GPU good
-    # (/run/hart/gpu-render == hardware). wlroots keeps its own pixman fallback via
-    # WLR_RENDERER_ALLOW_SOFTWARE, and a GPU that lies still drops to the cage floor.
-    # The chosen mode is logged to the journal so a real-HW boot shows what engaged.
+    # (/run/hart/gpu-render == hardware). The chosen mode is logged to the journal so
+    # a real-HW boot shows what engaged.
+    #
+    # WLR_RENDERER=pixman, not merely ALLOW_SOFTWARE. This comment used to read
+    # "wlroots keeps its own pixman fallback via WLR_RENDERER_ALLOW_SOFTWARE",
+    # which is the same misreading the cage floor carried:
+    # WLR_RENDERER_ALLOW_SOFTWARE PERMITS a software renderer, it does not
+    # SELECT one. wlroots stayed on its default GLES2 path, opened EGL against
+    # the DRM node, and Mesa refused the LIBGL_ALWAYS_SOFTWARE combination
+    # ("Not allowed to force software rendering when API explicitly selects a
+    # hardware device"), so the tier died instead of falling back — and then
+    # the cage floor died the same way, which is how a crash-loop reached the
+    # one tier that has nothing below it (run 30848154453).
     HART_GPU_VERDICT="$(cat /run/hart/gpu-render 2>/dev/null || echo unknown)"
     if [ "$HART_GPU_VERDICT" != "hardware" ]; then
       export LIBGL_ALWAYS_SOFTWARE=1
+      export WLR_RENDERER=pixman
       echo "[hart-gtk4-session] Tier-2 GL = SOFTWARE (gpu-render verdict: $HART_GPU_VERDICT)" >&2
     else
       echo "[hart-gtk4-session] Tier-2 GL = HARDWARE (gpu-render verdict: hardware)" >&2

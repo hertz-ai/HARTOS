@@ -18,8 +18,8 @@
 >
 > Steward 2026-06-29: *"checklist shd find what are not there as actual
 > functionality in HARTOS and explicitly list them rather than taking note."*
-> So this doc lists gaps explicitly, concretely, per-feature - it does not just
-> note them. A route existing is NOT the feature working; a placeholder / sample
+> This doc therefore lists gaps concretely, per-feature, rather than noting them
+> in passing. A route existing is NOT the feature working; a placeholder / sample
 > dressed as real is STUB, not EXISTS; a UI with no backend producer is PARTIAL.
 >
 > **Intent source of truth:** `HOME_DESKTOP_DESIGN_CHECKLIST.md` (groups a-k) +
@@ -27,8 +27,8 @@
 > the checklist item it answers to.
 >
 > **Update this doc as gaps close.** When an item flips to EXISTS, move it out of
-> the gap list at the top, update its row, and adjust the totals line. Keep it
-> honest: if something is a sample dressed as real, say so.
+> the gap list at the top, update its row, and adjust the totals line. If
+> something is a sample dressed as real, say so.
 >
 > Status legend: **EXISTS** (works end to end, cited file:line) · **PARTIAL**
 > (UI or transport present, the producer / backend half is absent) · **STUB**
@@ -60,7 +60,7 @@
 |---|---|---|---|---|---|
 | Q1 | Cards show REAL photos, not gradient tiles | STUB | gap1 / b2,d3 | a producer sets `card.image` (W10 media index / agent-recipe art) | high / wire |
 | Q2 | Home is COMPOSED by the local LLM (agentic, not static sample) | MISSING | gap2 / i1, W1 | wire an agent_engine / local-LLM producer to call `compose_home` via the /chat decompose path | high / build |
-| Q3 | Earnings hero leads with the REAL money figure, honest-empty on fresh node | PARTIAL | gap3 / d1, k6, W1-F2 | surface the rupee/earnings figure; drop the 2,140-Spark sample on a 0-balance node | high / wire |
+| Q3 | Earnings hero leads with the REAL money figure, empty on a fresh node | PARTIAL | gap3 / d1, k6, W1-F2 | surface the rupee/earnings figure; drop the 2,140-Spark sample on a 0-balance node | high / wire |
 | Q4 | Top-bar small breathing orb (orb-sm) renders + compacts into the bar | STUB | gap4 / c7, e1, W1-F1 | mount the hartHero compact orb into `#top-bar-orb` | med / wire |
 | Q5 | W10 semantic media index wired at runtime | MISSING | gap5 / d7, W10 | call `register_media_routes` + `register_idle_indexer` at shell start; card producer queries `/api/media/search` | high / wire |
 | Q6 | Desktop app icons as REAL photos, not gradient glyph tiles | PARTIAL | gap10 / d6 | manifest entries set an `image` field | med / wire |
@@ -220,8 +220,8 @@ MISSING ~31 - PARTIAL ~43 - STUB ~7 - bug ~4 - unknown ~2.
 
 These are the items that do NOT work as the steward intended, grouped and sorted
 by user impact (most-visible / most-promised first). Each is concrete and
-actionable. PARTIAL items whose missing half is load-bearing are flagged at the
-end of this section so nothing hides.
+actionable. PARTIAL items whose missing half is the user-facing one are flagged
+at the end of this section so nothing hides.
 
 ### Home / desktop visual soul (highest impact - the "Netflix, agentic, real-money" promise)
 
@@ -261,11 +261,12 @@ end of this section so nothing hides.
    writers ship" comment at `api_compute_earnings.py:99-104`); (b) `payout_pending`
    is hardcoded `true` (`hartHome.js:631`) and there is NO payout rail; (c) on a
    fresh node `total_spark_in_window=0` so the hero falls back to the ~2,140-Spark
-   sample skeleton. So d1.1 "real money earned via the hive nodes working
-   together" reads a real ledger but has no peer-compute earning source and no
-   payout - the headline money is sample-or-cost-recovery, not hive earnings.
+   sample skeleton. d1.1 "real money earned via the hive nodes working together"
+   therefore reads a real ledger while the peer-compute earning source and the
+   payout rail are both absent - the headline money is sample-or-cost-recovery,
+   not hive earnings.
    **To close:** ship the peer-compute earning writer + a payout rail; until then
-   the hero is honest-but-empty on a real node.
+   the hero shows an empty state on a real node.
 
 4. **The top-bar small orb (orb-sm) never renders - it is a static button.**
    *(STUB · c7 "the hero orb compacts into an always-accessible top-bar orb")*
@@ -319,13 +320,13 @@ end of this section so nothing hides.
    **To close:** build one Settings hub that groups the existing SYSTEM_PANELS +
    Nunba settings iframes into categories.
 
-### PARTIAL items whose missing half is load-bearing (do not let these hide)
+### PARTIAL items where the missing half is the user-facing one
 
 8. **App Store is a glyph-card grid, not a Netflix image listing.**
    *(PARTIAL · d4 / W7)* `hartMarketplace.appCard` (`hartMarketplace.js:187`)
    builds a vertical `.hart-app-card` with a Material glyph icon (`app.i`) + an
-   Install button, by category. It does NOT reuse the `hh-row`/`hh-card` system,
-   has no real photos, no text-over-art, no hover-expand. Functional store,
+   Install button, by category. It does NOT reuse the `hh-row`/`hh-card` system:
+   real photos, text-over-art and hover-expand are all absent. Functional store,
    wrong design - "App Store as image-card category rows" is a glyph grid.
 
 9. **Omnibox 3-way routing is ask-only - no deterministic file/registry search,

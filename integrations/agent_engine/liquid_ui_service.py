@@ -37,7 +37,56 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from core.subprocess_safe import run_probe
+
 logger = logging.getLogger('hevolve.liquid_ui')
+
+# Device Manager: cap is high enough that a real machine is never silently
+# truncated (a loaded workstation lists ~100 PCI + USB entries), while still
+# bounding the JSON a hostile/looping enumerator could produce.
+SHELL_DEVICE_CAP = 500
+
+
+def parse_lspci_k(text):
+    """`lspci -mm -k` output → device dicts carrying DRIVER BINDING.
+
+    Pure parse, no I/O, so the Device Manager's actual contract is testable
+    without a PCI bus (the dev box is Windows; the target is NixOS).
+
+    `-k` appends indented continuation lines to each device:
+
+        02:00.0 "Network controller" "Intel" "Wireless 3165" ...
+                Kernel driver in use: iwlwifi
+                Kernel modules: iwlwifi
+
+    A device with NO "Kernel driver in use" line is UNCLAIMED — nothing is
+    driving it. That is the yellow-bang Windows shows and the single most
+    useful fact in the panel: it distinguishes "wifi is off" from "this NIC
+    has no driver/firmware". Default `unclaimed=True` and clear it only on
+    a real binding, so a parse miss fails toward "flag it", never toward a
+    false all-clear.
+    """
+    devices, cur = [], None
+    for raw in (text or '').splitlines():
+        if not raw.strip():
+            continue
+        if raw[0].isspace():                      # continuation → attributes
+            if cur is None:                       # stray indent before any slot
+                continue
+            key, sep, val = raw.strip().partition(':')
+            if not sep:
+                continue
+            if key == 'Kernel driver in use':
+                cur['driver'] = val.strip()
+                cur['unclaimed'] = False
+            elif key == 'Kernel modules':
+                cur['modules'] = [m.strip() for m in val.split(',') if m.strip()]
+        else:                                     # new device line
+            cur = {'type': 'pci', 'info': raw.strip(),
+                   'driver': None, 'modules': [], 'unclaimed': True}
+            devices.append(cur)
+    return devices
+
 
 # Verbs that MUTATE the desktop (window.close, fullscreen takeover, …) — added
 # in Phase 6.  These pass a fail-CLOSED guardrail; benign display cards do not
@@ -821,6 +870,11 @@ class LiquidUIService:
         self._agent_components: Dict[str, List[dict]] = {}
         self._a2ui_buckets: Dict[str, tuple] = {}   # agent_id -> (tokens, ts)
         self._lock = threading.Lock()
+        # Wakes the /api/notifications/stream SSE producer the instant an agent
+        # pushes a component, instead of the old 2s server-side poll. Dedicated CV
+        # (NOT self._lock) so the producer never holds self._lock while waiting and
+        # cannot deadlock with the writer's lock order. agent_ui_update notifies it.
+        self._ui_event_cv = threading.Condition()
         self._running = False
         self._model_available = False
 
@@ -1048,7 +1102,7 @@ class LiquidUIService:
         except Exception:
             logger.exception("agent_ui_update: swallowed Exception")
 
-        # 1. Store for SSE polling (Nunba web LiquidUI)
+        # 1. Store for the SSE stream (Nunba web LiquidUI)
         with self._lock:
             if agent_id not in self._agent_components:
                 self._agent_components[agent_id] = []
@@ -1056,6 +1110,12 @@ class LiquidUIService:
             if len(self._agent_components[agent_id]) > 5:
                 self._agent_components[agent_id] = \
                     self._agent_components[agent_id][-5:]
+        # Wake the SSE producer NOW (event-driven) instead of letting it discover
+        # this on its next 2s poll — the component is already stored, so a woken
+        # stream re-scans and emits it immediately. notify_all covers every open
+        # stream; a missed wake still self-heals on the producer's safety timeout.
+        with self._ui_event_cv:
+            self._ui_event_cv.notify_all()
 
         # 2. Push to EventBus → WAMP → Android/iOS/Desktop
         # The WAMP bridge (core/platform/events.py) auto-publishes to
@@ -1384,9 +1444,44 @@ class LiquidUIService:
             if resp.status_code == 200:
                 return {'text': text, 'response': resp.json().get('response', ''),
                         'source': 'voice'}
+            logger.warning("_process_voice_command: model bus returned HTTP %s",
+                           resp.status_code)
         except Exception:
-            logger.exception("_process_voice_command: swallowed Exception")
+            logger.exception("_process_voice_command: model bus call failed")
+
+        # HONEST FIRST-RUN (task #7, item 0.5). "Could not process" reads as
+        # "I did not understand you" — the user's fault, their microphone,
+        # their accent. On a fresh offline box the truth is the opposite: the
+        # words arrived fine and there is no model to answer them yet, because
+        # provisioning needs the network once. Two opposite problems wearing
+        # the same sentence is how a working machine feels broken.
+        #
+        # The probe is deliberately conservative: it claims "setup pending"
+        # ONLY when the Model Bus reports NO models at all, which is
+        # unambiguous. A bus with models that still failed this request is a
+        # real processing failure and keeps the original message.
+        # REUSE the ONE Model-Bus probe this module already has —
+        # ContextEngine._get_model_context — instead of adding a second. It
+        # queries the same /v1/models on the same port, returns
+        # {'available', 'models', 'count'}, and already treats ANY failure as
+        # count 0, which is exactly the semantic wanted here: a box that cannot
+        # reach its own model bus is not a box that failed to understand you.
+        # LiquidUIService already owns an instance (self.context_engine), so
+        # this needs no new state and no second network shape.
+        #
+        # `count`, not `available`: available is True for any HTTP 200 INCLUDING
+        # an empty model list, and an empty list IS the fresh-box case this
+        # message exists for.
+        if self.context_engine._get_model_context().get('count', 0) == 0:
+            return {'text': text, 'response': self._SETUP_PENDING_MSG,
+                    'source': 'voice', 'setup_pending': True}
         return {'text': text, 'response': 'Could not process', 'source': 'voice'}
+
+    #: Shown when the box has no local model yet. Names the ONE thing the user
+    #: must do, and says it is temporary — neither of which "Could not
+    #: process" managed.
+    _SETUP_PENDING_MSG = ("Still finishing AI setup — it needs the internet "
+                          "once. Voice will work after that.")
 
     # ─── Glass Desktop Shell Render ───────────────────────────
 
@@ -1463,10 +1558,11 @@ class LiquidUIService:
         # default '0' from hart-liquid-ui.nix) is NOT a force-off -- it falls through to
         # the runtime rung file so the ladder still governs. A hard '0' override would
         # peg the backend flat and defeat the ladder.
+        shell_rung = read_shell_render_mode()  # vulkan | webkit-cairo | software
         if os.environ.get('LIQUID_UI_PREFER_HW_GL') == '1':
             webkit_compositing = True
         else:
-            webkit_compositing = read_shell_render_mode() in ('vulkan', 'webkit-cairo')
+            webkit_compositing = shell_rung in ('vulkan', 'webkit-cairo')
         gpu_render_verdict = read_gpu_render_mode()  # compositor GLES capability probe
         gpu_mode = 'hardware' if (gpu_render_verdict == 'hardware' and webkit_compositing) else 'software'
         gpu_body_class = 'gpu-' + gpu_mode  # gpu-software | gpu-hardware
@@ -1490,7 +1586,21 @@ class LiquidUIService:
         # runtime rung (/run/hart/session/shell-render) with the LIQUID_UI_PREFER_HW_GL override;
         # reuse it here (ONE derivation, no second read path).
         # webkit-flat == "backdrop-filter blur won't paint" == solidify the glass.
-        flat_body_class = '' if webkit_compositing else ' webkit-flat'
+        #
+        # 2026-07-24 real-HW bug: the home bled THROUGH the App Store panel. backdrop-
+        # filter BLUR composites ONLY on the VULKAN rung (GSK=vulkan actually paints it).
+        # webkit-cairo composites TRANSFORMS (so gpu-hardware/animations are right) but
+        # its WebView is cairo -> its blur NEVER paints, so a translucent panel reads
+        # see-through. Key the glass off the RUNTIME RUNG, not preferHardwareGL: hart-
+        # comp forces webkit-cairo even when preferHardwareGL is on (vulkan is demoted
+        # for the hover VK_ERROR_SURFACE_LOST_KHR; hart-comp.nix:562), so keying off the
+        # flag would frost a cairo surface right back into see-through. Only a real
+        # vulkan rung frosts; every other rung (webkit-cairo, software) is OPAQUE +
+        # legible. Decoupled from gpu_mode so a GPU rung still lights the micro-
+        # animations while the glass stays solid -- alive AND readable. (Frosted glass
+        # returns when vulkan is stable == the "chase blur next" work, task #12.)
+        blur_composites = shell_rung == 'vulkan'
+        flat_body_class = '' if blur_composites else ' webkit-flat'
 
         # Potato (reduced-effects) tier: TRUE when the theme disables blur OR the
         # box is software-rendered. The GPU-only cinematic (backdrop blur, layered
@@ -1500,6 +1610,17 @@ class LiquidUIService:
         # inline-script PERF.potato + window.HART_PERF.potato engage on real
         # software-render hardware, not just on the theme tier.
         is_potato = perf.get('disable_blur', False) or gpu_mode == 'software'
+
+        # Which product this shell is serving — HART OS (the OS itself) vs the Nunba
+        # desktop companion. Drives the right-click "Ask <Product>" menu label
+        # (hartAskMenu.js) so it names what the user actually installed. is_os_mode()
+        # is the ONE canonical signal (HART_OS_MODE env / OS-mode port scheme).
+        try:
+            from core.port_registry import is_os_mode
+            hart_product = 'HART' if is_os_mode() else 'Nunba'
+        except Exception:
+            logger.exception("render_desktop_shell: is_os_mode probe failed")
+            hart_product = 'HART'
 
         # Ambient cinematic glow emission (2026-07-01, degrade-gracefully): the 3
         # drifting brand blooms are the single biggest "looks rich" lever (the
@@ -2991,6 +3112,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script defer src="/shell/static/hartHome.js"></script>
 <script defer src="/shell/static/hartBloom.js"></script>
 <script defer src="/shell/static/hartDesktop.js"></script>
+<script defer src="/shell/static/hartAskMenu.js"></script>
 <script defer src="/shell/static/hartWorkspaces.js"></script>
 <script defer src="/shell/static/hartEffects.js"></script>
 <script defer src="/shell/static/hartPersonalize.js"></script>
@@ -3193,6 +3315,10 @@ const PERF = {{
 // can read the SAME software-render gate (potato) without depending on the
 // inline-script const being reachable across script tags. Single source: PERF.
 window.HART_PERF = PERF;
+
+// Which product the user installed (HART OS vs the Nunba desktop companion) — the
+// right-click "Ask <Product>" menu (hartAskMenu.js) brands to it.
+window.HART_PRODUCT = '{hart_product}';
 
 // ═══ State ═══
 let panels = {{}};
@@ -7021,21 +7147,38 @@ function renderAgentOverlay(ev) {{
         # ── Shell APIs: Services ──
         @app.route('/api/shell/services', methods=['GET'])
         def shell_services():
-            services = []
-            svc_names = [
-                'hart-backend', 'hart-agent-daemon', 'hart-vision',
-                'hart-llm', 'hart-discovery', 'hart-liquid-ui', 'hart-conky']
-            for name in svc_names:
-                status = 'unknown'
-                try:
-                    result = subprocess.run(
-                        ['systemctl', 'is-active', name],
-                        capture_output=True, text=True, timeout=3)
-                    status = result.stdout.strip()
-                except Exception:
-                    logger.exception("shell_services: swallowed Exception")
-                services.append({'name': name, 'status': status})
-            return jsonify({'services': services})
+            """Systemd unit state (task #25).
+
+            Was: seven hardcoded hart-* names, each costing its OWN
+            `systemctl is-active` subprocess — seven processes per request to
+            answer something systemd answers in one — and no way to ask about
+            any other unit. That made the OS's own subsystems unreachable:
+            "is sshd up", "is Samba sharing", "is podman running" had no
+            surface at all, on an OS whose premise is that agents drive it.
+
+            Now backed by service_status(), which is one systemctl call for
+            every unit asked about and distinguishes NOT INSTALLED from
+            stopped (see parse_systemctl_show). The hart-* group is still the
+            default view, so existing callers see the same names with the same
+            {'name','status'} keys; `?units=` and `?group=` open it up.
+            """
+            from integrations.agent_engine.shell_system_apis import (
+                SERVICE_CATALOG, service_status)
+
+            want = (request.args.get('units') or '').strip()
+            group = (request.args.get('group') or '').strip()
+            if want:
+                names = [n.strip() for n in want.split(',') if n.strip()]
+            elif group == 'all':
+                names = [n for g in SERVICE_CATALOG.values() for n in g]
+            elif group in SERVICE_CATALOG:
+                names = list(SERVICE_CATALOG[group])
+            else:
+                names = list(SERVICE_CATALOG['hart'])
+
+            body = service_status(names)
+            body['groups'] = sorted(SERVICE_CATALOG)
+            return jsonify(body), (200 if body['available'] else 503)
 
         # ── Shell APIs: Session state persistence ──
         @app.route('/api/shell/session-state', methods=['GET'])
@@ -7064,16 +7207,102 @@ function renderAgentOverlay(ev) {{
         # ── Shell APIs: Drivers ──
         @app.route('/api/shell/drivers', methods=['GET'])
         def shell_drivers():
-            devices = []
-            for cmd, dev_type in [(['lspci', '-mm'], 'pci'), (['lsusb'], 'usb')]:
+            """Device tree with DRIVER BINDING — the Device Manager contract.
+
+            Was: `lspci -mm` + `lsusb`, joined as opaque strings and truncated
+            at 50. Two problems the steward's Windows Device Manager
+            screenshots made obvious (2026-07-31):
+
+              1. The CAP silently hid devices — a normal laptop tree is well
+                 past 50 entries, so the panel showed a prefix and said
+                 nothing about the rest.
+              2. No DRIVER and no STATUS. Windows' whole value here is the
+                 yellow bang: which device has no working driver. Listing
+                 hardware without saying whether the kernel claimed it hides
+                 exactly the failure worth seeing — the Intel AC 3165 that
+                 needs a firmware blob looks identical to a working NIC.
+
+            `lspci -mm -k` is the same tool with the binding already in it
+            (-k appends "Kernel driver in use" / "Kernel modules"), so this
+            is parsing what we already ran, not a new mechanism. `unclaimed`
+            is the yellow-bang equivalent; the shell can surface it and an
+            agent can reason about it ("wifi down AND unclaimed → firmware").
+            """
+            truncated = False
+            errors = []
+
+            def _probe(argv):
+                """Probe one enumerator; never let it blank the whole tree.
+
+                `run_probe` returns None for the two EXPECTED degrades (tool
+                absent, tool hung) and deliberately propagates anything else,
+                so a broken install is not disguised as a missing tool. That
+                is right for a library, but for a device PANEL one unusable
+                binary must not take out the other source — a machine with a
+                bad lspci should still show its USB tree.
+
+                So: logged loudly (never silent) AND reported in `errors`, so
+                the panel can say "PCI enumeration failed" instead of showing
+                a confident, silently-partial list.
+                """
                 try:
-                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-                    for line in r.stdout.strip().split('\n'):
-                        if line.strip():
-                            devices.append({'type': dev_type, 'info': line.strip()})
-                except Exception:
-                    logger.exception("shell_drivers: swallowed Exception")
-            return jsonify({'devices': devices[:50]})
+                    return run_probe(argv, timeout=6)
+                except OSError as e:
+                    logger.warning("shell_drivers: %s failed: %s", argv[0], e)
+                    errors.append({'source': argv[0], 'error': str(e)})
+                    return None
+
+            # `-k`, NOT `-mm -k`. In pciutils, show_machine() calls
+            # show_kernel_machine() only inside `if (verbose)`, and -mm/-k/-v are
+            # three INDEPENDENT flags — so `lspci -mm -k` has verbose==0 and the
+            # -k data is never printed. Every device then parses with no "Kernel
+            # driver in use" line, and the deliberate unclaimed=True default turns
+            # that into a 100% false alarm: the yellow-bang this feature exists to
+            # surface fires for everything, which is the same as firing for
+            # nothing.
+            #
+            # Adding -v does NOT fix it: in machine mode show_kernel_machine()
+            # prints "Driver:\t%s" at COLUMN 0, one line per module, so the
+            # parser's `raw[0].isspace()` continuation branch never fires and
+            # every attribute line becomes its own phantom device.
+            #
+            # Plain `lspci -k` prints unquoted device lines at column 0 with
+            # TAB-INDENTED "Kernel driver in use:" / "Kernel modules:"
+            # continuations — exactly the shape parse_lspci_k already handles,
+            # and the shape its fixtures already encode. The only loss is the
+            # quoted vendor/device split in `info`, which is cosmetic here.
+            #
+            # Mechanism established from pciutils source, not from a capture —
+            # the dev box is Windows. driver-matrix.nix now captures all three
+            # forms verbatim in a VM so the next run PROVES it.
+            r = _probe(['lspci', '-k'])
+            devices = parse_lspci_k(r.stdout if r else '')
+
+            r = _probe(['lsusb'])
+            if r:
+                for line in (r.stdout or '').splitlines():
+                    if line.strip():
+                        # lsusb has no binding column; a USB device's driver
+                        # lives per-interface in sysfs. Reported as unknown
+                        # rather than guessed — an invented "claimed" would be
+                        # worse than an honest gap.
+                        devices.append({'type': 'usb', 'info': line.strip(),
+                                        'driver': None, 'modules': [],
+                                        'unclaimed': None})
+
+            if len(devices) > SHELL_DEVICE_CAP:
+                devices, truncated = devices[:SHELL_DEVICE_CAP], True
+            return jsonify({
+                'devices': devices,
+                'count': len(devices),
+                'truncated': truncated,
+                # The signal a user acts on: PCI devices the kernel did not
+                # claim. None-valued (USB) are excluded — unknown is not a
+                # problem report.
+                'unclaimed_count': sum(1 for d in devices if d.get('unclaimed') is True),
+                # Non-empty ⇒ the list is INCOMPLETE for a reason worth showing.
+                'errors': errors,
+            })
 
         # ── Shell APIs: WiFi (CACHED) ──
         # Returns the wifi network list the background _connectivity_cache prober
@@ -7584,14 +7813,15 @@ function renderAgentOverlay(ev) {{
                     logger.exception("shell_system_metrics: swallowed AttributeError, Exception")
             except ImportError:
                 metrics['error'] = 'psutil not installed'
-            # GPU via VRAMManager
-            try:
-                from integrations.service_tools.vram_manager import get_vram_manager
-                gpu = get_vram_manager().detect_gpu()  # instance method — call on the singleton, not the class
-                if gpu and gpu.get('name'):
-                    metrics['gpu'] = gpu
-            except Exception:
-                logger.exception("shell_system_metrics: swallowed Exception")
+            # GPU — ONE shape, shared with /api/shell/gpu (task #25).
+            # This used to call the detector itself and attach metrics['gpu']
+            # only when a name came back, so a CPU-only box and a box whose
+            # probe FAILED were indistinguishable: the key was simply absent in
+            # both cases. gpu_status() distinguishes them (available/present)
+            # and never raises, so no try/except is needed around it and the
+            # two GPU surfaces cannot drift apart.
+            from integrations.agent_engine.shell_system_apis import gpu_status
+            metrics['gpu'] = gpu_status()
             return jsonify(metrics)
 
         @app.route('/api/shell/system/processes', methods=['GET'])
@@ -7718,23 +7948,41 @@ function renderAgentOverlay(ev) {{
         def notification_stream():
             import time as _time
 
+            def _collect(since):
+                # Lock-free snapshot (unchanged from the old poll): ALL component
+                # types newer than the caller's cursor, stamped with their agent.
+                out = []
+                for agent_id, comps in list(self._agent_components.items()):
+                    for c in comps:
+                        if c.get('_ts', 0) > since:
+                            event = dict(c)
+                            event['agent'] = agent_id
+                            out.append(event)
+                return out
+
             def generate():
                 last_check = _time.time()
+                # EVENT-DRIVEN (was a 2s server-side poll that capped the latency of
+                # every A2UI card / notification / desktop compose — the "Liquid UI
+                # is the heart" path). Block on the CV until agent_ui_update pushes a
+                # component (woken instantly); the 15s timeout is a safety net +
+                # SSE keep-alive that self-heals a missed wake. The check-then-wait
+                # is atomic under the CV so a push between them can't be lost. The
+                # producer holds ONLY the CV (never self._lock) -> no deadlock with
+                # the writer's lock order.
                 while True:
-                    _time.sleep(2)  # 2s for snappier live updates
-                    events = []
-                    for agent_id, comps in list(
-                            self._agent_components.items()):
-                        for c in comps:
-                            ts = c.get('_ts', 0)
-                            if ts > last_check:
-                                # Push ALL component types — not just notifications
-                                event = dict(c)
-                                event['agent'] = agent_id
-                                events.append(event)
-                    last_check = _time.time()
+                    with self._ui_event_cv:
+                        events = _collect(last_check)
+                        if not events:
+                            self._ui_event_cv.wait(timeout=15.0)
+                            events = _collect(last_check)
+                        last_check = _time.time()
                     if events:
                         yield f"data: {json.dumps(events)}\n\n"
+                    else:
+                        # SSE comment: keeps the stream warm through proxies,
+                        # ignored by the browser EventSource.
+                        yield ": hb\n\n"
             return Response(
                 generate(), mimetype='text/event-stream',
                 headers={
@@ -8407,8 +8655,9 @@ def _home_sanitize_hero(h) -> Optional[dict]:
 def _sanitize_home_payload(payload) -> Optional[dict]:
     """Coerce a (possibly LLM-authored) {hero, rows} to the schema + allow-sets,
     dropping anything unknown/unsafe. Returns a clean payload or None when there
-    is no usable row. This is the load-bearing guard that lets the LLM compose
-    freely without being able to inject a bad accent / verb / deep-link / markup."""
+    is no usable row. The LLM composes freely; this is the only thing standing
+    between its output and the client, so an unknown accent / verb / deep-link /
+    markup never reaches the shell."""
     if not isinstance(payload, dict):
         return None
     rows_in = payload.get('rows')
@@ -8449,9 +8698,10 @@ def _sanitize_home_payload(payload) -> Optional[dict]:
         return None
     out = {'hero': _home_sanitize_hero(payload.get('hero')), 'rows': rows}
     # Ambient mood/palette (§6a) — the LLM may name a HART_PALETTES id for the
-    # shell's ambient feel.  Coerced to a safe slug HERE (the load-bearing guard);
-    # the CLIENT is the single owner of the palette-id vocabulary and validates
-    # membership before calling applyPalette, so the server never forks that list.
+    # shell's ambient feel.  Coerced to a safe slug HERE, so a mood string can
+    # never carry markup or a path.  The CLIENT is the single owner of the
+    # palette-id vocabulary and validates membership before calling
+    # applyPalette, so the server never forks that list.
     mood = payload.get('mood')
     if isinstance(mood, str):
         slug = re.sub(r'[^a-z0-9_-]', '', mood.strip().lower())[:24]

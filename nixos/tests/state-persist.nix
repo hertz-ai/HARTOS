@@ -100,6 +100,18 @@ in
       with subtest("a vfat HARTSTATE fail-secure skips the wifi bind, state still persists"):
           sp.succeed(f"mkfs.vfat -n HARTSTATE {disk}")
           sp.succeed("udevadm settle || true")
+          # The module REFORMATS an EMPTY vfat to ext4 by design (the
+          # Windows-flash path: mkfs.ext4 is impossible from Windows, so an
+          # empty vfat HARTSTATE is upgraded in place) — and then the wifi
+          # bind proceeds legitimately on the resulting POSIX fs, which is
+          # exactly how this subtest failed against a CORRECT module
+          # (run 30485906966: mountpoint unexpectedly succeeded). Seed a
+          # file so the fs is NON-empty, the reformat correctly refuses,
+          # and the true fail-secure skip is what gets exercised.
+          sp.succeed(f"mkdir -p /tmp/vfseed && mount {disk} /tmp/vfseed "
+                     "&& touch /tmp/vfseed/existing-user-data.txt "
+                     "&& umount /tmp/vfseed")
+          sp.succeed("udevadm settle || true")
           out = sp.succeed("hart-state-persist 2>&1; echo RC=$?")
           assert "RC=0" in out, f"vfat persist must exit 0, got: {out!r}"
           # HART state DID persist (bind works on any fs; only perms differ).
@@ -118,6 +130,48 @@ in
               sp.succeed(f"umount -l {p} 2>/dev/null || true")
           # Best-effort signature wipe (a just-lazy-unmounted device can briefly
           # report busy); the ext4 mkfs -F below overwrites regardless.
+          sp.succeed(f"wipefs -a {disk} 2>/dev/null || true")
+          sp.succeed("udevadm settle || true")
+
+      # ── 3b. An EMPTY vfat HARTSTATE is upgraded to ext4 (the Windows-flash path) ──
+      # The reformat feature the old subtest 3 tripped over, covered on purpose:
+      # a Windows flash can only lay down vfat, so an EMPTY vfat HARTSTATE is
+      # mkfs.ext4'd in place and the wifi bind then proceeds on the POSIX fs.
+      with subtest("an EMPTY vfat HARTSTATE is upgraded to ext4 and wifi persists securely"):
+          sp.succeed(f"mkfs.vfat -n HARTSTATE {disk}")
+          sp.succeed("udevadm settle || true")
+          out_e = sp.succeed("hart-state-persist 2>&1; echo RC=$?")
+          assert "RC=0" in out_e, f"empty-vfat upgrade must exit 0, got: {out_e!r}"
+          fstype = sp.succeed(f"blkid -o value -s TYPE {disk}").strip()
+          assert fstype == "ext4", \
+              f"empty vfat HARTSTATE must be upgraded to ext4 (Windows-flash path), got {fstype!r}"
+          # SAY WHY WHEN THIS FAILS. `out_e` already holds the script's own
+          # narration — every persist_dir failure logs a reason ("bind of X
+          # failed", "cannot create backing") and marks the run PARTIAL — and
+          # this subtest was capturing it and then asserting only on RC, so a
+          # bind failure surfaced as a bare "command `mountpoint -q ...` failed
+          # (exit code 32)" with the explanation sitting unused in a local
+          # variable (run 30848154453).
+          #
+          # 32 is util-linux's MNT_EX_FAIL, i.e. "not a mountpoint" — it does
+          # NOT distinguish a missing directory from an unbound one, which is
+          # the other half of why that message said nothing.
+          if sp.execute("mountpoint -q /etc/NetworkManager/system-connections")[0] != 0:
+              raise AssertionError(
+                  "the wifi dir was not bind-persisted after the ext4 upgrade.\n"
+                  "--- hart-state-persist said ---\n" + out_e
+                  + "\n--- /run/hart/state-persist.status ---\n"
+                  + sp.succeed("cat /run/hart/state-persist.status 2>/dev/null || true")
+                  + "\n--- mounts under /etc + the backing store ---\n"
+                  + sp.succeed("findmnt -n | grep -iE 'NetworkManager|hart' || true")
+                  + "\n--- does the live dir even exist? ---\n"
+                  + sp.succeed("ls -ld /etc/NetworkManager/system-connections 2>&1 || true"))
+          perms = sp.succeed("stat -c '%a %U' /etc/NetworkManager/system-connections").strip()
+          assert perms == "700 root", \
+              f"upgraded wifi persist must be 0700 root, got {perms!r}"
+          for p in ["/etc/NetworkManager/system-connections", "/var/lib/hart",
+                    "/home/hart-admin", "/run/hart/hartstate"]:
+              sp.succeed(f"umount -l {p} 2>/dev/null || true")
           sp.succeed(f"wipefs -a {disk} 2>/dev/null || true")
           sp.succeed("udevadm settle || true")
 

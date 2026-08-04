@@ -64,6 +64,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # NEVER cancel a deploy mid-flight.
+  # Same shape as nix-check/coverage-baseline (3f5ee290): a manual
+  # workflow_dispatch gets its OWN group keyed by run id, so an
+  # on-demand run is never cancelled by an unrelated later push.
+  group: remote-deploy-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
+  cancel-in-progress: false
+
 jobs:
   remote-install:
     name: Install ${{ inputs.mode }} on ${{ inputs.target_host }}

@@ -314,6 +314,7 @@ class FrameCapture:
 
         frames = []
         self._running = True
+        t0 = time.monotonic()
         try:
             for _ in range(n_target):
                 if not self._running:
@@ -328,22 +329,38 @@ class FrameCapture:
                 elapsed = time.monotonic() - start
                 time.sleep(max(0, interval - elapsed))
         finally:
+            wall_s = time.monotonic() - t0
             self._running = False
             self._cleanup()
 
         if not frames:
-            return {'ok': False, 'error': 'no frames captured (no screen-capture backend?)'}
+            return {'ok': False, 'error': (
+                'no frames captured — no screen-capture backend. Install one: '
+                'pip install mss (cross-platform), or dxcam on Windows.')}
+
+        # Encode at the rate actually ACHIEVED, not the rate requested.
+        #
+        # Capture rarely keeps up: 8 fps asked for on a modest box measured 4.5.
+        # Writing the requested fps into the container makes playback faster than
+        # the events really were, which for a demo of a local model silently
+        # overstates how quick it is. Nobody who suspects one sped-up clip
+        # believes the rest of the reel, so the honest timeline is the useful one.
+        actual_fps = (len(frames) / wall_s) if wall_s > 0 else float(fps)
+        actual_fps = max(1.0, round(actual_fps, 2))
+        if actual_fps < fps * 0.8:
+            logger.info(f"capture achieved {actual_fps:g} fps of {fps} requested; "
+                        f"encoding at {actual_fps:g} so playback is real time")
 
         # Prefer mp4 (H.264); fall back to GIF if the ffmpeg plugin is missing.
         try:
-            imageio.mimwrite(output_path, frames, fps=fps, codec='libx264',
+            imageio.mimwrite(output_path, frames, fps=actual_fps, codec='libx264',
                              macro_block_size=None)
             fmt = 'mp4'
         except Exception as e:
             logger.info(f"mp4 encode unavailable ({e}); falling back to GIF")
             import os
             output_path = os.path.splitext(output_path)[0] + '.gif'
-            imageio.mimwrite(output_path, frames, duration=interval)
+            imageio.mimwrite(output_path, frames, duration=1.0 / actual_fps)
             fmt = 'gif'
 
         return {
@@ -351,8 +368,9 @@ class FrameCapture:
             'path': output_path,
             'format': fmt,
             'frames': len(frames),
-            'fps': fps,
-            'duration_s': round(len(frames) / fps, 2),
+            'fps': actual_fps,
+            'requested_fps': fps,
+            'duration_s': round(len(frames) / actual_fps, 2),
         }
 
     def stop(self) -> None:

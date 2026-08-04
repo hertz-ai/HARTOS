@@ -16,7 +16,22 @@ on:
       - 'deploy/distro/**'
 
 concurrency:
-  group: nix-check-${{ github.ref }}
+  # Push/PR runs share one group per ref and still cancel each other: on a busy
+  # branch only the newest commit is worth checking.
+  #
+  # A workflow_dispatch gets its OWN group (keyed by run id) so a MANUAL,
+  # on-demand run is never cancelled by a later push. Same fix already applied
+  # to nix-build-matrix.yml; this workflow was missed, and it is the one that
+  # produces the diagnostic output.
+  #
+  # Why it matters (2026-07-31): six attempts to get an attributed result for
+  # ❌ hart-desktop-shell-boot / hart-layer-shell-host-paint produced FIVE
+  # cancellations. Determinate Nix prints its error summary at the END of a
+  # run, so a cancelled run shows the ❌ with no cause — which is exactly why
+  # task #15 has read "red every run, NOT flake" since 07-26. Several sessions
+  # push to main; any push killed the run mid-flight. The symptom looked like
+  # a persistent failure rather than a cancellation.
+  group: nix-check-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
   cancel-in-progress: true
 
 jobs:
@@ -63,11 +78,26 @@ jobs:
           echo "::endgroup::"
           deadnix --no-lambda-arg --no-lambda-pattern-names nixos/
 
-  # ─── Flake Evaluation (10-30 seconds) ──────────────────────
+  # ─── Flake Evaluation ──────────────────────────────────────
+  # The old header said "10-30 seconds" and the cap was 10 minutes. Full
+  # evaluation now takes LONGER than that cap (task #23: the eval gate went
+  # from ~2.5min to >15min after the installer / Calamares / dev-tools
+  # commits), so every run was KILLED MID-EVALUATION.
+  #
+  # That is why task #15 has read "red every run, NOT flake" since 07-26:
+  # Determinate Nix prints its error summary at the END of a run, so a run
+  # killed at the cap shows a ❌ with NO cause, indistinguishable from a
+  # persistent failure. Six diagnostic attempts on 2026-07-31 produced zero
+  # attributions for exactly this reason.
+  #
+  # Raised to 45 so a run can REACH its summary. This is a diagnosis
+  # unblocker, not a fix for the slowness — task #23 owns bisecting the
+  # eval-time regression itself, and this cap should come back down once
+  # that lands.
   flake-check:
     name: Nix Flake Check (full evaluation)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -84,10 +114,93 @@ jobs:
       - name: Evaluate all flake outputs
         working-directory: nixos
         run: |
-          echo "Evaluating all nixosConfigurations, packages, and apps..."
-          nix flake check --no-build 2>&1
-          echo ""
-          echo "All flake outputs evaluate successfully."
+          # INSTRUMENTED 2026-08-02 (task #23). This step has been dying with
+          # `Process completed with exit code 143` (SIGTERM) roughly six
+          # minutes in, WELL inside the 45-minute job cap and with no timeout
+          # wrapper of its own. Because Determinate Nix prints its error
+          # summary at the END of a run, every death left the two real
+          # failures (hart-desktop-shell-boot, hart-layer-shell-host-paint)
+          # showing ❌ with no cause — which is the whole reason task #15 read
+          # "red every run" for a week.
+          #
+          # Ruled out already: concurrency cancellation (3f5ee290, log shows
+          # zero cancels) and the job timeout (dee36039, raised to 45min).
+          # Leading hypothesis is RUNNER MEMORY: `nix flake check` evaluates
+          # dozens of full nixosConfigurations in one process. Note the
+          # classic OOM signal is 137/SIGKILL, not 143, so this must be
+          # MEASURED rather than assumed — hence the sampler instead of a
+          # speculative `--max-jobs` tweak.
+          set +e
+          echo "::group::Runner capacity"
+          free -m; nproc; df -h /
+          echo "::endgroup::"
+
+          # Sample memory every 10s so the peak is visible even if the
+          # process is killed without a chance to report.
+          ( while true; do
+              printf '[mem] %s %s\n' "$(date -u +%H:%M:%S)" \
+                "$(free -m | awk '/^Mem:/{printf "used=%sMB avail=%sMB", $3, $7}')"
+              sleep 10
+            done ) > /tmp/memsample.log 2>&1 &
+          SAMPLER=$!
+
+          # WHY A timeout WRAPPER (2026-08-03, run 30781405882): the step died
+          # again, and this time the cap was NOT the cause — the job ran
+          # 14m48s against a 45-minute limit, and NO push landed in the window
+          # (checked: nothing between 72e18952 at 03:16 and f89ab63d at 03:36),
+          # so it was neither the job timeout nor concurrency. The log simply
+          # STOPS after `evaluating 'checks.x86_64-linux.hart-portal-
+          # screencast'` and says nothing for 12m13s before "The operation was
+          # canceled". Twelve minutes of total silence is a stall, and the
+          # absence of a 137 argues against a clean OOM kill; a runner
+          # thrashing itself unresponsive fits both facts.
+          #
+          # An explicit timeout turns that into a self-naming 124 instead of a
+          # mystery cancellation, and — crucially — lets the lines BELOW run.
+          timeout --signal=TERM --kill-after=60 1500 nix flake check --no-build 2>&1
+          RC=$?
+
+          kill "$SAMPLER" 2>/dev/null || true
+          echo "::group::Memory during evaluation (peak last)"
+          sort -t= -k2 -n /tmp/memsample.log 2>/dev/null | tail -5
+          echo "--- final ---"
+          free -m
+          echo "::endgroup::"
+
+          # 143 = 128+15 (SIGTERM), 137 = 128+9 (SIGKILL/OOM). Naming them
+          # means the NEXT failure is self-describing instead of a bare code.
+          case "$RC" in
+            0)   echo "All flake outputs evaluate successfully." ;;
+            137) echo "::error::eval SIGKILLed (137) — OOM killer. Confirms the memory hypothesis; split the check or raise the runner." ;;
+            124) echo "::error::eval hit OUR 25-minute wrapper (124) — it stalled rather than failed. The memory table above is now the evidence; a flat curve exonerates memory and points at the Nix daemon." ;;
+            143) echo "::error::eval SIGTERMed (143) — NOT the job cap and NOT concurrency. If memory above looks healthy, suspect the Nix daemon or the installer post-hook." ;;
+            *)   echo "::error::eval failed rc=$RC — a real evaluation failure; the summary above names the outputs." ;;
+          esac
+          exit "$RC"
+
+      # The sampler above only ever printed when `nix flake check` RETURNED.
+      # Run 30781405882 was CANCELLED mid-eval, so the kill, the sort and the
+      # whole ::group:: never ran and every sample it had faithfully collected
+      # for 12 minutes was thrown away at the moment it finally mattered.
+      # A diagnostic that dies with the thing it is diagnosing is not a
+      # diagnostic. This step runs on cancellation too.
+      - name: Memory + OOM evidence (survives cancellation)
+        if: always()
+        run: |
+          echo "::group::Memory samples (chronological — watch the trend, not the peak)"
+          tail -60 /tmp/memsample.log 2>/dev/null || echo "no samples: the step died before the sampler wrote"
+          echo "::endgroup::"
+          echo "::group::Peak sample"
+          sort -t= -k2 -n /tmp/memsample.log 2>/dev/null | tail -3 || true
+          echo "::endgroup::"
+          echo "::group::Kernel OOM verdict"
+          # The one fact that separates "thrashed itself unresponsive" from
+          # "something else killed it". dmesg needs no root on hosted runners.
+          (dmesg -T 2>/dev/null || sudo dmesg -T 2>/dev/null || true) \
+            | grep -iE "out of memory|oom-kill|killed process" | tail -20 \
+            || echo "no OOM lines in dmesg — memory did NOT kill it"
+          echo "::endgroup::"
+          free -m; df -h /
 
       - name: Show flake metadata
         working-directory: nixos
@@ -95,6 +208,86 @@ jobs:
           echo "::group::Flake outputs"
           nix flake show 2>&1
           echo "::endgroup::"
+
+  # ─── Targeted failure diagnosis (own job, on purpose) ──────
+  # This lives in a SEPARATE job from flake-check, not as a step inside it.
+  # As a step it was useless in practice: GitHub only serves a job's log blob
+  # after the JOB finishes, so a 2-minute diagnostic sat unreadable behind a
+  # 45-minute full evaluation. Its whole value is being readable FAST.
+  # It also never gates — see exit 0 below.
+  diagnose-failing-checks:
+    name: Diagnose known-failing checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Cache Nix store
+        uses: DeterminateSystems/magic-nix-cache-action@v7
+
+      - name: Evaluate each failing check by name
+        working-directory: nixos
+        run: |
+          # WHY THIS RUNS BEFORE THE FULL CHECK (task #23 -> #15):
+          # `nix flake check` evaluates every output in one process and no
+          # longer finishes inside 45 minutes, and Determinate Nix prints its
+          # error summary only at the END. So the two checks that actually
+          # fail have never had their CAUSE reported — six diagnostic attempts
+          # produced a bare ❌ each time.
+          #
+          # Evaluating them by NAME takes seconds and cannot be starved by the
+          # other ~40 outputs. `.drvPath` forces full evaluation of the
+          # derivation without building it, so an eval error surfaces here.
+          #
+          # `exit 0` deliberately: this step exists to REPORT, never to gate.
+          # The real pass/fail verdict stays with the full check below, so a
+          # diagnostic aid can never mask or invent a build result.
+          set +e
+          FAILED_CHECKS="hart-desktop-shell-boot hart-layer-shell-host-paint"
+          for c in $FAILED_CHECKS; do
+            echo "::group::eval checks.x86_64-linux.$c"
+            nix eval ".#checks.x86_64-linux.$c.drvPath" --raw 2>&1 | tail -60
+            echo ""
+            echo "(rc above is from the eval of $c)"
+            echo "::endgroup::"
+          done
+
+          # ── Per-check TIMING (task #23) ───────────────────────────────
+          # #23 needs to know WHICH output made full evaluation outgrow every
+          # cap we set. `nix flake check` is one opaque process, so it can
+          # only be timed as a whole — which tells you nothing actionable.
+          # Timing each check separately localises the cost, and that IS the
+          # bisect #23 has been asking for since it was filed.
+          #
+          # Printed INCREMENTALLY and unsorted-as-we-go: if this job hits its
+          # own 20min cap, the lines already emitted still name the expensive
+          # attributes. A sort-at-the-end would lose exactly the data we came
+          # for, which is the same "summary only at the END" trap that hid
+          # #15 for a week.
+          echo "::group::Per-check evaluation time (incremental; slowest matter)"
+          ATTRS=$(nix eval --impure --raw --expr \
+            'builtins.concatStringsSep " " (builtins.attrNames (builtins.getFlake (toString ./.)).checks.x86_64-linux)' \
+            2>/dev/null)
+          if [ -z "$ATTRS" ]; then
+            echo "(could not enumerate checks — skipping timing, not failing)"
+          else
+            for a in $ATTRS; do
+              s=$(date +%s)
+              nix eval ".#checks.x86_64-linux.$a.drvPath" --raw >/dev/null 2>&1
+              rc=$?
+              printf '%5ss  rc=%s  %s\n' "$(( $(date +%s) - s ))" "$rc" "$a"
+            done
+          fi
+          echo "::endgroup::"
+          exit 0
+
 
   # ─── Python Structural Validation ──────────────────────────
   python-tests:

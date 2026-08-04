@@ -1059,7 +1059,7 @@ class TestShellWiFi(unittest.TestCase):
     `{enabled, connected, ssid, signal, frequency, ip}`.
     """
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_wifi_scan_returns_networks(self, mock_sub):
         client = _make_system_app()
         proc = MagicMock()
@@ -1068,8 +1068,7 @@ class TestShellWiFi(unittest.TestCase):
         proc.stdout = ('MyNet:85:WPA2:5180 MHz:AA:BB:CC\n'
                        'OpenNet:60::2412 MHz:DD:EE:FF\n')
         proc.stderr = ''
-        mock_sub.run.return_value = proc
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.return_value = proc
         r = client.get('/api/shell/wifi/networks')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
@@ -1080,42 +1079,39 @@ class TestShellWiFi(unittest.TestCase):
         self.assertEqual(data['networks'][0]['signal'], 85)
         self.assertEqual(data['networks'][0]['security'], 'WPA2')
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_wifi_scan_empty(self, mock_sub):
         client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
         proc.stdout = ''
         proc.stderr = ''
-        mock_sub.run.return_value = proc
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.return_value = proc
         r = client.get('/api/shell/wifi/networks')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertEqual(data['networks'], [])
         self.assertEqual(data['count'], 0)
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_wifi_scan_nmcli_not_found(self, mock_sub):
         client = _make_system_app()
         # _run swallows FileNotFoundError → None → empty network list.
-        mock_sub.run.side_effect = FileNotFoundError
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.return_value = None  # _run swallows ENOENT → None
         r = client.get('/api/shell/wifi/networks')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertEqual(data['networks'], [])
         self.assertEqual(data['count'], 0)
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_wifi_connect_success(self, mock_sub):
         client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
         proc.stdout = 'successfully activated'
         proc.stderr = ''
-        mock_sub.run.return_value = proc
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.return_value = proc
         r = client.post('/api/shell/wifi/connect',
                         json={'ssid': 'MyNet', 'password': '1234'})
         self.assertEqual(r.status_code, 200)
@@ -1123,7 +1119,7 @@ class TestShellWiFi(unittest.TestCase):
         self.assertTrue(data['connected'])
         self.assertEqual(data['ssid'], 'MyNet')
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_wifi_connect_missing_ssid(self, mock_sub):
         client = _make_system_app()
         r = client.post('/api/shell/wifi/connect', json={})
@@ -1131,7 +1127,7 @@ class TestShellWiFi(unittest.TestCase):
         data = json.loads(r.data)
         self.assertIn('error', data)
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_wifi_status(self, mock_sub):
         client = _make_system_app()
         proc = MagicMock()
@@ -1152,8 +1148,7 @@ class TestShellWiFi(unittest.TestCase):
                 p.stdout = 'IP4.ADDRESS[1]:192.168.1.5/24\n'
             return p
 
-        mock_sub.run.side_effect = run_side_effect
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.side_effect = run_side_effect
         r = client.get('/api/shell/wifi/status')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
@@ -1178,7 +1173,7 @@ class TestShellVPN(unittest.TestCase):
     `os.path.isfile`, and returns `{'imported': True, 'name': ...}`.
     """
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_vpn_list(self, mock_sub):
         client = _make_system_app()
         proc = MagicMock()
@@ -1186,8 +1181,7 @@ class TestShellVPN(unittest.TestCase):
         # nmcli -t -f NAME,TYPE,ACTIVE connection show
         proc.stdout = 'MyVPN:vpn:yes\nWork:vpn:no\nEth:ethernet:no\n'
         proc.stderr = ''
-        mock_sub.run.return_value = proc
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.return_value = proc
         r = client.get('/api/shell/vpn/list')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
@@ -1196,22 +1190,21 @@ class TestShellVPN(unittest.TestCase):
         self.assertEqual(data['connections'][0]['name'], 'MyVPN')
         self.assertTrue(data['connections'][0]['active'])
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_vpn_connect_success(self, mock_sub):
         client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
         proc.stdout = 'Connection successfully activated'
         proc.stderr = ''
-        mock_sub.run.return_value = proc
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.return_value = proc
         r = client.post('/api/shell/vpn/connect', json={'name': 'MyVPN'})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertTrue(data['connected'])
         self.assertEqual(data['name'], 'MyVPN')
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_vpn_connect_missing_name(self, mock_sub):
         client = _make_system_app()
         r = client.post('/api/shell/vpn/connect', json={})
@@ -1219,21 +1212,20 @@ class TestShellVPN(unittest.TestCase):
         data = json.loads(r.data)
         self.assertIn('error', data)
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     def test_vpn_disconnect(self, mock_sub):
         client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
         proc.stdout = 'Connection successfully deactivated'
         proc.stderr = ''
-        mock_sub.run.return_value = proc
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.return_value = proc
         r = client.post('/api/shell/vpn/disconnect', json={'name': 'MyVPN'})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertTrue(data['disconnected'])
 
-    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis._run')
     @patch('integrations.agent_engine.shell_system_apis.os.path.isfile', return_value=True)
     def test_vpn_import_wireguard(self, _mock_isfile, mock_sub):
         client = _make_system_app()
@@ -1242,8 +1234,7 @@ class TestShellVPN(unittest.TestCase):
         # nmcli echoes the new connection name in single quotes.
         proc.stdout = "Connection 'test' (uuid) successfully added."
         proc.stderr = ''
-        mock_sub.run.return_value = proc
-        mock_sub.TimeoutExpired = Exception
+        mock_sub.return_value = proc
         r = client.post('/api/shell/vpn/import',
                         json={'config_path': '/tmp/test.conf', 'type': 'wireguard'})
         self.assertEqual(r.status_code, 200)
@@ -1614,10 +1605,18 @@ class TestAppStore(unittest.TestCase):
 class TestCloudSync(unittest.TestCase):
     """Tests for cloud file sync (rclone wrapper) endpoints."""
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess.run',
-           side_effect=FileNotFoundError)
+    @patch('integrations.agent_engine.shell_os_apis.run_probe',
+           return_value=None)
     def test_remotes_rclone_not_installed(self, mock_run):
-        """When rclone not installed, returns empty list."""
+        """When rclone not installed, returns empty list.
+
+        Patches the `run_probe` SEAM, not `subprocess.run` beneath it. The
+        old target broke the moment cloud-sync moved onto the canonical
+        probe, because the real work then happened in core.subprocess_safe's
+        namespace and the mock silently stopped intercepting -- the same
+        trap that took out the WiFi/VPN suites. run_probe swallows ENOENT
+        into None, so None IS the "tool absent" contract here.
+        """
         client = _make_os_app()
         r = client.get('/api/shell/cloud-sync/remotes')
         self.assertEqual(r.status_code, 200)
@@ -1625,7 +1624,7 @@ class TestCloudSync(unittest.TestCase):
         self.assertEqual(data['remotes'], [])
         self.assertFalse(data['rclone_available'])
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess.run')
+    @patch('integrations.agent_engine.shell_os_apis.run_probe')
     def test_remotes_with_rclone(self, mock_run):
         """rclone listremotes returns configured remotes."""
         mock_run.return_value = MagicMock(
@@ -1654,7 +1653,7 @@ class TestCloudSync(unittest.TestCase):
                         content_type='application/json')
         self.assertEqual(r.status_code, 400)
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess.run')
+    @patch('integrations.agent_engine.shell_os_apis.run_probe')
     def test_sync_status(self, mock_run):
         """Sync status shows rclone availability."""
         mock_run.return_value = MagicMock(
@@ -2014,3 +2013,65 @@ class TestEmailLauncher(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestDestructiveClassifierFailsClosed(unittest.TestCase):
+    """The terminal-exec gate must DENY when it cannot decide.
+
+    #31 degraded-mode review. `_classify_destructive` is the guard on
+    /api/shell/terminal/exec — arbitrary command execution, the highest
+    blast radius on the whole shell surface. Its code is CORRECT: the
+    `except` returns False and logs "fail-closed".
+
+    But nothing PROVED it. Every existing terminal test patches
+    `_classify_destructive` to return True, i.e. mocks the guard away.
+    Measured 2026-08-03: flipping `return False` to `return True` in the
+    except — silently turning arbitrary command execution from deny-by-
+    default into ALLOW-by-default — left all 148 tests in this file GREEN.
+
+    These call the real function with the classifier broken, so the
+    fail-closed property is a tested property rather than a comment.
+    """
+
+    def _classify(self):
+        from integrations.agent_engine.shell_os_apis import _classify_destructive
+        return _classify_destructive
+
+    def test_denies_when_the_classifier_raises(self):
+        """Classifier blows up => DENY. The failure mode that matters: a
+        busy or crashed local LLM must never widen what may run."""
+        with patch('security.action_classifier.classify_action',
+                   side_effect=RuntimeError('classifier down')):
+            self.assertFalse(
+                self._classify()('terminal exec: rm -rf /'),
+                "a raising classifier must DENY — returning True here turns "
+                "the exec gate into allow-by-default")
+
+    def test_denies_when_the_classifier_module_is_absent(self):
+        """ImportError => DENY. On a stripped build security.action_classifier
+        may not be present at all; absence must not mean permission."""
+        with patch.dict('sys.modules', {'security.action_classifier': None}):
+            self.assertFalse(
+                self._classify()('terminal exec: dd if=/dev/zero of=/dev/sda'),
+                "an absent classifier must DENY, never default to allow")
+
+    def test_denies_on_an_unknown_verdict(self):
+        """Only the literal 'safe' may pass.
+
+        'unknown' is the classifier saying it could not decide, which is a
+        refusal, not an endorsement — and any future verdict string must
+        default to denied rather than silently passing.
+        """
+        for verdict in ('unknown', 'destructive', '', 'SAFE', 'probably-safe'):
+            with patch('security.action_classifier.classify_action',
+                       return_value=verdict):
+                self.assertFalse(
+                    self._classify()('terminal exec: mkfs.ext4 /dev/sda1'),
+                    f"verdict {verdict!r} must NOT be treated as permission")
+
+    def test_allows_only_the_explicit_safe_verdict(self):
+        """The positive case — a guard that denies everything gets removed,
+        which would be worse than the leak it prevents."""
+        with patch('security.action_classifier.classify_action',
+                   return_value='safe'):
+            self.assertTrue(self._classify()('terminal exec: ls -l'))

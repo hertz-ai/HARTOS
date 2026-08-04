@@ -15,6 +15,7 @@
 
 {
   imports = [
+    ../profiles/server.nix   # variant feature profile (hart.* block; moved 2026-07-28)
     "${modulesPath}/installer/cd-dvd/installation-cd-minimal.nix"
   ];
 
@@ -32,71 +33,20 @@
     ''
   );
 
-  # ─── HART OS Core Services ───
-  hart = {
-    enable = true;
-    variant = "server";
-
-    # All AI services
-    agent.enable = true;
-    llm.enable = true;
-    vision.enable = true;
-
-    # ── Kernel Extensions ──
-    kernel = {
-      enable = true;
-      androidNative.enable = false;    # No Android on server
-      windowsNative.enable = false;    # No Windows on server
-      aiCompute = {
-        enable = true;                 # Full GPU compute
-        hugePagesCount = 0;            # Auto (set high for dedicated inference)
-      };
-      agentSandbox.enable = true;      # Isolate agents
-    };
-
-    # ── AI Runtime (full power) ──
-    aiRuntime = {
-      enable = true;
-      gpu.enable = true;
-      worldModel.enable = true;
-      agents = {
-        maxConcurrent = 16;            # Server can handle many agents
-        maxMemoryPerAgent = "4G";
-      };
-      # Semantic intelligence: self-healing services + predictive prefetch
-      semantic = {
-        enable = true;
-        serviceIntelligence = true;
-        predictivePrefetch = true;
-        smartFS = false;               # No user files on server typically
-      };
-    };
-
-    # ── AI-Native OS Layers ──
-    # Model Bus: every app/service gets native AI access
-    modelBus.enable = true;
-
-    # Compute Mesh: share this server's GPU with user's other devices
-    computeMesh = {
-      enable = true;
-      maxOffloadPercent = 70;          # Server donates generously
-      allowWAN = true;
-    };
-
-    # No LiquidUI (headless server)
-    # No App Bridge (no subsystems on server)
-
-    # ── Sandbox ──
-    sandbox.enable = true;
-  };
+  # ─── HART OS Core Services: moved to ../profiles/server.nix ───
+  # The hart.* feature block (what makes the server a server) now lives in
+  # profiles/server.nix, imported above, so the SAME block can also drive the
+  # nixosTest nodes (#15) and the installer (#17) without duplicating it here.
+  # This file keeps only what is image/media-specific plus hart.package below.
 
   # HART application package
   hart.package = pkgs.callPackage ../packages/hart-app.nix { inherit hartSrc; };
 
-  # CLI tool
-  environment.systemPackages = [
-    (pkgs.callPackage ../packages/hart-cli.nix { inherit hartSrc; })
-  ];
+  # ─── Server experience: moved to ../profiles/server.nix (task #21) ───
+  # hart-cli, sshd enable, serial console, headless, getty autologin — an
+  # installed server composes the same surface. THIS file keeps the
+  # LIVE-MEDIUM access story below (permissive SSH + baked passwords +
+  # ssh-diag), which must NEVER reach an installed system.
 
   # ISO branding
   isoImage = {
@@ -110,12 +60,10 @@
   # Boot configuration
   boot.loader.timeout = lib.mkForce 5;
 
-  # Serial console for headless/QEMU boot
-  boot.kernelParams = [ "console=ttyS0,115200n8" ];
-
-  # SSH for remote access (NixOS live env)
+  # SSH relaxations for remote access to the LIVE MEDIUM only — sshd itself
+  # is enabled by the profile with the module's secure defaults; an installed
+  # server never gets these mkForces (it doesn't import this file).
   services.openssh = {
-    enable = true;
     settings.PermitRootLogin = lib.mkForce "yes";
     settings.PasswordAuthentication = lib.mkForce true;
     settings.UsePAM = lib.mkForce true;
@@ -217,10 +165,4 @@ SHEOF
     '';
   };
   networking.firewall.allowedTCPPorts = [ 8888 ];
-
-  # Headless: no desktop
-  services.xserver.enable = false;
-
-  # Auto-login on console (first-time setup)
-  services.getty.autologinUser = lib.mkDefault "hart-admin";
 }

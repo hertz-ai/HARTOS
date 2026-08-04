@@ -1,8 +1,8 @@
 # AI-native OS: first-boot LLM, agents, casual chat, Tier-1 100x — grounded plan
 
-> Maps onto `AI_NATIVE_OS_VISION.md`'s proof ledger: the local LLM up on first boot is the
+> Maps onto `../internal/AI_NATIVE_OS_VISION.md`'s proof ledger: the local LLM up on first boot is the
 > SUBSTRATE the whole vision rests on (P1 "the LLM is the heart"); the AutoGen/langchain
-> agents are P1/P4 (composable agents); cross-OS install is P6 (One Fabric, honestly 🟡
+> agents are P1/P4 (composable agents); cross-OS install is P6 (One Fabric, 🟡
 > runtime-gated). Same discipline: a pillar is real only when its PROBE is green AND
 > load-bearing — "the agent stack is packaged" must be proven by a behavioural /chat +
 > recipe-write round-trip on the booted node, not asserted. Do not relabel a 🟡 as ✅.

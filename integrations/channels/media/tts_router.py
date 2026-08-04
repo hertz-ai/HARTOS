@@ -13,7 +13,7 @@ Decision factors (in priority order):
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -640,6 +640,36 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         ),
     ),
 }
+
+# Pristine snapshot of the code-shipped seed, captured BEFORE any runtime
+# mutation.  `populate_tts_catalog` rebuilds ENGINE_REGISTRY in place from
+# the catalog (#58 snapshot semantics), and the catalog round trip must
+# never degrade a code-shipped engine: dispatch identity (tool_module,
+# tool_worker_attr, required_package, pip_install_plan, install_target)
+# is CODE-OWNED and restored from here — a catalog entry can tune
+# capability metadata but can never redirect a seed engine's dispatch
+# target.  Seed engines with tool_module=None (piper, makeittalk) are
+# dispatched in-process by engine-specific branches, a third shape the
+# foreign-manifest caps validation does not model — membership here is
+# what marks them dispatchable.
+_SEED_SPECS: Dict[str, TTSEngineSpec] = dict(ENGINE_REGISTRY)
+
+
+def _engine_id_to_catalog_id(engine_id: str) -> str:
+    """Canonical registry-key → catalog-id map: 'f5_tts' → 'tts-f5-tts'."""
+    return 'tts-' + engine_id.replace('_', '-')
+
+
+def _catalog_id_to_engine_id(catalog_id: str) -> str:
+    """Inverse of `_engine_id_to_catalog_id`: 'tts-f5-tts' → 'f5_tts'.
+
+    Registry keys are underscore-canonical (they must match the names in
+    LANG_ENGINE_PREFERENCE); catalog ids are dash-canonical.  Dropping the
+    underscore restoration was the root cause of language_priority={} on
+    every populate after the first (task #16).
+    """
+    raw = catalog_id[4:] if catalog_id.startswith('tts-') else catalog_id
+    return raw.replace('-', '_')
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1598,8 +1628,12 @@ def _validate_engine_caps(caps: Dict[str, Any]) -> Optional[str]:
          The entry will be dispatched via the existing
          `gpu_worker._dispatch_and_run` path: import the module, pick
          up `_load[_<variant>]` / `_synthesize[_<variant>]` callbacks
-         by convention.  This is what every code-shipped engine in
-         ENGINE_REGISTRY uses today.
+         by convention.  Most code-shipped engines in ENGINE_REGISTRY
+         use this.  (Seed engines with tool_module=None — piper,
+         makeittalk — are a THIRD shape: in-process engine-specific
+         dispatch.  They are exempt from this validator by seed
+         membership at the call sites; this function only models the
+         two FOREIGN-manifest shapes.)
 
       2. Pure-config / reflection path:
             caps lacks tool_module BUT declares ALL of _REFLECTION_FIELDS.
@@ -1850,11 +1884,20 @@ def populate_tts_catalog(catalog) -> int:
 
     # Pre-pass: validate any existing TTS entries (admin/hive seeded the
     # catalog before us).  Invalid entries are removed + logged so they
-    # don't poison `_refresh_engine_registry_from_catalog` below.  Code-
-    # shipped engines (ENGINE_REGISTRY) ALWAYS have tool_module so they
-    # never trip this; the gate exists for foreign manifests.
+    # don't poison `_refresh_engine_registry_from_catalog` below.  The
+    # gate exists for FOREIGN manifests only: seed engines are exempt —
+    # they are dispatchable by construction (piper/makeittalk ship with
+    # tool_module=None and in-process dispatch, a shape the caps
+    # validator does not model), and `_catalog_entry_to_spec` restores
+    # their dispatch identity from _SEED_SPECS regardless of what the
+    # catalog entry claims, so the exemption cannot be abused to smuggle
+    # a foreign dispatch target under a seed id.  Before this exemption
+    # the pre-pass UNREGISTERED tts-piper/tts-makeittalk from the
+    # persisted catalog on every boot (task #16).
     _drop_ids: List[str] = []
     for entry in list(catalog.list_by_type('tts')):
+        if _catalog_id_to_engine_id(entry.id) in _SEED_SPECS:
+            continue
         err = _validate_engine_caps(entry.capabilities or {})
         if err:
             logger.warning(
@@ -1880,7 +1923,7 @@ def populate_tts_catalog(catalog) -> int:
     added = 0
     for engine_id, spec in ENGINE_REGISTRY.items():
         # Skip if already registered (preserves user edits from admin UI)
-        if catalog.get(f'tts-{engine_id.replace("_", "-")}') is not None:
+        if catalog.get(_engine_id_to_catalog_id(engine_id)) is not None:
             continue
 
         device_value = spec.device.value
@@ -1927,7 +1970,7 @@ def populate_tts_catalog(catalog) -> int:
         languages = list(spec.languages)
 
         entry = ModelEntry(
-            id=f'tts-{engine_id.replace("_", "-")}',
+            id=_engine_id_to_catalog_id(engine_id),
             name=_ENGINE_DISPLAY_NAMES.get(engine_id, engine_id),
             model_type=ModelType.TTS,
             version='1.0',
@@ -1996,7 +2039,11 @@ def _catalog_entry_to_spec(entry) -> Optional[TTSEngineSpec]:
     (e.g. when the router consults the catalog for dynamically registered
     engines that were not present in ENGINE_REGISTRY at startup).
 
-    Returns None if:
+    Code-shipped engines (id maps into _SEED_SPECS) round-trip via the
+    pristine seed spec with catalog-tunable knobs overlaid — never via
+    the lossy from-caps reconstruction below, and never dropped.
+
+    Returns None (foreign entries only) if:
       * the entry's capabilities fail validation (#58 contract — see
         `_validate_engine_caps`); the caller should NOT see that entry
         because the dispatcher cannot route to it.
@@ -2007,6 +2054,30 @@ def _catalog_entry_to_spec(entry) -> Optional[TTSEngineSpec]:
         excluded from the ENGINE_REGISTRY snapshot.
     """
     caps = entry.capabilities or {}
+    engine_id = _catalog_id_to_engine_id(entry.id)
+
+    seed = _SEED_SPECS.get(engine_id)
+    if seed is not None:
+        # Code-shipped engine: dispatch identity (tool_module,
+        # tool_worker_attr, required_package, pip_install_plan,
+        # install_target, device) is CODE-OWNED — restored from the
+        # pristine seed, never from the catalog entry.  Overlay only the
+        # catalog-tunable capability knobs so admin/hive edits stay
+        # visible (#58) while a catalog entry can never redirect a seed
+        # engine's dispatch target.  The from-caps path below would also
+        # silently zero every field populate does not persist (task #16).
+        return _dc_replace(
+            seed,
+            languages=tuple(entry.languages) if entry.languages else seed.languages,
+            quality=entry.quality_score if entry.quality_score else seed.quality,
+            voice_clone=caps.get('voice_clone', seed.voice_clone),
+            latency_gpu_ms=caps.get('latency_gpu_ms', seed.latency_gpu_ms),
+            latency_cpu_ms=caps.get('latency_cpu_ms', seed.latency_cpu_ms),
+            latency_cloud_ms=caps.get('latency_cloud_ms', seed.latency_cloud_ms),
+            sample_rate=caps.get('sample_rate', seed.sample_rate),
+            vram_key=caps.get('vram_key', seed.vram_key),
+        )
+
     err = _validate_engine_caps(caps)
     if err:
         # Loud at ingest, silent on subsequent re-reads — the catalog
@@ -2031,11 +2102,8 @@ def _catalog_entry_to_spec(entry) -> Optional[TTSEngineSpec]:
     else:
         device = TTSDevice.CPU_ONLY
 
-    # Strip the 'tts-' prefix that populate_tts_catalog adds
-    raw_id = entry.id[4:] if entry.id.startswith('tts-') else entry.id
-
     return TTSEngineSpec(
-        engine_id=raw_id,
+        engine_id=engine_id,
         device=device,
         vram_key=caps.get('vram_key', ''),
         languages=tuple(entry.languages) if entry.languages else ('en',),

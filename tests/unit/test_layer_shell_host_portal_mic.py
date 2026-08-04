@@ -292,3 +292,70 @@ class TestPortalWiringSourceGuards:
         assert "WebKit.LoadEvent.FINISHED" in src
         assert "def _on_load_changed" in src
         assert "_signal_painted()" in src
+
+
+# ═══════════════════════════════════════════════════════════════
+# 4. WEB-PROCESS CRASH RECOVERY PARITY — the cage floor must match the GTK4 host
+# ═══════════════════════════════════════════════════════════════
+
+CAGE_MODULE = os.path.join(REPO_ROOT, "nixos", "modules", "hart-liquid-ui.nix")
+
+
+class TestWebProcessCrashRecoveryParity:
+    """Both shell hosts — the GTK4 layer-shell host (Tier-1 hart-comp / Tier-2 sway)
+    AND the GTK3 cage floor (Tier-3, the never-fail surface) — must:
+      (a) wire `web-process-terminated` so a dead web process crashes the HOST and
+          the session-supervisor relaunches the tier (instead of the surface going
+          blank forever), and
+      (b) export `GST_PLUGIN_SYSTEM_PATH_1_0` (resolved from the 'out' output) so
+          the mic / getUserMedia capture path finds pulsesrc/valve instead of
+          SIGSEGV-ing WebKitWebProcess.
+
+    The cage floor lacked BOTH until 2026-07-24 — the real-HW "clicking the mic hung
+    the entire cage" incident: the GTK4 host got the fix, the floor it degrades to
+    did not. This locks the PARITY so the floor can never silently regress.
+
+    Labelled cross-file source-parity guard: this is exactly the acceptable class —
+    a single behavioural call site cannot catch "one host has it, the other doesn't",
+    and the wrapper only runs under a compositor (unbootable on the dev box). The
+    companion `test_nix_embedded_python_parses.py` separately proves the cage's
+    embedded python (incl. the new handler) actually PARSES after Nix emission.
+    """
+
+    @pytest.fixture(scope="class")
+    def cage_src(self):
+        return _read(CAGE_MODULE)
+
+    @pytest.fixture(scope="class")
+    def host_src(self):
+        return _read(MODULE)
+
+    def test_both_hosts_export_gst_plugin_path_from_out(self, cage_src, host_src):
+        for name, src in (("cage floor", cage_src), ("GTK4 host", host_src)):
+            assert "GST_PLUGIN_SYSTEM_PATH_1_0" in src, (
+                f"{name} does not export GST_PLUGIN_SYSTEM_PATH_1_0 -> mic capture "
+                "SIGSEGVs WebKitWebProcess (the cage mic-freeze class)")
+            # makeSearchPathOutput "out" (NOT plain makeSearchPath): gstreamer core's
+            # DEFAULT output is `bin`, so plain makeSearchPath resolves an empty
+            # plugin dir and the capture elements stay invisible.
+            assert 'makeSearchPathOutput "out" "lib/gstreamer-1.0"' in src, (
+                f"{name} must resolve gstreamer plugins from the 'out' output")
+            # The plugins live under pkgs.gst_all_1, NOT top-level pkgs -- the bare
+            # `gstreamer` attribute is an UNDEFINED VARIABLE that broke iso-desktop
+            # (2026-07-24). Both hosts must scope them the same, correct way.
+            assert "gst_all_1" in src, (
+                f"{name} must scope GStreamer plugins under pkgs.gst_all_1 "
+                "(top-level `gstreamer` is undefined and fails the nix build)")
+
+    def test_both_hosts_wire_web_process_terminated_to_exit(self, cage_src, host_src):
+        for name, src in (("cage floor", cage_src), ("GTK4 host", host_src)):
+            assert "webview.connect('web-process-terminated'" in src, (
+                f"{name} does not connect web-process-terminated -> a dead web "
+                "process leaves the surface blank with no supervisor relaunch")
+            assert "def _on_web_process_terminated" in src, (
+                f"{name} is missing the _on_web_process_terminated handler")
+            # The handler must actually FORCE-EXIT the host; a wired-but-logging-only
+            # handler would still hang blank. Both hosts use os._exit (aliased _os).
+            assert "_os._exit(1)" in src, (
+                f"{name}'s web-process-terminated handler must os._exit(1) so the "
+                "supervisor relaunches the tier with a fresh web process")

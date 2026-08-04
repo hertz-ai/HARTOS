@@ -73,9 +73,16 @@ def _install_fake_models(monkeypatch, goal):
     )
     monkeypatch.setitem(sys.modules,
                         'integrations.social.models', fake_models)
+    # THROUGH monkeypatch, so it is UNDONE — see the same fix in
+    # test_dashboard_snapshot.py for the full account. A raw
+    # `pkg.models = fake_models` is permanent: setitem restores sys.modules,
+    # but a plain attribute assignment on the real package object is never
+    # reverted, and `from integrations.social import models` prefers the
+    # package ATTRIBUTE. Every later test in the process then sees this
+    # SimpleNamespace instead of the real models module.
     pkg = sys.modules.get('integrations.social')
     if pkg is not None:
-        pkg.models = fake_models  # type: ignore[attr-defined]
+        monkeypatch.setattr(pkg, 'models', fake_models, raising=False)
     return fake_db
 
 

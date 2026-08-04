@@ -74,7 +74,7 @@ mesh (PeerLink), one VRAM-sizing path, no vendored stack.
 ## Sequencing (decentralization-safe MVP first)
 
 `ComputeMeshService`'s privacy boundary is `user_id`: only YOUR devices join YOUR
-mesh. So the first cut is **same-user-device sharding** (your phone + laptop +
+mesh. The first cut is therefore **same-user-device sharding** (your phone + laptop +
 desktop split one big model): trust is trivial (all nodes are yours), so the
 verify/benchmark_prover leg can start as a no-op and the risk of a lying shard is
 zero. The **crowdsourced cross-user** case (different people's nodes) reuses the

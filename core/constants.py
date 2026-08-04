@@ -183,6 +183,48 @@ assert NON_LATIN_SCRIPT_LANGS <= set(SUPPORTED_LANG_DICT), (
 )
 
 
+# Script display names (with a native-script sample) for the non-Latin
+# languages — used by the regional-tone prompt builder's SCRIPT:
+# monoscript directive ("Reply entirely in Devanagari (हिन्दी) ...").
+#
+# Single source of truth — previously an inline _NON_LATIN_SCRIPTS dict
+# in core/agent_personality.py, a SECOND enumeration of "which languages
+# are non-Latin" that drifted: ur/as/sa/sd/bg had regional-tone entries
+# AND are in NON_LATIN_SCRIPT_LANGS, but were missing from the inline
+# dict, so their prompts got the Latin-script rules and the LLM emitted
+# romanized text the TTS backends cannot synthesize (task #10).
+#
+# Keys must stay a subset of NON_LATIN_SCRIPT_LANGS (asserted below);
+# agent_personality asserts the other direction at import — every
+# non-Latin language it carries tone data for must have a name here.
+NON_LATIN_SCRIPT_NAMES = {
+    'ta': 'Tamil (தமிழ்)', 'hi': 'Devanagari (हिन्दी)', 'bn': 'Bengali (বাংলা)',
+    'te': 'Telugu (తెలుగు)', 'mr': 'Devanagari (मराठी)', 'gu': 'Gujarati (ગુજરાતી)',
+    'kn': 'Kannada (ಕನ್ನಡ)', 'ml': 'Malayalam (മലയാളം)', 'pa': 'Gurmukhi (ਪੰਜਾਬੀ)',
+    'or': 'Odia (ଓଡ଼ିଆ)', 'ar': 'Arabic (العربية)', 'he': 'Hebrew (עברית)',
+    'th': 'Thai (ไทย)', 'ko': 'Hangul (한국어)', 'ja': 'Japanese (日本語)',
+    'zh': 'Chinese (中文)', 'ru': 'Cyrillic (Русский)', 'uk': 'Cyrillic (Українська)',
+    'el': 'Greek (Ελληνικά)', 'ne': 'Devanagari (नेपाली)',
+    # The drifted twelve (see docstring above; the import-time lockstep
+    # assert in agent_personality surfaced the six scheduled-Indic ones):
+    'ur': 'Perso-Arabic (اردو)', 'as': 'Bengali-Assamese (অসমীয়া)',
+    'sa': 'Devanagari (संस्कृतम्)', 'sd': 'Perso-Arabic (سنڌي)',
+    'bg': 'Cyrillic (Български)',
+    'kok': 'Devanagari (कोंकणी)', 'mai': 'Devanagari (मैथिली)',
+    'doi': 'Devanagari (डोगरी)', 'brx': 'Devanagari (बड़ो)',
+    'sat': 'Ol Chiki (ᱥᱟᱱᱛᱟᱲᱤ)', 'mni': 'Meitei Mayek (ꯃꯤꯇꯩꯂꯣꯟ)',
+    # In NON_LATIN_SCRIPT_LANGS with no tone entry yet — named ahead so a
+    # future tone entry cannot re-open the gap:
+    'fa': 'Perso-Arabic (فارسی)', 'lo': 'Lao (ລາວ)',
+    'km': 'Khmer (ខ្មែរ)', 'my': 'Burmese (မြန်မာ)', 'sr': 'Cyrillic (Српски)',
+}
+
+assert set(NON_LATIN_SCRIPT_NAMES) <= NON_LATIN_SCRIPT_LANGS, (
+    f"NON_LATIN_SCRIPT_NAMES has codes outside NON_LATIN_SCRIPT_LANGS: "
+    f"{set(NON_LATIN_SCRIPT_NAMES) - NON_LATIN_SCRIPT_LANGS}"
+)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # GREETINGS — canonical, localized "first-run handshake" phrase per
 # language.  Used by the TTS first-run handshake smoke test
@@ -696,3 +738,112 @@ def generic_tool_label(name: str) -> str:
     labeled_autogen_function.generic_autogen_label, and the tool_logging emit
     site all delegate here instead of pasting the template."""
     return f'Running {name}…'
+
+
+# ──────────────────────────────────────────────────────────────────────
+# LATENCY BUDGETS — the ONE place a performance ceiling is written down.
+#
+# CLAUDE.md's review checklist names the hot-path budgets (chat 1.5s,
+# draft 300ms, cache <1ms) but NOTHING enforced them, while six test
+# files each carried their own unrelated inline literal (`< 1.0`,
+# `< 0.5`, `< 2.0`, `< 6.0`, `< 5.0`, `< 0.4`) with no shared definition
+# and no way to tell a deliberate ceiling from a number someone typed.
+#
+# These are CEILINGS, not targets: a test asserts the measured value is
+# UNDER the budget. Keys are stable; a caller imports the name, never a
+# literal, so tightening a budget is one edit and every enforcement
+# point moves with it.
+#
+# Adding a budget is cheap and expected. Changing one is a product
+# decision — the number is the contract, so state WHY in the comment.
+# ──────────────────────────────────────────────────────────────────────
+LATENCY_BUDGETS = {
+    # ── Hot path (CLAUDE.md review checklist) ──
+    # A user chat turn's non-LLM overhead. core.user_context enforces the
+    # same 1.5s as its own DEFAULT_BUDGET_SECONDS wall-clock fetch cap.
+    'chat_turn_overhead_s': 1.5,
+    # Draft/speculative classify: must stay an order under the main model
+    # or the speculation costs more than it saves.
+    'draft_classify_s': 0.3,
+    # An in-process cache lookup. Anything slower is not a cache.
+    'cache_lookup_ms': 1.0,
+
+    # ── Shell / desktop responsiveness ──
+    # The metrics poll must never block the shell's paint loop.
+    'shell_metrics_poll_s': 0.4,
+    # Cross-process authority check (ai_sensing gate) on the toast path.
+    'sense_gate_s': 0.5,
+
+    # ── Failure detection (fast-fail is a feature) ──
+    # A crashed GPU worker must be noticed before the user retries.
+    'gpu_worker_crash_detect_s': 2.0,
+    # Startup failure of a model server, incl. its retry window.
+    'gpu_worker_startup_fail_s': 6.0,
+    # Dedup/coordination decisions are pure-compute; sub-second or the
+    # coordinator becomes the bottleneck it exists to remove.
+    'coordinator_dedup_s': 0.5,
+
+    # ── Never-block guarantees (an async call that blocks is a hang) ──
+    # A fire-and-forget capture must RETURN, not wait for its own work.
+    'async_dispatch_return_s': 1.0,
+    # Telemetry object construction, 10k iterations. Telemetry that costs
+    # measurable time stops being telemetry and becomes the workload.
+    'telemetry_build_10k_ms': 1000.0,
+    # Cold import of the Flask entry module. Not "fast", but bounded: the
+    # learning pipeline must stay in the background rather than being
+    # dragged onto the import path.
+    'entry_module_import_s': 5.0,
+    # First cross-device state sync after a cold start. Bounded so a new
+    # device feels joined rather than pending.
+    'multidevice_cold_sync_s': 5.0,
+
+    # ── Boot, enforced IN THE VM on a real booted node (task #29) ──
+    # Every budget above is enforced by a PYTHON suite. Nothing enforced
+    # anything on the booted OS, which is how userspace startup reached
+    # 6min36s with no test failing on it.
+    #
+    # `boot_userspace_s` is a REGRESSION CEILING, not the product target.
+    # Measured across nixosTest desktop nodes on 2026-08-02:
+    #   3min30s, 3min56s, 4min22s, 4min50s, 6min48s  (210s - 408s)
+    # The spread itself says the pole is load-dependent, and no single unit
+    # explains it: hart-sandbox-firstboot, the last unit before "Startup
+    # finished", takes ~2.7s and only STARTS at t=280s. So the ceiling is set
+    # above the observed max deliberately — a budget nobody can pass gets
+    # disabled, and then nothing is measured at all. It catches a
+    # catastrophic regression today; tightening it needs `systemd-analyze
+    # blame` to name the pole, which the VM test now captures on EVERY run
+    # (pass or fail) precisely so the next tightening is evidence-led.
+    'boot_userspace_s': 600.0,
+    # Kernel-side boot. Observed 6.5s-12.5s, so this one is already near
+    # where it should be and is a genuine gate rather than a placeholder.
+    'boot_kernel_s': 30.0,
+    # /status must answer fast even on a busy node: it is what every health
+    # check and the shell's own boot-wait poll. A slow /status is
+    # indistinguishable from a hung one to the caller.
+    'status_endpoint_ms': 2000.0,
+}
+
+
+def latency_budget(name: str) -> float:
+    """The ceiling for ``name``. Raises on an unknown key ON PURPOSE.
+
+    A typo'd budget name must fail the test loudly rather than silently
+    returning a default that asserts nothing — an enforcement point that
+    quietly stops enforcing is worse than no enforcement at all.
+    """
+    try:
+        return LATENCY_BUDGETS[name]
+    except KeyError:
+        raise KeyError(
+            f"unknown latency budget {name!r}; known: "
+            f"{sorted(LATENCY_BUDGETS)}") from None
+
+
+# Every budget must be a POSITIVE, FINITE number — a zero or negative
+# ceiling can never be satisfied, and an infinite one silently disables
+# the check. Loud at import, like the language-registry invariants above.
+assert all(isinstance(v, (int, float)) and 0 < v < 3600
+           for v in LATENCY_BUDGETS.values()), (
+    "LATENCY_BUDGETS values must be positive finite seconds/ms: "
+    f"{ {k: v for k, v in LATENCY_BUDGETS.items() if not (isinstance(v, (int, float)) and 0 < v < 3600)} }"
+)

@@ -30,6 +30,8 @@ import os
 import shlex
 import shutil
 import subprocess
+
+from core.subprocess_safe import run_probe
 import tempfile
 import time
 from functools import wraps
@@ -76,9 +78,26 @@ def _get_allowed_roots():
 
 
 def _is_path_allowed(path):
-    """Check if a resolved path is within allowed roots."""
+    """Check if a resolved path is within allowed roots.
+
+    realpath, not abspath: abspath only NORMALISES (`../../etc/shadow` becomes
+    `/etc/shadow` and is then happily accepted) and does not follow symlinks, so
+    a link pointing out of an allowed root would pass untouched.
+
+    commonpath, not startswith: a prefix test lets `/home/hart` authorise
+    `/home/hart-evil`, because the string genuinely starts with the root. Only a
+    component-wise comparison answers "is this INSIDE the root". commonpath
+    raises ValueError across drives/mixed absolute-relative, which is a "no".
+    """
     real = os.path.realpath(path)
-    return any(real.startswith(root) for root in _get_allowed_roots())
+    for root in _get_allowed_roots():
+        root_real = os.path.realpath(root)
+        try:
+            if os.path.commonpath([real, root_real]) == root_real:
+                return True
+        except ValueError:
+            continue        # different drive / not comparable -> not inside
+    return False
 
 
 # ─── Shell Auth (local-only, no social DB dependency) ─────────────
@@ -300,8 +319,16 @@ def register_shell_os_routes(app):
                     'notifications': [n.to_dict() for n in notifs],
                     'source': 'database',
                 })
-        except (ImportError, Exception):
-            pass
+        except Exception as e:
+            # LEGITIMATE fallback (the in-memory queue below), but it must not
+            # be SILENT: without this line a DB outage renders an empty
+            # notification list that looks like "you have no notifications".
+            # The response already distinguishes source=database vs the
+            # fallback, so the caller can tell WHICH path ran — this says WHY.
+            # `except (ImportError, Exception)` was redundant: ImportError IS
+            # an Exception, so the tuple caught everything anyway.
+            logger.warning("notifications: DB path unavailable (%s: %s) — "
+                           "serving the in-memory queue", type(e).__name__, e)
 
         # Fallback: in-memory queue
         items = _notification_queue[-limit:]
@@ -1256,8 +1283,12 @@ def register_shell_os_routes(app):
             resp = req.get(f'http://localhost:{mesh_port}/mesh/peers', timeout=3)
             if resp.ok:
                 return jsonify(resp.json())
-        except Exception:
-            pass
+        except Exception as e:
+            # Same shape: a real fallback, but a silent one made "no paired
+            # devices" indistinguishable from "the mesh relay is down".
+            logger.warning("devices: mesh relay unreachable (%s: %s) — "
+                           "falling back to the peer files on disk",
+                           type(e).__name__, e)
 
         # Fallback: read peer files
         peer_dir = os.environ.get(
@@ -1688,18 +1719,10 @@ def register_shell_os_routes(app):
         with open(_SYNC_CONFIG, 'w') as f:
             json.dump(data, f, indent=2)
 
-    def _sync_run(cmd, timeout=10):
-        """Run a subprocess for cloud sync, returning result or None."""
-        try:
-            return subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=timeout)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return None
-
     @app.route('/api/shell/cloud-sync/remotes', methods=['GET'])
     def shell_sync_remotes():
         """List configured rclone remotes."""
-        r = _sync_run(['rclone', 'listremotes'], timeout=10)
+        r = run_probe(['rclone', 'listremotes'], timeout=10)
         remotes = []
         if r and r.returncode == 0:
             for line in r.stdout.strip().split('\n'):
@@ -1761,7 +1784,7 @@ def register_shell_os_routes(app):
 
     @app.route('/api/shell/cloud-sync/run', methods=['POST'])
     @_require_shell_auth
-    def shell_sync_run():
+    def shellrun_probe():
         """Trigger sync for a specific pair or all pairs."""
         body = request.get_json(silent=True) or {}
         pair_id = body.get('pair_id')
@@ -1784,7 +1807,7 @@ def register_shell_os_routes(app):
             if direction == 'bisync':
                 cmd = ['rclone', 'bisync', local, remote, '--resync']
 
-            r = _sync_run(cmd, timeout=300)
+            r = run_probe(cmd, timeout=300)
             success = r is not None and r.returncode == 0
             results.append({
                 'pair_id': pair.get('id'),
@@ -1805,7 +1828,7 @@ def register_shell_os_routes(app):
         """Get sync status for all pairs."""
         cfg = _load_sync_config()
         # Check if rclone is available
-        r = _sync_run(['rclone', 'version'], timeout=5)
+        r = run_probe(['rclone', 'version'], timeout=5)
         return jsonify({
             'rclone_installed': r is not None and r.returncode == 0,
             'rclone_version': r.stdout.split('\n')[0] if r and r.returncode == 0 else None,

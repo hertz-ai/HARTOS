@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-**Revolutionary Change:** The system now has **ZERO hardcoded agents**. All agents are dynamically discovered from recipe JSON files in the `prompts/` directory.
+**The change:** The system now has **ZERO hardcoded agents**. All agents are dynamically discovered from recipe JSON files in the `prompts/` directory.
 
 ### Key Principles
 

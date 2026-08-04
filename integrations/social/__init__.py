@@ -160,6 +160,15 @@ def init_social(app):
     except Exception as e:
         logger.warning(f"HevolveSocial compute earnings blueprint skipped: {e}")
 
+    # Hive census — the projection half of collection-and-projection. Serves
+    # what receive_peer_delta already verified, with the denominator attached.
+    try:
+        from .api_hive_census import hive_census_bp
+        app.register_blueprint(hive_census_bp)
+        logger.info("HevolveSocial hive census registered at /api/hive/census/")
+    except Exception as e:
+        logger.warning(f"HevolveSocial hive census blueprint skipped: {e}")
+
     # Register hive contest UI (single-page local view — reads the same
     # /api/hive/contest/* endpoints, used by the HART shell panel and
     # by a direct browser visit for operators).
@@ -313,6 +322,16 @@ def init_social(app):
         logger.info("Thought experiment endpoints registered at /api/social/experiments/")
     except Exception as e:
         logger.debug(f"Thought experiments blueprint skipped: {e}")
+
+    # Register site pages blueprint — publish blog/site content via the API
+    # with draft -> in_review -> published states, instead of a frontend
+    # redeploy per post.
+    try:
+        from .api_pages import pages_bp
+        app.register_blueprint(pages_bp)
+        logger.info("Site pages endpoints registered at /api/social/pages/")
+    except Exception as e:
+        logger.debug(f"Site pages blueprint skipped: {e}")
 
     # Register encounter (P2P BLE meetup + mutual-like icebreaker) blueprint.
     # PR-A alpha skeleton — in-memory state; DB migration v38 lands

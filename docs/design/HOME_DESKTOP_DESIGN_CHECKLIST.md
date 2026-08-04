@@ -137,7 +137,7 @@ This is the steward's most-repeated structural rule. Capture every nuance.
   - *"wear clear designers hat like a behance UX designer and overhaul in ultracode
     style with max effort"* `[#1675]`
 - **b5. Better than Windows / macOS** at microanimations, usability, buttery-smooth
-  snappy feel - the areas where modern OSes are genuinely better.
+  snappy feel - the areas where modern OSes do better today.
   - *"make HARTOS UI better than Microsoft desktop and mac OS"* `[#1285]`
   - *"app opening app to app trasitions everything shd be better than windows ,
     explorer, desktop shd be better than windows and mac"* `[#1434]`
@@ -329,12 +329,12 @@ This is the steward's most-repeated structural rule. Capture every nuance.
 - **f3. Right-click CONTEXT MENUS like Windows** (on desktop, icons, app store
   entries), canonical (retire any duplicate `#ctx-menu`).
   - *"context menu like windows?"* `[#1368]`
-- **f3a. UNIFIED IN-PLACE NAVIGATION (hartNav) — one surface, navigated; not many
+- **f3a. UNIFIED IN-PLACE NAVIGATION (hartNav): one surface, navigated; not many
   windows stacked.** HARTOS-native surfaces (explorer, Settings, utilities, panels)
   navigate in place with back / forward / up / breadcrumb over the ONE `openPanel`
   single-instance registry; reuse-by-default, explicit `openPanel(id,{newInstance:true})`
   for a deliberate 2nd instance; real EXTERNAL apps stay compositor windows (f5). The
-  `#hart-nav` chrome is UNOBTRUSIVE — hidden until a panel opens, its own fixed layer,
+  `#hart-nav` chrome is UNOBTRUSIVE: hidden until a panel opens, its own fixed layer,
   never alters the home/fixed-canvas layout (must not regress group (a)). APPLIED
   2026-07-01 via `static/hartNav.js` (generalises `hartFiles.js` history); absorbs the
   W8/#122 context-menu canonicalization (f3) as a tracked follow-up.
@@ -386,8 +386,8 @@ This is the steward's most-repeated structural rule. Capture every nuance.
   - FOLLOW-UP (open gap, NOT faked): HartWmClient is still a swaymsg shim, so
     native-window switching on the real hart-comp desktop stays a no-op until the
     com.hart.Compositor IPC backend (`compositor/IPC_PROTOCOL.md` §4.8) replaces
-    the shim. The route reflects this honestly (`switched:false` under the shim),
-    rather than reporting a phantom switch.
+    the shim. The route reports `switched:false` under the shim rather than a
+    phantom switch.
 - **f8. Floating "disable all AI" button** (shut eyes/ears/sensory) with proof it
   has shut its real-world sensory signals, minimalist, AI-native.
   - *"a floating button which disables all AI (shut eyes ears and all things it can
@@ -588,7 +588,7 @@ the item is out of W1's file scope.
 | d1 Value-first earnings hero | **APPLIED (PARTIAL wording)** | "Your hive earned <amount> while you slept" + "N agents ran M tasks overnight, fully local". Uses "Spark" not "Rs/INR"; steward's mockup led with real-rupees value (k6) - consider showing the money figure. |
 | d2 Continue row + progress | **APPLIED** | First row "Continue" with `hh-card-prog` progress bars, fed by running/in-progress agents. |
 | d3 Image cards text-over-art | **APPLIED** | `.hh-card-body` over `.hh-card-art` + `.hh-card-scrim`; real photos lazy-load over gradient. |
-| d4 Netflix listings everywhere | **PARTIAL → advancing** | Home is fully Netflix. Now the **install/registry/uninstall** surface (`loadAppPermissionsPanel` "Installed Apps") and **This PC drives** (`loadMyComputerPanel`) render as cinematic `.hh-card` rows via the shared `hhCardRow(title,items,opts)` helper in `liquid_ui_service.py` — reusing the SAME hartHome.css `.hh-card`/`.hh-cards`/`.hh-card-prog` vocabulary + `window.HartBrandArt` gradient/glyph (one palette, no parallel renderer). Registry cards keep the shared Uninstall action; drive cards show a real usage progress bar and still hand browsing to the canonical File Explorer (`openFilesAt`). App Store already ships premium `hart-app-card` (hartMarketplace.js). REMAINING: agents/recipes/communities are iframe-served web surfaces (out of the panel layer); the functional File Explorer (hartFiles.js) intentionally KEEPS its Finder-grade list/grid (converting it to cards would regress j4 "full parity"/f6). |
+| d4 Netflix listings everywhere | **PARTIAL → advancing** | Home is fully Netflix. Now the **install/registry/uninstall** surface (`loadAppPermissionsPanel` "Installed Apps") and **This PC drives** (`loadMyComputerPanel`) render as cinematic `.hh-card` rows via the shared `hhCardRow(title,items,opts)` helper in `liquid_ui_service.py`, reusing the SAME hartHome.css `.hh-card`/`.hh-cards`/`.hh-card-prog` vocabulary + `window.HartBrandArt` gradient/glyph (one palette, no parallel renderer). Registry cards keep the shared Uninstall action; drive cards show a real usage progress bar and still hand browsing to the canonical File Explorer (`openFilesAt`). App Store already ships premium `hart-app-card` (hartMarketplace.js). REMAINING: agents/recipes/communities are iframe-served web surfaces (out of the panel layer); the functional File Explorer (hartFiles.js) intentionally KEEPS its Finder-grade list/grid (converting it to cards would regress j4 "full parity"/f6). |
 | d5 Hover-expand 60fps | **APPLIED (GPU-gated)** | `body.gpu-hardware .hh-card:hover { transform:scale(1.07) ... }`; flat + calm on software per #137. |
 | d6 Image-rich desktop app icons | **APPLIED (hook)** | hartHome.css ships `.di-glyph.di-image` image-plate rules for hartDesktop.js (image + name, glyph fallback); the manifest must supply `image`. |
 | d7 Dynamic image cache / semantic index feeds cards | **PARTIAL** | Card `image` field + lazy-load wired; the semantic media index -> card image pipeline (W10) is not yet connected here (cards currently photo-or-gradient from payload). |
@@ -648,7 +648,7 @@ resolved in this layer.** Concrete evidence:
   experience still needs the compositor GPU lever + a real-hardware boot to clear
   the "better than Windows/macOS" bar.
 
-Net: the desktop is now a genuine fixed canvas (the core webpage complaint is
+Net: the desktop is now a fixed canvas (the core webpage complaint is
 addressed); the remaining gaps are the missing top-bar orb-sm, the money-figure
 hero wording, discoverability of dropped rows, the orb voice-viz restoration, and
 real-hardware polish proof.
@@ -665,7 +665,7 @@ rule; each REFINES an existing item.
 |---|---|---|---|---|
 | FIX A | Drag affordances should show only WHILE DRAGGING, not at rest / on hover. | g2.1 (new) + c4 (orb compact) + f4 | **APPLIED** | Sensory-pod grip default `opacity:0`, revealed only under `.hart-senses.dragging` (no `:hover` reveal) in `liquid_ui_service.py`; `hartSenses.js` adds/removes `.dragging` on drag start/end. Orb minimise control (`hartHero.js`) revealed by the drag handlers (onDown -> showMin / onUp -> hideMin), the hover/focus reveal removed, kept visible while compact (restore affordance). Body stays draggable; grip is visual only (hidden via opacity, width + pointer-events preserved). Behavioural `.mjs` + CSS source-guard in `tests/unit/test_orb_drag_affordances_breathing.mjs`. |
 | FIX B | The orb's breathing should be switchable on/off (default ON). | c8 (new) - refines c1 transparency control + c2 breathing | **APPLIED** | One persisted flag `hart_orb_breathing` (hartHero is the sole writer) gates BOTH the `buildOrbAura` brand rings AND `voiceOrbViz`'s breathe glow (`setBreathing`); default ON keeps today's look; flipped via the orb right-click (reuses the context affordance + toast, no second settings panel). Behavioural `.mjs` proves rings build/tear + glow damps. |
-| FIX C | Clicking the pager should actually SWITCH workspaces, not just select. | f7 | **APPLIED (client + honest backend no-op)** | `hartWorkspaces.js` `hartSwitchWorkspace` now also fire-and-forgets `POST /api/shell/workspaces/switch {id,name}` (covers BOTH the pager segments and the settings squares - one fn, DRY); the backend degrades hart-comp/Wayland to a 200 no-op (never 500). FOLLOW-UP (not faked): native-window workspace switching on the real hart-comp desktop stays a no-op until the `com.hart.Compositor` IPC backend replaces the `HartWmClient` swaymsg shim. (Implemented under a sibling task; recorded here for the audit trail.) |
+| FIX C | Clicking the pager should actually SWITCH workspaces, not just select. | f7 | **APPLIED (client + a declared backend no-op)** | `hartWorkspaces.js` `hartSwitchWorkspace` now also fire-and-forgets `POST /api/shell/workspaces/switch {id,name}` (covers BOTH the pager segments and the settings squares - one fn, DRY); the backend degrades hart-comp/Wayland to a 200 no-op (never 500). FOLLOW-UP (not faked): native-window workspace switching on the real hart-comp desktop stays a no-op until the `com.hart.Compositor` IPC backend replaces the `HartWmClient` swaymsg shim. (Implemented under a sibling task; recorded here for the audit trail.) |
 
 Audit note: FIX A + FIX B were implemented on the orb/hero side (`hartHero.js`,
 `voiceOrbViz.js`, `liquid_ui_service.py` CSS); they do not regress any APPLIED W1
@@ -686,7 +686,7 @@ Root cause (audit, NOT a guess): the served shell DOES load the latest JS in the
 right order. The home looked cheaper than the `hartos_home_mockup.html` because
 the software-render floor (`body.gpu-software` + `is_potato`) OVER-SHED. It
 discarded STATIC depth (card drop-shadows, the 3 ambient cinematic glows, the
-earnings/CTA glow) along with the genuinely per-frame-expensive effects
+earnings/CTA glow) along with the per-frame-expensive effects
 (backdrop-filter blur, continuous drift animation, hover transforms). A static
 box-shadow or a static radial glow rasters ONCE and composites cheaply forever,
 so dropping them bought no per-frame saving and gutted the look. On the steward's
@@ -698,7 +698,7 @@ halo.
 
 | # | Steward 2026-07-01 (captured intent) | Item | Status | Evidence |
 |---|---|---|---|---|
-| GF1 | The reduced-effects / software floor must DEGRADE GRACEFULLY, not GUT the look. Keep the richness (gradients, glow, the brand spectrum, the orb depth) on software; only drop the genuinely expensive live-blur / backdrop-filter / continuous animation / hover-transform. | i3 + i4 + b2/b4 (refines #137) | **APPLIED** | (1) The 3 ambient cinematic glows are now EMITTED on software (`liquid_ui_service.py` `emit_ambient = (not is_potato) or gpu_mode=='software'`) and rendered STATIC + low-blur via `body.gpu-software .hart-ambient` (animation:none, blur reduced, NOT display:none) - depth restored for ~zero per-frame cost. (2) `hartHome.css` moves the STATIC card drop-shadow + the primary-CTA teal glow to the BASE rule (software gets them); only hover-scale + transitions stay gated to `body.gpu-hardware`. The grain overlay (a per-frame blend) stays dropped on software. |
+| GF1 | The reduced-effects / software floor must DEGRADE GRACEFULLY, not GUT the look. Keep the richness (gradients, glow, the brand spectrum, the orb depth) on software; only drop the per-frame-expensive live-blur / backdrop-filter / continuous animation / hover-transform. | i3 + i4 + b2/b4 (refines #137) | **APPLIED** | (1) The 3 ambient cinematic glows are now EMITTED on software (`liquid_ui_service.py` `emit_ambient = (not is_potato) or gpu_mode=='software'`) and rendered STATIC + low-blur via `body.gpu-software .hart-ambient` (animation:none, blur reduced, NOT display:none) - depth restored for ~zero per-frame cost. (2) `hartHome.css` moves the STATIC card drop-shadow + the primary-CTA teal glow to the BASE rule (software gets them); only hover-scale + transitions stay gated to `body.gpu-hardware`. The grain overlay (a per-frame blend) stays dropped on software. |
 | GF2 | Match the mockup palette: the deep blue-black `#05070d` canvas, not a lighter purple wash. | b1.1 (background half) | **APPLIED** | `hartResponsive.css` `.wallpaper`, `body.gpu-software .wallpaper`, and `--hart-background` deepened toward `#05070d` (was `#0A0A11`/`#07070B`/`#0F0E17`); the brand-hue blooms are unchanged (still spectrum, never flat black). Teal/violet anchor hues stay per b1.1 (intentional, not reverted). |
 | GF3 | The big orb should read like the mockup: teal core with a teal + VIOLET layered halo, not a flat indigo bloom. | c (orb) + b1.1 | **APPLIED** | `#hart-voice-orb` drop-shadow: the leftover indigo `rgba(108,99,255,.25)` (the #6C63FF b1.1 flagged) -> a teal-inner + brand-violet-outer pair (`drop-shadow(... rgba(0,230,195,.34)) drop-shadow(... rgba(155,92,255,.26))`), matching the mockup's `0 0 90px teal + 0 0 160px violet`. Core/body stay teal (no blue wash); the hero aura already frames it with a violet ring. |
 | GF4 | Statically pack the prebundled apps + agents with awesome on-brand icons + images (bundled, no-network). | d6 + d8 | **APPLIED (offline pack)** | Bundled brand-art SVG posters in `integrations/agent_engine/static/app_art/` (one source generator + emitted files), referenced as the OFFLINE-default `image` on the Flagship agent cards (`hartHome.js`) and on high-recognition app manifest entries (`shell_manifest.py`). The network per-source sourcing (`app_poster.py` -> `card.image_url`, #143/d8) stays the CONTINUOUS enhancement layered ON TOP - the static pack is the no-network floor, the network poster wins only where no static `image` is set. |
@@ -733,7 +733,7 @@ SELECTABLE palette AND the b1.2 duotone as the default (teal LEADS via `--hart-a
 violet ACCENTS via `--hart-a2`); nothing functional is forced to one hue. CH2 preserves
 the exact legacy orb look as the default variety (zero regression on c/GF3), only adds
 switchable skins (c3). CH3 preserves #137's keystroke-lag kill + GF1's graceful floor:
-the genuinely per-frame-expensive media (video playback, lottie ticking) is shed on the
+the per-frame-expensive media (video playback, lottie ticking) is shed on the
 software floor to a static frame, so a heavy background can never reintroduce the 500ms
 lag. All three EXTEND the one Personalize path (k1 no parallel path).
 

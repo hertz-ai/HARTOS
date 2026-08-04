@@ -58,9 +58,28 @@ in
         RestrictRealtime = true;
         RestrictSUIDSGID = true;
 
-        # Resource limits — discovery is lightweight
-        MemoryMax = if cfg.variant == "edge" then "48M" else "128M";
-        MemoryHigh = if cfg.variant == "edge" then "32M" else "96M";
+        # Resource limits — discovery is lightweight.
+        #
+        # EDGE MemoryHigh 32M -> 48M, MEASURED not estimated (task #19,
+        # 2026-08-03). hart-edge-boot's cap check ran on a booted edge node and
+        # reported:
+        #     hart-discovery.service  peak=32.0M  high=32.0M  max=48.0M
+        # i.e. the service's peak sat EXACTLY on its own MemoryHigh. MemoryHigh
+        # is a throttle, not a kill, so nothing crashed and restarts=0 — which
+        # is why this never showed up as a failure. It just means the cgroup
+        # was applying reclaim pressure on essentially every allocation, on the
+        # variant with the least CPU to spare for it.
+        #
+        # 48M is the observed peak + 50%. MemoryMax stays 64M so the hard
+        # ceiling still exists and still sits above MemoryHigh — a MemoryHigh
+        # equal to MemoryMax would make the throttle meaningless.
+        #
+        # Worth recording because the estimate was WRONG BY 6x in the other
+        # direction: a dev-box import measurement suggested ~188 MB, which does
+        # not transfer at all — that box's venv carries transformers/torch and
+        # hart-app.nix ships neither. Real environment, real number.
+        MemoryMax = if cfg.variant == "edge" then "64M" else "128M";
+        MemoryHigh = if cfg.variant == "edge" then "48M" else "96M";
         CPUWeight = 20;
         TasksMax = 16;
         IOWeight = 20;

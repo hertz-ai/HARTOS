@@ -16,9 +16,9 @@ Benchmarks to target:
   - ARC (reasoning) — split by difficulty
   - Custom hive benchmarks (latency, throughput, cost vs cloud APIs)
 
-The key insight: distribute problems, not just compute.
-10 nodes solving 10 different MMLU subjects simultaneously = 10x faster.
-But also: nodes share context, so each answer benefits from collective knowledge.
+Distribute problems, not just compute: 10 nodes solving 10 different MMLU
+subjects simultaneously = 10x faster. Nodes also share context, so each answer
+can draw on what the others have already retrieved.
 
 Ledger persistence: agent_data/benchmark_ledger.json
 Leaderboard persistence: agent_data/benchmark_leaderboard.json
@@ -127,7 +127,7 @@ BUILTIN_BENCHMARKS = {
         'source': 'huggingface',
         'dataset': 'gaia-benchmark/GAIA',
     },
-    # ── Ensemble benchmarks — THIS is where sum > single is proven ──
+    # ── Ensemble benchmarks — where the sum > single claim is tested ──
     # Same questions sent to ALL nodes (different models), answers fused.
     # Fusion accuracy must beat every individual model.
     'ensemble_mmlu': {
@@ -256,6 +256,16 @@ KNOWN_BASELINES = {
 }
 
 # ── The Convergence Strategy (updated Apr 2026 with Mythos baselines) ──
+#
+# EVERY NUMBER IN THE LADDER BELOW IS A PROJECTION. None has been measured.
+# They are a hypothesis about how ensembling should scale, written down so it can
+# be falsified, not results. Do not quote them anywhere public as findings, and
+# do not let them into the README: a reader who checks and finds no measurement
+# behind a percentage stops believing the numbers that are real.
+#
+# Stage 2 is the one that matters and the cheapest to settle: three nodes beating
+# one node is the threshold where the whole approach either works or does not.
+# Three laptops can answer it. VERIFICATION.md row 16 tracks it.
 #
 # The target: Mythos Preview scores 93.9% SWE-bench, 92.7% MMLU, 97.6% USAMO.
 # But Mythos is ONE model, proprietary, not public.

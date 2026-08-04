@@ -85,6 +85,16 @@ in
       environment.systemPackages =
         [ pkgs.libinput pkgs.util-linux ]
         ++ pkgs.lib.optional (pkgs ? evemu) pkgs.evemu;
+
+      # The `seat` group this test asserts is GRANTED BY the session supervisor:
+      # seatd.enable (nixpkgs creates users.groups.seat) and hart-admin's
+      # extraGroups = [hart seat] both live inside hart-session-supervisor.nix's
+      # `mkIf (cfg.enable && sup.enable)`. Without it the node has no seat group
+      # to be in, and NixOS silently drops the unknown extraGroups entry -- the
+      # test then failed on 'seat' every run since 2026-07-26 while the SHIPPED
+      # desktop (profile enables the supervisor) granted it fine. Enable what the
+      # assertion assumes; defaults are the shipped ones (compCommand null).
+      hart.sessionSupervisor.enable = true;
     };
 
     testScript = ''

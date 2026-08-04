@@ -63,7 +63,7 @@ in
       # hart.portal pins HART_AI_SENSING_SOCK on the hart-liquid-ui unit AND grants
       # it ReadWritePaths=/run/hart (hart-portal.nix) — so enable BOTH, exactly the
       # proven portal-screencast.nix node, to drive the gate on/off.
-      hart.liquidUI = { enable = true; renderer = "webkit"; voiceEnabled = false; };
+      hart.liquidUI = { enable = true; renderer = "webkit"; voiceEnabled = pkgs.lib.mkForce false; };
       hart.portal.enable = true;
 
       # The daemon under test (default-ON on desktop; set explicit for clarity).
@@ -132,7 +132,11 @@ in
       # ── 3 (regression / privacy core). Screen CUT ⇒ emitter SUPPRESSES (77) ──
       with subtest("screen cut ⇒ hart-notify-send suppresses the native AI toast fail-closed"):
           set_screen(True)
-          rc, out = notifynode.execute("hart-notify-send 'HART' 'a private message body'")
+          # 2>&1: the suppression message goes to STDERR by design, and the
+          # test driver's execute() captures STDOUT only — without the
+          # redirect the rc==77 assert passed while this one read an empty
+          # string against a correctly-suppressing gate (run 30485906966).
+          rc, out = notifynode.execute("hart-notify-send 'HART' 'a private message body' 2>&1")
           assert rc == 77, \
               f"AI emitter must refuse with 77 when the human cut 'screen', got rc={rc}: {out}"
           assert "SUPPRESSED" in out, \

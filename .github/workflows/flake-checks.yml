@@ -45,6 +45,27 @@ on:
   workflow_call:
   # Manual full run (e.g. to validate a tricky branch before opening a PR).
   workflow_dispatch:
+  # NIGHTLY ON MAIN — because nothing else gates main (2026-08-03).
+  #
+  # This workflow runs on pull_request, workflow_call (from release.yml) and
+  # manual dispatch. HART OS is developed DIRECTLY ON MAIN with no PRs
+  # (CLAUDE.md: "Work directly on `main` in the main clone. Every session."),
+  # so in practice the comprehensive VM gate fired only at release time — it
+  # had run TWICE, both on PRs, most recently 2026-07-23. Between releases,
+  # main was ungated.
+  #
+  # Deliberately a SCHEDULE and not a push trigger. A push trigger with
+  # cancel-in-progress would be cancelled by the next push, and this repo sees
+  # many pushes an hour against a ~1.5h suite — the gate would almost never
+  # reach a verdict, which is worse than no gate because the red/green would
+  # depend on typing speed. (That failure is not theoretical; several sessions
+  # of "red every run" turned out to be cancellations.) A nightly always
+  # finishes and always names a commit.
+  #
+  # No concurrency group on purpose: a manual dispatch must not be killed by
+  # the nightly, nor the nightly by a dispatch — both are wanted answers.
+  schedule:
+    - cron: '0 3 * * *'   # 03:00 UTC daily
   # Standalone PR gate. Path-scoped to the trees these heavy checks validate so a
   # docs-only PR doesn't boot 30+ VMs. The release push always runs the full set
   # via the workflow_call above.
@@ -63,14 +84,89 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # KEYED BY EVENT, because the first version of this group broke the very
+  # thing the header above says must not break.
+  #
+  # It keyed only dispatch by run_id and lumped EVERY other event into one
+  # 'auto' lane. release.yml calls this workflow on push, so a push-triggered
+  # workflow_call shared a group with the NIGHTLY — and killed it. Observed:
+  # run 30881593061, event=schedule, cancelled at 47 minutes having produced
+  # nothing. The header's "no concurrency group on purpose ... both are wanted
+  # answers" was a deliberate decision and adding a group contradicted it.
+  #
+  # Including event_name gives each source its own lane:
+  #   schedule         -> the nightly always finishes and always names a commit
+  #   workflow_call    -> push-triggered release gates DO supersede each other,
+  #                       which is the runner-starvation fix that motivated a
+  #                       group in the first place
+  #   workflow_dispatch-> plus run_id, so two manual runs never fight
+  #   pull_request     -> per-ref, newest push to a PR wins
+  group: flake-checks-${{ github.ref }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'shared' }}
+  cancel-in-progress: true
+
 jobs:
   # ─── Python: unit + functional (the runtime gate) ──────────────────────────
   unit-tests:
-    name: Python unit + functional tests
+    name: Python tests shard ${{ matrix.shard }}/8
     runs-on: ubuntu-latest
     # Hard ceiling so one hung test can never burn the 6h job cap — the per-test
     # --timeout below names the culprit; this is the backstop for a C-level block.
-    timeout-minutes: 45
+    #
+    # RAISED 45 -> 120 (2026-08-04). At 45 this cap was silently eating the
+    # gate: measured on run 30873065760,
+    #
+    #     shard 0  02:52:30 -> 03:38:18   45m48s   cancelled
+    #     shard 1  02:52:29 -> 02:57:32    5m03s   failure   (4233 passed, 50 failed)
+    #     shard 2  02:52:36 -> 03:37:51   45m15s   cancelled
+    #     shard 3  02:52:28 -> 03:37:43   45m15s   cancelled
+    #
+    # THREE OF FOUR SHARDS NEVER REACHED A VERDICT, in every recent run. GitHub
+    # reports a timeout as "cancelled", not "failure", which is why this read
+    # for days as concurrency superseding runs or as fail-fast — it is neither
+    # (fail-fast is explicitly false, and dispatched runs get their own
+    # concurrency group). The gate has therefore never reported on 3/4 of the
+    # suite, and the only verdict anyone ever saw came from the one shard that
+    # happens to finish fast.
+    #
+    # The 9x spread between shard 1 and the rest is a RUNTIME imbalance, not a
+    # file-count one: the split is even by file, and some files are far slower.
+    # --durations below names them so the next run supplies the evidence to
+    # balance on, rather than guessing which tests are slow.
+    timeout-minutes: 120
+    # SHARDED 2026-08-03. As a single job this DID NOT FINISH: run 30783792736
+    # ran 45m37s against the 45-minute cap and the step was killed, so the
+    # release gate's Python job could not pass at all — release.yml depends on
+    # this workflow, and a job that always times out is a gate that is always
+    # red for a reason unrelated to the code.
+    #
+    # SPLIT 4 -> 8 (2026-08-04), because at 120 minutes ALL FOUR shards still
+    # timed out (run 30876035103: 120m15s .. 120m44s, every one "cancelled").
+    # So the suite is roughly 8 HOURS of work, and 4 ways was never going to
+    # fit under any sane cap.
+    #
+    # That total was hidden until the split became insertion-stable. Under the
+    # old `i % 4`, shard 1 happened to collect the fast files and finished in
+    # 5m03s while the rest were guillotined — which read as "one slow quarter"
+    # rather than "the suite does not fit". Hashing by path spread the slow
+    # files evenly and made the real cost visible.
+    #
+    # 8 ways is a SCALING fix, and only that: ~60 min per shard buys a verdict
+    # without changing what any test does. Measured balance over the real
+    # 710-file set: 92/85/100/104/94/86/78/71 (spread 33). Uneven by FILE
+    # COUNT is fine and expected from a hash split; what matters is that the
+    # slow files are no longer clustered, which is what `i % 4` was doing.
+    #
+    # (The commit that introduced this, fb204af9, quoted a different set of
+    # numbers in its message — they were written before the measurement and
+    # are wrong. These are the measured ones.) The actual problem is that some
+    # tests wait on real network I/O (TestHttpPool made a live 15s request to
+    # localhost:8080 on every run until ab407eda). --durations=25 now prints,
+    # since the shards can finish, and that is the evidence to fix it properly.
+    strategy:
+      fail-fast: false   # one red shard must not hide the other seven
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v4
 
@@ -101,19 +197,68 @@ jobs:
           # patches resolve to MagicMock objects and raise. Deselect until the VLM
           # patch targets are refactored to not require the heavy module at
           # patch-time. Tracked non-blocking.
+          set -eo pipefail
+          # Deterministic file sharding — sorted, then round-robin.
+          mapfile -t ALL < <(find tests/unit tests/functional -name 'test_*.py' | sort)
+          TOTAL=${#ALL[@]}
+          echo "discovered $TOTAL test files"
+          if [[ "$TOTAL" -eq 0 ]]; then
+            echo "::error::found 0 test files — discovery is broken, and a green"
+            echo "::error::shard here would mean this gate tested nothing"
+            exit 1
+          fi
+          # Shard by a HASH OF THE PATH, not by list index.
+          #
+          # `i % 4` over a sorted list is deterministic at a FIXED commit but is
+          # NOT stable when the set changes: inserting one test file shifts every
+          # later index and moves ~3/4 of the suite to a different shard. Proven
+          # on 2026-08-04 — adding three test files made shard 1's failure list
+          # differ by 5 files added and 4 removed against the previous run, with
+          # no behaviour change behind any of them.
+          #
+          # That makes a shard's history incomparable: you cannot tell a fix from
+          # a reshuffle, and "shard 1 went red" stops meaning anything. The
+          # header above this job claimed membership was "stable across runs and
+          # a failing quarter is identifiable rather than arbitrary" — true
+          # run-to-run, false across commits, which is the comparison anyone
+          # actually makes.
+          #
+          # sha256(path) % N is deterministic AND insertion-stable: adding a file
+          # moves only that file. Same technique CLAUDE.md already prescribes for
+          # sharding seeded goals across peers, so this is the repo's existing
+          # answer to the same problem rather than a new one.
+          #
+          # Measured over the real 710-file set, adding one file:
+          #     index  %4 :  701 of 710 files change shard
+          #     sha256 %4 :    0 of 710 files change shard
+          # and the hash split stays balanced: 186 / 171 / 178 / 175.
+          SEL=()
+          for f in "${ALL[@]}"; do
+            h=$(printf '%s' "$f" | sha256sum | cut -c1-8)
+            if (( 0x$h % 8 == ${{ matrix.shard }} )); then SEL+=( "$f" ); fi
+          done
+          echo "shard ${{ matrix.shard }} runs ${#SEL[@]} files"
+          if [[ "${#SEL[@]}" -eq 0 ]]; then
+            echo "::error::shard ${{ matrix.shard }} selected 0 of $TOTAL files —"
+            echo "::error::the hash split is broken and a green shard would be a lie"
+            exit 1
+          fi
           python -m pytest \
-            tests/unit/ \
-            tests/functional/ \
+            "${SEL[@]}" \
             --deselect tests/unit/test_vlm_qwen3vl.py::TestFullActionLoop \
             --deselect tests/unit/test_vlm_qwen3vl.py::TestVLMDeterministicActions::test_vlm_action_list_shared_by_legacy_and_unified \
             --timeout=120 \
+            --durations=25 \
             -q --tb=line
 
       # Integration + e2e — cross-module flows. Best-effort: surfaced but
       # non-blocking (they exercise live-ish paths a hermetic runner can't fully
       # stand up), exactly as the previous release.yml `test` job had them.
+      # Shard 0 ONLY: these are best-effort cross-module smoke, not part of the
+      # sharded set. Without this they would run four times per gate for no
+      # extra signal.
       - name: Run integration tests (best-effort)
-        if: always()
+        if: always() && matrix.shard == 0
         env:
           HEVOLVE_DB_PATH: ':memory:'
           PYTHONPATH: ${{ github.workspace }}
@@ -126,7 +271,7 @@ jobs:
             -q --tb=line || echo "Integration tests had failures (non-blocking)"
 
       - name: Run e2e tests (best-effort)
-        if: always()
+        if: always() && matrix.shard == 0
         env:
           HEVOLVE_DB_PATH: ':memory:'
           PYTHONPATH: ${{ github.workspace }}

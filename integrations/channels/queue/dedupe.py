@@ -115,7 +115,7 @@ class MessageDeduplicator(Generic[T]):
 
     def _compute_content_hash(self, content: str) -> str:
         """Compute normalized content hash."""
-        # Normalize whitespace for more robust matching
+        # Collapse runs of whitespace so "a  b\n" and "a b" hash the same
         normalized = ' '.join(content.split())
         return self._compute_hash(normalized)
 

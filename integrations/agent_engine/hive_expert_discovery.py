@@ -14,8 +14,8 @@ fast and the speculative refine path is just the local 4B refining
 its own kind of output — pure waste.
 
 This module closes that gap on the **consumer** side.  When a peer
-emits a ``peer.capability.announce`` event (producer side ships
-separately on the peer's node daemon), this subscriber:
+emits a ``peer.capability.announce`` event (producer side is
+``hive_capability_advertiser``, attached at boot), this subscriber:
 
   1. Validates the peer's trust signature against the master-key
      delegation chain (``security.key_delegation.verify_peer_attestation``).
@@ -41,11 +41,14 @@ separately on the peer's node daemon), this subscriber:
 Producer-side gap
 =================
 
-No peer emits ``peer.capability.announce`` yet — that producer ships
-separately on the peer node daemon.  Until then this subscriber sits
-idle: ``on_peer_announce`` is never called, the registry has no hive
-entries, and the dispatcher transparently falls through to local
-langchain.  Telemetry's ``served_by`` field will read ``local_langchain``
+The producer shipped: ``hive_capability_advertiser`` emits the gossip
+and ``core/platform/bootstrap.py`` attaches both sides at boot.  It is
+opt-in per node though, gated on ``HEVOLVE_HIVE_ADVERTISE=1`` plus
+``HEVOLVE_HIVE_PUBLIC_ENDPOINT``, so on a network where nobody has
+opted in this subscriber still sits idle: ``on_peer_announce`` is never
+called, the registry has no hive entries, and the dispatcher falls
+through to local langchain.  Telemetry's ``served_by`` reads
+``local_langchain``
 100% of the time until peers start announcing, giving you a clean
 metric for hive-tier uptake afterwards.
 

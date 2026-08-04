@@ -21,7 +21,7 @@ This is the binding plan. It is a **strangler-fig re-platforming**, NOT a rewrit
 - the Model Bus ROUTING (a router; inference itself is already native llama.cpp).
 - the WebView-serving Flask shell (glue; the UI is web tech).
 
-## 2. Tiers + functional parity (LOAD-BEARING — do not break Nunba)
+## 2. Tiers + functional parity (do not break Nunba)
 HARTOS runs in TWO tiers; parity is enforced per-op:
 
 | Tier | Platform | Rust system-ops daemon | Fallback |

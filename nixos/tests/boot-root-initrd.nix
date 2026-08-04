@@ -132,8 +132,15 @@ in
           rootsrc = br.succeed("findmnt -n -o SOURCE / ").strip()
           assert rootsrc, "root (/) has no backing source — root never mounted"
           br.log(f"root mounted from: {rootsrc}")
+          # NO root= cmdline assertion here: the nixos-test driver boots its
+          # VMs with a host-shared store root and NO root= param BY FRAMEWORK
+          # DESIGN — the old assert failed every run against a correctly
+          # booted VM (run 30485906966). The "kernel root= matches the boot
+          # medium" link is real-HW-only, probed by hart-boot-log's
+          # root/boot-device+cmdline section exactly as this file's header
+          # already documents. Log it for the record instead.
           cmdline = br.succeed("cat /proc/cmdline").strip()
-          assert "root=" in cmdline, f"kernel cmdline carries no root= param: {cmdline!r}"
+          br.log(f"kernel cmdline (driver-booted, root= absent by design): {cmdline}")
 
       # ── 2. The BUILT initrd carries usb_storage / xhci / sd_mod (PACKED, not just
       #       listed). This is the link a virtio-root VM never exercises — the guard
@@ -150,17 +157,120 @@ in
               # we also try `cpio -t` for a clean listing. The module FILE name uses
               # '-' (usb-storage.ko) while the module NAME uses '_' (usb_storage), so
               # the pattern uses '.' to match either.
+              # PASS 1 — a plain, single-segment initrd: decompress the whole
+              # file and list it.
+              #
+              # PASS 2 — a CONCATENATED initrd, which is what this node now
+              # builds. `hardware.cpu.{intel,amd}.updateMicrocode` (enabled in
+              # hart-base.nix for runs-anywhere parity) sets
+              # `boot.initrd.prepend`, and early-microcode MUST be an
+              # UNCOMPRESSED cpio at offset 0 for the kernel to read it before
+              # decompression. The image is therefore
+              #     uncompressed-microcode-cpio || compressed-main-cpio
+              # and every pass-1 strategy fails on it for a different reason:
+              #   * `zstd -dc <file>` sees the wrong magic at offset 0,
+              #   * `cat | cpio -t` lists ONLY the microcode archive and stops
+              #     at its trailer (so: no modules),
+              #   * `cat | grep -a` scans bytes that are still compressed, so
+              #     no filename can ever match.
+              # The result is a confident MISS for a module that IS packed.
+              # So: find the compressor magic and decompress FROM that offset.
+              #
+              # Strictly additive — pass 1 runs first and is unchanged, and
+              # pass 2 still requires the name in a real `cpio -t` listing, so
+              # this can only ever turn a false MISS into a true HIT, never
+              # manufacture a false HIT.
               script = (
                   f'i="{initrd}"; '
                   'for dc in "zstd -dc" "gzip -dc" "xz -dc" "lz4 -dc" "cat"; do '
                   f'  if $dc "$i" 2>/dev/null | cpio -t 2>/dev/null | grep -Eq "{pattern}"; then echo HIT; exit 0; fi; '
                   f'  if $dc "$i" 2>/dev/null | grep -aEq "{pattern}"; then echo HIT; exit 0; fi; '
+                  'done; '
+                  # OCTAL escapes through `printf`, not `grep -P "\xNN"`:
+                  # -P is locale-fragile ("supports only unibyte and UTF-8
+                  # locales") and refused outright when this was dry-run, and
+                  # it does not interpret \x from a shell variable anyway — the
+                  # first version of this block silently found NO offset and
+                  # would have shipped a fix that fixed nothing. `printf` with
+                  # POSIX octal produces the real bytes and `grep -F` matches
+                  # them literally. None of the four magics contains a NUL, so
+                  # command substitution carries them intact.
+                  'for spec in '
+                  r'"zstd -dc:\050\265\057\375" '
+                  r'"gzip -dc:\037\213\010" '
+                  r'"xz -dc:\375\067\172\130\132" '
+                  r'"lz4 -dc:\004\042\115\030"; do '
+                  '  dc=$(echo "$spec" | cut -d: -f1); '
+                  '  esc=$(echo "$spec" | cut -d: -f2); '
+                  '  mg=$(printf "$esc"); '
+                  '  off=$(LC_ALL=C grep -abo -F "$mg" "$i" 2>/dev/null | head -1 | cut -d: -f1); '
+                  '  if [ -n "$off" ]; then '
+                  '    n=$(expr "$off" + 1); '
+                  f'    if tail -c +$n "$i" 2>/dev/null | $dc 2>/dev/null | cpio -t 2>/dev/null | grep -Eq "{pattern}"; then echo HIT; exit 0; fi; '
+                  '  fi; '
                   'done; echo MISS'
               )
               return "HIT" in br.succeed(script)
 
-          assert initrd_has("usb.storage"), \
-              "initrd does NOT carry usb_storage — a USB root cannot enumerate (VFS panic)"
+          def builtin_has(pattern):
+              # A module compiled INTO the kernel (=y) has no .ko to pack, so a
+              # MISS in the initrd is then CORRECT, not a brick. modules.builtin
+              # lists exactly those. Without this distinction the failure below
+              # is ambiguous and the two possible fixes are OPPOSITE ones:
+              # force-include into the initrd, vs. teach this test about builtins.
+              script = (
+                  'b="/run/booted-system/kernel-modules/lib/modules/$(uname -r)/modules.builtin"; '
+                  f'[ -f "$b" ] && grep -Eq "{pattern}" "$b" && echo HIT || echo MISS'
+              )
+              return "HIT" in br.succeed(script)
+
+          if not initrd_has("usb.storage"):
+              # SELF-DESCRIBING FAILURE. This assertion fired on 2026-08-02
+              # (run 30746514730) with no way to tell WHICH cause it was, so the
+              # next run must answer that itself instead of costing another
+              # round trip. Dump the discriminators into the failure message.
+              builtin = builtin_has("usb.storage")
+              # THIRD possibility, and the one that mimics the other two most
+              # closely: the unpack itself silently produced nothing. A NixOS
+              # initrd can be CONCATENATED segments (an uncompressed firmware
+              # cpio followed by the compressed main cpio). `zstd -dc` stops at
+              # the first frame, and the `cat` fallback greps raw COMPRESSED
+              # bytes where no filename can ever appear — so "module absent"
+              # and "we never actually read the archive" look identical.
+              # Count what the unpack yields: a healthy initrd lists thousands
+              # of entries, so a near-zero count indicts the TEST, not the OS.
+              avail = br.succeed(
+                  "cat /proc/cmdline; echo '--- initrd ---'; "
+                  "ls -l /run/current-system/initrd; "
+                  "file -L /run/current-system/initrd 2>/dev/null || true; "
+                  "echo '--- entries seen per decompressor ---'; "
+                  'for dc in "zstd -dc" "gzip -dc" "xz -dc" "lz4 -dc" "cat"; do '
+                  '  n=$($dc /run/current-system/initrd 2>/dev/null | cpio -t 2>/dev/null | wc -l); '
+                  '  echo "$dc -> $n entries"; done; '
+                  "echo '--- any .ko at all? ---'; "
+                  'for dc in "zstd -dc" "gzip -dc" "xz -dc" "lz4 -dc" "cat"; do '
+                  '  k=$($dc /run/current-system/initrd 2>/dev/null | cpio -t 2>/dev/null | grep -c "\\.ko"); '
+                  '  echo "$dc -> $k .ko files"; done; '
+                  "echo '--- kernel config ---'; "
+                  "zcat /proc/config.gz 2>/dev/null | grep -E '^CONFIG_USB_STORAGE=' "
+                  "|| echo 'CONFIG_USB_STORAGE unknown (/proc/config.gz absent)'"
+              ).strip()
+              assert False, (
+                  "initrd does NOT carry usb_storage — a USB root cannot "
+                  "enumerate (VFS panic).\n"
+                  f"  usb_storage BUILT INTO kernel (modules.builtin): {builtin}\n"
+                  "  THREE causes, THREE DIFFERENT fixes — read the probe below:\n"
+                  "   (A) builtin True  -> the OS is FINE; this test must accept "
+                  "a kernel builtin (no .ko exists to pack).\n"
+                  "   (B) '.ko files' ~0 for every decompressor -> the UNPACK "
+                  "failed (concatenated/multi-segment initrd); this test must "
+                  "unpack properly before it may claim anything.\n"
+                  "   (C) thousands of .ko but no usb_storage -> the packing is "
+                  "genuinely broken; hart-boot-root-initrd.nix must force-include "
+                  "via boot.initrd.kernelModules, not only availableKernelModules. "
+                  "THIS is the only case that means a real USB-boot brick.\n"
+                  f"  probe:\n{avail}"
+              )
           assert initrd_has("xhci"), \
               "initrd does NOT carry an xhci host-controller module — a USB3 port can't enumerate the stick"
           assert initrd_has("sd_mod"), \

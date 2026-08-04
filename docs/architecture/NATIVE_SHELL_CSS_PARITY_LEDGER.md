@@ -23,7 +23,7 @@ Rules that follow from that mandate:
 1. **No silent omissions.** If a rule is not portable it gets a row anyway, marked as a
    GAP or a DEAD rule, with the reason. Absence from the native shell must be a recorded
    decision, never an oversight.
-2. **Cascade order is load-bearing.** Several selectors are declared 2-3 times and
+2. **Cascade order is part of the spec.** Several selectors are declared 2-3 times and
    later-source-wins is a deliberate "re-skin without deleting" strategy, so a stale
    cached build still renders. A native port that de-duplicates naively ships the WRONG
    visual. Every confirmed supersession is recorded in the row for its component.
@@ -537,12 +537,12 @@ Rules that follow from that mandate:
 |---|---|---|---|---|
 | `.hh-spark` / `svg` | `margin:2px 0 4px;height:44px;width:232px;opacity:.95`; svg `display:block;100%x100%`; height 44 -> 34px @`max-height:820px` | breakpoint | none | **Glyph** sparkline (vector path) -- M4 |
 
-## B7. EARNINGS HERO -- honest meta strip (L176-220)
+## B7. EARNINGS HERO -- payout meta strip (L176-220)
 
 | CSS surface | effects | states | animations | native SceneNode mapping |
 |---|---|---|---|---|
 | `.hh-hero-meta` | `flex;align-items:center;wrap;gap:10px 16px;margin-top:12px;15px;color:#C3CDD9` [**HARD-CODED slate**] | -- | none | **Row**+**Text** -- M4 |
-| `.hh-pill` / `.hh-pill-dot` | payout-pending pill `inline-flex;gap:7px;padding:5px 12px;radius 30px;13px;700;color:var(--hh-amber);background:rgba(255,200,61,.12);border:1px solid rgba(255,200,61,.30)`; dot `7x7;50%;background:var(--hh-amber)` | pending; software floor (solid dot); reduced-motion | GPU-only `hhLiveDot calc(1.8s * var(--hart-motion-speed,1)) ease-in-out infinite`, `animation-play-state:var(--hart-motion-detail,running)` -- amber breathe = honest state reads as live | **Glyph** live dot -- M3 |
+| `.hh-pill` / `.hh-pill-dot` | payout-pending pill `inline-flex;gap:7px;padding:5px 12px;radius 30px;13px;700;color:var(--hh-amber);background:rgba(255,200,61,.12);border:1px solid rgba(255,200,61,.30)`; dot `7x7;50%;background:var(--hh-amber)` | pending; software floor (solid dot); reduced-motion | GPU-only `hhLiveDot calc(1.8s * var(--hart-motion-speed,1)) ease-in-out infinite`, `animation-play-state:var(--hart-motion-detail,running)` -- amber breathe = pending state reads as live | **Glyph** live dot -- M3 |
 | `.hh-usd` / `.hh-stat` / `.hh-stat b` / `.hh-local-mini` / `.hh-shield` | usd `var(--hh-dim);600`; stat `#C3CDD9` [HARD-CODED], `b{color:var(--hh-ink);800}`; local badge `inline-flex;gap:6px;color:var(--hh-teal);700`; shield `8x8;50%;background:var(--hh-teal)` -- **a DOT, not a shield glyph** | -- | none | **Text**+**Glyph** -- M4 |
 
 ## B8. HERO CTA BUTTONS (L222-252, GPU L499-504)

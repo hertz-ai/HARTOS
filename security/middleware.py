@@ -3,8 +3,10 @@ Security Middleware for Flask
 Applies security headers, CORS, CSRF protection, host validation, and API auth.
 """
 
+import ipaddress
 import os
 import logging
+import socket
 from functools import wraps
 from flask import Flask, request, jsonify, g
 
@@ -139,6 +141,33 @@ def _apply_csrf_protection(app: Flask):
             return jsonify({'error': 'CSRF token required'}), 403
 
 
+def _is_private_address(host: str) -> bool:
+    """Is `host` a literal address that can only mean THIS local network?
+
+    Host validation exists to stop an attacker-supplied Host being reflected
+    into generated absolute URLs — the password-reset / cache-poisoning class.
+    That attack needs a host a VICTIM will later resolve and trust, which means
+    a public name. A literal RFC1918/loopback/link-local/ULA address cannot
+    serve that purpose: it resolves to nothing outside the LAN it names.
+
+    So accepting these is not a relaxation of the injection defence, and it is
+    required by the peer mesh. A HART node is addressed by its LAN IP by every
+    peer that discovers it; with the shipped default of
+    ALLOWED_HOSTS=localhost,127.0.0.1 the node answered 400 to all of them.
+    Verified in a VM: hart-peer-discovery's "Server backend accessible from
+    edge" got `{"error":"Invalid host"}` cross-host, and NO nixos module sets
+    ALLOWED_HOSTS — only the cloud deploy does (to '*'), which is why this was
+    invisible outside the OS.
+
+    A public address or any domain name still falls through to the allowlist.
+    """
+    try:
+        ip = ipaddress.ip_address(host.strip('[]'))     # [::1] → ::1
+    except ValueError:
+        return False                                   # a NAME, not a literal
+    return bool(ip.is_loopback or ip.is_private or ip.is_link_local)
+
+
 def _apply_host_validation(app: Flask):
     """Prevent Host header injection."""
 
@@ -147,6 +176,25 @@ def _apply_host_validation(app: Flask):
         os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
         if h.strip()
     )
+    # '*' is the Django-style wildcard: the operator opted into allow-all. The
+    # deploy default is exactly this (deploy-hartos-deepbox.yml sets
+    # ALLOWED_HOSTS=`secrets.ALLOWED_HOSTS || '*'`), and it is load-bearing:
+    # /api/ota/latest is a PUBLIC pointer fleet nodes poll with
+    # Host: <central-host>. Without wildcard support a '*' config is treated as a
+    # literal host, so every real Host is rejected 400 and OTA delivery silently
+    # breaks fleet-wide. Precompute once — allowed_hosts is fixed at app init.
+    allow_all_hosts = '*' in allowed_hosts
+
+    # The node's own name. gethostname() is a local syscall — no DNS, no
+    # network — so this is safe to compute at init on an offline box, unlike
+    # getfqdn()/gethostbyname_ex(), which can block on resolution.
+    try:
+        _own_hostname = socket.gethostname().split('.')[0].lower()
+    except OSError as exc:            # pragma: no cover - gethostname failing
+        logger.warning("host validation: gethostname failed (%s) — "
+                       "peers addressing this node by name will be rejected",
+                       exc)
+        _own_hostname = ''
 
     @app.before_request
     def validate_host():
@@ -154,11 +202,18 @@ def _apply_host_validation(app: Flask):
             return
         if os.environ.get('NUNBA_BUNDLED'):
             return
+        if allow_all_hosts:
+            return
 
         host = request.host.split(':')[0]
-        if host not in allowed_hosts:
-            logger.warning(f"Rejected request with invalid Host: {host}")
-            return jsonify({'error': 'Invalid host'}), 400
+        if host in allowed_hosts:
+            return
+        if _own_hostname and host.lower() == _own_hostname:
+            return
+        if _is_private_address(host):
+            return
+        logger.warning(f"Rejected request with invalid Host: {host}")
+        return jsonify({'error': 'Invalid host'}), 400
 
 
 #: Admin operations that modify persistent state. ALWAYS require auth

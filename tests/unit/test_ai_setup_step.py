@@ -20,44 +20,121 @@ import pytest
 from integrations.service_tools import model_onboarding as mo
 
 
-def test_recommend_falls_to_smallest_tier_on_a_potato(monkeypatch):
-    """0 / low VRAM -> the smallest tier. A potato must never be handed a 7B."""
+class _Entry:
+    """Minimal stand-in for catalog ModelEntry (only the fields selection reads)."""
+    def __init__(self, mid, name, vram, ram, prio, quality=0.5, disk=1.0):
+        self.id, self.name = mid, name
+        self.repo_id = f"vendor/{mid}"
+        self.vram_gb, self.ram_gb, self.disk_gb = vram, ram, disk
+        self.priority, self.quality_score = prio, quality
+        self.enabled, self.downloaded = True, False
+        self.purposes, self.min_build = ['main'], None
+        self.capabilities = {'quant': 'Q4_K_M'}
+
+
+_TINY = _Entry('tiny', 'Tiny 0.8B', vram=1.0, ram=2.0, prio=30)
+_MID = _Entry('mid', 'Mid 2B', vram=2.5, ram=4.0, prio=40)
+_BIG = _Entry('big', 'Big 7B', vram=6.0, ram=12.0, prio=55)
+
+
+def _catalog(monkeypatch, entries=(_TINY, _MID, _BIG)):
+    """Point selection at a known catalog so these assert policy, not seed data."""
+    class _Cat:
+        def list_by_type(self, t):
+            return list(entries)
+    monkeypatch.setattr(mo, "_get_catalog", lambda: _Cat())
+
+
+def _gpu(monkeypatch, **gpu):
     class _VM:
         def detect_gpu(self):
-            return {"total_gb": 0.0, "cuda_available": False}
+            return gpu
     monkeypatch.setattr(mo, "_get_vram_manager", lambda: _VM())
+
+
+def test_recommend_never_exceeds_the_budget(monkeypatch):
+    """The core safety invariant: whatever is chosen must FIT. A potato must
+    never be handed a model it cannot run."""
+    _catalog(monkeypatch)
+    _gpu(monkeypatch, total_gb=0.0, cuda_available=False)
+    monkeypatch.setattr(mo, "compute_budget", lambda: {
+        'budget_gb': 2.0, 'source': 'ram', 'run_mode': 'cpu',
+        'total_vram_gb': 0.0, 'free_vram_gb': 0.0, 'total_ram_gb': 3.4,
+        'gpu_name': None})
     rec = mo.recommend_for_hardware()
-    assert rec["model_name"] == mo.MODEL_TIERS[-1][1]
-    assert rec["total_vram_gb"] == 0.0
+    assert rec['model_id'] == 'tiny', "must pick the only entry that fits in 2GB RAM"
 
 
 def test_recommend_scales_up_with_vram(monkeypatch):
-    class _VM:
-        def __init__(self, gb):
-            self._gb = gb
-        def detect_gpu(self):
-            return {"total_gb": self._gb}
-    monkeypatch.setattr(mo, "_get_vram_manager", lambda: _VM(24.0))
-    assert "7B" in mo.recommend_for_hardware()["label"]
-    monkeypatch.setattr(mo, "_get_vram_manager", lambda: _VM(8.0))
-    assert "3B" in mo.recommend_for_hardware()["label"]
+    """A real GPU gets the biggest entry that fits, not merely a bigger one."""
+    _catalog(monkeypatch)
+    _gpu(monkeypatch, total_gb=24.0, free_gb=24.0, cuda_available=True, name='RTX')
+    assert mo.recommend_for_hardware()['model_id'] == 'big'
+    _gpu(monkeypatch, total_gb=3.0, free_gb=3.0, cuda_available=True, name='small')
+    assert mo.recommend_for_hardware()['model_id'] == 'mid'
+
+
+def test_cpu_only_box_uses_RAM_not_just_vram(monkeypatch):
+    """REGRESSION GUARD. The VRAM-only ladder this replaced collapsed every
+    CPU-only box to the smallest model however much RAM it had. A no-GPU box
+    with plenty of RAM must get a real model."""
+    _catalog(monkeypatch)
+    _gpu(monkeypatch, total_gb=0.0, cuda_available=False)   # no usable GPU
+    monkeypatch.setattr(mo, "psutil", None, raising=False)
+    import psutil
+    monkeypatch.setattr(psutil, "virtual_memory",
+                        lambda: type('M', (), {'total': 32 * 1024 ** 3})())
+    rec = mo.recommend_for_hardware()
+    assert rec['source'] == 'ram' and rec['run_mode'] == 'cpu'
+    assert rec['model_id'] == 'big', "32GB RAM must reach the big entry on CPU"
+
+
+def test_present_but_driver_gated_gpu_falls_to_the_ram_arm(monkeypatch):
+    """VRAM that no CUDA build can address must not be spent. cuda_available
+    already folds in the driver-too-old gate, so the budget comes from RAM."""
+    _catalog(monkeypatch)
+    _gpu(monkeypatch, total_gb=8.0, free_gb=8.0, cuda_available=False,
+         name='GeForce 940MX', driver_cuda_ok=False)
+    import psutil
+    monkeypatch.setattr(psutil, "virtual_memory",
+                        lambda: type('M', (), {'total': 8 * 1024 ** 3})())
+    b = mo.compute_budget()
+    assert b['source'] == 'ram', "an unusable GPU must not fund a VRAM budget"
+    assert b['total_vram_gb'] == 8.0, "but its VRAM is still reported"
 
 
 def test_recommend_is_failsafe_when_probe_raises(monkeypatch):
-    """A VRAM-probe exception must not crash the setup step -- it falls to the
-    smallest tier (safe on any hardware)."""
+    """A probe exception must not crash the setup step; it still returns a
+    usable recommendation with the legacy keys intact."""
+    _catalog(monkeypatch)
     class _VM:
         def detect_gpu(self):
             raise RuntimeError("no gpu tools")
     monkeypatch.setattr(mo, "_get_vram_manager", lambda: _VM())
     rec = mo.recommend_for_hardware()
-    assert rec["model_name"] == mo.MODEL_TIERS[-1][1]
+    assert rec['model_name'] and rec['quant']
+    assert all(k in rec for k in ('model_name', 'quant', 'label', 'total_vram_gb'))
 
 
-def test_tiers_are_monotonic_and_smallest_is_the_catch_all():
-    thresholds = [t[0] for t in mo.MODEL_TIERS]
-    assert thresholds == sorted(thresholds, reverse=True), "tiers must descend by VRAM"
-    assert mo.MODEL_TIERS[-1][0] == 0.0, "the smallest tier must accept any hardware"
+def test_recommend_survives_an_unavailable_catalog(monkeypatch):
+    """The catalog is the source of truth, but its absence must not leave the
+    caller without a model."""
+    def _boom():
+        raise RuntimeError("catalog down")
+    monkeypatch.setattr(mo, "_get_catalog", _boom)
+    _gpu(monkeypatch, total_gb=0.0, cuda_available=False)
+    rec = mo.recommend_for_hardware()
+    assert rec['model_name'], "must still name a fallback model"
+    assert all(k in rec for k in ('model_name', 'quant', 'label', 'total_vram_gb'))
+
+
+def test_legacy_return_contract_is_preserved(monkeypatch):
+    """native_onboarding._build_ai_model_page reads these four keys."""
+    _catalog(monkeypatch)
+    _gpu(monkeypatch, total_gb=8.0, free_gb=8.0, cuda_available=True, name='gpu')
+    rec = mo.recommend_for_hardware()
+    for k in ('model_name', 'quant', 'label', 'total_vram_gb'):
+        assert k in rec, f"legacy caller depends on {k}"
 
 
 def test_needs_setup_true_when_no_model_active(monkeypatch):

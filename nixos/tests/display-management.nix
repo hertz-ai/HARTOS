@@ -73,11 +73,28 @@ in
           # sources the full /etc/profile -> /etc/set-environment chain).
           val = dispnode.succeed("bash -l -c 'echo GDKDPI=$GDK_DPI_SCALE'")
           assert "GDKDPI=1.25" in val, "fontScale 1.25 not in GDK_DPI_SCALE:\n" + val
-          # fontconfig dpi edit (96 * 1.25 = 120) materialised under /etc/fonts —
-          # found via the module's own marker so we never pick another conf file.
-          fc = dispnode.succeed(
-              "grep -rl 'hart.display.fontScale' /etc/fonts").strip().split()[0]
-          conf = dispnode.succeed("cat " + fc)
+          # fontconfig dpi edit (96 * 1.25 = 120) materialised under /etc/fonts.
+          #
+          # READ THE CANONICAL PATH, do not search for it (run 30783792736).
+          # This was `grep -rl 'hart.display.fontScale' /etc/fonts`, which
+          # exited 1 while the content was PRESENT AND CORRECT. nixpkgs'
+          # fontconfig module emits localConf by symlinking the generated
+          # config into place:  ln -s <localConf-store-path> $dst/../local.conf
+          # (written WITHOUT a nix interpolation on purpose — see below)
+          # so /etc/fonts/local.conf is a SYMLINK into the store (and
+          # /etc/fonts is itself environment.etc.fonts.source -> a store dir).
+          # `grep -r` follows symlinks given on the COMMAND LINE but never ones
+          # it meets during recursion, so it walked into /etc/fonts, reached
+          # local.conf, saw a symlink, and skipped it. `-R` would follow — but
+          # then it recurses the store closure behind every other conf.d
+          # symlink too, which is slow and imprecise.
+          #
+          # The path is guaranteed by the nixpkgs module, so assert it directly:
+          # faster, exact, and a missing file now says WHICH file is missing.
+          conf = dispnode.succeed("cat /etc/fonts/local.conf")
+          assert "hart.display.fontScale" in conf, (
+              "/etc/fonts/local.conf exists but carries no HART marker — "
+              "something else owns localConf now:\n" + conf)
           assert "120" in conf, "fontconfig dpi (=120) not written:\n" + conf
 
       with subtest("3. kanshi is a NEVER-FAIL user service (never boot-critical)"):

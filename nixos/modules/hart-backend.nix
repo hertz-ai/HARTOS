@@ -24,6 +24,16 @@ in
       partOf = [ "hart.target" ];
       wantedBy = [ "hart.target" ];
 
+      # Crash-loop containment: Restart=on-failure/RestartSec=5 (below) would
+      # otherwise restart a persistently-failing backend every 5s forever,
+      # pinning a core at boot. Cap at 5 fast failures within 5 min, then let
+      # systemd mark the unit failed and move on — the shell still boots (it
+      # degrades to "backend unavailable") rather than the OS hanging on a
+      # doomed service. A legitimately slow start (see TimeoutStartSec below)
+      # is a single long attempt, so it never trips this fast-failure limit.
+      startLimitIntervalSec = 300;
+      startLimitBurst = 5;
+
       environment = {
         # Recipe/prompts data must land in the service's WRITABLE StateDirectory
         # (cfg.dataDir), not the /nix/store package dir (read-only) nor the
@@ -90,7 +100,13 @@ in
         # No WatchdogSec: waitress never sends sd_notify(WATCHDOG=1), so a watchdog
         # timer would SIGABRT the backend every 120s once it is actually serving.
         # Restart=on-failure still covers real crashes.
-        TimeoutStartSec = 30;
+        # 600s (not 30s): the backend imports langchain + chromadb + autogen at
+        # startup, which alone can take ~170s frozen and is far slower on USB /
+        # SD-card live media. A 30s start timeout SIGKILLs the process mid-import
+        # before it ever binds :6777, so the shell only ever sees "connection
+        # refused" and the crash-loop guard above burns through its attempts on a
+        # backend that was actually making progress. 600s covers cold USB boots.
+        TimeoutStartSec = 600;
         TimeoutStopSec = 15;
 
         # Security hardening
@@ -121,14 +137,26 @@ in
         # e2e boot smoke, and it would bite real hardware too — the cap is the
         # same there). Give the ML init real headroom; edge stays minimal (no
         # heavy ML), so its small cap is correct.
-        MemoryMax = if cfg.variant == "edge" then "384M"
+        # Edge caps raised 384M/256M/32 -> 640M/512M/64 (2026-07-28, measured):
+        # a full hart_intelligence_entry import is 275 MB RSS / 11 threads ON THE
+        # DEV BOX WITH THE ML STACK ABSENT — i.e. 275 MB is the FLOOR of the
+        # module-scope import, and it is variant-independent (nothing slims it on
+        # edge). The old MemoryHigh=256M sat BELOW that floor (perpetual reclaim)
+        # and MemoryMax=384M barely above it, so a real edge device would
+        # OOM-kill its backend at boot; TasksMax=32 left ~17 for the app after
+        # waitress's 4 workers + interpreter housekeeping. The old sizing
+        # reasoned "edge stays minimal (no heavy ML)" — true of the VARIANT, not
+        # of the IMPORT. Slimming the import itself (lazy module-scope init) is
+        # the real fix and is tracked; these caps are the honest cost of the
+        # import that exists today.
+        MemoryMax = if cfg.variant == "edge" then "640M"
                     else if cfg.variant == "desktop" then "3G"
                     else "4G";
-        MemoryHigh = if cfg.variant == "edge" then "256M"
+        MemoryHigh = if cfg.variant == "edge" then "512M"
                      else if cfg.variant == "desktop" then "2560M"
                      else "3584M";
         CPUWeight = if cfg.variant == "edge" then 50 else 100;
-        TasksMax = if cfg.variant == "edge" then 32 else 512;
+        TasksMax = if cfg.variant == "edge" then 64 else 512;
         IOWeight = if cfg.variant == "edge" then 50 else 100;
 
         StandardOutput = "journal";

@@ -27,7 +27,17 @@ on:
       - 'claw_native/rust/**'
 
 concurrency:
-  group: nix-build-${{ github.ref }}
+  # Push/PR runs share one group per ref and still cancel each other: on a busy
+  # branch only the newest commit is worth building.
+  #
+  # A workflow_dispatch gets its OWN group (keyed by run id) so it is never
+  # cancelled by a later push. Both used to resolve to `nix-build-refs/heads/main`,
+  # so an on-demand build was killed the moment anyone pushed: run 30283762645, a
+  # raw-desktop build, died at 16:58 to a push that landed 44 minutes after it
+  # started. With several sessions pushing to main, a build that takes ~54 minutes
+  # could effectively never finish, and the symptom looked like a flaky build
+  # rather than a cancellation.
+  group: nix-build-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
   cancel-in-progress: true
 
 jobs:
@@ -35,7 +45,15 @@ jobs:
   evaluate:
     name: Flake Evaluation Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 25 (was 10): the eval outgrew the old budget on 2026-07-29 — attempt 3 of
+    # run 30435280105 ran a MEASURED 15 minutes before enforcement cancelled it,
+    # where the gate took ~2.5 min the day before. The two earlier "runner has
+    # received a shutdown signal" deaths at 2-4 min were slow runners dying
+    # inside the same overrun, not infra flake. The ~6x eval-time growth landed
+    # with the installer/Calamares/dev-tools commits and is tracked as its own
+    # regression (a gate this slow taxes every push) — this bump un-bricks the
+    # gate while that hunt happens, it does not excuse it.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v12
@@ -51,10 +69,101 @@ jobs:
         working-directory: nixos
         run: nix flake check --no-build
 
+      # The gate died twice on ab6825cc with SIGTERM ("runner has received a
+      # shutdown signal") after ~80s of silence, at a DIFFERENT eval position
+      # each time — the shape of a single eval process crossing the 16 GB runner
+      # ceiling, not of a broken expression (every output that evaluated passed,
+      # both runs). Same instrument-don't-guess step that cornered the repart
+      # ENOSPC and the governor RLIMIT_AS bug: capture what the machine looked
+      # like at death so the next failure names its resource. dmesg is the only
+      # place an OOM kill leaves a trace.
+      - name: Why did the gate die (resources at failure time)
+        # failure() is FALSE when the previous step was CANCELLED, and both
+        # runner shutdown and concurrency supersession CANCEL rather than fail —
+        # so this fired for the ENOSPC/OOM case it was written for and NEVER for
+        # the dominant one (38 of 65 runs this week ended cancelled). On a
+        # concurrency-cancelled run the runner is still alive and can still
+        # capture state, which is exactly when we most want it.
+        if: failure() || cancelled()
+        run: |
+          echo "── memory ──"; free -m || true
+          echo "── disk ──"; df -h / /tmp 2>/dev/null || true
+          echo "── OOM / kills (dmesg — KERNEL oom only) ──"
+          sudo dmesg 2>/dev/null | grep -iE "out of memory|oom|killed process" | tail -15; true
+          # Round-2 addition: the kernel dmesg came back EMPTY while the job was
+          # SIGTERMed at ~3min with 15G free post-mortem and no timeout (3m37s /
+          # 2m37s vs the 10min cap). The remaining suspect is systemd-oomd —
+          # Ubuntu 24's USERSPACE killer: acts on memory-pressure stalls (PSI),
+          # not exhaustion, and logs to the JOURNAL, which round 1 never read.
+          echo "── systemd-oomd (journal — the userspace killer dmesg misses) ──"
+          sudo journalctl --no-pager -q 2>/dev/null | grep -iE "oomd|out of memory|killed" | tail -20; true
+          echo "── oomd status + pressure config ──"
+          systemctl is-active systemd-oomd 2>/dev/null; true
+          oomctl 2>/dev/null | head -30; true
+          echo "── job cgroup pressure ──"
+          cat /proc/pressure/memory 2>/dev/null; true
+          echo "── biggest processes at death ──"
+          ps aux --sort=-%mem 2>/dev/null | head -8; true
+
+  # ─── Resolve which targets to build ────────────────────────
+  # The `targets` dispatch input existed but was NEVER READ: the matrix below was a
+  # hardcoded list, so choosing targets by hand did nothing and the only way to
+  # build something outside that list was to edit this file. This job makes the
+  # input real. A push still builds exactly the same default set, so push behaviour
+  # is unchanged.
+  targets:
+    name: Resolve targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      list: ${{ steps.pick.outputs.list }}
+    steps:
+      - id: pick
+        run: |
+          set -euo pipefail
+          # The default set: what a push to nixos/** has always built.
+          DEFAULT='hart-rust-precedent,hart-comp,iso-server,iso-desktop,iso-edge,qcow2-server,docker-server'
+          # Everything the flake can build on demand, including the raw INSTALLED
+          # images, which are deliberately NOT in the default set: they are only
+          # needed when someone is actually shipping an installed system.
+          ALL="$DEFAULT,raw-desktop,raw-server,raw-edge"
+          REQ='${{ inputs.targets }}'
+          if [ '${{ github.event_name }}' != 'workflow_dispatch' ] || [ -z "$REQ" ]; then
+            REQ="$DEFAULT"
+          elif [ "$REQ" = 'all' ]; then
+            REQ="$ALL"
+          fi
+          LIST=$(printf '%s' "$REQ" | tr -d '[:space:]' | jq -Rc 'split(",") | map(select(length > 0))')
+
+          # Reject unknown targets HERE, in a job that costs seconds, instead of
+          # letting them reach the matrix. The input is comma-separated BARE NAMES
+          # and `jq -Rc split(",")` array-ifies them, so passing a JSON array by
+          # mistake (targets='["raw-desktop"]') yields a one-element list whose
+          # element is the literal string `["raw-desktop"]`. That is not an error to
+          # any later step: it produces a job cheerfully named `Build [raw-desktop]`
+          # in which every `startsWith(matrix.target, 'raw-')` guard is FALSE, so the
+          # disk purge and the closure budget silently skip and `nix build` fails on
+          # a nonexistent attribute ~90 seconds later (run 30333633950). A wrong
+          # dispatch should say so immediately and say what the right one looks like.
+          INVALID=$(printf '%s' "$LIST" | jq -r --arg all "$ALL" \
+            '($all | split(",")) as $ok | map(select(IN($ok[]) | not)) | join(", ")')
+          if [ -n "$INVALID" ]; then
+            echo "::error::Unknown build target(s): $INVALID"
+            echo "Valid targets: $ALL  (or 'all')"
+            echo "Input is COMMA-SEPARATED BARE NAMES, e.g.  targets=raw-desktop"
+            echo "                                  NOT JSON, e.g. '[\"raw-desktop\"]'"
+            exit 1
+          fi
+
+          echo "resolved: $LIST"
+          echo "list=$LIST" >> "$GITHUB_OUTPUT"
+
   # ─── Build Matrix ──────────────────────────────────────────
   build:
     name: Build ${{ matrix.target }}
-    needs: evaluate
+    # `targets` as well as `evaluate`: the matrix is now computed, so the build
+    # cannot start before the list exists.
+    needs: [evaluate, targets]
     runs-on: ubuntu-latest
     # Bumped 90 -> 150: with the throttling magic-nix-cache removed (see the Install
     # Nix step), HART's own derivations build from source each run instead of being
@@ -63,20 +172,45 @@ jobs:
     timeout-minutes: 150
     strategy:
       fail-fast: false
+      # Resolved by the `targets` job above. On a push this is the same default set
+      # as before (hart-rust-precedent, hart-comp, the three ISOs, qcow2-server,
+      # docker-server); a workflow_dispatch can name any flake target, including the
+      # raw INSTALLED images which are too expensive to build on every push.
       matrix:
-        target:
-          # ── Rust-in-Nix crate compiles (M9) — actually BUILD the crates, not eval ──
-          - hart-rust-precedent  # FIRST Rust-in-Nix compile (claw-cli) — isolate toolchain resolution
-          - hart-comp            # the Smithay compositor crate (buildFeatures=["smithay"]) — THE M9 gate
-          - iso-server      # x86_64 headless — core variant
-          - iso-desktop     # x86_64 GNOME + native subsystems
-          - iso-edge        # x86_64 minimal observer
-          - qcow2-server    # VM format for QEMU testing
-          - docker-server   # OCI container image (fastest build)
+        target: ${{ fromJSON(needs.targets.outputs.list) }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      # raw-* only: put the ENTIRE nix store on the runner's second data disk (/mnt)
+      # when there IS one, BEFORE the Nix installer runs.
+      #
+      # SELF-VERIFYING ON PURPOSE. This step was added on the assumption that every
+      # Actions runner has a separate ~65 GB /mnt data disk (release.yml carries the
+      # same step). On the image backing THIS workflow it is a lie: run 30308494154's
+      # failure diagnostics printed `/` and `/mnt` as the SAME `/dev/root` (145G), so
+      # the bind moved the store from one directory to another on one filesystem and
+      # bought exactly zero bytes -- while reading, in the log, like a fix had been
+      # applied. A no-op that looks like a mitigation is worse than no step at all,
+      # because it makes the next person rule out the very thing that is still wrong.
+      # So: compare the backing devices and only bind when they actually differ, and
+      # say plainly which branch was taken.
+      - name: Move /nix to the /mnt data disk (raw only, if a real second disk exists)
+        if: startsWith(matrix.target, 'raw-')
+        run: |
+          root_dev=$(findmnt -no SOURCE --target / || echo unknown)
+          mnt_dev=$(findmnt -no SOURCE --target /mnt || echo none)
+          echo "root=$root_dev  /mnt=$mnt_dev"
+          if [ "$mnt_dev" != "none" ] && [ "$mnt_dev" != "$root_dev" ]; then
+            echo "Separate data disk found -> moving /nix onto it."
+            sudo mkdir -p /mnt/nix /nix
+            sudo mount --bind /mnt/nix /nix
+          else
+            echo "NO separate data disk on this runner image -- /mnt shares $root_dev."
+            echo "Leaving /nix on the root disk; the budget comes from the purge below."
+          fi
+          df -h / /mnt 2>/dev/null || true
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v12
@@ -101,12 +235,110 @@ jobs:
       # RELIABLE, no throttling proxy to abort the Rust compiles. Re-add only once the
       # org has working FlakeHub/cache auth.
 
+      # The baseline purge (dotnet + android SDK + ghc) frees ~15 GB: 57G used -> 42G,
+      # measured in run 30312462459. That is enough for every ISO leg and NOT enough
+      # for a raw image, which needs the closure resident TWICE at peak -- see the
+      # raw-only block below for the arithmetic.
       - name: Free disk space
         run: |
+          before=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo apt-get autoremove -y
           sudo apt-get clean
           df -h /
+          echo "freed $(( $(df --output=avail -BG / | tail -1 | tr -dc '0-9') - before )) GB (baseline purge)"
+
+      # raw-* only: strip the rest of the preinstalled toolchains.
+      #
+      # WHY, with the numbers, because six builds died guessing at this. The desktop
+      # closure is ~37 GiB (repart's own minimize pass measured 9627552 4k blocks).
+      # systemd-repart gets NO loop device inside the Nix sandbox, so it cannot mkfs
+      # straight into the image: it builds the ext4 in a TEMP FILE, then copies that
+      # file into the .raw at the partition offset. Both exist at once, so the peak is
+      # roughly 2x the closure (~78 GB) on top of the ~42 GB the closure occupies in
+      # /nix/store. Run 30312462459 reached repart with 61 GB free, wrote the 37 GB
+      # temp filesystem, started the copy and hit ENOSPC ~24 GB in -- which is exactly
+      # the unexplained 2-minute gap between "Writing superblocks ... done" (00:42:22)
+      # and the failure (00:44:31), and exactly why nothing was printed: the copy loop
+      # dies without reaching any of repart's own log statements.
+      #
+      # This purge frees ~25 GB more (hostedtoolcache alone is ~10 GB), taking the
+      # free space at repart time from ~61 GB to ~86 GB against a ~78 GB worst-case
+      # need. Scoped to raw-* so the green ISO legs keep the exact environment they
+      # are proven on; hostedtoolcache in particular holds the Python/Node the ISO
+      # jobs' actions may reach for. Nothing after this step needs it: the remaining
+      # steps are bash + nix, and the post-job hooks use the runner's own bundled
+      # node under /home/runner/runners/*/externals.
+      - name: Free MORE disk space (raw only)
+        if: startsWith(matrix.target, 'raw-')
+        run: |
+          before=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          sudo rm -rf \
+            /opt/hostedtoolcache \
+            /usr/local/.ghcup \
+            /usr/share/swift \
+            /usr/local/share/powershell \
+            /usr/share/miniconda \
+            /usr/local/share/boost \
+            /opt/az \
+            /usr/local/lib/node_modules || true
+          sudo docker image prune --all --force 2>/dev/null || true
+          df -h /
+          echo "freed $(( $(df --output=avail -BG / | tail -1 | tr -dc '0-9') - before )) GB (raw purge)"
+
+      # raw-* only: build the system closure on its own FIRST and print its size.
+      # The image build is closure-bound and, per the note above, needs ~2x the
+      # closure free at repart time -- so the closure size IS the disk budget, and
+      # it has been the one number nobody had while six builds failed. Splitting it
+      # out costs no extra time (the image build needs the same closure and picks it
+      # straight out of the store) and it reports even when the image step later
+      # fails, which is the point. The per-path listing turns "the image is too big"
+      # into a named list of what to shrink.
+      - name: Closure budget (raw only)
+        if: startsWith(matrix.target, 'raw-')
+        working-directory: nixos
+        run: |
+          set -o pipefail
+          # -raw, NOT the bare variant: nixosConfigurations.hart-desktop carries
+          # hartImageKind = "iso" and is a DIFFERENT closure. hart-desktop-raw is
+          # built from the same mkRepartSystem the image itself is made from.
+          variant="${{ matrix.target }}"
+          cfg="hart-${variant#raw-}-raw"
+          # Only the variants on the repart path have a -raw config; raw-server and
+          # raw-edge still go through nixos-generators, where this budget does not
+          # apply. Skip rather than red-fail their dispatch. hasAttr tests the KEY, so
+          # it does not force the config and costs a flake-outputs eval, not a system
+          # eval — checking by building the attr would evaluate the whole system twice.
+          if [ "$(nix eval --json ".#nixosConfigurations" \
+                    --apply "c: builtins.hasAttr \"$cfg\" c")" != "true" ]; then
+            echo "No nixosConfigurations.$cfg -- ${{ matrix.target }} is not on the"
+            echo "repart path, so the 2x-closure disk budget does not apply. Skipping."
+            exit 0
+          fi
+          top=$(nix build ".#nixosConfigurations.$cfg.config.system.build.toplevel" \
+                  -L --no-link --print-out-paths)
+          bytes=$(nix path-info -S "$top" | awk '{print $2}')
+          echo ""
+          echo "── closure budget ─────────────────────────────────────────"
+          echo "toplevel : $top"
+          echo "closure  : $(numfmt --to=iec-i --suffix=B "$bytes")  ($bytes bytes)"
+          echo "repart peak needs ~2x that free, plus the store copy."
+          echo "free now : $(df -h --output=avail / | tail -1 | tr -d ' ')"
+          echo ""
+          echo "── 25 largest paths in the closure (SELF size) ────────────"
+          # -s (self/NAR size), NOT -S (closure size). With -S every path near the
+          # root reports ~the whole system -- the first fifteen lines came back as
+          # "21GiB etc", "21GiB dbus-1", "21GiB system-units", which is true and
+          # completely useless for finding what to cut. Self size names the actual
+          # heavy packages.
+          #
+          # awk 'NR<=25', NOT `head -25`: `head` exits after 25 lines, `sort` gets
+          # EPIPE, and under the `set -o pipefail` at the top of this step the whole
+          # pipeline reports failure -- which failed this step and SKIPPED the image
+          # build in run 30334471869 after the budget had already printed correctly.
+          # awk reads its input to the end, so there is no early close to trip on.
+          nix path-info -rs "$top" | sort -k2 -n -r \
+            | awk 'NR<=25 { printf "%9.2f MiB  %s\n", $2/1048576, $1 }'
 
       - name: Build ${{ matrix.target }}
         working-directory: nixos
@@ -119,9 +351,43 @@ jobs:
           set -o pipefail
           echo "Building: nix build .#${{ matrix.target }}"
           echo ""
-          time nix build .#${{ matrix.target }} --no-link --print-out-paths | tee /tmp/build-output.txt
+          # -L / --print-build-logs: stream the FULL builder output instead of the
+          # 25-line tail nix prints on failure. raw-desktop failed after 54 minutes
+          # (2026-07-27, run 30263310599) having built the whole closure, the UKI and
+          # both filesystems, and the only thing nix showed was 25 lines of trailing
+          # mke2fs progress -- the actual error had scrolled out of that window. A
+          # build worth 54 minutes deserves a readable failure the first time.
+          time nix build .#${{ matrix.target }} -L --no-link --print-out-paths | tee /tmp/build-output.txt
           echo ""
           echo "Build successful!"
+
+      # Five raw-desktop builds died silently after ~50 minutes, each time straight
+      # after the filesystem was written, with the builder printing NOTHING even
+      # under -L. Silence is not evidence, and guessing a cause per 50-minute
+      # iteration is the expensive way to debug. This captures the machine state at
+      # the moment of failure so the next run says which resource ran out rather
+      # than leaving it to inference: disk (the ENOSPC theory), memory (an OOM kill
+      # leaves no message in the build log, only in dmesg), or neither.
+      - name: Why did it fail (resources at failure time)
+        # failure() is FALSE when the previous step was CANCELLED, and both
+        # runner shutdown and concurrency supersession CANCEL rather than fail —
+        # so this fired for the ENOSPC/OOM case it was written for and NEVER for
+        # the dominant one (38 of 65 runs this week ended cancelled). On a
+        # concurrency-cancelled run the runner is still alive and can still
+        # capture state, which is exactly when we most want it.
+        if: failure() || cancelled()
+        run: |
+          echo "── disk ──"
+          df -h / /mnt /tmp 2>/dev/null || true
+          echo ""
+          echo "── largest consumers ──"
+          sudo du -xh --max-depth=1 /nix 2>/dev/null | sort -rh | head -5 || true
+          echo ""
+          echo "── memory ──"
+          free -m || true
+          echo ""
+          echo "── OOM kills / IO errors (dmesg) ──"
+          sudo dmesg 2>/dev/null | grep -iE "out of memory|oom-kill|killed process|No space|I/O error" | tail -20 || echo "  none found"
 
       - name: Compute checksum
         run: |

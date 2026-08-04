@@ -1,0 +1,230 @@
+name: Closure Audit — what does a feature actually cost?
+
+# Answers "how many GB would we save by turning X off?" with a MEASUREMENT.
+#
+# WHY THIS EXISTS (2026-07-28): the desktop closure is 21.9 GiB and the obvious way
+# to find the expensive parts -- `nix path-info -rS`, closure size per path -- is a
+# trap. Closure size counts every dependency, so heroic, lutris, bottles and wine
+# each reported 4-6 GiB while overwhelmingly counting the SAME shared Mesa / Vulkan
+# / X / GStreamer paths, most of which the desktop needs for Firefox and the shell
+# anyway. Reading those as separate costs overstated the gaming stack by several GB.
+# Self size (-s) fixes the double counting but answers a different question: it says
+# what a package contributes ALONE, not what disappears if you remove it, because
+# removing it also drops dependencies nothing else needs.
+#
+# The only honest answer is a differential: build the system twice, once with the
+# feature and once without, and diff the closures. That is what this does. The
+# second build reuses the store, so it costs ~2 minutes on top of the first.
+#
+# The variant is derived with `extendModules` from the SAME nixosConfiguration the
+# real image is built from -- never a hand-copied config -- so the diff cannot be
+# contaminated by an unrelated difference between two hand-maintained variants.
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: 'nixosConfigurations attr to audit'
+        default: 'hart-desktop-raw'
+        required: false
+      disable:
+        description: 'Dotted option path to force OFF (e.g. hart.subsystems.windows.gaming)'
+        default: 'hart.subsystems.windows.gaming'
+        required: false
+      enable:
+        description: 'Dotted option path to force ON — measures what turning a currently-OFF feature would COST. Mutually exclusive with `disable`.'
+        default: ''
+        required: false
+      explain:
+        description: 'Optional store-path substring to trace with nix why-depends (e.g. clang)'
+        default: ''
+        required: false
+
+concurrency:
+  group: closure-audit-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Closure diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            fallback = true
+
+      # Two full system closures share nearly every path, so this is not double the
+      # disk -- but the base closure alone is ~42 GB in the store and the runner
+      # ships ~57 GB of preinstalled toolchains. Same purge the raw image build uses.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache /usr/local/.ghcup /usr/share/swift \
+                      /usr/local/share/powershell /usr/share/miniconda \
+                      /usr/local/share/boost /opt/az /usr/local/lib/node_modules || true
+          sudo docker image prune --all --force 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Build both closures and diff them
+        working-directory: nixos
+        run: |
+          set -euo pipefail
+          CFG='${{ inputs.config }}'
+          OPT_OFF='${{ inputs.disable }}'
+          OPT_ON='${{ inputs.enable }}'
+
+          # WHY BOTH DIRECTIONS (2026-08-03): this tool could only answer "what
+          # would we SAVE by turning X off?". The question task #4 has to answer
+          # before flipping hart.nunba.enable is the mirror image — "what would
+          # it COST to turn X on?" — and that is not askable by forcing an
+          # already-false option false. #14 made it urgent: the raw image sizes
+          # root at 26 GiB against a ~24 GiB closure, so a feature is affordable
+          # or it is not, and guessing is how the devtools 3 GiB nearly shipped
+          # into 2 GiB of slack.
+          # PRECEDENCE, NOT A CONFLICT ERROR (fixed after run 30785149972).
+          # The first version errored when both were set — and then errored on
+          # its own first real use, because `disable` carries a non-empty
+          # DEFAULT. Passing `-f disable=` does not clear it, so EVERY enable
+          # audit collided with a value the caller never typed. A required
+          # input whose default makes the other input unusable is a trap, not
+          # a safety check.
+          #
+          # So `enable` wins, and says out loud that it is winning — a silent
+          # precedence rule would be the same trap wearing a different hat.
+          if [ -n "$OPT_ON" ] && [ -n "$OPT_OFF" ]; then
+            echo "note: both inputs set; using enable=$OPT_ON and IGNORING disable=$OPT_OFF"
+            echo "      (disable has a non-empty default, so this is the normal case)"
+          fi
+          if [ -n "$OPT_ON" ]; then
+            OPT="$OPT_ON"; FORCE=true;  DIRECTION="enable"
+          else
+            OPT="$OPT_OFF"; FORCE=false; DIRECTION="disable"
+          fi
+          if [ -z "$OPT" ]; then
+            echo '::error::no option given — set the disable OR the enable input'
+            exit 2
+          fi
+          echo "config   : $CFG"
+          echo "option   : $OPT"
+          echo "direction: force $DIRECTION (variant is built with the option $FORCE)"
+          echo ""
+
+          # extendModules on the SAME config, so the only difference is this option.
+          #
+          # The flake ref is `git+file://<repo>?dir=nixos`, ROOTED AT THE REPO, not
+          # `path:$PWD`. path: copies only the nixos/ directory into the store, and
+          # the flake reaches OUTSIDE it for ../compositor (hart-comp's crate source)
+          # -- which fails deep in evaluation with the memorable "'compositor' is too
+          # short to be a valid store path" (run 30347017963, 35 minutes in, after the
+          # base closure had already built). This is the same ref `nix build .#…`
+          # resolves for itself; shallow=1 because actions/checkout clones shallow.
+          #
+          # mkForce is REQUIRED, not defensive: desktop.nix assigns `gaming = true`
+          # as a plain value, and a second plain definition of the same option is a
+          # conflict error, not an override. setAttrByPath keeps this generic for any
+          # dotted option path passed in.
+          VARIANT_EXPR="
+            let
+              flake = builtins.getFlake \"git+file://${GITHUB_WORKSPACE}?dir=nixos&shallow=1\";
+              base  = flake.nixosConfigurations.${CFG};
+            in (base.extendModules {
+                 modules = [ ({ lib, ... }:
+                   lib.setAttrByPath (lib.splitString \".\" \"${OPT}\") (lib.mkForce ${FORCE})) ];
+               }).config.system.build.toplevel
+          "
+
+          # EVALUATE the variant before BUILDING the base. Evaluation catches every
+          # way this expression can be wrong -- bad flake ref, missing attr, option
+          # conflict, typo in the dotted path -- in ~3 minutes. Building the base
+          # first meant the previous failure surfaced 35 minutes in, having spent the
+          # entire closure build before the expression was ever exercised.
+          echo "── validating the variant expression (eval only) ──────────"
+          nix eval --impure --raw --expr "($VARIANT_EXPR).drvPath"
+          echo ""
+          echo "  expression is valid; building both closures now."
+          echo ""
+
+          echo "── building WITH the feature ──────────────────────────────"
+          BASE=$(nix build ".#nixosConfigurations.${CFG}.config.system.build.toplevel" \
+                   -L --no-link --print-out-paths)
+          echo "base: $BASE"
+          echo ""
+
+          # WHY is a path in the closure? A size number says what to cut; this says
+          # what to cut it FROM. Runs against the base closure, before the variant,
+          # so the chain reflects the shipped system.
+          #
+          # Reads the path list from a FILE rather than piping into grep -m1 / head:
+          # those exit early, the writer takes EPIPE, and `set -o pipefail` turns a
+          # successful lookup into a failed step.
+          EXPLAIN='${{ inputs.explain }}'
+          if [ -n "$EXPLAIN" ]; then
+            nix path-info -r "$BASE" > /tmp/allpaths.txt
+            matches=$(grep -- "$EXPLAIN" /tmp/allpaths.txt | sed -n '1,4p')
+            if [ -z "$matches" ]; then
+              echo "── why-depends: no closure path matching '$EXPLAIN' ──"
+            else
+              for m in $matches; do
+                echo ""
+                echo "── why does the closure contain $(basename "$m")? ─────────"
+                # Default (shortest chain), not --all: the shortest path names the
+                # package actually responsible, where --all buries it in every route.
+                nix why-depends "$BASE" "$m" 2>&1 | sed -n '1,40p' || true
+              done
+            fi
+            echo ""
+          fi
+
+          echo "── building WITHOUT the feature ───────────────────────────"
+          VARIANT=$(nix build --impure --no-link --print-out-paths --expr "$VARIANT_EXPR")
+          echo "variant: $VARIANT"
+          echo ""
+
+          A=$(nix path-info -S "$BASE"    | awk '{print $2}')
+          B=$(nix path-info -S "$VARIANT" | awk '{print $2}')
+
+          # A is always the config AS SHIPPED, B the forced variant. Which of
+          # them is the feature-ON side depends on the direction, so name them
+          # before subtracting — reporting a negative "cost" would be worse
+          # than useless, it would read as a saving.
+          if [ "$FORCE" = true ]; then
+            ON=$B; OFF=$A; VERB="appear"; NOUN="added"
+          else
+            ON=$A; OFF=$B; VERB="disappear"; NOUN="dropped"
+          fi
+
+          echo "══ RESULT ═════════════════════════════════════════════════"
+          printf 'with %s ON  : %s\n' "$OPT" "$(numfmt --to=iec-i --suffix=B "$ON")"
+          printf 'with %s OFF : %s\n' "$OPT" "$(numfmt --to=iec-i --suffix=B "$OFF")"
+          printf 'MARGINAL COST: %s  (%.2f%% of the feature-ON closure)\n' \
+            "$(numfmt --to=iec-i --suffix=B "$((ON-OFF))")" \
+            "$(awk -v on="$ON" -v off="$OFF" 'BEGIN{printf "%.2f", (on-off)*100/on}')"
+          echo ""
+
+          # Paths present ONLY with the feature ON — what the option actually
+          # brings in (or takes away). Direction-aware for the same reason.
+          nix path-info -r "$BASE"    | sort -u > /tmp/base.txt
+          nix path-info -r "$VARIANT" | sort -u > /tmp/variant.txt
+          if [ "$FORCE" = true ]; then
+            comm -13 /tmp/base.txt /tmp/variant.txt > /tmp/only-base.txt
+          else
+            comm -23 /tmp/base.txt /tmp/variant.txt > /tmp/only-base.txt
+          fi
+          echo "paths $NOUN: $(wc -l < /tmp/only-base.txt)"
+          echo ""
+          echo "── 30 largest paths that $VERB (self size) ────────────"
+          # awk 'NR<=30', never `head`: head exits early, sort gets EPIPE, and under
+          # `set -o pipefail` that fails the step (it already cost run 30334471869).
+          if [ -s /tmp/only-base.txt ]; then
+            xargs -a /tmp/only-base.txt nix path-info -s \
+              | sort -k2 -n -r \
+              | awk 'NR<=30 { printf "%9.2f MiB  %s\n", $2/1048576, $1 }'
+          else
+            echo "  (none -- the option changed nothing in the closure)"
+          fi

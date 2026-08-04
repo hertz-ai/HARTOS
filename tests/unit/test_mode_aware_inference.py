@@ -8,6 +8,7 @@ Verifies:
 - LearningLLMProvider teacher HTTP routing when no local model
 - Flat mode regression (zero changes to existing behavior)
 """
+from core.constants import latency_budget
 import os
 import sys
 import json
@@ -2175,7 +2176,7 @@ class TestBootPhase:
 
         # Module import should be near-instant (< 5s)
         # The learning pipeline runs in background
-        assert elapsed < 5.0, (
+        assert elapsed < latency_budget('entry_module_import_s'), (
             f"Module import took {elapsed:.1f}s - _init_learning_pipeline "
             f"may be blocking instead of running in a daemon thread"
         )

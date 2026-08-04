@@ -42,6 +42,30 @@ permissions:
   pages: write
   id-token: write
 
+# ── RUNNER STARVATION FIX (2026-07-30) ────────────────────────────────────
+# This workflow had NO concurrency block at all, while every OTHER heavy
+# workflow has one. Each push therefore started a full Release run — 3x
+# build-iso, 4 nixosTest shards, installers, docs — and NONE ever stood down.
+# Measured on main: 13 runs alive with zero progress across a 20-minute window
+# with no commits in between, while light workflows (Docker, Security Scan)
+# passed fine on the same SHAs. So it was not the GitHub outage; the pool was
+# simply held by superseded Release runs.
+#
+# Chronic, not a bad afternoon. Nix Build Matrix push runs, 07-27..07-30:
+# 38 cancelled / 16 failed / 11 succeeded = a 17% success rate, and the last
+# successful run on main was 07-28 — two days of zero runtime verification
+# while commit volume climbed 3 -> 20 a day. sso (bf69b952) and ptrace
+# (b83c7591) are permanently unverified at runtime on their own SHAs because
+# of it.
+#
+# Same idiom as nix-build-matrix.yml:40. The workflow_dispatch carve-out is
+# MANDATORY here specifically: tag-and-sign is dispatch-only and gates
+# master-key signing, so a signing run must never be cancellable by someone
+# else's push — hence run_id (unique per dispatch) instead of a shared key.
+concurrency:
+  group: release-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
+  cancel-in-progress: true
+
 jobs:
   # ═══════════════════════════════════════════════════════════
   # 1. Comprehensive gate — the release-blocking checks (PARALLEL to build-iso)
@@ -204,12 +228,13 @@ jobs:
     # ~30 min to the baseline. iso-server/iso-edge stay well under
     # 15 min so bumping the shared cap doesn't waste any runner time
     # on the fast variants.
-    # 300 (was 180): raw-desktop needs more than iso-desktop — make-disk-image
-    # copies the whole ~20 GB closure into an ext4 inside a VM (slow I/O) on
-    # top of the same closure build; the 2026-07-16 first attempt (run
-    # 29509018080) was CANCELLED at the 180-min wall. The fast variants finish
-    # in ~15 min regardless, so the higher shared cap costs nothing there and
-    # only pays out on hangs.
+    # 300 (was 180): sized for iso-desktop, which is the long pole. raw-desktop
+    # used to be the reason for this cap -- make-disk-image copied the closure
+    # into an ext4 inside a qemu VM and the 2026-07-16 attempt (run 29509018080)
+    # was CANCELLED at the 180-min wall -- but on systemd-repart it finishes in
+    # ~56 min, so it no longer sets the ceiling and no longer extends the
+    # nightly's critical path. The fast variants finish in ~15 min regardless, so
+    # the higher shared cap costs nothing there and only pays out on hangs.
     timeout-minutes: 300
     # raw-desktop (the INSTALLED writable-root image, 2026-07-16) must NEVER
     # block the nightly: publish-nightly `needs: build-iso`, and a failed matrix
@@ -220,35 +245,60 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # raw-desktop (the installed writable-root image) builds ONLY on manual
-        # dispatch, never automatically on push. Its image-assembly VM runs
-        # under TCG on GitHub runners (no KVM), so it grinds 4h+ and hits the
-        # wall -- and being in the push matrix meant EVERY commit to main spun a
-        # fresh doomed 5h raw build, burning runners for nothing (it is
-        # continue-on-error, so it never blocked the ISO nightly, but it still
-        # churned). Gate it out of push so the ISO nightlies stay clean; build
-        # raw deliberately via `gh workflow run` once the no-VM (systemd-repart)
-        # image path lands. The ISO legs always run.
-        target: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.build_iso == 'true') && fromJSON('["iso-server","iso-desktop","iso-edge","raw-desktop"]') || fromJSON('["iso-server","iso-desktop","iso-edge"]') }}
+        # raw-desktop is BACK IN THE PUSH MATRIX (2026-07-28). It was gated out
+        # because nixos-generators assembled its ext4 inside a qemu VM running
+        # under TCG (no KVM on GitHub runners), so it ground 4h+ and hit the wall
+        # -- every commit to main spun a fresh doomed 5h build. It now builds via
+        # systemd-repart with no VM at all: 56 minutes end to end, verified in
+        # nix-build-matrix run 30336832563 (hart-os.raw, 25 GB).
+        #
+        # It belongs in the nightly because the 2026-07-16 pivot made the INSTALLED
+        # raw image the thing the USB is supposed to ship -- a writable root, real
+        # OTA, no squashfs "Disk 100%". Gating it to manual dispatch meant every
+        # nightly the steward flashed was still the live ISO. publish-nightly
+        # already downloads `raw-*` artifacts best-effort, so the plumbing needed
+        # nothing; and the leg keeps continue-on-error (see above), so a red raw
+        # build still cannot hold back the ISO nightlies.
+        # One plain list, not a ternary whose branches are identical: the job's own
+        # `if:` above already restricts this to dispatch-with-build_iso or a push,
+        # so there is nothing left for the conditional to decide. Two identical
+        # branches are where a future edit silently changes only one of them.
+        target: [iso-server, iso-desktop, iso-edge, raw-desktop]
     steps:
       - uses: actions/checkout@v4
 
-      # raw-* only: put the ENTIRE nix store on the runner's second, nearly
-      # empty ~65 GB data disk (/mnt). The raw build's peak — the ~20 GB
-      # closure PLUS the ~20 GB disk-image output, both in the store — cannot
-      # fit the root disk no matter how much preinstalled bloat is stripped
-      # (2026-07-16 run 29522446118: ENOSPC crashed the nix daemon itself at
-      # 50 min, AFTER the hostedtoolcache purge). Bind-mounting /nix onto /mnt
-      # BEFORE the installer splits the load: store+image on /mnt (~65 GB),
-      # while build tmp, the xz and the split parts keep the root disk's
-      # ~45 GB. The ISO legs stay on the root disk unchanged (their squashfs
-      # peak fits and their cache behaviour is proven).
-      - name: Move /nix to the /mnt data disk (raw only)
+      # raw-* only: put the ENTIRE nix store on the runner's second data disk
+      # (/mnt) when there IS one. The raw build's peak is the closure PLUS the
+      # disk-image output; splitting them across two spindles was the 2026-07-16
+      # answer to run 29522446118, where ENOSPC crashed the nix daemon itself at
+      # 50 min even AFTER the hostedtoolcache purge.
+      #
+      # SELF-VERIFYING, because on some runner images this step is a LIE: the
+      # sibling nix-build-matrix.yml carried the identical block and its failure
+      # diagnostics showed `/` and `/mnt` as the SAME `/dev/root` (run 30308494154,
+      # confirmed again as /dev/sda1 in 30334471869). There the bind moved the store
+      # between two directories on one filesystem and bought zero bytes -- while
+      # reading in the log exactly like a fix had been applied, which is worse than
+      # no step at all: it makes the next person rule out the thing that is still
+      # wrong. Compare the backing devices, bind only when they differ, and say
+      # which branch was taken. The real budget comes from the aggressive purge
+      # below plus sizing the root partition from the measured closure
+      # (nixos/modules/hart-repart-image.nix).
+      - name: Move /nix to the /mnt data disk (raw only, if a real second disk exists)
         if: startsWith(matrix.target, 'raw-')
         run: |
-          sudo mkdir -p /mnt/nix /nix
-          sudo mount --bind /mnt/nix /nix
-          df -h / /mnt
+          root_dev=$(findmnt -no SOURCE --target / || echo unknown)
+          mnt_dev=$(findmnt -no SOURCE --target /mnt || echo none)
+          echo "root=$root_dev  /mnt=$mnt_dev"
+          if [ "$mnt_dev" != "none" ] && [ "$mnt_dev" != "$root_dev" ]; then
+            echo "Separate data disk found -> moving /nix onto it."
+            sudo mkdir -p /mnt/nix /nix
+            sudo mount --bind /mnt/nix /nix
+          else
+            echo "NO separate data disk on this runner image -- /mnt shares $root_dev."
+            echo "Leaving /nix on the root disk; the budget comes from the purge below."
+          fi
+          df -h / /mnt 2>/dev/null || true
 
       # raw-* only: make /dev/kvm usable by the nix build sandbox BEFORE the
       # installer runs (it detects kvm at install time). Without it,
@@ -257,8 +307,11 @@ jobs:
       # (closure done in 30 min) and STILL hit the 5h wall. This is the
       # GitHub-documented KVM enable recipe (same one Android-emulator jobs
       # use); with -enable-kvm the image step is minutes, not hours.
-      - name: Enable KVM for the image-assembly VM (raw only)
-        if: startsWith(matrix.target, 'raw-')
+      # raw-desktop now builds via systemd-repart (no qemu VM) -> it needs neither
+      # KVM nor a disabled sandbox. This step stays only for the still-generators
+      # raw-server / raw-edge (not in the CI matrix today, kept correct for later).
+      - name: Enable KVM for the image-assembly VM (raw only, non-repart)
+        if: startsWith(matrix.target, 'raw-') && matrix.target != 'raw-desktop'
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -294,8 +347,8 @@ jobs:
       # so the image VM stayed sandboxed away from /dev/kvm and ground on TCG.
       # A daemon-level nix.conf line cannot be ignored. Applied only on raw
       # legs; ISO legs keep the sandbox.
-      - name: Disable nix sandbox daemon-wide (raw only)
-        if: startsWith(matrix.target, 'raw-')
+      - name: Disable nix sandbox daemon-wide (raw only, non-repart)
+        if: startsWith(matrix.target, 'raw-') && matrix.target != 'raw-desktop'
         run: |
           echo 'sandbox = false' | sudo tee -a /etc/nix/nix.conf
           sudo systemctl restart nix-daemon || sudo systemctl restart determinate-nixd || true
@@ -408,17 +461,15 @@ jobs:
           # pipefail + set -e: `tee` no longer hides a failed `nix build`.
           # Retry once: the magic-nix-cache GitHub API is rate-limited
           # and transient 429s shouldn't break a 90-minute OS build.
-          # raw-*: build with the sandbox OFF. make-disk-image assembles the
-          # image inside a qemu VM, and the nix sandbox only passes /dev/kvm
-          # through when the derivation itself demands the kvm feature -- on
-          # this pin it evidently does not, so the VM ran under TCG software
-          # emulation even with host /dev/kvm at 0666 + the kvm system-feature
-          # advertised (runs 29551668370 and 29565871234: 4h+ inside
-          # nixos-disk-image.drv). sandbox=false lets the builder see the
-          # host's /dev/kvm directly, so qemu engages KVM. CI-only, raw-only;
-          # the ISO legs keep the sandbox.
+          # sandbox OFF only for the still-generators raw-server/raw-edge:
+          # make-disk-image assembles the image inside a qemu VM and needs the
+          # builder to see the host's /dev/kvm directly (the nix sandbox hid it,
+          # so qemu ran under TCG -- runs 29551668370/29565871234: 4h+ inside
+          # nixos-disk-image.drv). raw-DESKTOP now builds via systemd-repart
+          # (fakeroot systemd-repart in stdenvNoCC, no qemu) and builds WITH the
+          # sandbox, exactly like the ISO legs -- so it is excluded here.
           SANDBOX_OPT=""
-          if [[ "${{ matrix.target }}" == raw-* ]]; then
+          if [[ "${{ matrix.target }}" == raw-* && "${{ matrix.target }}" != raw-desktop ]]; then
             SANDBOX_OPT="--option sandbox false"
           fi
           for attempt in 1 2; do

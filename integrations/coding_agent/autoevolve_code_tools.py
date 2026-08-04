@@ -210,8 +210,8 @@ class AutoResearchEngine:
             # incremental-tuning prompt stance for a radical-mutation
             # stance.  The LLM remains the code mutator (no parallel
             # code-generator path), but the instruction distribution
-            # shifts — this is the cheapest honest wiring of the
-            # stochastic arm without inventing a second mutation backend.
+            # shifts, which wires the stochastic arm without inventing
+            # a second mutation backend.
             # Safety: the candidate still passes RSI-1 + RSI-2 gates
             # inside commit_improvement before promotion.
             exploration_hint = ''
@@ -689,7 +689,27 @@ class AutoResearchEngine:
         except Exception as e:
             logger.warning(f"[{session.session_id}] Report save failed: {e}")
 
-        self.export_learning_delta(session)
+        # Federation egress (RSI-3). This was OUTSIDE the guard above, which
+        # inverted the exception safety: the cheap, local, already-safe JSON
+        # write was protected while the RISKY network broadcast was not, so a
+        # dead peer propagated straight out of a method whose contract is
+        # best-effort persistence. Callers reasonably assume `save_report`
+        # either saves or logs — not that it raises on someone else's node.
+        #
+        # NOT a fix for the latency: this call is MEASURED at ~37s of the
+        # method's 37.24s (2026-08-02), because it broadcasts to peer Hive
+        # nodes with no bound. Splitting egress out of `save_report`, or
+        # making it async/bounded, is a design decision that changes
+        # federation semantics — tracked in task #28, deliberately not made
+        # here. The comment in export_learning_delta is explicit that the
+        # broadcast is intentional ("without it, improvements stay local"),
+        # so it must not simply be dropped to make a test fast.
+        try:
+            self.export_learning_delta(session)
+        except Exception as e:
+            logger.warning(
+                f"[{session.session_id}] Learning-delta export failed "
+                f"(report itself is saved): {e}")
 
     def export_learning_delta(self, session: AutoResearchSession):
         """Export session results as a federated learning delta AND

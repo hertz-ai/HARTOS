@@ -223,7 +223,11 @@ class Post(Base):
         return d
 
 
-# ─── TABLE 4: comments ───
+# ─── TABLE 3b: site_pages ───
+# CMS pages (blog posts, landing copy) published through the API instead of
+# through a frontend redeploy. Deliberately NOT a Post: a page has a slug and
+# a publish state, a Post has votes, feeds and communities, and gluing SEO
+# fields onto Post would leak pages into the social surfaces.
 
 class Comment(Base):
     __tablename__ = 'comments'

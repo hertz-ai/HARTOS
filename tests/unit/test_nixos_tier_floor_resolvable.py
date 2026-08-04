@@ -61,7 +61,10 @@ def test_liquid_ui_does_not_block_on_model_bus():
 
 
 def test_desktop_watchdog_outlasts_shell_health_wait():
-    desktop = _read("configurations/desktop.nix")
+    # profiles/, not configurations/: the hart.* feature block (where
+    # sessionSupervisor.shellPaintTimeoutSeconds lives) moved to the variant
+    # profile on 2026-07-28 so images, nixosTest nodes and the installer share it.
+    desktop = _read("profiles/desktop.nix")
     host = _read("modules/hart-layer-shell-host.nix")
     # The GTK4 host waits `for i in $(seq 1 N)` seconds for :6800/health before it
     # can paint its first frame; the watchdog must be strictly longer than that.

@@ -81,8 +81,33 @@ def test_hartdesktop_js_wires_the_customize_action():
     travels in the single desktop_icons writer (no parallel override store)."""
     src = open(os.path.join(ROOT, 'integrations', 'agent_engine', 'static', 'hartDesktop.js'),
                encoding='utf-8').read()
-    assert "'Customize" in src and "hartCustomizeIcon('" in src   # menu entry -> action
+    # WAS: assert "'Customize" in src and "hartCustomizeIcon('" in src
+    # Red since at least 2026-07-31 (six consecutive runs of the Shell UI
+    # WebKit Safety gate) while the FEATURE WORKED — and wrong in a more
+    # instructive way than a plain rename:
+    #   * "hartCustomizeIcon('" appears ZERO times. The call sites are
+    #     `window.hartCustomizeIcon && window.hartCustomizeIcon(id)` (:345)
+    #     and the definition (:389). The literal open-quote could never have
+    #     matched this code, so this half was simply wrong.
+    #   * "'Customize" DOES still match — but at :401, as
+    #     `ov.setAttribute('aria-label', 'Customize icon')` inside the dialog.
+    #     The MENU entry it claims to check was renamed to 'Properties'
+    #     (:345). So this half was passing for a coincidental reason, in a
+    #     different part of the file, about a different thing.
+    # A guard half-passing by accident and half-failing on a string that never
+    # existed is exactly what feedback_no_grep_tests warns about: it says
+    # nothing about whether the wiring survived, in either direction.
+    #
+    # Assert the WIRING instead: some context-menu entry must invoke the
+    # action, and the action must be defined. That is what "menu entry ->
+    # action" was always trying to say, and it survives renaming the label.
     assert 'window.hartCustomizeIcon =' in src                    # action defined
+    _menu_entry = [ln for ln in src.splitlines()
+                   if 'label:' in ln and 'hartCustomizeIcon' in ln]
+    assert _menu_entry, (
+        "no context-menu entry invokes hartCustomizeIcon — the action is "
+        "defined but unreachable from the menu, which is the regression this "
+        "guard exists to catch (the LABEL may be renamed freely)")
     assert 'function applyIconVisual' in src                      # single apply path (render + dialog)
     # one writer: overrides ride inside readPositions()/persist(), not a new key
     assert "HartSession.set('desktop_icons'" in src

@@ -75,21 +75,53 @@ let
     glib gobject-introspection gtk3 webkitgtk_4_1
     pango gdk-pixbuf atk harfbuzz libsoup_3 cairo
   ]);
+  # GStreamer capture plugins for the cage floor's mic/getUserMedia path. WebKit2
+  # (like the GTK4 host) routes MediaStream capture through GStreamer, and a bare
+  # cage session sets NO GST_PLUGIN_SYSTEM_PATH_1_0 -> the `valve`/`pulsesrc`
+  # elements are invisible -> a mic click SIGSEGVs WebKitWebProcess (the real-HW
+  # 2026-07-18 "clicking the mic hung the entire cage" incident). This back-ports
+  # the GTK4 host's fix (hart-layer-shell-host.nix:99-120) to the never-fail floor
+  # so the floor is safe on the same path. makeSearchPathOutput "out", NOT plain
+  # makeSearchPath: gstreamer core's DEFAULT output is `bin`, so plain makeSearchPath
+  # resolves an empty plugin dir and the elements stay invisible.
+  # The GStreamer packages live under pkgs.gst_all_1 (NOT top-level pkgs -- the
+  # bare `gstreamer` attr does not exist, which broke iso-desktop with "undefined
+  # variable 'gstreamer'"). Mirror the GTK4 host exactly, incl. pipewiresrc for the
+  # PipeWire desktop.
+  gstCapturePlugins = (with pkgs.gst_all_1; [
+    gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad
+  ]) ++ [ pkgs.pipewire ];
+  gstPluginPath = lib.makeSearchPathOutput "out" "lib/gstreamer-1.0" gstCapturePlugins;
   glassShell = pkgs.writeShellScriptBin "hart-glass-shell" ''
     set -euo pipefail
     URL="http://localhost:${toString ui.port}"
+    # --max-time IS LOAD-BEARING (task #8, item 2.2). `curl -sf` has NO total
+    # timeout: a backend that ACCEPTS the TCP connection and then never answers
+    # — the half-up case, which is exactly what a still-initialising Flask app
+    # looks like — blocks this forever, and with it the whole boot wait. The
+    # retry loop below never gets a second iteration, so "wait up to 30s" was
+    # really "wait forever" on the one failure it exists to survive.
+    #
+    # 5s is generous for a LOCAL /health. If the loop exhausts, the fall-back
+    # below picks the Nunba SPA rather than hanging — and a premature fallback
+    # to a working surface beats a shell that never appears, which is the whole
+    # never-blank principle this script is built on.
     for i in $(seq 1 30); do
-      if ${pkgs.curl}/bin/curl -sf "$URL/health" >/dev/null 2>&1; then break; fi
+      if ${pkgs.curl}/bin/curl -sf --connect-timeout 2 --max-time 5 "$URL/health" >/dev/null 2>&1; then break; fi
       sleep 1
     done
-    if ! ${pkgs.curl}/bin/curl -sf "$URL/health" >/dev/null 2>&1; then
+    if ! ${pkgs.curl}/bin/curl -sf --connect-timeout 2 --max-time 5 "$URL/health" >/dev/null 2>&1; then
       # LiquidUI down — fall back to the Nunba SPA so the shell is never blank.
-      if ${pkgs.curl}/bin/curl -sf "http://localhost:${nunbaPort}/" >/dev/null 2>&1; then
+      if ${pkgs.curl}/bin/curl -sf --connect-timeout 2 --max-time 5 "http://localhost:${nunbaPort}/" >/dev/null 2>&1; then
         URL="http://localhost:${nunbaPort}"
       fi
     fi
     # GI typelibs for the GTK/WebKit2 python below (see giTypelibPath note).
     export GI_TYPELIB_PATH="${giTypelibPath}"
+    # GStreamer capture plugins so the mic/getUserMedia path finds pulsesrc/valve
+    # instead of SIGSEGV-ing WebKitWebProcess (see gstPluginPath note; back-port of
+    # the GTK4 host fix to the never-fail floor).
+    export GST_PLUGIN_SYSTEM_PATH_1_0="${gstPluginPath}"
     # WebKitGTK robustness on fresh-ISO boots (VM / software GL / no GPU): the
     # DMABUF renderer + GL compositing crash on a GL-less display, which is
     # exactly the first-boot / live-USB case. Disable both so a shell that
@@ -156,6 +188,12 @@ class GlassShell(Gtk.Window):
         # tapping the orb IS the user's intent to talk, so auto-grant the media
         # (mic/camera) request; any other permission class is denied by default.
         webview.connect('permission-request', self._on_permission_request)
+        # If the web process dies (mic-capture SIGSEGV, OOM, codec, GPU), the surface
+        # stays mapped but renders nothing and shell-ready has already passed -- so
+        # crash the HOST: the session-supervisor counts it and relaunches the tier
+        # with a fresh web process, and a repeat-crash walks the ladder. Without this
+        # the cage floor froze blank forever (back-port of hart-layer-shell-host.nix).
+        webview.connect('web-process-terminated', self._on_web_process_terminated)
         webview.load_uri(os.environ.get('HART_SHELL_URL', 'http://localhost:${toString ui.port}'))
         s = webview.get_settings()
         s.set_enable_javascript(True)
@@ -186,6 +224,17 @@ class GlassShell(Gtk.Window):
     def _on_load_changed(self, _webview, event):
         if event == WebKit2.LoadEvent.FINISHED:
             _signal_painted()
+
+    def _on_web_process_terminated(self, _webview, reason):
+        # The web process died (mic-capture SIGSEGV / OOM / codec / GPU). The surface
+        # stays mapped but renders NOTHING and shell-ready already passed, so the only
+        # honest move is to crash the HOST: the supervisor counts it and relaunches
+        # the tier with a fresh web process; a repeat-crash loop walks the ladder.
+        import sys as _sys, os as _os
+        print('[hart-glass-shell] WebKitWebProcess TERMINATED (%s) -- exiting so the '
+              'supervisor relaunches the tier' % reason, file=_sys.stderr)
+        _sys.stderr.flush()
+        _os._exit(1)
 
     def _on_permission_request(self, _webview, request):
         # Auto-grant mic/camera for the trusted local shell so getUserMedia does
@@ -229,10 +278,36 @@ Gtk.main()
   # wlroots pixman): the shell is 2D and renders fine in software, KMS scanout
   # still uses the kernel driver (the console text proves KMS works), and the
   # broken GPU GL/compute path is never touched. A kiosk MUST paint on any GPU.
+  #
+  # WLR_RENDERER=pixman IS THE MISSING HALF OF THAT SENTENCE. The comment above
+  # has always said "Mesa llvmpipe + wlroots pixman", but the script only set
+  # WLR_RENDERER_ALLOW_SOFTWARE, which PERMITS a software renderer without
+  # SELECTING one — so wlroots still took its default GLES2 path and opened EGL
+  # against the DRM node. With LIBGL_ALWAYS_SOFTWARE also set, Mesa then refuses
+  # the combination outright, and the floor died (run 30848154453):
+  #
+  #   libEGL warning: Not allowed to force software rendering when API
+  #                   explicitly selects a hardware device
+  #   [ERROR] [render/egl.c:268]  Failed to initialize EGL
+  #   [ERROR] [../cage.c:330]     Unable to create the wlroots renderer
+  #   hart-session-supervisor: tier 'cage' exited rc=1 after 1s
+  #   hart-session-supervisor: crash-loop on the floor ('cage') — cannot drop further
+  #
+  # "greeter exited without creating a session" then appeared 66x in
+  # layer-shell-host-paint, 22x in desktop-shell-boot and 13x in the reboot
+  # latch: ONE cause behind several failures, and the floor is exactly the tier
+  # that must never have one.
+  #
+  # pixman is wlroots' CPU renderer and does not go through EGL at all, so the
+  # refusal cannot arise. Gated on the SAME !preferHardwareGL condition as
+  # LIBGL_ALWAYS_SOFTWARE: a box that wants hardware GL keeps the GLES2 path
+  # untouched, and only the already-software path changes — where EGL was
+  # failing anyway, so this cannot be worse.
   kioskLauncher = pkgs.writeShellScriptBin "hart-shell-session" ''
     export WLR_RENDERER_ALLOW_SOFTWARE=1
     export WLR_NO_HARDWARE_CURSORS=1
-    ${lib.optionalString (!ui.preferHardwareGL) "export LIBGL_ALWAYS_SOFTWARE=1"}
+    ${lib.optionalString (!ui.preferHardwareGL)
+      "export LIBGL_ALWAYS_SOFTWARE=1\n    export WLR_RENDERER=pixman"}
     exec ${pkgs.cage}/bin/cage -- ${glassShell}/bin/hart-glass-shell
   '';
 
@@ -322,6 +397,29 @@ in
         known-good GPU driver: on a flaky GPU it re-introduces the WebKitGTK/cage
         crash. This is the documented lever for the software-GL-vs-glass-perf
         trade-off — robustness stays the default.
+      '';
+    };
+
+    gpuDiagnostic = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        GPU RENDER DIAGNOSTIC MODE — root-cause the layer-shell vulkan/GSK hang
+        (task #12) instead of avoiding it. DEFAULT FALSE (a normal build is
+        byte-identical + un-bloated). When true:
+          * the Tier-1 hart-comp session FORCES the vulkan rung
+            (HART_SHELL_RENDER=vulkan) instead of the safe webkit-cairo default, so
+            the hang is actually ATTEMPTED (every boot since 2026-07-20 silently
+            skipped it);
+          * the GTK4 host exports Vulkan validation layers + GSK/GDK/WebKit debug
+            and dumps `vulkaninfo --summary` to the journal, so a real-HW boot
+            CAPTURES the exact VK_ERROR_SURFACE_LOST_KHR / swapchain-recreate
+            failure (hover the orb to trigger it) instead of us guessing;
+          * ships vulkan-tools + vulkan-validation-layers.
+        SAFE: the paint-watchdog still self-heals — a vulkan hang drops to the cage
+        floor, so a diagnostic boot can NEVER brick. Workflow: flash a build with
+        this ON, boot, hover the orb, pull the HARTJRNL, read the VK trace. Turn
+        OFF for normal builds.
       '';
     };
 
@@ -485,7 +583,7 @@ in
             echo "[HART OS LiquidUI] A2UI: ${if ui.enableA2UI then "enabled" else "disabled"}"
 
             # Check if Model Bus is available (LiquidUI degrades gracefully without it)
-            if curl -sf "http://localhost:${toString (config.hart.modelBus.ports.http or 6790)}/v1/status" >/dev/null 2>&1; then
+            if curl -sf --connect-timeout 2 --max-time 5 "http://localhost:${toString (config.hart.modelBus.ports.http or 6790)}/v1/status" >/dev/null 2>&1; then
               echo "[HART OS LiquidUI] Model Bus: connected — generative UI active"
             else
               echo "[HART OS LiquidUI] Model Bus: not available — falling back to static UI"
@@ -598,6 +696,28 @@ in
     })
 
     # ─────────────────────────────────────────────────────────
+    # OFFLINE VOICE FLOOR — UNCONDITIONAL (task #7, item 0.5)
+    # ─────────────────────────────────────────────────────────
+    # Deliberately NOT behind ui.voiceEnabled. That option is one flag over
+    # two concerns — its own description says "voice input (STT) and output
+    # (TTS)" — so turning off the wake-word LISTENER also removed the ability
+    # to SPEAK. Disabling a microphone should never mute the OS.
+    #
+    # Found in a VM (run 30848154453): desktop-boot sets voiceEnabled=false to
+    # trim the listener user service, a legitimate thing to want, and the
+    # offline-voice-floor subtest then failed on `command -v espeak-ng`. The
+    # same would happen to any real node that runs the desktop without voice
+    # input — a kiosk, or a user who simply does not want a hot mic — and it
+    # would land on exactly the moment the OS is supposed to introduce itself
+    # by talking.
+    #
+    # espeak-ng is small, needs no model and no download, so there is no cost
+    # to making it always present. It is not the voice we want; it is the
+    # voice that always works, which is the whole point of a floor. The good
+    # voice still arrives via the Model Bus when a model does.
+    { environment.systemPackages = [ pkgs.espeak-ng ]; }
+
+    # ─────────────────────────────────────────────────────────
     # Voice I/O (when enabled)
     # ─────────────────────────────────────────────────────────
     (lib.mkIf ui.voiceEnabled {
@@ -606,6 +726,14 @@ in
       environment.systemPackages = with pkgs; [
         sox          # Audio manipulation (record, play, convert)
         alsa-utils   # arecord, aplay
+
+        # The offline voice FLOOR (espeak-ng) used to live here and has moved
+        # UP to an unconditional block — see the comment above this mkIf.
+        # It stays in this module (one writer for "what voice needs"); it just
+        # no longer depends on voice INPUT being on. The other entry in the
+        # tree is hart-accessibility.nix behind screenReader.enable, which
+        # defaults false and drags in Orca auto-starting at login — a screen
+        # reader, not a fallback synthesizer.
       ];
 
       # Voice input listener (background, activated by wake word or push-to-talk)
@@ -624,7 +752,7 @@ in
             echo "[HART OS Voice] Listener active"
 
             # Check if STT model is available via Model Bus
-            STT_AVAILABLE=$(curl -sf "$MODEL_BUS/v1/models" 2>/dev/null | \
+            STT_AVAILABLE=$(curl -sf --connect-timeout 2 --max-time 5 "$MODEL_BUS/v1/models" 2>/dev/null | \
               ${pkgs.jq}/bin/jq -r '.models[]? | select(.type == "stt") | .id' || echo "")
 
             if [[ -z "$STT_AVAILABLE" ]]; then

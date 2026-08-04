@@ -18,7 +18,7 @@ ledger = SmartLedger(
 
 ---
 
-## Why This Makes Sense
+## Rationale
 
 ### agent_id = prompt_id
 - **Prompt ID** identifies the specific agent/conversation instance

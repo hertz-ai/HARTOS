@@ -25,6 +25,10 @@ class CodingAgentDaemon:
         self._running = False
         self._thread = None
         self._lock = threading.Lock()
+        # Interruptible-sleep primitive. `_running` alone cannot WAKE a
+        # sleeping worker — it is only polled between sleeps — so stop()
+        # had to wait out the full interval. See _wd_sleep.
+        self._stop_event = threading.Event()
         self._tick_count = 0
 
     def start(self):
@@ -32,6 +36,7 @@ class CodingAgentDaemon:
             if self._running:
                 return
             self._running = True
+            self._stop_event.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True,
                                         name='coding_daemon')
         self._thread.start()
@@ -40,6 +45,8 @@ class CodingAgentDaemon:
     def stop(self):
         with self._lock:
             self._running = False
+        # Wake the worker NOW rather than letting it finish its nap.
+        self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=10)
 
@@ -73,7 +80,15 @@ class CodingAgentDaemon:
                 return
         except Exception:
             pass
-        time.sleep(seconds)
+        # FALLBACK — must keep the interruptibility the watchdog path
+        # provides via stop_check. A bare time.sleep() does not: it
+        # cannot be woken, so stop() blocked for the WHOLE interval
+        # (join(timeout=10) then expired in full — measured 10.00s and
+        # 10.01s in test_start_stop / test_double_start, the giveaway
+        # constant). That hits any node where get_watchdog() returns
+        # None or raises, i.e. exactly the degraded case. Event.wait()
+        # sleeps the same duration but returns immediately on stop().
+        self._stop_event.wait(seconds)
 
     def _loop(self):
         # Boot grace period: let user chat have exclusive LLM access

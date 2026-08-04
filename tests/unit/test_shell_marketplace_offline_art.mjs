@@ -50,11 +50,11 @@ function makeEl(tag) {
 }
 
 const doc = { createElement: makeEl, getElementById() { return null; } };
-let fetchCalls = 0;
+const fetchUrls = [];
 const sandbox = {
   window: {}, document: doc, console,
   setTimeout: () => 0, clearTimeout: () => {},
-  fetch: () => { fetchCalls++; return Promise.reject(new Error('offline in test')); },
+  fetch: (u) => { fetchUrls.push(String(u || '')); return Promise.reject(new Error('offline in test')); },
 };
 sandbox.window.document = doc;
 vm.createContext(sandbox);
@@ -75,10 +75,25 @@ const img = ic && ic.kidTag('IMG');
 ok(!!img, '[#143] a known app renders a bundled logo <img> in the icon tile');
 ok(img && /^\/shell\/static\/app_art\/apps\/[a-z0-9.]+\.svg$/i.test(img.src),
   '[#143] the logo src is the same-origin bundled path (' + (img && img.src) + ')');
-// The only fetch is the pre-existing best-effort /api/apps/installed probe; the
-// LOGOS add zero network (they are same-origin static <img src>), so the whole
-// featured grid paints its art offline.
-ok(fetchCalls <= 1, '[#143] the bundled logos add NO network fetch (offline-first; got ' + fetchCalls + ')');
+// #143 is about the ART, so assert on the ART, not on a call count.
+//
+// This used to be `fetchCalls <= 1`, a proxy for "only the best-effort
+// /api/apps/installed probe runs". That broke the moment the marketplace grew a
+// legitimate second same-origin call (/api/apps/catalog, the canonical offline
+// catalogue), and the tempting repair -- raise the ceiling to 2 -- would have made
+// the guard weaker than the bug it exists to catch: a logo silently re-pointed at
+// a remote CDN still fits under any count that also admits the API calls.
+//
+// So: NO fetch may be for artwork (logos are same-origin static <img src>, which
+// never reaches this stub), and every fetch that does happen must be a same-origin
+// /api/ call. That is the real invariant, it cannot be satisfied by a CDN logo, and
+// it does not need editing each time a legitimate API call is added.
+const artFetches = fetchUrls.filter((u) => /app_art|\.svg|\.png|\.webp|logo|icon/i.test(u));
+ok(artFetches.length === 0,
+  '[#143] the bundled logos add NO network fetch (offline-first; art fetched: ' + artFetches.join(', ') + ')');
+const offOrigin = fetchUrls.filter((u) => !/^\/api\//.test(u));
+ok(offOrigin.length === 0,
+  '[#143] every marketplace fetch is a same-origin /api call (got: ' + offOrigin.join(', ') + ')');
 
 // onerror swaps in the Material glyph (never a broken-image icon).
 ok(img && typeof img.onerror === 'function', '[#143] the <img> carries an onerror fallback');

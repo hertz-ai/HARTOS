@@ -478,6 +478,44 @@ def desktop_screenshot(ctx, save):
         _error_exit(f'Screenshot not available: {e}', json_output)
 
 
+# ── Record ──
+
+@desktop.command('record')
+@click.option('--duration', default=10.0, type=float, help='Seconds to record')
+@click.option('--fps', default=10, type=int, help='Frames per second')
+@click.option('--save', default='', help='Output path (default: <data dir>/demos/)')
+@click.pass_context
+def desktop_record(ctx, duration, fps, save):
+    """Record the screen to an mp4 (or GIF if no ffmpeg plugin).
+
+    Uses the same tiered capture as the remote desktop: dxcam where it is
+    available, mss otherwise, pyautogui last. Recording happens on the machine,
+    which is the point of demoing this node with itself.
+    """
+    json_output = ctx.obj['json_output']
+
+    try:
+        from integrations.remote_desktop.frame_capture import FrameCapture
+    except ImportError as e:
+        _error_exit(f'Recording not available: {e}', json_output)
+        return
+
+    if not json_output:
+        click.echo(f'Recording {duration:g}s at {fps} fps. Ctrl-C stops early.')
+
+    result = FrameCapture().record_to_video(
+        duration_s=duration, fps=fps, output_path=save or None)
+
+    if json_output:
+        click.echo(json.dumps(result))
+    elif result.get('ok'):
+        click.echo(f"Saved {result['path']} "
+                   f"({result['format']}, {result['frames']} frames, "
+                   f"{result['duration_s']:g}s)")
+    else:
+        _error_exit(result.get('error', 'recording failed'), json_output)
+
+
 # ── Wait ──
 
 @desktop.command('wait')
@@ -2480,6 +2518,155 @@ def zeroshot(ctx, task, model_override):
             click.echo(output)
         else:
             click.echo(json.dumps(result, indent=2, default=str))
+
+
+# ─── hart hive — join the hive as a coding worker ───
+#
+# Thin client over the routes claude_hive_session.get_blueprint() already
+# serves. No session logic lives here; the CLI exists because the session
+# docstring has advertised `hart hive connect` as the entry point since it
+# was written, and there was no `hive` command to run.
+
+try:  # single source of truth when importable, safe literal when not
+    from integrations.coding_agent.claude_hive_session import (
+        TASK_SCOPES as _HIVE_SCOPES,
+    )
+except Exception:  # pragma: no cover - CLI must work without the backend
+    _HIVE_SCOPES = {'own_repos', 'public', 'any'}
+
+
+@hart.group(invoke_without_command=True)
+@click.pass_context
+def hive(ctx):
+    """Join the hive as a coding worker.
+
+    Registers this session with PeerLink so the hive dispatcher can send it
+    coding tasks. Task origin is master-key verified, the shard engine
+    filters what code is shared, and nothing is committed without your
+    approval.
+
+    \b
+        hart hive connect --scope own_repos
+        hart hive status
+        hart hive disconnect
+    """
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+
+
+@hive.command('connect')
+@click.option('--scope', default='own_repos',
+              type=click.Choice(sorted(_HIVE_SCOPES)),
+              help='Which tasks this session accepts')
+@click.pass_context
+def hive_connect(ctx, scope):
+    """Register this session as available for hive coding tasks."""
+    server, json_output = ctx.obj['server'], ctx.obj['json_output']
+    result = _api_post(f'{server}/api/hive/session/connect',
+                       {'user_id': ctx.obj['user_id'], 'task_scope': scope},
+                       json_output)
+    if result is None or json_output:
+        return
+    if not result.get('success'):
+        _error_exit(result.get('error', 'connect failed'), json_output)
+    click.echo(f"Connected as {result.get('session_id', 'unknown session')}")
+    click.echo(f"Scope: {scope}. Disconnect with: hart hive disconnect")
+
+
+@hive.command('status')
+@click.pass_context
+def hive_status(ctx):
+    """Show whether this session is connected and what it is doing."""
+    server, json_output = ctx.obj['server'], ctx.obj['json_output']
+    result = _api_get(f'{server}/api/hive/session/status', json_output)
+    if result is None or json_output:
+        return
+    # get_status() reports `status` in disconnected/connecting/idle/working/
+    # paused. There is no `connected` boolean, and the counters live under
+    # `stats`, not at the top level.
+    state = result.get('status', 'unknown')
+    if state == 'disconnected':
+        click.echo('Not connected. Run: hart hive connect')
+        return
+    stats = result.get('stats') or {}
+    click.echo(f"{state}  {result.get('session_id', '')}")
+    click.echo(f"Scope       {result.get('task_scope', '?')}")
+    click.echo(f"Pending     {result.get('pending_tasks', 0)}")
+    click.echo(f"Completed   {stats.get('tasks_completed', 0)}"
+               f"  (failed {stats.get('tasks_failed', 0)})")
+    click.echo(f"Spark       {stats.get('spark_earned', 0)}")
+    if result.get('current_task'):
+        click.echo(f"Working on  {result['current_task']}")
+
+
+@hive.command('tasks')
+@click.pass_context
+def hive_tasks(ctx):
+    """List tasks this session has received."""
+    server, json_output = ctx.obj['server'], ctx.obj['json_output']
+    result = _api_get(f'{server}/api/hive/session/tasks', json_output)
+    if result is None or json_output:
+        return
+    # get_tasks() returns {'pending': [...], 'completed': [...]}
+    pending = result.get('pending') or []
+    completed = result.get('completed') or []
+    if not pending and not completed:
+        click.echo('No tasks yet.')
+        return
+    for t in pending:
+        click.echo(f"pending     {t.get('task_id', '?')}  "
+                   f"{str(t.get('description', ''))[:52]}")
+    for t in completed:
+        click.echo(f"{str(t.get('status', 'done')):<11} {t.get('task_id', '?')}  "
+                   f"quality {t.get('quality_score', '-')}  "
+                   f"spark {t.get('spark_reward', '-')}")
+
+
+@hive.command('scope')
+@click.argument('scope', type=click.Choice(sorted(_HIVE_SCOPES)))
+@click.pass_context
+def hive_scope(ctx, scope):
+    """Change which tasks this session will accept."""
+    server, json_output = ctx.obj['server'], ctx.obj['json_output']
+    result = _api_post(f'{server}/api/hive/session/scope',
+                       {'scope': scope}, json_output)
+    if result is None or json_output:
+        return
+    if not result.get('success'):
+        _error_exit(result.get('error', 'could not set scope'), json_output)
+    click.echo(f'Scope is now {scope}')
+
+
+def _hive_simple(ctx, path, done):
+    """pause / resume / disconnect all POST an empty body and report."""
+    server, json_output = ctx.obj['server'], ctx.obj['json_output']
+    result = _api_post(f'{server}/api/hive/session/{path}', {}, json_output)
+    if result is None or json_output:
+        return
+    if not result.get('success'):
+        _error_exit(result.get('error', f'{path} failed'), json_output)
+    click.echo(done)
+
+
+@hive.command('pause')
+@click.pass_context
+def hive_pause(ctx):
+    """Stop accepting new tasks, keep the session registered."""
+    _hive_simple(ctx, 'pause', 'Paused. No new tasks will be accepted.')
+
+
+@hive.command('resume')
+@click.pass_context
+def hive_resume(ctx):
+    """Start accepting tasks again."""
+    _hive_simple(ctx, 'resume', 'Resumed.')
+
+
+@hive.command('disconnect')
+@click.pass_context
+def hive_disconnect(ctx):
+    """Leave the hive and unregister from PeerLink."""
+    _hive_simple(ctx, 'disconnect', 'Disconnected.')
 
 
 # ─── Utilities ───

@@ -5,7 +5,7 @@ Talk to a Hevolve agent right from the docs. The frame below auto-guests you in,
 <div id="hevolve-plugin-wrap" style="max-width: 720px; margin: 24px auto; border: 1px solid #ddd; border-radius: 12px; overflow: hidden; position: relative; background: #fafafa;">
   <iframe
     id="hevolve-plugin-frame"
-    title="Hevolve agent — audio only"
+    title="Hevolve agent (audio only)"
     src="https://hevolve.ai/agents/Hevolve?plugin=1&audio_only=1&auto_guest=1"
     loading="lazy"
     allow="microphone; autoplay; clipboard-write"
@@ -28,8 +28,8 @@ The embed points at `https://hevolve.ai/agents/<AgentName>` with three URL param
 
 | Param | Effect |
 |---|---|
-| `plugin=1` | Convenience flag — implies `audio_only=1` and `auto_guest=1` together |
-| `audio_only=1` | Strips `video_url`, `teacher_avatar_id`, and filler video links from agent data before handing it to Demopage. Demopage's existing `videoUrl ? <video> : audioUrl ? <audio>` ternary then falls through to the audio-only branch with VoiceVisualizer — **no Demopage edits, no parallel page** |
+| `plugin=1` | Convenience flag: implies `audio_only=1` and `auto_guest=1` together |
+| `audio_only=1` | Strips `video_url`, `teacher_avatar_id`, and filler video links from agent data before handing it to Demopage. Demopage's existing `videoUrl ? <video> : audioUrl ? <audio>` ternary then falls through to the audio-only branch, so **Demopage is not edited and no second page exists** |
 | `auto_guest=1` | On mount, if no signed-in user and no prior guest: call `authApi.guestRegister({ guest_name, device_id })`, store the token + `guest_mode=true` in localStorage, then render. Idempotent: repeat visits reuse the existing guest |
 
 ## Why no new route
@@ -45,4 +45,4 @@ Drop the same frame markup on any page you control. Two prerequisites server-sid
 
 ## Consent
 
-Same guardrail posture as the rest of HARTOS — the mic permission is still a browser-level gate. The `allow="microphone"` attribute on the iframe *enables* the ask; the user's browser still prompts. No audio reaches the hive until the user accepts.
+Same guardrail posture as the rest of HARTOS: the mic permission is still a browser-level gate. The `allow="microphone"` attribute on the iframe *enables* the ask; the user's browser still prompts. No audio reaches the hive until the user accepts.

@@ -1,0 +1,241 @@
+name: Coverage Baseline
+
+# WHY THIS EXISTS (task #30)
+#   "100% test coverage" cannot be pursued while the CURRENT number is
+#   unknown, so the first deliverable is a MEASURED number — not a target.
+#
+#   Three attempts to measure it on the dev box failed, and the third proved
+#   the method was wrong rather than unlucky:
+#     * tests/unit collects 15,538 TESTS; collection ALONE takes 240s
+#     * the full sweep died at ~3% twice, at the same point, under two
+#       different timeouts (1700s / 2400s) — so not a timeout
+#     * an 80-file shard reached only 27% in 560s
+#   Repo-wide coverage on that box is a multi-hour job with one point of
+#   failure and ZERO partial value: a kill at 99% yields the same nothing as
+#   a kill at 3%. CI has the time budget; a laptop shared with cx_Freeze
+#   builds does not. So it belongs here.
+#
+# WHY IT IS NOW SHARDED (2026-08-03, after the FOURTH failure)
+#   Moving to CI did not fix it. Run 30778027342 ran the single job past its
+#   own 180-minute cap without producing a number — the same shape as the dev
+#   box, just with a bigger budget. One job measuring 15.5k tests keeps the
+#   property that made this task fail four times: no partial value.
+#
+#   Sharding gives it partial value. Four runners each measure a quarter of
+#   the test FILES, write `coverage run -p` data files, and a combine job
+#   merges them. If one shard dies the other three still produce data and the
+#   report says how many contributed, instead of the run yielding nothing.
+#   Same reasoning as flake-checks.yml's 4 nixosTest shards — and the
+#   ORIGINAL step already wrote `-p` data files "so a future SHARDED variant
+#   can `coverage combine` without changing this step's shape". This is that
+#   variant.
+#
+# MANUAL-FIRST, like nixos-vm-tests.yml: this is a long job and the first
+# runs exist to establish a number, not to gate anything. Once the baseline
+# is checked in, add the regression gate — a DROP fails, not "less than
+# 100%", because a gate nobody can pass gets disabled and then nothing is
+# measured at all.
+on:
+  workflow_dispatch:
+
+concurrency:
+  # A workflow_dispatch gets its OWN group (keyed by run id) so a manual,
+  # on-demand measurement is never cancelled by a later push. Same fix as
+  # 3f5ee290 applied to nix-check/nixos-vm-tests, where ref-only grouping
+  # made a week of runs unattributable.
+  group: coverage-baseline-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
+  cancel-in-progress: true
+
+env:
+  SHARD_TOTAL: 4
+
+jobs:
+  measure:
+    name: Coverage shard ${{ matrix.shard }}/4
+    runs-on: ubuntu-latest
+    # A quarter of the work, but still generous: the point is a run that
+    # FINISHES, and a cap that kills it reproduces the exact failure this job
+    # exists to escape.
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false      # one dead shard must not delete the other three
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Same setup as nix-check.yml's structural-test job — reused, not
+      # reinvented. tests/conftest.py pulls the project's runtime deps, so
+      # pytest cannot even collect without them.
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install pytest + coverage + project deps
+        run: |
+          pip install -r requirements.txt
+          pip install pytest coverage
+
+      - name: Run this shard under coverage
+        # -p writes a separate data file per process, which is what lets the
+        # combine job below merge four runners' results.
+        #
+        # The three exclusions are an ENV gap, not product defects: hevolveai
+        # is a closed-source Cython .pyd that is absent here exactly as it is
+        # on the dev box, and those three files fail at COLLECTION on its
+        # stub. A fourth blocker (test_site_pages) was a REAL defect and was
+        # FIXED in 804547c6 rather than excluded.
+        #
+        # `|| true`: a FAILING test must not abort the MEASUREMENT. This job
+        # answers "how much is covered", and the suite's pass/fail is gated
+        # elsewhere (flake-checks.yml). Without this a single red test yields
+        # no number at all — which is the state task #30 has been stuck in.
+        run: |
+          set -o pipefail
+          # Deterministic file sharding: sorted, then round-robin, so shard
+          # membership is stable across runs and a missing quarter is
+          # identifiable rather than arbitrary.
+          mapfile -t ALL < <(find tests/unit -name 'test_*.py' | sort)
+          TOTAL=${#ALL[@]}
+          echo "discovered $TOTAL test files"
+          if [[ "$TOTAL" -eq 0 ]]; then
+            echo "::error::found 0 test files — discovery is broken, and a green"
+            echo "::error::shard here would report coverage of nothing"
+            exit 1
+          fi
+          SKIP='tests/unit/test_simplemem_zep_parity.py tests/unit/test_user_context.py tests/unit/test_world_model_bridge.py'
+          SEL=()
+          for i in "${!ALL[@]}"; do
+            if (( i % SHARD_TOTAL == ${{ matrix.shard }} )); then
+              case " $SKIP " in
+                *" ${ALL[$i]} "*)
+                  echo "  skipping ${ALL[$i]} (hevolveai stub: fails at COLLECTION)"
+                  continue ;;
+              esac
+              SEL+=( "${ALL[$i]}" )
+            fi
+          done
+          echo "shard ${{ matrix.shard }} measures ${#SEL[@]} files"
+          if [[ "${#SEL[@]}" -eq 0 ]]; then
+            echo "nothing in this shard — writing no data file."
+            exit 0
+          fi
+          # --continue-on-collection-errors is LOAD-BEARING (first sharded run,
+          # 30785733712): ONE file failing to import aborts pytest's whole
+          # collection ("Interrupted: 1 error during collection"), so a 171-file
+          # shard ran ZERO tests and wrote no coverage data. The offender was
+          # tests/unit/test_livekit_audio_publisher.py (KeyError on its own
+          # module name). A single bad import must cost its own file, not the
+          # other 170.
+          coverage run -p -m pytest "${SEL[@]}" -q \
+            --noconftest -p no:cacheprovider \
+            --continue-on-collection-errors \
+            2>&1 | tail -30 || true
+          # THE `|| true` ABOVE IS WHY THIS CHECK EXISTS. It is there so a
+          # FAILING TEST cannot abort the MEASUREMENT — but it equally swallows
+          # a collection abort that measured nothing, and the first sharded run
+          # duly reported SUCCESS for a shard that produced no data at all.
+          # "Measured nothing" is a failure, exactly like "discovered 0 files".
+          # WHERE coverage ACTUALLY WROTE (run 30840295949). This step first
+          # looked for ./.coverage.* — the DEFAULT location — and found nothing
+          # even on a shard that ran 3951 tests, because .coveragerc:24 sets
+          #     data_file = test-reports/coverage/.coverage
+          # Asking coverage itself keeps .coveragerc the single source of truth
+          # instead of pasting that path into the workflow as a second copy
+          # that would silently rot if the config moved.
+          COV_DIR="$(python -c 'import coverage,os; d=os.path.dirname(coverage.Coverage().config.data_file); print(d or ".")')"
+          echo "coverage data dir (from .coveragerc): $COV_DIR"
+          echo "COV_DIR=$COV_DIR" >> "$GITHUB_ENV"
+          echo "=== data files produced ==="
+          if ! ls "$COV_DIR"/.coverage.* >/dev/null 2>&1; then
+            echo "::error::shard ${{ matrix.shard }} produced NO coverage data."
+            echo "::error::pytest ran but wrote nothing — look for a collection"
+            echo "::error::abort or an interpreter crash in the tail above."
+            exit 1
+          fi
+          ls -la "$COV_DIR"/.coverage.*
+
+      - name: Upload this shard's coverage data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # v4 requires a unique artifact name per job.
+          name: coverage-data-${{ matrix.shard }}
+          # $COV_DIR is exported to GITHUB_ENV by the step above, so the upload
+          # path follows .coveragerc rather than restating it.
+          path: ${{ env.COV_DIR }}/.coverage.*
+          include-hidden-files: true    # .coverage.* is dotfile-prefixed
+          if-no-files-found: warn
+
+  combine:
+    name: Combine shards + report the baseline
+    runs-on: ubuntu-latest
+    needs: measure
+    # ALWAYS: three shards' data is a real, partial answer and the report says
+    # how many contributed. Requiring all four would reproduce the
+    # all-or-nothing failure this rewrite exists to remove.
+    if: always()
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install coverage
+        run: pip install coverage
+
+      - name: Download every shard's data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-data-*
+          merge-multiple: true
+
+      - name: Combine + report
+        run: |
+          echo "=== shard data files recovered ==="
+          # download-artifact with merge-multiple flattens every shard's files
+          # into the CWD, so they land beside coverage's CONFIGURED data_file
+          # dir rather than inside it. Move them where `coverage combine` will
+          # look, which is the path .coveragerc names.
+          COV_DIR="$(python -c 'import coverage,os; d=os.path.dirname(coverage.Coverage().config.data_file); print(d or ".")')"
+          mkdir -p "$COV_DIR"
+          mv .coverage.* "$COV_DIR"/ 2>/dev/null || true
+          ls -la "$COV_DIR"/.coverage.* 2>/dev/null || echo "NONE"
+          # How many shards actually contributed. Printed because a number
+          # computed from two shards is NOT the repo baseline, and nothing
+          # else in this output would say so.
+          echo "shards reporting: $(ls "$COV_DIR"/.coverage.* 2>/dev/null | wc -l) data file(s)"
+          coverage combine || true
+          echo "=== PER-FILE (lowest 30 first) ==="
+          coverage report --sort=cover | head -35 || true
+          echo "=== TOTAL ==="
+          coverage report | tail -3 || true
+          # Machine-readable, so the baseline can be checked in from the run
+          # rather than transcribed by hand.
+          coverage json -o coverage.json || true
+          python - <<'PY'
+          import json
+          try:
+              d = json.load(open('coverage.json'))
+              t = d['totals']
+              print(f"COVERAGE_PERCENT={t['percent_covered']:.2f}")
+              print(f"COVERAGE_STATEMENTS={t['num_statements']}")
+              print(f"COVERAGE_MISSING={t['missing_lines']}")
+          except Exception as e:
+              print("could not read coverage.json:", e)
+          PY
+
+      - name: Upload the combined baseline
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-baseline
+          path: |
+            coverage.json
+          if-no-files-found: warn

@@ -10,6 +10,7 @@ Fix verified here:
 2. save() builds the snapshot under _lock but writes under _io_lock — the slow
    serialize never holds _lock (so another thread's add_task isn't wedged).
 """
+from core.constants import latency_budget
 import os
 import sys
 import threading
@@ -101,7 +102,7 @@ class TestSaveLockHygiene:
         elapsed = time.time() - t0
         slow.join(timeout=5)
         assert got is not None and got.task_id == 't0'
-        assert elapsed < 0.5, (
+        assert elapsed < latency_budget('coordinator_dedup_s'), (
             f"get_task blocked {elapsed:.2f}s during a slow save — _lock is "
             f"still held across the json.dump (lock-hygiene regression)")
 

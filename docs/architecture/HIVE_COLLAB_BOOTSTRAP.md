@@ -25,7 +25,7 @@ resources.** The `SEED_BOOTSTRAP_GOALS` in
 `integrations/agent_engine/goal_seeding.py` are the hive's curriculum (~70
 goals); left to one idle flywheel they cost days of 1-wide grind with a
 historically low completion rate, and left to N naive nodes they get CREATEd
-N times over. The fleet bootstrap protocol a session executes. The primitive is CODE:
+N times over. A session executes the fleet bootstrap protocol below. The primitive is CODE:
 `peer_reuse.try_peer_recipe_reuse` (called by the daemon before every CREATE)
 discovers whether any admitted peer already has this goal's recipe and pulls
 it. The session layers a SHARD STRATEGY on top so N nodes divide the CREATE
@@ -194,8 +194,8 @@ transports.
   GOSSIP HTTP so it works central-off and Nunba-off TODAY; the
   `TOPIC_MAP['recipe.available']` alias means the same publish rides WAMP
   prefix-subscription (`com.hertzai.hevolve.recipe.*`) the day a
-  node-local router ships -- no code change. This is capability routing +
-  instant curriculum spread; per-action compositional routing and
+  node-local router ships -- no code change. The result is capability routing
+  plus instant curriculum spread; per-action compositional routing and
   reputation-ranked specialization (5%-cap-guarded) are the next
   increments. Verified by `tests/unit/test_recipe_capability_mesh.py`.
 

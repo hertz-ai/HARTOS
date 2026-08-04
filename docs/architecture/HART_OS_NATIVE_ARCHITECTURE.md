@@ -14,7 +14,7 @@
 
 ## 1. North Star (v2 — intent-first)
 
-**HART OS becomes genuinely AI-native by making INTENT the primary operating surface —
+**HART OS becomes AI-native by making INTENT the primary operating surface —
 not by cloning Windows 11 and bolting an agent onto the app layer.**
 
 The self-review graded the compositor-first v1 at **4.5/10** with a precise verdict:
@@ -22,7 +22,7 @@ The self-review graded the compositor-first v1 at **4.5/10** with a precise verd
 `intent → decompose → compose` loop is **real** (`hart_intelligence_entry.py:8213` `/chat`
 runs a draft intent classifier routing free-form prompts to CREATE / REUSE / tool / vision /
 casual) — but **it never reaches the glass**, for two structural reasons this document now
-treats as the load-bearing fix, ahead of any compositor:
+treats as the fix that comes first, ahead of any compositor:
 
 1. **The surface is still a chatbot-launcher, not an intent composer.** `acSend`
    (`liquid_ui_service.py:3751`) string-matches `open X` → `openPanel` (launcher is the
@@ -65,7 +65,7 @@ window in a kiosk" to a first-class layer-shell surface (the background / deskto
 top-layer overlays, so it keeps being painted by WebKitGTK but now floats above real,
 agent-placeable native windows (Wine / Android / Flatpak / PWA) that the compositor tiles and
 **the agent can summon / place / arrange** — the moat no GNOME or Windows can match. But the
-honest distinction from "Linux + an agent" is **structural and lands brain-side first**: the AI
+distinction from "Linux + an agent" is **structural and lands brain-side first**: the AI
 is the deciding intelligence of the *session* (it composes the desktop from intent and arbitrates
 the shared local-LLM slot via `should_yield_to_user`), while humans hold control all the way
 down to who can place a window. **v1 was AI-at-the-app-layer-on-a-conventional-session; v2 is
@@ -99,19 +99,19 @@ place a window**.
    and a never-fail tier ladder guarantees that a half-finished compositor can never
    brick a user.
 
-### 1.2 The honesty discipline of this document
+### 1.2 Claims that were verified false in code
 
-This architecture was written against the tree, not against optimism. Several earlier
-"preserved" / "enhanced" claims were **verified false in code** and are corrected here
-rather than shipped on assumption. The corrections are load-bearing:
+This architecture was written against the tree. Several earlier "preserved" / "enhanced"
+claims were **verified false in code** and are corrected here rather than shipped on
+assumption. Each correction changed what got built:
 
 - The A2UI push path is **already broken cross-process** — `agent_ui_update`
   (`integrations/agent_engine/liquid_ui_service.py:394`) does only an allowlist check +
   a 5-item ring-buffer cap + an EventBus emit. There is **no** `GuardrailEnforcer`, **no**
   `ImmutableAuditLog`, **no** server-side escaping, and **zero**
   `ServiceRegistry.register('LiquidUIService')` anywhere in the tree (verified by grep).
-  The shell runs as its own systemd unit on `:6800`, separate from the `:6777` brain. So
-  the claim that `window.*` verbs "inherit" audit/guardrail/cap is **false**, and the
+  The shell runs as its own systemd unit on `:6800`, separate from the `:6777` brain. The
+  claim that `window.*` verbs "inherit" audit/guardrail/cap is therefore **false**, and the
   "FIXED by in-process co-location" claim is **asserted, not built**.
 - `core.ai_sensing` is per-process memory and `'screen'` has **zero enforcing consumers**
   today. Adding native windows + a screencast portal **net-regresses** the kill-switch
@@ -201,7 +201,7 @@ and Smithay is treated as a **later moat upgrade behind a sway-as-Tier-1 fast pa
   a NATIVE app, workspace switch) into compositor IPC instead of client-side div show/hide.
 - **Reuse:** **REUSED:** `liquid_ui_service.render_desktop_shell`, the `/shell/static`
   `static_url_path` fix (f294f52), all 13 JS modules, `_CSS_DESIGN_SYSTEM`, `ThemeService`
-  tokens, `shell_manifest`, shell os/desktop/system APIs. **Honest caveat (corrected from
+  tokens, `shell_manifest`, shell os/desktop/system APIs. **Caveat (corrected from
   source):** the shell ships as **GTK3 + WebKit2-4.1**; `gtk4-layer-shell` forces a GTK3→GTK4
   host-window port — so this is a *budgeted port with its own broken-GPU validation*, **not**
   a config flag, and **not** "JS untouched" if the dual-WebView model (Phase 4) is chosen.
@@ -228,8 +228,8 @@ and Smithay is treated as a **later moat upgrade behind a sway-as-Tier-1 fast pa
   existing realtime/SSE+WAMP fabric; `wlr-screencopy` for screenshot/cast routed through
   `core.ai_sensing` so the kill-switch governs app screencast too.
 - **Reuse:** reuses `ThemeService` (`--hart-*` tokens), `NotificationService.create`,
-  `core.ai_sensing` as the single screencast/mic gate, `realtime.publish_event`. **Honest
-  caveat:** GTK/Qt portal theming and the screencast backend are **NET-NEW code**, labeled
+  `core.ai_sensing` as the single screencast/mic gate, `realtime.publish_event`. **Caveat:**
+  GTK/Qt portal theming and the screencast backend are **NET-NEW code**, labeled
   as such — the only thing *preserved* is in-shell token application.
 
 ### L5 — App install / marketplace / bridge
@@ -264,13 +264,13 @@ blocked** on a first-ever Rust-Nix bring-up.
    (XWayland, decorations, layer-shell stacking). That glue is *where the AI-native WM value
    lives*, and the never-fail tiering means a half-finished HART-comp can never brick a user.
 
-### 3.2 The honest correction to the original rationale
+### 3.2 The correction to the original rationale
 
 The original decisive reason — *"in-ecosystem already; reuses existing Rust CI/packaging
 muscle; adds no new toolchain class"* — is **factually wrong about this repo**. There is
 **zero** `buildRustPackage` / `rustPlatform` / `cargoHash` anywhere in `nixos/` (verified),
 and the `claw_native/rust` crates + `hevolvearmor` are **not** referenced by any `.nix`
-module. So HART-comp would be the **first** Rust-in-Nix build in the tree — a brand-new
+module. HART-comp would therefore be the **first** Rust-in-Nix build in the tree — a brand-new
 toolchain class, a new bundle-accounting surface, and a new #70-VM-test-eval-gate risk
 **with no existing precedent to reuse**.
 
@@ -281,8 +281,8 @@ toolchain class, a new bundle-accounting surface, and a new #70-VM-test-eval-gat
   proving the crate graph resolves on the June-2025 pin *before* HART-comp depends on it.
 - **Ship sway as Tier-1 to deliver agent-driven windowing NOW.** Tier-2 already mandates a
   working sway + layer-shell setup that runs the same shell and shims tile/summon via
-  `swaymsg`. So sway-as-Tier-1 delivers the OS-native moat immediately; Smithay HART-comp is
-  a **later upgrade** behind the same never-fail watchdog.
+  `swaymsg`. Sway-as-Tier-1 therefore delivers the OS-native moat immediately; Smithay
+  HART-comp is a **later upgrade** behind the same never-fail watchdog.
 
 ### 3.3 The never-fail floor below HART-comp
 
@@ -317,7 +317,7 @@ behavior preserved) · **E** = enhanced (gains capability, never loses).
 | Voice Orb Visualizer (`voiceOrbViz.js`, 3-band WebAudio) | **P** | L2 top-layer region inside the shell WebView | Verbatim canvas renderer in the same WebKitGTK context. Only change is z-order: the orb's hero surface can be promoted to a top layer-shell overlay so it floats over native windows when speaking (subject to the Phase-4 single-vs-dual-WebView decision). |
 | Boot Splash (`hartBootSplash.js` + Lottie, 8s ceiling) | **P** | L2 in-shell overlay; compositor shows a solid-color KMS splash before the shell paints | JS overlay unchanged. HART-comp additionally paints a brand-color clear before the first WebView frame so there's no flash-of-black. |
 | Onboarding ceremony "Light Your HART" | **P** | L2 in-shell (primary); L3 `onboarding_routes` unchanged | In-shell `hartOnboarding.js` is canonical and unchanged. The opt-in native GTK4 pre-launch becomes "run as a HART-comp toplevel before the shell layer mounts" — same timeout-bounded, Esc-skippable contract. |
-| Lock screen / password / desktop widgets (`hartSessionUI.js`, salted SHA-256) | **E** | L2 lock overlay (UX) + L1 input-grab + display-manager/PAM (real boundary) | `hartSessionUI` stays the UX lock. HART-comp can grab input and blank app surfaces during lock via `ext-session-lock-v1`, closing the "lock is a removable div" gap **without** changing that PAM/display-manager remains the true auth boundary. See §7 for the autologin honesty gap + fix. |
+| Lock screen / password / desktop widgets (`hartSessionUI.js`, salted SHA-256) | **E** | L2 lock overlay (UX) + L1 input-grab + display-manager/PAM (real boundary) | `hartSessionUI` stays the UX lock. HART-comp can grab input and blank app surfaces during lock via `ext-session-lock-v1`, closing the "lock is a removable div" gap **without** changing that PAM/display-manager remains the true auth boundary. See §7 for the autologin gap + fix. |
 | Desktop icons (`hartDesktop.js`, grid-snap, persisted) | **P** | L2 | Pure client JS over `HartSession` blob; renders in the background shell surface unchanged. |
 | Virtual desktops / workspaces (`hartWorkspaces.js`) | **E** | L2 JS UI ↔ L1 **real** compositor workspaces | **Augment, not replace:** keep client-side panel show/hide on every tier (incl. cage); ALSO drive `MoveToWorkspace` for real native windows **only when** `com.hart.Compositor` is feature-detected. One source of truth per object class: shell panels = client state, native windows = compositor. |
 | Themes & wallpaper gallery (`hartPersonalize.js`, 8 presets, `ThemeService` `--hart-*`) | **E** | L2 + L4 portal Settings | `ThemeService` stays the single token source. `org.freedesktop.portal.Settings` bridges tokens so native GTK/Qt apps follow the HART theme — **labeled NET-NEW** portal code, not "free." |
@@ -330,7 +330,7 @@ behavior preserved) · **E** = enhanced (gains capability, never loses).
 | HART Design System (MD3 tokens, `ds-*` primitives, `dsBtn`/`dsModal`/`showToast`) | **P** | L2 inline `_CSS_DESIGN_SYSTEM` + `ThemeService` | Verbatim; same WebKitGTK engine renders it identically. |
 | Generative & adaptive UI (`ContextEngine` + `generate_ui`, `/api/ui`) | **P** | L3 — terminal/Conky degraded surface only | **NOT resurrected** as a boot path (zero desktop frontends fetch `/api/ui`). Remains the static/Conky fallback for headless/edge. A labeled source-guard (Phase 0) freezes this. |
 | Multi-surface render + kiosk compositor (WebKitGTK + cage, software-GL hardening, health-wait, Nunba fallback) | **M** | L1 HART-comp primary; cage = Tier-3 floor | cage moves from PRIMARY to the never-fail Tier-3 floor — its software-GL/DMABUF-off/health-wait/Nunba-fallback hardening preserved **verbatim** as the bottom tier. HART-comp reproduces the same guarantee at Tier-1. Browser + Nunba-desktop surfaces untouched. |
-| `/shell/static` static asset route (`static_url_path` fix, the dead-husk lesson) | **P** | L2/L3 `LiquidUIService._create_flask_app` | Unchanged and load-bearing. The "verify served assets with a real `test_client` fetch — inline-render is blind" lesson is carried into the compositor smoke test. |
+| `/shell/static` static asset route (`static_url_path` fix, the dead-husk lesson) | **P** | L2/L3 `LiquidUIService._create_flask_app` | Unchanged, and still what serves the assets. The "verify served assets with a real `test_client` fetch — inline-render is blind" lesson is carried into the compositor smoke test. |
 
 ### 4.2 The brain (recipe pipeline, FSM, daemon, A2A, MCP)
 
@@ -365,7 +365,7 @@ behavior preserved) · **E** = enhanced (gains capability, never loses).
 | Universal `AppManifest` + `AppRegistry` (9 types, `purpose` field, `to_shell_manifest`) | **P** | L5 `core/platform` | Verbatim; the single catalog the shell reads. Gains a **window-handle field** on launched native apps so the WM can map manifest ↔ toplevel. |
 | Browser/PWA install (Flathub browsers + `hart-pwa-install chromium --app`) | **P** | L0/L5 `hart-subsystems` | Unchanged; PWA `.desktop` launches a chromium toplevel HART-comp now manages natively. **No `.crx`/`.xpi` path** — carried as a known gap. |
 | App Bridge (`CapabilityRegistry`/`SemanticRouter`/`UnifiedClipboard`, `/v1/* :6810`, D-Bus, hardened unit) | **E** | L5 `app_bridge_service` + L1 compositor clipboard authority | Unchanged API. `UnifiedClipboard` is corrected to its real baseline (in-memory string + a side `wl-clipboard` sync unit, **not** a poller) and gains `wl_data_device` integration as explicit Smithay glue — keeping the in-memory + sync-unit fallback so cross-subsystem paste never regresses to nothing. |
-| NixOS subsystem layer (Flatpak/AppImage/Android-ART/Wine/PWA/Darling) | **P** | L0/L5 `hart-subsystems.nix` | Verbatim. **Honest limits carried forward UNCHANGED, not silently fixed:** Android ART is still `exec sleep infinity` inert; Wine success = unconditional `True` at the installer layer; macOS Darling default-off; no `.crx`/`.xpi`. Documented as openRisks (§9), not claimed solved. |
+| NixOS subsystem layer (Flatpak/AppImage/Android-ART/Wine/PWA/Darling) | **P** | L0/L5 `hart-subsystems.nix` | Verbatim. **Limits carried forward UNCHANGED, not silently fixed:** Android ART is still `exec sleep infinity` inert; Wine success = unconditional `True` at the installer layer; macOS Darling default-off; no `.crx`/`.xpi`. Documented as openRisks (§9), not claimed solved. |
 | Unified kernel layer (binder/ashmem/PE-binfmt/GPU/Landlock) | **P** | L0 `hart-kernel.nix` | Verbatim; HART-comp consumes the surfaces (XWayland for Wine toplevels, ART surfaces when/if real). |
 
 ### 4.4 Security (cross-layer, never weakened)
@@ -416,7 +416,7 @@ check + a 5-item ring-buffer truncation (a *display* cap, not a security control
 `EventBus` emit. There is **no** `GuardrailEnforcer`, **no** `ImmutableAuditLog`, **no**
 server-side escaping (escaping is client-side in `renderAgentOverlay`).
 
-So routing `CloseWindow` / fullscreen-takeover / `SummonApp` through this path **as-is**
+Routing `CloseWindow` / fullscreen-takeover / `SummonApp` through this path **as-is**
 would give destructive, OS-level desktop mutation the same unaudited, unguardrailed,
 server-trusting treatment as a cosmetic card — a **real security regression**, since window
 ops are far more dangerous than the cards the path was built for.
@@ -475,7 +475,7 @@ WM verb can re-enable senses.
   `window.unresponsive`; the self-healing daemon can offer to close + relaunch via the same
   IPC, audited.
 
-### 5.4 No phantom windows (the honest-success rule)
+### 5.4 No phantom windows (success keyed on a real window map)
 
 `app_installer.py:_install_windows` returns `success=True` after `subprocess.run`
 **regardless of whether any toplevel mapped** (the comment literally says *"Wine often
@@ -543,8 +543,8 @@ use `Type=notify` `READY=1` **once** + `Restart=on-failure`, **NOT** a periodic 
 ## 7. Preservation Gaps & Their Fixes
 
 The gaps the code contradicted, each with severity and the concrete fix that lands **before**
-the dependent capability ships. (Full detail per gap; these are the load-bearing
-corrections.)
+the dependent capability ships. (Full detail per gap; these are the corrections the build
+order depends on.)
 
 ### 7.1 BLOCKER — A2UI cross-process push path
 - **Risk:** `agent_ui_update` writes to a **process-local** `_agent_components` dict; the SSE
@@ -601,7 +601,7 @@ corrections.)
   the audited never-fail software-GL paint floor on an unproven GTK4 stack.
 - **Fix (Phase 4, explicit budgeted milestone):** pick **one** z-order model in code —
   (1) single layer-shell surface, overlays/orb co-planar with the desktop (native windows sit
-  ABOVE the orb — **stated honestly**), OR (2) two WebViews + a **real cross-WebView message
+  ABOVE the orb — **stated plainly**), OR (2) two WebViews + a **real cross-WebView message
   bus** replacing the implicit single-window sharing (then **drop "JS untouched"** and budget
   the bus). Treat GTK3→GTK4 as its own milestone with its **own** broken-GPU/llvmpipe paint
   proof; keep the GTK3 cage path **verbatim** as Tier-3.
@@ -634,11 +634,11 @@ corrections.)
 ### 7.7 MAJOR — Session lock / PAM boundary under autologin + cage
 - **Risk:** `desktop.nix` sets `displayManager.autoLogin.enable=true` + `defaultSession=
   hart-shell`, so a normal boot **never hits a PAM prompt** — the "true PAM boundary" the
-  honesty caveat leans on does not gate normal use. `/api/shell/session/lock` shells to
+  caveat leans on does not gate normal use. `/api/shell/session/lock` shells to
   `loginctl lock-session`, a **no-op under cage** (cage implements no session-lock protocol).
   The `ext-session-lock-v1` fix is scoped to Tier-1/2 only, leaving the audited Tier-3 floor
   with a lock button that does nothing.
-- **Fix (Phase 7):** state honestly that an autologin+cage boot has **no real lock**, then
+- **Fix (Phase 7):** state plainly that an autologin+cage boot has **no real lock**, then
   close it — disable autologin (require PAM at boot) **or** add a PAM-backed kiosk lock so
   `lock-session` is not a silent no-op. For Tier-1/2, ship `ext-session-lock-v1` as actual
   code with a test that `loginctl lock-session` blanks app surfaces + requires PAM re-auth.
@@ -718,7 +718,7 @@ A2UI co-location fix.
 
 ---
 
-## 9. Open Risks (carried honestly, not claimed solved)
+## 9. Open Risks (carried, not claimed solved)
 
 1. **Smithay glue burden is real.** XWayland, CSD-vs-SSD decorations, layer-shell stacking,
    multi-output, fractional scaling, clipboard/data-device — all things wlroots gives for free
@@ -727,7 +727,7 @@ A2UI co-location fix.
    ONE native window class (XWayland/Wine)."* Do **not** block the OS on a complete compositor.
 2. **A2UI co-location vs split topology must be verified before commit** — it is a real,
    untested migration deliverable (§7.1), not an assumption.
-3. **Android is genuinely inert** — `hart-android-runtime` = `exec sleep infinity`, no
+3. **Android is inert** — `hart-android-runtime` = `exec sleep infinity`, no
    ART/Waydroid. Native Android windows are **vaporware** until a real surface exists.
 4. **Wine launch-success is unconditional `True`** at the installer layer; **macOS/Darling is
    a stub** — `SummonApp` must report real toplevel-map success (§5.4), or agents think they
@@ -765,7 +765,7 @@ A2UI co-location fix.
 built and VM-proven **before** any compositor becomes default; the pre-existing
 A2UI/ai_sensing/audit gaps are **closed before** `window.*` or portal screencast; Smithay is a
 later moat upgrade behind sway-as-Tier-1. **Every phase is additive behind the watchdog; every
-claim becomes a tested deliverable or an honestly-labeled openRisk.**
+claim becomes a tested deliverable or a labeled openRisk.**
 
 | Phase | Title | Gate to unlock the next |
 |---|---|---|
@@ -774,7 +774,7 @@ claim becomes a tested deliverable or an honestly-labeled openRisk.**
 | **2** | Close pre-existing A2UI/audit/ai_sensing gaps in the BRAIN (display-independent) | cross-process A2UI push observable on SSE; circuit-breaker-halted push refused + audited; capture refused when `screen` cut |
 | **3** | HART-comp skeleton (tinywl-class) + software-render floor, **opt-in only** | `buildRustPackage` precedent lands; eval gate green; pixman paints on GBM-fail fixture; tampered binary trips integrity monitor; crash-loop lands on cage |
 | **4** | Glass shell as layer-shell surface — the GTK3→GTK4 host-window port (explicit, budgeted, re-validated) | GTK4 layer-shell paints on llvmpipe + real `/shell/static` fetch; z-order model proven per chosen option |
-| **5** | Native app windows (xdg-shell + XWayland) + honest install→real-window path | `SummonApp` reports FAILURE on a no-map fixture (no phantom window); iframe-panel path preserved |
+| **5** | Native app windows (xdg-shell + XWayland) + an install→real-window path with no phantom success | `SummonApp` reports FAILURE on a no-map fixture (no phantom window); iframe-panel path preserved |
 | **6** | AI-native WM IPC wired to the brain — agents arrange REAL windows, fully audited | `window.close` on a focused window refused without PREVIEW + recorded in audit chain; workspaces still work on cage; governor does not trip from compositor render CPU |
 | **7** | L4 portals + REAL cross-process AI-senses screencast gate + theming | screencast REFUSED when `screen` disabled (not just flag set); `ext-session-lock-v1` blanks surfaces + PAM re-auth; theme applies in-shell with no portal |
 | **8** | Effects, polish, sway Tier-2 parity, meet-copilot pinning (behind its real deps), telemetry, route consolidation | effects degrade to flat (never black) on broken GPU; sway shim arranges windows; route-collision guard green |
@@ -806,7 +806,7 @@ grep.
 software-GL VM **AND** its supervisor fault-injection proves the floor still paints **AND** its
 never-break gates pass — only then does the next additive phase unlock behind the same watchdog.
 
-### 10.2 Honest hardware limits (why this is docs-only today)
+### 10.2 Hardware limits (why this is docs-only today)
 
 - **No Wayland compositor, KMS/DRM, libinput, gtk4-layer-shell, or Smithay/Rust build can be
   compiled or booted on the Windows dev box.** Every L1/L2 paint, software-GL fallback, XWayland,

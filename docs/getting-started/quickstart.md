@@ -34,14 +34,26 @@ pip install -r requirements.txt
 
 ## 2. Configure Environment
 
-Create a `.env` file in the project root:
+**No API key is required.** With none set, chat is served by a local model
+through llama.cpp. That is the point: it works with the wifi off, and what you
+type stays on the machine because there is nowhere else for it to go.
+
+Local is the floor, not the ceiling. When a turn is beyond what the local model
+should take, it can be handed whole to a peer whose model is bigger, rather than
+answered badly. That path is opt-in per node (`HEVOLVE_HIVE_ADVERTISE=1` plus a
+public endpoint), so on a network where nobody has opted in it simply stays
+local. Anything that leaves the device is consent-gated, and the consent prompt
+fans out to your own devices for an explicit yes.
+
+Add a key only if you also want a cloud route. Create a `.env` file in the
+project root:
 
 ```
-OPENAI_API_KEY=your-openai-key
-GROQ_API_KEY=your-groq-key
+OPENAI_API_KEY=your-openai-key      # optional
+GROQ_API_KEY=your-groq-key          # optional
 ```
 
-At minimum, one of these API keys is required. See [Configuration](configuration.md) for the full list of environment variables.
+See [Configuration](configuration.md) for the full list of environment variables.
 
 ---
 
@@ -57,7 +69,10 @@ python hart_intelligence_entry.py
 scripts/start_docker.sh
 ```
 
-The server starts on `http://localhost:6777` using Waitress as the production WSGI server.
+The server starts on `http://localhost:6777`. It runs on Hypercorn (ASGI), so
+idle keep-alive and SSE clients do not each hold a worker thread; Waitress is
+the fallback when the Hypercorn stack is unavailable, such as in a frozen
+bundle missing the h2/wsproto chain.
 
 ---
 

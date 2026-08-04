@@ -15,6 +15,8 @@ Usage:
     pytest tests/test_nixos_configs.py -v
 """
 
+import ast
+import glob
 import os
 import re
 import pytest
@@ -25,6 +27,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 NIXOS_DIR = os.path.join(REPO_ROOT, "nixos")
 MODULES_DIR = os.path.join(NIXOS_DIR, "modules")
 CONFIGS_DIR = os.path.join(NIXOS_DIR, "configurations")
+PROFILES_DIR = os.path.join(NIXOS_DIR, "profiles")
 PACKAGES_DIR = os.path.join(NIXOS_DIR, "packages")
 HARDWARE_DIR = os.path.join(NIXOS_DIR, "hardware")
 ASSETS_DIR = os.path.join(NIXOS_DIR, "assets")
@@ -37,6 +40,21 @@ def read_nix(path):
     full = os.path.join(REPO_ROOT, path) if not os.path.isabs(path) else path
     with open(full, "r", encoding="utf-8") as f:
         return f.read()
+
+
+def read_variant(variant):
+    """The variant's COMPOSED text surface: configuration + feature profile.
+
+    The 2026-07-28 extraction (5975c519) moved the hart.* feature block
+    VERBATIM from configurations/<v>.nix into profiles/<v>.nix, and
+    mkHartSystem imports BOTH.  A test asserting the variant's feature
+    surface must therefore read the union — reading the configuration
+    alone re-broke every variant-feature assertion in this file the day
+    the profiles landed.
+    """
+    name = variant if variant.endswith(".nix") else variant + ".nix"
+    return (read_nix(os.path.join(CONFIGS_DIR, name))
+            + read_nix(os.path.join(PROFILES_DIR, name)))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -117,6 +135,13 @@ class TestFileExistence:
     def test_configuration_exists(self, config):
         path = os.path.join(CONFIGS_DIR, config)
         assert os.path.isfile(path), f"Config missing: nixos/configurations/{config}"
+
+    @pytest.mark.parametrize("config", EXPECTED_CONFIGS)
+    def test_profile_exists(self, config):
+        # Every variant has a feature profile (the 2026-07-28 extraction):
+        # read_variant() composes configuration + profile, so both must exist.
+        path = os.path.join(PROFILES_DIR, config)
+        assert os.path.isfile(path), f"Feature profile missing: nixos/profiles/{config}"
 
     @pytest.mark.parametrize("pkg", EXPECTED_PACKAGES)
     def test_package_exists(self, pkg):
@@ -247,7 +272,7 @@ class TestServerVariant:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "server.nix"))
+        self.config = read_variant("server")
 
     def test_variant_is_server(self):
         assert 'variant = "server"' in self.config
@@ -281,7 +306,7 @@ class TestDesktopVariant:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        self.config = read_variant("desktop")
 
     def test_variant_is_desktop(self):
         assert 'variant = "desktop"' in self.config
@@ -330,7 +355,7 @@ class TestEdgeVariant:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "edge.nix"))
+        self.config = read_variant("edge")
 
     def test_variant_is_edge(self):
         assert 'variant = "edge"' in self.config
@@ -369,7 +394,7 @@ class TestPhoneVariant:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "phone.nix"))
+        self.config = read_variant("phone")
 
     def test_variant_is_phone(self):
         assert 'variant = "phone"' in self.config
@@ -689,7 +714,7 @@ class TestNixSyntaxPatterns:
     @pytest.mark.parametrize("config", EXPECTED_CONFIGS)
     def test_config_sets_variant(self, config):
         """Each configuration must set hart.variant."""
-        content = read_nix(os.path.join(CONFIGS_DIR, config))
+        content = read_variant(config)
         assert "variant" in content, \
             f"{config} doesn't set hart.variant"
 
@@ -1046,7 +1071,7 @@ class TestServerAINativeModules:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "server.nix"))
+        self.config = read_variant("server")
 
     def test_model_bus_enabled(self):
         assert "modelBus" in self.config
@@ -1085,7 +1110,7 @@ class TestDesktopAINativeModules:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        self.config = read_variant("desktop")
 
     def test_model_bus_enabled(self):
         assert "modelBus" in self.config
@@ -1132,7 +1157,7 @@ class TestEdgeAINativeModules:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "edge.nix"))
+        self.config = read_variant("edge")
 
     def test_compute_mesh_enabled(self):
         assert "computeMesh" in self.config
@@ -1167,7 +1192,7 @@ class TestPhoneAINativeModules:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "phone.nix"))
+        self.config = read_variant("phone")
 
     def test_model_bus_enabled(self):
         assert "modelBus" in self.config
@@ -1547,7 +1572,7 @@ class TestOSKModule:
         assert "hart-osk.nix" in flake
 
     def test_phone_enables_osk(self):
-        phone = read_nix(os.path.join(CONFIGS_DIR, "phone.nix"))
+        phone = read_variant("phone")
         assert "osk" in phone
 
 
@@ -1649,7 +1674,7 @@ class TestHartlogCreateModule:
     def test_desktop_enables_it(self):
         """Cross-config wiring the nixosTest (which enables it via mkNode, not the
         desktop closure) does NOT cover: the shipped desktop must opt it on."""
-        desktop = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        desktop = read_variant("desktop")
         assert "hartlogCreate.enable = true" in desktop
 
 
@@ -1716,7 +1741,7 @@ class TestBootContinuityModule:
 
     def test_desktop_enables_it(self):
         """Cross-config wiring the nixosTest (mkNode enable) does not cover."""
-        desktop = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        desktop = read_variant("desktop")
         assert "bootContinuity.enable = true" in desktop
 
 
@@ -1767,7 +1792,7 @@ class TestBootLogModule:
 
     def test_desktop_enables_it(self):
         """Cross-config wiring the nixosTest (mkNode enable) does not cover."""
-        desktop = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        desktop = read_variant("desktop")
         assert "bootLog.enable = true" in desktop
 
 
@@ -1833,7 +1858,7 @@ class TestBootRootInitrdModule:
     def test_desktop_enables_it(self):
         """Cross-config wiring the nixosTest (mkNode enable) does not cover: the real
         USB-boot ISO config turns the guard ON."""
-        desktop = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        desktop = read_variant("desktop")
         assert "bootRootInitrd.enable = true" in desktop
 
 
@@ -1964,11 +1989,11 @@ class TestBootNixosTestsRegistered:
         assert "useEFIBoot" in content
         # It drives the poweroff via the scheduled-shutdown record + a recorder.
         assert "MODE=poweroff" in content
-        # The node must be built in the CI VM workflow (a test that never runs
-        # guards nothing — Gate 5).
-        wf = read_nix(os.path.join(REPO_ROOT, ".github", "workflows", "nixos-vm-tests.yml"))
-        assert "hart-boot-continuity-poweroff-gate" in wf, \
-            "VM workflow does not build hart-boot-continuity-poweroff-gate — it would never gate"
+        # "and it must RUN in CI" is no longer a per-check fact. The VM gate
+        # (flake-checks.yml) enumerates every check DYNAMICALLY, so DEFINING it
+        # is what makes it run. That mechanism is guarded once, by
+        # TestTheVmGateEnumeratesDynamically — asserting it here too would be
+        # three copies of one fact.
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2123,7 +2148,7 @@ class TestSessionSupervisorDesktopWiring:
 
     @pytest.fixture(autouse=True)
     def load_config(self):
-        self.config = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        self.config = read_variant("desktop")
 
     def test_desktop_enables_supervisor(self):
         assert "sessionSupervisor" in self.config
@@ -2262,10 +2287,17 @@ class TestSessionSupervisorNixTestWiring:
         assert "HART_INPUT_ALIVE_FLAG" in self.nixtest
         assert "input-alive" in self.nixtest
 
-    def test_each_new_node_in_ci_vm_workflow(self):
-        """Every check that should RUN must be built explicitly in the VM workflow
-        (the workflow targets checks by name, not `nix flake check`)."""
-        wf = read_nix(os.path.join(REPO_ROOT, ".github", "workflows", "nixos-vm-tests.yml"))
+    def test_each_new_node_is_defined_so_the_gate_discovers_it(self):
+        """Every supervisor node must be DEFINED — which is what makes it run.
+
+        WAS: "must appear in nixos-vm-tests.yml's build list". That list is
+        gone; the workflow delegates to flake-checks.yml, whose nixos-tests job
+        enumerates checks with
+            nix eval .#checks.x86_64-linux --apply builtins.attrNames
+        and shards them. A check runs BECAUSE it is defined, so the thing worth
+        asserting here is that these nodes still exist — the enumeration
+        mechanism itself is guarded once, in TestTheVmGateEnumeratesDynamically.
+        """
         for node in [
             "hart-session-supervisor-tier-drop",
             "hart-session-supervisor-paint-watchdog",
@@ -2278,7 +2310,10 @@ class TestSessionSupervisorNixTestWiring:
             "hart-session-supervisor-input-watchdog-keep",
             "hart-session-supervisor-input-watchdog-disabled",
         ]:
-            assert node in wf, f"VM workflow does not build/run {node} — it would never gate"
+            assert node in self.nixtest, (
+                f"{node} is no longer defined in session-supervisor.nix — a "
+                f"dynamic gate runs whatever exists, so deleting the check "
+                f"deletes the verification silently")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2358,3 +2393,1539 @@ class TestSeatDrmBringUp:
         assert "tierTermGraceSeconds" in self.sup
         assert "drmMasterSettleSeconds" in self.sup
         assert "drm_master_settle" in self.sup
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Firmware-support matrix: which medium boots which firmware
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestFirmwareSupportMatrix:
+    """Every shipped medium's firmware support is PINNED, not assumed.
+
+    The goal says "All Bios compatibility like hyper v etc" and this is the
+    file that can hold the whole matrix in one place. The gap it caught
+    (2026-07-30): only the SERVER iso set isoImage.makeBiosBootable, so the
+    desktop and edge ISOs were built EFI-ONLY — no El Torito BIOS image, no
+    isolinux — and a legacy-BIOS machine, including a Hyper-V GENERATION 1
+    VM which has no UEFI at all, could not boot them even to reach the
+    installer.
+
+    Structural by necessity (these are Nix build-time options; the
+    behavioural half is the ISO build itself in CI plus a real Gen-1 boot),
+    and deliberately NOT the only coverage: the guest-agent and microcode
+    claims from the same parity pass are asserted on a booted VM in
+    nixos/tests/vm-tests.nix.
+    """
+
+    ISO_VARIANTS = ["desktop.nix", "server.nix", "edge.nix"]
+
+    @pytest.mark.parametrize("cfg", ISO_VARIANTS)
+    def test_every_iso_is_bios_bootable(self, cfg):
+        src = read_nix(os.path.join(CONFIGS_DIR, cfg))
+        assert "makeBiosBootable" in src, (
+            f"{cfg}'s ISO is EFI-ONLY — a BIOS/CSM machine (or a Hyper-V "
+            f"Gen 1 VM, which has no UEFI) cannot boot it at all")
+
+    def test_raw_image_is_uefi_only_by_design(self):
+        """The raw image is UEFI-only ON PURPOSE — pin the design choice so a
+        later 'fix' does not quietly bolt GRUB onto systemd-repart's
+        Discoverable-Partitions + UKI model. BIOS users install from the ISO."""
+        src = read_nix(os.path.join(MODULES_DIR, "hart-repart-image.nix"))
+        assert "boot.loader.systemd-boot.enable = true" in src
+        assert "boot.loader.grub.enable = false" in src
+        assert "UEFI-only" in src, "the UEFI-only decision must stay documented"
+
+    def test_installer_picks_the_bootloader_from_firmware(self):
+        """An INSTALLED system supports both firmwares: the installer probes
+        /sys/firmware/efi and writes systemd-boot or GRUB accordingly."""
+        src = read_nix(os.path.join(MODULES_DIR, "hart-installer.nix"))
+        assert "/sys/firmware/efi" in src, "installer must probe the firmware"
+        assert "boot.loader.grub.enable = true" in src, "no BIOS path in the installer"
+        assert "boot.loader.systemd-boot.enable = true" in src, "no EFI path"
+
+    def test_installed_bios_path_keeps_os_prober(self):
+        """Dual-boot on BIOS needs os-prober or Windows vanishes from the menu."""
+        src = read_nix(os.path.join(MODULES_DIR, "hart-installer.nix"))
+        assert "useOSProber = true" in src
+
+
+class TestHypervisorGuestParity:
+    """Guest integration is configured for EVERY hypervisor, not just QEMU.
+
+    Windows and macOS guests get display resize, clipboard, graceful
+    host-initiated shutdown and host time sync out of the box; HART shipped
+    none of it. All stock NixOS options, so this pins that they stay wired.
+    Behavioural counterpart: the 'hypervisor guest agents are configured'
+    subtest in nixos/tests/vm-tests.nix asserts the units on a real boot.
+    """
+
+    def setup_method(self):
+        self.base = read_nix(os.path.join(MODULES_DIR, "hart-base.nix"))
+
+    @pytest.mark.parametrize("opt", [
+        "virtualisation.hypervGuest.enable",   # Hyper-V (incl. hv_utils time sync)
+        "services.qemuGuest.enable",           # QEMU / KVM / Proxmox
+        "services.spice-vdagentd.enable",      # SPICE clipboard + auto-resize
+        "virtualisation.vmware.guest.enable",  # open-vm-tools
+    ])
+    def test_guest_agent_is_configured(self, opt):
+        assert opt in self.base, (
+            f"{opt} missing — a HART guest on that hypervisor loses display "
+            f"resize / clipboard / graceful shutdown that Windows guests have")
+
+    def test_vmware_guest_is_x86_gated(self):
+        """open-vm-tools does not exist on aarch64; an ungated enable breaks
+        every ARM variant's eval."""
+        assert "isx86" in self.base
+
+    @pytest.mark.parametrize("opt", [
+        "hardware.cpu.intel.updateMicrocode",
+        "hardware.cpu.amd.updateMicrocode",
+    ])
+    def test_cpu_microcode_is_applied(self, opt):
+        """Both closed OSes ship microcode; missing it is a silent
+        correctness/security exposure."""
+        assert opt in self.base
+
+    def test_microcode_rides_existing_firmware_consent(self):
+        """No NEW licensing decision: microcode is gated on the same
+        redistributable-firmware consent the wifi firmware already uses."""
+        assert "enableRedistributableFirmware" in self.base
+
+
+class TestEnabledOptionsExist:
+    """Every hart.<feature> a profile enables must come from a module that is
+    actually in hartModules.
+
+    THE BUG THIS CATCHES (2026-07-30, run 30567029164): three module FILES —
+    hart-openclaw.nix, hart-scanner.nix, hart-sso.nix — sat in the tree with
+    complete option sets and config but were never added to the flake's
+    hartModules list. Their options therefore did not EXIST, so nothing could
+    turn them on, and the moment a profile did the WHOLE flake eval aborted:
+
+        error: The option `hart.openclaw' does not exist.
+
+    A file on disk is not a loaded module. Local + instant; the eval gate
+    catches it too, but only after a CI round trip that took every unrelated
+    target red with it.
+    """
+
+    FLAKE = os.path.join(NIXOS_DIR, "flake.nix")
+
+    def _loaded_modules(self):
+        src = read_nix(self.FLAKE)
+        return set(re.findall(r'\./modules/(hart-[\w-]+)\.nix', src))
+
+    def _module_defining(self, feature):
+        """The module file whose options block defines hart.<feature>."""
+        for path in glob.glob(os.path.join(MODULES_DIR, "hart-*.nix")):
+            src = read_nix(path)
+            if re.search(r'config\.hart\.' + re.escape(feature) + r'\b', src) or \
+               re.search(r'options\.hart\.' + re.escape(feature) + r'\b', src):
+                return os.path.basename(path)[:-4]
+        return None
+
+    @pytest.mark.parametrize("variant", ["desktop", "server", "edge", "phone"])
+    def test_every_enabled_feature_has_a_loaded_module(self, variant):
+        prof = read_nix(os.path.join(PROFILES_DIR, variant + ".nix"))
+        loaded = self._loaded_modules()
+        # Features the profile turns on, as `<name>.enable = true` or
+        # `<name> = { ... enable = true; ... }` inside the hart block.
+        enabled = set(re.findall(r'^\s{4}([a-zA-Z][\w]*)\.enable\s*=\s*true',
+                                 prof, re.M))
+        enabled |= set(re.findall(r'^\s{4}([a-zA-Z][\w]*)\s*=\s*\{', prof, re.M))
+        missing = []
+        for feat in sorted(enabled):
+            mod = self._module_defining(feat)
+            if mod is not None and mod not in loaded:
+                missing.append(f"hart.{feat} (defined in {mod}.nix)")
+        assert not missing, (
+            f"{variant}.nix enables options whose modules are NOT in the "
+            f"flake's hartModules — the option does not exist and the WHOLE "
+            f"eval aborts: {missing}")
+
+    def test_every_module_file_is_loaded(self):
+        """A module file nobody imports is dead code that looks live — the
+        exact shape of the openclaw/scanner/sso gap. Deliberate exclusions
+        are listed here so the reason is written down, not implied."""
+        # hart-app / package helpers are not NixOS modules; ARM/board files
+        # live under hardware/ and are imported per-machine.
+        EXPECTED_UNLOADED = set()
+        on_disk = {os.path.basename(p)[:-4]
+                   for p in glob.glob(os.path.join(MODULES_DIR, "hart-*.nix"))}
+        unloaded = on_disk - self._loaded_modules() - EXPECTED_UNLOADED
+        assert not unloaded, (
+            f"module files present but never imported into hartModules "
+            f"(their hart.* options do not exist): {sorted(unloaded)}")
+
+
+class TestNoRequiredOptionTraps:
+    """A module option with a type but NO default is REQUIRED — and the
+    instant its module is imported and enabled, eval ABORTS.
+
+    THE CASCADE THIS ENDS (2026-07-30, three CI rounds, one per error
+    because nix stops at the first):
+      round 1  error: The option `hart.openclaw' does not exist
+      round 2  (three modules unwired — two hidden behind the first)
+      round 3  error: The option `hart.sso.domain' was accessed but has
+               no value defined      ... with ldapUri and ldapBaseDn each
+               queued behind it as rounds 4 and 5.
+
+    Every one of those cost a full CI cycle to learn ONE fact. This
+    asserts the whole class locally in milliseconds.
+
+    The rule: a required option is only acceptable when EVERY consumer is
+    guaranteed to set it. `hart.package` qualifies — mkNode, every
+    configuration and mkInstalledSystem all set it explicitly, and a
+    default would silently ship the wrong closure. Anything else must
+    carry a default and, if it needs real configuration, an assertion
+    that says so in a sentence.
+    """
+
+    # Options allowed to stay required, with the reason they are safe.
+    ALLOWED_REQUIRED = {
+        # (module, option): why
+        ("hart-base", "package"): "every consumer sets it; a default would ship the wrong app",
+        ("hart-comp", "package"): "compositor package is wired per-consumer",
+        ("hart-rust-precedent", "package"): "package is wired per-consumer",
+    }
+
+    def _required_options(self):
+        """(module, option, type) for every mkOption with a type and no
+        default — the exact shape that aborts eval when enabled."""
+        found = []
+        for path in sorted(glob.glob(os.path.join(MODULES_DIR, "hart-*.nix"))):
+            src = read_nix(path)
+            mod = os.path.basename(path)[:-4]
+            for m in re.finditer(
+                    r'(\w+)\s*=\s*lib\.mkOption\s*\{(.*?)\n\s*\};', src, re.S):
+                name, body = m.group(1), m.group(2)
+                # `default` must be an ASSIGNMENT, not the word appearing in
+                # prose. `"default" in body` also matched description/example
+                # text, so any option documented as "there is no default; ..."
+                # or "defaults to X" was skipped UNCHECKED — a latent hole in
+                # the guard everyone now trusts INSTEAD of a CI round (found
+                # by the reviewing session against a synthetic module; no live
+                # instance among 69 modules / 257 real `default =`).
+                if re.search(r'^\s*default\s*=', body, re.M) \
+                        or "mkEnableOption" in body:
+                    continue
+                if "type" not in body:
+                    continue
+                found.append((mod, name))
+        return found
+
+    def test_no_module_declares_an_unguarded_required_option(self):
+        offenders = [f"hart.{opt} (in {mod}.nix)"
+                     for mod, opt in self._required_options()
+                     if (mod, opt) not in self.ALLOWED_REQUIRED]
+        assert not offenders, (
+            "these options have a type but NO default, so enabling their "
+            "module aborts the WHOLE flake eval with 'was accessed but has "
+            "no value defined' — give each a default plus an assertion, or "
+            "add it to ALLOWED_REQUIRED with the reason it is safe: "
+            f"{offenders}")
+
+    def test_sso_is_configured_or_disabled_never_half(self):
+        """SSO is the case that proved the rule: an LDAP client needs
+        site-specific values HART cannot invent. Either a profile sets all
+        three alongside enable, or it does not enable it at all."""
+        for variant in ("desktop", "server", "edge", "phone"):
+            prof = read_nix(os.path.join(PROFILES_DIR, variant + ".nix"))
+            if re.search(r'^\s+sso\.enable\s*=\s*true', prof, re.M):
+                for opt in ("domain", "ldapUri", "ldapBaseDn"):
+                    assert re.search(r'sso\.' + opt + r'\s*=|' + opt + r'\s*=',
+                                     prof), (
+                        f"{variant} enables hart.sso without setting {opt} — "
+                        f"an SSO client with no directory does nothing and "
+                        f"trips the module's assertion")
+
+    def test_sso_module_has_defaults_and_an_assertion(self):
+        """The consumer-protecting half: defaults so eval survives, an
+        assertion so an unconfigured enable fails readably."""
+        src = read_nix(os.path.join(MODULES_DIR, "hart-sso.nix"))
+        assert "assertions" in src, "hart-sso must assert on unconfigured enable"
+        for opt in ("domain", "ldapUri", "ldapBaseDn"):
+            block = re.search(opt + r'\s*=\s*lib\.mkOption\s*\{(.*?)\n\s*\};',
+                              src, re.S)
+            assert block and "default" in block.group(1), (
+                f"hart.sso.{opt} still has no default — it will abort eval")
+
+
+class TestHardeningSurvivesFeatureEnables:
+    """A security hardening must never be undone as a SIDE EFFECT of enabling
+    an unrelated feature.
+
+    THE REGRESSION (2026-07-30, introduced then caught in the same session):
+    hart-devtools set `kernel.yama.ptrace_scope = 0` with NO priority inside
+    its debugger bundle. hart-security sets it to `mkDefault 1`, and in the
+    NixOS module system a plain definition BEATS mkDefault — so the moment
+    the desktop profile enabled devtools, every shipped machine silently got
+    unrestricted ptrace (any process may read any other of the same user)
+    while nixos/tests/security.nix still asserted it was 1.
+
+    Neither Windows (SeDebugPrivilege) nor macOS (SIP + entitlements) ships
+    that open, so restricted is also the parity-correct default.
+    """
+
+    def test_ptrace_is_only_opened_by_an_explicit_opt_in(self):
+        src = read_nix(os.path.join(MODULES_DIR, "hart-devtools.nix"))
+        assert "ptraceUnrestricted" in src, (
+            "opening ptrace must be its own opt-in, not a side effect of "
+            "installing a debugger")
+        # The debugger bundle must no longer touch ptrace at all.
+        debug_block = re.search(
+            r'\(lib\.mkIf cfg\.debug \{(.*?)\n    \}\)', src, re.S)
+        assert debug_block, "could not locate the cfg.debug block"
+        assert "ptrace_scope" not in debug_block.group(1), (
+            "the debug bundle still changes ptrace_scope — installing gdb "
+            "must not change the machine's security posture")
+
+    def test_opening_ptrace_is_loud_when_it_happens(self):
+        """An override of a hardening must be mkForce — visible in source,
+        not an accident of merge priority."""
+        src = read_nix(os.path.join(MODULES_DIR, "hart-devtools.nix"))
+        block = re.search(
+            r'lib\.mkIf cfg\.ptraceUnrestricted \{(.*?)\}\)', src, re.S)
+        assert block and "mkForce" in block.group(1), (
+            "ptrace opt-in must mkForce so it deliberately (and visibly) "
+            "overrides hart-security's default")
+
+    def test_security_hardening_still_defaults_restricted(self):
+        src = read_nix(os.path.join(MODULES_DIR, "hart-security.nix"))
+        assert re.search(r'"kernel\.yama\.ptrace_scope"\s*=\s*lib\.mkDefault 1',
+                         src), "hart-security must still default ptrace to 1"
+
+    def test_no_profile_silently_opens_ptrace(self):
+        for variant in ("desktop", "server", "edge", "phone"):
+            prof = read_nix(os.path.join(PROFILES_DIR, variant + ".nix"))
+            assert "ptraceUnrestricted" not in prof, (
+                f"{variant} opts into unrestricted ptrace — that is a "
+                f"deliberate developer-box choice, not a shipped default")
+
+
+class TestDriverFirmwareBreadth:
+    """Device firmware and microcode reach EVERY variant.
+
+    THE GAP (2026-07-30): hardware.enableRedistributableFirmware was set only
+    in profiles/desktop.nix. Server and edge therefore shipped with no
+    redistributable firmware, and a large share of Intel/Realtek wifi and
+    ethernet parts need a firmware blob to bring the link up — so a HEADLESS
+    server could boot with no network and no screen to diagnose it from.
+    Windows and macOS both ship device firmware as standard.
+    """
+
+    def test_firmware_is_enabled_for_every_variant_from_one_writer(self):
+        base = read_nix(os.path.join(MODULES_DIR, "hart-base.nix"))
+        assert "hardware.enableRedistributableFirmware" in base, (
+            "firmware must be enabled in hart-base so EVERY variant gets it, "
+            "not per-profile where a variant can silently miss out")
+
+    def test_no_profile_re_declares_firmware(self):
+        """Two writers for one option is the drift this consolidation removes;
+        the profile's copy is why the gap was invisible."""
+        for variant in ("desktop", "server", "edge", "phone"):
+            prof = read_nix(os.path.join(PROFILES_DIR, variant + ".nix"))
+            assert not re.search(
+                r'^\s*hardware\.enableRedistributableFirmware\s*=', prof, re.M), (
+                f"{variant}.nix re-declares firmware — hart-base owns it")
+
+    def test_firmware_stays_overridable_for_size_bound_variants(self):
+        """mkDefault, not a hard true: an edge image on a tiny board must be
+        able to drop ~1GiB of firmware without editing hart-base."""
+        base = read_nix(os.path.join(MODULES_DIR, "hart-base.nix"))
+        assert re.search(
+            r'hardware\.enableRedistributableFirmware\s*=\s*lib\.mkDefault',
+            base), "firmware must be mkDefault so a size-bound variant can opt out"
+
+    def test_microcode_rides_the_same_consent(self):
+        """Microcode is gated on the firmware consent, so enabling firmware
+        per-variant cannot leave a variant silently without microcode."""
+        base = read_nix(os.path.join(MODULES_DIR, "hart-base.nix"))
+        for vendor in ("intel", "amd"):
+            assert re.search(
+                r'hardware\.cpu\.' + vendor + r'\.updateMicrocode\s*=\s*\n?\s*'
+                r'lib\.mkDefault config\.hardware\.enableRedistributableFirmware',
+                base), f"{vendor} microcode must ride the firmware consent"
+
+
+class TestImageFitsItsTargetDevice:
+    """A feature enable must not push the raw image past the device it ships on.
+
+    MEASURED, not judged (closure audit 30570492265, hart-desktop-raw, the real
+    config with exactly one option flipped):
+
+        hart.devtools.enable ON  : 24 GiB
+        hart.devtools.enable OFF : 21 GiB
+
+    hart-repart-image.nix sizes the root at 26 GiB against a ~24 GiB image —
+    about 2 GiB of slack — and that 26 GiB is itself bounded by the 28.7 GiB
+    stick (its comment records that 1 GiB ESP + 28 GiB root did NOT fit). So
+    +3 GiB does not merely bloat the image, it stops the raw image fitting the
+    target device.
+
+    This is the guard the everything-on sweep needed and did not have: the
+    size-ceiling failure mode is one where the BUILD can pass and the ARTIFACT
+    is unusable, so a test that fails in seconds is worth more than finding out
+    after a multi-hour ISO job.
+    """
+
+    #: Features whose measured closure cost exceeds the raw image's slack.
+    #: (option path, measured GiB delta, audit run) — extend as audits land.
+    TOO_BIG_FOR_THE_DESKTOP_IMAGE = [
+        ("devtools", 3, "30570492265"),
+    ]
+
+    def test_oversized_features_stay_off_the_desktop_profile(self):
+        prof = read_nix(os.path.join(PROFILES_DIR, "desktop.nix"))
+        for feat, cost, run in self.TOO_BIG_FOR_THE_DESKTOP_IMAGE:
+            assert not re.search(r'^\s+' + feat + r'\.enable\s*=\s*true',
+                                 prof, re.M), (
+                f"hart.{feat} is enabled on the desktop image but measured "
+                f"+{cost} GiB (audit {run}) against ~2 GiB of slack — the raw "
+                f"image would no longer fit the 28.7 GiB stick")
+
+    def test_the_root_size_and_its_reasoning_stay_documented(self):
+        """The 26 GiB is derived from the TARGET DEVICE, not from CI. If that
+        derivation is ever dropped, the next person sizes against the build
+        host again and reintroduces the ship-time failure."""
+        src = read_nix(os.path.join(MODULES_DIR, "hart-repart-image.nix"))
+        assert 'SizeMinBytes = "26G"' in src, "root size changed — re-measure"
+        assert "28.7" in src, (
+            "the stick-size derivation must stay in the comment; without it "
+            "the next change sizes against the runner, not the device")
+
+    def test_language_toolchains_still_ship(self):
+        """Dropping devtools must NOT cost the desktop its compilers —
+        hart.devTools (the near-identically-named sibling) is the toolchain
+        module and stays on."""
+        prof = read_nix(os.path.join(PROFILES_DIR, "desktop.nix"))
+        assert re.search(r'^\s+devTools\.enable\s*=\s*true', prof, re.M), (
+            "hart.devTools (language toolchains) must stay enabled — it is a "
+            "different module from hart.devtools despite the name")
+
+
+class TestNoInheritShadowedProfileOptions:
+    """`inherit X;` inside a test node is a PLAIN definition of X.
+
+    THE BLIND SPOT (2026-07-30 -> caught 07-31): when mkNode began composing
+    the real variant profile, I swept every test for leaves that would now
+    collide and migrated the two I found to mkForce. The sweep was a regex for
+    `name = value`, so it could not see
+
+        hart.sessionSupervisor = { inherit startTier; }
+
+    which is exactly as much a plain definition as `startTier = "sway"`. The
+    desktop profile sets startTier = "hart-comp"; the test's sway and cage
+    nodes therefore conflicted and FAILED TO EVALUATE — ❌
+    hart-session-supervisor-start-tier in run 30574137255, where 69 other
+    targets were green.
+
+    An enum/str merges only when definitions are EQUAL, so this class is
+    invisible for the value that happens to match the profile and fatal for
+    every other — the worst possible failure shape to leave to a regex.
+    """
+
+    def _profile_leaves(self, variant):
+        src = read_nix(os.path.join(PROFILES_DIR, variant + ".nix"))
+        return {m.group(1) for m in
+                re.finditer(r'^\s{4,6}([a-zA-Z][\w]*)\s*=\s*[^;{]+;\s*$',
+                            src, re.M)}
+
+    def test_no_test_inherits_an_option_the_profile_also_sets(self):
+        offenders = []
+        for path in sorted(glob.glob(os.path.join(TESTS_DIR, "*.nix"))):
+            src = read_nix(path)
+            for variant in ("desktop", "server", "edge", "phone"):
+                if f'mkNode "{variant}"' not in src:
+                    continue
+                leaves = self._profile_leaves(variant)
+                for m in re.finditer(r'inherit\s+([\w\s]+);', src):
+                    for name in m.group(1).split():
+                        if name in leaves:
+                            offenders.append(
+                                f"{os.path.basename(path)}: inherit {name} "
+                                f"(profiles/{variant}.nix also sets it)")
+        assert not offenders, (
+            "`inherit X` is a PLAIN definition and collides with the variant "
+            "profile's own plain definition unless the values are equal — the "
+            "node fails to EVALUATE. Use `X = lib.mkForce ...;` to say the "
+            "override is deliberate: " + "; ".join(sorted(set(offenders))))
+
+
+class TestSysctlPriorityCollisions:
+    """No test may re-declare a sysctl that hart-kernel.nix already mkForces.
+
+    THE BUG THIS EXISTS FOR (found 2026-08-02, red since 07-26):
+    `nixosTests` hart-desktop-shell-boot and hart-layer-shell-host-paint both
+    failed with
+
+        The option `nodes.<n>.boot.kernel.sysctl."fs.inotify.max_user_watches"'
+        is defined multiple times while it's expected to be unique.
+
+    Both tests carried `mkForce 524288` to break a collision between two
+    mkDefaults (graphical-desktop's and hart-base's). That was CORRECT when
+    written. Then hart-kernel.nix started mkForce-ing the same option to
+    1048576, and the desktop profile enables hart.kernel — so the test-local
+    line became a SECOND mkForce at EQUAL priority with a DIFFERENT value,
+    which is exactly the error it was written to prevent. The workaround
+    became the bug, and stayed invisible for a week because the eval never
+    ran long enough to print why.
+
+    mkForce is priority 50 for everyone; two of them never merge. So the rule
+    is structural: if hart-kernel owns an option with mkForce, a test must not
+    also mkForce it. Source-shape guard by necessity — the failure is an
+    EVAL-time module-system merge, which no runtime assertion can reach, and
+    `nix` cannot run on the dev box.
+    """
+
+    KERNEL_MODULE = os.path.join(MODULES_DIR, "hart-kernel.nix")
+    TESTS_DIR = os.path.join(REPO_ROOT, "nixos", "tests")
+
+    def _kernel_forced_sysctls(self):
+        src = read_nix(self.KERNEL_MODULE)
+        return set(re.findall(r'"([a-z0-9_.]+)"\s*=\s*lib\.mkForce', src))
+
+    def test_hart_kernel_still_owns_sysctls(self):
+        """Guard the guard: if this set empties, the check below goes vacuous."""
+        forced = self._kernel_forced_sysctls()
+        assert "fs.inotify.max_user_watches" in forced, (
+            "hart-kernel.nix no longer mkForces max_user_watches — the "
+            "collision guard below would silently stop protecting anything")
+
+    def test_no_test_mkforces_a_kernel_owned_sysctl(self):
+        forced = self._kernel_forced_sysctls()
+        offenders = []
+        for path in sorted(glob.glob(os.path.join(self.TESTS_DIR, "*.nix"))):
+            src = read_nix(path)
+            for key in re.findall(
+                    r'sysctl\."([a-z0-9_.]+)"\s*=\s*(?:pkgs\.)?lib\.mkForce', src):
+                if key in forced:
+                    offenders.append(f"{os.path.basename(path)}:{key}")
+        assert not offenders, (
+            f"{offenders} mkForce a sysctl hart-kernel.nix already mkForces. "
+            f"Two mkForce definitions are the SAME priority (50), so they do "
+            f"not merge — this is the 'defined multiple times' eval error that "
+            f"kept hart-desktop-shell-boot and hart-layer-shell-host-paint red "
+            f"for a week. Drop the test-local line: hart-kernel's mkForce "
+            f"already beats the mkDefaults you are working around.")
+
+
+class TestBackgroundAgentBlastRadius:
+    """A wedged background agent must degrade ITSELF, never the machine.
+
+    The steward's rule (2026-07-31): "reviewer hangs shd be isolated to
+    process and not hanging whole computer, use android's way of handling
+    isolation" — and "blast radius shd be minimised always".
+
+    The trap this guards is that `CPUWeight`, `Nice` and `IOWeight` LOOK like
+    caps and are not: they are relative shares that only bite under
+    contention. hart-copilot.nix carried a comment claiming "hard caps + the
+    lowest scheduling priority mean a wedged agent degrades itself" while
+    only MemoryMax was actually a bound — a busy-looping agent on an idle box
+    still took every core, and with no TasksMax a fork storm was unbounded.
+
+    Android's answer is bandwidth control + a restricted cpuset for
+    background apps, not merely a lower priority. systemd expresses the same
+    natively (CPUQuota / TasksMax), so this is composition, not reinvention.
+    """
+
+    #: `Nice = 19` is the codebase's marker for "lowest-priority background
+    #: work". Any unit wearing it is by definition the kind that must not be
+    #: able to saturate the box.
+    NICE_MARKER = re.compile(r"Nice\s*=\s*(1[5-9])\s*;")
+
+    def _module_files(self):
+        return sorted(glob.glob(os.path.join(MODULES_DIR, "*.nix")))
+
+    def test_lowest_priority_units_have_a_hard_cpu_bound(self):
+        """Deprioritised is not bounded — such a unit needs CPUQuota too.
+
+        File-level rather than block-level: coarse, but a module that
+        deprioritises a unit and hard-bounds nothing is exactly the shape
+        being outlawed, and the coarseness fails SAFE (it can only ask for
+        more containment, never less).
+        """
+        offenders = []
+        for path in self._module_files():
+            src = read_nix(path)
+            if self.NICE_MARKER.search(src) and "CPUQuota" not in src:
+                offenders.append(os.path.basename(path))
+        assert not offenders, (
+            f"{offenders} deprioritise a unit (Nice>=15) but set no CPUQuota. "
+            f"Nice only bites under contention — on an idle node the unit "
+            f"still takes every core (heat, battery, and an interactive app "
+            f"must preempt it). Add a hard bandwidth ceiling.")
+
+    def test_copilot_is_bounded_on_every_dimension(self):
+        """The autonomous agent — the one that edits the repo unattended —
+        must be bounded in cpu, memory, AND task count.
+
+        Memory alone was bounded before; a runaway could still pin the CPU
+        or fork without limit.
+        """
+        src = read_nix(os.path.join(MODULES_DIR, "hart-copilot.nix"))
+        for knob in ("MemoryMax", "MemoryHigh", "CPUQuota", "TasksMax"):
+            assert re.search(rf"{knob}\s*=", src), (
+                f"hart-copilot.nix sets no {knob}: an unattended agent with "
+                f"an unbounded {knob} can take the node down with it")
+
+    def test_memory_high_sits_below_memory_max(self):
+        """MemoryHigh must be the SOFT step before the hard kill.
+
+        Set at or above MemoryMax it is inert, and the agent goes straight
+        from fine to killed with no reclaim in between (the same inversion
+        hart-backend.nix documents having got wrong for edge).
+        """
+        src = read_nix(os.path.join(MODULES_DIR, "hart-copilot.nix"))
+
+        def _mb(knob):
+            m = re.search(rf'{knob}\s*=\s*"(\d+)([MG])"', src)
+            assert m, f"{knob} not found as a literal size in hart-copilot.nix"
+            return int(m.group(1)) * (1024 if m.group(2) == "G" else 1)
+
+        assert _mb("MemoryHigh") < _mb("MemoryMax"), (
+            "MemoryHigh >= MemoryMax makes the soft reclaim step inert")
+
+
+class TestParityMatrix:
+    """The Windows/macOS parity matrix is CHECKED, not asserted in prose.
+
+    docs/architecture/OS_PARITY_MATRIX.md answers "does HART have parity" with
+    a row per capability instead of a judgement call. A doc alone rots the
+    moment an option moves, so every row claiming a Nix option must name one
+    the tree actually has, and the honest-gap rows must STAY honest — a row
+    silently upgraded from ❌ to ✅ without the route existing would be exactly
+    the false-parity claim the matrix exists to prevent.
+    """
+
+    MATRIX = os.path.join(REPO_ROOT, "docs", "architecture", "OS_PARITY_MATRIX.md")
+
+    #: capability -> a regex that must match somewhere under nixos/ for the
+    #: matrix's Nix column to be truthful.
+    CLAIMED_NIX = {
+        "networking.networkmanager": r'networking\.networkmanager\.enable',
+        "pipewire": r'services\.pipewire',
+        "printing": r'services\.printing\.enable',
+        "sane": r'hardware\.sane',
+        "bluetooth": r'hardware\.bluetooth',
+        "udisks2": r'services\.udisks2|hart\.storage',
+        "firmware": r'hardware\.enableRedistributableFirmware',
+        "microcode": r'hardware\.cpu\.(intel|amd)\.updateMicrocode',
+        "hypervGuest": r'virtualisation\.hypervGuest\.enable',
+        "qemuGuest": r'services\.qemuGuest\.enable',
+        "spice": r'services\.spice-vdagentd\.enable',
+        "biosBootable": r'makeBiosBootable',
+        "localRtc": r'time\.hardwareClockInLocalTime',
+        "inputMethod": r'i18n\.inputMethod',
+    }
+
+    def _nix_tree(self):
+        parts = []
+        for pat in ("nixos/modules/*.nix", "nixos/profiles/*.nix",
+                    "nixos/configurations/*.nix", "nixos/*.nix"):
+            for p in glob.glob(os.path.join(REPO_ROOT, pat)):
+                parts.append(read_nix(p))
+        return "\n".join(parts)
+
+    def test_matrix_exists(self):
+        assert os.path.isfile(self.MATRIX), (
+            "the parity matrix is the artifact that turns 'do we have parity' "
+            "from a judgement call into a checked table")
+
+    @pytest.mark.parametrize("name", sorted(CLAIMED_NIX))
+    def test_every_claimed_nix_option_is_real(self, name):
+        """A row may not claim an option the tree does not have."""
+        assert re.search(self.CLAIMED_NIX[name], self._nix_tree()), (
+            f"OS_PARITY_MATRIX.md claims {name} but no nixos/ file defines it "
+            f"— the matrix would be advertising parity HART does not have")
+
+    # ── Agent column ────────────────────────────────────────────────────
+    # The Nix column was guarded from the start; the AGENT column was not,
+    # and on 2026-07-31 that let a row sit at ❌ ("no /api/shell action") for
+    # screen capture while /api/shell/screenshot and /api/shell/recording/
+    # {start,stop} had been registered all along. The row was wrong because
+    # it came from a name-only search, and no test could contradict it.
+    #
+    # Both directions are now checked: a ✅/🟡 row may not name a route that
+    # does not exist, and a ❌ row may not be hiding one that does.
+
+    #: capability -> regex for routes that must NOT exist while its row says ❌.
+    CLAIMED_NO_ROUTE = {
+        # "disk encryption" left this list 2026-07-31 — /api/shell/encryption/status
+        # now exists; the row is ✅ and its path is checked by the citation test.
+        # "remote desktop" left this list on 2026-07-31. Its row is 🟡, not
+        # ❌: agent TOOLS are registered (core/agent_tools.py:1391), only the
+        # shell route is missing. This guard only ever knew about the HTTP
+        # channel, so it happily blessed a row that was wrong about the other
+        # one — see test_matrix_agent_column_covers_the_tool_channel below.
+        # "antivirus" left this list on 2026-07-31 — /api/shell/antivirus/
+        # {status,scan} now exist, so the matrix row is ✅ and the paths are
+        # checked by test_every_api_path_named_in_the_matrix_is_registered
+        # instead. Keeping it here would fail exactly as designed.
+    }
+
+    def _registered_routes(self):
+        """Every route path registered anywhere under integrations/.
+
+        Reads the decorators rather than importing the app: importing pulls
+        in autogen/chromadb and is exactly the kind of heavyweight import
+        this suite avoids. The decorator IS the registration, so a path that
+        appears here is genuinely served.
+        """
+        cached = getattr(TestParityMatrix, "_route_cache", None)
+        if cached is not None:
+            return cached
+        pat = re.compile(r"""@(?:\w+)\.(?:route|get|post|put|delete)\(\s*['"]([^'"]+)""")
+        found = set()
+        for root, _dirs, files in os.walk(os.path.join(REPO_ROOT, "integrations")):
+            if "__pycache__" in root:
+                continue
+            for fn in files:
+                if not fn.endswith(".py"):
+                    continue
+                try:
+                    with open(os.path.join(root, fn), encoding="utf-8",
+                              errors="replace") as fh:
+                        found.update(pat.findall(fh.read()))
+                except OSError:
+                    continue
+        # Scanning the tree is the slow part and it cannot change mid-run;
+        # without this the parametrized gap tests re-walk integrations/ once
+        # each (measured 3m39s for the class).
+        TestParityMatrix._route_cache = found
+        return found
+
+    def _matrix_text(self):
+        with open(self.MATRIX, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_every_api_path_named_in_the_matrix_is_registered(self):
+        """A row may not advertise a route the code does not serve.
+
+        Catches the inverse of the screen-capture error: a row upgraded to ✅
+        citing an endpoint nobody wired.
+        """
+        routes = self._registered_routes()
+        # Paths as written in the matrix, incl. brace-expanded forms like
+        # /api/shell/storage/{defrag,trim,fsck} and /recording/{start,stop}.
+        cited = set()
+        for m in re.finditer(r"`(/api/[^`]+?)`", self._matrix_text()):
+            raw = m.group(1).strip()
+            # Prose placeholders, not claims: "/api/shell/...", "/api/shell/*".
+            # A wildcard means "the family of routes", which is exactly what a
+            # row says when it is describing the ABSENCE of one.
+            if any(ch in raw for ch in ("...", "…", "*")):
+                continue
+            brace = re.search(r"\{([^}]*)\}", raw)
+            if brace:
+                stem = raw[:brace.start()]
+                for alt in brace.group(1).split(","):
+                    alt = alt.strip()
+                    if alt:
+                        cited.add(stem + alt)
+            else:
+                cited.add(raw)
+        missing = sorted(p for p in cited if p not in routes)
+        assert not missing, (
+            f"OS_PARITY_MATRIX.md cites {missing} but no @route registers "
+            f"them — the matrix would advertise parity that does not exist")
+
+    @pytest.mark.parametrize("capability", sorted(CLAIMED_NO_ROUTE))
+    def test_honest_gap_rows_are_still_gaps(self, capability):
+        """A ❌ row must be a REAL gap, not a stale search result.
+
+        This is the test that would have caught the screen-capture row: it
+        fails the moment someone wires the route without upgrading the row,
+        which turns "we still owe this" into a checked fact instead of a
+        claim nobody re-verified.
+        """
+        pat = re.compile(self.CLAIMED_NO_ROUTE[capability], re.I)
+        live = sorted(r for r in self._registered_routes() if pat.search(r))
+        assert not live, (
+            f"OS_PARITY_MATRIX.md lists '{capability}' as an honest gap with "
+            f"no agent route, but these are registered: {live}. Upgrade the "
+            f"row — an understated matrix hides finished work the same way an "
+            f"overstated one invents it")
+
+    def test_matrix_agent_column_covers_the_tool_channel(self):
+        """The Agent column means BOTH channels, and the doc must say so.
+
+        HART reaches capabilities two ways: `/api/shell/*` routes (what the
+        shell UI calls) and the LLM tool registry (what an agent calls during
+        a turn). Reading the column as "has an /api/shell route" produced a
+        wrong ❌ for remote desktop, which has had registered agent tools all
+        along. The header now states both; this fails if that guidance is
+        dropped, because the next reader would repeat the mistake.
+        """
+        text = self._matrix_text()
+        assert "TWO legitimate agent channels" in text, (
+            "the matrix header must keep saying the Agent column covers both "
+            "the /api/shell routes AND the LLM tool registry")
+        assert "core/agent_tools.py" in text, (
+            "the header must name the tool-registry channel concretely")
+
+    def test_remote_desktop_tools_reach_the_agent_registry(self):
+        """Behavioural backing for the 🟡 remote-desktop row.
+
+        Scope is deliberately narrow: the BUILDER is already covered in
+        depth by tests/unit/test_remote_desktop_agent_tools.py (tool set,
+        tuple shape, session flows), so asserting it again here would be a
+        duplicate. What no test covered — and what this row actually
+        claims — is the WIRING: that core.agent_tools exposes the hook that
+        pulls those tools into the agent's registry. Tools nobody registers
+        are not an agent channel.
+        """
+        import core.agent_tools as ct
+        assert hasattr(ct, "register_remote_desktop_tools_if_available"), (
+            "core.agent_tools must expose the remote-desktop registration "
+            "hook the matrix row cites — without it the tools exist but no "
+            "agent ever sees them, and the row's 🟡 would be false")
+
+    def test_the_dual_boot_clock_fix_is_actually_wired(self):
+        """The row that matters most on real hardware: the installer must
+        WRITE time.hardwareClockInLocalTime when it finds Windows, or a
+        dual-boot node's clock jumps by the timezone offset on first NTP sync
+        (task #24, the steward's hang)."""
+        src = read_nix(os.path.join(MODULES_DIR, "hart-installer.nix"))
+        # The ASSIGNMENT, not the mention. Written as a substring check first,
+        # this passed against the explanatory COMMENT that merely names the
+        # option — vacuous, and the same shape as the `"default" in body` hole
+        # the reviewing session found in the required-option guard. Proof by
+        # revert is what exposed it: deleting the real assignment left the test
+        # green.
+        assert re.search(r'time\.hardwareClockInLocalTime\s*=\s*true\s*;', src), (
+            "hart-install must WRITE time.hardwareClockInLocalTime = true into "
+            "local.nix, not merely mention it")
+        assert "bootmgfw.efi" in src, (
+            "it must be conditioned on an ACTUAL Windows bootloader — a "
+            "blanket setting is wrong for single-OS machines whose RTC is UTC")
+
+    def test_the_clock_fix_reaches_BOTH_installers(self):
+        """There are TWO installers, and this guard originally read one file.
+
+        nixos/installer/calamares/hartcfg-main.py calls itself "the GUI twin of
+        hart-install --mounted" — an ALTERNATIVE path that writes local.nix
+        itself, not a step inside the CLI. The CLI got the clock fix and the
+        GUI did not, so a user installing beside Windows through the GRAPHICAL
+        installer (the default for a desktop OS) still hit the +5:30 jump —
+        while this test passed and the matrix row read ✅.
+
+        That is the vacuous-guard shape one level up: the assertion held, the
+        claim it was read as supporting did not. Both paths are checked now.
+        """
+        # CONSOLIDATED (steward: "why are they not canonicalised?"). Two
+        # installer FRONT-ENDS is legitimate — a CLI for headless/scripted
+        # installs, a GUI for the desktop — and they already drive ONE
+        # generator (Calamares shells out to hart-write-install-config). What
+        # was not legitimate: local.nix had three renderers in two languages,
+        # so the clock probe landed in the CLI and missed the GUI. Probed
+        # facts now live in hardware-local.nix with the generator as their
+        # only writer; local.nix stays the front-end's user-choice file, and
+        # NixOS module imports compose them.
+        gen = read_nix(os.path.join(MODULES_DIR, "hart-installer.nix"))
+        assert "hardware-local.nix" in gen, (
+            "the shared generator must write the probed-facts file")
+        assert re.search(r'\./hardware-local\.nix', gen), (
+            "hardware-local.nix must be in the written flake's module list, "
+            "or it is generated and never imported")
+        gui = read_nix(os.path.join(
+            REPO_ROOT, "nixos", "installer", "calamares", "hartcfg-main.py"))
+        # No ASSIGNMENT, not no mention: the GUI's docstring legitimately names
+        # the option to explain why it is NOT rendered there. Asserting on the
+        # bare word would forbid the documentation of the very decision — the
+        # mirror image of the vacuity bug where a comment SATISFIED a check.
+        assert not re.search(r'hardwareClockInLocalTime\s*=', gui), (
+            "the GUI must NOT re-render a probed fact — that duplication is "
+            "exactly what let the two installers drift")
+
+    def test_declared_gaps_are_not_silently_upgraded(self):
+        """The five declarative-only capabilities are listed as ❌ on purpose.
+        Turning one into ✅ requires the route to exist; this keeps the claim
+        and the code in step rather than letting the doc drift optimistic."""
+        doc = open(self.MATRIX, encoding="utf-8").read()
+        api = "\n".join(
+            open(p, encoding="utf-8").read()
+            for p in glob.glob(os.path.join(
+                REPO_ROOT, "integrations", "agent_engine", "shell_*apis*.py")))
+        for cap, route in [("Disk encryption", r'/api/shell/(luks|encrypt)'),
+                           ("Firewall", r'/api/shell/firewall')]:
+            row = [l for l in doc.splitlines() if l.startswith(f"| {cap} ")]
+            assert row, f"matrix lost its {cap} row"
+            if "❌" in row[0]:
+                assert not re.search(route, api), (
+                    f"{cap} now HAS a live route — update the matrix row to ✅ "
+                    f"rather than leaving a stale gap claim")
+
+
+class TestEveryNixosTestIsActuallyBuilt:
+    """A check wired into flake.nix but absent from the workflow NEVER RUNS.
+
+    THE MISS THIS EXISTS TO PREVENT (2026-08-03): three new nixosTests
+    (hart-firmware-boot-matrix, hart-boot-latency, hart-driver-matrix) were
+    written, wired into flake.nix's `checks`, and dispatched to FOUR VM runs
+    — and none of them could have executed. nixos-vm-tests.yml does NOT run
+    `nix flake check`; it builds an EXPLICIT hardcoded list of check
+    attributes, and the three were not on it. The runs came back with other
+    tests' failures, which read exactly like "my tests passed".
+
+    Wiring a test into flake.nix is NECESSARY BUT NOT SUFFICIENT. The
+    workflow's list is the real gate, and nothing connected the two.
+
+    A source guard is the only shape that can catch this: the defect spans a
+    .nix file and a .yml file, so no behavioural test on either one sees it.
+    """
+
+    WORKFLOW = os.path.join(REPO_ROOT, ".github", "workflows", "nixos-vm-tests.yml")
+
+    #: Checks defined but not yet built, measured BY THIS GUARD on 2026-08-03.
+    #: A CEILING: it may only go DOWN. Building all 51 in one job would take
+    #: many hours, so this does not demand zero — it demands the gap stay
+    #: VISIBLE and shrink, instead of new tests silently joining the unrun
+    #: pile.
+    #:
+    #: NOTE — this number was wrong TWICE before it was right, and the
+    #: sequence is the argument for computing it instead of transcribing it:
+    #:   24  an ad-hoc shell diff (wrong: different extraction)
+    #:   29  a same-line regex (wrong: missed `name =` with the call on the
+    #:       next line, AND reported five real RUNNING checks as "missing")
+    #:   31  structural — split on top-level attribute boundaries and ask
+    #:       whether the chunk mentions runNixOSTest, which handles
+    #:       `= runNixOSTest`, `=\n  runNixOSTest` and `= let ... in
+    #:       runNixOSTest` alike. This found two further real checks.
+    #: A guard that miscounts is worse than none: the 29-version would have
+    #: sent someone deleting working tests from the workflow.
+    # 31 -> 30 on 2026-08-03: hart-edge-boot joined the built list, because the
+    # edge cgroup-cap check (task #19) was about to be written INTO a test that
+    # CI never builds. Lowered in the same commit that built it, per this
+    # class's own rule — a ceiling that only ever rises is not a ratchet.
+    #
+    # ══ READ THIS BEFORE "FIXING" THE GAP BY GROWING THE LIST ══
+    # "unbuilt" here means ABSENT FROM nixos-vm-tests.yml's HAND-WRITTEN list.
+    # It does NOT mean the test never runs anywhere, and the difference matters:
+    #
+    #   flake-checks.yml's `nixos-tests` job enumerates EVERY check
+    #   dynamically (`nix eval .#checks.x86_64-linux --apply builtins.attrNames`)
+    #   and round-robins them across 4 shards. Nothing can drift out of that
+    #   set — it is the comprehensive gate, and release.yml depends on it.
+    #
+    # So the honest statement of the gap is about WHEN, not WHETHER:
+    # flake-checks runs on pull_request / workflow_dispatch / release, and this
+    # repo works DIRECTLY ON MAIN (CLAUDE.md: main branch only, no PRs), so a
+    # push to main fires NEITHER workflow. That is the real hole.
+    #
+    # Growing the hand-written list is the WRONG fix and has already cost us:
+    # it reached 23 VM images in ONE job, and run 30779764495 lost its runner
+    # 27 minutes in with zero results (disk was ruled out — 115G free). The
+    # sharded job exists precisely so no single runner carries all of them.
+    # Prefer dispatching flake-checks.yml over adding another name here.
+    UNBUILT_CEILING = 30
+
+    def _defined(self):
+        names = set()
+        for path in glob.glob(os.path.join(REPO_ROOT, "nixos", "tests", "*.nix")):
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                # `name = pkgs.testers.runNixOSTest` appears in TWO layouts:
+                # on one line, and with the call on the NEXT line (e.g.
+                # session-supervisor.nix:396). Matching only the first form
+                # made this guard report five real, RUNNING checks as
+                # "missing" — a false positive that would have sent someone
+                # editing the workflow to remove working tests.
+                # STRUCTURAL, not pattern-guessing. A check is a TOP-LEVEL
+                # attribute of the returned set whose value mentions
+                # runNixOSTest — and the value takes at least three shapes:
+                #     name = pkgs.testers.runNixOSTest { ... }
+                #     name =
+                #       pkgs.testers.runNixOSTest { ... }
+                #     name = let ... in pkgs.testers.runNixOSTest { ... }
+                # Two earlier regexes each matched only some of these and
+                # reported five real, RUNNING checks as "missing" — a false
+                # positive that would have sent someone deleting working
+                # tests from the workflow. So: split on top-level attribute
+                # boundaries and ask whether the CHUNK mentions runNixOSTest.
+                src = fh.read()
+                starts = [(m.start(), m.group(1)) for m in
+                          re.finditer(r"^  ([a-z][a-z0-9-]*) =", src, re.M)]
+                for i, (pos, nm) in enumerate(starts):
+                    end = starts[i + 1][0] if i + 1 < len(starts) else len(src)
+                    if "runNixOSTest" in src[pos:end]:
+                        names.add(nm)
+        return names
+
+    def _built(self):
+        with open(self.WORKFLOW, encoding="utf-8", errors="replace") as fh:
+            return set(re.findall(r'"\.#checks\.x86_64-linux\.([a-z0-9-]+)"', fh.read()))
+
+    # ── THE LIST IS GONE; THESE NOW GUARD WHAT REPLACED IT ──────────────
+    # nixos-vm-tests.yml no longer carries a hand-written build list — it
+    # delegates to flake-checks.yml, whose nixos-tests job enumerates every
+    # check with `nix eval .#checks.x86_64-linux --apply builtins.attrNames`
+    # and shards it. So "defined but not built" is no longer a state that can
+    # exist, and _built()/UNBUILT_CEILING have nothing left to measure.
+    #
+    # This class's ORIGINAL MISS is still worth preventing, though. Three
+    # parity matrices were written, wired into flake.nix, dispatched to four VM
+    # runs, and could not have executed. Under dynamic enumeration the way that
+    # recurs is not "absent from a list" but "absent from the flake" — a check
+    # nix cannot see is a check that never runs, exactly as before.
+
+    def test_the_three_parity_matrices_are_discoverable(self):
+        """The specific tests whose absence made four VM runs meaningless.
+
+        Asserts they are in the flake's `checks`, which IS what makes them run
+        now — the enumeration walks that attrset.
+        """
+        # BOTH halves, because the name and the wiring live in different files:
+        # flake.nix imports the test FILE (./tests/driver-matrix.nix) and the
+        # CHECK NAME is set inside it (runNixOSTest { name = "hart-driver-
+        # matrix"; }). Asserting only the name against flake.nix finds nothing
+        # — which is exactly the mistake this test made on its first draft.
+        flake = read_nix(os.path.join(NIXOS_DIR, "flake.nix"))
+        for filename, check in (("firmware-boot-matrix.nix", "hart-firmware-boot-matrix"),
+                                ("boot-latency.nix", "hart-boot-latency"),
+                                ("driver-matrix.nix", "hart-driver-matrix")):
+            assert f"./tests/{filename}" in flake, (
+                f"flake.nix no longer imports tests/{filename}, so "
+                f"`nix eval .#checks.x86_64-linux` cannot enumerate it and the "
+                f"VM gate will never run it — the same silent miss this class "
+                f"was written for, one layer down")
+            path = os.path.join(TESTS_DIR, filename)
+            assert os.path.isfile(path), f"tests/{filename} is gone"
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                assert check in fh.read(), (
+                    f"tests/{filename} no longer defines the check {check!r} — "
+                    f"it would still be imported while testing nothing")
+
+    def test_no_hand_written_check_list_has_come_back(self):
+        """RATCHET, inverted: the gate must keep DISCOVERING, not listing.
+
+        The old ceiling counted how far a hand-maintained list had fallen
+        behind (31 of 53, at its worst). The durable fix was to delete the
+        list, so what needs guarding now is that nobody reintroduces one —
+        which is how the gap opened in the first place, and how the job grew
+        to 23 VM images on a single runner.
+        """
+        with open(self.WORKFLOW, encoding="utf-8", errors="replace") as fh:
+            wf = fh.read()
+        listed = re.findall(r'"\.#checks\.x86_64-linux\.([a-z0-9-]+)"', wf)
+        assert not listed, (
+            f"nixos-vm-tests.yml names {len(listed)} checks explicitly again "
+            f"({listed[:5]}...). That is the parallel path: a hand-written "
+            f"list silently drops whatever is not on it, and growing it is "
+            f"what lost the runner twice (30779764495, 30781499301). The "
+            f"workflow should delegate to flake-checks.yml, which enumerates "
+            f"dynamically.")
+
+
+class TestEveryTestScriptIsValidPython:
+    """A nixosTest's `testScript` is Python — but nix only sees a STRING.
+
+    Nothing between writing it and the VM booting ever compiles it. `nix
+    flake check` is happy, the derivation builds, the VM starts, and only
+    THEN does the driver hand the text to python and get a SyntaxError —
+    roughly an hour into CI, with the whole script dead, not just one
+    subtest.
+
+    This caught five real ones at once (2026-08-03), all the same shape: a
+    literal newline inside a python string literal where `\n` was meant.
+    In a nix ''-string a backslash is literal, so `"...path.\n"` is exactly
+    right and easy to typo into a real line break that nix accepts happily:
+
+        "not at either /etc/greetd path.
+    "
+        "--- greetd.service ---
+    " + _unit)
+
+    Sites: desktop-boot.nix, layer-shell-host.nix, session-supervisor.nix x3
+    — every one of them written earlier in that same session, every one
+    green in `pytest`, because pytest never parsed the nix files.
+
+    NOT a grep test: it EXTRACTS the real source and hands it to ast.parse.
+    """
+
+    #: Nix indented-string escapes -> the text python actually receives.
+    _UNESCAPE = (("''${", "${"), ("'''", "''"))
+
+    @staticmethod
+    def _blocks(path):
+        """Yield (source_line, python_text) for each testScript in a file."""
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+        for m in re.finditer(r"testScript\s*=\s*''", src):
+            i = start = m.end()
+            while i < len(src):
+                if src[i] == "'" and src[i + 1:i + 2] == "'":
+                    # ''${ and ''' are escapes, not the terminator.
+                    if src[i + 2:i + 3] in ("$", "'"):
+                        i += 3
+                        continue
+                    break
+                i += 1
+            yield src[:start].count("\n") + 1, src[start:i]
+
+    @classmethod
+    def _to_python(cls, body):
+        for frm, to in cls._UNESCAPE:
+            body = body.replace(frm, to)
+        # A real ${...} interpolation becomes a BARE identifier: these often
+        # sit inside a python string ("port ${p}"), where a quoted stand-in
+        # would produce ""X"" and a false SyntaxError. A bare name parses
+        # both inside a string and as a standalone expression.
+        body = re.sub(r"\$\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", "NIXV", body)
+        lines = body.split("\n")
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        # Dedent by the FIRST line's indent, not the minimum. Nix itself uses
+        # the minimum, and for a VALID block the two are identical — the base
+        # indent IS the minimum. They diverge only when a python string
+        # literal is broken across a real newline, which parks its tail at
+        # column 0. Using min() there dedents by 0, leaves every real line
+        # indented, and reports "unexpected indent" on line 6 instead of the
+        # unterminated string 70 lines later. Same verdict, useless address.
+        pad = len(lines[0]) - len(lines[0].lstrip()) if lines else 0
+        prefix = " " * pad
+        return "\n".join(
+            ln[pad:] if ln.startswith(prefix) else ln for ln in lines)
+
+    def _all(self):
+        return sorted(glob.glob(os.path.join(TESTS_DIR, "*.nix")))
+
+    def test_there_are_testscripts_to_check(self):
+        """Guard the guard: a broken extractor must not read as 'all clean'.
+
+        If the regex ever stops matching, every assertion below passes
+        vacuously — the same silent-zero failure mode this suite keeps
+        finding elsewhere.
+        """
+        n = sum(1 for p in self._all() for _ in self._blocks(p))
+        assert n >= 40, (
+            f"only {n} testScript blocks found across {len(self._all())} "
+            f"nixos/tests/*.nix files — the extractor is broken, so a green "
+            f"run here would prove nothing")
+
+    def test_every_testscript_compiles(self):
+        """Every testScript must be parseable python."""
+        broken = []
+        for path in self._all():
+            for line, body in self._blocks(path):
+                try:
+                    ast.parse(self._to_python(body))
+                except SyntaxError as exc:
+                    broken.append(
+                        f"{os.path.basename(path)}:{line} -> testScript line "
+                        f"{exc.lineno}: {exc.msg}")
+        assert not broken, (
+            "nixosTest testScript(s) are not valid python. Nix will build "
+            "these happily and the VM will boot; the driver then dies on the "
+            "SyntaxError with EVERY subtest lost.\n  " + "\n  ".join(broken))
+
+
+class TestHartOptionNamesDoNotCollideOnlyByCase:
+    """Two hart options may not differ ONLY in capitalisation.
+
+    HOW THIS WAS FOUND (2026-08-03): reading closure-audit run 30570492265,
+    which reported `hart.devtools.enable` costing 3 GiB. The desktop profile
+    sets `devTools.enable = true`, so the obvious reading is "the audit
+    disabled the toolchain the desktop enables". It did not. There are TWO
+    modules, both wired into flake.nix, whose options differ by ONE CAPITAL:
+
+        hart-dev-tools.nix -> options.hart.devTools   gcc/go/jdk21/rustup
+                                                      desktop: ON
+        hart-devtools.nix  -> options.hart.devtools   LSP, debuggers, linters,
+                                                      container tools
+                                                      desktop: OFF (measured)
+
+    Both are legitimate and separately justified. The hazard is the NAME: nix
+    reports no conflict, `hart.devtools.enable = true` silently configures the
+    other module, and an audit attributes GB to the wrong feature. It very
+    nearly did exactly that here.
+
+    The pair below is GRANDFATHERED, not endorsed — renaming a declared option
+    is a product decision (and needs mkRenamedOptionModule so existing configs
+    keep evaluating), so it is tracked rather than done silently. What this
+    test prevents is a SECOND one.
+    """
+
+    #: Known case-collisions, tracked for rename. Do NOT add to this list to
+    #: make a failure go away — that is the ratchet slipping.
+    #:
+    #: EMPTY as of 2026-08-04. It held ("devTools", "devtools") until
+    #: hart.devtools was renamed to hart.ideTools; the sweep now finds ZERO
+    #: case-collisions across all 61 `options.hart.<root>` declarations.
+    #:
+    #: The removal was not optional housekeeping — test_grandfathered_
+    #: collisions_are_still_real went RED the moment the rename landed,
+    #: because the pair it excused no longer existed. That is the guard
+    #: working: an exception that outlives its problem would silently permit a
+    #: FUTURE collision reusing those exact names.
+    GRANDFATHERED = set()
+
+    def _option_roots(self):
+        roots = set()
+        for path in glob.glob(os.path.join(MODULES_DIR, "*.nix")):
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for m in re.finditer(r"options\.hart\.([A-Za-z0-9_]+)", fh.read()):
+                    roots.add(m.group(1))
+        return roots
+
+    def test_the_probe_finds_the_option_declarations(self):
+        """Guard the guard: an empty scan would pass every assertion below."""
+        roots = self._option_roots()
+        assert len(roots) >= 40, (
+            f"only {len(roots)} `options.hart.<name>` declarations found across "
+            f"{MODULES_DIR} — the pattern no longer matches how modules declare "
+            f"options, so a green result here would prove nothing")
+
+    def test_no_new_case_only_option_collisions(self):
+        roots = self._option_roots()
+        buckets = {}
+        for r in roots:
+            buckets.setdefault(r.lower(), set()).add(r)
+        collisions = {
+            tuple(sorted(v)) for v in buckets.values() if len(v) > 1}
+        new = collisions - self.GRANDFATHERED
+        assert not new, (
+            f"hart options differing only by case: {sorted(new)}.\n"
+            f"Nix treats these as unrelated options and reports no conflict, so "
+            f"setting one silently configures the other — and a closure audit "
+            f"or a profile flip lands on the wrong feature. Give one of them a "
+            f"distinct name (with mkRenamedOptionModule so existing configs "
+            f"still evaluate).")
+
+    def test_grandfathered_collisions_are_still_real(self):
+        """When the rename lands, this list must shrink with it.
+
+        Without this, the exception outlives the problem and quietly permits a
+        future collision that happens to reuse the same names.
+        """
+        roots = self._option_roots()
+        for pair in self.GRANDFATHERED:
+            missing = [p for p in pair if p not in roots]
+            assert not missing, (
+                f"{missing} no longer declared, so the grandfathered pair "
+                f"{pair} is stale — delete it from GRANDFATHERED in the same "
+                f"commit that renamed the option")
+
+
+class TestTheVmGateEnumeratesDynamically:
+    """The VM gate must DISCOVER checks, never carry a hand-written list.
+
+    THIS ONE CLASS REPLACES FIVE SCATTERED ASSERTIONS (2026-08-03). Five tests
+    across two files each required their own check to appear in
+    nixos-vm-tests.yml's `nix build` list — the boot-continuity poweroff gate,
+    ten session-supervisor nodes, the three parity matrices, and the GDM
+    desktop-boot check. Every one was really claiming "and therefore it RUNS in
+    CI", and every one had to be hand-edited whenever a test was added.
+
+    That list is gone. nixos-vm-tests.yml delegates to flake-checks.yml, whose
+    nixos-tests job enumerates every check with
+        nix eval .#checks.x86_64-linux --apply builtins.attrNames
+    and shards it 4 ways. A check runs because it is DEFINED, so the per-check
+    assertions had nothing left to say — and five copies of one fact is exactly
+    the duplication the standing rule forbids.
+
+    What genuinely needs guarding is that the MECHANISM stays dynamic. If a
+    list comes back, every "and therefore it runs" claim in this suite becomes
+    quietly false at once — which is how 31 of 53 checks came to be absent from
+    the old list without anyone noticing, and how the job grew to 23 VM images
+    on one runner and lost it twice (30779764495, 30781499301).
+    """
+
+    GATE = os.path.join(REPO_ROOT, ".github", "workflows", "flake-checks.yml")
+    LEGACY = os.path.join(REPO_ROOT, ".github", "workflows", "nixos-vm-tests.yml")
+
+    @staticmethod
+    def _read(path):
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+
+    def test_checks_are_enumerated_from_the_flake(self):
+        wf = self._read(self.GATE)
+        assert "builtins.attrNames" in wf and "checks.x86_64-linux" in wf, (
+            "flake-checks.yml no longer enumerates checks dynamically. Every "
+            "test in this suite that assumes 'defined => runs in CI' rests on "
+            "this; a hand-written list silently drops whatever is not on it "
+            "(31 of 53, last time it was measured).")
+
+    def test_zero_discovered_checks_is_a_hard_error(self):
+        """A gate that enumerates nothing must FAIL, not pass quietly."""
+        wf = self._read(self.GATE)
+        assert 'TOTAL" -eq 0' in wf or "TOTAL -eq 0" in wf, (
+            "the shard step no longer fails when it discovers 0 checks — an "
+            "eval hiccup would then produce a GREEN gate that ran nothing, "
+            "which is the silent-zero failure this repo keeps rediscovering")
+
+    def test_the_legacy_workflow_delegates_and_keeps_no_list(self):
+        legacy = self._read(self.LEGACY)
+        assert "flake-checks.yml" in legacy, (
+            "nixos-vm-tests.yml no longer delegates to flake-checks.yml — the "
+            "two-implementations problem is back")
+        listed = re.findall(r'"\.#checks\.x86_64-linux\.([a-z0-9-]+)"', legacy)
+        assert not listed, (
+            f"nixos-vm-tests.yml names {len(listed)} checks explicitly again "
+            f"({listed[:5]}...). That is the parallel path this delegation "
+            f"removed.")
+
+
+class TestNoNixInterpolationInTestScriptComments:
+    """A `${...}` in a testScript COMMENT is a nix interpolation, not a comment.
+
+    THE BREAKAGE (2026-08-04). Documenting how nixpkgs emits a config, I wrote
+    this inside a testScript:
+
+        # fontconfig module emits localConf with
+        #     ln -s ${localConf} $dst/../local.conf
+
+    A testScript is a nix ''-string, so `${localConf}` is INTERPOLATED — the
+    `#` means nothing to nix. `localConf` is not in scope, so:
+
+        error: undefined variable 'localConf'
+
+    That is an EVAL error, which does not fail one test — it fails the whole
+    flake. `nix eval .#checks.x86_64-linux --apply builtins.attrNames`
+    enumerated ZERO checks, and every one of the four VM shards went red
+    without running anything.
+
+    WHY THE EXISTING GUARD MISSED IT: TestEveryTestScriptIsValidPython checks
+    that the extracted script is valid PYTHON, and to do that it must replace
+    `${...}` with a placeholder. It is therefore blind to whether the
+    interpolation itself is valid nix. Different failure, different guard.
+
+    THE RULE IS NARROW ON PURPOSE: real interpolations in executable lines are
+    the whole point of a testScript (there are 23 in session-supervisor.nix
+    alone). A comment is the one place that never needs one, so flagging only
+    comments catches this mistake with no false positives — measured: 0 across
+    every nixos/tests/*.nix at the time this was written.
+
+    Escape it (''${...}) or reword, as display-management.nix now does.
+    """
+
+    def _testscript_bodies(self, path):
+        """Yield (first_line_no, body) for each testScript in a .nix file."""
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+        for m in re.finditer(r"testScript\s*=\s*''", src):
+            i = start = m.end()
+            while i < len(src):
+                if src[i] == "'" and src[i + 1:i + 2] == "'":
+                    if src[i + 2:i + 3] in ("$", "'"):
+                        i += 3
+                        continue
+                    break
+                i += 1
+            yield src[:start].count("\n") + 1, src[start:i]
+
+    def test_no_interpolation_inside_a_comment(self):
+        offenders = []
+        for path in sorted(glob.glob(os.path.join(TESTS_DIR, "*.nix"))):
+            for base, body in self._testscript_bodies(path):
+                for n, line in enumerate(body.split("\n"), 1):
+                    stripped = line.strip()
+                    # `''${` is the ESCAPED form and is correct — skip it.
+                    if stripped.startswith("#") and re.search(r"(?<!')\$\{", line):
+                        offenders.append(
+                            f"{os.path.basename(path)}:{base + n - 1}: {stripped[:90]}")
+        assert not offenders, (
+            "nix interpolation inside a testScript COMMENT — nix expands it "
+            "regardless of the '#', and an undefined name is an EVAL error "
+            "that fails the WHOLE flake, so every VM shard enumerates zero "
+            "checks and goes red without running:\n  " + "\n  ".join(offenders)
+            + "\nEscape it as ''${...} or reword the comment.")
+
+
+class TestNoOrphanedNixosTests:
+    """A test file the flake never imports is a test that never runs.
+
+    THE MISS (2026-08-04). Two files sat in nixos/tests/ defining real checks —
+    hart-app-install-verify and hart-llm-provision — and neither was imported
+    by flake.nix. Dynamic enumeration walks `checks`, so a test that never
+    reaches `checks` is invisible to it: `nix eval .#checks.x86_64-linux
+    --apply builtins.attrNames` cannot list what is not there.
+
+    Found by accident, which is the point. I had added a num2words assertion to
+    hart-app-install-verify.nix, recorded it in the VM verification matrix as
+    covered, and only later checked whether that file was wired in. It was not.
+    The assertion had never executed and never could have.
+
+    This is the SAME shape as "31 of 53 checks were absent from the workflow's
+    hand-written list" — but one layer down, and the layer that still matters.
+    Deleting the workflow list fixed the first; nothing was watching this one.
+
+    TWO CONDITIONS, because a file can fail either half:
+      * imported by flake.nix at all;
+      * and its binding actually reaches the `//` merge that becomes `checks`.
+    An import whose binding is never merged evaluates and then goes nowhere.
+    """
+
+    FLAKE = os.path.join(NIXOS_DIR, "flake.nix")
+
+    def _flake(self):
+        with open(self.FLAKE, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+
+    def _test_files_defining_a_check(self):
+        """Files that define a `name = "hart-..."`, i.e. a runnable check."""
+        out = set()
+        for entry in sorted(os.listdir(TESTS_DIR)):
+            if not entry.endswith(".nix") or entry == "lib.nix":
+                continue
+            with open(os.path.join(TESTS_DIR, entry), encoding="utf-8",
+                      errors="replace") as fh:
+                if re.search(r'name\s*=\s*"hart-[a-z0-9-]+"', fh.read()):
+                    out.add(entry[:-4])
+        return out
+
+    def test_there_are_test_files_to_check(self):
+        """Guard the guard: an empty scan would pass the assertions below."""
+        found = self._test_files_defining_a_check()
+        assert len(found) >= 25, (
+            f"only {len(found)} nixos/tests files define a check — the scan is "
+            f"broken, so a green result here would prove nothing")
+
+    def test_every_test_file_is_imported_by_the_flake(self):
+        imported = set(re.findall(r"import \./tests/([a-z0-9-]+)\.nix",
+                                  self._flake()))
+        orphans = sorted(self._test_files_defining_a_check() - imported)
+        assert not orphans, (
+            f"nixos/tests files defining a check that flake.nix never imports: "
+            f"{orphans}.\nDynamic enumeration walks `checks`; a test that never "
+            f"reaches `checks` is invisible to it and has NEVER run, however "
+            f"green the gate looks.")
+
+    def test_every_import_reaches_the_checks_merge(self):
+        """An imported binding that is never merged evaluates and goes nowhere."""
+        flake = self._flake()
+        chain = re.search(r"in ((?:\w+ // )+\w+);", flake)
+        assert chain, (
+            "could not find the `in a // b // ...;` merge that builds `checks` "
+            "— if its shape changed, this guard is blind and must be updated")
+        merged = set(chain.group(1).split(" // "))
+        bindings = dict(re.findall(
+            r"(\w+)\s*=\s*import \./tests/([a-z0-9-]+)\.nix", flake))
+        unmerged = sorted(f"{b} ({f}.nix)" for b, f in bindings.items()
+                          if b not in merged)
+        assert not unmerged, (
+            f"test bindings imported but never merged into `checks`: "
+            f"{unmerged}.\nThey evaluate and are then discarded, so the check "
+            f"never appears in `nix eval .#checks.x86_64-linux`.")
+
+
+class TestForcedSoftwareGLAlsoSelectsAPixmanRenderer:
+    """ALLOW_SOFTWARE permits a software renderer; it does not SELECT one (#15).
+
+    Both wlroots launchers forced Mesa to llvmpipe with LIBGL_ALWAYS_SOFTWARE
+    while leaving wlroots on its default GLES2 path. wlroots then opened EGL
+    against the DRM node and Mesa refused the combination outright:
+
+        libEGL warning: Not allowed to force software rendering when API
+                        explicitly selects a hardware device
+        [ERROR] [render/egl.c:268]  Failed to initialize EGL
+        [ERROR] [../cage.c:330]     Unable to create the wlroots renderer
+
+    So the tier died instead of degrading, and the CAGE FLOOR died the same
+    way — a crash-loop on the one tier with nothing beneath it. In run
+    30848154453 "greeter exited without creating a session" appeared 66x in
+    layer-shell-host-paint, 22x in desktop-shell-boot and 13x in the reboot
+    latch: one cause, several red checks.
+
+    Both files' comments already CLAIMED pixman ("Mesa llvmpipe + wlroots
+    pixman", "wlroots keeps its own pixman fallback via
+    WLR_RENDERER_ALLOW_SOFTWARE"), which is what made the gap easy to miss for
+    so long — the intent was written down and never implemented.
+
+    SOURCE GUARD, labelled: nix cannot be evaluated on the Windows dev box and
+    no Wayland session can run there either, so the behavioural proof is the
+    VM (cage must reach paint). This is the cheap tripwire for the invariant.
+    """
+
+    LAUNCHERS = [
+        ('nixos/modules/hart-liquid-ui.nix', 'cage floor'),
+        ('nixos/modules/hart-layer-shell-host.nix', 'Tier-2 sway host'),
+    ]
+
+    def test_source_guard_software_gl_always_pairs_with_pixman(self):
+        offenders = []
+        for rel, what in self.LAUNCHERS:
+            with open(os.path.join(REPO_ROOT, rel), encoding='utf-8') as fh:
+                src = fh.read()
+            # Every line that FORCES software GL must have a pixman selection
+            # somewhere in the same file; without it wlroots keeps the EGL path.
+            forces = [ln for ln in src.splitlines()
+                      if 'LIBGL_ALWAYS_SOFTWARE=1' in ln
+                      and not ln.strip().startswith('#')]
+            selects = [ln for ln in src.splitlines()
+                       if 'WLR_RENDERER=pixman' in ln
+                       and not ln.strip().startswith('#')]
+            if forces and not selects:
+                offenders.append(
+                    f"{rel} ({what}): forces LIBGL_ALWAYS_SOFTWARE with no "
+                    f"WLR_RENDERER=pixman — wlroots will take the EGL path and "
+                    f"Mesa will refuse it")
+        assert not offenders, "\n".join(offenders)
+
+    def test_source_guard_pixman_is_gated_not_unconditional(self):
+        """A box that opted into hardware GL must keep the GLES2 path."""
+        with open(os.path.join(REPO_ROOT, 'nixos/modules/hart-liquid-ui.nix'),
+                  encoding='utf-8') as fh:
+            src = fh.read()
+        # The cage launcher selects pixman inside the same optionalString as
+        # LIBGL_ALWAYS_SOFTWARE, so hardware boxes are untouched.
+        i = src.index('kioskLauncher = ')
+        block = src[i:i + 900]
+        assert 'preferHardwareGL' in block, (
+            "the cage launcher no longer gates its software-GL exports on "
+            "preferHardwareGL — pixman would be forced on hardware boxes too")
+
+
+class TestOfflineVoiceFloorIsUnconditional:
+    """Disabling the microphone must never mute the OS (task #7 / #15).
+
+    espeak-ng is the offline voice FLOOR: the synthesizer that needs no model
+    and no download, so a fresh no-network box can still speak its narrated
+    onboarding while the good voice is downloading.
+
+    It used to sit inside `lib.mkIf ui.voiceEnabled`, and that option covers
+    two concerns at once — its own description reads "voice input (STT) and
+    output (TTS)". So turning off the wake-word LISTENER also removed the
+    ability to SPEAK. Found in a VM (run 30848154453): desktop-boot sets
+    voiceEnabled=false purely to trim the listener user service, and the
+    offline-voice-floor subtest then failed on `command -v espeak-ng`. Any
+    real node running the desktop without voice input — a kiosk, or anyone
+    who does not want a hot mic — was mute for the same reason.
+
+    SOURCE GUARD, deliberately: nix cannot be evaluated on the Windows dev
+    box, so the behavioural proof is the desktop-boot subtest, which takes a
+    full VM boot in CI. This is the cheap local tripwire for the same
+    invariant, not a replacement for it.
+    """
+
+    def _module(self):
+        p = os.path.join(REPO_ROOT, 'nixos', 'modules', 'hart-liquid-ui.nix')
+        with open(p, encoding='utf-8') as fh:
+            return fh.read()
+
+    def test_source_guard_espeak_is_not_gated_on_voice_input(self):
+        src = self._module()
+        gate = src.index('(lib.mkIf ui.voiceEnabled {')
+        # Find where that mkIf block's package list ends, then confirm no
+        # espeak-ng DECLARATION lives inside it. Comments mentioning the name
+        # are fine and expected — the move left one behind on purpose.
+        block = src[gate:gate + 3000]
+        decls = [ln for ln in block.splitlines()
+                 if 'espeak-ng' in ln and not ln.strip().startswith('#')]
+        assert not decls, (
+            "espeak-ng is declared inside `lib.mkIf ui.voiceEnabled`, so a "
+            "node with voice INPUT off has no synthesizer and boots mute:\n"
+            + "\n".join(decls))
+
+    def test_source_guard_espeak_is_still_shipped_by_this_module(self):
+        """Un-gating must not become un-shipping."""
+        src = self._module()
+        gate = src.index('(lib.mkIf ui.voiceEnabled {')
+        before = src[:gate]
+        decls = [ln for ln in before.splitlines()
+                 if 'espeak-ng' in ln and not ln.strip().startswith('#')]
+        assert decls, (
+            "no unconditional espeak-ng declaration before the voiceEnabled "
+            "block — the offline voice floor is gone entirely, which is worse "
+            "than it being gated")

@@ -105,7 +105,7 @@ Consequences, binding:
   dialect. Same node types, same bindings, same action names.
 - One agent payload renders on EITHER surface: Nunba's React renderer (app
   surfaces, per the split rule) or hart-comp's native scene (shell chrome).
-  That is what makes the split invisible to the agent.
+  The split is therefore invisible to the agent.
 - `buildStylePresets` / `buildSocialTokens` are the style-token source; the
   native side consumes the SAME tokens (with the conky-themes palette) rather
   than forking a second token table (Gate 4).
@@ -121,8 +121,8 @@ Four layers, each independently agent-addressable:
 - **L2 FORM (SDF expression tree -> WGSL codegen).** The agent composes
   primitives (circle/box/field/noise) with operators (smooth-union, subtract,
   displace, refract, glow). We codegen WGSL from the tree, VALIDATE it (naga),
-  compile OFF the render thread, and atomically swap the pipeline. A genuinely
-  new visual component with zero OS recompile.
+  compile OFF the render thread, and atomically swap the pipeline. A new visual
+  component with zero OS recompile.
 ### THE SEMANTICS TRAP -- binding rule for `animated` and for user-driven motion
 Adopting Nunba's vocabulary costs nothing at runtime (it is parsed once per
 COMPOSE, never per frame) and nothing in nativeness (nativeness lives in the
@@ -188,7 +188,7 @@ Nunba is not a handful of pages: the landing-page tree carries ~36 Social
 surfaces (Feed, Communities, Chat, Inbox, Profile, Marketplace, Recipes,
 Wallet/Compute, Agents, Notifications, Settings, Onboarding, KidsLearning,
 Mindstory, ...) plus Admin/Channels/Agent/payments. Porting that to Rust would
-be insane and would fork the product. So the rule, once, for all of it:
+be insane and would fork the product. The rule, once, for all of it:
 
 **SHELL CHROME goes NATIVE. APPLICATION SURFACES stay NUNBA-CANONICAL, served
 natively as microfrontends.**
@@ -246,8 +246,8 @@ M6 flip: nativeShell default ON on Tier-1; WebView demoted to app content +
 
 ## THE BAR: better than Windows 12 and macOS (steward 2026-07-20)
 Parity with our own HTML shell is the FLOOR, not the goal. The goal is a desktop
-that beats the incumbents. That requires being honest about which fights are
-winnable, because a small project that attacks their strengths loses.
+that beats the incumbents. That requires naming which fights are winnable,
+because a small project that attacks their strengths loses.
 
 **Where we do NOT compete (accept and route around):** driver/hardware breadth,
 app-ecosystem size, decades of accumulated small-detail polish, enterprise
@@ -271,7 +271,7 @@ management + certifications, localization breadth. We buy these where possible
 
 **Where we WIN on feel (measurable, and the fastest visible win):**
 The single most "premium" quality of macOS is not looks, it is LATENCY and the
-absence of jank. That is winnable by us because we own the whole path.
+absence of jank. We own the whole path, so that one is winnable.
 | Metric | Windows 11/12 typical | macOS typical | HART TARGET |
 |---|---|---|---|
 | input-to-photon (drag/hover) | 60-120ms, high variance | 50-80ms | **< 25ms, low variance** |
@@ -303,7 +303,7 @@ milestone that regresses latency fails even if it looks better.
 
 ## Rules
 - Ladder discipline: native shell rides Tier-1 only until proven; paint-watchdog
-  + honest-ready markers apply identically (write shell-ready on first composed
+  + ready markers apply identically (write shell-ready on first composed
   frame containing the scene).
 - Zero parallel paths: palettes from conky-themes JSON; A2UI schema unchanged;
   IPC via the existing com.hart.Compositor socket + typed OS bridge.

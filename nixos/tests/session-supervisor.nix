@@ -123,7 +123,45 @@ in
           # uses the logind seat manager (the canonical greetd-on-systemd path), and
           # must NOT force seatd-over-logind (the dual-seat-manager regression that
           # froze input + EBUSY-looped the boot on real hardware).
-          greetd_cmd = sup.succeed("systemctl cat greetd.service")
+          # The forced backend lives in greetd's SESSION COMMAND (the module
+          # wraps the selector: `env LIBSEAT_BACKEND=logind ...`), which greetd
+          # reads from its config.toml — it is NOT in the systemd unit file, so
+          # the old `systemctl cat greetd.service` grep failed against a
+          # CORRECT config on every run (run 30485906966). Assert the config
+          # greetd actually consumes.
+          # RESOLVE the config path off the unit — do not guess /etc/greetd.
+          #
+          # On NixOS `services.greetd.settings` renders the config into the
+          # STORE and passes it to greetd as `--config /nix/store/...`. There
+          # is no /etc/greetd/config.toml and no /etc/greetd/greetd.toml, so
+          # both cats failed and the subtest reported a config problem when
+          # the config was correct (run 30774512407).
+          #
+          # The comment above this block records the previous swing: the check
+          # used to grep `systemctl cat greetd.service` and was moved to
+          # /etc/greetd because the COMMAND is not in the unit. Both are half
+          # right — the command is not IN the unit, but the path to the file
+          # containing it IS. So: read the path from the unit, then read the
+          # file. That is the only place NixOS actually puts it.
+          _unit = sup.succeed("systemctl cat greetd.service 2>/dev/null || true")
+          _cfg = sup.succeed(
+              "systemctl cat greetd.service 2>/dev/null "
+              "| grep -oE '\-\-config[= ][^ ]+' | head -1 "
+              "| sed -E 's/^--config[= ]//' || true"
+          ).strip()
+          if not _cfg:
+              # Fall back to the /etc locations before failing, so a distro
+              # layout that DOES use them still works.
+              _cfg = sup.succeed(
+                  "for f in /etc/greetd/config.toml /etc/greetd/greetd.toml; do "
+                  "  [ -f \"$f\" ] && echo \"$f\" && break; done || true"
+              ).strip()
+          assert _cfg, (
+              "could not locate greetd's config: it is not referenced by "
+              "--config on greetd.service and not at either /etc/greetd path.\n"
+              "--- greetd.service ---\n" + _unit)
+          sup.log(f"greetd config resolved to: {_cfg}")
+          greetd_cmd = sup.succeed(f"cat {_cfg}")
           assert "LIBSEAT_BACKEND=logind" in greetd_cmd, \
               "greetd session must force the logind libseat backend (canonical greetd-on-systemd)"
           assert "LIBSEAT_BACKEND=seatd" not in greetd_cmd, \
@@ -240,7 +278,7 @@ in
         crashLoopCount = 3;
         crashLoopWindowSeconds = 300;
         # Short paint budget so the VM test is fast (real default is 20s).
-        shellPaintTimeoutSeconds = 3;
+        shellPaintTimeoutSeconds = pkgs.lib.mkForce 3;
         # Exercise the SIGTERM grace (sleep dies on TERM immediately, so 2s is the
         # ceiling, not a real wait) but zero the post-kill settle (no real DRM
         # master in the VM) so the 8× hung-kill loop stays fast.
@@ -335,7 +373,7 @@ in
           swayCommand = "${paintThenStay}";         # Tier-2 PAINTS then stays alive
           crashLoopCount = 3;
           crashLoopWindowSeconds = 300;
-          shellPaintTimeoutSeconds = 5;             # ample for the immediate touch
+          shellPaintTimeoutSeconds = pkgs.lib.mkForce 5;             # ample for the immediate touch
           drmMasterSettleSeconds = 0;               # no real DRM master in the VM
         };
       };
@@ -396,7 +434,14 @@ in
         virtualisation = { memorySize = 2048; cores = 2; };
         hart.sessionSupervisor = {
           enable = true;
-          inherit startTier;
+          # mkForce, NOT `inherit startTier`: since mkNode composes the real
+          # variant profile, the desktop profile ALSO sets startTier (its
+          # shipped value "hart-comp"). Two plain definitions of one enum
+          # conflict unless equal — so the `sway` and `cage` nodes failed to
+          # EVALUATE (run 30574137255, ❌ hart-session-supervisor-start-tier).
+          # This test's whole point is overriding the shipped start tier, so
+          # saying so explicitly is also the honest expression of intent.
+          startTier = pkgs.lib.mkForce startTier;
           # Make ALL tiers available so startTier is honored verbatim (an
           # unavailable tier would legitimately skip down — tested elsewhere).
           compCommand = "${pkgs.coreutils}/bin/true";
@@ -407,7 +452,7 @@ in
           drmMasterSettleSeconds = 0;  # no real DRM master in the VM — stay fast
           # Disable the paint watchdog: this test only exercises the un-latched
           # START resolution, not the hang path.
-          shellPaintTimeoutSeconds = 0;
+          shellPaintTimeoutSeconds = pkgs.lib.mkForce 0;
         };
       };
     in
@@ -492,7 +537,7 @@ in
         swayCommand = "${pkgs.coreutils}/bin/false";    # Tier-2 crashes instantly
         crashLoopCount = 3;
         crashLoopWindowSeconds = 300;
-        shellPaintTimeoutSeconds = 0;   # crash-only path for this test
+        shellPaintTimeoutSeconds = pkgs.lib.mkForce 0;   # crash-only path for this test
         drmMasterSettleSeconds = 0;     # no real DRM master in the VM — stay fast
       };
     };
@@ -540,6 +585,43 @@ in
               "post-reboot crash-loop dropped below the floor — NEVER allowed"
 
       with subtest("reset-tier re-arms Tier-1 and that ALSO survives a reboot"):
+          # RACE-FREE isolation (run 30485906966): with both tiers = /bin/false,
+          # greetd's own loop crash-drops the freshly reset latch within
+          # seconds — before shutdown AND again right after the reboot, ahead
+          # of the assert. The subtest proves the DISK persistence of a
+          # reset-armed latch, so greetd (already proven the supervisor above)
+          # is masked across this reboot: the mask symlink lives in /etc on
+          # the VM's persistent disk, so the next boot cannot race the read.
+          # `sup.succeed` DISCARDS stderr, so when this failed (exit 1, run
+          # 30774512407) the report was just "command failed" with no reason —
+          # and on NixOS there are several plausible ones, with different
+          # fixes. /etc/systemd/system/greetd.service already exists as a
+          # symlink into the store, and systemd can refuse to mask over an
+          # existing unit file rather than silently replacing it.
+          #
+          # Capture WHY. If masking is genuinely unavailable here, fall back to
+          # stop + a RUNTIME mask, which is enough for this subtest's actual
+          # claim: it only needs greetd not to run while the latch is read
+          # back. Then say plainly, in the log, which path was taken — a
+          # fallback that hides itself is how a test starts proving something
+          # weaker than it says.
+          _rc, _out = sup.execute("systemctl mask --now greetd.service 2>&1")
+          if _rc != 0:
+              sup.log(f"persistent mask refused (rc={_rc}): {_out.strip()}")
+              _rc2, _out2 = sup.execute(
+                  "systemctl stop greetd.service 2>&1; "
+                  "systemctl mask --runtime --now greetd.service 2>&1")
+              sup.log(f"runtime-mask fallback rc={_rc2}: {_out2.strip()}")
+              # Whatever the mechanism, the REQUIREMENT is that greetd is not
+              # running — assert that, not the mechanism.
+              _active = sup.succeed(
+                  "systemctl is-active greetd.service || true").strip()
+              assert _active != "active", (
+                  f"greetd is still ACTIVE after mask+stop ({_active!r}); this "
+                  f"subtest needs it quiet so its crash-loop cannot eat the "
+                  f"freshly reset latch.\nmask: {_out.strip()}\n"
+                  f"fallback: {_out2.strip()}")
+              sup.log("greetd quiesced via the runtime fallback")
           sup.succeed("hartctl session reset-tier")
           assert sup.succeed(f"cat {LATCH}").strip() == "hart-comp"
           sup.shutdown()
@@ -577,7 +659,7 @@ in
         # NOT killed — we want VT1 held for the duration of the probes).
         compCommand = null;
         swayCommand = "${pkgs.coreutils}/bin/sleep infinity";
-        shellPaintTimeoutSeconds = 0;   # don't let the watchdog tear down VT1
+        shellPaintTimeoutSeconds = pkgs.lib.mkForce 0;   # don't let the watchdog tear down VT1
       };
       # The desktop config pre-spawns autovt@tty2; the minimal mkNode node does not
       # import desktop.nix, so wire the SAME recovery contract here so the test
@@ -600,12 +682,56 @@ in
           # units logind would and confirm each comes up as a real getty login —
           # i.e. a VT switch would land on a console, not a void. tty2 is already
           # pre-spawned (below); start tty3..tty6 to prove the whole range works.
+          # NOTE the instance NAME: starting autovt@ttyN instantiates the unit
+          # AS autovt@ttyN — getty@ttyN is a SEPARATE, never-started instance.
+          # The old wait on getty@ttyN therefore failed against a WORKING
+          # recovery console on every run ("unit getty@tty2.service is
+          # inactive", run 30485906966). Assert the instance we actually start.
+          #
+          # WHY THE PROCESS AND NOT ExecStart (run 30774512407): the previous
+          # version asserted `"agetty" in ExecStart` and failed on tty3 with
+          #     path=/nix/store/…-getty ; argv[]=/nix/store/…-getty
+          # while tty2 logged a plain `(agetty)`. That is not two behaviours,
+          # it is nixpkgs' two SHAPES — getty@ and autovt@ are distinct unit
+          # definitions in nixos/modules/services/ttys/getty.nix:
+          #     getty@   ExecStart = writers.writeDash "getty" autologinScript
+          #     autovt@  ExecStart = gettyCmd "--noclear %I $TERM"
+          # The first is a dash wrapper whose last line EXECs agetty, so both
+          # shapes end up as a real login — one just isn't spelled "agetty" in
+          # its ExecStart. (The comment this replaces claimed autovt@ is a
+          # symlink to the getty@ template; at this nixpkgs pin it is not, and
+          # believing that is what made the string check look sound.)
+          #
+          # So assert the REQUIREMENT — a login program is RUNNING on that VT —
+          # rather than which of the two shapes systemd resolved. Reading the
+          # main PID's comm is also STRICTLY STRONGER: it proves agetty actually
+          # started, where the string only ever proved it was configured to.
           for n in range(2, 7):
               sup.succeed(f"systemctl start autovt@tty{n}.service")
-              sup.wait_for_unit(f"getty@tty{n}.service", timeout=30)
-              # The unit must be a getty (agetty) login prompt, not a stub.
-              active = sup.succeed(f"systemctl is-active getty@tty{n}.service").strip()
-              assert active == "active", f"getty@tty{n} not active ({active}) — recovery void"
+              sup.wait_for_unit(f"autovt@tty{n}.service", timeout=30)
+              # Retry: the unit reports active at fork, and the wrapper shape
+              # needs one more exec before comm settles to "agetty".
+              try:
+                  sup.wait_until_succeeds(
+                      f"pid=$(systemctl show -p MainPID --value "
+                      f"autovt@tty{n}.service); "
+                      f'[ -n "$pid" ] && [ "$pid" != 0 ] && '
+                      f'grep -qx agetty "/proc/$pid/comm"',
+                      timeout=30)
+              except Exception:
+                  pid = sup.succeed(
+                      f"systemctl show -p MainPID --value "
+                      f"autovt@tty{n}.service").strip()
+                  comm = sup.succeed(
+                      f'cat "/proc/{pid}/comm" 2>/dev/null || echo "<no pid>"'
+                  ).strip()
+                  execstart = sup.succeed(
+                      f"systemctl show -p ExecStart --value "
+                      f"autovt@tty{n}.service").strip()
+                  raise AssertionError(
+                      f"autovt@tty{n} is active but its main process is "
+                      f"{comm!r} (pid {pid}), not agetty — a Ctrl+Alt+F{n} "
+                      f"switch would land on a void.\nExecStart: {execstart!r}")
 
       with subtest("autovt@tty2 is PRE-SPAWNED from boot (recovery console already alive)"):
           # The belt-and-suspenders pin: tty2's getty must be active WITHOUT us
@@ -617,13 +743,13 @@ in
           assert "multi-user.target" in sup.succeed(
               "systemctl show -p WantedBy autovt@tty2.service"
           ), "autovt@tty2 is not wantedBy multi-user.target — not pre-spawned"
-          assert sup.succeed("systemctl is-active getty@tty2.service").strip() == "active", \
+          assert sup.succeed("systemctl is-active autovt@tty2.service").strip() == "active", \
               "tty2 getty is not active from boot — recovery console not pre-spawned"
 
       with subtest("the TTY autologin is nulled so a recovery F-key never lands on a hidden user"):
           # getty.autologinUser is null → the F-key reaches a real LOGIN PROMPT,
           # not an auto-session on the hidden `nixos`/kiosk user.
-          al = sup.succeed("systemctl cat getty@tty2.service || true")
+          al = sup.succeed("systemctl cat autovt@tty2.service || true")
           assert "--autologin" not in al, \
               "getty has --autologin wired — a recovery F-key would skip the login prompt"
 
@@ -676,7 +802,7 @@ in
         drmMasterSettleSeconds = 0;  # no real DRM master in the VM — stay fast
         # Irrelevant here (no launch happens in an unhealthy run) but pin it off so
         # nothing about the paint path can interfere with the assertion.
-        shellPaintTimeoutSeconds = 0;
+        shellPaintTimeoutSeconds = pkgs.lib.mkForce 0;
       };
     };
 
@@ -702,6 +828,13 @@ in
           ).strip())
 
       with subtest("a clean start state: arm Tier-1, clear the window + the flag"):
+          # ISOLATE from greetd first: in this GPU-less VM every tier crashes
+          # instantly, so greetd re-runs the crashing selector continuously in
+          # the background — polluting the crash window and dropping the latch
+          # UNDERNEATH the exact-count assertions below (the family-wide red,
+          # run 30485906966). greetd's supervisor role was already asserted in
+          # subtest 1; from here the test IS the session runner.
+          sup.succeed("systemctl stop greetd.service")
           sup.succeed("hartctl session reset-tier")  # latch = hart-comp, window cleared
           sup.succeed(f"rm -f {WINDOW} {UNHEALTHY}")
           assert sup.succeed(f"cat {LATCH}").strip() == "hart-comp"
@@ -794,7 +927,7 @@ in
           swayCommand = "${paintNoInput}";          # Tier-2 PAINTS but never input
           crashLoopCount = 3;
           crashLoopWindowSeconds = 300;
-          shellPaintTimeoutSeconds = 3;             # ample for the immediate paint touch
+          shellPaintTimeoutSeconds = pkgs.lib.mkForce 3;             # ample for the immediate paint touch
           inputAliveTimeoutSeconds = 3;             # OPT IN: short input budget for the VM
           tierTermGraceSeconds = 2;
           drmMasterSettleSeconds = 0;               # no real DRM master in the VM
@@ -874,7 +1007,7 @@ in
           swayCommand = "${paintAndInput}";         # Tier-2 PAINTS + signals input
           crashLoopCount = 3;
           crashLoopWindowSeconds = 300;
-          shellPaintTimeoutSeconds = 5;
+          shellPaintTimeoutSeconds = pkgs.lib.mkForce 5;
           inputAliveTimeoutSeconds = 5;             # OPT IN: input watchdog active
           drmMasterSettleSeconds = 0;
         };
@@ -943,7 +1076,7 @@ in
           swayCommand = "${paintNoInput}";          # PAINTS, never signals input
           crashLoopCount = 3;
           crashLoopWindowSeconds = 300;
-          shellPaintTimeoutSeconds = 5;
+          shellPaintTimeoutSeconds = pkgs.lib.mkForce 5;
           # inputAliveTimeoutSeconds omitted -> DEFAULT 0 (input watchdog disabled).
           drmMasterSettleSeconds = 0;
         };
@@ -1024,7 +1157,7 @@ in
           swayCommand = "${paintNoInput}";          # PAINTS, never signals input
           crashLoopCount = 3;
           crashLoopWindowSeconds = 300;
-          shellPaintTimeoutSeconds = 5;
+          shellPaintTimeoutSeconds = pkgs.lib.mkForce 5;
           inputAliveTimeoutSeconds = 3;             # ARMED — but the seat is touch-only
           # Inject the touch-only seat enumeration (the VM really has a keyboard, so
           # this is the only deterministic way to exercise the touch-only branch).
@@ -1108,7 +1241,7 @@ in
           swayCommand = "${pkgs.coreutils}/bin/false";   # Tier-2 fake crash
           crashLoopCount = 3;              # ONE run records 1 crash (< 3) → no drop
           crashLoopWindowSeconds = 300;
-          shellPaintTimeoutSeconds = 0;    # crash-only path — no paint wait
+          shellPaintTimeoutSeconds = pkgs.lib.mkForce 0;    # crash-only path — no paint wait
           drmMasterSettleSeconds = 0;      # no real DRM master in the VM — stay fast
           tierTermGraceSeconds = 0;
         };
@@ -1120,6 +1253,17 @@ in
         sup.wait_for_unit("multi-user.target")
         sup.wait_for_unit("greetd.service", timeout=120)
 
+        # ISOLATE from greetd's own loop before driving the selector manually:
+        # in this GPU-less VM every tier crashes instantly, so greetd re-runs
+        # the crashing selector continuously in the background, racking the
+        # crash window past crashLoopCount and dropping the latch underneath
+        # the single-run assertions (run 30485906966: the "one sub-threshold
+        # crash" check read a latch the BACKGROUND loop had already dropped —
+        # the wrap's accounting was never at fault). greetd's supervisor role
+        # is already asserted above by wait_for_unit; from here the test IS
+        # the session runner.
+        sup.succeed("systemctl stop greetd.service")
+
         selector = sup.succeed(
             "find /nix/store -maxdepth 3 -name '*-hart-session-selector' -type f -print -quit"
         ).strip()
@@ -1127,6 +1271,7 @@ in
 
         with subtest("the launched tier's stdout+stderr are captured under journalctl -t hart-tier-hart-comp"):
             sup.succeed("hartctl session reset-tier")  # arm Tier-1 (hart-comp)
+            sup.succeed("rm -f /var/lib/hart/session-tier.window")  # clean crash budget
             sup.succeed(f"runuser -u hart -- {selector} || true")
             # The tier's OWN output (BOTH streams) reached the journal under the
             # per-tier identifier — the exact diagnosability the real-HW boot lacked.

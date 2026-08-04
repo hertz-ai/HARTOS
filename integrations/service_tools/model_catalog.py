@@ -521,6 +521,7 @@ class ModelCatalog:
             except Exception as e:
                 logger.debug(f"Populator '{name}' failed: {e}")
         # Built-in entries that don't depend on application modules
+        added += self._populate_llm_models()
         added += self._populate_tts_models()
         added += self._populate_stt_models()
         added += self._populate_vlm_models()
@@ -610,6 +611,126 @@ class ModelCatalog:
                 tags=['local', 'stt', 'cpu-friendly'],
             )
             self.register(entry, persist=False)
+            added += 1
+        return added
+
+    def _populate_llm_models(self) -> int:
+        """Chat/LLM entries — the ladder every hardware-based recommendation reads.
+
+        This catalog is the SINGLE SOURCE OF TRUTH for which chat models exist.
+        Before this existed the LLM rung was missing (populate_from_subsystems
+        seeded tts/stt/vlm/embodied/videogen/audiogen and skipped llm), so three
+        ad-hoc lists grew to fill the gap and drifted apart: model_onboarding's
+        MODEL_TIERS still named Qwen2.5 while agent_engine/model_registry.py had
+        moved to Qwen3.5, and Nunba kept a fourth list of its own. Anything that
+        needs "which chat model suits this box" reads THIS, and nothing else
+        hardcodes a ladder.
+
+        Sizing carries BOTH budgets on purpose. vram_gb gates the GPU path and
+        ram_gb gates the CPU path, because a box with no GPU but plenty of RAM
+        can still run a mid-size model -- the VRAM-only ladder this replaces
+        collapsed every CPU-only machine to the smallest entry regardless of how
+        much RAM it had.
+
+        repo_id values are taken from core/hub_allowlist.py, so every entry here
+        is already download-allowlisted; adding a model means adding it there
+        too, and the allowlist stays the security boundary.
+
+        Extending: append an entry. Selection is data-driven (budget vs
+        vram_gb/ram_gb, ranked by priority) so no code changes to add a family.
+        """
+        # Rows are DOWNLOAD-COMPLETE on purpose: repo_id alone is not enough to
+        # fetch a GGUF, so each carries the exact file name and, for the VL
+        # models, the mmproj projector. mmproj has TWO names because the file is
+        # published as mmproj-F16.gguf in every repo and must be stored under a
+        # model-specific name locally or the second model overwrites the first.
+        #
+        # Sourced from Nunba's llama/llama_installer.py MODEL_PRESETS, which is
+        # what actually downloads today. NOT from core/hub_allowlist.py: that is
+        # a security allowlist and lists transformers repos (google/gemma-2b-it)
+        # that contain no GGUF at all, so seeding from it produced rows the
+        # llama_cpp backend could never load. Gemma is therefore absent here
+        # until a GGUF repo for it is allowlisted; a row that cannot download is
+        # worse than no row.
+        #
+        # vram_gb/ram_gb are derived from weight size: GPU needs the weights
+        # plus ~35% for KV cache and context, CPU needs roughly double the
+        # weights to stay comfortable. Extending: add a row.
+        MIN_BUILD_QWEN35 = 8148          # llama.cpp b8148+ required by Qwen3.5
+        # (id, name, repo, gguf, mmproj|None, size_mb, tier, prio, quality,
+        #  speed, purposes, min_build)
+        _llms = [
+            ('llm-qwen3.5-0.8b', 'Qwen3.5 0.8B VL', 'unsloth/Qwen3.5-0.8B-GGUF',
+             'Qwen3.5-0.8B-UD-Q4_K_XL.gguf', 'mmproj-Qwen3.5-0.8B-F16.gguf',
+             550, 'lite', 30, 0.45, 0.95, ['draft'], MIN_BUILD_QWEN35),
+            ('llm-qwen3-2b-text', 'Qwen3 2B (text only)',
+             'unsloth/Qwen3-2B-Instruct-GGUF', 'Qwen3-2B-Instruct-Q4_K_M.gguf',
+             None, 1100, 'lite', 35, 0.50, 0.88, ['main'], None),
+            ('llm-qwen3.5-2b', 'Qwen3.5 2B VL', 'unsloth/Qwen3.5-2B-GGUF',
+             'Qwen3.5-2B-UD-Q4_K_XL.gguf', 'mmproj-Qwen3.5-2B-F16.gguf',
+             1340, 'lite', 45, 0.55, 0.85, ['main'], MIN_BUILD_QWEN35),
+            ('llm-qwen3.5-4b', 'Qwen3.5 4B VL', 'unsloth/Qwen3.5-4B-GGUF',
+             'Qwen3.5-4B-UD-Q4_K_XL.gguf', 'mmproj-Qwen3.5-4B-F16.gguf',
+             2910, 'standard', 60, 0.60, 0.70, ['main'], MIN_BUILD_QWEN35),
+            ('llm-qwen3.5-9b', 'Qwen3.5 9B VL', 'unsloth/Qwen3.5-9B-GGUF',
+             'Qwen3.5-9B-UD-Q4_K_XL.gguf', 'mmproj-Qwen3.5-9B-F16.gguf',
+             6113, 'standard', 70, 0.72, 0.50, ['main'], MIN_BUILD_QWEN35),
+            ('llm-qwen3.5-27b', 'Qwen3.5 27B VL', 'unsloth/Qwen3.5-27B-GGUF',
+             'Qwen3.5-27B-UD-Q4_K_XL.gguf', 'mmproj-Qwen3.5-27B-F16.gguf',
+             18022, 'full', 80, 0.85, 0.30, ['main'], MIN_BUILD_QWEN35),
+            ('llm-qwen3.5-35b-a3b', 'Qwen3.5 35B-A3B MoE',
+             'unsloth/Qwen3.5-35B-A3B-GGUF', 'Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf',
+             'mmproj-Qwen3.5-35B-A3B-F16.gguf',
+             22733, 'full', 85, 0.88, 0.35, ['main'], MIN_BUILD_QWEN35),
+        ]
+        # Rows seeded by an EARLIER version of this method that are now known to
+        # be unloadable: google/gemma-*-it are transformers repos with no GGUF,
+        # so the llama_cpp backend can never start them. Remove them rather than
+        # leave a row the recommender might select. Scoped to these exact ids.
+        for _bad in ('llm-gemma-2b-it', 'llm-gemma-7b-it'):
+            if _bad in self._entries:
+                self.unregister(_bad, persist=False)
+                logger.info("Removed unloadable seeded LLM row %s (no GGUF in repo)", _bad)
+
+        added = 0
+        for (mid, name, repo, gguf, mmproj, size_mb, tier, prio,
+             quality, speed, purposes, min_build) in _llms:
+            weights_gb = round(size_mb / 1024.0, 2)
+            files = {'model': gguf}
+            if mmproj:
+                # Local name is model-specific; source name is what the repo
+                # publishes. Collapsing them overwrites across models.
+                files['mmproj'] = mmproj
+                files['mmproj_source'] = 'mmproj-F16.gguf'
+            _definition = dict(
+                name=name, model_type=ModelType.LLM,
+                source='huggingface', repo_id=repo, files=files,
+                vram_gb=round(weights_gb * 1.35, 1),
+                ram_gb=round(weights_gb * 2.0, 1),
+                disk_gb=weights_gb,
+                min_capability_tier=tier,
+                backend='llama_cpp',
+                supports_gpu=True, supports_cpu=True,
+                supports_cpu_offload=True, cpu_offload_method='restart_cpu',
+                min_build=min_build,
+                capabilities={'chat': True, 'vision': bool(mmproj),
+                              'quant': 'Q4_K_M' if mmproj is None else 'UD-Q4_K_XL',
+                              'size_mb': size_mb},
+                quality_score=quality, speed_score=speed, priority=prio,
+                purposes=list(purposes),
+                tags=['local', 'chat', 'qwen'] + (['vision'] if mmproj else []),
+            )
+            if mid in self._entries:
+                # UPDATE, do not skip. A seeded row is owned by this method, so a
+                # corrected definition (a wrong file name, a missing mmproj, a
+                # bumped min_build) has to reach boxes that already persisted the
+                # old one -- "add if absent" silently pins the first version ever
+                # written and makes the catalog uncorrectable. User-owned flags
+                # (enabled / pinned / auto_load) and runtime state (downloaded /
+                # loaded) are NOT in _definition, so they survive untouched.
+                self.override(mid, persist=False, **_definition)
+                continue
+            self.register(ModelEntry(id=mid, **_definition), persist=False)
             added += 1
         return added
 

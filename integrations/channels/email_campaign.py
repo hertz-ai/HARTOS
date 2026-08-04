@@ -25,6 +25,7 @@ published, valid TLS) rather than from renting somebody's IP reputation.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -48,6 +49,12 @@ SMTP_USER = os.environ.get('HEVOLVE_SMTP_USER', 'sathish@mail.hertzai.com')
 SMTP_PASS = os.environ.get('HEVOLVE_SMTP_PASS', '')
 FROM_NAME = os.environ.get('HEVOLVE_SMTP_FROM_NAME', 'Sathish at Hevolve')
 REPLY_TO = os.environ.get('HEVOLVE_SMTP_REPLY_TO', 'sathish@hertzai.com')
+
+# Where the one-click unsubscribe link points. Deliberately the public site
+# rather than the mail host: the reader recognises hevolve.ai, and the
+# endpoint has to answer a POST from the receiver's infrastructure without
+# any of the sending machinery being reachable.
+UNSUB_BASE = os.environ.get('HEVOLVE_UNSUB_BASE', 'https://hevolve.ai')
 
 # Pacing. The default is deliberately unhurried: a burst is what trips
 # receiving-side rate limits, and there is rarely a reason to rush a campaign.
@@ -157,6 +164,71 @@ def load_optouts() -> set:
         return {line.strip().lower() for line in f if line.strip()}
 
 
+def resolve_unsubscribe_tokens(token_lines: Iterable[str],
+                               recipients: Iterable[str],
+                               campaign: str,
+                               *, dry_run: bool = False) -> dict:
+    """Turn one-click unsubscribe tokens back into addresses, and opt them out.
+
+    The web endpoint that receives a one-click unsubscribe records only the
+    per-recipient HMAC: it has neither the list nor the signing secret, so it
+    cannot know whose token it just collected. That is deliberate -- it keeps
+    every address off the public web server. The cost is this step, which has
+    to run where the list and the secret already live.
+
+    Resolution is by recomputation rather than a stored map: for each address
+    we know, derive its token and see whether it was reported. That means no
+    token->address table exists anywhere to be leaked, and it is cheap even
+    for the full list (one HMAC per address).
+
+    An unmatched token is reported, never guessed at. It usually means a
+    different campaign's token, and silently dropping it would hide a real
+    opt-out.
+    """
+    wanted = set()
+    for line in token_lines:
+        line = (line or '').strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if row.get('event') != 'unsubscribe':
+            continue
+        tok = (row.get('token') or '').strip().lower()
+        if tok:
+            wanted.add(tok)
+
+    out = {'reported': len(wanted), 'matched': 0, 'unmatched': 0,
+           'already_opted_out': 0, 'dry_run': dry_run, 'addresses': []}
+    if not wanted:
+        return out
+
+    existing = load_optouts()
+    seen_tokens = set()
+    for addr in recipients:
+        addr = (addr or '').strip()
+        if not addr:
+            continue
+        tok = tracking_token(addr, campaign)
+        if tok not in wanted:
+            continue
+        seen_tokens.add(tok)
+        low = addr.lower()
+        if low in existing:
+            out['already_opted_out'] += 1
+            continue
+        out['matched'] += 1
+        out['addresses'].append(low)
+        if not dry_run:
+            record_optout(low)
+            existing.add(low)
+
+    out['unmatched'] = len(wanted - seen_tokens)
+    return out
+
+
 def record_optout(address: str) -> None:
     """Honour an unsubscribe. Failing to record one is the error that
     actually matters here, so it is logged loudly."""
@@ -223,10 +295,12 @@ def recent_bounce_rate(campaign: str, days: int = 3) -> dict:
     """
     sent_path = _state_path(campaign, 'sent')
     if not os.path.exists(sent_path):
-        return {'sent': 0, 'bounced': 0, 'rate': 0.0, 'window_days': days}
+        return {'sent': 0, 'bounced': 0, 'rate': 0.0, 'window_days': days,
+                'stale': False, 'newest_send': None, 'bounce_log_day': None}
 
     cutoff = time.time() - days * 86400
     recent = set()
+    newest_send = None
     with open(sent_path, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
@@ -237,14 +311,46 @@ def recent_bounce_rate(campaign: str, days: int = 3) -> dict:
                 ts = time.mktime(time.strptime(day, '%Y-%m-%d'))
             except ValueError:
                 continue
+            if newest_send is None or ts > newest_send:
+                newest_send = ts
             if ts >= cutoff:
                 recent.add(addr.strip().lower())
 
     bounced = load_bounced() & recent
     n = len(recent)
+
+    # Is this rate actually measured, or merely absent?
+    #
+    # This guard reads the bounce log, and the bounce log is only written by
+    # bounce_handler.py. If that stops running, recent sends accumulate with
+    # no bounces recorded against them, the rate computes as 0/n = 0.0, and a
+    # 5% ceiling waves the next batch through. The guard reports "safe"
+    # precisely when measurement has stopped, which is the one failure mode a
+    # safety check must not have.
+    #
+    # Not hypothetical. Bounce collection stopped on 2026-07-22 and 3,161
+    # further messages went out on 07-25 and 07-26 with no bounce data at all;
+    # the only day that WAS measured bounced at 52.8% against this 5% ceiling.
+    #
+    # So report whether the bounce log has been updated since the newest send.
+    # `stale` means the rate below is unknown, not low, and the caller must
+    # treat it as a halt rather than a pass.
+    bounce_path = os.path.join(_STATE_DIR, 'bounced')
+    bounce_mtime = os.path.getmtime(bounce_path) if os.path.exists(bounce_path) else None
+    stale = False
+    if newest_send is not None and n > 0:
+        # A send is dated to the day, so allow the whole of the send's day to
+        # elapse before calling the log stale; bounces legitimately lag hours.
+        stale = bounce_mtime is None or bounce_mtime < (newest_send + 86400)
+
     return {'sent': n, 'bounced': len(bounced),
             'rate': (len(bounced) / n) if n else 0.0,
-            'window_days': days}
+            'window_days': days,
+            'stale': stale,
+            'newest_send': (time.strftime('%Y-%m-%d', time.localtime(newest_send))
+                            if newest_send else None),
+            'bounce_log_day': (time.strftime('%Y-%m-%d', time.localtime(bounce_mtime))
+                               if bounce_mtime else None)}
 
 
 # Above this, stop. Receiving systems tolerate a few percent; sustained
@@ -320,9 +426,29 @@ def build_message(to: str, subject: str, html: str, text: str,
     msg['Reply-To'] = REPLY_TO
     msg['Date'] = formatdate(localtime=True)
     msg['Message-ID'] = make_msgid(domain=SMTP_HOST)
-    # Machine-readable unsubscribe: mail clients surface this as a button,
-    # which is both courteous and a positive deliverability signal.
-    msg['List-Unsubscribe'] = '<mailto:%s?subject=unsubscribe>' % REPLY_TO
+
+    # One-click unsubscribe (RFC 8058). This was a mailto: only, and that gap
+    # is not merely a missing feature -- it is a plausible cause of the
+    # 550-5.7.1 block Gmail applied to this sender on 2026-07-26.
+    #
+    # A mailto: unsubscribe asks the reader to compose an email. Most people
+    # will not; faced with mail they do not want, the one-tap control in front
+    # of them is "Report spam". So a weak unsubscribe path converts directly
+    # into the complaint rate that receivers block on. Giving an HTTPS link
+    # that unsubscribes in a single tap is the cheapest way to move those
+    # people out of the complaint bucket.
+    #
+    # It is also a hard requirement: Google and Yahoo require one-click for
+    # bulk senders, and this campaign's ramp reaches 5k/day and beyond.
+    #
+    # The URL carries only the per-recipient HMAC, never the address, so the
+    # link cannot be used to harvest anyone. Both forms are offered because
+    # some clients still use the mailto:.
+    token = tracking_token(to, campaign)
+    unsub_url = '%s/u/%s' % (UNSUB_BASE.rstrip('/'), token)
+    msg['List-Unsubscribe'] = '<%s>, <mailto:%s?subject=unsubscribe>' % (
+        unsub_url, REPLY_TO)
+    msg['List-Unsubscribe-Post'] = 'List-Unsubscribe=One-Click'
     msg.attach(MIMEText(text, 'plain'))
     msg.attach(MIMEText(html, 'html'))
     return msg
@@ -407,6 +533,29 @@ def send_campaign(recipients: Iterable[str],
     ceiling = MAX_BOUNCE_RATE if max_bounce_rate is None else float(max_bounce_rate)
     bounce = recent_bounce_rate(campaign)
     result['recent_bounce'] = bounce
+
+    # Halt on UNKNOWN as well as on high.
+    #
+    # The check below can only see bounces that bounce_handler.py has written
+    # down. When it is not running, recent sends carry no bounces, the rate is
+    # 0.0, and the ceiling test passes -- so the campaign runs fastest exactly
+    # when nobody is watching it. That is what happened between 2026-07-22 and
+    # 07-26: collection stopped after the first day, 3,161 more messages went
+    # out unmeasured, and the one measured day had bounced at 52.8%.
+    #
+    # An unknown rate is not a safe rate. Fail closed and say what to run.
+    if ceiling > 0 and bounce['sent'] >= 100 and bounce.get('stale'):
+        result['error'] = (
+            'HALTED: bounce data is stale, so the bounce rate is UNKNOWN, not '
+            'low. %d messages were sent up to %s but the bounce log was last '
+            'written %s. Run bounce_handler.py to collect them, then retry. '
+            'Sending now would repeat 2026-07-25/26, when 3,161 messages went '
+            'out with no bounce measurement at all.'
+            % (bounce['sent'], bounce['newest_send'],
+               bounce['bounce_log_day'] or 'never'))
+        result['candidates'] = 0
+        return result
+
     if ceiling > 0 and bounce['sent'] >= 100 and bounce['rate'] > ceiling:
         result['error'] = (
             'HALTED: %d of the %d messages sent in the last %d days '

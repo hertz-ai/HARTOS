@@ -5,7 +5,7 @@
 Email **security@hertzai.com**. Do not open a public issue.
 
 Include what you found, how to reproduce it, and what an attacker gets. If you
-are unsure whether something counts, send it anyway — a false alarm costs us
+are unsure whether something counts, send it anyway. A false alarm costs us
 ten minutes and the alternative costs more.
 
 We will acknowledge within 3 working days and tell you whether we can
@@ -29,9 +29,13 @@ adapters. The interesting boundaries are:
   node never agreed to share.
 - **The guardrail hash.** Boot-time, re-checked every 300 seconds. Anything
   that disables, spoofs or races that check.
-- **Credential storage.** Provider keys are encrypted at rest (AES-256,
-  PBKDF2). Anything recovering them, weakening the derivation, or writing
-  them in the clear — including to logs.
+- **Credential storage.** Provider keys live in a Fernet vault, which is
+  AES-128-CBC with HMAC-SHA256, keyed by PBKDF2-HMAC-SHA256 at 480,000
+  iterations (`security/secrets_manager.py`). Anything recovering them,
+  weakening the derivation, or writing them in the clear, including to logs.
+  AES-256-GCM is used elsewhere in the system, for peer traffic
+  (`security/channel_encryption.py`) and the armored binary, but not for this
+  vault.
 - **Supply chain.** Anything letting a downloaded model, update or plugin
   execute code the operator did not intend. Releases are Ed25519-signed.
 - **The locality claim itself.** HART OS states that data does not leave the
@@ -41,7 +45,7 @@ adapters. The interesting boundaries are:
 ## Out of scope
 
 - Attacks needing physical access to an unlocked machine.
-- Vulnerabilities in a model's *outputs* — a model saying something wrong is
+- Vulnerabilities in a model's *outputs*. A model saying something wrong is
   a quality issue, not a vulnerability.
 - Reports from automated scanners with no demonstrated impact.
 

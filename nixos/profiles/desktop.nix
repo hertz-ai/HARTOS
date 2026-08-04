@@ -1,0 +1,1089 @@
+# ═══════════════════════════════════════════════════════════════
+# HART OS DESKTOP — the variant FEATURE PROFILE (canonical home)
+# ═══════════════════════════════════════════════════════════════
+#
+# This is "what a desktop IS": the hart.* feature block plus the full desktop
+# EXPERIENCE (apps, GNOME/GDM, fonts/i18n, audio, networking, printing,
+# branding, boot splash), MOVED VERBATIM out of configurations/desktop.nix
+# (hart.* 2026-07-28; the experience in parity slices 2-4, task #21). Takes
+# lib/pkgs/hartSrc since slice 4 (app set + branding drvs need them) — still no
+# `config` capture. No media/image concerns (ISO branding, repart sizing,
+# growPartition, live-CD countermeasures stay in the configuration), no
+# hardware assumptions (GPU driver policy, 32-bit GL, nouveau blacklist stay
+# with the configuration/hardware layer).
+#
+# WHY A SEPARATE FILE: three consumers need exactly this block and nothing else,
+# and until now it lived entangled with image concerns so only the images got it:
+#   - configurations/desktop.nix        (the iso/raw images — imports this)
+#   - tests/lib.nix mkNode          (the nixosTest VMs; their nodes ran with every
+#                                    hart.* feature at default-false, which is why
+#                                    25 nixosTests were red — task #15)
+#   - the hardware-agnostic installer (task #17: an installed system must be the
+#                                    UNION of nixos-generate-config hardware +
+#                                    THIS profile — never stock NixOS)
+# One canonical home, consumed everywhere; per the steward's rule the union of
+# NixOS's hardware layer and HART's OS layer, and never two drifting copies.
+#
+# hart.package is NOT here on purpose: it captures pkgs+hartSrc, so each consumer
+# wires it (configurations use packages/hart-app.nix; mkNode builds its own).
+
+{ lib, pkgs, hartSrc, ... }:
+
+let
+  # Rasterize the HART logo (SVG source in nixos/branding/) → PNG for Plymouth
+  # and the GDM greeter, which need raster.  GNOME renders the SVG wallpaper
+  # directly (dconf below).
+  hartLogoPng = pkgs.runCommand "hart-logo-png" { nativeBuildInputs = [ pkgs.librsvg ]; } ''
+    mkdir -p $out
+    rsvg-convert -w 320 -h 320 ${../branding/hart-logo.svg} -o $out/logo.png
+  '';
+
+  # ─── Premium boot splash (opt-in) ──────────────────────────────────────
+  # DEFAULT FALSE — boot stays on NixOS's stock Plymouth theme with the HART
+  # logo swapped in (boot.plymouth.logo below), the combination proven on the
+  # #99-103 boot path. Flip to true for the custom HART theme (dark gradient +
+  # centered logo + LUKS message/password support) AFTER verifying it paints on
+  # a real ISO boot. The theme uses Plymouth's `script` plugin (framebuffer/KMS,
+  # no GL — safe on the same broken-GPU path the glass shell hardens for), so a
+  # bad GPU can't text-downgrade it. Off = byte-identical to the current boot.
+  useCustomBootSplash = false;
+
+  hartPlymouth = pkgs.runCommand "hart-plymouth-theme" { } ''
+    d=$out/share/plymouth/themes/hart
+    mkdir -p "$d"
+    cp ${hartLogoPng}/logo.png "$d/logo.png"
+    cp ${../branding/plymouth/hart.script} "$d/hart.script"
+    {
+      echo "[Plymouth Theme]"
+      echo "Name=HART OS"
+      echo "Description=HART OS boot splash"
+      echo "ModuleName=script"
+      echo ""
+      echo "[script]"
+      echo "ImageDir=$d"
+      echo "ScriptFile=$d/hart.script"
+    } > "$d/hart.plymouth"
+  '';
+in
+{
+  # ─── HART OS Core Services ───
+  hart = {
+    enable = true;
+    variant = "desktop";
+
+    # AI services
+    agent.enable = true;
+    llm.enable = true;
+    vision.enable = true;
+
+    # Desktop UI
+    conky.enable = true;
+
+    # Preinstalled developer toolchain (modules/hart-dev-tools.nix — one writer;
+    # see its header for the four consumers and the closure-cost note for #14).
+    devTools.enable = true;
+    # NATIVE NUNBA DAEMON — the single flip that wires the FULL Nunba (Python +
+    # React) into HART OS: `nunba.enable = true` starts hart-nunba.service (binds
+    # unix:/run/hart/nunba.sock, no host port) AND auto-enables liquidUI.embedNunba
+    # (its default == nunba.enable), so LiquidUI reverse-proxies the daemon same-
+    # origin with the SAME React store-path as the graceful static floor.
+    #
+    # STAYS OFF until CI is green — flipping it before that would fail the desktop
+    # ISO. Two CI prerequisites (nixos/packages/nunba.nix):
+    #   1. Pin the FOD hashes: nunbaRev (current Nunba HEAD, has HART_NUNBA_SOCKET) +
+    #      nunbaHash (nix-prefetch-github hertz-ai Nunba --rev <rev>) + npmDepsHash
+    #      (prefetch-npm-deps landing-page/package-lock.json) — all in ONE commit.
+    #   2. `nix build .#packages.x86_64-linux.nunba` green — walk the import-domino
+    #      boot loop (add curated nixpkgs pkgs / guard Nunba ML imports until main.py
+    #      binds the socket), per hart-app.nix's method.
+    # Then set this to true (embedNunba follows automatically). Until then the
+    # React-static floor path is byte-for-byte the current behaviour.
+    nunba.enable = false;
+
+    # ── Unified Kernel Extensions ──
+    kernel = {
+      enable = true;
+      androidNative.enable = true;     # binder + ashmem kernel modules
+      windowsNative.enable = true;     # PE binfmt + NTFS + high mmap
+      aiCompute = {
+        enable = true;                 # GPU scheduling + huge pages
+        hugePagesCount = 0;            # Auto (THP); set to 4096 for 8GB dedicated
+      };
+      agentSandbox.enable = true;      # cgroups v2 + Landlock LSM
+    };
+
+    # ── Native Subsystems (no emulation) ──
+    subsystems = {
+      enable = true;
+
+      # Linux: native + distribution methods
+      linux = {
+        flatpak = true;                # Flathub app store
+        appimage = true;               # Portable apps
+      };
+
+      # Android: native ART runtime (not a container)
+      android = {
+        enable = true;
+        playStore = false;             # AOSP + F-Droid; set true for Google Play
+      };
+
+      # Windows: native Wine API (not an emulator)
+      windows = {
+        enable = true;
+        gaming = true;                 # Steam + Proton + DXVK
+      };
+
+      # Web: PWA as native windows
+      web.enable = true;
+    };
+
+    # ── AI Runtime ──
+    aiRuntime = {
+      enable = true;
+      gpu.enable = true;
+      worldModel.enable = true;
+      agents = {
+        maxConcurrent = 8;
+        maxMemoryPerAgent = "2G";
+      };
+      # Full semantic intelligence on desktop
+      semantic = {
+        enable = true;
+        serviceIntelligence = true;
+        smartFS = true;                # AI-indexed filesystem for desktop users
+        predictivePrefetch = true;
+      };
+    };
+
+    # ── AI-Native Everything OS ──
+    # Model Bus: every app (Linux, Android, Windows) gets native AI
+    modelBus = {
+      enable = true;
+      enableAndroidBridge = true;
+      enableWineBridge = true;
+    };
+
+    # Compute Mesh: aggregate compute across user's devices
+    computeMesh = {
+      enable = true;
+      allowWAN = true;
+    };
+
+    # LiquidUI: AI-generated adaptive interface
+    liquidUI = {
+      enable = true;
+      voiceEnabled = true;
+      renderer = "webkit";
+    };
+
+    # ── Supervisor-managed compositor TIER LADDER (the never-blank boot) ──
+    # The out-of-process session tier-drop supervisor (greetd) OWNS the boot
+    # session: it starts at the BEST tier and falls back on failure —
+    #   Tier-1 hart-comp (Smithay/Rust, --backend drm)
+    #     → Tier-2 sway (the hart-glass-gtk4 layer-shell session)
+    #       → Tier-3 cage (hart-shell, the audited never-fail paint floor).
+    # A crash OR a shell-paint timeout drops + LATCHES one tier down; cage is the
+    # floor the supervisor can never drop below. This REPLACES the crude fixed
+    # cage-pin (68ce3c3 `defaultSession = "hart-shell"`) with the real tiered
+    # design — see the session block lower in this file.
+    sessionSupervisor = {
+      enable = true;
+      # Fresh/un-latched boots start at Tier-1 (hart-comp). The supervisor owns
+      # the never-blank guarantee, so an unavailable/crashing/hung Tier-1 falls
+      # RE-ARMED to hart-comp: both deferral blockers are fixed —
+      #   (1) the GTK4 glass-host paint hang — GSK's GL renderer on a real GPU +
+      #       an undefined _on_load_changed that never fired the shell-ready marker
+      #       — fixed in 75ba78d (GSK_RENDERER=cairo + the marker handler), and
+      #   (2) the iso-desktop build hang — the Release build-iso cores=2 throttle on
+      #       the from-source Rust compile — fixed in 48b73d6 (warm the Rust closure
+      #       at full cores before the throttled ISO step).
+      # The boot now tries Tier-1 first; the shell-paint watchdog still drops to
+      # sway then the cage floor if Tier-1 fails on real HW (safe to re-arm).
+      startTier = "hart-comp";
+      # The glass-shell host blocks on the :6800 LiquidUI server's /health for up to
+      # 30s before it can paint its first frame. The default 20s watchdog therefore
+      # killed a tier that was legitimately WAITING for the backend (real-HW boot
+      # 2026-06-24: Tier-1/2 dropped to cage mid-wait). 45s > the host's 30s wait +
+      # load + paint, so a backend that comes up within 30s is NOT killed; a truly
+      # hung tier still drops (just 25s later). Paired with the :6800-starts-fast fix
+      # (hart-liquid-ui no longer orders after the model bus), this should rarely bind.
+      shellPaintTimeoutSeconds = 45;
+    };
+
+    # Tier-1: HART-comp, the AI-native Smithay/Rust compositor (--backend drm).
+    # Enabling it puts the hart-comp package + the `hart-comp-session` launcher in
+    # the desktop closure and arms the supervisor's Tier-1 rung (compCommand via
+    # mkDefault in hart-comp.nix). hart-comp reuses the SAME GTK4 layer-shell glass
+    # host as Tier-2 sway, so it satisfies the same shell-paint watchdog marker.
+    # RE-ARMED (both deferral preconditions met): (a) the GTK4 glass-host paint
+    # hang is fixed (75ba78d — GSK cairo renderer + the shell-ready marker handler),
+    # and (b) the iso-desktop build no longer hangs (48b73d6 — the Release build-iso
+    # job warms the hart.comp Rust closure at full cores BEFORE the throttled ISO
+    # step, so it is reused, not recompiled under the cores=2 cap). The shell-paint
+    # watchdog still falls back to sway then cage if Tier-1 fails on real HW.
+    # Leak attribution: sample shell/compositor RSS + FDs into the journal every
+    # 20s. The steward's desktop went 'fast snappy' then hung after a sustained
+    # orb drag; the JS/DOM layer was measured clean on the dev box, so the
+    # accumulation is below JS (WebKit compositing / GPU memory or hart-comp
+    # buffers) and only the node can see it. Cheap + read-only.
+    shellMemWatch.enable = true;
+
+    # Capture the local-2B agent baseline on this hardware (hourly, off the
+    # boot path). Modelless boot is a clean no-op; a model present records the
+    # baseline JSON + a journal PASS/FAIL line.
+    agentBaseline.enable = true;
+
+    comp.enable = true;
+    rustPrecedent.enable = true;
+
+    # Tier-2: sway running the canonical glass shell + the swaymsg WM shim the
+    # brain drives when HART-comp is absent. Registers the sway session + the
+    # supervisor's Tier-2 rung. The supervisor's swayCommand is repointed to the
+    # GTK4 layer-shell host session (the `hart-glass-gtk4` session) lower in this
+    # file so Tier-2 is a TRUE layer-shell desktop, not bare sway.
+    swayTier1.enable = true;
+
+    # App Bridge: Android ↔ Linux ↔ Windows cross-subsystem routing
+    appBridge = {
+      enable = true;
+      clipboardSync = true;
+      dragAndDrop = true;
+      intentRouter = true;
+    };
+
+    # ── Subsystem Sandbox ──
+    sandbox.enable = true;             # `hart sandbox test-all`
+
+    # ── Self-Building OS ──
+    selfBuild = {
+      enable = true;                   # OS can rebuild itself at runtime
+      autoRebuild = false;             # Require explicit `hart-ota self-build`
+      allowAgentBuilds = false;        # Agents propose, humans approve
+      maxBuildsPerDay = 10;
+    };
+
+    # ── OTA Updates ──
+    # Autonomous central-controlled OTA: the node polls CENTRAL on boot (and on
+    # `hart-ota check`) and receives CENTRAL pushes at any time over the existing
+    # fleet/gossip fabric — NO periodic interval poll. autoApply=true makes the
+    # apply hands-off (the `completed` branch switches via `nixos-rebuild switch
+    # --flake` with `|| nixos-rebuild switch --rollback`), so a steward publish
+    # lands on every node with no per-node USB/flash. The master-key SIGN gate +
+    # canary + auto-rollback still run before DEPLOY — central only chooses WHICH
+    # commit; the node never force-applies past canary, and the master key is
+    # never touched on the node. This replaces the user's last manual flash.
+    ota = {
+      enable = true;
+      channel = "stable";
+      autoApply = true;                # hands-off: central publish → auto-apply
+    };
+
+    # ── Persistent boot-diagnostic log partition ──
+    # The live ISO's journal lives in tmpfs (RAM) — wiped on reboot, never on the
+    # stick, unreadable from the Windows host. With this ON, IF a FAT32 partition
+    # labelled HARTLOG is present (the flasher creates it in the stick's free
+    # space after a successful flash), HART OS writes the full current-boot
+    # journal + the session-supervisor tier latch/decisions + the shell-ready
+    # paint marker + the GTK4/GSK/GDK/EGL/GBM/WebKit GL diagnostics to
+    # /hart-boot-latest.log on it — EARLY in boot, on a ~20s periodic timer (so a
+    # HUNG Tier-1 pointer-only boot STILL leaves the journal-so-far), and at
+    # shutdown, fsync'ing each write. So the loop becomes: flash → boot (even if
+    # Tier-1 hangs) → plug the stick into Windows → read the journal. A pure
+    # NO-OP when no HARTLOG partition is present, so an old stick still boots
+    # fine and the capture never blocks/slows/fails boot.
+    bootLog.enable = true;
+
+    # ── Live-OS self-creation of the HARTLOG partition ──
+    # The HARTLOG partition (read by bootLog above) is now created BY THE LIVE OS
+    # on first USB boot, NOT by the Windows flasher. The flasher's diskpart path
+    # was doubly broken — it HUNG on a wedged Windows VDS, and a half-completed
+    # `diskpart create partition` CORRUPTED a freshly-flashed stick's EFI/GPT
+    # (boot failed with start_image returned 0x8000000000000001 = EFI_LOAD_ERROR).
+    # With this ON, the first boot from the USB carves a FAT32 HARTLOG partition
+    # into ONLY the stick's trailing free space (sgdisk --largest-new + mkfs.vfat),
+    # ordered BEFORE the bootLog capture so the very first boot's journal lands on
+    # it. NEVER touches the in-use ISO/EFI/boot partitions; a pure NO-OP when not
+    # USB-booted, when no free space exists, when HARTLOG already exists, or on any
+    # error — it can never block or fail boot. The label defaults to bootLog.label
+    # so the create-side and read-side stay in lockstep.
+    hartlogCreate.enable = true;
+
+    # ── Stateful across boots: persist onto the HARTSTATE partition ──
+    # The live ISO is stateless (tmpfs), so the box re-asks for Wi-Fi EVERY boot,
+    # forgets the theme/skins/onboarding, and wipes the user's home. With this ON,
+    # IF the flasher carved a HARTSTATE-labelled partition on the USB, a boot
+    # oneshot mounts it (by-label, the same lookup hart-boot-log uses) BEFORE
+    # NetworkManager + the session and bind-persists the stateful paths so they
+    # SURVIVE reboot: /etc/NetworkManager/system-connections (Wi-Fi creds — THE
+    # "asks for wifi every boot" fix; NM auto-connects next boot), the HART state
+    # dir (active theme, custom skins, HartSession, the onboarding/identity seal so
+    # first-boot setup is NOT re-asked), and /home/hart-admin. The Wi-Fi keyfiles
+    # persist SECURELY (0700 dir / 0600 files, root:root) and ONLY on a POSIX fs
+    # (fail-secure: never world-readable on FAT/NTFS; format HARTSTATE ext4).
+    # TPM-sealed LUKS on HARTSTATE is the stronger follow-up (needs a key
+    # mechanism) — not attempted yet. A pure NO-OP when no HARTSTATE partition is
+    # present (the OS still boots stateless, exactly as today); nothing requires
+    # the unit, so it can NEVER block or fail boot. [Real-HW-gated — verify on the
+    # node via the loop that Wi-Fi + theme + onboarding actually survive a reboot.]
+    statePersist.enable = true;
+
+    # ── Boot continuity (return to HART OS on a Live-OS-initiated restart) ──
+    # When the user restarts FROM the Live OS, set a ONE-SHOT efibootmgr BootNext
+    # to the USB's OWN EFI boot entry so the next boot returns to HART OS without
+    # mashing F12. It does NOT change the permanent BootOrder, so the user's
+    # Windows still boots normally when chosen — only a Live-OS restart returns
+    # here. A no-op if efibootmgr is missing, not UEFI-booted, or the USB entry
+    # can't be matched. Intentionally BootNext (one-shot), never BootOrder, so it
+    # can never strand the user's Windows boot.
+    bootContinuity.enable = true;
+
+    # ── Boot / root-mount / initrd hardening (USB-root enumeration) ──
+    # HART OS boots from a USB stick, so the initrd MUST carry the modules that
+    # enumerate a USB block device before the root pivot (usb_storage/uas/sd_mod +
+    # the xhci/ehci host controllers). The installer-CD profile this config imports
+    # already ships them, but a future profile/override change must NOT be able to
+    # silently drop them and brick the real-HW USB boot with "VFS: Unable to mount
+    # root fs on LABEL=HART_OS". This guard re-ENSURES the USB-root module set is in
+    # the initrd AND ASSERTS (at eval time) the critical subset survived the merge —
+    # so a stripped module set is a loud BUILD failure, never a silent black-hang on
+    # the stick. A pure eval/closure guard: it adds initrd modules + an assertion and
+    # does NOTHING at runtime, so it can never block, slow, or fail a boot.
+    bootRootInitrd.enable = true;
+
+    # ── External-USB journal export (field recovery for a wedged shell) ──
+    # The software-rendered glass shell can peg the CPU and wedge the in-shell
+    # terminal/compositor, leaving the user unable to copy anything out. With this
+    # ON, plugging in an ordinary FAT32 USB stick (NOT the boot medium) makes HART
+    # OS dump the full current-boot journal + the last 200 warning lines to
+    # hart-journal-<hostname>.txt on it, on a ~15s timer and at shutdown. It runs
+    # as a low-level systemd unit INDEPENDENT of the shell, so it keeps exporting
+    # through a hang (capturing the pre-hang state). NEVER writes to the live boot
+    # medium (the HART_OS ISO disk + the HARTLOG partition + the disks backing /
+    # and /nix/store are excluded); a pure NO-OP when no eligible external stick is
+    # present, so it can never clobber the boot stick or block boot/shutdown.
+    journalExport.enable = true;
+
+    # ── LAN-path diagnostics + network-up (the steward's "log to the network") ──
+    # The dev box and the live-OS box sit on the SAME home LAN, so the journal
+    # should be reachable OVER THE NETWORK - no stick to yank. With this ON, the
+    # dev box reads the live-OS box's journal with ONE curl over the LAN:
+    #   curl "http://<liveos-ip>:6699/diag?t=<TOKEN>"
+    # returning journalctl -b + dmesg + lspci + lsusb + rfkill + wpctl + ip -br a +
+    # the boot-log - all run through a SECRET-REDACTION filter. The endpoint is
+    # READ-ONLY (runs no actions), token-gated (constant-time, FAIL-CLOSED), and
+    # LAN-scoped via the firewall.
+    #
+    # #148 HARDENING (security advisory closed):
+    #   - TOKEN: NOT a hardcoded "hart-lan-diag" default any more. With token=""
+    #     (omitted) the module GENERATES a random token at first boot, writes it
+    #     0600 to /run/hart/netdiag-token (tmpfs, never the store, never in
+    #     `systemctl show`), and SURFACES it to the boot-log/journal + the login
+    #     MOTD so the operator reads it out-of-band. Find it on the box with:
+    #       cat /run/hart/netdiag-token        (or read it off the login MOTD)
+    #   - BIND LAN-ONLY: bindAddress = "auto" binds the detected private LAN IP (not
+    #     all interfaces); the firewall opens the port ONLY from RFC1918 + link-local
+    #     SOURCE ranges (nftables) - never a global/WAN-reachable accept.
+    #   - READ-ONLY + SECRET-EXCLUDING: execs only the fixed diag bundle; the bundle
+    #     redacts PEM keys / *_PRIVATE_KEY|SECRET|TOKEN|PASSWORD / Authorization /
+    #     the diag token itself, and never cats /var/lib/hart key material or
+    #     security/*.pem.
+    #
+    # netconsole (kernel ring over UDP) + the periodic PUSH stay OFF here: each
+    # needs a dev-box target IP, and netconsole would pull network-online.target into
+    # the boot path (a known boot-stall risk) for a no-op without a target. Arm them
+    # per-incident with hart.netDiag.netconsole.{enable,target} / .push.{enable,target}.
+    # Network-up (so the diag is reachable): a boot rfkill-unblock clears soft-block
+    # on the radio, and the USB-NIC drivers load so plugging a USB-ethernet dongle
+    # DHCP-auto-connects instantly (the "debug wifi without wifi" shortcut).
+    netDiag = {
+      enable = true;
+      http = {
+        enable = true;
+        port = 6699;
+        # token = ""  -> generated at first boot (see #148 hardening above).
+        # bindAddress = "auto" + RFC1918 firewall scoping = LAN-only (module default).
+      };
+      wifiUnblock.enable = true;
+      usbEthernet.enable = true;
+    };
+
+    # ── Cross-OS storage interop (#145): read/write ALL filesystems ──
+    # A user plugs in a disk formatted on another OS — a Windows NTFS drive, a
+    # camera/phone exFAT card, a Linux ext4/btrfs disk, a FAT32 stick — and HART
+    # OS reads AND writes it, like macOS or Windows would. This turns on
+    # boot.supportedFilesystems for ntfs/exfat/vfat/ext4/btrfs (kernel drivers +
+    # userspace mount helpers), the udisks2 on-demand mount authority the file
+    # manager + glass shell call to mount removable media (under /run/media), and
+    # the per-filesystem format/repair tooling. PRIVACY-FIRST: reading a plugged
+    # disk is a LOCAL capability, so it ships ON (no opt-in friction); nothing
+    # here leaves the device. DEGRADE-NOT-DIE: it adds only AVAILABLE drivers +
+    # an ON-DEMAND mount path (NEVER an fstab/.mount unit), so a disconnected or
+    # corrupt disk is simply never mounted and can never stall local-fs.target or
+    # wedge boot — an unmountable disk fails fast and clean. (Proven by
+    # tests/storage-filesystems.nix.)
+    storage.enable = true;
+
+    # ── Memory sanity (#157): compressed-RAM zram swap + graceful systemd-oomd ──
+    # zram is RAM-only (never blocks boot); oomd kills a runaway cgroup not the seat;
+    # swappiness is coordinated up for the zram desktop. LOCAL feature -> ON.
+    memory.enable = true;
+
+    # ── Automatic GPU allocation (#156): hybrid PRIME render-offload ──
+    # Intel iGPU drives the display AND the shell's software floor (unchanged, so the
+    # cairo WebView never flips into the expensive effects tier / reintroduces lag);
+    # the NVIDIA 940MX is armed for heavy-app render-offload (hart-gpu-offload /
+    # prime-run) ONLY when the boot probe proves it present (#132-safe). Degrades to
+    # pure Intel, then the software floor. The native force-load arm
+    # (gpu.offload.specialisation.enable) stays OFF for the portable ISO.
+    gpu.offload.enable = true;
+
+    # ── Privacy-first networking + desktop apps (Category-4 LOCAL features) ──
+    # Per the privacy-first principle every LOCAL capability ships ON by default
+    # (no opt-in friction); nothing here leaves the device without consent.
+    #   - firewall: nftables zones + SYN-flood rate limiting + fwupd firmware
+    #     checks. The module enables networking.nftables and uses
+    #     extraInputRules (NOT the iptables-only extraCommands) so it coexists
+    #     with the rest of the desktop closure WITHOUT the iptables-vs-nftables
+    #     assertion that broke iso-desktop before. Ports: hart backend (6777) +
+    #     SSH (22) TCP, discovery UDP.
+    #   - dns: encrypted resolution (DoT via systemd-resolved, Cloudflare
+    #     default). A pure local resolver config; systemd-resolved coexists with
+    #     GNOME's NetworkManager (NM uses resolved as its DNS backend).
+    #   - email: Thunderbird as the default mailto handler. The email module OWNS
+    #     the x-scheme-handler/mailto MIME association (the desktop xdg.mime block
+    #     below no longer sets it, so the two definitions can't collide), and its
+    #     gnome-keyring/PAM-login settings agree with GNOME's own (both true).
+    firewall.enable = true;
+    dns.enable = true;
+    # A roaming desktop lives on hotel / café / captive / corporate Wi-Fi that
+    # routinely blocks or MITMs DNS-over-TLS (port 853). Strict DoT (the default)
+    # then fails ALL name resolution with no fallback — the "I connected to the
+    # internet and flatpak STILL couldn't reach dl.flathub.org" symptom. Opportunistic
+    # DoT (fallbackToPlaintext = true) keeps encrypted resolution when the network
+    # allows it and degrades to plaintext when it doesn't, so the box stays usable on
+    # any network. dnssec stays ON (unchanged) — this only relaxes the transport, not
+    # validation. On the server/edge variants (fixed, trusted egress) strict DoT stays.
+    dns.fallbackToPlaintext = true;
+    email.enable = true;
+
+    # ── Endpoint security (#155; Category-4 LOCAL feature, privacy-first ON) ──
+    #   - ClamAV: clamd LOCAL scanning + freshclam signature updates (the pull is the
+    #     ONLY egress, gated like the fwupd check + the OTA pull).
+    #   - firewall hardening: defense-in-depth kernel sysctls that COMPLEMENT the
+    #     nftables firewall above; purely additive (the shell 6777 / SSH 22 / netdiag
+    #     6699 ports all stay open, asserted at eval + tests/security.nix).
+    #   - OS + application security fixes are delivered over-the-air via hart-ota.
+    security.enable = true;
+
+    # ── Preinstall the curated FOSS gap-fillers (#154) ──
+    # Bake the catalog's preinstall set (VLC, Inkscape, Audacity + the GNOME core,
+    # de-duped against systemPackages) so the App Store shows Open, not a network
+    # Install. The offline catalog route + the Appearance wallpaper fix are already
+    # live in the backend. NOTE: the desktop ISO size ceiling is CI-gated (iso-desktop)
+    # - if the bake overflows ISO9660, flip bakeMissing off; zstd-22 gives headroom.
+    apps.bakeMissing = true;
+    apps.wallpapers = true;
+
+    # ═══════════════════════════════════════════════════════════════
+    # EVERYTHING ON (steward 2026-07-30: "enable all")
+    # ═══════════════════════════════════════════════════════════════
+    # Every hart.* feature that shipped OFF is now on. Audited first: these
+    # were the 9 with an enable option that no consumer ever set, so the
+    # modules were dead weight in the tree. (luks/nvidia/power already
+    # default-ON in their own modules; `installer` stays ISO-only in
+    # configurations/desktop.nix by design — an installed system carries no
+    # installer.)
+    #
+    # HISTORY THIS RESPECTS: an earlier everything-on sweep broke iso-desktop
+    # FOUR times (memory: hartos_everything_on_feature_enables_2026-06-24),
+    # which is why two of these are NOT bare flips — hart.ime and hart.scanner
+    # each own options this profile was hand-rolling beside them, and enabling
+    # them naively is an eval conflict, not a feature. Those duplicates are
+    # DELETED below and the modules take ownership (one writer per concern).
+    accessibility.enable = true;   # a11y beyond the at-spi2 bus
+    # devtools: OFF on the desktop image, and this one is MEASURED, not judged.
+    # Closure audit 30570492265 on hart-desktop-raw — the real config with
+    # exactly this option flipped:
+    #     hart.ideTools.enable ON  : 24 GiB
+    #     hart.ideTools.enable OFF : 21 GiB
+    # +3 GiB. hart-repart-image.nix sizes the root at 26 GiB against a ~24 GiB
+    # image (~2 GiB slack), and that 26 GiB is itself bounded by the 28.7 GiB
+    # stick — its comment records that 1 GiB ESP + 28 GiB root already did NOT
+    # fit. 3 into 2 does not go: enabling this does not merely bloat the image,
+    # it stops the raw image fitting the device it ships on.
+    #
+    # NOT a silent narrowing of "enable all": the feature stays fully available
+    # (hart.ideTools.enable = true on any workstation), and the desktop still
+    # ships the language TOOLCHAINS via hart.devTools above — the confusingly
+    # near-identical sibling — so compilers are present either way. What is
+    # deferred is the LSP/debugger/linter layer.
+    #
+    # SUB-BUNDLE MEASUREMENT — and it REFUTED the obvious hypothesis. I assumed
+    # the LSP servers were the bulk (rust-analyzer, clang-tools, gopls, the
+    # TypeScript stack) and said so. Audit 30573861911 flipping ONLY
+    # hart.ideTools.lsp:
+    #     lsp ON  : 24 GiB
+    #     lsp OFF : 24 GiB
+    # i.e. under the rounding — LSP is NOT the cost, so turning it off would
+    # have bought nothing while feeling like a fix. The remaining candidates
+    # are `debug` (lldb drags a full LLVM; plus gdb/delve/valgrind) and `lint`
+    # (audit 30602854187 measures debug). containers/editors are already
+    # default-off, so they were never in play.
+    #
+    # Keep this comment updated with each measured number: the point of the
+    # instrument is that the next person inherits evidence instead of my
+    # plausible-sounding guess.
+    nightlight.enable = true;      # blue-light schedule
+    openclaw.enable = true;        # ClawHub skill surface
+    osk.enable = true;             # on-screen keyboard (touch)
+    portal.enable = true;          # xdg-desktop-portal: screencast/file-picker.
+                                   # Also the home of hart-screencast-gate, whose
+                                   # PYTHONPATH false-lockout was fixed in ab83489f
+                                   # — the gate ships dead weight unless this is on.
+    scanner.enable = true;         # SANE + simple-scan + hart-scanner CLI
+    # sso: deliberately NOT enabled here, and this is the one exception to
+    # "enable all". hart.sso is an LDAP/Kerberos CLIENT: it needs a domain,
+    # an ldapUri and a base DN that only the SITE can supply, so there is no
+    # value HART could default them to. Enabling it blind is what took the
+    # eval red (`hart.sso.domain was accessed but has no value defined`) —
+    # and an SSO client pointed at no directory does nothing anyway. The
+    # module now defaults those three to "" and ASSERTS with an actionable
+    # message, so a site that wants SSO turns it on WITH its own values and
+    # gets a sentence rather than a crash if it forgets one.
+
+    # The IME module OWNS i18n.inputMethod + xkb (duplicates deleted below).
+    # ibus, not the module default fcitx5: the profile's shipped stack was
+    # ibus and switching frameworks is a UX change, not an enable.
+    ime = {
+      enable = true;
+      engine = "ibus";
+      inputMethods = [ "pinyin" "anthy" "hangul" ];   # m17n is unconditional
+      # Preserve the deliberate power-user mapping the profile used to set
+      # directly; composed with the module's layout toggle rather than
+      # either side silently winning.
+      xkbOptions = "ctrl:nocaps,grp:alt_shift_toggle";
+    };
+
+    # The resident co-pilot DAEMON — the reason "copilot.enable = true" alone
+    # did nothing on the flashed node (2026-07-30): enable installs only the
+    # `hart-copilot` launcher; the bounded Claude Code worker is this second,
+    # separate opt-in and no consumer set it. Still gated in-module on
+    # claude-code being present in the closure.
+    copilot.daemon.enable = true;
+
+    # ─── Boot session = the SUPERVISOR-MANAGED TIER LADDER (not a fixed default) ───
+    # (Moved VERBATIM from configurations/desktop.nix, parity slice 2 — an
+    # INSTALLED desktop must run the same ladder as the image.)
+    # The crude fixed cage-pin (68ce3c3: `services.displayManager.defaultSession =
+    # lib.mkForce "hart-shell"`) is REMOVED in favour of the real tiered design the
+    # architecture mandates. With sessionSupervisor.enable = true (above), greetd
+    # REPLACES GDM and runs the tier-drop SELECTOR as the boot session — so the
+    # supervisor, not a fixed defaultSession, owns which tier boots:
+    #
+    #   Tier-1 hart-comp (Smithay/Rust, --backend drm; the START tier)
+    #     → Tier-2 sway   (the hart-glass-gtk4 layer-shell session)
+    #       → Tier-3 cage (hart-shell, the audited never-fail paint floor — the
+    #                       supervisor can NEVER drop below it).
+    #
+    # The ladder tries the BEST tier first and DROPS one rung on a real failure —
+    # a crash OR the shell-paint watchdog firing (compositor up but no first frame
+    # within shellPaintTimeoutSeconds; the "only-a-pointer" hang ff02e48 exposed).
+    # A drop LATCHES across boot; `hartctl session reset-tier` re-arms Tier-1. The
+    # supervisor's config sets `defaultSession = "hart-shell"` for the floor, which
+    # is moot under greetd's command model — greetd runs the selector, not a named
+    # session. So we do NOT (and must not) ALSO mkForce defaultSession here (two
+    # equal-priority mkForces would collide); the supervisor block owns it.
+    #
+    # Tier-2 = the GTK4 layer-shell glass host UNDER sway (the `hart-glass-gtk4`
+    # session), not bare sway. The layer-shell-host module repoints the supervisor's
+    # swayCommand to its `hart-glass-shell-gtk4-session` launcher (mkOverride, so it
+    # wins over both the bare-sway option default and swayTier1's mkDefault). This
+    # gives Tier-2 a TRUE layer-shell desktop running the same glass host as Tier-1.
+    layerShellHost.enable = true;
+
+    # ── Claude Code as the resident co-pilot, in the node's OWN terminal ─────────
+    # The steward's ask (2026-07-26): the co-pilot should live INSIDE HART OS,
+    # debugging and bootstrapping the OS from within and working the 71 seeded goals
+    # as its own — through the guardrails the OS already has.
+    #
+    # Bounded by design ("trust is a boundary"): full autonomy INSIDE the work, zero
+    # authority AT the boundaries. `hart-copilot` opens it on a writable checkout on a
+    # FRESH BRANCH; merge, OTA publish and master-key signing stay human/democratic,
+    # so the worst case of an unattended run is a branch nobody merges.
+    #
+    # No API key ships in the image — authenticate interactively (`claude` -> /login).
+    # On the live ISO that login is tmpfs (lost on reboot); it persists only on the
+    # INSTALLED writable-root image.
+    copilot.enable = true;
+
+    # ── Boot-time audio rescue (never boot silent) ──
+    # A real-HW "no audio out" the steward hit: the default sink existed but was
+    # MUTED / at volume 0 on boot (WirePlumber persists per-user mute/volume state
+    # across reboots, so a once-muted sink stays silent forever). hart.audio runs a
+    # graphical-session USER oneshot that UNMUTES the default sink and rescues its
+    # level to 60% ONLY when it reads 0 (a deliberate non-zero level is left as-is).
+    # Best-effort + a pure no-op when there is no sink / no wpctl/pactl, so it can
+    # never block or fail the session. Default-ON wherever PipeWire is on; set
+    # explicit here for clarity. Privacy-first LOCAL capability (nothing leaves).
+    audio.bootUnmute = {
+      enable = true;
+      bootVolumePercent = 60;
+    };
+  };
+
+  # Audio: PipeWire bridges all subsystems (Linux, Android, Wine).
+  # Variant surface (hart.audio.bootUnmute rides on it) — moved with slice 2.
+  services.pipewire = {
+    enable = true;
+    alsa.enable = true;
+    pulse.enable = true;
+    jack.enable = true;
+  };
+
+  # ─── Auto-login (parity slice 3) ───
+  # The appliance experience: boot straight into hart-admin's session.
+  # hart-admin is created by hart-base.nix (a hartModule), so it exists on
+  # installed systems too. mkForce beats the live-CD profile's own
+  # autologin ("nixos") when this profile composes into the ISO; on an
+  # installed system there is no competitor and the force is inert.
+  services.displayManager.autoLogin = {
+    enable = true;
+    user = lib.mkForce "hart-admin";
+  };
+
+  # ─── Recovery consoles: Ctrl+Alt+F2..F6 ALWAYS reach a TTY (slice 3) ───
+  # The "only a mouse pointer, no desktop, and Ctrl+Alt+F2 does nothing" boot
+  # regression had no recovery path: the graphical session held VT1 with a hung
+  # shell host and the user could not reach a console. This block guarantees a
+  # login console is ALWAYS reachable, independent of the graphical session's
+  # health, so a stuck compositor can never trap the machine — on the image AND
+  # on an installed system alike.
+  #
+  # 1. Keep getty ENABLED (NixOS default). The ISO branch additionally nulls the
+  #    TTY AUTOLOGIN (configurations/desktop.nix, hide-the-nixos-user block) so a
+  #    Ctrl+Alt+F-key never lands on the hidden `nixos` live user — getty itself
+  #    still runs on tty1..tty6. We assert the default `console` framework stays on
+  #    so a future kiosk tweak can't silently disable the virtual terminals.
+  #    `quiet`/`splash` in boot.kernelParams do NOT affect VT switching.
+  console.enable = lib.mkDefault true;
+  #
+  # 2. VT switching is a kernel + systemd-logind seat function: Ctrl+Alt+Fn asks
+  #    logind to activate the target VT (logind spawns autovt@ttyN on demand).
+  #    We rely on the stock NAutoVTs=6 (NixOS/logind default) so the seat can
+  #    switch to tty2..tty6 — we do NOT override it (writing the same default via
+  #    extraConfig/settings only risks an option-name mismatch for zero gain). The
+  #    hung GRAPHICAL session cannot veto a kernel VT switch — logind owns the
+  #    seat, not the compositor — so this is the reliable escape when tier-2 hangs.
+  #    Nothing in this profile sets a logind option that would refuse VT switching.
+  #
+  # 3. Belt-and-suspenders: pre-spawn a getty on tty2 from boot so a recovery
+  #    console is ALREADY alive (not summoned lazily) the instant the user
+  #    switches to it — recovery never depends on logind's on-demand autovt spawn
+  #    working while the graphical session is wedged. `autovt@tty2` is the exact
+  #    unit logind would itself start on a switch to VT2 (NixOS aliases autovt@ to
+  #    the getty@ template), so pinning THIS one instance to multi-user.target
+  #    cannot collide with logind's seat management — it is the same unit logind
+  #    uses, merely started eagerly. (tty3..tty6 stay on-demand via NAutoVTs.)
+  systemd.services."autovt@tty2".wantedBy = [ "multi-user.target" ];
+
+  # ═══════════════════════════════════════════════════════════════
+  # Prebundled Apps — best-in-class from ALL OS ecosystems (slice 4)
+  # ═══════════════════════════════════════════════════════════════
+  #
+  # Philosophy: every app a real OS ships, HART OS ships better.
+  # GTK4/libadwaita preferred for native GNOME 50 experience.
+  # Users can install Android/Windows apps via subsystems.
+  #
+  environment.systemPackages = with pkgs; [
+    (pkgs.callPackage ../packages/hart-cli.nix { inherit hartSrc; })
+
+    # ── Browser & Web ──
+    firefox                     # Primary browser (privacy-first)
+    epiphany                    # GNOME Web — lightweight secondary / PWA host
+
+    # ── Terminal ──
+    gnome-console               # GNOME Console — GTK4/libadwaita native
+    kitty                       # GPU-accelerated power terminal
+    # OpenTerminal: gnome-console IS the modern open terminal for GNOME 50
+    # (replaces legacy gnome-terminal with native GTK4/Adwaita)
+
+    # ── Text & Code Editors ──
+    gnome-text-editor           # Simple text editor (like Notepad/TextEdit)
+    helix                       # Modal editor (like Vim, but modern — Rust)
+
+    # ── File Management ──
+    nautilus                    # GNOME Files (like Explorer/Finder)
+    file-roller                 # Archive manager (ZIP/RAR/7z/tar)
+    baobab                      # Disk usage analyzer (like WinDirStat/Storage Sense)
+
+    # ── Image & Photo ──
+    loupe                       # GNOME image viewer (like Photos/Preview) — GTK4
+    shotwell                    # Photo manager (like Photos/Gallery) — import/organize
+    drawing                     # Simple drawing/paint app (like Paint/Markup)
+
+    # ── Video & Music ──
+    celluloid                   # Video player (mpv frontend, GTK4 — like Media Player/QuickTime)
+    amberol                     # Music player (GTK4/libadwaita — clean, local-first)
+
+    # ── Documents & PDF ──
+    papers                      # Document/PDF viewer (like Preview/Edge PDF — GTK4)
+    libreoffice                 # Full office suite (like Microsoft 365/iWork)
+
+    # ── Communication ──
+    thunderbird                 # Email client (like Mail/Gmail/Outlook)
+    gnome-contacts              # Contacts manager
+    fractal                     # Matrix chat client (GTK4/libadwaita — federated messaging)
+
+    # ── Productivity ──
+    gnome-calculator            # Calculator
+    gnome-calendar              # Calendar (CalDAV sync)
+    gnome-clocks                # World clock, timer, stopwatch, alarms
+    gnome-weather               # Weather (like Weather app on every OS)
+    gnome-maps                  # Maps (OpenStreetMap — like Maps on every OS)
+    iotas                       # Notes app (GTK4/libadwaita — like Notes/Samsung Notes)
+
+    # ── Camera & Recording ──
+    snapshot                    # Camera app (GTK4/libadwaita — like Camera)
+    gnome-sound-recorder        # Voice recorder (like Voice Memos/Sound Recorder)
+    obs-studio                  # Screen recording & streaming (like Game Bar/screen recorder)
+
+    # ── System Tools ──
+    gnome-system-monitor        # Task/process manager (like Task Manager/Activity Monitor)
+    gnome-disk-utility          # Disk management (partitioning, formatting, SMART)
+    gnome-font-viewer           # Font viewer/installer (like Font Book)
+    gnome-connections           # Remote desktop viewer (RDP/VNC)
+    dconf-editor                # System configuration editor (advanced)
+
+    # ── Media Creation ──
+    pitivi                      # Video editor (like iMovie/Clipchamp — GTK/GStreamer)
+    gimp                        # Image editor (like Photoshop — advanced)
+
+    # ── Security ──
+    seahorse                    # Password & key manager (like Keychain Access)
+
+    # ── Development ──
+    # Moved to modules/hart-dev-tools.nix (hart.devTools.enable, set in the
+    # hart block above) so every consumer gets the same toolchain and the
+    # test can assert it without duplicating the list.
+
+    # ── System Utilities ──
+    htop btop                   # System monitors (CLI)
+    fastfetch                   # System info (neofetch successor)
+    file unzip p7zip            # File tools
+    wget curl                   # Network tools
+    ripgrep fd bat              # Modern CLI tools (better grep/find/cat)
+    tree jq                     # Directory tree / JSON processor
+    mpv                         # Media backend (used by celluloid, also standalone)
+
+    # ── GNOME Shell Extensions ──
+    gnomeExtensions.dash-to-dock       # Taskbar (dock) at bottom
+    gnomeExtensions.appindicator       # System tray support
+    jetbrains-mono                     # Default monospace font
+  ]
+  # ── Remote Desktop (open-source TeamViewer equivalent) ──
+  # RustDesk: ID-based P2P remote control + file transfer. gnome-connections
+  # above is only an RDP/VNC *viewer*; RustDesk is the TeamViewer-style remote-
+  # control client+server the OS was missing. Attr-guarded so a nixpkgs rev that
+  # names it differently (rustdesk vs rustdesk-flutter) or lacks it cannot break
+  # evaluation; CI's Nix Build Matrix validates the package itself builds.
+  ++ lib.optional (pkgs ? rustdesk) pkgs.rustdesk
+  ++ lib.optional (pkgs ? "rustdesk-flutter") pkgs."rustdesk-flutter";
+
+  # ═══════════════════════════════════════════════════════════════
+  # GNOME 50 Desktop — full desktop environment
+  # ═══════════════════════════════════════════════════════════════
+  services.xserver = {
+    enable = true;
+    displayManager.gdm.enable = true;
+    desktopManager.gnome.enable = true;
+    # (xkb layout/options: OWNED by hart.ime — see hart.ime.xkbOptions above.
+    # This profile used to set them here beside the module, which is a
+    # conflicting second definition of one scalar option the moment hart.ime
+    # is enabled. One writer.)
+  };
+
+  # ─── Touchpad: libinput tap-to-click (session-agnostic) ───
+  # The dconf "org/gnome/desktop/peripherals/touchpad" tap-to-click below ONLY
+  # applies to a GNOME Shell session. The shipped defaultSession is the cage
+  # glass shell (services.displayManager.defaultSession = "hart-shell"),
+  # which reads its pointer config straight from libinput at the seat level — so
+  # tapping the touch SURFACE did nothing on the live OS while the physical
+  # button still clicked (pointer + button work; Tapping was simply never
+  # enabled for non-GNOME sessions). Enabling services.libinput.touchpad here
+  # turns tap-to-click on for EVERY session (cage glass shell + GTK4 host + GNOME
+  # fallback), not just GNOME's dconf path.
+  services.libinput = {
+    enable = true;
+    touchpad = {
+      tapping = true;            # single-finger tap = left click (THE fix)
+      tappingDragLock = true;    # tap-drag stays engaged across a lift
+      naturalScrolling = true;   # match the GNOME dconf natural-scroll above
+      clickMethod = "clickfinger";  # 2-finger tap = right, 3 = middle
+      disableWhileTyping = true; # ignore palm/stray taps while typing
+    };
+  };
+
+  # GNOME Shell extensions + theming
+  environment.gnome.excludePackages = with pkgs; [
+    gnome-tour  # Disable first-run tour (HART has its own onboarding)
+  ];
+  # ─── GDM greeter branding ───
+  # The login screen (first thing after Plymouth) was stock GNOME. Brand it: HART
+  # logo (raster PNG — the greeter doesn't render SVG reliably) + a banner + dark
+  # scheme. GDM reads its OWN dconf profile, separate from the user one below.
+  # disable-user-list is intentionally NOT set: the ISO's installer 'nixos' user
+  # is already hidden via uid<1000 (configurations/desktop.nix), and forcing the
+  # list off would also hide hart-admin. Additive — does not touch autologin or
+  # the kiosk session.
+  programs.dconf.profiles.gdm.databases = [{
+    settings = {
+      "org/gnome/login-screen" = {
+        logo = "${hartLogoPng}/logo.png";
+        banner-message-enable = true;
+        banner-message-text = "HART OS — Humans are always in control";
+      };
+      "org/gnome/desktop/interface" = {
+        color-scheme = "prefer-dark";
+        gtk-theme = "Adwaita-dark";
+      };
+    };
+  }];
+
+  programs.dconf.profiles.user.databases = [{
+    settings = {
+      # ─── HART OS Branding ───
+      "org/gnome/desktop/interface" = {
+        gtk-theme = "Adwaita-dark";
+        color-scheme = "prefer-dark";
+        monospace-font-name = "JetBrains Mono 11";
+        document-font-name = "Cantarell 11";
+      };
+      "org/gnome/desktop/background" = {
+        picture-uri = "file:///etc/hart/branding/wallpaper.svg";
+        picture-uri-dark = "file:///etc/hart/branding/wallpaper.svg";
+        primary-color = "#080808";
+      };
+      "org/gnome/desktop/screensaver" = {
+        picture-uri = "file:///etc/hart/branding/lock-screen.svg";
+        primary-color = "#080808";
+      };
+      # ─── Taskbar / Dash / Top Bar customization ───
+      "org/gnome/shell" = {
+        favorite-apps = [
+          "firefox.desktop"
+          "org.gnome.Nautilus.desktop"
+          "org.gnome.Console.desktop"
+          "org.gnome.TextEditor.desktop"
+          "org.libreoffice.LibreOffice.Writer.desktop"
+          "org.gnome.Calculator.desktop"
+          "hart-identity.desktop"
+        ];
+        # GNOME 50: dynamic workspaces + app grid
+        enabled-extensions = [
+          "dash-to-dock@micxgx.gmail.com"
+          "appindicatorsupport@rgcjonas.gmail.com"
+        ];
+      };
+      "org/gnome/shell/extensions/dash-to-dock" = {
+        dock-position = "BOTTOM";
+        dash-max-icon-size = lib.gvariant.mkInt32 48;
+        extend-height = false;
+        transparency-mode = "DYNAMIC";
+        running-indicator-style = "DOTS";
+        show-trash = true;
+        show-mounts = false;
+      };
+      # ─── Keyboard Shortcuts (Windows-style defaults) ───
+      # User can switch to Mac profile via keyboard_shortcuts panel
+      "org/gnome/desktop/wm/keybindings" = {
+        close = ["<Alt>F4"];                    # Win: Alt+F4, Mac: Cmd+W
+        minimize = ["<Super>h"];                # Minimize window
+        toggle-maximized = ["<Super>Up"];        # Win: Win+Up
+        switch-applications = ["<Alt>Tab"];      # App switching
+        switch-windows = ["<Alt>grave"];         # Window cycling within app
+        move-to-workspace-left = ["<Super><Shift>Left"];
+        move-to-workspace-right = ["<Super><Shift>Right"];
+        switch-to-workspace-left = ["<Super><Ctrl>Left"];
+        switch-to-workspace-right = ["<Super><Ctrl>Right"];
+      };
+      "org/gnome/shell/keybindings" = {
+        toggle-overview = ["<Super>space"];      # Activities / Spotlight
+        toggle-application-grid = ["<Super>a"];  # App grid
+        screenshot = ["Print"];
+        show-screenshot-ui = ["<Shift>Print"];
+        screenshot-window = ["<Alt>Print"];
+      };
+      "org/gnome/settings-daemon/plugins/media-keys" = {
+        home = ["<Super>e"];                     # File manager (Win: Win+E)
+        terminal = ["<Ctrl><Alt>t"];              # Terminal
+        www = ["<Super>b"];                       # Browser
+        search = ["<Super>s"];                    # Search
+        screensaver = ["<Super>l"];               # Lock screen (Win: Win+L)
+        calculator = ["<Super>c"];                # Calculator
+      };
+      # ─── Multi-monitor & Window snapping ───
+      "org/gnome/mutter" = {
+        edge-tiling = true;           # Snap windows to edges
+        dynamic-workspaces = true;    # Auto create/remove workspaces
+        workspaces-only-on-primary = true;
+      };
+      # ─── Touchpad gestures (3-finger swipe = workspace switch) ───
+      "org/gnome/desktop/peripherals/touchpad" = {
+        tap-to-click = true;
+        two-finger-scrolling-enabled = true;
+        natural-scroll = true;
+      };
+    };
+  }];
+
+  # ─── i18n / Language Support ───
+  # Install fonts for ALL major writing systems
+  fonts = {
+    packages = with pkgs; [
+      noto-fonts                   # Pan-Unicode coverage
+      noto-fonts-cjk-sans          # Chinese, Japanese, Korean
+      noto-fonts-color-emoji       # Emoji
+      liberation_ttf               # Metric-compatible with Arial/Times
+      jetbrains-mono               # Monospace for code
+      fira-code                    # Alternative monospace with ligatures
+      material-icons               # Material Icons (offline icons for LiquidUI shell)
+    ];
+    fontconfig.defaultFonts = {
+      serif = [ "Noto Serif" "Liberation Serif" ];
+      sansSerif = [ "Noto Sans" "Liberation Sans" ];
+      monospace = [ "JetBrains Mono" "Fira Code" "Noto Sans Mono" ];
+      emoji = [ "Noto Color Emoji" ];
+    };
+  };
+
+  # Input methods (CJK + multilingual)
+  i18n = {
+    defaultLocale = "en_US.UTF-8";
+    supportedLocales = [
+      "en_US.UTF-8/UTF-8" "en_GB.UTF-8/UTF-8"
+      "de_DE.UTF-8/UTF-8" "fr_FR.UTF-8/UTF-8" "es_ES.UTF-8/UTF-8"
+      "pt_BR.UTF-8/UTF-8" "it_IT.UTF-8/UTF-8" "nl_NL.UTF-8/UTF-8"
+      "ja_JP.UTF-8/UTF-8" "ko_KR.UTF-8/UTF-8"
+      "zh_CN.UTF-8/UTF-8" "zh_TW.UTF-8/UTF-8"
+      # hi_IN / vi_VN have no `.UTF-8` variant in nixpkgs glibcLocales
+      "hi_IN/UTF-8" "ar_SA.UTF-8/UTF-8" "ru_RU.UTF-8/UTF-8"
+      "tr_TR.UTF-8/UTF-8" "th_TH.UTF-8/UTF-8" "vi_VN/UTF-8"
+    ];
+    # (inputMethod: OWNED by hart.ime — enabled above with engine="ibus" and
+    # the same pinyin/anthy/hangul set; m17n is unconditional in the module.
+    # Defining it here too is a second writer for one option, which is an
+    # eval conflict the moment the module is on.)
+  };
+
+  # ─── Default Apps (XDG MIME associations) ───
+  xdg.mime.defaultApplications = {
+    "text/html" = "firefox.desktop";
+    "x-scheme-handler/http" = "firefox.desktop";
+    "x-scheme-handler/https" = "firefox.desktop";
+    "text/plain" = "org.gnome.TextEditor.desktop";
+    "application/pdf" = "org.gnome.Papers.desktop";
+    "image/png" = "org.gnome.Loupe.desktop";
+    "image/jpeg" = "org.gnome.Loupe.desktop";
+    "image/gif" = "org.gnome.Loupe.desktop";
+    "image/webp" = "org.gnome.Loupe.desktop";
+    "video/mp4" = "io.github.celluloid_player.Celluloid.desktop";
+    "video/webm" = "io.github.celluloid_player.Celluloid.desktop";
+    "audio/mpeg" = "io.bassi.Amberol.desktop";
+    "audio/flac" = "io.bassi.Amberol.desktop";
+    "inode/directory" = "org.gnome.Nautilus.desktop";
+    # x-scheme-handler/mailto is OWNED by hart-email.nix (hart.email.enable above),
+    # which registers thunderbird.desktop as the mailto handler. Setting it here
+    # too would be a second, conflicting attrsOf-str definition (different value)
+    # and fail eval, so the email module is the single source of truth for it.
+  };
+
+  # D-Bus policy for HART agent bridge
+  services.dbus.packages = lib.mkIf (builtins.pathExists ../dbus/com.hart.Agent.conf) [
+    (pkgs.writeTextDir "share/dbus-1/system.d/com.hart.Agent.conf"
+      (builtins.readFile ../dbus/com.hart.Agent.conf))
+  ];
+
+  # Bluetooth
+  hardware.bluetooth = {
+    enable = true;
+    powerOnBoot = true;
+  };
+
+  # ─── Wi-Fi: NetworkManager + redistributable firmware (privacy-first) ───
+  # On real HW the glass shell's connectivity indicator showed "Wi-Fi not
+  # available" even though the Intel wifi was present. The PRIMARY cause was the
+  # shell server unit being unable to exec `nmcli` (fixed in hart-liquid-ui.nix's
+  # unit PATH). These two settings are the defense-in-depth half — both were only
+  # TRANSITIVELY satisfied before, and a desktop OS's core radio must not depend
+  # on a side effect:
+  #   1. NetworkManager OWNS wifi and provides the `nmcli` the shell calls. It was
+  #      enabled only as a side effect of the GNOME desktopManager default
+  #      (mkDefault true). greetd REPLACES gdm as the boot session, but NM is a
+  #      system service and keeps running regardless — still, enable it outright
+  #      so the wifi stack never rides on the GNOME fallback's default.
+  #   2. The Intel/Realtek wifi DRIVER needs redistributable firmware (iwlwifi,
+  #      rtw/rtl) to bring the radio up and clear soft-rfkill. On the ISO it is
+  #      in the closure via the all-hardware installation-CD profile; explicit
+  #      here so EVERY consumer (installed systems included) carries it and a
+  #      future profile change can't silently drop it.
+  # PRIVACY-FIRST: wifi is ON by default (a LOCAL capability, no opt-in friction),
+  # but NetworkManager NEVER auto-connects to an unknown SSID — it only activates a
+  # saved connection profile, and joining a new network is an explicit user action.
+  # No opportunistic / auto-join behaviour, so "wifi ON" does not mean "leaks onto
+  # any open network". (wifi.powersave is left at the NM default — unset — so the
+  # desktop/laptop radio is not throttled the way the phone variant chooses to.)
+  networking.networkmanager.enable = true;
+  # (hardware.enableRedistributableFirmware moved to hart-base: EVERY variant
+  # needs device firmware, and having it only here meant a headless server
+  # could boot with no working NIC. One writer, all variants.)
+
+  # ─── Printing & Scanning ───
+  services.printing.enable = true;
+  services.avahi = {
+    enable = true;
+    nssmdns4 = true;  # mDNS for network printer discovery
+  };
+  # (hardware.sane: OWNED by hart.scanner — enabled above. The module already
+  # appends pkgs.sane-airscan unconditionally AND adds simple-scan + the
+  # hart-scanner CLI, so this hand-rolled block was a strictly smaller
+  # duplicate and a conflicting second writer.)
+
+  # ─── Location Services (for weather, timezone auto-detect) ───
+  services.geoclue2.enable = true;
+
+  # ─── Accessibility ───
+  services.gnome.at-spi2-core.enable = true;  # Screen reader support
+
+  # ─── Power Management ───
+  services.upower.enable = true;
+  services.thermald.enable = true;
+
+  # ─── HART OS Branding (real assets, not placeholders) ───
+  # SVG sources live in nixos/branding/.  GNOME renders SVG wallpapers directly
+  # (dconf above points here); Plymouth gets the rasterized logo (hartLogoPng).
+  # The mark: a geometric heart with circuit-board traces — human compassion +
+  # machine intelligence — in #00D4AA (HART teal) on dark #080808.
+  environment.etc = {
+    "hart/branding/wallpaper.svg".source = ../branding/hart-wallpaper.svg;
+    "hart/branding/lock-screen.svg".source = ../branding/hart-wallpaper.svg;
+    "hart/branding/logo.svg".source = ../branding/hart-logo.svg;
+  };
+
+  # ─── Boot splash: HART logo, not the NixOS lizard ───
+  # Uses NixOS's default Plymouth theme but swaps in our logo via
+  # boot.plymouth.logo (low-risk — no custom theme module).  quiet+splash hide
+  # the kernel/systemd text boot behind the graphical splash.
+  boot.plymouth = {
+    enable = lib.mkForce true;  # base installer-CD profile may also set this
+    logo = lib.mkForce "${hartLogoPng}/logo.png";
+  } // lib.optionalAttrs useCustomBootSplash {
+    # Opt-in only (useCustomBootSplash above). Off ⇒ {} ⇒ this merge is a no-op
+    # and boot.plymouth is byte-identical to the proven stock-theme-plus-logo.
+    themePackages = [ hartPlymouth ];
+    theme = lib.mkForce "hart";
+  };
+  # (nouveau.modeset=0 stays with the nouveau blacklist in the configuration —
+  # a hardware-policy choice, not variant surface; kernelParams lists merge.)
+  boot.kernelParams = [ "quiet" "splash" ];
+}

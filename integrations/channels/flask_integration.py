@@ -166,10 +166,37 @@ class FlaskChannelIntegration:
 
             logger.info(f"Routing message from {message.channel}:{message.sender_id} to agent")
 
+            # Authenticate the internal hop to /chat.
+            #
+            # This call had no headers at all. On central/regional tiers
+            # security/middleware.py Gate 2 rejects an unauthenticated
+            # internal /chat POST with 401 "Authentication required (Bearer
+            # token)", so EVERY inbound channel message -- Telegram, Discord,
+            # WhatsApp, Slack -- got back "Sorry, I encountered an error
+            # processing your request." A connected channel looked wired up
+            # and answered every message with an apology.
+            #
+            # Reusing agent_engine.dispatch._internal_auth_headers rather than
+            # minting a header here: it already solves exactly this (its
+            # docstring records the same 401 silently breaking the outreach
+            # dispatch path from 2026-03-14). One implementation, so a future
+            # change to internal auth cannot fix one caller and miss the
+            # other -- which is precisely how this bug survived. Imported
+            # lazily to keep channels -> agent_engine out of module import
+            # order. Returns None on flat tier, where no header is needed.
+            try:
+                from integrations.agent_engine.dispatch import (
+                    _internal_auth_headers)
+                _auth_headers = _internal_auth_headers()
+            except Exception as _auth_err:  # never block a message on this
+                logger.debug("internal auth header unavailable: %s", _auth_err)
+                _auth_headers = None
+
             # Call agent API
             response = pooled_post(
                 self.agent_api_url,
                 json=payload,
+                headers=_auth_headers,
                 timeout=120,  # 2 minute timeout for agent processing
             )
 

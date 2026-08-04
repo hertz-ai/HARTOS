@@ -285,6 +285,14 @@ python_files = ["test_*.py", "*_test.py"]
 python_functions = ["test_*"]
 asyncio_mode = "auto"
 addopts = "-v --tb=short"
+# agent_ledger is vendored in-tree (agent-ledger-opensource/agent_ledger) and
+# packaged by setup.py at INSTALL time — but tests run from the SOURCE
+# checkout, where `from agent_ledger import ...` (13+ call sites) has nothing
+# on the path. Ini-level pythonpath (works under --noconftest, unlike a
+# conftest shim) resolves the ONE canonical in-tree package for every test
+# invocation; production resolution (installed wheel / frozen bundle) is
+# unchanged. Fixed 8 standing test_lifecycle_hooks reds (task #15-adjacent).
+pythonpath = [".", "agent-ledger-opensource"]
 
 [tool.mypy]
 python_version = "3.9"

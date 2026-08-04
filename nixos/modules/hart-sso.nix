@@ -16,18 +16,21 @@ in
 
     domain = lib.mkOption {
       type = lib.types.str;
+      default = "";
       description = "SSO domain name (e.g., 'corp.example.com').";
       example = "corp.example.com";
     };
 
     ldapUri = lib.mkOption {
       type = lib.types.str;
+      default = "";
       description = "LDAP server URI.";
       example = "ldaps://ldap.corp.example.com";
     };
 
     ldapBaseDn = lib.mkOption {
       type = lib.types.str;
+      default = "";
       description = "LDAP base distinguished name for user lookups.";
       example = "dc=corp,dc=example,dc=com";
     };
@@ -77,6 +80,28 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # REQUIRED-OPTION TRAP (2026-07-30): domain/ldapUri/ldapBaseDn were
+    # `types.str` with NO default, i.e. REQUIRED. The moment this module was
+    # actually imported and enabled, eval died with "The option
+    # `hart.sso.domain' was accessed but has no value defined" — and because
+    # eval stops at the first error, ldapUri and ldapBaseDn were each a
+    # further CI round waiting behind it. They now default to "" and an
+    # ASSERTION reports all three at once, so enabling SSO without
+    # configuring it fails with a sentence a human can act on instead of an
+    # eval crash that takes every unrelated target down with it.
+    assertions = [{
+      assertion = cfg.domain != "" && cfg.ldapUri != "" && cfg.ldapBaseDn != "";
+      message = ''
+        hart.sso.enable = true, but SSO is not configured. Set all three:
+          hart.sso.domain      (currently ${if cfg.domain == "" then "UNSET" else cfg.domain})
+          hart.sso.ldapUri     (currently ${if cfg.ldapUri == "" then "UNSET" else cfg.ldapUri})
+          hart.sso.ldapBaseDn  (currently ${if cfg.ldapBaseDn == "" then "UNSET" else cfg.ldapBaseDn})
+        These are site-specific (your directory), so HART cannot default them
+        to anything meaningful. If you do not run a directory, leave
+        hart.sso.enable = false — an SSO client with no directory does nothing.
+      '';
+    }];
+
     # ── Required packages ──
     environment.systemPackages = with pkgs; [
       sssd

@@ -70,6 +70,25 @@ _session_lock = threading.Lock()
 # Default timeout for all requests (connect, read) in seconds
 DEFAULT_TIMEOUT = (3, 15)
 
+# LLM *completion* calls need their own budget.  A 15s read timeout is right
+# for health checks and ordinary JSON APIs but is SHORTER THAN A LOCAL 4B
+# GENERATION, so any completion inheriting DEFAULT_TIMEOUT cannot succeed —
+# it times out, the caller falls into an except branch, and the same work is
+# re-issued.  Measured 2026-08-03: every chat turn logged
+#   "In except the exception is HTTPConnectionPool(host='127.0.0.1',
+#    port=8080): Read timed out. (read timeout=15)"
+# exactly 30s (2 x 15s) after "casual conv first call", then a third call
+# finally answered — ~110s wall for a one-word reply.
+#
+# 120s matches what every other LLM-completion call site already hardcodes:
+# integrations/agentic_router.py:391, integrations/channels/self_chat.py:149,
+# integrations/distributed_agent/worker_loop.py:257,
+# integrations/mcp/mcp_server.py:191.  This is the canonical home for that
+# number; those four should migrate to it (tracked, not swept into this fix).
+# Short timeouts elsewhere (5s federated delta, 10s ComfyUI enqueue) are NOT
+# completions and must stay short.
+LLM_COMPLETION_TIMEOUT = (3, 120)
+
 # Shared httpx.Client for the autogen/openai LLM path.  Separate from the
 # requests Session above (openai uses httpx, not requests).
 _llm_httpx_client = None
@@ -287,12 +306,51 @@ _bg_llm_requests_lock = threading.Lock()
 _bg_requests_cancel_registered = False
 
 
+_main_llama_port_cache = None
+
+
+def _main_llama_port() -> str:
+    """The MAIN llama-server's port, resolved once per process ('' if unknown).
+
+    The scheduler (core.llama_scheduler) governs the single MAIN server's
+    slots. A chat-completion POST to any OTHER local llama-server — the
+    draft server runs on its own port with its own slots — must NOT contend
+    for main slots (serializing sub-second draft-classifier calls behind
+    main-model generations would defeat the draft's purpose). Resolution
+    failure returns '' and `_is_llama_completion_url` fails OPEN: every
+    local llama call is treated as main — never accidentally unscheduled.
+    """
+    global _main_llama_port_cache
+    if _main_llama_port_cache is None:
+        try:
+            import re as _re
+            from core.port_registry import get_local_llm_url
+            m = _re.search(r':(\d+)', str(get_local_llm_url() or ''))
+            _main_llama_port_cache = m.group(1) if m else ''
+        except Exception:
+            _main_llama_port_cache = ''
+    return _main_llama_port_cache
+
+
 def _is_llama_completion_url(url) -> bool:
-    """True for a LOCAL llama-server chat-completion POST — the only calls that
-    contend for the single GPU slot and so need foreground priority."""
+    """True for a chat-completion POST to the LOCAL MAIN llama-server — the
+    only calls that contend for its slots and so need foreground priority.
+
+    Port-scoped (task #10): a localhost llama URL on a DIFFERENT port (the
+    draft server) is NOT the main server and returns False, so pooled_post
+    is safe as the ONE transport for every local llama call — main-port
+    calls are scheduled, draft-port calls pass straight through."""
     try:
         u = str(url)
-        return '/chat/completions' in u and ('127.0.0.1' in u or 'localhost' in u)
+        if not ('/chat/completions' in u and ('127.0.0.1' in u or 'localhost' in u)):
+            return False
+        main_port = _main_llama_port()
+        if main_port:
+            import re as _re
+            m = _re.search(r':(\d+)/', u)
+            if m and m.group(1) != main_port:
+                return False
+        return True
     except Exception:
         return False
 

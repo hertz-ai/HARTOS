@@ -111,7 +111,15 @@ in
 
     # Low-latency audio
     (lib.mkIf cfg.audio.lowLatency {
-      environment.etc."pipewire/pipewire.conf.d/99-hart-gaming.conf".text = builtins.toJSON {
+      # services.pipewire.extraConfig, NOT a raw environment.etc entry: nixpkgs
+      # 24.11 hard-ASSERTS against the etc path ("no longer supported"). This
+      # module was DORMANT — nothing ever enabled hart.gaming until the
+      # desktop-boot nixosTest did (2026-07-29) — so the assertion sat latent
+      # and eval-bricked the whole flake gate the first time the module was
+      # actually used: the same dormant-module failure class as hart-power's
+      # ppd/TLP co-enable. extraConfig is the module system's own seam for
+      # exactly this drop-in (it renders the same pipewire.conf.d JSON).
+      services.pipewire.extraConfig.pipewire."99-hart-gaming" = {
         "context.properties" = {
           "default.clock.rate" = cfg.audio.sampleRate;
           "default.clock.quantum" = cfg.audio.bufferSize;

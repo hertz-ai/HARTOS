@@ -10,8 +10,8 @@ suddenly reads an empty buffer — the on-disk evidence was ~6 fragmented buffer
 for one human.  This module moves the guest memory onto the account so recall is
 continuous across the login boundary.
 
-Safety (THE load-bearing part)
-------------------------------
+Safety
+------
 Re-keying ``from -> to`` is a memory-THEFT vector if ``from`` is arbitrary: a
 caller could absorb another user's chat history by naming their id.  So the
 *mechanism* here is deliberately dumb (re-key + merge), and **eligibility is the

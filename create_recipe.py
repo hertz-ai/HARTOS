@@ -120,6 +120,25 @@ _GOAL_PARK_AFTER_BREAKS: int = 3
 # because verify shares the same backend LLM.
 _ASSISTANT_STREAK_STATE: dict = {}
 _ASSISTANT_STREAK_THRESHOLD: int = 3
+
+# Speakers that are part of the Assistant round-trip and therefore must NOT
+# reset the streak above.  Seeing one of these means the lap is still in
+# progress, not that anything advanced.
+#
+# The livelock this closes (live 2026-08-04):
+#     ChatInstructor -> Assistant -> StatusVerifier -> ChatInstructor -> ...
+# Both partners are "non-Assistant", so an unconditional reset on any
+# non-Assistant speaker cleared the counter every lap and the streak never
+# reached the threshold — the escalation was unreachable for the one cycle it
+# was written to break.  20,920 [ROLE-ORDER-GUARD] lines in a single session,
+# still spinning 4 minutes after a one-word message, saturating llama-server.
+#
+# Executor / Helper are deliberately ABSENT: reaching them means a tool ran or
+# the escalation already fired, which is genuine forward progress and SHOULD
+# reset.  Any future agent not listed here also resets, preserving the original
+# "inverse-of-Assistant is future-proof" intent for everything except the two
+# speakers proven to form the cycle.
+_ASSISTANT_ROUNDTRIP_SPEAKERS: frozenset = frozenset({'StatusVerifier', 'ChatInstructor'})
 def publish_async(topic, message, timeout=2.0):
     """Delegate to the canonical publish_async in hart_intelligence.
 
@@ -226,6 +245,7 @@ from lifecycle_hooks import (
     sync_action_state_to_ledger,  # Sync ActionState to SmartLedger
     register_ledger_for_session,  # Register ledger for auto-sync
     stall_guard_step,             # No-progress stall tracker (reachable guard)
+    cycle_guard_step,             # No-NET-progress tracker: cycling action (#485)
     recipe_correction_directive,  # Escalating "emit ONLY JSON" recipe fix (#89)
     is_recipe_creation_request,   # Deterministic recipe-prompt detector (speaker routing)
     RECIPE_CREATE_PROMPT_PREFIX,  # canonical recipe-prompt prefix (single source)
@@ -2689,9 +2709,32 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 _ASSISTANT_STREAK_STATE[user_prompt] = 0
                 return helper
             return verify
-        # Non-Assistant speaker → reset streak (inverse-of-Assistant is
-        # future-proof for new agents added to GroupChat).
-        _ASSISTANT_STREAK_STATE.pop(user_prompt, None)
+        # Reset the streak only on speakers OUTSIDE the Assistant round-trip.
+        #
+        # THE LIVELOCK (observed live 2026-08-04, 20,920 [ROLE-ORDER-GUARD]
+        # lines in one session, still cycling 4 minutes after a one-word user
+        # message and starving llama-server so an unrelated "hi" took 56s):
+        #
+        #     ChatInstructor --(:2676)--> Assistant --(:2683)--> verify
+        #          ^                                              |
+        #          +-------------------(:2699)--------------------+
+        #
+        # `verify` and `ChatInstructor` are non-Assistant speakers, so the
+        # unconditional pop here fired on EVERY lap.  The streak went 1 -> reset
+        # -> 1 -> reset and never reached _ASSISTANT_STREAK_THRESHOLD, making
+        # the Helper escalation above unreachable for the exact cycle it was
+        # added to break.  The guard was being reset by the loop it guards —
+        # #485's "catches STUCK actions, not CYCLING ones", with the mechanism
+        # now pinned to a line.
+        #
+        # The original intent — "inverse-of-Assistant is future-proof for new
+        # agents" — is preserved for genuinely NEW agents: anything not named
+        # below still resets.  Only the two cycle partners are excluded, because
+        # seeing them means the round-trip is still in progress, not that
+        # progress was made.  Executor/Helper DO reset: reaching them means a
+        # tool ran or the escalation fired, which is real forward motion.
+        elif last_speaker.name not in _ASSISTANT_ROUNDTRIP_SPEAKERS:
+            _ASSISTANT_STREAK_STATE.pop(user_prompt, None)
 
         json_obj = None
 
@@ -4181,6 +4224,31 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     f"[STALL-GUARD] action {current_action_id} stuck in "
                     f"{current_state.value} for {_sg_iters} iterations with no "
                     f"recipe — breaking clean (was spinning to max_iterations)")
+                break
+
+            # Second no-progress SIGNAL feeding the SAME break decision above —
+            # not a second guard.  stall_guard_step counts consecutive iterations
+            # in ONE state and resets on every transition and every terminal
+            # state, so it cannot see an action going round in a circle: live
+            # 2026-08-04 action 2 churned assigned -> in_progress ->
+            # status_verification_requested -> completed -> terminated ->
+            # recipe_requested -> terminated -> recipe_requested ->
+            # recipe_received, resetting the stall counter the whole way while
+            # the loop ran toward max_iterations and starved the chat hot path.
+            _cg_key, _cg_entries, _cg_break = cycle_guard_step(
+                getattr(_ut, '_cycle_key', None),
+                getattr(_ut, '_cycle_entries', None),
+                current_action_id, current_state,
+                os.path.exists(helper_fun.safe_prompt_path(
+                    prompt_id, get_current_flow(user_prompt), current_action_id)),
+            )
+            _ut._cycle_key, _ut._cycle_entries = _cg_key, _cg_entries
+            if _cg_break:
+                current_app.logger.warning(
+                    f"[CYCLE-GUARD] action {current_action_id} re-entered the "
+                    f"same states without finishing "
+                    f"({dict((s.value, n) for s, n in _cg_entries.items())}) — "
+                    f"breaking clean instead of draining max_iterations")
                 break
 
             if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':

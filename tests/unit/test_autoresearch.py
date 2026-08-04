@@ -682,3 +682,55 @@ class TestBenchmarkIntegration(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestSaveReportIsBestEffort(unittest.TestCase):
+    """`save_report` must not raise because FEDERATION failed.
+
+    Regression guard for the exception-safety inversion found 2026-08-02
+    (task #28): the cheap local JSON write was wrapped in try/except while
+    the risky network broadcast (export_learning_delta -> peer Hive nodes)
+    sat OUTSIDE it. A dead peer therefore propagated out of a method whose
+    contract is best-effort persistence, defeating the guard directly above
+    it. The protection was on the wrong operation.
+
+    This fails against the pre-fix code, which is the point: without the
+    guard the RuntimeError below escapes.
+    """
+
+    def test_federation_failure_does_not_escape(self):
+        from integrations.coding_agent.autoevolve_code_tools import (
+            AutoResearchEngine, AutoResearchSession,
+        )
+        engine = AutoResearchEngine()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = AutoResearchSession(
+                repo_path=tmpdir, target_file='t.py', run_command='echo')
+            session.status = 'completed'
+            session.results = []
+            with patch.object(AutoResearchEngine, 'export_learning_delta',
+                              side_effect=RuntimeError('peer unreachable')):
+                engine.save_report(session)   # must NOT raise
+
+    def test_report_is_still_written_when_federation_dies(self):
+        """The local half must still succeed — degrading egress must not
+        silently cost the persistence the method is named for."""
+        from integrations.coding_agent.autoevolve_code_tools import (
+            AutoResearchEngine, AutoResearchSession,
+        )
+        engine = AutoResearchEngine()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = AutoResearchSession(
+                repo_path=tmpdir, target_file='t.py', run_command='echo')
+            session.status = 'completed'
+            session.results = []
+            with patch.object(AutoResearchEngine, 'export_learning_delta',
+                              side_effect=RuntimeError('peer unreachable')):
+                engine.save_report(session)
+            report_dir = os.path.join(
+                os.path.dirname(__file__), '..', '..',
+                'agent_data', 'autoresearch')
+            written = os.path.join(report_dir, f'{session.session_id}.json')
+            self.assertTrue(os.path.isfile(written),
+                            "report was not written despite egress failing")
+            os.remove(written)

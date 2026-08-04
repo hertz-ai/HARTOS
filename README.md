@@ -1,6 +1,7 @@
 <h1 align="center">HART OS</h1>
 <p align="center"><strong>Hevolve Hive Agentic Runtime</strong></p>
-<p align="center">The AI-native operating system for every device, from your computer to embodied AI. Local-first, federated, OpenAI-compatible.</p>
+<p align="center"><strong>Democratic frontier intelligence with zero lock-in, fronted by an agentic OS.</strong></p>
+<p align="center">An AI-native operating system. Models run on your own hardware, nodes federate directly with each other, and the API is OpenAI-compatible.</p>
 
 <p align="center">
   <a href="https://hevolve.ai"><img src="https://img.shields.io/badge/Live%20demo-hevolve.ai-FFD700?style=flat-square" alt="Live demo"></a>
@@ -10,519 +11,344 @@
   <a href="https://github.com/hertz-ai/Nunba"><img src="https://img.shields.io/badge/Frontend-Nunba-5865F2?style=flat-square" alt="Nunba"></a>
 </p>
 
-> **HART** = the bare engine (`pip install hart-backend`, listens on `:6777`).
-> **HART OS** = the full AI-native OS. It boots on a laptop, server, or edge node, runs on phones, and reaches into embodied AI, and it ships the agentic Liquid Shell, Model Bus, model catalog, channel pairing, agent dashboard, and hive view.
-> **[Nunba](https://github.com/hertz-ai/Nunba)** = the consumer companion app, one signed client across Windows / macOS / Linux.
-
-**AI-native** means the OS adapts to the machine, not the other way around. On each device it probes what the hardware can actually do, serves LLM, vision, and speech to every app over the Model Bus (socket, D-Bus, or HTTP), and lets the on-device model compose the interface and learn each task once so it can replay it later. The runtime that drives a desktop is the same one that drives a robot, so a robot's AI access is just another Model Bus call. It is one Python codebase that runs in three shapes (flat laptop, regional LAN, or central cloud mesh), speaks the OpenAI protocol on `:6777/v1/chat/completions`, and federates with peers over PeerLink (direct peer-to-peer WebSocket, no broker). A boot-time guardrail hash, re-checked every 300 seconds, plus Ed25519 release signing, keep humans in control.
-
-You would notice it last, the way you notice anything alive: it improves on its own. Each node learns from what it does and gets quietly better, locally, on your own hardware, with nothing leaving the device. Calling an operating system alive should make you reach for the off switch, so that came first: the self-improvement is a toggle, every node is killable on its own, and it runs only as long as you let it.
-
-This README is written to be read by people and by agents alike. Every capability below names the file it lives in, so whether you are a developer or an AI agent exploring the repo, you can go from a feature straight to its source.
-
 ---
 
-> **Status: public alpha.** The runtime, the Model Bus and the channel
-> adapters are in daily use; APIs still move. Issues and PRs are genuinely
-> wanted — see [Contributing](CONTRIBUTING.md).
+### What it is
 
----
+An assistant that runs on your own machine, with no subscription, that works
+with the wifi off. What you type stays on the device because there is nowhere
+else for it to go, and you can watch the network to check.
 
-## Table of Contents
+8GB of RAM is enough, and on 8GB it is the modest version. Exactly what you
+get at which spec is in [Start it](#start-it), because that is where it
+matters.
 
-- [Why HART OS?](#why-hart-os)
-- [60-second start](#60-second-start)
-- [How it compares](#how-it-compares)
-- [Capabilities](#capabilities)
-- [Hello, agent](#hello-agent)
-- [Architecture map](#architecture-map)
-- [API surface](#api-surface)
-- [How auto-evolve works](#how-auto-evolve-works)
-- [How hive connectivity works](#how-hive-connectivity-works)
-- [Topology](#topology)
-- [Build / extend](#build--extend)
-- [Economics (for node operators)](#economics-for-node-operators)
-- [Documentation index](#documentation-index)
-- [License](#license)
+On a hard question a frontier model beats anything that fits on a laptop. Most
+of what people ask in a day is not that, and this is for the rest.
 
----
+Ready today: [Nunba](https://github.com/hertz-ai/Nunba) for Windows, Linux and
+Android. This repo is the runtime underneath it: it serves local inference as a
+system service, federates peer to peer, and is drivable end to end from
+`/v1/chat/completions` or the `hart` CLI.
 
-## Why HART OS?
+## Start it
 
-Most software described as AI-powered ships an assistant: a separate app,
-usually talking to somebody else's server, that can drive a few functions.
-Remove the assistant and everything underneath works exactly as before.
+**Just want to use it?** Download
+[Nunba](https://github.com/hertz-ai/Nunba/releases/latest): one signed
+installer, no Python, and a setup wizard that picks a model for your hardware.
+Read the next section anyway, because it is what that wizard is deciding; the
+clone-and-pip part further down is the only bit that assumes you are running
+from source.
 
-HART OS inverts that. Inference becomes a service the system provides, the
-way it provides a filesystem or a network stack. An application does not
-bundle a model or hold an API key — it asks the OS, and the OS decides which
-model answers, running locally where it can. Ten apps on one machine do not
-each load their own copy or each pay their own bill.
+**What your machine gets you.** Two components decide. `core/gpu_tier.py`
+classifies the hardware into a tier, and the frontend badge quotes its words
+rather than paraphrasing. What actually loads, and onto which device, is the
+VRAM manager's call: it keeps a budget per model, checks fit before anything
+loads, and places each one gpu, cpu-offload or cpu-only
+(`integrations/service_tools/vram_manager.py`). A 10GB+ CUDA card
+unlocks speculative decoding, a 0.8B draft answering while the main model
+verifies, which the tier text puts at roughly 40% faster replies. Between 4
+and 10GB the GPU runs the main model alone. With no CUDA at all, chat runs on
+CPU with a compact model as the main, 0.8B or 2B class, and the model catalog
+treats `main` as a slot any GGUF can take
+(`integrations/service_tools/model_catalog.py`), so swapping the model is
+configuration rather than surgery. A local 7B wants 16GB of RAM and a GPU
+(`security/system_requirements.py`, FULL tier).
 
-That has a practical consequence worth stating plainly: **every device
-becomes the same target.** The runtime driving a laptop is the runtime
-driving a robot, so a robot's AI access is just another Model Bus call, and
-code written against `:6777/v1/chat/completions` runs unchanged on both.
+None of that caps what a node can answer, which is the part worth
+understanding before judging it by its hardware. The agent daemon runs the
+same on any tier, and a turn the local model should not take can be handed
+whole to a peer whose model is bigger. Both halves of that are shipped and
+attached at boot, `hive_capability_advertiser` announcing and
+`hive_expert_discovery` registering what it hears, with the peer's model
+taking the turn directly rather than reviewing a draft. Advertising is opt-in
+per node (`HEVOLVE_HIVE_ADVERTISE=1` and a public endpoint), so on a network
+where nobody has opted in it falls through to local. A modest machine is a
+small model plus a route to a larger one, not a small model on its own.
 
-**If you are here to contribute**, the parts that most need outside eyes are
-the auto-evolve loop (`autoresearch_loop.py`), the guardrails that gate every
-self-improvement (`hive_guardrails.py`), and the 31 channel adapters — the
-most self-contained place to start. See [CONTRIBUTING.md](CONTRIBUTING.md).
+The server starts in seconds. The install does not. `requirements.txt` pins
+191 packages and pulls torch, torchvision, transformers, onnxruntime and
+scipy, so budget a few minutes and a few GB on a first run.
 
----
-
-## 60-second start
+**Use Python 3.10 or 3.11, not a newer one.** Twenty-four pins have no
+cp312 wheel, among them pandas, scipy, PyYAML, onnxruntime, grpcio and
+tokenizers, so on 3.12 the install stops with "No matching distribution
+found", which reads like a broken repository rather than a version mismatch.
+Every one of them has a current release that would work;
+[issue #92](https://github.com/hertz-ai/HARTOS/issues/92) carries the lowest
+compatible version for each.
 
 ```bash
 git clone https://github.com/hertz-ai/HARTOS.git && cd HARTOS
-python3.10 -m venv venv && source venv/Scripts/activate   # Windows: venv\Scripts\activate.bat
+python3.10 -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate.bat
 pip install -r requirements.txt
 echo "OPENAI_API_KEY=sk-..." > .env       # or GROQ_API_KEY, or none for local llama.cpp
 python hart_intelligence_entry.py         # listens on :6777
 ```
 
+It speaks the OpenAI protocol, so any OpenAI SDK, LangChain, LiteLLM, Aider or
+Continue setup points at it unchanged:
+
 ```bash
-# OpenAI-compatible (drop-in for any OpenAI SDK / LangChain / LiteLLM / Aider / Continue)
 curl -X POST http://localhost:6777/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "hevolve", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-[Live demo](https://hevolve.ai) · [Full quickstart](https://docs.hevolve.ai/getting-started/quickstart/) · [Nunba desktop](https://github.com/hertz-ai/Nunba)
+[Live demo](https://hevolve.ai) · [Quickstart](https://docs.hevolve.ai/getting-started/quickstart/) · [Nunba desktop](https://github.com/hertz-ai/Nunba)
 
 ---
 
-## How it compares
+## What "AI-native" actually means here
 
-| | HART OS | OpenAI Agents | LangChain | AutoGen |
+Most software described as AI-powered ships an assistant: a separate app,
+usually talking to somebody else's server, that can drive a few functions.
+Remove the assistant and everything underneath works as before.
+
+Here inference is a service the system provides, the way it provides a
+filesystem. An application does not bundle a model or hold an API key, it asks
+the OS over the Model Bus, and the OS decides which model answers and runs it
+locally where it can. Ten apps on one machine do not each load their own copy.
+
+One consequence is worth stating plainly: every device becomes the same
+target. The runtime driving a laptop is the runtime driving a robot, so a
+robot's AI access is just another Model Bus call, and code written against
+`:6777/v1/chat/completions` runs unchanged on both.
+
+It is one Python codebase that federates over PeerLink, a direct peer-to-peer
+WebSocket with no broker in the middle. Two things vary per node and they are
+independent of each other. What a node **can** do is a capability tier read off
+its hardware. Where a node **sits** in the network is a topology mode set by
+`HEVOLVE_NODE_TIER`, and only `flat` is self-declared. `regional` needs a
+certificate issued by central, `central` needs the Ed25519 master private key,
+and a node claiming either without the proof falls back to `flat` and logs why
+(`security/key_delegation.py:103`).
+
+A boot-time guardrail hash re-checked every 300 seconds, plus Ed25519 release
+signing, keep humans in control. Nodes improve themselves from their own use,
+locally, and that is a toggle you can switch off, because an operating system
+that describes itself as alive should come with an off switch.
+
+### Then why does it ship a Dockerfile
+
+Because it is one source tree packaged three ways, and the topology mode picks
+which. In `flat` it rides inside the Nunba bundle and runs as an ordinary app
+on Windows, macOS or Linux. As `regional` or `central` it runs standalone in
+Docker, which is how the nodes that other nodes federate with get deployed. As
+HART OS it is built with Nix and boots on the metal, hosting the same runtime
+the other two forms run. Nothing is reimplemented per form, and only the last
+one is the OS claim.
+
+Nix is worth naming because most of what people mean by "immutable OS" comes
+from there rather than from us. Generations, one-command rollback, a read-only
+store: all NixOS, and plain NixOS gives you all three today if that is the only
+thing you want. What sits on top here is the update pipeline, BUILD through
+TEST, AUDIT, BENCHMARK, SIGN, CANARY and DEPLOY, where the canary reverts the
+generation by itself when health regresses and the signing step needs a master
+key that a human holds and the AI cannot reach
+(`nixos/modules/hart-ota.nix`). The inheritance is also why the copilot
+boundary below is structural instead of a promise. The store is read only, so
+a coding agent cannot rewrite the running system in place however much it
+would like to.
+
+If you think "OS" is doing more work in that name than the code earns, that is
+a reasonable suspicion and **[Is it an OS?](docs/IS_IT_AN_OS.md)** takes it
+seriously. The compositor does build with Smithay linked, green in CI on
+2026-07-26. There are nineteen nixosTest VM checks covering initrd, paint
+watchdogs, tier drops and the recovery TTY, and that page is blunt that they
+are **defined but not passing**: the suite is manual-dispatch only and has no
+green run. Writing an initrd test still tells you what kind of project this
+is. It does not tell you the boot works, and the page says so rather than
+letting you assume it.
+
+### Two things people miss
+
+**It can see and drive its own desktop.** A vision model takes a screenshot
+and the usual action vocabulary drives the real machine through pyautogui, so
+it can operate a browser or any other GUI. The seeing happens on the device
+(`integrations/vlm/local_computer_tool.py`).
+
+**Claude Code runs as the node's own copilot.** `hart-copilot` drops you into
+Claude Code inside a writable checkout on a fresh branch, with the boundary
+enforced by the filesystem rather than by a prompt: the nix store is read
+only, so it structurally cannot modify the running system in place, and
+nothing in that path touches `main`. Merging, OTA publishing and release
+signing stay human. Details and the current limits are in
+[the design note](docs/architecture/HART_COPILOT_RESIDENT_CLAUDE.md). The
+module is built and flake-eval green, and `hart hive connect` now exists, so
+the session can register with the hive dispatcher and take work. What is
+still missing: no live dispatcher has handed it a task yet, and the login
+does not survive a reboot on the live ISO.
+
+### Where it differs from the OS you are running now
+
+Windows and macOS both run models on-device now, so this is not the old story
+about local versus cloud. Copilot+ uses the NPU and Apple Intelligence uses the
+Neural Engine. What differs is who the model belongs to, what an application is
+allowed to ask for, and whether the thing keeps learning.
+
+Those two ship a finished artifact. It runs on your silicon, but it was trained
+somewhere you had no part in, it arrives the same for everyone, and your use of
+it improves the vendor's next release rather than your machine. Here a node
+improves from its own use, and what it learns is gossiped to peers and
+aggregated periodically (`federated_aggregator.py`) instead of flowing to one
+owner, so the intelligence is built by the machines running it. That is the
+democratic part, and it is a direction rather than a finished claim: what
+aggregates today is real, but the learning code itself is not open, which
+[Why it exists](#why-it-exists) and the section after it deal with squarely.
+
+| | HART OS | Windows | macOS | Linux |
 |---|---|---|---|---|
-| Self-improves at runtime (auto-evolve loop + RSI-2 gate) | yes | no | no | partial |
-| Continuous baselining vs prior snapshots | yes (`agent_baseline_service.py`) | no | no | no |
-| Built-in benchmark adapters | 7 (registry-driven) | n/a | n/a | n/a |
-| Federates across peer nodes | yes (PeerLink + hash-verified) | no | no | no |
-| Local-first multimodal | yes (llama.cpp + Whisper + 6 TTS + VLM) | no | partial | partial |
-| Channel adapters out of the box | 31 | 1 (webhook) | custom | custom |
-| One codebase, multiple topologies | flat / regional / central | hosted only | library | library |
-| OpenAI-compatible endpoint | yes | yes | bring your own | bring your own |
-| Recipe replay (cached LLM steps) | yes (90% faster) | no | no | no |
-| Native source protection (HevolveArmor) | yes | n/a | n/a | n/a |
+| Any app can ask the OS for inference | yes, Model Bus on `:6777` | vendor assistant only | Apple Intelligence is Apple's | no, each app brings its own |
+| Model chosen from the hardware | `core/gpu_tier.py`, `vram_manager.py` | fixed | fixed | manual |
+| Runs Windows, macOS, Linux and Android apps | Wine, Darling, Flatpak/Snap/AppImage/Nix, Waydroid (`app_installer.py`) | Windows, Linux via WSL | macOS, others need a VM | Linux, Windows via Wine |
+| Finds your other devices and hands over a turn | `compute_mesh_service.py`, LAN beacon `:6780` | no | Continuity moves tasks, not inference | no |
+| Federates with other people's nodes | PeerLink, no broker | no | no | no |
+| Consent is a system primitive | append-only, JWT-authed, fanned out to your devices (`consent_api.py`) | per-app prompts | per-app prompts | per-app |
+| Learns a task once and replays it | `create_recipe.py` / `reuse_recipe.py` | no | no | no |
+| Updates are generations you can roll back | NixOS underneath | in-place, System Restore is partial | sealed volume, no generation rollback | NixOS and Silverblue yes, most distros no |
+
+Three of those rows are more flattering than they should be. The mesh hands a
+peer a whole turn, it does not split one model across machines, so if you came
+here looking for parallax-style layer sharding it is not that. A hive of nodes
+coordinating on a goal is not the same thing as one larger model, and a
+question that needs frontier capability still wants a frontier model. And a
+recipe is learned from a real run, which means a wrong recipe replays wrongly
+until a person corrects it, and nothing else in the loop will catch it.
+
+**[Full capability map →](CAPABILITIES.md)** covers every subsystem with the
+file that implements it: agent runtime, auto-evolve, federation, 31 channel
+adapters, 16 providers, security, economics, the API surface, and how it
+compares to the agent frameworks rather than to operating systems.
+
+> **HART** is the bare engine in this repo, listening on `:6777`. There is no
+> PyPI package yet, so install from source as above. **HART OS** is the full
+> AI-native OS that boots on a laptop, server, phone or edge node.
+> **[Nunba](https://github.com/hertz-ai/Nunba)** is the consumer app, one
+> signed client across Windows, macOS and Linux.
 
 ---
 
-## Capabilities
+### Why it exists
 
-### Agent runtime
+A handful of organisations own the most capable AI, and with it the refusal
+policy, the price, and the logs of everything you type. None of that follows
+from any law of nature. It follows from who paid for the cluster.
 
-| | What it does | Where |
-|---|---|---|
-| **CREATE / REUSE recipe pattern** | Run a task once via LLM, save the trace, replay 90% faster with no LLM calls on cached steps | `create_recipe.py`, `reuse_recipe.py` |
-| **GoalManager** | Unified goal lifecycle, guardrail-gated state machine, escalation hooks | `integrations/agent_engine/goal_manager.py` |
-| **AgentDaemon** | Autonomous tick loop, circuit breaker, frozen-thread detection | `integrations/agent_engine/agent_daemon.py` |
-| **SpeculativeDispatcher** | Fast draft model answers first, expert agent takes over if confidence drops | `speculative_dispatcher.py` |
-| **ParallelDispatch** | ThreadPoolExecutor fan-out across SmartLedger tasks | `parallel_dispatch.py` |
-| **SelfHealingDispatcher** | Catches transient failures, retries with backoff + alternative providers | `self_healing_dispatcher.py` |
-| **96 expert agents** | Coding, research, marketing, product, security, ethics, ops, ... auto-dispatched per goal | `integrations/expert_agents/` |
-| **Recipe Pattern + Aider** | In-process Aider backend (no subprocess) for code edits | `integrations/coding_agent/aider_native_backend.py` |
+Learning here is incremental and gossiped, accumulated on consumer hardware as
+nodes get used, with `federated_aggregator.py` doing periodic aggregation
+rather than a tight all-reduce. Nobody blocks on anybody else's gradient, so
+the machines do not need to sit in one building. Inference runs on llama.cpp
+with GGUF weights, so CUDA, ROCm, Metal, Vulkan and plain CPU are all real
+paths and nothing in the delivery path needs one vendor's silicon.
 
-### Auto-evolve, baselining, benchmarking
+The aim, which is a bet and not a shipped feature: an internet of intelligence
+that nobody owns.
 
-| | What it does | Where |
-|---|---|---|
-| **AutoEvolve loop** | Realtime: hypothesis -> 33-rule filter -> hive vote -> parallel sandbox -> RSI-2 gate -> federated broadcast | `integrations/agent_engine/auto_evolve.py` |
-| **RSI-2 monotonic gate** | New release must beat prior baseline on every benchmark by configurable margin or PR is rejected | `rsi_trigger.py`, `pr_review_service.py` |
-| **Benchmark registry** | 7 built-in adapters (3 sourced from HevolveAI: QuantiPhy, Embodied, Qwen). Pluggable via `register_adapter()` | `benchmark_registry.py` |
-| **Per-agent baselines** | Per-agent snapshots at `agent_data/baselines/<agent_id>.json`, used as the regression floor | `agent_baseline_service.py` |
-| **Coding benchmark tracker** | SQLite-backed coding benchmarks (`coding_benchmarks.db`), HumanEval / MBPP / custom suites | `integrations/coding_agent/benchmark_tracker.py` |
-| **Hive benchmark prover** | Cryptographic proof that a benchmark was run on the claimed model + dataset (resists fake-score federation) | `hive_benchmark_prover.py` |
-| **Continual learner gate** | Gates access to hive learning by verified compute contribution (Compute Contribution Tokens): no contribution, no learning | `continual_learner_gate.py` |
-| **PR review service** | Auto-rejects PRs on baseline regression or guardrail mismatch | `pr_review_service.py` |
-| **Upgrade orchestrator** | 7-stage pipeline: BUILD -> TEST -> AUDIT -> BENCHMARK -> SIGN -> CANARY -> DEPLOY | `upgrade_orchestrator.py` |
-| **OTA service** | systemd service does daily check + cryptographically-verified upgrade | `hart-update-service.py` |
+### The part we are not comfortable with
 
-### Hive connectivity + federation
+The learning is not open. Hebbian, Bayesian and gradient code lives in a
+private repo called HevolveAI, and it does not ship as source you could read:
+it is compiled, encrypted and master-signed, and this runtime loads that bundle
+and falls back to a stub when it is missing. You can see the seam in
+`security/native_hive_loader.py`. Worth being exact about, since "closed" here
+means closed rather than merely inconvenient to obtain.
 
-| | What it does | Where |
-|---|---|---|
-| **PeerLink** | Direct P2P WebSocket mesh, trust-aware encryption (same-user devices skip overhead, cross-user E2E), works offline on LAN, across the internet, multi-device | `core/peer_link/` |
-| **NAT traversal** | UDP hole-punching, STUN-style fallbacks for residential NATs | `core/peer_link/nat.py` |
-| **Hivemind handler** | Tier-aware routing (flat / regional / central), connection budget per tier (10 / 50 / 200) | `core/peer_link/hivemind_handler.py` |
-| **FederatedAggregator** | Equal-weighted delta merging (log1p-floor, not hardware tier). Channels: model deltas, resonance, recipes, event counters | `federated_aggregator.py` |
-| **Federated gradient protocol** | Optional weight-level sync interface (Phase 2, not active); the hive shares derived, signed, privacy-scoped learning, never raw data or model weights | `federated_gradient_protocol.py` |
-| **Federation handshake** | Peer presents guardrail hash; mismatch = connection refused; re-verified every 300 s | `integrations/social/federation.py` |
-| **Gossip + verification** | Tier-aware gossip with cert verification, peer-verified task results | `integrity_service.py`, gossip layer |
-| **EventBus + WAMP bridge** | In-process EventBus auto-publishes to Crossbar WAMP when `CBURL` env set; remote nodes subscribe to `com.hartos.event.*` topics | `core/platform/events.py` |
-| **Federated equality** | Tier multipliers replaced with `log1p(interactions)` floor=1.0. A Pi node has the same vote weight as a GPU rack at equal participation | (federation rule) |
-| **Hive contests** | Open contests on the network; agents propose, hive votes, winners federate | `hive_contest.py` |
-| **Native hive loader** | Loads closed-source HevolveAI binary at runtime with master-key signature verification, falls back to stub | `security/native_hive_loader.py` |
+The reason is the boring one. It is the piece a funded competitor would copy
+first, and it is how the rest of this gets paid for. That is a normal way to
+run a company and an awkward thing to put next to an argument about nobody
+owning the intelligence. Both are true and we would rather say so up here than
+have you work it out from a table row halfway down.
 
-### Idea engine (thought experiments)
-
-| | What it does | Where |
-|---|---|---|
-| **Thought experiment** | Propose an idea, community votes (humans + agents, confidence-weighted), believers pledge compute | `api_thought_experiments.py`, `experiment_discovery_service.py` |
-| **ComputePledge** | Spark-budget pledge to a specific experiment, redeemable on idle GPUs across the network | `compute_borrowing.py`, `compute_mesh_service.py` |
-| **Type-aware agents** | `software` / `traditional` / `physical_ai` / `code_evolution` agent types per experiment | `dispatch.py` |
-| **Agent Hive View** | Real-time swarm visualization, encounter lines (collaboration), inject mid-experiment variables | `api_hive_contest.py` + Nunba UI |
-| **Reasoning trace** | Per-agent reasoning capture, queryable post-completion ("interview the agent") | `reasoning_trace.py` |
-
-### LLM + multimodal
-
-| | What it does | Where |
-|---|---|---|
-| **15 LLM providers** | Local llama.cpp, OpenAI, Anthropic, Google Gemini, Groq, Mistral, DeepSeek, OpenRouter, Together, Fireworks, Cohere, Perplexity, Hugging Face, Ollama, custom OpenAI-compatible | `integrations/providers/` |
-| **Universal gateway** | One router, cost / latency / capability scoring, AES-256 keys at rest (PBKDF2 KDF) | `model_registry.py`, `model_bus_service.py` |
-| **Speculative decoding** | Qwen3-0.8B draft + Qwen3-4B main, ~300 ms TTFT on consumer hardware | `speculative_dispatcher.py` |
-| **Faster-Whisper STT** | Local STT, multi-lang, GPU-accelerated when available | `integrations/service_tools/whisper_tool.py` |
-| **MiniCPM VLM** | Vision-language model for camera + screenshot reasoning | `integrations/vision/minicpm_server.py` |
-| **6 TTS engines** | Indic Parler (22 Indic + EU), Chatterbox Turbo (English expressive), Kokoro (English neural), CosyVoice3 (en/zh), F5 (zero-shot voice clone), Piper (CPU fallback) | `integrations/channels/media/`, `tts.py` |
-| **Auto-VRAM tiering** | Detects GPU + free VRAM, picks largest model that fits with headroom; degrades gracefully on 6 GB cards | `core/gpu_tier.py`, `vram_manager.py` |
-
-### Channels (31 adapters)
-
-| Surface | Adapters |
-|---|---|
-| **Core chat** | Telegram, Discord, Slack, WhatsApp, Signal, iMessage (BlueBubbles), Teams, Web SPA |
-| **Enterprise** | Mattermost, Matrix, Nextcloud, Rocket.Chat |
-| **Social** | Messenger, Instagram, Twitter / X, LINE, Viber, WeChat, Twitch |
-| **Decentralized** | Nostr, Tlon (Urbit), OpenProse |
-| **Bridge variants** | TelegramUser, DiscordUser, BlueBubbles, ZaloUser |
-| **Other** | Email (IMAP/SMTP), SMS (Twilio), Google Chat |
-
-`ResponseRouter` fan-out + WAMP desktop mirror; per-channel agent + prompt assignment; AutoGen-side tools so agents can register/send via channels themselves. [Catalog endpoint](#api-surface): `GET /api/social/channels/catalog`.
-
-### Personality + resonance
-
-| | What it does | Where |
-|---|---|---|
-| **AgentPersonality** | 8-dim personality dataclass (warmth, formality, verbosity, ...), generates per-agent system prompt | `core/agent_personality.py` |
-| **UserResonanceProfile** | 8-dim continuous floats (0-1), stored at `agent_data/resonance/<user_id>.json` | `core/resonance_profile.py` |
-| **ResonanceTuner** | EMA tuning (alpha 0.15) from dialogue signals, federated-delta export, oscillation detector | `core/resonance_tuner.py` |
-| **ResonanceIdentifier** | Thin proxy that dispatches biometric ops (face, voice) to HevolveAI sibling. No ML in HART OS. | `core/resonance_identifier.py` |
-
-### Memory + knowledge
-
-| | What it does | Where |
-|---|---|---|
-| **MemoryGraph** | SQLite FTS5 + `memory_links` table, provenance-aware | `core/memory/` |
-| **SimpleMem** | Semantic vector search for long-term recall | (vector store) |
-| **PersistentChatHistory** | Single shared buffer for LangChain + AutoGen (zero parallel paths) | (conversation buffer) |
-| **ConversationEntry** | Cross-channel unified conversation log | `chat_messages.py` |
-| **Embedding delta** | Per-node embedding deltas federated back to the hive | `embedding_delta.py` |
-
-### Distributed compute + economics
-
-| | What it does | Where |
-|---|---|---|
-| **3-tier topology** | flat (single device, SQLite WAL) -> regional (LAN/VPN, MySQL QueuePool) -> central (cloud, Docker mesh) | env-detected, single code path |
-| **SmartLedger** | 15-state task lifecycle, parallel + sequential dispatch, ledger persistence per user | `helper_ledger.py`, `lifecycle_hooks.py` |
-| **ComputeMesh** | Match compute supply (idle GPUs, Nunba desktops) to demand (inference, training, experiments) | `compute_mesh_service.py` |
-| **ComputeEscrow** | Persistent escrow for pledged compute, replaces in-memory `_compute_debts` | (DB table in `models.py`) |
-| **BudgetGate** | Local models (llama / mistral / phi / qwen / groq) cost 0 Spark; cloud models per-1k-token cost | `budget_gate.py` |
-| **MeteredAPIUsage** | Per-call metering for cost recovery on metered providers | `models.py: MeteredAPIUsage` |
-| **NodeComputeConfig** | Per-node policy: GPU hours served, total inferences, energy contributed, electricity rate, cause alignment | `models.py: NodeComputeConfig` |
-| **AdService** | Peer-witnessed impressions (70% witnessed payout, 50% unwitnessed) | `ad_service.py` |
-| **HostingRewardService** | Reward score weighted by gpu_hours / inferences / energy / api_costs | `hosting_reward_service.py` |
-| **RevenueAggregator** | 90 / 9 / 1 split (users / infra / central). Single source of truth for all revenue queries | `revenue_aggregator.py` |
-| **Compute democracy** | Logarithmic reward scaling, max 5% influence per entity, +20% diversity bonus | (constitutional rule, enforced) |
-| **Audit invariant** | Combined compute of nodes auditing any single node must exceed that node's compute | (network self-enforces) |
-
-### Security + governance
-
-| | What it does | Where |
-|---|---|---|
-| **HiveGuardrails** | 10-class guardrail network. Frozen Python (`__slots__=()`, blocked `__setattr__`), SHA-256 hash verified at boot + every 300 s. Gossip peers reject mismatched hashes. | `security/hive_guardrails.py` |
-| **MasterKey** | Ed25519. Signs releases, triggers `HiveCircuitBreaker` (network-wide kill switch). `MASTER_PUBLIC_KEY_HEX` is the immutable trust anchor. | `security/master_key.py` |
-| **3-tier cert chain** | central -> regional -> local, short-TTL local certs | `security/key_delegation.py` |
-| **RuntimeMonitor** | Background tamper-detection daemon, frozen-thread detection, auto-restart | `security/runtime_monitor.py`, `security/node_watchdog.py` |
-| **ImmutableAuditLog** | SHA-256 hash chain, `AuditLogEntry` table, tamper detection on read | `security/immutable_audit_log.py` |
-| **Tool allowlist** | FAST = read-only, BALANCED = read-write, EXPERT = unrestricted | `tool_allowlist.py` |
-| **ActionClassifier** | Destructive pattern detection, `PREVIEW_PENDING` / `APPROVED` states for risky actions | `security/action_classifier.py` |
-| **DLP engine** | PII scan + redact (email, phone, SSN, credit card), outbound gating | `security/dlp_engine.py` |
-| **Rate limiter** | Redis-backed; goal_create limited to 10/hour, /chat at 30/min on central instance | `security/rate_limiter_redis.py` |
-| **Boot hardening** | Tier authorization at boot, dev mode forced off on central (3 layers), TLS check, secret validation, DB encryption check | `__init__.py`, `start_cloud.sh` |
-| **Origin attestation** | Cryptographic origin proof. Federation handshake requires signed attestation. Anti-rebranding. | `security/origin_attestation.py` |
-| **HSM trust** | HSM provider abstraction for key custody | `security/hsm_trust.py`, `security/hsm_provider.py` |
-
-### HevolveArmor (source protection)
-
-| | What it does | Where |
-|---|---|---|
-| **AES-256-GCM at rest** | Python modules encrypted at rest with derived key | `core/security/` (Rust-native) |
-| **Ed25519 key derivation** | node_identity -> HKDF -> AES key | (key derivation) |
-| **BCC mode** | Cython compile-to-C, irreversible | (build flag) |
-| **RFT mode** | AST symbol renaming | (build flag) |
-| **Anti-debug, anti-tamper** | Process introspection guards, license management | (Rust binary) |
-| **Test coverage** | 54 tests (unit + integration + stress + e2e + pen) | `tests/` |
-
-### Platform layer (HART OS specific)
-
-| | What it does | Where |
-|---|---|---|
-| **ServiceRegistry** | Dynamic service discovery + lifecycle | `core/platform/registry.py` |
-| **AppRegistry** | 9 manifest types (chat, panel, channel, agent, plugin, ...) | `core/platform/app_registry.py` |
-| **AppManifest + validator** | Schema-validated app manifests | `core/platform/manifest_validator.py` |
-| **EventBus** | In-process pub/sub + WAMP bridge for cross-node events | `core/platform/events.py` |
-| **Bootstrap** | Migrates 55 shell_manifest panels, registers services, detects native apps, loads extensions, starts PeerLink | `core/platform/bootstrap.py` |
-| **CapabilityRouter** | Routes capability requests to the right service | `core/platform/registry.py` |
-| **EnvironmentManager** | OS detection (NixOS / generic Linux / macOS / Windows), env-specific routing | `core/platform/agent_environment.py` |
-| **Extensions** | Sandboxed extension loader with manifest gating | `core/platform/extensions.py`, `extension_sandbox.py` |
-| **PrGuardian** | Auto-reject PR on guardrail / baseline regression | `core/platform/pr_guardian.py` |
-
-### Desktop / OS management (Nunba surface)
-
-| | What it does | Where |
-|---|---|---|
-| **Shell APIs** | 40+ OS routes (`shell_os_apis.py`), 9 desktop features (`shell_desktop_apis.py`), 6 system features (`shell_system_apis.py`) | `integrations/agent_engine/shell_*.py` |
-| **App installer** | Cross-platform: Nix, Flatpak, AppImage, Wine, Android, Darling. Magic-bytes detection | `integrations/social/app_installer.py` |
-| **NixOS modules** | OTA, NVIDIA, LUKS, firewall, power, accessibility, CUPS, nightlight, IME | (nix flakes) |
-| **Liquid UI service** | MD3 design tokens, JS component lib (dsBtn, dsCard, dsModal) | `liquid_ui_service.py` |
-| **Theme service** | EventBus-driven theme distribution | `theme_service.py` |
-| **Native remote desktop** | RustDesk + Sunshine wrappers, 3-tier transport (DirectWS / WAMP / WireGuard), OTP session auth, DLP scan, peripheral bridge, DLNA casting | `integrations/remote_desktop/` |
-| **System panels** | 36 panels (model catalog, channel pairing, agent dashboard, hive view, ...) | `shell_manifest.py` |
-| **Unified hart CLI** | 21 subcommands: chat, code, social, agent, expert, pay, mcp, compute, channel, a2a, skill, voice, vision, desktop, remote, screenshot, tools, recipe, status, repomap, schedule, zeroshot | `hart_cli.py` |
-
-### Vision + robotics
-
-| | What it does | Where |
-|---|---|---|
-| **Vision sidecar** | MiniCPM VLM server, screenshot + camera frame reasoning | `integrations/vision/` |
-| **Embodied AI bridge** | Frame store + VLM grounding + actuator dispatch (universal robot API) | `integrations/vision/`, `integrations/robotics/` |
-| **OpenClaw** | Computer-use action library | `integrations/openclaw/` |
-
-### Other integrations
-
-- **Agent Protocol 2** (e-commerce, payments) - `integrations/ap2/`
-- **Google A2A** (dynamic agent registry) - `integrations/google_a2a/`
-- **MCP (Model Context Protocol)** servers - `integrations/mcp/`
-- **Internal A2A** (task delegation between agents) - `integrations/internal_comm/`
-- **Skills** (reusable capability bundles) - `integrations/skills/`
-- **Marketing tools** (campaigns, content gen, video orchestrator) - `integrations/marketing/`, `marketing_tools.py`, `video_orchestrator.py`
-- **Trading agents** (SmartLedger-tracked, budget-gated) - `trading_tools.py`
-- **Coding agent** (idle compute -> distributed code tasks via Aider in-process) - `integrations/coding_agent/`
-- **Web crawler** - `integrations/web_crawler.py`
-- **Kids learning** (25+ educational game templates) - `api_games.py`
+The narrower claims hold and you can test them yourself. llama.cpp and GGUF
+run on CUDA, ROCm, Metal, Vulkan and bare CPU, so no vendor owns the silicon
+you need. Apache 2.0 means a fork costs you an afternoon. What we cannot say
+without a caveat is that nobody owns the intelligence, because today somebody
+owns a piece of it, and it is us.
+[Open problem 9](OPEN_PROBLEMS.md) is that argument, including the case that
+we are wrong to ship it this way at all.
 
 ---
 
-## Hello, agent
+## Where to start if you want to help
 
-```python
-import requests
+**Status: public alpha.** The runtime, the Model Bus and the channel adapters
+are in daily use. APIs still move.
 
-# 1. CREATE: teach a task once, save the trace as a recipe
-requests.post("http://localhost:6777/chat", json={
-    "user_id": "alice",
-    "prompt_id": "research_assistant",
-    "prompt": "Find arXiv papers from the last week on speculative decoding",
-    "create_agent": True,
-})
+If you want something concrete, the
+[good first issue](https://github.com/hertz-ai/HARTOS/labels/good%20first%20issue)
+and [help wanted](https://github.com/hertz-ai/HARTOS/labels/help%20wanted)
+labels are real gaps rather than manufactured onboarding tasks. Each says what
+is wrong, why it matters, and what would count as done. A couple carry the
+measurement that found the bug, and one names a hypothesis we already ruled
+out so nobody spends a Saturday re-testing it. Setup is in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
-# 2. REUSE: replay the recipe, no LLM calls on cached steps
-for query in ["mixture of experts", "constitutional AI"]:
-    res = requests.post("http://localhost:6777/chat", json={
-        "user_id": "alice",
-        "prompt_id": "research_assistant",
-        "prompt": query,
-    })
-    print(res.json()["output"])
-```
+The gap we cannot close ourselves is hardware. Twelve claims in
+[VERIFICATION.md](VERIFICATION.md) are written and never run on the metal:
+whether the Pi image boots, whether GPIO toggles from the agent, what
+tokens/sec the 2B actually manages on a Pi 4, whether two machines owned by two
+people can borrow compute from each other and settle what they owe. CI has no
+boards. If you have one, an evening with it settles a row, and a failure is as
+useful as a pass.
 
-Custom tools, channel bindings, agent plugins: [docs.hevolve.ai/agent-plugin](https://docs.hevolve.ai/agent-plugin/).
+If you would rather argue than patch, start at
+**[Open problems](OPEN_PROBLEMS.md)**. Ten things we have not solved, each
+with the code implementing today's inadequate answer: what convergence can
+mean when no node can see the population, whether a system that rewrites
+itself can still be verified, and why a turn escalates itself to a better
+model automatically but can never decide on its own that a problem deserves an
+hour and three machines. Telling us a framing there is wrong is worth more to
+us than a patch.
 
----
+## If you lend it compute
 
-## Architecture map
+A node with spare capacity can serve turns for nodes that do not have it. What
+the lender gets, in code rather than in principle:
 
-```
-HART OS  (port 6777)
-|-- Engine            CREATE -> save Recipe -> REUSE (90% faster replay)
-|-- Agent runtime     GoalManager . AgentDaemon . SpeculativeDispatch . ParallelDispatch . AutoEvolve
-|-- Auto-evolve       Hypothesis -> 33-rule filter -> hive vote -> sandbox -> RSI-2 gate -> federate
-|-- Baselining        agent_baseline_service . benchmark_registry . benchmark_tracker . hive_benchmark_prover
-|-- Memory            Shared LangChain + AutoGen buffer (zero parallel paths) . MemoryGraph . SimpleMem
-|-- Channels (31)     ResponseRouter fan-out + WAMP desktop mirror + per-channel agent binding
-|-- Providers (15)    Universal gateway . AES-256 keys . cost/latency/capability routing
-|-- Multimodal        Whisper STT . 6 TTS engines . MiniCPM VLM . VRAM-tiered
-|-- Hive              PeerLink P2P (NAT-traversed) . FederatedAggregator (equal-weighted)
-|                     Gossip + verification . hash-gated handshake . EventBus + WAMP bridge
-|-- Idea Engine       Thought experiments . ComputePledge . type-aware agents . Hive View
-|-- Compute           3-tier topology (flat/regional/central) . SmartLedger . ComputeMesh . ComputeEscrow
-|-- Economics         AdService (70/50) . RevenueAggregator (90/9/1) . log-scaled compute democracy
-|-- Security          33 guardrails . Ed25519 master key . 3-tier cert chain . RuntimeMonitor
-|                     ImmutableAuditLog . tool allowlist . ActionClassifier . DLP . rate limiter
-|-- HevolveArmor      AES-256-GCM modules . BCC compile-to-C . RFT AST renaming . anti-debug
-|-- Platform          ServiceRegistry . AppRegistry . AppManifest . Bootstrap . EnvironmentManager
-|-- Desktop           Shell APIs . app installer . NixOS modules . LiquidUI . themes . remote desktop
-|-- CLI               hart (21 subcommands) . OpenAI-compatible client . Aider in-process backend
-`-- Other             AP2 . Google A2A . MCP . skills . marketing . trading . coding agent . vision
-```
+`integrations/agent_engine/revenue_aggregator.py:26` splits gross revenue
+90/9/1. Ninety percent to the pool that pays the people who ran the work, nine
+to infrastructure, one to central. The same ninety holds for apps: creators keep
+90% of every Spark their app earns (`app_marketplace.py:7`).
 
-Full architecture: [docs.hevolve.ai/architecture](https://docs.hevolve.ai/architecture/overview/).
+Three things earn: the API, ads, and agents completing work. A provider is paid
+out of what the network takes in rather than out of a subscription someone else
+pays, which is the difference between this and renting your GPU to a company.
 
----
+`compute_borrowing.py` is the mechanism: peers advertise idle capacity, a node
+under pressure borrows, and the work is accounted against the lender.
+Contribution is scored by participation, not by hardware. A Pi and a GPU rack
+carry the same vote weight at equal participation, `log1p(interactions)` with no
+tier multiplier (`federated_aggregator.py:642`), so lending a small machine is
+not a rounding error.
 
-## API surface
+**What has not happened yet.** No payment has settled end to end. The aggregator
+currently sums the API and ad legs; agent work earns into Spark but the
+cross-node collective-earning slice is deliberately inert and says so in its own
+first line (`collective_earning.py`: "Neither broadcasts, remits, nor mutates
+anything"). The split is constants, the borrowing path is written, and nobody
+has been paid through any of it.
 
-```
-POST /chat                                Core agent (LangChain + AutoGen)
-POST /v1/chat/completions                 OpenAI-compatible (drop-in)
-POST /time_agent                          Scheduled task execution
-POST /visual_agent                        VLM + computer use
-GET  /status                              Health
+So anyone lending compute today is helping prove the mechanism, not collecting
+on it. That is [row 8](VERIFICATION.md), and it wants two machines owned by two
+people.
 
-# Hive + thought experiments
-POST /api/social/experiments/auto-evolve  Start evolution cycle
-GET  /api/social/hive/active              All parallel agents (Hive View)
-POST /api/social/hive/<id>/inject         Inject mid-experiment variable
-GET  /api/social/tracker/experiments      Experiment tracker with task progress
-
-# Channels
-GET  /api/social/channels/catalog         All 31 channels + capabilities
-POST /api/social/channels/bindings        Bind a channel to an agent
-POST /api/social/channels/pair/generate   QR for cross-device pairing
-
-# Goals + dashboard
-POST /api/goals                           Create an autonomous goal
-GET  /api/social/dashboard/agents         Truth-grounded agent overview
-
-# Compute + earnings
-GET  /api/compute-earnings/summary        Per-node earnings breakdown
-GET  /api/settings/compute                Local compute policy
-PUT  /api/settings/compute                Update policy
-PUT  /api/settings/provider               Provider config (cause alignment, electricity rate)
-PUT  /api/settings/provider/join          Opt into provider role
-
-# A2A protocol
-GET  /a2a/<prompt_id>_<flow_id>/.well-known/agent.json
-POST /a2a/<prompt_id>_<flow_id>/execute
-```
-
-195+ endpoints total. [Full reference](https://docs.hevolve.ai/api/core/).
+Details at [provider join](https://docs.hevolve.ai/provider/joining/).
 
 ---
 
-## How auto-evolve works
-
-```
-chat / tool call / observed outcome
-   v
-autoresearch hypothesis            (what could improve next response)
-   v
-33-rule guardrail filter           (immutable, hash-verified, rejects unsafe)
-   v
-hive vote                          (humans + agents, confidence-weighted)
-   v
-top-k dispatched to parallel sandboxes
-   v
-benchmark replay vs baseline       (per-agent baseline at agent_data/baselines/)
-   v
-RSI-2 monotonic gate               (must beat last commit on every metric)
-   v
-PR review                          (auto-rejects regression, hive contests merge)
-   v
-upgrade orchestrator               (BUILD -> TEST -> AUDIT -> BENCHMARK -> SIGN -> CANARY -> DEPLOY)
-   v
-FederatedAggregator broadcasts the delta to peer nodes
-   v
-hart-update-service (OTA) pulls signed upgrade on every node
-```
-
-Owner can pause, resume, or veto at any stage. [Mechanism details](https://docs.hevolve.ai/features/overview/).
-
----
-
-## How hive connectivity works
-
-```
-Same-user devices
-  trust = SAME_USER          -> no encryption (user_id auth), LAN or WAN
-  
-Cross-user peers
-  trust = PEER               -> E2E encryption (per-link key)
-  
-Through relay (NAT-bound)
-  trust = RELAY              -> E2E encryption (relay can't read)
-
-Crossbar = safety measure (telemetry metadata + kill switch). Never content path.
-
-Connection budget per tier:  flat=10  regional=50  central=200
-ALL tiers participate equally in hive consensus.
-Federation handshake = byte-for-byte guardrail hash match. Mismatch -> refused.
-```
-
-PeerLink is wired into bootstrap, gossip, federation, compute_mesh, world_model_bridge. [Wire format](docs/architecture/peer_link.md).
-
----
-
-## Topology
-
-| | Storage | Network | Use case |
-|---|---|---|---|
-| `flat` | SQLite WAL | localhost | Single device, laptop, Raspberry Pi, Nunba desktop |
-| `regional` | MySQL QueuePool | LAN / VPN | Office cluster, family hive, edge node |
-| `central` | MySQL + Docker | public mesh | Federated cloud workers |
-
-Same code path. Env-detected at boot via `HART_OS_MODE` or `/etc/os-release ID=hart-os`. Port resolution: override > env var > OS / app mode default.
-
----
-
-## Build / extend
-
-| Audience | Where to start |
-|---|---|
-| **Developers** | [Build an agent + recipe](https://docs.hevolve.ai/agent-plugin/) - CREATE once, REUSE forever |
-| | [Add a channel adapter](https://docs.hevolve.ai/features/overview/) - wire a new chat surface |
-| | [Add a provider](https://docs.hevolve.ai/neuro-providers/) - new LLM / TTS / STT / VLM backend |
-| | [Add a benchmark](integrations/agent_engine/benchmark_registry.py) - register an adapter, gets RSI-2 protection |
-| | [PeerLink wire format](docs/architecture/peer_link.md) - direct P2P protocol |
-| | [Federation protocol](docs/architecture/FEDERATION.md) - hash-gated peer handshake |
-| | [HART SDK](docs/developer/sdk.md) - Python client + `hart` CLI |
-| **Node operators** | [Run a node](https://docs.hevolve.ai/provider/joining/) - lend compute, host a region, earn from witnessed traffic |
-| | [Compute settings](#api-surface) - cause alignment, electricity rate, idle policy |
-| **End users** | [Nunba desktop](https://github.com/hertz-ai/Nunba) - chat / social / encounter app |
-| **Security reviewers** | [Guardrail network](security/hive_guardrails.py) · [Master key](security/master_key.py) · [Audit log](security/immutable_audit_log.py) · [DLP](security/dlp_engine.py) |
-| **Researchers** | [Auto-evolve](integrations/agent_engine/auto_evolve.py) · [RSI-2 trigger](integrations/agent_engine/rsi_trigger.py) · [Federated aggregator](integrations/agent_engine/federated_aggregator.py) · [Hive contests](integrations/agent_engine/hive_contest.py) |
-
-Front it with `/v1/chat/completions` (any OpenAI client), the [`hart` CLI](docs/developer/sdk.md), or build for the desktop with [Nunba](https://github.com/hertz-ai/Nunba).
-
----
-
-## Economics (for node operators)
-
-```
-Advertisers pay for witnessed impressions
-   |
-   v
-Ad service           70% witnessed view, 50% unwitnessed
-   |
-   v
-Compute democracy    log scaling, max 5% influence per entity, +20% diversity bonus
-   |
-   v
-   90% -> Contributors  (compute, hosting, training)
-    9% -> Infrastructure (regional hosts, bandwidth)
-    1% -> hevolve.ai     (master key, central coordination, security)
-```
-
-Idle GPU in Tokyo serves Berlin. Reward score weighted by `gpu_hours`, `inferences`, `energy_kwh`, `api_costs`. Per-node `cause_alignment` and `electricity_rate_kwh` affect dispatch routing. [Joining the Hive](https://docs.hevolve.ai/provider/joining/).
-
----
-
-## Documentation index
+## Documentation
 
 | Section | What's in it |
 |---|---|
-| [Downloads](https://docs.hevolve.ai/downloads/) | HART OS backend installer + Nunba desktop + headless pip |
-| [Quickstart](https://docs.hevolve.ai/getting-started/quickstart/) | Install -> first agent -> first thought-experiment in 2 minutes |
-| [Features](https://docs.hevolve.ai/features/overview/) | Auto-evolve, federation, channels, multimodal, encounters |
+| [Capabilities](CAPABILITIES.md) | Every subsystem, with the file that implements it |
+| [Open problems](OPEN_PROBLEMS.md) | Ten things we have not solved |
+| [Verification](VERIFICATION.md) | What is proven, what is not, and how to settle a row |
+| [Contributing](CONTRIBUTING.md) | Setup, where help is wanted, what we will not merge |
+| [Quickstart](https://docs.hevolve.ai/getting-started/quickstart/) | Install to first agent |
+| [Architecture](https://docs.hevolve.ai/architecture/overview/) | Topology, PeerLink, draft-first dispatch, federation |
 | [API](https://docs.hevolve.ai/api/core/) | `/chat`, OpenAI-compatible, 195+ endpoints |
-| [Architecture](https://docs.hevolve.ai/architecture/overview/) | 3-tier topology, PeerLink, draft-first, agent engine, federation |
-| [User journey](https://docs.hevolve.ai/developer/user-journey/) | What every screen does, end to end |
-| [UI settings](https://docs.hevolve.ai/ui/settings-spec/) | Admin console + every setting |
-| [Provider join](https://docs.hevolve.ai/provider/joining/) | Lend compute, host a region, earn |
-| [Hive contests](https://docs.hevolve.ai/hive-contest/) | Open contests on the network |
-| [Neuro providers](https://docs.hevolve.ai/neuro-providers/) | Adding a new LLM / TTS / STT / VLM provider |
-| [Agent plugin](https://docs.hevolve.ai/agent-plugin/) | Building custom agents + recipes |
+| [Provider join](https://docs.hevolve.ai/provider/joining/) | Lend compute, host a region |
 
 ---
 

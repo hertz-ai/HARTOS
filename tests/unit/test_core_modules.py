@@ -644,7 +644,19 @@ class TestHttpPool:
         mock_session.get.assert_called_once_with('http://example.com', timeout=10)
 
     def test_pooled_post_llm_logging_no_crash(self):
-        """POST to /chat/completions triggers LLM logging — must not crash."""
+        """POST to /chat/completions triggers LLM logging — must not crash.
+
+        PATCH THE LLAMA SEAM, not the general pooled session. pooled_post
+        deliberately routes a LOCAL llama completion through
+        `_llama_session_for(kind)` rather than `get_http_session()`, so the
+        priority scheduler has a session it can close to preempt an in-flight
+        daemon call. Setting `http_pool._session` — which is the right seam for
+        pooled_get, and for any NON-llama post — therefore did not intercept
+        anything here, and this test issued a REAL request to localhost:8080 on
+        every run: a 15s read timeout on a box with something listening there,
+        a connection error on CI. A unit test doing live network I/O.
+        """
+        from unittest.mock import patch
         from core import http_pool
         mock_resp = MagicMock()
         mock_resp.json.return_value = {
@@ -653,11 +665,28 @@ class TestHttpPool:
         }
         mock_session = MagicMock()
         mock_session.post.return_value = mock_resp
-        http_pool._session = mock_session
-        resp = http_pool.pooled_post(
-            'http://localhost:8080/v1/chat/completions',
-            json={'messages': [{'role': 'user', 'content': 'hi'}]})
+        with patch.object(http_pool, '_llama_session_for',
+                          return_value=mock_session):
+            resp = http_pool.pooled_post(
+                'http://localhost:8080/v1/chat/completions',
+                json={'messages': [{'role': 'user', 'content': 'hi'}]})
         assert resp is mock_resp
+        assert mock_session.post.called, (
+            "the llama session was never used — pooled_post took a different "
+            "path and this test is again asserting nothing")
+
+    def test_a_non_llama_post_uses_the_GENERAL_pooled_session(self):
+        """The other half of the split, so the two paths stay distinguishable."""
+        from core import http_pool
+        mock_resp = MagicMock()
+        mock_session = MagicMock()
+        mock_session.post.return_value = mock_resp
+        http_pool._session = mock_session
+        resp = http_pool.pooled_post('http://example.com/api', timeout=10,
+                                     json={'a': 1})
+        assert resp is mock_resp
+        mock_session.post.assert_called_once_with(
+            'http://example.com/api', timeout=10, json={'a': 1})
 
     def test_retry_status_forcelist(self):
         from core.http_pool import get_http_session
@@ -865,24 +894,86 @@ class TestLLMURLResolution:
         assert url.startswith('http://127.0.0.1:')
         assert url.endswith('/v1')
 
-    def test_canonical_env_var(self):
-        from core.port_registry import get_local_llm_url
-        os.environ['HEVOLVE_LOCAL_LLM_URL'] = 'http://127.0.0.1:9090/v1'
-        url = get_local_llm_url()
+    # ── The resolver PROBES; it does not merely rank ────────────────────────
+    # These three used to set an env var and assert it came straight back, which
+    # is not what get_local_llm_url promises: "every non-empty candidate is
+    # PROBED, and the first REACHABLE one wins". That change was made on purpose
+    # so a stale configured port (wizard wrote 8080, llama-server later moved to
+    # 8082) stops causing silent chat hangs.
+    #
+    # As written they were also environment-dependent: they passed on a box with
+    # nothing on 8080 and failed on one where something was listening, because
+    # the reachable default then correctly beat the unreachable configured URL.
+    # And they never invalidated the cache between cases, so the first test's
+    # result leaked into the rest — test_custom_base_url even imported
+    # invalidate_llm_url without calling it.
+    #
+    # Rewritten to drive the documented contract through its own seam
+    # (_probe_llm_endpoint), so they are deterministic on any machine.
+
+    def _resolve_with_reachable(self, reachable, env):
+        """Resolve with ONLY `reachable` answering, and `env` applied."""
+        from unittest.mock import patch
+        from core import port_registry
+        old = {k: os.environ.get(k) for k in env}
+        try:
+            for k, v in env.items():
+                os.environ[k] = v
+            port_registry.invalidate_llm_url()
+            with patch.object(port_registry, '_probe_llm_endpoint',
+                              side_effect=lambda u: u == reachable):
+                return port_registry.get_local_llm_url()
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            port_registry.invalidate_llm_url()
+
+    def test_canonical_env_var_wins_when_reachable(self):
+        url = self._resolve_with_reachable(
+            'http://127.0.0.1:9090/v1',
+            {'HEVOLVE_LOCAL_LLM_URL': 'http://127.0.0.1:9090/v1'})
         assert url == 'http://127.0.0.1:9090/v1'
 
-    def test_custom_base_url(self):
-        from core.port_registry import get_local_llm_url, invalidate_llm_url
-        os.environ['CUSTOM_LLM_BASE_URL'] = 'http://myhost:1234'
-        url = get_local_llm_url()
+    def test_custom_base_url_wins_when_reachable(self):
+        url = self._resolve_with_reachable(
+            'http://myhost:1234/v1',
+            {'CUSTOM_LLM_BASE_URL': 'http://myhost:1234'})
         assert 'myhost:1234' in url
         assert url.endswith('/v1')
 
-    def test_deprecated_port_var(self):
-        from core.port_registry import get_local_llm_url
-        os.environ['LLAMA_CPP_PORT'] = '8888'
-        url = get_local_llm_url()
+    def test_deprecated_port_var_wins_when_reachable(self):
+        url = self._resolve_with_reachable(
+            'http://127.0.0.1:8888/v1', {'LLAMA_CPP_PORT': '8888'})
         assert '8888' in url
+
+    def test_an_unreachable_configured_url_loses_to_a_reachable_one(self):
+        """The anti-drift behaviour the probe exists for — previously untested.
+
+        The wizard writes 8080; llama-server later moves to 8082. Ranking alone
+        would keep sending chat at the dead 8080 and hang. The resolver must
+        walk past the unreachable higher-priority candidate.
+        """
+        from core.port_registry import get_port
+        live = f'http://127.0.0.1:{get_port("llm")}/v1'
+        url = self._resolve_with_reachable(
+            live, {'HEVOLVE_LOCAL_LLM_URL': 'http://127.0.0.1:9999/v1'})
+        assert url == live, (
+            "a DEAD configured URL was returned over a reachable one — this is "
+            "the silent chat hang the probe was added to prevent")
+
+    def test_nothing_reachable_still_returns_the_configured_url(self):
+        """Cold boot: llama-server has not spawned yet.
+
+        The documented fallback is the highest-priority candidate, so callers
+        hit their normal connection-error path instead of a None special case.
+        """
+        url = self._resolve_with_reachable(
+            '__nothing_is_reachable__',
+            {'HEVOLVE_LOCAL_LLM_URL': 'http://127.0.0.1:9090/v1'})
+        assert url == 'http://127.0.0.1:9090/v1'
 
     def test_is_local_llm_true(self):
         from core.port_registry import is_local_llm

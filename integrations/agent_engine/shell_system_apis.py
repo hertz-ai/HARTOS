@@ -22,12 +22,14 @@ logger = logging.getLogger('hevolve.shell.system')
 
 # ─── Helpers ────────────────────────────────────────────────────
 
-def _run(cmd, timeout=10, **kw):
-    try:
-        return subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout, **kw)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
+# The bounded probe lives in core.subprocess_safe — ONE implementation for
+# both shell API modules. First attempt (6e0a101d) was reverted because
+# TestShellWiFi/TestShellVPN mocked `<module>.subprocess` wholesale, so the
+# mock stopped intercepting once the syscall moved into another namespace.
+# Those tests now patch the `_run` SEAM instead of the implementation detail
+# beneath it, which is what they always should have done — so the duplicate
+# can finally go. Any test that patches `_run` is unaffected by this alias.
+from core.subprocess_safe import run_probe as _run
 
 
 def _first_int(r, default=0):
@@ -449,9 +451,324 @@ def _audit_system_op(action, detail=None):
         pass
 
 
+
+# The default view of "what services does this OS run". NOT a limit — the
+# /api/shell/services route takes ?units= for anything else — and deliberately
+# grouped, because the point of task #25 is that an agent can ask about the
+# common OS subsystems by name instead of knowing HART's own unit names.
+#
+# Units that are not installed are reported as such rather than omitted: on a
+# desktop that never enabled sharing, "nfs-server is not installed" is the
+# useful answer, and dropping the row would make it indistinguishable from a
+# unit we forgot to ask about.
+SERVICE_CATALOG = {
+    'hart': ['hart-backend', 'hart-agent-daemon', 'hart-vision',
+             'hart-llm', 'hart-discovery', 'hart-liquid-ui', 'hart-conky'],
+    'remote-access': ['sshd'],
+    'file-sharing': ['nfs-server', 'smbd', 'nmbd'],
+    'containers': ['podman', 'docker', 'libvirtd'],
+    'core': ['NetworkManager', 'systemd-timesyncd', 'systemd-resolved'],
+}
+
+
+def parse_systemctl_show(text: str) -> list:
+    """`systemctl show <units> -p Id,LoadState,...` output -> unit dicts.
+
+    Pure parse, no I/O, so the contract is testable without systemd — same
+    reason parse_lspci_k and parse_proc_modules are pure.
+
+    systemd emits one KEY=VALUE block per unit, blocks separated by a blank
+    line. The key field is LoadState: `not-found` means the unit does not
+    exist on this system, which is a DIFFERENT fact from `inactive` (it
+    exists and is stopped). `systemctl is-active` collapses both to
+    "inactive", which is why this uses `show` — reporting an uninstalled
+    Samba as merely "stopped" invites an agent to try starting it forever.
+    """
+    units, cur = [], {}
+    for raw in (text or '').splitlines():
+        line = raw.strip()
+        if not line:
+            if cur:
+                units.append(cur)
+                cur = {}
+            continue
+        key, sep, val = line.partition('=')
+        if sep:
+            cur[key] = val
+    if cur:
+        units.append(cur)
+
+    out = []
+    for u in units:
+        if not u.get('Id'):
+            continue
+        load = u.get('LoadState')
+        out.append({
+            'name': u['Id'].rsplit('.service', 1)[0],
+            'unit': u['Id'],
+            'installed': load not in ('not-found', 'masked', None),
+            'load_state': load,
+            'status': u.get('ActiveState'),      # active/inactive/failed
+            'sub_state': u.get('SubState'),      # running/dead/exited
+            'enabled': u.get('UnitFileState'),   # enabled/disabled/static
+        })
+    return out
+
+
+def parse_proc_modules(text: str) -> list:
+    """`/proc/modules` text -> loaded-module dicts.
+
+    Pure parse, no I/O, so the contract is testable without a Linux kernel —
+    same reason parse_lspci_k is pure (the dev box is Windows, the target is
+    NixOS). Each line is:
+
+        snd_hda_intel 57344 5 snd_hda_codec,snd_hwdep Live 0xffffffffc0a00000
+        ^name         ^size ^refs ^deps               ^state ^offset
+
+    `deps` is "-" when nothing depends on the module. `state` is Live /
+    Loading / Unloading: a module stuck in Loading or Unloading is a real
+    fault worth surfacing, which is the whole reason state is kept rather
+    than assuming Live.
+
+    A malformed line is SKIPPED rather than guessed at — a module list with
+    an invented entry is worse than one that is short.
+    """
+    mods = []
+    for raw in (text or '').splitlines():
+        parts = raw.split()
+        if len(parts) < 4:            # name size refs deps — the minimum
+            continue
+        name, size, refs, deps = parts[0], parts[1], parts[2], parts[3]
+        try:
+            size_i, refs_i = int(size), int(refs)
+        except ValueError:
+            continue                  # not a module line
+        mods.append({
+            'name': name,
+            'size_bytes': size_i,
+            'refcount': refs_i,
+            'used_by': [] if deps == '-' else [d for d in deps.split(',') if d],
+            'state': parts[4] if len(parts) > 4 else None,
+        })
+    return mods
+
+
+def service_status(names) -> dict:
+    """State of the named systemd units — ONE systemctl call for all of them.
+
+    The previous implementation ran `systemctl is-active` once PER unit: seven
+    subprocesses on every request to answer a question systemd will answer in
+    one. `systemctl show` accepts every unit at once, so this is 1 process
+    regardless of how many are asked for, and it returns LoadState, which
+    is-active cannot express (see parse_systemctl_show).
+
+    Uses the canonical bounded probe (`_run` -> core.subprocess_safe.run_probe)
+    rather than a fresh subprocess.run, which is the repo-wide rule.
+
+    Never raises. Same three answers as the other #25 surfaces: available
+    False means systemd could not be consulted at all, which is NOT the same
+    as "no services are running".
+    """
+    names = [n for n in (names or []) if n and re.fullmatch(r'[A-Za-z0-9@:_.\-]+', n)]
+    if not names:
+        return {'available': True, 'services': []}
+
+    # A bare name means the .service unit; an explicit type is left alone, so
+    # a caller can ask about sshd.socket or hart-ota.timer without having it
+    # rewritten into a unit that does not exist.
+    _UNIT_TYPES = ('.service', '.socket', '.timer', '.target', '.mount',
+                   '.path', '.slice', '.scope', '.device', '.swap')
+    units = [n if n.endswith(_UNIT_TYPES) else f'{n}.service' for n in names]
+
+    try:
+        r = _run(['systemctl', 'show', *units,
+                  '--property=Id,LoadState,ActiveState,SubState,UnitFileState'],
+                 timeout=8)
+    except OSError as exc:
+        logger.warning("service_status: systemctl failed (%s: %s)",
+                       type(exc).__name__, exc)
+        return {'available': False, 'services': [],
+                'error': f'systemctl unavailable: {exc}'}
+
+    if r is None:
+        # run_probe returns None for the two EXPECTED degrades: tool absent
+        # or tool hung. Either way we did not get to look.
+        logger.warning("service_status: systemctl absent or timed out")
+        return {'available': False, 'services': [],
+                'error': 'systemctl is absent or did not answer in time'}
+
+    return {'available': True, 'services': parse_systemctl_show(r.stdout or '')}
+
+
+def kernel_status() -> dict:
+    """Running kernel + loaded modules — the "what is actually driving this
+    machine" surface (task #25).
+
+    Reads /proc/modules DIRECTLY rather than shelling out to lsmod, because
+    lsmod does nothing but format that same file. No subprocess means no
+    timeout, no missing-binary degrade, and no PATH assumption — strictly
+    fewer ways to fail for identical information.
+
+    `tainted` is the kernel's own "I am in a state nobody supports" flag
+    (proprietary module loaded, module force-unloaded, hardware reported
+    unsound). It is the OS-level counterpart of the unclaimed-device yellow
+    bang in /api/shell/drivers: the single most useful bit for an agent
+    triaging "why is this machine behaving strangely".
+
+    Honest degrade, same three answers as gpu_status(): on a machine with no
+    /proc/modules (Windows and macOS dev boxes) this is available=False with
+    a reason, NOT an empty module list — "no modules loaded" and "this OS
+    has no such concept" are different facts and an empty list asserts the
+    first.
+    """
+    import platform
+
+    info = {
+        'available': False,
+        'kernel_release': platform.release() or None,
+        'modules': [],
+        'module_count': 0,
+        'tainted': None,
+    }
+
+    try:
+        with open('/proc/modules', encoding='utf-8', errors='replace') as fh:
+            text = fh.read()
+    except (FileNotFoundError, NotADirectoryError):
+        info['error'] = ('/proc/modules is absent — this kernel does not '
+                         'expose loadable modules (non-Linux host?)')
+        return info
+    except OSError as exc:
+        logger.warning("kernel_status: /proc/modules unreadable (%s: %s)",
+                       type(exc).__name__, exc)
+        info['error'] = f'/proc/modules unreadable: {exc}'
+        return info
+
+    info['available'] = True
+    info['modules'] = parse_proc_modules(text)
+    info['module_count'] = len(info['modules'])
+
+    # Tainted is a separate file and a separate failure: a kernel that lists
+    # its modules but hides its taint flag is still a useful answer, so this
+    # degrades to None on its own rather than failing the whole call.
+    try:
+        with open('/proc/sys/kernel/tainted', encoding='utf-8') as fh:
+            info['tainted'] = int(fh.read().strip())
+    except (OSError, ValueError) as exc:
+        logger.warning("kernel_status: taint flag unreadable (%s: %s)",
+                       type(exc).__name__, exc)
+
+    return info
+
+
+def gpu_status() -> dict:
+    """The ONE shape for "what GPU is present", used by every GPU surface.
+
+    TASK #25. vram_manager.detect_gpu() is the canonical DETECTOR (nvidia-smi
+    -> torch -> Metal, cached) and was already correct; what was duplicated was
+    the PRESENTATION. /api/shell/system/metrics called the detector itself and
+    attached `metrics['gpu']` only when a name came back, so a CPU-only box and
+    a box whose probe FAILED looked identical from outside — the key was simply
+    absent in both cases.
+
+    That is the false-healthy shape this codebase keeps producing, so the shape
+    lives here and both callers use it. Three distinguishable answers:
+
+        available=True,  present=True   -> a GPU, with its numbers
+        available=True,  present=False  -> genuinely no GPU (a CPU-only box)
+        available=False                 -> could not LOOK (detector absent/raised)
+
+    "No GPU" and "could not look" are opposite facts; reporting a fabricated
+    0 GB for the second reads as "a GPU with no memory".
+
+    Never raises — a status probe that throws is worse than one that degrades.
+    """
+    try:
+        from integrations.service_tools.vram_manager import detect_gpu
+    except Exception as exc:
+        logger.warning("gpu_status: vram_manager unavailable (%s: %s)",
+                       type(exc).__name__, exc)
+        return {'available': False, 'present': False,
+                'error': f'GPU detector unavailable: {exc}'}
+
+    try:
+        info = detect_gpu() or {}
+    except Exception as exc:
+        logger.warning("gpu_status: detect_gpu failed (%s: %s)",
+                       type(exc).__name__, exc)
+        return {'available': False, 'present': False,
+                'error': f'GPU probe failed: {exc}'}
+
+    return {
+        'available': True,
+        'present': bool(info.get('name')),
+        'name': info.get('name'),
+        'total_gb': info.get('total_gb', 0.0),
+        'free_gb': info.get('free_gb', 0.0),
+        'cuda_available': bool(info.get('cuda_available')),
+    }
+
+
 def register_shell_system_routes(app):
     """Register all system management API routes."""
     from flask import jsonify, request
+
+    # ─── 0. Firewall status ────────────────────────────────
+    # PARITY GAP the matrix named (docs/architecture/OS_PARITY_MATRIX.md):
+    # HART has a real firewall (networking.firewall / hart.firewall, nftables)
+    # but NO way to see it. Worse, shell_manifest.py declares a
+    # "Firewall & Firmware" PANEL whose api list points at
+    # /api/shell/power/profiles — a POWER endpoint, borrowed "for system
+    # status". A panel that cannot show firewall state is a false surface: it
+    # looks like the OS has a firewall control and it does not.
+    #
+    # READ-ONLY on purpose. Opening or closing a port from an unauthenticated
+    # local HTTP API is a security decision, not a convenience, and this file
+    # already treats destructive process actions with a protected-name list.
+    # The declarative half stays the source of truth (networking.firewall in
+    # the profile) and the OTA/rebuild path applies changes; this route makes
+    # the state VISIBLE and agent-readable, which is what the panel needs and
+    # what an agent needs to reason about connectivity.
+    #
+    # Packaging only: nft/iptables/systemctl are the existing mechanisms.
+    @app.route('/api/shell/firewall', methods=['GET'])
+    def shell_firewall_status():
+        info = {'available': False, 'active': False, 'backend': None,
+                'tcp_ports': [], 'udp_ports': [], 'source': None}
+        # Which unit is actually running — nftables and iptables are both
+        # possible NixOS backends; report the one that is live rather than
+        # assuming the configured one took effect.
+        for unit, backend in (('nftables.service', 'nftables'),
+                              ('firewall.service', 'iptables')):
+            r = _run(['systemctl', 'is-active', unit])
+            if r and (r.stdout or '').strip() == 'active':
+                info.update(available=True, active=True, backend=backend)
+                break
+        else:
+            r = _run(['systemctl', 'is-enabled', 'firewall.service'])
+            if r and r.returncode == 0:
+                info.update(available=True, backend='iptables')
+
+        # Parse the LIVE ruleset, not the config: what is enforced can differ
+        # from what was declared (a failed reload leaves the old ruleset up).
+        rules = _run(['nft', 'list', 'ruleset'], timeout=8)
+        if rules and rules.returncode == 0 and (rules.stdout or '').strip():
+            info['source'] = 'nft'
+            # NixOS renders allowed ports as a brace SET on one accept rule
+            # ("tcp dport { 22, 6777 } accept"); a single port has no braces.
+            # Both shapes, or the ports silently read as empty — the exact
+            # mistake that made tests/security.nix red against a CORRECT
+            # firewall for weeks.
+            for proto, key in (('tcp', 'tcp_ports'), ('udp', 'udp_ports')):
+                found = set()
+                for line in rules.stdout.splitlines():
+                    if f'{proto} dport' not in line or 'accept' not in line:
+                        continue
+                    seg = line.split(f'{proto} dport', 1)[1]
+                    for num in re.findall(r'\d+', seg.split('accept')[0]):
+                        found.add(int(num))
+                info[key] = sorted(found)
+        return jsonify(info)
 
     # ─── 10. Task / Process Manager ────────────────────────
 
@@ -515,13 +832,46 @@ def register_shell_system_routes(app):
             return jsonify({'error': 'Valid pid required'}), 400
         if pid == 1:
             return jsonify({'error': 'Cannot kill PID 1 (init)'}), 403
+        # FAIL CLOSED. This was `except Exception: pass`, which fell through to
+        # os.kill() below — so whenever psutil was ABSENT, or Process(pid)
+        # raised (AccessDenied on a root-owned process being the ordinary
+        # case, i.e. exactly when the target is most likely protected), the
+        # protected-name check was skipped ENTIRELY and the kill proceeded.
+        # The system reported itself protected and was not.
+        #
+        # An unverifiable guard is not a passed guard. A caller that cannot be
+        # told "no" for the right reason must be told "no" anyway: 503 says
+        # the check could not run, which is honest and retryable, rather than
+        # 200 "killed" on a process we were never allowed to touch.
+        #
+        # NoSuchProcess is the ONE benign case — there is nothing to protect —
+        # so it falls through to os.kill(), whose ProcessLookupError handler
+        # returns the accurate 404.
         try:
             import psutil
+        except ImportError:
+            logger.warning("tasks/kill REFUSED: psutil unavailable, cannot "
+                           "verify the protected-process guard (pid=%s)", pid)
+            return jsonify({
+                'error': 'Cannot verify protected-process guard (psutil '
+                         'unavailable) — refusing to kill',
+                'killed': False,
+            }), 503
+        try:
             proc = psutil.Process(pid)
-            if proc.name() in _PROTECTED_NAMES:
-                return jsonify({'error': f'Cannot kill protected process: {proc.name()}'}), 403
-        except Exception:
-            pass
+            name = proc.name()
+        except psutil.NoSuchProcess:
+            name = None          # nothing to protect; os.kill will 404 below
+        except Exception as e:
+            logger.warning("tasks/kill REFUSED: protected-process guard could "
+                           "not run for pid=%s: %s", pid, e)
+            return jsonify({
+                'error': f'Cannot verify protected-process guard ({type(e).__name__}) '
+                         f'— refusing to kill',
+                'killed': False,
+            }), 503
+        if name is not None and name in _PROTECTED_NAMES:
+            return jsonify({'error': f'Cannot kill protected process: {name}'}), 403
         sig = getattr(signal, sig_name, signal.SIGTERM)
         try:
             os.kill(pid, sig)
@@ -547,6 +897,190 @@ def register_shell_system_routes(app):
             return jsonify({'error': 'psutil not available'}), 500
         except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
             return jsonify({'error': str(e)}), 400
+
+    # ── Disk encryption (LUKS) ──────────────────────────────────────────
+    # hart-luks.nix sets encryption up at INSTALL time; nothing could report
+    # it afterwards. Last of the declarative-only rows (tasks #25/#26).
+    #
+    # READ ONLY, and that is the complete answer rather than half of one:
+    # you cannot turn disk encryption on at runtime. It is decided when the
+    # volume is created — an "enable" route could only ever lie, or start a
+    # destructive re-encrypt behind a GET. Windows shows BitLocker status
+    # the same way and sends you to setup for the rest.
+    @app.route('/api/shell/gpu', methods=['GET'])
+    def shell_gpu():
+        """What GPU does this box have, and how much VRAM is free?
+
+        Thin wrapper over gpu_status() so /api/shell/system/metrics reports the
+        SAME shape from the SAME code — see that helper's note.
+        """
+        body = gpu_status()
+        return jsonify(body), (200 if body['available'] else 503)
+
+    @app.route('/api/shell/kernel', methods=['GET'])
+    def shell_kernel():
+        """Running kernel, loaded modules, and the taint flag (#25).
+
+        Thin wrapper over kernel_status(); see it for why /proc/modules is
+        read directly instead of shelling out to lsmod.
+
+        503 when the kernel exposes no module list at all, so a caller can
+        tell "this OS has no such concept" from "nothing is loaded" — an
+        empty 200 would assert the second.
+        """
+        body = kernel_status()
+        return jsonify(body), (200 if body['available'] else 503)
+
+    @app.route('/api/shell/encryption/status', methods=['GET'])
+    def shell_encryption_status():
+        """Which block devices are LUKS-backed, and is root among them?
+
+        `root_encrypted` is the field that matters: full-disk encryption
+        that covers a data mount but not root is a common half-configured
+        state that reads as "encrypted" to a user and protects far less
+        than they think.
+        """
+        # lsblk is the enumerator udisks2/`/storage/devices` already use, so
+        # this reuses the tree rather than inventing a second view of disks.
+        r = _run(['lsblk', '-o', 'NAME,TYPE,FSTYPE,MOUNTPOINT', '-P'], timeout=6)
+        if r is None:
+            return jsonify({'available': False,
+                            'error': 'lsblk not available'}), 503
+
+        devices, root_encrypted = [], False
+        for line in (r.stdout or '').splitlines():
+            f = dict(re.findall(r'(\w+)="([^"]*)"', line))
+            if not f:
+                continue
+            is_luks = (f.get('FSTYPE') == 'crypto_LUKS')
+            is_mapper = (f.get('TYPE') == 'crypt')
+            if is_luks or is_mapper:
+                devices.append({'name': f.get('NAME', ''),
+                                'type': f.get('TYPE', ''),
+                                'fstype': f.get('FSTYPE', ''),
+                                'mountpoint': f.get('MOUNTPOINT') or None,
+                                'luks_container': is_luks})
+            # An unlocked LUKS volume presents as TYPE=crypt; if THAT is
+            # what carries /, root is genuinely on encrypted storage.
+            if is_mapper and f.get('MOUNTPOINT') == '/':
+                root_encrypted = True
+
+        return jsonify({
+            'available': True,
+            'root_encrypted': root_encrypted,
+            'encrypted_device_count': len(devices),
+            'devices': devices,
+            # Encryption is an install-time decision — say so, so no caller
+            # goes looking for a toggle that cannot exist.
+            'runtime_toggle_supported': False,
+        })
+
+    # ── Antivirus (ClamAV) ──────────────────────────────────────────────
+    # hart-security.nix has run clamd + freshclam since it landed, but there
+    # was NO agent-visible surface: the OS scanned, and nothing could ask it
+    # what it found. That is the declarative-only gap the parity matrix
+    # tracked as ❌ (task #25/#26) — a capability the node HAS but no agent
+    # can see or drive. Read + scan only; enable/disable stays declarative,
+    # because turning the scanner OFF from an unauthenticated local HTTP API
+    # is a security decision, not a convenience (same line the firewall row
+    # draws).
+    @app.route('/api/shell/antivirus/status', methods=['GET'])
+    def shell_antivirus_status():
+        """Is the scanner live, and are its signatures current?
+
+        Signature AGE is the load-bearing field. A running clamd with a
+        6-month-old database looks healthy and catches nothing, which is the
+        failure mode worth surfacing — same shape as the `unclaimed` flag on
+        the device tree.
+        """
+        r = _run(['systemctl', 'is-active', 'clamav-daemon'], timeout=5)
+        running = bool(r and (r.stdout or '').strip() == 'active')
+
+        # freshclam writes the signature DB here; mtime is its freshness.
+        db_age_days, db_present = None, False
+        for db_dir in ('/var/lib/clamav',):
+            try:
+                newest = max(
+                    (os.path.getmtime(os.path.join(db_dir, f))
+                     for f in os.listdir(db_dir)
+                     if f.endswith(('.cvd', '.cld'))),
+                    default=None)
+            except OSError:
+                # Absent on a non-NixOS dev box / before first freshclam run.
+                newest = None
+            if newest:
+                db_present = True
+                db_age_days = round((time.time() - newest) / 86400, 1)
+        return jsonify({
+            'running': running,
+            'signatures_present': db_present,
+            'signature_age_days': db_age_days,
+            # Explicitly stale rather than making every caller re-derive it.
+            'signatures_stale': (db_age_days is not None and db_age_days > 7),
+        })
+
+    @app.route('/api/shell/antivirus/scan', methods=['POST'])
+    def shell_antivirus_scan():
+        """Scan a path with clamdscan (the DAEMON client, not clamscan).
+
+        clamdscan hands the work to the already-running clamd, so the
+        signature DB is not re-loaded per invocation — clamscan would spend
+        ~30s and hundreds of MB doing exactly that every call.
+
+        Bounded via _run_async_bounded: a scan of a large tree runs for
+        minutes, and a synchronous call would pin a pool thread and queue
+        every other shell fetch behind it (the click-to-freeze class this
+        module already documents). The caller gets `finished: false` and the
+        scan continues out-of-band rather than the request hanging.
+        """
+        data = request.get_json(silent=True) or {}
+        target = (data.get('path') or '').strip()
+        if not target:
+            return jsonify({'error': 'path required'}), 400
+        # CONFINE, do not merely normalise. This comment used to claim it
+        # "rejects traversal + relative paths outright" while the code was
+        # `os.path.abspath(target)` — and abspath NORMALISES: '../../etc/shadow'
+        # becomes '/etc/shadow' and was then accepted. It also does not resolve
+        # symlinks, so a link out of any intended area passed untouched. With no
+        # auth in front of this route that meant POST {"path": "/"} would launch
+        # a full-filesystem clamd scan on demand, and the 202-vs-404 split was a
+        # file-existence oracle for any path on the box.
+        #
+        # _is_path_allowed is the repo's single answer to "may this caller name
+        # this path?" (realpath + allowed roots). It already guards the file
+        # routes in shell_os_apis; this endpoint was the one that reimplemented
+        # the question and got it wrong. Same file already had the CORRECT shape
+        # ~1000 lines below in the audio route, which is what made this a
+        # parallel path rather than an oversight.
+        from integrations.agent_engine.shell_os_apis import _is_path_allowed
+        target = os.path.realpath(target)
+        if not _is_path_allowed(target):
+            logger.warning("antivirus scan refused out-of-root path: %s", target)
+            return jsonify({'error': 'Path outside allowed roots',
+                            'path': target}), 403
+        if not os.path.exists(target):
+            return jsonify({'error': 'path not found', 'path': target}), 404
+
+        finished, r = _run_async_bounded(
+            ['clamdscan', '--fdpass', '--no-summary', target],
+            run_timeout=900, wait=8, name='hart-av-scan')
+        if not finished:
+            return jsonify({'scanning': True, 'finished': False, 'path': target,
+                            'note': 'scan continues in background'}), 202
+        if r is None:
+            return jsonify({'ok': False, 'error': 'clamdscan not available'}), 503
+        # clamdscan exit codes: 0 = clean, 1 = infected, 2 = error.
+        infected = [ln for ln in (r.stdout or '').splitlines()
+                    if ln.strip().endswith('FOUND')]
+        return jsonify({
+            'ok': r.returncode in (0, 1),
+            'finished': True,
+            'path': target,
+            'clean': r.returncode == 0,
+            'infected_count': len(infected),
+            'infected': infected[:100],
+            'error': (r.stderr or '').strip() if r.returncode == 2 else None,
+        }), (200 if r.returncode in (0, 1) else 503)
 
     @app.route('/api/shell/tasks/resources', methods=['GET'])
     def shell_tasks_resources():
@@ -611,8 +1145,19 @@ def register_shell_system_routes(app):
             import psutil
         except ImportError:
             return jsonify({'partitions': [], 'error': 'psutil not available'})
+        # Exclude read-only image mounts (squashfs / iso9660 on the live ISO, any ro
+        # loop image) and overlay/pseudo filesystems: the squashfs Nix store is ALWAYS
+        # 100% full by nature, so counting it made the Storage panel alarm at ~100% for
+        # no real reason (audit #0.4 -- the "Disk 100%" seen on the live ISO). psutil's
+        # all=False does NOT drop these (a squashfs has a real loop device + fstype), so
+        # filter explicitly; only writable, real storage is aggregated.
+        _SKIP_FSTYPES = {'squashfs', 'iso9660', 'overlay', 'ramfs'}
         partitions = []
         for part in psutil.disk_partitions(all=False):
+            if (part.fstype or '').lower() in _SKIP_FSTYPES:
+                continue
+            if 'ro' in (part.opts or '').split(','):
+                continue
             try:
                 usage = psutil.disk_usage(part.mountpoint)
                 partitions.append({

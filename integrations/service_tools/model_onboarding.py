@@ -572,34 +572,129 @@ def status() -> Dict:
 # (is one already running?) + vram_manager (what fits this box?). Both callers
 # (native_onboarding.py and the API) import these, so there is ONE decision.
 
-# Tiered defaults keyed on total VRAM. The potato node (Intel HD 620, no CUDA)
-# lands on the smallest tier: a small instruct GGUF that runs on CPU/iGPU -- the
-# "llama.cpp 2B running locally" baseline. Tunable data, not logic.
-MODEL_TIERS = [
-    (12.0, 'Qwen/Qwen2.5-7B-Instruct', 'Q4_K_M', '7B - capable, needs a real GPU'),
-    (6.0, 'Qwen/Qwen2.5-3B-Instruct', 'Q4_K_M', '3B - balanced'),
-    (0.0, 'Qwen/Qwen2.5-1.5B-Instruct', 'Q4_K_M', '1.5B - runs on this machine'),
-]
+# The model ladder that used to live here (MODEL_TIERS, keyed on total VRAM)
+# is GONE. It was a second copy of the catalog and had drifted a full generation
+# behind agent_engine/model_registry.py -- it still named Qwen2.5 while the
+# runtime had moved to Qwen3.5 -- and being VRAM-only it collapsed every
+# CPU-only box to the smallest entry no matter how much RAM it had.
+# ModelCatalog._populate_llm_models is now the single source of truth, and
+# recommend_for_hardware() below selects from it. Add a model there, not here.
 
 
-def recommend_for_hardware() -> Dict:
-    """Pick a model sized to THIS box's VRAM, REUSING vram_manager (no second
-    hardware probe). Fail-safe: any detection error falls to the smallest tier,
-    so a potato is never recommended a model it cannot run."""
-    total = 0.0
+def compute_budget() -> Dict:
+    """What this box can actually spend on a model, and where that came from.
+
+    ONE hardware question, answered once: if there is a usable GPU the budget is
+    its VRAM and the run mode is gpu; otherwise the budget is system RAM and the
+    run mode is cpu. Reuses vram_manager (no second hardware probe) and psutil
+    for RAM.
+
+    The RAM arm matters: keying only on VRAM collapses every CPU-only box to the
+    smallest model no matter how much RAM it has, which is what the previous
+    VRAM-only ladder did.
+
+    Returns {budget_gb, source: 'vram'|'ram', run_mode: 'gpu'|'cpu',
+             total_vram_gb, free_vram_gb, total_ram_gb, gpu_name}.
+    Fail-safe: any probe error yields a small RAM budget rather than raising, so
+    a detection failure never recommends a model the box cannot run.
+    """
+    gpu = {}
     vm = _get_vram_manager()
     if vm:
         try:
-            total = float(vm.detect_gpu().get('total_gb', 0.0) or 0.0)
+            gpu = vm.detect_gpu() or {}
         except Exception:
-            logger.debug("recommend_for_hardware: VRAM probe failed; smallest tier")
-    for min_gb, name, quant, label in MODEL_TIERS:
-        if total >= min_gb:
-            return {'model_name': name, 'quant': quant, 'label': label,
-                    'total_vram_gb': total}
-    last = MODEL_TIERS[-1]
-    return {'model_name': last[1], 'quant': last[2], 'label': last[3],
-            'total_vram_gb': total}
+            logger.debug("compute_budget: GPU probe failed; falling back to RAM")
+    total_vram = float(gpu.get('total_gb', 0.0) or 0.0)
+    free_vram = float(gpu.get('free_gb', 0.0) or 0.0)
+    # cuda_available already folds in the driver-too-old gate, so a present but
+    # unusable GPU correctly falls through to the RAM arm instead of promising
+    # VRAM that no CUDA build can address.
+    gpu_usable = bool(gpu.get('cuda_available') or gpu.get('metal_available'))
+
+    total_ram = 0.0
+    try:
+        import psutil
+        total_ram = round(psutil.virtual_memory().total / (1024 ** 3), 1)
+    except Exception:
+        logger.debug("compute_budget: psutil unavailable; RAM budget unknown")
+
+    if gpu_usable and total_vram > 0:
+        return {'budget_gb': total_vram, 'source': 'vram', 'run_mode': 'gpu',
+                'total_vram_gb': total_vram, 'free_vram_gb': free_vram,
+                'total_ram_gb': total_ram, 'gpu_name': gpu.get('name')}
+    # CPU arm: leave headroom for the OS and everything else on the box.
+    return {'budget_gb': round(total_ram * 0.6, 1), 'source': 'ram',
+            'run_mode': 'cpu', 'total_vram_gb': total_vram,
+            'free_vram_gb': free_vram, 'total_ram_gb': total_ram,
+            'gpu_name': gpu.get('name')}
+
+
+def recommend_for_hardware() -> Dict:
+    """Pick the best chat model THIS box can run, from the catalog.
+
+    Reads ModelCatalog (the single source of truth for which models exist)
+    rather than a ladder hardcoded here: the previous MODEL_TIERS list had
+    drifted a whole generation behind agent_engine/model_registry.py (Qwen2.5 vs
+    Qwen3.5) precisely because it was a second copy.
+
+    Selection is data-driven, so adding a model is a catalog entry and no code
+    change: take enabled LLM entries whose purpose includes 'main', keep those
+    whose requirement fits the budget (vram_gb on the gpu arm, ram_gb on the cpu
+    arm), and pick the highest priority. Fail-safe: if nothing fits, or the
+    catalog is unavailable, fall back to the smallest entry so a potato still
+    gets a runnable model.
+
+    Return keys model_name / quant / label / total_vram_gb are preserved for
+    existing callers (native_onboarding._build_ai_model_page); everything else
+    is additive.
+    """
+    budget = compute_budget()
+    gpu_arm = budget['source'] == 'vram'
+
+    entries = []
+    try:
+        catalog = _get_catalog()
+        if catalog:
+            # 'llm' not ModelType.LLM: list_by_type takes a str and ModelType is
+            # a str-Enum, so this avoids importing the catalog module at import
+            # time (the getters here are all lazy for the same reason).
+            entries = [e for e in catalog.list_by_type('llm')
+                       if e.enabled and 'main' in (e.purposes or [])]
+    except Exception:
+        logger.debug("recommend_for_hardware: catalog unavailable", exc_info=True)
+
+    def _need(e):
+        return float(e.vram_gb if gpu_arm else e.ram_gb)
+
+    chosen = None
+    if entries:
+        fits = [e for e in entries if _need(e) <= budget['budget_gb']]
+        chosen = (max(fits, key=lambda e: (e.priority, e.quality_score))
+                  if fits else min(entries, key=_need))
+
+    if chosen is None:
+        # Catalog empty or unreadable — never leave the caller without a model.
+        logger.warning("recommend_for_hardware: no catalog LLM entry; using fallback")
+        return {'model_name': 'unsloth/Qwen3.5-0.8B-GGUF', 'quant': 'Q4_K_M',
+                'label': '0.8B - fallback, catalog unavailable',
+                'total_vram_gb': budget['total_vram_gb'], **budget}
+
+    quant = (chosen.capabilities or {}).get('quant', 'Q4_K_M')
+    return {
+        'model_name': chosen.repo_id or chosen.id,
+        'quant': quant,
+        'label': f"{chosen.name} - {budget['run_mode']}, "
+                 f"{budget['budget_gb']}GB {budget['source']}",
+        'total_vram_gb': budget['total_vram_gb'],
+        # ── additive: the union of what both implementations knew ──
+        'model_id': chosen.id,
+        'display_name': chosen.name,
+        'size_gb': chosen.disk_gb,
+        'min_build': chosen.min_build,
+        'downloaded': chosen.downloaded,
+        **budget,
+    }
 
 
 def needs_setup() -> bool:

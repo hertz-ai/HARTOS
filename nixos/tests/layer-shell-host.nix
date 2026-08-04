@@ -80,7 +80,7 @@ in
       # NO variant turns it on (desktop-boot.nix:94) -> enable it explicitly.
       # defaultSession is NOT touched here — the GTK4 path is additive, cage stays
       # the floor (the never-break gate).
-      hart.liquidUI = { enable = true; renderer = "webkit"; voiceEnabled = false; };
+      hart.liquidUI = { enable = true; renderer = "webkit"; voiceEnabled = pkgs.lib.mkForce false; };
       hart.layerShellHost.enable = true;
       # gst-inspect-1.0 on PATH so the #150 mic subtest can resolve a real capture
       # element against the host's exported GST_PLUGIN_SYSTEM_PATH_1_0. Test-only —
@@ -284,10 +284,46 @@ in
               host.log("hart-comp session launcher not in closure (Tier-1 disabled here) — name-parity asserted in the unit guard")
           # The Tier-2 sway host config (the layer-shell session's single client)
           # MUST exec the same binary basename — read it back off the closure.
+          # -maxdepth 6, not 3. A config installed into a package lands at
+          #     /nix/store/<hash>-name/etc/sway/hart-gtk4-layer-host.conf
+          # which is FOUR levels below /nix/store, so `-maxdepth 3` could never
+          # see it and the assertion reported "not realized" for a file that
+          # was present (run 30774512407). The sibling launcher check three
+          # lines below already used -maxdepth 4 — the two disagreed about how
+          # deep the same closure is.
+          #
+          # `|| true` on find: a permission error inside /nix/store must not
+          # abort the search and masquerade as absence.
+          # LEADING GLOB IS REQUIRED. pkgs.writeText names the store entry
+          # `<hash>-<name>`, so the basename is
+          #   ml0m2q8kd39dsfi4xcba2q9yqfvvfc7r-hart-gtk4-layer-host.conf
+          # and `-name 'hart-gtk4-layer-host.conf'` can never match it. The
+          # file was present the whole time: the diagnostic dump below printed
+          # its exact path from a `*layer-host*` pattern in the same run that
+          # reported it "not found in the closure" (run 30848154453).
+          #
+          # Same species as the driver-matrix filter and the OTA timer probe —
+          # a probe matching a name shape the system never produces, then read
+          # as evidence about the system. The self-describing dump is what made
+          # it a five-minute fix instead of another CI round.
           sway_conf = host.succeed(
-              "find /nix/store -maxdepth 3 -name 'hart-gtk4-layer-host.conf' "
-              "-print -quit").strip()
-          assert sway_conf, "Tier-2 sway host config (hart-gtk4-layer-host.conf) not realized"
+              "find /nix/store -maxdepth 6 -name '*hart-gtk4-layer-host.conf' "
+              "-print -quit 2>/dev/null || true").strip()
+          if not sway_conf:
+              # Self-describing: say what IS there. "not realized" alone cannot
+              # distinguish "never built" from "built somewhere I did not look",
+              # and those have opposite fixes.
+              probe = host.succeed(
+                  "echo '--- any hart-gtk4* in the store ---'; "
+                  "find /nix/store -maxdepth 6 -name 'hart-gtk4*' -print 2>/dev/null | head -10; "
+                  "echo '--- any *layer-host* ---'; "
+                  "find /nix/store -maxdepth 6 -name '*layer-host*' -print 2>/dev/null | head -10; "
+                  "echo '--- sway configs ---'; "
+                  "find /nix/store -maxdepth 6 -name '*.conf' -path '*sway*' -print 2>/dev/null | head -10 || true"
+              )
+              raise AssertionError(
+                  "Tier-2 sway host config (hart-gtk4-layer-host.conf) not "
+                  "found in the closure.\n" + probe)
           conf_src = host.succeed("cat " + sway_conf)
           assert "hart-glass-shell-gtk4" in conf_src, \
               "Tier-2 sway host config does not exec the hart-glass-shell-gtk4 host binary"
@@ -351,7 +387,7 @@ in
       # left at the desktop default; it is irrelevant to the paint/crash gates.
       # hart.layerShellHost asserts hart.liquidUI.enable=true + renderer="webkit"
       # (it re-hosts the served glass shell); liquidUI defaults OFF, so enable it.
-      hart.liquidUI = { enable = true; renderer = "webkit"; voiceEnabled = false; };
+      hart.liquidUI = { enable = true; renderer = "webkit"; voiceEnabled = pkgs.lib.mkForce false; };
       hart.layerShellHost.enable = true;
 
       # ── A real display manager that autologins the GTK4 layer-shell session ──
@@ -377,11 +413,13 @@ in
       };
       services.displayManager.defaultSession = "hart-glass-gtk4";
 
-      # GDM pulls graphical-desktop's fs.inotify.max_user_watches mkDefault while
-      # hart-base.nix also mkDefaults it -> two equal-priority mkDefaults collide
-      # ("defined multiple times"). mkForce wins over both (same fix as
-      # desktop-boot.nix + the b86aa93 session-supervisor DM path).
-      boot.kernel.sysctl."fs.inotify.max_user_watches" = pkgs.lib.mkForce 524288;
+      # NO fs.inotify.max_user_watches override here — see the matching note in
+      # desktop-boot.nix. Briefly: this mkForce 524288 was written to break a
+      # two-mkDefault collision, but hart-kernel.nix now mkForces the same
+      # option to 1048576 and the profile enables hart.kernel, so this line
+      # became a SECOND equal-priority mkForce with a different value — the
+      # very "defined multiple times" error it was meant to prevent.
+      # hart-kernel's mkForce already beats both mkDefaults.
     };
 
     testScript = ''
@@ -411,9 +449,36 @@ in
       # ════════════════════════════════════════════════════════════════
       # 1. REGISTRATION — GDM materialized the GTK4 hart-glass-gtk4 session
       # ════════════════════════════════════════════════════════════════
-      session_desktop = "/run/current-system/sw/share/wayland-sessions/hart-glass-gtk4.desktop"
+      # RESOLVED, not guessed — identical treatment to desktop-boot.nix
+      # (0725adca). This hard-coded the environment.systemPackages path while
+      # the session is registered through
+      # `services.displayManager.sessionPackages`, which feeds displayManager
+      # sessionData: a different store path. The subtest name already said
+      # "sessionData materialized"; only the assertion disagreed, and its
+      # failure named just the guessed path (run 30774512407).
+      session_desktop = paint.succeed(
+          "for d in /run/current-system/sw/share/wayland-sessions "
+          "         /etc/X11/sessions "
+          "         /run/current-system/sw/share/xsessions; do "
+          "  [ -f \"$d/hart-glass-gtk4.desktop\" ] && echo \"$d/hart-glass-gtk4.desktop\" && exit 0; "
+          "done; "
+          "ls -d /nix/store/*-desktops/share/wayland-sessions/hart-glass-gtk4.desktop "
+          "  2>/dev/null | head -1"
+      ).strip()
       with subtest("GDM registered the GTK4 'hart-glass-gtk4' wayland-session (sessionData materialized)"):
-          paint.succeed(f"test -f {session_desktop}")
+          if not session_desktop:
+              dirs = paint.succeed(
+                  "echo '--- sw/share/wayland-sessions ---'; "
+                  "ls -la /run/current-system/sw/share/wayland-sessions 2>&1 | head -20; "
+                  "echo '--- any *-desktops store paths ---'; "
+                  "ls -d /nix/store/*-desktops 2>/dev/null | head -5"
+              )
+              raise AssertionError(
+                  "hart-glass-gtk4.desktop is registered NOWHERE a wayland "
+                  "session can be found — showing what IS present rather than "
+                  "only the path this test guessed.\n" + dirs
+              )
+          paint.log(f"hart-glass-gtk4 session registered at: {session_desktop}")
           entry = paint.succeed(f"cat {session_desktop}")
           # The registered session must exec the GTK4 layer-shell launcher (sway +
           # the GTK4 host), not some other compositor.

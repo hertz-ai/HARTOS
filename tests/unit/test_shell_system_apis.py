@@ -614,13 +614,25 @@ class TestShellWebcam(unittest.TestCase):
 
     @patch('integrations.agent_engine.shell_system_apis._run', return_value=None)
     def test_webcam_capture_ffmpeg_not_found(self, mock_run):
+        """A missing capture tool is 503 UNAVAILABLE, not 500 SERVER ERROR.
+
+        Was asserting 500 and had been red since 2b2be57f, which changed the
+        handler on purpose ("a missing/failed capture tool is an UNAVAILABLE
+        peripheral") without updating this test. The distinction is not
+        cosmetic: 500 tells the shell the backend is broken and trips retry
+        /error UI, while 503 tells it this node simply has no ffmpeg — a
+        permanent, honest degrade the panel should render as such.
+        """
         client = _make_system_app()
         r = client.post('/api/shell/webcam/capture',
                         data=json.dumps({'device': '/dev/video0'}),
                         content_type='application/json')
-        self.assertEqual(r.status_code, 500)
+        self.assertEqual(r.status_code, 503)
         data = json.loads(r.data)
         self.assertIn('error', data)
+        self.assertFalse(data.get('ok', False))
+        # Names the absent tool, so the panel can say WHAT is missing.
+        self.assertIn('ffmpeg', data['error'])
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -650,12 +662,21 @@ class TestShellScanner(unittest.TestCase):
 
     @patch('integrations.agent_engine.shell_system_apis._run')
     def test_scanner_scan_error(self, mock_run):
+        """A scanner that reports no devices is 503 UNAVAILABLE (see the
+        webcam sibling above for why this is not 500).
+
+        Also asserts the tool's own stderr reaches the caller — "no SANE
+        devices found" is the actionable half; a bare status code leaves
+        the user with nothing to act on.
+        """
         mock_run.return_value = MagicMock(returncode=1, stderr='scanimage: no SANE devices found')
         client = _make_system_app()
         r = client.post('/api/shell/scanner/scan',
                         data=json.dumps({'format': 'png'}),
                         content_type='application/json')
-        self.assertEqual(r.status_code, 500)
+        self.assertEqual(r.status_code, 503)
+        data = json.loads(r.data)
+        self.assertIn('no SANE devices found', data['error'])
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1106,3 +1127,270 @@ class TestScreenRotation(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestShellAntivirus(unittest.TestCase):
+    """ClamAV agent surface — closing a declarative-only parity gap.
+
+    hart-security.nix had run clamd + freshclam for a long time with NO
+    agent-visible surface: the OS scanned, and nothing could ask it what it
+    found. These routes are the read/scan half (enable/disable stays
+    declarative on purpose — turning the scanner OFF from an unauthenticated
+    local API is a security decision, not a convenience).
+    """
+
+    def test_status_reports_running_daemon(self):
+        with patch('integrations.agent_engine.shell_system_apis._run') as run:
+            run.return_value = MagicMock(returncode=0, stdout='active\n', stderr='')
+            r = _make_system_app().get('/api/shell/antivirus/status')
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(json.loads(r.data)['running'])
+
+    def test_status_reports_stopped_daemon(self):
+        with patch('integrations.agent_engine.shell_system_apis._run') as run:
+            run.return_value = MagicMock(returncode=3, stdout='inactive\n', stderr='')
+            r = _make_system_app().get('/api/shell/antivirus/status')
+        self.assertFalse(json.loads(r.data)['running'])
+
+    def test_status_survives_missing_systemctl(self):
+        """Dev boxes and containers have no systemctl — must degrade, not 500."""
+        with patch('integrations.agent_engine.shell_system_apis._run',
+                   return_value=None):
+            r = _make_system_app().get('/api/shell/antivirus/status')
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(json.loads(r.data)['running'])
+
+    def test_stale_signatures_are_flagged(self):
+        """A live daemon with an ancient DB looks healthy and catches nothing.
+
+        This is THE field worth having: `signatures_stale` is derived once
+        here rather than left for every caller to recompute from a raw age.
+        """
+        import time as _t
+        with tempfile.TemporaryDirectory() as d:
+            old = os.path.join(d, 'daily.cvd')
+            with open(old, 'w') as fh:
+                fh.write('x')
+            os.utime(old, (_t.time() - 30 * 86400, _t.time() - 30 * 86400))
+            with patch('integrations.agent_engine.shell_system_apis.os.listdir',
+                       return_value=['daily.cvd']), \
+                 patch('integrations.agent_engine.shell_system_apis.os.path.getmtime',
+                       return_value=_t.time() - 30 * 86400), \
+                 patch('integrations.agent_engine.shell_system_apis._run',
+                       return_value=MagicMock(returncode=0, stdout='active\n')):
+                r = _make_system_app().get('/api/shell/antivirus/status')
+        data = json.loads(r.data)
+        self.assertTrue(data['signatures_present'])
+        self.assertTrue(data['signatures_stale'])
+        self.assertGreater(data['signature_age_days'], 7)
+
+    def test_scan_requires_a_path(self):
+        r = _make_system_app().post('/api/shell/antivirus/scan',
+                                    data=json.dumps({}),
+                                    content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_scan_rejects_a_nonexistent_path(self):
+        r = _make_system_app().post(
+            '/api/shell/antivirus/scan',
+            data=json.dumps({'path': '/definitely/not/here/9f3a'}),
+            content_type='application/json')
+        self.assertEqual(r.status_code, 404)
+
+    def test_scan_reports_clean(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch('integrations.agent_engine.shell_system_apis._run_async_bounded',
+                       return_value=(True, MagicMock(returncode=0, stdout='', stderr=''))):
+                r = _make_system_app().post(
+                    '/api/shell/antivirus/scan',
+                    data=json.dumps({'path': d}),
+                    content_type='application/json')
+        data = json.loads(r.data)
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(data['clean'])
+        self.assertEqual(data['infected_count'], 0)
+
+    def test_scan_reports_infected_without_erroring(self):
+        """clamdscan exits 1 for 'infected'. That is a SUCCESSFUL scan with a
+        finding — collapsing it into an error would hide the detection."""
+        out = '/tmp/x/evil.bin: Eicar-Test-Signature FOUND\n'
+        with tempfile.TemporaryDirectory() as d:
+            with patch('integrations.agent_engine.shell_system_apis._run_async_bounded',
+                       return_value=(True, MagicMock(returncode=1, stdout=out, stderr=''))):
+                r = _make_system_app().post(
+                    '/api/shell/antivirus/scan',
+                    data=json.dumps({'path': d}),
+                    content_type='application/json')
+        data = json.loads(r.data)
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(data['ok'])
+        self.assertFalse(data['clean'])
+        self.assertEqual(data['infected_count'], 1)
+        self.assertIn('Eicar-Test-Signature', data['infected'][0])
+
+    def test_long_scan_returns_202_instead_of_hanging(self):
+        """A big tree scans for minutes. The request must NOT hold a pool
+        thread — that is the click-to-freeze class this module documents."""
+        with tempfile.TemporaryDirectory() as d:
+            with patch('integrations.agent_engine.shell_system_apis._run_async_bounded',
+                       return_value=(False, None)):
+                r = _make_system_app().post(
+                    '/api/shell/antivirus/scan',
+                    data=json.dumps({'path': d}),
+                    content_type='application/json')
+        self.assertEqual(r.status_code, 202)
+        self.assertFalse(json.loads(r.data)['finished'])
+
+    def test_scan_503_when_clamdscan_absent(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch('integrations.agent_engine.shell_system_apis._run_async_bounded',
+                       return_value=(True, None)):
+                r = _make_system_app().post(
+                    '/api/shell/antivirus/scan',
+                    data=json.dumps({'path': d}),
+                    content_type='application/json')
+        self.assertEqual(r.status_code, 503)
+
+
+class TestShellEncryption(unittest.TestCase):
+    """LUKS status — the last declarative-only parity row.
+
+    hart-luks.nix configures encryption at INSTALL time and nothing could
+    report it afterwards. Read-only by design: encryption cannot be turned
+    on at runtime, so an "enable" route could only lie or kick off a
+    destructive re-encrypt.
+    """
+
+    LSBLK_ENCRYPTED = (
+        'NAME="nvme0n1" TYPE="disk" FSTYPE="" MOUNTPOINT=""\n'
+        'NAME="nvme0n1p2" TYPE="part" FSTYPE="crypto_LUKS" MOUNTPOINT=""\n'
+        'NAME="cryptroot" TYPE="crypt" FSTYPE="ext4" MOUNTPOINT="/"\n'
+    )
+    LSBLK_PLAIN = (
+        'NAME="sda" TYPE="disk" FSTYPE="" MOUNTPOINT=""\n'
+        'NAME="sda1" TYPE="part" FSTYPE="ext4" MOUNTPOINT="/"\n'
+    )
+
+    def _get(self, stdout):
+        with patch('integrations.agent_engine.shell_system_apis._run',
+                   return_value=MagicMock(returncode=0, stdout=stdout, stderr='')):
+            return _make_system_app().get('/api/shell/encryption/status')
+
+    def test_detects_encrypted_root(self):
+        data = json.loads(self._get(self.LSBLK_ENCRYPTED).data)
+        self.assertTrue(data['root_encrypted'])
+        self.assertEqual(data['encrypted_device_count'], 2)
+
+    def test_plain_disk_is_not_reported_encrypted(self):
+        data = json.loads(self._get(self.LSBLK_PLAIN).data)
+        self.assertFalse(data['root_encrypted'])
+        self.assertEqual(data['encrypted_device_count'], 0)
+
+    def test_encrypted_data_volume_does_not_imply_encrypted_root(self):
+        """The half-configured state worth catching.
+
+        A LUKS volume mounted at /data with a PLAINTEXT root reads as
+        "encrypted" to a user and protects far less than they think, so
+        root_encrypted must stay False while the device still appears.
+        """
+        out = ('NAME="sda1" TYPE="part" FSTYPE="ext4" MOUNTPOINT="/"\n'
+               'NAME="sdb1" TYPE="part" FSTYPE="crypto_LUKS" MOUNTPOINT=""\n'
+               'NAME="cryptdata" TYPE="crypt" FSTYPE="ext4" MOUNTPOINT="/data"\n')
+        data = json.loads(self._get(out).data)
+        self.assertFalse(data['root_encrypted'])
+        self.assertEqual(data['encrypted_device_count'], 2)
+
+    def test_reports_runtime_toggle_unsupported(self):
+        """Say it explicitly so no caller hunts for a toggle that cannot exist."""
+        data = json.loads(self._get(self.LSBLK_ENCRYPTED).data)
+        self.assertFalse(data['runtime_toggle_supported'])
+
+    def test_missing_lsblk_degrades_to_503(self):
+        with patch('integrations.agent_engine.shell_system_apis._run',
+                   return_value=None):
+            r = _make_system_app().get('/api/shell/encryption/status')
+        self.assertEqual(r.status_code, 503)
+        self.assertFalse(json.loads(r.data)['available'])
+
+    def test_malformed_lsblk_line_does_not_crash(self):
+        data = json.loads(self._get('garbage\n\nNAME="x" TYPE="crypt" FSTYPE="ext4" MOUNTPOINT="/"\n').data)
+        self.assertTrue(data['root_encrypted'])
+
+
+class TestKillGuardFailsClosed(unittest.TestCase):
+    """The protected-process guard must FAIL CLOSED, not open.
+
+    Found by the #31 degraded-mode review, ranked by blast radius: an agent
+    drives /api/shell/tasks/kill unattended, so a guard that silently stops
+    guarding is the worst shape a check can take.
+
+    The original code was:
+
+        try:
+            import psutil
+            proc = psutil.Process(pid)
+            if proc.name() in _PROTECTED_NAMES:
+                return ..., 403
+        except Exception:
+            pass                    # <-- falls through to os.kill()
+
+    So whenever psutil was ABSENT, or Process(pid) raised (AccessDenied on a
+    root-owned process is the common one), the protection check was skipped
+    ENTIRELY and the kill proceeded. The system looked protected and was not.
+
+    An unverifiable guard is not a passed guard.
+    """
+
+    def test_kill_is_refused_when_the_guard_cannot_run(self):
+        """psutil unavailable => REFUSE, never 'kill anyway'."""
+        killed = []
+        with patch('integrations.agent_engine.shell_system_apis.os.kill',
+                   side_effect=lambda *a: killed.append(a)), \
+             patch.dict('sys.modules', {'psutil': None}):
+            # psutil=None makes `import psutil` raise ImportError inside the route.
+            r = _make_system_app().post(
+                '/api/shell/tasks/kill',
+                data=json.dumps({'pid': 424242}),
+                content_type='application/json')
+        self.assertNotEqual(r.status_code, 200, (
+            "kill succeeded while the protected-process guard could not run — "
+            "the guard failed OPEN"))
+        self.assertEqual(killed, [], (
+            "os.kill was CALLED despite the guard being unverifiable; a "
+            "protected process could have been killed"))
+
+    def test_kill_is_refused_when_process_lookup_raises(self):
+        """psutil present but Process() raises => still REFUSE.
+
+        AccessDenied on a root-owned process is the ordinary case, and it is
+        precisely when the target is most likely to be protected.
+        """
+        import psutil as _ps
+        killed = []
+        with patch('integrations.agent_engine.shell_system_apis.os.kill',
+                   side_effect=lambda *a: killed.append(a)), \
+             patch.object(_ps, 'Process', side_effect=_ps.AccessDenied(424242)):
+            r = _make_system_app().post(
+                '/api/shell/tasks/kill',
+                data=json.dumps({'pid': 424242}),
+                content_type='application/json')
+        self.assertNotEqual(r.status_code, 200,
+                            "kill succeeded despite an unverifiable guard")
+        self.assertEqual(killed, [], "os.kill was called with the guard bypassed")
+
+    def test_a_normal_kill_still_works(self):
+        """Failing closed must not break the ordinary path — a guard that
+        blocks everything gets removed, which is worse than one that leaks."""
+        import psutil as _ps
+        fake = MagicMock()
+        fake.name.return_value = 'some-user-process'
+        killed = []
+        with patch('integrations.agent_engine.shell_system_apis.os.kill',
+                   side_effect=lambda *a: killed.append(a)), \
+             patch.object(_ps, 'Process', return_value=fake):
+            r = _make_system_app().post(
+                '/api/shell/tasks/kill',
+                data=json.dumps({'pid': 424242}),
+                content_type='application/json')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertTrue(killed, "the ordinary kill path stopped working")

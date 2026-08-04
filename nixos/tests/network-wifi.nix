@@ -175,9 +175,15 @@ in
           # The SOFTWARE radio switch answers 'enabled' even with ZERO wifi
           # devices — which is exactly why rfkill (NOT this) must decide presence.
           assert radio in ("enabled", "disabled"), f"unexpected nmcli radio: {radio!r}"
-          # This VM has no wifi chip: `nmcli device wifi` reports no device (rc!=0
-          # / "No Wi-Fi device found") — the FM1 hardware reality the probe faces.
-          wifi.fail("nmcli -t -f ACTIVE,SSID,SIGNAL device wifi")
+          # This VM has no wifi chip. The OLD assertion demanded rc!=0 from
+          # `nmcli device wifi` — but NetworkManager on the pinned nixpkgs
+          # exits 0 with an EMPTY list when no wifi device exists, so the
+          # test failed against a CORRECT stack on every run ("unexpectedly
+          # succeeded", run 30485906966). Assert the hardware reality itself:
+          # zero wifi scan results, however nmcli spells it.
+          scan = wifi.execute("nmcli -t -f ACTIVE,SSID,SIGNAL device wifi")[1].strip()
+          assert scan == "" or "No Wi-Fi device" in scan, \
+              f"VM has no wifi chip yet nmcli returned scan rows: {scan!r}"
 
       # ── 2. The REAL probe degrades + the rfkill parser reads a real fs tree ──
       with subtest("the real wifi probe degrades (no crash/hang) + rfkill parses a real fs"):
@@ -229,11 +235,28 @@ in
               "for d in /run/current-system/firmware /run/booted-system/firmware "
               "/lib/firmware; do [ -d \"$d\" ] && echo \"$d\" && break; done").strip()
           assert fw_root, "no firmware directory found (enableRedistributableFirmware off?)"
+          # RECURSIVE, and follow symlinks. -maxdepth 1 only ever worked by
+          # accident: it matched families whose top-level entry happens to be
+          # named after the family (ath10k/, brcm/, rtw88/ are directories).
+          # iwlwifi ships as loose *.ucode FILES whose layout upstream has
+          # moved, so depth-1 reported "family missing" on a node that sets
+          # enableRedistributableFirmware=true (verified: network-wifi.nix
+          # sets it on THIS node) — i.e. the probe was wrong, not the OS.
+          # -L matters because /run/current-system/firmware is a symlink tree
+          # into the store.
           for fam in ["iwlwifi", "ath", "brcm", "rtw"]:
               n = wifi.succeed(
-                  "find " + fw_root + " -maxdepth 1 -iname '"
-                  + fam + "*' | wc -l").strip()
-              assert int(n) > 0, "no " + fam + " firmware blobs shipped (family missing)"
+                  "find -L " + fw_root + " -iname '" + fam
+                  + "*' 2>/dev/null | wc -l").strip()
+              assert int(n) > 0, (
+                  "no " + fam + " firmware blobs shipped (family missing).\n"
+                  # Dump the actual layout: a bare "missing" told us nothing
+                  # last time and cost a full CI round to re-ask.
+                  "--- " + fw_root + " (top level) ---\n"
+                  + wifi.succeed("ls -1 " + fw_root + " | head -40 || true")
+                  + "--- entries matching '" + fam + "' at ANY depth ---\n"
+                  + wifi.succeed("find -L " + fw_root + " -iname '*" + fam
+                                 + "*' 2>/dev/null | head -10 || true"))
 
       # ── 4. Driver lever: the wifi driver modules are in the kernel module set ──
       with subtest("common wifi DRIVER modules are available (iwlwifi/ath/brcm/rtw)"):

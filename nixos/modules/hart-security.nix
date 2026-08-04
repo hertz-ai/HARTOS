@@ -159,10 +159,15 @@ in
 
     # ── (2) Firewall hardening: defense-in-depth sysctls (additive) ──
     (lib.mkIf sec.firewallHardening.enable {
-      # mkDefault throughout: these keys are NOT set by hart-base/hart-kernel (the
-      # one exception, kernel.yama.ptrace_scope, is set without priority by
-      # hart-devtools when devtools is on -> its plain value wins over this default,
-      # which is correct: a debug box wants ptrace open). Every value here only
+      # mkDefault throughout: these keys are NOT set by hart-base/hart-kernel.
+      # (HISTORY: hart-devtools used to set kernel.yama.ptrace_scope = 0 WITHOUT
+      # priority, so merely installing debuggers beat this default. That was
+      # written when devtools was an opt-in developer choice; once the desktop
+      # PROFILE enabled devtools for every shipped machine it silently became an
+      # OS-wide posture change and contradicted the ptrace assertion in
+      # nixos/tests/security.nix. It is now gated behind the explicit
+      # hart.ideTools.ptraceUnrestricted, which mkForces it — so this hardening
+      # holds unless a box deliberately opts out.) Every value here only
       # tightens the network stack; none opens a port or changes routing the LAN
       # needs.
       boot.kernel.sysctl = {

@@ -55,10 +55,28 @@ in
         pulse.enable = true;
       };
 
-      # The boot-time rescue under test (default-ON where PipeWire is on). We do
-      # NOT set bootVolumePercent so the assertions verify the DEFAULT (100%) -
-      # both the unit ExecStart arg and the live first-boot set.
+      # The boot-time rescue under test (default-ON where PipeWire is on).
+      #
+      # bootVolumePercent is set EXPLICITLY, and that is not redundant. This
+      # comment used to read "we do NOT set it so the assertions verify the
+      # DEFAULT (100%)" — but the node is `mkNode "desktop"`, and
+      # profiles/desktop.nix sets bootVolumePercent = 60. Leaving an option
+      # unset does not yield the OPTION default when a profile in the node's
+      # own stack defines it, so the unit rendered
+      # `ExecStart=...hart-audio-unmute 60` and the assertion expecting 100
+      # failed against a correctly-built node (run 30848154453).
+      #
+      # Naming the value here makes the subtest verify what it actually claims
+      # to: that the configured percent reaches the unit's ExecStart. The two
+      # live-behaviour subtests below are unaffected either way — they invoke
+      # `hart-audio-unmute 100` directly as a CLI argument.
+      #
+      # NOTE for the steward, not resolved here: the option's own default is
+      # 100 and its description cites "steward: default sink at 100%", while
+      # the desktop profile ships 60. One of those is stale; changing what a
+      # real desktop boots at is a product call, not a test fix.
       hart.audio.bootUnmute.enable = true;
+      hart.audio.bootUnmute.bootVolumePercent = 100;
 
       # A non-login user whose systemd instance + PipeWire we start via linger, so
       # we get a real per-user PipeWire socket without a graphical session.

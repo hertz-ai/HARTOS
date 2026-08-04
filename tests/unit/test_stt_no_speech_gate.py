@@ -1,20 +1,42 @@
-"""STT anti-hallucination gate (#159).
+"""STT anti-hallucination gates (#159, #604).
 
-A noise/silence window must NOT surface as a (hallucinated) phrase, and its
-auto-detected language must NOT leak to the caller as if a human had spoken it
-(the live "さて、さて、もみ" → Japanese reply incident).  vad_filter=True strips
-silent audio regions but a short noise burst still decodes to a hallucinated
-segment; the post-decode no_speech_prob/avg_logprob gate is what catches it.
+Two layered gates answer one question — "did a human actually speak?" — and
+they live together because touching either without seeing the other is how the
+second one got missed for months.
 
-Behavioural: real _filter_speech_text / _faster_whisper_transcribe /
-_legacy_transcribe; mock ONLY the model boundary; assert observable text +
-language.  No grep asserts.
+GATE 1, probabilistic (#159).  A noise/silence window must NOT surface as a
+(hallucinated) phrase, and its auto-detected language must NOT leak to the
+caller as if a human had spoken it (the live "さて、さて、もみ" → Japanese reply
+incident).  vad_filter=True strips silent audio regions but a short noise burst
+still decodes to a hallucinated segment; the post-decode
+no_speech_prob/avg_logprob gate is what catches it.
+
+GATE 2, textual (#604).  Whisper is TRAINED to emit bracketed annotations for
+non-speech audio — "[Music]", "(applause)" — and it emits them confidently, so
+no_speech_prob stays low, avg_logprob stays high, and gate 1 passes them
+straight through.  Live 2026-08-04 on the shipped build: the composer held
+"(sad music)" and the assistant answered a turn whose entire content was
+"(audience laughing)".  Auto-send fires 1s after a final transcript, so an
+annotation becomes a user message with no human involved.
+
+Gate 2 sits at `_transcribe_impl`, the one point every engine returns through,
+because gate 1 is applied INSIDE two of the three engines and `_sherpa_transcribe`
+has never had it — exactly the bypass this placement makes impossible.
+
+Behavioural: real _filter_speech_text / _drop_non_speech_text /
+_faster_whisper_transcribe / _legacy_transcribe; mock ONLY the model boundary;
+assert observable text + language.
 
     python -m pytest tests/unit/test_stt_no_speech_gate.py --noconftest -q
 """
+import ast
+import inspect
 import json
+import textwrap
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 import integrations.service_tools.whisper_tool as wt
 
@@ -106,3 +128,99 @@ def test_legacy_speech_returns_text_and_language():
         out = json.loads(wt._legacy_transcribe("/tmp/x.wav"))
     assert out["text"] == "good morning"
     assert out["language"] == "en"
+
+
+# ══ GATE 2: the textual gate — annotations gate 1 is blind to (#604) ═══════
+#
+# Every string below was produced by the live shipped build, not invented.
+@pytest.mark.parametrize("annotation", [
+    "(sad music)",                              # composer, 04:39
+    "(audience laughing)",                      # auto-sent; the assistant replied
+    "(audience chattering)",
+    "(air whooshing)",
+    "(swoosh) (swoosh) (swoosh) (swoosh)",      # repeated → still all annotation
+    "[Music]",
+    "[silence]",
+    "[BLANK_AUDIO]",
+    "[ Applause ]",                             # padded
+    "♪ ♪",                                      # music glyphs, no words
+    "(音楽)",                                    # Whisper annotates in-language too
+    "  [Music]  \n ",                           # surrounding whitespace
+    "(swoosh).",                                # trailing punctuation only
+])
+def test_pure_annotation_is_dropped(annotation):
+    assert wt._drop_non_speech_text(annotation) == ""
+
+
+# The conservative half of the contract, and the more important one: a false
+# positive here DELETES a user's sentence.  Anything with a word outside the
+# brackets comes back byte-identical.
+@pytest.mark.parametrize("speech", [
+    "hello there",
+    "I paid fifty (fifty!) dollars",            # real parenthetical aside
+    "the [main] point is this",
+    "Hello [Music] world",                      # mixed → keep, don't half-strip
+    "こんにちは",                                 # CJK is \w — must not be dropped
+    "नमस्ते",                                    # Devanagari likewise
+    "(swoosh",                                  # unmatched bracket → keep
+])
+def test_real_speech_is_returned_untouched(speech):
+    assert wt._drop_non_speech_text(speech) == speech
+
+
+def test_empty_and_none_are_safe():
+    assert wt._drop_non_speech_text("") == ""
+    assert wt._drop_non_speech_text(None) == ""
+
+
+# ── the chokepoint: applies to whatever the engine chain returned ──────────
+def test_chokepoint_drops_annotation_and_disowns_the_language():
+    """Mirrors gate 1's own convention: nothing spoken → language 'unknown',
+    never the language Whisper inferred from music."""
+    with patch.object(wt, '_run_engine_chain',
+                      return_value=json.dumps({"text": "(sad music)",
+                                               "language": "en"})):
+        out = json.loads(wt._transcribe_impl("/tmp/x.wav"))
+    assert out["text"] == ""
+    assert out["language"] == "unknown"
+
+
+def test_chokepoint_passes_real_speech_through_unchanged():
+    with patch.object(wt, '_run_engine_chain',
+                      return_value=json.dumps({"text": "hello there",
+                                               "language": "en"})):
+        out = json.loads(wt._transcribe_impl("/tmp/x.wav"))
+    assert out["text"] == "hello there"
+    assert out["language"] == "en"
+
+
+def test_chokepoint_passes_engine_errors_through_verbatim():
+    err = json.dumps({"error": "No STT engine available (install faster-whisper)"})
+    with patch.object(wt, '_run_engine_chain', return_value=err):
+        assert wt._transcribe_impl("/tmp/x.wav") == err
+
+
+def test_no_engine_can_bypass_the_gate():
+    """THE structural point of #604.
+
+    Gate 1 is applied inside _faster_whisper_transcribe and _legacy_transcribe
+    but NOT _sherpa_transcribe — a per-engine gate that one engine silently
+    skips.  Gate 2 must never repeat that: if engine dispatch moves back into
+    _transcribe_impl, a later `return result` can sidestep the filter again.
+
+    Matches CALL expressions via AST rather than substrings, because
+    _transcribe_impl's docstring names _sherpa_transcribe to explain exactly
+    this — a text scan flags that prose and fails on the fix it is guarding.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(wt._transcribe_impl)))
+    called = {n.func.id for n in ast.walk(tree)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    for engine in ('_faster_whisper_transcribe', '_sherpa_transcribe',
+                   '_legacy_transcribe'):
+        assert engine not in called, (
+            f'{engine} is called inside _transcribe_impl. Engine selection '
+            f'belongs in _run_engine_chain so every result passes the '
+            f'annotation gate on the way out.')
+    assert '_run_engine_chain' in called, (
+        '_transcribe_impl no longer delegates to _run_engine_chain — the gate '
+        'is only meaningful if it wraps the whole engine ladder')

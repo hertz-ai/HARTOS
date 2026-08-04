@@ -70,11 +70,11 @@ def bootstrap_platform(extensions_dir: Optional[str] = None) -> ServiceRegistry:
     # HiveExpertDiscovery — subscribes to peer.capability.announce /
     # revoke and auto-registers reachable, trust-verified hive peers
     # as ModelTier.EXPERT backends.  Idempotent attach; sits idle
-    # until a peer's capability advertiser daemon emits the gossip.
-    # No peer emits today, so this is a no-op-on-the-hot-path
-    # subscriber — once the producer ships, hive routing activates
-    # without any dispatcher-side change (the dispatcher already
-    # calls registry.get_expert_model()).
+    # until a peer's capability advertiser emits the gossip.  That
+    # producer is the sibling attached just below, and it is opt-in,
+    # so on a network where nobody advertises this stays a
+    # no-op-on-the-hot-path subscriber and the dispatcher falls
+    # through to local (it already calls registry.get_expert_model()).
     try:
         from integrations.agent_engine.hive_expert_discovery import (
             get_hive_expert_discovery,

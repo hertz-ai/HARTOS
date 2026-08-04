@@ -23,8 +23,8 @@ hart-comp owns BOTH ends:
   already runs at exactly this point (it is where the #131 first-scanout beacon
   fires).
 
-`latency = T_photon - T_input`. That is the real number, including compositor
-queueing and scanout -- not "time to paint".
+`latency = T_photon - T_input`, measured across compositor queueing and scanout,
+not "time to paint".
 
 ## 2. Attribution: which component was that frame for
 A raw histogram is not actionable ("something is slow"). Each measurement must
@@ -37,9 +37,9 @@ name the component.
   `(component_id, interaction_kind, latency_us)`, where kind is one of
   `press | drag | hover | scroll | key | resize | window-move | animate-start`.
 - **The same instrument measures the WEB shell**, because hart-comp also
-  delivers its input and presents its surface. That gives an honest A/B: the
-  native and WebView shells measured by ONE instrument, so "native is faster" is
-  a demonstrated delta, not a claim.
+  delivers its input and presents its surface. The native and WebView shells are
+  measured by ONE instrument, so "native is faster" is a demonstrated delta, not
+  a claim.
 
 ## 3. Output contract
 Two sinks, both machine-readable:
@@ -56,8 +56,8 @@ Three layers. Only the third is per-component, and it is GENERATED, not authored
 `tests/unit/test_latency_budget_coverage.py` enumerates every interactive and
 animated surface from the SERVED shell + the CSS parity ledger, and asserts each
 has a declared budget in `docs/architecture/latency_budgets.json`. A new
-component with no budget FAILS the build. This is what makes "full spectrum"
-enforceable rather than aspirational -- coverage cannot silently regress.
+component with no budget FAILS the build, so "full spectrum" coverage cannot
+silently regress.
 
 **L2 -- synthetic input replay (VM/nixosTest).**
 A uinput virtual pointer/keyboard replays a scripted interaction per component

@@ -5,12 +5,13 @@ Marketing Nunban — Tamil-Rooted, Globally Adaptive Marketing Intelligence.
 (Every place is our hometown, every person is our kin)
 — Kaniyan Pungundranar, Sangam Literature (~300 BCE)
 
-This is Nunba's marketing philosophy. Honest. Tamil by default. Universal by nature.
+This module holds Nunba's marketing philosophy: Tamil by default, adapted per
+region rather than translated.
 
 The marketing agent uses:
   - Thirukkural couplets as the foundation (2000+ years of Tamil ethical wisdom)
   - cultural_wisdom.py traits for geographic adaptation
-  - No dark patterns, no manipulation, no hype — just truth
+  - claims that can be checked, rather than dark patterns or urgency tricks
 """
 
 from cultural_wisdom import CULTURAL_TRAITS, get_trait_by_name

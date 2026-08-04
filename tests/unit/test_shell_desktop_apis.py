@@ -415,6 +415,49 @@ class TestDateTime(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
 
     @patch('integrations.agent_engine.shell_desktop_apis._run')
+    def test_set_local_rtc_enabled(self, mock_run):
+        """An agent can ACT on the RTC mode, not just read it (task #24).
+
+        Windows keeps the hardware clock in local time; a dual-boot HART node
+        assuming UTC ran hours wrong until NTP yanked the wall clock backwards
+        on connect. --adjust-system-clock is what makes the correction
+        re-interpret the RTC instead of stepping the clock again.
+        """
+        mock_run.return_value = MagicMock(returncode=0)
+        client = _make_desktop_app()
+        r = client.post('/api/shell/datetime/set-local-rtc',
+                        data=json.dumps({'enabled': True}),
+                        content_type='application/json')
+        data = json.loads(r.data)
+        self.assertTrue(data['set'])
+        self.assertTrue(data['rtc_in_local_time'])
+        args = mock_run.call_args[0][0]
+        self.assertEqual(args[:3], ['timedatectl', 'set-local-rtc', 'true'])
+        self.assertIn('--adjust-system-clock', args)
+
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
+    def test_set_local_rtc_disabled(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0)
+        client = _make_desktop_app()
+        r = client.post('/api/shell/datetime/set-local-rtc',
+                        data=json.dumps({'enabled': False}),
+                        content_type='application/json')
+        data = json.loads(r.data)
+        self.assertFalse(data['rtc_in_local_time'])
+        self.assertEqual(mock_run.call_args[0][0][2], 'false')
+
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
+    def test_set_local_rtc_reports_failure(self, mock_run):
+        """A refused timedatectl must surface, never claim success."""
+        mock_run.return_value = MagicMock(returncode=1, stderr='denied')
+        client = _make_desktop_app()
+        r = client.post('/api/shell/datetime/set-local-rtc',
+                        data=json.dumps({'enabled': True}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 500)
+        self.assertFalse(json.loads(r.data)['set'])
+
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
     def test_set_ntp(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
         client = _make_desktop_app()

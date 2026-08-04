@@ -1,11 +1,31 @@
 # Embedding the Hevolve Agent on Any Page
 
-Add the Hevolve AI chat agent to any website. Three integration levels:
-drop-in widget, iframe embed, or OpenAI-compatible API.
+Add the Hevolve AI chat agent to any website.
+
+!!! warning "Start with Option 3. Options 1 and 2 are not deployed."
+
+    Measured 2026-07-30 against the live hosts:
+
+    | Endpoint | Result |
+    |---|---|
+    | `cdn.hertzai.com/mindstory.js` (Option 1) | **does not resolve, no DNS** |
+    | `hevolve.hertzai.com/hevolve-widget.js` (Option 2) | **404** |
+    | `hevolve.hertzai.com/agents/<Name>?embed=true` (Option 3) | 200 |
+    | `hevolve.ai/agents/<Name>?plugin=1` ([Agent Plugin](../agent-plugin.md)) | 200 |
+    | `hevolve.ai/v1` (Option 4) | 200 |
+    | `@hertzai/mindstory` on npm | unpublished |
+
+    Option 1 was marked Recommended, and its host has no DNS record at all, so
+    the script tag fails to load rather than failing to work. It is the first
+    thing anyone tries, which means the likely result of reading this page was
+    concluding the product is broken. Options 1 and 2 are kept below as the
+    intended interface, not as something you can integrate against today.
 
 ---
 
-## Option 1: Chat Widget (Recommended)
+## Option 1: Chat Widget (NOT DEPLOYED)
+
+!!! danger "cdn.hertzai.com does not resolve. This snippet cannot load."
 
 One script tag. Floating chat pill appears bottom-right.
 
@@ -41,7 +61,9 @@ One script tag. Floating chat pill appears bottom-right.
 
 ---
 
-## Option 2: HevolveWidget Script
+## Option 2: HevolveWidget Script (NOT DEPLOYED)
+
+!!! danger "hevolve-widget.js returns 404 and nothing currently builds that bundle. The React components it wraps do exist, so this is a packaging gap rather than a missing feature."
 
 For more control over initialization and events.
 
@@ -80,9 +102,20 @@ with download buttons — no extra UI needed.
 
 ---
 
-## Option 3: iframe Embed
+## Option 3: iframe Embed (works today)
 
-Embed a full chat interface in any container.
+Embed a full chat interface in any container. This and the
+[Agent Plugin](../agent-plugin.md) are the two methods that are actually
+deployed, and they are not interchangeable:
+
+- **`?embed=true`**, below, is the full chat and can act as a specific user via
+  `&token=` and `&user_id=`. Use it where you already know who the person is.
+- **`?plugin=1`** is anonymous: no key, no login, audio only, and it
+  guest-registers the visitor on mount. Use it on a docs or marketing page where
+  you want someone talking to an agent before they have an account.
+
+Note the two are served from different hosts, `hevolve.hertzai.com` and
+`hevolve.ai`. That is how they are deployed, not a typo.
 
 ```html
 <iframe

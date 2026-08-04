@@ -307,10 +307,10 @@ def _image_gen_ready(model_bus_port: Optional[int]) -> bool:
     Model Bus.  Today the Model Bus exposes no image_gen backend (its router is
     a stub), so this returns False and agent cards keep the brand-art fallback.
 
-    The probe is the honest realisation of the steward rule "find if an image
-    generator is reachable and use it; if none exists, fall back": when a real
-    local generator registers as an 'image_gen' backend (status 'ready'), this
-    flips True and agent_art_url begins requesting generated art."""
+    This implements the steward rule "find if an image generator is reachable
+    and use it; if none exists, fall back": when a real local generator
+    registers as an 'image_gen' backend (status 'ready'), this flips True and
+    agent_art_url begins requesting generated art."""
     now = time.time()
     with _gen_lock:
         if (now - _gen_state['ts']) < _GEN_PROBE_TTL:

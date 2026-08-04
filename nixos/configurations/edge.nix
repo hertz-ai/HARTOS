@@ -14,77 +14,34 @@
 
 {
   imports = [
+    ../profiles/edge.nix     # variant feature profile (hart.* block; moved 2026-07-28)
     "${modulesPath}/installer/cd-dvd/installation-cd-minimal.nix"
   ];
 
   # ─── Disable ZFS (broken in nixpkgs 24.11 for kernel 6.15) ───
   boot.supportedFilesystems.zfs = lib.mkForce false;
 
-  # ─── HART OS (minimal) ───
-  hart = {
-    enable = true;
-    variant = "edge";
-
-    # Observer: no agent, no LLM, no vision
-    agent.enable = false;
-    llm.enable = false;
-    vision.enable = false;
-
-    # Kernel: minimal — only agent sandbox for security
-    kernel = {
-      enable = true;
-      androidNative.enable = false;
-      windowsNative.enable = false;
-      aiCompute.enable = false;
-      agentSandbox.enable = false;     # No agents on edge
-    };
-
-    # Sandbox for diagnostics
-    sandbox.enable = true;
-
-    # ── AI-Native: Compute Mesh Only ──
-    # Edge devices contribute compute to the user's mesh.
-    # No local models, no UI, no subsystems — just compute donation.
-    computeMesh = {
-      enable = true;
-      maxOffloadPercent = 80;          # Edge donates most of its compute
-      allowWAN = true;
-    };
-    # No modelBus (edge has no local models — uses mesh)
-    # No liquidUI (edge has no display)
-    # No appBridge (edge has no subsystems)
-  };
+  # ─── HART OS Core Services: moved to ../profiles/edge.nix ───
+  # The hart.* feature block (what makes the edge a edge) now lives in
+  # profiles/edge.nix, imported above, so the SAME block can also drive the
+  # nixosTest nodes (#15) and the installer (#17) without duplicating it here.
+  # This file keeps only what is image/media-specific plus hart.package below.
 
   # HART application package
   hart.package = pkgs.callPackage ../packages/hart-app.nix { inherit hartSrc; };
 
-  # CLI only
-  environment.systemPackages = [
-    (pkgs.callPackage ../packages/hart-cli.nix { inherit hartSrc; })
-  ];
+  # ─── Edge experience: moved to ../profiles/edge.nix (task #21) ───
+  # hart-cli, headless, swappiness, docs-off, getty autologin, journald
+  # caps — an installed edge node composes the same surface.
 
   # ISO branding
   isoImage = {
     isoName = lib.mkForce "hart-os-${config.hart.version}-edge-${pkgs.system}.iso";
     volumeID = lib.mkForce "HART_OS";
     appendToMenuLabel = " HART OS Edge";
+    # BIOS/CSM boot as well as UEFI — same gap the desktop ISO had. Edge
+    # targets old industrial boards, which are the MOST likely to be
+    # BIOS-only, so an EFI-only edge ISO was the worst fit of the three.
+    makeBiosBootable = lib.mkDefault true;
   };
-
-  # Headless
-  services.xserver.enable = false;
-
-  # Minimal footprint
-  boot.kernel.sysctl."vm.swappiness" = lib.mkForce 60;
-
-  # environment.noXlibs removed in nixpkgs — headless by not including X/GNOME
-  documentation.enable = false;
-  documentation.man.enable = false;
-  documentation.nixos.enable = false;
-
-  services.getty.autologinUser = lib.mkDefault "hart-admin";
-
-  services.journald.extraConfig = ''
-    SystemMaxUse=50M
-    MaxRetentionSec=7day
-  '';
 }

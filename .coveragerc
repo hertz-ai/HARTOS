@@ -1,29 +1,74 @@
 [run]
+# STOP ENUMERATING. `source = .` with the omit list below doing the excluding,
+# so new code is measured BY DEFAULT and exclusion is the deliberate act.
+#
+# core/ was missing from the old hand-written list until 2026-07-31, so the
+# package holding the canonical single-sources — constants.py
+# (LATENCY_BUDGETS), subprocess_safe.py (the one bounded probe, 139 callers),
+# port_registry, llama_scheduler, platform/, peer_link/ — reported no coverage
+# at all. Not LOW coverage: NO DATA, which reads identically to "nothing to
+# see" on a report, and is how the gap stayed invisible.
+#
+# Adding `core` fixed that one entry and left the MECHANISM in place. Counted
+# against what actually exists, the list still reached 5 of 25 integrations
+# subpackages, and missed two whole top-level packages (desktop/, hart_sdk/)
+# that both have __init__.py. Invisible: remote_desktop, internal_comm, mcp,
+# expert_agents, google_a2a, ap2, gateway, providers, openclaw, audio,
+# marketing, browser_research, distributed_agent, agent_lightning and more —
+# several of which the parity matrix cites, and any of which would answer a
+# "which tests cover this?" query with a confident EMPTY set.
+#
+# The next package added would have been invisible the same way `core` was.
+# This inverts the failure mode from "silently absent" to "explicitly
+# excluded" — the same fail-toward-visible principle as `unclaimed=True` in
+# the device panel.
 source =
-    integrations/agent_engine
-    integrations/social
-    integrations/coding_agent
-    integrations/channels
-    integrations/service_tools
-    security
-    hart_intelligence_entry
-    threadlocal
-    helper
-    helper_func
-    helper_ledger
-    lifecycle_hooks
-    create_recipe
-    reuse_recipe
+    .
 data_file = test-reports/coverage/.coverage
 
+# Record WHICH TEST executed each line. This answers "what tests exercise
+# shell_system_apis.py?" — the question whose absence let a regression ship
+# on 2026-07-31: `_run` was changed in shell_system_apis.py, but the suite
+# that caught it is named test_shell_os_apis.py (WiFi/VPN routes live in the
+# former, are tested from the latter), so the obvious "run the same-named
+# test file" reflex missed it entirely.
+#
+# With contexts recorded, the impacted-test set is derivable from coverage
+# data instead of guessed from filenames. `coverage report` has no context
+# flag (only `coverage html --show-contexts` does), so to answer it directly:
+#
+#   python -c "import coverage; d=coverage.CoverageData('test-reports/coverage/.coverage'); \
+#     d.read(); f=[x for x in d.measured_files() if 'shell_system_apis' in x][0]; \
+#     print(sorted({c for c in d.contexts_by_lineno(f).values() for c in c if c}))"
+#
+# ...which lists every test that executed a line of that file. Verified
+# working 2026-07-31 (23 contexts recorded); do not swap in a flag that
+# does not exist.
+dynamic_context = test_function
+
+# With `source = .` these carry the whole exclusion job, so they are now
+# load-bearing rather than incidental. Anything not listed here IS measured.
 omit =
     tests/*
     venv*/*
+    .venv*/*
     .idea/*
     autogen-*/*
     docs/*
     */migrations/*
     */__pycache__/*
+    # Added with `source = .`: these were previously excluded by simply not
+    # being enumerated, and would otherwise become newly-measured noise.
+    setup.py
+    conftest.py
+    */conftest.py
+    build/*
+    dist/*
+    *.egg-info/*
+    node_modules/*
+    nixos/*
+    scripts/*
+    .github/*
 
 [report]
 show_missing = true

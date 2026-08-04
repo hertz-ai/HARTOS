@@ -31,41 +31,58 @@ let
 
   memwatch = pkgs.writeShellScript "hart-shell-memwatch" ''
     set -u
-    # RSS in kB for a process name pattern, summed across matches (WebKit forks a
-    # WebProcess/NetworkProcess, so per-name summing is what shows real growth).
-    rss_of() {
-      pat="$1"
-      total=0
-      for p in /proc/[0-9]*; do
-        [ -r "$p/comm" ] || continue
-        c=$(cat "$p/comm" 2>/dev/null || echo "")
-        case "$c" in
-          *"$pat"*)
-            r=$(awk '/^VmRSS:/{print $2}' "$p/status" 2>/dev/null || echo 0)
-            [ -n "$r" ] && total=$((total + r))
-            ;;
-        esac
-      done
-      echo "$total"
-    }
-
-    web=$(rss_of WebKitWebProc)
-    net=$(rss_of WebKitNetwor)
-    comp=$(rss_of hart-comp)
-    host=$(rss_of python)
+    # ONE forkless pass over /proc.
+    #
+    # This used to be an rss_of() helper called FOUR times, each walking all of
+    # /proc and running `cat` (a fork+exec) per PID, plus a FIFTH walk for the
+    # FD count -- roughly 5*N subprocesses per sample. On a booting desktop with
+    # a few hundred processes that overran TimeoutStartSec=20 and systemd
+    # SIGTERM'd the unit: observed 2026-08-02 in the VM run,
+    #   "Main process exited, code=killed, status=15/TERM"
+    #   "Failed with result 'timeout'"
+    # A leak sampler that dies under load is worst-useless -- load is exactly
+    # when the leak it exists to attribute is happening, so the signal vanishes
+    # precisely when it is needed. It also burned that CPU every 20s.
+    #
+    # `read < file` is a shell BUILTIN: no fork. Reading each comm once and only
+    # opening status for the processes we actually care about turns ~5*N forks
+    # into zero (bar the single optional `ls` for the FD count), and one pass
+    # instead of five. Same output line, same fields, same semantics.
+    web=0; net=0; comp=0; host=0; fds="na"
+    for p in /proc/[0-9]*; do
+      [ -r "$p/comm" ] || continue
+      c=""
+      read -r c < "$p/comm" 2>/dev/null || continue
+      case "$c" in
+        *WebKitWebProc*|*WebKitNetwor*|*hart-comp*|*python*) ;;
+        *) continue ;;
+      esac
+      # VmRSS only exists for processes with an mm (kernel threads have none),
+      # so a miss here is normal and must not abort the sweep.
+      r=""
+      while read -r k v _rest; do
+        if [ "$k" = "VmRSS:" ]; then r="$v"; break; fi
+      done < "$p/status" 2>/dev/null || true
+      [ -n "$r" ] || continue
+      case "$c" in
+        *WebKitWebProc*)
+          web=$((web + r))
+          # First WebProcess only -- matches the previous `break` semantics.
+          if [ "$fds" = "na" ]; then
+            n=$(ls "$p/fd" 2>/dev/null | wc -l) || n="na"
+            fds="$n"
+          fi
+          ;;
+        *WebKitNetwor*) net=$((net + r)) ;;
+        *hart-comp*)    comp=$((comp + r)) ;;
+        *python*)       host=$((host + r)) ;;
+      esac
+    done
     # GPU memory: i915 exposes per-client gem info on some kernels; best-effort.
     gpu="na"
     if [ -r /sys/class/drm/card1/device/mem_info_vram_used ]; then
-      gpu=$(cat /sys/class/drm/card1/device/mem_info_vram_used 2>/dev/null || echo na)
+      read -r gpu < /sys/class/drm/card1/device/mem_info_vram_used 2>/dev/null || gpu="na"
     fi
-    # Open FDs of the shell host: a compositing/buffer leak often shows here first.
-    fds="na"
-    for p in /proc/[0-9]*; do
-      c=$(cat "$p/comm" 2>/dev/null || echo "")
-      case "$c" in
-        *WebKitWebProc*) n=$(ls "$p/fd" 2>/dev/null | wc -l); fds="$n"; break ;;
-      esac
-    done
 
     if [ "$web" = "0" ] && [ "$comp" = "0" ]; then
       echo "[hart-memwatch] no shell/compositor processes visible (session not up yet)"

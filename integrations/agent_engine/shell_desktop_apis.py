@@ -58,18 +58,20 @@ def _is_wayland():
                               capture_output=True, text=True, timeout=3)
             if r.returncode == 0:
                 return True
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            # Benign: returning False is the SAFE default for a detection
+            # helper. Logged at debug because it is expected on any box
+            # without pgrep, and a warning here would be noise — but a
+            # detection that always answers "no" for an unseen reason is
+            # still worth being able to see.
+            logger.debug("wayland detect: pgrep unavailable (%s) — "
+                         "reporting not-wayland", type(e).__name__)
     return False
 
 
-def _run(cmd, timeout=10, **kw):
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, **kw)
-        return r
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
+# Canonical bounded probe — same alias as shell_system_apis.py. The two
+# byte-equivalent `_run` copies are now ONE implementation (139 callers).
+from core.subprocess_safe import run_probe as _run
 
 
 # ─── About > Credits: third-party art licence ledger (#143 offline-art) ──────
@@ -947,6 +949,34 @@ def register_shell_desktop_routes(app):
         if r and r.returncode == 0:
             return jsonify({'set': True, 'timezone': tz})
         return jsonify({'set': False, 'error': r.stderr.strip() if r else 'timedatectl not available'}), 500
+
+    @app.route('/api/shell/datetime/set-local-rtc', methods=['POST'])
+    def shell_datetime_set_local_rtc():
+        """Whether the hardware clock holds LOCAL time instead of UTC.
+
+        Packaging systemd's own `timedatectl set-local-rtc` — the sibling of
+        the `rtc_in_local_time` field GET /api/shell/datetime already reports,
+        which until now could be READ but never ACTED ON.
+
+        Why an agent needs this (real-HW 2026-07-30, task #24): Windows keeps
+        the RTC in local time, HART assumed UTC, so a dual-boot node ran hours
+        wrong until NTP connected and then yanked the wall clock BACKWARDS by
+        the whole timezone offset. The declarative half is NixOS's own
+        `time.hardwareClockInLocalTime` (written into local.nix at install);
+        this is the live half, so an agent that detects the skew can correct
+        the running system without a rebuild.
+
+        `--adjust-system-clock` re-interprets the RTC under the new mode
+        instead of letting the wall clock jump — the whole point here.
+        """
+        data = request.get_json(force=True)
+        enabled = bool(data.get('enabled', True))
+        val = 'true' if enabled else 'false'
+        r = _run(['timedatectl', 'set-local-rtc', val, '--adjust-system-clock'])
+        if r and r.returncode == 0:
+            return jsonify({'set': True, 'rtc_in_local_time': enabled})
+        return jsonify({'set': False,
+                        'error': r.stderr.strip() if r else 'timedatectl not available'}), 500
 
     @app.route('/api/shell/datetime/set-ntp', methods=['POST'])
     def shell_datetime_set_ntp():

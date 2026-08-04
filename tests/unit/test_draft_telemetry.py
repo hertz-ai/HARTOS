@@ -6,6 +6,7 @@ fields for offline calibration and drift detection.
 
 Source: integrations/agent_engine/speculative_dispatcher.py ~line 265
 """
+from core.constants import latency_budget
 import json
 import logging
 import os
@@ -243,7 +244,10 @@ class TestDraftTelemetryNonFunctional:
             _build_telemetry_dict()
         elapsed_ms = (time.time() - start) * 1000
         # 10k iterations should finish in well under 1 second
-        assert elapsed_ms < 1000, f"Telemetry construction too slow: {elapsed_ms:.1f}ms for 10k"
+        _budget = latency_budget('telemetry_build_10k_ms')
+        assert elapsed_ms < _budget, (
+            f"Telemetry construction too slow: {elapsed_ms:.1f}ms for 10k "
+            f"(budget {_budget}ms)")
 
     def test_large_reply_len_handled(self):
         """Very large draft_reply computes len correctly."""

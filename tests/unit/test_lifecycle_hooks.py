@@ -356,9 +356,21 @@ class TestForceStateThroughValidPath:
     def test_same_state_returns_true(self):
         assert force_state_through_valid_path(UP, 1, ActionState.ASSIGNED) is True
 
+    def test_forced_terminate_routes_through_completed(self):
+        # STALE PIN CORRECTED: this test used to assert ASSIGNED->TERMINATED
+        # has no path — true before the 2026-06-13 liveness fix, which added
+        # the force-to-terminal edges (routed through COMPLETED, TERMINATED's
+        # only legal predecessor) because the missing path re-ran the same
+        # action forever (187x/boot) and the flywheel never spun.
+        assert force_state_through_valid_path(UP, 1, ActionState.TERMINATED) is True
+        assert get_action_state(UP, 1) == ActionState.TERMINATED
+
     def test_no_valid_path_returns_false(self):
-        # ASSIGNED -> TERMINATED has no direct path in state_paths
-        assert force_state_through_valid_path(UP, 1, ActionState.TERMINATED) is False
+        # TERMINATED is the absorbing terminal: no path BACK to active
+        # execution (FIX-5.1 silently no-ops only for states that come
+        # BEFORE terminated; IN_PROGRESS is not one of them).
+        assert force_state_through_valid_path(UP, 1, ActionState.TERMINATED) is True
+        assert force_state_through_valid_path(UP, 1, ActionState.IN_PROGRESS) is False
 
     def test_error_to_completed(self):
         set_action_state(UP, 1, ActionState.IN_PROGRESS)

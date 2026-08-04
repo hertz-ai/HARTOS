@@ -535,7 +535,7 @@ FederationRule           Hive membership requirements
 | X25519 private key | `agent_data/node_x25519_private.key` | Yes |
 | Public keys | `agent_data/node_*_public.*` | No (public) |
 
-Design: encrypt on write, decrypt on read. Auto-detect Fernet prefix (`gAAAAA`) for seamless plaintext migration. Opt-in via `HEVOLVE_DATA_KEY` env var.
+Design: encrypt on write, decrypt on read. Auto-detect Fernet prefix (`gAAAAA`) so existing plaintext files still read and migrate on the next write. Opt-in via `HEVOLVE_DATA_KEY` env var.
 
 ### Node Identity & Network Joining
 
@@ -1353,7 +1353,7 @@ The reward calculator supports 7 reward types (task_completion, task_failure, to
 
 ## 30. Marketing (`integrations/marketing/`)
 
-Tamil-rooted, globally adaptive marketing intelligence. Named "Nunban" ("one of Nunba" in Tamil), the marketing agent is grounded in Thirukkural couplets (2000+ years of Tamil ethical wisdom) and cultural_wisdom.py traits for geographic adaptation. Core values: Mei (truth), Aram (righteousness), Anbu (love), Virunthombal (hospitality). No dark patterns, no manipulation, no hype — just truth. The 10 marketing rules include honest claims, no FOMO manipulation, healthy disengagement, and measuring success by trust earned rather than clicks.
+Tamil-rooted, globally adaptive marketing intelligence. Named "Nunban" ("one of Nunba" in Tamil), the marketing agent is grounded in Thirukkural couplets (2000+ years of Tamil ethical wisdom) and cultural_wisdom.py traits for geographic adaptation. Core values: Mei (truth), Aram (righteousness), Anbu (love), Virunthombal (hospitality). Dark patterns, manipulation and hype are ruled out. The 10 marketing rules include honest claims, no FOMO manipulation, healthy disengagement, and measuring success by trust earned rather than clicks.
 
 Geographic adaptation covers 12 regions (tamil_nadu, south_asia, east_asia, southeast_asia, middle_east, africa, northern_europe, southern_europe, north_america, latin_america, oceania) with region-specific tone, values, cultural traits, and explicit "things to avoid" guidance. Tamil Nadu is the default voice; all other styles adapt from it.
 
@@ -1634,7 +1634,7 @@ Exception collection, recipe experience recording, notifications — never block
 |----------|---------|---------|
 | `HEVOLVE_LLM_ENDPOINT_URL` | | Custom LLM endpoint |
 | `HEVOLVE_LLM_MODEL_NAME` | `gpt-4.1-mini` | Primary model |
-| `HEVOLVE_LOCAL_LLM_URL` | `http://localhost:8000/v1` | Local LLM endpoint |
+| `HEVOLVE_LOCAL_LLM_URL` | `http://localhost:8080/v1` | Local LLM endpoint. Resolved by `core/port_registry.py` (`llm` = 8080; 808 in OS mode), so prefer `get_local_llm_url()` over hardcoding. |
 | `HEVOLVE_ACTIVE_CLOUD_PROVIDER` | | Cloud provider name |
 
 ### Networking

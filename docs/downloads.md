@@ -4,7 +4,7 @@ Pick your device and grab it. Every build is automated, Ed25519-signed, and chec
 
 ---
 
-## Get the app — Nunba
+## Get the app: Nunba
 
 The client you actually use. Same experience on every device, one identity. **Most people only need this.**
 
@@ -14,7 +14,7 @@ The client you actually use. Same experience on every device, one identity. **Mo
 | **macOS** | [**Nunba_Setup.dmg**](https://github.com/hertz-ai/Nunba/releases/latest/download/Nunba_Setup.dmg) |
 | **Linux** | [**AppImage**](https://github.com/hertz-ai/Nunba/releases/latest/download/Nunba-x86_64.AppImage) · [.deb](https://github.com/hertz-ai/Nunba/releases/latest) |
 | **Android** | [**Google Play**](https://play.google.com/store/apps/details?id=com.hertzai.hevolve) |
-| **Web** | [**hevolve.ai**](https://hevolve.ai/) — no install |
+| **Web** | [**hevolve.ai**](https://hevolve.ai/), no install |
 | **iOS** | [TestFlight / App Store](https://github.com/hertz-ai/nunba-ios) |
 
 !!! tip "Not sure which file? Use the universal installer"
@@ -25,7 +25,7 @@ The client you actually use. Same experience on every device, one identity. **Mo
 
 ---
 
-## Get the full OS — HART OS
+## Get the full OS: HART OS
 
 Boot from a USB stick, SD card, or VM. The complete agentic runtime + hive. Rebuilt on every push to `main`.
 
@@ -36,12 +36,12 @@ Boot from a USB stick, SD card, or VM. The complete agentic runtime + hive. Rebu
 | **Edge** | Minimal observer / embedded nodes | [**ISO**](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-edge-x86_64-linux.iso) · [torrent](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-edge-x86_64-linux.iso.torrent) · [sha256](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-edge-x86_64-linux.iso.sha256) |
 
 !!! tip "Easiest way to flash"
-    `python scripts/hart_usb_flasher.py --gui` — fetches the ISO, writes it to the stick, and verifies the boot signature in one step.
+    `python scripts/hart_usb_flasher.py --gui` fetches the ISO, writes it to the stick, and verifies the boot signature in one step.
 
 ---
 
-??? question "Nunba vs HART OS — which do I need?"
-    - **Nunba** is the client you use — Windows, macOS, Linux, Android, web, and inside HART OS itself. One identity, every device. Most people only need this.
+??? question "Nunba vs HART OS: which do I need?"
+    - **Nunba** is the client you use: Windows, macOS, Linux, Android, web, and inside HART OS itself. One identity, every device. Most people only need this.
     - **HART OS** is the backend OS + agentic runtime Nunba talks to: a Mixture-of-Experts hive mind that learns and infers at the same time. Runs on your laptop (flat), your LAN (regional), or the cloud (central), and federates over PeerLink.
 
     On HART OS itself, Nunba is pre-installed (systemd user service `hart-nunba`, port 5000, rendered in the LiquidUI Glass Shell). Everywhere else, Nunba bundles the runtime locally or points at a remote node via `NUNBA_BACKEND_URL`.
@@ -63,7 +63,7 @@ Boot from a USB stick, SD card, or VM. The complete agentic runtime + hive. Rebu
 
     Can't reach `docs.hevolve.ai` for the desktop ISO? Grab the split `part-*` files + `.sha256` + `reassemble.sh` from [GitHub Releases](https://github.com/hertz-ai/HARTOS/releases) and run `bash …reassemble.sh` (or `cat *.part-* > …iso`), then verify the checksum.
 
-??? note "Backend only — pip or Docker"
+??? note "Backend only: pip or Docker"
     ```bash
     # pip
     pip install -r requirements.txt

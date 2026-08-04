@@ -38,6 +38,21 @@ in
       default = [ "us" ];
       description = "Default keyboard layouts.";
     };
+
+    xkbOptions = lib.mkOption {
+      type = lib.types.str;
+      default = "grp:alt_shift_toggle";
+      description = ''
+        xkb options string. This module OWNS services.xserver.xkb.options —
+        it used to hardcode the layout-toggle, which collided with the
+        desktop profile's own `ctrl:nocaps` the moment hart.ime was enabled
+        (two different values for one scalar option = eval failure). Exposed
+        as an option so a consumer keeps its deliberate mapping instead of
+        the module silently winning or the profile hand-rolling xkb beside
+        it. Consumers that want both compose them: "ctrl:nocaps,grp:alt_shift_toggle".
+      '';
+      example = "ctrl:nocaps,grp:alt_shift_toggle";
+    };
   };
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
@@ -97,7 +112,7 @@ in
     # ── Keyboard layout configuration ──
     {
       services.xserver.xkb.layout = lib.concatStringsSep "," cfg.defaultLayouts;
-      services.xserver.xkb.options = "grp:alt_shift_toggle";
+      services.xserver.xkb.options = cfg.xkbOptions;
 
       # ── CLI tool ──
       environment.systemPackages = [

@@ -243,10 +243,51 @@ in
           # if a card is present - proving /proc/asound/cards + /dev/snd were
           # actually read, not silently skipped. (Real-or-placeholder, mirroring
           # the evdev "Name=" / "no /proc/bus/input/devices" assertion above.)
-          assert ("no /proc/asound/cards" in latest
+          # SELF-DESCRIBING. This fired in run 30773186426 and the message
+          # ("probe did not run") could not distinguish the two things it
+          # conflates, so it cost a 2-hour round trip to learn nothing:
+          #   (a) the probe genuinely did not run, or
+          #   (b) it RAN and wrote a verdict this assertion does not recognise.
+          # (b) is very plausible: the module prints "no /proc/asound/cards"
+          # and "no /dev/snd" ONLY as `||` fallbacks when cat/ls FAIL. On a
+          # kernel with ALSA built in but no card, /proc/asound/cards EXISTS
+          # and `cat` SUCCEEDS, printing the kernel's own wording — so none of
+          # the three accepted markers appear even though the probe worked.
+          #
+          # The accepted list is deliberately NOT widened on that hypothesis:
+          # guessing a marker could make this assertion vacuous. Dump the
+          # section instead and let the next run say what is actually there.
+          #
+          # ANSWERED (run 30848154453). Hypothesis (b) was right, and the
+          # dump printed the verbatim proof:
+          #
+          #     ── kernel sound cards (/proc/asound/cards) ──
+          #     --- no soundcards ---
+          #     ── /dev/snd nodes ──
+          #     crw-rw----+ 1 root audio 116,  1 seq
+          #     crw-rw----+ 1 root audio 116, 33 timer
+          #
+          # /proc/asound/cards EXISTS and cat SUCCEEDS, so neither `||`
+          # fallback fires; /dev/snd exists with seq+timer but no controlC
+          # because the VM has ALSA and ZERO cards. "--- no soundcards ---" is
+          # the KERNEL's own wording for that state, so it is a fourth real
+          # verdict, not a guess — added on evidence, exactly as this comment
+          # asked the next run to provide.
+          if not ("no /proc/asound/cards" in latest
                   or "no /dev/snd" in latest
-                  or "controlC" in latest), \
-              "kernel sound-card probe produced no HW verdict (probe did not run)"
+                  or "no soundcards" in latest
+                  or "controlC" in latest):
+              lines = latest.splitlines()
+              start = next((i for i, l in enumerate(lines) if "sound card" in l.lower()), None)
+              section = ("\n".join(lines[start:start + 25]) if start is not None
+                         else "(no 'sound card' heading found in the bundle at all "
+                              "— then the probe really did not run)")
+              raise AssertionError(
+                  "kernel sound-card probe produced no RECOGNISED HW verdict.\n"
+                  "Expected one of: 'no /proc/asound/cards' | 'no /dev/snd' | "
+                  "'controlC'.\n"
+                  "--- the bundle's sound section, verbatim ---\n" + section
+              )
 
           # A per-boot file ALSO landed (history within this boot).
           bl.succeed("ls /tmp/hl/hart-boot-*.log | grep -v latest | grep -q .")

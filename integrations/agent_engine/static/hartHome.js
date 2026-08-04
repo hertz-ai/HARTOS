@@ -85,33 +85,37 @@
     return {
       hero: {
         eyebrow: 'Earned on the hive',
-        // amount is a NUMBER so the hero animates it UP (the value-first money
-        // moment). The unit is rendered separately so only the figure counts up.
-        amount: 2140,
+        // ZERO, never a fabricated figure (2026-07-24). This is the FALLBACK the
+        // home paints before/without live data, and fetchEarnings KEEPS it on
+        // 401/offline -- so a fabricated number here is what a fresh or offline box
+        // actually shows the user (the real-HW "2,140 Spark / 3 agents / 41 tasks"
+        // on a just-installed machine). A number is still used so the hero's
+        // count-up animation works; it just counts up from and to a truthful 0.
+        amount: 0,
         amount_unit: 'Spark',
-        agents: 3,
-        tasks: 41,
+        agents: 0,
+        tasks: 0,
         local: true,
         // Honest state (d1.1): no payout rail is wired yet, so the real Spark is
         // the figure and the money is marked pending. This sample is only the
         // OFFLINE skeleton; refresh() overwrites it with the real ledger.
         payout_pending: true,
-        // tiny settlement series -> the hero sparkline (real rows replace it).
-        spark_series: [120, 90, 160, 130, 210, 180, 260, 230, 320, 300, 360],
+        // No invented settlement series -- the sparkline stays empty until real
+        // settlement rows arrive (fetchEarnings fills it).
+        spark_series: [],
         primary: { label: 'Resume', action: 'resume', target: 'recipes' },
         secondary: { label: 'Ask anything', action: 'ask' }
       },
       rows: [
         {
+          // Continue = the user's OWN in-progress work. Empty until fetchAgents
+          // finds live agents; render() paints the honest "Nothing here yet" card
+          // for an empty row. The old six invented half-done tasks ("Trip to Goa
+          // 30%", "Invoice chaser 80%", "Fix STT streaming 45%"...) persisted on a
+          // fresh box because fetchAgents returns early when there are no agents,
+          // so a brand-new machine showed someone else's fake history.
           title: 'Continue', accent: 'teal', see_all: 'agents_browse',
-          cards: [
-            { title: 'Weekly recap', icon: 'edit_note', progress: 0.62, action: 'resume' },
-            { title: 'Trip to Goa', icon: 'beach_access', progress: 0.30, action: 'resume' },
-            { title: 'Invoice chaser', icon: 'receipt_long', progress: 0.80, action: 'resume' },
-            { title: 'Fix STT streaming', icon: 'build', progress: 0.45, action: 'resume' },
-            { title: 'Resume builder', icon: 'description', progress: 0.15, action: 'resume' },
-            { title: 'Inbox triage', icon: 'mark_email_unread', progress: 0.90, action: 'resume' }
-          ]
+          cards: []
         },
         // FLAGSHIP agents row - the REAL HART OS product agents, always featured
         // (flagship:true keeps refresh() from replacing it with live dashboard
@@ -145,15 +149,15 @@
           ]
         },
         {
+          // "from the network" -- so it must come FROM the network. There is no
+          // fetch that ever populates this row (grep-verified), so its five entries
+          // (Invoice Chaser / Resume Builder / Sheet Wizard / Trip Planner / Deal
+          // Hunter) were permanent fiction presented as live hive activity. Empty
+          // until a real feed exists; render() shows the honest empty card, and the
+          // agent's compose() can still fill it over A2UI.
           title: 'Top agents in the hive today', note: 'from the network',
           accent: 'magenta', see_all: 'communities', ranked: true,
-          cards: [
-            { title: 'Invoice Chaser', icon: 'receipt_long', action: 'open', target: 'communities' },
-            { title: 'Resume Builder', icon: 'description', action: 'open', target: 'communities' },
-            { title: 'Sheet Wizard', icon: 'table_chart', action: 'open', target: 'communities' },
-            { title: 'Trip Planner', icon: 'flight_takeoff', action: 'open', target: 'communities' },
-            { title: 'Deal Hunter', icon: 'local_offer', action: 'open', target: 'communities' }
-          ]
+          cards: []
         }
       ]
     };

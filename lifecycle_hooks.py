@@ -211,24 +211,48 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
                         "moved to %s — skipping invalid transition (authoritative "
                         "FSM is ActionState).", task_id, task.status, state.value)
                 else:
+                    _apply = True
                     if _recover_failed:
                         if _is_possible_masked_failure(_recover_failed, state):
-                            _MASKED_FAILURE_STATE['count'] += 1
-                            _n = _MASKED_FAILURE_STATE['count']
-                            # Warn ONCE per process, then debug — #56 de-spammed
-                            # this exact path; the counter is the aggregate signal.
-                            (logger.warning if _n == 1 else logger.debug)(
-                                "#139 possible MASKED FAILURE (#%d this run): ledger "
-                                "FAILED → COMPLETED for %s via TERMINATED (a forced/"
-                                "give-up terminal, NOT a verified success) — audit "
-                                "the completed count. Behaviour unchanged; preventing "
-                                "this is a policy call (#139).", _n, task_id)
+                            # #139 policy, finally made (task #6): disambiguate
+                            # the forced terminal by the BANKED ARTIFACT.
+                            _artifact = _banked_artifact_exists(task)
+                            if _artifact is False:
+                                # No proof-of-work → the force-terminate masked a
+                                # genuine failure. The ledger stays FAILED (the
+                                # honest signal the daemon's retry loop acts on)
+                                # instead of inflating the completed count.
+                                _apply = False
+                                _MASKED_FAILURE_STATE['prevented'] += 1
+                                _n = _MASKED_FAILURE_STATE['prevented']
+                                (logger.warning if _n == 1 else logger.debug)(
+                                    "#139 masked failure PREVENTED (#%d this run): "
+                                    "%s reached TERMINATED with NO banked artifact "
+                                    "— ledger stays FAILED (was: silently flipped "
+                                    "to COMPLETED).", _n, task_id)
+                            else:
+                                # True → genuine recovery (artifact banked);
+                                # None → coordinates unknown, FAIL OPEN to the
+                                # historical reconcile (never block the flywheel
+                                # on a heuristic that couldn't run).
+                                _MASKED_FAILURE_STATE['count'] += 1
+                                _n = _MASKED_FAILURE_STATE['count']
+                                # Warn ONCE per process, then debug — #56
+                                # de-spammed this exact path; the counter is the
+                                # aggregate signal.
+                                (logger.warning if _n == 1 else logger.debug)(
+                                    "#139 possible MASKED FAILURE (#%d this run): "
+                                    "ledger FAILED → COMPLETED for %s via "
+                                    "TERMINATED (banked artifact: %s).",
+                                    _n, task_id,
+                                    'present' if _artifact else 'unknown')
                         else:
                             logger.info(
                                 "Reconciled stale ledger FAILED → COMPLETED for %s "
                                 "(ActionState %s authoritative — recovered work).",
                                 task_id, state.value)
-                    ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
+                    if _apply:
+                        ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
 
             # === BLOCKED REASON: set specific reason based on ActionState source ===
             if ledger_status == LedgerTaskStatus.BLOCKED:
@@ -410,7 +434,39 @@ _TERMINAL_STATES = (ActionState.COMPLETED, ActionState.TERMINATED, ActionState.E
 # reconcile logs a WARNING only ONCE per process (then debug), because #56
 # deliberately de-spammed this path (it WARN-spammed ~100/run) — a per-event
 # warning here would re-introduce that.
-_MASKED_FAILURE_STATE = {'count': 0}
+# 'prevented' (task #6, the #139 policy call finally made): masked failures
+# the reconcile now REFUSES to flip — TERMINATED over a FAILED ledger with
+# no banked artifact stays FAILED (see _banked_artifact_exists).
+_MASKED_FAILURE_STATE = {'count': 0, 'prevented': 0}
+
+
+def _banked_artifact_exists(task):
+    """The action's banked recipe on disk — the PROOF-OF-WORK disambiguator
+    for the #139 masked-failure policy (task #6).
+
+    TERMINATED does not carry WHY it terminated (success cleanup vs
+    force-kill of a stalled/failed action). The banked action recipe
+    (prompts/{prompt_id}_{flow_id}_{action_id}.json, the spark-economy
+    ground truth: recipe-existence proves the work happened) does:
+
+      True  -> the recipe was banked; a FAILED->COMPLETED reconcile is a
+               GENUINE recovery (the #128 un-trap).
+      False -> no artifact; the forced terminal masked a real failure and
+               COMPLETED would be a lie.
+      None  -> unknown (task lacks recipe coordinates, or the path check
+               errored) — callers FAIL OPEN to the historical reconcile
+               behaviour, never blocking the flywheel on this heuristic.
+    """
+    try:
+        p = getattr(task, 'recipe_prompt_id', None)
+        f = getattr(task, 'recipe_flow_id', None)
+        a = getattr(task, 'recipe_action_id', None)
+        if p is None or f is None or a is None:
+            return None
+        from helper import safe_prompt_path
+        return os.path.exists(safe_prompt_path(str(p), str(f), str(a)))
+    except Exception:
+        return None
 
 
 def _is_possible_masked_failure(recover_failed, action_state):
@@ -464,6 +520,62 @@ def stall_guard_step(prev_stuck_key, prev_iters, action_id, state,
     key = (action_id, state)
     iters = (prev_iters + 1) if prev_stuck_key == key else 1
     return key, iters, iters > cap
+
+
+# How many times one action may RE-ENTER a state it has already been in before
+# the CREATE loop gives up.  6 leaves room for the legitimate retry rounds the
+# recipe phase already does (request -> parse fail -> re-request) while still
+# catching a cycle long before the 300-iteration hard cap.
+CYCLE_GUARD_MAX_REVISITS = 6
+
+
+def cycle_guard_step(prev_key, prev_entries, action_id, state, recipe_exists):
+    """Pure no-NET-progress tracker: catches an action CYCLING through states.
+
+    Complement to ``stall_guard_step``, which catches an action STUCK IN ONE
+    state and by design treats every state change as progress and every terminal
+    state as a reset.  Those are the right semantics for a state machine that
+    advances monotonically — and exactly why an action that goes round in a
+    circle escapes it: the key changes on each transition so the counter
+    restarts, and revisiting COMPLETED/TERMINATED hard-resets it to 0.
+
+    Live 2026-08-04, one 40s window, action 2:
+        assigned -> in_progress -> status_verification_requested -> completed
+        -> terminated -> recipe_requested -> terminated -> recipe_requested
+        -> recipe_received
+    Seven states, no net progress, guard never fired, loop ran toward
+    max_iterations=300 and starved the chat hot path.
+
+    Counts ENTRIES into a state, not iterations spent in it.  That distinction
+    is load-bearing: an action legitimately working in IN_PROGRESS for the full
+    ``STALL_GUARD_INPROGRESS_ITERS`` window is ONE entry and must never trip
+    this, while an action bouncing back into RECIPE_REQUESTED again and again
+    accrues one count per bounce.
+
+    Returns ``(key, entries, should_break)``:
+      * ``key``     — opaque ``(action_id, state)`` the caller threads back, used
+                      to spot the next real transition.
+      * ``entries`` — opaque ``{state: entry_count}`` for the CURRENT action.
+      * resets whenever the current action changes (the pipeline genuinely moved
+        on) or that action's OWN recipe lands on disk.
+
+    Terminal states are deliberately NOT special-cased here: re-entering
+    COMPLETED/TERMINATED is the cycle's signature, not evidence of progress.  A
+    genuinely finished action still resets, because ``current_action`` advances
+    and ``action_id`` therefore changes.
+
+    Pure — no I/O, no logging.  Guarded by tests/unit/test_stall_guard.py.
+    """
+    if recipe_exists:
+        return None, {}, False
+    prev_action, prev_state = prev_key if prev_key else (None, None)
+    if prev_action != action_id:
+        return (action_id, state), {state: 1}, False
+    entries = dict(prev_entries or {})
+    if state != prev_state:                      # a real transition INTO `state`
+        entries[state] = entries.get(state, 0) + 1
+    return ((action_id, state), entries,
+            max(entries.values(), default=0) > CYCLE_GUARD_MAX_REVISITS)
 
 
 # Minimal valid recipe the model is told to emit as a last resort so a wedged

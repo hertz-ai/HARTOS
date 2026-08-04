@@ -107,7 +107,7 @@ in
       hart.liquidUI = {
         enable = true;
         renderer = "webkit";
-        voiceEnabled = false;
+        voiceEnabled = pkgs.lib.mkForce false;
       };
 
       # ── A real display manager (the whole point) ──
@@ -129,12 +129,20 @@ in
         wayland = true;
       };
 
-      # GDM pulls nixpkgs' graphical-desktop module, which mkDefaults
-      # fs.inotify.max_user_watches; hart-base.nix ALSO mkDefaults it -> two
-      # equal-priority mkDefaults collide ("defined multiple times"). mkForce
-      # wins over both (same class as the b86aa93 session-supervisor fix for its
-      # DM path). The CI eval gate caught this; verified-by-CI on re-push.
-      boot.kernel.sysctl."fs.inotify.max_user_watches" = pkgs.lib.mkForce 524288;
+      # NO fs.inotify.max_user_watches override here — deliberately.
+      #
+      # This test used to mkForce 524288 to break a collision between
+      # graphical-desktop's mkDefault (pulled in by GDM) and hart-base.nix's
+      # mkDefault. That reasoning was correct WHEN WRITTEN, but hart-kernel.nix
+      # later began mkForce-ing the same option to 1048576, and the profile
+      # enables hart.kernel — so this line became a SECOND mkForce at equal
+      # priority with a DIFFERENT value, which is itself the "defined multiple
+      # times" error. The workaround became the bug.
+      #
+      # hart-kernel's mkForce already beats both mkDefaults, so the original
+      # collision cannot recur; keeping a test-local copy would just be a
+      # parallel path that drifts from production tuning. Verified 2026-08-02
+      # against the eval error naming `nodes.shell...max_user_watches`.
 
       # Autologin hart-admin straight into the cage floor — exactly the pin
       # desktop.nix ships (defaultSession = "hart-shell"), but without importing
@@ -175,15 +183,106 @@ in
           body = shell.succeed("curl -fs http://localhost:6800/shell/static/hartHero.js")
           assert body.strip(), "/shell/static/hartHero.js served EMPTY — dead-husk"
 
+      with subtest("right-click 'Ask <Product>' is SERVED and branded (task #11)"):
+          # Three separate ways this feature can be present-but-dead, so all
+          # three are checked. A file existing in the repo proves none of them:
+          #   1. the shell must REFERENCE the script,
+          #   2. the server must SERVE it non-empty (the dead-husk failure),
+          #   3. the served copy must still carry the per-product BRANDING,
+          #      which is the whole point of the task — "Ask HART" in OS mode,
+          #      "Ask Nunba" in Nunba mode, never a hardcoded product name.
+          #
+          # Written this way because the same day found two nixosTests that
+          # existed and had never run, and a shell JS module is exactly as easy
+          # to leave unreferenced.
+          page = shell.succeed("curl -fs http://localhost:6800/")
+          assert "hartAskMenu.js" in page, (
+              "the shell page does not reference hartAskMenu.js — the "
+              "right-click Ask entry is in the repo but never loaded")
+          ask = shell.succeed(
+              "curl -fs http://localhost:6800/shell/static/hartAskMenu.js")
+          assert ask.strip(), (
+              "/shell/static/hartAskMenu.js served EMPTY — referenced but not "
+              "served, which looks identical to working from the page source")
+          # The label is COMPUTED from the installed product, not literal.
+          assert "product()" in ask, (
+              "hartAskMenu.js no longer derives its label from product() — a "
+              "hardcoded name is the drift this task exists to prevent")
+          assert "'Ask '" in ask, (
+              "hartAskMenu.js no longer builds an 'Ask <Product>' label at all")
+
       # ════════════════════════════════════════════════════════════════
       # 1. REGISTRATION — GDM materialized the cage hart-shell wayland-session
       # ════════════════════════════════════════════════════════════════
       # floor-lock can only prove the launcher is in the *closure* (no DM to
       # register it); with GDM here, sessionData puts the .desktop on the runtime
       # search path. This is the real "the floor IS the session" proof.
-      session_desktop = "/run/current-system/sw/share/wayland-sessions/hart-shell.desktop"
+      # The path is RESOLVED, not assumed. This assertion hard-coded
+      # /run/current-system/sw/share/... — the environment.systemPackages
+      # path — but the session is registered through
+      # `services.displayManager.sessionPackages` (hart-liquid-ui.nix:635),
+      # which feeds displayManager **sessionData**, a separate store path.
+      # The subtest name says "sessionData materialized"; the assertion was
+      # checking somewhere else, and the failure ("test -f ... failed") named
+      # only the path it guessed, never what actually exists (run 30774512407).
+      #
+      # So: look in every place a wayland session can legitimately land, and
+      # if it is in none of them, SHOW the directories rather than asserting a
+      # path. A registration test that cannot say where it looked sends the
+      # reader hunting for a missing file that is simply elsewhere.
+      session_desktop = shell.succeed(
+          "for d in /run/current-system/sw/share/wayland-sessions "
+          "         /etc/X11/sessions "
+          "         /run/current-system/sw/share/xsessions; do "
+          "  [ -f \"$d/hart-shell.desktop\" ] && echo \"$d/hart-shell.desktop\" && exit 0; "
+          "done; "
+          # sessionData is a store path referenced by the DM unit; find it.
+          "ls -d /nix/store/*-desktops/share/wayland-sessions/hart-shell.desktop "
+          "  2>/dev/null | head -1"
+      ).strip()
+      with subtest("offline voice floor: the box can SPEAK with no network (task #7)"):
+          # A nixosTest node has NO outbound network, which is exactly the
+          # fresh-box case: the Model Bus has no model and nothing can be
+          # downloaded. Before 0cd59eb1 there was no speech synthesizer in the
+          # closure AT ALL — espeak-ng existed only in hart-accessibility.nix
+          # behind screenReader.enable (default false, set by no profile) — so
+          # the narrated onboarding and the orb were simply SILENT on first
+          # boot, which is the one moment the OS is supposed to introduce
+          # itself by talking.
+          #
+          # ASSERT THE OUTCOME, NOT THE PACKAGE. `command -v espeak-ng` would
+          # prove the dependency landed; it would not prove the box can
+          # actually produce audio. So synthesise to a WAV and check the file
+          # has real content — the same reasoning as the num2words assertion
+          # in hart-app-install-verify.nix, where a silently-degrading
+          # component made presence and function two different questions.
+          shell.succeed("command -v espeak-ng")
+          size = int(shell.succeed(
+              "espeak-ng --stdout 'hart o s is ready' > /tmp/hart-voice.wav; "
+              "stat -c %s /tmp/hart-voice.wav").strip())
+          assert size > 1000, (
+              f"espeak-ng produced only {size} bytes of audio — it is present "
+              f"but cannot synthesise, so a no-network box is still mute")
+
       with subtest("GDM registered the cage 'hart-shell' wayland-session (sessionData materialized)"):
-          shell.succeed(f"test -f {session_desktop}")
+          if not session_desktop:
+              dirs = shell.succeed(
+                  "echo '--- sw/share/wayland-sessions ---'; "
+                  "ls -la /run/current-system/sw/share/wayland-sessions 2>&1 | head -20; "
+                  "echo '--- any *-desktops store paths ---'; "
+                  "ls -d /nix/store/*-desktops 2>/dev/null | head -5; "
+                  "echo '--- sessionPackages referenced by the DM unit ---'; "
+                  "systemctl cat display-manager.service 2>/dev/null | grep -i session | head -10 || true"
+              )
+              raise AssertionError(
+                  "hart-shell.desktop is registered NOWHERE a wayland session "
+                  "can be found. hart-liquid-ui.nix:635 sets "
+                  "services.displayManager.sessionPackages = [ kioskSession ] "
+                  "under `mkIf (ui.renderer == \"webkit\")`, and the desktop "
+                  "profile sets renderer = \"webkit\", so it SHOULD be "
+                  "registered.\n" + dirs
+              )
+          shell.log(f"hart-shell session registered at: {session_desktop}")
           entry = shell.succeed(f"cat {session_desktop}")
           # The registered session must point at the cage launcher (the floor),
           # not some other compositor — the session IS the cage floor.
@@ -220,6 +319,90 @@ in
               "glass shell missing WEBKIT_DISABLE_DMABUF_RENDERER — DMABUF path crashes GL-less"
           assert "WEBKIT_DISABLE_COMPOSITING_MODE=1" in glass, \
               "glass shell missing WEBKIT_DISABLE_COMPOSITING_MODE — compositing crashes GL-less"
+
+          # ── MIC ON THE CAGE FLOOR (task #3a) ──────────────────────────
+          # The real-HW 2026-07-18 incident: "clicking the mic hung the entire
+          # cage". WebKit2 routes getUserMedia capture through GStreamer, and a
+          # bare cage session sets NO GST_PLUGIN_SYSTEM_PATH_1_0 — so pulsesrc
+          # and valve were invisible and WebKitWebProcess SIGSEGV'd. The fix
+          # back-ported the GTK4 host's plugin path to this never-fail floor.
+          #
+          # ASSERT THE PATH RESOLVES TO REAL PLUGINS, not merely that the
+          # variable is exported. The original bug was exactly an exported
+          # path that resolved to an EMPTY directory: makeSearchPath was used
+          # where makeSearchPathOutput "out" was needed, because gstreamer
+          # core's default output is `bin`. A present-but-empty path looks
+          # identical to a correct one in the script text, and is what made the
+          # mic hang while everything appeared configured.
+          gst_path = shell.succeed(
+              f"awk -F= '/GST_PLUGIN_SYSTEM_PATH_1_0=/{{print $2; exit}}' {glass_path}"
+          ).strip().strip('"')
+          assert gst_path, (
+              "the cage floor's launcher exports no GST_PLUGIN_SYSTEM_PATH_1_0 "
+              "— a mic click SIGSEGVs WebKitWebProcess and takes the cage with "
+              "it (the 2026-07-18 real-HW hang)")
+          # pulsesrc is the capture SOURCE; coreelements holds `valve`. Their
+          # absence is the exact shape of the incident.
+          for element_so in ("libgstpulseaudio.so", "libgstcoreelements.so"):
+              hits = shell.succeed(
+                  f"found=0; for d in $(echo '{gst_path}' | tr ':' ' '); do "
+                  f"  [ -e \"$d/{element_so}\" ] && found=1; "
+                  f"done; echo $found").strip()
+              assert hits == "1", (
+                  f"{element_so} is not on GST_PLUGIN_SYSTEM_PATH_1_0 "
+                  f"({gst_path!r}) — the path is exported but does not resolve "
+                  f"to the capture plugins, which is the empty-search-path bug "
+                  f"that made the mic hang look like a configured system")
+
+          # ── THE BOOT HEALTH-WAIT CANNOT HANG (task #8, item 2.2) ──────
+          # A backend that ACCEPTS the TCP connection and then never answers is
+          # the half-up case — a still-initialising Flask app looks exactly
+          # like this. `curl -sf` has NO total timeout, so the wait loop
+          #     for i in $(seq 1 30); do curl -sf "$URL/health" && break; sleep 1; done
+          # blocked forever on iteration 1: there was never an iteration 2, and
+          # "wait up to 30 seconds" was really "wait forever" on the single
+          # failure the loop exists to survive.
+          #
+          # EXERCISE THE FLAGS THE SHIPPED LAUNCHER ACTUALLY USES, pulled out
+          # of the script itself, against a REAL black hole. Asserting that
+          # curl supports --max-time would prove nothing about our invocation.
+          flags = shell.succeed(
+              "grep -oE -- '--connect-timeout [0-9]+ --max-time [0-9]+' "
+              f"{glass_path} | head -1").strip()
+          assert flags, (
+              "the glass shell's health probe carries no timeout flags — a "
+              "half-up backend blocks the boot wait forever and the shell "
+              "never appears")
+
+          # listen() WITHOUT accept(): the kernel completes the handshake from
+          # the backlog, so curl connects and then waits for a reply that never
+          # comes. That is the half-up shape exactly, and it is what
+          # --connect-timeout alone would NOT catch.
+          #
+          # `python3` resolves on THIS node: the desktop profile sets
+          # devTools.enable = true, and hart-dev-tools.nix:42 ships python310
+          # (whose bin/ carries the python3 symlink). Checked rather than
+          # assumed — hart-installer.nix and native-subsystems.nix are both
+          # mkNode "desktop" and already call bare python3, so the dependency
+          # is established, not introduced here.
+          shell.succeed(
+              "nohup python3 -c \"import socket, time; "
+              "s = socket.socket(); "
+              "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); "
+              "s.bind(('127.0.0.1', 9911)); s.listen(8); time.sleep(600)\" "
+              ">/dev/null 2>&1 & sleep 2")
+
+          # Timed INSIDE the guest — driver round-trip latency would blur a
+          # bound this tight.
+          waited = int(shell.succeed(
+              "start=$(date +%s); "
+              f"curl -sf {flags} http://127.0.0.1:9911/health >/dev/null 2>&1 || true; "
+              "echo $(( $(date +%s) - start ))").strip())
+          assert waited <= 15, (
+              f"the shipped health probe took {waited}s against a backend that "
+              f"accepts and never answers — it is not bounded, so the boot "
+              f"wait can still hang (flags were {flags!r})")
+          shell.log(f"health probe bounded: returned in {waited}s using {flags}")
 
       # ════════════════════════════════════════════════════════════════
       # 3. FIRST WEBVIEW FRAME PAINTS ON llvmpipe (the broken-GPU floor)

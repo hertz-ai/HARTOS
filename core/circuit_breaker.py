@@ -64,7 +64,7 @@ class CircuitBreaker:
         """Internal state check (caller must hold lock)."""
         if self._failures < self.threshold:
             return CircuitState.CLOSED
-        elapsed = time.time() - self._opened_at
+        elapsed = time.monotonic() - self._opened_at
         if elapsed > self.cooldown:
             return CircuitState.HALF_OPEN
         return CircuitState.OPEN
@@ -94,7 +94,7 @@ class CircuitBreaker:
             self._failures += 1
             self._half_open_in_flight = False
             if self._failures >= self.threshold:
-                self._opened_at = time.time()
+                self._opened_at = time.monotonic()
                 logger.warning(
                     f"[CircuitBreaker:{self.name}] OPEN after "
                     f"{self._failures} failures. Cooldown {self.cooldown}s.")
@@ -186,7 +186,7 @@ class PeerBackoff:
             entry = self._entries.get(key)
             if not entry:
                 return False
-            return time.time() < entry[0]
+            return time.monotonic() < entry[0]
 
     def record_failure(self, key: str):
         with self._lock:
@@ -195,7 +195,7 @@ class PeerBackoff:
                 new_delay = min(entry[1] * 2, self.maximum)
             else:
                 new_delay = self.initial
-            self._entries[key] = (time.time() + new_delay, new_delay)
+            self._entries[key] = (time.monotonic() + new_delay, new_delay)
 
     def record_success(self, key: str):
         with self._lock:
@@ -204,7 +204,7 @@ class PeerBackoff:
     def prune_expired(self):
         """Remove entries whose backoff period has elapsed."""
         with self._lock:
-            now = time.time()
+            now = time.monotonic()
             expired = [k for k, (retry_at, _) in self._entries.items()
                        if now >= retry_at]
             for k in expired:

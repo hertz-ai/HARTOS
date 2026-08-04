@@ -120,18 +120,46 @@ in
               "/run/systemd/system 2>/dev/null | xargs -r grep -l -i android")
 
       with subtest("Waydroid first-boot init is NEVER-FAIL (oneshot + hart.target child, not graphical)"):
-          unit = host.succeed("systemctl cat hart-waydroid-init.service")
-          assert "Type=oneshot" in unit, "waydroid init must be Type=oneshot (non-blocking)"
-          assert "RemainAfterExit=yes" in unit, "waydroid init must RemainAfterExit (idempotent oneshot)"
+          # Assert via `systemctl show` (systemd-NORMALIZED properties), not
+          # `systemctl cat` file literals: NixOS renders the Nix boolean as
+          # RemainAfterExit=true in the file (systemd accepts both spellings)
+          # and wires wantedBy as .wants SYMLINKS, never an [Install] section —
+          # the old literal greps failed against a CORRECT unit on every run
+          # (run 30485906966; this was the whole test's red).
+          def unit_prop(prop):
+              return host.succeed(
+                  "systemctl show -p " + prop
+                  + " --value hart-waydroid-init.service").strip()
+          assert unit_prop("Type") == "oneshot", "waydroid init must be Type=oneshot (non-blocking)"
+          assert unit_prop("RemainAfterExit") == "yes", "waydroid init must RemainAfterExit (idempotent oneshot)"
           # Pulled in by hart.target (a plain HART child) — NOT multi-user ->
           # graphical, which formed the ordering cycle the old runtime hit.
-          assert "WantedBy=hart.target" in unit, \
+          wanted_by = unit_prop("WantedBy")
+          assert "hart.target" in wanted_by, \
               "waydroid init must be wantedBy=hart.target (avoids the graphical ordering cycle)"
-          assert "graphical.target" not in unit, \
+          assert "graphical.target" not in wanted_by + unit_prop("After") + unit_prop("Before"), \
               "waydroid init must NOT order against graphical.target (#ordering-cycle lesson)"
           # ConditionPathExists guard makes it skip once images exist (idempotent).
-          assert "ConditionPathExists=!/var/lib/waydroid/images/system.img" in unit, \
-              "waydroid init must guard on the system image (idempotent first-boot only)"
+          #
+          # NOT via `systemctl show -p ConditionPathExists`. Conditions are the
+          # one thing the note above does not apply to: systemd does NOT expose
+          # them as individual properties — they live in the aggregate
+          # `Conditions` property — so `show -p ConditionPathExists --value`
+          # returns EMPTY and the assertion failed against a unit that carries
+          # the guard correctly (hart-subsystems.nix sets
+          # unitConfig.ConditionPathExists). That is the same shape as the
+          # literal-grep red this subtest was already rewritten once to escape:
+          # a probe reading a field that does not exist, blamed on the OS.
+          #
+          # `systemctl cat` reads the GENERATED unit out of the store, so this
+          # is still the runtime artefact and not a source grep. Accept the
+          # aggregate form too, in case systemd starts reporting it.
+          cond = host.succeed(
+              "systemctl cat hart-waydroid-init.service 2>/dev/null | "
+              "grep -i '^Condition' || true") + unit_prop("Conditions")
+          assert "!/var/lib/waydroid/images/system.img" in cond, (
+              "waydroid init must guard on the system image (idempotent "
+              "first-boot only). Conditions seen:\n" + (cond or "(none)"))
 
       with subtest("Waydroid init does NOT block boot when its image download fails (no-net tolerant)"):
           # On this offline VM `waydroid init` cannot download images, but the

@@ -53,7 +53,18 @@ jobs:
         # self-skip when the heavy shell module can't import (this stays a fast,
         # deps-light gate); requests just lets the fixture chain + the node/source
         # guards run green.
-        run: python -m pip install --upgrade pip pytest requests
+        #
+        # `flask` joins it for the SAME reason, one incident later (2026-08-03):
+        # the session-state round-trip tests build the shell's Flask app, and
+        # flask is imported LAZILY inside LiquidUIService._create_flask_app —
+        # so the module imports fine and the tests' own skip-guard (which wraps
+        # only the import) does not fire. They died at CALL time with
+        # `ModuleNotFoundError: No module named 'flask'` instead of skipping,
+        # and this gate had been red on every run since at least 07-31.
+        # Installing it makes those tests RUN, which is better than teaching
+        # them to skip: they are the behavioural half that the source-shape
+        # guard beside them is explicitly not allowed to replace.
+        run: python -m pip install --upgrade pip pytest requests flask
 
       # The node + source tests always run (no heavy deps). The render tests
       # self-skip if the shell module can't import in a minimal runner.

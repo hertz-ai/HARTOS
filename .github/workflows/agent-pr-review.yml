@@ -1,0 +1,158 @@
+# Peer review for agent-authored PRs, using the review policy this repo already has.
+#
+# The policy is NOT defined here. It lives in
+# integrations/agent_engine/pr_review_service.py, which has carried the decision
+# matrix since it was written:
+#
+#   tests fail                            -> request_changes
+#   baseline regression                   -> request_changes
+#   tests pass, no regression, simple     -> approve
+#   tests pass, no regression, complex    -> flag_steward
+#
+# and core/platform/pr_guardian.py adds the AST analysis behind "complex":
+# cyclomatic complexity, function length, nesting depth, imports. Both are
+# tested. Neither had a trigger, so on every PR the repo has ever received, the
+# review service did not run.
+#
+# That is the same shape as two other bugs found on 2026-07-27: record_to_video
+# existed with no caller, and the co-pilot's nixos-rebuild step could not
+# execute. Code that ships is not code that runs.
+#
+# This file is the trigger and nothing else. If the policy is wrong, change
+# pr_review_service.py; do not add rules here, or the repo ends up with two
+# answers and no way to tell which one governed a merge.
+#
+# `flag_steward` is where open source review enters: a complex change from an
+# agent stops and waits for a person. That is the human-in-the-loop step, and it
+# is a decision the daemon cannot make for itself.
+#
+# LIMIT: `main` has no branch protection, so a failure reports rather than
+# blocks. Making this a required check is a repository setting and the owner's
+# call. See VERIFICATION.md.
+name: Agent PR review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+concurrency:
+  # only the newest push to a PR is worth reviewing.
+  # Same shape as nix-check/coverage-baseline (3f5ee290): a manual
+  # workflow_dispatch gets its OWN group keyed by run id, so an
+  # on-demand run is never cancelled by an unrelated later push.
+  group: agent-pr-review-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Review policy (pr_review_service)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Is this an agent PR?
+        id: origin
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          agent=false
+          # start_branch() cuts copilot/<slug>-<epoch> from origin/main.
+          case "$HEAD_REF" in copilot/*) agent=true ;; esac
+          # And the daemon names itself in the body, so a hand-renamed branch still matches.
+          case "$PR_BODY" in *"resident co-pilot daemon"*) agent=true ;; esac
+          echo "agent=$agent" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD_REF agent=$agent"
+
+      - name: Check out the base, not the PR head
+        if: steps.origin.outputs.agent == 'true'
+        uses: actions/checkout@v4
+        with:
+          # pull_request_target runs with repo secrets. Checking out the PR head
+          # would run a contributor's code with them. Take the base ref; the
+          # review service fetches the diff through the API by number.
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      - uses: actions/setup-python@v5
+        if: steps.origin.outputs.agent == 'true'
+        with:
+          python-version: '3.10'
+
+      - name: Run the repo's review policy
+        if: steps.origin.outputs.agent == 'true'
+        id: review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -uo pipefail
+          python - <<'PY' | tee review.json
+          import json, os, sys
+          sys.path.insert(0, os.getcwd())
+          try:
+              from integrations.agent_engine.pr_review_service import PRReviewService
+          except Exception as e:
+              # Never silently pass. An import failure means the policy did not
+              # run, which is not the same as a PR being fine.
+              print(json.dumps({'decision': 'error',
+                                'reason': f'could not import PRReviewService: {e}'}))
+              raise SystemExit(0)
+          try:
+              out = PRReviewService.review_pr(os.environ['REPO_URL'],
+                                              int(os.environ['PR_NUMBER']))
+          except Exception as e:
+              out = {'decision': 'error', 'reason': f'review_pr raised: {e}'}
+          print(json.dumps({'decision': out.get('decision'),
+                            'reason': out.get('reason')}))
+          PY
+
+      - name: Apply the decision
+        if: steps.origin.outputs.agent == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          decision=$(python -c "import json;print(json.load(open('review.json')).get('decision') or 'error')")
+          reason=$(python -c "import json;print(json.load(open('review.json')).get('reason') or '')")
+          echo "decision=$decision"
+          echo "reason=$reason"
+
+          case "$decision" in
+            approve)
+              # The service approving is not a human approving. It says the change
+              # is simple and green; a person still merges it.
+              echo "Policy: $reason"
+              echo "Simple and green. A person still presses merge."
+              ;;
+            flag_steward)
+              # Look for a real approval from someone other than the author.
+              approvals=$(gh api "repos/$REPO/pulls/$PR/reviews" \
+                --jq "[.[] | select(.state==\"APPROVED\") | select(.user.login != \"$AUTHOR\")] | length")
+              echo "Human approvals (excluding $AUTHOR): $approvals"
+              if [ "$approvals" -lt 1 ]; then
+                echo "Policy: $reason"
+                echo "A complex change from an agent waits for a person. Read the diff."
+                exit 1
+              fi
+              echo "Reviewed by a human."
+              ;;
+            request_changes)
+              echo "Policy: $reason"
+              exit 1
+              ;;
+            *)
+              echo "The review policy did not produce a decision: $reason"
+              echo "Treating that as unreviewed rather than as passing."
+              exit 1
+              ;;
+          esac
+
+      - name: Not an agent PR
+        if: steps.origin.outputs.agent != 'true'
+        run: echo "Ordinary human review applies."

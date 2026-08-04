@@ -8,9 +8,9 @@
 >
 > **Companions:** [`HART_OS_NATIVE_ARCHITECTURE.md`](HART_OS_NATIVE_ARCHITECTURE.md)
 > §6 (Never-Fail Tiering) and [`../../compositor/ROADMAP.md`](https://github.com/hertz-ai/HARTOS/blob/main/compositor/ROADMAP.md)
-> Phases 0–1. This contract is the load-bearing artifact that lets a half-finished
-> compositor **never** brick the box: the screen is never blank because the tier is
-> a latched, operator-clearable file, not a guess.
+> Phases 0–1. This contract is how a half-finished compositor is kept from bricking
+> the box: the screen is never blank because the tier is a latched,
+> operator-clearable file, not a guess.
 
 ---
 
@@ -91,8 +91,8 @@ whitespace beyond a single optional newline:
    (`hart-session-supervisor`), **not** an in-process Python thread.
    `node_watchdog` is structurally a thread supervisor and **must not** own this
    file — at most it emits a "compositor unhealthy" signal the supervisor consumes
-   (Phase 1). This separation is why the never-blank guarantee is real and not a
-   spec hand-wave.
+   (Phase 1). A thread supervisor cannot switch a display-manager session or latch
+   the choice across a reboot.
 
 ---
 

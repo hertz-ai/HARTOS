@@ -136,6 +136,40 @@ def _cached_node_count(what: str) -> int:
 class GossipProtocol:
     """Gossip-based peer discovery for HevolveBot network."""
 
+    @property
+    def base_url(self) -> str:
+        """This node's reachable base URL, as advertised to every peer.
+
+        LAZY ON PURPOSE.  ``gossip = GossipProtocol()`` runs at module scope
+        (bottom of this file), i.e. at IMPORT time — long before Flask binds
+        its port.  Resolving in __init__ therefore always loses the port race
+        and freezes the cold-boot fallback into `_self_info()['url']` for the
+        life of the process, so every peer that discovers us dials a dead port.
+
+        Delegates to the canonical ``core.port_registry.get_local_backend_url``
+        (Gate 4 — the same resolver hartos_bootstrap, agent_engine.dispatch,
+        channels.flask_integration and mcp._tool_impls already use).  That
+        function probes which port is actually LISTENING: standalone HARTOS
+        serves on backend (6777), the bundled desktop serves HARTOS in-process
+        on the Flask port (5000).
+
+        Cached only once it returns a real answer.  While nothing is listening
+        the resolver yields its backend fallback, and caching THAT is precisely
+        the bug — so we keep re-resolving until a port actually answers.
+        """
+        if self._base_url_final:
+            return self._base_url_cached
+
+        from core.port_registry import get_local_backend_url, get_port
+        url = get_local_backend_url()
+        # An explicit env override, or any answer that is not the
+        # nothing-is-listening fallback, is final.
+        fallback = f'http://localhost:{get_port("backend")}'
+        if os.environ.get('HEVOLVE_BASE_URL') or url != fallback:
+            self._base_url_final = True
+        self._base_url_cached = url
+        return url
+
     def __init__(self):
         # Identity — persisted across restarts so the central side can
         # dedupe joins by node_id.  Without persistence, every watchdog
@@ -146,9 +180,11 @@ class GossipProtocol:
         self.node_id = _load_or_create_node_id()
         self.node_name = os.environ.get(
             'HEVOLVE_NODE_NAME', f'hevolve-{self.node_id[:8]}')
-        from core.port_registry import get_port
-        self.base_url = os.environ.get(
-            'HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}').rstrip('/')
+        # base_url is a lazy @property (see above) — do NOT resolve it here.
+        # This runs at import time, before Flask binds, so any value computed
+        # now is the cold-boot fallback.
+        self._base_url_cached = ''
+        self._base_url_final = False
         self.version = '1.0.0'
         self.started_at = datetime.utcnow()
 
@@ -699,24 +735,76 @@ class GossipProtocol:
     # ─── Peer List ───
 
     def get_peer_list(self):
-        """Return all non-dead peers as dicts, including self."""
-        peers = self._load_peers_from_db(exclude_dead=True)
-        # Include self
-        self_info = self._self_info()
-        if not any(p.get('node_id') == self.node_id for p in peers):
-            peers.append(self_info)
+        """Return all non-dead REMOTE peers, plus this node's LIVE self-info.
+
+        Self is deliberately part of the list (callers render "this node"
+        alongside its peers), but it must NEVER be served from the PeerNode
+        table.
+
+        Task #596.  The previous version appended _self_info() only when the
+        DB did not already contain a row for our own node_id:
+
+            if not any(p.get('node_id') == self.node_id for p in peers):
+                peers.append(self_info)
+
+        Once a self-row exists in PeerNode, that guard is False and the fresh
+        _self_info() is silently discarded, so the node reports STALE data
+        about itself.  Nothing culls such a row either: _load_peers_from_db
+        filters on ``PeerNode.status != 'dead'`` — a status column, not a
+        last_seen age check — so it survives indefinitely.
+
+        Measured on a live node 2026-08-03: /api/social/peers returned its own
+        node_id with endpoint=None, every capability/compute field None, and
+        last_seen "2026-04-30T07:16:29" — 95 days stale while the node was
+        running and its gossip _send_loop was demonstrably alive.
+
+        Filtering self out of the DB result and unconditionally appending
+        _self_info() makes live self-state authoritative, and has the side
+        benefit that the self entry now always has ONE shape (_self_info's)
+        instead of flip-flopping with PeerNode.to_dict()'s.
+        """
+        peers = [
+            p for p in self._load_peers_from_db(exclude_dead=True)
+            if p.get('node_id') != self.node_id
+        ]
+        peers.append(self._self_info())
         return peers
 
+    def count_remote_peers(self):
+        """Number of known non-dead peers EXCLUDING self.
+
+        ``len(get_peer_list())`` is never 0 — self is always in it — so it
+        cannot answer "am I actually federated with anyone?".  Callers that
+        need that question answered must use this (task #596).
+        """
+        return sum(
+            1 for p in self._load_peers_from_db(exclude_dead=True)
+            if p.get('node_id') != self.node_id
+        )
+
     def get_health(self):
-        """Return this node's health info for the /health endpoint."""
+        """Return this node's health info for the /health endpoint.
+
+        ``peer_count`` counts REMOTE peers only.  Task #596 follow-up: this
+        method loads straight from PeerNode and used to report ``len(peers)``,
+        which includes the node's own persisted self-row — so a single machine
+        with zero federation partners advertised ``peer_count: 1``.  Measured
+        live 2026-08-03: /api/social/peers/health returned peer_count=1 while
+        count_remote_peers() returned 0 against the same table.
+
+        That number is user-visible — liquid_ui_service renders
+        ``health.peer_count`` directly — and it is also served to other nodes
+        over /api/social/peers/health, so the lie propagates across the mesh.
+        The key name is kept (consumers depend on it); only the value is
+        corrected.
+        """
         uptime = (datetime.utcnow() - self.started_at).total_seconds()
-        peers = self._load_peers_from_db(exclude_dead=True)
         return {
             'node_id': self.node_id,
             'name': self.node_name,
             'version': self.version,
             'uptime_seconds': int(uptime),
-            'peer_count': len(peers),
+            'peer_count': self.count_remote_peers(),
             'agent_count': self._get_count('agent'),
             'post_count': self._get_count('post'),
             'status': 'healthy',
@@ -1090,9 +1178,10 @@ class GossipProtocol:
         )
         db.add(new_peer)
 
-        # ─── Seamless Mind Merge ───
-        # Valid peer accepted - auto-federate so minds merge without friction.
-        # Connection is a breeze; the audit layer handles trust continuously.
+        # ─── Auto-federation ───
+        # Peer passed verification, so follow it now rather than waiting for an
+        # operator to do it by hand. Trust is re-checked by the integrity round
+        # below, which can mark the peer dead later.
         threading.Thread(
             target=self._auto_federate_peer,
             args=(node_id, url),
@@ -1102,8 +1191,8 @@ class GossipProtocol:
         return True
 
     def _auto_federate_peer(self, peer_node_id: str, peer_url: str):
-        """Auto-follow a newly accepted peer for seamless mind merge.
-        Valid peers get instant bidirectional content sharing - no manual step."""
+        """Auto-follow a newly accepted peer so its content starts flowing.
+        Runs on its own thread; failures are logged and dropped."""
         try:
             from .models import get_db
             from .federation import federation
