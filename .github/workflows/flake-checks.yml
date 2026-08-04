@@ -139,7 +139,14 @@ jobs:
     # files evenly and made the real cost visible.
     #
     # 8 ways is a SCALING fix, and only that: ~60 min per shard buys a verdict
-    # without changing what any test does. The actual problem is that some
+    # without changing what any test does. Measured balance over the real
+    # 710-file set: 92/85/100/104/94/86/78/71 (spread 33). Uneven by FILE
+    # COUNT is fine and expected from a hash split; what matters is that the
+    # slow files are no longer clustered, which is what `i % 4` was doing.
+    #
+    # (The commit that introduced this, fb204af9, quoted a different set of
+    # numbers in its message — they were written before the measurement and
+    # are wrong. These are the measured ones.) The actual problem is that some
     # tests wait on real network I/O (TestHttpPool made a live 15s request to
     # localhost:8080 on every run until ab407eda). --durations=25 now prints,
     # since the shards can finish, and that is the evidence to fix it properly.
