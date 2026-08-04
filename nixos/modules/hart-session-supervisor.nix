@@ -631,6 +631,28 @@ let
     export HART_SHELL_READY_FLAG="$READY"
     export HART_INPUT_ALIVE_FLAG="$INPUT_ALIVE"
 
+    # XDG_RUNTIME_DIR — DERIVED, never merely inherited.
+    #
+    # cage aborts immediately without it (`cage.c:299 XDG_RUNTIME_DIR is not set
+    # in the environment`), and so does every other wlroots compositor. It is
+    # normally supplied by pam_systemd, which greetd's startSession=true does
+    # create a logind session for — so inheritance SHOULD work, and the code
+    # relied on that.
+    #
+    # It does not always arrive. Run 30876035103 shows the floor crash-looping
+    # on exactly this line, on a node whose greetd session is configured with
+    # startSession=true. That surfaced only after the pixman fix (e740e422)
+    # got cage past its EGL failure — one blocker hid the next.
+    #
+    # A floor that "must NEVER fail" cannot depend on a variable being handed to
+    # it. /run/user/<uid> is what logind creates for an active session, so
+    # deriving it costs nothing and removes the dependency. Only set when
+    # ABSENT, so a correctly-populated environment is never overridden.
+    if [ -z "''${XDG_RUNTIME_DIR:-}" ]; then
+      export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+      echo "[hart-session-supervisor] XDG_RUNTIME_DIR was unset — derived $XDG_RUNTIME_DIR" >&2
+    fi
+
     # Run the session in the BACKGROUND so the paint-watchdog can observe a HUNG
     # tier (compositor up, shell never paints, process never exits). When it
     # EXITS (crash or clean), `wait` below returns its rc; greetd then relaunches
