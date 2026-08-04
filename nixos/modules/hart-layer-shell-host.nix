@@ -831,12 +831,23 @@ app.run(None)
     echo "[hart-gtk4-session] Tier-2 GL = HARDWARE (operator preferHardwareGL=true)" >&2
     '' else ''
     # GPU smoke-test gate: force software GL UNLESS the boot probe proved the GPU good
-    # (/run/hart/gpu-render == hardware). wlroots keeps its own pixman fallback via
-    # WLR_RENDERER_ALLOW_SOFTWARE, and a GPU that lies still drops to the cage floor.
-    # The chosen mode is logged to the journal so a real-HW boot shows what engaged.
+    # (/run/hart/gpu-render == hardware). The chosen mode is logged to the journal so
+    # a real-HW boot shows what engaged.
+    #
+    # WLR_RENDERER=pixman, not merely ALLOW_SOFTWARE. This comment used to read
+    # "wlroots keeps its own pixman fallback via WLR_RENDERER_ALLOW_SOFTWARE",
+    # which is the same misreading the cage floor carried:
+    # WLR_RENDERER_ALLOW_SOFTWARE PERMITS a software renderer, it does not
+    # SELECT one. wlroots stayed on its default GLES2 path, opened EGL against
+    # the DRM node, and Mesa refused the LIBGL_ALWAYS_SOFTWARE combination
+    # ("Not allowed to force software rendering when API explicitly selects a
+    # hardware device"), so the tier died instead of falling back — and then
+    # the cage floor died the same way, which is how a crash-loop reached the
+    # one tier that has nothing below it (run 30848154453).
     HART_GPU_VERDICT="$(cat /run/hart/gpu-render 2>/dev/null || echo unknown)"
     if [ "$HART_GPU_VERDICT" != "hardware" ]; then
       export LIBGL_ALWAYS_SOFTWARE=1
+      export WLR_RENDERER=pixman
       echo "[hart-gtk4-session] Tier-2 GL = SOFTWARE (gpu-render verdict: $HART_GPU_VERDICT)" >&2
     else
       echo "[hart-gtk4-session] Tier-2 GL = HARDWARE (gpu-render verdict: hardware)" >&2

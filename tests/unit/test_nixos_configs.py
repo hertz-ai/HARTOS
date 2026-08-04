@@ -3810,6 +3810,73 @@ class TestNoOrphanedNixosTests:
             f"never appears in `nix eval .#checks.x86_64-linux`.")
 
 
+class TestForcedSoftwareGLAlsoSelectsAPixmanRenderer:
+    """ALLOW_SOFTWARE permits a software renderer; it does not SELECT one (#15).
+
+    Both wlroots launchers forced Mesa to llvmpipe with LIBGL_ALWAYS_SOFTWARE
+    while leaving wlroots on its default GLES2 path. wlroots then opened EGL
+    against the DRM node and Mesa refused the combination outright:
+
+        libEGL warning: Not allowed to force software rendering when API
+                        explicitly selects a hardware device
+        [ERROR] [render/egl.c:268]  Failed to initialize EGL
+        [ERROR] [../cage.c:330]     Unable to create the wlroots renderer
+
+    So the tier died instead of degrading, and the CAGE FLOOR died the same
+    way — a crash-loop on the one tier with nothing beneath it. In run
+    30848154453 "greeter exited without creating a session" appeared 66x in
+    layer-shell-host-paint, 22x in desktop-shell-boot and 13x in the reboot
+    latch: one cause, several red checks.
+
+    Both files' comments already CLAIMED pixman ("Mesa llvmpipe + wlroots
+    pixman", "wlroots keeps its own pixman fallback via
+    WLR_RENDERER_ALLOW_SOFTWARE"), which is what made the gap easy to miss for
+    so long — the intent was written down and never implemented.
+
+    SOURCE GUARD, labelled: nix cannot be evaluated on the Windows dev box and
+    no Wayland session can run there either, so the behavioural proof is the
+    VM (cage must reach paint). This is the cheap tripwire for the invariant.
+    """
+
+    LAUNCHERS = [
+        ('nixos/modules/hart-liquid-ui.nix', 'cage floor'),
+        ('nixos/modules/hart-layer-shell-host.nix', 'Tier-2 sway host'),
+    ]
+
+    def test_source_guard_software_gl_always_pairs_with_pixman(self):
+        offenders = []
+        for rel, what in self.LAUNCHERS:
+            with open(os.path.join(REPO_ROOT, rel), encoding='utf-8') as fh:
+                src = fh.read()
+            # Every line that FORCES software GL must have a pixman selection
+            # somewhere in the same file; without it wlroots keeps the EGL path.
+            forces = [ln for ln in src.splitlines()
+                      if 'LIBGL_ALWAYS_SOFTWARE=1' in ln
+                      and not ln.strip().startswith('#')]
+            selects = [ln for ln in src.splitlines()
+                       if 'WLR_RENDERER=pixman' in ln
+                       and not ln.strip().startswith('#')]
+            if forces and not selects:
+                offenders.append(
+                    f"{rel} ({what}): forces LIBGL_ALWAYS_SOFTWARE with no "
+                    f"WLR_RENDERER=pixman — wlroots will take the EGL path and "
+                    f"Mesa will refuse it")
+        assert not offenders, "\n".join(offenders)
+
+    def test_source_guard_pixman_is_gated_not_unconditional(self):
+        """A box that opted into hardware GL must keep the GLES2 path."""
+        with open(os.path.join(REPO_ROOT, 'nixos/modules/hart-liquid-ui.nix'),
+                  encoding='utf-8') as fh:
+            src = fh.read()
+        # The cage launcher selects pixman inside the same optionalString as
+        # LIBGL_ALWAYS_SOFTWARE, so hardware boxes are untouched.
+        i = src.index('kioskLauncher = ')
+        block = src[i:i + 900]
+        assert 'preferHardwareGL' in block, (
+            "the cage launcher no longer gates its software-GL exports on "
+            "preferHardwareGL — pixman would be forced on hardware boxes too")
+
+
 class TestOfflineVoiceFloorIsUnconditional:
     """Disabling the microphone must never mute the OS (task #7 / #15).
 

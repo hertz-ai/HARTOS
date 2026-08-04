@@ -278,10 +278,36 @@ Gtk.main()
   # wlroots pixman): the shell is 2D and renders fine in software, KMS scanout
   # still uses the kernel driver (the console text proves KMS works), and the
   # broken GPU GL/compute path is never touched. A kiosk MUST paint on any GPU.
+  #
+  # WLR_RENDERER=pixman IS THE MISSING HALF OF THAT SENTENCE. The comment above
+  # has always said "Mesa llvmpipe + wlroots pixman", but the script only set
+  # WLR_RENDERER_ALLOW_SOFTWARE, which PERMITS a software renderer without
+  # SELECTING one — so wlroots still took its default GLES2 path and opened EGL
+  # against the DRM node. With LIBGL_ALWAYS_SOFTWARE also set, Mesa then refuses
+  # the combination outright, and the floor died (run 30848154453):
+  #
+  #   libEGL warning: Not allowed to force software rendering when API
+  #                   explicitly selects a hardware device
+  #   [ERROR] [render/egl.c:268]  Failed to initialize EGL
+  #   [ERROR] [../cage.c:330]     Unable to create the wlroots renderer
+  #   hart-session-supervisor: tier 'cage' exited rc=1 after 1s
+  #   hart-session-supervisor: crash-loop on the floor ('cage') — cannot drop further
+  #
+  # "greeter exited without creating a session" then appeared 66x in
+  # layer-shell-host-paint, 22x in desktop-shell-boot and 13x in the reboot
+  # latch: ONE cause behind several failures, and the floor is exactly the tier
+  # that must never have one.
+  #
+  # pixman is wlroots' CPU renderer and does not go through EGL at all, so the
+  # refusal cannot arise. Gated on the SAME !preferHardwareGL condition as
+  # LIBGL_ALWAYS_SOFTWARE: a box that wants hardware GL keeps the GLES2 path
+  # untouched, and only the already-software path changes — where EGL was
+  # failing anyway, so this cannot be worse.
   kioskLauncher = pkgs.writeShellScriptBin "hart-shell-session" ''
     export WLR_RENDERER_ALLOW_SOFTWARE=1
     export WLR_NO_HARDWARE_CURSORS=1
-    ${lib.optionalString (!ui.preferHardwareGL) "export LIBGL_ALWAYS_SOFTWARE=1"}
+    ${lib.optionalString (!ui.preferHardwareGL)
+      "export LIBGL_ALWAYS_SOFTWARE=1\n    export WLR_RENDERER=pixman"}
     exec ${pkgs.cage}/bin/cage -- ${glassShell}/bin/hart-glass-shell
   '';
 

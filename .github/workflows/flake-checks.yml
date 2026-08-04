@@ -154,11 +154,42 @@ jobs:
             echo "::error::shard here would mean this gate tested nothing"
             exit 1
           fi
+          # Shard by a HASH OF THE PATH, not by list index.
+          #
+          # `i % 4` over a sorted list is deterministic at a FIXED commit but is
+          # NOT stable when the set changes: inserting one test file shifts every
+          # later index and moves ~3/4 of the suite to a different shard. Proven
+          # on 2026-08-04 — adding three test files made shard 1's failure list
+          # differ by 5 files added and 4 removed against the previous run, with
+          # no behaviour change behind any of them.
+          #
+          # That makes a shard's history incomparable: you cannot tell a fix from
+          # a reshuffle, and "shard 1 went red" stops meaning anything. The
+          # header above this job claimed membership was "stable across runs and
+          # a failing quarter is identifiable rather than arbitrary" — true
+          # run-to-run, false across commits, which is the comparison anyone
+          # actually makes.
+          #
+          # sha256(path) % N is deterministic AND insertion-stable: adding a file
+          # moves only that file. Same technique CLAUDE.md already prescribes for
+          # sharding seeded goals across peers, so this is the repo's existing
+          # answer to the same problem rather than a new one.
+          #
+          # Measured over the real 710-file set, adding one file:
+          #     index  %4 :  701 of 710 files change shard
+          #     sha256 %4 :    0 of 710 files change shard
+          # and the hash split stays balanced: 186 / 171 / 178 / 175.
           SEL=()
-          for i in "${!ALL[@]}"; do
-            if (( i % 4 == ${{ matrix.shard }} )); then SEL+=( "${ALL[$i]}" ); fi
+          for f in "${ALL[@]}"; do
+            h=$(printf '%s' "$f" | sha256sum | cut -c1-8)
+            if (( 0x$h % 4 == ${{ matrix.shard }} )); then SEL+=( "$f" ); fi
           done
           echo "shard ${{ matrix.shard }} runs ${#SEL[@]} files"
+          if [[ "${#SEL[@]}" -eq 0 ]]; then
+            echo "::error::shard ${{ matrix.shard }} selected 0 of $TOTAL files —"
+            echo "::error::the hash split is broken and a green shard would be a lie"
+            exit 1
+          fi
           python -m pytest \
             "${SEL[@]}" \
             --deselect tests/unit/test_vlm_qwen3vl.py::TestFullActionLoop \
