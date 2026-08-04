@@ -311,3 +311,129 @@ class TestE2ERoundtrip:
         assert resp.status_code == 200
         result = resp.get_json()
         assert result['success'] is True
+
+
+# ── JSON-RPC 2.0 surface (#598) ───────────────────────────────
+#
+# Everything above tests the REST surface, and it all passes — which is
+# precisely why this gap survived.  MCP-over-HTTP is not REST: a compliant
+# client POSTs JSON-RPC 2.0 to ONE endpoint and never calls GET /tools/list.
+#
+# What we advertise (.claude/settings.local.json:19, and
+# docs/architecture/hive_moe_architecture_map.md:873):
+#     {"type": "http", "url": "http://localhost:5000/api/mcp/local"}
+# What exists: no rule at that bare prefix at all -> 404 on the client's very
+# first request.  Adding a route there is necessary but NOT sufficient: there
+# is no "jsonrpc" envelope, no `id` correlation and no `initialize` handshake
+# anywhere in the bridge, so a client that got past the 404 still could not
+# speak to it.  Fixing only the 404 would be an inert fix.
+#
+# Third defect, independent of the other two: the descriptor emits
+# "parameters", but MCP tools/list requires "inputSchema".  A client that
+# tolerated both the URL and the shape would still see zero usable schemas.
+
+RPC_URL = '/api/mcp/local'
+
+
+def _rpc(client, method, params=None, rid=1):
+    body = {"jsonrpc": "2.0", "id": rid, "method": method}
+    if params is not None:
+        body["params"] = params
+    return client.post(RPC_URL, data=json.dumps(body),
+                       content_type='application/json')
+
+
+class TestJsonRpcSurface:
+    def test_bare_prefix_is_routed(self, client):
+        """The advertised URL must exist. Live probe returns
+        404 {"error":"API endpoint not found","path":"/api/mcp/local"}."""
+        resp = _rpc(client, 'initialize')
+        assert resp.status_code != 404, (
+            'no route at /api/mcp/local — the URL we advertise to MCP clients '
+            'in .claude/settings.local.json 404s on the first request')
+
+    def test_initialize_returns_jsonrpc_envelope(self, client):
+        resp = _rpc(client, 'initialize', {"protocolVersion": "2024-11-05"}, rid=7)
+        body = resp.get_json()
+        assert body.get('jsonrpc') == '2.0', f'missing jsonrpc envelope: {body}'
+        assert body.get('id') == 7, 'id must be echoed for request correlation'
+        assert 'result' in body
+        assert 'serverInfo' in body['result']
+
+    def test_tools_list_uses_inputSchema_not_parameters(self, client):
+        """MCP names this field inputSchema. The REST projection calls it
+        `parameters` (mcp_http_bridge.py ~:876) — a client reading the spec
+        finds no schema at all."""
+        body = _rpc(client, 'tools/list', rid=2).get_json()
+        tools = (body.get('result') or {}).get('tools')
+        assert isinstance(tools, list) and tools, f'no tools in result: {body}'
+        assert 'inputSchema' in tools[0], (
+            f"tool descriptor exposes {sorted(tools[0])} — MCP requires "
+            f"'inputSchema'")
+
+    def test_tools_call_returns_the_mcp_content_shape(self, client):
+        """Asserts the real CallToolResult contract, not merely 'a result'.
+
+        An earlier draft of this test only checked `'result' in body`, which
+        would have passed a non-compliant payload — the same leniency that let
+        24 green REST tests sit on top of an unusable feature.
+        """
+        body = _rpc(client, 'tools/call',
+                    {"name": "list_recipes", "arguments": {}}, rid=3).get_json()
+        assert body.get('id') == 3
+        result = body.get('result')
+        assert isinstance(result, dict), f'tools/call returned no result: {body}'
+        content = result.get('content')
+        assert isinstance(content, list) and content, (
+            f"MCP tools/call must return a content[] array, got {result}")
+        assert content[0].get('type') == 'text'
+        assert isinstance(content[0].get('text'), str)
+        assert result.get('isError') is False
+
+    def test_tools_call_unknown_tool_is_a_jsonrpc_error(self, client):
+        body = _rpc(client, 'tools/call',
+                    {"name": "no_such_tool_xyz", "arguments": {}}, rid=4).get_json()
+        assert body.get('id') == 4
+        assert (body.get('error') or {}).get('code') == -32602, (
+            f'expected -32602 Invalid params for an unknown tool, got {body}')
+
+    def test_unknown_method_is_a_jsonrpc_error(self, client):
+        body = _rpc(client, 'no/such/method', rid=9).get_json()
+        assert body.get('id') == 9, 'id must be echoed even on error'
+        assert (body.get('error') or {}).get('code') == -32601, (
+            f'expected JSON-RPC -32601 Method not found, got {body}')
+
+    def test_jsonrpc_endpoint_inherits_the_auth_gate(self, app):
+        """SECURITY: the gate is @mcp_local_bp.before_request (bridge :237),
+        so a route added to the SAME blueprint is covered automatically.  This
+        pins that — a JSON-RPC endpoint registered outside the blueprint (or
+        with its own bespoke auth) would be an unauthenticated tool-execution
+        hole and a second auth path.
+        """
+        raw = app.test_client()          # no Authorization header injected
+        resp = raw.post(RPC_URL,
+                        data=json.dumps({"jsonrpc": "2.0", "id": 1,
+                                         "method": "tools/list"}),
+                        content_type='application/json')
+        assert resp.status_code in (401, 403), (
+            f'unauthenticated JSON-RPC call returned {resp.status_code} — '
+            f'the endpoint is not behind the blueprint auth gate')
+
+
+class TestRestSurfaceUnchangedByJsonRpc:
+    """Zero-regression: the three REST routes have existing callers and must
+    keep their current shape, INCLUDING the `parameters` field name.  The
+    inputSchema rename belongs only in the JSON-RPC projection."""
+
+    def test_rest_tools_list_still_returns_parameters(self, client):
+        body = client.get('/api/mcp/local/tools/list').get_json()
+        assert 'tools' in body and body['tools']
+        assert 'parameters' in body['tools'][0]
+
+    def test_rest_execute_still_uses_tool_and_arguments(self, client):
+        resp = client.post('/api/mcp/local/tools/execute',
+                           data=json.dumps({"tool": "list_recipes",
+                                            "arguments": {}}),
+                           content_type='application/json')
+        assert resp.status_code == 200
+        assert resp.get_json()['success'] is True

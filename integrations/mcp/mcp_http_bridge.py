@@ -881,37 +881,36 @@ def mcp_list_tools():
     return jsonify({"tools": tools_out})
 
 
-@mcp_local_bp.route('/tools/execute', methods=['POST'])
-def mcp_execute_tool():
-    """Execute a local MCP tool.
+def _invoke_tool(tool_name, arguments):
+    """Resolve and execute ONE local MCP tool.  The single execution path.
 
-    Request body: {"tool": "tool_name", "arguments": {"key": "value"}}
+    Returns ``(payload, http_status)`` where ``payload`` is the REST-shaped
+    dict the /tools/execute route has always returned.
+
+    Extracted so the REST route and the JSON-RPC dispatcher share it rather
+    than each implementing invocation.  That matters specifically because of
+    ``_canonicalize_args`` below: a second implementation that forgot it would
+    pass every test and then silently mis-route real client calls whose kwargs
+    use an alias.
     """
     _load_tools()
-    data = request.get_json(force=True, silent=True) or {}
-    tool_name = data.get('tool', '').strip()
-    arguments = data.get('arguments', {})
+    tool_name = (tool_name or '').strip()
+    arguments = arguments or {}
 
     if not tool_name:
-        return jsonify({"success": False, "error": "tool name required"}), 400
+        return {"success": False, "error": "tool name required"}, 400
 
-    tool_entry = None
-    for t in _local_tools:
-        if t["name"] == tool_name:
-            tool_entry = t
-            break
-
+    tool_entry = next((t for t in _local_tools if t["name"] == tool_name), None)
     if tool_entry is None:
-        available = [t["name"] for t in _local_tools]
-        return jsonify({
+        return {
             "success": False,
             "error": f"Unknown tool: {tool_name}",
-            "available_tools": available,
-        }), 404
+            "available_tools": [t["name"] for t in _local_tools],
+        }, 404
 
     fn = tool_entry["fn"]
     if fn is None:
-        return jsonify({"success": False, "error": f"Tool {tool_name} has no callable"}), 500
+        return {"success": False, "error": f"Tool {tool_name} has no callable"}, 500
 
     # Apply per-tool alias canonicalization so MCP clients that call
     # with `search=` / `model_id=` / `user=` land on the correct Python
@@ -922,16 +921,119 @@ def mcp_execute_tool():
         result = fn(**arguments)
         if isinstance(result, str):
             try:
-                parsed = json.loads(result)
-                return jsonify({"success": True, "result": parsed})
+                result = json.loads(result)
             except json.JSONDecodeError:
-                return jsonify({"success": True, "result": result})
-        return jsonify({"success": True, "result": result})
+                pass          # plain string result — pass through verbatim
+        return {"success": True, "result": result}, 200
     except TypeError as e:
-        return jsonify({"success": False, "error": f"Invalid arguments: {e}"}), 400
+        return {"success": False, "error": f"Invalid arguments: {e}"}, 400
     except Exception as e:
         logger.error(f"MCP tool {tool_name} execution error: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        return {"success": False, "error": str(e)}, 500
+
+
+@mcp_local_bp.route('/tools/execute', methods=['POST'])
+def mcp_execute_tool():
+    """Execute a local MCP tool (REST shape — unchanged, has existing callers).
+
+    Request body: {"tool": "tool_name", "arguments": {"key": "value"}}
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    payload, status = _invoke_tool(data.get('tool'), data.get('arguments', {}))
+    return jsonify(payload), status
+
+
+# ── JSON-RPC 2.0 surface: MCP over HTTP ───────────────────────
+#
+# The three routes above are REST.  MCP is NOT REST — a compliant client POSTs
+# JSON-RPC 2.0 to ONE endpoint and never calls GET /tools/list.  We advertise
+#     {"type": "http", "url": "http://localhost:5000/api/mcp/local"}
+# in .claude/settings.local.json and docs/architecture/hive_moe_architecture_map.md,
+# and until now there was no rule at that path at all: every compliant client
+# got 404 on its first request.
+#
+# Registered on mcp_local_bp deliberately: the auth gate is
+# @mcp_local_bp.before_request (above), so this endpoint inherits bearer/loopback
+# auth with no new auth code.  Registering it outside the blueprint, or giving
+# it its own decorator, would create a second auth path — and getting that
+# wrong here means unauthenticated tool EXECUTION.
+MCP_PROTOCOL_VERSION = "2024-11-05"
+MCP_SERVER_VERSION = "1.0.0"
+
+_RPC_PARSE_ERROR = -32700
+_RPC_INVALID_REQUEST = -32600
+_RPC_METHOD_NOT_FOUND = -32601
+_RPC_INVALID_PARAMS = -32602
+_RPC_INTERNAL_ERROR = -32603
+
+
+def _rpc_ok(rid, result):
+    return jsonify({"jsonrpc": "2.0", "id": rid, "result": result})
+
+
+def _rpc_err(rid, code, message):
+    # JSON-RPC carries failure in the envelope, not the HTTP status, so these
+    # return 200 unless the request itself was unparseable.
+    return jsonify({"jsonrpc": "2.0", "id": rid,
+                    "error": {"code": code, "message": message}})
+
+
+@mcp_local_bp.route('', methods=['POST'])
+@mcp_local_bp.route('/', methods=['POST'])
+def mcp_jsonrpc():
+    """MCP-over-HTTP JSON-RPC 2.0 endpoint — the URL we advertise to clients.
+
+    Both '' and '/' are registered because our own docs advertise the prefix
+    with and without the trailing slash.
+    """
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return _rpc_err(None, _RPC_PARSE_ERROR, "invalid JSON body"), 400
+
+    rid = body.get('id')
+    method = body.get('method')
+    params = body.get('params') or {}
+
+    if not method:
+        return _rpc_err(rid, _RPC_INVALID_REQUEST, "missing 'method'"), 400
+
+    if method == 'initialize':
+        return _rpc_ok(rid, {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "hartos-mcp-local",
+                           "version": MCP_SERVER_VERSION},
+        })
+
+    # Client courtesy notification after initialize; no response body.
+    if method == 'notifications/initialized':
+        return '', 204
+
+    if method == 'tools/list':
+        _load_tools()
+        # MCP names this field inputSchema.  The REST projection calls it
+        # "parameters" and MUST keep doing so (existing callers) — the rename
+        # lives here, in the JSON-RPC projection only.
+        return _rpc_ok(rid, {"tools": [
+            {"name": t["name"],
+             "description": t["description"],
+             "inputSchema": t["parameters"]}
+            for t in _local_tools
+        ]})
+
+    if method == 'tools/call':
+        payload, status = _invoke_tool(params.get('name'),
+                                       params.get('arguments') or {})
+        if not payload.get('success'):
+            code = (_RPC_INVALID_PARAMS if status in (400, 404)
+                    else _RPC_INTERNAL_ERROR)
+            return _rpc_err(rid, code, payload.get('error', 'tool failed'))
+        result = payload.get('result')
+        text = result if isinstance(result, str) else json.dumps(result, default=str)
+        return _rpc_ok(rid, {"content": [{"type": "text", "text": text}],
+                             "isError": False})
+
+    return _rpc_err(rid, _RPC_METHOD_NOT_FOUND, f"Unknown method: {method}")
 
 
 # ── Auto-registration ─────────────────────────────────────────
