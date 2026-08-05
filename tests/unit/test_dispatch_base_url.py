@@ -98,8 +98,11 @@ def _fresh_gossip():
     except Exception as e:  # pragma: no cover - env without deps
         pytest.skip(f"peer_discovery unavailable: {e}")
     g = pd.gossip
-    g._base_url_cache = ''
-    g._base_url_cache_ts = 0.0
+    # Field names come from the property in peer_discovery: _base_url_cached
+    # holds the answer, _base_url_final says it is settled. Resetting both is
+    # what makes each test see a cold node.
+    g._base_url_cached = ''
+    g._base_url_final = False
     return pd, g
 
 
@@ -169,8 +172,10 @@ def test_peer_discovery_base_url_is_not_frozen_at_import(monkeypatch):
     monkeypatch.setattr(pr, '_is_port_listening', lambda *a, **k: False)
     assert g.base_url == f'http://localhost:{pr.get_port("backend")}'
 
-    # Network and server come up. Expire the short cache the way time would.
-    g._base_url_cache_ts = 0.0
+    # Network and server come up. The property only marks an answer final once
+    # it is neither the nothing-is-listening fallback nor loopback, so a cold
+    # read must NOT have settled.
+    assert not g._base_url_final, 'a cold-boot answer must not be cached as final'
     monkeypatch.setattr(pr, 'get_lan_ip', lambda: '192.168.1.77')
     flask_port = pr.get_port('flask')
     monkeypatch.setattr(
