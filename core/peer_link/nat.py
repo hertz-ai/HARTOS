@@ -61,19 +61,28 @@ class NATTraversal:
         peer_url = peer_info.get('url', '')
         peer_mesh_ip = peer_info.get('mesh_ip', '')
 
-        # Extract host from URL
+        # Extract host AND port from the peer's advertised URL.
+        #
+        # _extract_host deliberately drops the port, and strategies 1 and 2
+        # then re-added get_port('backend') -- OUR local backend port -- as if
+        # every peer served on the same one we do. That is wrong twice: a
+        # bundled peer serves HARTOS in-process on the flask port, and any peer
+        # behind a port-forward or in a container is reachable on whatever port
+        # it advertised. The peer already told us in its URL, so use it and
+        # only fall back to our local default when it did not.
         peer_host = self._extract_host(peer_url)
+        peer_port = self._extract_port(peer_url)
 
         # Strategy 1: LAN direct
-        ws_url = self._try_lan_direct(peer_host)
+        ws_url = self._try_lan_direct(peer_host, peer_port)
         if ws_url:
-            logger.debug(f"NAT: LAN direct to {peer_host}")
+            logger.debug(f"NAT: LAN direct to {peer_host}:{peer_port}")
             return ws_url
 
         # Strategy 2: Direct WAN (peer might have public IP)
-        ws_url = self._try_direct_wan(peer_host)
+        ws_url = self._try_direct_wan(peer_host, peer_port)
         if ws_url:
-            logger.debug(f"NAT: Direct WAN to {peer_host}")
+            logger.debug(f"NAT: Direct WAN to {peer_host}:{peer_port}")
             return ws_url
 
         # Strategy 3: WireGuard mesh IP
@@ -95,15 +104,19 @@ class NATTraversal:
         logger.debug(f"NAT: All strategies failed for {peer_host}")
         return None
 
-    def _try_lan_direct(self, peer_host: str) -> Optional[str]:
-        """Check if peer is on same LAN subnet."""
+    def _try_lan_direct(self, peer_host: str, peer_port: int = 0) -> Optional[str]:
+        """Check if the peer answers on the LAN.
+
+        peer_port comes from the peer's advertised URL. Falls back to our local
+        backend port only when the peer advertised none.
+        """
         if not peer_host:
             return None
 
         try:
             # Check if peer is reachable on LAN
             from core.port_registry import get_port
-            port = get_port('backend')
+            port = peer_port or get_port('backend')
 
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(2)
@@ -116,14 +129,19 @@ class NATTraversal:
             pass
         return None
 
-    def _try_direct_wan(self, peer_host: str) -> Optional[str]:
-        """Try direct connection to peer's public address."""
+    def _try_direct_wan(self, peer_host: str, peer_port: int = 0) -> Optional[str]:
+        """Try direct connection to the peer's public address.
+
+        peer_port comes from the peer's advertised URL, which matters more here
+        than on the LAN: a peer reachable from the WAN is usually behind a
+        port-forward on a port that is not our local default.
+        """
         if not peer_host or self._is_private_ip(peer_host):
             return None
 
         try:
             from core.port_registry import get_port
-            port = get_port('backend')
+            port = peer_port or get_port('backend')
 
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(5)
@@ -220,6 +238,25 @@ class NATTraversal:
         # Remove port
         host = host.split(':')[0]
         return host
+
+    @staticmethod
+    def _extract_port(url: str) -> int:
+        """Extract the port from a peer's advertised URL, 0 if absent.
+
+        Companion to _extract_host, which drops the port. Callers used to
+        discard it and substitute their own backend port, which assumes every
+        peer serves where we do. Returns 0 rather than a default so the caller
+        decides the fallback.
+        """
+        if not url:
+            return 0
+        hostport = url.split('://')[-1].split('/')[0]
+        if ':' not in hostport:
+            return 0
+        try:
+            return int(hostport.rsplit(':', 1)[1])
+        except (ValueError, IndexError):
+            return 0
 
     @staticmethod
     def _is_private_ip(ip: str) -> bool:
