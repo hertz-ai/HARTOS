@@ -146,26 +146,38 @@ class GossipProtocol:
         and freezes the cold-boot fallback into `_self_info()['url']` for the
         life of the process, so every peer that discovers us dials a dead port.
 
-        Delegates to the canonical ``core.port_registry.get_local_backend_url``
-        (Gate 4 — the same resolver hartos_bootstrap, agent_engine.dispatch,
-        channels.flask_integration and mcp._tool_impls already use).  That
-        function probes which port is actually LISTENING: standalone HARTOS
-        serves on backend (6777), the bundled desktop serves HARTOS in-process
-        on the Flask port (5000).
+        Delegates to the canonical ``core.port_registry.get_advertisable_base_url``
+        (Gate 4 — built on the same get_local_backend_url that hartos_bootstrap,
+        agent_engine.dispatch, channels.flask_integration and mcp._tool_impls
+        already use).  That resolver probes which port is actually LISTENING:
+        standalone HARTOS serves on backend (6777), the bundled desktop serves
+        HARTOS in-process on the Flask port (5000).
+
+        ADVERTISABLE, not local.  get_local_backend_url answers "where do I
+        reach my own backend" and correctly returns loopback; this property is
+        published to peers, where loopback is never right.  It is why every row
+        in the live peer table read http://localhost:6777, and why
+        core/peer_link/nat.py — which dials peer_info['url'] — resolved every
+        peer back to the caller's own machine.  get_advertisable_base_url pairs
+        the LAN address with the port this resolver just proved is live, and
+        HEVOLVE_BASE_URL still wins when set.
 
         Cached only once it returns a real answer.  While nothing is listening
         the resolver yields its backend fallback, and caching THAT is precisely
-        the bug — so we keep re-resolving until a port actually answers.
+        the bug — so we keep re-resolving until a port actually answers.  The
+        same test applies to the host: a loopback answer means no LAN address
+        was available yet, so it is not final either.
         """
         if self._base_url_final:
             return self._base_url_cached
 
-        from core.port_registry import get_local_backend_url, get_port
-        url = get_local_backend_url()
+        from core.port_registry import get_advertisable_base_url, get_port
+        url = get_advertisable_base_url()
         # An explicit env override, or any answer that is not the
         # nothing-is-listening fallback, is final.
         fallback = f'http://localhost:{get_port("backend")}'
-        if os.environ.get('HEVOLVE_BASE_URL') or url != fallback:
+        _loopback = '//localhost' in url or '//127.' in url
+        if os.environ.get('HEVOLVE_BASE_URL') or (url != fallback and not _loopback):
             self._base_url_final = True
         self._base_url_cached = url
         return url
