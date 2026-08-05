@@ -369,6 +369,8 @@ def action_flow_scenarios():
 
 def pytest_sessionfinish(session, exitstatus):
     """Report any non-daemon thread still alive, then guarantee we exit."""
+    import os
+    import sys
     import threading
 
     alive = [t for t in threading.enumerate()
@@ -379,8 +381,10 @@ def pytest_sessionfinish(session, exitstatus):
 
     import sys
     print("\n" + "=" * 74, file=sys.stderr)
-    print("NON-DAEMON THREADS STILL ALIVE — these would hang interpreter exit:",
-          file=sys.stderr)
+    print("NON-DAEMON THREADS STILL ALIVE at session end:", file=sys.stderr)
+    print("(reported BEFORE atexit runs, so a pool with a registered "
+          "shutdown may still clear on its own — the blocked frame below is "
+          "what tells you which.)", file=sys.stderr)
     for t in alive:
         print(f"  - {t.name!r}  target={getattr(t, '_target', None)!r}",
               file=sys.stderr)
@@ -394,11 +398,42 @@ def pytest_sessionfinish(session, exitstatus):
                       f"in {f.f_code.co_name}", file=sys.stderr)
     except Exception as exc:        # never let diagnostics break the exit
         print(f"  (could not read frames: {exc})", file=sys.stderr)
-    print("Whatever started these owns a teardown. Forcing exit so the gate "
-          "reports instead of hanging.", file=sys.stderr)
+    print("A thread idle in _worker is an executor awaiting shutdown; one "
+          "blocked ELSEWHERE is running work that never returns. Forcing exit "
+          "so the gate reports instead of hanging.", file=sys.stderr)
     print("=" * 74, file=sys.stderr)
     sys.stderr.flush()
     sys.stdout.flush()
 
-    import os
+    # FORCE EXIT ONLY FOR THREADS THAT WOULD ACTUALLY HANG.
+    #
+    # An executor worker parked in concurrent/futures/thread.py::_worker is
+    # IDLE, waiting on its work queue — and concurrent.futures registers its own
+    # atexit hook that wakes every such worker before joining it. Those always
+    # clear on their own, so killing the process for them would skip atexit and
+    # the coverage flush for no reason. The first version of this hook did
+    # exactly that, and the evidence was in its own output: uctx-refresh_0/_1
+    # sitting in _worker on a run that had no hang at all.
+    #
+    # A thread blocked ANYWHERE ELSE is running work that never returns. That is
+    # the one that hangs, and the one worth dying for.
+    blocking = []
+    try:
+        frames = sys._current_frames()
+        for t in alive:
+            f = frames.get(t.ident)
+            if f is None or os.path.basename(f.f_code.co_filename) != 'thread.py'                     or f.f_code.co_name != '_worker':
+                blocking.append(t)
+    except Exception:
+        blocking = alive          # cannot tell -> assume the worst, still exit
+
+    if not blocking:
+        print("All of the above are IDLE executor workers; concurrent.futures "
+              "wakes those at exit. Leaving shutdown alone.", file=sys.stderr)
+        sys.stderr.flush()
+        return
+
+    print("Blocking (NOT idle): "
+          + ", ".join(repr(t.name) for t in blocking), file=sys.stderr)
+    sys.stderr.flush()
     os._exit(exitstatus)

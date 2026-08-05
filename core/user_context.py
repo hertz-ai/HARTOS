@@ -56,6 +56,7 @@ pass ``mode='reuse'`` or ``mode='create'``. They no longer own any of
 the HTTP, caching, or formatting logic.
 """
 from __future__ import annotations
+import atexit as _atexit
 
 import json
 import logging
@@ -187,6 +188,17 @@ def get_user_context_cache() -> UserContextCache:
 #: blocks on pool saturation. Small (4 workers) — refreshes are cheap
 #: and we don't want to steal CPU from the LLM subprocesses.
 _refresh_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='uctx-refresh')
+
+#: SHUT IT DOWN AT EXIT. ThreadPoolExecutor workers are NON-daemon, so
+#: concurrent.futures' own atexit hook JOINS them before the interpreter
+#: can exit — a pool that is never shut down keeps the process alive.
+#: Named 'uctx-refresh_0' in CI run 30978623541, blocked in a refresh that
+#: never returned, which is how five of eight test shards burned the full
+#: 120-minute cap in silence (task #37). Same hazard for the BACKEND: a
+#: process that will not exit turns `systemctl stop` into a timeout.
+#: wait=False so shutdown never blocks the dying process; this is the
+#: pattern already used by world_model_bridge and speculative_dispatcher.
+_atexit.register(lambda: _refresh_pool.shutdown(wait=False))
 
 #: Per-user lock that prevents N concurrent refreshes of the same user.
 #: A stampede of messages for user 10077 still triggers exactly one

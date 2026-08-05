@@ -140,6 +140,13 @@ class HiveExpertDiscovery:
         # the bus dispatcher's caller thread.
         self._pool = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix='hive_expert_discovery')
+        # See the note in agent_baseline_service: a pool that is never shut
+        # down keeps the process alive, because its workers are non-daemon and
+        # concurrent.futures joins them at interpreter exit. This one was
+        # 'hive_expert_discovery_0', observed blocked in threading.wait rather
+        # than idle, in CI run 30978623541 (task #37).
+        import atexit as _atexit
+        _atexit.register(lambda: self._pool.shutdown(wait=False))
         self._stop = threading.Event()
         self._subscribed = False
 
