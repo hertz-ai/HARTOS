@@ -32,7 +32,7 @@ There are two production-relevant hosts on 192.168.0.0/24. Other addresses on th
 
 This is the "central" node. The HARTOS agent backend, email service, Kong, monitoring, and most ancillary services live here.
 
-- SSH: port 422, user sathish, standard password (`506066Hertzai2021.`).
+- SSH: port 422, user sathish, standard password (see password manager).
 - OS: Ubuntu/Debian-based Linux. Hostname `sathish-linux-deep`. NIC `enp3s0` is the LAN-facing interface.
 - Has 5 Docker bridge networks (`docker0`, `br-d45274ea1c8b`, `br-918d4626ec3e`, `br-5e3895f01c64`, `br-a39656213c1e`) in addition to host networking.
 - Repos checked out under `/opt/hzai-*` (one per service).
@@ -70,9 +70,9 @@ Note the four mounts. `/app/agent_data` is NOT mounted. State written there does
 
 The host `.env` file at `/opt/hzai-LLM-Langchain-Chatbot-Agent/repo/LLM-langchain_Chatbot-Agent/.env` is what supplies the container env via `--env-file`. Its current contents:
 ```
-OPENAI_API_KEY="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"
-LANGCHAIN_API_KEY="ls__7099736e1e5e4079bb9f6e5b3db0d15c"
-GROQ_API_KEY="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"
+OPENAI_API_KEY=<redacted — see password manager / rotate>
+LANGCHAIN_API_KEY=<redacted — see password manager / rotate>
+GROQ_API_KEY=<redacted — see password manager / rotate>
 LANGCHAIN_PROJECT="hz-langchain-test"
 HEVOLVE_NODE_TIER=central
 HEVOLVE_ENFORCEMENT_MODE=hard
@@ -93,7 +93,7 @@ This is the registry / CRM machine. Memory calls it the "registry machine". It h
 - Erxes UI on :3000.
 - Erxes API on :3300 (GraphQL).
 - 6 containers: erxes-mongo, erxes-redis, erxes-elasticsearch, erxes-api, erxes-ui, erxes-integrations.
-- Admin login: sathish@hevolve.ai / Hertzai2021.
+- Admin login: <redacted — see password manager>
 - Configured Board: "HARTOS Sales". Pipeline: "Robotics Outreach".
 - Pipeline stages (in order): New, Contacted, Replied, Meeting, Negotiation, Won, Lost.
 - Known quirk: after a redis container restart, the Redis hostname key must be re-set to `erxes-redis`. The flywheel setup script does this automatically (`redis-cli SET erxes:hostname erxes-redis`).
