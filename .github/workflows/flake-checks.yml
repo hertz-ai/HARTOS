@@ -129,10 +129,16 @@ jobs:
     # suite, and the only verdict anyone ever saw came from the one shard that
     # happens to finish fast.
     #
-    # The 9x spread between shard 1 and the rest is a RUNTIME imbalance, not a
-    # file-count one: the split is even by file, and some files are far slower.
-    # --durations below names them so the next run supplies the evidence to
-    # balance on, rather than guessing which tests are slow.
+    # THAT DIAGNOSIS WAS WRONG, and the evidence is below. I attributed the
+    # spread to slow tests ("a RUNTIME imbalance ... some files are far
+    # slower"). Run 30885611303 disproves it: shard 2 ran 1548 tests in 59s
+    # with its slowest single test at 10s, and shard 0's pytest printed its
+    # summary at 06:58:23 having run 1519 tests in 117.86s — then produced
+    # NOTHING for the next 115 minutes until the cap.
+    #
+    # The tests are fast. The INTERPRETER will not exit. See the wall-clock
+    # net on the pytest step for the full timeline; this cap is now only the
+    # last-resort backstop behind that net, not the thing doing the work.
     timeout-minutes: 120
     # SHARDED 2026-08-03. As a single job this DID NOT FINISH: run 30783792736
     # ran 45m37s against the 45-minute cap and the step was killed, so the
@@ -243,13 +249,47 @@ jobs:
             echo "::error::the hash split is broken and a green shard would be a lie"
             exit 1
           fi
-          python -m pytest \
-            "${SEL[@]}" \
-            --deselect tests/unit/test_vlm_qwen3vl.py::TestFullActionLoop \
-            --deselect tests/unit/test_vlm_qwen3vl.py::TestVLMDeterministicActions::test_vlm_action_list_shared_by_legacy_and_unified \
-            --timeout=120 \
-            --durations=25 \
-            -q --tb=line
+          # WALL-CLOCK NET around pytest itself.
+          #
+          # --timeout is PER TEST and cannot see a hang that happens AFTER the last
+          # test. Measured on run 30885611303, shard 0:
+          #
+          #     06:56:23  step starts, 76 files
+          #     06:58:23  pytest PRINTS ITS SUMMARY - 1519 passed in 117.86s
+          #               <- nothing at all for 1h55m ->
+          #     08:53     the 120-minute job cap fires, reported as "cancelled"
+          #               "Terminate orphan process: pid (5652) (pt_main_thread)"
+          #
+          # The suite runs in TWO MINUTES. The interpreter then refuses to exit -
+          # something leaves a non-daemon thread or an unclosed listener behind (the
+          # same log shows hevolve_vision failing to bind :5460 because it was
+          # ALREADY bound inside that process). FIVE of eight shards burned the full
+          # cap that way and reported nothing, which is the real reason this gate has
+          # never produced a full python verdict - it was never the volume of tests.
+          #
+          # `timeout` bounds the whole invocation, turning a hung interpreter into a
+          # fast attributable failure instead of two silent hours. 900s is ~7x the
+          # observed 118s, so a genuine slowdown still passes. -k SIGKILLs if SIGTERM
+          # is ignored too, which it will be if a thread is stuck in C.
+          set +e
+          timeout -k 30 900 \
+            python -m pytest \
+              "${SEL[@]}" \
+              --deselect tests/unit/test_vlm_qwen3vl.py::TestFullActionLoop \
+              --deselect tests/unit/test_vlm_qwen3vl.py::TestVLMDeterministicActions::test_vlm_action_list_shared_by_legacy_and_unified \
+              --timeout=120 \
+              --durations=25 \
+              -q --tb=line
+          rc=$?
+          set -e
+          if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            echo "::error::pytest did not EXIT within 900s. The tests themselves"
+            echo "::error::finish in ~2 minutes, so this is the interpreter refusing"
+            echo "::error::to shut down - a non-daemon thread or an unclosed listener"
+            echo "::error::left behind by a test. Look for a server started in a"
+            echo "::error::fixture without a matching teardown."
+          fi
+          exit $rc
 
       # Integration + e2e — cross-module flows. Best-effort: surfaced but
       # non-blocking (they exercise live-ish paths a hermetic runner can't fully
