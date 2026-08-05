@@ -331,3 +331,74 @@ def action_flow_scenarios():
             ActionState.COMPLETED
         ]
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# The interpreter MUST exit. (task #37)
+# ═══════════════════════════════════════════════════════════════════════════
+# Measured on CI run 30885611303, shard 0:
+#
+#     06:56:23  step starts, 76 files
+#     06:58:23  pytest PRINTS ITS SUMMARY - 1519 passed in 117.86s
+#               <- nothing at all for 1h55m ->
+#     08:53     the 120-minute job cap fires, reported as "cancelled"
+#               "Terminate orphan process: pid (5652) (pt_main_thread)"
+#
+# The tests take TWO MINUTES. Everything after is Python's threading._shutdown()
+# joining a non-daemon thread that never returns, so the process never exits.
+# FIVE of eight shards burned the full cap that way and reported NOTHING — which
+# is the real reason this gate has never produced a full verdict. It was never
+# the volume of tests, and neither raising the cap nor adding shards could have
+# helped; both treat a hang as slowness.
+#
+# `--timeout` cannot see it: that is PER TEST, and this happens after the last
+# test has finished.
+#
+# Two jobs here, in order:
+#   1. NAME the leaker. A hang with no attribution costs a full CI round to
+#      learn nothing, which is exactly what happened for days.
+#   2. GUARANTEE termination, so a leak degrades to a named warning instead of
+#      a two-hour silence. os._exit skips interpreter shutdown — and therefore
+#      the very join that hangs — while preserving pytest's exit status, so the
+#      gate's verdict is unchanged.
+#
+# Deliberately conditional: if nothing is leaking, this does nothing at all and
+# the normal shutdown runs (atexit handlers, coverage flush, everything). The
+# hard exit happens ONLY in the case that would otherwise hang forever, where
+# the alternative is not "clean shutdown" but "no result at all".
+
+def pytest_sessionfinish(session, exitstatus):
+    """Report any non-daemon thread still alive, then guarantee we exit."""
+    import threading
+
+    alive = [t for t in threading.enumerate()
+             if t is not threading.main_thread()
+             and t.is_alive() and not t.daemon]
+    if not alive:
+        return                      # normal shutdown — untouched
+
+    import sys
+    print("\n" + "=" * 74, file=sys.stderr)
+    print("NON-DAEMON THREADS STILL ALIVE — these would hang interpreter exit:",
+          file=sys.stderr)
+    for t in alive:
+        print(f"  - {t.name!r}  target={getattr(t, '_target', None)!r}",
+              file=sys.stderr)
+    try:
+        frames = sys._current_frames()
+        for t in alive:
+            f = frames.get(t.ident)
+            if f is not None:
+                print(f"  {t.name} is blocked at "
+                      f"{f.f_code.co_filename}:{f.f_lineno} "
+                      f"in {f.f_code.co_name}", file=sys.stderr)
+    except Exception as exc:        # never let diagnostics break the exit
+        print(f"  (could not read frames: {exc})", file=sys.stderr)
+    print("Whatever started these owns a teardown. Forcing exit so the gate "
+          "reports instead of hanging.", file=sys.stderr)
+    print("=" * 74, file=sys.stderr)
+    sys.stderr.flush()
+    sys.stdout.flush()
+
+    import os
+    os._exit(exitstatus)
