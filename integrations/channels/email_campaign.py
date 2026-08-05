@@ -371,7 +371,19 @@ def tracking_token(address: str, campaign: str) -> str:
     """
     import hashlib
     import hmac
-    secret = os.environ.get('HEVOLVE_TRACK_SECRET', 'hevolve-campaign')
+    # Was: os.environ.get('HEVOLVE_TRACK_SECRET', 'hevolve-campaign')
+    #
+    # That default sits in the public source, so this token was not opaque.
+    # It is an HMAC over 'campaign|address', which means anyone holding the
+    # repository and a candidate address could confirm whether a token
+    # belonged to that address, across every recipient of every campaign.
+    #
+    # core.node_secret owns the per-node secret. HEVOLVE_TRACK_SECRET still
+    # wins when set. The same class of bug was already fixed for federation
+    # deltas ("a hardcoded/default key vulnerability"); this is the caller
+    # that was missed.
+    from core.node_secret import get_tracking_secret
+    secret = get_tracking_secret()
     mac = hmac.new(secret.encode(), ('%s|%s' % (campaign, address.lower())).encode(),
                    hashlib.sha256)
     return mac.hexdigest()[:12]
