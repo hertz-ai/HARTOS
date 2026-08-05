@@ -242,6 +242,81 @@ def get_local_backend_url() -> str:
     return f'http://localhost:{get_port("backend")}'
 
 
+def get_lan_ip() -> str:
+    """This machine's LAN address, or '' if it cannot be determined.
+
+    Opens a UDP socket toward a non-routable address and reads back the local
+    end. No packet is sent; the kernel just picks the interface it would use,
+    which is what tells us our own address on the network we can actually reach
+    peers over.
+
+    Lives here because this module already owns "how is this node addressed"
+    (get_port, get_local_backend_url). The same socket idiom is currently
+    open-coded in remote_desktop/transport.py, remote_desktop/dlna_bridge.py,
+    agent_engine/network_provisioner.py and deploy/distro/pxe. Those are not
+    touched here, but this is the one to migrate them onto rather than adding a
+    sixth.
+    """
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.5)
+        # 203.0.113.0/24 is TEST-NET-3, reserved and unroutable. Nothing is
+        # sent; this only selects an interface.
+        s.connect(('203.0.113.1', 9))
+        ip = s.getsockname()[0]
+        return '' if ip.startswith('127.') else ip
+    except Exception:
+        return ''
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+def get_advertisable_base_url() -> str:
+    """The base URL to hand to OTHER nodes, as opposed to the local one.
+
+    get_local_backend_url answers "where do I reach my own backend" and
+    correctly returns loopback. Peers cannot use that. Every node in the live
+    peer table advertised http://localhost:6777 for exactly this reason: the
+    local answer was published as though it were a contact address, so
+    core/peer_link/nat.py received a host it could never dial and its LAN and
+    WAN strategies both resolved to the caller's own machine.
+
+    Precedence:
+      1. HEVOLVE_BASE_URL, unchanged. It is how Docker Compose and remote SSH
+         installs already publish a routable name, and it stays authoritative.
+      2. The LAN address with the port we are actually serving on, taken from
+         get_local_backend_url so bundled installs advertise the flask port
+         rather than a dead 6777.
+      3. The local URL, when there is no usable LAN address. No worse than
+         today.
+
+    Deliberately LAN, not the STUN external IP. nat.get_external_ip() exists
+    and is the right input for the WAN case, but a bare external IP is only
+    dialable with a port-forward, and advertising one without that produces a
+    peer entry that fails slowly instead of failing fast. The LAN address is
+    correct for same-network nodes, which is the case in front of us, and the
+    traversal ladder already falls through to WireGuard and relay for the rest.
+    """
+    env = os.environ.get('HEVOLVE_BASE_URL')
+    if env:
+        return env.rstrip('/')
+    local = get_local_backend_url()
+    ip = get_lan_ip()
+    if not ip:
+        return local
+    # Reuse the port from the local resolver: it already probed which one is
+    # live, which is the whole point of that function.
+    port = local.rsplit(':', 1)[-1]
+    if not port.isdigit():
+        port = str(get_port('backend'))
+    return f'http://{ip}:{port}'
+
+
 # ── LLM URL Resolution ──────────────────────────────────────
 
 _llm_url_cache: str = ''
