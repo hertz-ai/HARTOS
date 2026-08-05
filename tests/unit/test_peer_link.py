@@ -1220,3 +1220,87 @@ class TestLinkState(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TestAutoUpgradeUsesNATTraversal
+# ═══════════════════════════════════════════════════════════════════
+#
+# _try_auto_upgrade used to derive the dial address by string-stripping the
+# scheme off the peer's advertised URL. That assumes the advertised URL is
+# directly reachable from here, which is false for any NAT-bound desktop,
+# Android or iOS node, and false for a bundled node whose advertised host is
+# loopback. NATTraversal exists for this and was called from nowhere in
+# production, only from its own tests in this file.
+
+class TestAutoUpgradeUsesNATTraversal(unittest.TestCase):
+    """_try_auto_upgrade must resolve through NAT traversal, with the old
+    string-strip kept only as a fallback."""
+
+    def setUp(self):
+        reset_link_manager()
+        self.mgr = PeerLinkManager.__new__(PeerLinkManager)
+        self.mgr._links = {}
+        self.mgr._lock = threading.Lock()
+        self.mgr._running = False
+        self.mgr._maintenance_thread = None
+        self.mgr._http_exchange_counts = {}
+        self.mgr._channel_handlers = {}
+        self.mgr._reconnect_backoff = {}
+        self.mgr._max_links = 10
+        self.mgr._tier = 'flat'
+        self.upgraded = {}
+        self.mgr.upgrade_peer = lambda **kw: self.upgraded.update(kw)
+
+    def tearDown(self):
+        reset_link_manager()
+
+    @staticmethod
+    def _peer(url):
+        return [{'node_id': 'peerX', 'url': url,
+                 'x25519_public': '', 'public_key': ''}]
+
+    def test_uses_address_from_nat_traversal_not_the_advertised_url(self):
+        """The traversal result wins over the advertised URL.
+
+        The peer advertises loopback, which is what every bundled node in the
+        live table does. Traversal finds it on the LAN. The link must be
+        opened to the LAN address, not to localhost.
+        """
+        class _Stub:
+            @staticmethod
+            def resolve_peer_address(peer_info):
+                return 'ws://192.168.1.42:6777/peer_link'
+
+        with patch('integrations.social.peer_discovery.gossip.get_peer_list',
+                   return_value=self._peer('http://localhost:6777')), \
+             patch('core.peer_link.nat.get_nat_traversal', return_value=_Stub()):
+            self.mgr._try_auto_upgrade('peerX')
+
+        self.assertEqual(self.upgraded.get('address'), '192.168.1.42:6777')
+
+    def test_falls_back_to_advertised_url_when_traversal_finds_nothing(self):
+        """A reachable peer on a flat network must behave exactly as before."""
+        class _Stub:
+            @staticmethod
+            def resolve_peer_address(peer_info):
+                return None
+
+        with patch('integrations.social.peer_discovery.gossip.get_peer_list',
+                   return_value=self._peer('http://10.0.0.7:6777')), \
+             patch('core.peer_link.nat.get_nat_traversal', return_value=_Stub()):
+            self.mgr._try_auto_upgrade('peerX')
+
+        self.assertEqual(self.upgraded.get('address'), '10.0.0.7:6777')
+
+    def test_traversal_failure_does_not_break_upgrade(self):
+        """If the traversal module raises, fall back rather than lose the peer."""
+        def _boom():
+            raise RuntimeError('stun unreachable')
+
+        with patch('integrations.social.peer_discovery.gossip.get_peer_list',
+                   return_value=self._peer('http://10.0.0.9:6777')), \
+             patch('core.peer_link.nat.get_nat_traversal', side_effect=_boom):
+            self.mgr._try_auto_upgrade('peerX')
+
+        self.assertEqual(self.upgraded.get('address'), '10.0.0.9:6777')
