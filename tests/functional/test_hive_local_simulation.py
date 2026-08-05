@@ -129,3 +129,122 @@ class TestNodeTierGating:
     def test_feature_gates_exist(self):
         from security.system_requirements import FEATURE_TIER_MAP
         assert 'local_llm' in FEATURE_TIER_MAP or len(FEATURE_TIER_MAP) > 0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# T213 continued: the two-node census this file's docstring promises
+# ═══════════════════════════════════════════════════════════════════
+#
+# The header says "two HARTOS instances on different ports ... without needing
+# a physical second node", but every test above is a shape check. None of them
+# peers two nodes, so none would have caught the live symptom: hive-census
+# reporting nodes_reporting=1 with local:true, on a network with 66 registered
+# peers.
+#
+# These run the real production path in HARD enforcement, which is the default
+# (security/master_key.get_enforcement_mode: "the correct default for Sybil
+# resistance"). No warn-mode shortcut: a census test that passes only because
+# verification was relaxed would prove nothing about production.
+
+class TestTwoNodeCensus:
+    """Node A produces a delta, node B accepts it, B's census counts two."""
+
+    @staticmethod
+    def _pair(monkeypatch):
+        from integrations.agent_engine.federated_aggregator import (
+            FederatedAggregator, register_peer_hmac_secret, _get_hmac_secret,
+            _sign_delta,
+        )
+        monkeypatch.setenv('HEVOLVE_ENFORCEMENT_MODE', 'hard')
+        node_a = FederatedAggregator()
+        node_b = FederatedAggregator()
+        # A running node always holds its own delta; that is the entry the live
+        # census reported as local:true. Without it the census counts only
+        # peers, and this test would assert against a state no real node is in.
+        node_b._local_delta = node_b.extract_local_delta()
+        # Simulate the federation handshake: B learns A's HMAC secret. In
+        # production this is exchanged signed by the node's Ed25519 key. Both
+        # aggregators share this process's per-node secret, so registering it
+        # under A's id is what the handshake would have cached.
+        return (node_a, node_b, register_peer_hmac_secret, _get_hmac_secret,
+                _sign_delta)
+
+    @staticmethod
+    def _wire_delta(node, sign, as_node_id=None):
+        """A delta exactly as it appears on the wire.
+
+        extract_local_delta() attaches the Ed25519 signature and public key;
+        broadcast_delta() then calls _sign_delta() to add the HMAC before
+        posting (federated_aggregator.py:422). Both steps are the production
+        path, and a receiver in hard mode requires both.
+
+        Worth stating because I got this wrong first: testing with the output
+        of extract_local_delta() alone produces "missing HMAC signature (hard
+        enforcement)" and looks exactly like a broken federation. It is not.
+        It is a test that skipped the signing step the sender performs.
+        """
+        delta = node.extract_local_delta()
+        if not delta:
+            return delta
+        if as_node_id:
+            # Both aggregators in this process resolve the SAME node identity,
+            # so without this the census sees one distinct node and counts 1.
+            # Re-sign after changing the id: Ed25519 covers node_id, and the
+            # receiver verifies against delta['public_key'], which does not
+            # bind a key to an id. This is a peer that shares our keypair, not
+            # a forged one, and it exercises the real acceptance path.
+            from security.node_integrity import sign_json_payload
+            delta['node_id'] = as_node_id
+            delta['signature'] = sign_json_payload(
+                {k: v for k, v in delta.items() if k != 'hmac_signature'})
+        sign(delta)
+        return delta
+
+    def test_census_counts_a_second_node_after_a_delta_is_accepted(self, monkeypatch):
+        """The end-to-end assertion. Live this reads 1; it must read 2."""
+        node_a, node_b, register, own_secret, sign = self._pair(monkeypatch)
+
+        delta = self._wire_delta(node_a, sign, as_node_id='peer_node_a')
+        if not delta:
+            pytest.skip('no local delta available in this environment')
+
+        register(delta.get('node_id', ''), own_secret())
+        accepted, reason = node_b.receive_peer_delta(delta)
+        assert accepted, f'delta rejected under hard enforcement: {reason}'
+
+        census = node_b.hive_census()
+        assert census.get('nodes_reporting', 0) >= 2, census
+
+    def test_census_marks_exactly_one_node_local(self, monkeypatch):
+        """local:true is how the live census revealed it was alone. With a real
+        peer present, exactly one entry may claim it."""
+        node_a, node_b, register, own_secret, sign = self._pair(monkeypatch)
+
+        delta = self._wire_delta(node_a, sign, as_node_id='peer_node_a')
+        if not delta:
+            pytest.skip('no local delta available in this environment')
+
+        register(delta.get('node_id', ''), own_secret())
+        node_b.receive_peer_delta(delta)
+
+        per_node = node_b.hive_census().get('per_node', {})
+        locals_ = [k for k, v in per_node.items() if v.get('local')]
+        assert len(locals_) == 1, per_node
+
+    def test_unsigned_delta_is_refused_under_hard_enforcement(self, monkeypatch):
+        """The guard that makes the two tests above meaningful.
+
+        If anything can be accepted, counting to 2 proves nothing.
+        """
+        _, node_b, _, _, _ = self._pair(monkeypatch)
+        import time as _t
+        from integrations.agent_engine.federated_aggregator import DELTA_VERSION
+
+        accepted, reason = node_b.receive_peer_delta({
+            'version': DELTA_VERSION,
+            'node_id': 'impostor',
+            'timestamp': _t.time(),
+            'signature': '',
+        })
+        assert not accepted
+        assert 'signature' in reason.lower(), reason
