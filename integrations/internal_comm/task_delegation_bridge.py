@@ -21,7 +21,19 @@ import sys
 import os
 
 # Add parent directory to path for imports
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+sys.path.insert(0, _ROOT)
+# `agent_ledger` does NOT live at the repo root — it lives in
+# agent-ledger-opensource/agent_ledger, surfaced as a top-level package by
+# setup.py's package_dir mapping in INSTALLED builds. On a bare source
+# checkout that mapping does not exist, so the root insert above was not
+# enough: `import create_recipe` (which imports this module at top level)
+# died with ModuleNotFoundError before the app could even load. Mirror the
+# mapping for source runs; on an installed build this path simply does not
+# exist and the entry is inert.
+_LEDGER_SRC = os.path.join(_ROOT, 'agent-ledger-opensource')
+if os.path.isdir(_LEDGER_SRC) and _LEDGER_SRC not in sys.path:
+    sys.path.insert(0, _LEDGER_SRC)
 
 from agent_ledger import (
     SmartLedger, Task, TaskType, TaskStatus, ExecutionMode
