@@ -8,6 +8,7 @@ backup restore, power, i18n, accessibility, screenshot, devices, upgrades.
 import json
 import os
 import tempfile
+import types
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -866,6 +867,42 @@ class TestShellScreenshot(unittest.TestCase):
                 r = client.post('/api/shell/screenshot')
                 # May succeed via mss or fail gracefully
                 self.assertIn(r.status_code, (200, 501))
+
+    def test_screenshot_mss_present_but_failing_is_the_designed_501(self):
+        """The regression 6864f6b2 fixed, now pinned: mss IMPORTABLE but
+        raising (no DISPLAY/WAYLAND socket, missing X11 client libs — every
+        failure mode it has once installed). Catching only ImportError let
+        those escape a deployed handler as an unhandled 500; the designed
+        answer is the controlled 501 two lines below. Early boot, before a
+        compositor is up, hits exactly this path."""
+        client = _make_os_app()
+        fake_mss = types.SimpleNamespace(
+            mss=MagicMock(side_effect=Exception('no DISPLAY')))
+        with patch('subprocess.run', side_effect=FileNotFoundError), \
+                patch.dict('sys.modules', {'mss': fake_mss}):
+            r = client.post('/api/shell/screenshot')
+        self.assertEqual(r.status_code, 501, r.get_data(as_text=True))
+        self.assertFalse(json.loads(r.data)['captured'])
+
+    def test_screenshot_refuses_an_output_dir_outside_owned_roots(self):
+        """output_dir is a caller-controlled WRITE path and was the one
+        file-writing route with no path guard at all. Confined like every
+        other mutation: refused BEFORE any tool runs or directory is made."""
+        client = _make_os_app()
+        with patch('subprocess.run') as mock_run:
+            r = client.post('/api/shell/screenshot',
+                            json={'output_dir': '/etc'})
+        self.assertEqual(r.status_code, 403, r.get_data(as_text=True))
+        mock_run.assert_not_called()
+
+    def test_recording_refuses_an_output_dir_outside_owned_roots(self):
+        """Same confinement on the recording route's write path."""
+        client = _make_os_app()
+        with patch('subprocess.Popen') as mock_popen:
+            r = client.post('/api/shell/recording/start',
+                            json={'output_dir': '/etc'})
+        self.assertEqual(r.status_code, 403, r.get_data(as_text=True))
+        mock_popen.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════

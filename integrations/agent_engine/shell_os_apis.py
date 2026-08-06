@@ -81,8 +81,11 @@ def _get_allowed_roots():
     # This PC / partition browsing: admit every real disk mountpoint reported by
     # psutil (the SAME read-only source the Storage + This-PC panels use), so a
     # drive root like C:\ or /mnt/data opens in the file manager instead of 403.
-    # Read paths only, and every shell route is _require_shell_auth (local-only)
-    # gated — this widens what the local desktop session can browse, nothing more.
+    # BROWSE (read) routes only: every mutation route and whole-tree walk must
+    # ask _is_path_allowed(..., include_mounts=False) — on Linux `/` is itself
+    # a mountpoint, so this union contains the ENTIRE filesystem and confines
+    # nothing. Every shell route is additionally _require_shell_auth
+    # (local-only) gated.
     try:
         import psutil
         for part in psutil.disk_partitions(all=False):
@@ -482,7 +485,11 @@ def register_shell_os_routes(app):
         path = data.get('path', '')
         if not path:
             return jsonify({'error': 'path required'}), 400
-        if not _is_path_allowed(path):
+        # MUTATION -> confined roots. The browse default admits every disk
+        # mountpoint (This-PC), and on Linux `/` IS a mountpoint — with the
+        # default this guard passes for any path on the box (see
+        # _is_path_allowed's docstring). Reads may roam; writes may not.
+        if not _is_path_allowed(path, include_mounts=False):
             return jsonify({'error': 'Path outside allowed roots'}), 403
         try:
             os.makedirs(path, exist_ok=True)
@@ -499,7 +506,9 @@ def register_shell_os_routes(app):
         path = data.get('path', '')
         if not path or not os.path.exists(path):
             return jsonify({'error': 'path not found'}), 400
-        if not _is_path_allowed(path):
+        # MUTATION -> confined roots (see mkdir). The destructive classifier
+        # below is the second gate, not a substitute for this one.
+        if not _is_path_allowed(path, include_mounts=False):
             return jsonify({'error': 'Path outside allowed roots'}), 403
 
         if not _classify_destructive(f'delete file: {path}'):
@@ -537,7 +546,9 @@ def register_shell_os_routes(app):
         dst = data.get('destination', '')
         if not src or not dst:
             return jsonify({'error': 'source and destination required'}), 400
-        if not _is_path_allowed(src) or not _is_path_allowed(dst):
+        # MUTATION on BOTH ends (the source is removed) -> confined roots.
+        if not _is_path_allowed(src, include_mounts=False) \
+                or not _is_path_allowed(dst, include_mounts=False):
             return jsonify({'error': 'Path outside allowed roots'}), 403
         try:
             _audit_shell_op('file_move', {'from': src, 'to': dst})
@@ -555,7 +566,12 @@ def register_shell_os_routes(app):
         dst = data.get('destination', '')
         if not src or not dst:
             return jsonify({'error': 'source and destination required'}), 400
-        if not _is_path_allowed(src) or not _is_path_allowed(dst):
+        # Confined on both ends. dst is a write; src stays confined too until
+        # the #35 browse-parity decision consciously relaxes it — a roaming
+        # copy-src is exfiltration-by-copy, and the committed contract
+        # (test_ws11 test_copy_rejects_src_outside_roots) says 403.
+        if not _is_path_allowed(src, include_mounts=False) \
+                or not _is_path_allowed(dst, include_mounts=False):
             return jsonify({'error': 'Path outside allowed roots'}), 403
         try:
             _audit_shell_op('file_copy', {'from': src, 'to': dst})
@@ -1200,6 +1216,10 @@ def register_shell_os_routes(app):
         region = data.get('region')  # {x, y, width, height} or None for full
         output_dir = data.get('output_dir',
             os.path.expanduser('~/Pictures/Screenshots'))
+        # Caller-controlled WRITE path: confine it like every other mutation.
+        # This was the one file-writing route with no path guard at all.
+        if not _is_path_allowed(output_dir, include_mounts=False):
+            return jsonify({'error': 'Path outside allowed roots'}), 403
         os.makedirs(output_dir, exist_ok=True)
 
         filename = f'screenshot_{int(time.time())}.png'
@@ -1258,6 +1278,10 @@ def register_shell_os_routes(app):
         data = request.get_json(force=True) if request.data else {}
         output_dir = data.get('output_dir',
             os.path.expanduser('~/Videos/Recordings'))
+        # Caller-controlled WRITE path — same confinement as the screenshot
+        # route above.
+        if not _is_path_allowed(output_dir, include_mounts=False):
+            return jsonify({'error': 'Path outside allowed roots'}), 403
         os.makedirs(output_dir, exist_ok=True)
 
         filename = f'recording_{int(time.time())}.mp4'
@@ -2575,7 +2599,10 @@ def register_shell_os_routes(app):
 
         if not path or not os.path.exists(path):
             return jsonify({'error': 'path not found'}), 404
-        if not _is_path_allowed(path):
+        # MUTATION -> confined roots (see shell_files_mkdir): with the browse
+        # default this "sandbox" admits every mountpoint, so a chmod on
+        # /etc/anything would have passed the guard on Linux.
+        if not _is_path_allowed(path, include_mounts=False):
             return jsonify({'error': 'Path outside allowed roots'}), 403
 
         # Parse mode: octal string ('0755'/'755') or int -> 0..0o777
