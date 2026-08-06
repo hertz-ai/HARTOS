@@ -148,11 +148,13 @@ def test_power_firmware_verb_gated_on_uefi_capability(client, fake_os):
     # ENTRY  POST /api/shell/power/action {'action': 'firmware'}
     #   -> shell_power_action: 'firmware' IS in the allowlist, but before any
     #      logind call it must pass firmware_setup_supported()
-    #      [shell_os_apis.py:1016-1019 -> 213]:
-    #        1) os.path.isdir('/sys/firmware/efi') -- absent on this dev box
-    #           (and on any legacy-BIOS box) ==> False immediately;
-    #        2) (on UEFI) read the OsIndicationsSupported efivar and test the
-    #           boot-to-fw-UI bit -- a pure FILE read, never a subprocess.
+    #      [shell_os_apis.py:1016-1019 -> 213]. The probe is a pure sysfs read
+    #      (isdir('/sys/firmware/efi'), then the OsIndicationsSupported efivar's
+    #      boot-to-fw-UI bit) -- never a subprocess, so FakeOS cannot see it and
+    #      it would otherwise answer from the HOST: False on the BIOS/Windows
+    #      dev box, True on a UEFI Linux runner. The fixture pins it to the fake
+    #      machine's declared identity, which defaults to legacy BIOS; the
+    #      capable branch is driven below by test_power_firmware_verb_arms...
     # DATA   unsupported ==> 400 {'error': 'Reboot to firmware setup is not
     #        supported...'} -- the user asked for firmware setup, so a plain
     #        reboot would be the WRONG action; refusing is the design.
@@ -162,6 +164,44 @@ def test_power_firmware_verb_gated_on_uefi_capability(client, fake_os):
     assert resp.status_code == 400
     assert 'not supported' in resp.get_json()['error']
     assert fake_os.calls == []
+
+
+def test_power_firmware_verb_arms_then_reboots_when_capable(client, fake_os):
+    # BRANCH the OTHER side of the gate above, and the reason the capability is
+    #        a declared knob rather than a read of the host: on a legacy-BIOS
+    #        (or Windows) box this path was UNREACHABLE from this suite, so the
+    #        two-step arm-then-reboot sequence -- the part a user actually feels
+    #        when they pick "restart into firmware setup" -- went unexercised.
+    # ENTRY  POST /api/shell/power/action {'action': 'firmware'} on a UEFI box
+    #   -> firmware_setup_supported() True  [shell_os_apis.py:1043]
+    #   -> _logind_call('SetRebootToFirmwareSetup','b','true')  [.py:1051]
+    #   -> only if THAT succeeded: _logind_call('Reboot','b','true')  [.py:1055]
+    # DATA   ORDER is the contract: arming after the reboot request would be a
+    #        plain reboot, which is the wrong action for the user's intent.
+    fake_os.uefi_firmware_setup = True
+    resp = client.post('/api/shell/power/action', json={'action': 'firmware'})
+    assert resp.status_code == 200
+    assert resp.get_json()['initiated'] is True
+    assert _login1('SetRebootToFirmwareSetup', 'b', 'true') in fake_os.calls
+    assert _login1('Reboot', 'b', 'true') in fake_os.calls
+    # The arm MUST precede the reboot.
+    assert (fake_os.calls.index(_login1('SetRebootToFirmwareSetup', 'b', 'true'))
+            < fake_os.calls.index(_login1('Reboot', 'b', 'true')))
+
+
+def test_power_firmware_arm_denied_never_reboots(client, fake_os):
+    # BRANCH arming is DENIED (polkit says no to SetRebootToFirmwareSetup).
+    #        The handler must surface the real error and NOT fall through to a
+    #        plain Reboot -- rebooting without the flag armed would drop the
+    #        user back into the OS instead of firmware setup  [.py:1052-1054].
+    fake_os.uefi_firmware_setup = True
+    fake_os.rc_for['SetRebootToFirmwareSetup'] = 1
+    resp = client.post('/api/shell/power/action', json={'action': 'firmware'})
+    assert resp.status_code == 500
+    body = resp.get_json()
+    assert body['initiated'] is False
+    assert 'Could not arm firmware setup' in body['error']
+    assert _login1('Reboot', 'b', 'true') not in fake_os.calls
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -282,13 +322,21 @@ def test_session_firmware_capability_probe_is_pure_read(client, fake_os):
     #      -> firmware_setup_supported()  [shell_os_apis.py:213] -- the SAME
     #         single-source probe the power routes gate on: isdir
     #         ('/sys/firmware/efi') then an efivar file read. No subprocess.
-    # DATA   this box has no /sys/firmware/efi ==> {'supported': False}, so the
-    #        power menu HIDES the firmware button instead of offering a verb
-    #        that would degrade into a plain reboot.
+    # DATA   the fake machine is declared legacy-BIOS ==> {'supported': False},
+    #        so the power menu HIDES the firmware button instead of offering a
+    #        verb that would degrade into a plain reboot.
     # BRANCH boundary log stays EMPTY: capability is answered from sysfs alone.
     resp = client.get('/api/shell/session/firmware-capable')
     assert resp.status_code == 200
     assert resp.get_json() == {'supported': False}
+    assert fake_os.calls == []
+
+    # And the capable box reports the opposite through the SAME probe, so the
+    # shell reveals the button. One surface, one source of truth.
+    fake_os.uefi_firmware_setup = True
+    resp = client.get('/api/shell/session/firmware-capable')
+    assert resp.status_code == 200
+    assert resp.get_json() == {'supported': True}
     assert fake_os.calls == []
 
 

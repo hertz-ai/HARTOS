@@ -355,9 +355,14 @@ def test_07_wallpaper_state_and_set_x11_branch(client, fake_os, monkeypatch):
     # THEN   the user picks an image: POST /api/shell/wallpaper/set
     #        {'path': '/usr/share/backgrounds/hart/aura.png', 'mode': 'fill'}
     #        -> shell_wallpaper_set():
-    #        BRANCH _is_wayland()? -- WAYLAND_DISPLAY / XDG_SESSION_TYPE are
-    #        cleared here (and pgrep only runs on sys.platform=='linux'), so
-    #        the X11 branch runs:
+    #        BRANCH _is_wayland()? -- it has THREE inputs and this test must
+    #        pin all three or the branch flips per box: WAYLAND_DISPLAY and
+    #        XDG_SESSION_TYPE are cleared (the fixture clears them too, so a
+    #        developer's own Wayland session cannot leak in), and the third --
+    #        `pgrep -x sway|labwc|hyprland`, which runs on Linux only -- is
+    #        declared to find NO compositor. Without that last one the default
+    #        rc-0 FakeOS answers "a compositor IS running" on every Linux
+    #        runner and the Wayland branch runs instead. So the X11 branch:
     #           mode 'fill' -> _run(['feh', '--bg-fill', <path>])
     #           (fake_os records the argv; nothing paints on this box)
     #        -> cfg['current']=path, cfg['mode']=mode -> _save_json
@@ -367,6 +372,7 @@ def test_07_wallpaper_state_and_set_x11_branch(client, fake_os, monkeypatch):
     #        wallpaper survives a session restart.  (Config restored after.)
     monkeypatch.delenv('WAYLAND_DISPLAY', raising=False)
     monkeypatch.delenv('XDG_SESSION_TYPE', raising=False)
+    fake_os.rc_for['pgrep'] = 1          # no Wayland compositor process
     path, original = _wallpaper_cfg_snapshot()
     try:
         state = client.get('/api/shell/wallpaper')
