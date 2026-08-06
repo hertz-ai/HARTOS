@@ -46,10 +46,23 @@ def v36_db(tmp_path, monkeypatch):
     monkeypatch.delenv('HEVOLVE_DB_URL', raising=False)
     monkeypatch.delenv('DATABASE_URL', raising=False)
 
-    # Force a fresh engine — the module caches one globally.
-    import importlib
+    # Point the module at the tmp DB by patching its GLOBALS, never by
+    # importlib.reload. Reload re-executes models.py, which mints a NEW
+    # declarative Base — the facade's own classes (SitePage) land on the new
+    # metadata while the branch module's classes (User, ...) stay cached on
+    # the OLD one. create_all on the split metadata then dies resolving
+    # SitePage's lazy string FK: "Foreign key associated with column
+    # 'site_pages.author_id' could not find table 'users'". This fixture is
+    # exactly how that read: two ERRORs, since the facade grew SitePage.
+    # DB_URL/DB_PATH are import-time env snapshots, so patch them directly;
+    # `_engine = None` is the module's documented reset seam (tenant_filter's
+    # own docs name it), and monkeypatch restores everything afterwards.
     from integrations.social import models as models_mod
-    importlib.reload(models_mod)
+    monkeypatch.setattr(models_mod, 'DB_PATH', str(db_path), raising=False)
+    monkeypatch.setattr(models_mod, 'DB_URL', f'sqlite:///{db_path}',
+                        raising=False)
+    monkeypatch.setattr(models_mod, '_engine', None, raising=False)
+    monkeypatch.setattr(models_mod, '_SessionLocal', None, raising=False)
 
     # Bootstrap the schema and stamp it at v36 (pre-voice_profile).
     from sqlalchemy import text
