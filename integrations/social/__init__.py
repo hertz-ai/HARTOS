@@ -389,10 +389,44 @@ def init_social(app):
         from security.master_key import full_boot_verification, is_dev_mode, get_enforcement_mode
         verification = full_boot_verification()
         enforcement = get_enforcement_mode()
-        _boot_verified = verification['passed'] or is_dev_mode() or enforcement in ('off', 'warn')
+        # An install with NO manifest has nothing to verify, which is not the
+        # same as failing verification, and must not disable the hive.
+        #
+        # This gate gets gossip, LAN auto-discovery and the sync engine. No
+        # bundled desktop build ships a release_manifest.json, so
+        # full_boot_verification returns passed False with reason no_manifest
+        # on every desktop, enforcement defaults to hard, and gossip.start()
+        # was skipped on all of them. That is why the peer table on a live
+        # desktop held zero rows, not even the seed rows _seed_initial_peers
+        # writes on start, and why remote_count stayed 0 no matter what was
+        # fixed downstream. The node announced to nobody and heard from
+        # nobody. The critical log below fired every boot and nobody saw it,
+        # because desktop logs are not surfaced anywhere.
+        #
+        # Failing closed here protected nothing: with no manifest present
+        # there is no signed baseline to compare the code against, so the
+        # check has no signal, exactly like the empty release hash registry.
+        # It only turned the product's networking off for every desktop user.
+        #
+        # A manifest that IS present and fails is a real tamper signal and
+        # still fails closed: reason is bad_signature, code_mismatch or
+        # origin_failed, and none of those are admitted here.
+        _no_manifest = verification.get('reason') == 'no_manifest'
+        _boot_verified = (
+            verification['passed']
+            or is_dev_mode()
+            or enforcement in ('off', 'warn')
+            or _no_manifest
+        )
         _boot_manifest = verification.get('manifest')
         if verification['passed']:
             logger.info(f"HevolveSocial boot verification PASSED: {verification['details']}")
+        elif _no_manifest:
+            logger.warning(
+                "HevolveSocial: no release manifest, so code integrity is "
+                "UNVERIFIED. Starting the hive anyway; there is no signed "
+                "baseline to check against, and refusing to start would "
+                "disable peering without detecting anything.")
         elif _boot_verified:
             logger.warning(f"HevolveSocial boot verification not passed but allowed "
                           f"(enforcement={enforcement}): {verification['details']}")

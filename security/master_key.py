@@ -220,12 +220,19 @@ def full_boot_verification(code_root: str = None) -> dict:
     # Step 1: Load manifest
     manifest = load_release_manifest(code_root)
     if not manifest:
+        # `reason` lets callers tell "there was nothing to verify" apart from
+        # "verification failed". They are very different facts and the boolean
+        # collapses them. No bundled desktop build ships a manifest, so every
+        # desktop install lands here, and callers that fail closed on this
+        # disable themselves on 100% of desktops while catching no tampering.
         return {'passed': False, 'enforcement': enforcement,
+                'reason': 'no_manifest',
                 'details': 'No release_manifest.json found', 'manifest': None}
 
     # Step 2: Verify master signature
     if not verify_release_manifest(manifest):
         return {'passed': False, 'enforcement': enforcement,
+                'reason': 'bad_signature',
                 'details': 'Invalid master signature on release manifest', 'manifest': manifest}
 
     # Step 3: Compare local code hash
@@ -234,6 +241,7 @@ def full_boot_verification(code_root: str = None) -> dict:
         return {
             'passed': False,
             'enforcement': enforcement,
+            'reason': 'code_mismatch',
             'details': result['details'],
             'manifest': manifest,
         }
@@ -248,6 +256,7 @@ def full_boot_verification(code_root: str = None) -> dict:
                 return {
                     'passed': False,
                     'enforcement': enforcement,
+                    'reason': 'origin_failed',
                     'details': f"Origin attestation failed: {origin['details']}",
                     'manifest': manifest,
                 }

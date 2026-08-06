@@ -315,10 +315,34 @@ class GossipProtocol:
     # ─── Payload Serialization ───
 
     def _gossip_self_info(self):
-        """Return self info appropriate for current bandwidth profile."""
+        """Return self info appropriate for current bandwidth profile.
+
+        Re-signs after compaction. _COMPACT_FIELDS keeps `signature` and
+        `public_key` but drops name, version, agent_count, post_count,
+        x25519_public and current_version, all of which the signature covers.
+        The receiver verifies over every field except 'signature', so a
+        compacted record carrying the full record's signature can never
+        verify, and under enforcement=hard the peer is refused. That made
+        every constrained and minimal profile node permanently unverifiable,
+        the same defect as signing _self_info before finishing it.
+
+        Signing what is actually sent keeps the invariant in one place. The
+        bandwidth saving is unaffected.
+        """
         info = self._self_info()
         if self.payload_mode == 'json_compact':
-            return {k: v for k, v in info.items() if k in _COMPACT_FIELDS}
+            compact = {k: v for k, v in info.items() if k in _COMPACT_FIELDS}
+            if compact.get('public_key'):
+                try:
+                    from security.node_integrity import sign_json_payload
+                    compact.pop('signature', None)
+                    compact['signature'] = sign_json_payload(compact)
+                except Exception:
+                    # No crypto available: send it unsigned rather than with a
+                    # signature that cannot match, so the receiver's
+                    # enforcement path sees the truth.
+                    compact.pop('signature', None)
+            return compact
         return info
 
     def _gossip_peer_list(self):
@@ -486,14 +510,38 @@ class GossipProtocol:
             peers = self._load_peers_by_tier()
 
         if not peers:
-            # Retry seeds if we have no peers — limit to 2 seeds max
-            # to avoid blocking for N × 5s when all seeds are unreachable
+            # Bootstrap. Retry seeds, limited to 2 so a cold node does not
+            # block for N x 5s when every seed is unreachable.
+            #
+            # EXCHANGE as well as announce. Announcing only tells the seed we
+            # exist; _announce_to_peer discards the response body, so it
+            # teaches us nothing. Exchange is the only call that returns the
+            # other side's peer list, and it was reached exclusively through
+            # the `peers` path below, which requires already having a peer.
+            # That was a closed loop: a node with no peers could register
+            # itself with central forever and never learn of a single node,
+            # so remote_count stayed 0 on every fresh install no matter what
+            # else was fixed. Observed live: central accepted this desktop and
+            # listed it, while the desktop still reported remote_count 0
+            # through repeated gossip rounds.
+            #
+            # Announce is kept ahead of the exchange rather than replaced.
+            # Exchange carries `sender`, so a peer that implements it learns
+            # us either way, but a node that predates the endpoint would 404
+            # the exchange and we would lose the registration. Two requests to
+            # at most two seeds, and only while we have no peers at all.
             for url in list(self.seed_peers)[:2]:
                 if not self._running:
                     return
                 if self._is_peer_backed_off(url):
                     continue
                 self._announce_to_peer(url)
+                try:
+                    their_peers = self._exchange_with_peer(url)
+                    if their_peers:
+                        self._merge_peer_list(their_peers)
+                except Exception as e:
+                    logger.debug(f"Bootstrap exchange with {url} failed: {e}")
                 self._heartbeat()
             return
 
@@ -999,14 +1047,34 @@ class GossipProtocol:
             db.close()
 
     def _merge_peer_list(self, peer_list):
-        """Merge a list of peer dicts into the DB."""
+        """Merge a list of peer dicts into the DB.
+
+        These are RELAYED records, so they are address hints, not identity
+        claims, and are merged with relayed=True. A relayed record physically
+        cannot carry proof of who it describes: PeerNode has no signature
+        column, so a peer list can only ever republish node_id, url and
+        public_key. Judging them by the rules for a direct announce meant
+        every third-party record was refused for having no signature, and a
+        node could therefore never learn about anyone it had not already
+        contacted. The network could only ever be a star around whoever you
+        announced to directly.
+
+        Measured against live central: of 72 records returned by
+        /api/social/peers/exchange, exactly ONE carried a signature, the
+        sender's own live self-info. The other 71 were unusable.
+
+        A hint gets the node an address to try. The direct announce that
+        follows carries a live signature and is what actually verifies the
+        peer, so nothing is trusted on hearsay: relayed rows land as
+        unverified and have to prove themselves on contact.
+        """
         from .models import get_db
         db = get_db()
         try:
             new_count = 0
             for p in peer_list:
                 if p.get('node_id') and p.get('node_id') != self.node_id:
-                    if self._merge_peer(db, p):
+                    if self._merge_peer(db, p, relayed=True):
                         new_count += 1
             if new_count > 0:
                 logger.info(f"Gossip: merged {new_count} new peers")
@@ -1017,9 +1085,23 @@ class GossipProtocol:
         finally:
             db.close()
 
-    def _merge_peer(self, db, peer_data, reasons=None):
+    def _merge_peer(self, db, peer_data, reasons=None, relayed=False):
         """Upsert a single peer into PeerNode table. Returns True if new.
         Verifies Ed25519 signature if present. Rejects banned nodes.
+
+        ``relayed``: the record came from another node's peer list rather than
+        from the node it describes. It is an address hint. A relayed record
+        cannot carry a signature (PeerNode stores none), and it is not the
+        subject asserting anything, so the gates that test what a node claims
+        about ITSELF do not apply: absent signature, and the certificate
+        required of a regional or central tier. Those are enforced on the
+        direct announce, which is the node speaking for itself. A relayed row
+        is always recorded unverified.
+
+        The checks that still apply to a hint are the ones about whether the
+        record is safe to hold at all: banned nodes, the per-host Sybil cap,
+        a guardrail hash that disagrees with ours, and a signature that IS
+        present but does not verify, which is worse than none.
 
         ``reasons``: optional list. When supplied, a rejection appends the
         reason to it. The return value stays a plain bool so existing callers
@@ -1104,8 +1186,9 @@ class GossipProtocol:
 
         integrity_status = 'verified' if signature_valid else 'unverified'
 
-        # Enforcement gate: reject unsigned peers in hard mode
-        if not signature_valid:
+        # Enforcement gate: reject unsigned peers in hard mode.
+        # Skipped for relayed hints, which cannot carry one by construction.
+        if not signature_valid and not relayed:
             try:
                 from security.master_key import get_enforcement_mode
                 enforcement = get_enforcement_mode()
@@ -1231,7 +1314,7 @@ class GossipProtocol:
         peer_tier = peer_data.get('tier', 'flat')
         certificate = peer_data.get('certificate')
         certificate_verified = False
-        if peer_tier in ('regional', 'central') and not certificate:
+        if peer_tier in ('regional', 'central') and not certificate and not relayed:
             logger.warning(f"Rejecting {node_id[:8]}: {peer_tier} tier requires certificate")
             return _reject(f'tier {peer_tier} requires a certificate, none sent')
         if peer_tier in ('regional', 'central') and certificate:
@@ -1260,6 +1343,18 @@ class GossipProtocol:
             except Exception as e:
                 logger.debug(f"Certificate verification error for {node_id[:8]}: {e}")
 
+        if relayed:
+            # A hint carries no proof of anything, so it must not inherit
+            # trust from what it happens to assert. The code hash and
+            # certificate above were read from a record some OTHER node
+            # republished; treating either as established would let a peer
+            # list launder trust for nodes nobody has spoken to. These get
+            # set for real when the node announces itself and its live
+            # signature verifies.
+            master_key_verified = False
+            certificate_verified = False
+            integrity_status = 'unverified'
+
         if existing:
             existing.last_seen = datetime.utcnow()
             existing.url = url
@@ -1276,14 +1371,20 @@ class GossipProtocol:
                 existing.code_version = peer_data['version']
             if signature_valid:
                 existing.integrity_status = 'verified'
-            existing.master_key_verified = master_key_verified
+            # A relayed hint must not DOWNGRADE a peer that already proved
+            # itself with a direct signed announce. It carries no evidence
+            # either way, and letting hearsay clear master_key_verified,
+            # certificate_verified or tier would mean any node could strip a
+            # verified peer's standing just by republishing a stale row.
+            # Hints may add a peer we did not know; they may not unmake one.
+            if not relayed:
+                existing.master_key_verified = master_key_verified
+                existing.tier = peer_tier
+                if certificate:
+                    existing.certificate_json = certificate
+                    existing.certificate_verified = certificate_verified
             if peer_data.get('release_version'):
                 existing.release_version = peer_data['release_version']
-            # Update tier/certificate fields
-            existing.tier = peer_tier
-            if certificate:
-                existing.certificate_json = certificate
-                existing.certificate_verified = certificate_verified
             # Update capability tier from HART OS equilibrium
             if peer_data.get('capability_tier'):
                 existing.capability_tier = peer_data['capability_tier']
