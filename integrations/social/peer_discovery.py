@@ -171,14 +171,25 @@ class GossipProtocol:
         if self._base_url_final:
             return self._base_url_cached
 
-        from core.port_registry import get_advertisable_base_url, get_port
-        url = get_advertisable_base_url()
-        # An explicit env override, or any answer that is not the
-        # nothing-is-listening fallback, is final.
-        fallback = f'http://localhost:{get_port("backend")}'
-        _loopback = '//localhost' in url or '//127.' in url
-        if os.environ.get('HEVOLVE_BASE_URL') or (url != fallback and not _loopback):
+        from core import port_registry as _pr
+        url = _pr.get_advertisable_base_url()
+        # Finality is decided by the PORT, never the host form. The previous
+        # rule compared against the LOOPBACK fallback string
+        # (http://localhost:6777) and called anything else final — but
+        # get_advertisable_base_url rewrites the host to the LAN address, so
+        # on any networked box the cold-boot fallback arrives as
+        # http://<lan>:6777, matched nothing, and was FROZEN. That is the
+        # exact regression this property exists to prevent, reintroduced for
+        # the LAN path: every peer dialled a dead 6777 for the life of the
+        # process. Ask the honest question instead — is the port in the
+        # answer actually LISTENING? (Same probe the resolver itself uses;
+        # attribute access through the module so test seams keep working.)
+        if os.environ.get('HEVOLVE_BASE_URL'):
             self._base_url_final = True
+        else:
+            _port = url.rsplit(':', 1)[-1]
+            if _port.isdigit() and _pr._is_port_listening(int(_port)):
+                self._base_url_final = True
         self._base_url_cached = url
         return url
 
