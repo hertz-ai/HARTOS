@@ -236,6 +236,31 @@ def find_block(content, header_re, open_ch="{", close_ch="}"):
     return None
 
 
+def find_all_blocks(content, header_re, open_ch="{", close_ch="}"):
+    """Every `<header> { ... }` block in `content`, in order.
+
+    find_block stops at the FIRST match, which is a shadowing hazard when the
+    content is a closure CONCATENATION (desktop_closure): a block appearing in
+    the variant file would silently shadow the profile's block of the same
+    name, and every assertion would read the wrong scope — a false red at
+    best, a false green (asserting a key's ABSENCE against the wrong block)
+    at worst. Callers over a concatenation must either iterate all matches or
+    assert uniqueness first.
+    """
+    out = []
+    pos = 0
+    while True:
+        m = re.search(header_re, content[pos:])
+        if not m:
+            return out
+        inner = find_block(content[pos:], header_re, open_ch, close_ch)
+        if inner is None:
+            return out
+        out.append(inner)
+        # Resume after this block's header (inner may be empty — always move).
+        pos += m.end() + max(len(inner), 1)
+
+
 def list_paths(block):
     """Real relative `./...nix` and `../...nix` import paths in a list block
     (comment-stripped first so a commented-out path is NOT counted).
@@ -381,6 +406,17 @@ class TestNixReaderBoundary:
         inner = find_block("hart = { a = { z = 1; }; b = 2; };", r"hart\s*=\s*\{")
         assert "b = 2" in inner
         assert inner.count("{") == inner.count("}")  # nested block fully captured
+
+    def test_find_all_blocks_returns_every_match_in_order(self):
+        """Concatenated-closure safety: the assertion helpers must be able to
+        see EVERY block of a given name, or a second block silently shadows
+        the first (absence-assertions then check the wrong scope)."""
+        content = "a = { x = 1; };\nother = 2;\na = { y = 2; };\n"
+        blocks = find_all_blocks(content, r"(?:^|[^\w.])a\s*=\s*\{")
+        assert len(blocks) == 2
+        assert "x = 1" in blocks[0]
+        assert "y = 2" in blocks[1]
+        assert find_all_blocks(content, r"missing\s*=\s*\{") == []
 
     def test_bool_assignment_sees_through_priority_wrappers(self):
         """A NixOS option's VALUE is what these tests assert; mkDefault /
@@ -541,11 +577,20 @@ class TestDesktopEnables:
     @pytest.fixture(autouse=True)
     def load(self):
         self.raw = desktop_closure()
-        block = find_block(nix_skeleton(self.raw), r"(?:^|[^\w.])hart\s*=\s*\{")
-        assert block is not None, (
+        blocks = find_all_blocks(nix_skeleton(self.raw),
+                                 r"(?:^|[^\w.])hart\s*=\s*\{")
+        assert blocks, (
             "`hart = { ... }` block not found anywhere in the desktop closure "
             "(configurations/desktop.nix + the profiles it imports)")
-        self.hart = block
+        # Exactly ONE: the closure is a concatenation, so a second hart block
+        # (say, one growing back in the variant file) would be silently
+        # shadowed by whichever comes first and every assertion here would
+        # read the wrong scope. If this fires, scope the assertions to the
+        # intended file rather than weakening it.
+        assert len(blocks) == 1, (
+            f"{len(blocks)} `hart = {{ ... }}` blocks in the desktop closure — "
+            "assertions cannot know which scope they are reading")
+        self.hart = blocks[0]
 
     def test_firewall_enabled(self):
         assert bool_assignment(self.hart, "firewall.enable") == "true"
@@ -624,11 +669,17 @@ class TestEmailOwnsMailto:
         NOT set it (comment-aware: the explanatory comment that names it must
         not count as a key)."""
         raw = desktop_closure()
-        block = find_block(raw, r"xdg\.mime\.defaultApplications\s*=")
-        m = string_map(block)
-        assert "x-scheme-handler/mailto" not in m
-        # sanity: the parser does see the other real handlers in that same block
-        assert m.get("x-scheme-handler/http") == "firefox.desktop"
+        # ALL xdg.mime blocks in the closure, not the first: this asserts a
+        # key's ABSENCE, and absence checked against the wrong block is a
+        # false green.
+        blocks = find_all_blocks(raw, r"xdg\.mime\.defaultApplications\s*=")
+        assert blocks, "no xdg.mime.defaultApplications block in the closure"
+        maps = [string_map(b) for b in blocks]
+        for m in maps:
+            assert "x-scheme-handler/mailto" not in m
+        # sanity: the parser does see the other real handlers somewhere
+        assert any(m.get("x-scheme-handler/http") == "firefox.desktop"
+                   for m in maps)
 
     def test_email_config_is_gated(self):
         form = config_form(read(EMAIL_NIX))

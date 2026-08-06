@@ -116,9 +116,46 @@ def test_tts_engine_imports_indic_langs_from_canonical():
                         )
 
 
+_CJK = {'zh', 'ja', 'ko'}
+_RTL = {'ar', 'he', 'fa', 'ur'}
+# Latin-script codes are the DISCRIMINATOR, not part of the signature:
+# NON_LATIN_SCRIPT_LANGS by definition contains none of them, while a
+# backend's supported-LANGUAGES capability set (tts_engine's per-engine
+# `'languages': {...}` blocks, which legitimately mix 'zh'+'ar' with
+# 'en'/'es'/...) always does. A literal with CJK+RTL AND Latin codes is a
+# coverage list, not a duplicate of the canonical concept.
+_LATIN = {'en', 'es', 'fr', 'de', 'it', 'pt', 'nl', 'pl'}
+
+
+def _is_non_latin_concept(elems):
+    s = set(elems)
+    return bool(_CJK & s) and bool(_RTL & s) and not (_LATIN & s)
+
+
+def _set_literal_strings(node: ast.AST):
+    """String elements of a set/frozenset LITERAL node, else None."""
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+            and node.func.id == 'frozenset' and node.args:
+        node = node.args[0]
+    if isinstance(node, (ast.Set, ast.List, ast.Tuple)):
+        elems = [e.value for e in node.elts
+                 if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        return elems
+    return None
+
+
 def test_no_cjk_rtl_duplicates_across_files():
-    """No two source files should each define their own frozenset of
-    CJK/RTL codes.  There's only one concept; it lives in constants."""
+    """No source file may define its own set literal of the NON-LATIN-SCRIPT
+    concept.  There's only one; it lives in core.constants.
+
+    The signature is a SINGLE set/frozenset literal whose elements include
+    both a CJK code and an RTL code — only the canonical concept mixes those
+    scripts in one collection.  The old heuristic ("the file mentions 'zh'
+    somewhere AND 'ar' somewhere") false-positived on tts_engine.py, whose
+    language→backend capability map legitimately contains both codes as DICT
+    KEYS with frozensets of BACKEND NAMES as values.  A guard that is red on
+    a legal file trains everyone to ignore it.
+    """
     offenders = []
     for path in (
         HARTOS_ROOT / 'integrations' / 'agent_engine' / 'speculative_dispatcher.py',
@@ -127,15 +164,33 @@ def test_no_cjk_rtl_duplicates_across_files():
     ):
         if not path.is_file():
             continue
-        text = path.read_text(encoding='utf-8')
-        # Heuristic: CJK + RTL codes appearing together in a `frozenset({...})`
-        # literal is the signature of a non-Latin-script set.
-        if ("'zh'" in text or '"zh"' in text) and (
-            "'ar'" in text or '"ar"' in text
-        ):
-            # OK if they only appear via `from core.constants import`
-            if 'NON_LATIN_SCRIPT_LANGS' not in text:
-                offenders.append(path)
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        for node in ast.walk(tree):
+            elems = _set_literal_strings(node)
+            if elems and _is_non_latin_concept(elems):
+                offenders.append((path, sorted(set(elems))[:6]))
+                break
     assert not offenders, (
-        f"Files with inline CJK+RTL frozensets (DRY violation): {offenders}"
+        f"Inline CJK+RTL set literals (DRY violation — import "
+        f"core.constants.NON_LATIN_SCRIPT_LANGS instead): {offenders}"
     )
+
+
+def test_cjk_rtl_signature_detector_boundary():
+    """The detector itself, proven on synthetic inputs against BOTH legal
+    shapes that previously false-positived in tts_engine.py."""
+    def hits(src):
+        return [n for n in ast.walk(ast.parse(src))
+                if (e := _set_literal_strings(n)) and _is_non_latin_concept(e)]
+
+    # The canonical-concept duplicate: CJK + RTL, no Latin codes.
+    assert hits("x = frozenset({'zh', 'ar', 'hi'})"), \
+        'the canonical-concept signature must be detected'
+    # Legal shape 1: capability map — backend-name sets keyed by language.
+    assert not hits("caps = {'zh': frozenset({'pocket', 'lux'}),"
+                    " 'ar': frozenset({'lux'})}"), \
+        'backend-name sets keyed by language must NOT be flagged'
+    # Legal shape 2: a backend's supported-languages coverage list — mixes
+    # CJK + RTL with Latin codes, which the canonical concept never contains.
+    assert not hits("langs = {'en', 'es', 'cs', 'ar', 'zh', 'ja'}"), \
+        'a coverage list containing Latin codes must NOT be flagged'
