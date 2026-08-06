@@ -71,19 +71,26 @@ class ImmutableAuditLog:
         except ImportError:
             return False
 
-    def _get_last_hash(self) -> str:
-        """Get the hash of the last entry in the chain."""
+    def _get_last_hash(self, db=None) -> str:
+        """Get the hash of the last entry in the chain.
+
+        ``db``: reuse the CALLER'S session instead of opening one. This is not
+        an optimization — see record(): a second session over a shared-pool
+        connection (sqlite:// StaticPool) resets that connection on checkout,
+        ROLLING BACK the caller's uncommitted transaction.
+        """
         if self._use_db:
             try:
                 from integrations.social.models import get_db, AuditLogEntry
-                db = get_db()
+                session = db if db is not None else get_db()
                 try:
-                    last = db.query(AuditLogEntry).order_by(
+                    last = session.query(AuditLogEntry).order_by(
                         AuditLogEntry.id.desc()
                     ).first()
                     return last.entry_hash if last else 'genesis'
                 finally:
-                    db.close()
+                    if db is None:
+                        session.close()
             except Exception:
                 pass
 
@@ -94,7 +101,8 @@ class ImmutableAuditLog:
 
     def log_event(self, event_type: str, actor_id: str, action: str,
                   detail: Optional[Dict] = None,
-                  target_id: Optional[str] = None) -> Tuple[int, str]:
+                  target_id: Optional[str] = None,
+                  db=None) -> Tuple[int, str]:
         """
         Append an immutable event to the audit log.
 
@@ -104,6 +112,20 @@ class ImmutableAuditLog:
             action: What happened (free text, e.g. 'completed action 5')
             detail: Optional structured data (sensitive keys auto-redacted)
             target_id: Optional target entity ID
+            db: A caller MID-TRANSACTION on its own session MUST pass it.
+                The entry is added to that session WITHOUT commit, so it
+                persists atomically with the work it describes. Two reasons,
+                one per environment:
+                  * shared-connection pools (sqlite:// StaticPool — every CI /
+                    in-memory test env): opening a second session here resets
+                    the shared connection on checkout, which ROLLS BACK the
+                    caller's uncommitted writes. Measured: a settlement's
+                    wallet + transaction inserts were destroyed mid-flight
+                    while this log's own commit survived, and the settlement
+                    still reported success.
+                  * real databases: a separate session commits the entry even
+                    if the caller's transaction later rolls back — the
+                    immutable trail then attests to work that never happened.
 
         Returns:
             (entry_id, entry_hash)
@@ -118,14 +140,15 @@ class ImmutableAuditLog:
             now = datetime.utcnow()
             timestamp = now.isoformat()
             detail_json = _redact_sensitive(detail)
-            prev_hash = self._get_last_hash()
+            prev_hash = self._get_last_hash(db=db)
             entry_hash = _compute_hash(
                 prev_hash, event_type, actor_id, action, timestamp, detail_json)
 
             if self._use_db:
                 try:
                     from integrations.social.models import get_db, AuditLogEntry
-                    db = get_db()
+                    caller_session = db is not None
+                    session = db if caller_session else get_db()
                     try:
                         entry = AuditLogEntry(
                             event_type=event_type,
@@ -137,16 +160,24 @@ class ImmutableAuditLog:
                             entry_hash=entry_hash,
                             created_at=now,  # #48: persist the hashed timestamp
                         )
-                        db.add(entry)
-                        db.commit()
+                        session.add(entry)
+                        if caller_session:
+                            # NEVER commit/rollback/close a borrowed session —
+                            # the entry rides the caller's transaction. Flush
+                            # only, to obtain the id.
+                            session.flush()
+                        else:
+                            session.commit()
                         entry_id = entry.id
                         logger.debug(f"Audit log: {event_type} by {actor_id}: {action}")
                         return entry_id, entry_hash
                     except Exception:
-                        db.rollback()
+                        if not caller_session:
+                            session.rollback()
                         raise
                     finally:
-                        db.close()
+                        if not caller_session:
+                            session.close()
                 except Exception as e:
                     logger.warning(f"DB audit log failed, using memory: {e}")
 
