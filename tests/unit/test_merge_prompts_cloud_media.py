@@ -12,6 +12,7 @@ whole Flask app, so the function (+ its _CLOUD_MEDIA_FIELDS constant) is
 extracted from source and exec'd with a stubbed ``pooled_get`` boundary; the
 REAL merge logic runs and observable mutations are asserted.
 """
+import logging
 import os
 import re
 import sys
@@ -35,7 +36,20 @@ def _load_merge(cloud_items, status=200, raise_exc=None):
         resp.json.return_value = cloud_items
         return resp
 
-    ns = {'pooled_get': pooled_get}
+    # The exec namespace must carry every module-level name the extracted
+    # block touches, INCLUDING on its error paths. `logging` and `__name__`
+    # are needed by the except arm's
+    # `logging.getLogger(__name__).exception(...)`; without them the handler
+    # itself raised NameError, so the one test that drives a cloud failure
+    # exploded instead of asserting the swallow. That is the standing cost of
+    # extract-and-exec: a namespace is a hand-maintained copy of the module's
+    # imports, and it silently rots when production grows a new one (here, the
+    # no-silent-exception-gulping fix).
+    ns = {
+        'pooled_get': pooled_get,
+        'logging': logging,
+        '__name__': 'hart_intelligence_entry',
+    }
     exec(block, ns)
     return ns['_merge_prompts_with_cloud']
 
