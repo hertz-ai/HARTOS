@@ -721,15 +721,32 @@ class TestLocalVsCloudDeploymentDifferences:
         # Cloud DB endpoint
         assert 'hertzai.com' in config.get('DB_URL', '')
 
-    def test_gossip_protocol_default_base_url(self):
-        """Default GossipProtocol → http://localhost:6777."""
-        with patch.dict(os.environ, {}, clear=True):
-            # Remove HEVOLVE_BASE_URL if set
-            env = os.environ.copy()
-            env.pop('HEVOLVE_BASE_URL', None)
-            with patch.dict(os.environ, env, clear=True):
-                g = GossipProtocol()
-                assert g.base_url == 'http://localhost:6777'
+    def test_gossip_protocol_default_base_url_is_never_loopback(self):
+        """With no env override, base_url must be advertisable, not loopback.
+
+        This used to assert exactly 'http://localhost:6777'. That was the
+        defect, not the contract: base_url is what gets published to other
+        nodes, and no peer can dial a loopback address. Every row in the live
+        peer table read http://localhost:6777 and every node that followed one
+        reached itself.
+
+        It also made the result depend on the host. The old assertion passed
+        only on a machine with no usable LAN address and failed on any machine
+        that had one, so it flipped with the network rather than with the code.
+        Asserting the property (a routable address whenever one exists, with a
+        loopback fallback when none does) holds on both.
+        """
+        env = {k: v for k, v in os.environ.items() if k != 'HEVOLVE_BASE_URL'}
+        with patch.dict(os.environ, env, clear=True):
+            from core.port_registry import get_lan_ip
+            g = GossipProtocol()
+            url = g.base_url
+            if get_lan_ip():
+                assert '//localhost' not in url and '//127.' not in url, (
+                    f'advertised {url}; peers cannot reach a loopback address')
+            else:
+                # No LAN address available, so loopback is the honest answer.
+                assert url.startswith('http://')
 
     def test_gossip_protocol_custom_base_url(self):
         """Env var override → custom URL."""

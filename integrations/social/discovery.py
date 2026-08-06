@@ -171,13 +171,25 @@ def peer_announce():
     data = request.get_json(force=True, silent=True) or {}
     if not data.get('node_id') or not data.get('url'):
         return jsonify({'success': False, 'error': 'node_id and url required'}), 400
-    is_new = gossip.handle_announce(data)
-    return jsonify({
+    # `success` has always meant "the request was well formed and processed",
+    # not "your peer was accepted", and `is_new` is False both for a duplicate
+    # and for a refusal. A node could be turned away by every gate in
+    # _merge_peer while reading HTTP 200 success:true, which is how the
+    # announce-signing defect stayed invisible across the whole network.
+    # `accepted` and `reason` say what actually happened. Both are additive,
+    # so existing clients are unaffected.
+    reasons = []
+    is_new = gossip.handle_announce(data, reasons=reasons)
+    body = {
         'success': True,
         'is_new': is_new,
+        'accepted': not reasons,
         'node_id': gossip.node_id,
         'name': gossip.node_name,
-    })
+    }
+    if reasons:
+        body['reason'] = reasons[0]
+    return jsonify(body)
 
 
 @discovery_bp.route('/api/social/peers')

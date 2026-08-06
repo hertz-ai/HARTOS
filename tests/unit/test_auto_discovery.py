@@ -133,12 +133,15 @@ class TestAutoDiscoveryIntegration:
         # Simulate recv
         parsed = discovery._parse_beacon(data)
         assert parsed  # Valid beacon
-        discovery._discovered_nodes.add(parsed['node_id'])
+        # _discovered_nodes became a TTLCache under #83 (unbounded set leaked
+        # on peer churn). Membership is still `in`, but insertion is a keyed
+        # write, not set.add.
+        discovery._discovered_nodes[parsed['node_id']] = True
         mock_gossip.handle_announce(parsed)
         mock_gossip.handle_announce.assert_called_once_with(parsed)
 
     def test_duplicate_node_tracked(self, discovery):
-        discovery._discovered_nodes.add('dup-node-020')
+        discovery._discovered_nodes['dup-node-020'] = True
         assert 'dup-node-020' in discovery._discovered_nodes
 
     def test_stop_sets_running_false(self, discovery):

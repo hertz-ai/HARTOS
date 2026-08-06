@@ -161,3 +161,109 @@ class TestEndpointRegistration:
     def test_integrity_code_hash_exists(self, app):
         rules = [r.rule for r in app.url_map.iter_rules()]
         assert '/api/social/integrity/code-hash' in rules
+
+
+# ============================================================
+# Announce signature must cover the whole payload
+# ============================================================
+
+class TestAnnounceSignatureCoversWholePayload:
+    """The announce signature has to survive the receiver's reconstruction.
+
+    _merge_peer verifies with ``{k: v for k, v in peer_data.items()
+    if k != 'signature'}``. If the sender signs anything narrower, every
+    announce fails verification, and since get_enforcement_mode() defaults to
+    hard the peer is rejected outright. That happened live: _self_info signed
+    mid-construction and then appended x25519_public, guardrail_hash,
+    capability_tier, enabled_features, hardware_summary, idle_compute and
+    current_version, so the network carried 69 registered nodes and every one
+    reported remote_count 0.
+
+    It stayed invisible for two reasons worth keeping in mind here. First,
+    peer_announce returns HTTP 200 success:true on all five _merge_peer
+    rejection paths, so a rejection is indistinguishable from a duplicate.
+    Second, the tests that touched this either patched verify_json_signature
+    out (tests/e2e/test_e2e_pipelines.py) or verified a hand-built dict rather
+    than real _self_info output (test_security_modules_functional.py). So this
+    test deliberately does neither: real payload, real crypto, receiver's exact
+    reconstruction.
+    """
+
+    def _self_info(self):
+        from integrations.social.peer_discovery import gossip
+        return gossip._self_info()
+
+    def test_signature_verifies_over_receivers_reconstruction(self):
+        info = self._self_info()
+        if not info.get('signature') or not info.get('public_key'):
+            pytest.skip('node crypto identity unavailable in this environment')
+
+        from security.node_integrity import verify_json_signature
+
+        # Byte for byte what _merge_peer builds.
+        receiver_view = {k: v for k, v in info.items() if k != 'signature'}
+        assert verify_json_signature(
+            info['public_key'], receiver_view, info['signature']), (
+            'announce signature does not cover the payload actually sent; '
+            'a field is being added to _self_info after sign_json_payload')
+
+    def test_fields_added_after_signing_are_caught(self):
+        """Appending a field post-signature must break verification.
+
+        Guards the fix itself: if someone later adds an attribute below the
+        signing call, the test above starts failing rather than the network
+        going quiet.
+        """
+        info = self._self_info()
+        if not info.get('signature') or not info.get('public_key'):
+            pytest.skip('node crypto identity unavailable in this environment')
+
+        from security.node_integrity import verify_json_signature
+
+        tampered = {k: v for k, v in info.items() if k != 'signature'}
+        tampered['some_field_added_after_signing'] = 'x'
+        assert not verify_json_signature(
+            info['public_key'], tampered, info['signature'])
+
+
+# ============================================================
+# A refused announce must say so
+# ============================================================
+
+class TestAnnounceReportsRejection:
+    """HTTP 200 success:true used to cover every refusal.
+
+    _merge_peer has eight rejection paths and all of them returned the same
+    False that an already-known peer returns, so a node could be turned away
+    by all of them while reading back success:true. `accepted` and `reason`
+    make the outcome legible. Both paths exercised here reject before any DB
+    access, so these tests need no database.
+    """
+
+    def test_merge_peer_records_why_it_refused(self):
+        from integrations.social.peer_discovery import gossip
+        reasons = []
+        # No url. Rejected on the first check, before the session is touched,
+        # so passing None for db is safe.
+        assert gossip._merge_peer(None, {'node_id': 'abc'},
+                                  reasons=reasons) is False
+        assert reasons, 'rejection recorded no reason'
+        assert 'url' in reasons[0]
+
+    def test_merge_peer_stays_silent_when_no_list_passed(self):
+        """The reasons list is opt-in; existing callers keep the old shape."""
+        from integrations.social.peer_discovery import gossip
+        assert gossip._merge_peer(None, {'node_id': 'abc'}) is False
+
+    def test_endpoint_reports_accepted_false_with_reason(self, client):
+        from integrations.social.peer_discovery import gossip
+        # A node announcing itself is refused before any DB query.
+        resp = client.post('/api/social/peers/announce', json={
+            'node_id': gossip.node_id,
+            'url': 'http://192.0.2.10:5000',
+        })
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body['success'] is True      # request was well formed
+        assert body['accepted'] is False    # but the peer was refused
+        assert 'reason' in body and body['reason']
