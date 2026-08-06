@@ -54,6 +54,35 @@ def read(path):
         return f.read()
 
 
+def desktop_closure():
+    """Every local Nix source the desktop closure is built from: the variant
+    entry point plus the profiles it imports.
+
+    NOT just configurations/desktop.nix. The variant-level surface was migrated
+    into profiles/desktop.nix so ONE block could drive the ISO, the raw image
+    and a nixos-rebuild alike. These tests read only the entry point, so they
+    reported that MOVE as a deletion -- ten reds asserting `hart = { ... }`
+    block not found, while every option they care about was set, correctly, one
+    file over.
+
+    Following the imports asserts the property that actually matters ("the
+    desktop closure turns hart.firewall on") wherever the option is written, so
+    the next refactor that preserves the OUTCOME does not red this file again.
+    That is the difference between checking a layout and checking a claim.
+    """
+    raw = read(DESKTOP_NIX)
+    sources = [raw]
+    block = find_block(nix_skeleton(raw), r"imports\s*=\s*\[",
+                       open_ch="[", close_ch="]")
+    for rel in list_paths(block):
+        path = os.path.normpath(os.path.join(CONFIGS_DIR, rel))
+        # Non-local entries (e.g. "${modulesPath}/...") never resolve to a file
+        # here and are skipped; they are upstream NixOS, not our surface.
+        if os.path.isfile(path):
+            sources.append(read(path))
+    return "\n".join(sources)
+
+
 # ═══════════════════════════════════════════════════════════════
 # A tiny comment / string aware Nix structural reader.
 #
@@ -208,18 +237,38 @@ def find_block(content, header_re, open_ch="{", close_ch="}"):
 
 
 def list_paths(block):
-    """Real `./...nix` import paths in a list block (comment-stripped first so a
-    commented-out path is NOT counted)."""
+    """Real relative `./...nix` and `../...nix` import paths in a list block
+    (comment-stripped first so a commented-out path is NOT counted).
+
+    The parent-relative form matters: a variant at configurations/ imports its
+    shared profile as `../profiles/desktop.nix`. Matching only `./` did not
+    miss it outright — worse, it matched from the SECOND dot and yielded
+    `./profiles/desktop.nix`, a path that resolves under configurations/ and
+    does not exist. A silently wrong path reads as "no such import"."""
     if block is None:
         return []
-    return re.findall(r"\.\/[\w./-]+\.nix", strip_comments(block))
+    return re.findall(r"\.{1,2}\/[\w./-]+\.nix", strip_comments(block))
+
+
+# NixOS priority wrappers. The VALUE is what these tests assert; the priority
+# is a separate concern (which option definition wins a merge). hart-firewall
+# moved to `lib.mkDefault true` so an image format can still set the option to
+# false without a "has conflicting definition values" eval failure — a real fix
+# that made bool_assignment return None and read as "the firewall is not
+# enabled". Unwrapping keeps the assertion about the value, where it belongs.
+_PRIORITY_WRAPPER = (
+    r"(?:(?:lib\.)?mk(?:Default|Force)\s+|(?:lib\.)?mkOverride\s+\d+\s+)*"
+)
 
 
 def bool_assignment(code, dotted):
-    """Return 'true'/'false'/None for `<dotted> = true|false` (comment-aware:
-    caller passes comment-stripped code). The leading boundary stops
-    `networking.firewall.enable` from matching a query for `firewall.enable`."""
-    pat = r"(?:^|[^\w.])" + re.escape(dotted) + r"\s*=\s*(true|false)\b"
+    """Return 'true'/'false'/None for `<dotted> = true|false`, seeing through
+    NixOS priority wrappers (`lib.mkDefault true`, `mkForce false`,
+    `lib.mkOverride 50 true`). Comment-aware: caller passes comment-stripped
+    code. The leading boundary stops `networking.firewall.enable` from matching
+    a query for `firewall.enable`."""
+    pat = (r"(?:^|[^\w.])" + re.escape(dotted) + r"\s*=\s*"
+           + _PRIORITY_WRAPPER + r"(true|false)\b")
     m = re.search(pat, code)
     return m.group(1) if m else None
 
@@ -332,6 +381,44 @@ class TestNixReaderBoundary:
         inner = find_block("hart = { a = { z = 1; }; b = 2; };", r"hart\s*=\s*\{")
         assert "b = 2" in inner
         assert inner.count("{") == inner.count("}")  # nested block fully captured
+
+    def test_bool_assignment_sees_through_priority_wrappers(self):
+        """A NixOS option's VALUE is what these tests assert; mkDefault /
+        mkForce / mkOverride only decide which definition wins a merge. Reading
+        a wrapped `true` as "unset" is how a real priority fix in
+        hart-firewall.nix came to look like a disabled firewall."""
+        assert bool_assignment("networking.firewall.enable = true;",
+                               "networking.firewall.enable") == "true"
+        assert bool_assignment("networking.firewall.enable = lib.mkDefault true;",
+                               "networking.firewall.enable") == "true"
+        assert bool_assignment("x.enable = mkDefault true;", "x.enable") == "true"
+        assert bool_assignment("x.enable = lib.mkForce false;", "x.enable") == "false"
+        assert bool_assignment("x.enable = lib.mkOverride 50 true;",
+                               "x.enable") == "true"
+
+    def test_bool_assignment_still_rejects_a_non_boolean_rhs(self):
+        """Unwrapping must not turn the parser into "matches anything": a
+        non-boolean RHS is still None, so `enable = cfg.something` cannot be
+        mistaken for a literal true."""
+        assert bool_assignment("x.enable = cfg.wanted;", "x.enable") is None
+        assert bool_assignment("x.enable = lib.mkDefault cfg.wanted;",
+                               "x.enable") is None
+        assert bool_assignment("x.enable = truthy;", "x.enable") is None
+
+    def test_bool_assignment_keeps_its_dotted_boundary(self):
+        """The pre-existing guarantee, re-asserted against the new pattern: a
+        query for the short name must not match the longer dotted option."""
+        assert bool_assignment("networking.firewall.enable = true;",
+                               "firewall.enable") is None
+
+    def test_list_paths_captures_parent_relative_imports(self):
+        """A variant imports its shared profile as `../profiles/x.nix`. Matching
+        only `./` silently produced `./profiles/x.nix` — a path that resolves in
+        the wrong directory and looks like a missing import."""
+        block = "[\n  ../profiles/desktop.nix\n  ./local.nix\n]"
+        paths = list_paths(block)
+        assert "../profiles/desktop.nix" in paths
+        assert "./local.nix" in paths
 
     def test_list_paths_skips_commented_path(self):
         block = "[\n  ./modules/a.nix\n  # ./modules/ghost.nix\n  ./modules/b.nix\n]"
@@ -453,9 +540,11 @@ class TestDesktopEnables:
 
     @pytest.fixture(autouse=True)
     def load(self):
-        self.raw = read(DESKTOP_NIX)
+        self.raw = desktop_closure()
         block = find_block(nix_skeleton(self.raw), r"(?:^|[^\w.])hart\s*=\s*\{")
-        assert block is not None, "`hart = { ... }` block not found in desktop.nix"
+        assert block is not None, (
+            "`hart = { ... }` block not found anywhere in the desktop closure "
+            "(configurations/desktop.nix + the profiles it imports)")
         self.hart = block
 
     def test_firewall_enabled(self):
@@ -534,7 +623,7 @@ class TestEmailOwnsMailto:
         x-scheme-handler/mailto would fail eval. The desktop xdg.mime block must
         NOT set it (comment-aware: the explanatory comment that names it must
         not count as a key)."""
-        raw = read(DESKTOP_NIX)
+        raw = desktop_closure()
         block = find_block(raw, r"xdg\.mime\.defaultApplications\s*=")
         m = string_map(block)
         assert "x-scheme-handler/mailto" not in m
