@@ -1204,7 +1204,16 @@ def register_shell_os_routes(app):
                     sct.shot(output=output_path)
                     captured = True
             except ImportError:
-                pass
+                logger.debug('screenshot: mss not installed — no Python fallback')
+            except Exception as e:
+                # mss raises far more than ImportError: no DISPLAY/WAYLAND
+                # (ScreenShotError), missing X11 client libs, an unwritable
+                # output path. Catching only ImportError let those escape as an
+                # UNHANDLED 500 out of a deployed handler; the designed answer
+                # is the controlled 501 below. A shell with no compositor yet
+                # (early boot) hits exactly this path.
+                logger.debug('screenshot: mss fallback failed (%s: %s)',
+                             type(e).__name__, e)
 
         if captured:
             size = os.path.getsize(output_path)
