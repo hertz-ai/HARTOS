@@ -56,7 +56,18 @@ class TestFederatedAggregator:
         assert stats['peer_count'] == 0
         assert stats['convergence'] == 0.0
 
-    def test_receive_valid_delta(self):
+    def test_receive_valid_delta(self, monkeypatch):
+        """Schema acceptance + storage of a well-formed delta.
+
+        HEVOLVE_ENFORCEMENT_MODE=soft is deliberate, not a shortcut: the
+        default is now HARD, which rejects any unsigned delta before a single
+        schema field is read (Sybil resistance — 010cab72 and the SIGN-chain
+        hardening made authentication run FIRST). This test is about the
+        SCHEMA layer, so it pins the mode that lets an unsigned-but-well-
+        formed delta reach it; test_receive_unsigned_rejected_in_hard_mode
+        below pins the hard-mode refusal itself.
+        """
+        monkeypatch.setenv('HEVOLVE_ENFORCEMENT_MODE', 'soft')
         agg = self._make_aggregator()
         delta = {
             'version': 1,
@@ -92,12 +103,31 @@ class TestFederatedAggregator:
         assert accepted is False
         assert 'too old' in reason
 
-    def test_receive_missing_node_id(self):
+    def test_receive_missing_node_id(self, monkeypatch):
+        """The node_id validation still exists and fires — reachable only in
+        a permissive mode, because hard enforcement now authenticates BEFORE
+        reading any field (an unsigned delta is refused as 'missing Ed25519
+        signature' without ever being parsed, which is the correct order:
+        never validate attacker-controlled fields pre-authentication)."""
+        monkeypatch.setenv('HEVOLVE_ENFORCEMENT_MODE', 'soft')
         agg = self._make_aggregator()
         delta = {'version': 1, 'node_id': '', 'timestamp': time.time()}
         accepted, reason = agg.receive_peer_delta(delta)
         assert accepted is False
         assert 'missing node_id' in reason
+
+    def test_receive_unsigned_rejected_in_hard_mode(self, monkeypatch):
+        """The hard-mode contract the two tests above step around, pinned on
+        its own: with the default enforcement, an unsigned delta is refused at
+        the authentication layer — before node_id or any other field matters."""
+        monkeypatch.delenv('HEVOLVE_ENFORCEMENT_MODE', raising=False)
+        agg = self._make_aggregator()
+        delta = {'version': 1, 'node_id': 'test-node-1',
+                 'timestamp': time.time(), 'signature': ''}
+        accepted, reason = agg.receive_peer_delta(delta)
+        assert accepted is False
+        assert 'missing Ed25519 signature' in reason
+        assert 'test-node-1' not in agg._peer_deltas
 
     def test_aggregate_single_delta(self):
         agg = self._make_aggregator()
