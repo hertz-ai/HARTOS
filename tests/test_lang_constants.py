@@ -11,6 +11,21 @@ from pathlib import Path
 
 import pytest
 
+# Repo paths are DERIVED, never hardcoded. These guards read source files, and
+# an absolute dev-box path (`C:/Users/sathi/...`) makes the test pass on
+# exactly one machine and fail everywhere else -- which is what it did in CI.
+# Same relative idiom the rest of tests/ already uses.
+HARTOS_ROOT = Path(__file__).resolve().parents[1]
+# Nunba is a SIBLING repo, so it is genuinely absent on a CI runner that only
+# checked out HARTOS. Skip there rather than fail: a missing sibling is not a
+# DRY regression, and reporting it as one trains everyone to ignore this file.
+NUNBA_ROOT = HARTOS_ROOT.parent / 'Nunba-HART-Companion'
+TTS_ENGINE = NUNBA_ROOT / 'tts' / 'tts_engine.py'
+_needs_nunba = pytest.mark.skipif(
+    not TTS_ENGINE.is_file(),
+    reason='sibling repo Nunba-HART-Companion not checked out beside HARTOS',
+)
+
 
 def test_non_latin_script_langs_exists():
     from core.constants import NON_LATIN_SCRIPT_LANGS, SUPPORTED_LANG_DICT
@@ -49,10 +64,8 @@ def test_dispatcher_imports_canonical_set():
     """speculative_dispatcher.py MUST NOT define its own frozenset.
     If this fails, revert the inline `_skip_draft_langs = frozenset({...})`
     and `from core.constants import NON_LATIN_SCRIPT_LANGS`."""
-    src = Path(
-        'C:/Users/sathi/PycharmProjects/HARTOS/integrations/agent_engine/'
-        'speculative_dispatcher.py'
-    ).read_text(encoding='utf-8')
+    src = (HARTOS_ROOT / 'integrations' / 'agent_engine'
+           / 'speculative_dispatcher.py').read_text(encoding='utf-8')
     tree = ast.parse(src)
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
@@ -67,9 +80,7 @@ def test_dispatcher_imports_canonical_set():
 
 
 def test_hart_intelligence_entry_imports_canonical_set():
-    src = Path(
-        'C:/Users/sathi/PycharmProjects/HARTOS/hart_intelligence_entry.py'
-    ).read_text(encoding='utf-8')
+    src = (HARTOS_ROOT / 'hart_intelligence_entry.py').read_text(encoding='utf-8')
     tree = ast.parse(src)
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
@@ -83,10 +94,9 @@ def test_hart_intelligence_entry_imports_canonical_set():
                     )
 
 
+@_needs_nunba
 def test_tts_engine_imports_indic_langs_from_canonical():
-    src = Path(
-        'C:/Users/sathi/PycharmProjects/Nunba-HART-Companion/tts/tts_engine.py'
-    ).read_text(encoding='utf-8')
+    src = TTS_ENGINE.read_text(encoding='utf-8')
     # Must have the import line; must NOT still have `_INDIC_LANGS = {...}`
     assert 'from core.constants import' in src, (
         "tts_engine.py must import INDIC_LANGS from core.constants"
@@ -111,12 +121,13 @@ def test_no_cjk_rtl_duplicates_across_files():
     CJK/RTL codes.  There's only one concept; it lives in constants."""
     offenders = []
     for path in (
-        'C:/Users/sathi/PycharmProjects/HARTOS/integrations/agent_engine/'
-        'speculative_dispatcher.py',
-        'C:/Users/sathi/PycharmProjects/HARTOS/hart_intelligence_entry.py',
-        'C:/Users/sathi/PycharmProjects/Nunba-HART-Companion/tts/tts_engine.py',
+        HARTOS_ROOT / 'integrations' / 'agent_engine' / 'speculative_dispatcher.py',
+        HARTOS_ROOT / 'hart_intelligence_entry.py',
+        TTS_ENGINE,          # sibling repo — skipped below when absent
     ):
-        text = Path(path).read_text(encoding='utf-8')
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding='utf-8')
         # Heuristic: CJK + RTL codes appearing together in a `frozenset({...})`
         # literal is the signature of a non-Latin-script set.
         if ("'zh'" in text or '"zh"' in text) and (

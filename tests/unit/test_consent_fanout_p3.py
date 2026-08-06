@@ -45,10 +45,28 @@ def _snapshot_and_restore_services():
         yield
 
 
-HARTOS_ROOT = r'C:/Users/sathi/PycharmProjects/HARTOS'
-NUNBA_ROOT = r'C:/Users/sathi/PycharmProjects/Nunba-HART-Companion'
-HEVOLVE_ROOT = r'C:/Users/sathi/PycharmProjects/Hevolve'
-IOS_ROOT = r'C:/Users/sathi/StudioProjects/Nunba-Companion-iOS'
+# DERIVED, never hardcoded: an absolute dev-box path makes these guards pass on
+# exactly one machine and fail everywhere else (they did, in CI). Server/desktop
+# siblings sit beside HARTOS under PycharmProjects/; mobile lives under
+# StudioProjects/. A runner that checked out only HARTOS has none of them, so
+# each cross-repo test SKIPS rather than reporting a drift that isn't there.
+from pathlib import Path as _Path
+
+HARTOS_ROOT = str(_Path(__file__).resolve().parents[2])
+_PYCHARM = _Path(HARTOS_ROOT).parent
+_STUDIO = _PYCHARM.parent / 'StudioProjects'
+NUNBA_ROOT = str(_PYCHARM / 'Nunba-HART-Companion')
+HEVOLVE_ROOT = str(_PYCHARM / 'Hevolve')
+HEVOLVE_DB_ROOT = str(_PYCHARM / 'Hevolve_Database')
+IOS_ROOT = str(_STUDIO / 'Nunba-Companion-iOS')
+
+
+def _needs(root: str, name: str):
+    """Skip a cross-repo guard when that sibling is not checked out."""
+    return pytest.mark.skipif(
+        not _Path(root).is_dir(),
+        reason='sibling repo %s not checked out beside HARTOS' % name,
+    )
 
 
 def _read(path: str) -> str:
@@ -306,10 +324,15 @@ def test_p3b_notification_model_exposes_read_at_dismissed_at():
     declare the columns or HARTOS hits 'Unknown column' after the
     v53 migration adds them to the DB.  Subprocess isolation avoids
     SQLAlchemy MetaData pollution from earlier tests."""
-    code = textwrap.dedent('''
-        import sys
-        sys.path.insert(0, r'C:/Users/sathi/PycharmProjects/HARTOS')
-        sys.path.insert(0, r'C:/Users/sathi/PycharmProjects/Hevolve_Database')
+    # The sys.path preamble is built by concatenation, NOT str.format/%: the
+    # snippet below is full of braces ({cols}, the set comprehension), so any
+    # templating would try to interpolate them.
+    preamble = (
+        'import sys\n'
+        'sys.path.insert(0, ' + repr(HARTOS_ROOT) + ')\n'
+        'sys.path.insert(0, ' + repr(HEVOLVE_DB_ROOT) + ')\n'
+    )
+    code = preamble + textwrap.dedent('''
         from integrations.social.models import Notification
         cols = {c.name for c in Notification.__table__.columns}
         assert 'read_at' in cols, f'read_at missing from {cols}'
@@ -348,6 +371,7 @@ def test_p3b_v53_migration_registered():
 
 
 # ─── P3c: APNsTokenStore source guard (Swift) ────────────────────────
+@_needs(IOS_ROOT, 'Nunba-Companion-iOS')
 def test_p3c_apns_token_store_registers_with_backend():
     """Source guard, NOT a behavioural test.  Honest label: Swift +
     URLSession + UserDefaults aren't unit-testable from Python.
@@ -374,6 +398,7 @@ def test_p3c_apns_token_store_registers_with_backend():
 
 
 # ─── P3d: Hevolve web NotificationsPage routes via deeplink ──────────
+@_needs(HEVOLVE_ROOT, 'Hevolve')
 def test_p3d_hevolve_web_resolve_link_follows_message_deeplink():
     """Behavioural via Node: extract the resolveLink helper from the
     Hevolve web NotificationsPage source, run it with three inputs,
@@ -428,6 +453,7 @@ console.log('OK');
     )
 
 
+@_needs(HEVOLVE_ROOT, 'Hevolve')
 def test_p3d_hevolve_web_optimistic_mark_read():
     """The handleClick edit also adds optimistic mark-read (mirrors
     P1-S2 in Nunba landing-page).  Verify the optimistic state
