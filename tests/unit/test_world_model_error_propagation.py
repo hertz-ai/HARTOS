@@ -77,14 +77,40 @@ def test_breaker_records_every_failure_to_collector_until_open():
 
 
 def test_sensor_ingest_failure_also_propagates():
+    """A CAMERA reading, not imu: HevolveAI's one sensor mouth is
+    /v1/sensor/ingest (vision/audio only), and ingest_sensor_batch skips
+    sensor types with no modality branch rather than POSTing a body the
+    endpoint would 400. The old imu payload therefore never reached
+    pooled_post — no POST, no failure, nothing to propagate — and the test
+    crashed unpacking record.call_args (None). Vision actually posts, so a
+    503 exercises the propagation this test exists to pin."""
     b = _make_bridge()
     resp = MagicMock(); resp.status_code = 503
     with patch.object(wmb, 'pooled_post', return_value=resp), \
             patch('exception_collector.ExceptionCollector') as MockEC:
+        n = b.ingest_sensor_batch([{
+            'sensor_id': 'cam0', 'sensor_type': 'camera',
+            'data': {'frame_base64': 'aGk=', 'encoding': 'jpeg'},
+        }])
+    assert n == 0
+    inst = MockEC.get_instance.return_value
+    assert inst.record.called, "embodied ingest failure must reach the hive error sink"
+    _, kwargs = inst.record.call_args
+    assert kwargs.get('function') == 'ingest_sensor_batch'
+
+
+def test_sensor_types_without_a_modality_are_skipped_not_posted():
+    """The behaviour the old test tripped over, pinned on purpose: imu/gps/
+    lidar/... have no /v1/sensor/ingest modality, so they are SKIPPED — no
+    POST (a post would 400 as an unsupported modality) and consequently no
+    error propagation, because nothing failed."""
+    b = _make_bridge()
+    with patch.object(wmb, 'pooled_post') as post, \
+            patch('exception_collector.ExceptionCollector') as MockEC:
         n = b.ingest_sensor_batch([{'sensor_id': 's0', 'sensor_type': 'imu'}])
     assert n == 0
-    _, kwargs = MockEC.get_instance.return_value.record.call_args
-    assert kwargs.get('function') == 'ingest_sensor_batch'
+    post.assert_not_called()
+    assert not MockEC.get_instance.return_value.record.called
 
 
 def test_success_does_not_propagate_or_gossip():
