@@ -537,6 +537,35 @@ class TestEmitAndLifecycle:
             advertiser.shutdown()
         assert revoke.call_count == 1
 
+    def test_reattach_after_shutdown_starts_a_fresh_live_loop(
+            self, advertiser, monkeypatch):
+        """The attach/shutdown pair must survive a full cycle: shutdown sets
+        `_stop`, and a later attach must CLEAR it before starting the new
+        thread — otherwise the re-attached loop exits on its first tick and
+        the node silently stops announcing. Both writes now happen under the
+        same lock hold as the `_attached` flip, so a concurrent
+        attach/shutdown interleaving can no longer erase the other's
+        stop-event write (the lost-set race)."""
+        monkeypatch.setenv('HEVOLVE_HIVE_ADVERTISE', '1')
+        monkeypatch.setenv(
+            'HEVOLVE_HIVE_PUBLIC_ENDPOINT', 'https://x.example.com')
+        with patch.object(advertiser, '_advertise_loop'):
+            assert advertiser.attach() is True
+            first = advertiser._thread
+            with patch.object(advertiser, '_emit_revoke'):
+                advertiser.shutdown()
+            assert advertiser._stop.is_set()
+            assert advertiser._thread is None
+
+            assert advertiser.attach() is True
+            assert not advertiser._stop.is_set(), (
+                're-attach must clear the stop event or the new loop exits '
+                'on its first wait')
+            second = advertiser._thread
+            assert second is not None and second is not first
+            with patch.object(advertiser, '_emit_revoke'):
+                advertiser.shutdown()
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Singleton

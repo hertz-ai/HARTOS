@@ -250,10 +250,17 @@ class HiveCapabilityAdvertiser:
             if self._attached:
                 return False
             self._attached = True
-        self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._advertise_loop, name='hive_advertiser', daemon=True)
-        self._thread.start()
+            # The event + thread handle are written under the SAME lock hold
+            # that flips the flag. Split (flag under lock, clear/start after),
+            # a concurrent shutdown() could interleave: it sees attached=True,
+            # proceeds, sets _stop — and THEN this clear erases the stop and
+            # starts a loop shutdown never saw, leaving _attached=False with a
+            # live announce loop advertising a revoked peer. Serialized, the
+            # last lock holder's flag and event always agree.
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._advertise_loop, name='hive_advertiser', daemon=True)
+            self._thread.start()
         # Best-effort revoke on graceful exit so other peers don't have
         # to wait 3 × 60s health checks before dropping us.
         if not self._atexit_registered:
@@ -285,7 +292,12 @@ class HiveCapabilityAdvertiser:
                 # or close.
                 return
             self._attached = False
-        self._stop.set()
+            # Set + handle-swap under the lock, mirroring attach (see there
+            # for the lost-stop interleaving this prevents). The revoke and
+            # the join stay OUTSIDE: one is network I/O, the other a wait,
+            # and the announce loop briefly takes this lock itself.
+            self._stop.set()
+            thread, self._thread = self._thread, None
         try:
             self._emit_revoke()
         except Exception as e:
@@ -294,7 +306,6 @@ class HiveCapabilityAdvertiser:
                 "consumers will drop us via health-check fail budget", e)
         # Bounded join so a caller gets a deterministic stop; the thread is a
         # daemon, so overrunning it can never keep the process alive.
-        thread, self._thread = self._thread, None
         if thread is not None and thread.is_alive():
             thread.join(timeout=_SHUTDOWN_JOIN_TIMEOUT_S)
             if thread.is_alive():
