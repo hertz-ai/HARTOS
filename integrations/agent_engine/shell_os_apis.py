@@ -45,11 +45,20 @@ logger = logging.getLogger('hevolve.shell')
 _ALLOWED_ROOTS = None  # Lazily computed
 
 
-def _get_allowed_roots():
-    """Get allowed filesystem roots (user home + /tmp + configurable)."""
-    global _ALLOWED_ROOTS
-    if _ALLOWED_ROOTS is not None:
-        return _ALLOWED_ROOTS
+def _user_owned_roots():
+    """The roots this session OWNS: home, the temp dir, and anything named in
+    HART_SHELL_ALLOWED_PATHS.
+
+    Deliberately EXCLUDES disk mountpoints. A mountpoint root contains the
+    whole filesystem under it -- on Linux `/` is a mountpoint, so admitting
+    mountpoints does not "widen browsing to drive roots", it removes the
+    sandbox outright. Callers that must stay confined (mutation, whole-tree
+    scans) ask for these roots; see _is_path_allowed(include_mounts=False).
+
+    Not cached: it is two path lookups and an env split, and a second cache
+    would go stale against the `_ALLOWED_ROOTS = None` reset that test helpers
+    already use to pick up an HART_SHELL_ALLOWED_PATHS override.
+    """
     roots = [
         os.path.realpath(os.path.expanduser('~')),
         os.path.realpath(tempfile.gettempdir()),
@@ -60,6 +69,15 @@ def _get_allowed_roots():
             rp = os.path.realpath(p.strip())
             if os.path.isdir(rp):
                 roots.append(rp)
+    return roots
+
+
+def _get_allowed_roots():
+    """Browse roots: the user-owned roots PLUS every disk mountpoint."""
+    global _ALLOWED_ROOTS
+    if _ALLOWED_ROOTS is not None:
+        return _ALLOWED_ROOTS
+    roots = _user_owned_roots()
     # This PC / partition browsing: admit every real disk mountpoint reported by
     # psutil (the SAME read-only source the Storage + This-PC panels use), so a
     # drive root like C:\ or /mnt/data opens in the file manager instead of 403.
@@ -77,7 +95,7 @@ def _get_allowed_roots():
     return roots
 
 
-def _is_path_allowed(path):
+def _is_path_allowed(path, include_mounts=True):
     """Check if a resolved path is within allowed roots.
 
     realpath, not abspath: abspath only NORMALISES (`../../etc/shadow` becomes
@@ -88,9 +106,17 @@ def _is_path_allowed(path):
     `/home/hart-evil`, because the string genuinely starts with the root. Only a
     component-wise comparison answers "is this INSIDE the root". commonpath
     raises ValueError across drives/mixed absolute-relative, which is a "no".
+
+    include_mounts=False confines the answer to the USER-OWNED roots (see
+    _user_owned_roots). Use it for anything that mutates the filesystem or
+    walks a whole tree: with mountpoints admitted, `/` is itself a root on
+    Linux, so the default answers True for EVERY path on the box and any guard
+    built on it is a no-op. Reads keep the default so the This-PC panel can
+    still hand a drive row to the file manager (commit 9325bf54).
     """
     real = os.path.realpath(path)
-    for root in _get_allowed_roots():
+    roots = _get_allowed_roots() if include_mounts else _user_owned_roots()
+    for root in roots:
         root_real = os.path.realpath(root)
         try:
             if os.path.commonpath([real, root_real]) == root_real:
