@@ -207,6 +207,19 @@ class GossipProtocol:
         self._base_url_cached = (value or '').rstrip('/')
         self._base_url_final = bool(self._base_url_cached)
 
+    @base_url.deleter
+    def base_url(self):
+        """Forget any pinned/cached answer and resume lazy resolution.
+
+        Completes the property contract the setter opened: an explicit
+        assignment is authoritative, so its UNDO must exist too. Concretely,
+        `patch.object(gossip, 'base_url', ...)` — the pattern
+        test_recipe_capability_mesh already uses — assigns through the setter
+        on enter and `del`s on exit; without a deleter every such patch died
+        at TEARDOWN with "property ... has no deleter"."""
+        self._base_url_cached = ''
+        self._base_url_final = False
+
     def __init__(self):
         # Identity — persisted across restarts so the central side can
         # dedupe joins by node_id.  Without persistence, every watchdog
