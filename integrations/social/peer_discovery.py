@@ -1164,26 +1164,68 @@ class GossipProtocol:
                 except Exception:
                     pass
 
-            # Enforcement: reject unknown hashes in hard mode
+            # An unrecognised code hash is recorded, not fatal.
+            #
+            # This gate used to reject under enforcement=hard and it
+            # partitioned the entire network: 69 registered nodes, none
+            # federating. Three separate things make it unworkable as a hard
+            # gate, and none of them are fixed by publishing more hashes.
+            #
+            # It cannot bootstrap. _KNOWN_HASHES ships empty, so a stock
+            # desktop knows no hashes and refuses everyone. The runtime
+            # discovery path only learns from peers that already passed, so
+            # nothing can ever be the first to pass.
+            #
+            # It cannot span builds. Central signs a release manifest at
+            # deploy time covering its own container, so its only trusted
+            # hash is its own. A frozen desktop bundle is a different file
+            # set and hashes differently by construction, so central would
+            # refuse every desktop no matter how many GA hashes were
+            # published. Live proof: central 61c1dd94, this desktop 2d66b241.
+            #
+            # It never stopped an attacker anyway. code_hash is self-reported.
+            # The signature authenticates that the sender's key asserted the
+            # value, not that it matches the code actually running, so a
+            # hostile node simply claims a known-good hash. The gate only ever
+            # turned away honest nodes on unpublished builds.
+            #
+            # So the peer is admitted with master_key_verified False and
+            # hash_trusted_source untrusted, exactly the values it would have
+            # carried before. Every downstream trust decision (visibility
+            # tier, contribution scoring, fraud_score, and the
+            # challenge/attestation endpoints, which DO prove running code)
+            # sees what it saw before and can still act on it. Nothing that
+            # was verified becomes unverified; something that was refused
+            # becomes recorded-and-untrusted.
+            #
+            # Operators who genuinely want strict provenance, e.g. a locked
+            # regional cluster where every node runs one published build, set
+            # HEVOLVE_REQUIRE_KNOWN_CODE_HASH=1. That is guarded by
+            # has_trust_basis() so it cannot be switched on into a vacuum and
+            # silently partition the cluster it was meant to protect.
             if not master_key_verified:
+                _strict = os.environ.get(
+                    'HEVOLVE_REQUIRE_KNOWN_CODE_HASH', '').lower() in (
+                        '1', 'true', 'yes')
                 try:
-                    from security.master_key import get_enforcement_mode
-                    enforcement = get_enforcement_mode()
-                    if enforcement == 'hard':
-                        logger.warning(
-                            f"Rejecting peer {node_id[:8]}: unknown code hash "
-                            f"{peer_code_hash[:16]}... (enforcement=hard)")
-                        return _reject(
-                            f'code hash {peer_code_hash[:16]} is not in the '
-                            f'release hash registry or current manifest, and '
-                            f'enforcement mode is hard. A freshly built '
-                            f'nightly hits this until its hash is published.')
-                    elif enforcement == 'soft':
-                        logger.warning(
-                            f"Peer {node_id[:8]} unknown code hash "
-                            f"(enforcement=soft, allowing)")
+                    from security.release_hash_registry import (
+                        get_release_hash_registry as _reg)
+                    _have_basis = _reg().has_trust_basis()
                 except Exception:
-                    pass
+                    _have_basis = False
+                if _strict and _have_basis:
+                    logger.warning(
+                        f"Rejecting peer {node_id[:8]}: unknown code hash "
+                        f"{peer_code_hash[:16]}... "
+                        f"(HEVOLVE_REQUIRE_KNOWN_CODE_HASH=1)")
+                    return _reject(
+                        f'code hash {peer_code_hash[:16]} is not in the '
+                        f'release hash registry or current manifest, and '
+                        f'HEVOLVE_REQUIRE_KNOWN_CODE_HASH is set')
+                logger.info(
+                    f"Peer {node_id[:8]} code hash {peer_code_hash[:16]} is "
+                    f"unrecognised; admitting as untrusted "
+                    f"(master_key_verified=False)")
 
         # Certificate verification for peers claiming regional/central tier
         peer_tier = peer_data.get('tier', 'flat')
