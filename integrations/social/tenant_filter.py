@@ -110,13 +110,14 @@ _INSTALLED = False
 _INSTALL_LOCK = threading.Lock()
 
 
-def _augment_class(cls: Type) -> None:
+def _augment_class(cls: Type) -> bool:
     """Teach SQLAlchemy about the `tenant_id` column on `cls`.
 
-    The migration v40 created the column in the SQL schema; we just
-    need to declare it on the in-memory Table + Mapper so ORM queries
-    can reference it.
+    The migration v40 created the column in the SQL schema; this declares it
+    on the in-memory Table + Mapper so ORM queries can reference it — but only
+    after VERIFYING the live schema actually has it (see below).
 
+    Returns True iff the class ends up with a usable tenant_id mapping.
     Idempotent — if the class already has `tenant_id` (because some
     future canonical model adds it declaratively), this is a no-op.
     """
@@ -124,15 +125,43 @@ def _augment_class(cls: Type) -> None:
         mapper = inspect(cls)
     except Exception as e:
         logger.warning("tenant_filter: cannot inspect %s: %s", cls, e)
-        return
+        return False
 
     # Already declared (canonical model added it) — nothing to do.
     if 'tenant_id' in mapper.columns:
-        return
+        return True
 
-    # Add the column to the Table object. append_column is in-memory
-    # only; SQLAlchemy never re-issues DDL for it.
+    # THE LIVE SCHEMA IS THE GATE, not the migration's promise. append_column
+    # is in-memory only — SQLAlchemy never re-issues DDL for it — so teaching
+    # the ORM a column the SQL table does not have turns EVERY INSERT on that
+    # table into `sqlite3.OperationalError: table users has no column named
+    # tenant_id`. That is not hypothetical: run_migrations() failing is
+    # non-fatal by design (social/__init__ logs and carries on), and a test DB
+    # built by create_all BEFORE this augmentation ran has the same gap. In
+    # both cases the correct degrade is to SKIP augmentation for this class —
+    # tenant filtering simply stays inactive for it (single-tenant behaviour,
+    # writes keep working) until a boot where the v40 migration has actually
+    # run. The migration stays the ONE writer of schema; this never ALTERs.
     table = cls.__table__
+    try:
+        from sqlalchemy import inspect as _sa_inspect
+        from .models import get_engine
+        live_cols = {c['name'] for c in
+                     _sa_inspect(get_engine()).get_columns(table.name)}
+    except Exception as e:
+        logger.warning(
+            "tenant_filter: cannot inspect live schema for %s (%s) — "
+            "skipping augmentation (fail-safe: writes keep working, "
+            "tenant filtering inactive for this class)", table.name, e)
+        return False
+    if 'tenant_id' not in live_cols:
+        logger.warning(
+            "tenant_filter: table %r has no tenant_id column in the LIVE "
+            "schema (v40 migration not applied here) — skipping ORM "
+            "augmentation so inserts keep working; tenant filtering is "
+            "INACTIVE for %s on this database", table.name, cls.__name__)
+        return False
+
     if 'tenant_id' not in table.c:
         try:
             table.append_column(
@@ -140,7 +169,7 @@ def _augment_class(cls: Type) -> None:
         except Exception as e:
             logger.warning("tenant_filter: append_column failed for %s: %s",
                            cls, e)
-            return
+            return False
 
     # Register the column as a mapped property so cls.tenant_id works.
     try:
@@ -148,6 +177,8 @@ def _augment_class(cls: Type) -> None:
     except Exception as e:
         logger.warning("tenant_filter: add_property failed for %s: %s",
                        cls, e)
+        return False
+    return True
 
 
 def register_tenant_aware(cls: Type) -> None:
@@ -158,7 +189,14 @@ def register_tenant_aware(cls: Type) -> None:
     with _TENANT_AWARE_LOCK:
         if cls in _TENANT_AWARE:
             return
-        _augment_class(cls)
+        if not _augment_class(cls):
+            # NOT registered: the query filter and the insert stamper both
+            # reference cls.tenant_id, which does not exist when augmentation
+            # was skipped (live schema lacks the column). Registering anyway
+            # would move the failure from a skipped filter to a broken QUERY.
+            # Not cached as "seen" either — a later register call after the
+            # migration has run gets a fresh chance to activate.
+            return
         _TENANT_AWARE.append(cls)
     logger.debug("tenant_filter: registered %s", cls.__name__)
 
