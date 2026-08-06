@@ -8,6 +8,7 @@ G9:  Trust downgrade prevention in PeerLink
 G10: Hardcoded URLs replaced with env vars / port_registry
 """
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -200,6 +201,34 @@ class TestG7ShellInjection(unittest.TestCase):
 # G8: Federation HMAC — per-node secret
 # ═══════════════════════════════════════════════════════════════
 
+@contextlib.contextmanager
+def _hmac_secret_at(path):
+    """Point the per-node HMAC secret at `path`, with a cleared cache.
+
+    The seam is core.node_secret, NOT federated_aggregator. The secret used to
+    live in federated_aggregator and was consolidated into core.node_secret so
+    one persisted value would have one writer (the campaign tracking key needs
+    the same secret). federated_aggregator now imports the FUNCTIONS by name,
+    so assigning `fa._HMAC_SECRET_PATH` does not redirect anything — the name
+    it binds is a function object, and the path those functions read is a
+    global in the canonical module. These eight tests kept assigning to `fa`
+    and died at `module ... has no attribute '_HMAC_SECRET_PATH'`; they were
+    the consolidation's un-updated callers (mocks are callers too).
+
+    Restores the previous cache rather than blanking it, so a test cannot leave
+    the process's real node secret cleared for whatever runs next.
+    """
+    import core.node_secret as ns
+    old_path, old_cache = ns._HMAC_SECRET_PATH, ns._NODE_HMAC_SECRET
+    ns._HMAC_SECRET_PATH = path
+    ns._NODE_HMAC_SECRET = ''
+    try:
+        yield ns
+    finally:
+        ns._HMAC_SECRET_PATH = old_path
+        ns._NODE_HMAC_SECRET = old_cache
+
+
 class TestG8FederationHMAC(unittest.TestCase):
     """Verify per-node HMAC secret generation and usage."""
 
@@ -213,63 +242,36 @@ class TestG8FederationHMAC(unittest.TestCase):
 
     def test_hmac_secret_generated_on_first_boot(self):
         """Per-node HMAC secret is auto-generated when file doesn't exist."""
-        from integrations.agent_engine import federated_aggregator as fa
-        old_path = fa._HMAC_SECRET_PATH
-        fa._HMAC_SECRET_PATH = self._secret_path
-        fa._NODE_HMAC_SECRET = ''  # Reset cache
-        try:
-            secret = fa._load_or_create_hmac_secret()
+        with _hmac_secret_at(self._secret_path) as ns:
+            secret = ns.load_or_create_hmac_secret()
             self.assertTrue(len(secret) >= 32, "Secret should be at least 32 chars")
             self.assertTrue(os.path.isfile(self._secret_path), "Secret file should be created")
-        finally:
-            fa._HMAC_SECRET_PATH = old_path
-            fa._NODE_HMAC_SECRET = ''
 
     def test_hmac_secret_persisted_to_disk(self):
         """Secret is written to disk and reloaded correctly."""
-        from integrations.agent_engine import federated_aggregator as fa
-        old_path = fa._HMAC_SECRET_PATH
-        fa._HMAC_SECRET_PATH = self._secret_path
-        fa._NODE_HMAC_SECRET = ''
-        try:
-            secret1 = fa._load_or_create_hmac_secret()
-            fa._NODE_HMAC_SECRET = ''
-            secret2 = fa._load_or_create_hmac_secret()
+        with _hmac_secret_at(self._secret_path) as ns:
+            secret1 = ns.load_or_create_hmac_secret()
+            ns._NODE_HMAC_SECRET = ''
+            secret2 = ns.load_or_create_hmac_secret()
             self.assertEqual(secret1, secret2, "Reloaded secret should match")
-        finally:
-            fa._HMAC_SECRET_PATH = old_path
-            fa._NODE_HMAC_SECRET = ''
 
     def test_hmac_secret_different_between_nodes(self):
         """Two separate generations produce different secrets."""
-        from integrations.agent_engine import federated_aggregator as fa
-        old_path = fa._HMAC_SECRET_PATH
-        try:
-            path1 = os.path.join(self._tmpdir, 'node1_secret')
-            path2 = os.path.join(self._tmpdir, 'node2_secret')
-
-            fa._HMAC_SECRET_PATH = path1
-            fa._NODE_HMAC_SECRET = ''
-            secret1 = fa._load_or_create_hmac_secret()
-
-            fa._HMAC_SECRET_PATH = path2
-            fa._NODE_HMAC_SECRET = ''
-            secret2 = fa._load_or_create_hmac_secret()
-
-            self.assertNotEqual(secret1, secret2, "Different nodes must have different secrets")
-        finally:
-            fa._HMAC_SECRET_PATH = old_path
-            fa._NODE_HMAC_SECRET = ''
+        path1 = os.path.join(self._tmpdir, 'node1_secret')
+        path2 = os.path.join(self._tmpdir, 'node2_secret')
+        with _hmac_secret_at(path1) as ns:
+            secret1 = ns.load_or_create_hmac_secret()
+        with _hmac_secret_at(path2) as ns:
+            secret2 = ns.load_or_create_hmac_secret()
+        self.assertNotEqual(secret1, secret2,
+                            "Different nodes must have different secrets")
 
     def test_sign_delta_uses_per_node_secret(self):
         """_sign_delta uses the per-node secret, not env var."""
         from integrations.agent_engine import federated_aggregator as fa
-        old_path = fa._HMAC_SECRET_PATH
-        fa._HMAC_SECRET_PATH = self._secret_path
-        fa._NODE_HMAC_SECRET = ''
-        try:
-            secret = fa._load_or_create_hmac_secret()
-            fa._NODE_HMAC_SECRET = secret
+        with _hmac_secret_at(self._secret_path) as ns:
+            secret = ns.load_or_create_hmac_secret()
+            ns._NODE_HMAC_SECRET = secret
 
             delta = {'version': 1, 'node_id': 'test', 'timestamp': time.time()}
             signed = fa._sign_delta(delta)
@@ -281,46 +283,29 @@ class TestG8FederationHMAC(unittest.TestCase):
             payload = json.dumps(to_verify, sort_keys=True).encode()
             expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
             self.assertEqual(signed['hmac_signature'], expected)
-        finally:
-            fa._HMAC_SECRET_PATH = old_path
-            fa._NODE_HMAC_SECRET = ''
 
     def test_verify_delta_with_own_secret(self):
         """_verify_delta_signature verifies our own signed deltas."""
         from integrations.agent_engine import federated_aggregator as fa
-        old_path = fa._HMAC_SECRET_PATH
-        fa._HMAC_SECRET_PATH = self._secret_path
-        fa._NODE_HMAC_SECRET = ''
-        try:
-            secret = fa._load_or_create_hmac_secret()
-            fa._NODE_HMAC_SECRET = secret
+        with _hmac_secret_at(self._secret_path) as ns:
+            ns._NODE_HMAC_SECRET = ns.load_or_create_hmac_secret()
 
             delta = {'version': 1, 'node_id': 'test', 'timestamp': time.time()}
             fa._sign_delta(delta)
 
             self.assertTrue(fa._verify_delta_signature(delta))
-        finally:
-            fa._HMAC_SECRET_PATH = old_path
-            fa._NODE_HMAC_SECRET = ''
 
     def test_verify_rejects_tampered_delta(self):
         """Modified delta fails signature verification."""
         from integrations.agent_engine import federated_aggregator as fa
-        old_path = fa._HMAC_SECRET_PATH
-        fa._HMAC_SECRET_PATH = self._secret_path
-        fa._NODE_HMAC_SECRET = ''
-        try:
-            secret = fa._load_or_create_hmac_secret()
-            fa._NODE_HMAC_SECRET = secret
+        with _hmac_secret_at(self._secret_path) as ns:
+            ns._NODE_HMAC_SECRET = ns.load_or_create_hmac_secret()
 
             delta = {'version': 1, 'node_id': 'test', 'timestamp': time.time()}
             fa._sign_delta(delta)
             delta['node_id'] = 'tampered'  # Tamper with payload
 
             self.assertFalse(fa._verify_delta_signature(delta))
-        finally:
-            fa._HMAC_SECRET_PATH = old_path
-            fa._NODE_HMAC_SECRET = ''
 
     def test_verify_rejects_unsigned_delta(self):
         """Delta without hmac_signature is rejected."""
@@ -338,17 +323,11 @@ class TestG8FederationHMAC(unittest.TestCase):
     def test_get_hmac_secret_for_handshake(self):
         """get_hmac_secret_for_handshake returns the local node's HMAC secret."""
         from integrations.agent_engine import federated_aggregator as fa
-        old_path = fa._HMAC_SECRET_PATH
-        fa._HMAC_SECRET_PATH = self._secret_path
-        fa._NODE_HMAC_SECRET = ''
-        try:
-            secret = fa._load_or_create_hmac_secret()
-            fa._NODE_HMAC_SECRET = secret
+        with _hmac_secret_at(self._secret_path) as ns:
+            secret = ns.load_or_create_hmac_secret()
+            ns._NODE_HMAC_SECRET = secret
             handshake_secret = fa.get_hmac_secret_for_handshake()
             self.assertEqual(handshake_secret, secret)
-        finally:
-            fa._HMAC_SECRET_PATH = old_path
-            fa._NODE_HMAC_SECRET = ''
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -551,24 +530,20 @@ class TestSecurityFixesNoRegression(unittest.TestCase):
         """Sign + verify roundtrip works with per-node secret."""
         from integrations.agent_engine import federated_aggregator as fa
         tmpdir = tempfile.mkdtemp()
-        old_path = fa._HMAC_SECRET_PATH
-        fa._HMAC_SECRET_PATH = os.path.join(tmpdir, '.hmac_secret')
-        fa._NODE_HMAC_SECRET = ''
         try:
-            fa._load_or_create_hmac_secret()
+            with _hmac_secret_at(os.path.join(tmpdir, '.hmac_secret')) as ns:
+                ns.load_or_create_hmac_secret()
 
-            delta = {
-                'version': 1,
-                'node_id': 'roundtrip-test',
-                'timestamp': time.time(),
-                'metrics': {'accuracy': 0.95},
-            }
-            fa._sign_delta(delta)
-            self.assertTrue(fa._verify_delta_signature(delta),
-                            "Roundtrip sign+verify should succeed")
+                delta = {
+                    'version': 1,
+                    'node_id': 'roundtrip-test',
+                    'timestamp': time.time(),
+                    'metrics': {'accuracy': 0.95},
+                }
+                fa._sign_delta(delta)
+                self.assertTrue(fa._verify_delta_signature(delta),
+                                "Roundtrip sign+verify should succeed")
         finally:
-            fa._HMAC_SECRET_PATH = old_path
-            fa._NODE_HMAC_SECRET = ''
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
 
