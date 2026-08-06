@@ -31,7 +31,15 @@ Lifecycle
   3. ``shutdown()`` emits a final ``peer.capability.revoke`` so
      consumers drop this node's backends immediately (otherwise they'd
      wait for 3 × 60s health-check failures).
-  4. ``atexit.register(shutdown)`` covers process termination.
+  4. ``atexit.register(shutdown)`` makes a GRACEFUL exit emit that revoke.
+     It is best-effort only, and deliberately not the thing that lets the
+     process exit: the announce loop runs on a DAEMON thread for that. An
+     atexit hook cannot be load-bearing for termination, because
+     ``concurrent.futures`` joins its workers from
+     ``threading._register_atexit`` — which runs during ``threading._shutdown``,
+     BEFORE any atexit callback. While the loop lived on a pool worker, this
+     hook never ran at all (measured on 3.12.10) and the process hung; see
+     ``hive_expert_discovery.__init__``.
 
 Opt-in by design
 ----------------
@@ -87,7 +95,6 @@ import os
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from integrations.agent_engine.model_registry import (
@@ -105,6 +112,10 @@ logger = logging.getLogger('hevolve_social')
 # at most one missed cycle before the consumer drops us — operator
 # can shorten via env var if their cluster has tight latency budgets.
 _ADVERTISE_INTERVAL_S = 300
+# How long shutdown() waits for the announce thread to notice `_stop`. The loop
+# wakes immediately on the event, so this only absorbs an iteration that is
+# mid-announce; the thread is a daemon, so overrunning it is safe.
+_SHUTDOWN_JOIN_TIMEOUT_S = 5
 
 # Producer's qualification floor for accuracy.  Lower than the
 # consumer's _MIN_VERIFIED_BASELINE (0.5) so the consumer's floor
@@ -192,8 +203,19 @@ class HiveCapabilityAdvertiser:
         self._registry = registry or _default_registry
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._pool = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix='hive_advertiser')
+        # DAEMON thread, not a ThreadPoolExecutor worker: _advertise_loop is
+        # infinite, and a non-daemon worker running an infinite task is joined
+        # at interpreter exit and never returns. See the long note in
+        # hive_expert_discovery.__init__ (the consumer half of this pair) —
+        # same bug, measured on 3.12.10, and there it hung a whole CI shard.
+        #
+        # The `atexit.register(self.shutdown)` below does set `_stop`, so it
+        # LOOKS sufficient. It is not: concurrent.futures joins its workers
+        # from threading._register_atexit, which runs during
+        # threading._shutdown() — BEFORE any atexit callback — so the join
+        # blocks first and the hook never runs. That is why this module's
+        # header claim that atexit "covers process termination" was wrong.
+        self._thread: Optional[threading.Thread] = None
         self._attached = False
         self._atexit_registered = False
         # Per-instance UUID for nodes that haven't set HEVOLVE_NODE_ID.
@@ -228,7 +250,10 @@ class HiveCapabilityAdvertiser:
             if self._attached:
                 return False
             self._attached = True
-        self._pool.submit(self._advertise_loop)
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._advertise_loop, name='hive_advertiser', daemon=True)
+        self._thread.start()
         # Best-effort revoke on graceful exit so other peers don't have
         # to wait 3 × 60s health checks before dropping us.
         if not self._atexit_registered:
@@ -247,7 +272,7 @@ class HiveCapabilityAdvertiser:
         return True
 
     def shutdown(self) -> None:
-        """Stop the announce loop, emit a final revoke, shut the pool.
+        """Stop the announce loop, emit a final revoke, join the thread.
 
         Idempotent.  Safe to call from atexit + manual teardown +
         signal handler.  Resets ``_attached`` so a second call (e.g.
@@ -267,7 +292,16 @@ class HiveCapabilityAdvertiser:
             logger.debug(
                 "HiveCapabilityAdvertiser: final revoke raised (%s); "
                 "consumers will drop us via health-check fail budget", e)
-        self._pool.shutdown(wait=False)
+        # Bounded join so a caller gets a deterministic stop; the thread is a
+        # daemon, so overrunning it can never keep the process alive.
+        thread, self._thread = self._thread, None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=_SHUTDOWN_JOIN_TIMEOUT_S)
+            if thread.is_alive():
+                logger.debug(
+                    "HiveCapabilityAdvertiser: announce thread still running "
+                    "after %ss; it is a daemon and will not block exit",
+                    _SHUTDOWN_JOIN_TIMEOUT_S)
 
     # ── Internals ────────────────────────────────────────────────
 
