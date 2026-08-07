@@ -422,7 +422,43 @@ class PeerLinkManager:
             if not peer_info:
                 return
 
-            address = peer_info.get('url', '').replace('http://', '').replace('https://', '').rstrip('/')
+            # Resolve through NAT traversal, not by string-stripping the URL.
+            #
+            # This used to be:
+            #     address = peer_info.get('url', '') \
+            #         .replace('http://', '').replace('https://', '').rstrip('/')
+            #
+            # which assumes the advertised URL is directly dialable from here.
+            # For a desktop, Android or iOS node behind NAT it never is, and for
+            # a bundled node the advertised host is loopback, so this resolved
+            # to the local machine and the upgrade silently connected to itself
+            # or failed.
+            #
+            # core/peer_link/nat.py exists for exactly this and implements the
+            # full ladder (LAN direct via UDP beacon, STUN direct WAN,
+            # WireGuard mesh, relay through a mutual public peer, crossbar as
+            # last resort). Its docstring says it "Reuses existing
+            # infrastructure: peer_discovery.py -> peer list with addresses",
+            # and it takes the same peer_info dict we already hold here. It was
+            # never called from production code, only from its own tests.
+            #
+            # Falls back to the old string-strip when traversal yields nothing,
+            # so a reachable peer on a flat network behaves exactly as before.
+            address = ''
+            try:
+                from core.peer_link.nat import get_nat_traversal
+                ws_url = get_nat_traversal().resolve_peer_address(peer_info)
+                if ws_url:
+                    # resolve_peer_address returns ws://host:port/peer_link;
+                    # upgrade_peer wants host:port.
+                    address = (ws_url.replace('ws://', '').replace('wss://', '')
+                               .split('/peer_link')[0].rstrip('/'))
+            except Exception as e:
+                logger.debug(f"NAT traversal unavailable for {peer_id[:8]}: {e}")
+
+            if not address:
+                address = (peer_info.get('url', '')
+                           .replace('http://', '').replace('https://', '').rstrip('/'))
             if not address:
                 return
 

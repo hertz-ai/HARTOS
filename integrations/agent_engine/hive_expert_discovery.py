@@ -73,7 +73,6 @@ import logging
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Set
 
 import requests
@@ -92,6 +91,10 @@ logger = logging.getLogger('hevolve_social')
 # is dropped within ~3 minutes (3 misses × 60s).
 _HEALTH_CHECK_INTERVAL_S = 60
 _HEALTH_CHECK_FAIL_BUDGET = 3
+# How long shutdown() waits for the health thread to notice `_stop`. Short on
+# purpose: the loop wakes immediately on the event, so this only ever absorbs a
+# tick that is mid-ping, and the thread is a daemon so overrunning it is safe.
+_SHUTDOWN_JOIN_TIMEOUT_S = 5
 _PING_TIMEOUT_S = 2.0
 
 # Minimum verified_baseline a peer's advertised model needs in order to
@@ -125,9 +128,8 @@ class HiveExpertDiscovery:
     Internal state (``_peer_models``, ``_fail_count``) is guarded by
     ``self._lock``.  ``ModelRegistry.register`` / ``unregister`` carry
     their own lock so cross-thread registration is safe.  The health
-    check loop runs on a dedicated ``ThreadPoolExecutor`` worker; it
-    holds ``self._lock`` only while reading the peer list, never while
-    pinging.
+    check loop runs on a dedicated DAEMON thread; it holds ``self._lock``
+    only while reading the peer list, never while pinging.
     """
 
     def __init__(self, registry: Optional[ModelRegistry] = None):
@@ -135,11 +137,35 @@ class HiveExpertDiscovery:
         self._lock = threading.Lock()
         self._peer_models: Dict[str, Set[str]] = {}
         self._fail_count: Dict[str, int] = {}
-        # Worker pool size 2: one for the health-check loop, one slack
-        # for any future async announce-validation that needs more than
-        # the bus dispatcher's caller thread.
-        self._pool = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix='hive_expert_discovery')
+        # The health check is an INFINITE loop, so it runs on a DAEMON THREAD
+        # and never on a ThreadPoolExecutor worker.
+        #
+        # It used to be `pool.submit(self._health_check_loop)` on a 2-worker
+        # pool, guarded by `atexit.register(pool.shutdown(wait=False))` — the
+        # same guard agent_baseline_service / world_model_bridge /
+        # speculative_dispatcher use. That guard CANNOT work here, and the
+        # difference is what the loop does, not how the pool is closed:
+        #
+        #   * shutdown(wait=False) only stops the pool ACCEPTING work. It
+        #     cannot interrupt a worker that is already inside a task, and this
+        #     task never returns.
+        #   * concurrent.futures joins its non-daemon workers from
+        #     threading._register_atexit, which runs during threading._shutdown
+        #     — BEFORE any atexit callback. Measured on 3.12.10: the atexit
+        #     hook never ran at all while the worker ticked on forever.
+        #
+        # For the other three pools the guard is fine: their tasks are short
+        # fire-and-forget, so the worker is back to IDLE in _worker and the
+        # joiner's sentinel wakes it. That is exactly the split the CI shard
+        # reported — spec_expert_0 and wm_flush_0 idle, 'hive_expert_discovery_0'
+        # BLOCKED — before force-exiting the interpreter (task #30).
+        #
+        # A daemon thread is not joined at interpreter exit, so the process can
+        # always leave; `self._stop` still gives shutdown() a clean cooperative
+        # stop. tests/unit/test_hive_expert_discovery.py already drove the loop
+        # on `threading.Thread(..., daemon=True)` — the test had the right shape
+        # and production did not.
+        self._health_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._subscribed = False
 
@@ -168,14 +194,33 @@ class HiveExpertDiscovery:
                     "attach_to_event_bus is a no-op until platform.init runs")
                 return False
             bus = registry.get('events')
-            bus.on(_TOPIC_ANNOUNCE, self._on_announce_event)
-            bus.on(_TOPIC_REVOKE, self._on_revoke_event)
+            # Check-and-set, subscribe, and thread start under ONE lock hold.
+            # Two invariants live or die on this atomicity:
+            #   * two concurrent attaches must not both pass the flag check
+            #     (double bus subscription -> every announce handled twice,
+            #     plus TWO health loops);
+            #   * the _stop.clear() must be serialized with shutdown()'s
+            #     _stop.set(), or an attach/shutdown interleaving can erase
+            #     the stop and leave a live loop behind a False flag.
+            # Holding our lock across bus.on is safe: EventBus.emit copies its
+            # listener list under the BUS lock and releases it before calling
+            # callbacks, so there is no hold-and-wait cycle with the callbacks
+            # that take self._lock. The early flag check above stays as a
+            # cheap fast path.
             with self._lock:
+                if self._subscribed:
+                    return False
+                bus.on(_TOPIC_ANNOUNCE, self._on_announce_event)
+                bus.on(_TOPIC_REVOKE, self._on_revoke_event)
                 self._subscribed = True
-            # Kick off the background health checker.  Submit to our
-            # own pool so the dispatcher and platform shutdown lifecycle
-            # can stop us cleanly via ``self._stop``.
-            self._pool.submit(self._health_check_loop)
+                # Daemon thread, never a pool worker (see __init__). Clear the
+                # stop event first so an attach AFTER a shutdown starts a live
+                # loop instead of one that exits on its first tick.
+                self._stop.clear()
+                self._health_thread = threading.Thread(
+                    target=self._health_check_loop,
+                    name='hive_expert_discovery', daemon=True)
+                self._health_thread.start()
             logger.info(
                 "HiveExpertDiscovery: subscribed to %s + %s, "
                 "health check every %ds",
@@ -188,25 +233,34 @@ class HiveExpertDiscovery:
             return False
 
     def shutdown(self) -> None:
-        """Stop the health-check loop, unsubscribe from the EventBus,
-        and shut the worker pool down.
+        """Stop the health-check loop and unsubscribe from the EventBus.
 
         Unsubscribe matters for test isolation and hot-reload paths:
         if a new instance gets constructed after a shutdown, the old
-        callbacks would otherwise remain bound to the bus and fire on
-        a dead executor (``ThreadPoolExecutor.submit`` raises
-        ``RuntimeError`` after ``shutdown()``).  ``bus.off`` removes
-        them cleanly so the bus only ever talks to the live instance.
+        callbacks would otherwise remain bound to the bus and fire into
+        a stopped instance.  ``bus.off`` removes them cleanly so the bus
+        only ever talks to the live instance.
+
+        Idempotent, and safe to call without a preceding attach.
 
         Does NOT unregister already-registered hive backends — leave
         them in place for graceful drain.  ``ModelRegistry.unregister``
         is still callable; callers that need a hard reset can iterate.
         """
-        self._stop.set()
-        # Unsubscribe before pool shutdown so any in-flight callback
-        # finishes (or noops) without scheduling new work onto a dead
-        # executor.
-        if self._subscribed:
+        # Flag, stop event, and thread handle change together under the lock —
+        # mirroring attach, so an attach/shutdown interleaving can never erase
+        # the other's stop-event write (the lost-set race). The bus.off I/O
+        # and the join happen OUTSIDE: the health loop briefly takes this lock
+        # itself, so joining it while holding the lock could deadlock until
+        # the join timeout.
+        with self._lock:
+            was_subscribed = self._subscribed
+            self._subscribed = False
+            self._stop.set()
+            thread, self._health_thread = self._health_thread, None
+        # Unsubscribe so a fresh instance constructed after this shutdown is
+        # the only thing the bus talks to.
+        if was_subscribed:
             try:
                 from core.platform.registry import get_registry
                 registry = get_registry()
@@ -218,9 +272,18 @@ class HiveExpertDiscovery:
                 logger.debug(
                     "HiveExpertDiscovery: unsubscribe during shutdown "
                     "raised (%s); continuing", e)
-            with self._lock:
-                self._subscribed = False
-        self._pool.shutdown(wait=False)
+        # Join the health thread so a caller (or a test) that shuts down gets a
+        # deterministic "it has stopped", not a racing daemon. BOUNDED: if the
+        # loop is mid-ping we do not hold the caller for the ping's full
+        # timeout, and because the thread is a daemon a missed join can never
+        # keep the process alive — the property the pool version lacked.
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=_SHUTDOWN_JOIN_TIMEOUT_S)
+            if thread.is_alive():
+                logger.debug(
+                    "HiveExpertDiscovery: health thread still running after "
+                    "%ss; it is a daemon and will not block exit",
+                    _SHUTDOWN_JOIN_TIMEOUT_S)
 
     # ── EventBus callbacks (bus passes (topic, data)) ───────────────
 

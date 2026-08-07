@@ -217,3 +217,50 @@ def test_auto_sync_reconciles_failed_ledger_on_recovery():
             "not leave it FAILED")
     finally:
         L._ledger_registry.pop(up, None)
+
+
+def test_refusal_is_not_logged_as_error(caplog):
+    """A PREDICATE must not log ERROR when the answer is simply 'no'.
+
+    validate_state_transition() is used purely as a question — :730, :901,
+    :1024, :1059, :1091, :1109, :1119, :1148, :1174, :1197, :1223 all consume
+    its RETURN VALUE, and the tests above assert True/False.  Nothing reads
+    its log to decide anything.
+
+    It also double-logged every genuine failure: set_action_state() calls it
+    (:730), it logged ERROR, then set_action_state raised
+    StateTransitionError (:732), which safe_set_state caught and logged
+    ERROR again (:777).  One bad set produced TWO error lines — observed
+    2026-08-05 as 275 of each for ~275 real terminated→pending events, i.e.
+    550 lines reading as 550 failures.
+
+    FAILS PRE-FIX: the refusal was logger.error at :982.
+    """
+    import logging
+    try:
+        import lifecycle_hooks as L
+    except Exception as e:
+        pytest.skip(f"lifecycle_hooks unavailable: {e}")
+
+    up, aid = 'u626_predicate', 1
+    with L._state_lock:
+        L.action_states.setdefault(up, {})[aid] = L.ActionState.TERMINATED
+    try:
+        with caplog.at_level(logging.DEBUG):
+            caplog.clear()
+            # terminated → pending is NOT an allowed edge (:971 lists only
+            # ASSIGNED and RECIPE_REQUESTED) — the exact live case.
+            assert L.validate_state_transition(up, aid, L.ActionState.PENDING) is False
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not errors, (
+            "predicate logged at ERROR for a normal 'no' answer: "
+            f"{[r.getMessage() for r in errors]}")
+
+        # The diagnostic must survive — silencing it would lose the only
+        # evidence the pattern exists.  It just belongs at DEBUG.
+        assert any('Invalid transition' in r.getMessage() for r in caplog.records), \
+            "refusal text disappeared entirely; it should be DEBUG, not gone"
+    finally:
+        with L._state_lock:
+            L.action_states.pop(up, None)

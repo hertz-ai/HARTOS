@@ -942,6 +942,25 @@ class ToolMessageHandler:
         # merged events at INFO so future diagnoses are visible.
         try:
             cleaned: List[Dict] = []
+            # Accumulate and log ONCE per invocation instead of once per
+            # message.  The intent above ("surface dropped/merged events at
+            # INFO so future diagnoses are visible") is right and is kept —
+            # what was wrong was the CARDINALITY.  This fires per message per
+            # turn, so on 2026-08-05 it was the single largest consumer of
+            # disk on a running desktop: 15,855 lines / 3.45 MB inside one
+            # 400k-line sample, with gui_app.log growing 3.4 MB/min and the
+            # log dir at 492 MB against 23 GB free.  create_recipe.py:133
+            # already records the extreme case — 20,920 of these lines in one
+            # session during the livelock.
+            #
+            # A summary keeps every fact the per-message lines carried (that
+            # it happened, how many, which indices, which names) at O(1) lines
+            # per call, so the diagnostic survives and the disk does too.
+            # Demoting to DEBUG was the obvious alternative and is worse: it
+            # would silence the signal precisely when a livelock makes it
+            # loudest, which is when you need it.
+            _dropped: List[str] = []
+            _coalesced: List[str] = []
             for i, msg in enumerate(messages):
                 role = (msg.get('role') or '').lower()
                 content = msg.get('content')
@@ -949,13 +968,7 @@ class ToolMessageHandler:
                 # Drop empty assistant placeholders (no content + no tool calls)
                 if role == 'assistant' and not has_calls:
                     if content is None or (isinstance(content, str) and content.strip() == ''):
-                        current_app.logger.info(
-                            f"[ROLE-ORDER-GUARD] Dropping empty assistant "
-                            f"placeholder at index {i} (name="
-                            f"{msg.get('name','unknown')!r}) — autogen "
-                            f"speaker-selection artifact, would cause OpenAI "
-                            f"400 'Cannot have 2 or more assistant messages'."
-                        )
+                        _dropped.append(f"{i}({msg.get('name','unknown')})")
                         continue
                 # Coalesce consecutive same-role messages
                 if cleaned:
@@ -972,16 +985,30 @@ class ToolMessageHandler:
                             merged = (merged + '\n\n' + content
                                       if merged.strip() else content)
                         prev['content'] = merged
-                        current_app.logger.info(
-                            f"[ROLE-ORDER-GUARD] Coalesced consecutive "
-                            f"role={role!r} messages at indices "
-                            f"{i-1}+{i} (would cause OpenAI 400 "
-                            f"alternation rule); merged content kept "
-                            f"in earlier slot."
-                        )
+                        _coalesced.append(f"{i-1}+{i}({role})")
                         continue
                 cleaned.append(msg)
             messages = cleaned
+
+            # One line per invocation, only when the guard actually acted.
+            # Indices are capped so a pathological turn cannot reintroduce the
+            # unbounded growth this replaced — the count stays exact either way.
+            if _dropped or _coalesced:
+                _cap = 12
+                _d = ', '.join(_dropped[:_cap]) + (
+                    f" (+{len(_dropped) - _cap} more)" if len(_dropped) > _cap else '')
+                _c = ', '.join(_coalesced[:_cap]) + (
+                    f" (+{len(_coalesced) - _cap} more)" if len(_coalesced) > _cap else '')
+                current_app.logger.info(
+                    f"[ROLE-ORDER-GUARD] {len(messages)} msgs out of "
+                    f"{len(_dropped) + len(_coalesced) + len(messages)} in; "
+                    f"dropped {len(_dropped)} empty assistant placeholder(s)"
+                    f"{' at ' + _d if _dropped else ''}; "
+                    f"coalesced {len(_coalesced)} consecutive same-role pair(s)"
+                    f"{' at ' + _c if _coalesced else ''} "
+                    f"— both would cause OpenAI 400 (2+ assistant messages / "
+                    f"alternation rule)."
+                )
         except Exception as _guard_err:
             # Never break the upstream pipeline — if the guard itself
             # crashes, fall through with the original messages and let

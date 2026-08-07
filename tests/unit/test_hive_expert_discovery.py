@@ -502,6 +502,66 @@ class TestHealthCheck:
         finally:
             hed._HEALTH_CHECK_INTERVAL_S = original_interval
 
+    def test_health_thread_is_a_daemon_so_the_interpreter_can_exit(self):
+        """The regression that reddened a whole CI shard with ZERO failing
+        tests (task #30).
+
+        The loop used to run on a ThreadPoolExecutor worker guarded by
+        `atexit.register(pool.shutdown(wait=False))`. Both halves fail for an
+        INFINITE task: shutdown(wait=False) cannot interrupt a worker already
+        inside one, and concurrent.futures joins its non-daemon workers from
+        threading._register_atexit — which runs BEFORE any atexit callback, so
+        the guard never even executed. The shard's tests all passed and the
+        interpreter then refused to exit; the workflow force-killed it and
+        reported red.
+
+        Asserted as a PROPERTY of the running thread, because that is the thing
+        the interpreter actually consults when deciding whether to join.
+        """
+        import integrations.agent_engine.hive_expert_discovery as hed
+
+        d = hed.HiveExpertDiscovery(registry=_fresh_registry_obj())
+        d._stop.clear()
+        d._health_thread = threading.Thread(
+            target=d._health_check_loop,
+            name='hive_expert_discovery', daemon=True)
+        d._health_thread.start()
+        try:
+            assert d._health_thread.daemon is True, (
+                'a non-daemon health thread is joined at interpreter exit and '
+                'this loop never returns — the process would hang forever')
+        finally:
+            d.shutdown()
+
+    def test_shutdown_joins_the_health_thread(self, fresh_registry):
+        """shutdown() must leave a DETERMINISTICALLY stopped loop, not a
+        racing daemon — otherwise a test's loop keeps pinging into the next
+        test's registry."""
+        import integrations.agent_engine.hive_expert_discovery as hed
+        original_interval = hed._HEALTH_CHECK_INTERVAL_S
+        hed._HEALTH_CHECK_INTERVAL_S = 0.05
+        try:
+            d = hed.HiveExpertDiscovery(registry=fresh_registry)
+            d._stop.clear()
+            d._health_thread = threading.Thread(
+                target=d._health_check_loop,
+                name='hive_expert_discovery', daemon=True)
+            d._health_thread.start()
+            thread = d._health_thread
+            d.shutdown()
+            assert not thread.is_alive(), 'shutdown() left the loop running'
+            assert d._health_thread is None, (
+                'the handle must be released so a later attach starts a fresh '
+                'thread instead of re-joining a dead one')
+        finally:
+            hed._HEALTH_CHECK_INTERVAL_S = original_interval
+
+
+def _fresh_registry_obj():
+    """A bare ModelRegistry, for the tests that do not take the fixture."""
+    from integrations.agent_engine.model_registry import ModelRegistry
+    return ModelRegistry()
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Lifecycle: attach + shutdown

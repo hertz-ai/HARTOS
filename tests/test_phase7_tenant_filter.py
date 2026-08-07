@@ -270,3 +270,66 @@ def test_install_idempotent(fresh_db):
     register_tenant_aware(User)  # second call must be a no-op
     classes = get_tenant_aware_classes()
     assert classes.count(User) == 1
+
+
+# ── 8. The live schema gates augmentation ──
+
+def test_registering_against_a_schema_without_the_column_degrades_not_breaks(
+        monkeypatch):
+    """The shard-order crash, pinned (task #33): `table users has no column
+    named tenant_id` killed every INSERT in tests/e2e/test_e2e_pipelines.py.
+
+    Mechanism: v40's ALTER adds the SQL column and _augment_class teaches the
+    ORM about it — two steps social/__init__ runs in separate best-effort
+    blocks. When the DB predates the migration (run_migrations failed and was
+    swallowed, or a test built its schema by create_all BEFORE augmentation),
+    the ORM knew a column the table did not have, and the INSERT died at
+    flush. The correct degrade is SKIP: writes keep working, tenant filtering
+    stays inactive for that class on that database, and the class is NOT
+    cached as registered so a later boot (post-migration) can activate it.
+    """
+    import sqlalchemy as sa
+    from sqlalchemy.orm import declarative_base, sessionmaker
+
+    import integrations.social.tenant_filter as tf
+    from integrations.social import models as models_mod
+
+    Base = declarative_base()
+
+    class LegacyThing(Base):
+        __tablename__ = 'legacy_things_no_tenant'
+        id = sa.Column(sa.String(64), primary_key=True)
+        name = sa.Column(sa.String(50))
+
+    # A LIVE schema WITHOUT tenant_id — the v36-era shape.
+    eng = sa.create_engine('sqlite://')
+    Base.metadata.create_all(eng)
+    monkeypatch.setattr(models_mod, 'get_engine', lambda: eng)
+
+    tf.register_tenant_aware(LegacyThing)
+
+    # 1. Not registered: the filter/stamper would reference a property that
+    #    does not exist.
+    assert LegacyThing not in tf.get_tenant_aware_classes()
+    # 2. The ORM was NOT taught the phantom column...
+    assert 'tenant_id' not in LegacyThing.__table__.c
+    # 3. ...so the write that used to die at flush works.
+    session = sessionmaker(bind=eng)()
+    try:
+        session.add(LegacyThing(id='x1', name='survives'))
+        session.commit()
+        assert session.query(LegacyThing).count() == 1
+    finally:
+        session.close()
+    # 4. Not cached-as-seen: once the migration HAS run, a later register
+    #    call activates for real.
+    with eng.connect() as conn:
+        conn.execute(sa.text(
+            'ALTER TABLE legacy_things_no_tenant ADD COLUMN tenant_id VARCHAR(64)'))
+        conn.commit()
+    tf.register_tenant_aware(LegacyThing)
+    assert LegacyThing in tf.get_tenant_aware_classes()
+    assert 'tenant_id' in LegacyThing.__table__.c
+    # Leave no residue for other tests in this module.
+    with tf._TENANT_AWARE_LOCK:
+        tf._TENANT_AWARE.remove(LegacyThing)

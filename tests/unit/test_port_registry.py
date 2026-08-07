@@ -11,17 +11,34 @@ import unittest
 from unittest.mock import patch, mock_open
 
 
+# The services that must NEVER silently disappear from the registry. A SUBSET
+# check, not equality: the old tests froze a copy of the key set, so adding a
+# legitimate service (flask, langchain, crossbar all arrived this way) reddened
+# two tests that claimed to check "all services present". That made the registry
+# expensive to extend while protecting nothing extra — the properties worth
+# guarding are "a core service never vanishes" (here), "both tables agree"
+# (test_os_and_app_have_same_services), "every service has an env override"
+# (test_all_services_have_env_var), and "no duplicates".
+CORE_SERVICES = {
+    'backend', 'discovery', 'vision', 'llm', 'websocket',
+    'diarization', 'dlna_stream', 'mesh_wg', 'mesh_relay',
+    'model_bus', 'mcp', 'vlm_caption', 'stt_stream',
+}
+
+# Services allowed to stay on a user-space port in OS mode. Each entry needs a
+# justification in core/port_registry.py; see test_os_ports_are_privileged and
+# test_privileged_exemptions_are_still_needed.
+PRIVILEGED_EXEMPT = {'crossbar'}
+
+
 class TestAppPorts(unittest.TestCase):
     """Verify APP_PORTS table is complete and uses user-space ports."""
 
     def test_all_services_present(self):
         from core.port_registry import APP_PORTS
-        expected = {
-            'backend', 'discovery', 'vision', 'llm', 'websocket',
-            'diarization', 'dlna_stream', 'mesh_wg', 'mesh_relay',
-            'model_bus', 'mcp', 'vlm_caption', 'stt_stream',
-        }
-        self.assertEqual(set(APP_PORTS.keys()), expected)
+        missing = CORE_SERVICES - set(APP_PORTS.keys())
+        self.assertEqual(missing, set(),
+                         f"core services dropped from APP_PORTS: {missing}")
 
     def test_app_ports_are_user_space(self):
         from core.port_registry import APP_PORTS
@@ -40,18 +57,41 @@ class TestOSPorts(unittest.TestCase):
 
     def test_all_services_present(self):
         from core.port_registry import OS_PORTS
-        expected = {
-            'backend', 'discovery', 'vision', 'llm', 'websocket',
-            'diarization', 'dlna_stream', 'mesh_wg', 'mesh_relay',
-            'model_bus', 'mcp', 'vlm_caption', 'stt_stream',
-        }
-        self.assertEqual(set(OS_PORTS.keys()), expected)
+        missing = CORE_SERVICES - set(OS_PORTS.keys())
+        self.assertEqual(missing, set(),
+                         f"core services dropped from OS_PORTS: {missing}")
 
     def test_os_ports_are_privileged(self):
+        """In OS mode a service binds a privileged port so an UNPRIVILEGED
+        local process cannot squat it before the real service starts and then
+        impersonate it.
+
+        One documented exemption: crossbar. core/port_registry.py keeps it on
+        8088 in both modes because crossbar_server.py and core.platform.events
+        hardcode that port with no OS-mode variant, so the bridge has to match.
+        It is named here rather than left to blanket-fail, because a test that
+        can never pass stops guarding the OTHER twelve.
+        """
         from core.port_registry import OS_PORTS
         for service, port in OS_PORTS.items():
+            if service in PRIVILEGED_EXEMPT:
+                continue
             self.assertLess(port, 1024,
                             f"{service} OS port {port} is not privileged")
+
+    def test_privileged_exemptions_are_still_needed(self):
+        """Keeps the exemption list from rotting: if an exempt service is moved
+        below 1024, this fails and tells us to delete its exemption rather than
+        leave a hole standing open for nothing."""
+        from core.port_registry import OS_PORTS
+        for service in PRIVILEGED_EXEMPT:
+            self.assertIn(service, OS_PORTS,
+                          f"exemption for '{service}' names a service that no "
+                          f"longer exists — delete it")
+            self.assertGreaterEqual(
+                OS_PORTS[service], 1024,
+                f"'{service}' is privileged now — remove it from "
+                f"PRIVILEGED_EXEMPT so the invariant covers it again")
 
     def test_os_ports_no_duplicates(self):
         from core.port_registry import OS_PORTS

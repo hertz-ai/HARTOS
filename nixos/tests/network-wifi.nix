@@ -274,7 +274,22 @@ in
               cmd = " ; ".join(
                   "modinfo " + m + " >/dev/null 2>&1 && echo FOUND-" + m
                   for m in mods)
-              res = wifi.succeed("( " + cmd + " ) ; true")
+              # `|| true`, NOT `; true`. The test driver runs commands under
+              # errexit, so a failing subshell aborts BEFORE a following
+              # `; true` can run — the rescue never fired. `||` is a
+              # condition, so errexit ignores the left side and the whole
+              # line exits 0.
+              #
+              # Why it matters: the subshell's status is its LAST command's.
+              # With `;` chaining, a family whose FINAL probe misses fails the
+              # assertion even when the family is present. Real 2026-08-06
+              # failure — FOUND-rtw88_pci, FOUND-rtw89_pci and FOUND-rtw88_core
+              # were all printed, then `modinfo rtw_pci` (absent in this
+              # kernel) made the whole thing exit 1. The intent is "at least
+              # one of these resolves", which the `assert "FOUND-" in res`
+              # below already expresses correctly — the command just has to
+              # let it be reached.
+              res = wifi.succeed("( " + cmd + " ) || true")
               assert "FOUND-" in res, \
                   label + ": none of " + str(mods) + " resolved via modinfo"
 

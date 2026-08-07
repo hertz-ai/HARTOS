@@ -22,9 +22,15 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+# DERIVED, never hardcoded: these guards read HARTOS source files, and an
+# absolute dev-box path made them pass on one machine and raise
+# FileNotFoundError in CI.
+HARTOS_ROOT = str(Path(__file__).resolve().parents[2])
 
 
 # ─── P0-A: LiquidUIService validator accepts the new types ───────────
@@ -329,7 +335,7 @@ def test_source_guard_no_legacy_type_strings():
     in HARTOS production code (e.g. via merge from an old branch).
     Behavioural alternative would require instantiating every code
     path in the repo, which is impractical."""
-    hartos_root = r'C:/Users/sathi/PycharmProjects/HARTOS'
+    hartos_root = HARTOS_ROOT
     excluded = (
         '.git', '__pycache__', 'venv', 'venv311', 'node_modules',
         'build', '.pytest_cache', 'tests', '_probe_', 'memory',
@@ -369,7 +375,7 @@ def _load_isolated_function(name: str):
     mocks set up by the caller."""
     import re
     import textwrap
-    path = r'C:/Users/sathi/PycharmProjects/HARTOS/hart_intelligence_entry.py'
+    path = os.path.join(HARTOS_ROOT, 'hart_intelligence_entry.py')
     with open(path, encoding='utf-8') as fh:
         src = fh.read()
     m = re.search(

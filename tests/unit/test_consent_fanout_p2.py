@@ -13,13 +13,23 @@ import re
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 
-HARTOS_ROOT = r'C:/Users/sathi/PycharmProjects/HARTOS'
-IOS_ROOT = r'C:/Users/sathi/StudioProjects/Nunba-Companion-iOS'
+# DERIVED, never hardcoded: an absolute dev-box path makes these guards pass on
+# exactly one machine and fail everywhere else (they did, in CI). Siblings live
+# beside their own parent -- PycharmProjects/ for desktop+server, StudioProjects/
+# for mobile -- and are genuinely absent on a runner that checked out only
+# HARTOS, so tests that need one SKIP rather than fail.
+HARTOS_ROOT = str(Path(__file__).resolve().parents[2])
+IOS_ROOT = str(Path(HARTOS_ROOT).parents[1] / 'StudioProjects' / 'Nunba-Companion-iOS')
+_needs_ios = pytest.mark.skipif(
+    not Path(IOS_ROOT).is_dir(),
+    reason='sibling repo Nunba-Companion-iOS not checked out',
+)
 
 
 def _read(path: str) -> str:
@@ -204,6 +214,7 @@ def test_p2s4_interview_agent_posts_with_channel_type():
 
 
 # ─── P2-S5 (iOS): chat.new subscription wired ────────────────────────
+@_needs_ios
 def test_p2s5_ios_subscribes_to_chat_new():
     """Source guard, NOT a behavioural test.  Honest label: Swift
     unit-tests need XCTest infrastructure that's not callable from
@@ -228,6 +239,7 @@ def test_p2s5_ios_subscribes_to_chat_new():
     )
 
 
+@_needs_ios
 def test_p2s5_ios_chat_new_emitter_exists():
     """Source guard for the new emitter file's RN bridge contract."""
     swift_path = (f'{IOS_ROOT}/ios/NunbaCompanion/Modules/'

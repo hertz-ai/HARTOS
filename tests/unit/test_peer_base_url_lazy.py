@@ -48,9 +48,22 @@ def _bare_gossip():
     return g
 
 
+# The LAN address these tests DECLARE (TEST-NET-1, never a real host). The
+# resolver's contract moved with e91600d3: base_url is now the ADVERTISABLE
+# form — get_lan_ip() paired with the live port — because publishing loopback
+# made every peer dial itself (the live peer table read http://localhost:6777
+# on every row). These tests asserted the loopback form, so they pinned the
+# bug; worse, they left get_lan_ip unmocked, so they read the DEV BOX'S REAL
+# NIC ('http://192.168.0.15:...' in the failure output) — the machine-identity
+# leak again. The LAN address is declared here and the expectations follow the
+# advertised contract.
+LAN = "192.0.2.7"
+
+
 @pytest.fixture(autouse=True)
-def _no_env_override(monkeypatch):
+def _sealed_machine(monkeypatch):
     monkeypatch.delenv("HEVOLVE_BASE_URL", raising=False)
+    monkeypatch.setattr(port_registry, "get_lan_ip", lambda: LAN)
 
 
 def test_does_not_freeze_the_cold_boot_fallback(monkeypatch):
@@ -69,13 +82,27 @@ def test_does_not_freeze_the_cold_boot_fallback(monkeypatch):
     )
 
     g = _bare_gossip()  # "constructed" while nothing listens
-    assert g.base_url == f"http://localhost:{backend}", "expected the fallback"
+    assert g.base_url == f"http://{LAN}:{backend}", "expected the fallback"
 
     listening.add(flask)  # Flask finishes binding
-    assert g.base_url == f"http://localhost:{flask}", (
+    assert g.base_url == f"http://{LAN}:{flask}", (
         "base_url froze the cold-boot fallback — every peer would dial a dead "
         "port for the life of the process"
     )
+
+
+def test_no_lan_address_degrades_to_the_local_url(monkeypatch):
+    """Precedence rung 3: with NO usable LAN address (get_lan_ip ''), the
+    advertised URL falls back to the local form — no worse than before the
+    advertisable resolver existed."""
+    flask = port_registry.get_port("flask")
+    monkeypatch.setattr(port_registry, "get_lan_ip", lambda: "")
+    monkeypatch.setattr(
+        port_registry, "_is_port_listening",
+        lambda port, *a, **kw: int(port) == flask,
+    )
+    g = _bare_gossip()
+    assert g.base_url == f"http://localhost:{flask}"
 
 
 def test_a_real_answer_is_cached(monkeypatch):
@@ -89,7 +116,7 @@ def test_a_real_answer_is_cached(monkeypatch):
     monkeypatch.setattr(port_registry, "_is_port_listening", counting)
 
     g = _bare_gossip()
-    assert g.base_url == f"http://localhost:{flask}"
+    assert g.base_url == f"http://{LAN}:{flask}"
     n = len(calls)
     for _ in range(5):
         g.base_url
@@ -136,8 +163,9 @@ def test_self_info_publishes_the_resolved_url(monkeypatch):
     g._get_count = lambda _what: 0
 
     info = g._self_info()
-    assert info["url"] == f"http://localhost:{flask}", (
-        "the advertised url is what peers dial; it must be the live port"
+    assert info["url"] == f"http://{LAN}:{flask}", (
+        "the advertised url is what peers dial; it must be the LAN address "
+        "with the live port — loopback here made every peer dial itself"
     )
 
 

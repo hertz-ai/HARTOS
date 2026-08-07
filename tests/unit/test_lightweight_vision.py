@@ -4,6 +4,7 @@ Tests for lightweight vision backends (Phase 4 - Embedded/Robot Support).
 Tests: VisionBackend interface, NoneBackend, MiniCPMBackend, auto-selection,
 backend registry.
 """
+import contextlib
 import os
 import sys
 from unittest.mock import patch, MagicMock
@@ -204,26 +205,46 @@ class TestGetVisionBackend:
         backend = get_vision_backend('imaginary')
         assert backend.name == 'none'
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _upper_tiers_off():
+        """Pin every selection tier ABOVE the direct VRAM/RAM fallback OFF.
+
+        get_vision_backend probes, in order: Qwen0.8B server → Qwen3-VL server
+        → catalog → direct VRAM/RAM query. These tests are about the LAST
+        tier, so all earlier ones must be declared absent — the probes ask the
+        REAL machine (is a server up, is a model file installed), so an
+        unpinned tier makes the test answer differently per box. That is
+        exactly what happened: the tests pinned Qwen3-VL when it was the first
+        probe, production then grew the Qwen0.8B preference ABOVE it, and on
+        any box with the 0.8B model installed auto-select returned 'qwen08b'
+        before reaching a single mocked layer. CI stayed green only because
+        the runner has no models — accident, not hermeticity.
+        """
+        from integrations.vision.lightweight_backend import (
+            Qwen08BBackend, Qwen3VLVisionBackend,
+        )
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('HEVOLVE_VISION_BACKEND', None)
+            with patch.object(Qwen08BBackend, 'is_available',
+                              return_value=False), \
+                 patch.object(Qwen3VLVisionBackend, 'is_available',
+                              return_value=False), \
+                 patch.dict('sys.modules',
+                            {'integrations.service_tools.model_orchestrator': None}):
+                yield
+
     def test_auto_select_gpu(self):
         """With 4GB+ VRAM, auto-selects minicpm via direct VRAM fallback."""
         mock_caps = MagicMock()
         mock_caps.hardware.gpu_vram_gb = 8
         mock_caps.hardware.ram_gb = 16
 
-        from integrations.vision.lightweight_backend import Qwen3VLVisionBackend
-
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop('HEVOLVE_VISION_BACKEND', None)
-            # Disable Qwen3VL server check and catalog so we test
-            # the direct VRAM fallback path
-            with patch.object(Qwen3VLVisionBackend, 'is_available',
-                              return_value=False), \
-                 patch.dict('sys.modules',
-                            {'integrations.service_tools.model_orchestrator': None}), \
-                 patch('security.system_requirements.get_capabilities',
-                       return_value=mock_caps):
-                backend = get_vision_backend()
-                assert backend.name == 'minicpm'
+        with self._upper_tiers_off(), \
+             patch('security.system_requirements.get_capabilities',
+                   return_value=mock_caps):
+            backend = get_vision_backend()
+            assert backend.name == 'minicpm'
 
     def test_auto_select_no_gpu_with_onnx(self):
         """With 2GB+ RAM, no GPU, and ONNX available, selects mobilevlm."""
@@ -231,33 +252,25 @@ class TestGetVisionBackend:
         mock_caps.hardware.gpu_vram_gb = 0
         mock_caps.hardware.ram_gb = 4
 
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop('HEVOLVE_VISION_BACKEND', None)
-            with patch('security.system_requirements.get_capabilities',
-                       return_value=mock_caps):
-                with patch.object(MobileVLMBackend, 'is_available', return_value=True):
-                    backend = get_vision_backend()
-                    assert backend.name == 'mobilevlm'
+        with self._upper_tiers_off(), \
+             patch('security.system_requirements.get_capabilities',
+                   return_value=mock_caps), \
+             patch.object(MobileVLMBackend, 'is_available', return_value=True):
+            backend = get_vision_backend()
+            assert backend.name == 'mobilevlm'
 
     def test_auto_select_fallback_to_none(self):
         """With no GPU, no ONNX, no CLIP → NoneBackend."""
-        from integrations.vision.lightweight_backend import Qwen3VLVisionBackend
-
         mock_caps = MagicMock()
         mock_caps.hardware.gpu_vram_gb = 0
         mock_caps.hardware.ram_gb = 0.5  # Below 1GB
 
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop('HEVOLVE_VISION_BACKEND', None)
-            with patch.object(Qwen3VLVisionBackend, 'is_available',
-                              return_value=False), \
-                 patch.dict('sys.modules',
-                            {'integrations.service_tools.model_orchestrator': None}), \
-                 patch('security.system_requirements.get_capabilities',
-                       return_value=mock_caps), \
-                 patch.object(MiniCPMBackend, 'is_available', return_value=False):
-                backend = get_vision_backend()
-                assert backend.name == 'none'
+        with self._upper_tiers_off(), \
+             patch('security.system_requirements.get_capabilities',
+                   return_value=mock_caps), \
+             patch.object(MiniCPMBackend, 'is_available', return_value=False):
+            backend = get_vision_backend()
+            assert backend.name == 'none'
 
 
 class TestBackendProperties:
@@ -337,7 +350,11 @@ class TestVisionServiceBackendIntegration:
         assert svc._desc_thread is None
 
     def test_describe_frame_uses_lightweight_backend(self):
-        """When _vision_backend is set, _describe_frame() uses it."""
+        """When _vision_backend is set, _describe_frame() uses it — and
+        FORWARDS the prompt. Every backend's describe() signature is
+        (frame_bytes, prompt); the old assertion pinned the promptless call,
+        so the service growing prompt forwarding (the caller's intent actually
+        reaching the model) read as a failure."""
         from integrations.vision.vision_service import VisionService
         svc = VisionService.__new__(VisionService)
         svc._circuit_open = False
@@ -346,7 +363,24 @@ class TestVisionServiceBackendIntegration:
         svc._vision_backend = mock_backend
         result = svc._describe_frame('user1', b'fake_jpeg')
         assert result == 'A robot arm moving'
-        mock_backend.describe.assert_called_once_with(b'fake_jpeg')
+        mock_backend.describe.assert_called_once()
+        args, _ = mock_backend.describe.call_args
+        assert args[0] == b'fake_jpeg'
+        assert len(args) == 2 and isinstance(args[1], str) and args[1], (
+            'describe() must receive the prompt — a promptless call silently '
+            'falls back to the backend default and drops the caller\'s intent')
+
+    def test_describe_frame_forwards_a_caller_prompt_verbatim(self):
+        """An explicit prompt from the caller must reach the backend untouched."""
+        from integrations.vision.vision_service import VisionService
+        svc = VisionService.__new__(VisionService)
+        svc._circuit_open = False
+        mock_backend = MagicMock()
+        mock_backend.describe.return_value = 'ok'
+        svc._vision_backend = mock_backend
+        svc._describe_frame('user1', b'fake_jpeg', prompt='count the chairs')
+        mock_backend.describe.assert_called_once_with(b'fake_jpeg',
+                                                      'count the chairs')
 
     def test_describe_frame_minicpm_path(self):
         """When _vision_backend is None, uses MiniCPM HTTP."""

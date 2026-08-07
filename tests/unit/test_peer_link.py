@@ -1220,3 +1220,174 @@ class TestLinkState(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TestAutoUpgradeUsesNATTraversal
+# ═══════════════════════════════════════════════════════════════════
+#
+# _try_auto_upgrade used to derive the dial address by string-stripping the
+# scheme off the peer's advertised URL. That assumes the advertised URL is
+# directly reachable from here, which is false for any NAT-bound desktop,
+# Android or iOS node, and false for a bundled node whose advertised host is
+# loopback. NATTraversal exists for this and was called from nowhere in
+# production, only from its own tests in this file.
+
+class TestAutoUpgradeUsesNATTraversal(unittest.TestCase):
+    """_try_auto_upgrade must resolve through NAT traversal, with the old
+    string-strip kept only as a fallback."""
+
+    def setUp(self):
+        reset_link_manager()
+        self.mgr = PeerLinkManager.__new__(PeerLinkManager)
+        self.mgr._links = {}
+        self.mgr._lock = threading.Lock()
+        self.mgr._running = False
+        self.mgr._maintenance_thread = None
+        self.mgr._http_exchange_counts = {}
+        self.mgr._channel_handlers = {}
+        self.mgr._reconnect_backoff = {}
+        self.mgr._max_links = 10
+        self.mgr._tier = 'flat'
+        self.upgraded = {}
+        self.mgr.upgrade_peer = lambda **kw: self.upgraded.update(kw)
+
+    def tearDown(self):
+        reset_link_manager()
+
+    @staticmethod
+    def _peer(url):
+        return [{'node_id': 'peerX', 'url': url,
+                 'x25519_public': '', 'public_key': ''}]
+
+    def test_uses_address_from_nat_traversal_not_the_advertised_url(self):
+        """The traversal result wins over the advertised URL.
+
+        The peer advertises loopback, which is what every bundled node in the
+        live table does. Traversal finds it on the LAN. The link must be
+        opened to the LAN address, not to localhost.
+        """
+        class _Stub:
+            @staticmethod
+            def resolve_peer_address(peer_info):
+                return 'ws://192.168.1.42:6777/peer_link'
+
+        with patch('integrations.social.peer_discovery.gossip.get_peer_list',
+                   return_value=self._peer('http://localhost:6777')), \
+             patch('core.peer_link.nat.get_nat_traversal', return_value=_Stub()):
+            self.mgr._try_auto_upgrade('peerX')
+
+        self.assertEqual(self.upgraded.get('address'), '192.168.1.42:6777')
+
+    def test_falls_back_to_advertised_url_when_traversal_finds_nothing(self):
+        """A reachable peer on a flat network must behave exactly as before."""
+        class _Stub:
+            @staticmethod
+            def resolve_peer_address(peer_info):
+                return None
+
+        with patch('integrations.social.peer_discovery.gossip.get_peer_list',
+                   return_value=self._peer('http://10.0.0.7:6777')), \
+             patch('core.peer_link.nat.get_nat_traversal', return_value=_Stub()):
+            self.mgr._try_auto_upgrade('peerX')
+
+        self.assertEqual(self.upgraded.get('address'), '10.0.0.7:6777')
+
+    def test_traversal_failure_does_not_break_upgrade(self):
+        """If the traversal module raises, fall back rather than lose the peer."""
+        def _boom():
+            raise RuntimeError('stun unreachable')
+
+        with patch('integrations.social.peer_discovery.gossip.get_peer_list',
+                   return_value=self._peer('http://10.0.0.9:6777')), \
+             patch('core.peer_link.nat.get_nat_traversal', side_effect=_boom):
+            self.mgr._try_auto_upgrade('peerX')
+
+        self.assertEqual(self.upgraded.get('address'), '10.0.0.9:6777')
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TestPeerPortFromAdvertisedUrl
+# ═══════════════════════════════════════════════════════════════════
+#
+# _extract_host drops the port, and the LAN/WAN strategies used to re-add
+# get_port('backend') -- OUR local port -- as if every peer served where we do.
+# A bundled peer serves in-process on the flask port; a port-forwarded or
+# containerised peer is reachable on whatever it advertised. The peer already
+# told us in its URL.
+
+class TestPeerPortFromAdvertisedUrl(unittest.TestCase):
+
+    def setUp(self):
+        from core.peer_link.nat import NATTraversal
+        self.nat = NATTraversal(stun_server='stun.example.com:3478')
+
+    def test_extract_port_reads_the_advertised_port(self):
+        self.assertEqual(self.nat._extract_port('http://10.0.0.5:5000'), 5000)
+        self.assertEqual(self.nat._extract_port('https://host.example:8443/x'), 8443)
+
+    def test_extract_port_returns_zero_when_absent(self):
+        """0, not a default, so the caller decides the fallback."""
+        self.assertEqual(self.nat._extract_port('http://10.0.0.5'), 0)
+        self.assertEqual(self.nat._extract_port(''), 0)
+        self.assertEqual(self.nat._extract_port('http://host/path'), 0)
+
+    def test_extract_port_survives_garbage(self):
+        self.assertEqual(self.nat._extract_port('http://host:notaport'), 0)
+
+    def test_lan_direct_dials_the_peers_port_not_ours(self):
+        """The regression: a bundled peer on 5000 must not be dialled on 6777."""
+        seen = {}
+
+        class _Sock:
+            def settimeout(self, *_a):
+                pass
+
+            def connect_ex(self, addr):
+                seen['addr'] = addr
+                return 0
+
+            def close(self):
+                pass
+
+        with patch('socket.socket', return_value=_Sock()):
+            url = self.nat._try_lan_direct('10.0.0.5', 5000)
+
+        self.assertEqual(seen['addr'], ('10.0.0.5', 5000))
+        self.assertEqual(url, 'ws://10.0.0.5:5000/peer_link')
+
+    def test_lan_direct_falls_back_to_local_default_when_peer_gave_no_port(self):
+        from core.port_registry import get_port
+        seen = {}
+
+        class _Sock:
+            def settimeout(self, *_a):
+                pass
+
+            def connect_ex(self, addr):
+                seen['addr'] = addr
+                return 0
+
+            def close(self):
+                pass
+
+        with patch('socket.socket', return_value=_Sock()):
+            self.nat._try_lan_direct('10.0.0.5', 0)
+
+        self.assertEqual(seen['addr'], ('10.0.0.5', get_port('backend')))
+
+    def test_resolve_passes_the_advertised_port_through(self):
+        """End to end through resolve_peer_address, which is what link_manager
+        calls."""
+        seen = {}
+
+        def _lan(host, port=0):
+            seen['host'], seen['port'] = host, port
+            return f'ws://{host}:{port}/peer_link'
+
+        with patch.object(self.nat, '_try_lan_direct', _lan):
+            out = self.nat.resolve_peer_address(
+                {'url': 'http://192.168.1.42:5000', 'node_id': 'p1'})
+
+        self.assertEqual((seen['host'], seen['port']), ('192.168.1.42', 5000))
+        self.assertEqual(out, 'ws://192.168.1.42:5000/peer_link')

@@ -2178,8 +2178,18 @@ except Exception as e:
 # New: Using get_llm() to automatically use Qwen3-VL or OpenAI based on USE_QWEN3VL flag
 try:
     llm_math = LLMMathChain(llm=get_llm(model_name="gpt-3.5-turbo"))
-except Exception:
+except Exception as _llm_math_err:
+    # NEVER silent.  On the 2026-08-07 nightly this except swallowed the
+    # constructor error, llm_math stayed None for the whole boot, and every
+    # Tier-1 chat died at `llm_math.run` (AttributeError) while --validate
+    # stayed green — import succeeds, so the breakage left zero trace until
+    # a live user traceback.  The Calculator tool is optional; chat is not.
+    # Guarded use sites: get_tools (x2) + tools_func — same `is not None`
+    # idiom as `chain` below.
     llm_math = None
+    logging.getLogger(__name__).warning(
+        "LLMMathChain init failed — Calculator tool disabled for this boot "
+        "(chat continues without it): %s", _llm_math_err)
 # llm_math = LLMMathChain(llm= ChatGroq(groq_api_key=groq_api_key,
 #                model_name = "mixtral-8x7b-32768"))
 
@@ -2195,7 +2205,14 @@ chain = None
 # URL precedence: WAMP_URL env (set by Nunba desktop / regional / central) →
 # legacy cloud default.  Flat mode (no cloud) sets WAMP_URL to localhost so
 # DNS to aws_rasa.hertzai.com is never attempted (#323).
-_wamp_url = os.environ.get('WAMP_URL') or 'http://localhost:8088/publish'
+try:
+    from core.wamp_url import resolve_publish_url as _resolve_wamp_publish
+except ImportError:  # cx_Freeze defence — never let realtime kill boot
+    def _resolve_wamp_publish():
+        return os.environ.get('WAMP_URL') or 'http://localhost:8088/publish'
+# The run scripts export ws://…:8088/ws here; this normalises that to the
+# HTTP bridge instead of POSTing at a router socket.  See core/wamp_url.py.
+_wamp_url = _resolve_wamp_publish()
 try:
     if _CrossbarPub is not None:
         client = _CrossbarPub(_wamp_url)
@@ -4841,15 +4858,19 @@ def get_tools(req_tool, is_first: bool = False):
         # calls further down.
         tools = list(_get_heavy_tools_nonblocking())
         _gt_mark('heavy_tools_nonblocking')
-        tool = [
-
-            labeled_tool(
+        tool = []
+        # llm_math is None when its module-level init failed (logged there).
+        # Same guard shape as `chain` just below: the Calculator is optional,
+        # but evaluating `llm_math.run` on None kills the WHOLE tool list and
+        # with it every chat turn (live 2026-08-07: AttributeError on each
+        # /chat for a full 7h boot).
+        if llm_math is not None:
+            tool.append(labeled_tool(
                 name='Calculator',
                 func=llm_math.run,
                 description='Useful for when you need to answer questions about math.',
                 ui_label='Calculating…',
-            ),
-        ]
+            ))
 
         # Only add OpenAPI tool if chain is initialized
         if chain is not None:
@@ -5311,7 +5332,6 @@ def get_tools(req_tool, is_first: bool = False):
         }
         tools_func = {
             'google_search': top5_results,
-            'Calculator': llm_math.run,
             'FULL_HISTORY': parsing_string,
             'Text to image': parse_text_to_image,
             'Image_Inference_Tool': parse_image_to_text,
@@ -5320,12 +5340,22 @@ def get_tools(req_tool, is_first: bool = False):
             'Visual_Context_Camera': parse_visual_context
         }
 
+        # Calculator/OpenAPI only when their chains initialized — same guard
+        # shape; llm_math None = failed boot init (logged at module level).
+        if llm_math is not None:
+            tools_func['Calculator'] = llm_math.run
         # Only add OpenAPI_Specification to tools_func if chain is initialized
         if chain is not None:
             tools_func['OpenAPI_Specification'] = chain.run
         if req_tool == "google_search":
             req_tool = "Google Search Snippets"
-        if req_tool is not None and req_tool in tools_dict.values():
+        # `req_tool in tools_func` guards the tools_func[req_tool] lookup two
+        # lines down: with llm_math None a Calculator req_tool would KeyError
+        # here; instead it takes the else-branch (google-search only), which
+        # is the same degraded-but-alive behaviour as the tool list above.
+        # When every chain initialized, the maps agree and this is a no-op.
+        if req_tool is not None and req_tool in tools_dict.values() \
+                and req_tool in tools_func:
             tool_description = tool_desc[req_tool]
             tool_func = tools_func[req_tool]
             req_tool_from_user = [
@@ -5344,14 +5374,15 @@ def get_tools(req_tool, is_first: bool = False):
             tools = _safe_load_google_search()
             # tools += req_tool_from_user
 
-        tool = [
-
-            Tool(
+        tool = []
+        # Same None-guard as the first-tools branch above — see the comment
+        # there and at the module-level init.
+        if llm_math is not None:
+            tool.append(Tool(
                 name='Calculator',
                 func=llm_math.run,
                 description='Useful for when you need to answer questions about math.'
-            ),
-        ]
+            ))
 
         # Only add OpenAPI tool if chain is initialized
         if chain is not None:

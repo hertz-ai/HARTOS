@@ -287,24 +287,28 @@ class TestSelfInfoSigning:
         assert 'signature' in info, "_self_info() should include signature"
         assert 'public_key' in info, "_self_info() should include public_key"
 
-    def test_self_info_signature_is_verifiable_on_signed_fields(self):
-        """The signature from _self_info() verifies against the fields that existed at signing time.
+    def test_self_info_signature_verifies_on_the_payload_actually_sent(self):
+        """The signature must verify over the whole announced payload.
 
-        Note: _self_info() adds post-signing fields (x25519_public, guardrail_hash,
-        capability_tier, idle_compute, current_version) AFTER calling sign_json_payload().
-        The receiver's _merge_peer() includes these extra fields in the verification payload,
-        which means verification fails on the full dict. This test verifies that the signature
-        IS valid against the originally-signed subset of fields.
+        This test previously asserted the opposite. It excluded
+        x25519_public, guardrail_hash, capability_tier, enabled_features,
+        hardware_summary, idle_compute, current_version and available_version,
+        and its docstring recorded that _self_info added them after
+        sign_json_payload, that _merge_peer includes them when verifying, and
+        therefore that "verification fails on the full dict". All of that was
+        accurate. It was written as the expected result rather than as a bug,
+        so the suite stayed green while no announce on the network could be
+        verified by any receiver, enforcement mode defaulted to hard, and every
+        node rejected every peer.
+
+        The contract that matters is the receiver's: _merge_peer verifies
+        ``{k: v for k, v in peer_data.items() if k != 'signature'}``. Nothing
+        anywhere reconstructs the narrower subset, so a signature valid only
+        over that subset is valid to nobody. _self_info now signs last, and
+        this asserts the real contract.
         """
         from integrations.social.peer_discovery import GossipProtocol
         from security.node_integrity import verify_json_signature
-
-        # Fields known to be added AFTER sign_json_payload() in _self_info()
-        POST_SIGNING_FIELDS = {
-            'x25519_public', 'guardrail_hash', 'capability_tier',
-            'enabled_features', 'hardware_summary', 'idle_compute',
-            'current_version', 'available_version',
-        }
 
         with patch.dict(os.environ, {'HEVOLVE_GOSSIP_BANDWIDTH': 'full'}):
             gp = GossipProtocol()
@@ -315,11 +319,11 @@ class TestSelfInfoSigning:
         assert sig, "signature must be present"
         assert pub, "public_key must be present"
 
-        # Build the signed-fields-only payload (what was present when signature was computed)
-        signed_payload = {k: v for k, v in info.items()
-                         if k != 'signature' and k not in POST_SIGNING_FIELDS}
-        assert verify_json_signature(pub, signed_payload, sig), \
-            "Signature should verify against the originally-signed fields"
+        receiver_view = {k: v for k, v in info.items() if k != 'signature'}
+        assert verify_json_signature(pub, receiver_view, sig), \
+            ("signature must cover every field that is actually sent; a field "
+             "added to _self_info after sign_json_payload breaks every "
+             "announce on the network")
 
     def test_gossip_self_info_compact_still_signs(self):
         """Even in compact mode, _gossip_self_info() should include signature if available."""

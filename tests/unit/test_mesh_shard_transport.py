@@ -77,7 +77,20 @@ class _Node:
 
 
 @pytest.fixture
-def two_nodes():
+def two_nodes(monkeypatch):
+    """Two live mesh nodes WITH compute_contribute consent granted.
+
+    The shard route grew a fail-closed consent gate (serving a peer's shard
+    frame contributes this device's compute to the hive — explicit opt-in,
+    humans-always-in-control), and without granting it every frame in this
+    suite answered 403 before the transport code ran. These tests are about
+    the TRANSPORT (frame round-trip, bad-frame -> 400), so the fixture
+    declares the consented state; the gate's own refusal is pinned separately
+    by test_shard_frame_refused_without_compute_consent.
+    """
+    from integrations.agent_engine.compute_mesh_service import ComputeMeshService
+    monkeypatch.setattr(ComputeMeshService, '_compute_contribute_consented',
+                        lambda self: True)
     a = _Node()
     b = _Node()
     try:
@@ -85,6 +98,25 @@ def two_nodes():
     finally:
         a.stop()
         b.stop()
+
+
+def test_shard_frame_refused_without_compute_consent():
+    """The fail-closed gate itself: no compute_contribute consent -> HTTP 403
+    with code consent_required, and the frame handler is NEVER reached — the
+    device must not contribute compute the human did not authorise."""
+    from unittest.mock import patch as _patch
+    from integrations.agent_engine.compute_mesh_service import ComputeMeshService
+    with _patch.object(ComputeMeshService, '_compute_contribute_consented',
+                       lambda self: False):
+        node = _Node()
+        try:
+            with _patch.object(node.mesh, '_handle_shard_frame') as handler:
+                status, _ctype, body = node.mesh._route_shard(b'anything')
+            assert status == 403
+            assert b'consent_required' in body
+            handler.assert_not_called()
+        finally:
+            node.stop()
 
 
 def test_pairing_registers_peer_by_device_id(two_nodes):

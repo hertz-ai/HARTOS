@@ -260,13 +260,22 @@ class TestAttachRefusal:
         monkeypatch.setenv('HEVOLVE_HIVE_ADVERTISE', '1')
         monkeypatch.setenv(
             'HEVOLVE_HIVE_PUBLIC_ENDPOINT', 'https://x.example.com')
-        # Mock the worker pool so we don't actually start a thread
-        with patch.object(advertiser._pool, 'submit') as submit:
+        # Stub the LOOP BODY, not the executor: the announce loop now runs on
+        # a daemon thread (a non-daemon pool worker running an infinite task
+        # hung the interpreter at exit). The thread really starts here, so this
+        # exercises the real lifecycle and just gives it nothing to do.
+        with patch.object(advertiser, '_advertise_loop') as loop:
             assert advertiser.attach() is True
             # Second call is no-op
             assert advertiser.attach() is False
-        # Pool submitted the loop exactly once
-        assert submit.call_count == 1
+            started = advertiser._thread
+            assert started is not None
+            assert started.daemon is True, (
+                'non-daemon announce thread is joined at interpreter exit')
+            started.join(timeout=5)
+        # The loop was entered exactly once, despite two attach() calls.
+        assert loop.call_count == 1
+        advertiser.shutdown()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -505,25 +514,57 @@ class TestEmitAndLifecycle:
         monkeypatch.setenv('HEVOLVE_HIVE_ADVERTISE', '1')
         monkeypatch.setenv(
             'HEVOLVE_HIVE_PUBLIC_ENDPOINT', 'https://x.example.com')
-        # Block the worker submit so the test doesn't race the loop
-        with patch.object(advertiser._pool, 'submit'):
+        # Stub the loop body so the test doesn't race a live announce cycle.
+        with patch.object(advertiser, '_advertise_loop'):
             advertiser.attach()
         with patch.object(advertiser, '_emit_revoke') as revoke:
             advertiser.shutdown()
         revoke.assert_called_once()
+        assert advertiser._thread is None, (
+            'shutdown must release the thread handle so a later attach starts '
+            'a fresh one instead of re-joining a dead thread')
 
     def test_shutdown_idempotent(
             self, advertiser, monkeypatch):
         monkeypatch.setenv('HEVOLVE_HIVE_ADVERTISE', '1')
         monkeypatch.setenv(
             'HEVOLVE_HIVE_PUBLIC_ENDPOINT', 'https://x.example.com')
-        with patch.object(advertiser._pool, 'submit'):
+        with patch.object(advertiser, '_advertise_loop'):
             advertiser.attach()
         # Second shutdown is a no-op (no double-revoke)
         with patch.object(advertiser, '_emit_revoke') as revoke:
             advertiser.shutdown()
             advertiser.shutdown()
         assert revoke.call_count == 1
+
+    def test_reattach_after_shutdown_starts_a_fresh_live_loop(
+            self, advertiser, monkeypatch):
+        """The attach/shutdown pair must survive a full cycle: shutdown sets
+        `_stop`, and a later attach must CLEAR it before starting the new
+        thread — otherwise the re-attached loop exits on its first tick and
+        the node silently stops announcing. Both writes now happen under the
+        same lock hold as the `_attached` flip, so a concurrent
+        attach/shutdown interleaving can no longer erase the other's
+        stop-event write (the lost-set race)."""
+        monkeypatch.setenv('HEVOLVE_HIVE_ADVERTISE', '1')
+        monkeypatch.setenv(
+            'HEVOLVE_HIVE_PUBLIC_ENDPOINT', 'https://x.example.com')
+        with patch.object(advertiser, '_advertise_loop'):
+            assert advertiser.attach() is True
+            first = advertiser._thread
+            with patch.object(advertiser, '_emit_revoke'):
+                advertiser.shutdown()
+            assert advertiser._stop.is_set()
+            assert advertiser._thread is None
+
+            assert advertiser.attach() is True
+            assert not advertiser._stop.is_set(), (
+                're-attach must clear the stop event or the new loop exits '
+                'on its first wait')
+            second = advertiser._thread
+            assert second is not None and second is not first
+            with patch.object(advertiser, '_emit_revoke'):
+                advertiser.shutdown()
 
 
 # ─────────────────────────────────────────────────────────────────────

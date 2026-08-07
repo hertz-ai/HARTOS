@@ -29,59 +29,14 @@ DELTA_VERSION = 1
 DELTA_MAX_AGE_SECONDS = 3600  # 1 hour freshness window
 
 # ── G8: Per-node HMAC secret (generated at first boot) ──
-# Default to user-writable dir — installed builds at Program Files are read-only.
-_HMAC_SECRET_PATH = os.path.join(
-    os.environ.get('HEVOLVE_AGENT_DATA',
-                   os.path.join(os.path.expanduser('~'), '.nunba', 'agent_data')),
-    '.hmac_secret')
-
-
-def _load_or_create_hmac_secret() -> str:
-    """Load per-node HMAC secret from disk, or generate on first boot.
-
-    The secret is 32 random bytes (hex-encoded, 64 chars) stored at
-    agent_data/.hmac_secret.  This replaces the old HART_NODE_KEY env var
-    and Ed25519-public-key fallback with a proper per-node secret that is
-    never transmitted in cleartext.
-    """
-    try:
-        if os.path.isfile(_HMAC_SECRET_PATH):
-            with open(_HMAC_SECRET_PATH, 'r') as f:
-                secret = f.read().strip()
-            if len(secret) >= 32:
-                return secret
-    except (OSError, PermissionError) as e:
-        logger.warning(f'Cannot read HMAC secret ({e}), regenerating')
-
-    # Generate new secret
-    secret = os.urandom(32).hex()
-    try:
-        os.makedirs(os.path.dirname(_HMAC_SECRET_PATH), exist_ok=True)
-        with open(_HMAC_SECRET_PATH, 'w') as f:
-            f.write(secret)
-        # Restrict permissions (owner read/write only)
-        try:
-            import stat
-            os.chmod(_HMAC_SECRET_PATH, stat.S_IRUSR | stat.S_IWUSR)
-        except (OSError, NotImplementedError):
-            pass  # Windows doesn't support POSIX chmod the same way
-        logger.info(f'Generated per-node HMAC secret at {_HMAC_SECRET_PATH}')
-    except (OSError, PermissionError) as e:
-        logger.warning(f'Cannot persist HMAC secret ({e}), using ephemeral')
-
-    return secret
-
-
-# Cache the secret at module load
-_NODE_HMAC_SECRET: str = ''
-
-
-def _get_hmac_secret() -> str:
-    """Return the per-node HMAC secret (lazy-loaded, cached)."""
-    global _NODE_HMAC_SECRET
-    if not _NODE_HMAC_SECRET:
-        _NODE_HMAC_SECRET = _load_or_create_hmac_secret()
-    return _NODE_HMAC_SECRET
+# Per-node HMAC secret now lives in core.node_secret, so the email campaign's
+# click-attribution token can use the same one instead of the public
+# 'hevolve-campaign' literal it had. Moved, not copied: these remain the names
+# the rest of this module and its tests use.
+from core.node_secret import (  # noqa: E402
+    load_or_create_hmac_secret as _load_or_create_hmac_secret,
+    get_hmac_secret as _get_hmac_secret,
+)
 
 
 def _sign_delta(delta_dict):
@@ -547,8 +502,34 @@ class FederatedAggregator:
         if sig:
             try:
                 from security.node_integrity import verify_json_signature
+                # Verify against the delta WITHOUT hmac_signature, because
+                # that field did not exist when the sender signed.
+                #
+                # Order of operations on the send side: extract_local_delta()
+                # computes the Ed25519 signature, then broadcast_delta() calls
+                # _sign_delta() which ADDS hmac_signature before posting
+                # (line ~422). verify_json_signature strips only 'signature',
+                # so the payload it hashes on this side contains a field the
+                # signed payload did not, and every delta on the wire failed
+                # with 'invalid signature'.
+                #
+                # Measured on a real delta from extract_local_delta():
+                #   before _sign_delta                       verifies True
+                #   after  _sign_delta (the wire form)       verifies False
+                #   wire form minus hmac_signature only      verifies True
+                #
+                # Since hard is the default enforcement mode, this rejected
+                # every peer delta regardless of networking, which is a second
+                # and independent reason hive-census reported one node.
+                #
+                # Fixed here rather than in verify_json_signature because that
+                # helper is generic and also verifies peer announcements, which
+                # carry no HMAC. The two-signature layering is specific to
+                # federation deltas.
+                _ed_payload = {k: v for k, v in delta.items()
+                               if k != 'hmac_signature'}
                 if not verify_json_signature(delta.get('public_key', ''),
-                                             delta, sig):
+                                             _ed_payload, sig):
                     return False, 'invalid signature'
             except ImportError:
                 logger.warning('Ed25519 verification module unavailable')

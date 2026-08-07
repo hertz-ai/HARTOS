@@ -325,13 +325,20 @@ def settle_metered_api_costs(db, period_hours: int = 24) -> Dict:
         logger.info(f"Metered API settlement: {settled_count} records, "
                      f"{total_spark} Spark, ${total_usd:.2f} USD")
 
-        # Immutable audit trail for revenue settlements
+        # Immutable audit trail for revenue settlements. `db=db` is
+        # load-bearing: we are MID-TRANSACTION (awards + status flips flushed,
+        # not committed). Without it the audit log opened its OWN session,
+        # which on a shared-connection pool (every sqlite:// test env) reset
+        # the connection and ROLLED BACK the settlement it was attesting to —
+        # the audit row said "Settled 1" while the wallet credit was destroyed.
+        # With it, the entry commits atomically with the settlement.
         try:
             from security.immutable_audit_log import get_audit_log
             get_audit_log().log_event(
                 'revenue_settlement',
                 actor_id='revenue_aggregator',
                 action=f'Settled {settled_count} metered API records',
+                db=db,
                 detail={
                     'settled_count': settled_count,
                     'total_spark_awarded': total_spark,

@@ -7,6 +7,7 @@ bluetooth management, print manager, media indexer.
 
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -1191,11 +1192,63 @@ class TestShellAntivirus(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
 
     def test_scan_rejects_a_nonexistent_path(self):
+        """A path that does not exist INSIDE the owned roots is a plain 404."""
+        missing = os.path.join(tempfile.gettempdir(), 'definitely-not-here-9f3a')
+        r = _make_system_app().post(
+            '/api/shell/antivirus/scan',
+            data=json.dumps({'path': missing}),
+            content_type='application/json')
+        self.assertEqual(r.status_code, 404, r.get_data(as_text=True))
+
+    def test_nonexistent_path_outside_roots_is_403_not_404(self):
+        """The ordering that kills the file-existence ORACLE this route's guard
+        was written to close: out-of-root is answered BEFORE existence, so a
+        caller cannot learn whether an arbitrary path exists by reading the
+        403-vs-404 split.
+
+        This previously answered 404 -- i.e. the oracle was live -- because the
+        guard admitted every mountpoint and `/definitely/not/here` therefore
+        counted as inside an allowed root. It only looked correct."""
         r = _make_system_app().post(
             '/api/shell/antivirus/scan',
             data=json.dumps({'path': '/definitely/not/here/9f3a'}),
             content_type='application/json')
-        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.status_code, 403, r.get_data(as_text=True))
+
+    def test_scan_refuses_the_filesystem_root(self):
+        """The threat this route's path guard was WRITTEN for: POST {"path":"/"}
+        must not start a full-filesystem clamd scan.
+
+        It was untested, and it did not hold. _is_path_allowed's default root
+        set admits every psutil mountpoint (so the This-PC panel can open a
+        drive in the file manager), and on Linux `/` is itself a mountpoint --
+        so `/` resolved INSIDE an allowed root and the guard waved it through.
+        Same on Windows, where `/` realpaths to the system drive.
+
+        Asserted behaviourally, with the executor patched so a regression can
+        never actually launch the scan: a refusal must come back 403 and
+        _run_async_bounded must never be reached.
+        """
+        with patch('integrations.agent_engine.shell_system_apis._run_async_bounded') as run:
+            r = _make_system_app().post(
+                '/api/shell/antivirus/scan',
+                data=json.dumps({'path': '/'}),
+                content_type='application/json')
+        self.assertEqual(r.status_code, 403, r.get_data(as_text=True))
+        self.assertIn('outside allowed roots', json.loads(r.data)['error'])
+        run.assert_not_called()
+
+    def test_scan_refuses_a_system_dir_outside_the_owned_roots(self):
+        """Not only the root itself: any tree the session does not own is
+        refused, so the scan cannot be aimed at /etc (or C:\\Windows) either."""
+        outside = 'C:\\Windows' if sys.platform == 'win32' else '/etc'
+        with patch('integrations.agent_engine.shell_system_apis._run_async_bounded') as run:
+            r = _make_system_app().post(
+                '/api/shell/antivirus/scan',
+                data=json.dumps({'path': outside}),
+                content_type='application/json')
+        self.assertEqual(r.status_code, 403, r.get_data(as_text=True))
+        run.assert_not_called()
 
     def test_scan_reports_clean(self):
         with tempfile.TemporaryDirectory() as d:

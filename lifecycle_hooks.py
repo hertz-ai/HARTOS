@@ -979,7 +979,28 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
 
     allowed = valid_transitions.get(current_state, [])
     if new_state not in allowed:
-        logger.error(f"[ERROR] Invalid transition: {current_state.value} → {new_state.value}")
+        # DEBUG, not ERROR — this function is a PREDICATE.  Every caller uses
+        # its return value as a question:
+        #     :730  if not validate_state_transition(...):  raise
+        #     :901  elif validate_state_transition(...):
+        #     :1024/:1059/:1091/:1109/:1119/:1148/:1174/:1197/:1223
+        #           if validate_state_transition(...):
+        # and the unit tests assert True/False.  Nothing reads this log to
+        # make a decision, so a "no" answer is normal control flow, not a
+        # failure.
+        #
+        # It also DOUBLE-LOGGED every genuine failure: set_action_state()
+        # calls this at :730, logs here, then raises StateTransitionError
+        # (:732), which safe_set_state() catches and logs AGAIN at :777.  One
+        # bad set produced two ERROR lines — observed 2026-08-05 as 275 of
+        # each for ~275 real events (terminated → pending), i.e. 550 lines
+        # that read as 550 failures.
+        #
+        # After this change: a guarded caller asking permission logs nothing;
+        # a genuinely-refused set still logs exactly one ERROR, from :777.
+        # Same family as #534 (probe_failed false-positive demoted to INFO).
+        # The text is unchanged so the pattern stays greppable at DEBUG.
+        logger.debug(f"Invalid transition: {current_state.value} → {new_state.value}")
         return False
 
     logger.info(f"[OK] Valid transition: {current_state.value} → {new_state.value}")

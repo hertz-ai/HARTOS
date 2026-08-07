@@ -3959,6 +3959,103 @@ def create_action_with_ledger(actions: List[Dict], user_id: int, prompt_id: int,
     action_instance.set_ledger(ledger)
     return action_instance
 
+_REMEDY_MAX_ATTEMPTS = 3
+
+
+def _remedy_replay_exceeded(attempts, key, limit=_REMEDY_MAX_ATTEMPTS):
+    """Count an attempt at `key`; True once it has been tried `limit` times.
+
+    Guards the two remedy sites in the main loop that re-issue a
+    BYTE-IDENTICAL prompt whenever their guard condition survives the
+    remedy.  Neither condition is changed by the remedy failing:
+
+      * recipe-not-banked -> ask the model for a recipe.  If the model
+        does not save one, ``os.path.exists(_recipe_file)`` is still
+        False next iteration, so the same request is sent again.
+      * completion-claim-rejected -> tell the model to keep working.  If
+        it re-claims the same task, ``_claim_valid`` is False again, so
+        the same rejection text is sent again.
+
+    Measured in llm_outbound.jsonl (1,190 records): 982 of 1088 calls
+    re-sent an already-sent payload; the worst single payload went out
+    222 times, the recipe request 170 times and the rejection 75 times.
+    That is what filled 19.3h of cumulative LLM latency, not model speed
+    -- the loop's existing bounds (max_iterations=300, 30-min pipeline
+    timeout) cap the damage but do not stop the replay.
+
+    Bounding the remedy, not the loop, is the fix: after `limit` tries
+    the caller takes its escape path instead of re-asking.
+    """
+    attempts[key] = attempts.get(key, 0) + 1
+    return attempts[key] > limit
+
+
+_RETRY_TAG_PREFIX = '[retry:'
+
+
+def _retry_marker(tag):
+    """The sentinel that identifies a retry prompt in group-chat history."""
+    return f'{_RETRY_TAG_PREFIX}{tag}]'
+
+
+def send_retry(group_chat, sender, manager, tag, message, logger=None):
+    """Send a retry prompt that REPLACES the previous one instead of stacking.
+
+    Every remedy site re-issues its prompt with ``clear_history=False``, so
+    before this helper each attempt APPENDED another copy.  Autogen re-sends
+    the whole message list on every call, so N attempts cost O(N) copies in
+    the context window and O(N^2) tokens over the loop -- the mechanism
+    behind the measurements in ``_remedy_replay_exceeded``'s docstring (982
+    of 1088 calls re-sent an already-sent payload; worst payload 222x) and
+    behind the 14,330 "Finish what you started" occurrences observed live
+    2026-08-05.
+
+    Retrying is legitimate; PAYING for it repeatedly is not.  A retry is a
+    correction of the previous one, so history should hold the newest and
+    forget the rest.  This drops every earlier message carrying the same
+    tag, then sends the new one tagged, leaving AT MOST ONE retry per tag in
+    context no matter how many attempts run.  Token cost becomes flat in the
+    attempt count instead of quadratic, and the model sees one current
+    instruction rather than a wall of near-identical repeats it is being
+    told not to repeat.
+
+    Tags are per-remedy so the sites do not clear each other: a pending
+    recipe request must survive while a claim rejection is retried.
+
+    MUTATES ``group_chat.messages`` IN PLACE (``msgs[:] = keep``).  Autogen
+    holds a reference to that exact list object, so rebinding it would leave
+    the manager writing to a detached list -- the same stale-reference shape
+    as the frozen-stdout rotation bug (#621).  Do not "simplify" this to an
+    assignment.
+
+    Returns whatever ``initiate_chat`` returns; callers are unchanged
+    otherwise.
+    """
+    marker = _retry_marker(tag)
+    msgs = getattr(group_chat, 'messages', None)
+    dropped = 0
+    if isinstance(msgs, list) and msgs:
+        keep = []
+        for _m in msgs:
+            _c = _m.get('content') if isinstance(_m, dict) else None
+            if isinstance(_c, str) and marker in _c:
+                dropped += 1
+                continue
+            keep.append(_m)
+        if dropped:
+            msgs[:] = keep          # in place -- see docstring
+    if dropped and logger is not None:
+        try:
+            logger.info(
+                "[RETRY-REPLACE] tag=%s dropped %d stale cop%s from history "
+                "(history now %d msgs)",
+                tag, dropped, 'y' if dropped == 1 else 'ies', len(msgs))
+        except Exception:
+            pass
+    return sender.initiate_chat(
+        recipient=manager, message=f'{marker} {message}', clear_history=False)
+
+
 def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     """
     Handles the response generation process for an agent group.
@@ -4123,6 +4220,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         max_iterations = 300  # Time-based: ~5s per iteration = ~25 min max
         _pipeline_start = time.time()
         _pipeline_timeout = 1800  # 30 minutes — CREATE is the learning phase, needs time
+        # Per-run replay ledger for _remedy_replay_exceeded (see its docstring).
+        _remedy_attempts = {}
 
         while while_loop_iterations < max_iterations:
             # Hard timeout: don't let pipeline run forever
@@ -4340,17 +4439,43 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                             user_prompt, prompt_id, flow, json_action_id,
                                             group_chat)
                                     if not os.path.exists(_recipe_file):
-                                        # Trace banking failed — request it from the model
-                                        current_app.logger.info(
-                                            f"[RECIPE-NEEDED] {_claimed_task_id} completed but recipe not saved, requesting")
-                                        user_tasks[user_prompt].recipe = True
-                                        user_tasks[user_prompt].fallback = False
-                                        _recipe_msg = request_recipe_for_action(json_action_id, prompt_id, role, user_prompt)
-                                        result = chat_instructor.initiate_chat(
-                                            recipient=manager, message=_recipe_msg, clear_history=False, silent=False)
-                                        _rh = chat_instructor.chat_messages.get(manager, [])
-                                        if _rh and len(group_chat.messages) == 0:
-                                            group_chat.messages.extend(_rh)
+                                        if _remedy_replay_exceeded(
+                                                _remedy_attempts,
+                                                ('recipe', prompt_id, json_action_id)):
+                                            # Asked _REMEDY_MAX_ATTEMPTS times and the file is
+                                            # STILL absent.  os.path.exists() above is unchanged
+                                            # by the model failing to save, so re-entering this
+                                            # branch re-sends a byte-identical request forever
+                                            # (measured 170x).  Advance unbanked instead — the
+                                            # action itself did complete; only its recipe is
+                                            # missing, and _bank_action_recipe_from_trace already
+                                            # had first refusal.
+                                            current_app.logger.warning(
+                                                f"[RECIPE-GIVEUP] {_claimed_task_id} action "
+                                                f"{json_action_id}: still unbanked after "
+                                                f"{_REMEDY_MAX_ATTEMPTS} requests — advancing "
+                                                f"without a recipe rather than replaying")
+                                            if json_action_id < len(user_tasks[user_prompt].actions):
+                                                user_tasks[user_prompt].current_action = json_action_id + 1
+                                                user_tasks[user_prompt].recipe = False
+                                        else:
+                                            # Trace banking failed — request it from the model
+                                            current_app.logger.info(
+                                                f"[RECIPE-NEEDED] {_claimed_task_id} completed but recipe not saved, requesting")
+                                            user_tasks[user_prompt].recipe = True
+                                            user_tasks[user_prompt].fallback = False
+                                            _recipe_msg = request_recipe_for_action(json_action_id, prompt_id, role, user_prompt)
+                                            # Replace the previous request instead of stacking it:
+                                            # os.path.exists(_recipe_file) is still False next lap
+                                            # if the model did not bank one, so the SAME request
+                                            # goes out again (measured 170x).  One copy in context.
+                                            result = send_retry(
+                                                group_chat, chat_instructor, manager,
+                                                f'recipe-{json_action_id}', _recipe_msg,
+                                                logger=current_app.logger)
+                                            _rh = chat_instructor.chat_messages.get(manager, [])
+                                            if _rh and len(group_chat.messages) == 0:
+                                                group_chat.messages.extend(_rh)
                                     else:
                                         current_app.logger.info(
                                             f"[ALREADY DONE] {_claimed_task_id} completed + recipe saved, advancing")
@@ -4381,10 +4506,30 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
                         if not _claim_valid:
                             current_app.logger.error(f"[CLAIM REJECTED] {_rejection_reason}")
+                            if _remedy_replay_exceeded(
+                                    _remedy_attempts,
+                                    ('claim', prompt_id, current_action_id, _rejection_reason)):
+                                # Same action rejected for the same reason
+                                # _REMEDY_MAX_ATTEMPTS times.  _claim_valid is recomputed from
+                                # whatever the model claims next, so a model that keeps
+                                # re-claiming one task keeps landing here with identical text
+                                # (measured 75x).  Stop and keep the progress already saved —
+                                # the same thing the wall-clock timeout above does.
+                                current_app.logger.error(
+                                    f"[CLAIM-GIVEUP] action {current_action_id} rejected "
+                                    f"{_REMEDY_MAX_ATTEMPTS}x for an unchanged reason — "
+                                    f"stopping instead of replaying: {_rejection_reason}")
+                                break
                             message = (f"Your completion claim was rejected: {_rejection_reason}. "
                                        f"Continue working on action {current_action_id}.")
-                            result = chat_instructor.initiate_chat(
-                                recipient=manager, message=message, clear_history=False)
+                            # Replace the previous rejection instead of stacking it:
+                            # _claim_valid is recomputed each lap, so a model that
+                            # keeps re-claiming lands here with identical text
+                            # (measured 75x).  One copy in context, not 75.
+                            result = send_retry(
+                                group_chat, chat_instructor, manager,
+                                f'claim-{current_action_id}', message,
+                                logger=current_app.logger)
                             continue
 
                         # Only set COMPLETED if not already done by state_transition
@@ -4431,8 +4576,17 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         actions_prompt = user_tasks[user_prompt].get_action(current_action_id - 1)
                         message = f'Finish what you started, Do not go into loop and do not repeat same thing in different way, Continue with action {current_action_id}: {actions_prompt}'
 
-                    result = agents_object['helper'].initiate_chat(recipient=manager, message=message,
-                                                                   clear_history=False, silent=False)
+                    # Replace the previous nudge instead of stacking it.  This is
+                    # the site that produced 14,330 copies of "Finish what you
+                    # started, Do not go into loop..." on 2026-08-05 — an
+                    # anti-repetition instruction that was itself repeated into
+                    # the context window.  Unlike the recipe/claim sites it has
+                    # no _remedy_replay_exceeded bound, so replacement (not a
+                    # cap) is what keeps it correct AND cheap.
+                    result = send_retry(
+                        group_chat, agents_object['helper'], manager,
+                        f'nojson-{current_action_id}', message,
+                        logger=current_app.logger)
                     continue
 
                 current_app.logger.info('resuming chat')

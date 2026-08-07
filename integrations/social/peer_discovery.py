@@ -146,29 +146,79 @@ class GossipProtocol:
         and freezes the cold-boot fallback into `_self_info()['url']` for the
         life of the process, so every peer that discovers us dials a dead port.
 
-        Delegates to the canonical ``core.port_registry.get_local_backend_url``
-        (Gate 4 — the same resolver hartos_bootstrap, agent_engine.dispatch,
-        channels.flask_integration and mcp._tool_impls already use).  That
-        function probes which port is actually LISTENING: standalone HARTOS
-        serves on backend (6777), the bundled desktop serves HARTOS in-process
-        on the Flask port (5000).
+        Delegates to the canonical ``core.port_registry.get_advertisable_base_url``
+        (Gate 4 — built on the same get_local_backend_url that hartos_bootstrap,
+        agent_engine.dispatch, channels.flask_integration and mcp._tool_impls
+        already use).  That resolver probes which port is actually LISTENING:
+        standalone HARTOS serves on backend (6777), the bundled desktop serves
+        HARTOS in-process on the Flask port (5000).
+
+        ADVERTISABLE, not local.  get_local_backend_url answers "where do I
+        reach my own backend" and correctly returns loopback; this property is
+        published to peers, where loopback is never right.  It is why every row
+        in the live peer table read http://localhost:6777, and why
+        core/peer_link/nat.py — which dials peer_info['url'] — resolved every
+        peer back to the caller's own machine.  get_advertisable_base_url pairs
+        the LAN address with the port this resolver just proved is live, and
+        HEVOLVE_BASE_URL still wins when set.
 
         Cached only once it returns a real answer.  While nothing is listening
         the resolver yields its backend fallback, and caching THAT is precisely
-        the bug — so we keep re-resolving until a port actually answers.
+        the bug — so we keep re-resolving until a port actually answers.  The
+        same test applies to the host: a loopback answer means no LAN address
+        was available yet, so it is not final either.
         """
         if self._base_url_final:
             return self._base_url_cached
 
-        from core.port_registry import get_local_backend_url, get_port
-        url = get_local_backend_url()
-        # An explicit env override, or any answer that is not the
-        # nothing-is-listening fallback, is final.
-        fallback = f'http://localhost:{get_port("backend")}'
-        if os.environ.get('HEVOLVE_BASE_URL') or url != fallback:
+        from core import port_registry as _pr
+        url = _pr.get_advertisable_base_url()
+        # Finality is decided by the PORT, never the host form. The previous
+        # rule compared against the LOOPBACK fallback string
+        # (http://localhost:6777) and called anything else final — but
+        # get_advertisable_base_url rewrites the host to the LAN address, so
+        # on any networked box the cold-boot fallback arrives as
+        # http://<lan>:6777, matched nothing, and was FROZEN. That is the
+        # exact regression this property exists to prevent, reintroduced for
+        # the LAN path: every peer dialled a dead 6777 for the life of the
+        # process. Ask the honest question instead — is the port in the
+        # answer actually LISTENING? (Same probe the resolver itself uses;
+        # attribute access through the module so test seams keep working.)
+        if os.environ.get('HEVOLVE_BASE_URL'):
             self._base_url_final = True
+        else:
+            _port = url.rsplit(':', 1)[-1]
+            if _port.isdigit() and _pr._is_port_listening(int(_port)):
+                self._base_url_final = True
         self._base_url_cached = url
         return url
+
+    @base_url.setter
+    def base_url(self, value: str):
+        """Pin the advertised URL explicitly.
+
+        Turning base_url into a read-only property broke every caller that
+        assigned to it, which is most of tests/unit/test_gossip_security.py.
+        The lazy resolver exists so nothing freezes the cold-boot fallback, not
+        to forbid callers who genuinely know the answer, and a test that needs
+        a node to claim a specific address is a legitimate case. An explicit
+        assignment is authoritative, so mark it final and stop resolving.
+        """
+        self._base_url_cached = (value or '').rstrip('/')
+        self._base_url_final = bool(self._base_url_cached)
+
+    @base_url.deleter
+    def base_url(self):
+        """Forget any pinned/cached answer and resume lazy resolution.
+
+        Completes the property contract the setter opened: an explicit
+        assignment is authoritative, so its UNDO must exist too. Concretely,
+        `patch.object(gossip, 'base_url', ...)` — the pattern
+        test_recipe_capability_mesh already uses — assigns through the setter
+        on enter and `del`s on exit; without a deleter every such patch died
+        at TEARDOWN with "property ... has no deleter"."""
+        self._base_url_cached = ''
+        self._base_url_final = False
 
     def __init__(self):
         # Identity — persisted across restarts so the central side can
@@ -289,10 +339,34 @@ class GossipProtocol:
     # ─── Payload Serialization ───
 
     def _gossip_self_info(self):
-        """Return self info appropriate for current bandwidth profile."""
+        """Return self info appropriate for current bandwidth profile.
+
+        Re-signs after compaction. _COMPACT_FIELDS keeps `signature` and
+        `public_key` but drops name, version, agent_count, post_count,
+        x25519_public and current_version, all of which the signature covers.
+        The receiver verifies over every field except 'signature', so a
+        compacted record carrying the full record's signature can never
+        verify, and under enforcement=hard the peer is refused. That made
+        every constrained and minimal profile node permanently unverifiable,
+        the same defect as signing _self_info before finishing it.
+
+        Signing what is actually sent keeps the invariant in one place. The
+        bandwidth saving is unaffected.
+        """
         info = self._self_info()
         if self.payload_mode == 'json_compact':
-            return {k: v for k, v in info.items() if k in _COMPACT_FIELDS}
+            compact = {k: v for k, v in info.items() if k in _COMPACT_FIELDS}
+            if compact.get('public_key'):
+                try:
+                    from security.node_integrity import sign_json_payload
+                    compact.pop('signature', None)
+                    compact['signature'] = sign_json_payload(compact)
+                except Exception:
+                    # No crypto available: send it unsigned rather than with a
+                    # signature that cannot match, so the receiver's
+                    # enforcement path sees the truth.
+                    compact.pop('signature', None)
+            return compact
         return info
 
     def _gossip_peer_list(self):
@@ -460,14 +534,38 @@ class GossipProtocol:
             peers = self._load_peers_by_tier()
 
         if not peers:
-            # Retry seeds if we have no peers — limit to 2 seeds max
-            # to avoid blocking for N × 5s when all seeds are unreachable
+            # Bootstrap. Retry seeds, limited to 2 so a cold node does not
+            # block for N x 5s when every seed is unreachable.
+            #
+            # EXCHANGE as well as announce. Announcing only tells the seed we
+            # exist; _announce_to_peer discards the response body, so it
+            # teaches us nothing. Exchange is the only call that returns the
+            # other side's peer list, and it was reached exclusively through
+            # the `peers` path below, which requires already having a peer.
+            # That was a closed loop: a node with no peers could register
+            # itself with central forever and never learn of a single node,
+            # so remote_count stayed 0 on every fresh install no matter what
+            # else was fixed. Observed live: central accepted this desktop and
+            # listed it, while the desktop still reported remote_count 0
+            # through repeated gossip rounds.
+            #
+            # Announce is kept ahead of the exchange rather than replaced.
+            # Exchange carries `sender`, so a peer that implements it learns
+            # us either way, but a node that predates the endpoint would 404
+            # the exchange and we would lose the registration. Two requests to
+            # at most two seeds, and only while we have no peers at all.
             for url in list(self.seed_peers)[:2]:
                 if not self._running:
                     return
                 if self._is_peer_backed_off(url):
                     continue
                 self._announce_to_peer(url)
+                try:
+                    their_peers = self._exchange_with_peer(url)
+                    if their_peers:
+                        self._merge_peer_list(their_peers)
+                except Exception as e:
+                    logger.debug(f"Bootstrap exchange with {url} failed: {e}")
                 self._heartbeat()
             return
 
@@ -660,12 +758,17 @@ class GossipProtocol:
 
     # ─── Handlers (called by Flask endpoints) ───
 
-    def handle_announce(self, peer_data):
-        """Process an incoming peer announcement. Returns True if peer was new."""
+    def handle_announce(self, peer_data, reasons=None):
+        """Process an incoming peer announcement. Returns True if peer was new.
+
+        ``reasons``: optional list; a rejection appends why. False alone is
+        ambiguous, it means both "already knew this peer" and "refused it",
+        and the caller cannot tell those apart without this.
+        """
         from .models import get_db
         db = get_db()
         try:
-            is_new = self._merge_peer(db, peer_data)
+            is_new = self._merge_peer(db, peer_data, reasons=reasons)
             db.commit()
             if is_new:
                 logger.info(f"New peer discovered: {peer_data.get('name', '')} "
@@ -674,6 +777,8 @@ class GossipProtocol:
         except Exception as e:
             db.rollback()
             logger.debug(f"Announce handler error: {e}")
+            if reasons is not None:
+                reasons.append(f'announce handler errored: {e}')
             return False
         finally:
             db.close()
@@ -826,7 +931,7 @@ class GossipProtocol:
         }
         # Add cryptographic identity if available
         try:
-            from security.node_integrity import get_public_key_hex, compute_code_hash, sign_json_payload
+            from security.node_integrity import get_public_key_hex, compute_code_hash
             info['public_key'] = get_public_key_hex()
             info['code_hash'] = compute_code_hash()
             # Include release manifest info if available
@@ -846,7 +951,6 @@ class GossipProtocol:
                     info['certificate'] = cert
             except Exception:
                 pass
-            info['signature'] = sign_json_payload(info)
         except Exception:
             pass
         # Include X25519 public key for E2E encryption
@@ -902,6 +1006,37 @@ class GossipProtocol:
                 info['available_version'] = status['version']
         except Exception:
             pass
+        # Sign LAST, over the fully populated dict.
+        #
+        # The signature used to be taken mid-construction, straight after
+        # public_key and code_hash were set. Everything below that point
+        # (x25519_public, guardrail_hash, capability_tier, enabled_features,
+        # hardware_summary, idle_compute, current_version) was added AFTER
+        # signing. _merge_peer rebuilds the verification payload as "every
+        # field except 'signature'", so it always checked the signature
+        # against a superset of what was actually signed, and no announce
+        # could ever verify.
+        #
+        # get_enforcement_mode() defaults to hard, so an unverified peer is
+        # rejected outright. That is why the live network held 69 registered
+        # nodes while every one of them reported remote_count 0. Nothing
+        # surfaced it because peer_announce returns HTTP 200 success:true on
+        # all five _merge_peer rejection paths, making a rejection
+        # indistinguishable from a duplicate.
+        #
+        # Signing last makes the sender's covered set exactly equal to the
+        # receiver's reconstruction, so unchanged receivers verify these
+        # announces. _build_beacon already signs last for the same reason;
+        # this brings _self_info onto that one pattern rather than adding
+        # another. Same defect and same fix as the federation delta path,
+        # where Ed25519 verification ran over a payload that excluded the
+        # later-added hmac_signature.
+        if info.get('public_key'):
+            try:
+                from security.node_integrity import sign_json_payload
+                info['signature'] = sign_json_payload(info)
+            except Exception:
+                pass
         return info
 
     def _seed_initial_peers(self):
@@ -936,14 +1071,34 @@ class GossipProtocol:
             db.close()
 
     def _merge_peer_list(self, peer_list):
-        """Merge a list of peer dicts into the DB."""
+        """Merge a list of peer dicts into the DB.
+
+        These are RELAYED records, so they are address hints, not identity
+        claims, and are merged with relayed=True. A relayed record physically
+        cannot carry proof of who it describes: PeerNode has no signature
+        column, so a peer list can only ever republish node_id, url and
+        public_key. Judging them by the rules for a direct announce meant
+        every third-party record was refused for having no signature, and a
+        node could therefore never learn about anyone it had not already
+        contacted. The network could only ever be a star around whoever you
+        announced to directly.
+
+        Measured against live central: of 72 records returned by
+        /api/social/peers/exchange, exactly ONE carried a signature, the
+        sender's own live self-info. The other 71 were unusable.
+
+        A hint gets the node an address to try. The direct announce that
+        follows carries a live signature and is what actually verifies the
+        peer, so nothing is trusted on hearsay: relayed rows land as
+        unverified and have to prove themselves on contact.
+        """
         from .models import get_db
         db = get_db()
         try:
             new_count = 0
             for p in peer_list:
                 if p.get('node_id') and p.get('node_id') != self.node_id:
-                    if self._merge_peer(db, p):
+                    if self._merge_peer(db, p, relayed=True):
                         new_count += 1
             if new_count > 0:
                 logger.info(f"Gossip: merged {new_count} new peers")
@@ -954,14 +1109,48 @@ class GossipProtocol:
         finally:
             db.close()
 
-    def _merge_peer(self, db, peer_data):
+    def _merge_peer(self, db, peer_data, reasons=None, relayed=False):
         """Upsert a single peer into PeerNode table. Returns True if new.
-        Verifies Ed25519 signature if present. Rejects banned nodes."""
+        Verifies Ed25519 signature if present. Rejects banned nodes.
+
+        ``relayed``: the record came from another node's peer list rather than
+        from the node it describes. It is an address hint. A relayed record
+        cannot carry a signature (PeerNode stores none), and it is not the
+        subject asserting anything, so the gates that test what a node claims
+        about ITSELF do not apply: absent signature, and the certificate
+        required of a regional or central tier. Those are enforced on the
+        direct announce, which is the node speaking for itself. A relayed row
+        is always recorded unverified.
+
+        The checks that still apply to a hint are the ones about whether the
+        record is safe to hold at all: banned nodes, the per-host Sybil cap,
+        a guardrail hash that disagrees with ours, and a signature that IS
+        present but does not verify, which is worse than none.
+
+        ``reasons``: optional list. When supplied, a rejection appends the
+        reason to it. The return value stays a plain bool so existing callers
+        and their assertions are untouched.
+
+        Why this exists: every rejection below returns the same False that a
+        duplicate announce returns, and peer_announce reports HTTP 200
+        success:true either way. A node could therefore be refused by all five
+        gates without anything observable happening, which is exactly how the
+        announce-signing defect survived across the whole network. Recording
+        the reason costs nothing and makes the next one a single request to
+        diagnose instead of a bisect.
+        """
+        def _reject(reason):
+            if reasons is not None:
+                reasons.append(reason)
+            return False
+
         from .models import PeerNode
         node_id = peer_data.get('node_id')
         url = peer_data.get('url', '').rstrip('/')
-        if not node_id or not url or node_id == self.node_id:
-            return False
+        if not node_id or not url:
+            return _reject('node_id and url are both required')
+        if node_id == self.node_id:
+            return _reject('announcement is from this node itself')
 
         # Sybil protection: max 5 nodes per IP/hostname.
         # Loopback addresses are exempt - single-user dev installs
@@ -985,7 +1174,9 @@ class GossipProtocol:
                 max_per_ip = int(os.environ.get('HEVOLVE_MAX_PEERS_PER_IP', '5'))
                 if same_host_count >= max_per_ip:
                     logger.warning(f"Sybil limit: {same_host_count} nodes from {host}, rejecting {node_id[:8]}")
-                    return False
+                    return _reject(
+                        f'sybil limit: {same_host_count} nodes already '
+                        f'registered from {host}, max {max_per_ip}')
         except Exception:
             pass  # URL parsing failed — proceed with other checks
 
@@ -993,7 +1184,7 @@ class GossipProtocol:
         existing = db.query(PeerNode).filter(PeerNode.node_id == node_id).first()
         if existing and existing.integrity_status == 'banned':
             logger.debug(f"Rejecting banned node: {node_id[:8]}")
-            return False
+            return _reject('node is banned')
 
         # Verify signature if present (backward-compatible: unsigned peers accepted as 'unverified')
         signature = peer_data.get('signature')
@@ -1007,23 +1198,29 @@ class GossipProtocol:
                 signature_valid = verify_json_signature(public_key, payload, signature)
                 if not signature_valid:
                     logger.warning(f"Invalid signature from node {node_id[:8]} at {url}")
-                    return False
+                    return _reject(
+                        'signature does not verify over the announced payload '
+                        '(receiver checks every field except "signature"; a '
+                        'sender that signs before appending fields fails here)')
             except ImportError:
                 pass  # crypto module not available, accept unsigned
             except Exception as e:
                 logger.warning(f"Unexpected error verifying signature for {node_id[:8]}: {e}")
-                return False  # Reject on unexpected verification errors
+                return _reject(f'signature verification errored: {e}')
 
         integrity_status = 'verified' if signature_valid else 'unverified'
 
-        # Enforcement gate: reject unsigned peers in hard mode
-        if not signature_valid:
+        # Enforcement gate: reject unsigned peers in hard mode.
+        # Skipped for relayed hints, which cannot carry one by construction.
+        if not signature_valid and not relayed:
             try:
                 from security.master_key import get_enforcement_mode
                 enforcement = get_enforcement_mode()
                 if enforcement == 'hard':
                     logger.warning(f"Rejecting unsigned peer {node_id[:8]} (enforcement=hard)")
-                    return False
+                    return _reject(
+                        'peer carries no usable signature and enforcement '
+                        'mode is hard')
                 elif enforcement == 'soft':
                     logger.info(f"Unsigned peer {node_id[:8]} accepted (enforcement=soft)")
             except ImportError:
@@ -1038,7 +1235,10 @@ class GossipProtocol:
                 if peer_guardrail_hash != local_guardrail_hash:
                     logger.warning(
                         f"Rejecting peer {node_id[:8]}: guardrail hash mismatch")
-                    return False
+                    return _reject(
+                        f'guardrail hash mismatch: peer '
+                        f'{peer_guardrail_hash[:16]}, local '
+                        f'{local_guardrail_hash[:16]}')
             except Exception:
                 pass
 
@@ -1071,30 +1271,76 @@ class GossipProtocol:
                 except Exception:
                     pass
 
-            # Enforcement: reject unknown hashes in hard mode
+            # An unrecognised code hash is recorded, not fatal.
+            #
+            # This gate used to reject under enforcement=hard and it
+            # partitioned the entire network: 69 registered nodes, none
+            # federating. Three separate things make it unworkable as a hard
+            # gate, and none of them are fixed by publishing more hashes.
+            #
+            # It cannot bootstrap. _KNOWN_HASHES ships empty, so a stock
+            # desktop knows no hashes and refuses everyone. The runtime
+            # discovery path only learns from peers that already passed, so
+            # nothing can ever be the first to pass.
+            #
+            # It cannot span builds. Central signs a release manifest at
+            # deploy time covering its own container, so its only trusted
+            # hash is its own. A frozen desktop bundle is a different file
+            # set and hashes differently by construction, so central would
+            # refuse every desktop no matter how many GA hashes were
+            # published. Live proof: central 61c1dd94, this desktop 2d66b241.
+            #
+            # It never stopped an attacker anyway. code_hash is self-reported.
+            # The signature authenticates that the sender's key asserted the
+            # value, not that it matches the code actually running, so a
+            # hostile node simply claims a known-good hash. The gate only ever
+            # turned away honest nodes on unpublished builds.
+            #
+            # So the peer is admitted with master_key_verified False and
+            # hash_trusted_source untrusted, exactly the values it would have
+            # carried before. Every downstream trust decision (visibility
+            # tier, contribution scoring, fraud_score, and the
+            # challenge/attestation endpoints, which DO prove running code)
+            # sees what it saw before and can still act on it. Nothing that
+            # was verified becomes unverified; something that was refused
+            # becomes recorded-and-untrusted.
+            #
+            # Operators who genuinely want strict provenance, e.g. a locked
+            # regional cluster where every node runs one published build, set
+            # HEVOLVE_REQUIRE_KNOWN_CODE_HASH=1. That is guarded by
+            # has_trust_basis() so it cannot be switched on into a vacuum and
+            # silently partition the cluster it was meant to protect.
             if not master_key_verified:
+                _strict = os.environ.get(
+                    'HEVOLVE_REQUIRE_KNOWN_CODE_HASH', '').lower() in (
+                        '1', 'true', 'yes')
                 try:
-                    from security.master_key import get_enforcement_mode
-                    enforcement = get_enforcement_mode()
-                    if enforcement == 'hard':
-                        logger.warning(
-                            f"Rejecting peer {node_id[:8]}: unknown code hash "
-                            f"{peer_code_hash[:16]}... (enforcement=hard)")
-                        return False
-                    elif enforcement == 'soft':
-                        logger.warning(
-                            f"Peer {node_id[:8]} unknown code hash "
-                            f"(enforcement=soft, allowing)")
+                    from security.release_hash_registry import (
+                        get_release_hash_registry as _reg)
+                    _have_basis = _reg().has_trust_basis()
                 except Exception:
-                    pass
+                    _have_basis = False
+                if _strict and _have_basis:
+                    logger.warning(
+                        f"Rejecting peer {node_id[:8]}: unknown code hash "
+                        f"{peer_code_hash[:16]}... "
+                        f"(HEVOLVE_REQUIRE_KNOWN_CODE_HASH=1)")
+                    return _reject(
+                        f'code hash {peer_code_hash[:16]} is not in the '
+                        f'release hash registry or current manifest, and '
+                        f'HEVOLVE_REQUIRE_KNOWN_CODE_HASH is set')
+                logger.info(
+                    f"Peer {node_id[:8]} code hash {peer_code_hash[:16]} is "
+                    f"unrecognised; admitting as untrusted "
+                    f"(master_key_verified=False)")
 
         # Certificate verification for peers claiming regional/central tier
         peer_tier = peer_data.get('tier', 'flat')
         certificate = peer_data.get('certificate')
         certificate_verified = False
-        if peer_tier in ('regional', 'central') and not certificate:
+        if peer_tier in ('regional', 'central') and not certificate and not relayed:
             logger.warning(f"Rejecting {node_id[:8]}: {peer_tier} tier requires certificate")
-            return False
+            return _reject(f'tier {peer_tier} requires a certificate, none sent')
         if peer_tier in ('regional', 'central') and certificate:
             try:
                 from security.key_delegation import verify_certificate_chain
@@ -1106,16 +1352,32 @@ class GossipProtocol:
                     # Always reject invalid certificates for regional/central tiers
                     if peer_tier in ('regional', 'central'):
                         logger.warning(f"Rejecting peer {node_id[:8]}: {peer_tier} tier requires valid certificate")
-                        return False
+                        return _reject(
+                            f'tier {peer_tier} certificate failed chain '
+                            f'verification')
                     if enforcement == 'hard':
                         logger.warning(f"Rejecting peer {node_id[:8]}: invalid certificate "
                                       f"for tier={peer_tier} (enforcement=hard)")
-                        return False
+                        return _reject(
+                            f'certificate invalid for tier {peer_tier} and '
+                            f'enforcement mode is hard')
                     else:
                         logger.warning(f"Peer {node_id[:8]} has invalid certificate "
                                       f"for tier={peer_tier} (enforcement={enforcement})")
             except Exception as e:
                 logger.debug(f"Certificate verification error for {node_id[:8]}: {e}")
+
+        if relayed:
+            # A hint carries no proof of anything, so it must not inherit
+            # trust from what it happens to assert. The code hash and
+            # certificate above were read from a record some OTHER node
+            # republished; treating either as established would let a peer
+            # list launder trust for nodes nobody has spoken to. These get
+            # set for real when the node announces itself and its live
+            # signature verifies.
+            master_key_verified = False
+            certificate_verified = False
+            integrity_status = 'unverified'
 
         if existing:
             existing.last_seen = datetime.utcnow()
@@ -1133,14 +1395,20 @@ class GossipProtocol:
                 existing.code_version = peer_data['version']
             if signature_valid:
                 existing.integrity_status = 'verified'
-            existing.master_key_verified = master_key_verified
+            # A relayed hint must not DOWNGRADE a peer that already proved
+            # itself with a direct signed announce. It carries no evidence
+            # either way, and letting hearsay clear master_key_verified,
+            # certificate_verified or tier would mean any node could strip a
+            # verified peer's standing just by republishing a stale row.
+            # Hints may add a peer we did not know; they may not unmake one.
+            if not relayed:
+                existing.master_key_verified = master_key_verified
+                existing.tier = peer_tier
+                if certificate:
+                    existing.certificate_json = certificate
+                    existing.certificate_verified = certificate_verified
             if peer_data.get('release_version'):
                 existing.release_version = peer_data['release_version']
-            # Update tier/certificate fields
-            existing.tier = peer_tier
-            if certificate:
-                existing.certificate_json = certificate
-                existing.certificate_verified = certificate_verified
             # Update capability tier from HART OS equilibrium
             if peer_data.get('capability_tier'):
                 existing.capability_tier = peer_data['capability_tier']

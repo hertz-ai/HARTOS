@@ -151,5 +151,102 @@ class RoleOrderGuardTests(unittest.TestCase):
         self.assertIn('part 3', out[1]['content'])
 
 
+class RoleOrderGuardLogCardinalityTests(unittest.TestCase):
+    """#623 — the guard's LOGGING must cost O(1) lines per invocation.
+
+    The guard's diagnostics were correct and deliberate ("surfaces dropped /
+    merged events at INFO so future diagnoses are visible") but emitted one
+    INFO per affected message.  Measured on a live desktop 2026-08-05, that
+    made it the single largest consumer of disk: 15,855 lines / 3.45 MB inside
+    one 400k-line sample, gui_app.log growing 3.4 MB/min, log dir 492 MB
+    against 23 GB free.  create_recipe.py:133 records the extreme — 20,920 of
+    these lines in one session during the livelock.
+
+    These tests pin the CARDINALITY, which is the property that regressed, and
+    they discriminate: against the pre-fix code the first one sees 12 info
+    calls, not 1, and fails.  Behaviour is pinned by RoleOrderGuardTests above
+    and must not change — that separation is deliberate, so a future edit that
+    "fixes" logging by also dropping messages fails the other class.
+    """
+
+    def setUp(self):
+        self._logger = MagicMock()
+        fake_app = MagicMock()
+        fake_app.logger = self._logger
+        self._patcher = patch('helper.current_app', fake_app)
+        self._patcher.start()
+        from helper import ToolMessageHandler
+        self.handler = ToolMessageHandler(user_tasks=None, user_prompt=None)
+
+    def tearDown(self):
+        self._patcher.stop()
+
+    def test_many_dropped_placeholders_emit_exactly_one_log_line(self):
+        """12 drops must produce 1 INFO, not 12.  FAILS PRE-FIX (12 calls)."""
+        messages = [{'role': 'user', 'content': 'hello'}]
+        for _ in range(12):
+            messages.append({'role': 'assistant', 'content': ''})
+        messages.append({'role': 'assistant', 'content': 'Hi!'})
+
+        out = self.handler.validate_messages(messages)
+
+        # Behaviour unchanged: every placeholder still dropped.
+        self.assertEqual(
+            [(m['role'], m.get('content')) for m in out],
+            [('user', 'hello'), ('assistant', 'Hi!')],
+        )
+        self.assertEqual(
+            self._logger.info.call_count, 1,
+            f"expected exactly 1 summary line, got "
+            f"{self._logger.info.call_count} — per-message logging is back",
+        )
+
+    def test_the_one_line_still_carries_the_counts(self):
+        """Bounding volume must not cost the diagnostic.  A summary that
+        omits the counts would pass the cardinality test above while being
+        useless, so assert the payload too."""
+        messages = [
+            {'role': 'user', 'content': 'a'},
+            {'role': 'assistant', 'content': ''},
+            {'role': 'assistant', 'content': ''},
+            {'role': 'assistant', 'content': 'x'},
+            {'role': 'assistant', 'content': 'y'},
+        ]
+        self.handler.validate_messages(messages)
+
+        self.assertEqual(self._logger.info.call_count, 1)
+        line = self._logger.info.call_args[0][0]
+        self.assertIn('[ROLE-ORDER-GUARD]', line)
+        self.assertIn('dropped 2', line)
+        self.assertIn('coalesced 1', line)
+
+    def test_silent_when_the_guard_had_nothing_to_do(self):
+        """Clean alternating input is the common case; it must log nothing.
+        This is most of the saving — the guard runs on every turn."""
+        messages = [
+            {'role': 'user', 'content': 'hello'},
+            {'role': 'assistant', 'content': 'hi'},
+        ]
+        out = self.handler.validate_messages(messages)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(self._logger.info.call_count, 0)
+
+    def test_index_list_is_capped_but_count_stays_exact(self):
+        """A pathological turn must not reintroduce unbounded growth through
+        the index list.  Count exact, indices truncated with '+N more'."""
+        messages = [{'role': 'user', 'content': 'hello'}]
+        for _ in range(50):
+            messages.append({'role': 'assistant', 'content': ''})
+        messages.append({'role': 'assistant', 'content': 'done'})
+
+        self.handler.validate_messages(messages)
+
+        self.assertEqual(self._logger.info.call_count, 1)
+        line = self._logger.info.call_args[0][0]
+        self.assertIn('dropped 50', line)      # count exact
+        self.assertIn('more)', line)           # indices truncated
+        self.assertLess(len(line), 800, "summary line is growing with input")
+
+
 if __name__ == '__main__':
     unittest.main()

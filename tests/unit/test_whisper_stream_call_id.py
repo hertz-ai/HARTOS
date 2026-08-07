@@ -17,6 +17,7 @@ to spin up the actual whisper subprocess + websockets server.
 """
 from __future__ import annotations
 
+import ast
 import unittest
 
 
@@ -155,36 +156,63 @@ class HandlerWiringDriftGuardTest(unittest.TestCase):
     regression class (a refactor that drops the helper call without
     realizing it was the producer side of UNIF-G3)."""
 
-    def test_handler_calls_maybe_enqueue_on_final_branches(self):
-        import ast
+    @staticmethod
+    def _fn(tree, name):
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) \
+                    and node.name == name:
+                return node
+        return None
+
+    @staticmethod
+    def _calls_to(fn, callee):
+        return sum(
+            1 for sub in ast.walk(fn)
+            if isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Name)
+            and sub.func.id == callee)
+
+    def test_every_final_branch_routes_through_the_one_producer(self):
+        """The invariant (UNIF-G3): every FINAL send produces a call-segment
+        enqueue. The old guard asserted the SHAPE that once implemented it —
+        two inline _maybe_enqueue_call_segment calls in the handler — so when
+        finalization was consolidated into _emit_final() (one source shared by
+        the {control:final}, 30s-overflow and VAD-pause branches, precisely to
+        BAN parallel finalization logic) the guard reported the improvement as
+        the regression it exists to catch. Assert the claim, not the layout:
+
+          1. the handler funnels every final branch into _emit_final
+             (>= 3 awaits: control-final, overflow, VAD pause);
+          2. _emit_final calls the enqueue producer exactly once;
+          3. the handler itself calls the producer ZERO times — a direct call
+             appearing there again would be a second finalization path.
+        """
         src = open(
             'integrations/service_tools/whisper_tool.py',
             encoding='utf-8',
         ).read()
         tree = ast.parse(src)
-        # Find the _stt_stream_handler async function definition.
-        handler = None
-        for node in ast.walk(tree):
-            if isinstance(node, ast.AsyncFunctionDef) and \
-                    node.name == '_stt_stream_handler':
-                handler = node
-                break
-        self.assertIsNotNone(handler, 'handler not found in source')
 
-        # Count Call nodes whose .func.id == '_maybe_enqueue_call_segment'.
-        # Today the handler has exactly TWO final-send branches (control
-        # 'final' and buffer-overflow forced final).  Both must call
-        # the helper.  Interim sends (is_final=False) do NOT call it.
-        call_count = 0
-        for sub in ast.walk(handler):
-            if isinstance(sub, ast.Call) and \
-                    isinstance(sub.func, ast.Name) and \
-                    sub.func.id == '_maybe_enqueue_call_segment':
-                call_count += 1
+        handler = self._fn(tree, '_stt_stream_handler')
+        self.assertIsNotNone(handler, 'handler not found in source')
+        emit_final = self._fn(tree, '_emit_final')
+        self.assertIsNotNone(
+            emit_final,
+            '_emit_final not found — if finalization moved again, follow it '
+            'and update all three assertions below together')
+
         self.assertGreaterEqual(
-            call_count, 2,
-            f'expected >= 2 calls to _maybe_enqueue_call_segment in '
-            f'_stt_stream_handler, found {call_count}')
+            self._calls_to(handler, '_emit_final'), 3,
+            'a final-send branch in _stt_stream_handler no longer routes '
+            'through _emit_final — that branch just lost its call-segment '
+            'enqueue (and re-opened parallel finalization logic)')
+        self.assertEqual(
+            self._calls_to(emit_final, '_maybe_enqueue_call_segment'), 1,
+            '_emit_final must call the enqueue producer exactly once')
+        self.assertEqual(
+            self._calls_to(handler, '_maybe_enqueue_call_segment'), 0,
+            'a direct producer call reappeared in the handler — finalization '
+            'must stay consolidated in _emit_final')
 
 
 if __name__ == '__main__':

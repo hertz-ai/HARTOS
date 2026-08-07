@@ -1052,9 +1052,16 @@ def register_shell_system_routes(app):
         # the question and got it wrong. Same file already had the CORRECT shape
         # ~1000 lines below in the audio route, which is what made this a
         # parallel path rather than an oversight.
+        # include_mounts=False is load-bearing, not tidiness. _is_path_allowed's
+        # DEFAULT root set admits every psutil mountpoint so the This-PC panel
+        # can open a drive in the file manager — and on Linux `/` IS a
+        # mountpoint. With the default, `POST {"path": "/"}` resolves INSIDE an
+        # allowed root and this guard permits precisely the full-filesystem
+        # clamd scan it exists to refuse. A scan walks the whole tree, so it
+        # must stay inside the roots the session owns.
         from integrations.agent_engine.shell_os_apis import _is_path_allowed
         target = os.path.realpath(target)
-        if not _is_path_allowed(target):
+        if not _is_path_allowed(target, include_mounts=False):
             logger.warning("antivirus scan refused out-of-root path: %s", target)
             return jsonify({'error': 'Path outside allowed roots',
                             'path': target}), 403

@@ -141,6 +141,87 @@ class TestRedactSensitive(unittest.TestCase):
         self.assertIsNone(_redact_sensitive(None))
 
 
+class TestBorrowedSessionContract(unittest.TestCase):
+    """log_event(db=...) rides the CALLER'S transaction.
+
+    Why this exists (measured, not theorized): settle_metered_api_costs was
+    mid-transaction — wallet credit + spark transaction flushed, uncommitted —
+    when it wrote its audit entry. log_event opened its OWN session; on a
+    shared-connection pool (sqlite:// StaticPool, i.e. every in-memory test
+    env including CI) checking that second session's connection out RESET it,
+    which ROLLED BACK the caller's writes. The SQL trace read:
+
+        INSERT resonance_wallets / INSERT resonance_transactions /
+        UPDATE metered_api_usage ... ROLLBACK ... INSERT audit_log_entries /
+        COMMIT
+
+    — the settlement was destroyed, its audit row survived, and settle
+    reported success. On a real database the same design commits the entry
+    even when the caller's transaction later rolls back: the immutable trail
+    then attests to work that never happened.
+    """
+
+    def _fresh_log(self):
+        import security.immutable_audit_log as mod
+        log = ImmutableAuditLog()
+        log._use_db = True
+        return log
+
+    def test_borrowed_session_is_never_committed_rolled_back_or_closed(self):
+        from unittest.mock import MagicMock
+        log = self._fresh_log()
+        db = MagicMock()
+        # _get_last_hash path: no prior entries.
+        db.query.return_value.order_by.return_value.first.return_value = None
+
+        log.log_event('security', 'tester', 'borrowed-session probe', db=db)
+
+        db.add.assert_called_once()
+        db.flush.assert_called_once()      # id materialised on the caller's txn
+        db.commit.assert_not_called()
+        db.rollback.assert_not_called()
+        db.close.assert_not_called()
+
+    def test_borrowed_session_entry_carries_the_chain_hash(self):
+        """The entry added to the caller's session is a REAL chain link:
+        prev_hash from the same session's view, entry_hash recomputable."""
+        from unittest.mock import MagicMock
+        from security.immutable_audit_log import _compute_hash
+        log = self._fresh_log()
+        db = MagicMock()
+        prior = MagicMock()
+        prior.entry_hash = 'abc123'
+        db.query.return_value.order_by.return_value.first.return_value = prior
+
+        log.log_event('security', 'tester', 'chained', db=db)
+
+        entry = db.add.call_args[0][0]
+        self.assertEqual(entry.prev_hash, 'abc123')
+        recomputed = _compute_hash(
+            entry.prev_hash, entry.event_type, entry.actor_id, entry.action,
+            entry.created_at.isoformat(), entry.detail_json)
+        self.assertEqual(entry.entry_hash, recomputed)
+
+    def test_without_db_the_owned_session_still_commits(self):
+        """The pre-existing contract for every caller that does NOT pass a
+        session is untouched: own session, own commit, closed after."""
+        from unittest.mock import MagicMock, patch
+        log = self._fresh_log()
+        own = MagicMock()
+        own.query.return_value.order_by.return_value.first.return_value = None
+        fake_models = MagicMock()
+        fake_models.get_db.return_value = own
+        with patch.dict('sys.modules',
+                        {'integrations.social.models': fake_models}):
+            log.log_event('security', 'tester', 'own-session probe')
+        own.add.assert_called_once()
+        own.commit.assert_called_once()
+        # Two owned sessions run through get_db here — _get_last_hash's read
+        # and the insert — and BOTH must be closed. The count is exactly 2;
+        # a third would mean a leaked acquisition somewhere new.
+        self.assertEqual(own.close.call_count, 2)
+
+
 class TestSingleton(unittest.TestCase):
 
     def test_singleton_returns_same_instance(self):

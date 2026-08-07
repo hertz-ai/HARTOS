@@ -118,6 +118,34 @@ class ReleaseHashRegistry:
             while len(self._runtime_hashes) > _MAX_RUNTIME_HASHES:
                 self._runtime_hashes.popitem(last=False)
 
+    def has_trust_basis(self) -> bool:
+        """Is there any authoritative basis for judging a peer's code hash?
+
+        True only for hashes that came from the release pipeline: the
+        hardcoded GA table, or a release manifest that passed signature
+        verification. Runtime-discovered hashes deliberately do NOT count.
+        They are learned from other peers, so counting them would let the
+        gate switch itself on from hearsay, and the first hash learned would
+        become the standard everyone else is measured against.
+
+        This exists because "is this hash known" has no meaningful answer on
+        a node that knows no hashes at all. _KNOWN_HASHES ships empty, no
+        workflow populates it, and no signed manifest ships in the desktop
+        bundle, so is_known_release_hash() returned False for every peer.
+        Under enforcement=hard that rejected all of them, which is what held
+        the live network at zero peers: 69 registered nodes, none federating.
+
+        Note also that an announced code_hash is self-reported. It is signed,
+        so it is authenticated as "this key asserted this hash", but nothing
+        proves it matches the code actually running. A hostile node simply
+        claims a known-good hash. So rejecting unknown hashes never stopped
+        an attacker; it only stopped honest nodes on new builds. Provenance
+        belongs in the trust signals (integrity_status, master_key_verified,
+        fraud_score, the challenge/attestation endpoints), not in a gate that
+        cannot be enforced meaningfully without a basis.
+        """
+        return bool(_KNOWN_HASHES) or bool(self._manifest_hash)
+
     def hash_count(self) -> int:
         """Total number of known hashes (for diagnostics)."""
         count = len(_KNOWN_HASHES)

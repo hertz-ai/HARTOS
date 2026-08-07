@@ -44,6 +44,10 @@ FRAUD_WEIGHTS = {
 IMPRESSION_ANOMALY_STDDEV = 3.0
 SCORE_JUMP_THRESHOLD_PCT = 200
 FRAUD_BAN_THRESHOLD = 80.0
+# Score at or above which a node is 'suspicious'.  Was a bare 40 literal in
+# three places (auto-ban branch, decrease_fraud_score, decay sweep); they must
+# move together or a node can be released by one path and re-flagged by another.
+FRAUD_SUSPICIOUS_THRESHOLD = 40.0
 ATTESTATION_EXPIRY_DAYS = 7
 MIN_WITNESS_PEERS = 1
 CHALLENGE_TIMEOUT_SECONDS = 30
@@ -949,7 +953,7 @@ class IntegrityService:
         # Auto-ban at threshold — fail2ban progressive duration
         if peer.fraud_score >= FRAUD_BAN_THRESHOLD:
             IntegrityService._apply_fail2ban(db, peer, reason)
-        elif peer.fraud_score >= 40:
+        elif peer.fraud_score >= FRAUD_SUSPICIOUS_THRESHOLD:
             peer.integrity_status = 'suspicious'
 
         db.flush()
@@ -974,6 +978,46 @@ class IntegrityService:
             f"fraud_score={peer.fraud_score}, reason={reason}")
 
     @staticmethod
+    def _release_if_score_fell(peer: 'PeerNode') -> bool:
+        """Bring integrity_status back in line with a fallen fraud_score.
+
+        THE single writer for the "penalty no longer applies" transition.
+        Both the per-peer path (decrease_fraud_score) and the batch sweep
+        (apply_fraud_score_decay) call this, so a node cannot be released by
+        one and left flagged by the other.
+
+        Two rules it enforces:
+
+        1. A ban does not outlive the score that justified it.  Previously the
+           only route out of 'banned' was the ban_until sweep inside
+           apply_fraud_score_decay, whose sole caller is run_full_audit, which
+           nothing schedules.  A node banned by a defect that was later fixed
+           stayed banned forever.
+        2. Decay NEVER confers 'verified'.  That status is granted only by a
+           valid Ed25519 signature in _merge_peer, and it gates
+           compute_learning_tier -> issue_cct -> skill distribution.  Letting a
+           score decay into it would hand out contribution credentials for
+           serving out a penalty instead of for proving identity.  A released
+           node returns to the neutral state and must re-prove itself.
+
+        ban_count is deliberately NOT reset — fail2ban escalation depends on
+        the history, so the next offense still earns a longer ban.
+        """
+        score = peer.fraud_score or 0.0
+
+        if peer.integrity_status == 'banned' and score < FRAUD_BAN_THRESHOLD:
+            peer.integrity_status = 'suspicious'   # released, not trusted
+            peer.ban_until = None
+            return True
+
+        if (peer.integrity_status == 'suspicious'
+                and score < FRAUD_SUSPICIOUS_THRESHOLD):
+            peer.integrity_status = 'unverified'
+            return True
+
+        return False
+
+    @staticmethod
     def decrease_fraud_score(db: Session, node_id: str, delta: float,
                               reason: str) -> float:
         """Decrease fraud_score (e.g., after successful verification)."""
@@ -983,9 +1027,11 @@ class IntegrityService:
 
         peer.fraud_score = max((peer.fraud_score or 0) - delta, 0.0)
 
-        # Upgrade status if score dropped below threshold
-        if peer.fraud_score < 40 and peer.integrity_status == 'suspicious':
-            peer.integrity_status = 'verified'
+        if IntegrityService._release_if_score_fell(peer):
+            logger.info(
+                f"Node {peer.node_id[:8]} released to "
+                f"'{peer.integrity_status}' (fraud_score={peer.fraud_score}, "
+                f"reason={reason})")
 
         db.flush()
         return peer.fraud_score
@@ -994,11 +1040,19 @@ class IntegrityService:
     def apply_fraud_score_decay(db: Session) -> Dict:
         """Decay all nodes' fraud scores by a small amount each audit round.
 
-        Good behavior over time earns back trust.  Called every audit round
-        (typically every ~5 minutes via AgentDaemon integrity tick).
+        Good behavior over time earns back trust.
 
-        Also checks ban expiry: if a banned node's ban_until has passed,
-        move to 'suspicious' (not 'verified' — they must prove themselves).
+        CALLER REALITY (corrected 2026-08-07): this docstring used to claim it
+        ran "every ~5 minutes via AgentDaemon integrity tick".  No such tick
+        exists.  The only caller is run_full_audit, whose only caller is the
+        discovery route — so this runs on demand, never on a clock.  Anything
+        that depends SOLELY on this sweep may never happen.  That is why ban
+        release also lives in _release_if_score_fell, which the per-peer
+        decrease path invokes on every successful audit.
+
+        Two release routes, deliberately:
+          - score fell below threshold  -> _release_if_score_fell (either path)
+          - ban_until expired           -> the sweep below (needs this to run)
 
         Returns summary of decay effects.
         """
@@ -1017,10 +1071,13 @@ class IntegrityService:
             if peer.fraud_score != old_score:
                 decayed += 1
 
-            # If score drops below suspicious threshold, upgrade
-            if (peer.fraud_score < 40 and
-                    peer.integrity_status == 'suspicious'):
-                peer.integrity_status = 'verified'
+            # Same transition as the per-peer path — one writer, no drift.
+            # This also releases a peer whose score decayed back under the ban
+            # threshold, which the ban_until sweep below would otherwise miss
+            # entirely for a ban that has not yet expired.
+            if IntegrityService._release_if_score_fell(peer):
+                if peer.integrity_status == 'suspicious':
+                    unbanned += 1
 
         # Check ban expiry (fail2ban timer)
         banned_peers = db.query(PeerNode).filter(

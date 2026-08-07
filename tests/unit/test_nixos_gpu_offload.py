@@ -194,7 +194,11 @@ def test_base_never_sets_videodrivers_only_the_specialisation_does():
     assert len(matches) == 1, (
         f"there must be exactly one videoDrivers=[\"nvidia\"] assignment (the "
         f"specialisation's mkForce), found {len(matches)}")
-    spec_idx = src.find('boot.specialisation."nvidia-offload"')
+    # Top-level `specialisation`, NOT `boot.specialisation`: the latter is not
+    # a NixOS option at all — writing it broke the entire Release/ISO eval and
+    # c1bb2213 corrected the module. This test kept grepping the wrong name
+    # and reported the FIX as "the specialisation block is missing".
+    spec_idx = src.find('specialisation."nvidia-offload"')
     assert spec_idx != -1, "the opt-in nvidia-offload specialisation block is missing"
     assert matches[0] > spec_idx, (
         "services.xserver.videoDrivers must live INSIDE the boot.specialisation block — "

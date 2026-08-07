@@ -26,11 +26,41 @@ class TestEventBusBasic(unittest.TestCase):
         self.bus = EventBus()
 
     def test_emit_calls_listener(self):
+        """The listener gets the topic + payload — and emit() STAMPS the
+        payload with a `msg_id` dedup key (the cross-transport dedup contract,
+        events.py emit docstring: WAMP + SSE can both deliver the same event,
+        and clients suppress the duplicate by msg_id). The old assertion here
+        demanded the payload arrive verbatim, i.e. asserted the ABSENCE of the
+        dedup key the bus deliberately adds."""
         events = []
         self.bus.on('test.event', lambda t, d: events.append((t, d)))
         self.bus.emit('test.event', {'value': 42})
         self.assertEqual(len(events), 1)
-        self.assertEqual(events[0], ('test.event', {'value': 42}))
+        topic, payload = events[0]
+        self.assertEqual(topic, 'test.event')
+        self.assertEqual(payload['value'], 42)
+        # The dedup key is present and non-trivial.
+        self.assertTrue(payload.get('msg_id'), 'emit() must stamp msg_id')
+        self.assertEqual(set(payload), {'value', 'msg_id'})
+
+    def test_emit_msg_ids_are_unique_per_event(self):
+        """msg_id is the per-EVENT dedup key: two emits of identical payloads
+        are two events, so each must carry its own id — otherwise a client
+        would dedup the second real event away."""
+        seen = []
+        self.bus.on('test.event', lambda t, d: seen.append(d['msg_id']))
+        self.bus.emit('test.event', {'value': 42})
+        self.bus.emit('test.event', {'value': 42})
+        self.assertEqual(len(seen), 2)
+        self.assertNotEqual(seen[0], seen[1])
+
+    def test_emit_preserves_a_caller_supplied_msg_id(self):
+        """Documented escape hatch: a caller may set a domain-stable msg_id
+        (replay-on-reconnect) and the bus must not overwrite it."""
+        events = []
+        self.bus.on('test.event', lambda t, d: events.append(d))
+        self.bus.emit('test.event', {'value': 1, 'msg_id': 'stable-id-7'})
+        self.assertEqual(events[0]['msg_id'], 'stable-id-7')
 
     def test_emit_returns_listener_count(self):
         self.bus.on('x', lambda t, d: None)

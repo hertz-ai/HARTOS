@@ -736,6 +736,14 @@ def capture_baseline_async(
     if _snapshot_executor is None:
         _snapshot_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix='baseline_snap')
+        # Non-daemon workers: concurrent.futures joins them at exit, so a pool
+        # that is never shut down keeps the PROCESS alive. Named in CI run
+        # 30978623541 among the threads that hung five of eight test shards for
+        # the full 120-minute cap (task #37) - and the same hazard makes
+        # `systemctl stop` on the backend a timeout rather than a stop.
+        # Matches world_model_bridge / speculative_dispatcher.
+        import atexit as _atexit
+        _atexit.register(lambda: _snapshot_executor.shutdown(wait=False))
     try:
         _snapshot_executor.submit(
             AgentBaselineService.capture_snapshot,
