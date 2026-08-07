@@ -9,6 +9,13 @@ import logging
 import time as _time
 from flask import Blueprint, jsonify, request
 from core.port_registry import get_port
+# Module level ON PURPOSE: a decorator is resolved at def time, so the
+# lazy in-function import style used elsewhere in this file cannot work for
+# one (integrity_alerts did `from .auth import require_admin` inside its
+# body and never applied it — an import that decorates nothing).  Safe:
+# auth.py imports no social blueprint, and api.py / api_gamification.py
+# already import require_admin exactly this way.
+from .auth import require_admin
 
 logger = logging.getLogger('hevolve_social')
 
@@ -1009,9 +1016,9 @@ def integrity_trusted_keys():
 # ─── Admin Endpoints ───
 
 @discovery_bp.route('/api/social/integrity/alerts')
+@require_admin
 def integrity_alerts():
     """Admin: list fraud alerts."""
-    from .auth import require_admin
     from .models import get_db
     from .integrity_service import IntegrityService
     db = get_db()
@@ -1030,6 +1037,7 @@ def integrity_alerts():
 
 
 @discovery_bp.route('/api/social/integrity/alerts/<alert_id>', methods=['PATCH'])
+@require_admin
 def integrity_alert_update(alert_id):
     """Admin: update fraud alert status."""
     from .models import get_db
@@ -1052,6 +1060,7 @@ def integrity_alert_update(alert_id):
 
 
 @discovery_bp.route('/api/social/integrity/node/<node_id>/audit', methods=['POST'])
+@require_admin
 def integrity_node_audit(node_id):
     """Admin: trigger full audit on a specific node."""
     from .models import get_db
@@ -1070,8 +1079,17 @@ def integrity_node_audit(node_id):
 
 
 @discovery_bp.route('/api/social/integrity/node/<node_id>/ban', methods=['POST'])
+@require_admin
 def integrity_node_ban(node_id):
-    """Admin: ban or unban a node."""
+    """Admin: ban or unban a node.
+
+    Banning is a DENIAL-OF-FEDERATION primitive, which is why this is the
+    most important gate in the file: _merge_peer refuses a banned peer's
+    announces and receive_inbox refuses its posts, so an anonymous caller
+    able to reach this route could partition any node from the network
+    with one request per victim (and `unban` could clear penalties placed
+    for real fraud).
+    """
     from .models import get_db
     from .integrity_service import IntegrityService
     db = get_db()
@@ -1106,6 +1124,7 @@ def integrity_audit_coverage():
 
 
 @discovery_bp.route('/api/social/integrity/dashboard')
+@require_admin
 def integrity_dashboard():
     """Admin: integrity overview dashboard data."""
     from .models import get_db
