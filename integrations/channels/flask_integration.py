@@ -333,8 +333,184 @@ class FlaskChannelIntegration:
         'discord':   'DISCORD_BOT_TOKEN',
         'whatsapp':  'WHATSAPP_API_URL',
         'slack':     'SLACK_BOT_TOKEN',
-        'signal':    'SIGNAL_CLI_URL',
+        'signal':    'SIGNAL_PHONE_NUMBER',
         'teams':     'TEAMS_BOT_TOKEN',
+        'matrix':    'MATRIX_ACCESS_TOKEN',
+        'mattermost': 'MATTERMOST_TOKEN',
+        'rocketchat': 'ROCKETCHAT_AUTH_TOKEN',
+        'nextcloud': 'NEXTCLOUD_APP_PASSWORD',
+        'twitch': 'TWITCH_ACCESS_TOKEN',
+        'nostr': 'NOSTR_PRIVATE_KEY',
+        'bluebubbles': 'BLUEBUBBLES_PASSWORD',
+        'tlon': 'URBIT_CODE',
+        'messenger': 'MESSENGER_PAGE_TOKEN',
+        'instagram': 'INSTAGRAM_PAGE_TOKEN',
+        'twitter': 'TWITTER_ACCESS_TOKEN',
+        'viber': 'VIBER_AUTH_TOKEN',
+        'zalo': 'ZALO_ACCESS_TOKEN',
+        'wechat': 'WECHAT_APP_SECRET',
+        'google_chat': 'GOOGLE_CHAT_WEBHOOK',
+    }
+
+    # Channels that register without any external token/credential.
+    _NO_TOKEN_CHANNELS = ('web', 'imessage', 'openprose')
+
+    # Declarative specs for channels that need more than the single generic
+    # `token`: the token maps to a differently-named factory param
+    # (`token_param`) and/or extra credentials must be resolved.  This replaces
+    # a per-channel elif ladder in register_channel — to support a new
+    # multi-input channel, add a dict entry here instead of a code branch.
+    #   token_param: factory kwarg the generic `token` maps to
+    #   extra: list of {param, env?, default?, required?}
+    #          (param doubles as the caller-supplied kwarg name)
+    #          resolution order per extra: explicit kwarg -> env -> default;
+    #          a missing `required` extra skips registration with a warning.
+    _CHANNEL_SPECS: Dict[str, Dict[str, Any]] = {
+        'slack': {
+            'token_param': 'bot_token',
+            'extra': [
+                # xapp- app-level token for Socket Mode's websocket.
+                {'param': 'app_token', 'env': 'SLACK_APP_TOKEN', 'required': True},
+            ],
+        },
+        'signal': {
+            # "token" is the linked phone number; talks to signal-cli-rest-api.
+            'token_param': 'phone_number',
+            'extra': [
+                {'param': 'api_url', 'env': 'SIGNAL_API_URL',
+                 'default': 'http://localhost:8080'},
+            ],
+        },
+        'matrix': {
+            'token_param': 'token',
+            'extra': [
+                {'param': 'user_id', 'env': 'MATRIX_USER_ID', 'required': True},
+                {'param': 'homeserver_url', 'env': 'MATRIX_HOMESERVER_URL',
+                 'default': 'https://matrix.org'},
+            ],
+        },
+        'mattermost': {
+            # factory has no `token` param; the PAT must land on
+            # personal_access_token or auth silently fails.
+            'token_param': 'personal_access_token',
+            'extra': [
+                {'param': 'server_url', 'env': 'MATTERMOST_SERVER_URL',
+                 'required': True},
+            ],
+        },
+        'rocketchat': {
+            # header auth (X-Auth-Token + X-User-Id) needs the token AND the
+            # bot user_id, against a server_url.  (username/password login is
+            # a separate mode not driven through the token path.)
+            'token_param': 'auth_token',
+            'extra': [
+                {'param': 'server_url', 'env': 'ROCKETCHAT_URL', 'required': True},
+                {'param': 'user_id', 'env': 'ROCKETCHAT_USER_ID', 'required': True},
+            ],
+        },
+        'nextcloud': {
+            # Nextcloud Talk uses Basic auth: the "token" is the bot's app
+            # password, against a server_url + username.
+            'token_param': 'app_password',
+            'extra': [
+                {'param': 'server_url', 'env': 'NEXTCLOUD_URL', 'required': True},
+                {'param': 'username', 'env': 'NEXTCLOUD_USERNAME', 'required': True},
+            ],
+        },
+        'twitch': {
+            # Twitch IRC-over-WS: the "token" is the OAuth access token; the
+            # bot_username is required to authenticate the IRC login.  The
+            # factory pulls client_id/client_secret/channels from env itself.
+            'token_param': 'access_token',
+            'extra': [
+                {'param': 'bot_username', 'env': 'TWITCH_BOT_USERNAME', 'required': True},
+            ],
+        },
+        'nostr': {
+            # Nostr identity is a private key (hex/nsec); relays come from
+            # NOSTR_RELAYS env or the adapter's defaults, so no extra params.
+            # (Live relay connect/sign additionally needs secp256k1.)
+            'token_param': 'private_key',
+        },
+        'bluebubbles': {
+            # BlueBubbles iMessage bridge: the "token" is the server password,
+            # against a server_url. (Needs python-socketio for the live link.)
+            'token_param': 'password',
+            'extra': [
+                {'param': 'server_url', 'env': 'BLUEBUBBLES_SERVER_URL', 'required': True},
+            ],
+        },
+        'tlon': {
+            # Urbit/Tlon: the "token" is the ship +code; ship_name identifies
+            # the ship, ship_url is the ship's HTTP endpoint (defaults local).
+            'token_param': 'ship_code',
+            'extra': [
+                {'param': 'ship_name', 'env': 'URBIT_SHIP', 'required': True},
+                {'param': 'ship_url', 'env': 'URBIT_URL',
+                 'default': 'http://localhost:8080'},
+            ],
+        },
+        'messenger': {
+            # Meta Messenger (webhook-based; served by register_webhook_routes).
+            # "token" is the page access token; app_secret validates inbound
+            # signatures (optional) and verify_token gates the GET handshake.
+            'token_param': 'page_access_token',
+            'extra': [
+                {'param': 'app_secret', 'env': 'MESSENGER_APP_SECRET'},
+                {'param': 'verify_token', 'env': 'MESSENGER_VERIFY_TOKEN'},
+            ],
+        },
+        'instagram': {
+            # Meta Instagram — same Graph webhook model as Messenger.
+            'token_param': 'page_access_token',
+            'extra': [
+                {'param': 'app_secret', 'env': 'INSTAGRAM_APP_SECRET'},
+                {'param': 'verify_token', 'env': 'INSTAGRAM_VERIFY_TOKEN'},
+            ],
+        },
+        'twitter': {
+            # Twitter/X OAuth 1.0a — all four credentials required.
+            'token_param': 'access_token',
+            'extra': [
+                {'param': 'consumer_key', 'env': 'TWITTER_CONSUMER_KEY', 'required': True},
+                {'param': 'consumer_secret', 'env': 'TWITTER_CONSUMER_SECRET', 'required': True},
+                {'param': 'access_token_secret', 'env': 'TWITTER_ACCESS_TOKEN_SECRET', 'required': True},
+            ],
+        },
+        'viber': {
+            # Viber bot: "token" is the auth token; bot_name is a display name.
+            'token_param': 'auth_token',
+            'extra': [
+                {'param': 'bot_name', 'env': 'VIBER_BOT_NAME', 'default': 'Bot'},
+            ],
+        },
+        'zalo': {
+            # Zalo OA: "token" is the access token; oa_id identifies the OA;
+            # app_id/app_secret optional (token refresh).
+            'token_param': 'access_token',
+            'extra': [
+                {'param': 'oa_id', 'env': 'ZALO_OA_ID', 'required': True},
+                {'param': 'app_id', 'env': 'ZALO_APP_ID'},
+                {'param': 'app_secret', 'env': 'ZALO_APP_SECRET'},
+            ],
+        },
+        'wechat': {
+            # WeChat OA: "token" maps to app_secret; app_id required; the
+            # factory's own `token` is the webhook verification token.
+            'token_param': 'app_secret',
+            'extra': [
+                {'param': 'app_id', 'env': 'WECHAT_APP_ID', 'required': True},
+                {'param': 'token', 'env': 'WECHAT_TOKEN'},
+            ],
+        },
+        'google_chat': {
+            # Google Chat (webhook-based): "token" is the outgoing webhook_url;
+            # service_account_file optionally enables full Chat-API mode.
+            'token_param': 'webhook_url',
+            'extra': [
+                {'param': 'service_account_file', 'env': 'GOOGLE_CHAT_SA_FILE'},
+            ],
+        },
     }
 
     def register_channel(self, channel_type: str, token: str = None, **kwargs) -> bool:
@@ -350,19 +526,44 @@ class FlaskChannelIntegration:
 
         module_path, factory_name = factory_info
         token = token or os.getenv(self._ENV_FALLBACKS.get(channel_type, ''))
-        if not token and channel_type not in ('web', 'imessage', 'openprose'):
-            # web/imessage/openprose don't need external tokens
+        if not token and channel_type not in self._NO_TOKEN_CHANNELS:
             logger.warning(f"{channel_type} token not provided, skipping")
             return False
+
+        # Build the factory call kwargs.  Multi-input channels (see
+        # _CHANNEL_SPECS) map the generic `token` to their real param name and
+        # resolve extra credentials from explicit kwarg -> env -> default,
+        # skipping (with a warning) when a required one is missing.  Everything
+        # else is a plain single-token (or no-token) factory call.
+        call_kwargs = dict(kwargs)
+        spec = self._CHANNEL_SPECS.get(channel_type)
+        if spec:
+            if token:
+                call_kwargs[spec['token_param']] = token
+            for p in spec.get('extra', ()):
+                name = p['param']
+                if call_kwargs.get(name):
+                    continue  # explicit kwarg wins over env/default
+                val = (os.getenv(p['env']) if p.get('env') else None) or p.get('default')
+                if not val:
+                    if p.get('required'):
+                        env_hint = f" ({p['env']})" if p.get('env') else ''
+                        logger.warning(
+                            f"{channel_type} requires {name}{env_hint} — skipping")
+                        return False
+                    continue
+                call_kwargs[name] = val
+        elif token:
+            call_kwargs['token'] = token
 
         try:
             import importlib
             mod = importlib.import_module(module_path, package='integrations.channels')
             factory_fn = getattr(mod, factory_name)
-            if token:
-                adapter = factory_fn(**self._credential_kwarg(factory_fn, token), **kwargs)
-            else:
-                adapter = factory_fn(**kwargs)
+            # Declarative _CHANNEL_SPECS path (built call_kwargs above) —
+            # a superset of the single-credential mapping, so it handles
+            # multi-input channels (slack app_token, matrix user_id, ...).
+            adapter = factory_fn(**call_kwargs)
             self.registry.register(adapter)
             logger.info(f"{channel_type} adapter registered")
             return True
@@ -412,6 +613,94 @@ class FlaskChannelIntegration:
 
     def register_whatsapp(self, api_url: str = None, **kwargs) -> None:
         self.register_channel('whatsapp', token=api_url, **kwargs)
+
+    def register_webhook_routes(self, app, path_prefix: str = '/channels/webhook') -> None:
+        """Register ONE generic inbound-webhook endpoint for the webhook-based
+        channels (line, messenger, instagram, twitter, viber, wechat, zalo,
+        google_chat, ...).  Those adapters expose ``handle_webhook()`` but
+        nothing HTTP-facing ever calls it — this is the missing seam.
+
+        Routes (one rule, per channel_type):
+          GET  {prefix}/<channel_type>  → Meta-style verification handshake:
+                echoes ``hub.challenge`` when ``hub.verify_token`` matches
+                ``<CHANNEL>_VERIFY_TOKEN`` (or ``WEBHOOK_VERIFY_TOKEN``).
+          POST {prefix}/<channel_type>  → hands the raw body (+ signature
+                header) to the adapter's ``handle_webhook``, which parses and
+                ``_dispatch_message`` → agent.  A dict return (e.g.
+                google_chat) becomes the inline JSON response.
+
+        handle_webhook signatures vary (``body:str, signature`` | ``body:Dict``
+        | ``data:Dict``), so arguments are mapped by introspection.  The
+        coroutine is scheduled on the channel event loop (adapters live there).
+        """
+        import inspect
+        from flask import request, jsonify, Response
+
+        def _channel_inbound_webhook(channel_type):
+            adapter = self.registry.get(channel_type)
+
+            if request.method == 'GET':
+                mode = request.args.get('hub.mode')
+                token = request.args.get('hub.verify_token')
+                challenge = request.args.get('hub.challenge')
+                expected = (os.getenv(f'{channel_type.upper()}_VERIFY_TOKEN')
+                            or os.getenv('WEBHOOK_VERIFY_TOKEN'))
+                if mode == 'subscribe' and challenge and expected and token == expected:
+                    return Response(challenge, mimetype='text/plain')
+                return ('verification failed', 403)
+
+            # POST
+            if adapter is None:
+                return jsonify({'error': f'no adapter registered for {channel_type}'}), 404
+            handler = getattr(adapter, 'handle_webhook', None)
+            if not callable(handler):
+                return jsonify({'error': f'{channel_type} has no webhook handler'}), 400
+            if self._loop is None:
+                return jsonify({'error': 'channel event loop not running'}), 503
+
+            raw = request.get_data(as_text=True)
+            sig = (request.headers.get('X-Hub-Signature-256')
+                   or request.headers.get('X-Hub-Signature')
+                   or request.headers.get('X-Line-Signature')
+                   or request.headers.get('X-Signature'))
+
+            # Map raw body + signature onto handle_webhook's actual params.
+            call: Dict[str, Any] = {}
+            for i, p in enumerate(inspect.signature(handler).parameters.values()):
+                ann = str(p.annotation)
+                if i == 0 or p.name in ('body', 'data', 'payload'):
+                    wants_dict = ('Dict' in ann or 'dict' in ann or p.name == 'data')
+                    if wants_dict:
+                        try:
+                            call[p.name] = json.loads(raw) if raw else {}
+                        except Exception:
+                            call[p.name] = {}
+                    else:
+                        call[p.name] = raw
+                elif p.name in ('signature', 'sig'):
+                    call[p.name] = sig
+                elif p.name == 'event_type':
+                    call[p.name] = request.headers.get('X-Event-Type', '')
+
+            try:
+                fut = asyncio.run_coroutine_threadsafe(handler(**call), self._loop)
+                result = fut.result(timeout=30)
+            except Exception as e:
+                logger.warning(f"webhook {channel_type} handler error: {e}")
+                return jsonify({'error': str(e)}), 500
+
+            if isinstance(result, dict):
+                return jsonify(result)  # e.g. google_chat inline reply
+            return ('', 200)
+
+        app.add_url_rule(
+            f'{path_prefix}/<channel_type>',
+            'channel_inbound_webhook',
+            _channel_inbound_webhook,
+            methods=['GET', 'POST'],
+        )
+        logger.info(
+            f"Channel inbound-webhook route registered at {path_prefix}/<channel_type>")
 
     def set_user_session(
         self,
