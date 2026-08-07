@@ -503,15 +503,25 @@ def init_social(app):
     else:
         logger.critical("HevolveSocial: gossip NOT started - boot verification failed (hard mode)")
 
-    # Start sync engine for regional/local tiers
+    # Start the sync engine on EVERY tier.
+    #
+    # This used to be gated to ('regional', 'local') — and a flat desktop is
+    # neither, so no desktop install ever started the drain loop.  Found live
+    # 2026-08-07: 96 sync_queue rows on this node, every one status='queued',
+    # zero errors, while queue_entity kept producing on each public post.
+    # The tier gate was redundant belt-and-braces that turned into a
+    # killswitch: _do_sync_drain already self-gates per tick on
+    # parent_tier_url() (empty → return) and is_connected_to (unreachable →
+    # return), so a node with no parent pays one no-op check per interval and
+    # nothing else.  With parent_tier_url now resolving to a live genesis
+    # central on flat nodes (task #629), the loop must exist for the resolver
+    # to matter.
     if _boot_verified:
         try:
-            from security.key_delegation import get_node_tier
-            node_tier = get_node_tier()
-            if node_tier in ('regional', 'local'):
-                from .sync_engine import sync_engine
-                sync_engine.start_background_sync()
-                logger.info(f"HevolveSocial sync engine started (tier={node_tier})")
+            from .sync_engine import sync_engine
+            sync_engine.start_background_sync()
+            logger.info("HevolveSocial sync engine started (all tiers; "
+                        "drain self-gates on parent reachability)")
         except Exception as e:
             logger.debug(f"HevolveSocial sync engine start skipped: {e}")
 
