@@ -454,6 +454,16 @@ def _init_channel_adapters(app, cfg: dict) -> None:
             'device_id': cfg.get('device_id'),
         })
 
+        # Mount the ONE generic inbound-webhook endpoint that serves every
+        # webhook-based channel (line/messenger/instagram/twitter/viber/
+        # wechat/zalo/google_chat...).  Registered here, inside the same
+        # setup-lock-bypass window as the blueprints, so Flask accepts the
+        # url rule before the first request.  Non-fatal on failure.
+        try:
+            channels.register_webhook_routes(app)
+        except Exception as _wh_e:
+            logger.debug(f"webhook route registration skipped: {_wh_e}")
+
         # Auto-activate channels saved in admin config
         activated_from_cfg = 0
         try:

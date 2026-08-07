@@ -5613,7 +5613,10 @@ def detect_and_resume_progress(prompt_id, user_prompt):
     import json
 
     config = get_prompt_config_json(prompt_id)
-    total_flows = len(config['flows'])
+    # A freshly-created or error-state config may have no 'flows' yet — treat
+    # that as zero flows (start fresh) instead of KeyError-crashing the whole
+    # /chat request into "Sorry, I encountered an error".
+    total_flows = len((config or {}).get('flows', []))
 
     # Track progress across all flows
     flow_progress = {}

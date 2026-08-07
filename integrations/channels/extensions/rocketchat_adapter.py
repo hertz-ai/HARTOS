@@ -373,12 +373,15 @@ class RocketChatAdapter(ChannelAdapter):
                 timestamp=datetime.fromisoformat(
                     data.get("ts", {}).get("$date", datetime.now().isoformat())
                 ) if isinstance(data.get("ts"), dict) else datetime.now(),
-                message_type=MessageType.TEXT,
-                reply_to=data.get("tmid"),
-                metadata={
+                # NOTE: the unified Message has no message_type/reply_to/
+                # metadata fields — the previous names raised TypeError on
+                # every inbound message (swallowed -> messages silently
+                # dropped -> Rocket.Chat never routed).  Use the real fields.
+                reply_to_id=data.get("tmid"),
+                raw={
                     "mentions": data.get("mentions", []),
                     "channels": data.get("channels", []),
-                }
+                },
             )
         except Exception as e:
             logger.error(f"Error parsing message: {e}")
