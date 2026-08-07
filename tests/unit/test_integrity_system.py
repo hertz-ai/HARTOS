@@ -624,6 +624,85 @@ class TestFraudDetection:
         assert peer.fraud_score >= FRAUD_BAN_THRESHOLD
         assert peer.integrity_status == 'banned'
 
+    def test_ban_lifts_when_score_decays_below_threshold(self, db):
+        """A ban must not outlive the score that justified it.
+
+        Regression (2026-08-07): the only code able to lift a ban was
+        apply_fraud_score_decay's ban_until sweep, whose sole caller is
+        run_full_audit, which nothing schedules. A peer banned by a defect
+        that was subsequently fixed stayed banned indefinitely — observed
+        live between two LAN nodes, 14h past ban_until and still enforced.
+        """
+        from datetime import datetime, timedelta
+        from integrations.social.integrity_service import (
+            IntegrityService, FRAUD_BAN_THRESHOLD)
+
+        peer = _make_peer(db, fraud_score=81.0, integrity_status='banned')
+        peer.ban_count = 1
+        peer.ban_until = datetime.utcnow() + timedelta(hours=1)
+        db.flush()
+
+        IntegrityService.decrease_fraud_score(
+            db, peer.node_id, 5.0, 'Guardrail audit passed')
+        db.refresh(peer)
+
+        assert peer.fraud_score == 76.0
+        assert peer.fraud_score < FRAUD_BAN_THRESHOLD
+        assert peer.integrity_status == 'suspicious'   # released, not trusted
+        assert peer.ban_until is None
+        assert peer.ban_count == 1, "ban history must never be erased"
+
+    def test_ban_holds_while_score_still_over_threshold(self, db):
+        """Boundary: decaying toward the threshold does not release early."""
+        from integrations.social.integrity_service import IntegrityService
+
+        peer = _make_peer(db, fraud_score=95.0, integrity_status='banned')
+        peer.ban_count = 2
+        db.flush()
+
+        IntegrityService.decrease_fraud_score(
+            db, peer.node_id, 5.0, 'Guardrail audit passed')
+        db.refresh(peer)
+
+        assert peer.fraud_score == 90.0
+        assert peer.integrity_status == 'banned'
+
+    def test_decay_never_grants_verified(self, db):
+        """'verified' is earned by a valid signature, never by waiting.
+
+        integrity_status == 'verified' gates compute_learning_tier ->
+        issue_cct -> skill distribution. If a decaying fraud score could
+        confer it, a node would earn contribution credentials by serving out
+        a penalty instead of by proving its identity.
+        """
+        from integrations.social.integrity_service import IntegrityService
+
+        peer = _make_peer(db, fraud_score=41.0, integrity_status='suspicious')
+        IntegrityService.decrease_fraud_score(
+            db, peer.node_id, 2.0, 'Challenge passed')
+        db.refresh(peer)
+
+        assert peer.fraud_score == 39.0
+        assert peer.integrity_status != 'verified'
+        assert peer.integrity_status == 'unverified'
+
+    def test_decay_sweep_uses_the_same_transition(self, db):
+        """The batch sweep and the single-peer path share one writer."""
+        from integrations.social.integrity_service import (
+            IntegrityService, FRAUD_SCORE_DECAY_PER_ROUND)
+
+        peer = _make_peer(db, fraud_score=79.0 + FRAUD_SCORE_DECAY_PER_ROUND,
+                          integrity_status='banned')
+        peer.ban_count = 1
+        db.flush()
+
+        IntegrityService.apply_fraud_score_decay(db)
+        db.refresh(peer)
+
+        assert peer.fraud_score == 79.0
+        assert peer.integrity_status == 'suspicious'
+        assert peer.ban_until is None
+
 
 # =====================================================================
 # 9. TestCodeHashVerification (3 tests)
