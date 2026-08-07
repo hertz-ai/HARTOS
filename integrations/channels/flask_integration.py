@@ -184,10 +184,18 @@ class FlaskChannelIntegration:
             # other -- which is precisely how this bug survived. Imported
             # lazily to keep channels -> agent_engine out of module import
             # order. Returns None on flat tier, where no header is needed.
+            # 2026-08-06 fix: pass the REAL resolved user_id here, not the
+            # function's 'system_daemon' default. /chat's JWT-vs-body
+            # check always trusts the JWT over the body (correct — stops
+            # body-spoofing), so leaving this at the default silently
+            # collapsed every channel user's identity into one shared
+            # 'system_daemon' agent session, corrupting concurrent turns
+            # across channels (empty/lost replies). See
+            # _internal_auth_headers' docstring for the full incident.
             try:
                 from integrations.agent_engine.dispatch import (
                     _internal_auth_headers)
-                _auth_headers = _internal_auth_headers()
+                _auth_headers = _internal_auth_headers(user_id=str(user_id))
             except Exception as _auth_err:  # never block a message on this
                 logger.debug("internal auth header unavailable: %s", _auth_err)
                 _auth_headers = None
@@ -197,7 +205,12 @@ class FlaskChannelIntegration:
                 self.agent_api_url,
                 json=payload,
                 headers=_auth_headers,
-                timeout=120,  # 2 minute timeout for agent processing
+                # 2 minute default for agent processing.  Overridable because
+                # a multi-agent turn against a LOCAL model makes several LLM
+                # calls (30-45s each on a 4B), blowing past 120s and replying
+                # "Sorry, the request timed out" even though the agent went on
+                # to produce a perfectly good answer.
+                timeout=int(os.environ.get('HEVOLVE_CHANNEL_AGENT_TIMEOUT', '120')),
             )
 
             if response.status_code == 200:
