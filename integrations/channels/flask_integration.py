@@ -553,16 +553,31 @@ class FlaskChannelIntegration:
                         return False
                     continue
                 call_kwargs[name] = val
-        elif token:
-            call_kwargs['token'] = token
 
         try:
             import importlib
             mod = importlib.import_module(module_path, package='integrations.channels')
             factory_fn = getattr(mod, factory_name)
-            # Declarative _CHANNEL_SPECS path (built call_kwargs above) —
-            # a superset of the single-credential mapping, so it handles
-            # multi-input channels (slack app_token, matrix user_id, ...).
+
+            # Single-credential channels: resolve the credential's REAL param
+            # name from the factory signature. Done here because it needs
+            # factory_fn, which only exists after the import above.
+            #
+            # NOT a hardcoded `token=`. create_whatsapp_adapter takes
+            # (api_url, phone_number, ...) and has NO `token` parameter, so
+            # token= raises TypeError, the except below swallows it, and the
+            # channel silently never registers. That is the exact bug
+            # _credential_kwarg was written to fix — its test file says so:
+            # "register_channel() returned False for every credential-based
+            # channel whose factory doesn't happen to name its parameter
+            # 'token', and no live adapter was ever constructed."
+            #
+            # So the two paths divide cleanly and neither is orphaned:
+            # _CHANNEL_SPECS for multi-credential channels, signature
+            # introspection for the single-credential rest.
+            if not spec and token:
+                call_kwargs.update(self._credential_kwarg(factory_fn, token))
+
             adapter = factory_fn(**call_kwargs)
             self.registry.register(adapter)
             logger.info(f"{channel_type} adapter registered")
@@ -636,6 +651,80 @@ class FlaskChannelIntegration:
         import inspect
         from flask import request, jsonify, Response
 
+        def _webhook_caller_is_authenticated(channel_type: str, raw: str):
+            """Return None when the caller may post, else a Flask error tuple.
+
+            THIS ROUTE IS PUBLIC BY NATURE — Meta/LINE/Viber dial it from their
+            own infrastructure and cannot hold a HART credential — so it needs
+            an auth model that is neither "open" nor "our API key".
+
+            Two accepted proofs, checked in this order:
+
+              1. KONG. When the deployment fronts HART with Kong
+                 (HEVOLVE_TRUST_KONG=true, the flag integrations/social/auth.py
+                 already defines for exactly this), Kong has authenticated the
+                 caller and stamps X-Consumer-*. Reusing that flag rather than
+                 inventing a second gateway convention keeps ONE answer to
+                 "did the gateway vouch for this caller".
+
+              2. PROVIDER SIGNATURE. The HMAC the platform computes over the
+                 body with the app secret. This is the real webhook credential
+                 and the only one Meta can present.
+
+            FAILS CLOSED. Without either proof the request is rejected before
+            any adapter runs. The adapters cannot be relied on for this: their
+            own check is `if signature and not verify(...)`, which SKIPS
+            verification entirely when the header is absent, and zalo's
+            handle_webhook takes no signature parameter at all. So an
+            unsigned POST would have been parsed and dispatched to the agent
+            as a genuine user message — an unauthenticated injection into
+            agent dispatch, which is what this gate exists to stop.
+            """
+            # (1) Kong-authenticated consumer.
+            if os.environ.get('HEVOLVE_TRUST_KONG', '').lower() == 'true':
+                if (request.headers.get('X-Consumer-ID')
+                        or request.headers.get('X-Consumer-Username')
+                        or request.headers.get('X-Consumer-Custom-ID')):
+                    return None
+
+            # (2) Provider signature over the raw body.
+            secret = (os.getenv(f'{channel_type.upper()}_APP_SECRET')
+                      or os.getenv(f'{channel_type.upper()}_CHANNEL_SECRET')
+                      or os.getenv(f'{channel_type.upper()}_WEBHOOK_SECRET'))
+            sig_hdr = (request.headers.get('X-Hub-Signature-256')
+                       or request.headers.get('X-Hub-Signature')
+                       or request.headers.get('X-Line-Signature')
+                       or request.headers.get('X-Signature'))
+            if secret and sig_hdr:
+                import base64
+                import hashlib
+                import hmac as _hmac
+                body = raw.encode('utf-8')
+                # Strip ONLY a real algorithm prefix. Meta sends
+                # "sha256=<hex>"; LINE sends bare base64 — and base64 PADDING
+                # is '=', so a blind split('=', 1)[-1] mangles every padded
+                # LINE signature into a mismatch. (Caught by the base64 case in
+                # tests/unit/test_channel_webhook_auth.py, which is why that
+                # case exists.)
+                presented = sig_hdr.strip()
+                for _pfx in ('sha256=', 'sha1=', 'sha512='):
+                    if presented.lower().startswith(_pfx):
+                        presented = presented[len(_pfx):]
+                        break
+                for algo in (hashlib.sha256, hashlib.sha1):
+                    mac = _hmac.new(secret.encode('utf-8'), body, algo)
+                    # Meta sends hex ("sha256=<hex>"); LINE sends base64.
+                    for candidate in (mac.hexdigest(),
+                                      base64.b64encode(mac.digest()).decode()):
+                        if _hmac.compare_digest(candidate, presented):
+                            return None
+
+            logger.warning(
+                "webhook %s REJECTED: no Kong consumer and no valid provider "
+                "signature (secret_configured=%s, signature_header=%s)",
+                channel_type, bool(secret), bool(sig_hdr))
+            return jsonify({'error': 'unauthenticated webhook'}), 401
+
         def _channel_inbound_webhook(channel_type):
             adapter = self.registry.get(channel_type)
 
@@ -649,7 +738,12 @@ class FlaskChannelIntegration:
                     return Response(challenge, mimetype='text/plain')
                 return ('verification failed', 403)
 
-            # POST
+            # POST — AUTHENTICATE FIRST, before the adapter is touched.
+            raw = request.get_data(as_text=True)
+            denied = _webhook_caller_is_authenticated(channel_type, raw)
+            if denied is not None:
+                return denied
+
             if adapter is None:
                 return jsonify({'error': f'no adapter registered for {channel_type}'}), 404
             handler = getattr(adapter, 'handle_webhook', None)
@@ -658,7 +752,6 @@ class FlaskChannelIntegration:
             if self._loop is None:
                 return jsonify({'error': 'channel event loop not running'}), 503
 
-            raw = request.get_data(as_text=True)
             sig = (request.headers.get('X-Hub-Signature-256')
                    or request.headers.get('X-Hub-Signature')
                    or request.headers.get('X-Line-Signature')
