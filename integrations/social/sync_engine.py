@@ -698,9 +698,26 @@ class SyncEngine:
         """Canonical parent-tier node URL this node syncs UP to — central, else
         regional (empty on a flat/standalone node).  SINGLE resolver shared by
         the drain loop (_do_sync_drain) and federation's C4 content-retrieval
-        fallback, so "where is my parent" has one source, not two."""
-        return (os.environ.get('HEVOLVE_CENTRAL_URL', '')
-                or os.environ.get('HEVOLVE_REGIONAL_URL', ''))
+        fallback, so "where is my parent" has one source, not two.
+
+        Env always wins (explicit operator config).  When neither env var is
+        set — every flat desktop install — fall back to the first LIVE genesis
+        central (core.superadmins.resolve_reachable_central).  Measured
+        2026-08-07: queue_entity had been gating+queuing public posts on every
+        install while this returned '' fleet-wide, so nothing ever drained;
+        central's sync ingress (/api/social/hierarchy/sync via azurekong)
+        answers 200 and was simply never dialed.  Offline installs still get
+        '' (resolver returns '' when no central answers) and keep their exact
+        prior no-parent behaviour."""
+        explicit = (os.environ.get('HEVOLVE_CENTRAL_URL', '')
+                    or os.environ.get('HEVOLVE_REGIONAL_URL', ''))
+        if explicit:
+            return explicit
+        try:
+            from core.superadmins import resolve_reachable_central
+            return resolve_reachable_central()
+        except Exception:
+            return ''
 
     @staticmethod
     def get_queue_stats(db, node_id: str) -> Dict:

@@ -83,6 +83,65 @@ def is_superadmin_email(email: str) -> bool:
     return email.strip().lower() in {e.lower() for e in SUPERADMIN_EMAILS}
 
 
+# ─── Reachable-central resolution ─────────────────────────────────────
+#
+# Which central can this node actually TALK to right now?  Probed live
+# 2026-08-07: central.hevolve.ai has been DNS-dead for months while
+# azurekong.hertzai.com serves the full social API — yet flat desktops
+# resolved their sync parent from env vars alone, so the entire fleet
+# (147 registered nodes) queued public posts that never drained
+# anywhere.  This resolver is the ONE place that answers "first alive
+# central, in priority order"; superadmin_report keeps its own walk
+# because its outbox semantics differ (it must try EVERY central, not
+# stop at the first alive one).
+#
+# Probe target is /api/social/peers/health — the same endpoint
+# SyncEngine.is_connected_to gates the drain on, so "resolved" and
+# "drainable" can never disagree about what alive means.
+
+_PROBE_TTL_OK = 600.0     # remember an alive central for 10 min
+_PROBE_TTL_FAIL = 60.0    # re-probe a dead fleet after 1 min
+_PROBE_TIMEOUT = 4.0
+
+_resolve_cache = {'url': '', 'expires': 0.0}
+
+
+def resolve_reachable_central(force: bool = False) -> str:
+    """First central in ``ALL_CENTRAL_URLS`` whose peers/health answers 200.
+
+    Returns '' when none are reachable (offline installs keep exactly
+    their current no-parent behaviour).  Cached module-wide so callers
+    on the sync/profile cadence never stack probes; ``force=True``
+    bypasses the cache (tests, admin diagnostics).
+    """
+    import time
+    now = time.monotonic()
+    if not force and now < _resolve_cache['expires']:
+        return _resolve_cache['url']
+    url_found = ''
+    try:
+        from core.http_pool import pooled_get
+        for candidate in ALL_CENTRAL_URLS:
+            try:
+                resp = pooled_get(
+                    f"{candidate.rstrip('/')}/api/social/peers/health",
+                    timeout=_PROBE_TIMEOUT,
+                )
+                if resp.status_code == 200:
+                    url_found = candidate.rstrip('/')
+                    break
+            except Exception:
+                continue
+    except Exception:
+        # http_pool unavailable (degraded cx_Freeze early boot) — report
+        # unreachable rather than guessing; next call re-probes.
+        url_found = ''
+    _resolve_cache['url'] = url_found
+    _resolve_cache['expires'] = now + (
+        _PROBE_TTL_OK if url_found else _PROBE_TTL_FAIL)
+    return url_found
+
+
 __all__ = [
     'SUPERADMIN_EMAILS',
     'SUPERADMIN_CENTRAL_URLS',
@@ -93,4 +152,5 @@ __all__ = [
     'REPORT_TIMEOUT_READ',
     'REPORT_OUTBOX_RETRY_SEC',
     'is_superadmin_email',
+    'resolve_reachable_central',
 ]
