@@ -162,6 +162,31 @@ def discover_communities():
 # Decentralized Gossip Peer Discovery
 # ════════════════════════════════════════════════════════════════
 
+def _observed_ip() -> str:
+    """The IP this request ACTUALLY came from, as seen by us or our proxy.
+
+    Why: the peer registry is poisoned by claimed addresses — measured
+    2026-08-07 on central's live table, 147 peers, 67 advertising
+    ``localhost`` and 80 advertising private LAN IPs, zero routable.  A node
+    behind NAT cannot know its own public address, but the RECEIVER of its
+    announce can see it.  This is the one place that truth exists.
+
+    Proxy handling: behind Kong the socket peer is the gateway, and the real
+    client is in X-Forwarded-For.  We take the LAST entry — the one appended
+    by the outermost proxy we trust — never the first, which a direct client
+    can forge outright.  (A client-forged XFF still gets the real address
+    APPENDED by Kong, so last-wins survives spoofing; and on a direct LAN
+    request there is no XFF and remote_addr is already the truth.)  Worst
+    case this field is a wrong dial CANDIDATE, never a trust input.
+    """
+    xff = (request.headers.get('X-Forwarded-For') or '').strip()
+    if xff:
+        last_hop = xff.split(',')[-1].strip()
+        if last_hop:
+            return last_hop
+    return request.remote_addr or ''
+
+
 @discovery_bp.route('/api/social/peers/announce', methods=['POST'])
 def peer_announce():
     """Receive a peer announcement. Merge into local peer list."""
@@ -178,14 +203,24 @@ def peer_announce():
     # announce-signing defect stayed invisible across the whole network.
     # `accepted` and `reason` say what actually happened. Both are additive,
     # so existing clients are unaffected.
+    #
+    # observed_ip is derived HERE, beside the payload, never injected into
+    # it: announces are Ed25519-signed over every field except 'signature',
+    # so mutating `data` would invalidate every signed announce.
     reasons = []
-    is_new = gossip.handle_announce(data, reasons=reasons)
+    observed_ip = _observed_ip()
+    is_new = gossip.handle_announce(data, reasons=reasons,
+                                    observed_ip=observed_ip)
     body = {
         'success': True,
         'is_new': is_new,
         'accepted': not reasons,
         'node_id': gossip.node_id,
         'name': gossip.node_name,
+        # Echo: tell the announcer what address IT came from.  A NAT'd node
+        # has no other way to learn its public IP; with this echo it can
+        # advertise `observed_url` in its own self-info and become dialable.
+        'observed_ip': observed_ip,
     }
     if reasons:
         body['reason'] = reasons[0]
@@ -221,13 +256,17 @@ def peer_exchange():
     data = request.get_json(force=True, silent=True) or {}
     their_peers = data.get('peers', [])
     sender = data.get('sender', {})
+    observed_ip = _observed_ip()
     if sender.get('node_id') and sender.get('url'):
-        gossip.handle_announce(sender)
+        gossip.handle_announce(sender, observed_ip=observed_ip)
     my_peers = gossip.handle_exchange(their_peers)
     return jsonify({
         'success': True,
         'node_id': gossip.node_id,
         'peers': my_peers,
+        # Same echo contract as peer_announce — additive, ignored by old
+        # clients, lets the sender learn its own public address.
+        'observed_ip': observed_ip,
     })
 
 

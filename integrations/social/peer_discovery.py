@@ -310,6 +310,16 @@ class GossipProtocol:
         # HART node identity (loaded on start)
         self._hart_tag = ''
 
+        # Our public IP as ECHOED back by a peer's announce response
+        # (discovery.peer_announce 'observed_ip').  A NAT'd node cannot know
+        # this by itself — 0/147 fleet peers advertised a routable URL on
+        # 2026-08-07 because every node could only claim its LAN address.
+        # When set (and public), _self_info advertises `observed_url` so
+        # other peers gain a WAN dial candidate.  In-memory on purpose:
+        # re-learned within one announce round, and a moved node (new
+        # network) must not persist a stale public IP.
+        self._observed_public_ip = ''
+
         # State
         self._running = False
         self._thread = None
@@ -661,12 +671,37 @@ class GossipProtocol:
             )
             if resp.status_code == 200:
                 self._record_peer_success(peer_url)
+                self._consume_observed_ip_echo(resp)
                 return True
             self._record_peer_failure(peer_url)
             return False
         except requests.RequestException:
             self._record_peer_failure(peer_url)
             return False
+
+    def _consume_observed_ip_echo(self, resp):
+        """Learn our own public IP from a peer's announce response.
+
+        peer_announce echoes 'observed_ip' — the source address the RECEIVER
+        saw for us.  Only a PUBLIC echo is kept (a LAN peer echoing our LAN
+        address teaches nothing WAN-dialable), and only a change is logged.
+        Old peers without the field simply don't teach us — no-op.
+        """
+        try:
+            echoed = ((resp.json() or {}).get('observed_ip') or '').strip()
+        except Exception:
+            return
+        if not echoed:
+            return
+        try:
+            from core.peer_link.nat import NATTraversal
+            if NATTraversal._is_private_ip(echoed.strip('[]')):
+                return
+        except Exception:
+            return
+        if echoed != self._observed_public_ip:
+            self._observed_public_ip = echoed
+            logger.info(f"Public address learned from announce echo: {echoed}")
 
     # ─── Exchange ───
 
@@ -758,17 +793,22 @@ class GossipProtocol:
 
     # ─── Handlers (called by Flask endpoints) ───
 
-    def handle_announce(self, peer_data, reasons=None):
+    def handle_announce(self, peer_data, reasons=None, observed_ip=''):
         """Process an incoming peer announcement. Returns True if peer was new.
 
         ``reasons``: optional list; a rejection appends why. False alone is
         ambiguous, it means both "already knew this peer" and "refused it",
         and the caller cannot tell those apart without this.
+
+        ``observed_ip``: the source address the Flask endpoint saw for this
+        announce — side-band, NEVER merged into ``peer_data`` (which is
+        signed over every field except 'signature').
         """
         from .models import get_db
         db = get_db()
         try:
-            is_new = self._merge_peer(db, peer_data, reasons=reasons)
+            is_new = self._merge_peer(db, peer_data, reasons=reasons,
+                                      observed_ip=observed_ip)
             db.commit()
             if is_new:
                 logger.info(f"New peer discovered: {peer_data.get('name', '')} "
@@ -1006,6 +1046,21 @@ class GossipProtocol:
                 info['available_version'] = status['version']
         except Exception:
             pass
+        # Advertise our WAN address when a peer's announce echo taught it to
+        # us (_consume_observed_ip_echo — public echoes only).  `url` stays
+        # the LAN truth for same-subnet dialing; observed_url is the WAN
+        # candidate that nat.py tries next.  MUST sit above the signing
+        # block: the signature covers every field except 'signature', so a
+        # field added after signing would unverify every announce (the exact
+        # defect documented below).
+        if self._observed_public_ip:
+            try:
+                _port = int((self.base_url or '').rsplit(':', 1)[-1])
+                _ip = self._observed_public_ip
+                _host = f'[{_ip}]' if ':' in _ip else _ip
+                info['observed_url'] = f'http://{_host}:{_port}'
+            except Exception:
+                pass
         # Sign LAST, over the fully populated dict.
         #
         # The signature used to be taken mid-construction, straight after
@@ -1109,9 +1164,45 @@ class GossipProtocol:
         finally:
             db.close()
 
-    def _merge_peer(self, db, peer_data, reasons=None, relayed=False):
+    @staticmethod
+    def _observed_url_for(peer_url: str, observed_ip: str) -> str:
+        """The dialable-from-here hint for a peer: observed source IP paired
+        with the peer's CLAIMED service port.
+
+        Returns '' when the hint adds nothing: no observed ip, loopback
+        (says nothing about where the peer lives), or observed host equal to
+        the claimed host (the claim is already the truth — writing it again
+        every 30s beacon would only churn the row).  NAT port mapping means
+        the claimed port is only guaranteed correct for port-forwarded or
+        full-cone peers — which is exactly the population this hint exists
+        to make dialable.  It is a dial CANDIDATE, never a trust input.
+        """
+        if not observed_ip:
+            return ''
+        ip = observed_ip.strip().strip('[]')
+        if ip in ('127.0.0.1', '::1', 'localhost') or ip.startswith('127.'):
+            return ''
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(peer_url)
+            if (parsed.hostname or '').lower() == ip.lower():
+                return ''
+            port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+        except Exception:
+            return ''
+        host = f'[{ip}]' if ':' in ip else ip
+        return f'http://{host}:{port}'
+
+    def _merge_peer(self, db, peer_data, reasons=None, relayed=False,
+                    observed_ip=''):
         """Upsert a single peer into PeerNode table. Returns True if new.
         Verifies Ed25519 signature if present. Rejects banned nodes.
+
+        ``observed_ip``: side-band source address from the receiving
+        endpoint (never part of the signed payload).  Stored as
+        ``metadata_json['observed_url']`` so gossip carries a dialable WAN
+        hint for NAT'd peers — the registry held 0/147 routable URLs on
+        2026-08-07 because only claimed addresses ever existed.
 
         ``relayed``: the record came from another node's peer list rather than
         from the node it describes. It is an address hint. A relayed record
@@ -1421,8 +1512,21 @@ class GossipProtocol:
                 # Only resurrect if announcement is recent (not stale gossip)
                 if (datetime.utcnow() - existing.last_seen).total_seconds() < 60:
                     existing.status = 'active'
+            # Direct announces update the observed-address hint; relayed
+            # records carry the RELAYER's vantage, not the subject's, so
+            # they must not overwrite what a direct announce established.
+            if not relayed:
+                _obs = self._observed_url_for(url, observed_ip)
+                _meta = existing.metadata_json or {}
+                if _obs and _meta.get('observed_url') != _obs:
+                    # Reassign (not mutate) so SQLAlchemy sees the change.
+                    existing.metadata_json = {**_meta, 'observed_url': _obs}
             return False
 
+        _obs = '' if relayed else self._observed_url_for(url, observed_ip)
+        _new_meta = dict(peer_data.get('metadata', {}) or {})
+        if _obs:
+            _new_meta['observed_url'] = _obs
         new_peer = PeerNode(
             node_id=node_id, url=url,
             name=peer_data.get('name', ''),
@@ -1430,7 +1534,7 @@ class GossipProtocol:
             status='active',
             agent_count=peer_data.get('agent_count', 0),
             post_count=peer_data.get('post_count', 0),
-            metadata_json=peer_data.get('metadata', {}),
+            metadata_json=_new_meta,
             public_key=public_key or '',
             code_hash=peer_data.get('code_hash', ''),
             code_version=peer_data.get('version', ''),

@@ -85,6 +85,27 @@ class NATTraversal:
             logger.debug(f"NAT: Direct WAN to {peer_host}:{peer_port}")
             return ws_url
 
+        # Strategy 2b: OBSERVED address — the WAN candidate discovery
+        # recorded from the peer's actual announce source (or the peer
+        # advertised after learning it from an announce echo).  The claimed
+        # URL above is what the peer BELIEVES its address is; behind NAT
+        # that is a private IP and strategy 2 refuses it, which as of
+        # 2026-08-07 was every single one of central's 147 registered peers.
+        # observed_url is what some receiver actually SAW.  Same reachability
+        # probe, same public-only rule — _try_direct_wan refuses private
+        # hosts, so a LAN-vantage observation can never fake a WAN rung.
+        observed = (peer_info.get('observed_url')
+                    or (peer_info.get('metadata') or {}).get('observed_url')
+                    or '')
+        if observed:
+            obs_host = self._extract_host(observed)
+            obs_port = self._extract_port(observed)
+            if obs_host and obs_host != peer_host:
+                ws_url = self._try_direct_wan(obs_host, obs_port)
+                if ws_url:
+                    logger.debug(f"NAT: Observed WAN to {obs_host}:{obs_port}")
+                    return ws_url
+
         # Strategy 3: WireGuard mesh IP
         if peer_mesh_ip:
             ws_url = self._try_wireguard(peer_mesh_ip)
