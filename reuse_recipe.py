@@ -279,6 +279,107 @@ llm_call_track = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_llm_call_t
 _active_tools = {}
 _active_tools_lock = threading.Lock()
 
+# ── Re-entrancy guard for concurrent turns on the SAME user+prompt ──────────
+#
+# user_agents[user_prompt] caches ONE autogen GroupChat per user+prompt, and
+# every agent in it is mutable shared state.  Two turns running concurrently
+# for the same key therefore drive the same GroupChat, and they corrupt each
+# other -- observed live as group_chat.messages being EMPTY the instant
+# initiate_chat() returned, which then raised IndexError out of
+# get_agent_response and delivered the literal text "Error getting response:
+# list index out of range" to the user on Discord/WhatsApp/Telegram.
+#
+# The concurrency is not hypothetical and not the caller's fault: a real user
+# turn causes the speculative dispatcher to POST *back* to /chat on localhost
+# (integrations/agent_engine/speculative_dispatcher.py -- the non-bundled
+# branch), landing a second, identical turn on the same key ~6ms later.
+# speculative_dispatcher.py already warns that re-entering /chat "causes
+# re-entrancy" and avoids it in bundled mode; the HTTP path had no such guard.
+#
+# A speculative turn is a pure optimisation whose callers all tolerate an
+# empty result, so the duplicate is dropped rather than queued -- queueing it
+# behind the real turn would deadlock, because the real turn is what is
+# blocked waiting on it.
+_inflight_turns = set()
+_inflight_turns_lock = threading.Lock()
+
+
+class _TracedMessageList(list):
+    """TEMP diagnostic: log a stack whenever the list is shortened/emptied.
+
+    Preserves any ``_hook`` already installed on the list it replaces (the
+    MemoryGraph ingest hook wraps group_chat.messages in its own subclass), so
+    installing this must not silently disable provenance tracking.
+    """
+
+    def __init__(self, data=(), hook=None):
+        super().__init__(data)
+        self._hook = hook
+
+    def append(self, msg):
+        super().append(msg)
+        try:
+            current_app.logger.error(
+                f'[GC-MUTATE] append -> len={len(self)} id={id(self)}')
+        except Exception:
+            pass
+        if self._hook is not None:
+            try:
+                self._hook(msg)
+            except Exception:
+                pass
+
+    def _trace(self, op):
+        try:
+            stack = ''.join(traceback.format_stack()[-9:-1])
+            current_app.logger.error(
+                f'[GC-MUTATE] {op} len_before={len(self)}\n{stack}')
+        except Exception:
+            pass
+
+    def clear(self):
+        self._trace('clear()')
+        return super().clear()
+
+    def __delitem__(self, key):
+        self._trace(f'__delitem__({key!r})')
+        return super().__delitem__(key)
+
+    def __setitem__(self, key, value):
+        if isinstance(key, slice):
+            self._trace(f'__setitem__(slice {key!r})')
+        return super().__setitem__(key, value)
+
+    def pop(self, *a):
+        self._trace(f'pop{a!r}')
+        return super().pop(*a)
+
+    def remove(self, v):
+        self._trace('remove()')
+        return super().remove(v)
+
+
+def _is_expert_dispatch_reentry() -> bool:
+    """True when this /chat request is the dispatcher calling back into itself.
+
+    Detected by the SHAPE of the payload, not by a truthy flag: the dispatcher
+    deliberately sends ``'speculative': False`` / ``'draft_first': False`` (its
+    own "hard no-reentry" markers, telling the inner /chat not to speculate
+    again), so testing those values always reports False.  What actually
+    identifies the caller is that it explicitly sends ``model_config`` together
+    with those markers -- a combination no external client (curl, the RN app,
+    a channel adapter) ever produces.
+    """
+    try:
+        from flask import request as _rq
+        body = _rq.get_json(silent=True) or {}
+    except Exception:
+        return False
+    if not isinstance(body, dict):
+        return False
+    return 'model_config' in body and (
+        'speculative' in body or 'draft_first' in body)
+
 # (removed dead module-level redis_client — never referenced; the only
 # `redis_client` uses here are getattr(backend, 'redis_client') on ledger
 # backends, unrelated. The one live recipe-pipeline client is helper.py. #93)
@@ -2993,6 +3094,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         llm_config={"cache_seed": None, "config_list": config_list}
     )
 
+
     group_chat_1 = autogen.GroupChat(
         agents=[time_agent, helper1, time_user, multi_role_agent1, executor1, chat_instructor1, verify1],
         messages=[],
@@ -3157,6 +3259,19 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             f"system_introspect autogen registration failed: {_ie}",
         )
 
+    # TEMP DIAGNOSTIC: installed LAST so it wraps the final list -- the
+    # MemoryGraph hook above replaces group_chat.messages, so anything
+    # installed earlier is orphaned and silently sees nothing.  Carries the
+    # existing hook forward so provenance ingest keeps working.
+    try:
+        group_chat.messages = _TracedMessageList(
+            group_chat.messages, getattr(group_chat.messages, '_hook', None))
+        current_app.logger.error(
+            f'[GC-TRACE-INSTALLED] id(list)={id(group_chat.messages)} '
+            f'id(group_chat)={id(group_chat)} len={len(group_chat.messages)}')
+    except Exception:
+        pass
+
     return assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group
 
 
@@ -3189,6 +3304,30 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                     if _reuse_task.is_sla_breached() and not _reuse_task.sla_breached:
                         _reuse_task.mark_sla_breached()
                         current_app.logger.warning(f"[SLA] Task {_reuse_task_id} SLA breached in reuse loop")
+
+            # An empty group chat here used to raise IndexError straight out of
+            # the loop, so the whole turn was answered with the raw exception
+            # text ("Error getting response: list index out of range") on every
+            # channel.  Break instead and let the post-loop fallback answer.
+            # The diagnostic is deliberately loud: it records whether the
+            # manager is even holding the same GroupChat object we were handed,
+            # which is the one thing the traceback alone could never tell us.
+            if not group_chat.messages:
+                try:
+                    _mgr_chat = getattr(manager, 'groupchat', None)
+                    _same = _mgr_chat is group_chat
+                    _mgr_len = len(_mgr_chat.messages) if _mgr_chat is not None else -1
+                except Exception:
+                    _same, _mgr_len = 'unknown', -1
+                current_app.logger.error(
+                    f'[EMPTY-GROUPCHAT] group_chat.messages empty in reuse loop '
+                    f'(user_prompt={user_prompt}, iteration={count}, '
+                    f'manager_holds_same_object={_same}, '
+                    f'len(manager.groupchat.messages)={_mgr_len}, '
+                    f'list_type={type(group_chat.messages).__name__}, '
+                    f'id(list)={id(group_chat.messages)}, '
+                    f'id(group_chat)={id(group_chat)})')
+                break
 
             if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                 current_app.logger.info(
@@ -3305,11 +3444,20 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
 
         # if individual_recipe[currentaction_id-1]['can_perform_without_user_input'] == 'yes':
         #     return assistant
+        # Same emptiness hazard as the loop head — reached when the group chat
+        # produced nothing at all.  Return a plain sentence rather than letting
+        # IndexError escape into the channel reply.
+        if not group_chat.messages:
+            current_app.logger.error(
+                f'[EMPTY-GROUPCHAT] group_chat.messages empty after reuse loop '
+                f'(user_prompt={user_prompt}) — returning fallback reply')
+            return "I wasn't able to put a response together just then. Could you try asking again?"
+
         last_message = group_chat.messages[-1]
-        if last_message['content'] == 'TERMINATE':
+        if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
             last_message = group_chat.messages[-2]
 
-        content_lower = last_message['content'].lower()
+        content_lower = (last_message.get('content') or '').lower()
 
         if f'message2userfinal'.lower() in content_lower:
             try:
@@ -3694,6 +3842,25 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
     user_message = text
     user_prompt = f'{user_id}_{prompt_id}'
 
+    # Drop a speculative re-entry that would race the real turn already
+    # running on this key.  See _inflight_turns above for why.
+    with _inflight_turns_lock:
+        already_running = user_prompt in _inflight_turns
+        if not already_running:
+            _inflight_turns.add(user_prompt)
+    # Only the turn that actually claimed the key may release it, or a
+    # duplicate would clear the real turn's flag on its way out.
+    owns_inflight = not already_running
+    if already_running:
+        if _is_expert_dispatch_reentry():
+            current_app.logger.warning(
+                f'[REENTRANCY] dropped expert-dispatch /chat re-entry for '
+                f'{user_prompt} — a real turn is already in flight')
+            return ''
+        current_app.logger.warning(
+            f'[REENTRANCY] concurrent non-speculative turn for {user_prompt} '
+            f'— proceeding, shared GroupChat may interleave')
+
     request_id_list[user_prompt] = request_id
     try:
         if file_id:
@@ -3870,6 +4037,10 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
     except Exception as e:
         current_app.logger.info(f'Some ERROR IN REUSE RECIPE {e}')
         raise
+    finally:
+        if owns_inflight:
+            with _inflight_turns_lock:
+                _inflight_turns.discard(user_prompt)
 
 
 def crossbar_multiagent(msg):
