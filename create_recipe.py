@@ -917,6 +917,32 @@ def has_pending_tool_calls(messages):
             last_msg['tool_calls'])
 
 
+def _seed_messages(user_id):
+    """Recent shared-history messages used to seed an autogen GroupChat.
+
+    ONE builder for every GroupChat.  create_agents' main group_chat and
+    create_time_agents' time_group_chat both start from the same shared
+    LangChain/autogen buffer; two copies of this try/except would let the
+    two chats drift into different memory of the same conversation.
+
+    Extracted 2026-08-07 fixing a live NameError: create_time_agents
+    passed `messages=_seed_msgs` with the comment "same as main
+    group_chat", but _seed_msgs is a LOCAL of create_agents — the caller
+    copied the use and not the definition, so every create_time_agents
+    call raised `NameError: name '_seed_msgs' is not defined` and time
+    agents could never be built.
+
+    Best-effort by design: a seeding failure returns [] rather than
+    blocking agent creation.
+    """
+    try:
+        from integrations.channels.memory.shared_history import (
+            seed_autogen_from_shared_history)
+        return seed_autogen_from_shared_history(user_id, max_messages=8)
+    except Exception:
+        return []
+
+
 def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
     """Create new assistant & user agents for a given user_id"""
     user_prompt = f'{user_id}_{prompt_id}'
@@ -2856,11 +2882,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
     # Try to use select_speaker_transform_messages if supported (added in AutoGen 0.2.36+)
     # Seed autogen with recent messages from shared LangChain/autogen buffer
-    try:
-        from integrations.channels.memory.shared_history import seed_autogen_from_shared_history
-        _seed_msgs = seed_autogen_from_shared_history(user_id, max_messages=8)
-    except Exception:
-        _seed_msgs = []
+    _seed_msgs = _seed_messages(user_id)
 
     group_chat_kwargs = {
         'agents': all_agents,
@@ -3556,7 +3578,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     )
     time_group_chat = autogen.GroupChat(
         agents=[time_agent, helper1, time_user,multi_role_agent1,executor1,chat_instructor1,verify1],
-        messages=_seed_msgs,  # shared history seed (same as main group_chat)
+        messages=_seed_messages(user_id),  # same seed builder as main group_chat
         max_round=10,
         select_speaker_transform_messages=select_speaker_transforms,
         speaker_selection_method=state_transition1,  # using an LLM to decide
