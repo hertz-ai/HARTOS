@@ -63,8 +63,34 @@ in
 
     contextSize = lib.mkOption {
       type = lib.types.int;
-      default = 4096;
-      description = "Context window size";
+      # 12288, NOT 4096 — this MUST equal core/constants.py::LLAMA_CTX_SIZE_DEFAULT.
+      # That constant is the wire-trim layer's budget ceiling (llm_outbound_logger.py
+      # left-trims to `(n_ctx / slots) - max_tokens - safety`), and its own comment
+      # already says it "must match the --ctx-size cmdline". At 4096 the two DISAGREED
+      # by 3x: the trim layer believed it had 12288, trimmed to a target the server
+      # could not accept, and llama-server rejected the request — so the
+      # "zero-tolerance context overflow" guard was computing against a ceiling that
+      # did not exist.
+      #
+      # Measured on 1,407 real requests (~/Documents/Nunba/logs/llm_outbound.jsonl,
+      # 2026-08-07): 78.7% overflow at 4096, 2.1% at 12288, 0% at 16384. The overflow
+      # is NOT runaway history (~95 tok) — it is a ~2,229-tok system prompt plus a
+      # ~2,029-tok task, i.e. a two-message request born over a 4096 limit with
+      # nothing to trim. Raising to 12288 is not a new number; it is ending a drift
+      # against the value the Python side already assumes.
+      #
+      # The residual 2.1% are the requests carrying the 67-tool schema block
+      # (~10,713 tok), which _trim_body_for_ctx does not count at all because it only
+      # walks body['messages'] — tracked separately; do NOT paper over it by pushing
+      # this to 16384, since n_ctx costs KV-cache RAM on the CPU-only potato floor.
+      default = 12288;
+      description = ''
+        Context window size (n_ctx) passed to llama-server as --ctx-size.
+        MUST equal core/constants.py::LLAMA_CTX_SIZE_DEFAULT — the wire-layer trim
+        budget is derived from that constant, so a mismatch silently reintroduces
+        context-overflow rejections. Guarded by
+        tests/unit/test_source_guard_llama_ctx_size_agrees.py.
+      '';
     };
 
     threads = lib.mkOption {
