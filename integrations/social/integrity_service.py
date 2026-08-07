@@ -843,6 +843,11 @@ class IntegrityService:
         Principle: audit_compute > target_compute — always.
         This is enforced by compute democracy (max 5% influence) but we
         verify it explicitly here to catch edge cases.
+
+        DETECTS, does not punish.  A shortfall means this audit is not
+        authoritative; it is not evidence against the audited node.  See the
+        comment at the shortfall branch for why scoring it was wrong and what
+        it did to a live two-node LAN.
         """
         target = db.query(PeerNode).filter_by(node_id=target_node_id).first()
         if not target:
@@ -864,19 +869,42 @@ class IntegrityService:
         dominant = auditor_compute > target_compute
 
         if not dominant and auditor_count > 0:
-            # If a single node has more compute than all its auditors combined,
-            # flag it — this violates compute democracy
+            # A shortfall here describes the AUDITOR POPULATION, not the node
+            # being audited.  This used to charge the target 10.0 fraud every
+            # round for a condition it neither caused nor can influence:
+            #
+            #   - _get_node_compute() returns contribution_score, so "compute"
+            #     is how much the node has CONTRIBUTED.  Fining it meant the
+            #     harder a node worked, the sooner it was banned — the exact
+            #     inverse of the incentive the contribution model rests on.
+            #   - the auditor query excludes banned peers, so every ban shrank
+            #     the pool and made the next one likelier.  A cascade.
+            #   - the condition is STANDING, so an unchanged network re-scored
+            #     it every ~5 minutes; 8 rounds reached the 80.0 ban threshold.
+            #
+            # Observed on live hardware 2026-08-07: a peer that had just
+            # verified was fined eleven times in one hour and banned, with no
+            # misbehaviour of any kind.
+            #
+            # The shortfall is still detected and still recorded — delta 0.0
+            # keeps the alert trail and the dashboards — it is simply no longer
+            # scored against the audited node.  What it actually means is "this
+            # audit lacks the collective weight to be authoritative", which is
+            # a fact about the auditors, not about the target.
             logger.warning(
-                f"Audit dominance violation: node {target_node_id[:8]} has "
-                f"{target_compute} compute vs {auditor_compute} auditor compute "
-                f"({auditor_count} auditors)")
+                f"Audit dominance shortfall: node {target_node_id[:8]} has "
+                f"{target_compute} compute vs {auditor_compute} auditor "
+                f"compute ({auditor_count} auditors) — this audit is not "
+                f"authoritative; target NOT penalised")
             IntegrityService.increase_fraud_score(
-                db, target_node_id, 10.0,
-                f'Audit dominance violation: target compute ({target_compute}) '
-                f'exceeds auditor compute ({auditor_compute})',
+                db, target_node_id, 0.0,
+                f'Audit dominance shortfall (informational, not scored): '
+                f'target compute ({target_compute}) exceeds auditor compute '
+                f'({auditor_compute})',
                 {'target_compute': target_compute,
                  'auditor_compute': auditor_compute,
-                 'auditor_count': auditor_count})
+                 'auditor_count': auditor_count,
+                 'scored': False})
 
         return {
             'dominant': dominant,
