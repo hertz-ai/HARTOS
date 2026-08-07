@@ -147,6 +147,21 @@ def test_legacy_speech_returns_text_and_language():
     "(音楽)",                                    # Whisper annotates in-language too
     "  [Music]  \n ",                           # surrounding whitespace
     "(swoosh).",                                # trailing punctuation only
+    # ── DECISION FLIPPED 2026-08-07: unclosed annotation fragments ──────
+    # "(swoosh" used to sit in the KEEP list below ("unmatched bracket →
+    # keep") — the conservative default.  Three live incidents priced that
+    # default: the streaming path truncates an annotation MID-TOKEN, the
+    # missing ")" defeats the balanced-span regex, and the fragment reaches
+    # chat as a user turn.  Shipped-build evidence: composer "(swoosh"
+    # (2026-08-04), composer "(sizzling) (sizzling) (s" (#615, 2026-08-04),
+    # and auto-SENT "(crick" answered by the assistant with a
+    # "Crickets/Cricket/cramp?" reply (2026-08-07, installed app).  An
+    # utterance that is ENTIRELY an unclosed annotation fragment is now
+    # annotation; real words before the fragment still win (kept, below).
+    "(crick",                                   # the 2026-08-07 auto-sent turn
+    "(swoosh",                                  # was in the keep-list; flipped
+    "(sizzling) (sizzling) (s",                 # #615 — balanced pair + tail
+    "[Mus",                                     # square-bracket variant
 ])
 def test_pure_annotation_is_dropped(annotation):
     assert wt._drop_non_speech_text(annotation) == ""
@@ -162,7 +177,9 @@ def test_pure_annotation_is_dropped(annotation):
     "Hello [Music] world",                      # mixed → keep, don't half-strip
     "こんにちは",                                 # CJK is \w — must not be dropped
     "नमस्ते",                                    # Devanagari likewise
-    "(swoosh",                                  # unmatched bracket → keep
+    "I paid fifty (fifty",                      # real words BEFORE an unclosed
+                                                # fragment → byte-identical, the
+                                                # all-or-nothing rule unchanged
 ])
 def test_real_speech_is_returned_untouched(speech):
     assert wt._drop_non_speech_text(speech) == speech

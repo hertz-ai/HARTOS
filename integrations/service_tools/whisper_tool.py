@@ -349,7 +349,22 @@ def _filter_speech_text(segments) -> str:
 # assistant answered a turn whose whole content was "(audience laughing)".
 # Auto-send fires 1s after a final transcript, so an annotation becomes a user
 # message with nobody in the room.
-_ANNOTATION_SPAN_RE = re.compile(r'\[[^\[\]]*\]|\([^()]*\)|♪[^♪]*♪|♪|\*[^*]*\*')
+#
+# The three end-anchored alternatives cover an annotation the STREAMING path
+# truncated MID-TOKEN, so its closer never arrives: live "(swoosh" (2026-08-04
+# composer), "(sizzling) (sizzling) (s" (#615 — the balanced pair matched but
+# the "(s" tail kept the whole string alive), and "(crick" (2026-08-07,
+# auto-SENT on the installed build; the assistant replied with a
+# "Crickets/Cricket/cramp?" menu to an empty room).  They are anchored at
+# end-of-string on purpose: an opener that is closed later in the text still
+# only matches the balanced alternatives, and real words before an unclosed
+# tail keep the whole utterance via the all-or-nothing rule in
+# _drop_non_speech_text — only an utterance that is ENTIRELY annotation
+# (balanced or truncated) is dropped.
+_ANNOTATION_SPAN_RE = re.compile(
+    r'\[[^\[\]]*\]|\([^()]*\)|♪[^♪]*♪|♪|\*[^*]*\*'
+    r'|\([^()]*$|\[[^\[\]]*$|\*[^*]*$'
+)
 
 
 # How many repeats of ONE annotation span mark a decoder loop rather than
