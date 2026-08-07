@@ -1,6 +1,19 @@
 # Fix Windows encoding for non-ASCII characters (Telugu, emojis, etc.)
 import sys
 import io
+
+# Diagnostic escape hatch: `kill -USR1 <pid>` dumps every thread's stack to
+# stderr (the server log).  Added while chasing a chat turn that hangs with
+# the local model idle -- py-spy needs root on macOS, this does not.  Costs
+# nothing until the signal is actually sent.
+try:
+    import faulthandler as _faulthandler
+    import signal as _signal
+    if hasattr(_signal, 'SIGUSR1'):
+        _faulthandler.register(_signal.SIGUSR1, all_threads=True, chain=True)
+except Exception:
+    pass
+
 if sys.platform == 'win32' and 'pytest' not in sys.modules:
     # Force UTF-8 encoding for stdout/stderr to prevent crashes with non-ASCII characters
     # Skip when running under pytest — pytest wraps stdout/stderr for capture,
@@ -947,10 +960,25 @@ if _is_bundled:
     # so ALL module loggers (hevolveai, langchain, etc.) are captured.
     app.logger.propagate = True
 else:
-    # Standalone: only Flask's logger gets the handlers
+    # Standalone: app.logger gets the handlers directly, AND (2026-08-06
+    # fix) so does root. Module-level loggers (logging.getLogger(__name__),
+    # used throughout integrations/channels/*.py and integrations/social/
+    # api_channels.py -- the actual channel-dispatch code, e.g. "Routing
+    # message from <channel>...") are children of ROOT, not of app.logger,
+    # so without this every one of those lines was silently dropped in
+    # standalone runs: confirmed live, zero lines from flask_integration/
+    # discord_adapter/api_channels across hours of real Discord testing,
+    # while reuse_recipe/helper (which use current_app.logger, routed
+    # below) logged constantly. Guarded by the same dedup tag the bundled
+    # branch above uses, so a module re-import never double-attaches.
     app.logger.addHandler(stream_handler)
     app.logger.addHandler(handler)
     app.logger.propagate = False
+    if not any(getattr(h, _HARTOS_HANDLER_TAG, False) for h in _root.handlers):
+        setattr(handler, _HARTOS_HANDLER_TAG, True)
+        setattr(stream_handler, _HARTOS_HANDLER_TAG, True)
+        _root.addHandler(handler)
+        _root.addHandler(stream_handler)
 
 # Security: Audit logging — redact API keys, JWTs, passwords from all logs
 try:
