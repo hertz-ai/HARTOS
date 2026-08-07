@@ -46,6 +46,17 @@ def get_autogen_config_list() -> list:
             "api_key": 'dummy',
             "base_url": _local_llm_url,
             "price": [0, 0],
+            # A local model that never emits a stop token will generate until
+            # it exhausts the context while the caller blocks forever: the
+            # openai client is given no timeout, so autogen's initiate_chat
+            # simply never returns and the whole chat turn hangs.  Observed
+            # live -- llama-server logged n_decoded=3448 and climbing on a
+            # one-word "hello" until the client gave up ("srv stop: cancel
+            # task").  Bound both ends so a runaway generation degrades to a
+            # truncated reply instead of an unbounded hang.  Cloud configs are
+            # left alone; the providers there enforce their own limits.
+            "max_tokens": int(os.environ.get('HEVOLVE_LOCAL_LLM_MAX_TOKENS', '1024')),
+            "timeout": int(os.environ.get('HEVOLVE_LOCAL_LLM_TIMEOUT', '180')),
         }]
 
     # Attach the shared httpx client so autogen/openai reuse ONE SSL context
