@@ -284,6 +284,27 @@ def test_follow_notification_handler_calls_record_follow():
     assert 'commit' in calls, 'follow record is never committed'
 
 
+# ─── integrity round runs the forgiveness sweep ──────────────────────────────
+
+def test_integrity_round_schedules_the_decay_sweep():
+    """apply_fraud_score_decay's docstring believed it ran 'every ~5 minutes
+    via AgentDaemon integrity tick'; no scheduled caller existed — only a
+    manual admin route.  Result, measured live 2026-08-07: 72 expired bans
+    wedged on this node (oldest March), 69 on the LAN peer, and federation
+    strangled both directions because banned peers' announces AND inbox
+    posts are rejected.  The gossip _integrity_round (the tick that DOES
+    exist, HEVOLVE_INTEGRITY_INTERVAL=300) must invoke the sweep."""
+    import ast
+    import inspect
+    import textwrap
+    from integrations.social.peer_discovery import GossipProtocol
+    src = textwrap.dedent(inspect.getsource(GossipProtocol._integrity_round))
+    calls = {n.func.attr for n in ast.walk(ast.parse(src))
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    assert 'apply_fraud_score_decay' in calls, \
+        'integrity round no longer runs the forgiveness sweep'
+
+
 # ─── link_manager rung-5 guard — relay URLs are not dial addresses ───────────
 
 def test_auto_upgrade_never_mangles_relay_url():

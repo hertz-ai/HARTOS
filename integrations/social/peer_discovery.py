@@ -1611,6 +1611,32 @@ class GossipProtocol:
         from .models import get_db, PeerNode
         db = get_db()
         try:
+            # 0. Forgiveness sweep — decay fraud scores and release EXPIRED
+            #    bans.  This round has always run the punitive half
+            #    (challenges, guardrail audits) every integrity_interval while
+            #    apply_fraud_score_decay — whose docstring believed it ran
+            #    "every ~5 minutes via AgentDaemon integrity tick" — had no
+            #    scheduled caller at all: its only route was a manually-hit
+            #    admin endpoint.  Measured live 2026-08-07: this node held 72
+            #    'banned' rows with ban_until dates back to MARCH, the LAN
+            #    peer held 69, and one on-demand audit released them all.
+            #    Bans that outlive their own expiry strangled every
+            #    federation path (banned peers' announces AND inbox posts are
+            #    rejected, so a ban can never heal itself).  Runs FIRST so a
+            #    just-released peer rejoins this same round's audit.
+            try:
+                from .integrity_service import IntegrityService as _IS
+                _decay = _IS.apply_fraud_score_decay(db)
+                if _decay.get('unbanned_count'):
+                    logger.info(
+                        f"Integrity round: released "
+                        f"{_decay['unbanned_count']} expired ban(s), "
+                        f"decayed {_decay.get('decayed_count', 0)} score(s)")
+                db.commit()
+            except Exception as _e:
+                db.rollback()
+                logger.debug(f"Integrity round decay sweep failed: {_e}")
+
             active_peers = db.query(PeerNode).filter(
                 PeerNode.status == 'active',
                 PeerNode.node_id != self.node_id,
