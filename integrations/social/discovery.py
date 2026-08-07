@@ -682,6 +682,7 @@ def federation_follow_notification():
     data = request.get_json(force=True, silent=True) or {}
     follower_node = data.get('follower_node_id', '')
     follower_url = data.get('follower_url', '')
+    recorded = False
     if follower_node and follower_url:
         # Ensure the follower is in our peer list
         gossip.handle_announce({
@@ -689,8 +690,30 @@ def federation_follow_notification():
             'url': follower_url,
             'name': f'follower-{follower_node[:8]}',
         })
-        logger.info(f"Federation: instance {follower_node[:8]} now follows us")
-    return jsonify({'success': True, 'node_id': gossip.node_id})
+        # RECORD the follow — for this handler's whole life it logged "now
+        # follows us" while writing nothing, so get_followers() stayed empty
+        # on every node and push_to_followers never had a single target
+        # (found live 2026-08-07: log line present, instance_follows row
+        # absent).  record_follow is the one canonical writer, record-only —
+        # follow_instance would fire a wrong-direction notification back at
+        # the follower.  peer_url = the FOLLOWER's url: push_to_followers
+        # delivers new posts there.
+        from .models import get_db
+        from .federation import federation
+        db = get_db()
+        try:
+            recorded = federation.record_follow(
+                db, follower_node, gossip.node_id, follower_url)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.debug(f"Federation: follow record failed: {e}")
+        finally:
+            db.close()
+        logger.info(f"Federation: instance {follower_node[:8]} now follows us"
+                    f" (recorded={recorded})")
+    return jsonify({'success': True, 'node_id': gossip.node_id,
+                    'recorded': recorded})
 
 
 @discovery_bp.route('/api/social/federation/following')

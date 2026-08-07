@@ -227,6 +227,63 @@ def test_nat_skips_observed_when_same_as_claimed():
     assert [c.args[0] for c in wan.call_args_list] == ['203.0.113.4']
 
 
+# ─── follow-notification actually records the follow ─────────────────────────
+
+def _mock_db(existing_row=None):
+    db = mock.MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = existing_row
+    return db
+
+
+def test_record_follow_creates_row_once():
+    """The passive follow leg: record WITHOUT notifying.  For this handler's
+    whole life 'now follows us' was logged while nothing was written, so
+    get_followers() was empty on every node and push_to_followers never had
+    a target."""
+    from integrations.social.federation import federation
+    db = _mock_db(existing_row=None)
+    assert federation.record_follow(db, 'them', 'us', 'http://peer:5000') \
+        is True
+    db.add.assert_called_once()
+    # Idempotent: an existing row means no second write.
+    db2 = _mock_db(existing_row=object())
+    assert federation.record_follow(db2, 'them', 'us', 'http://peer:5000') \
+        is False
+    db2.add.assert_not_called()
+
+
+def test_follow_instance_delegates_to_the_one_writer():
+    """follow_instance = record + notify; the record half must be the SAME
+    writer the notification handler uses (no parallel InstanceFollow
+    writers)."""
+    from integrations.social.federation import federation
+    with mock.patch.object(federation, 'record_follow',
+                           return_value=True) as rec, \
+         mock.patch('threading.Thread') as thread:
+        assert federation.follow_instance(
+            mock.MagicMock(), 'us', 'them', 'http://peer:5000') is True
+    rec.assert_called_once_with(mock.ANY, 'us', 'them', 'http://peer:5000')
+    thread.assert_called_once()  # active side still notifies
+
+
+def test_follow_notification_handler_calls_record_follow():
+    """AST drift guard: the handler must persist the follow, not just log
+    it — the exact defect this change fixes."""
+    import ast
+    import inspect
+    import integrations.social.discovery as discovery
+    src = inspect.getsource(discovery)
+    tree = ast.parse(src)
+    handler = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef)
+                   and n.name == 'federation_follow_notification')
+    calls = {n.func.attr for n in ast.walk(handler)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    assert 'record_follow' in calls, \
+        'follow-notification no longer persists the follow'
+    assert 'commit' in calls, 'follow record is never committed'
+
+
 # ─── link_manager rung-5 guard — relay URLs are not dial addresses ───────────
 
 def test_auto_upgrade_never_mangles_relay_url():
