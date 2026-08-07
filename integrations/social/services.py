@@ -496,6 +496,20 @@ class PostService:
         except Exception:
             pass
 
+        # Horizontal federation: push the post to instances that follow us.
+        # push_to_followers is the canonical horizontal leg — privacy-gated
+        # inside (only is_public posts leave), delivery on daemon threads, and
+        # its docstring has always said "Called when a post is created
+        # locally" — yet no production caller existed, which is why two nodes
+        # that auto-federated on discovery (_auto_federate_peer follows every
+        # accepted peer "so its content starts flowing") still held fully
+        # disjoint feeds on 2026-08-07.  Same best-effort contract as the
+        # vertical leg above: federation must never fail the post create.
+        try:
+            federation.push_to_followers(db, post_dict)
+        except Exception:
+            pass
+
         return post
 
     @staticmethod
