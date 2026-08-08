@@ -1,7 +1,16 @@
 # HART Co-Pilot: Claude Code resident inside HART OS
 
-**Status:** module built, flake-eval green (`03cd1cbb`), ISO build pending.
-**Date:** 2026-07-26/27.
+**Status:** shipped into an installed image. `hart.copilot.enable` **and**
+`hart.copilot.daemon.enable` are both `true` in `nixos/profiles/desktop.nix`, and the
+raw-desktop image built at `3ed0fc2b` (CI run `31213146492`) carries the module. That
+image was verified byte-perfect against its published `.raw.xz.sha256` and written to
+USB on 2026-08-08. §6.1's blocker is therefore CLOSED: the writable root persists the
+OAuth credential across reboots.
+**Date:** 2026-07-26/27; status refreshed 2026-08-08.
+
+**One manual step remains by design.** No API key ships in the image (§5), so on a
+freshly flashed node the daemon starts with no credential until a human runs `claude`
+once and completes `/login`. Unattended residency begins after that, not at first boot.
 **Steward's ask:** *"claude code shd be the co-pilot of HARTOS fixing and
 bootstrapping it"*, living in the node's own Linux/Nix terminal, *"achieving all
 the seeded goals as its own"*, *"via the guardrails HARTOS has"*.
@@ -158,9 +167,20 @@ does to a human one.
 | # | Item | Why |
 |---|---|---|
 | 1 | ~~**`hart hive connect` CLI**~~ **DONE** | Built. `hart_cli.py` gained a `hive` group (connect, status, tasks, scope, pause, resume, disconnect) that calls the routes `claude_hive_session.get_blueprint()` already served. What remains is not code: run it against a live dispatcher and confirm a task actually arrives, executes and reports. |
-| 2 | **Installed writable-root image** | Makes the credential (and any state) persist. Prerequisite for unattended operation. |
-| 3 | **Full `iso-desktop` build green** | Confirms the closure fits. |
-| 4 | *(optional)* systemd daemon mode | Only after 2 and 3, and only with the branch-only boundary preserved. |
+| 2 | ~~**Installed writable-root image**~~ **DONE** | raw-desktop built at `3ed0fc2b`, hash-verified, flashed 2026-08-08. The root is writable, so the OAuth credential and all state persist. |
+| 3 | **Full `iso-desktop` build green** | Still open, but no longer gates this: the raw/installed image is the delivery path now (`raw_image_installed_system_pivot_2026-07-16`), and updates arrive OTA rather than by re-flash. |
+| 4 | ~~*(optional)* systemd daemon mode~~ **DONE** | `hart-copilot-daemon.service` exists and `copilot.daemon.enable = true` is set in the profile. Bounded: 1 core / 2 G, `Restart=on-failure` + `RestartSec=60`, and activation goes through a ROOT path unit whose `ExecStart` hardcodes `test` — the daemon passes no arguments, so an agent that ignores every instruction in its prompt still cannot activate an arbitrary config. |
+| 5 | **First `/login` on the node** | The one remaining human step. Until it happens the daemon has no credential (§5 — no key in the image, by design). |
+| 6 | **Prove a task actually lands** | Carried over from item 1: `hart hive` was driven end to end against a stood-up blueprint, but a LIVE dispatcher sending this session a real task has still never been run. |
+
+### Why `enable` alone was not enough (2026-07-30 incident)
+
+The 30 July flash had `copilot.enable = true` and the resident co-pilot did nothing.
+`enable` installs only the `hart-copilot` launcher; the bounded Claude Code worker is a
+SECOND, separate opt-in (`copilot.daemon.enable`) and no consumer had set it. Both are
+now set in `nixos/profiles/desktop.nix`. Recorded here because the symptom — an
+enabled feature that is inert on the node — reads as a broken module rather than an
+unset second switch.
 
 ---
 
