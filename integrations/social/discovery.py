@@ -1362,6 +1362,29 @@ def _verify_sync_sender(db, data: dict) -> bool:
             # clean, or update _signed_send_payload in lockstep.
             peer = db.query(PeerNode).filter_by(node_id=node_id).first()
             pk = getattr(peer, 'public_key', None) if peer else None
+            if not peer:
+                # LEGACY SENDERS (delete once the fleet has rolled past the
+                # 2026-08-08 identity unification): before that fix, sync
+                # stamped node_id = get_public_key_hex()[:16] — a public-key
+                # PREFIX — while PeerNode keys on the gossip UUID.  The lookup
+                # above therefore missed for every node, and hard enforcement
+                # turned that into a fleet-wide 403 (measured: 65 dead rows
+                # here, central holding our correct key on the UUID row the
+                # whole time).  An un-upgraded peer still declares the prefix,
+                # so resolve it by the only thing it can mean: the peer whose
+                # registered public_key STARTS WITH that prefix.  This proves
+                # exactly as much as the modern path — the signature is still
+                # verified against a key we already had on file — it just
+                # finds the row a second way.
+                if len(node_id) == 16 and all(
+                        c in '0123456789abcdef' for c in node_id.lower()):
+                    peer = db.query(PeerNode).filter(
+                        PeerNode.public_key.startswith(node_id)).first()
+                    pk = getattr(peer, 'public_key', None) if peer else None
+                    if pk:
+                        logger.info(
+                            "hierarchy_sync: resolved legacy key-prefix "
+                            "sender %s -> node %s", node_id, peer.node_id)
             if pk and verify_json_signature(pk, data, sig):
                 return True
         except Exception:

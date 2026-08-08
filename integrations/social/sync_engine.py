@@ -53,15 +53,49 @@ class SyncEngine:
     MAX_QUEUE_SIZE = 10000
 
     @staticmethod
+    def canonical_node_id() -> str:
+        """This node's identity for sync — the SAME id the rest of the system
+        uses (gossip, PeerNode, follows, bans): ``gossip.node_id``.
+
+        WHY THIS EXISTS (proven live 2026-08-08, fleet-wide 403):
+        sync used to stamp ``get_public_key_hex()[:16]`` — a public-key prefix
+        — while every other subsystem keys on the gossip UUID.  Central's
+        ``_verify_sync_sender`` looks the sender up with
+        ``PeerNode.filter_by(node_id=<what the batch declares>)``, so it
+        searched for '25cedaa441302f25' while its row for us was
+        '46329c87-cbb6-...'.  No row -> no public_key -> hard enforcement ->
+        403 on EVERY signed batch from EVERY node.  Central was holding the
+        correct key the whole time and simply could not find it.
+
+        The same mismatch broke the LOCAL drain: the prefix changes whenever
+        the keypair does (data-dir reset), so queued rows were stamped with
+        ids the drain filter no longer matched — 40 rows orphaned here across
+        three dead prefixes.  A UUID that survives restarts (that is
+        _load_or_create_node_id's entire stated purpose) has neither problem.
+
+        Falls back to the legacy prefix only if gossip is genuinely
+        unavailable (degraded cx_Freeze early boot); the receiver's legacy
+        branch still resolves that shape.
+        """
+        try:
+            from .peer_discovery import gossip
+            nid = getattr(gossip, 'node_id', '') or ''
+            if nid:
+                return nid
+        except Exception:
+            pass
+        try:
+            from security.node_integrity import get_public_key_hex
+            return get_public_key_hex()[:16]
+        except Exception:
+            return 'unknown'
+
+    @staticmethod
     def queue(db, target_tier: str, operation_type: str, payload: dict) -> Optional[str]:
         """Queue a sync operation for later delivery."""
         from .models import SyncQueue
-        from security.node_integrity import get_public_key_hex
 
-        try:
-            node_id = get_public_key_hex()[:16]
-        except Exception:
-            node_id = 'unknown'
+        node_id = SyncEngine.canonical_node_id()
 
         # Backpressure: reject if queue is too large for this node
         current_count = db.query(SyncQueue).filter(
@@ -676,11 +710,29 @@ class SyncEngine:
             return
 
         db = get_db()
+        node_id = SyncEngine.canonical_node_id()
+
+        # Adopt rows stamped with a PREVIOUS identity so they can finally
+        # drain.  sync_queue is this node's OUTBOUND queue — every row in it
+        # is ours by construction — but the drain filters on node_id, so any
+        # row written under an older id (legacy key-prefix, or a rotated key)
+        # was unreachable forever.  Measured here: 40 rows across three dead
+        # prefixes, none matching the current identity.  One idempotent
+        # re-stamp fixes the backlog and is a no-op once converged.
         try:
-            from security.node_integrity import get_public_key_hex
-            node_id = get_public_key_hex()[:16]
-        except Exception:
-            node_id = 'unknown'
+            from .models import SyncQueue
+            adopted = db.query(SyncQueue).filter(
+                SyncQueue.node_id != node_id,
+                SyncQueue.status.in_(['queued', 'failed']),
+            ).update({'node_id': node_id}, synchronize_session=False)
+            if adopted:
+                logger.info(
+                    "Sync: adopted %d queued row(s) from a previous node "
+                    "identity into %s", adopted, node_id)
+                db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.debug(f"Sync queue re-stamp skipped: {e}")
 
         try:
             result = self.drain_queue(db, node_id, target_url, self._batch_size)

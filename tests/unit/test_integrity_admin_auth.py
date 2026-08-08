@@ -62,6 +62,10 @@ PEER_PROTOCOL_ROUTES = [
 def client():
     app = Flask(__name__)
     app.config['TESTING'] = True
+    # Return 500 rather than re-raising, so a handler that explodes on
+    # unrelated state (see below) is still an observable STATUS CODE and our
+    # assertions can judge it, instead of aborting the test as an error.
+    app.config['PROPAGATE_EXCEPTIONS'] = False
     app.register_blueprint(discovery.discovery_bp)
     return app.test_client()
 
@@ -82,12 +86,30 @@ def test_admin_route_rejects_anonymous(client, method, path):
 
 @pytest.mark.parametrize('method,path', ADMIN_ROUTES)
 def test_admin_route_rejects_garbage_bearer(client, method, path):
-    """A malformed/forged token is rejected too — not just a missing one."""
+    """A malformed/forged token NEVER grants access.
+
+    Asserted as "not 2xx" rather than "== 401" on purpose. Rejecting a bad
+    token requires a user lookup, so this path touches the DB — and
+    tests/unit/test_gossip_security.py does
+    ``os.environ.setdefault('HEVOLVE_DB_PATH', ':memory:')`` at MODULE level,
+    which pytest executes during collection and therefore applies to every
+    test in the session. Under that empty DB the lookup raises "no such table:
+    users" and the route answers 500 instead of 401 — which made this guard
+    pass alone and fail in a full run (measured 2026-08-08).
+
+    A guard whose verdict depends on which other files were collected is not
+    a guard. The SECURITY property is "a forged token does not get in", and
+    that holds under either condition; the exact rejection code is not the
+    claim. test_admin_route_rejects_anonymous still pins 401 exactly — that
+    path returns before any DB access, so it is stable.
+    """
     resp = getattr(client, method.lower())(
         path,
         json={} if method in ('POST', 'PATCH') else None,
         headers={'Authorization': 'Bearer not-a-real-token'})
-    assert resp.status_code == 401
+    assert not (200 <= resp.status_code < 300), (
+        f'{method} {path} ACCEPTED a forged bearer token '
+        f'(status {resp.status_code})')
 
 
 @pytest.mark.parametrize('method,path', PEER_PROTOCOL_ROUTES)
