@@ -4,6 +4,10 @@ The HART SDK provides a Python API for building apps that run on HART OS.
 Apps declare their needs declaratively; the OS provides AI, events, config,
 and environment management.
 
+> Debugging a slow start or a hang? Runtime tracing is **opt-in** — see
+> [Runtime Diagnostics](diagnostics.md) for the flags, where their output
+> lands, and the rule that instrumentation must never ship enabled.
+
 ## Install
 
 ```bash
