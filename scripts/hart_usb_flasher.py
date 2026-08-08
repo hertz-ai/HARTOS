@@ -385,6 +385,33 @@ def list_parts(gh, tag, variant, image="iso"):
     return parts
 
 
+def list_local_parts(src_dir, variant, image="raw"):
+    """Enumerate a part set ALREADY ON DISK, so a RUN ARTIFACT can be flashed.
+
+    A build artifact (`gh run download <run-id> -n raw-desktop`) carries exactly
+    the same .raw.xz.part-NN files a release does, but a run artifact has no
+    release assets to enumerate -- and the nightly pruner regularly leaves the
+    newest raw image reachable ONLY as a run artifact. Without this, a
+    downloaded artifact could not be flashed by this script at all, and the
+    hand-rolled `dd` this script exists to replace becomes the only option.
+
+    Returns the same [{name, id, size, state}] shape list_parts returns -- id is
+    None (there is no asset to fetch) and state is "uploaded" (the bytes are
+    already here) -- so every downstream consumer is untouched. Sorted by name,
+    identically to list_parts, so part order is the same on both sources."""
+    part_token = {"iso": ".iso.part-", "raw": ".raw.xz.part-"}[image]
+    try:
+        names = os.listdir(src_dir)
+    except OSError as e:
+        raise RuntimeError("cannot read --from-dir %s: %s" % (src_dir, e))
+    parts = [{"name": n, "id": None,
+              "size": os.path.getsize(os.path.join(src_dir, n)),
+              "state": "uploaded"}
+             for n in names if variant in n and part_token in n]
+    parts.sort(key=lambda a: a["name"])
+    return parts
+
+
 def latest_nightly_tag(gh):
     """Newest PUBLISHED nightly tag, or None. GitHub's /releases lists DRAFT
     releases FIRST, so a half-uploaded draft (whose ISO parts may not be
@@ -1651,6 +1678,20 @@ def fetch_release_asset_text(gh, tag, name, tmp, log):
     return None
 
 
+def read_local_companion(src_dir, name, log):
+    """The --from-dir twin of fetch_release_asset_text: read the .raw.sha256
+    companion sitting next to a locally-downloaded part set. Same contract --
+    return its text, or None so verification degrades loudly upstream rather
+    than crashing the flash."""
+    p = os.path.join(src_dir, name)
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError as e:
+        log("  %s: not readable in %s (%s)" % (name, src_dir, e))
+    return None
+
+
 def verify_raw_sigs(disk, dd, log):
     """The raw image's on-disk boot contract: the protective-MBR 0x55AA boot
     signature at 0x1FE plus the GPT header magic 'EFI PART' at LBA 1 (byte 512).
@@ -1665,7 +1706,8 @@ def verify_raw_sigs(disk, dd, log):
     return ok_boot and ok_gpt
 
 
-def flash_raw(tag, variant, disk, tmp, progress=None, log=None, verify=True):
+def flash_raw(tag, variant, disk, tmp, progress=None, log=None, verify=True,
+              src_dir=None):
     """Flash the INSTALLED raw image: download the .raw.xz.part-NN set, stream
     the single xz through decompression straight onto the device from byte 0,
     then verify the decompressed stream sha256 against the published
@@ -1673,29 +1715,38 @@ def flash_raw(tag, variant, disk, tmp, progress=None, log=None, verify=True):
 
     No per-part offsets exist here (offsets live in compressed space), so
     there is no --start-part resume and no per-part verify -- the stream hash
-    covers every byte end to end."""
+    covers every byte end to end.
+
+    src_dir: flash a part set already on disk (a `gh run download` of the build
+    artifact) instead of a release. The write, hashing and verification below
+    are IDENTICAL either way -- only where the parts come from differs."""
     log = log or (lambda m: None)
     progress = progress or (lambda f: None)
     gh = find_gh()
-    if not gh:
+    if not gh and not src_dir:
         raise RuntimeError("GitHub CLI `gh` not found")
     dd = find_dd()
-    parts = list_parts(gh, tag, variant, image="raw")
+    if src_dir:
+        parts = list_local_parts(src_dir, variant, image="raw")
+        tmp = src_dir
+    else:
+        parts = list_parts(gh, tag, variant, image="raw")
     if not parts:
         raise RuntimeError("no %s raw image parts in %s (the raw artifact ships "
                            "from 2026-07-16 nightlies onward; older tags are ISO-only)"
-                           % (variant, tag))
+                           % (variant, src_dir or tag))
     bad = [p["name"] for p in parts if p.get("state") and p["state"] != "uploaded"]
     if bad:
         raise RuntimeError("assets still uploading: %s" % ", ".join(bad))
     total_comp = sum(p["size"] for p in parts)
     base = parts[0]["name"].rsplit(".xz.part-", 1)[0]      # hart-os-...-linux.raw
     log("Flashing RAW image %s (%s) -> %s [%s], %d xz parts, %s compressed"
-        % (tag, variant, disk["dev"] if dd else disk["physdrive"],
+        % (src_dir or tag, variant, disk["dev"] if dd else disk["physdrive"],
            disk["model"], len(parts), human(total_comp)))
 
     expected = None
-    txt = fetch_release_asset_text(gh, tag, base + ".sha256", tmp, log)
+    txt = (read_local_companion(src_dir, base + ".sha256", log) if src_dir else
+           fetch_release_asset_text(gh, tag, base + ".sha256", tmp, log))
     if txt and txt.split():
         expected = txt.split()[0].lower()
         log("  companion %s.sha256: %s" % (base, expected))
@@ -1704,7 +1755,10 @@ def flash_raw(tag, variant, disk, tmp, progress=None, log=None, verify=True):
             "against the streamed hash only (device==stream, stream==source unproven)"
             % base)
 
-    srcs = [download_part(gh, tag, p["name"], tmp, p["size"], log) for p in parts]
+    if src_dir:
+        srcs = [os.path.join(src_dir, p["name"]) for p in parts]
+    else:
+        srcs = [download_part(gh, tag, p["name"], tmp, p["size"], log) for p in parts]
 
     writer = None
     if IS_WIN:
@@ -1748,11 +1802,18 @@ def flash_raw(tag, variant, disk, tmp, progress=None, log=None, verify=True):
         back = sha256_device_region(dev, 0, reader.count, dd)
         if back == stream_sha:
             log("  FULL VERIFY: OK - every byte on the device matches the stream (sha256)")
-            for s in srcs:                      # only drop the cache once proven
-                try:
-                    os.remove(s)
-                except OSError as e:
-                    log("  (part cleanup skipped: %s)" % e)
+            if src_dir:
+                # --from-dir parts were placed there by the operator, not
+                # downloaded by this script. Deleting someone else's input
+                # directory is not ours to do -- only our own cache is.
+                log("  keeping the --from-dir part set in %s (not this script's "
+                    "download cache)" % src_dir)
+            else:
+                for s in srcs:                  # only drop the cache once proven
+                    try:
+                        os.remove(s)
+                    except OSError as e:
+                        log("  (part cleanup skipped: %s)" % e)
         else:
             log("  FULL VERIFY: MISMATCH - device %s vs stream %s; re-flash" % (back, stream_sha))
             ok = False
@@ -2022,10 +2083,21 @@ def cmd_flash(args):
         sys.stderr.write("Refusing to write without --yes (this ERASES the disk).\n")
         return 2
     gh = find_gh()
-    tag = args.tag or latest_nightly_tag(gh)
-    if not tag:
-        sys.stderr.write("No --tag and no nightly release found.\n")
+    if args.from_dir and args.image != "raw":
+        sys.stderr.write("--from-dir applies to --image raw only: the ISO path "
+                         "computes per-part DEVICE offsets from release sizes, "
+                         "which a locally-assembled part set has not been proven "
+                         "to reproduce. Pass --image raw.\n")
         return 2
+    if args.from_dir:
+        # A run artifact has no release to resolve; the dir IS the source. `tag`
+        # stays only as the label the log line prints.
+        tag = args.from_dir
+    else:
+        tag = args.tag or latest_nightly_tag(gh)
+        if not tag:
+            sys.stderr.write("No --tag and no nightly release found.\n")
+            return 2
     disk = pick_disk(args)
     warn = disk_warning(disk)
     if warn:
@@ -2058,7 +2130,7 @@ def cmd_flash(args):
     try:
         if args.image == "raw":
             ok = flash_raw(tag, args.variant, disk, args.tmp, log=log,
-                           verify=args.verify)
+                           verify=args.verify, src_dir=args.from_dir)
         else:
             ok = flash(tag, args.variant, disk, args.mode, args.tmp, log=log,
                        make_log_partition=args.windows_log_partition,
@@ -2090,6 +2162,12 @@ def build_parser():
                    help="stream (default, ~40%% faster: overlaps download+write) "
                         "or download (download each part fully, then write)")
     p.add_argument("--tmp", default=default_tmp(), help="scratch dir (download mode)")
+    p.add_argument("--from-dir", metavar="DIR",
+                   help="flash the .raw.xz.part-NN set ALREADY in DIR (e.g. from "
+                        "`gh run download <run-id> -n raw-desktop`) instead of a "
+                        "release. Needs --image raw; no --tag and no network. Use "
+                        "when the nightly pruner has left the newest raw image "
+                        "reachable only as a run artifact.")
     p.add_argument("--jobs", type=int, default=1, metavar="N",
                    help="download mode only: prefetch up to N parts CONCURRENTLY "
                         "(default 1 = serial). Only the downloads overlap; writes to "

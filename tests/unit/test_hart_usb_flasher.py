@@ -413,24 +413,16 @@ def test_xz_parts_reader_rejects_trailing_garbage(tmp_path):
             pass
 
 
-def _wire_fake_raw_release(monkeypatch, tmp_path, data, sha_line):
-    """Wire flash_raw's collaborators to a fake release + fake device: real
-    reader, real verify_raw_sigs logic, device = an in-memory buffer."""
+def _wire_fake_device(monkeypatch):
+    """Device side ONLY: the write lands in an in-memory buffer, and read_at /
+    sha256_device_region answer from that same buffer -- so the REAL
+    verify_raw_sigs and the REAL full read-back comparison both run for
+    whatever actually got written. Shared by the release-sourced and the
+    --from-dir tests so there is exactly one fake device."""
     import hashlib as _h
-    base = "hart-os-1.0.0-desktop-x86_64-linux.raw"
-    paths = _mk_xz_parts(tmp_path, data, base=base)
-    parts = [{"name": os.path.basename(p), "id": i + 1,
-              "size": os.path.getsize(p), "state": "uploaded"}
-             for i, p in enumerate(paths)]
     dev = {}
-    monkeypatch.setattr(flasher, "find_gh", lambda: "gh")
     monkeypatch.setattr(flasher, "find_dd", lambda: None)
     monkeypatch.setattr(flasher, "IS_WIN", False)
-    monkeypatch.setattr(flasher, "list_parts", lambda gh, tag, variant, image="iso": parts)
-    monkeypatch.setattr(flasher, "download_part",
-                        lambda gh, tag, name, tmp, size, log: str(tmp_path / name))
-    monkeypatch.setattr(flasher, "fetch_release_asset_text",
-                        lambda gh, tag, name, tmp, log: sha_line)
     monkeypatch.setattr(flasher, "_run", lambda cmd, **kw: _CP(""))
 
     def fake_py_write(devpath, off, fobj, log):
@@ -448,6 +440,29 @@ def _wire_fake_raw_release(monkeypatch, tmp_path, data, sha_line):
     monkeypatch.setattr(flasher, "sha256_device_region",
                         lambda d, off, size, dd, chunk=0:
                         _h.sha256(dev.get("bytes", b"")[off:off + size]).hexdigest())
+    return dev
+
+
+def _fake_disk(size):
+    return {"number": 9, "model": "FakeStick", "dev": None,
+            "physdrive": "/dev/fake9", "size": size}
+
+
+def _wire_fake_raw_release(monkeypatch, tmp_path, data, sha_line):
+    """Wire flash_raw's collaborators to a fake release + fake device: real
+    reader, real verify_raw_sigs logic, device = an in-memory buffer."""
+    base = "hart-os-1.0.0-desktop-x86_64-linux.raw"
+    paths = _mk_xz_parts(tmp_path, data, base=base)
+    parts = [{"name": os.path.basename(p), "id": i + 1,
+              "size": os.path.getsize(p), "state": "uploaded"}
+             for i, p in enumerate(paths)]
+    dev = _wire_fake_device(monkeypatch)
+    monkeypatch.setattr(flasher, "find_gh", lambda: "gh")
+    monkeypatch.setattr(flasher, "list_parts", lambda gh, tag, variant, image="iso": parts)
+    monkeypatch.setattr(flasher, "download_part",
+                        lambda gh, tag, name, tmp, size, log: str(tmp_path / name))
+    monkeypatch.setattr(flasher, "fetch_release_asset_text",
+                        lambda gh, tag, name, tmp, log: sha_line)
     return dev
 
 
@@ -479,6 +494,120 @@ def test_flash_raw_rejects_companion_sha_mismatch(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="does not match the published"):
         flasher.flash_raw("nightly-x", "desktop", disk, str(tmp_path),
                           log=lambda m: None)
+
+
+# ─────────── --from-dir: flash a RUN ARTIFACT, with no release ───────────
+# The nightly pruner regularly deletes the last release carrying raw parts, and
+# the CI run artifact (`gh run download <run-id> -n raw-desktop`) becomes the
+# only place the newest installed image exists. Before --from-dir, flash_raw
+# enumerated parts EXCLUSIVELY from a release and raised "no desktop raw image
+# parts in <tag>" before ever looking at --tmp -- so a fully downloaded 7 GB
+# artifact could not be flashed by this script at all, and hand-rolled dd (no
+# ESP-claim retry, no read-back verify) was the only remaining option.
+
+
+def test_list_local_parts_enumerates_a_downloaded_artifact(tmp_path):
+    """The parts must come back IN WRITE ORDER with their real sizes: the xz
+    stream is reassembled by concatenation, so a mis-ordered list decompresses
+    to garbage."""
+    data = _mk_raw_image(128 * 1024)
+    paths = _mk_xz_parts(tmp_path, data, n_parts=4)
+    parts = flasher.list_local_parts(str(tmp_path), "desktop", image="raw")
+    assert [p["name"] for p in parts] == sorted(os.path.basename(p) for p in paths)
+    assert [p["size"] for p in parts] == [os.path.getsize(p) for p in paths], \
+        "sizes must be the real on-disk sizes; a wrong size silently truncates"
+    assert all(p["state"] == "uploaded" for p in parts), \
+        "local bytes are already here, so the still-uploading guard must pass"
+
+
+def test_list_local_parts_never_mixes_iso_parts_or_other_variants(tmp_path):
+    """Same exact-suffix contract list_parts documents: a dir holding both image
+    kinds must not interleave them, or two images get written onto one device."""
+    (tmp_path / "hart-os-1.0.0-desktop-x86_64-linux.raw.xz.part-00").write_bytes(b"a")
+    (tmp_path / "hart-os-1.0.0-desktop-x86_64-linux.iso.part-00").write_bytes(b"b")
+    (tmp_path / "hart-os-1.0.0-server-x86_64-linux.raw.xz.part-00").write_bytes(b"c")
+    (tmp_path / "hart-os-1.0.0-desktop-x86_64-linux.raw.sha256").write_bytes(b"d")
+    names = [p["name"] for p in
+             flasher.list_local_parts(str(tmp_path), "desktop", image="raw")]
+    assert names == ["hart-os-1.0.0-desktop-x86_64-linux.raw.xz.part-00"]
+
+
+def test_flash_raw_from_dir_writes_the_image_with_NO_release_and_NO_gh(
+        monkeypatch, tmp_path):
+    """The point of --from-dir: no release is consulted and gh need not exist.
+
+    Every release-side collaborator is wired to EXPLODE, so if flash_raw touches
+    the release path at all this test fails rather than quietly passing on a
+    fallback. find_gh returns None because a local flash must work on a box with
+    no GitHub CLI installed."""
+    import hashlib as _h
+    data = _mk_raw_image(256 * 1024)
+    base = "hart-os-1.0.0-desktop-x86_64-linux.raw"
+    _mk_xz_parts(tmp_path, data, base=base)
+    (tmp_path / (base + ".sha256")).write_text(
+        "%s  %s\n" % (_h.sha256(data).hexdigest(), base))
+
+    dev = _wire_fake_device(monkeypatch)
+    monkeypatch.setattr(flasher, "find_gh", lambda: None)
+
+    def _boom(*a, **kw):
+        raise AssertionError("--from-dir consulted the RELEASE path")
+    monkeypatch.setattr(flasher, "list_parts", _boom)
+    monkeypatch.setattr(flasher, "download_part", _boom)
+    monkeypatch.setattr(flasher, "fetch_release_asset_text", _boom)
+
+    ok = flasher.flash_raw(None, "desktop", _fake_disk(len(data) * 4),
+                           str(tmp_path), log=lambda m: None,
+                           src_dir=str(tmp_path))
+    assert ok is True
+    assert dev["bytes"] == data, \
+        "the device must hold the exact decompressed image from byte 0"
+
+
+def test_flash_raw_from_dir_still_enforces_the_companion_sha256(
+        monkeypatch, tmp_path):
+    """A corrupt artifact must fail just as loudly as a corrupt download -- the
+    local source must not become the weak link that skips verification."""
+    data = _mk_raw_image(128 * 1024)
+    base = "hart-os-1.0.0-desktop-x86_64-linux.raw"
+    _mk_xz_parts(tmp_path, data, base=base)
+    (tmp_path / (base + ".sha256")).write_text("%s  %s\n" % ("0" * 64, base))
+    _wire_fake_device(monkeypatch)
+    monkeypatch.setattr(flasher, "find_gh", lambda: None)
+    with pytest.raises(RuntimeError, match="does not match the published"):
+        flasher.flash_raw(None, "desktop", _fake_disk(len(data) * 4),
+                          str(tmp_path), log=lambda m: None,
+                          src_dir=str(tmp_path))
+
+
+def test_flash_raw_from_dir_does_not_delete_the_operators_parts(
+        monkeypatch, tmp_path):
+    """The release path deletes its own download cache once the flash verifies.
+    A --from-dir set was placed there by the operator (a 7 GB download that may
+    be flashed to several sticks) -- deleting it is not this script's call."""
+    import hashlib as _h
+    data = _mk_raw_image(128 * 1024)
+    base = "hart-os-1.0.0-desktop-x86_64-linux.raw"
+    paths = _mk_xz_parts(tmp_path, data, base=base)
+    (tmp_path / (base + ".sha256")).write_text(
+        "%s  %s\n" % (_h.sha256(data).hexdigest(), base))
+    _wire_fake_device(monkeypatch)
+    monkeypatch.setattr(flasher, "find_gh", lambda: None)
+    assert flasher.flash_raw(None, "desktop", _fake_disk(len(data) * 4),
+                             str(tmp_path), log=lambda m: None,
+                             src_dir=str(tmp_path)) is True
+    assert all(os.path.exists(p) for p in paths), \
+        "the operator-supplied part set was deleted after a successful flash"
+
+
+def test_from_dir_is_refused_for_the_iso_image(capsys):
+    """--image iso computes per-part DEVICE offsets from release sizes; half-
+    honoring --from-dir there would write at unproven offsets. Refuse loudly,
+    the same way the other ISO-only/raw-only flags are refused."""
+    args = flasher.build_parser().parse_args(
+        ["--from-dir", "/some/dir", "--image", "iso", "--device", "9", "--yes"])
+    assert flasher.cmd_flash(args) == 2
+    assert "--from-dir" in capsys.readouterr().err
 
 
 # ─────────── HARTLOG diagnostic-log partition (Part B) ───────────
