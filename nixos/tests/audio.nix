@@ -75,8 +75,26 @@ in
       # 100 and its description cites "steward: default sink at 100%", while
       # the desktop profile ships 60. One of those is stale; changing what a
       # real desktop boots at is a product call, not a test fix.
+      # mkForce, not a plain assignment. Naming the value alone was NOT enough:
+      # profiles/desktop.nix:631 also sets it (60), and two plain definitions
+      # carry the SAME priority (100), so neither wins and the module system
+      # aborts EVAL:
+      #
+      #   error: The option `nodes.audionode.hart.audio.bootUnmute.bootVolumePercent'
+      #          has conflicting definition values:  100 (this file) / 60 (desktop profile)
+      #
+      # That is worse than the assertion failure it replaced — an eval abort
+      # takes down the WHOLE nixosTests shard, so all 12 VM tests sharing it
+      # (hart-desktop-shell-boot, hart-peer-discovery, hart-floor-lock, the
+      # session-supervisor watchdogs …) stop booting and the gate reports red
+      # for a reason unrelated to any of them. Seen on run 31193885461.
+      #
+      # A test overriding a profile is legitimate; it just has to say so in the
+      # priority. Same defect class as the fs.inotify.max_user_watches collision
+      # in desktop-boot.nix — if a THIRD one appears, make profiles/*.nix use
+      # lib.mkDefault so tests can override without an arms race.
       hart.audio.bootUnmute.enable = true;
-      hart.audio.bootUnmute.bootVolumePercent = 100;
+      hart.audio.bootUnmute.bootVolumePercent = pkgs.lib.mkForce 100;
 
       # A non-login user whose systemd instance + PipeWire we start via linger, so
       # we get a real per-user PipeWire socket without a graphical session.
