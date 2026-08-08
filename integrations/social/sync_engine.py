@@ -82,12 +82,30 @@ class SyncEngine:
             nid = getattr(gossip, 'node_id', '') or ''
             if nid:
                 return nid
+            logger.warning(
+                "canonical_node_id: gossip is importable but carries no "
+                "node_id — falling back to the legacy key prefix")
         except Exception:
-            pass
+            logger.warning(
+                "canonical_node_id: gossip unavailable — falling back to the "
+                "legacy key prefix", exc_info=True)
         try:
             from security.node_integrity import get_public_key_hex
-            return get_public_key_hex()[:16]
+            nid = get_public_key_hex()[:16]
+            # Loud on purpose: a receiver only resolves this shape via the
+            # legacy branch in _verify_sync_sender, and a node that changes
+            # keypairs silently orphans its own queued rows under the old
+            # prefix.  Both cost real outages on 2026-08-08.
+            logger.warning(
+                "canonical_node_id: using LEGACY key-prefix identity %s "
+                "(gossip UUID unavailable) — batches are resolvable only by "
+                "receivers carrying the legacy branch", nid)
+            return nid
         except Exception:
+            logger.error(
+                "canonical_node_id: NO identity available — batches will "
+                "declare 'unknown' and every receiver in hard enforcement "
+                "will reject them with 403", exc_info=True)
             return 'unknown'
 
     @staticmethod
@@ -161,7 +179,10 @@ class SyncEngine:
             on_notification(str(owner_id), {'type': 'sync_status',
                                             'entity': op, 'sync_status': status})
         except Exception:
-            pass
+            logger.warning(
+                "sync: could not emit sync_status=%s for entity=%s to owner "
+                "%s — the client's sync indicator will be stale",
+                status, op, owner_id, exc_info=True)
 
     @staticmethod
     def _signed_send_payload(node_id, batch) -> dict:
@@ -174,7 +195,14 @@ class SyncEngine:
             from security.node_integrity import sign_json_payload
             payload['signature'] = sign_json_payload(payload)
         except Exception:
-            pass
+            # An unsigned batch is a GUARANTEED 403 against any receiver in
+            # 'hard' enforcement.  Silently returning one here is what made
+            # the 2026-08-08 outage look like a receiver-side trust bug.
+            logger.error(
+                "sync: FAILED TO SIGN batch of %d item(s) for node_id=%s — "
+                "sending UNSIGNED; a receiver in 'hard' enforcement will "
+                "reject this with 403 'unverified node identity'",
+                len(batch), node_id, exc_info=True)
         return payload
 
     @staticmethod
@@ -234,9 +262,15 @@ class SyncEngine:
                     send_payload = {'encrypted': True,
                                     'envelope': encrypt_json_for_peer(send_payload, target_x25519)}
                 except Exception:
-                    pass  # Encryption unavailable, send plaintext
+                    # Silently downgrading confidentiality is never acceptable
+                    # — the operator must be able to see it in the log.
+                    logger.warning(
+                        "sync: E2E encryption to %s FAILED — falling back to "
+                        "PLAINTEXT for this batch", target_url, exc_info=True)
         except Exception:
-            pass
+            logger.warning(
+                "sync: could not resolve an X25519 key for %s — sending "
+                "plaintext", target_url, exc_info=True)
         try:
             resp = pooled_post(
                 f"{target_url}/api/social/hierarchy/sync",
@@ -297,7 +331,9 @@ class SyncEngine:
             if peer and getattr(peer, 'x25519_public', None):
                 return peer.x25519_public
         except Exception:
-            pass
+            logger.warning(
+                "sync: X25519 lookup failed for target %s — caller will send "
+                "plaintext", target_url, exc_info=True)
         return ''
 
     @staticmethod

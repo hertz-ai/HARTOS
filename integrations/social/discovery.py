@@ -1385,10 +1385,29 @@ def _verify_sync_sender(db, data: dict) -> bool:
                         logger.info(
                             "hierarchy_sync: resolved legacy key-prefix "
                             "sender %s -> node %s", node_id, peer.node_id)
-            if pk and verify_json_signature(pk, data, sig):
-                return True
+            if pk:
+                if verify_json_signature(pk, data, sig):
+                    return True
+                # "Resolved but wrong key" is a COMPLETELY different fault from
+                # "unknown sender", and until 2026-08-08 both produced the same
+                # opaque 403.  A node whose keypair moved (the CWD-relative
+                # key-dir split) lands HERE, not in the else-branch — say so.
+                logger.warning(
+                    "hierarchy_sync: node_id=%s resolved to peer %s, but the "
+                    "batch signature does NOT match the public_key on file "
+                    "(%s...) — the sender is signing with a DIFFERENT keypair "
+                    "than this node has registered for it",
+                    node_id, getattr(peer, 'node_id', '?'), str(pk)[:16])
+            else:
+                logger.warning(
+                    "hierarchy_sync: NO peer row resolves node_id=%s (tried "
+                    "exact node_id, then the legacy key-prefix branch) — the "
+                    "sender is unknown to this node, cannot verify",
+                    node_id)
         except Exception:
-            pass
+            logger.warning(
+                "hierarchy_sync: sender verification RAISED for node_id=%s — "
+                "treating as unverified", node_id, exc_info=True)
     # No valid signature. Apply ONLY outside hard enforcement (migration path).
     # If the mode can't be determined, fail closed — this module's whole job.
     try:
@@ -1418,8 +1437,19 @@ def hierarchy_sync():
             decrypted = decrypt_json_from_peer(data['envelope'])
             if decrypted:
                 data = decrypted
+            else:
+                logger.warning(
+                    "hierarchy_sync: envelope decrypt returned empty — the "
+                    "un-decrypted wrapper carries no node_id, so this batch "
+                    "will be rejected as unverified")
         except Exception:
-            pass  # Decryption failed, try using data as-is
+            # Falling through leaves `data` as {'encrypted':.., 'envelope':..}
+            # — no node_id, so _verify_sync_sender fails and the caller 403s.
+            # Never let that look like a trust problem.
+            logger.warning(
+                "hierarchy_sync: envelope DECRYPT FAILED — falling back to the "
+                "raw body, which has no node_id and will be rejected as "
+                "unverified", exc_info=True)
     items = data.get('items', [])
     if not items:
         return jsonify({'success': True, 'processed': [], 'errors': []})
