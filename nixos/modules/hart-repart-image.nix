@@ -19,10 +19,24 @@
   imports = [
     "${modulesPath}/image/repart.nix"
     # Parity with the outgoing nixos-generators raw-efi format (virtio for VM boot;
-    # bare-metal storage coverage comes from hart-boot-root-initrd, enabled in
-    # desktop.nix, plus the extra modules pinned below for USB/SATA/NVMe).
+    # bare-metal storage coverage comes from hart-boot-root-initrd, enabled
+    # below for every repart image, plus the extra modules pinned for
+    # USB/SATA/NVMe).
     "${modulesPath}/profiles/qemu-guest.nix"
   ];
+
+  # ── Bare-metal storage initrd for EVERY repart image ──
+  # This used to ride on desktop.nix's PROFILE enabling hart.bootRootInitrd —
+  # which meant a repart raw-server/raw-edge (routed here since the mkImage
+  # special case was deleted, 2026-08-08) would boot in a VM (virtio via
+  # qemu-guest above) but VFS-panic from a USB/SATA/NVMe root on real
+  # hardware, exactly the initrd-lacks-usb_storage class the desktop already
+  # debugged. The IMAGE module is the right owner: every dd-able disk image
+  # needs the storage drivers of the disks it may be dd'd onto, regardless of
+  # variant. mkDefault, so a variant profile that already sets it (desktop)
+  # merges cleanly, and ISO closures are untouched (this module is imported
+  # only by mkRepartSystem).
+  hart.bootRootInitrd.enable = lib.mkDefault true;
 
   # ── UEFI-only: systemd-boot in the ESP, no GRUB, no NVRAM writes ──
   # canTouchEfiVariables=false keeps the image portable (a dd'd stick boots via

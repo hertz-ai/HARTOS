@@ -524,33 +524,34 @@
 
     mkRepartImage = args: (mkRepartSystem args).config.system.build.image;
 
-    # Build an image via nixos-generators (for non-ISO formats).
+    # Build an image: systemd-repart owns EVERY raw-efi variant; nixos-generators
+    # owns every OTHER format (qcow/vmware/vbox/docker/cloud/sd). One builder per
+    # format — this is no longer a parallel path.
     #
-    # raw-efi for the DESKTOP now takes the no-VM systemd-repart path (mkRepartImage).
-    # Every other format (qcow/vmware/vbox/docker/cloud/sd) AND the not-yet-migrated
-    # raw-server / raw-edge keep nixos-generators unchanged (no regression) — those
-    # variants import the installation-CD profile + isoImage UNCONDITIONALLY, so
-    # routing them through repart would double-define fileSystems."/"; they migrate
-    # only after gaining desktop.nix's `hartImageKind == "iso"` import guard.
+    # ── THE TEMPORARY PARALLEL PATH IS CLOSED (Gate 4 exit met, 2026-08-08) ────
+    # The 2026-07-27 note here demanded two conditions before deleting the
+    # per-variant special case, and both now hold:
+    #   1. repart raw-desktop BUILT AND BOOTED: built by Nix Build Matrix run
+    #      30336832563 (2026-07-28, commit a870e1d9), flashed 2026-07-30 with a
+    #      full sha256 read-back verify (D:\hart_flash_tmp\hart_flash.log:
+    #      "FULL VERIFY: OK"), booting on the steward's device since.
+    #   2. server.nix + edge.nix now wrap their CD-profile import + isoImage
+    #      block (and, for server, the whole live-medium access story — the
+    #      permissive SSH / baked passwords / ssh-diag that "must NEVER reach
+    #      an installed system") in `lib.optionals (hartImageKind == "iso")`,
+    #      mirroring desktop.nix, so repart can own every raw-* variant.
     #
-    # ── THIS IS A PARALLEL PATH, AND IT IS TEMPORARY (Gate 4) ──────────────────
-    # Two ways to build one thing is exactly the drift this repo fights, so the
-    # exit condition is written down rather than left to memory:
-    #
-    #   DELETE the `else nixos-generators` branch below, and this whole `if`, when
-    #   BOTH hold:
-    #     1. repart raw-desktop has actually BUILT and BOOTED (eval green is not
-    #        enough; it has never been built or booted as of 2026-07-27), and
-    #     2. server.nix + edge.nix wrap their CD-profile import and `isoImage`
-    #        block in `lib.optionals (hartImageKind == "iso")`, mirroring
-    #        desktop.nix:65, so repart can own every raw-* variant.
-    #
-    # Until then the old path stays because it is the only PROVEN one, and the new
-    # one is scoped to the single variant that needs the speed. If (1) fails, the
-    # correct move is to delete mkRepartImage instead and keep generators: one
-    # path either way, never two forever.
+    # The `variant == "desktop"` clause is therefore gone: raw-server and
+    # raw-edge take the same proven no-VM repart path (no KVM, no sandbox-off,
+    # no 5h make-disk-image qemu leg). The generators branch below is NOT the
+    # old parallel path surviving under a new name — it builds formats repart
+    # does not implement (qcow/vmware/vbox/docker/amazon/sd), one artifact
+    # kind per builder. Those installed-disk formats also stop inheriting the
+    # CD profile + live passwords now that the variant guards exist: the
+    # hartImageKind = "raw" signal they always carried finally does what its
+    # comment says.
     mkImage = { system, variant, format, extraModules ? [] }:
-      if format == "raw-efi" && variant == "desktop"
+      if format == "raw-efi"
       then mkRepartImage { inherit system variant extraModules; }
       else nixos-generators.nixosGenerate {
         inherit system format;
