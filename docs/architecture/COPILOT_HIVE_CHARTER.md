@@ -155,8 +155,11 @@ deliberately does not touch weights — and must never be described as live.
 
 Every mutation passes the existing gate: guardrail + circuit breaker + per-agent
 rate cap + immutable audit, with PREVIEW for destructive geometry
-(`IPC_PROTOCOL.md` §6). `tool_allowlist.py`, `action_classifier.py`,
-`dlp_engine.py` are the security surface. The copilot is audited **identically**
+(`IPC_PROTOCOL.md` §6). `action_classifier.py` and `dlp_engine.py` are the
+security surface — **wiring unverified, do not cite either as live until
+checked.** `tool_allowlist.py` was listed here too and should not have been: it
+lives in `integrations/agent_engine/`, not `security/`, and has **no production
+caller** (see *Corrections already earned*). The copilot is audited **identically**
 to an in-hive agent (`origin="mcp"`).
 
 It never re-enables a cut AI sense, never treats a launcher exit code as
@@ -200,6 +203,28 @@ Recorded so they are not re-learned:
   `TaskDelegationBridge`'s parent-BLOCKED + child model is live.
 - **"Only `window.list` is implemented" is wrong** (my own bad grep). Eleven
   verbs are live.
+- **`tool_allowlist.py` is an unwired orphan, and §6/§9 were wrong about it.**
+  Verified 2026-08-08: it lives in `integrations/agent_engine/`, not
+  `security/`; `filter_tools_for_model` has **no production caller** (4 files
+  repo-wide — its own module, two test files, and a *comment* in
+  `dispatch.py:674-676` asserting "create_recipe uses it", which
+  `create_recipe.py` does not); it filters by **model tier**, not persona; and
+  it matches a **flat** `t['name']` while the wire schema is nested
+  `{'type':'function','function':{'name':…}}`. So #43 is not "wire up an
+  existing helper" — it is a real decision between fixing that module and
+  deleting it. Leaving both notions of "which tools may this agent see" is the
+  parallel-path trap.
+- **A2UI is proven live, end to end (2026-08-08).** `GET /api/a2ui/specs`
+  returns 29 types; a copilot push through `POST /api/a2ui` was read back
+  *rendered in the shell's own HTML*, not merely acknowledged by a `success`
+  flag; `home_composer` is live-composing the home rows. What is NOT reachable
+  is the LOCAL BRAIN driving it — `agent_ask` blocks 30s on a `/chat` measured
+  at 49–76s (task #46).
+- **Component-type registration is deliberately in-process.**
+  `register_component_type`'s own docstring: *"Composer = HART agents only
+  (this is in-process; no external/cloud path exists or is added)."* Do not add
+  an HTTP route for it. An external copilot composes with the existing types and
+  drives new UI through `POST /chat`, which is the ONE execution path anyway.
 - **A native A2UI renderer is not a next-burn item.** `compositor/Cargo.toml`
   has no font, glyph, cosmic-text, cairo or skia — only pixman/GLES. Native
   A2UI needs a text stack, layout engine and widget code. The GSK-vulkan hang
@@ -216,7 +241,8 @@ Recorded so they are not re-learned:
 | `ead16d3a` | n_ctx drift — OS shipped 4096 while the trim layer budgeted 12288. Overflow **78.7% → 2.1%** over 1,407 measured requests |
 | `c0fbcb03` | the overflow guard never counted `body['tools']`, hiding a ~10,713-token schema |
 | `696f618a` | empty-personas `IndexError` killed CREATE on small models |
-| **OPEN — task #43** | that 67-tool schema is still **87% of a 12288 window**, leaving ~1,500 tokens for a system prompt measuring ~2,229. Prune per persona via the existing `tool_allowlist.py`. **Last CREATE blocker.** |
+| **OPEN — task #43** | that 67-tool schema is still **87% of a 12288 window**, leaving ~1,500 tokens for a system prompt measuring ~2,229. Prune per persona — but **NOT** "via the existing `tool_allowlist.py`", which is unwired and filters by model tier, not persona (see §8). **Last CREATE blocker.** |
+| **CORROBORATED 2026-08-08** | 8 recipes banked, newest **10 June — 59 days**, against 1,183 ledger files. Dispatching, not banking. Exactly what #43 predicts, measured on disk rather than read off a completion flag |
 
 ---
 
