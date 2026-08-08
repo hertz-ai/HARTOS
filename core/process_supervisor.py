@@ -42,6 +42,12 @@ class ProcessSupervisor:
     # waiting the 60s cap accumulated during an earlier storm). None = never
     # reset (preserves livekit/whatsapp's original behaviour).
     reset_backoff_after: Optional[float] = None
+    # One-shot extra wait a subclass may request from _on_child_exit: the
+    # NEXT restart wait becomes max(normal backoff, extra_wait_once), then
+    # the field auto-clears. This is how a circuit breaker COOLS DOWN AND
+    # RE-ARMS instead of disabling forever (return True remains the
+    # terminal option). 0.0 = no effect (default for all supervisors).
+    extra_wait_once: float = 0.0
     # Exception types from the spawn that should DISABLE the loop (stop retrying)
     # rather than back off and respawn — e.g. whatsapp's FileNotFoundError when
     # node is missing. Empty = every spawn error is treated as transient.
@@ -150,5 +156,11 @@ class ProcessSupervisor:
             self.restart_count += 1
             wait = min(backoff, self.backoff_cap)
             backoff = min(backoff * 2.0, self.backoff_cap)
+            # Breaker cooldown: honour a one-shot extended wait requested by
+            # _on_child_exit (cool-down-and-rearm; see extra_wait_once).
+            extra = float(getattr(self, 'extra_wait_once', 0.0) or 0.0)
+            if extra > 0.0:
+                self.extra_wait_once = 0.0
+                wait = max(wait, extra)
             if self.stop_event.wait(wait):
                 return
