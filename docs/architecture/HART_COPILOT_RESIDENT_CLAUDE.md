@@ -171,7 +171,45 @@ does to a human one.
 | 3 | **Full `iso-desktop` build green** | Still open, but no longer gates this: the raw/installed image is the delivery path now (`raw_image_installed_system_pivot_2026-07-16`), and updates arrive OTA rather than by re-flash. |
 | 4 | ~~*(optional)* systemd daemon mode~~ **DONE** | `hart-copilot-daemon.service` exists and `copilot.daemon.enable = true` is set in the profile. Bounded: 1 core / 2 G, `Restart=on-failure` + `RestartSec=60`, and activation goes through a ROOT path unit whose `ExecStart` hardcodes `test` — the daemon passes no arguments, so an agent that ignores every instruction in its prompt still cannot activate an arbitrary config. |
 | 5 | **First `/login` on the node** | The one remaining human step. Until it happens the daemon has no credential (§5 — no key in the image, by design). |
+| 7 | **MCP self-configuration on the node — task #48** | **The resident co-pilot currently has NO connection to the agent stack.** See §9. |
 | 6 | **Prove a task actually lands** | Carried over from item 1: `hart hive` was driven end to end against a stood-up blueprint, but a LIVE dispatcher sending this session a real task has still never been run. |
+
+## 9. The Nunba integration page belongs to THIS plan (steward, 2026-08-08)
+
+> *"whatever Nunba page offers is to wire into `HART_COPILOT_RESIDENT_CLAUDE.md`"*
+
+Nunba already ships the other half of this capability: `/admin/integrations/claude-code`
+(commit `1f876118`, routed at `MainRoute.js:684`, backed by `main.py:4890`
+`GET /api/admin/mcp/token` + `:4918` rotate). It hands a **human** the MCP endpoint,
+the bearer token, and a copy-paste `mcpServers.hartos` snippet.
+
+**These are one capability at two locations, and they are not connected.** Verified:
+`nixos/modules/hart-copilot.nix` contains no MCP wiring at all (the only `.claude` hit
+is a comment about the Windows dev box), and `grep -ri mcp nixos/` returns **zero
+files**. So the resident co-pilot boots as a **bare** Claude Code: it can edit and test
+in `~/HARTOS`, but it cannot `list_goals`, `agent_status`, `create_goal`,
+`dispatch_goal` or `steer_goal` — the exact loop the Nunba page advertises is the one
+the node cannot run. A human would have to open a browser and paste a snippet into the
+filesystem of a machine that already knows its own endpoint and already owns its token.
+
+The hook needs no new mechanism: `integrations/mcp/mcp_http_bridge.py:82-94` already
+resolves `HARTOS_MCP_TOKEN` → `HARTOS_MCP_TOKEN_FILE` → `~/.nunba/mcp.token`. The node
+mints the token and serves the bridge; `hart-copilot` just has to write the config
+before it `exec`s.
+
+**DRY constraint:** the snippet shape must come from the ONE generator Nunba already
+exposes as `config_snippet` — never re-templated in Nix. The last drift of this exact
+shape (stdio → http + bearer, `f5b99d8`) produced silent 403s and is *why* the Nunba
+page had to be written.
+
+This does not touch the boundary in §1/§5: no key enters the image, the checkout stays
+writable-only, the branch stays fresh, and merge / OTA / master-key signing stay human.
+It grants the resident agent the same verbs the steward already grants their own Claude
+Code, under the same audit actor and the same guardrail gate.
+
+Full scope, rotation handling and artifact-level acceptance: **task #48**.
+
+---
 
 ### Why `enable` alone was not enough (2026-07-30 incident)
 
