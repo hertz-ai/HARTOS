@@ -55,7 +55,7 @@ place and concluding about the whole.
 | BIOS + UEFI boot | `isoImage.makeBiosBootable`; systemd-boot / GRUB by probe | n/a | **BOOTED, not asserted**: `hart-firmware-boot-matrix` boots the desktop variant on OVMF/UEFI (Hyper-V **Gen 2** shape) AND on legacy SeaBIOS (**Gen 1** shape), and checks each node is really on the path its config claims — `/sys/firmware/efi` must exist on one and be ABSENT on the other, so a mis-set flag cannot boot UEFI twice and pass |
 | Disk encryption | `hart.luks` | ✅ | `/api/shell/encryption/status` — LUKS device tree plus **`root_encrypted`** (an encrypted /data with a plaintext root reads as "encrypted" and protects far less). Read-only is the COMPLETE answer: encryption is an install-time decision, so `runtime_toggle_supported: false` is stated rather than implied |
 | Screen capture / portal | `xdg.portal` (`hart.portal`) | ✅ | `/api/shell/screenshot` + `/api/shell/recording/{start,stop}` (`shell_os_apis.py`) — this row previously read ❌ from a name-only search that missed all three |
-| Remote desktop | RustDesk / Sunshine (`integrations/remote_desktop`) | 🟡 | **agent tools ARE registered** (`core/agent_tools.py:1391` → `build_remote_desktop_tools`), so an agent can drive sessions during a turn. No `/api/shell/*` route, so the shell UI cannot — that half is the remaining work, not the whole row |
+| Remote desktop | RustDesk / Sunshine (`integrations/remote_desktop`) | 🟡 | **agent tools ARE registered** (`core/agent_tools.py:1391` → `build_remote_desktop_tools`), so an agent can drive sessions during a turn, AND the shell UI can now READ host state — `/api/shell/remote-desktop/status` reuses `host_service.get_status()` and reports presence/viewers with the live **password + device_id REDACTED** (whitelist, so a future secret field cannot leak). The remaining half is the CONTROL routes (start/stop): a session that hands over machine control is a deliberate steward-gated ingress like firewall-write, not an unauthenticated toggle |
 | Antivirus | ClamAV (`hart.security`) | ✅ | `/api/shell/antivirus/{status,scan}` — daemon liveness **plus `signatures_stale`** (a live clamd with an old DB looks healthy and catches nothing); scan is async-bounded (202, never holds a pool thread). Enable/disable stays declarative on purpose |
 | Firewall | `networking.firewall` (`hart.firewall`) | 🟡 | `/api/shell/firewall` reads live backend + open ports; changing ports stays declarative on purpose |
 
@@ -74,8 +74,11 @@ tier-drop compositor ladder (`hart.sessionSupervisor`) with a cage floor.
    encryption were real and are now routed. Two rows stay 🟡 **on purpose**,
    not as unfinished work: firewall is readable but not writable (opening a
    port from an unauthenticated local HTTP API is a security decision), and
-   remote desktop is agent-tool-reachable but has no shell route. Disk
-   encryption is read-only because runtime enable cannot exist.
+   remote desktop is agent-tool-reachable and now shell-READABLE
+   (`/api/shell/remote-desktop/status`, credentials redacted) — only its
+   start/stop CONTROL stays a deliberate steward-gated decision, the same
+   security posture as firewall-write. Disk encryption is read-only because
+   runtime enable cannot exist.
 2. **`hart.devtools` does not fit the desktop image** — measured +3 GiB against
    ~2 GiB of slack (audits 30570492265 / 30573861911).
 3. **Runtime verification** of the current tree is still owed: CI runner

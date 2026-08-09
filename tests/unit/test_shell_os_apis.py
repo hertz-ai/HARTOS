@@ -449,6 +449,53 @@ class TestShellUsers(unittest.TestCase):
 # First-Time Setup Wizard
 # ═══════════════════════════════════════════════════════════════
 
+class TestShellRemoteDesktop(unittest.TestCase):
+    """GET /api/shell/remote-desktop/status — read-only presence, credentials redacted."""
+
+    def test_status_redacts_credentials(self):
+        """HostService.get_status() carries the live password + device_id (together
+        = full remote access); the route MUST NOT echo them — only the whitelisted
+        presence fields. This is the load-bearing security assertion."""
+        client = _make_os_app()
+        fake = MagicMock()
+        fake.get_status.return_value = {
+            'running': True, 'viewers': 2, 'transport_connected': True,
+            'device_id': 'HART-123-456', 'password': 's3cr3t-live-pw',
+            'capture_stats': {'fps': 30},
+        }
+        with patch('integrations.remote_desktop.host_service.get_host_service',
+                   return_value=fake):
+            r = client.get('/api/shell/remote-desktop/status')
+        self.assertEqual(r.status_code, 200)
+        raw = r.get_data(as_text=True)
+        data = json.loads(r.data)
+        self.assertTrue(data['available'])
+        self.assertTrue(data['running'])
+        self.assertEqual(data['viewers'], 2)
+        self.assertTrue(data['transport_connected'])
+        # No credential leaks — neither the keys nor their values, anywhere.
+        self.assertNotIn('password', data)
+        self.assertNotIn('device_id', data)
+        self.assertNotIn('s3cr3t-live-pw', raw)
+        self.assertNotIn('HART-123-456', raw)
+
+    def test_status_degrades_when_service_errors(self):
+        """A broken/absent backend degrades honestly (available:False), never 500."""
+        client = _make_os_app()
+        with patch('integrations.remote_desktop.host_service.get_host_service',
+                   side_effect=RuntimeError('boom')):
+            r = client.get('/api/shell/remote-desktop/status')
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(json.loads(r.data)['available'])
+
+    def test_status_auth_denied_for_nonlocal(self):
+        """Read-only, but still local-only (defense in depth for a security subsystem)."""
+        client = _make_os_app()
+        r = client.get('/api/shell/remote-desktop/status',
+                       environ_overrides={'REMOTE_ADDR': '203.0.113.7'})
+        self.assertEqual(r.status_code, 403)
+
+
 class TestShellSetupWizard(unittest.TestCase):
     """Tests for /api/shell/setup/*."""
 

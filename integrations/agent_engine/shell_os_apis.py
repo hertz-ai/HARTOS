@@ -2285,6 +2285,47 @@ def register_shell_os_routes(app):
 
     # ─── SSO / LDAP (sssd + PAM) ─────────────────────────────
 
+    @app.route('/api/shell/remote-desktop/status', methods=['GET'])
+    @_require_shell_auth
+    def shell_remote_desktop_status():
+        """Read-only remote-desktop host status for the shell UI — the
+        OS_PARITY_MATRIX 'Remote desktop' row's shell-visibility half (Windows
+        Remote Desktop / macOS Screen Sharing parity).
+
+        REUSES the existing host service (integrations/remote_desktop), never a
+        reimplementation. READ-ONLY on purpose: starting/stopping a session is a
+        control ingress (like changing firewall ports) and stays a deliberate,
+        steward-gated decision, not an unauthenticated toggle.
+
+        SECURITY: HostService.get_status() carries the live connection PASSWORD
+        and device_id (together = full remote access). This route WHITELISTS only
+        the non-secret presence fields, so a status poll reports whether remote
+        desktop is on and how many viewers — never the credentials, and never a
+        NEW secret field a future get_status() might add. The connection code is
+        revealed through a separate explicit user action, not this ambient poll.
+        """
+        try:
+            from integrations.remote_desktop.host_service import get_host_service
+        except Exception as exc:
+            logger.info("remote-desktop status: backend unavailable (%s)", exc)
+            return jsonify({'available': False,
+                            'reason': 'remote_desktop backend not importable'})
+        try:
+            st = get_host_service().get_status() or {}
+        except Exception as exc:
+            logger.warning("remote-desktop status: get_status failed (%s)", exc)
+            return jsonify({'available': False, 'reason': str(exc)})
+        # Whitelist non-secret presence fields ONLY. Never echo password/device_id
+        # (or any field not named here) — a status endpoint reports presence, not
+        # credentials.
+        return jsonify({
+            'available': True,
+            'running': bool(st.get('running')),
+            'viewers': int(st.get('viewers') or 0),
+            'transport_connected': bool(st.get('transport_connected')),
+            'capture_stats': st.get('capture_stats'),
+        })
+
     @app.route('/api/shell/sso/status', methods=['GET'])
     def shell_sso_status():
         """Check SSO/LDAP integration status."""
