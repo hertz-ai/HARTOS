@@ -429,5 +429,430 @@ def test_tier2_goal_detection_parity():
                 f"`{cat}` Tier-2 branch")
 
 
+# ─── T7: Cross-user-join fallback + per-persona-owner topic ─────────
+#
+# Gap closed here: same-user register+send was covered (T5), but the
+# live send_message_to_roles path also routes through
+# _resolve_session_for_user's cross-user-join fallback — when a joinee
+# (set in reuse_recipe.py:855 via chat_joinees[joinee]={prompt_id:creator})
+# has no session of its own and must borrow the creator's persona
+# session.  The per-user multichat topic is then derived PER ENTRY from
+# `entry['user_id']` (the persona OWNER), not from the caller.  A
+# mis-derivation would broadcast one tenant's persona message onto
+# another user's WAMP topic.  These behavioural tests import the real
+# functions, seed the real TTLCaches (the boundary state), call the
+# real impl with a fake publisher, and assert the wire topic + payload.
+
+
+@pytest.fixture
+def track_keys():
+    """Yield a recorder of (cache, key) tuples touched by a test and pop
+    them afterwards, so the module-global TTLCaches don't leak state into
+    sibling tests (TTL is 7200s — far longer than a run)."""
+    from core.persona_registry import (
+        agents_session, agents_roles, chat_joinees,
+    )
+    tracked: list = []
+    yield tracked
+    for cache, key in tracked:
+        try:
+            cache.pop(key, None)
+        except Exception:
+            pass
+
+
+class TestCrossUserJoinResolution:
+    """_resolve_session_for_user: own-session hit, join fallback, and the
+    isolation guarantees that keep one tenant out of another's session."""
+
+    def test_direct_hit_returns_own_key_no_fallback(self, track_keys):
+        from core.persona_registry import (
+            agents_session, agents_roles, register_persona_for_session,
+            _resolve_session_for_user,
+        )
+        track_keys.append((agents_session, 'alice_pown'))
+        track_keys.append((agents_roles, 'alice_pown'))
+        register_persona_for_session('alice', 'pown', [{'name': 'student'}])
+
+        sessions, key = _resolve_session_for_user('alice', 'pown')
+        assert key == 'alice_pown'
+        assert [e['role'] for e in sessions] == ['student']
+
+    def test_cross_user_join_returns_creator_session_and_key(self, track_keys):
+        """Joinee with an empty own session + a chat_joinees mapping to a
+        creator that HAS a session resolves to the creator's session,
+        under the CREATOR's key (creator_key), not the joinee's."""
+        from core.persona_registry import (
+            agents_session, agents_roles, chat_joinees,
+            register_persona_for_session, _resolve_session_for_user,
+        )
+        track_keys.append((agents_session, 'creator_pj'))
+        track_keys.append((agents_roles, 'creator_pj'))
+        track_keys.append((chat_joinees, 'joinee'))
+        register_persona_for_session(
+            'creator', 'pj', [{'name': 'student'}, {'name': 'parent'}])
+        # reuse_recipe.py:855 shape: {joinee: {prompt_id: creator}}
+        chat_joinees['joinee'] = {'pj': 'creator'}
+
+        sessions, key = _resolve_session_for_user('joinee', 'pj')
+        assert key == 'creator_pj', (
+            "join fallback must return the CREATOR's key so caller-metadata "
+            "and roles resolve against the session that actually owns the "
+            "personas")
+        assert {e['role'] for e in sessions} == {'student', 'parent'}
+
+    def test_own_session_takes_precedence_over_join_record(self, track_keys):
+        """If a user has BOTH an own session AND a stale join record, the
+        own session wins — the fallback must never override a live
+        first-class session (guards a precedence regression)."""
+        from core.persona_registry import (
+            agents_session, agents_roles, chat_joinees,
+            register_persona_for_session, _resolve_session_for_user,
+        )
+        track_keys.append((agents_session, 'creator2_pp'))
+        track_keys.append((agents_roles, 'creator2_pp'))
+        track_keys.append((agents_session, 'bob_pp'))
+        track_keys.append((agents_roles, 'bob_pp'))
+        track_keys.append((chat_joinees, 'bob'))
+        register_persona_for_session('creator2', 'pp', [{'name': 'teacher'}])
+        register_persona_for_session('bob', 'pp', [{'name': 'guest_of_bob'}])
+        chat_joinees['bob'] = {'pp': 'creator2'}
+
+        sessions, key = _resolve_session_for_user('bob', 'pp')
+        assert key == 'bob_pp'
+        assert [e['role'] for e in sessions] == ['guest_of_bob']
+
+    def test_no_join_record_returns_empty_for_unrelated_user(self, track_keys):
+        """A bare user that shares a prompt_id NUMBER with a creator but
+        has neither an own session nor a join record must resolve to an
+        EMPTY session under its own key — never bleed into the creator's
+        session.  This is the core cross-tenant isolation guarantee."""
+        from core.persona_registry import (
+            agents_session, agents_roles,
+            register_persona_for_session, _resolve_session_for_user,
+        )
+        track_keys.append((agents_session, 'owner_piso'))
+        track_keys.append((agents_roles, 'owner_piso'))
+        register_persona_for_session('owner', 'piso', [{'name': 'student'}])
+
+        sessions, key = _resolve_session_for_user('stranger', 'piso')
+        assert sessions == []
+        assert key == 'stranger_piso'
+
+    def test_join_to_creator_with_empty_session_degrades_to_empty(
+            self, track_keys):
+        """chat_joinees points at a creator whose session is absent/empty →
+        resolution degrades to ([], own_key), not a crash and not a
+        phantom session."""
+        from core.persona_registry import (
+            chat_joinees, _resolve_session_for_user,
+        )
+        track_keys.append((chat_joinees, 'orphan'))
+        chat_joinees['orphan'] = {'pgh': 'ghost_creator'}  # no ghost session
+
+        sessions, key = _resolve_session_for_user('orphan', 'pgh')
+        assert sessions == []
+        assert key == 'orphan_pgh'
+
+    def test_malformed_joinees_none_value_is_survived(self, track_keys):
+        """chat_joinees[user] stored as None → `or {}` guard prevents an
+        AttributeError; resolution returns ([], key)."""
+        from core.persona_registry import (
+            chat_joinees, _resolve_session_for_user,
+        )
+        track_keys.append((chat_joinees, 'noneuser'))
+        chat_joinees['noneuser'] = None
+
+        sessions, key = _resolve_session_for_user('noneuser', 'pn')
+        assert sessions == []
+        assert key == 'noneuser_pn'
+
+    def test_joinees_dict_missing_prompt_returns_empty(self, track_keys):
+        """A join record exists for the user but not for THIS prompt_id →
+        no creator resolved → ([], key)."""
+        from core.persona_registry import (
+            chat_joinees, _resolve_session_for_user,
+        )
+        track_keys.append((chat_joinees, 'partial'))
+        chat_joinees['partial'] = {'other_prompt': 'somebody'}
+
+        sessions, key = _resolve_session_for_user('partial', 'pmissing')
+        assert sessions == []
+        assert key == 'partial_pmissing'
+
+    def test_lookup_exception_is_caught_and_logged(self, monkeypatch, caplog):
+        """If the chat_joinees lookup itself raises, _resolve_session_for_user
+        must swallow it (return ([], key)) and log a warning — 'no silent
+        gulps' AND no propagation into the live send path."""
+        import core.persona_registry as pr
+
+        class _Raiser:
+            def get(self, *a, **k):
+                raise RuntimeError('cache boom')
+
+        monkeypatch.setattr(pr, 'chat_joinees', _Raiser())
+        with caplog.at_level(logging.WARNING, logger='core.persona_registry'):
+            sessions, key = pr._resolve_session_for_user('whoever', 'pexc')
+        assert sessions == []
+        assert key == 'whoever_pexc'
+        assert any('chat_joinees lookup failed' in r.message
+                   for r in caplog.records)
+
+
+class TestPersonaOwnerTopicRouting:
+    """The security-relevant behaviour: the multichat WAMP topic is
+    derived from the persona OWNER (entry['user_id']), so a joinee's
+    broadcast to a creator-owned persona lands on the CREATOR's topic —
+    never leaks onto the caller's own topic, and an unrelated caller can
+    reach no personas at all."""
+
+    def test_joinee_broadcast_routes_to_persona_owner_topic(self, track_keys):
+        from core.persona_registry import (
+            agents_session, agents_roles, chat_joinees,
+            register_persona_for_session, _send_message_to_roles_impl,
+            multichat_topic_for,
+        )
+        track_keys.append((agents_session, 'alice_pmix'))
+        track_keys.append((agents_roles, 'alice_pmix'))
+        track_keys.append((chat_joinees, 'bob'))
+        register_persona_for_session(
+            'alice', 'pmix', [{'name': 'student'}, {'name': 'parent'}])
+        # bob joins alice's chat: his persona is appended to ALICE's
+        # session carrying HIS user_id (mirrors reuse_recipe.py:850-855).
+        agents_session['alice_pmix'].append({
+            'agentInstanceID': 'com.hertzai.hevolve.chat.pmix.bob',
+            'user_id': 'bob', 'role': 'guest', 'deviceID': 'something',
+        })
+        chat_joinees['bob'] = {'pmix': 'alice'}
+
+        captured = []
+
+        def fake_publish(topic, message, *a, **kw):
+            captured.append((topic, message))
+
+        # bob (the joinee) messages a persona OWNED BY ALICE →
+        # must publish to ALICE's topic, NOT bob's.
+        result = _send_message_to_roles_impl(
+            'bob', 'pmix', 'student', 'hi teacher',
+            publish_fn=fake_publish)
+        assert result == 'Message sent Successfully'
+        assert len(captured) == 1
+        topic, payload = captured[0]
+        assert topic == multichat_topic_for('alice'), (
+            "joinee's message to a creator-owned persona leaked onto the "
+            f"wrong topic {topic!r}; must be the persona owner's "
+            f"{multichat_topic_for('alice')!r}")
+        assert topic != multichat_topic_for('bob')
+        # Caller identity is preserved in the payload even though the
+        # topic is the owner's.
+        assert payload['caller_user_id'] == 'bob'
+        assert payload['message'] == 'hi teacher'
+
+    def test_broadcast_to_joinee_owned_persona_routes_to_joinee_topic(
+            self, track_keys):
+        """Same shared session, but the target persona is the JOINEE's own
+        entry (user_id='bob'): topic must be bob's, proving the topic is
+        derived per-entry from the owner, not a single session-wide user."""
+        from core.persona_registry import (
+            agents_session, agents_roles, chat_joinees,
+            register_persona_for_session, _send_message_to_roles_impl,
+            multichat_topic_for,
+        )
+        track_keys.append((agents_session, 'alice_pmix2'))
+        track_keys.append((agents_roles, 'alice_pmix2'))
+        track_keys.append((chat_joinees, 'bob'))
+        register_persona_for_session('alice', 'pmix2', [{'name': 'student'}])
+        agents_session['alice_pmix2'].append({
+            'agentInstanceID': 'com.hertzai.hevolve.chat.pmix2.bob',
+            'user_id': 'bob', 'role': 'guest', 'deviceID': 'something',
+        })
+        chat_joinees['bob'] = {'pmix2': 'alice'}
+
+        captured = []
+        result = _send_message_to_roles_impl(
+            'bob', 'pmix2', 'guest', 'note to self',
+            publish_fn=lambda t, m, *a, **kw: captured.append((t, m)))
+        assert result == 'Message sent Successfully'
+        assert captured[0][0] == multichat_topic_for('bob')
+
+    def test_unrelated_same_prompt_user_reaches_no_personas(self, track_keys):
+        """The isolation guarantee at the SEND boundary: a stranger sharing
+        alice's prompt_id number, with no join record, gets the helpful
+        'no personas' error and NOTHING is published — so a creator's
+        persona broadcast can never be triggered onto/for another tenant."""
+        from core.persona_registry import (
+            agents_session, agents_roles,
+            register_persona_for_session, _send_message_to_roles_impl,
+        )
+        track_keys.append((agents_session, 'alice_pguard'))
+        track_keys.append((agents_roles, 'alice_pguard'))
+        register_persona_for_session('alice', 'pguard', [{'name': 'student'}])
+
+        captured = []
+        result = _send_message_to_roles_impl(
+            'mallory', 'pguard', 'student', 'give me the broadcast',
+            publish_fn=lambda *a, **kw: captured.append(a))
+        assert 'No personas registered' in result
+        assert captured == [], (
+            "unrelated same-prompt user must not trigger any publish — "
+            "cross-tenant isolation breach")
+
+    def test_missing_user_id_entry_falls_back_to_caller_topic(self, track_keys):
+        """Defensive `entry.get('user_id') or user_id`: a legacy entry with
+        no user_id must route to the CALLER's own topic (best available
+        owner), never to a bare `None` suffix."""
+        from core.persona_registry import (
+            agents_session, agents_roles,
+            _send_message_to_roles_impl, multichat_topic_for,
+        )
+        track_keys.append((agents_session, 'carol_pleg'))
+        track_keys.append((agents_roles, 'carol_pleg'))
+        # Entry deliberately missing 'user_id' (pre-contract legacy shape).
+        agents_session['carol_pleg'] = [{'role': 'student', 'deviceID': 'x'}]
+        agents_roles['carol_pleg'] = {'carol': 'student'}
+
+        captured = []
+        result = _send_message_to_roles_impl(
+            'carol', 'pleg', 'student', 'hello',
+            publish_fn=lambda t, m, *a, **kw: captured.append((t, m)))
+        assert result == 'Message sent Successfully'
+        assert captured[0][0] == multichat_topic_for('carol')
+        assert 'None' not in captured[0][0], (
+            "topic must never carry a literal None suffix when the entry "
+            "lacks a user_id")
+
+
+class TestSendMessagePublisherResolution:
+    """Publisher-resolution + failure surfaces of _send_message_to_roles_impl."""
+
+    def test_publish_exception_returns_error_and_logs(self, track_keys, caplog):
+        from core.persona_registry import (
+            agents_session, agents_roles,
+            register_persona_for_session, _send_message_to_roles_impl,
+        )
+        track_keys.append((agents_session, 'dan_pfail'))
+        track_keys.append((agents_roles, 'dan_pfail'))
+        register_persona_for_session('dan', 'pfail', [{'name': 'student'}])
+
+        def boom(*a, **kw):
+            raise RuntimeError('crossbar down')
+
+        with caplog.at_level(logging.ERROR, logger='core.persona_registry'):
+            result = _send_message_to_roles_impl(
+                'dan', 'pfail', 'student', 'x', publish_fn=boom)
+        assert result == "Failed to publish to role=student"
+        assert any('publish failed' in r.message for r in caplog.records)
+
+    def test_publisher_resolves_to_none_returns_unavailable(
+            self, track_keys, monkeypatch):
+        """publish_fn omitted + safe_hartos_attr('publish_async') resolves to
+        None (HARTOS not loaded) → 'Crossbar publisher unavailable', no
+        crash."""
+        from core.persona_registry import (
+            agents_session, agents_roles,
+            register_persona_for_session, _send_message_to_roles_impl,
+        )
+        track_keys.append((agents_session, 'eve_pnone'))
+        track_keys.append((agents_roles, 'eve_pnone'))
+        register_persona_for_session('eve', 'pnone', [{'name': 'student'}])
+        # The impl does `from core.safe_hartos_attr import safe_hartos_attr`
+        # at call time, so patching the module attribute takes effect.
+        monkeypatch.setattr(
+            'core.safe_hartos_attr.safe_hartos_attr', lambda *a, **kw: None)
+
+        result = _send_message_to_roles_impl(
+            'eve', 'pnone', 'student', 'x', publish_fn=None)
+        assert result == 'Crossbar publisher unavailable'
+
+    def test_publisher_resolver_raises_returns_unavailable(
+            self, track_keys, monkeypatch, caplog):
+        from core.persona_registry import (
+            agents_session, agents_roles,
+            register_persona_for_session, _send_message_to_roles_impl,
+        )
+        track_keys.append((agents_session, 'frank_praise'))
+        track_keys.append((agents_roles, 'frank_praise'))
+        register_persona_for_session('frank', 'praise', [{'name': 'student'}])
+
+        def raiser(*a, **kw):
+            raise RuntimeError('resolver boom')
+
+        monkeypatch.setattr(
+            'core.safe_hartos_attr.safe_hartos_attr', raiser)
+        with caplog.at_level(logging.ERROR, logger='core.persona_registry'):
+            result = _send_message_to_roles_impl(
+                'frank', 'praise', 'student', 'x', publish_fn=None)
+        assert result == 'Crossbar publisher unavailable'
+        assert any('cannot resolve publish_async' in r.message
+                   for r in caplog.records)
+
+
+class TestRegisterPersonaEdgeCases:
+    """register_persona_for_session: None ids, mixed persona shapes,
+    idempotent overwrite, device_id propagation."""
+
+    def test_none_user_id_returns_zero_and_registers_nothing(self, track_keys):
+        from core.persona_registry import (
+            agents_session, register_persona_for_session,
+        )
+        assert register_persona_for_session(None, 'p', [{'name': 'x'}]) == 0
+        assert register_persona_for_session('u', None, [{'name': 'x'}]) == 0
+        # Nothing landed under a None-shaped key
+        assert 'None_p' not in agents_session.keys()
+        assert 'u_None' not in agents_session.keys()
+
+    def test_mixed_persona_shapes_skips_junk(self, track_keys):
+        """str names, {'name':..}, {'role':..} accepted; ints, None, and
+        name-less dicts skipped with a warning (no silent gulp)."""
+        from core.persona_registry import (
+            agents_session, agents_roles, register_persona_for_session,
+        )
+        track_keys.append((agents_session, 'ug_pshape'))
+        track_keys.append((agents_roles, 'ug_pshape'))
+        count = register_persona_for_session('ug', 'pshape', [
+            'student',              # str → role 'student'
+            {'name': 'parent'},     # dict name
+            {'role': 'teacher'},    # dict role fallback
+            {'description': 'no name'},  # skipped (no name/role)
+            42,                     # skipped (unknown shape)
+            None,                   # skipped
+            {'name': ''},           # skipped (empty name)
+        ])
+        assert count == 3
+        roles = [e['role'] for e in agents_session['ug_pshape']]
+        assert roles == ['student', 'parent', 'teacher']
+
+    def test_none_persona_list_returns_zero(self, track_keys):
+        from core.persona_registry import (
+            agents_session, register_persona_for_session,
+        )
+        track_keys.append((agents_session, 'uz_pnl'))
+        assert register_persona_for_session('uz', 'pnl', None) == 0
+        # Empty registration is still an assignment (empty list) — the
+        # session key exists but carries no personas.
+        assert agents_session.get('uz_pnl') == []
+
+    def test_idempotent_overwrite_not_append(self, track_keys):
+        from core.persona_registry import (
+            agents_session, register_persona_for_session,
+        )
+        track_keys.append((agents_session, 'uo_pov'))
+        register_persona_for_session(
+            'uo', 'pov', [{'name': 'a'}, {'name': 'b'}])
+        # Re-register with a single persona → overwrites, not appends.
+        register_persona_for_session('uo', 'pov', [{'name': 'c'}])
+        roles = [e['role'] for e in agents_session['uo_pov']]
+        assert roles == ['c']
+
+    def test_device_id_propagates_into_entry(self, track_keys):
+        from core.persona_registry import (
+            agents_session, register_persona_for_session,
+        )
+        track_keys.append((agents_session, 'ud_pdev'))
+        register_persona_for_session(
+            'ud', 'pdev', [{'name': 'student'}], device_id='pixel-9')
+        assert agents_session['ud_pdev'][0]['deviceID'] == 'pixel-9'
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

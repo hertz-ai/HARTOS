@@ -19,7 +19,7 @@ import json
 import pytest
 from integrations.ap2 import (
     PaymentStatus, PaymentMethod, PaymentGateway,
-    PaymentRequest, PaymentLedger, MockPaymentGateway,
+    PaymentRequest, PaymentLedger, PaymentGatewayConnector, MockPaymentGateway,
     payment_ledger, create_payment_request_function,
     create_payment_authorization_function, create_payment_processing_function,
     get_ap2_tools_for_autogen
@@ -321,6 +321,270 @@ def test_complete_payment_workflow():
     # Cleanup
     if os.path.exists("agent_data/test_workflow_ledger.json"):
         os.remove("agent_data/test_workflow_ledger.json")
+
+
+# =============================================================================
+# process_payment() authorization gate, double-charge/replay guard, and
+# gateway-failure degrade paths.
+#
+# These are the security-critical branches the happy-path tests above never
+# exercise or assert: a weakened authorization gate = authorization bypass; a
+# weakened replay guard = silent double-charge; a mishandled gateway failure =
+# a payment stuck in a non-terminal state instead of FAILED.  Each test drives
+# the REAL PaymentLedger.process_payment and mocks only the gateway boundary,
+# asserting both the returned result AND the observable side effects (persisted
+# status, whether the gateway was actually invoked).
+# =============================================================================
+
+
+class _SpyGateway(PaymentGatewayConnector):
+    """Controllable gateway boundary double.
+
+    Records how many times create_payment / capture_payment are invoked so a
+    test can prove the ledger did (or crucially did NOT) attempt to charge the
+    gateway.  create/capture results and a create-time exception are all
+    injectable so every degrade branch of process_payment is reachable.
+    """
+
+    def __init__(self, create_result=None, capture_result=None, create_raises=None):
+        super().__init__(PaymentGateway.MOCK)
+        self._create_result = create_result if create_result is not None else {
+            'success': True, 'transaction_id': 'txn_spy_ok', 'status': 'authorized'
+        }
+        self._capture_result = capture_result if capture_result is not None else {
+            'success': True, 'status': 'captured'
+        }
+        self._create_raises = create_raises
+        self.create_calls = 0
+        self.capture_calls = 0
+        self.connected = True
+
+    def connect(self) -> bool:
+        self.connected = True
+        return True
+
+    def create_payment(self, payment_request):
+        self.create_calls += 1
+        if self._create_raises is not None:
+            raise self._create_raises
+        return self._create_result
+
+    def capture_payment(self, payment_id, gateway_transaction_id):
+        self.capture_calls += 1
+        return self._capture_result
+
+    def refund_payment(self, payment_id, gateway_transaction_id, amount=None):
+        return {'success': True, 'status': 'refunded'}
+
+
+def _ledger_with_gateway(tmp_path, spy):
+    """Fresh ledger with an isolated on-disk path and the MOCK gateway
+    slot replaced by the caller's spy (so a MOCK-routed payment hits it)."""
+    ledger = PaymentLedger(ledger_path=str(tmp_path / "spy_ledger.json"))
+    ledger.gateways[PaymentGateway.MOCK] = spy
+    return ledger
+
+
+def _authorized_payment(ledger, gateway=PaymentGateway.MOCK, amount="10.00"):
+    payment = ledger.create_payment_request(
+        amount=Decimal(amount),
+        currency="USD",
+        description="degrade-path test",
+        requester_agent_id="agent_degrade",
+        payment_method=PaymentMethod.INTERNAL_CREDITS,
+        gateway=gateway,
+    )
+    assert ledger.authorize_payment(payment.payment_id, "admin_approver") is True
+    return payment.payment_id
+
+
+class TestProcessPaymentAuthorizationGate:
+    """Refuse to process anything that is not currently AUTHORIZED."""
+
+    def test_unknown_payment_id_returns_not_found(self, tmp_path):
+        ledger = PaymentLedger(ledger_path=str(tmp_path / "l.json"))
+        result = ledger.process_payment("no-such-payment")
+        assert result == {'success': False, 'error': 'Payment not found'}
+
+    def test_pending_payment_refused_and_gateway_never_charged(self, tmp_path):
+        # A PENDING (un-authorized) payment must NOT reach the gateway — this
+        # is the authorization bypass guard.
+        spy = _SpyGateway()
+        ledger = _ledger_with_gateway(tmp_path, spy)
+        payment = ledger.create_payment_request(
+            amount=Decimal("42.00"), currency="USD", description="x",
+            requester_agent_id="agent_x", gateway=PaymentGateway.MOCK,
+        )
+        assert payment.status == PaymentStatus.PENDING
+
+        result = ledger.process_payment(payment.payment_id)
+
+        assert result['success'] is False
+        assert 'not authorized' in result['error'].lower()
+        # Boundary never touched -> no charge attempted.
+        assert spy.create_calls == 0
+        assert spy.capture_calls == 0
+        # Status must be untouched (still PENDING so it can be authorized later),
+        # NOT silently flipped to FAILED.
+        assert ledger.get_payment(payment.payment_id).status == PaymentStatus.PENDING
+
+    def test_failed_payment_cannot_be_reprocessed(self, tmp_path):
+        # After a gateway create-failure the payment is FAILED; re-processing
+        # must be refused (FAILED != AUTHORIZED), and must not re-hit the gateway.
+        spy = _SpyGateway(create_result={'success': False, 'error': 'declined'})
+        ledger = _ledger_with_gateway(tmp_path, spy)
+        pid = _authorized_payment(ledger)
+
+        first = ledger.process_payment(pid)
+        assert first['success'] is False
+        assert ledger.get_payment(pid).status == PaymentStatus.FAILED
+        assert spy.create_calls == 1
+
+        second = ledger.process_payment(pid)
+        assert second['success'] is False
+        assert 'not authorized' in second['error'].lower()
+        # No second charge attempt.
+        assert spy.create_calls == 1
+        assert spy.capture_calls == 0
+
+
+class TestProcessPaymentReplayGuard:
+    """A COMPLETED payment must never be charged a second time."""
+
+    def test_completed_payment_cannot_be_double_charged(self, tmp_path):
+        spy = _SpyGateway()
+        ledger = _ledger_with_gateway(tmp_path, spy)
+        pid = _authorized_payment(ledger)
+
+        first = ledger.process_payment(pid)
+        assert first['success'] is True
+        assert ledger.get_payment(pid).status == PaymentStatus.COMPLETED
+        assert spy.create_calls == 1
+        assert spy.capture_calls == 1
+
+        # Replay the exact same call — the double-charge guard must refuse.
+        second = ledger.process_payment(pid)
+        assert second['success'] is False
+        assert 'not authorized' in second['error'].lower()
+        # Critically: the gateway was NOT invoked a second time.
+        assert spy.create_calls == 1
+        assert spy.capture_calls == 1
+        # Terminal state preserved.
+        assert ledger.get_payment(pid).status == PaymentStatus.COMPLETED
+
+    def test_completed_payment_cannot_be_reauthorized(self, tmp_path):
+        # The replay guard rests on status leaving AUTHORIZED.  Prove it cannot
+        # be re-opened: authorize_payment refuses a non-PENDING payment, so a
+        # completed charge can't be re-armed for a second process_payment.
+        spy = _SpyGateway()
+        ledger = _ledger_with_gateway(tmp_path, spy)
+        pid = _authorized_payment(ledger)
+        assert ledger.process_payment(pid)['success'] is True
+        assert ledger.get_payment(pid).status == PaymentStatus.COMPLETED
+
+        assert ledger.authorize_payment(pid, "attacker") is False
+        assert ledger.get_payment(pid).status == PaymentStatus.COMPLETED
+        # And a follow-up process still refuses / never re-charges.
+        assert ledger.process_payment(pid)['success'] is False
+        assert spy.create_calls == 1
+
+
+class TestProcessPaymentGatewayDegradePaths:
+    """Every gateway-failure mode must degrade to a FAILED terminal state."""
+
+    def test_gateway_unavailable_marks_failed(self, tmp_path):
+        # Route to a gateway that is not registered (PAYPAL is never added by
+        # default) -> lookup returns None -> FAILED, no exception.
+        ledger = PaymentLedger(ledger_path=str(tmp_path / "l.json"))
+        assert ledger.gateways.get(PaymentGateway.PAYPAL) is None
+        pid = _authorized_payment(ledger, gateway=PaymentGateway.PAYPAL)
+
+        result = ledger.process_payment(pid)
+
+        assert result == {'success': False, 'error': 'Gateway not available'}
+        payment = ledger.get_payment(pid)
+        assert payment.status == PaymentStatus.FAILED
+        assert payment.error_message == "Gateway not available"
+
+    def test_create_failure_marks_failed_without_capture(self, tmp_path):
+        spy = _SpyGateway(create_result={'success': False, 'error': 'card declined'})
+        ledger = _ledger_with_gateway(tmp_path, spy)
+        pid = _authorized_payment(ledger)
+
+        result = ledger.process_payment(pid)
+
+        assert result['success'] is False
+        assert result['error'] == 'card declined'
+        # Capture must never run when create failed.
+        assert spy.create_calls == 1
+        assert spy.capture_calls == 0
+        payment = ledger.get_payment(pid)
+        assert payment.status == PaymentStatus.FAILED
+        assert payment.error_message == 'card declined'
+
+    def test_capture_failure_marks_failed(self, tmp_path):
+        spy = _SpyGateway(
+            create_result={'success': True, 'transaction_id': 'txn_created_1'},
+            capture_result={'success': False, 'error': 'capture timeout'},
+        )
+        ledger = _ledger_with_gateway(tmp_path, spy)
+        pid = _authorized_payment(ledger)
+
+        result = ledger.process_payment(pid)
+
+        # process_payment returns the capture result verbatim on capture failure.
+        assert result['success'] is False
+        assert result['error'] == 'capture timeout'
+        assert spy.create_calls == 1
+        assert spy.capture_calls == 1
+        payment = ledger.get_payment(pid)
+        assert payment.status == PaymentStatus.FAILED
+        assert payment.error_message == 'capture timeout'
+        # The gateway transaction id from create is still recorded for audit.
+        assert payment.gateway_transaction_id == 'txn_created_1'
+
+    def test_create_missing_error_key_uses_default_message(self, tmp_path):
+        # A gateway that reports failure without an 'error' key must still
+        # degrade cleanly (not KeyError) using the fallback message.
+        spy = _SpyGateway(create_result={'success': False})
+        ledger = _ledger_with_gateway(tmp_path, spy)
+        pid = _authorized_payment(ledger)
+
+        result = ledger.process_payment(pid)
+
+        assert result['success'] is False
+        payment = ledger.get_payment(pid)
+        assert payment.status == PaymentStatus.FAILED
+        assert payment.error_message == 'Gateway returned failure'
+
+    def test_gateway_exception_is_caught_and_marks_failed(self, tmp_path):
+        # An exception raised inside the gateway must be caught, recorded, and
+        # the payment marked FAILED — never propagate out of process_payment.
+        spy = _SpyGateway(create_raises=RuntimeError("network boom"))
+        ledger = _ledger_with_gateway(tmp_path, spy)
+        pid = _authorized_payment(ledger)
+
+        result = ledger.process_payment(pid)
+
+        assert result['success'] is False
+        assert result['error'] == 'network boom'
+        assert spy.capture_calls == 0
+        payment = ledger.get_payment(pid)
+        assert payment.status == PaymentStatus.FAILED
+        assert 'network boom' in (payment.error_message or '')
+
+    def test_failed_status_persisted_to_disk(self, tmp_path):
+        # The degrade path must survive a reload — a fresh ledger reading the
+        # same file must see FAILED, proving save_ledger ran on the failure path.
+        spy = _SpyGateway(create_raises=RuntimeError("boom"))
+        ledger_path = str(tmp_path / "persist_fail.json")
+        ledger = PaymentLedger(ledger_path=ledger_path)
+        ledger.gateways[PaymentGateway.MOCK] = spy
+        pid = _authorized_payment(ledger)
+        ledger.process_payment(pid)
+
+        reloaded = PaymentLedger(ledger_path=ledger_path)
+        assert reloaded.get_payment(pid).status == PaymentStatus.FAILED
 
 
 def run_all_tests():
