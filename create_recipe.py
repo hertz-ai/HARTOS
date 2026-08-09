@@ -2092,6 +2092,17 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             from integrations.agent_engine.revenue_tools import register_revenue_tools
             register_revenue_tools(helper, assistant, user_id)
             tool_logger.info("Revenue tools loaded (Tier 2) based on prompt content")
+        if 'news' in goal_tags:
+            # News tools: fetch_news_feeds / subscribe_news_feed /
+            # mark_news_for_web etc.  Required by the seeded
+            # `bootstrap_herald_news_friend` (news) goal — without these the
+            # daily-news-refresh agent has a prompt but no way to actually
+            # pull feeds or flag items for hevolve.ai, so it talks about
+            # curating news without doing it (register_news_tools was dead
+            # code — defined, never wired — until this branch).
+            from integrations.agent_engine.news_tools import register_news_tools
+            register_news_tools(helper, assistant, user_id)
+            tool_logger.info("News tools loaded (Tier 2) based on prompt content")
     except Exception as e:
         # Promoted from debug to warning: a failure here means the agent
         # boots without its goal-specific tools, so it can talk about the

@@ -386,6 +386,7 @@ def test_tier2_goal_detection_parity():
     replay because the matching Tier-2 modules never loaded."""
     EXPECTED_CATEGORIES = {
         'marketing', 'ip_protection', 'self_build', 'outreach', 'sales',
+        'news',
     }
     EXPECTED_REGISTERS = {
         'marketing': 'register_marketing_tools',
@@ -393,6 +394,9 @@ def test_tier2_goal_detection_parity():
         'self_build': 'register_self_build_tools',
         'outreach': 'register_outreach_tools',
         'sales': 'register_journey_tools',
+        # News feed-refresh tools — the seeded Herald (news) agent needs
+        # these wired in BOTH flows or a news recipe replays toolless.
+        'news': 'register_news_tools',
     }
     for filename in ('create_recipe.py', 'reuse_recipe.py'):
         src = _read(os.path.join(REPO_ROOT, filename))

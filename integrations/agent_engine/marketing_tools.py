@@ -470,4 +470,17 @@ def detect_goal_tags(prompt) -> list:
     if any(kw in lower for kw in sales_keywords):
         tags.append('sales')
 
+    # News curation / feed-refresh tools.  Keyed on distinctive phrases the
+    # news prompt (_build_news_prompt) and the `bootstrap_herald_news_friend`
+    # seed actually emit — deliberately NOT the bare substring 'news', which
+    # would false-fire on a marketing 'newsletter' goal and needlessly load
+    # feed tools onto an outreach agent.
+    news_keywords = [
+        'news curation', 'news agent', 'news feed', 'rss feed', 'atom feed',
+        'push notification', 'fetch_news', 'newsworthy', 'breaking news',
+        'mark_news_for_web', 'news notification', 'curate news',
+    ]
+    if any(kw in lower for kw in news_keywords):
+        tags.append('news')
+
     return tags

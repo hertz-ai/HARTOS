@@ -2749,6 +2749,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             from integrations.agent_engine.revenue_tools import register_revenue_tools
             register_revenue_tools(helper, assistant, user_id)
             current_app.logger.info("Revenue tools loaded (Tier 2) for reuse agent")
+        if 'news' in goal_tags:
+            # News tools parity with create_recipe.py — a Herald (news) recipe
+            # authored under the 'news' tag must replay with its feed tools,
+            # else fetch_news_feeds / mark_news_for_web 404 and the daily
+            # refresh step fails silently.
+            from integrations.agent_engine.news_tools import register_news_tools
+            register_news_tools(helper, assistant, user_id)
+            current_app.logger.info("News tools loaded (Tier 2) for reuse agent")
     except Exception as e:
         # Same observability promotion as create_recipe.py — a failure
         # here strips the agent of goal-specific tools, agent talks
