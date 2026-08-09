@@ -1640,6 +1640,7 @@ def register_shell_os_routes(app):
         return jsonify({'packages': packages})
 
     @app.route('/api/system/self-build/install', methods=['POST'])
+    @_require_shell_auth
     def _self_build_install():
         """Add a package to runtime config (requires self-build to apply)."""
         from flask import request, jsonify
@@ -1671,6 +1672,7 @@ def register_shell_os_routes(app):
             return jsonify({'error': 'Permission denied'}), 403
 
     @app.route('/api/system/self-build/remove', methods=['POST'])
+    @_require_shell_auth
     def _self_build_remove():
         """Remove a package from runtime config."""
         from flask import request, jsonify
@@ -1701,6 +1703,7 @@ def register_shell_os_routes(app):
             return jsonify({'error': 'Permission denied'}), 403
 
     @app.route('/api/system/self-build/trigger', methods=['POST'])
+    @_require_shell_auth
     def _self_build_trigger():
         """Trigger a self-build (dry-run or switch)."""
         from flask import request, jsonify
@@ -1752,6 +1755,7 @@ def register_shell_os_routes(app):
         })
 
     @app.route('/api/system/rollback', methods=['POST'])
+    @_require_shell_auth
     def _system_rollback():
         """Rollback to previous NixOS generation."""
         from flask import jsonify

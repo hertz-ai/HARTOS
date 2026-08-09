@@ -2185,6 +2185,233 @@ class TestEmailLauncher(unittest.TestCase):
         self.assertEqual(r.status_code, 404)
 
 
+# ═══════════════════════════════════════════════════════════════
+# Self-Build (runtime OS rebuild) + NixOS rollback
+# ═══════════════════════════════════════════════════════════════
+
+class TestSelfBuildAndRollback(unittest.TestCase):
+    """Tests for /api/system/self-build/{install,remove,trigger} and
+    /api/system/rollback.
+
+    These are the OS's self-modification surface: install/remove edit the
+    declarative /etc/hart/runtime.nix, trigger runs `hart-self-build switch`
+    (rebuilds the running OS), and rollback runs
+    `sudo nixos-rebuild switch --rollback`. Every one of them mutates the box,
+    so — like every other mutating shell route — each MUST be behind the
+    local-only @_require_shell_auth gate. A remote caller must never be able to
+    stage a package into runtime.nix or trigger an OS rebuild / rollback.
+
+    Also covers the package-name validator that guards what is written into
+    runtime.nix (only [A-Za-z0-9_-] alnum names) and the trigger mode allowlist.
+    """
+
+    MOD = 'integrations.agent_engine.shell_os_apis'
+    REMOTE = {'REMOTE_ADDR': '203.0.113.7'}  # non-loopback: must be refused
+
+    # ── Auth boundary: a remote caller must be refused BEFORE any side-effect ──
+
+    def test_install_denied_for_nonlocal(self):
+        """A remote caller cannot stage a package into runtime.nix. The gate must
+        refuse (403) before the config file is ever opened for write."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.open', create=True) as m_open, \
+                patch(f'{self.MOD}.os.path.isfile', return_value=True):
+            r = client.post('/api/system/self-build/install',
+                            json={'package': 'htop'}, environ_overrides=self.REMOTE)
+        self.assertEqual(r.status_code, 403, r.get_data(as_text=True))
+        # No write to /etc/hart/runtime.nix for an unauthenticated caller.
+        m_open.assert_not_called()
+
+    def test_remove_denied_for_nonlocal(self):
+        """A remote caller cannot stage a package removal from runtime.nix."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.open', create=True) as m_open, \
+                patch(f'{self.MOD}.os.path.isfile', return_value=True):
+            r = client.post('/api/system/self-build/remove',
+                            json={'package': 'htop'}, environ_overrides=self.REMOTE)
+        self.assertEqual(r.status_code, 403, r.get_data(as_text=True))
+        m_open.assert_not_called()
+
+    def test_trigger_denied_for_nonlocal(self):
+        """The load-bearing one: a remote caller must NOT be able to trigger an
+        OS rebuild. The gate refuses (403) and hart-self-build is never spawned."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run') as m_run:
+            r = client.post('/api/system/self-build/trigger',
+                            json={'mode': 'switch'}, environ_overrides=self.REMOTE)
+        self.assertEqual(r.status_code, 403, r.get_data(as_text=True))
+        m_run.assert_not_called()
+
+    def test_rollback_denied_for_nonlocal(self):
+        """A remote caller must NOT be able to roll the OS back to a prior
+        generation. The gate refuses (403); nixos-rebuild is never spawned."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run') as m_run:
+            r = client.post('/api/system/rollback', json={},
+                            environ_overrides=self.REMOTE)
+        self.assertEqual(r.status_code, 403, r.get_data(as_text=True))
+        m_run.assert_not_called()
+
+    # ── Package-name validation into runtime.nix (authorized/local caller) ──
+
+    def test_install_rejects_injection_package_name(self):
+        """A package name with shell/nix metacharacters is rejected (400) before
+        anything is written into runtime.nix — the value that lands in the
+        declarative config must be a bare [A-Za-z0-9_-] name."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.open', create=True) as m_open:
+            r = client.post('/api/system/self-build/install',
+                            json={'package': 'htop; rm -rf /'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('Invalid package', json.loads(r.data)['error'])
+        m_open.assert_not_called()
+
+    def test_install_rejects_empty_package(self):
+        """Empty / whitespace-only package name is rejected 400."""
+        client = _make_os_app()
+        r = client.post('/api/system/self-build/install', json={'package': '   '})
+        self.assertEqual(r.status_code, 400)
+
+    def test_install_rejects_path_traversal_package(self):
+        """A path-like package name ('../etc/foo') contains '/' and '.', neither
+        alnum — rejected 400, never written into the config."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.open', create=True) as m_open:
+            r = client.post('/api/system/self-build/install',
+                            json={'package': '../../etc/passwd'})
+        self.assertEqual(r.status_code, 400)
+        m_open.assert_not_called()
+
+    def test_install_missing_runtime_config(self):
+        """A valid package but no runtime.nix on disk → 404 (nothing to stage
+        into). Proves the validator lets a good name THROUGH to the file check."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.os.path.isfile', return_value=False):
+            r = client.post('/api/system/self-build/install',
+                            json={'package': 'ripgrep'})
+        self.assertEqual(r.status_code, 404)
+
+    def test_install_stages_valid_package(self):
+        """A well-formed package name passes the validator AND the auth gate
+        (local caller) and is written into runtime.nix at the marker comment."""
+        from unittest.mock import mock_open
+        client = _make_os_app()
+        content = ("{ pkgs, ... }: {\n  environment.systemPackages = with pkgs; [\n"
+                   "    # Packages added at runtime appear here\n  ];\n}\n")
+        m = mock_open(read_data=content)
+        with patch(f'{self.MOD}.os.path.isfile', return_value=True), \
+                patch(f'{self.MOD}.open', m, create=True):
+            r = client.post('/api/system/self-build/install',
+                            json={'package': 'ripgrep'})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(json.loads(r.data)['status'], 'staged')
+        # The package name was written back into the config exactly once.
+        handle = m()
+        handle.write.assert_called_once()
+        written = handle.write.call_args[0][0]
+        self.assertIn('ripgrep', written)
+        self.assertIn('# Packages added at runtime appear here', written)
+
+    def test_install_already_present_is_idempotent(self):
+        """If the package is already in runtime.nix, install reports
+        already_installed and does NOT rewrite the file."""
+        from unittest.mock import mock_open
+        client = _make_os_app()
+        content = "systemPackages = with pkgs; [\n    ripgrep\n  ];\n"
+        m = mock_open(read_data=content)
+        with patch(f'{self.MOD}.os.path.isfile', return_value=True), \
+                patch(f'{self.MOD}.open', m, create=True):
+            r = client.post('/api/system/self-build/install',
+                            json={'package': 'ripgrep'})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(json.loads(r.data)['status'], 'already_installed')
+        m().write.assert_not_called()
+
+    def test_remove_requires_package(self):
+        """Remove with an empty package name is rejected 400."""
+        client = _make_os_app()
+        r = client.post('/api/system/self-build/remove', json={'package': ''})
+        self.assertEqual(r.status_code, 400)
+
+    def test_remove_stages_removal(self):
+        """Removing a present package drops its line and reports staged_removal."""
+        from unittest.mock import mock_open
+        client = _make_os_app()
+        content = ("systemPackages = with pkgs; [\n    ripgrep\n    htop\n"
+                   "    # Packages added at runtime appear here\n  ];\n")
+        m = mock_open(read_data=content)
+        with patch(f'{self.MOD}.os.path.isfile', return_value=True), \
+                patch(f'{self.MOD}.open', m, create=True):
+            r = client.post('/api/system/self-build/remove',
+                            json={'package': 'ripgrep'})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(json.loads(r.data)['status'], 'staged_removal')
+
+    # ── trigger: mode allowlist + authorized happy path ──
+
+    def test_trigger_rejects_invalid_mode(self):
+        """Trigger mode must be one of dry-run/switch/diff; anything else 400 and
+        never spawns a build."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run') as m_run:
+            r = client.post('/api/system/self-build/trigger',
+                            json={'mode': 'nuke'})
+        self.assertEqual(r.status_code, 400)
+        m_run.assert_not_called()
+
+    def test_trigger_runs_self_build_when_authorized(self):
+        """A local caller with a valid mode reaches hart-self-build; the argv is
+        exactly ['hart-self-build', <mode>] and success maps to 'completed'."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run',
+                   return_value=MagicMock(returncode=0, stdout='ok', stderr='')) as m_run:
+            r = client.post('/api/system/self-build/trigger',
+                            json={'mode': 'dry-run'})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(json.loads(r.data)['status'], 'completed')
+        self.assertEqual(m_run.call_args[0][0], ['hart-self-build', 'dry-run'])
+
+    def test_trigger_defaults_to_dry_run(self):
+        """Omitting mode defaults to the non-destructive dry-run, never switch."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run',
+                   return_value=MagicMock(returncode=0, stdout='', stderr='')) as m_run:
+            r = client.post('/api/system/self-build/trigger', json={})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(m_run.call_args[0][0], ['hart-self-build', 'dry-run'])
+
+    def test_trigger_not_on_nixos(self):
+        """When hart-self-build is absent (non-NixOS host) the route degrades to a
+        clean 501, not a 500."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run', side_effect=FileNotFoundError):
+            r = client.post('/api/system/self-build/trigger',
+                            json={'mode': 'switch'})
+        self.assertEqual(r.status_code, 501)
+
+    # ── rollback: authorized happy path + degrade ──
+
+    def test_rollback_runs_when_authorized(self):
+        """A local caller reaches nixos-rebuild; success maps to 'rolled_back' and
+        the argv is the --rollback switch invocation."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run',
+                   return_value=MagicMock(returncode=0, stdout='done', stderr='')) as m_run:
+            r = client.post('/api/system/rollback', json={})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(json.loads(r.data)['status'], 'rolled_back')
+        argv = m_run.call_args[0][0]
+        self.assertIn('nixos-rebuild', argv)
+        self.assertIn('--rollback', argv)
+
+    def test_rollback_not_available(self):
+        """No nixos-rebuild on the host → clean 501, not a 500."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run', side_effect=FileNotFoundError):
+            r = client.post('/api/system/rollback', json={})
+        self.assertEqual(r.status_code, 501)
+
+
 if __name__ == '__main__':
     unittest.main()
 
