@@ -15,11 +15,15 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from decimal import Decimal
+import base64
+import hashlib
+import hmac
 import json
 import pytest
 from integrations.ap2 import (
     PaymentStatus, PaymentMethod, PaymentGateway,
     PaymentRequest, PaymentLedger, PaymentGatewayConnector, MockPaymentGateway,
+    PhonePePaymentGateway,
     payment_ledger, create_payment_request_function,
     create_payment_authorization_function, create_payment_processing_function,
     get_ap2_tools_for_autogen
@@ -585,6 +589,205 @@ class TestProcessPaymentGatewayDegradePaths:
 
         reloaded = PaymentLedger(ledger_path=ledger_path)
         assert reloaded.get_payment(pid).status == PaymentStatus.FAILED
+
+
+# =============================================================================
+# PhonePePaymentGateway.verify_callback() — S2S webhook signature verification.
+#
+# This is the trust boundary between the public internet and money settling in
+# the ledger.  PhonePe posts `{"response": "<base64>"}` with an
+# `X-VERIFY: sha256(base64_response + salt_key) + "###" + salt_index` header;
+# HARTOS must accept ONLY a callback whose header matches the digest computed
+# with the merchant's own secret salt.  A weakened digest/salt-index compare, or
+# a removed not-connected/empty-salt fail-closed guard, would let a forged or
+# tampered "PAYMENT_SUCCESS" callback verify and settle silently (revenue loss +
+# fraudulent tier grants).
+#
+# Every test below drives the REAL PhonePePaymentGateway.verify_callback and
+# asserts observable behaviour.  The only "boundary" touched is hmac.compare_digest
+# (patched in exactly one test to prove a constant-time compare is used, not `==`).
+# No network is involved — verify_callback is pure crypto over its two arguments.
+# =============================================================================
+
+_SALT_KEY = "s3cr3t_merchant_salt"
+_SALT_INDEX = "1"
+
+# A realistic PhonePe S2S "payment succeeded" body, base64-encoded exactly as it
+# arrives on the wire inside {"response": <this>}.
+_SUCCESS_B64 = base64.b64encode(json.dumps({
+    "success": True,
+    "code": "PAYMENT_SUCCESS",
+    "message": "Your payment is successful.",
+    "data": {
+        "merchantId": "MERCHANT_X",
+        "merchantTransactionId": "hartos_abc123",
+        "amount": 90000,
+        "state": "COMPLETED",
+    },
+}).encode("utf-8")).decode("utf-8")
+
+
+def _connected_phonepe(merchant_id="MERCHANT_X", salt_key=_SALT_KEY,
+                       salt_index=_SALT_INDEX, env="UAT"):
+    """A PhonePe gateway with explicit creds (env-independent) and connected."""
+    g = PhonePePaymentGateway(merchant_id=merchant_id, salt_key=salt_key,
+                              salt_index=salt_index, env=env)
+    assert g.connect() is True
+    assert g.connected is True
+    return g
+
+
+def _valid_header(b64_payload, salt_key=_SALT_KEY, salt_index=_SALT_INDEX):
+    """Compute the X-VERIFY header PhonePe would send for this payload+salt."""
+    digest = hashlib.sha256((b64_payload + salt_key).encode("utf-8")).hexdigest()
+    return f"{digest}###{salt_index}"
+
+
+class TestPhonePeVerifyCallbackAccepts:
+    """A genuine, correctly-signed callback must verify."""
+
+    def test_valid_signature_verifies(self):
+        g = _connected_phonepe()
+        header = _valid_header(_SUCCESS_B64)
+        assert g.verify_callback(_SUCCESS_B64, header) is True
+
+    def test_valid_with_non_default_salt_index(self):
+        # Merchant configured salt_index='2'; a header signed with ###2 must pass.
+        g = _connected_phonepe(salt_index="2")
+        header = _valid_header(_SUCCESS_B64, salt_index="2")
+        assert g.verify_callback(_SUCCESS_B64, header) is True
+
+
+class TestPhonePeVerifyCallbackRejectsForgery:
+    """The security core: reject anything not signed with the merchant secret."""
+
+    def test_forged_success_wrong_salt_key_rejected(self):
+        # Attacker crafts a PAYMENT_SUCCESS body and signs it — but does not know
+        # the merchant salt.  The signature must NOT verify.
+        g = _connected_phonepe()
+        forged_header = _valid_header(_SUCCESS_B64, salt_key="attacker_guess")
+        assert g.verify_callback(_SUCCESS_B64, forged_header) is False
+
+    def test_tampered_payload_with_stale_signature_rejected(self):
+        # Attacker captures a valid (b64, header) pair for a benign body, then
+        # swaps in a forged "success" body while replaying the old header.
+        benign_b64 = base64.b64encode(json.dumps({
+            "success": True, "code": "PAYMENT_PENDING",
+            "data": {"amount": 1},
+        }).encode("utf-8")).decode("utf-8")
+        g = _connected_phonepe()
+        stale_header = _valid_header(benign_b64)          # valid for benign body
+        assert g.verify_callback(_SUCCESS_B64, stale_header) is False  # not the success body
+
+    def test_wrong_salt_index_rejected_even_with_right_digest(self):
+        # Digest is correct, but the appended salt index does not match the
+        # merchant's configured index -> the salt-index compare must reject.
+        g = _connected_phonepe(salt_index="1")
+        digest = hashlib.sha256((_SUCCESS_B64 + _SALT_KEY).encode("utf-8")).hexdigest()
+        wrong_index_header = f"{digest}###9"
+        assert g.verify_callback(_SUCCESS_B64, wrong_index_header) is False
+
+    def test_bare_digest_without_index_rejected(self):
+        # A header that is just the digest (no "###index" suffix) must not pass —
+        # guards against a prefix/substring style weakened compare.
+        g = _connected_phonepe()
+        digest = hashlib.sha256((_SUCCESS_B64 + _SALT_KEY).encode("utf-8")).hexdigest()
+        assert g.verify_callback(_SUCCESS_B64, digest) is False
+
+    def test_salt_key_of_a_different_merchant_rejected(self):
+        # Signature valid for merchant A's salt must be rejected by merchant B's
+        # gateway — proves the digest actually binds to this gateway's secret.
+        gw_b = _connected_phonepe(salt_key="merchant_B_salt")
+        header_for_a = _valid_header(_SUCCESS_B64, salt_key=_SALT_KEY)
+        assert gw_b.verify_callback(_SUCCESS_B64, header_for_a) is False
+
+
+class TestPhonePeVerifyCallbackFailsClosed:
+    """Degrade / empty / malformed inputs must fail closed (return False)."""
+
+    def test_not_connected_rejects_forgery_signed_with_empty_salt(self, monkeypatch):
+        # THE critical fail-closed guard: with no credentials the gateway is
+        # disconnected and holds an EMPTY salt.  If the `not self.connected`
+        # guard were removed, an attacker could forge a valid signature using
+        # the empty key (no secret needed) and settle a fake payment.
+        for k in ("PHONEPE_MERCHANT_ID", "PHONEPE_SALT_KEY",
+                  "PHONEPE_SALT_INDEX", "PHONEPE_ENV"):
+            monkeypatch.delenv(k, raising=False)
+        g = PhonePePaymentGateway()
+        assert g.connect() is False
+        assert g.connected is False
+        assert g.api_key == ""  # no secret to protect the boundary
+        # Forge exactly what the gateway itself would compute with its empty key.
+        forged_header = _valid_header(_SUCCESS_B64, salt_key=g.api_key,
+                                      salt_index=g.salt_index)
+        assert g.verify_callback(_SUCCESS_B64, forged_header) is False
+
+    def test_none_and_empty_inputs_rejected(self):
+        g = _connected_phonepe()
+        assert g.verify_callback(None, "sig###1") is False
+        assert g.verify_callback(_SUCCESS_B64, None) is False
+        assert g.verify_callback("", "sig###1") is False
+        assert g.verify_callback(_SUCCESS_B64, "") is False
+        assert g.verify_callback("", "") is False
+        assert g.verify_callback(None, None) is False
+
+    def test_garbage_header_rejected(self):
+        g = _connected_phonepe()
+        assert g.verify_callback(_SUCCESS_B64, "not-a-signature") is False
+        assert g.verify_callback(_SUCCESS_B64, "###1") is False
+        assert g.verify_callback(_SUCCESS_B64, "deadbeef###1###extra") is False
+
+    def test_non_ascii_header_does_not_raise_and_rejects(self):
+        # hmac.compare_digest raises TypeError on non-ASCII str comparison; the
+        # method must catch it and fail closed, never propagate an exception out
+        # onto the webhook handler (which would 500 or, worse, be mishandled).
+        g = _connected_phonepe()
+        result = g.verify_callback(_SUCCESS_B64, "café_signature###1")
+        assert result is False
+
+
+class TestPhonePeVerifyCallbackContract:
+    """Lock in the exact crypto contract so a silent weakening is caught."""
+
+    def test_uses_constant_time_compare(self, monkeypatch):
+        # Prove the method routes through hmac.compare_digest (constant-time),
+        # not a naive `==`, which would leak the digest byte-by-byte via timing.
+        calls = []
+        real = hmac.compare_digest
+
+        def _spy(a, b):
+            calls.append((a, b))
+            return real(a, b)
+
+        monkeypatch.setattr(hmac, "compare_digest", _spy)
+        g = _connected_phonepe()
+        header = _valid_header(_SUCCESS_B64)
+        assert g.verify_callback(_SUCCESS_B64, header) is True
+        assert len(calls) == 1, "verify_callback must use hmac.compare_digest exactly once"
+        # It compared the fully-assembled expected header (digest###index), not
+        # just the bare digest — so the salt index is inside the constant-time compare.
+        expected_header, _received = calls[0]
+        assert expected_header == header
+        assert expected_header.endswith(f"###{_SALT_INDEX}")
+
+    def test_digest_binds_base64_payload_exactly(self):
+        # One trailing byte of difference in the payload must invalidate the
+        # signature — the digest covers the exact base64 string, no normalisation.
+        g = _connected_phonepe()
+        header = _valid_header(_SUCCESS_B64)
+        assert g.verify_callback(_SUCCESS_B64 + "=", header) is False
+
+    def test_replay_of_identical_valid_callback_still_verifies(self):
+        # HONEST CONTRACT: verify_callback authenticates the SIGNATURE only; it is
+        # not a freshness/replay oracle.  A byte-identical genuine callback verifies
+        # every time.  Replay defense lives upstream in the ledger's idempotent
+        # settlement keyed on merchantTransactionId (see process_payment replay
+        # guard tests above), NOT in this signature check.  This test documents
+        # that boundary so nobody mistakes signature validity for replay safety.
+        g = _connected_phonepe()
+        header = _valid_header(_SUCCESS_B64)
+        assert g.verify_callback(_SUCCESS_B64, header) is True
+        assert g.verify_callback(_SUCCESS_B64, header) is True
 
 
 def run_all_tests():
