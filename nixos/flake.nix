@@ -1014,6 +1014,18 @@
       # lets an UNCLAIMED device pass. One node, many devices: a VM job costs
       # ~2h, so per-device nodes would buy the same coverage for 6x the clock.
       driverMatrix = import ./tests/driver-matrix.nix desktopTestArgs;
+      # RESIDENT CO-PILOT: the 2026-07-30 flash shipped hart.copilot.enable=true
+      # and the co-pilot did NOTHING — `enable` installs only the launcher, the
+      # bounded worker is a SECOND opt-in (copilot.daemon.enable) nobody had set.
+      # A comment in profiles/desktop.nix now records that, but a comment is not a
+      # gate. There is a quieter twin: the module gates the daemon on
+      # `claudePkg != null` where claudePkg = newPkgs.claude-code or null, so an
+      # upstream attr move DELETES the unit silently with the build still green.
+      # This node is built from the REAL desktop profile and sets no hart.copilot.*
+      # of its own, so it asserts what an IMAGE ships, not what a test opts into.
+      # Honest scope: no OAuth exists in a VM (§5 ships no key), so it asserts the
+      # unit is LOADED + BOUNDED, never ACTIVE. Distinct attr -> clean //.
+      copilotResident = import ./tests/copilot-resident.nix desktopTestArgs;
 
       # ORPHANS ADOPTED 2026-08-04. Both files existed, both defined a real
       # check (hart-app-install-verify, hart-llm-provision), and NEITHER was
@@ -1185,7 +1197,7 @@
       # 'screen' kill-switch is cut OR the authority is down, and ALLOWS when on.
       # Distinct attr -> clean //; desktop-variant node (mkNode).
       notify = import ./tests/notify.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // firmwareBootMatrix // bootLatency // driverMatrix // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify // hartInstaller // appInstallVerify // llmProvision;
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // firmwareBootMatrix // bootLatency // driverMatrix // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify // hartInstaller // appInstallVerify // llmProvision // copilotResident;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)
