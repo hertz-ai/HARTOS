@@ -1225,6 +1225,171 @@ class TestHashFile(unittest.TestCase):
             self.assertEqual(result, expected)
 
 
+class TestNodeIntegrityKeyAtRest(unittest.TestCase):
+    """Encrypt-at-rest LOAD branch + the 'never silently rotate identity' invariant.
+
+    The existing node-integrity coverage only exercises fresh-key sign/verify.
+    These tests drive the disk-load path of get_or_create_keypair():
+      * a key persisted while HEVOLVE_DATA_KEY is set is Fernet-encrypted at rest
+        and reloads to the SAME identity through the decrypt branch;
+      * an EXISTING private key that fails to load/decrypt (wrong data key or a
+        corrupt file) must NOT be silently regenerated — doing so rotates the
+        node's peer trust anchor AND overwrites (destroys) the on-disk key that
+        was very likely recoverable (transient HEVOLVE_DATA_KEY misconfig).
+    """
+
+    def setUp(self):
+        from security.node_integrity import reset_keypair
+        reset_keypair()
+        self._tmpdir = tempfile.mkdtemp()
+        self._priv_path = Path(self._tmpdir) / 'node_private_key.pem'
+        self._pub_path = Path(self._tmpdir) / 'node_public_key.pem'
+
+    def tearDown(self):
+        from security.node_integrity import reset_keypair
+        reset_keypair()
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    @staticmethod
+    def _fernet_key():
+        from cryptography.fernet import Fernet
+        return Fernet.generate_key().decode()
+
+    @staticmethod
+    def _pub_hex(pub):
+        from cryptography.hazmat.primitives import serialization
+        return pub.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        ).hex()
+
+    def test_encrypted_key_reloads_same_identity_through_decrypt_branch(self):
+        """Key written under HEVOLVE_DATA_KEY is encrypted at rest and the
+        decrypt LOAD branch reloads the SAME public identity after a cache clear."""
+        from security.node_integrity import get_or_create_keypair, reset_keypair
+        data_key = self._fernet_key()
+        with patch.dict(os.environ, {'HEVOLVE_DATA_KEY': data_key}), \
+             patch('security.node_integrity._KEY_DIR', self._tmpdir):
+            reset_keypair()
+            _, pub1 = get_or_create_keypair()
+            hex1 = self._pub_hex(pub1)
+
+            # Persisted private key must be Fernet-encrypted at rest, not plaintext PEM.
+            raw = self._priv_path.read_bytes()
+            self.assertTrue(raw.startswith(b'gAAAAA'),
+                            "private key should be Fernet-encrypted at rest")
+            self.assertNotIn(b'PRIVATE KEY', raw)
+
+            # Clear the in-memory cache -> forces a reload from the encrypted file,
+            # exercising the decrypt_data + load_pem_private_key branch.
+            reset_keypair()
+            _, pub2 = get_or_create_keypair()
+            hex2 = self._pub_hex(pub2)
+
+        self.assertEqual(hex1, hex2, "reload from encrypted disk must yield same identity")
+
+    def test_wrong_data_key_does_not_silently_rotate_identity(self):
+        """Booting with the WRONG HEVOLVE_DATA_KEY (transient misconfig) must NOT
+        mint a new identity nor overwrite the existing encrypted key on disk."""
+        from security.node_integrity import get_or_create_keypair, reset_keypair
+        key_a = self._fernet_key()
+        key_b = self._fernet_key()
+
+        # First boot: persist an encrypted key under key_a.
+        with patch.dict(os.environ, {'HEVOLVE_DATA_KEY': key_a}), \
+             patch('security.node_integrity._KEY_DIR', self._tmpdir):
+            reset_keypair()
+            _, pub = get_or_create_keypair()
+            orig_hex = self._pub_hex(pub)
+        orig_bytes = self._priv_path.read_bytes()
+        self.assertTrue(orig_bytes.startswith(b'gAAAAA'))
+
+        # Second boot with a DIFFERENT (wrong) data key: decrypt fails, PEM load
+        # fails. The node must refuse to regenerate rather than rotate/destroy id.
+        reset_keypair()
+        with patch.dict(os.environ, {'HEVOLVE_DATA_KEY': key_b}), \
+             patch('security.node_integrity._KEY_DIR', self._tmpdir):
+            with self.assertRaises(RuntimeError):
+                get_or_create_keypair()
+
+        # The on-disk private key must be UNTOUCHED (original identity preserved).
+        self.assertEqual(self._priv_path.read_bytes(), orig_bytes,
+                         "existing private key file must not be overwritten on load failure")
+
+        # And with the correct key restored, the ORIGINAL identity still loads.
+        reset_keypair()
+        with patch.dict(os.environ, {'HEVOLVE_DATA_KEY': key_a}), \
+             patch('security.node_integrity._KEY_DIR', self._tmpdir):
+            _, pub_again = get_or_create_keypair()
+        self.assertEqual(self._pub_hex(pub_again), orig_hex,
+                         "original identity must survive a wrong-key boot")
+
+    def test_corrupt_private_key_file_is_not_silently_regenerated(self):
+        """A corrupt/garbage existing private key (with a valid public key present)
+        must raise rather than being silently overwritten with a fresh identity."""
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+        from security.node_integrity import get_or_create_keypair, reset_keypair
+
+        # Valid public key on disk so the (priv AND pub exists) guard is taken...
+        real = Ed25519PrivateKey.generate()
+        self._pub_path.write_bytes(real.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ))
+        # ...but the private key file is garbage (not Fernet, not valid PEM).
+        garbage = b'this is not a valid PEM private key at all\n'
+        self._priv_path.write_bytes(garbage)
+
+        reset_keypair()
+        with patch.dict(os.environ, {}, clear=False), \
+             patch('security.node_integrity._KEY_DIR', self._tmpdir):
+            os.environ.pop('HEVOLVE_DATA_KEY', None)
+            with self.assertRaises(RuntimeError):
+                get_or_create_keypair()
+
+        # The corrupt file must be preserved, not overwritten, so an operator can
+        # investigate / restore rather than discover the identity silently rotated.
+        self.assertEqual(self._priv_path.read_bytes(), garbage,
+                         "corrupt private key must not be overwritten on load failure")
+
+    def test_first_boot_generates_when_no_key_exists(self):
+        """Regression guard: with NO key files present, first boot still generates
+        a keypair (the fix must not turn a legitimate first boot into an error)."""
+        from security.node_integrity import get_or_create_keypair, reset_keypair
+        self.assertFalse(self._priv_path.exists())
+        reset_keypair()
+        with patch.dict(os.environ, {'HEVOLVE_DATA_KEY': self._fernet_key()}), \
+             patch('security.node_integrity._KEY_DIR', self._tmpdir):
+            priv, pub = get_or_create_keypair()
+        self.assertIsNotNone(priv)
+        self.assertIsNotNone(pub)
+        self.assertTrue(self._priv_path.exists(),
+                        "first boot must persist a freshly generated private key")
+
+    def test_plaintext_key_reloads_without_raising(self):
+        """When encryption is disabled (no data key configured), a plaintext PEM
+        key round-trips and reloads to the same identity without raising — the
+        refuse-to-regenerate fix must only bite on genuine load failures."""
+        from security.node_integrity import get_or_create_keypair, reset_keypair
+        # Force the "no encryption configured" boundary deterministically so the
+        # test does not depend on ambient env / secrets vault state.
+        with patch('security.crypto._get_data_key', return_value=None), \
+             patch('security.node_integrity._KEY_DIR', self._tmpdir):
+            reset_keypair()
+            _, pub1 = get_or_create_keypair()
+            hex1 = self._pub_hex(pub1)
+
+            raw = self._priv_path.read_bytes()
+            self.assertIn(b'PRIVATE KEY', raw, "key should be plaintext PEM when unencrypted")
+
+            reset_keypair()
+            _, pub2 = get_or_create_keypair()
+            hex2 = self._pub_hex(pub2)
+        self.assertEqual(hex1, hex2)
+
+
 class TestPurgePycache(unittest.TestCase):
     """__pycache__ purge functionality."""
 
