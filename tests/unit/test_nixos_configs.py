@@ -4007,6 +4007,36 @@ class TestRawImageSinglePath:
         src = self._read(MODULES_DIR, "hart-repart-image.nix")
         assert "hart.bootRootInitrd.enable = lib.mkDefault true" in src
 
+    def test_repart_initrd_covers_internal_disk_roots_sata_and_nvme(self):
+        """The installed raw image's PRIMARY boot medium is an INTERNAL disk, not
+        a USB stick — that is the whole reason it exists next to the live ISO. Yet
+        the hart.bootRootInitrd guard only pins the USB-root set (usb_storage / uas
+        / sd_mod / xhci; criticalModules in hart-boot-root-initrd.nix). SATA (ahci)
+        and NVMe (nvme) coverage lives ONLY in THIS module's explicit
+        boot.initrd.availableKernelModules list, so this test is their sole guard:
+        drop them and an installed image on any modern NVMe laptop or SATA SSD
+        'VFS: unable to mount root fs' bricks on first boot, while CI stays green
+        because the eval guard never checks ahci/nvme.
+
+        Source-shape guard by necessity — .nix cannot be evaluated on the Windows
+        dev box, and this asserts a cross-module invariant (the bootRootInitrd
+        guard's module set does NOT overlap ahci/nvme, so the repart list must
+        carry them) that no single behavioural test can reach."""
+        src = self._read(MODULES_DIR, "hart-repart-image.nix")
+        m = re.search(r"boot\.initrd\.availableKernelModules\s*=\s*\[([^\]]*)\]", src)
+        assert m, ("hart-repart-image.nix no longer pins an explicit "
+                   "boot.initrd.availableKernelModules list — the installed "
+                   "image's SATA/NVMe root coverage is gone")
+        listed = set(re.findall(r'"([^"]+)"', m.group(1)))
+        # ahci = SATA controller (2.5\" SSD / HDD); nvme = NVMe SSD (M.2). Neither
+        # is in the bootRootInitrd guard's critical set, so ONLY this list carries
+        # them — usb_storage/uas/sd_mod are belt-and-suspenders with the guard.
+        for mod in ("usb_storage", "uas", "ahci", "nvme", "sd_mod"):
+            assert mod in listed, (
+                f"hart-repart-image.nix dropped '{mod}' from the installed-image "
+                f"initrd (have: {sorted(listed)}) — a raw image dd'd onto a disk "
+                f"that needs '{mod}' cannot mount its root and VFS-panics on boot")
+
     def test_iso_branding_lives_inside_the_iso_branch(self):
         """isoImage.* options exist only under the CD profile; an
         unconditional block breaks the raw eval ('option does not exist')."""
