@@ -188,15 +188,33 @@ def test_body_webkit_flat_when_compositing_off_even_on_hardware_probe(svc, monke
     assert 'gpu-hardware' not in body
 
 
-def test_body_not_webkit_flat_when_hardware_gl_opted_in(svc, monkeypatch):
-    """Converse: preferHardwareGL=true (LIQUID_UI_PREFER_HW_GL='1') composites the
-    blur, so the glassy translucent look is KEPT — no webkit-flat, no opaque
-    override. The GPU path stays glassy; only the compositing-off path is flattened."""
-    monkeypatch.setenv('LIQUID_UI_PREFER_HW_GL', '1')
+def test_webkit_flat_keyed_off_the_vulkan_rung_not_the_gl_flag(svc, monkeypatch):
+    """The glass frost is keyed off the RUNTIME RENDER RUNG, not preferHardwareGL.
+
+    Deliberate 2026-07-24 (liquid_ui_service.py:1590-1602, and HOME_DESKTOP_
+    DESIGN_CHECKLIST GF1): backdrop-filter blur composites ONLY on the vulkan
+    rung. hart-comp forces webkit-cairo even when preferHardwareGL is on (vulkan
+    demoted for the hover VK_ERROR_SURFACE_LOST_KHR), and cairo cannot paint
+    blur — so keying the frost off the FLAG would render a cairo surface
+    see-through. Hence: only the vulkan rung drops webkit-flat; every other rung
+    keeps it opaque + legible. (Supersedes the old preferHardwareGL-keyed
+    behaviour this test used to assert.)"""
     monkeypatch.setattr(lus, 'read_gpu_render_mode', lambda: 'hardware')
+
+    # preferHardwareGL ON but the runtime rung is webkit-cairo (hart-comp's real
+    # state): blur will NOT paint, so the glass MUST stay flat/opaque.
+    monkeypatch.setenv('LIQUID_UI_PREFER_HW_GL', '1')
+    monkeypatch.setattr(lus, 'read_shell_render_mode', lambda: 'webkit-cairo')
+    body = _body_tag(svc.render_desktop_shell())
+    assert 'webkit-flat' in body, (
+        "a non-vulkan rung (cairo) cannot composite backdrop-filter — the glass "
+        "must stay opaque even with preferHardwareGL on, or panels read see-through")
+
+    # The vulkan rung DOES composite blur → the frosted glass returns, no flat.
+    monkeypatch.setattr(lus, 'read_shell_render_mode', lambda: 'vulkan')
     body = _body_tag(svc.render_desktop_shell())
     assert 'webkit-flat' not in body, (
-        "preferHardwareGL=true composites backdrop-filter — must NOT flatten the glass")
+        "the vulkan rung composites backdrop-filter — the glass frosts, no flat")
 
 
 def test_css_floor_solidifies_glass_and_panels_on_webkit_flat(svc):
@@ -213,10 +231,20 @@ def test_css_floor_solidifies_glass_and_panels_on_webkit_flat(svc):
     assert 'body.webkit-flat .panel' in css
     # The webkit-flat selector leads into a block that BOTH kills the (uncomposited)
     # blur AND sets a near-opaque fill — that pairing is what makes the panel solid.
-    assert re.search(r'body\.webkit-flat[^{]*\{[^}]*backdrop-filter:\s*none', css), \
+    m = re.search(r'body\.webkit-flat[^{]*\{([^}]*)\}', css)
+    assert m, "no body.webkit-flat rule block found on the served stylesheet"
+    block = m.group(1)
+    assert re.search(r'backdrop-filter:\s*none', block), \
         "webkit-flat glass must disable backdrop-filter (it paints nothing uncomposited)"
-    assert re.search(r'body\.webkit-flat[^{]*\{[^}]*background:\s*rgba', css), \
-        "webkit-flat glass must set a near-opaque rgba fill (else still see-through)"
+    # The fill must be an EXPLICIT opaque surface. GF1 (2026-07-12) upgraded the
+    # flat grey `background: rgba(...)` to a brand-tinted `linear-gradient` (keep
+    # COLOUR depth on the software floor at zero per-frame cost), so accept
+    # either — but require a near-opaque alpha (>= ~0.9), which is what actually
+    # stops the panel reading see-through.
+    assert re.search(r'background:\s*(rgba|linear-gradient)', block), \
+        "webkit-flat glass must set an explicit fill (flat rgba or brand gradient)"
+    assert re.search(r'0\.9[0-9]', block), \
+        "the webkit-flat fill must be near-opaque (>= ~0.9 alpha), not a see-through overlay"
 
 
 # ── #138 terminal exec re-render guard (inline JS — source guard) ──────────────
