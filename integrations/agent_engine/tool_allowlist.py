@@ -64,14 +64,27 @@ def _get_tier_tools() -> dict:
 
 
 def _resolve_tier(model_id: str):
-    """Resolve model ID to its tier. Returns None if unknown."""
+    """Resolve a model ID to its ModelTier enum. Returns None if unknown.
+
+    The registry stores ModelBackend objects whose ``.tier`` is a ModelTier
+    enum — that is what the tier→tool maps below are keyed on. A dict-shaped
+    entry ('tier' / 'model_tier') is tolerated for forward-compat with an
+    alternate registry. Any lookup failure degrades to None so the caller
+    fails closed (no tools) rather than silently over-permitting.
+    """
     try:
         from integrations.agent_engine.model_registry import model_registry
-        info = model_registry.get(model_id)
-        if info:
+        info = model_registry.get_model(model_id)
+        if info is None:
+            return None
+        if isinstance(info, dict):
             return info.get('tier') or info.get('model_tier')
+        return getattr(info, 'tier', None) or getattr(info, 'model_tier', None)
     except Exception:
-        pass
+        logger.debug(
+            f"Tool allowlist: tier resolution failed for '{model_id}' — fail-closed",
+            exc_info=True,
+        )
     return None
 
 
@@ -93,7 +106,15 @@ def filter_tools_for_model(model_id: str, tools: List[dict]) -> List[dict]:
         return []
 
     tier_tools = _get_tier_tools()
-    allowed_set = tier_tools.get(tier)
+    if tier not in tier_tools:
+        # Tier resolved but has no explicit mapping (e.g. DRAFT). Fail closed:
+        # a missing mapping must NEVER be read as "unrestricted" — only EXPERT,
+        # mapped explicitly to None below, is unrestricted.
+        logger.warning(
+            f"Tool allowlist: unmapped tier '{getattr(tier, 'value', tier)}' "
+            f"for model '{model_id}', fail-closed (no tools)")
+        return []
+    allowed_set = tier_tools[tier]
     if allowed_set is None:
         return tools  # Expert = unrestricted
 
@@ -116,7 +137,11 @@ def check_tool_allowed(model_id: str, tool_name: str) -> Tuple[bool, str]:
         return False, f"Unknown model '{model_id}' — fail-closed"
 
     tier_tools = _get_tier_tools()
-    allowed_set = tier_tools.get(tier)
+    if tier not in tier_tools:
+        # Unmapped tier (e.g. DRAFT) — fail closed, never unrestricted.
+        return False, (f"Tier '{getattr(tier, 'value', tier)}' has no tool "
+                       f"mapping — fail-closed")
+    allowed_set = tier_tools[tier]
     if allowed_set is None:
         return True, f"Model tier {tier.value} has unrestricted access"
 
