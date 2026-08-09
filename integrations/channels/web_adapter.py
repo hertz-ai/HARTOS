@@ -29,7 +29,7 @@ import base64
 import mimetypes
 from typing import Optional, List, Dict, Any, Set
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from dataclasses import dataclass, field
 
 try:
@@ -371,7 +371,16 @@ class WebAdapter(ChannelAdapter):
 
             # Save file
             file_id = str(uuid.uuid4())
-            file_name = metadata.get("file_name", "upload")
+            # Sanitize the untrusted filename: this arrives over an
+            # UNAUTHENTICATED WebSocket, so a crafted name like
+            # "../../../evil" or "/etc/cron.d/evil" (or the "..\\.." Windows
+            # variant, which the OS normalizes lexically) would otherwise
+            # escape upload_dir via the f"{file_id}_{file_name}" join and
+            # write to an arbitrary location. Strip every directory component
+            # and keep only the bare basename.
+            file_name = PurePosixPath(str(metadata.get("file_name", "upload")).replace("\\", "/")).name
+            if file_name in ("", ".", ".."):
+                file_name = "upload"
             file_path = self._upload_dir / f"{file_id}_{file_name}"
             file_path.write_bytes(file_data)
 
