@@ -233,6 +233,40 @@ class TestGoalManager:
             CodingGoalManager.create_goal(db, title='X', description='d',
                                            repo_url='a/b', branch='main; rm -rf /')
 
+    def test_create_goal_rejects_trailing_newline_repo(self, db):
+        r"""Regression: re.match(r'...$', 'owner/repo\n') ACCEPTS a trailing
+        newline (the $ anchors before a terminal \n), so an injection-prevention
+        validator would pass 'owner/repo\n' straight into git. fullmatch rejects
+        it — a trailing newline must never slip past the sanitiser."""
+        from integrations.coding_agent.goal_manager import CodingGoalManager
+        with pytest.raises(ValueError, match='Invalid repo_url'):
+            CodingGoalManager.create_goal(db, title='X', description='d',
+                                           repo_url='hertz-ai/test\n', branch='main')
+
+    def test_create_goal_rejects_trailing_newline_branch(self, db):
+        r"""Same trailing-newline bypass on the branch validator (would reach
+        `git checkout`) — now rejected by fullmatch."""
+        from integrations.coding_agent.goal_manager import CodingGoalManager
+        with pytest.raises(ValueError, match='Invalid branch'):
+            CodingGoalManager.create_goal(db, title='X', description='d',
+                                           repo_url='a/b', branch='main\n')
+
+    def test_create_goal_accepts_valid_feature_branch(self, db):
+        """The tightened validator rejects only malformed input: a well-formed
+        slash/dash/underscore branch still passes and creates the goal."""
+        from integrations.coding_agent.goal_manager import CodingGoalManager
+        result = CodingGoalManager.create_goal(db, title='T', description='d',
+                                               repo_url='hertz-ai/test',
+                                               branch='feature/new-thing_1')
+        assert result['status'] == 'active'
+
+    def test_api_validate_repo_rejects_trailing_newline(self):
+        r"""The sibling validator in coding_agent.api (_validate_repo) had the
+        same re.match trailing-newline bypass — 'owner/repo\n' must be rejected."""
+        from integrations.coding_agent.api import _validate_repo
+        assert _validate_repo('hertz-ai/test\n') == 'repo_url contains invalid characters'
+        assert _validate_repo('hertz-ai/test') is None  # valid still passes
+
     def test_get_goal(self, db, sample_goal):
         from integrations.coding_agent.goal_manager import CodingGoalManager
         result = CodingGoalManager.get_goal(db, sample_goal.id)

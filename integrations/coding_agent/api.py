@@ -48,7 +48,9 @@ def _validate_repo(repo_url: str) -> Optional[str]:
         return 'repo_url is required'
     if '/' not in repo_url or len(repo_url.split('/')) != 2:
         return 'repo_url must be in owner/repo format'
-    if not re.match(r'^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$', repo_url):
+    # fullmatch, NOT match: re.match(r'...$', 'owner/repo\n') accepts a trailing
+    # newline (the $ anchors before a terminal \n); fullmatch rejects it.
+    if not re.fullmatch(r'[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+', repo_url):
         return 'repo_url contains invalid characters'
     if ALLOWED_REPOS and repo_url not in ALLOWED_REPOS:
         return 'Repository not in allowlist'
