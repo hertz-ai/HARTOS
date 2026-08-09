@@ -247,9 +247,20 @@ in
       networking.networkmanager.dispatcherScripts = [{
         type = "basic";
         source = pkgs.writeShellScript "flathub-on-connectivity" ''
+          # Fire on the connectivity events, but ONLY act once the internet is
+          # ACTUALLY reachable. The bug this fixes: the dispatcher re-ran
+          # hart-flathub-init on `up` / dhcp-lease at ~+2 min, while DNS still
+          # could not resolve, so remote-add hit "Could not resolve hostname"
+          # AGAIN and gave up — event-driven, but on the wrong event (an
+          # interface having a lease is not the same as the internet being
+          # reachable). NetworkManager's own connectivity check answers the
+          # real question: gate on CONNECTIVITY=full so we only attempt
+          # remote-add when a captive-portal-free, DNS-resolving path exists.
           case "$2" in
             up|connectivity-change|dhcp4-change|dhcp6-change)
-              ${pkgs.systemd}/bin/systemctl start --no-block hart-flathub-init.service || true
+              if [ "$(${pkgs.networkmanager}/bin/nmcli -t -f CONNECTIVITY general status 2>/dev/null)" = "full" ]; then
+                ${pkgs.systemd}/bin/systemctl start --no-block hart-flathub-init.service || true
+              fi
               ;;
           esac
         '';

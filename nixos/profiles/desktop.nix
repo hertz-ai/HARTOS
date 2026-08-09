@@ -1038,6 +1038,21 @@ in
   # needs device firmware, and having it only here meant a headless server
   # could boot with no working NIC. One writer, all variants.)
 
+  # ─── Clock: the hardware clock is LOCAL time, not UTC ───
+  # The raw/live desktop image's whole point is "try HART OS on the machine you
+  # already run Windows on" (boot the USB alongside it). Windows keeps the RTC
+  # in LOCAL time; NixOS defaults to reading it as UTC, so a fresh boot showed a
+  # clock skewed by the timezone offset (observed live: journal stamps ~5.5 h
+  # ahead on an IST machine). A wrong clock fails TLS certificate validation,
+  # which then breaks HTTPS app installs, flatpak's remote-add, and the
+  # co-pilot's own OAuth /login — the exact symptoms a fresh flash hits. The
+  # Calamares installer already sets this when it detects a Windows bootloader
+  # (hart-installer.nix); the live image needs the same default because that is
+  # where dual-boot is the norm. systemd-timesyncd remains the backstop that
+  # corrects the displayed time once the network is genuinely up (see the
+  # flathub connectivity=full gate — same "wait for real internet" lesson).
+  time.hardwareClockInLocalTime = true;
+
   # ─── Printing & Scanning ───
   services.printing.enable = true;
   services.avahi = {
