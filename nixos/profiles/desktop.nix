@@ -1053,6 +1053,19 @@ in
   # flathub connectivity=full gate — same "wait for real internet" lesson).
   time.hardwareClockInLocalTime = true;
 
+  # ─── Magic SysRq: a guaranteed hard-escape from a fully-wedged shell ───
+  # When the glass shell software-renders (GSK=CAIRO) it can peg the CPU and
+  # wedge the in-shell terminal — the "commands return with no output" symptom.
+  # The blast radius is the graphical shell, NOT the kernel, so a kernel-level
+  # escape always exists IF SysRq is enabled. It was left at the kernel compile
+  # default (not guaranteed), so enable it explicitly: 1 = all functions, which
+  # gives REISUB (Alt+SysRq+R,E,I,S,U,B) — a clean sync-and-reboot that works
+  # even when userspace is completely hung, without a hard power-cut that risks
+  # the writable root. Ctrl+Alt+F2 (a real TTY) and Ctrl+Alt+Del (systemd
+  # reboot) remain the softer rungs; this is the floor of the escape ladder
+  # until the in-shell ANR watchdog lands to recover the surface autonomously.
+  boot.kernel.sysctl."kernel.sysrq" = 1;
+
   # ─── Printing & Scanning ───
   services.printing.enable = true;
   services.avahi = {
