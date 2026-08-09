@@ -18,6 +18,16 @@ logger = logging.getLogger('hevolve_social')
 # Consumed by the 'seo' goal type (goal_manager._build_seo_prompt).
 PUBLISH_WEB_MARKER = '<!-- publish_web -->'
 
+# Marker carrying the lead image for a web-published news event. When the news
+# agent crawls a source article (crawl4ai) and pulls its og:image, it passes
+# that URL here so the hevolve.ai news card renders a real preview instead of a
+# generated cover. Same content-marker convention as PUBLISH_WEB_MARKER (no
+# schema change); list_news_for_web parses it back out, and the 'seo' goal
+# includes it in the published item.
+import re as _re
+NEWS_IMAGE_PREFIX = '<!-- news_image:'
+NEWS_IMAGE_RE = _re.compile(r'<!--\s*news_image:(\S+?)\s*-->')
+
 
 def register_news_tools(helper, assistant, user_id: str):
     """Register news curation and push notification tools with an AutoGen agent."""
@@ -227,8 +237,14 @@ def register_news_tools(helper, assistant, user_id: str):
     def mark_news_for_web(
         post_id: Annotated[str, "Post ID of the ingested news item"],
         publishable: Annotated[bool, "True to flag for web publication, False to clear the flag"] = True,
+        image_url: Annotated[str, "Optional lead image URL (og:image) from the crawled source article, so the web card renders a real preview instead of a generated cover"] = '',
     ) -> str:
-        """Flag an ingested news post for hevolve.ai web publication (publish_web)."""
+        """Flag an ingested news post for hevolve.ai web publication (publish_web).
+
+        To close the loop with a rich card: crawl the source article with
+        crawl4ai, pull its og:image, and pass it as image_url. The published
+        news event then shows a real preview.
+        """
         try:
             from integrations.social.models import get_db, Post
 
@@ -239,20 +255,35 @@ def register_news_tools(helper, assistant, user_id: str):
                     return json.dumps({'error': f'post not found: {post_id}'})
 
                 content = post.content or ''
+                changed = False
                 marked = PUBLISH_WEB_MARKER in content
                 if publishable and not marked:
-                    post.content = f"{content}\n\n{PUBLISH_WEB_MARKER}"
-                    db.commit()
+                    content = f"{content}\n\n{PUBLISH_WEB_MARKER}"
+                    changed = True
                 elif not publishable and marked:
-                    post.content = content.replace(
+                    content = content.replace(
                         f"\n\n{PUBLISH_WEB_MARKER}", '').replace(
                         PUBLISH_WEB_MARKER, '')
+                    changed = True
+
+                # Attach (or clear) the lead-image marker.
+                img = (image_url or '').strip()
+                if publishable and img and NEWS_IMAGE_PREFIX not in content:
+                    content = f"{content}\n\n{NEWS_IMAGE_PREFIX}{img} -->"
+                    changed = True
+                elif not publishable and NEWS_IMAGE_PREFIX in content:
+                    content = NEWS_IMAGE_RE.sub('', content)
+                    changed = True
+
+                if changed:
+                    post.content = content
                     db.commit()
 
                 return json.dumps({
                     'success': True,
                     'post_id': str(post.id),
                     'publish_web': bool(publishable),
+                    'image_url': img or None,
                     'title': post.title,
                 })
             finally:
@@ -278,11 +309,15 @@ def register_news_tools(helper, assistant, user_id: str):
                 )
                 items = []
                 for post in posts:
+                    _content = post.content or ''
+                    _img = NEWS_IMAGE_RE.search(_content)
+                    _clean = NEWS_IMAGE_RE.sub('', _content).replace(
+                        PUBLISH_WEB_MARKER, '').strip()
                     items.append({
                         'id': str(post.id),
                         'title': post.title,
-                        'content': (post.content or '').replace(
-                            PUBLISH_WEB_MARKER, '').strip(),
+                        'content': _clean,
+                        'image_url': _img.group(1) if _img else None,
                         'link_url': post.link_url,
                         'source_channel': post.source_channel,
                         'created_at': post.created_at.isoformat() if post.created_at else None,

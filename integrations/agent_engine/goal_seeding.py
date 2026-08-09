@@ -1439,8 +1439,13 @@ SEED_BOOTSTRAP_GOALS = [
             'fact.  Every item keeps its source link and outlet attribution.  '
             '4) send_news_notification for the few that truly matter, capped, '
             'always with the source cited.  '
-            '5) mark_news_for_web on the two or three strongest items so the '
-            "'seo' goal opens a PR to hevolve.ai.  That PR is merged by a "
+            '5) For the two or three strongest items, CLOSE THE LOOP: use the '
+            'crawl4ai tool to open the source article and pull its full text '
+            'and its lead image (the og:image), so the published event is rich '
+            'and not a bare headline.  '
+            "6) mark_news_for_web on those items, passing image_url with the "
+            "og:image you crawled, so the 'seo' goal opens a PR to hevolve.ai "
+            'and the news card shows a real preview.  That PR is merged by a '
             'human, so nothing reaches the public site without review.  You '
             'FLAG for the web; you never post to the world yourself.  '
             'Cite the source for every claim.  If you cannot cite it, drop it.'
