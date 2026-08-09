@@ -223,7 +223,7 @@ $_x"
       # `lsblk RM/HOTPLUG/TRAN` on it returned empty and the removable gate
       # rejected EVERY genuinely-removable stick — the module's whole point.
       # Strip a leading /dev/ so both formats normalise to one bare name.
-      if [ -n "$PK" ] && [ "$PK" != "-" ]; then DISK="/dev/${PK#/dev/}"; else DISK=$(parent_disk "$DEV") || DISK=""; fi
+      if [ -n "$PK" ] && [ "$PK" != "-" ]; then DISK="/dev/''${PK#/dev/}"; else DISK=$(parent_disk "$DEV") || DISK=""; fi
       [ -n "$DISK" ] || continue
 
       # NEVER the live boot medium / a system disk (applies even to the test seam).
