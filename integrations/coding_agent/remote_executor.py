@@ -169,6 +169,14 @@ class RemoteDesktopExecutor:
         """Run security checks on command before remote dispatch.
 
         Returns error dict if blocked, None if OK.
+
+        FAIL SAFE: this gate stands between the coding agent and a remote
+        machine's /execute endpoint, so if a security module cannot be
+        imported we CANNOT verify the command is non-destructive / PII-free.
+        In that case we REFUSE to dispatch rather than silently forwarding an
+        unchecked command (the old ``except ImportError: pass`` was fail-OPEN).
+        A caller that genuinely needs to bypass the gate passes ``force=True``
+        to :meth:`execute`.
         """
         # Action classifier — detect destructive patterns
         try:
@@ -183,8 +191,19 @@ class RemoteDesktopExecutor:
                         'Use --force to override.'
                     ),
                 }
-        except ImportError:
-            pass
+        except ImportError as e:
+            logger.error(
+                'Security pre-check unavailable (action_classifier import '
+                'failed: %s); refusing remote dispatch', e)
+            return {
+                'success': False,
+                'output': '',
+                'error': (
+                    'Security pre-check unavailable: action_classifier could '
+                    'not be imported. Refusing to dispatch command. '
+                    'Use --force to override.'
+                ),
+            }
 
         # DLP — scan for PII before sending to remote
         try:
@@ -197,7 +216,18 @@ class RemoteDesktopExecutor:
                     'output': '',
                     'error': f'DLP blocked: {reason or "PII detected"}',
                 }
-        except ImportError:
-            pass
+        except ImportError as e:
+            logger.error(
+                'Security pre-check unavailable (dlp_engine import failed: '
+                '%s); refusing remote dispatch', e)
+            return {
+                'success': False,
+                'output': '',
+                'error': (
+                    'Security pre-check unavailable: dlp_engine could not be '
+                    'imported. Refusing to dispatch command. '
+                    'Use --force to override.'
+                ),
+            }
 
         return None
