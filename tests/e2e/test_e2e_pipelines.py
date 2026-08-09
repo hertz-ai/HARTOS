@@ -554,30 +554,34 @@ class TestCodingDispatchReview:
             'Fix auth tests', 'user1', 'goal123', goal_type='coding')
         assert result is not None
 
+    # The mock MUST target the seam dispatch_goal actually calls. It calls
+    # GuardrailEnforcer.before_dispatch(prompt) with the PROMPT ONLY — no
+    # goal_dict — so before_dispatch's `if goal_dict:` branch is skipped and
+    # ConstitutionalFilter.check_goal is NEVER reached. The old mock patched
+    # check_goal, so it was DEAD: the gate fell through to the unmocked
+    # check_prompt, passed "Some goal", and dispatch_goal proceeded to a REAL
+    # /chat socket — which hangs in CI (no network -> blackhole) and reddened
+    # this test as a timeout, not the assertion it claims to make. Patch the
+    # method dispatch_goal genuinely invokes; the block then short-circuits at
+    # dispatch.py:696-698 before any network, which is the real contract:
+    # "dispatch_goal honors a pre-dispatch guardrail block by returning None".
     @patch('integrations.agent_engine.dispatch.pooled_post')
-    @patch('security.hive_guardrails.ConstitutionalFilter.check_goal',
-           return_value=(False, 'Violates constructive humanity rule'))
+    @patch('security.hive_guardrails.GuardrailEnforcer.before_dispatch',
+           return_value=(False, 'Violates constructive humanity rule', 'Some goal'))
     @patch.dict('sys.modules', {
         'routes.hartos_backend_adapter': None,
         'hartos_backend_adapter': None,
     })
-    def test_coding_dispatch_blocked_by_constitution(self, mock_check, mock_post):
-        """Coding output blocked by constitutional filter."""
+    def test_coding_dispatch_blocked_by_constitution(self, mock_gate, mock_post):
+        """dispatch_goal returns None when the pre-dispatch guardrail blocks."""
         from integrations.agent_engine.dispatch import dispatch_goal
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            'response': 'Some harmful code output'
-        }
-        mock_resp.get_json.return_value = {
-            'response': 'Some harmful code output'
-        }
-        mock_post.return_value = mock_resp
 
         result = dispatch_goal(
             'Some goal', 'user1', 'goal456', goal_type='coding')
-        assert result is None  # Blocked by constitutional review
+        assert result is None  # Blocked by the guardrail gate
+        # The block is the WHOLE point: it must short-circuit before any
+        # network call, so a blocked dispatch never touches /chat.
+        mock_post.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════
