@@ -328,8 +328,11 @@ def onboard_guest_widget(
     # Plugins
     _log("Step 3/3 — Guest plugins")
     for plugin_cfg in GUEST_PLUGINS:
-        enable_plugin(session, kong_url, plugin_cfg)
-        # Re-scope to guest service
+        # Apply each plugin to the GUEST service ONLY.  enable_plugin() is
+        # hard-scoped to the main completions service (SERVICE_NAME), so calling
+        # it here would PATCH the paid API's rate-limiting down to the guest
+        # 5/min fail-closed limit and overwrite its wildcard CORS.  The block
+        # below targets GUEST_SERVICE_NAME explicitly.
         plugin_name = plugin_cfg["name"]
         payload = {
             "name": plugin_name,
