@@ -137,20 +137,21 @@ class TestExecuteToolRealSandbox:
 
 # ── 2) fail-open + error/degrade paths ───────────────────────────────────────
 class TestExecuteToolFailOpenAndErrors:
-    def test_sandbox_import_error_fails_open(self):
-        """Characterise the documented fail-open: when the sandbox module can't
-        be imported, execute_tool proceeds to the outbound call AND skips
-        response validation. Even a would-be-blocked URL goes through — this is
-        the risk the `except ImportError: pass` blocks accept, and the assertion
-        that would flip if that behaviour ever changed."""
+    def test_sandbox_import_error_fails_closed(self):
+        """When the security sandbox cannot be imported, execute_tool now FAILS
+        CLOSED — it refuses and makes NO outbound call (previously it was
+        fail-OPEN: even a would-be-blocked URL was called out and the response
+        returned unvalidated). Regression guard for the #39 fix — same posture as
+        remote_executor when its classifier can't import."""
         conn = _connected_connector(url="http://evil.example.com")
         post = mock.Mock(return_value=_FakeResponse(200, {"ok": True}))
         with mock.patch.dict("sys.modules", {"security.mcp_sandbox": None}), \
                 mock.patch.object(mcp_integration, "pooled_post", post):
             result = conn.execute_tool("read", {"q": "hello"})
 
-        post.assert_called_once()  # fail-OPEN: disallowed URL still called out
-        assert result == {"ok": True}  # response returned unvalidated
+        post.assert_not_called()  # fail-CLOSED: no outbound call when unverifiable
+        assert result["success"] is False
+        assert "sandbox unavailable" in result["error"].lower()
 
     def test_not_connected_returns_error_without_post(self):
         conn = MCPServerConnector("srv", "http://localhost:9000")
@@ -163,15 +164,38 @@ class TestExecuteToolFailOpenAndErrors:
         assert result["success"] is False
         assert "not connected" in result["error"].lower()
 
-    def test_non_200_returns_http_error(self):
+    def test_non_200_returns_status_without_echoing_raw_body(self):
+        """A non-200 reports the STATUS only — it no longer embeds the raw
+        response body in the error string. That raw echo was an exfil/inject
+        vector (a hostile server's error body relayed verbatim to the LLM). #39."""
         conn = _connected_connector(url="http://localhost:9000")
-        post = mock.Mock(return_value=_FakeResponse(500, text="boom"))
+        post = mock.Mock(return_value=_FakeResponse(500, text="boom leaked-token"))
         with mock.patch.object(mcp_integration, "pooled_post", post):
             result = conn.execute_tool("read", {"q": "hello"})
 
         assert result["success"] is False
         assert "HTTP 500" in result["error"]
-        assert "boom" in result["error"]
+        assert "boom" not in result["error"]  # raw body is NOT echoed back
+
+    def test_non_200_body_is_exfil_scanned(self):
+        """The exfil gate (validate_response) now runs on a NON-200 body too —
+        previously only the 200 path was scanned, so a malicious server could put
+        credentials in a 500 body and have them relayed. Now caught + rejected,
+        and the secret never appears in the returned error. #39."""
+        sandbox = mock.Mock()
+        sandbox.validate_server_url.return_value = True
+        sandbox.validate_tool_call.return_value = (True, None)
+        sandbox.validate_response.return_value = (False, "credential pattern")
+        post = mock.Mock(return_value=_FakeResponse(500, {"leaked": "sk-secret-xyz"}))
+        conn = _connected_connector(url="http://localhost:9000")
+        with mock.patch("security.mcp_sandbox.MCPSandbox", return_value=sandbox), \
+                mock.patch.object(mcp_integration, "pooled_post", post):
+            result = conn.execute_tool("read", {"q": "hello"})
+
+        sandbox.validate_response.assert_called_once_with({"leaked": "sk-secret-xyz"})
+        assert result["success"] is False
+        assert "Response rejected" in result["error"]
+        assert "sk-secret-xyz" not in result["error"]
 
     def test_request_exception_is_caught(self):
         conn = _connected_connector(url="http://localhost:9000")
