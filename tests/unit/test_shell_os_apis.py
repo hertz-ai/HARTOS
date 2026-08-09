@@ -7,10 +7,25 @@ backup restore, power, i18n, accessibility, screenshot, devices, upgrades.
 
 import json
 import os
+import shlex
+import sys
 import tempfile
 import types
 import unittest
 from unittest.mock import patch, MagicMock
+
+
+def _py_cmd(script):
+    """A terminal-exec command STRING that runs `script` via the current Python.
+
+    The exec handler shlex.split()s the string and subprocess.run(shell=False)s
+    the argv, so the command must be a REAL executable — and `echo`/`sleep` are
+    shell builtins, not exes, on Windows, so the old literals 500'd on the dev
+    box while passing in CI (Linux). sys.executable exists on every OS; shlex
+    quoting round-trips its path (backslashes and all) back through the
+    handler's shlex.split, so this tests the exec pipeline identically
+    everywhere with no coverage loss."""
+    return shlex.join([sys.executable, '-c', script])
 
 
 def _make_os_app():
@@ -234,7 +249,7 @@ class TestShellTerminal(unittest.TestCase):
         with patch('integrations.agent_engine.shell_os_apis._classify_destructive',
                    return_value=True):
             r = client.post('/api/shell/terminal/exec',
-                            json={'command': 'echo hello'})
+                            json={'command': _py_cmd('print("hello")')})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertIn('hello', data['stdout'])
@@ -258,7 +273,7 @@ class TestShellTerminal(unittest.TestCase):
         with patch('integrations.agent_engine.shell_os_apis._classify_destructive',
                    return_value=True):
             r = client.post('/api/shell/terminal/exec',
-                            json={'command': 'echo ok', 'cwd': cwd})
+                            json={'command': _py_cmd('print("ok")'), 'cwd': cwd})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertIn('ok', data['stdout'])
@@ -276,7 +291,8 @@ class TestShellTerminal(unittest.TestCase):
         with patch('integrations.agent_engine.shell_os_apis._classify_destructive',
                    return_value=True):
             r = client.post('/api/shell/terminal/exec',
-                            json={'command': 'sleep 60', 'timeout': 1})
+                            json={'command': _py_cmd('import time; time.sleep(60)'),
+                                  'timeout': 1})
         self.assertEqual(r.status_code, 408)
 
     def test_readonly_command_skips_the_llm_classifier(self):
