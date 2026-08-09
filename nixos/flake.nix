@@ -1014,6 +1014,14 @@
       # lets an UNCLAIMED device pass. One node, many devices: a VM job costs
       # ~2h, so per-device nodes would buy the same coverage for 6x the clock.
       driverMatrix = import ./tests/driver-matrix.nix desktopTestArgs;
+      # The STORAGE-CONTROLLER slice driver-matrix.nix's header defers: attach a
+      # real NVMe controller + an ICH9 AHCI (SATA) controller (null-co disks, no
+      # backing file) and assert the kernel BINDS nvme / ahci — the INSTALLED raw
+      # image's primary boot media (internal M.2 / SATA SSD), which virtio-root VM
+      # boots never exercise. The source-shape half (those modules pinned in the
+      # repart initrd) is guarded by test_nixos_configs.py::TestRawImageSinglePath.
+      # Distinct attr name -> clean //; desktop-variant node (mkNode).
+      driverMatrixStorage = import ./tests/driver-matrix-storage.nix desktopTestArgs;
       # RESIDENT CO-PILOT: the 2026-07-30 flash shipped hart.copilot.enable=true
       # and the co-pilot did NOTHING — `enable` installs only the launcher, the
       # bounded worker is a SECOND opt-in (copilot.daemon.enable) nobody had set.
@@ -1197,7 +1205,7 @@
       # 'screen' kill-switch is cut OR the authority is down, and ALLOWS when on.
       # Distinct attr -> clean //; desktop-variant node (mkNode).
       notify = import ./tests/notify.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // firmwareBootMatrix // bootLatency // driverMatrix // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify // hartInstaller // appInstallVerify // llmProvision // copilotResident;
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // firmwareBootMatrix // bootLatency // driverMatrix // driverMatrixStorage // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify // hartInstaller // appInstallVerify // llmProvision // copilotResident;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)
