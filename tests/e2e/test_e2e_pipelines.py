@@ -40,14 +40,24 @@ from integrations.social.models import (
 
 # ─── Fixtures ───
 
-@pytest.fixture(scope='session')
+# FUNCTION-scoped, not session. Session scope created the tables ONCE, early —
+# before any test triggered tenant_filter to augment the shared ORM classes
+# with `tenant_id`. After that augmentation the class carried the column but
+# the already-materialised session table did not, so every later INSERT died
+# with "table users has no column named tenant_id" — but ONLY in full-file
+# order (green under -k, red run-together). Rebuilding per test makes each
+# create_all reflect the CURRENT class shape: once augmented, every fresh table
+# includes tenant_id; before augmentation, class and table agree without it.
+# In-memory sqlite create_all is sub-millisecond, so the cost is noise and the
+# isolation is strictly better (each test gets a clean DB, not a shared one).
+@pytest.fixture
 def engine():
     eng = create_engine('sqlite://', echo=False)
     Base.metadata.create_all(eng)
     return eng
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture
 def tables(engine):
     Base.metadata.create_all(engine)
     yield
