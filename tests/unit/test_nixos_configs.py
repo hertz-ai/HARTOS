@@ -4022,3 +4022,39 @@ class TestRawImageSinglePath:
                 assert pos > guard, (
                     f"{cfg}: isoImage block at line {line_no + 1} is outside "
                     "the iso branch")
+
+    def test_bios_boot_preserved_for_every_iso_variant(self):
+        """makeBiosBootable must survive on ALL THREE ISO variants.
+
+        The standing goal names it: "All Bios compatibility like hyper v etc,
+        none of the feature native to Nix shd be lost." isoImage.makeBiosBootable
+        is what gives the ISO an El Torito BIOS boot catalog (isolinux) so a
+        legacy-BIOS machine — including a Hyper-V GENERATION 1 VM, which has no
+        UEFI at all — can boot the installer medium. Edge is the variant MOST
+        likely to be BIOS-only (old industrial boards; edge.nix says so), and
+        the repart refactor (63f07a98) moved this option into the
+        hartImageKind guard for server + edge — so a guard that it stays present
+        AND inside the iso branch is exactly the "not lost" invariant, and stops
+        a future edit dropping BIOS boot the way the desktop/edge ISOs once
+        lacked it (the gap firmware-boot-matrix.nix was written for).
+
+        (The RAW images are intentionally UEFI-only — systemd-repart's
+        Discoverable-Partitions + UKI model — so makeBiosBootable must NOT
+        appear outside the iso branch; that is asserted by position below.)
+        """
+        for cfg in ("desktop.nix", "server.nix", "edge.nix"):
+            src = self._read(CONFIGS_DIR, cfg)
+            lines = src.splitlines()
+            hits = [i for i, ln in enumerate(lines)
+                    if ln.strip().startswith("makeBiosBootable")
+                    and not ln.strip().startswith("#")]
+            assert hits, (
+                f"{cfg}: makeBiosBootable is gone — this ISO can no longer boot "
+                "a legacy-BIOS / Hyper-V Gen-1 machine (goal: all BIOS compat)")
+            guard = src.index('lib.optionals (hartImageKind == "iso")')
+            for line_no in hits:
+                pos = len("\n".join(lines[:line_no]))
+                assert pos > guard, (
+                    f"{cfg}: makeBiosBootable at line {line_no + 1} is OUTSIDE "
+                    "the iso branch — it would try to apply to the UEFI-only raw "
+                    "image and break the raw eval")
