@@ -857,6 +857,70 @@ def get_channel_integration() -> FlaskChannelIntegration:
     return _integration
 
 
+def _channel_send_authenticated(req) -> bool:
+    """Is the caller authorized to POST /channels/send?
+
+    ``/channels/send`` relays a message through ANY registered channel to ANY
+    ``chat_id``. Left open it is a spoof/spam relay — a reachable caller can
+    impersonate the node to arbitrary recipients. Its sibling
+    ``/channels/webhook`` is carefully gated by
+    ``_webhook_caller_is_authenticated`` (fails closed), but this route shipped
+    with no gate at all, and it lives in NEITHER of the security middleware's
+    protected tuples (``ADMIN_PATHS`` / ``NETWORK_PROTECTED_PATHS``), so the
+    app-level auth in ``security/middleware.py`` never covered it on any tier —
+    it was public on flat, regional AND central.
+
+    This mirrors the model that middleware already applies to state-mutating
+    operator routes, reusing the SAME primitives so there is ONE answer to "is
+    this caller authenticated", never a parallel auth scheme:
+
+      * ``NUNBA_BUNDLED`` single-user in-process desktop → trusted, exactly as
+        the middleware's ``check_api_auth`` early-returns for it.
+      * KONG vouched — ``HEVOLVE_TRUST_KONG=true`` and an ``X-Consumer-*`` stamp
+        present. The same proof the sibling webhook gate accepts.
+      * A configured ``HEVOLVE_API_KEY`` presented as ``X-API-Key`` (constant
+        time), the shared key the middleware's ``_require_api_key_or_bearer``
+        honors.
+      * A valid Bearer JWT, verified by the canonical
+        ``integrations.social.auth.decode_jwt`` (the very function the
+        middleware decodes with — not a second decoder).
+
+    Fails closed: anything else is unauthenticated.
+    """
+    # (0) Bundled single-user desktop is trusted — the desktop UI and the
+    #     in-process test client have no network exposure.
+    if os.environ.get('NUNBA_BUNDLED'):
+        return True
+
+    # (1) Kong authenticated the caller upstream and stamped its identity.
+    if os.environ.get('HEVOLVE_TRUST_KONG', '').lower() == 'true':
+        if (req.headers.get('X-Consumer-ID')
+                or req.headers.get('X-Consumer-Username')
+                or req.headers.get('X-Consumer-Custom-ID')):
+            return True
+
+    # (2) Shared API key.
+    expected_key = os.environ.get('HEVOLVE_API_KEY', '')
+    if expected_key:
+        import hmac as _hmac
+        presented = req.headers.get('X-API-Key', '')
+        if presented and _hmac.compare_digest(presented, expected_key):
+            return True
+
+    # (3) Bearer JWT — canonical verifier, no parallel decode path.
+    auth_header = req.headers.get('Authorization', '')
+    if auth_header.startswith('Bearer '):
+        try:
+            from integrations.social.auth import decode_jwt
+            payload = decode_jwt(auth_header[7:])
+            if payload and payload.get('user_id'):
+                return True
+        except Exception as e:  # never authenticate on a verifier error
+            logger.debug("channel_send bearer verify failed: %s", e)
+
+    return False
+
+
 def init_channels(app=None, config: Dict[str, Any] = None) -> FlaskChannelIntegration:
     """
     Initialize channel integrations.
@@ -900,6 +964,13 @@ def init_channels(app=None, config: Dict[str, Any] = None) -> FlaskChannelIntegr
         @app.route("/channels/send", methods=["POST"])
         def channel_send():
             from flask import request, jsonify
+
+            # AUTHENTICATE FIRST — before the body is read or any message is
+            # sent. Unauthenticated, this route is an outbound spoof/spam relay
+            # (see _channel_send_authenticated). Fail closed on every exposed
+            # tier; only bundled single-user desktop is trusted.
+            if not _channel_send_authenticated(request):
+                return jsonify({"error": "Authentication required"}), 401
 
             data = request.json
             channel = data.get("channel")
