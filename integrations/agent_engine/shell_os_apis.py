@@ -799,10 +799,14 @@ def register_shell_os_routes(app):
         if len(username) < 2 or not username.isalnum():
             return jsonify({'error': 'Invalid username (alphanumeric, 2+ chars)'}), 400
 
-        # G7: Sanitize group names — only allow alphanumeric, hyphens, underscores
+        # G7: Sanitize group names — only allow alphanumeric, hyphens, underscores.
+        # fullmatch, NOT match: re.match(r'...$', 'grp\n') ACCEPTS a trailing
+        # newline (the $ matches before a final \n), so a group name like
+        # 'grp\n' would slip past into useradd -G. shell=False neutralises
+        # injection, but the value must still be rejected as malformed.
         import re as _re_users
         for grp in groups:
-            if not _re_users.match(r'^[a-zA-Z0-9_-]+$', str(grp)):
+            if not _re_users.fullmatch(r'[a-zA-Z0-9_-]+', str(grp)):
                 return jsonify({'error': f'Invalid group name: {grp}'}), 400
 
         try:

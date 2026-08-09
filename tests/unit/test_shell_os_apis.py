@@ -370,6 +370,80 @@ class TestShellUsers(unittest.TestCase):
                         json={'username': 'hart'})
         self.assertEqual(r.status_code, 403)
 
+    def test_delete_hart_admin_blocked(self):
+        """hart-admin is the THIRD protected user — deleting it must 403."""
+        client = _make_os_app()
+        r = client.post('/api/shell/users/delete', json={'username': 'hart-admin'})
+        self.assertEqual(r.status_code, 403)
+
+    def test_create_non_alphanumeric_username(self):
+        """A username with metacharacters is rejected (400) before useradd —
+        returns at the isalnum() gate, so deterministic on every OS."""
+        client = _make_os_app()
+        r = client.post('/api/shell/users/create', json={'username': 'ab$cd'})
+        self.assertEqual(r.status_code, 400)
+
+    def test_create_rejects_injection_group_name(self):
+        """G7: a group name outside [A-Za-z0-9_-] (here a shell-metachar payload)
+        is rejected 400 BEFORE it can reach useradd -G. shell=False already blocks
+        injection, but a malformed group must never pass validation. Covers the
+        previously-untested group sanitiser."""
+        client = _make_os_app()
+        r = client.post('/api/shell/users/create',
+                        json={'username': 'newuser', 'groups': ['wheel; rm -rf /']})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('group', json.loads(r.data)['error'].lower())
+
+    def test_create_rejects_trailing_newline_group(self):
+        r"""Regression: re.match(r'...$', 'grp\n') ACCEPTS a trailing newline (the
+        $ matches before a final \n), so 'grp\n' slipped past into useradd. The
+        guard now uses re.fullmatch, so a trailing-newline group is rejected 400 —
+        returns before the subprocess, deterministic on every OS."""
+        client = _make_os_app()
+        r = client.post('/api/shell/users/create',
+                        json={'username': 'newuser', 'groups': ['grp\n']})
+        self.assertEqual(r.status_code, 400)
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess.run')
+    def test_create_valid_user_reaches_useradd_and_succeeds(self, mock_run):
+        """A well-formed username + group passes EVERY validator and reaches
+        useradd; with useradd succeeding (mocked) the endpoint reports created.
+        Proves the G7 validator lets valid input THROUGH (it rejects only
+        malformed, not every group) and covers the success branch on every OS —
+        a real useradd needs root/Linux, which would 400 on a non-root CI runner
+        and mask this as a validation failure."""
+        mock_run.return_value = MagicMock(returncode=0, stdout='', stderr='')
+        client = _make_os_app()
+        r = client.post('/api/shell/users/create',
+                        json={'username': 'newuser', 'groups': ['good-grp_1']})
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['created'], 'newuser')
+        self.assertEqual(data['groups'], ['good-grp_1'])
+
+    def test_delete_normal_user_fails_closed_when_destructive(self):
+        """The destructive-classifier gate: a non-protected user deletion the
+        classifier deems destructive is blocked 403 (fail-closed) BEFORE userdel.
+        Covers the previously-untested classifier gate on the delete path."""
+        client = _make_os_app()
+        with patch('security.action_classifier.classify_action',
+                   return_value='destructive'):
+            r = client.post('/api/shell/users/delete', json={'username': 'bob'})
+        self.assertEqual(r.status_code, 403)
+
+    def test_create_auth_denied_for_nonlocal(self):
+        """Every shell route is local-only: a non-loopback caller gets 403."""
+        client = _make_os_app()
+        r = client.post('/api/shell/users/create', json={'username': 'newuser'},
+                        environ_overrides={'REMOTE_ADDR': '203.0.113.7'})
+        self.assertEqual(r.status_code, 403)
+
+    def test_delete_auth_denied_for_nonlocal(self):
+        client = _make_os_app()
+        r = client.post('/api/shell/users/delete', json={'username': 'bob'},
+                        environ_overrides={'REMOTE_ADDR': '203.0.113.7'})
+        self.assertEqual(r.status_code, 403)
+
 
 # ═══════════════════════════════════════════════════════════════
 # First-Time Setup Wizard
