@@ -16,6 +16,7 @@ Reuses existing infrastructure:
 For same-user LAN: strategy 1 always works (UDP beacon discovery).
 For cross-user WAN: strategies 2-5 depending on NAT type.
 """
+import ipaddress
 import logging
 import os
 import socket
@@ -24,6 +25,23 @@ import threading
 from typing import Optional
 
 logger = logging.getLogger('hevolve.peer_link')
+
+# Non-public IPv4 blocks the WAN dial gate (_is_private_ip) must refuse.
+# This is the SSRF surface: a hostile peer controls the strings in its
+# advertised/observed URL, so every non-routable-public v4 block is listed
+# explicitly. Deliberately EXCLUDES the RFC 5737 documentation ranges
+# (192.0.2/24, 198.51.100/24, 203.0.113/24) — the stdlib now flags those
+# is_private, but the historical gate treated them as ordinary public hosts
+# and peers advertise them, so they must keep dialing as before.
+_PRIVATE_V4_NETS = (
+    ipaddress.ip_network('0.0.0.0/8'),       # "this network" / unspecified
+    ipaddress.ip_network('10.0.0.0/8'),      # RFC 1918
+    ipaddress.ip_network('100.64.0.0/10'),   # RFC 6598 CGNAT shared space
+    ipaddress.ip_network('127.0.0.0/8'),     # loopback
+    ipaddress.ip_network('169.254.0.0/16'),  # link-local (cloud metadata)
+    ipaddress.ip_network('172.16.0.0/12'),   # RFC 1918
+    ipaddress.ip_network('192.168.0.0/16'),  # RFC 1918
+)
 
 
 class NATType:
@@ -281,17 +299,50 @@ class NATTraversal:
 
     @staticmethod
     def _is_private_ip(ip: str) -> bool:
-        """Check if IP is in a private range."""
-        try:
-            parts = [int(p) for p in ip.split('.')]
-            if len(parts) != 4:
-                return False
-            return (parts[0] == 10 or
-                    (parts[0] == 172 and 16 <= parts[1] <= 31) or
-                    (parts[0] == 192 and parts[1] == 168) or
-                    parts[0] == 127)
-        except (ValueError, IndexError):
+        """Check if an IP is private / not a genuine public host.
+
+        This is the SSRF gate for the WAN dial strategies (_try_direct_wan
+        and the observed_url rung of resolve_peer_address). A hostile peer
+        fully controls its advertised and observed URLs, so any address that
+        is not a real routable public host must be refused, otherwise an
+        observed_url pointing at the cloud-metadata endpoint, loopback, CGNAT
+        or an IPv6 link-local host would be dialed as a WAN rung.
+
+        Refused: RFC 1918, loopback, IPv4 link-local (169.254.0.0/16 — the
+        cloud-metadata 169.254.169.254 endpoint), CGNAT shared space
+        (100.64.0.0/10), the 0.0.0.0/8 "this network" block, and every
+        non-global IPv6 host (loopback ::1, link-local fe80::/10, unique-local
+        fc00::/7, plus IPv4-mapped ::ffff:a.b.c.d forms, classified by the
+        embedded v4 address).
+
+        Malformed / non-literal hosts (bare DNS names, empty, None) return
+        False: they are not classified here and are resolved by the OS at
+        dial time — preserving the historical contract that this method only
+        vets IP literals.
+        """
+        if not ip:
             return False
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+
+        # IPv4-mapped IPv6 (::ffff:a.b.c.d) is exactly as (un)safe as the
+        # embedded IPv4 address — classify by that so a metadata IP cannot be
+        # smuggled through an IPv6 literal.
+        mapped = getattr(addr, 'ipv4_mapped', None)
+        if mapped is not None:
+            addr = mapped
+
+        if addr.version == 6:
+            # No public-IPv6 dial path is exercised today; refuse every
+            # non-global v6 host. (is_private covers ULA + documentation.)
+            return (addr.is_private or addr.is_loopback or addr.is_link_local
+                    or addr.is_unspecified or addr.is_reserved
+                    or addr.is_multicast)
+
+        # IPv4: explicit non-public blocks (see _PRIVATE_V4_NETS).
+        return any(addr in net for net in _PRIVATE_V4_NETS)
 
 
 # Module-level singleton
