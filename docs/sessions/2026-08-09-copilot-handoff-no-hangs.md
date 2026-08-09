@@ -157,6 +157,44 @@ Requirements:
   build, so it never reaches the next flashed image — the PR is the only way
   the work gets somewhere.
 
+## Second journal export — new leads (6675-line export, 20:56 boot)
+
+A LATER, fuller export off the stick (preserved Windows-side, 6675 lines vs the
+3144 above) confirms everything above and adds three concrete leads that point
+at the render-root, not just detection. These are the highest-value things to
+chase on live hardware:
+
+1. **The compositor is NOT DRM master.** `smithay::backend::drm::device::fd:
+   Unable to become drm master, assuming unprivileged mode` (t=20:56:53). The
+   GLES renderer still initialised on card1, but an unprivileged/nested DRM
+   device cannot do privileged atomic KMS or hand out scanout dma-bufs the way a
+   real master can. This is the most likely reason WebKit's DMABUF GPU path
+   (kept ON for the `webkit-cairo` rung) silently degrades to CPU compositing —
+   which is exactly what pegs a core when the orb animates. **Check first:** why
+   is hart-comp not DRM master? Is something else (cage? a leftover fbcon/plymouth
+   holder? logind seat assignment) holding the master? If hart-comp becomes real
+   master, the WebKit DMABUF path may actually reach the GPU and the wedge
+   disappears without touching the rung selection.
+2. **WebKit can't read the portal.** `WebKitWebProces: Failed to read portal
+   settings: ...No such interface "org.freedesktop.portal.Settings"` — even
+   though the shell logged `xdg-desktop-portal OWNED -> real session bus` one
+   second earlier. A portal-interface mismatch (wrong portal impl, or the
+   Settings portal not implemented on this backend) can push WebKit onto slower
+   fallbacks. Worth confirming which xdg-desktop-portal backend is running.
+3. **The clock skew is captured, not theorised.** This export has an entry
+   stamped `Aug 09 15:32:52` sitting inside a boot that is otherwise `20:56`, and
+   `systemd-resolved` dropping from `TLS+EDNS0+DO` to degraded `UDP+EDNS0+DO` for
+   192.168.0.1 at 20:58. That out-of-order stamp plus the DNS-over-TLS→plain
+   fallback is the RTC-skew→cert-failure cascade `time.hardwareClockInLocalTime =
+   true` (landed `886870f4`) is meant to end. First boot of the next flashed
+   image should show a monotonic clock and DoT staying up — verify that.
+
+Do NOT "fix" the rung by flipping the shell to `GSK=GL` blind: the host module
+(`hart-layer-shell-host.nix`, lines ~296-308) forces GSK to cairo specifically
+to avoid a known GSK-GL layer-shell hang on real hardware. The lead above (make
+hart-comp DRM master so the EXISTING WebKit DMABUF path reaches the GPU) fixes
+the orb wedge without reopening that hang. Chase that before changing rungs.
+
 ## Cross-agent context (the wider hive work in flight)
 
 There is an MSI-side HART OS agent and a HevolveAI backend agent working the
