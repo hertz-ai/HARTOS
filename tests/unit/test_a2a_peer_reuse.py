@@ -23,6 +23,7 @@ The JSON-RPC invoke tests use a minimal sync Flask app that serves
 the exact wire envelopes A2ATask.to_dict / the jsonrpc route produce
 (the real route is an async view; this env has no flask[async]).
 """
+import asyncio
 import json
 import os
 import sys
@@ -433,3 +434,172 @@ class TestInvokePeerAgent:
         assert recorded[0]['response'] == 'metrics collected'
         assert not os.path.exists(
             os.path.join(harness.b_dir, f'{LOCAL_PID}_0_recipe.json'))
+
+
+# ---------------------------------------------------------------------------
+# Server-side A2A route gates (google_a2a_integration.setup_routes).
+#
+# These exercise the REAL Flask routes an untrusted peer can reach with no
+# credentials:
+#   - GET  /a2a/<agent_id>/recipe   (sync)  -> _safe_filename traversal gate
+#   - POST /a2a/<agent_id>/jsonrpc  (async) -> unknown-agent / unknown-method
+#                                              routing + unauthenticated exec
+# The recipe route runs through the full werkzeug stack via test_client so
+# the "'..' after URL-decode" case is genuinely decoded by the router, not
+# hand-fed. The jsonrpc route is an ``async def`` view and this env has no
+# flask[async] (asgiref absent), so it is driven by running the REAL route
+# coroutine (``app.view_functions['handle_jsonrpc']``) under asyncio.run
+# inside a real request context; the only mock is the agent-executor
+# boundary (a spy coroutine).
+# ---------------------------------------------------------------------------
+
+
+def _bare_a2a_app():
+    app = Flask('a2a_route_test')
+    server = A2AProtocolServer(app, 'http://node:6777')
+    return app, server
+
+
+class TestRecipeExportTraversalGate:
+    """/a2a/<agent_id>/recipe derives prompt_id from the untrusted URL
+    segment; _safe_filename is the only barrier between a '..' that
+    survived URL-decode and an arbitrary-path recipe read. Fail-closed
+    means such a request must never return a 200 recipe body."""
+
+    def _client(self):
+        app, server = _bare_a2a_app()
+        server.setup_routes()
+        return app.test_client()
+
+    def test_dotdot_surviving_urldecode_is_rejected_400(self):
+        # %2e%2e decodes to the single segment '..' -> the exact
+        # "Flask permits '..' after URL-decode" case the route docstring
+        # warns about. It reaches the handler and must hit the gate.
+        r = self._client().get('/a2a/%2e%2e/recipe')
+        assert r.status_code == 400
+        assert r.get_json()['error'] == 'unsafe agent_id'
+
+    def test_double_encoded_dotdot_rejected_400(self):
+        # ..%252f..%252fx -> literal '..%2f..%2fx' as the agent_id;
+        # startswith('.') trips the gate before any disk access.
+        r = self._client().get('/a2a/..%252f..%252fx/recipe')
+        assert r.status_code == 400
+        assert r.get_json()['error'] == 'unsafe agent_id'
+
+    def test_dotfile_agent_id_rejected_400(self):
+        r = self._client().get('/a2a/.hidden/recipe')
+        assert r.status_code == 400
+        assert r.get_json()['error'] == 'unsafe agent_id'
+
+    def test_windows_drive_prefix_rejected_400(self):
+        # agent_id 'C:evil' -> prompt_id 'C:evil'; os.path.join silently
+        # honors a drive-relative anchor, so the gate must reject it.
+        r = self._client().get('/a2a/C:evil/recipe')
+        assert r.status_code == 400
+        assert r.get_json()['error'] == 'unsafe agent_id'
+
+    def test_encoded_slash_traversal_never_returns_recipe(self):
+        # ..%2f..%2fsecret carries embedded slashes; werkzeug refuses to
+        # bind it to the single-segment <agent_id> converter (404). Either
+        # way it is fail-closed: never a 200 recipe body reaches the peer.
+        r = self._client().get('/a2a/..%2f..%2fsecret/recipe')
+        assert r.status_code in (400, 404)
+        assert r.status_code != 200
+
+
+class TestJsonRpcRouteUnauthenticated:
+    """The jsonrpc route carries NO auth: any caller can drive a
+    registered agent's executor. Pin the routing gates (unknown agent,
+    unknown method), document the unauthenticated execution path, and
+    guard the error handler against its own crash on malformed input."""
+
+    def _server_with_agent(self):
+        app, server = _bare_a2a_app()
+        calls = []
+
+        async def spy(text, ctx):
+            calls.append((text, ctx))
+            return {'role': 'model', 'parts': [{'text': f'ran:{text}'}]}
+
+        server.register_agent('agentX_0', 'X', 'd', [{'id': 's'}], spy)
+        server.setup_routes()
+        return app, app.view_functions['handle_jsonrpc'], calls
+
+    @staticmethod
+    def _run(app, view, agent_id, *, json_body=None, raw_data=None,
+             content_type=None):
+        kw = {}
+        if json_body is not None:
+            kw['json'] = json_body
+        if raw_data is not None:
+            kw['data'] = raw_data
+            kw['content_type'] = content_type or 'text/plain'
+        with app.test_request_context(
+                f'/a2a/{agent_id}/jsonrpc', method='POST', **kw):
+            resp = asyncio.run(view(agent_id))
+            status = resp[1] if isinstance(resp, tuple) else 200
+            body = (resp[0] if isinstance(resp, tuple) else resp).get_json()
+        return status, body
+
+    def test_unknown_agent_returns_404_envelope(self):
+        app, view, calls = self._server_with_agent()
+        status, body = self._run(
+            app, view, 'ghost',
+            json_body={'method': 'message/send', 'params': {}, 'id': '1'})
+        assert status == 404
+        assert body['error']['code'] == -32602
+        assert 'ghost' in body['error']['message']
+        assert body['id'] is None
+        assert calls == []
+
+    def test_unknown_method_returns_400_envelope(self):
+        app, view, calls = self._server_with_agent()
+        status, body = self._run(
+            app, view, 'agentX_0',
+            json_body={'method': 'evil/exec', 'params': {}, 'id': '9'})
+        assert status == 400
+        assert body['error']['code'] == -32601
+        assert 'evil/exec' in body['error']['message']
+        assert body['id'] == '9'
+        assert calls == []  # unknown method must not touch the executor
+
+    def test_missing_method_field_is_unknown_method_400(self):
+        app, view, _ = self._server_with_agent()
+        status, body = self._run(
+            app, view, 'agentX_0',
+            json_body={'params': {}, 'id': '3'})
+        assert status == 400
+        assert body['error']['code'] == -32601
+
+    def test_message_send_executes_agent_unauthenticated(self):
+        # No token, no signature: the untrusted 'text' part drives the
+        # registered executor and the completed envelope is returned.
+        # This documents the current (auth-free) execution surface.
+        app, view, calls = self._server_with_agent()
+        status, body = self._run(
+            app, view, 'agentX_0',
+            json_body={'method': 'message/send', 'id': '7', 'params': {
+                'message': {'messageId': 'm1',
+                            'parts': [{'type': 'text',
+                                       'text': 'attacker input'}]}}})
+        assert status == 200
+        result = body['result']
+        assert result['state'] == 'completed'
+        assert result['content']['parts'][0]['text'] == 'ran:attacker input'
+        assert calls == [('attacker input', result['contextId'])]
+        assert body['id'] == '7'
+
+    def test_malformed_body_returns_clean_jsonrpc_error_not_crash(self):
+        # request.json raises (415 UnsupportedMediaType) inside the try.
+        # The except handler must still emit a JSON-RPC -32603 envelope.
+        # Regression guard: it previously referenced an unbound
+        # rpc_request and raised UnboundLocalError, so the peer got an
+        # opaque 500 crash instead of a protocol-level error object.
+        app, view, _ = self._server_with_agent()
+        status, body = self._run(
+            app, view, 'agentX_0',
+            raw_data='not json', content_type='text/plain')
+        assert status == 500
+        assert body['jsonrpc'] == '2.0'
+        assert body['error']['code'] == -32603
+        assert body['id'] is None

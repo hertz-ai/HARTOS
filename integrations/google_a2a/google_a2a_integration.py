@@ -382,6 +382,10 @@ class A2AProtocolServer:
                     "id": None
                 }), 404
 
+            # Bind before the try so the except handler can safely read
+            # rpc_request even when request.json itself raises (malformed
+            # body / wrong Content-Type -> 415) before the assignment.
+            rpc_request = None
             try:
                 rpc_request = request.json
                 method = rpc_request.get("method")
