@@ -2689,7 +2689,15 @@ def load_agent_data_from_file(prompt_id: int, agent_data: Dict) -> bool:
         if 'data' in loaded_data:
             agent_data[prompt_id] = loaded_data['data']
             current_app.logger.info(f" Loaded agent data from: {file_path}")
-            current_app.logger.info(f" Loaded data keys: {list(agent_data[prompt_id].keys())}")
+            # Guard the diagnostic: a non-dict payload (e.g. a list) has no
+            # .keys(), and letting that AttributeError propagate would discard
+            # data that was already extracted cleanly, dropping the load into
+            # the error path (return False, agent_data reset to {}). A logging
+            # line must never corrupt a successful load.
+            _loaded = agent_data[prompt_id]
+            current_app.logger.info(
+                f" Loaded data keys: "
+                f"{list(_loaded.keys()) if isinstance(_loaded, dict) else type(_loaded).__name__}")
             return True
         else:
             # Handle old format (direct data)

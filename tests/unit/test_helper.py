@@ -502,3 +502,231 @@ class TestPromptsDir:
         # On CI, ensure the directory exists (it may not in a fresh checkout)
         os.makedirs(PROMPTS_DIR, exist_ok=True)
         assert os.path.isdir(PROMPTS_DIR)
+
+
+# ============================================================
+# safe_function_call — deserialized LLM tool-arg -> function dispatcher
+# ============================================================
+
+class TestSafeFunctionCall:
+    """safe_function_call routes a deserialized tool-call argument (a dict, a
+    list, or a bare scalar) onto a Python function across 4 dispatch branches,
+    plus a TypeError recovery path that filters ['truncated'] sentinels and
+    re-maps a positional list onto the function's signature. A wrong dispatch
+    means the tool silently runs with the wrong arguments — so every branch and
+    the error/degrade edges are asserted here (function had zero test refs)."""
+
+    # ── happy-path dispatch branches ──────────────────────────────────────
+    def test_dict_dispatched_as_kwargs(self):
+        from helper import safe_function_call
+
+        def f(a, b):
+            return (a, b)
+        assert safe_function_call(f, {'a': 1, 'b': 2}) == (1, 2)
+
+    def test_list_of_single_dict_dispatched_as_kwargs(self):
+        """retrieve_json commonly wraps the arg dict in a 1-element list."""
+        from helper import safe_function_call
+
+        def f(a, b):
+            return {'a': a, 'b': b}
+        assert safe_function_call(f, [{'a': 10, 'b': 20}]) == {'a': 10, 'b': 20}
+
+    def test_list_dispatched_as_positional_args(self):
+        from helper import safe_function_call
+
+        def f(a, b):
+            return (a, b)
+        assert safe_function_call(f, [1, 2]) == (1, 2)
+
+    def test_scalar_dispatched_as_single_positional(self):
+        from helper import safe_function_call
+
+        def f(x):
+            return x * 2
+        assert safe_function_call(f, 5) == 10
+
+    def test_string_dispatched_as_single_positional(self):
+        from helper import safe_function_call
+
+        def f(x):
+            return x.upper()
+        assert safe_function_call(f, "hi") == "HI"
+
+    def test_none_dispatched_as_single_positional(self):
+        """None is neither dict nor list — passed through as the sole arg."""
+        from helper import safe_function_call
+
+        def f(x):
+            return x is None
+        assert safe_function_call(f, None) is True
+
+    def test_empty_list_dispatched_as_no_args(self):
+        """[] takes the positional branch → func() with no arguments."""
+        from helper import safe_function_call
+
+        def f():
+            return "ok"
+        assert safe_function_call(f, []) == "ok"
+
+    def test_tuple_is_single_arg_not_unpacked(self):
+        """Only list is special-cased for unpacking; a tuple is one argument."""
+        from helper import safe_function_call
+
+        def f(x):
+            return x
+        assert safe_function_call(f, (1, 2)) == (1, 2)
+
+    def test_falsy_return_value_preserved(self):
+        """A falsy return (0) must be returned verbatim, not coerced/dropped."""
+        from helper import safe_function_call
+
+        def f(a):
+            return 0
+        assert safe_function_call(f, [7]) == 0
+
+    # ── TypeError recovery: 'truncated' sentinel + signature remap ─────────
+    def test_truncated_sentinel_filtered_then_signature_remapped(self):
+        """A positional list carrying a ['truncated'] sentinel first fails the
+        *args call (too many positionals) → recovery filters the sentinel and
+        maps the remaining args onto the signature by name. This whole recovery
+        path is the reason the function exists; it must yield the clean call."""
+        from helper import safe_function_call
+
+        def f(a, b):
+            return (a, b)
+        assert safe_function_call(f, [1, 2, ['truncated']]) == (1, 2)
+
+    def test_extra_positional_no_remap_reraises_typeerror(self):
+        """More real args than the function accepts (no sentinel to strip) is
+        unrecoverable — the original TypeError must surface, not be swallowed."""
+        from helper import safe_function_call
+
+        def f(a):
+            return a
+        with pytest.raises(TypeError):
+            safe_function_call(f, [1, 2, 3])
+
+    def test_dict_wrong_keys_reraises_typeerror(self):
+        """A dict with keys the function doesn't accept is not a list, so the
+        recovery path doesn't apply — the TypeError propagates."""
+        from helper import safe_function_call
+
+        def f(a, b):
+            return (a, b)
+        with pytest.raises(TypeError):
+            safe_function_call(f, {'x': 1, 'y': 2})
+
+    def test_non_typeerror_from_func_propagates(self):
+        """Errors raised *inside* the target function (not dispatch mismatches)
+        must propagate unchanged — safe_function_call is not a swallow-all."""
+        from helper import safe_function_call
+
+        def f(**kwargs):
+            raise ValueError("boom")
+        with pytest.raises(ValueError, match="boom"):
+            safe_function_call(f, {'a': 1})
+
+
+# ============================================================
+# load_agent_data_from_file — on-disk agent-data (de)serialization + degrade
+# ============================================================
+
+class TestLoadAgentDataFromFile:
+    """load_agent_data_from_file reads persisted agent state, handling the
+    'data'-wrapped save format, the legacy direct-object format, and degrading
+    to an empty dict (return False) on a missing/undecryptable/corrupt file."""
+
+    @pytest.fixture
+    def env(self, tmp_path, monkeypatch):
+        """Point AGENT_DATA_DIR at an isolated tmp dir and give a Flask app
+        context (the function logs via current_app.logger)."""
+        import helper
+        from flask import Flask
+        monkeypatch.setattr(helper, 'AGENT_DATA_DIR', str(tmp_path))
+        app = Flask(__name__)
+        return helper, app
+
+    @staticmethod
+    def _write(helper, prompt_id, obj):
+        path = helper.get_agent_data_file_path(prompt_id)
+        with open(path, 'w', encoding='utf-8') as fh:
+            json.dump(obj, fh)
+        return path
+
+    def test_missing_file_returns_false_and_seeds_empty(self, env):
+        helper, app = env
+        agent_data = {}
+        with app.app_context():
+            result = helper.load_agent_data_from_file('nofile_999', agent_data)
+        assert result is False
+        assert agent_data['nofile_999'] == {}
+
+    def test_data_wrapped_format_extracts_inner_data(self, env):
+        """The canonical save format wraps the payload under 'data' with
+        metadata siblings — only the inner data is loaded."""
+        helper, app = env
+        pid = '12345'
+        self._write(helper, pid, {
+            'prompt_id': pid, 'saved_at': '2026-01-01T00:00:00',
+            'data': {'actions': [1, 2], 'flow': 3},
+        })
+        agent_data = {pid: {'stale': 'overwrite-me'}}
+        with app.app_context():
+            result = helper.load_agent_data_from_file(pid, agent_data)
+        assert result is True
+        assert agent_data[pid] == {'actions': [1, 2], 'flow': 3}
+
+    def test_old_format_loads_whole_object(self, env):
+        """A legacy file with no 'data' key is loaded verbatim as the payload."""
+        helper, app = env
+        pid = '777'
+        self._write(helper, pid, {'actions': ['a'], 'foo': 'bar'})
+        agent_data = {}
+        with app.app_context():
+            result = helper.load_agent_data_from_file(pid, agent_data)
+        assert result is True
+        assert agent_data[pid] == {'actions': ['a'], 'foo': 'bar'}
+
+    def test_malformed_json_degrades_to_false_and_empty(self, env):
+        """A par-broken file must not raise — degrade to False + empty dict."""
+        helper, app = env
+        pid = '888'
+        path = helper.get_agent_data_file_path(pid)
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write('{not valid json,,,')
+        agent_data = {pid: {'prev': 'value'}}
+        with app.app_context():
+            result = helper.load_agent_data_from_file(pid, agent_data)
+        assert result is False
+        assert agent_data[pid] == {}
+
+    def test_decrypt_returning_none_degrades_to_false(self, env):
+        """When the crypto layer can't produce a payload (returns None), the
+        function warns and degrades to False + empty dict, wiping stale state."""
+        helper, app = env
+        crypto = pytest.importorskip('security.crypto')
+        pid = '555'
+        self._write(helper, pid, {'data': {'x': 1}})
+        agent_data = {pid: {'stale': True}}
+        with app.app_context():
+            with patch.object(crypto, 'decrypt_json_file', return_value=None):
+                result = helper.load_agent_data_from_file(pid, agent_data)
+        assert result is False
+        assert agent_data[pid] == {}
+
+    def test_data_wrapped_non_dict_payload_still_loads(self, env):
+        """Regression: a 'data'-wrapped payload whose value is a LIST was
+        successfully extracted, then discarded because the very next log line
+        did list(payload.keys()) — which a list has not — dropping the load
+        into the error path (return False, agent_data reset to {}). A payload
+        that parsed and extracted cleanly must be kept, and the load reported
+        True; a debug-log formatting call must never corrupt a success."""
+        helper, app = env
+        pid = '444'
+        self._write(helper, pid, {'data': [{'action_id': 1}, {'action_id': 2}]})
+        agent_data = {}
+        with app.app_context():
+            result = helper.load_agent_data_from_file(pid, agent_data)
+        assert result is True
+        assert agent_data[pid] == [{'action_id': 1}, {'action_id': 2}]
