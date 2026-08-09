@@ -182,8 +182,11 @@ Three traps that manufacture false success:
 1. **0-spark trap.** `budget_gate` prices local models at 0 spark, but the
    daemon only completes a goal when `spark_spent > 0`, so purely-local work
    auto-pauses after 5 noops. **Count banked recipes on disk**
-   (`prompts/{prompt_id}_{flow_id}_recipe.json`) and ledger rows — never the
-   completed flag.
+   (`{prompt_id}_{flow_id}_recipe.json`) and ledger rows — never the
+   completed flag. **In the BUILD's data dir — `~/Documents/Nunba/data/prompts/`
+   — NOT the repo's `prompts/`.** The repo copy is stale (8 files, newest 10 June)
+   while the live one holds 24 with 16 banked in the last week. Reading the wrong
+   one has now produced a false "the flywheel is dead" diagnosis twice.
 2. **Completion is FSM-gated.** `COMPLETED` only via
    `STATUS_VERIFICATION_REQUESTED` → StatusVerifier verdict
    (`lifecycle_hooks.py`). Do not force states around it.
@@ -242,7 +245,7 @@ Recorded so they are not re-learned:
 | `c0fbcb03` | the overflow guard never counted `body['tools']`, hiding a ~10,713-token schema |
 | `696f618a` | empty-personas `IndexError` killed CREATE on small models |
 | **OPEN — task #43** | that 67-tool schema is still **87% of a 12288 window**, leaving ~1,500 tokens for a system prompt measuring ~2,229. Prune per persona — but **NOT** "via the existing `tool_allowlist.py`", which is unwired and filters by model tier, not persona (see §8). **Last CREATE blocker.** |
-| **CORROBORATED 2026-08-08** | 8 recipes banked, newest **10 June — 59 days**, against 1,183 ledger files. Dispatching, not banking. Exactly what #43 predicts, measured on disk rather than read off a completion flag |
+| ~~CORROBORATED 2026-08-08~~ **RETRACTED 2026-08-09** | I claimed "8 recipes, newest 10 June — 59 days, dispatching but not banking". **Wrong dir.** That was the dev repo's stale `prompts/`. The canonical build data dir `~/Documents/Nunba/data/prompts/` holds **24 `*_recipe.json`, 16 of them banked in the last 7 days, newest 2026-08-09 00:03 — two hours before the check.** CREATE **is** banking. This is the exact wrong-dir error already recorded in `copilot_steering_bridge_2026-05-31` ("that's why `ls prompts/` showed 0 autonomous recipes: WRONG DIR") — made a second time, by me. **Count recipes in the BUILD's data dir, never the repo's.** |
 
 ---
 
