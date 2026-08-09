@@ -3931,6 +3931,30 @@ class TestOfflineVoiceFloorIsUnconditional:
             "than it being gated")
 
 
+class TestNothingLostImportInvariant:
+    """The 'nothing lost' invariant (goal: none of the features implemented in
+    mkHart shd be lost). Every variant CONFIGURATION must import its feature
+    PROFILE. mkHartSystem AND this file's read_variant() both ASSUME it — they
+    read configuration+profile as one surface — so if the import were ever
+    dropped, the raw image built from configurations/<v>.nix would silently lose
+    EVERY hart.* feature the profile enables, while the whole suite (which reads
+    the union regardless) stayed green. This guard is the one thing that catches
+    that class. Source-shape by necessity: .nix does not evaluate on the dev box,
+    and this is a cross-file structural invariant no behavioural test can see."""
+
+    @pytest.mark.parametrize("variant", ["desktop", "server", "edge"])
+    def test_configuration_imports_its_profile(self, variant):
+        src = read_nix(os.path.join(CONFIGS_DIR, variant + ".nix"))
+        assert re.search(rf"\.\./profiles/{re.escape(variant)}\.nix", src), (
+            f"configurations/{variant}.nix no longer imports ../profiles/"
+            f"{variant}.nix — the raw image built from it would silently lose "
+            f"every hart.* feature the profile enables (the profile is the single "
+            f"source of the installed feature surface). Restore the import.")
+        assert os.path.exists(os.path.join(PROFILES_DIR, variant + ".nix")), (
+            f"profiles/{variant}.nix is missing — the import above dangles and "
+            f"the variant's feature surface has no home")
+
+
 class TestRawImageSinglePath:
     """Task #13 closure: systemd-repart owns EVERY raw-efi variant; the
     per-variant special case is gone; and no live-medium surface can reach
