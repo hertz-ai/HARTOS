@@ -164,7 +164,10 @@ def sanitize_path_component(value):
     Returns the value unchanged if safe, raises ValueError otherwise.
     """
     s = str(value)
-    if not re.match(r'^[a-zA-Z0-9_\-]+$', s):
+    # fullmatch, NOT match: re.match(r'...$', 'foo\n') accepts a trailing newline
+    # (the $ anchors before a terminal \n), so a path component 'foo\n' would pass
+    # this traversal guard and reach the filesystem. fullmatch rejects it.
+    if not re.fullmatch(r'[a-zA-Z0-9_\-]+', s):
         raise ValueError(f"Invalid path component: {s!r}")
     return s
 

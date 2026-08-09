@@ -83,6 +83,18 @@ class TestPathSanitization:
         result = sanitize_path_component("42")
         assert result == "42"
 
+    def test_rejects_trailing_newline(self):
+        r"""Regression: the guard used re.match(r'^...$', s), and re.match with a
+        trailing $ matches BEFORE a terminal \n — so 'prompt_1\n' slipped past as
+        a 'safe' path component and reached the filesystem. re.fullmatch rejects
+        it. A value that is valid EXCEPT for a trailing newline is exactly the
+        edge case a path-traversal guard must not wave through."""
+        from helper import sanitize_path_component
+        with pytest.raises(ValueError):
+            sanitize_path_component("prompt_1\n")
+        with pytest.raises(ValueError):
+            sanitize_path_component("42\n")
+
 
 class TestSafePromptPath:
     """safe_prompt_path builds paths that stay within PROMPTS_DIR."""

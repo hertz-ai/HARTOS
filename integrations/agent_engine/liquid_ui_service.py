@@ -7063,7 +7063,9 @@ function renderAgentOverlay(ev) {{
             import re
             data = request.get_json(force=True, silent=True) or {}
             app_id = data.get('app_id', '')
-            if not app_id or not re.match(r'^[a-zA-Z0-9._-]+$', app_id):
+            # fullmatch, NOT match: re.match(r'...$', 'firefox\n') accepts a
+            # trailing newline; app_id drives a launch, so reject it outright.
+            if not app_id or not re.fullmatch(r'[a-zA-Z0-9._-]+', app_id):
                 return jsonify({'error': 'Invalid app_id'}), 400
             try:
                 subprocess.Popen(

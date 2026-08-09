@@ -928,6 +928,45 @@ class TestHevolveFrontendFiles:
 
 
 # ============================================================
+# Input validation — trailing-newline bypass regression
+# ============================================================
+
+class TestUserRegisterEmailValidation:
+    """UserService.register email format guard: the re.match trailing-newline
+    bypass. A MagicMock db reports username/email free so register reaches the
+    format check without a real database."""
+
+    def _free_db(self):
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = None
+        return db
+
+    def test_register_rejects_trailing_newline_email(self):
+        r"""Regression: the guard used re.match(r'...$', email), which ACCEPTS a
+        trailing newline ('a@b.co\n' matches — $ anchors before the terminal \n).
+        A newline in a stored email is malformed and the classic
+        email-header-injection vector, so it must be rejected. re.fullmatch does."""
+        from integrations.social.services import UserService
+        with pytest.raises(ValueError, match='email'):
+            UserService.register(self._free_db(), username='newuser',
+                                 password='password123', email='a@b.co\n')
+
+    def test_register_accepts_valid_email(self):
+        """The tightened validator still accepts a well-formed address — proving
+        it rejects only malformed input, not every email. (Any non-format error
+        past the gate on the mock db is fine; only the format ValueError matters.)"""
+        from integrations.social.services import UserService
+        try:
+            UserService.register(self._free_db(), username='newuser',
+                                 password='password123',
+                                 email='valid.user+tag@sub.example.com')
+        except ValueError as e:
+            assert 'email' not in str(e).lower(), f"valid email wrongly rejected: {e}"
+        except Exception:
+            pass  # non-ValueError past the format gate means the gate accepted it
+
+
+# ============================================================
 # MAIN
 # ============================================================
 

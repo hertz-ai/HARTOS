@@ -8792,10 +8792,13 @@ def chat():
 
     app.logger.info(f"casual_conv type {casual_conv}")
 
-    # Security: sanitize prompt_id to prevent path traversal
+    # Security: sanitize prompt_id to prevent path traversal.
+    # fullmatch, NOT match: re.match(r'...$', '123\n') accepts a trailing newline
+    # (the $ anchors before a terminal \n), and prompt_id is interpolated into
+    # file paths (prompts/{prompt_id}.json) — a newline must never slip through.
     if prompt_id is not None:
         prompt_id = str(prompt_id)
-        if not re.match(r'^[a-zA-Z0-9_-]+$', prompt_id):
+        if not re.fullmatch(r'[a-zA-Z0-9_-]+', prompt_id):
             return jsonify({'error': 'Invalid prompt_id format', 'response': None}), 400
 
     # Per-request model config override (speculative execution)

@@ -143,8 +143,11 @@ class UserService:
         if db.query(User).filter(User.username == username).first():
             raise ValueError("Registration failed - username or email may already be in use")
         if email:
-            # Basic email format validation
-            if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+            # Basic email format validation. fullmatch, NOT match: re.match(r'...$',
+            # 'a@b.co\n') accepts a trailing newline (the $ anchors before a terminal
+            # \n) — a newline in a stored email is malformed and the classic
+            # email-header-injection vector, so it must be rejected.
+            if not re.fullmatch(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', email):
                 raise ValueError("Invalid email address format")
             if db.query(User).filter(User.email == email).first():
                 raise ValueError("Registration failed - username or email may already be in use")
