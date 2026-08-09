@@ -215,7 +215,15 @@ $_x"
       SEEN=$((SEEN + 1))
 
       # Resolve the candidate's whole disk ("-" pkname = a whole-disk fs).
-      if [ -n "$PK" ] && [ "$PK" != "-" ]; then DISK="/dev/$PK"; else DISK=$(parent_disk "$DEV") || DISK=""; fi
+      # PK reaches here in TWO formats: the enumerated vfat rows (line ~191)
+      # come from `lsblk -lnpo ...PKNAME`, whose -p makes PKNAME a FULL path
+      # (/dev/sdb); the dedicated-label row (line ~204) comes from
+      # `lsblk -ndo pkname`, a BARE name (sdb). Prefixing /dev/ blindly turned
+      # the first into /dev//dev/sdb, which is not a block device, so
+      # `lsblk RM/HOTPLUG/TRAN` on it returned empty and the removable gate
+      # rejected EVERY genuinely-removable stick — the module's whole point.
+      # Strip a leading /dev/ so both formats normalise to one bare name.
+      if [ -n "$PK" ] && [ "$PK" != "-" ]; then DISK="/dev/${PK#/dev/}"; else DISK=$(parent_disk "$DEV") || DISK=""; fi
       [ -n "$DISK" ] || continue
 
       # NEVER the live boot medium / a system disk (applies even to the test seam).
