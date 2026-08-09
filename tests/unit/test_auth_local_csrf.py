@@ -206,3 +206,249 @@ def test_module_imports_cleanly():
     from core import auth_local  # noqa: F401
     assert hasattr(auth_local, 'require_local_or_token_csrf_safe')
     assert hasattr(auth_local, '_is_safe_csrf_origin')
+
+
+# ════════════════════════════════════════════════════════════════════
+# Auth-bypass paths that never ran before: the whole remote-caller side
+# of require_local_or_token and the TRUSTED_PROXY / X-Forwarded-For
+# trust decision inside _is_local_request.  Every test above lands on
+# the default remote_addr=127.0.0.1, so these branches were unasserted.
+#
+# We drive them behaviourally through the real Flask routes on the
+# `app` fixture, overriding REMOTE_ADDR via the WSGI environ so the
+# real request.remote_addr / request.headers flow through the real
+# decorator code (no monkeypatching of _is_local_request itself).
+# ════════════════════════════════════════════════════════════════════
+
+# A stable non-loopback source address for "remote caller" tests.
+REMOTE_IP = '203.0.113.9'          # TEST-NET-3, never routable
+REMOTE = {'REMOTE_ADDR': REMOTE_IP}
+PROXY_IP = '10.0.0.1'
+
+
+# ── _is_local_request: direct remote_addr branch ───────────────────
+
+
+def test_ipv6_loopback_remote_addr_accepted(app):
+    """::1 is localhost too — the decorator accepts it with no token."""
+    client = app.test_client()
+    resp = client.post('/test/local-only',
+                       environ_base={'REMOTE_ADDR': '::1'})
+    assert resp.status_code == 200
+
+
+def test_remote_addr_non_loopback_rejected_without_token(app):
+    """A genuinely remote caller with no token configured → 401 with the
+    documented JSON body.  This is the core auth-bypass guard."""
+    client = app.test_client()
+    resp = client.post('/test/local-only', environ_base=REMOTE)
+    assert resp.status_code == 401
+    body = resp.get_json()
+    assert body['error'] == 'unauthorized'
+    assert 'HARTOS_API_TOKEN' in body['message']
+
+
+# ── require_local_or_token: remote Bearer-token branch ─────────────
+
+
+def test_remote_valid_bearer_accepted_constant_time(app, monkeypatch):
+    """Remote caller presenting the correct Bearer token is accepted
+    (the hmac.compare_digest constant-time accept path)."""
+    from core import auth_local
+    monkeypatch.setattr(auth_local, 'API_TOKEN', 'secret-token-123')
+    client = app.test_client()
+    resp = client.post('/test/local-only', environ_base=REMOTE,
+                       headers={'Authorization': 'Bearer secret-token-123'})
+    assert resp.status_code == 200
+
+
+def test_remote_wrong_bearer_rejected(app, monkeypatch):
+    from core import auth_local
+    monkeypatch.setattr(auth_local, 'API_TOKEN', 'secret-token-123')
+    client = app.test_client()
+    resp = client.post('/test/local-only', environ_base=REMOTE,
+                       headers={'Authorization': 'Bearer wrong-token'})
+    assert resp.status_code == 401
+    assert resp.get_json()['error'] == 'unauthorized'
+
+
+def test_remote_with_token_configured_but_no_auth_header_rejected(app,
+                                                                  monkeypatch):
+    from core import auth_local
+    monkeypatch.setattr(auth_local, 'API_TOKEN', 'secret-token-123')
+    client = app.test_client()
+    resp = client.post('/test/local-only', environ_base=REMOTE)
+    assert resp.status_code == 401
+
+
+def test_remote_non_bearer_auth_scheme_rejected(app, monkeypatch):
+    """Authorization present but not a Bearer scheme (e.g. Basic) must
+    not match — startswith('Bearer ') guard."""
+    from core import auth_local
+    monkeypatch.setattr(auth_local, 'API_TOKEN', 'secret-token-123')
+    client = app.test_client()
+    resp = client.post('/test/local-only', environ_base=REMOTE,
+                       headers={'Authorization': 'Basic secret-token-123'})
+    assert resp.status_code == 401
+
+
+def test_remote_bearer_but_no_token_configured_rejected(app):
+    """When API_TOKEN is unset (default), even a well-formed Bearer
+    header cannot grant remote access — the `if API_TOKEN:` guard is
+    false, so we never even compare.  Guards against an empty-secret
+    bypass."""
+    client = app.test_client()  # API_TOKEN defaults to '' in the fixture
+    resp = client.post('/test/local-only', environ_base=REMOTE,
+                       headers={'Authorization': 'Bearer '})  # empty == ''
+    assert resp.status_code == 401
+
+
+def test_remote_empty_bearer_value_rejected(app, monkeypatch):
+    """`Authorization: Bearer ` (empty token after the space) must not
+    match a configured non-empty API_TOKEN."""
+    from core import auth_local
+    monkeypatch.setattr(auth_local, 'API_TOKEN', 'secret-token-123')
+    client = app.test_client()
+    resp = client.post('/test/local-only', environ_base=REMOTE,
+                       headers={'Authorization': 'Bearer '})
+    assert resp.status_code == 401
+
+
+# ── EDGE-CASE BUG: non-ASCII Bearer token must not 500 ─────────────
+#
+# hmac.compare_digest(str, str) is ASCII-only; a non-ASCII candidate
+# raises TypeError, which escaped the decorator as an unhandled 500
+# instead of a clean 401.  A remote caller controls the Authorization
+# header, so this is an attacker-reachable error-handling defect.
+
+
+def test_remote_non_ascii_bearer_returns_401_not_500(app, monkeypatch):
+    from core import auth_local
+    monkeypatch.setattr(auth_local, 'API_TOKEN', 'secret-token-123')
+    client = app.test_client()
+    resp = client.post('/test/local-only', environ_base=REMOTE,
+                       headers={'Authorization': 'Bearer ünïcodé'})
+    assert resp.status_code == 401
+    assert resp.get_json()['error'] == 'unauthorized'
+
+
+def test_csrf_safe_non_ascii_bearer_does_not_500(app, monkeypatch):
+    """Same non-ASCII-token defect at the second call site inside
+    require_local_or_token_csrf_safe.  A local (127.0.0.1) caller with a
+    configured token and a junk non-ASCII Bearer header should fall
+    through to the local+CSRF path (200 here, no Origin), never 500."""
+    from core import auth_local
+    monkeypatch.setattr(auth_local, 'API_TOKEN', 'secret-token-123')
+    client = app.test_client()  # default remote_addr = 127.0.0.1 (local)
+    resp = client.post('/test/csrf-safe',
+                       headers={'Authorization': 'Bearer ünïcodé'})
+    assert resp.status_code != 500
+    assert resp.status_code == 200
+
+
+# ── _is_local_request: TRUSTED_PROXY + X-Forwarded-For decision ────
+
+
+def test_trusted_proxy_forwarded_loopback_accepted(app, monkeypatch):
+    """Behind a trusted reverse proxy, the real client IP arrives in
+    X-Forwarded-For.  Proxy addr matches TRUSTED_PROXY and XFF is
+    loopback → treat as local, accept without a token."""
+    monkeypatch.setenv('TRUSTED_PROXY', PROXY_IP)
+    client = app.test_client()
+    resp = client.post('/test/local-only',
+                       environ_base={'REMOTE_ADDR': PROXY_IP},
+                       headers={'X-Forwarded-For': '127.0.0.1'})
+    assert resp.status_code == 200
+
+
+def test_trusted_proxy_forwarded_remote_rejected(app, monkeypatch):
+    """Proxy is trusted but the forwarded client is a remote IP →
+    NOT local → 401 (no token)."""
+    monkeypatch.setenv('TRUSTED_PROXY', PROXY_IP)
+    client = app.test_client()
+    resp = client.post('/test/local-only',
+                       environ_base={'REMOTE_ADDR': PROXY_IP},
+                       headers={'X-Forwarded-For': '203.0.113.55'})
+    assert resp.status_code == 401
+
+
+def test_trusted_proxy_uses_first_forwarded_hop(app, monkeypatch):
+    """XFF can be a comma list (client, proxy1, proxy2).  The original
+    client is the FIRST hop; a loopback first hop is accepted even when
+    later hops are non-loopback."""
+    monkeypatch.setenv('TRUSTED_PROXY', PROXY_IP)
+    client = app.test_client()
+    resp = client.post('/test/local-only',
+                       environ_base={'REMOTE_ADDR': PROXY_IP},
+                       headers={'X-Forwarded-For': '127.0.0.1, 10.0.0.9'})
+    assert resp.status_code == 200
+
+
+def test_trusted_proxy_forwarded_ipv6_loopback_accepted(app, monkeypatch):
+    monkeypatch.setenv('TRUSTED_PROXY', PROXY_IP)
+    client = app.test_client()
+    resp = client.post('/test/local-only',
+                       environ_base={'REMOTE_ADDR': PROXY_IP},
+                       headers={'X-Forwarded-For': '::1'})
+    assert resp.status_code == 200
+
+
+def test_trusted_proxy_forwarded_localhost_string_accepted(app, monkeypatch):
+    """The literal token 'localhost' is in the accepted forwarded set."""
+    monkeypatch.setenv('TRUSTED_PROXY', PROXY_IP)
+    client = app.test_client()
+    resp = client.post('/test/local-only',
+                       environ_base={'REMOTE_ADDR': PROXY_IP},
+                       headers={'X-Forwarded-For': 'localhost'})
+    assert resp.status_code == 200
+
+
+def test_trusted_proxy_empty_forwarded_header_rejected(app, monkeypatch):
+    """Proxy matches but no XFF present → forwarded_for is '' → not in
+    the loopback set → NOT local → 401.  A misconfigured proxy that
+    strips XFF must fail closed, not open."""
+    monkeypatch.setenv('TRUSTED_PROXY', PROXY_IP)
+    client = app.test_client()
+    resp = client.post('/test/local-only',
+                       environ_base={'REMOTE_ADDR': PROXY_IP})
+    assert resp.status_code == 401
+
+
+def test_untrusted_source_xff_spoofing_ignored(app, monkeypatch):
+    """SECURITY: with TRUSTED_PROXY unset (default), X-Forwarded-For is
+    NOT consulted at all — a remote attacker cannot forge XFF: 127.0.0.1
+    to impersonate localhost."""
+    monkeypatch.delenv('TRUSTED_PROXY', raising=False)
+    client = app.test_client()
+    resp = client.post('/test/local-only', environ_base=REMOTE,
+                       headers={'X-Forwarded-For': '127.0.0.1'})
+    assert resp.status_code == 401
+
+
+def test_proxy_configured_but_request_not_from_proxy_ignores_xff(app,
+                                                                 monkeypatch):
+    """SECURITY: TRUSTED_PROXY is set, but the request arrives directly
+    from a non-proxy remote IP.  Since remote_addr != TRUSTED_PROXY, the
+    XFF header is ignored and the direct remote_addr governs → 401.
+    A non-proxy remote cannot spoof XFF to gain local trust."""
+    monkeypatch.setenv('TRUSTED_PROXY', PROXY_IP)
+    client = app.test_client()
+    resp = client.post('/test/local-only', environ_base=REMOTE,
+                       headers={'X-Forwarded-For': '127.0.0.1'})
+    assert resp.status_code == 401
+
+
+def test_trusted_proxy_remote_client_with_valid_token_accepted(app,
+                                                               monkeypatch):
+    """The token path is still reachable behind a proxy: a remote
+    forwarded client that carries a valid Bearer token is accepted even
+    though the XFF client isn't loopback."""
+    monkeypatch.setenv('TRUSTED_PROXY', PROXY_IP)
+    from core import auth_local
+    monkeypatch.setattr(auth_local, 'API_TOKEN', 'secret-token-123')
+    client = app.test_client()
+    resp = client.post('/test/local-only',
+                       environ_base={'REMOTE_ADDR': PROXY_IP},
+                       headers={'X-Forwarded-For': '203.0.113.55',
+                                'Authorization': 'Bearer secret-token-123'})
+    assert resp.status_code == 200
