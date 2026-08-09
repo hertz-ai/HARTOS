@@ -195,6 +195,91 @@ to avoid a known GSK-GL layer-shell hang on real hardware. The lead above (make
 hart-comp DRM master so the EXISTING WebKit DMABUF path reaches the GPU) fixes
 the orb wedge without reopening that hang. Chase that before changing rungs.
 
+## Input gaps (#45) — root-caused in source, ready-to-apply patch
+
+The steward reports, twice: **Ctrl+Alt+Fn+F2 (VT switch) does nothing, and
+two-finger touchpad scroll does nothing.** I traced both to the compositor
+source (`compositor/src/`). Neither is a mystery any more — apply these, then
+`cargo build --features smithay`, then RUNTIME-test on the Lenovo (I have no
+compiler on the Windows box and these are hardware behaviours, so CI can only
+prove they compile — you prove they work).
+
+### A. Ctrl+Alt+Fn VT switch — the compositor never binds it
+
+`process_keyboard_shortcut` (`comp_core.rs:1669`) maps chords to `WmAction`, and
+`apply_wm_action` (`comp_core.rs:687`) runs them. There is NO `change_vt`
+anywhere (grep confirms). The compositor reads evdev under libseat, so the
+kernel does NOT perform the VT switch for it — it must call
+`session.change_vt()` itself. It handles the session events that fire *after* a
+switch (`udev.rs:615` pause/resume libinput + DRM master) but never *initiates*
+one. So the recovery TTY is unreachable. Four edits, one new field:
+
+1. `comp_core.rs` — `enum WmAction` (~140): add `SwitchVt(i32),`.
+2. `comp_core.rs` — `process_keyboard_shortcut` top (right after the `let
+   workspace_digit` line, before the `mods.alt` branch): the Ctrl+Alt level of
+   the F-keys yields the contiguous `XF86Switch_VT_n` keysyms under the default
+   xkb map, so match the MODIFIED sym against that range (anvil does the same;
+   no need to also test mods.ctrl/alt):
+   ```rust
+   let raw = keysym.raw();
+   if (xkb::KEY_XF86Switch_VT_1..=xkb::KEY_XF86Switch_VT_12).contains(&raw) {
+       return Some(WmAction::SwitchVt((raw - xkb::KEY_XF86Switch_VT_1 + 1) as i32));
+   }
+   ```
+   (`xkb` is already imported as `keysyms as xkb` at `comp_core.rs:81`; confirm
+   the `KEY_XF86Switch_VT_1..12` const names resolve — xkbcommon spells them
+   exactly that way.)
+3. `comp_core.rs` — `apply_wm_action` match (~687): add
+   `WmAction::SwitchVt(n) => state.change_vt(n),`.
+4. `comp_core.rs` — `trait CompState` (~218): add a default no-op so only the
+   DRM backend implements it: `fn change_vt(&mut self, _vt: i32) {}`.
+5. `wayland.rs` (the DRM `State`, behind `cfg(feature="smithay")`):
+   - add field `pub session: Option<LibSeatSession>,` to `struct State` (~145);
+   - in the `State { .. }` constructor literal add `session: None,`;
+   - in `impl CompState for State` (~310) override:
+     ```rust
+     fn change_vt(&mut self, vt: i32) {
+         if let Some(s) = self.session.as_mut() {
+             if let Err(e) = s.change_vt(vt) { warn!(?e, "change_vt failed"); }
+         }
+     }
+     ```
+   - import: `use smithay::backend::session::{libseat::LibSeatSession, Session};`
+     (`Session` is the trait that provides `change_vt`; libseat import already
+     exists at `udev.rs:75`, mirror it here).
+6. `udev.rs` — right after `run_udev` creates the session (`~360`) and the
+   `State`, set `state.session = Some(session.clone());` (LibSeatSession is
+   Clone — the code already `.clone()`s it into the libinput interface at 490).
+
+`winit.rs::State` inherits the trait's no-op — correct, a windowed dev build has
+no VT. Watch for a compile-time WARN import (`warn!`) already in scope in
+wayland.rs; it is used elsewhere there.
+
+### B. Two-finger scroll — tap is configured, scroll method is not
+
+The `DeviceAdded` handler (`udev.rs:571-581`) enables tap-to-click and
+tap-and-drag but never sets a scroll method. libinput does NOT always default a
+clickpad to two-finger (some default to edge/button/none), so a two-finger drag
+can emit zero axis events. The axis PATH is fine — `process_input_event`
+forwards `PointerAxis` to `on_pointer_axis` (`comp_core.rs:610`) — so this is a
+device-config gap. In the same `if device.config_tap_finger_count() > 0` block,
+after the tap knobs, add (same best-effort contract):
+```rust
+if device.config_scroll_methods().contains(&ScrollMethod::TwoFinger) {
+    if let Err(err) = device.config_scroll_set_method(ScrollMethod::TwoFinger) {
+        debug!(?err, "libinput: two-finger scroll enable refused (best-effort)");
+    }
+}
+```
+`ScrollMethod` is the `input`-crate enum the `config_tap_*` methods already ride;
+import it from smithay's reexport (same crate the DeviceAdded `device` type
+comes from). **Runtime caveat to check FIRST:** confirm whether the failing
+scroll is over an actual scrollable WebView/app or over the background layer
+surface (nothing to scroll there). If axis events reach the surface but the
+WebKit shell does not scroll, the gap is shell-side, not this — verify with
+`libinput debug-events` on the Lenovo before assuming the config is the whole
+fix.
+
 ## Cross-agent context (the wider hive work in flight)
 
 There is an MSI-side HART OS agent and a HevolveAI backend agent working the
