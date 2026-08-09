@@ -214,9 +214,18 @@ class GoogleChatAdapter(ChannelAdapter):
                 slash_command = message_data.get("slashCommand")
                 if slash_command:
                     command_id = slash_command.get("commandId")
-                    # Find command by ID (requires matching configuration)
+                    # Google Chat sends the invoked command as the FIRST
+                    # token of the message text (e.g. "/deploy prod").  Match
+                    # by the configured commandId OR by that exact invoked
+                    # command token -- never a loose substring of the whole
+                    # message, which would fire ANY registered command whose
+                    # name merely appears somewhere in the text (e.g. "please
+                    # don't delete this" firing a registered "delete" command).
+                    first_token = (message.text or "").strip().split(maxsplit=1)
+                    invoked_name = first_token[0].lstrip("/") if first_token else ""
+                    # Find command by ID or by the invoked command name.
                     for cmd_name, cmd_info in self._slash_commands.items():
-                        if str(command_id) == cmd_name or cmd_name in message.text:
+                        if str(command_id) == cmd_name or invoked_name == cmd_name:
                             handler = cmd_info["handler"]
                             result = handler(message)
                             if asyncio.iscoroutine(result):

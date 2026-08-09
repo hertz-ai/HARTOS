@@ -560,6 +560,209 @@ class TestGoogleChatSlashCommands:
         assert response is not None
         assert "Hello, John!" in response["text"]
 
+    @pytest.mark.asyncio
+    async def test_slash_command_substring_does_not_false_dispatch(self, adapter):
+        """A registered command name appearing as a plain WORD inside the
+        message text must NOT fire that command's handler.  The slash
+        command actually invoked has a different (numeric) commandId, so
+        only the normal on_message handlers should see the message.
+
+        Regression guard: dispatch used ``cmd_name in message.text``, so a
+        message like "please do not delete this file" would fire a
+        registered "delete" command that the user never invoked.
+        """
+        delete_called = False
+
+        async def delete_handler(msg):
+            nonlocal delete_called
+            delete_called = True
+            return {"text": "deleted!"}
+
+        adapter.register_slash_command("delete", delete_handler)
+
+        normal_messages = []
+
+        async def normal_handler(msg):
+            normal_messages.append(msg)
+
+        adapter.on_message(normal_handler)
+
+        data = {
+            "type": "MESSAGE",
+            "message": {
+                "name": "spaces/ABC/messages/123",
+                # slashCommand present but for a DIFFERENT command (numeric id)
+                "slashCommand": {"commandId": "1"},
+                # "delete" appears only as a plain word, not the invoked cmd
+                "text": "please do not delete this file",
+                "sender": {"name": "users/456", "displayName": "John"},
+            },
+            "space": {"name": "spaces/ABC", "type": "ROOM"},
+        }
+
+        response = await adapter.handle_webhook(data)
+
+        assert delete_called is False, \
+            "substring match wrongly fired an un-invoked slash command"
+        assert response is None
+        assert len(normal_messages) == 1
+
+    @pytest.mark.asyncio
+    async def test_only_invoked_command_fires_not_other_substrings(self, adapter):
+        """With several registered commands, only the one actually invoked
+        fires -- even when another command's name is a substring of the
+        argument text (e.g. "start" inside "started")."""
+        calls = []
+
+        async def start_handler(msg):
+            calls.append("start")
+            return {"text": "started handler"}
+
+        async def help_handler(msg):
+            calls.append("help")
+            return {"text": "help handler"}
+
+        # register "start" FIRST so the buggy substring path would hit it
+        adapter.register_slash_command("start", start_handler)
+        adapter.register_slash_command("help", help_handler)
+
+        data = {
+            "type": "MESSAGE",
+            "message": {
+                "name": "spaces/ABC/messages/1",
+                "slashCommand": {"commandId": "9"},   # numeric, no id match
+                "text": "/help how do I get started",
+                "sender": {"name": "users/1", "displayName": "Jo"},
+            },
+            "space": {"name": "spaces/ABC", "type": "ROOM"},
+        }
+
+        response = await adapter.handle_webhook(data)
+
+        assert calls == ["help"]
+        assert response == {"text": "help handler"}
+
+    @pytest.mark.asyncio
+    async def test_slash_command_dispatch_by_name_token(self, adapter):
+        """Real-world case: Google sends a NUMERIC commandId, so dispatch
+        must still match by the invoked "/name" token at the start of the
+        message text."""
+        captured = {}
+
+        async def deploy_handler(msg):
+            captured["hit"] = True
+            return {"text": "deploying"}
+
+        adapter.register_slash_command("deploy", deploy_handler)
+
+        data = {
+            "type": "MESSAGE",
+            "message": {
+                "name": "spaces/ABC/messages/1",
+                "slashCommand": {"commandId": "7"},   # numeric, != "deploy"
+                "text": "/deploy production now",
+                "sender": {"name": "users/1", "displayName": "Jo"},
+            },
+            "space": {"name": "spaces/ABC", "type": "ROOM"},
+        }
+
+        response = await adapter.handle_webhook(data)
+
+        assert captured.get("hit") is True
+        assert response == {"text": "deploying"}
+
+    @pytest.mark.asyncio
+    async def test_slash_command_sync_handler_returns_string(self, adapter):
+        """A SYNCHRONOUS slash handler returning a plain string is wrapped
+        into {'text': ...}.  (Existing tests only exercised an async
+        handler returning a dict.)"""
+        def ping_handler(msg):          # sync def, not a coroutine
+            return "pong"
+
+        adapter.register_slash_command("ping", ping_handler)
+
+        data = {
+            "type": "MESSAGE",
+            "message": {
+                "name": "spaces/ABC/messages/1",
+                "slashCommand": {"commandId": "ping"},   # matches by id
+                "text": "/ping",
+                "sender": {"name": "users/1", "displayName": "Jo"},
+            },
+            "space": {"name": "spaces/ABC", "type": "ROOM"},
+        }
+
+        response = await adapter.handle_webhook(data)
+
+        assert response == {"text": "pong"}
+
+    @pytest.mark.asyncio
+    async def test_slash_command_handler_none_falls_through(self, adapter):
+        """A slash handler returning None does NOT short-circuit the
+        webhook: the message still reaches the normal on_message handlers
+        and the webhook returns None."""
+        async def noop_handler(msg):
+            return None
+
+        adapter.register_slash_command("log", noop_handler)
+
+        seen = []
+
+        async def normal(msg):
+            seen.append(msg)
+
+        adapter.on_message(normal)
+
+        data = {
+            "type": "MESSAGE",
+            "message": {
+                "name": "spaces/ABC/messages/1",
+                "slashCommand": {"commandId": "log"},
+                "text": "/log something",
+                "sender": {"name": "users/1", "displayName": "Jo"},
+            },
+            "space": {"name": "spaces/ABC", "type": "ROOM"},
+        }
+
+        response = await adapter.handle_webhook(data)
+
+        assert response is None
+        assert len(seen) == 1
+
+    @pytest.mark.asyncio
+    async def test_slash_command_none_text_no_crash(self, adapter):
+        """A MESSAGE carrying a slashCommand but no text at all (converted
+        text is None) must not raise while scanning registered commands,
+        and must fall through to the normal handlers."""
+        async def help_handler(msg):
+            return {"text": "help"}
+
+        adapter.register_slash_command("help", help_handler)
+
+        seen = []
+
+        async def normal(msg):
+            seen.append(msg)
+
+        adapter.on_message(normal)
+
+        data = {
+            "type": "MESSAGE",
+            "message": {
+                "name": "spaces/ABC/messages/1",
+                "slashCommand": {"commandId": "42"},   # numeric, no id match
+                "text": None,
+                "argumentText": None,
+                "sender": {"name": "users/1", "displayName": "Jo"},
+            },
+            "space": {"name": "spaces/ABC", "type": "ROOM"},
+        }
+
+        response = await adapter.handle_webhook(data)   # must not raise
+
+        assert response is None
+        assert len(seen) == 1
+
 
 class TestGoogleChatFactory:
     """Tests for Google Chat adapter factory."""
