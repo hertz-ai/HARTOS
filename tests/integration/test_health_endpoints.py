@@ -98,3 +98,30 @@ class TestExistingStatus:
         data = resp.get_json()
         assert data['response'] == 'Working...'
         assert data['status'] == 'running'
+
+    def test_status_answers_within_its_latency_budget(self, client):
+        """status_endpoint_ms (2000ms) lived in core.constants.LATENCY_BUDGETS
+        enforced NOWHERE (no python test, and boot-latency.nix only reads the two
+        boot_* keys) until 2026-08-10. /status is what every health check AND the
+        shell's boot-wait poll hit, and the registry's own note says a slow
+        /status is indistinguishable from a hung one. Warm once (the handler does
+        lazy imports on first hit), then take the best of several real calls so a
+        transient import/GC blip cannot flake it, and assert the handler answers
+        within budget. In the test env the HevolveAI bridge health check is on
+        its fail-safe path (no core), so this measures the handler's own bounded
+        overhead — a regression that lets /status block on an unbounded sync call
+        blows the budget here."""
+        import time
+        from core.constants import latency_budget
+        budget_ms = latency_budget('status_endpoint_ms')
+        client.get('/status')  # warm lazy imports -> measure steady state
+        best_ms = float('inf')
+        for _ in range(5):
+            t0 = time.perf_counter()
+            resp = client.get('/status')
+            best_ms = min(best_ms, (time.perf_counter() - t0) * 1000)
+            assert resp.status_code == 200
+        assert best_ms < budget_ms, (
+            f"/status took {best_ms:.1f}ms (best of 5), budget {budget_ms}ms — a "
+            f"slow /status reads as a hung node to every health check + the "
+            f"shell's boot-wait poll")
