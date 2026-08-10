@@ -52,6 +52,16 @@ exfil (`bd57dfbe`).
 **Availability bugs fixed + VM-validated:** `#40` wifi-starvation on state-persist
 (`7e5ed76f`), `#41` hart-discovery not restarting after backend crash (`40599414`).
 
+**Edge cgroup caps (`#19`) — CLOSED (fixed + guarded).** The edge backend caps were
+raised `384M/256M/32 → 640M/512M/64` (2026-07-28) after the module-scope import
+floor was measured at 275 MB — the old `MemoryHigh=256M` sat *below* it. Guarded by
+`hart-edge-boot`'s "capped HART units stay inside their own cgroup caps" subtest,
+which auto-discovers every capped `hart-*` unit and hard-fails on the real
+crash-loop signals (`peak ≥ MemoryMax`, `Result=oom-kill`, `NRestarts>0`) and on any
+running unit it couldn't measure. The `MemoryHigh` throttle-only case is deliberately
+NOT gated (the 275 MB figure is a dev-box measurement with torch/transformers that
+`hart-app.nix` does not ship — gating on an unmeasured guess = a gate nobody passes).
+
 **Nothing-lost audits:** every `nixos/modules/*.nix` is imported somewhere (orphan
 audit clean); each variant config imports its profile (`TestNothingLostImport
 Invariant`); Hyper-V guest storage (`hv_storvsc`) rides `hartModules`; the
@@ -69,8 +79,9 @@ sandboxed) — recorded + guarded.
 | `#42` | VM suite has FLAKY timing tests (`hart-server-boot` port-bind, `hart-session-supervisor-reboot-latch`) — different reds each run, blocks all-green | **ROOT-CAUSED + FIXED (verifying, run `31367253577`).** Three causes: (a) one-shot `curl` after `wait_for_open_port` raced socket-listening-before-Flask-serving → bounded `wait_until_succeeds` at all 4 sites (`8ef180d7`); (b) the reboot-latch subtest asserted a broken Tier-1 (`/bin/false`) FREEZES as `hart-comp` across a reboot — invalid: `greetd.service` is a NixOS-managed unit, so boot-time `/etc` regeneration undoes the runtime `systemctl mask`, greetd re-runs the selector and correctly re-drops. Now asserts the reboot READS+HONORS the durable re-arm via the supervisor's append-only journal (`f7eb7325`); (c) that rewrite's OWN terminal `cat`==cage was itself the one-shot race (cage needs a 2nd degrade after `sway`) → bounded `wait_until_succeeds` on the floor value (`a0e5c4fe`, caught by the parallel-path audit). Close when the re-run shows both absent from `--log-failed`. |
 | `#12` | `hart-layer-shell-host-paint` GTK4 SIGABRT on software GL (vulkan/GSK hang) | Known, deep, multi-session; GPU proven-good — the fix is root-causing the GSK-GL/layer-shell path, not another workaround |
 | `#29` | Python CI fleet red — harness inherits host machine identity (D-Bus/sysfs/abs paths) | Hermetic-harness fix; separate from the OS-parity VMs |
-| `#19` | Edge cgroup caps below the measured import floor | Edge backend would crash-loop on real edge HW; align caps to the import floor |
 | `#3` | Shell hang cluster: mic-freeze on cage FLOOR + false-healthy paint signals | Live; part of the shell-stability track |
+
+(`#19` edge cgroup caps moved to Verified above — fixed + VM-guarded.)
 
 ## 🧭 Steward decisions (yours — not mine to default)
 
