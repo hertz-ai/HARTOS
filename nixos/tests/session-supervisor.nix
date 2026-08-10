@@ -584,27 +584,36 @@ in
           assert sup.succeed(f"cat {LATCH}").strip() == "cage", \
               "post-reboot crash-loop dropped below the floor — NEVER allowed"
 
-      with subtest("reset-tier re-arms Tier-1 and that ALSO survives a reboot"):
-          # RACE-FREE isolation (run 30485906966): with both tiers = /bin/false,
-          # greetd's own loop crash-drops the freshly reset latch within
-          # seconds — before shutdown AND again right after the reboot, ahead
-          # of the assert. The subtest proves the DISK persistence of a
-          # reset-armed latch, so greetd (already proven the supervisor above)
-          # is masked across this reboot: the mask symlink lives in /etc on
-          # the VM's persistent disk, so the next boot cannot race the read.
-          # `sup.succeed` DISCARDS stderr, so when this failed (exit 1, run
-          # 30774512407) the report was just "command failed" with no reason —
-          # and on NixOS there are several plausible ones, with different
-          # fixes. /etc/systemd/system/greetd.service already exists as a
-          # symlink into the store, and systemd can refuse to mask over an
-          # existing unit file rather than silently replacing it.
+      with subtest("reset-tier re-arms Tier-1, and a reboot READS + HONORS the durable re-arm"):
+          # This proves TWO things and, deliberately, NOT a third that would be
+          # WRONG (the old freeze-assert; run 31354663901: the post-reboot latch
+          # was NOT hart-comp — and that is correct behaviour, not the bug it was
+          # reported as):
           #
-          # Capture WHY. If masking is genuinely unavailable here, fall back to
-          # stop + a RUNTIME mask, which is enough for this subtest's actual
-          # claim: it only needs greetd not to run while the latch is read
-          # back. Then say plainly, in the log, which path was taken — a
-          # fallback that hides itself is how a test starts proving something
-          # weaker than it says.
+          #  (1) reset-tier's WRITE is durable — asserted pre-reboot below, with
+          #      greetd quiesced so nothing races the write.
+          #  (2) A reboot READS that durable re-arm and HONORS it: the next boot's
+          #      supervisor re-attempts Tier-1. We prove the re-attempt with the
+          #      supervisor's OWN append-only journal ("tier degrade hart-comp ->
+          #      sway" on THIS boot) — a line that can ONLY appear if the durably
+          #      stored hart-comp survived the power cycle and was read at boot.
+          #
+          # NOT asserted: that the hart-comp VALUE is frozen across the reboot. It
+          # is not, and that is CORRECT — this node's fake Tier-1 is `/bin/false`
+          # (permanently broken), so the supervisor rightly re-attempts-then-drops
+          # it; a real node would KEEP a now-working Tier-1. The old assert was
+          # non-deterministic because it required greetd to stay masked across the
+          # reboot — impossible: greetd.service is a NixOS-MANAGED unit, so the
+          # declarative /etc regeneration on boot restores it over any runtime
+          # `systemctl mask`. The DISK reboot-durability of the latch file is
+          # already power-cycled + proved by the cage-drop subtest above (same
+          # file, different value) — not re-litigated here.
+          #
+          # greetd is quiesced ONLY for the pre-reboot write assert (a runtime mask
+          # suffices — no reboot yet). `sup.succeed` DISCARDS stderr, so when the
+          # mask failed (run 30774512407) the report was a bare "command failed";
+          # capture WHY and fall back to stop + runtime-mask, asserting the
+          # REQUIREMENT (greetd not active), not the mechanism.
           _rc, _out = sup.execute("systemctl mask --now greetd.service 2>&1")
           if _rc != 0:
               sup.log(f"persistent mask refused (rc={_rc}): {_out.strip()}")
@@ -619,16 +628,33 @@ in
               assert _active != "active", (
                   f"greetd is still ACTIVE after mask+stop ({_active!r}); this "
                   f"subtest needs it quiet so its crash-loop cannot eat the "
-                  f"freshly reset latch.\nmask: {_out.strip()}\n"
-                  f"fallback: {_out2.strip()}")
+                  f"freshly reset latch before the pre-reboot read.\n"
+                  f"mask: {_out.strip()}\nfallback: {_out2.strip()}")
               sup.log("greetd quiesced via the runtime fallback")
+
+          # (1) reset-tier durably re-arms Tier-1 (greetd quiet -> the write is stable).
           sup.succeed("hartctl session reset-tier")
-          assert sup.succeed(f"cat {LATCH}").strip() == "hart-comp"
+          assert sup.succeed(f"cat {LATCH}").strip() == "hart-comp", \
+              "reset-tier must durably write hart-comp (Tier-1 re-armed) to the latch"
+
+          # (2) Power-cycle. greetd is NixOS-managed -> it returns on boot (the
+          # runtime mask does NOT survive) and re-runs the selector, which reads the
+          # durable hart-comp re-arm and, Tier-1 being /bin/false, degrades from it.
           sup.shutdown()
           sup.start()
           sup.wait_for_unit("multi-user.target")
-          assert sup.succeed(f"cat {LATCH}").strip() == "hart-comp", \
-              "a reset-armed Tier-1 latch must also persist across reboot"
+          sup.wait_for_unit("greetd.service", timeout=120)
+          # The append-only supervisor journal on THIS boot must show the re-attempt
+          # degrading FROM hart-comp -> proof the durable re-arm survived the reboot
+          # and was read at boot. Bounded wait: the crash-loop reaches the drop in a
+          # few relaunches; never a single-instant catch.
+          sup.wait_until_succeeds(
+              "journalctl -t hart-session-supervisor -b --no-pager | "
+              "grep -q 'tier degrade hart-comp -> sway'", timeout=90)
+          # The terminal outcome is the audited floor — never a silent stay above it.
+          tier = sup.succeed(f"cat {LATCH}").strip()
+          assert tier == "cage", \
+              f"a re-attempted broken Tier-1 must settle on the cage floor, got {tier!r}"
     '';
   };
 
