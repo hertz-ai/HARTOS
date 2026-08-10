@@ -311,6 +311,50 @@ import logging as _logging  # noqa: E402  (intentional, see comment above)
 _LOG = _logging.getLogger(__name__)
 
 
+def _resync_manager_reply_config(manager, group_chat) -> int:
+    """Re-point a GroupChatManager's registered run_chat config at the LIVE
+    ``group_chat.messages`` list.  Returns the number of configs re-pointed.
+
+    Why this is needed
+    ------------------
+    autogen's ``ConversableAgent.register_reply`` stores ``copy.copy(config)``,
+    so ``GroupChatManager.__init__`` registers ``run_chat`` against a *shallow
+    copy* of the GroupChat -- a different object that merely shares the same
+    ``.messages`` list at construction time.
+
+    ``run_chat`` appends to that bound copy, never to ``manager.groupchat``.
+    So the moment anything REASSIGNS ``group_chat.messages`` after the manager
+    is built -- which the MemoryGraph/provenance hooks below do -- the copy
+    keeps pointing at the original list while every reader here uses the new
+    one.  Result: autogen writes a full conversation into a list nobody reads,
+    ``group_chat.messages`` stays empty forever, and every channel gets the
+    "I wasn't able to put a response together" fallback even though the model
+    produced a perfectly good reply.
+
+    That was the empty-GroupChat defect (2026-08-04..08-10).  It is
+    deterministic, not a race, which is why restarting never helped.
+
+    Keep this call AFTER the last ``.messages`` reassignment.  Better still, do
+    not reassign ``.messages`` after manager construction at all -- this
+    function exists because the hooks below have to.
+    """
+    _n = 0
+    try:
+        import autogen as _ag
+        for _entry in getattr(manager, '_reply_func_list', []) or []:
+            _cfg = _entry.get('config')
+            if isinstance(_cfg, _ag.GroupChat) and _cfg is not group_chat:
+                if _cfg.messages is not group_chat.messages:
+                    _cfg.messages = group_chat.messages
+                    _n += 1
+    except Exception as _e:
+        try:
+            _LOG.error(f'[GC-RESYNC-FAILED] {_e}')
+        except Exception:
+            pass
+    return _n
+
+
 def _is_expert_dispatch_reentry() -> bool:
     """True when this /chat request is the dispatcher calling back into itself.
 
