@@ -17,7 +17,17 @@ in
       after = [ "hart-backend.service" ];
       bindsTo = [ "hart-backend.service" ];
       partOf = [ "hart.target" ];
-      wantedBy = [ "hart.target" ];
+      # wantedBy hart-backend TOO, not only hart.target: bindsTo takes discovery
+      # DOWN when the backend dies, but nothing brought it back UP when the
+      # backend AUTO-restarted (Restart=on-failure) — partOf(hart.target) does
+      # not propagate a backend auto-restart, so after a real backend crash
+      # discovery stayed dead until next boot (VM run 31347690532: hart-edge-boot
+      # "critical unit RECOVERS" found hart-discovery inactive after the backend
+      # kill+restart cascade). Making the backend WANT discovery means every
+      # backend (re)start re-pulls discovery; combined with `after` + `bindsTo`
+      # discovery now follows the backend's FULL lifecycle. No cycle: the Want is
+      # soft and one-way (backend never blocks on discovery).
+      wantedBy = [ "hart.target" "hart-backend.service" ];
 
       environment = {
         HEVOLVE_DB_PATH = "${cfg.dataDir}/hevolve_database.db";
