@@ -266,13 +266,23 @@ def register_news_tools(helper, assistant, user_id: str):
                         PUBLISH_WEB_MARKER, '')
                     changed = True
 
-                # Attach (or clear) the lead-image marker.
+                # Store the lead image in the CANONICAL column (Post.media_urls) —
+                # the single home every consumer reads (feed card in social/api.py,
+                # sharing, federation, export, to_dict). media_urls is a JSON list,
+                # so REASSIGN (SQLAlchemy does not track in-place list mutation). Put
+                # it at [0], the lead-image slot those consumers treat as primary. No
+                # second storage channel: the old '<!-- news_image -->' content marker
+                # was invisible to all of them (the parallel-path this replaces).
                 img = (image_url or '').strip()
-                if publishable and img and NEWS_IMAGE_PREFIX not in content:
-                    content = f"{content}\n\n{NEWS_IMAGE_PREFIX}{img} -->"
-                    changed = True
-                elif not publishable and NEWS_IMAGE_PREFIX in content:
-                    content = NEWS_IMAGE_RE.sub('', content)
+                if publishable and img:
+                    urls = list(post.media_urls or [])
+                    if not urls or urls[0] != img:
+                        post.media_urls = [img] + [u for u in urls if u != img]
+                        changed = True
+                # Migrate forward: strip any legacy news_image comment an earlier
+                # version wrote into content (read-only shim — delete after 2026-09).
+                if NEWS_IMAGE_PREFIX in content:
+                    content = NEWS_IMAGE_RE.sub('', content).rstrip()
                     changed = True
 
                 if changed:
@@ -310,14 +320,20 @@ def register_news_tools(helper, assistant, user_id: str):
                 items = []
                 for post in posts:
                     _content = post.content or ''
-                    _img = NEWS_IMAGE_RE.search(_content)
+                    # Lead image from the canonical column; fall back to the legacy
+                    # content marker for posts written before the media_urls switch
+                    # (read-only migration shim — delete after 2026-09).
+                    _media = post.media_urls or []
+                    _legacy = NEWS_IMAGE_RE.search(_content)
+                    _img_url = _media[0] if _media else (
+                        _legacy.group(1) if _legacy else None)
                     _clean = NEWS_IMAGE_RE.sub('', _content).replace(
                         PUBLISH_WEB_MARKER, '').strip()
                     items.append({
                         'id': str(post.id),
                         'title': post.title,
                         'content': _clean,
-                        'image_url': _img.group(1) if _img else None,
+                        'image_url': _img_url,
                         'link_url': post.link_url,
                         'source_channel': post.source_channel,
                         'created_at': post.created_at.isoformat() if post.created_at else None,
