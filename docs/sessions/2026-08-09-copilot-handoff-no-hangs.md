@@ -26,7 +26,46 @@ This is the rewrite. The steward and I converged on a single hypothesis that
 ties together three separate-looking failures. **Chase this before anything
 else — if it holds, it collapses three tasks into one fix.**
 
-### The evidence (from the 6675-line journal export)
+### LIVE CONFIRMATION (2026-08-10, read off the hung stick's ext4 journal)
+
+A real hung boot was captured and its persistent journal read directly off the
+stick's ext4 (`/var/log/journal`), Windows-side, with a pure-Python ext4 reader.
+This UPGRADES the theory below to a confirmed root cause, and corrects one part:
+
+- The `drmSetMaster` failure carries a specific errno: **`Os { code: 13, kind:
+  PermissionDenied }` = EACCES, NOT EBUSY.** So it is NOT a holder conflict
+  (plymouth had already quit; nothing else holds card1). The compositor is simply
+  **not permitted** to become master. The log line: `HART-comp DRM: drmSetMaster
+  STILL refused (unprivileged) -- errno names the reason/holder; retrying every
+  tick` — and it retries in a busy-loop.
+- The compositor is launched by **greetd** (`session opened for user
+  hart-admin(uid=1000)`), through logind. So the real question is **why the
+  greetd/logind session is not the ACTIVE DRM-master session on the seat** — an
+  EACCES means the session isn't authorized to master card1, not that someone
+  holds it. Chase greetd↔logind↔libseat session *activation* (is the session
+  `Active=yes`? is libseat on the logind backend or seatd? does the session own
+  the foreground VT?), NOT "who holds the master."
+- Denied the master, the compositor correctly falls to its **pixman SOFTWARE
+  scanout floor** (`HART-comp DRM: output online (pixman scanout)`, `real-HW
+  scanout on the pixman floor`, first-scanout beacon written). The display goes
+  LIVE (cursor moves) but the ENTIRE display path is now CPU. That is the wedge:
+  pixman scanout + GSK cairo + degraded WebKit, all on the CPU.
+- **"Hung faster" is explained:** this machine is **Intel HD 4000 (Ivy Bridge)**,
+  an older/weaker CPU than the HD 620 machine. All-software rendering saturates it
+  faster. Same failure, slower silicon.
+- The boot reached the full graphical shell (greetd → compositor → glass-shell
+  GSK=CAIRO → XWayland → portals → PipeWire) over ~79s (20:47:18→20:48:37), then
+  the CPU-bound shell wedged — matching "cursor moves, nothing else responds."
+
+**So the #1 fix is: get the compositor's greetd/logind session AUTHORIZED as the
+active DRM master, so it does GPU KMS scanout instead of the pixman software
+floor.** That frees the CPU and removes the wedge on both machines. The pixman
+fallback is working-as-designed (degrade-not-die) — the bug is upstream of it, in
+session activation. Secondary: the busy-retry on `drmSetMaster` should back off,
+and once master is held via libseat's active-session fd the explicit
+`drmSetMaster` call may be redundant entirely.
+
+### The earlier evidence (from the 6675-line journal export)
 
 - The compositor got a real GPU context: `HART-comp DRM: GLES GPU renderer
   initialised on the primary node`, Intel HD 620, Mesa 24.2.8, OpenGL ES 3.2, on
