@@ -25,14 +25,16 @@ import base64
 import pytest
 
 try:
-    import requests
-    from integrations.coding_agent import remote_executor as rex
-    from integrations.coding_agent.remote_executor import RemoteDesktopExecutor
-except Exception as e:  # pragma: no cover - environment guard
-    pytest.skip(
-        f"remote_executor / requests not importable in this env: {e}",
-        allow_module_level=True,
-    )
+    import requests  # noqa: F401 - optional external dep; the tests mock it
+except ImportError:
+    pytest.skip("requests not installed in this env", allow_module_level=True)
+
+# Import the SUT UNCONDITIONALLY: an import-time regression in this fail-safe
+# security gate must FAIL LOUD, never be masked as a green skip (only a truly-
+# optional external dep belongs in the guard above). A broad `except Exception`
+# here previously converted any SUT import regression into a skip.
+from integrations.coding_agent import remote_executor as rex
+from integrations.coding_agent.remote_executor import RemoteDesktopExecutor
 
 from unittest import mock
 

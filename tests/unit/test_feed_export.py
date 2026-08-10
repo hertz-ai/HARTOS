@@ -287,7 +287,10 @@ try:
     )
     _DB_OK = True
     _DB_SKIP = ''
-except Exception as e:  # pragma: no cover - environment guard
+except ImportError as e:  # pragma: no cover - only a missing dep skips
+    # Narrowed from `except Exception`: a NON-import ORM breakage (mapper /
+    # model-registration RuntimeError — exactly the class that silently emptied
+    # feeds) must FAIL LOUD, not skip every feed_export security regression test.
     _DB_OK = False
     _DB_SKIP = f'social ORM unavailable: {e}'
 

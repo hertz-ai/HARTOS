@@ -31,20 +31,25 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 try:
-    import requests
-    from integrations.social.external_bot_bridge import (
-        ExternalBotRegistry,
-        process_webhook,
-        discover_santaclaw_agents,
-        send_to_santaclaw,
-        auto_register_discovered_agents,
-        SUPPORTED_PLATFORMS,
-    )
-    from integrations.social.models import get_engine, get_db, Base, User
-    from integrations.social.services import UserService
-except ImportError as e:  # pragma: no cover - environment guard
-    pytest.skip(f"external_bot_bridge deps unavailable: {e}",
+    import requests  # noqa: F401 - optional external dep; the tests mock it
+    import sqlalchemy  # noqa: F401 - the social ORM's backend, needed by the SUT
+except ImportError:
+    pytest.skip("requests/sqlalchemy not installed in this env",
                 allow_module_level=True)
+
+# With BOTH external deps proven present, import the SUT + ORM UNCONDITIONALLY:
+# an import-time regression in this unauthenticated write-path module (or the
+# social ORM it guards) must now FAIL LOUD, never be masked as a green skip.
+from integrations.social.external_bot_bridge import (
+    ExternalBotRegistry,
+    process_webhook,
+    discover_santaclaw_agents,
+    send_to_santaclaw,
+    auto_register_discovered_agents,
+    SUPPORTED_PLATFORMS,
+)
+from integrations.social.models import get_engine, get_db, Base, User
+from integrations.social.services import UserService
 
 BRIDGE = 'integrations.social.external_bot_bridge'
 
