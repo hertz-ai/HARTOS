@@ -115,10 +115,18 @@ def test_fetch_none_on_exception(monkeypatch):
 def test_fetch_none_without_central_configured(monkeypatch):
     monkeypatch.delenv('HEVOLVE_CENTRAL_URL', raising=False)
     monkeypatch.delenv('HEVOLVE_REGIONAL_URL', raising=False)
-    # even with a reachable stub, no central URL → no pull
+    # "No central configured" now means no env AND no reachable genesis
+    # central: parent_tier_url falls back to
+    # core.superadmins.resolve_reachable_central (task #629), so on an
+    # online dev box this test would find the real azurekong and stop
+    # testing its own claim.  Pin the resolver offline — the claim under
+    # test is "no central at all → no pull", and that stays true.
+    from unittest.mock import patch as _patch
     monkeypatch.setitem(sys.modules, 'requests',
                         _mock_requests(200, {'user_id': 1}))
-    assert profile_sync.fetch_central_profile(1) is None
+    with _patch('core.superadmins.resolve_reachable_central',
+                return_value=''):
+        assert profile_sync.fetch_central_profile(1) is None
 
 
 def test_fetch_none_without_central_user_id(monkeypatch):

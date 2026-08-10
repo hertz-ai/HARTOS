@@ -1,11 +1,29 @@
+# PEP 563: annotations are stored as strings and never evaluated at def-time.
+# REQUIRED here, not cosmetic. This module annotates with `autogen.AssistantAgent`
+# (create_agents_for_user, get_agent_response). Python evaluates annotations when
+# the `def` executes — i.e. at module import — so on a node without autogen the
+# module died with
+#     AttributeError: 'NoneType' object has no attribute 'AssistantAgent'
+# before reaching ANY function body. The `if autogen is None: raise ImportError`
+# guard below sat underneath the statement that killed it and could never run.
+# Observed 300x in the 2026-08-08 nightly VMs, in every nixosTests shard.
+from __future__ import annotations
+
 from typing import Any, Dict, Tuple
 import os
 from flask import current_app
 
-try:
-    import autogen
-except ImportError:
-    autogen = None
+from core.optional_import import lazy_module
+
+# ONE canonical way to bind an optional heavy dependency — the same helper
+# create_recipe.py:26 uses. The previous `try: import autogen / except:
+# autogen = None` was a second, ad-hoc mechanism for the same concern, and it
+# is the one that broke: a None sentinel needs a None check at EVERY use site,
+# including annotations, and one was missed. lazy_module has no sentinel to
+# miss — it defers the import to first attribute access and raises loudly then,
+# which is also what keeps autogen's ~12s import (google.api_core + flaml +
+# llmlingua -> torch) off the backend boot path.
+autogen = lazy_module("autogen")
 
 from helper import retrieve_json, retrieve_json, _is_terminate_msg
 from cultural_wisdom import get_cultural_prompt
@@ -329,11 +347,17 @@ def gather_info(user_id, user_message, prompt_id, autonomous=False):
         prompt_id: The prompt ID for this agent creation session
         autonomous: If True, LLM answers its own questions (no human input needed)
     """
-    if autogen is None:
+    # lazy_module never yields None, so the old `if autogen is None` check is not
+    # just dead — it would silently stop guarding. Touch one attribute to force
+    # the deferred import here, where a clear message can still be given, rather
+    # than letting it surface from inside agent construction further down.
+    try:
+        autogen.AssistantAgent
+    except ImportError as exc:
         raise ImportError(
             "Agent creation requires the 'pyautogen' package. "
             "Install it with: pip install pyautogen"
-        )
+        ) from exc
     current_app.logger.info('INSIDE GATHER INFo')
     current_app.logger.info('--'*100)
     # Push thinking to UI

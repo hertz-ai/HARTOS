@@ -448,11 +448,24 @@ class PeerLinkManager:
             try:
                 from core.peer_link.nat import get_nat_traversal
                 ws_url = get_nat_traversal().resolve_peer_address(peer_info)
-                if ws_url:
+                if ws_url and '/peer_link' in ws_url:
                     # resolve_peer_address returns ws://host:port/peer_link;
                     # upgrade_peer wants host:port.
                     address = (ws_url.replace('ws://', '').replace('wss://', '')
                                .split('/peer_link')[0].rstrip('/'))
+                elif ws_url:
+                    # Rung 5 (crossbar relay) returns a WAMP ROUTER URL, e.g.
+                    # ws://host:8088/ws.  The strip above would mangle it into
+                    # "host:8088/ws" and upgrade_peer would dial a WAMP router
+                    # expecting the PeerLink protocol — a connect that can
+                    # never handshake.  PeerLink has no WAMP relay mode; the
+                    # canonical WAN relay is MessageBus's CROSSBAR leg
+                    # (core/peer_link/message_bus.py), so skip the upgrade
+                    # honestly instead of dialing garbage.
+                    logger.debug(
+                        f"NAT resolved a relay URL for {peer_id[:8]} "
+                        f"({ws_url}); not dialable as PeerLink — leaving "
+                        f"transport to the MessageBus crossbar leg")
             except Exception as e:
                 logger.debug(f"NAT traversal unavailable for {peer_id[:8]}: {e}")
 

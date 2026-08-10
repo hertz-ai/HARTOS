@@ -164,15 +164,36 @@ class TestTTLCacheThreadSafety:
         assert len(errors) == 0, f"Thread safety errors: {errors}"
 
     def test_ttl_expiry_works(self):
-        """Expired entries must not be returned — prevents stale agent state."""
+        """Expired entries must not be returned — prevents stale agent state.
+
+        Drives a CONTROLLED clock rather than sleeping. The old version set
+        ttl_seconds=0 and slept 0.01s to manufacture elapsed time, but the cache
+        uses time.monotonic() and Windows' monotonic resolution is ~15 ms — so
+        `now - ts` could read exactly 0 within one tick, `0 > 0` is False, and
+        the entry looked un-expired: green in CI (Linux, ~1 ns monotonic), flaky
+        on a Windows dev box. Patching the clock makes elapsed time exact and
+        the test deterministic on every OS — no sleep, no resolution race."""
+        import core.session_cache as sc
         from core.session_cache import TTLCache
-        cache = TTLCache(ttl_seconds=0, max_size=10, name='test_expiry')  # 0s TTL = instant expire
-        cache['key'] = 'value'
-        # Entry should expire immediately (or on next access)
-        import time
-        time.sleep(0.01)
-        result = cache.get('key')
-        assert result is None  # Expired
+
+        clock = {'t': 1000.0}
+        with patch.object(sc.time, 'monotonic', lambda: clock['t']):
+            cache = TTLCache(ttl_seconds=5, max_size=10, name='test_expiry')
+
+            # Expiry: no access between set and the check, so the timestamp is
+            # not refreshed and the entry ages out.  (TTLCache is a SLIDING
+            # window — get() on a live key refreshes its timestamp — so a check
+            # that read the key mid-way would reset the clock and never expire;
+            # that is the behaviour, not a bug, and the reason this test never
+            # touches 'stale' until the final assert.)
+            cache['stale'] = 'value'
+            clock['t'] += 6.0  # 6s elapsed > 5s TTL, untouched
+            assert cache.get('stale') is None, "must be evicted once past its TTL"
+
+            # Within the TTL: a freshly-set key is still present.
+            cache['fresh'] = 'value'
+            clock['t'] += 3.0  # 3s < 5s
+            assert cache.get('fresh') == 'value', "must survive within its TTL"
 
     def test_max_size_eviction(self):
         """Overflow must evict oldest entries — prevents memory leak."""

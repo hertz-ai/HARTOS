@@ -123,56 +123,68 @@ class MCPServerConnector:
                 'error': f'Not connected to MCP server {self.server_name}'
             }
 
+        # Security sandbox is REQUIRED — one instance vets the URL, the tool call
+        # AND the response. If it cannot be imported we cannot verify any of
+        # those, so we FAIL CLOSED (refuse) rather than call out to a remote
+        # server unchecked. The old `except ImportError: pass` at each gate was
+        # fail-OPEN: a missing security module silently disabled URL allow-
+        # listing, tool-call rejection AND response exfil scanning. Same posture
+        # as remote_executor._check_security (319b8ab8).
         try:
-            # Security: MCP sandbox - validate tool call before execution
-            try:
-                from security.mcp_sandbox import MCPSandbox
-                sandbox = MCPSandbox()
-                if not sandbox.validate_server_url(self.server_url):
-                    logger.warning(f"MCP sandbox rejected server URL: {self.server_url}")
-                    return {'success': False, 'error': f'Server URL not allowed: {self.server_url}'}
-                is_valid, rejection = sandbox.validate_tool_call(tool_name, arguments)
-                if not is_valid:
-                    logger.warning(f"MCP sandbox rejected tool call: {rejection}")
-                    return {'success': False, 'error': f'Tool call rejected: {rejection}'}
-            except ImportError:
-                pass  # Security module not available
+            from security.mcp_sandbox import MCPSandbox
+            sandbox = MCPSandbox()
+        except ImportError as e:
+            logger.error(
+                "MCP sandbox unavailable (%s) — refusing to execute '%s' on %s",
+                e, tool_name, self.server_name)
+            return {'success': False,
+                    'error': 'MCP security sandbox unavailable — refusing tool execution'}
+
+        try:
+            # Pre-call gates: server-URL allow-list + tool-call rejection.
+            if not sandbox.validate_server_url(self.server_url):
+                logger.warning(f"MCP sandbox rejected server URL: {self.server_url}")
+                return {'success': False, 'error': f'Server URL not allowed: {self.server_url}'}
+            is_valid, rejection = sandbox.validate_tool_call(tool_name, arguments)
+            if not is_valid:
+                logger.warning(f"MCP sandbox rejected tool call: {rejection}")
+                return {'success': False, 'error': f'Tool call rejected: {rejection}'}
 
             headers = {'Content-Type': 'application/json'}
             if self.api_key:
                 headers['Authorization'] = f'Bearer {self.api_key}'
-
-            payload = {
-                'tool': tool_name,
-                'arguments': arguments
-            }
+            payload = {'tool': tool_name, 'arguments': arguments}
 
             response = pooled_post(
                 f"{self.server_url}/tools/execute",
-                headers=headers,
-                json=payload,
-                timeout=30
+                headers=headers, json=payload, timeout=30,
             )
 
+            # Exfiltration scan on EVERY response body, not just HTTP 200: a
+            # hostile server can put credentials in a non-200 body just as
+            # easily, and that body used to be embedded RAW into the error
+            # string below, bypassing the gate entirely.
+            try:
+                body = response.json()
+            except Exception:
+                body = None
+            if body is not None:
+                resp_safe, resp_reason = sandbox.validate_response(body)
+                if not resp_safe:
+                    logger.warning(f"MCP response validation failed: {resp_reason}")
+                    return {'success': False, 'error': f'Response rejected: {resp_reason}'}
+
             if response.status_code == 200:
-                result = response.json()
-                # Security: Validate response for data exfiltration
-                try:
-                    from security.mcp_sandbox import MCPSandbox
-                    sandbox = MCPSandbox()
-                    resp_safe, resp_reason = sandbox.validate_response(result)
-                    if not resp_safe:
-                        logger.warning(f"MCP response validation failed: {resp_reason}")
-                        return {'success': False, 'error': f'Response rejected: {resp_reason}'}
-                except ImportError:
-                    pass
-                return result
-            else:
-                logger.error(f"Tool execution failed on {self.server_name}: {response.status_code}")
-                return {
-                    'success': False,
-                    'error': f'HTTP {response.status_code}: {response.text}'
-                }
+                if body is None:
+                    return {'success': False, 'error': 'MCP server returned a non-JSON 200 body'}
+                return body
+
+            logger.error(f"Tool execution failed on {self.server_name}: {response.status_code}")
+            # Report the STATUS only — never echo the raw response body back to
+            # the caller/LLM. Even a body that passed validate_response is not
+            # worth relaying verbatim from a failed call, and a non-JSON error
+            # body could carry injected or sensitive content.
+            return {'success': False, 'error': f'HTTP {response.status_code}'}
 
         except requests.exceptions.RequestException as e:
             logger.error(f"Error executing tool {tool_name} on {self.server_name}: {e}")

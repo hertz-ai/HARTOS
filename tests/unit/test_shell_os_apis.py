@@ -7,10 +7,25 @@ backup restore, power, i18n, accessibility, screenshot, devices, upgrades.
 
 import json
 import os
+import shlex
+import sys
 import tempfile
 import types
 import unittest
 from unittest.mock import patch, MagicMock
+
+
+def _py_cmd(script):
+    """A terminal-exec command STRING that runs `script` via the current Python.
+
+    The exec handler shlex.split()s the string and subprocess.run(shell=False)s
+    the argv, so the command must be a REAL executable — and `echo`/`sleep` are
+    shell builtins, not exes, on Windows, so the old literals 500'd on the dev
+    box while passing in CI (Linux). sys.executable exists on every OS; shlex
+    quoting round-trips its path (backslashes and all) back through the
+    handler's shlex.split, so this tests the exec pipeline identically
+    everywhere with no coverage loss."""
+    return shlex.join([sys.executable, '-c', script])
 
 
 def _make_os_app():
@@ -234,7 +249,7 @@ class TestShellTerminal(unittest.TestCase):
         with patch('integrations.agent_engine.shell_os_apis._classify_destructive',
                    return_value=True):
             r = client.post('/api/shell/terminal/exec',
-                            json={'command': 'echo hello'})
+                            json={'command': _py_cmd('print("hello")')})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertIn('hello', data['stdout'])
@@ -258,7 +273,7 @@ class TestShellTerminal(unittest.TestCase):
         with patch('integrations.agent_engine.shell_os_apis._classify_destructive',
                    return_value=True):
             r = client.post('/api/shell/terminal/exec',
-                            json={'command': 'echo ok', 'cwd': cwd})
+                            json={'command': _py_cmd('print("ok")'), 'cwd': cwd})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertIn('ok', data['stdout'])
@@ -276,7 +291,8 @@ class TestShellTerminal(unittest.TestCase):
         with patch('integrations.agent_engine.shell_os_apis._classify_destructive',
                    return_value=True):
             r = client.post('/api/shell/terminal/exec',
-                            json={'command': 'sleep 60', 'timeout': 1})
+                            json={'command': _py_cmd('import time; time.sleep(60)'),
+                                  'timeout': 1})
         self.assertEqual(r.status_code, 408)
 
     def test_readonly_command_skips_the_llm_classifier(self):
@@ -354,10 +370,131 @@ class TestShellUsers(unittest.TestCase):
                         json={'username': 'hart'})
         self.assertEqual(r.status_code, 403)
 
+    def test_delete_hart_admin_blocked(self):
+        """hart-admin is the THIRD protected user — deleting it must 403."""
+        client = _make_os_app()
+        r = client.post('/api/shell/users/delete', json={'username': 'hart-admin'})
+        self.assertEqual(r.status_code, 403)
+
+    def test_create_non_alphanumeric_username(self):
+        """A username with metacharacters is rejected (400) before useradd —
+        returns at the isalnum() gate, so deterministic on every OS."""
+        client = _make_os_app()
+        r = client.post('/api/shell/users/create', json={'username': 'ab$cd'})
+        self.assertEqual(r.status_code, 400)
+
+    def test_create_rejects_injection_group_name(self):
+        """G7: a group name outside [A-Za-z0-9_-] (here a shell-metachar payload)
+        is rejected 400 BEFORE it can reach useradd -G. shell=False already blocks
+        injection, but a malformed group must never pass validation. Covers the
+        previously-untested group sanitiser."""
+        client = _make_os_app()
+        r = client.post('/api/shell/users/create',
+                        json={'username': 'newuser', 'groups': ['wheel; rm -rf /']})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('group', json.loads(r.data)['error'].lower())
+
+    def test_create_rejects_trailing_newline_group(self):
+        r"""Regression: re.match(r'...$', 'grp\n') ACCEPTS a trailing newline (the
+        $ matches before a final \n), so 'grp\n' slipped past into useradd. The
+        guard now uses re.fullmatch, so a trailing-newline group is rejected 400 —
+        returns before the subprocess, deterministic on every OS."""
+        client = _make_os_app()
+        r = client.post('/api/shell/users/create',
+                        json={'username': 'newuser', 'groups': ['grp\n']})
+        self.assertEqual(r.status_code, 400)
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess.run')
+    def test_create_valid_user_reaches_useradd_and_succeeds(self, mock_run):
+        """A well-formed username + group passes EVERY validator and reaches
+        useradd; with useradd succeeding (mocked) the endpoint reports created.
+        Proves the G7 validator lets valid input THROUGH (it rejects only
+        malformed, not every group) and covers the success branch on every OS —
+        a real useradd needs root/Linux, which would 400 on a non-root CI runner
+        and mask this as a validation failure."""
+        mock_run.return_value = MagicMock(returncode=0, stdout='', stderr='')
+        client = _make_os_app()
+        r = client.post('/api/shell/users/create',
+                        json={'username': 'newuser', 'groups': ['good-grp_1']})
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['created'], 'newuser')
+        self.assertEqual(data['groups'], ['good-grp_1'])
+
+    def test_delete_normal_user_fails_closed_when_destructive(self):
+        """The destructive-classifier gate: a non-protected user deletion the
+        classifier deems destructive is blocked 403 (fail-closed) BEFORE userdel.
+        Covers the previously-untested classifier gate on the delete path."""
+        client = _make_os_app()
+        with patch('security.action_classifier.classify_action',
+                   return_value='destructive'):
+            r = client.post('/api/shell/users/delete', json={'username': 'bob'})
+        self.assertEqual(r.status_code, 403)
+
+    def test_create_auth_denied_for_nonlocal(self):
+        """Every shell route is local-only: a non-loopback caller gets 403."""
+        client = _make_os_app()
+        r = client.post('/api/shell/users/create', json={'username': 'newuser'},
+                        environ_overrides={'REMOTE_ADDR': '203.0.113.7'})
+        self.assertEqual(r.status_code, 403)
+
+    def test_delete_auth_denied_for_nonlocal(self):
+        client = _make_os_app()
+        r = client.post('/api/shell/users/delete', json={'username': 'bob'},
+                        environ_overrides={'REMOTE_ADDR': '203.0.113.7'})
+        self.assertEqual(r.status_code, 403)
+
 
 # ═══════════════════════════════════════════════════════════════
 # First-Time Setup Wizard
 # ═══════════════════════════════════════════════════════════════
+
+class TestShellRemoteDesktop(unittest.TestCase):
+    """GET /api/shell/remote-desktop/status — read-only presence, credentials redacted."""
+
+    def test_status_redacts_credentials(self):
+        """HostService.get_status() carries the live password + device_id (together
+        = full remote access); the route MUST NOT echo them — only the whitelisted
+        presence fields. This is the load-bearing security assertion."""
+        client = _make_os_app()
+        fake = MagicMock()
+        fake.get_status.return_value = {
+            'running': True, 'viewers': 2, 'transport_connected': True,
+            'device_id': 'HART-123-456', 'password': 's3cr3t-live-pw',
+            'capture_stats': {'fps': 30},
+        }
+        with patch('integrations.remote_desktop.host_service.get_host_service',
+                   return_value=fake):
+            r = client.get('/api/shell/remote-desktop/status')
+        self.assertEqual(r.status_code, 200)
+        raw = r.get_data(as_text=True)
+        data = json.loads(r.data)
+        self.assertTrue(data['available'])
+        self.assertTrue(data['running'])
+        self.assertEqual(data['viewers'], 2)
+        self.assertTrue(data['transport_connected'])
+        # No credential leaks — neither the keys nor their values, anywhere.
+        self.assertNotIn('password', data)
+        self.assertNotIn('device_id', data)
+        self.assertNotIn('s3cr3t-live-pw', raw)
+        self.assertNotIn('HART-123-456', raw)
+
+    def test_status_degrades_when_service_errors(self):
+        """A broken/absent backend degrades honestly (available:False), never 500."""
+        client = _make_os_app()
+        with patch('integrations.remote_desktop.host_service.get_host_service',
+                   side_effect=RuntimeError('boom')):
+            r = client.get('/api/shell/remote-desktop/status')
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(json.loads(r.data)['available'])
+
+    def test_status_auth_denied_for_nonlocal(self):
+        """Read-only, but still local-only (defense in depth for a security subsystem)."""
+        client = _make_os_app()
+        r = client.get('/api/shell/remote-desktop/status',
+                       environ_overrides={'REMOTE_ADDR': '203.0.113.7'})
+        self.assertEqual(r.status_code, 403)
+
 
 class TestShellSetupWizard(unittest.TestCase):
     """Tests for /api/shell/setup/*."""
@@ -2046,6 +2183,233 @@ class TestEmailLauncher(unittest.TestCase):
         client = _make_os_app()
         r = client.post('/api/shell/email/launch')
         self.assertEqual(r.status_code, 404)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Self-Build (runtime OS rebuild) + NixOS rollback
+# ═══════════════════════════════════════════════════════════════
+
+class TestSelfBuildAndRollback(unittest.TestCase):
+    """Tests for /api/system/self-build/{install,remove,trigger} and
+    /api/system/rollback.
+
+    These are the OS's self-modification surface: install/remove edit the
+    declarative /etc/hart/runtime.nix, trigger runs `hart-self-build switch`
+    (rebuilds the running OS), and rollback runs
+    `sudo nixos-rebuild switch --rollback`. Every one of them mutates the box,
+    so — like every other mutating shell route — each MUST be behind the
+    local-only @_require_shell_auth gate. A remote caller must never be able to
+    stage a package into runtime.nix or trigger an OS rebuild / rollback.
+
+    Also covers the package-name validator that guards what is written into
+    runtime.nix (only [A-Za-z0-9_-] alnum names) and the trigger mode allowlist.
+    """
+
+    MOD = 'integrations.agent_engine.shell_os_apis'
+    REMOTE = {'REMOTE_ADDR': '203.0.113.7'}  # non-loopback: must be refused
+
+    # ── Auth boundary: a remote caller must be refused BEFORE any side-effect ──
+
+    def test_install_denied_for_nonlocal(self):
+        """A remote caller cannot stage a package into runtime.nix. The gate must
+        refuse (403) before the config file is ever opened for write."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.open', create=True) as m_open, \
+                patch(f'{self.MOD}.os.path.isfile', return_value=True):
+            r = client.post('/api/system/self-build/install',
+                            json={'package': 'htop'}, environ_overrides=self.REMOTE)
+        self.assertEqual(r.status_code, 403, r.get_data(as_text=True))
+        # No write to /etc/hart/runtime.nix for an unauthenticated caller.
+        m_open.assert_not_called()
+
+    def test_remove_denied_for_nonlocal(self):
+        """A remote caller cannot stage a package removal from runtime.nix."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.open', create=True) as m_open, \
+                patch(f'{self.MOD}.os.path.isfile', return_value=True):
+            r = client.post('/api/system/self-build/remove',
+                            json={'package': 'htop'}, environ_overrides=self.REMOTE)
+        self.assertEqual(r.status_code, 403, r.get_data(as_text=True))
+        m_open.assert_not_called()
+
+    def test_trigger_denied_for_nonlocal(self):
+        """The load-bearing one: a remote caller must NOT be able to trigger an
+        OS rebuild. The gate refuses (403) and hart-self-build is never spawned."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run') as m_run:
+            r = client.post('/api/system/self-build/trigger',
+                            json={'mode': 'switch'}, environ_overrides=self.REMOTE)
+        self.assertEqual(r.status_code, 403, r.get_data(as_text=True))
+        m_run.assert_not_called()
+
+    def test_rollback_denied_for_nonlocal(self):
+        """A remote caller must NOT be able to roll the OS back to a prior
+        generation. The gate refuses (403); nixos-rebuild is never spawned."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run') as m_run:
+            r = client.post('/api/system/rollback', json={},
+                            environ_overrides=self.REMOTE)
+        self.assertEqual(r.status_code, 403, r.get_data(as_text=True))
+        m_run.assert_not_called()
+
+    # ── Package-name validation into runtime.nix (authorized/local caller) ──
+
+    def test_install_rejects_injection_package_name(self):
+        """A package name with shell/nix metacharacters is rejected (400) before
+        anything is written into runtime.nix — the value that lands in the
+        declarative config must be a bare [A-Za-z0-9_-] name."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.open', create=True) as m_open:
+            r = client.post('/api/system/self-build/install',
+                            json={'package': 'htop; rm -rf /'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('Invalid package', json.loads(r.data)['error'])
+        m_open.assert_not_called()
+
+    def test_install_rejects_empty_package(self):
+        """Empty / whitespace-only package name is rejected 400."""
+        client = _make_os_app()
+        r = client.post('/api/system/self-build/install', json={'package': '   '})
+        self.assertEqual(r.status_code, 400)
+
+    def test_install_rejects_path_traversal_package(self):
+        """A path-like package name ('../etc/foo') contains '/' and '.', neither
+        alnum — rejected 400, never written into the config."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.open', create=True) as m_open:
+            r = client.post('/api/system/self-build/install',
+                            json={'package': '../../etc/passwd'})
+        self.assertEqual(r.status_code, 400)
+        m_open.assert_not_called()
+
+    def test_install_missing_runtime_config(self):
+        """A valid package but no runtime.nix on disk → 404 (nothing to stage
+        into). Proves the validator lets a good name THROUGH to the file check."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.os.path.isfile', return_value=False):
+            r = client.post('/api/system/self-build/install',
+                            json={'package': 'ripgrep'})
+        self.assertEqual(r.status_code, 404)
+
+    def test_install_stages_valid_package(self):
+        """A well-formed package name passes the validator AND the auth gate
+        (local caller) and is written into runtime.nix at the marker comment."""
+        from unittest.mock import mock_open
+        client = _make_os_app()
+        content = ("{ pkgs, ... }: {\n  environment.systemPackages = with pkgs; [\n"
+                   "    # Packages added at runtime appear here\n  ];\n}\n")
+        m = mock_open(read_data=content)
+        with patch(f'{self.MOD}.os.path.isfile', return_value=True), \
+                patch(f'{self.MOD}.open', m, create=True):
+            r = client.post('/api/system/self-build/install',
+                            json={'package': 'ripgrep'})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(json.loads(r.data)['status'], 'staged')
+        # The package name was written back into the config exactly once.
+        handle = m()
+        handle.write.assert_called_once()
+        written = handle.write.call_args[0][0]
+        self.assertIn('ripgrep', written)
+        self.assertIn('# Packages added at runtime appear here', written)
+
+    def test_install_already_present_is_idempotent(self):
+        """If the package is already in runtime.nix, install reports
+        already_installed and does NOT rewrite the file."""
+        from unittest.mock import mock_open
+        client = _make_os_app()
+        content = "systemPackages = with pkgs; [\n    ripgrep\n  ];\n"
+        m = mock_open(read_data=content)
+        with patch(f'{self.MOD}.os.path.isfile', return_value=True), \
+                patch(f'{self.MOD}.open', m, create=True):
+            r = client.post('/api/system/self-build/install',
+                            json={'package': 'ripgrep'})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(json.loads(r.data)['status'], 'already_installed')
+        m().write.assert_not_called()
+
+    def test_remove_requires_package(self):
+        """Remove with an empty package name is rejected 400."""
+        client = _make_os_app()
+        r = client.post('/api/system/self-build/remove', json={'package': ''})
+        self.assertEqual(r.status_code, 400)
+
+    def test_remove_stages_removal(self):
+        """Removing a present package drops its line and reports staged_removal."""
+        from unittest.mock import mock_open
+        client = _make_os_app()
+        content = ("systemPackages = with pkgs; [\n    ripgrep\n    htop\n"
+                   "    # Packages added at runtime appear here\n  ];\n")
+        m = mock_open(read_data=content)
+        with patch(f'{self.MOD}.os.path.isfile', return_value=True), \
+                patch(f'{self.MOD}.open', m, create=True):
+            r = client.post('/api/system/self-build/remove',
+                            json={'package': 'ripgrep'})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(json.loads(r.data)['status'], 'staged_removal')
+
+    # ── trigger: mode allowlist + authorized happy path ──
+
+    def test_trigger_rejects_invalid_mode(self):
+        """Trigger mode must be one of dry-run/switch/diff; anything else 400 and
+        never spawns a build."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run') as m_run:
+            r = client.post('/api/system/self-build/trigger',
+                            json={'mode': 'nuke'})
+        self.assertEqual(r.status_code, 400)
+        m_run.assert_not_called()
+
+    def test_trigger_runs_self_build_when_authorized(self):
+        """A local caller with a valid mode reaches hart-self-build; the argv is
+        exactly ['hart-self-build', <mode>] and success maps to 'completed'."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run',
+                   return_value=MagicMock(returncode=0, stdout='ok', stderr='')) as m_run:
+            r = client.post('/api/system/self-build/trigger',
+                            json={'mode': 'dry-run'})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(json.loads(r.data)['status'], 'completed')
+        self.assertEqual(m_run.call_args[0][0], ['hart-self-build', 'dry-run'])
+
+    def test_trigger_defaults_to_dry_run(self):
+        """Omitting mode defaults to the non-destructive dry-run, never switch."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run',
+                   return_value=MagicMock(returncode=0, stdout='', stderr='')) as m_run:
+            r = client.post('/api/system/self-build/trigger', json={})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(m_run.call_args[0][0], ['hart-self-build', 'dry-run'])
+
+    def test_trigger_not_on_nixos(self):
+        """When hart-self-build is absent (non-NixOS host) the route degrades to a
+        clean 501, not a 500."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run', side_effect=FileNotFoundError):
+            r = client.post('/api/system/self-build/trigger',
+                            json={'mode': 'switch'})
+        self.assertEqual(r.status_code, 501)
+
+    # ── rollback: authorized happy path + degrade ──
+
+    def test_rollback_runs_when_authorized(self):
+        """A local caller reaches nixos-rebuild; success maps to 'rolled_back' and
+        the argv is the --rollback switch invocation."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run',
+                   return_value=MagicMock(returncode=0, stdout='done', stderr='')) as m_run:
+            r = client.post('/api/system/rollback', json={})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(json.loads(r.data)['status'], 'rolled_back')
+        argv = m_run.call_args[0][0]
+        self.assertIn('nixos-rebuild', argv)
+        self.assertIn('--rollback', argv)
+
+    def test_rollback_not_available(self):
+        """No nixos-rebuild on the host → clean 501, not a 500."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run', side_effect=FileNotFoundError):
+            r = client.post('/api/system/rollback', json={})
+        self.assertEqual(r.status_code, 501)
 
 
 if __name__ == '__main__':

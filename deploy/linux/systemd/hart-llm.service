@@ -8,7 +8,25 @@ ConditionPathExists=/opt/hart/models/default.gguf
 Type=simple
 User=hart
 Group=hart
-ExecStart=/opt/hart/bin/llama-server --model /opt/hart/models/default.gguf --port ${HART_LLM_PORT:-8080} --ctx-size 4096 --threads ${HART_LLM_THREADS:-4}
+# Defaults live here, NOT as `${VAR:-default}` in ExecStart. systemd's variable
+# expansion supports ${VAR} / $VAR but NOT the shell `:-` default operator, so the
+# previous `${HART_LLM_PORT:-8080}` / `${HART_LLM_THREADS:-4}` were never defaults —
+# systemd does not parse them as such. Environment= is the supported mechanism, and
+# EnvironmentFile= below still overrides these, so /etc/hart/hart.env keeps the last
+# word.
+#
+# HART_LLM_CTX_SIZE was previously DEAD CONFIG: hart.env.template set it, but
+# ExecStart hardcoded `--ctx-size 4096`, so operators who set it got no effect and no
+# warning. It is now actually read.
+#
+# 12288 MUST equal core/constants.py::LLAMA_CTX_SIZE_DEFAULT (the wire-trim layer
+# budgets against that constant; a mismatch silently reintroduces context-overflow
+# rejections). Measured 2026-08-07 over 1,407 real requests: 78.7% overflow at 4096,
+# 2.1% at 12288. Guarded by tests/unit/test_source_guard_llama_ctx_size_agrees.py.
+Environment=HART_LLM_PORT=8080
+Environment=HART_LLM_CTX_SIZE=12288
+Environment=HART_LLM_THREADS=4
+ExecStart=/opt/hart/bin/llama-server --model /opt/hart/models/default.gguf --port ${HART_LLM_PORT} --ctx-size ${HART_LLM_CTX_SIZE} --threads ${HART_LLM_THREADS}
 EnvironmentFile=/etc/hart/hart.env
 Restart=on-failure
 RestartSec=10

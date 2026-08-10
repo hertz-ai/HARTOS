@@ -21,6 +21,15 @@ import json
 
 logger = logging.getLogger('hevolve_social')
 
+# ElementTree already maps the Dublin Core URI to the 'dc' prefix in its
+# built-in namespace map; register the Atom prefix too so generate_rss can
+# rely on ElementTree's own single xmlns declarations.  Setting literal
+# xmlns:dc / xmlns:atom attributes on <rss> instead collided with the
+# auto-generated 'dc' declaration and produced a duplicate-attribute,
+# non-well-formed feed as soon as any item carried a dc:creator element.
+ET.register_namespace('atom', 'http://www.w3.org/2005/Atom')
+ET.register_namespace('dc', 'http://purl.org/dc/elements/1.1/')
+
 # Feed configuration
 FEED_CONFIG = {
     'title': 'HART Social',
@@ -58,27 +67,38 @@ class FeedGenerator:
             community_id: Community ID for community feeds
         """
         try:
-            from .feed_engine import FeedEngine
-            from .models import Post, User, Community
+            from . import feed_engine
+            from .models import Post
 
-            engine = FeedEngine(self.db)
-
+            # These are ANONYMOUS, unauthenticated feeds, so every query
+            # routes through feed_engine's shared visibility gate
+            # (is_deleted + is_hidden + community privacy + per-post
+            # privacy).  apply_privacy with viewer_user=None collapses to
+            # public-only, so hidden / deleted / private / friends /
+            # community-scoped posts never reach a public feed.  This also
+            # replaces a dead `from .feed_engine import FeedEngine` import
+            # (feed_engine exposes module-level functions, not a class) that
+            # used to silently empty every non-community feed.
             if community_id:
-                # Community-specific feed
-                posts = self.db.query(Post).filter(
-                    Post.community_id == community_id,
-                    Post.deleted_at.is_(None)
-                ).order_by(Post.created_at.desc()).limit(limit).all()
+                q = self.db.query(Post).filter(Post.community_id == community_id)
+                q = feed_engine._base_post_filter(
+                    self.db, q, user_id=user_id, viewer_user=None,
+                    apply_privacy=True)
+                posts = q.order_by(Post.created_at.desc()).limit(limit).all()
             elif user_id and feed_type == 'personalized':
                 # Personalized feed for user
-                posts = engine.get_personalized_feed(user_id, limit=limit)
+                posts, _ = feed_engine.get_personalized_feed(
+                    self.db, user_id, limit=limit, apply_privacy=True)
             elif feed_type == 'trending':
-                posts = engine.get_trending_feed(limit=limit)
+                posts, _ = feed_engine.get_trending_feed(
+                    self.db, limit=limit, apply_privacy=True)
             elif feed_type == 'agents':
-                posts = engine.get_agent_feed(limit=limit)
+                posts, _ = feed_engine.get_agent_feed(
+                    self.db, limit=limit, apply_privacy=True)
             else:
                 # Global feed
-                posts = engine.get_global_feed(limit=limit)
+                posts, _ = feed_engine.get_global_feed(
+                    self.db, limit=limit, apply_privacy=True)
 
             # Convert to dict format
             result = []
@@ -138,8 +158,6 @@ class FeedGenerator:
 
         # Build RSS structure
         rss = ET.Element('rss', version='2.0')
-        rss.set('xmlns:atom', 'http://www.w3.org/2005/Atom')
-        rss.set('xmlns:dc', 'http://purl.org/dc/elements/1.1/')
 
         channel = ET.SubElement(rss, 'channel')
 
@@ -435,17 +453,21 @@ def get_user_feed_rss(db, user_id: int, limit: int = 50) -> str:
     generator = FeedGenerator(db)
 
     try:
+        from . import feed_engine
         from .models import Post, User
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             return generator.generate_rss(feed_type='global', limit=0)
 
         title = f"{user.display_name or user.username}'s Posts - Hevolve"
-        # Get user's posts directly
-        posts = db.query(Post).filter(
-            Post.author_id == user_id,
-            Post.deleted_at.is_(None)
-        ).order_by(Post.created_at.desc()).limit(limit).all()
+        # Anonymous public RSS: gate the author's posts through the shared
+        # visibility filter (viewer_user=None -> public-only) so hidden /
+        # deleted / private / friends posts never leak.  The previous query
+        # filtered on a non-existent `Post.deleted_at` column, which raised
+        # AttributeError and left this feed permanently empty.
+        q = db.query(Post).filter(Post.author_id == user_id)
+        q = feed_engine._base_post_filter(db, q, apply_privacy=True)
+        posts = q.order_by(Post.created_at.desc()).limit(limit).all()
 
         # Temporarily override _get_posts
         original_get_posts = generator._get_posts

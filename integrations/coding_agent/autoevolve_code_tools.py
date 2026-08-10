@@ -406,8 +406,12 @@ class AutoResearchEngine:
         """Revert the working directory to the last good state."""
         try:
             from integrations.coding_agent.aider_core.run_cmd import run_cmd_subprocess
+            # argv-list form → run_cmd_subprocess runs shell=False, so a
+            # goal-supplied target_file (e.g. 'x; rm -rf ~') is a literal git
+            # pathspec, never a shell command.  `--` stops a '-'-leading name
+            # from being read as a git option.
             run_cmd_subprocess(
-                f'git checkout -- {session.target_file}',
+                ['git', 'checkout', '--', session.target_file],
                 cwd=session.repo_path,
                 timeout=10,
             )
@@ -576,11 +580,22 @@ class AutoResearchEngine:
             msg = (f"autoresearch iter {result.iteration}: "
                    f"{session.metric_name}={result.metric_value} "
                    f"(was {result.baseline_value})")
-            run_cmd_subprocess(
-                f'git add {session.target_file} && git commit -m "{msg}"',
+            # argv-list form (shell=False) so a goal-supplied target_file OR
+            # metric_name (interpolated into msg) can never inject shell
+            # commands.  The '&&' chain becomes an explicit stage-then-commit
+            # so commit only runs when `git add` succeeded; `--` stops a
+            # '-'-leading filename being read as a git option.
+            add_code, _ = run_cmd_subprocess(
+                ['git', 'add', '--', session.target_file],
                 cwd=session.repo_path,
                 timeout=15,
             )
+            if add_code == 0:
+                run_cmd_subprocess(
+                    ['git', 'commit', '-m', msg],
+                    cwd=session.repo_path,
+                    timeout=15,
+                )
         except Exception as e:
             logger.debug(f"[{session.session_id}] Git commit skipped: {e}")
 
@@ -874,6 +889,24 @@ def autoresearch_setup(repo_path: str, target_file: str, run_command: str,
         return json.dumps({'error': f'repo_path not found: {repo_path}'})
 
     target_path = os.path.join(repo_path, target_file)
+
+    # Repo-escape guard.  target_file is goal-supplied; an absolute path or a
+    # '..' traversal (e.g. '../../etc/passwd') would otherwise slip past the
+    # isfile() check below and let the session's git checkout / add — and the
+    # saved report — operate on files OUTSIDE the repo.  Resolve symlinks on
+    # both sides and require the target to live under repo_path.
+    try:
+        repo_real = os.path.realpath(repo_path)
+        target_real = os.path.realpath(target_path)
+        contained = os.path.commonpath([repo_real, target_real]) == repo_real
+    except ValueError:
+        # Different drives / roots (Windows) — commonpath raises; that is
+        # itself an escape.
+        contained = False
+    if not contained:
+        return json.dumps(
+            {'error': f'target_file escapes repo_path: {target_file}'})
+
     if not os.path.isfile(target_path):
         return json.dumps({'error': f'target_file not found: {target_file}'})
 

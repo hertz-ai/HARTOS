@@ -96,6 +96,7 @@ nav:
     - Architecture: developer/architecture.md
     - Key Patterns: developer/patterns.md
     - Security Model: developer/security.md
+    - Runtime Diagnostics: developer/diagnostics.md
     - Database Schema: developer/schema.md
     - State Machine: developer/state-machine.md
     - Testing Guide: developer/testing.md

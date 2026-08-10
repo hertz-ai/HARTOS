@@ -300,6 +300,136 @@ class TaskDelegationBridge:
 
         return active
 
+    # ── Delegation failure recovery ──────────────────────────────────────────
+    # Without this, a delegate that never answers wedges its parent FOREVER.
+    # delegate_task_with_tracking drives the parent to BLOCKED and only
+    # complete_delegation_with_tracking ever unblocks it, so a delegate that
+    # crashes, drops off the LAN, or is powered off leaves the parent BLOCKED
+    # with nothing scheduled to notice. There was no timeout, deadline,
+    # heartbeat or reclaim anywhere in this bridge.
+    #
+    # That is the difference between "distributed" and "distributed and
+    # trustworthy": on a crowdsourced mesh, peers leaving mid-task is the NORMAL
+    # case, not an exceptional one. A user's work must not be lost because a
+    # stranger's laptop closed.
+    #
+    # DELIBERATELY NOT A NEW STATE MACHINE. A stale delegation is just a failed
+    # one, and complete_delegation_with_tracking(success=False) already walks the
+    # exact canonical path — child PENDING -> IN_PROGRESS -> FAILED, then parent
+    # BLOCKED -> RESUMING -> IN_PROGRESS via the ledger's resume_task once
+    # _all_dependencies_complete. Reusing it means reclaim can never drift from
+    # completion, and the FSM stays the single authority on legal transitions.
+    #
+    # The ledger's Task.reclaim_delegation() (DELEGATED -> IN_PROGRESS) is NOT
+    # used here on purpose: this bridge models delegation as parent-BLOCKED plus
+    # a child task, never touching TaskStatus.DELEGATED, so calling it would
+    # introduce a second delegation model in the same code path. One model.
+
+    #: How long a delegate may hold a task before it is assumed gone. 15 minutes
+    #: is comfortably above the bounded peer legs upstream (~10s per gossip tick,
+    #: 600s per-goal ceiling in peer_reuse) so a merely-slow peer on a potato is
+    #: never reclaimed out from under itself — only a genuinely absent one.
+    DEFAULT_DELEGATION_TTL_SECONDS: float = 900.0
+
+    def _delegation_age_seconds(self, delegation_id: str, now: datetime) -> Optional[float]:
+        """Seconds since this delegation was handed out, or None if unknowable.
+
+        Returns None rather than 0 when no timestamp can be found: an unknown age
+        must never be treated as "brand new" (reclaim would never fire) NOR as
+        "ancient" (a healthy delegation would be killed). The caller skips it and
+        says so.
+        """
+        mapping = self.delegation_map.get(delegation_id) or {}
+        stamp = mapping.get('delegated_at') or mapping.get('created_at')
+
+        if not stamp:
+            child = self.ledger.get_task(mapping.get('child_task_id'))
+            stamp = getattr(child, 'started_at', None) or getattr(child, 'created_at', None)
+
+        if not stamp:
+            return None
+        try:
+            return (now - datetime.fromisoformat(str(stamp))).total_seconds()
+        except (ValueError, TypeError):
+            return None
+
+    def reclaim_stale_delegations(
+        self,
+        max_age_seconds: Optional[float] = None,
+        now: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
+        """Fail-and-unblock every delegation whose delegate never came back.
+
+        Args:
+            max_age_seconds: TTL before a delegate is presumed gone. Defaults to
+                DEFAULT_DELEGATION_TTL_SECONDS.
+            now: Injectable clock. Present so tests can age a delegation without
+                sleeping; production passes nothing.
+
+        Returns:
+            One dict per reclaimed delegation (delegation_id, parent/child task
+            ids, delegated_to, age_seconds). Empty list when nothing was stale —
+            which is the normal, healthy result.
+        """
+        ttl = self.DEFAULT_DELEGATION_TTL_SECONDS if max_age_seconds is None else max_age_seconds
+        now = now or datetime.now()
+        reclaimed: List[Dict[str, Any]] = []
+
+        # Snapshot first: complete_delegation_with_tracking mutates ledger state
+        # that list_active_delegations reads, so iterating it lazily would be a
+        # mutation-during-iteration bug.
+        for status in list(self.list_active_delegations()):
+            delegation_id = status.get('delegation_id')
+            if not delegation_id:
+                continue
+
+            age = self._delegation_age_seconds(delegation_id, now)
+            if age is None:
+                logger.warning(
+                    "Delegation %s has no usable timestamp — cannot age it, so it "
+                    "is being left alone. Its parent stays BLOCKED; investigate "
+                    "rather than assuming this is healthy.", delegation_id)
+                continue
+            if age <= ttl:
+                continue
+
+            mapping = self.delegation_map.get(delegation_id) or {}
+            delegated_to = mapping.get('delegated_to', 'unknown')
+            logger.warning(
+                "Reclaiming stale delegation %s: %s has held it for %.0fs "
+                "(ttl %.0fs) and is presumed gone. Failing the child so parent "
+                "%s unblocks and the work can be retried elsewhere.",
+                delegation_id, delegated_to, age, ttl,
+                mapping.get('parent_task_id'))
+
+            ok = self.complete_delegation_with_tracking(
+                delegation_id,
+                {'error': 'delegation_timeout',
+                 'delegated_to': delegated_to,
+                 'age_seconds': age,
+                 'ttl_seconds': ttl},
+                success=False)
+            if not ok:
+                # Never silently swallow: a reclaim that did not take means the
+                # parent is STILL blocked, which is the whole failure this exists
+                # to prevent.
+                logger.error(
+                    "Reclaim of delegation %s FAILED — parent %s is still BLOCKED",
+                    delegation_id, mapping.get('parent_task_id'))
+                continue
+
+            reclaimed.append({
+                'delegation_id': delegation_id,
+                'parent_task_id': mapping.get('parent_task_id'),
+                'child_task_id': mapping.get('child_task_id'),
+                'delegated_to': delegated_to,
+                'age_seconds': age,
+            })
+
+        if reclaimed:
+            logger.info("Reclaimed %d stale delegation(s)", len(reclaimed))
+        return reclaimed
+
 
 def create_delegation_function_with_ledger(
     agent_name: str,

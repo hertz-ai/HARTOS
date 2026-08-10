@@ -180,7 +180,12 @@ in
       with subtest("LiquidUI server is active and serves its shell (not a dead husk)"):
           shell.wait_for_unit("hart-liquid-ui.service", timeout=180)
           shell.wait_for_open_port(6800, timeout=60)
-          body = shell.succeed("curl -fs http://localhost:6800/shell/static/hartHero.js")
+          # Bounded retry, not one-shot: the port can listen before Flask serves the
+          # static route (a transient refused/503 fails a one-shot `curl -fs`) — the
+          # #42 race class. An EMPTY 200 still returns "" and trips the dead-husk
+          # assert below; this only absorbs the startup-timing refusal.
+          body = shell.wait_until_succeeds(
+              "curl -fs http://localhost:6800/shell/static/hartHero.js", timeout=90)
           assert body.strip(), "/shell/static/hartHero.js served EMPTY — dead-husk"
 
       with subtest("right-click 'Ask <Product>' is SERVED and branded (task #11)"):

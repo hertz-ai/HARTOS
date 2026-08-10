@@ -29,28 +29,44 @@ class FederationManager:
 
     # ─── Instance Follow/Unfollow ───
 
+    def record_follow(self, db, follower_node_id: str,
+                      following_node_id: str, peer_url: str) -> bool:
+        """Record-only follow write — the ONE InstanceFollow writer.
+
+        Idempotent; returns True when a new row was created.  Split out of
+        follow_instance (SRP) because the two sides of a follow need
+        different halves: the ACTIVE side (we decide to follow someone)
+        records AND notifies them; the PASSIVE side (their notification
+        arrives) must record WITHOUT notifying — reusing follow_instance
+        there would fire a wrong-direction notification back at the
+        follower.  ``peer_url`` is the OTHER node's URL from the row
+        consumer's perspective: get_followers/push_to_followers deliver to
+        it, pull_from_peer fetches from it.
+        """
+        from .models import InstanceFollow
+        existing = db.query(InstanceFollow).filter(
+            InstanceFollow.follower_node_id == follower_node_id,
+            InstanceFollow.following_node_id == following_node_id,
+        ).first()
+        if existing:
+            return False
+        db.add(InstanceFollow(
+            follower_node_id=follower_node_id,
+            following_node_id=following_node_id,
+            peer_url=peer_url,
+            status='active',
+        ))
+        db.flush()
+        return True
+
     def follow_instance(self, db, local_node_id: str, peer_node_id: str,
                         peer_url: str) -> bool:
         """
         Follow a remote instance. Sends follow request to the peer.
         Returns True if follow was created.
         """
-        from .models import InstanceFollow, PeerNode
-        existing = db.query(InstanceFollow).filter(
-            InstanceFollow.follower_node_id == local_node_id,
-            InstanceFollow.following_node_id == peer_node_id,
-        ).first()
-        if existing:
+        if not self.record_follow(db, local_node_id, peer_node_id, peer_url):
             return False
-
-        follow = InstanceFollow(
-            follower_node_id=local_node_id,
-            following_node_id=peer_node_id,
-            peer_url=peer_url,
-            status='active',
-        )
-        db.add(follow)
-        db.flush()
 
         # Notify the remote instance
         threading.Thread(

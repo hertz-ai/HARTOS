@@ -59,7 +59,13 @@ def upgrade_url(url: str) -> str:
 
     parsed = urlparse(url)
     if parsed.scheme == 'http' and parsed.hostname not in _LOCALHOST_HOSTS:
-        upgraded = url.replace('http://', 'https://', 1)
+        # Rebuild from the PARSED scheme, not a case-sensitive str.replace:
+        # urlparse lowercases the scheme, so 'HTTP://host' passes the check above,
+        # but url.replace('http://', ...) would NOT match the uppercase original
+        # and leave the request on plaintext HTTP — a silent MITM bypass.
+        # _replace(scheme=...) upgrades regardless of the original case and touches
+        # ONLY the scheme (an 'http://' inside a query value is left intact).
+        upgraded = parsed._replace(scheme='https').geturl()
         logger.debug(f"Upgraded URL to HTTPS: {parsed.hostname}")
         return upgraded
     return url

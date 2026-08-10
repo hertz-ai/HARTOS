@@ -24,7 +24,16 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 from flask import Flask, jsonify, g
 
-from integrations.social.auth import require_auth
+from integrations.social.auth import (
+    require_auth,
+    require_admin,
+    require_moderator,
+    require_central,
+    require_regional,
+    hash_password,
+    verify_password,
+    PBKDF2_ITERATIONS,
+)
 
 
 @pytest.fixture
@@ -202,3 +211,356 @@ def test_kong_empty_token_does_not_match_empty_api_token(app):
             assert r.status_code == 401
     finally:
         os.environ.pop('HEVOLVE_TRUST_KONG', None)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# verify_password — sole login + recovery-code gate.  Dual-iteration
+# (600k current / 100k legacy) PBKDF2-SHA256 loop, hmac.compare_digest
+# timing-safe compare, fail-closed on malformed stored value.
+# ─────────────────────────────────────────────────────────────────────────
+import hashlib
+import hmac as _real_hmac
+
+
+def _legacy_hash(password: str, salt: str, iterations: int) -> str:
+    """Reproduce the module's on-disk format for an arbitrary iteration count."""
+    h = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), iterations)
+    return f"{salt}:{h.hex()}"
+
+
+class TestVerifyPassword:
+    def test_hash_password_format_is_salt_colon_hex(self):
+        """hash_password emits salt:hex with a 600k-derived digest."""
+        stored = hash_password('correct horse battery staple')
+        assert stored.count(':') == 1
+        salt, digest = stored.split(':', 1)
+        # 16 bytes token_hex → 32 hex chars salt; sha256 digest → 64 hex chars.
+        assert len(salt) == 32
+        assert len(digest) == 64
+        int(salt, 16)   # salt is valid hex (would raise otherwise)
+        int(digest, 16)  # digest is valid hex
+        # The stored digest must equal a fresh 600k derivation of the same input.
+        assert digest == hashlib.pbkdf2_hmac(
+            'sha256', b'correct horse battery staple', salt.encode(),
+            PBKDF2_ITERATIONS).hex()
+
+    def test_roundtrip_correct_password(self):
+        stored = hash_password('s3cr3t-pw')
+        assert verify_password('s3cr3t-pw', stored) is True
+
+    def test_roundtrip_uses_random_salt_each_time(self):
+        """Two hashes of the same password differ (salted); both verify."""
+        a = hash_password('same-pw')
+        b = hash_password('same-pw')
+        assert a != b
+        assert verify_password('same-pw', a) is True
+        assert verify_password('same-pw', b) is True
+
+    def test_wrong_password_fails(self):
+        stored = hash_password('right-pw')
+        assert verify_password('wrong-pw', stored) is False
+
+    def test_wrong_password_off_by_one_char_fails(self):
+        stored = hash_password('password123')
+        assert verify_password('password124', stored) is False
+
+    def test_none_stored_fails_closed(self):
+        assert verify_password('anything', None) is False
+
+    def test_empty_stored_fails_closed(self):
+        assert verify_password('anything', '') is False
+
+    def test_stored_without_colon_fails_closed(self):
+        assert verify_password('anything', 'no-delimiter-here') is False
+
+    def test_empty_hash_component_fails_closed(self):
+        """'salt:' → empty digest must never match anything."""
+        assert verify_password('anything', 'deadbeef:') is False
+
+    def test_bare_colon_stored_fails_closed_no_crash(self):
+        """':' → salt='' and digest='' — must return False, not raise."""
+        assert verify_password('anything', ':') is False
+
+    def test_non_hex_digest_fails_closed(self):
+        """A malformed (non-hex) stored digest fails closed, no exception."""
+        salt = 'aa' * 16
+        assert verify_password('anything', f'{salt}:zzzznothexzzzz') is False
+
+    def test_extra_colon_in_stored_fails(self):
+        """split(':', 1) keeps everything after the first colon as the digest;
+        a value with an extra colon can't be a valid hex digest → fails."""
+        salt = 'bb' * 16
+        assert verify_password('pw', f'{salt}:aa:bb') is False
+
+    def test_legacy_100k_iteration_hash_verifies(self):
+        """A password stored under the OLD 100k count must still log in
+        (proves the dual-iteration loop's second branch)."""
+        salt = secrets_hex()
+        stored = _legacy_hash('legacy-user-pw', salt, 100_000)
+        assert verify_password('legacy-user-pw', stored) is True
+
+    def test_current_600k_iteration_hash_verifies(self):
+        salt = secrets_hex()
+        stored = _legacy_hash('modern-user-pw', salt, PBKDF2_ITERATIONS)
+        assert verify_password('modern-user-pw', stored) is True
+
+    def test_intermediate_iteration_count_is_rejected(self):
+        """A digest derived with an UNSUPPORTED iteration count (e.g. 200k)
+        must NOT verify — only 600k and 100k are accepted."""
+        salt = secrets_hex()
+        stored = _legacy_hash('some-pw', salt, 200_000)
+        assert verify_password('some-pw', stored) is False
+
+    def test_correct_password_wrong_salt_fails(self):
+        """Right password, but the stored digest was derived under a
+        different salt → must fail (salt is part of the secret)."""
+        good = hash_password('shared-pw')
+        salt_a, digest_a = good.split(':', 1)
+        other_salt = ('cc' * 16)
+        assert other_salt != salt_a
+        assert verify_password('shared-pw', f'{other_salt}:{digest_a}') is False
+
+    def test_empty_password_matches_its_own_hash(self):
+        stored = hash_password('')
+        assert verify_password('', stored) is True
+        assert verify_password('x', stored) is False
+
+    def test_unicode_password_roundtrip(self):
+        pw = 'pÄsswörd-日本語-🔐'
+        stored = hash_password(pw)
+        assert verify_password(pw, stored) is True
+        assert verify_password('pÄsswörd-日本語', stored) is False
+
+    def test_uses_timing_safe_compare(self):
+        """Security invariant: the digest comparison goes through
+        hmac.compare_digest (constant-time), not a plain '=='.  Spy on the
+        real primitive and confirm it is exercised while the correct
+        password still verifies."""
+        stored = hash_password('timing-pw')
+        with patch('integrations.social.auth.hmac.compare_digest',
+                   wraps=_real_hmac.compare_digest) as spy:
+            assert verify_password('timing-pw', stored) is True
+        assert spy.called, "verify_password must use hmac.compare_digest"
+
+    def test_wrong_password_still_runs_both_iteration_branches(self):
+        """A wrong password with a well-formed stored value exhausts both
+        iteration counts (600k then 100k) before failing — proves the loop
+        doesn't short-circuit incorrectly."""
+        stored = hash_password('right')
+        with patch('integrations.social.auth.hmac.compare_digest',
+                   wraps=_real_hmac.compare_digest) as spy:
+            assert verify_password('wrong', stored) is False
+        # Both branches attempted → compare_digest invoked twice.
+        assert spy.call_count == 2
+
+
+def secrets_hex() -> str:
+    """A 32-hex-char salt matching hash_password's token_hex(16) shape."""
+    import secrets
+    return secrets.token_hex(16)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Role gates — require_admin / require_moderator / require_central /
+# require_regional.  Behavioral 200-vs-403 assertions (previously only
+# AST source-shape guards existed).  These gates wrap require_auth, so we
+# patch _get_user_from_token to inject an authenticated user with a chosen
+# role + flag set, then assert the HTTP status the gate produces.
+# ─────────────────────────────────────────────────────────────────────────
+
+def _fake_db():
+    """A DB mock satisfying require_auth's commit/close/rollback lifecycle."""
+    db = MagicMock()
+    db.is_active = True
+    return db
+
+
+def _role_user(role='flat', is_admin=False, is_moderator=False, user_id='u-role'):
+    """Authenticated user with explicit role + boolean flags.
+
+    is_admin / is_moderator MUST be set explicitly: a bare MagicMock
+    attribute is truthy, which would silently grant every gate.
+    """
+    u = MagicMock()
+    u.id = user_id
+    u.role = role
+    u.is_admin = is_admin
+    u.is_moderator = is_moderator
+    u.is_banned = False
+    return u
+
+
+@pytest.fixture
+def role_app():
+    app = Flask(__name__)
+    app.config['TESTING'] = True
+
+    @app.route('/admin')
+    @require_admin
+    def admin_route():
+        return jsonify({'ok': True, 'gate': 'admin'})
+
+    @app.route('/moderator')
+    @require_moderator
+    def moderator_route():
+        return jsonify({'ok': True, 'gate': 'moderator'})
+
+    @app.route('/central')
+    @require_central
+    def central_route():
+        return jsonify({'ok': True, 'gate': 'central'})
+
+    @app.route('/regional')
+    @require_regional
+    def regional_route():
+        return jsonify({'ok': True, 'gate': 'regional'})
+
+    return app
+
+
+@pytest.fixture(autouse=True)
+def _clean_role_env():
+    """Role gates must not be perturbed by cloud/kong env from other tests."""
+    saved = {k: os.environ.get(k) for k in
+             ('HEVOLVE_CLOUD_MODE', 'HEVOLVE_TRUST_KONG')}
+    for k in saved:
+        os.environ.pop(k, None)
+    yield
+    for k, v in saved.items():
+        if v is not None:
+            os.environ[k] = v
+        else:
+            os.environ.pop(k, None)
+
+
+def _call_gate(app, path, user):
+    """Drive `path` with an authenticated `user` injected via the patched
+    token lookup.  Returns the Flask test response."""
+    db = _fake_db()
+    with patch('integrations.social.auth._get_user_from_token',
+               return_value=(user, db)):
+        client = app.test_client()
+        return client.get(path, headers={'Authorization': 'Bearer faketoken'})
+
+
+class TestRequireAdmin:
+    def test_is_admin_flag_allows(self, role_app):
+        r = _call_gate(role_app, '/admin', _role_user(role='flat', is_admin=True))
+        assert r.status_code == 200
+        assert r.get_json()['gate'] == 'admin'
+
+    def test_central_role_allows(self, role_app):
+        r = _call_gate(role_app, '/admin', _role_user(role='central'))
+        assert r.status_code == 200
+
+    def test_flat_user_denied_403(self, role_app):
+        r = _call_gate(role_app, '/admin', _role_user(role='flat'))
+        assert r.status_code == 403
+        assert r.get_json()['error'] == 'Admin access required'
+
+    def test_regional_role_denied_403(self, role_app):
+        """regional is below admin — must not pass the admin gate."""
+        r = _call_gate(role_app, '/admin', _role_user(role='regional'))
+        assert r.status_code == 403
+
+    def test_moderator_flag_alone_denied_403(self, role_app):
+        """is_moderator does NOT grant admin."""
+        r = _call_gate(role_app, '/admin',
+                       _role_user(role='flat', is_moderator=True))
+        assert r.status_code == 403
+
+    def test_none_role_defaults_flat_and_denied(self, role_app):
+        """user.role=None → 'flat' fallback → denied (exercises `or 'flat'`)."""
+        r = _call_gate(role_app, '/admin', _role_user(role=None))
+        assert r.status_code == 403
+
+    def test_unauthenticated_401_before_role_check(self, role_app):
+        """No user from token → require_auth 401s before the role check."""
+        db = _fake_db()
+        with patch('integrations.social.auth._get_user_from_token',
+                   return_value=(None, db)):
+            client = role_app.test_client()
+            r = client.get('/admin', headers={'Authorization': 'Bearer x'})
+        assert r.status_code == 401
+
+    def test_missing_auth_header_401(self, role_app):
+        client = role_app.test_client()
+        r = client.get('/admin')
+        assert r.status_code == 401
+
+
+class TestRequireModerator:
+    def test_regional_role_allows(self, role_app):
+        r = _call_gate(role_app, '/moderator', _role_user(role='regional'))
+        assert r.status_code == 200
+
+    def test_central_role_allows(self, role_app):
+        r = _call_gate(role_app, '/moderator', _role_user(role='central'))
+        assert r.status_code == 200
+
+    def test_is_moderator_flag_allows(self, role_app):
+        r = _call_gate(role_app, '/moderator',
+                       _role_user(role='flat', is_moderator=True))
+        assert r.status_code == 200
+
+    def test_is_admin_flag_allows(self, role_app):
+        r = _call_gate(role_app, '/moderator',
+                       _role_user(role='flat', is_admin=True))
+        assert r.status_code == 200
+
+    def test_flat_user_denied_403(self, role_app):
+        r = _call_gate(role_app, '/moderator', _role_user(role='flat'))
+        assert r.status_code == 403
+        assert r.get_json()['error'] == 'Moderator access required'
+
+
+class TestRequireCentral:
+    def test_central_role_allows(self, role_app):
+        r = _call_gate(role_app, '/central', _role_user(role='central'))
+        assert r.status_code == 200
+
+    def test_is_admin_flag_allows(self, role_app):
+        r = _call_gate(role_app, '/central',
+                       _role_user(role='flat', is_admin=True))
+        assert r.status_code == 200
+
+    def test_regional_role_denied_403(self, role_app):
+        """regional must NOT reach central."""
+        r = _call_gate(role_app, '/central', _role_user(role='regional'))
+        assert r.status_code == 403
+        assert r.get_json()['error'] == 'Central access required'
+
+    def test_moderator_flag_alone_denied_403(self, role_app):
+        """is_moderator does not grant central (only is_admin or central role)."""
+        r = _call_gate(role_app, '/central',
+                       _role_user(role='flat', is_moderator=True))
+        assert r.status_code == 403
+
+    def test_flat_user_denied_403(self, role_app):
+        r = _call_gate(role_app, '/central', _role_user(role='flat'))
+        assert r.status_code == 403
+
+
+class TestRequireRegional:
+    def test_regional_role_allows(self, role_app):
+        r = _call_gate(role_app, '/regional', _role_user(role='regional'))
+        assert r.status_code == 200
+
+    def test_central_role_allows(self, role_app):
+        r = _call_gate(role_app, '/regional', _role_user(role='central'))
+        assert r.status_code == 200
+
+    def test_is_admin_flag_allows(self, role_app):
+        r = _call_gate(role_app, '/regional',
+                       _role_user(role='flat', is_admin=True))
+        assert r.status_code == 200
+
+    def test_is_moderator_flag_allows(self, role_app):
+        r = _call_gate(role_app, '/regional',
+                       _role_user(role='flat', is_moderator=True))
+        assert r.status_code == 200
+
+    def test_flat_user_denied_403(self, role_app):
+        r = _call_gate(role_app, '/regional', _role_user(role='flat'))
+        assert r.status_code == 403
+        assert r.get_json()['error'] == 'Regional access required'

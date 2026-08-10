@@ -510,8 +510,12 @@ class TestGitRevert(unittest.TestCase):
             engine.revert_changes(session)
             mock_cmd.assert_called_once()
             args = mock_cmd.call_args
-            self.assertIn('git checkout', args[0][0])
-            self.assertIn('train.py', args[0][0])
+            # argv-list form (shell=False) — not a shell string. The command
+            # is passed as a list so run_cmd_subprocess never invokes a shell.
+            cmd = args[0][0]
+            self.assertIsInstance(cmd, (list, tuple))
+            self.assertEqual(list(cmd), ['git', 'checkout', '--', 'train.py'])
+            self.assertEqual(args[1]['cwd'], '/tmp/repo')
 
 
 class TestGenericIterationTools(unittest.TestCase):
@@ -734,3 +738,224 @@ class TestSaveReportIsBestEffort(unittest.TestCase):
             self.assertTrue(os.path.isfile(written),
                             "report was not written despite egress failing")
             os.remove(written)
+
+
+# ── Security: command injection via goal-supplied target_file / metric_name ──
+
+class TestTargetFileShellInjection(unittest.TestCase):
+    """target_file and metric_name are GOAL-supplied and flow into git
+    commands.  run_cmd_subprocess runs `shell=isinstance(cmd, str)`, so the
+    ONLY safe contract is to pass an argv LIST (shell=False) — then a payload
+    like 'x; rm -rf ~' is a literal git argument, never a shell command.
+
+    These assert the boundary invariant behaviourally: the command passed to
+    run_cmd_subprocess must be a list/tuple, and the untrusted value must
+    appear as one discrete argv element.  Against the pre-fix shell-string
+    code (f'git checkout -- {target_file}') the list assertion fails — which
+    is the point.
+    """
+
+    def _engine_session(self, **kwargs):
+        from integrations.coding_agent.autoevolve_code_tools import (
+            AutoResearchEngine, AutoResearchSession)
+        engine = AutoResearchEngine()
+        defaults = {'repo_path': '/tmp/repo', 'target_file': 'train.py',
+                    'run_command': 'echo'}
+        defaults.update(kwargs)
+        return engine, AutoResearchSession(**defaults)
+
+    def test_revert_passes_argv_list_not_shell_string(self):
+        engine, session = self._engine_session(target_file='train.py')
+        with patch('integrations.coding_agent.aider_core.run_cmd.'
+                   'run_cmd_subprocess', return_value=(0, '')) as mock_cmd:
+            engine.revert_changes(session)
+        cmd = mock_cmd.call_args[0][0]
+        self.assertIsInstance(cmd, (list, tuple),
+                              'revert must pass argv list so shell=False')
+
+    def test_revert_neutralizes_shell_metacharacters(self):
+        payload = 'train.py; touch HACKED'
+        engine, session = self._engine_session(target_file=payload)
+        with patch('integrations.coding_agent.aider_core.run_cmd.'
+                   'run_cmd_subprocess', return_value=(0, '')) as mock_cmd:
+            engine.revert_changes(session)
+        cmd = mock_cmd.call_args[0][0]
+        # List → run_cmd_subprocess uses shell=False; the injection cannot fire.
+        self.assertIsInstance(cmd, (list, tuple))
+        # The whole malicious string is ONE discrete argv element (a git
+        # pathspec), not spliced into a shell command line.
+        self.assertIn(payload, cmd)
+        self.assertEqual(cmd[-1], payload)
+        # No element is a shell command line carrying the payload.
+        for part in cmd:
+            self.assertFalse(
+                isinstance(part, str) and 'touch HACKED' in part
+                and 'git' in part,
+                f'payload spliced into a shell command: {part!r}')
+
+    def test_revert_uses_double_dash_guard(self):
+        # A '-'-leading filename must not be read as a git option.
+        engine, session = self._engine_session(target_file='-rf')
+        with patch('integrations.coding_agent.aider_core.run_cmd.'
+                   'run_cmd_subprocess', return_value=(0, '')) as mock_cmd:
+            engine.revert_changes(session)
+        cmd = list(mock_cmd.call_args[0][0])
+        self.assertIn('--', cmd)
+        self.assertLess(cmd.index('--'), cmd.index('-rf'),
+                        "'--' must precede the filename")
+
+    def _force_gates_pass(self, engine):
+        # commit_improvement runs the RSI gates before the git commit;
+        # force both to pass so we reach the command construction.
+        return (
+            patch.object(engine, '_constitutional_gate',
+                         return_value=(True, 'ok')),
+            patch.object(engine, '_baseline_delta_gate',
+                         return_value=(True, [], 'ok')),
+            patch('integrations.coding_agent.recipe_bridge.CodingRecipeBridge'),
+            patch('integrations.agent_engine.agent_baseline_service.'
+                  'AgentBaselineService.capture_snapshot', return_value={}),
+        )
+
+    def _commit(self, engine, session, metric_value=0.95):
+        from integrations.coding_agent.autoevolve_code_tools import (
+            ExperimentResult)
+        result = ExperimentResult(
+            iteration=1, hypothesis='h', metric_name=session.metric_name,
+            metric_value=metric_value, baseline_value=0.9, improved=True)
+        g1, g2, g3, g4 = self._force_gates_pass(engine)
+        with g1, g2, g3, g4, patch(
+                'integrations.coding_agent.aider_core.run_cmd.'
+                'run_cmd_subprocess', return_value=(0, '')) as mock_cmd:
+            committed = engine.commit_improvement(session, result)
+        return committed, mock_cmd
+
+    def test_commit_passes_argv_lists(self):
+        engine, session = self._engine_session(
+            target_file='train.py', metric_name='score')
+        committed, mock_cmd = self._commit(engine, session)
+        self.assertTrue(committed)
+        self.assertGreaterEqual(mock_cmd.call_count, 1)
+        for call in mock_cmd.call_args_list:
+            self.assertIsInstance(call[0][0], (list, tuple),
+                                  'commit must pass argv list so shell=False')
+
+    def test_commit_benign_runs_add_then_commit(self):
+        engine, session = self._engine_session(
+            target_file='train.py', metric_name='accuracy')
+        committed, mock_cmd = self._commit(engine, session, metric_value=0.95)
+        self.assertTrue(committed)
+        cmds = [list(c[0][0]) for c in mock_cmd.call_args_list]
+        self.assertIn(['git', 'add', '--', 'train.py'], cmds)
+        commit_cmds = [c for c in cmds if c[:3] == ['git', 'commit', '-m']]
+        self.assertEqual(len(commit_cmds), 1)
+        # metric name + value are inside the single -m message argument.
+        msg = commit_cmds[0][3]
+        self.assertIn('accuracy', msg)
+        self.assertIn('0.95', msg)
+
+    def test_commit_isolates_target_file_injection(self):
+        payload = 'train.py; rm -rf ~'
+        engine, session = self._engine_session(
+            target_file=payload, metric_name='score')
+        committed, mock_cmd = self._commit(engine, session)
+        self.assertTrue(committed)
+        cmds = [list(c[0][0]) for c in mock_cmd.call_args_list]
+        # Every command is argv (shell=False) and the payload is one element.
+        for c in cmds:
+            for part in c:
+                self.assertFalse(
+                    isinstance(part, str) and 'rm -rf' in part
+                    and 'git' in part,
+                    f'payload spliced into a shell command: {part!r}')
+        self.assertIn(['git', 'add', '--', payload], cmds)
+
+    def test_commit_isolates_metric_name_injection(self):
+        # metric_name is interpolated into the commit -m message; with a
+        # shell string it would break out of the quotes. As an argv element
+        # it stays inert.
+        engine, session = self._engine_session(
+            target_file='train.py', metric_name='score"; rm -rf ~ #')
+        committed, mock_cmd = self._commit(engine, session)
+        self.assertTrue(committed)
+        for call in mock_cmd.call_args_list:
+            cmd = call[0][0]
+            self.assertIsInstance(cmd, (list, tuple))
+            for part in cmd:
+                # No argv element is a compound shell string that both names
+                # git and carries the injected command.
+                self.assertFalse(
+                    isinstance(part, str) and 'rm -rf' in part
+                    and 'git ' in part)
+
+
+class TestRepoEscapeContainment(unittest.TestCase):
+    """autoresearch_setup(target_file=...) is the goal-supplied entry point.
+    A '..' traversal or an absolute path outside repo_path must be REJECTED
+    before the isfile() check — otherwise git operations (and the saved
+    report) act on files outside the repository.
+    """
+
+    def _clean_baseline(self):
+        # A run_experiment stub so setup never spawns a real subprocess.
+        from integrations.coding_agent.autoevolve_code_tools import (
+            ExperimentResult)
+        return ExperimentResult(
+            iteration=0, hypothesis='baseline', metric_name='score',
+            metric_value=1.0, baseline_value=None, improved=False)
+
+    def test_setup_rejects_parent_traversal(self):
+        from integrations.coding_agent.autoevolve_code_tools import (
+            autoresearch_setup, AutoResearchEngine)
+        with tempfile.TemporaryDirectory() as outer:
+            repo = os.path.join(outer, 'repo')
+            os.makedirs(repo)
+            secret = os.path.join(outer, 'secret.txt')
+            with open(secret, 'w') as f:
+                f.write('top secret')
+            escaping = os.path.join('..', 'secret.txt')
+            with patch.object(AutoResearchEngine, 'run_experiment',
+                              return_value=self._clean_baseline()):
+                result = json.loads(autoresearch_setup(
+                    repo_path=repo, target_file=escaping,
+                    run_command='echo hi'))
+        self.assertIn('error', result)
+        self.assertIn('escape', result['error'].lower())
+        self.assertNotIn('session_id', result)
+
+    def test_setup_rejects_absolute_path_outside_repo(self):
+        from integrations.coding_agent.autoevolve_code_tools import (
+            autoresearch_setup, AutoResearchEngine)
+        with tempfile.TemporaryDirectory() as repo, \
+                tempfile.TemporaryDirectory() as elsewhere:
+            secret = os.path.join(elsewhere, 'secret.txt')
+            with open(secret, 'w') as f:
+                f.write('top secret')
+            # Absolute path: os.path.join(repo, secret) collapses to `secret`.
+            with patch.object(AutoResearchEngine, 'run_experiment',
+                              return_value=self._clean_baseline()):
+                result = json.loads(autoresearch_setup(
+                    repo_path=repo, target_file=secret,
+                    run_command='echo hi'))
+        self.assertIn('error', result)
+        self.assertIn('escape', result['error'].lower())
+
+    def test_setup_allows_legitimate_nested_file(self):
+        # The containment guard must NOT over-reject a real in-repo subdir.
+        from integrations.coding_agent.autoevolve_code_tools import (
+            autoresearch_setup, get_autoresearch_engine, AutoResearchEngine)
+        with tempfile.TemporaryDirectory() as repo:
+            src = os.path.join(repo, 'src')
+            os.makedirs(src)
+            with open(os.path.join(src, 'model.py'), 'w') as f:
+                f.write('x = 1\n')
+            nested = os.path.join('src', 'model.py')
+            with patch.object(AutoResearchEngine, 'run_experiment',
+                              return_value=self._clean_baseline()):
+                result = json.loads(autoresearch_setup(
+                    repo_path=repo, target_file=nested,
+                    run_command='echo hi'))
+        self.assertNotIn('error', result)
+        self.assertIn('session_id', result)
+        # Do not leak the session into the shared singleton engine.
+        get_autoresearch_engine().unregister_session(result['session_id'])

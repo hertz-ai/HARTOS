@@ -1,4 +1,4 @@
-{ config, lib, pkgs, modulesPath, hartSrc, ... }:
+{ config, lib, pkgs, modulesPath, hartSrc, hartImageKind ? "iso", ... }:
 
 # ═══════════════════════════════════════════════════════════════
 # HART OS Server Variant
@@ -15,9 +15,87 @@
 
 {
   imports = [
-    ../profiles/server.nix   # variant feature profile (hart.* block; moved 2026-07-28)
-    "${modulesPath}/installer/cd-dvd/installation-cd-minimal.nix"
-  ];
+      ../profiles/server.nix   # variant feature profile (hart.* block; moved 2026-07-28)
+    ]
+    # ISO-ONLY (mirrors desktop.nix's hartImageKind guard): the CD profile,
+    # the isoImage branding, and the ENTIRE live-medium access story below.
+    # The raw/installed builds (hartImageKind = "raw", via mkRepartSystem)
+    # must never see any of it — this file's own comments have always said
+    # the permissive SSH + baked passwords "must NEVER reach an installed
+    # system", and the raw image IS an installed system. Console access on
+    # raw comes from the profile's hart-admin getty autologin, same as the
+    # desktop raw image.
+    ++ lib.optionals (hartImageKind == "iso") [
+      "${modulesPath}/installer/cd-dvd/installation-cd-minimal.nix"
+      # isoImage.* options exist only while the CD profile above is imported —
+      # setting them unconditionally breaks the raw eval ("option does not
+      # exist"), which is why the whole block lives INSIDE the iso branch
+      # (same shape as desktop.nix).
+      ({ config, lib, pkgs, ... }: {
+        # ISO branding
+        isoImage = {
+          isoName = lib.mkForce "hart-os-${config.hart.version}-server-${pkgs.system}.iso";
+          volumeID = lib.mkForce "HART_OS";
+          appendToMenuLabel = " HART OS Server";
+          # Allow both EFI and BIOS boot (needed for QEMU without OVMF)
+          makeBiosBootable = lib.mkDefault true;
+        };
+
+        # Boot configuration (the ISO menu wait; the raw image's bootloader is
+        # owned by hart-repart-image.nix)
+        boot.loader.timeout = lib.mkForce 5;
+
+        # SSH relaxations for remote access to the LIVE MEDIUM only — sshd
+        # itself is enabled by the profile with the module's secure defaults;
+        # an installed server never gets these mkForces.
+        services.openssh = {
+          settings.PermitRootLogin = lib.mkForce "yes";
+          settings.PasswordAuthentication = lib.mkForce true;
+          settings.UsePAM = lib.mkForce true;
+          # Belt-and-suspenders: extraConfig appends at END of sshd_config,
+          # so last-occurrence wins even if the module hardcodes UsePAM earlier.
+          extraConfig = ''
+            UsePAM yes
+          '';
+        };
+
+        # Fix: PAM pam_setcred() fails because pam_deny.so (required) in auth
+        # stack returns PAM_PERM_DENIED during credential establishment.
+        # Override sshd PAM to remove the pam_deny.so auth catchall.
+        security.pam.services.sshd.text = lib.mkForce ''
+          # Account management.
+          account required pam_unix.so
+
+          # Authentication management.
+          auth sufficient pam_unix.so likeauth try_first_pass
+
+          # Password management.
+          password sufficient pam_unix.so nullok yescrypt
+
+          # Session management.
+          session required pam_env.so conffile=/etc/pam/environment readenv=0
+          session required pam_unix.so
+          session required pam_loginuid.so
+          session optional pam_systemd.so
+        '';
+
+        # Immutable passwords — NixOS generates /etc/shadow from these hashes
+        # exactly
+        users.mutableUsers = false;
+
+        # Password: hart123 (SHA-512 hash) — LIVE MEDIUM ONLY
+        users.users.root.hashedPassword = lib.mkForce "$6$AfVhhgH5HUHO0Dww$rb/YNzNp6Z29KRrjtweGvBj3Wh/7E92tFREXONqdHxvHFEa1y1rlk3hMbux9jE5NdycqpwQhHokxgdcX1SH6B.";
+        users.users.nixos.hashedPassword = lib.mkForce "$6$AfVhhgH5HUHO0Dww$rb/YNzNp6Z29KRrjtweGvBj3Wh/7E92tFREXONqdHxvHFEa1y1rlk3hMbux9jE5NdycqpwQhHokxgdcX1SH6B.";
+        users.users.nixos.openssh.authorizedKeys.keys = [
+          "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJZsU51nixnLUQMV/T4IeXruPZBfe17rB00pNb/WQEDc sathish@hertzai.com"
+        ];
+
+        # SSH authorized keys for root
+        users.users.root.openssh.authorizedKeys.keys = [
+          "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJZsU51nixnLUQMV/T4IeXruPZBfe17rB00pNb/WQEDc sathish@hertzai.com"
+        ];
+      })
+    ];
 
   # ─── Disable ZFS (broken in nixpkgs 24.11 for kernel 6.15) ───
   boot.supportedFilesystems.zfs = lib.mkForce false;
@@ -48,69 +126,15 @@
   # LIVE-MEDIUM access story below (permissive SSH + baked passwords +
   # ssh-diag), which must NEVER reach an installed system.
 
-  # ISO branding
-  isoImage = {
-    isoName = lib.mkForce "hart-os-${config.hart.version}-server-${pkgs.system}.iso";
-    volumeID = lib.mkForce "HART_OS";
-    appendToMenuLabel = " HART OS Server";
-    # Allow both EFI and BIOS boot (needed for QEMU without OVMF)
-    makeBiosBootable = lib.mkDefault true;
-  };
+  # ISO branding / boot timeout / SSH relaxations / PAM override / baked
+  # passwords + keys: ALL moved into the hartImageKind == "iso" branch of
+  # `imports` above (verbatim) — live-medium surface, never on an installed
+  # or raw system.
 
-  # Boot configuration
-  boot.loader.timeout = lib.mkForce 5;
-
-  # SSH relaxations for remote access to the LIVE MEDIUM only — sshd itself
-  # is enabled by the profile with the module's secure defaults; an installed
-  # server never gets these mkForces (it doesn't import this file).
-  services.openssh = {
-    settings.PermitRootLogin = lib.mkForce "yes";
-    settings.PasswordAuthentication = lib.mkForce true;
-    settings.UsePAM = lib.mkForce true;
-    # Belt-and-suspenders: extraConfig appends at END of sshd_config,
-    # so last-occurrence wins even if the module hardcodes UsePAM earlier.
-    extraConfig = ''
-      UsePAM yes
-    '';
-  };
-
-  # Fix: PAM pam_setcred() fails because pam_deny.so (required) in auth stack
-  # returns PAM_PERM_DENIED during credential establishment.
-  # Override sshd PAM to remove the pam_deny.so auth catchall.
-  security.pam.services.sshd.text = lib.mkForce ''
-    # Account management.
-    account required pam_unix.so
-
-    # Authentication management.
-    auth sufficient pam_unix.so likeauth try_first_pass
-
-    # Password management.
-    password sufficient pam_unix.so nullok yescrypt
-
-    # Session management.
-    session required pam_env.so conffile=/etc/pam/environment readenv=0
-    session required pam_unix.so
-    session required pam_loginuid.so
-    session optional pam_systemd.so
-  '';
-
-  # Immutable passwords — NixOS generates /etc/shadow from these hashes exactly
-  users.mutableUsers = false;
-
-  # Password: hart123 (SHA-512 hash)
-  users.users.root.hashedPassword = lib.mkForce "$6$AfVhhgH5HUHO0Dww$rb/YNzNp6Z29KRrjtweGvBj3Wh/7E92tFREXONqdHxvHFEa1y1rlk3hMbux9jE5NdycqpwQhHokxgdcX1SH6B.";
-  users.users.nixos.hashedPassword = lib.mkForce "$6$AfVhhgH5HUHO0Dww$rb/YNzNp6Z29KRrjtweGvBj3Wh/7E92tFREXONqdHxvHFEa1y1rlk3hMbux9jE5NdycqpwQhHokxgdcX1SH6B.";
-  users.users.nixos.openssh.authorizedKeys.keys = [
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJZsU51nixnLUQMV/T4IeXruPZBfe17rB00pNb/WQEDc sathish@hertzai.com"
-  ];
-
-  # SSH authorized keys for root
-  users.users.root.openssh.authorizedKeys.keys = [
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJZsU51nixnLUQMV/T4IeXruPZBfe17rB00pNb/WQEDc sathish@hertzai.com"
-  ];
-
-  # Diagnostic: serve SSH debug info on port 8888
-  systemd.services.ssh-diag = {
+  # Diagnostic: serve SSH debug info on port 8888 — LIVE MEDIUM ONLY (part of
+  # the same access story; it dumps shadow hash types and sshd config over
+  # unauthenticated HTTP, which must never run on an installed system).
+  systemd.services.ssh-diag = lib.mkIf (hartImageKind == "iso") {
     description = "SSH Diagnostic HTTP server";
     after = [ "sshd.service" "network.target" ];
     wantedBy = [ "multi-user.target" ];
@@ -164,5 +188,6 @@ SHEOF
       python3 /tmp/diag_server.py
     '';
   };
-  networking.firewall.allowedTCPPorts = [ 8888 ];
+  networking.firewall.allowedTCPPorts =
+    lib.optionals (hartImageKind == "iso") [ 8888 ];
 }

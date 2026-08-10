@@ -55,6 +55,29 @@ from flask import jsonify, request
 API_TOKEN = os.environ.get('HARTOS_API_TOKEN', '')
 
 
+def _token_matches(candidate: str) -> bool:
+    """Constant-time comparison of a caller-supplied token against
+    ``API_TOKEN``.
+
+    ``hmac.compare_digest`` on two ``str`` operands is ASCII-only and
+    raises ``TypeError`` if either side carries a non-ASCII character.
+    The candidate comes straight from an attacker-controllable
+    ``Authorization: Bearer …`` header, so a junk non-ASCII token would
+    otherwise escape the decorator as an unhandled 500 instead of a
+    clean 401.  Encoding both sides to bytes sidesteps the ASCII-only
+    restriction while keeping the comparison constant-time (bytes
+    compare_digest is constant-time and length-safe).
+
+    An unset (empty) ``API_TOKEN`` never matches.
+    """
+    if not API_TOKEN:
+        return False
+    return hmac.compare_digest(
+        candidate.encode('utf-8', 'surrogatepass'),
+        API_TOKEN.encode('utf-8', 'surrogatepass'),
+    )
+
+
 def _is_local_request() -> bool:
     """True if the request is from localhost, honouring TRUSTED_PROXY."""
     trusted_proxy = os.environ.get('TRUSTED_PROXY', '')
@@ -159,9 +182,11 @@ def require_local_or_token(f):
             auth = request.headers.get('Authorization', '')
             if auth.startswith('Bearer '):
                 token = auth[7:]
-                # hmac.compare_digest is constant-time — defends against
-                # timing-oracle leaks on the token comparison.
-                if hmac.compare_digest(token, API_TOKEN):
+                # _token_matches is constant-time — defends against
+                # timing-oracle leaks — and byte-safe against non-ASCII
+                # tokens (a raw str compare_digest would raise TypeError
+                # → 500 instead of 401 on attacker-supplied junk).
+                if _token_matches(token):
                     return f(*args, **kwargs)
         return jsonify({
             'error': 'unauthorized',
@@ -199,7 +224,7 @@ def require_local_or_token_csrf_safe(f):
             auth = request.headers.get('Authorization', '')
             if auth.startswith('Bearer '):
                 token = auth[7:]
-                if hmac.compare_digest(token, API_TOKEN):
+                if _token_matches(token):
                     return f(*args, **kwargs)
         # Local callers must additionally pass the CSRF check.
         if _is_local_request():

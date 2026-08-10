@@ -580,6 +580,56 @@ def status() -> Dict:
 # ModelCatalog._populate_llm_models is now the single source of truth, and
 # recommend_for_hardware() below selects from it. Add a model there, not here.
 
+# Last-resort floor for when the catalog cannot be read AT ALL. It deliberately
+# restates catalog row 'llm-qwen3.5-0.8b': a literal is unavoidable here, since
+# the entire job of this path is to still answer when the catalog is unreadable.
+# What IS avoidable is DRIFT -- and drift had already happened. This used to
+# claim quant 'Q4_K_M' while the row (and the only weights file that repo
+# publishes) is 'UD-Q4_K_XL', so the emergency path handed onboard() a quant
+# that does not exist. test_ai_setup_step::test_fallback_mirrors_the_catalog_row
+# now pins every field against the row, so they cannot diverge silently again.
+#
+# The 0.8B's catalog purposes are ['draft'], not ['main'], and it is used here
+# anyway -- knowingly. It is the smallest runnable entry and its capabilities
+# carry 'chat': True, so on a box we know nothing about it is the safest thing
+# to offer. Promoting the smallest ['main'] entry instead would RAISE the floor
+# from 0.8B to 2B and strand the weakest hardware, which is precisely the
+# failure mode of the VRAM-only ladder this whole path replaced.
+_CATALOG_UNAVAILABLE_FALLBACK = {
+    'catalog_id': 'llm-qwen3.5-0.8b',
+    'model_name': 'unsloth/Qwen3.5-0.8B-GGUF',
+    'display_name': 'Qwen3.5 0.8B VL',
+    'quant': 'UD-Q4_K_XL',
+}
+
+
+def describe_fit(need_gb: float, budget: Dict, fits: bool) -> str:
+    """Plain-language guidance on what running this model here will feel like.
+
+    DERIVED from the fit, never a per-model string. The MODEL_TIERS ladder that
+    used to live here carried hand-written labels -- '3B - balanced', '7B -
+    capable, needs a real GPU', '1.5B - runs on this machine' -- which told a
+    first-boot user what the trade-off MEANT, but had to be edited by hand for
+    every new model. Its catalog-driven replacement kept the `label` KEY and
+    dropped that content, restating the box's own specs instead ('cpu, 9.6GB
+    ram'), which says nothing about whether that is a good outcome.
+
+    Deriving the guidance restores what the old labels gave while keeping the
+    catalog's core promise intact: adding a model stays a catalog row and no
+    code change. Pure -- no I/O, no probes -- so it is cheap to test directly.
+    """
+    where = 'your GPU' if budget.get('source') == 'vram' else 'CPU'
+    if not fits:
+        return ("smallest available - larger than this machine's "
+                f"{budget.get('source') or 'ram'} budget, expect it to be slow")
+    avail = float(budget.get('budget_gb') or 0.0)
+    ratio = (need_gb / avail) if avail > 0 else 1.0
+    if ratio <= 0.5:
+        return f"comfortable on {where}, with room to spare"
+    if ratio <= 0.8:
+        return f"a good fit for {where}"
+    return f"fits {where}, with little headroom"
+
 
 def compute_budget() -> Dict:
     """What this box can actually spend on a model, and where that came from.
@@ -668,24 +718,44 @@ def recommend_for_hardware() -> Dict:
         return float(e.vram_gb if gpu_arm else e.ram_gb)
 
     chosen = None
+    fitted = False
     if entries:
         fits = [e for e in entries if _need(e) <= budget['budget_gb']]
+        fitted = bool(fits)
+        # Ordering is (priority, quality_score) BY DESIGN, and that is NOT the
+        # same rule as the old ladder's "biggest that fits": `priority` is the
+        # operator's editorial override and is ALLOWED to outrank raw size, so a
+        # deliberately-preferred model wins even when a larger one also fits.
+        # The old ladder's ordering was structurally guaranteed by its VRAM
+        # thresholds; this one is a hand-maintained column, so the shipped seed
+        # data is what keeps the two agreeing in practice. That agreement is
+        # pinned by test_catalog_populators::
+        # test_llm_seed_priority_is_monotonic_with_size -- if that guard goes
+        # red, the seed data has started to contradict this docstring, and a box
+        # that could run a big model may silently be handed a small one.
         chosen = (max(fits, key=lambda e: (e.priority, e.quality_score))
-                  if fits else min(entries, key=_need))
+                  if fitted else min(entries, key=_need))
 
     if chosen is None:
         # Catalog empty or unreadable — never leave the caller without a model.
         logger.warning("recommend_for_hardware: no catalog LLM entry; using fallback")
-        return {'model_name': 'unsloth/Qwen3.5-0.8B-GGUF', 'quant': 'Q4_K_M',
-                'label': '0.8B - fallback, catalog unavailable',
+        fb = _CATALOG_UNAVAILABLE_FALLBACK
+        return {'model_name': fb['model_name'], 'quant': fb['quant'],
+                'label': f"{fb['display_name']} - smallest available, "
+                         "chosen because the model catalog could not be read",
                 'total_vram_gb': budget['total_vram_gb'], **budget}
 
     quant = (chosen.capabilities or {}).get('quant', 'Q4_K_M')
     return {
         'model_name': chosen.repo_id or chosen.id,
         'quant': quant,
-        'label': f"{chosen.name} - {budget['run_mode']}, "
-                 f"{budget['budget_gb']}GB {budget['source']}",
+        # Guidance FIRST (what this will feel like), specs after in parentheses.
+        # Both halves matter: the old ladder had only guidance and went a
+        # generation stale; its replacement had only specs and told a first-boot
+        # user nothing. See describe_fit().
+        'label': f"{chosen.name} - {describe_fit(_need(chosen), budget, fitted)} "
+                 f"({budget['run_mode']}, {budget['budget_gb']}GB "
+                 f"{budget['source']})",
         'total_vram_gb': budget['total_vram_gb'],
         # ── additive: the union of what both implementations knew ──
         'model_id': chosen.id,

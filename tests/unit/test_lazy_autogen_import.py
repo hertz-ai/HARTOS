@@ -107,6 +107,63 @@ def test_module_import_does_not_pull_autogen(mod):
     )
 
 
+_NO_AUTOGEN_PROBE = textwrap.dedent(
+    """
+    import sys
+
+    class _Block:
+        def find_module(self, name, path=None):
+            return self if name == "autogen" or name.startswith("autogen.") else None
+        def find_spec(self, name, path=None, target=None):
+            if name == "autogen" or name.startswith("autogen."):
+                raise ImportError("blocked for test: autogen is not installed")
+            return None
+    sys.meta_path.insert(0, _Block())
+
+    import gather_agentdetails          # must NOT raise
+    print("IMPORT_OK")
+
+    # the module's own guard must still be reachable and still explain itself
+    try:
+        gather_agentdetails.create_agents_for_user("u1")
+    except ImportError as exc:
+        print("GUARD_OK", "pyautogen" in str(exc))
+    except Exception as exc:                       # noqa: BLE001
+        print("GUARD_WRONG", type(exc).__name__, exc)
+    """
+)
+
+
+def test_module_imports_on_a_node_without_autogen():
+    """gather_agentdetails must import where autogen is absent.
+
+    Regression (2026-08-08 nightly, every nixosTests shard, 300 occurrences):
+
+        AttributeError: 'NoneType' object has no attribute 'AssistantAgent'
+
+    The module bound `autogen = None` on ImportError, then annotated two
+    functions with `autogen.AssistantAgent`. Annotations are evaluated when the
+    `def` executes — at module import — so the module died before reaching any
+    function body, and its own `if autogen is None: raise ImportError(...)`
+    guard sat BELOW the statement that killed it and could never run.
+
+    Fixed by canonicalising onto the same mechanism create_recipe.py uses
+    (`lazy_module`, no None sentinel to miss) plus PEP 563 annotations.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c", _NO_AUTOGEN_PROBE],
+        capture_output=True, text=True, cwd=str(_repo_root()), timeout=180,
+    )
+    assert "IMPORT_OK" in proc.stdout, (
+        "gather_agentdetails failed to import without autogen:\n"
+        "STDOUT:%s\nSTDERR:%s" % (proc.stdout, proc.stderr[-2500:])
+    )
+    assert "GUARD_WRONG" not in proc.stdout, (
+        "the missing-autogen path raised the wrong exception type: %s"
+        % proc.stdout
+    )
+
+
 def _repo_root():
     import pathlib
     return pathlib.Path(__file__).resolve().parents[2]

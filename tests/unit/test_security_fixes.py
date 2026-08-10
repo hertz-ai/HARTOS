@@ -460,26 +460,45 @@ class TestG10HardcodedURLs(unittest.TestCase):
             self.assertGreater(port, 0, f"{svc} port should be positive")
 
     def test_ltx_server_uses_env_var(self):
-        """ltx2_server.py reads port from HART_LTX_PORT env var."""
-        import importlib
-        with patch.dict(os.environ, {'HART_LTX_PORT': '9999'}):
-            # Need to reimport to pick up the new env var
+        """G10: ltx2_server resolves its port from env, not a hardcoded 5002 —
+        _LTX_PORT + _LTX_BASE_URL exist AND _LTX_BASE_URL is built from _LTX_PORT
+        (consistent wiring, so the base URL cannot drift from the resolved port).
+
+        SKIPS (never fails) when ltx2_server cannot import because torch fails to
+        load — a broken/absent torch on the dev box (WinError 126 on shm.dll) or a
+        CPU-only CI is an ENVIRONMENT gap, not a G10 regression, and must not wear
+        the same red. Same rule as the latency-budget dateutil skip
+        (feedback: a dep gap must not look like a real violation)."""
+        try:
             import integrations.vision.ltx2_server as ltx
-            # The module-level _LTX_PORT should be configurable
-            # Check that the module references the variable
-            self.assertTrue(hasattr(ltx, '_LTX_PORT'),
-                            "ltx2_server should have _LTX_PORT variable")
-            self.assertTrue(hasattr(ltx, '_LTX_BASE_URL'),
-                            "ltx2_server should have _LTX_BASE_URL variable")
+        except (ImportError, OSError) as e:
+            import pytest
+            pytest.skip(f"ltx2_server import needs torch, unavailable here: {e}")
+        self.assertTrue(hasattr(ltx, '_LTX_PORT'), "needs a _LTX_PORT variable")
+        self.assertTrue(hasattr(ltx, '_LTX_BASE_URL'), "needs a _LTX_BASE_URL")
+        self.assertIsInstance(ltx._LTX_PORT, int)
+        self.assertIn(str(ltx._LTX_PORT), ltx._LTX_BASE_URL,
+                      "_LTX_BASE_URL must be derived from the resolved _LTX_PORT, "
+                      "not a second literal that can drift")
 
     def test_ltx_server_no_hardcoded_5002_in_responses(self):
-        """ltx2_server.py response URLs use _LTX_BASE_URL, not hardcoded 5002."""
-        import inspect
-        import integrations.vision.ltx2_server as ltx
-        source = inspect.getsource(ltx)
-        # The generate endpoint should NOT have hardcoded localhost:5002
+        """G10: response URLs use _LTX_BASE_URL, never a hardcoded localhost:5002
+        literal. Reads the SOURCE FILE directly (no import) so the check runs on
+        EVERY box — it must not depend on torch loading, and 'is there a hardcoded
+        literal' is inherently a source concern a behavioural test cannot see.
+        Both quote styles are checked (the old version missed single-quoted)."""
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))),
+            'integrations', 'vision', 'ltx2_server.py')
+        with open(path, encoding='utf-8') as f:
+            source = f.read()
         self.assertNotIn('"http://localhost:5002', source,
-                         "ltx2_server should not have hardcoded localhost:5002 in string literals")
+                         "no hardcoded localhost:5002 (double-quoted) literal")
+        self.assertNotIn("'http://localhost:5002", source,
+                         "no hardcoded localhost:5002 (single-quoted) literal")
+        self.assertIn('_LTX_BASE_URL', source,
+                      "response URLs must be built from _LTX_BASE_URL")
 
     def test_world_model_bridge_uses_env_var(self):
         """world_model_bridge reads URL from HEVOLVEAI_API_URL env var."""

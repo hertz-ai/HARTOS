@@ -3,6 +3,8 @@
 Covers: PeerLink, PeerLinkManager, Channels, NATTraversal, Telemetry,
         MessageBus, and integration wiring.
 """
+import contextlib
+import json
 import os
 import sys
 import time
@@ -1391,3 +1393,455 @@ class TestPeerPortFromAdvertisedUrl(unittest.TestCase):
 
         self.assertEqual((seen['host'], seen['port']), ('192.168.1.42', 5000))
         self.assertEqual(out, 'ws://192.168.1.42:5000/peer_link')
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TestIsPrivateIpSSRFGate
+# ═══════════════════════════════════════════════════════════════════
+#
+# _is_private_ip is the SSRF gate for _try_direct_wan and the observed_url
+# rung of resolve_peer_address: a hostile peer fully controls the strings in
+# its advertised/observed URL, so anything that is not a genuine public host
+# must be refused. The original four-range check (10/8, 172.16/12, 192.168/16,
+# 127/8) let three whole classes of dangerous target through as "public" and
+# therefore dialable:
+#   * 169.254.0.0/16 link-local — the cloud metadata endpoint 169.254.169.254
+#   * 100.64.0.0/10 CGNAT shared address space (RFC 6598)
+#   * every IPv6 address (the old dotted-quad parse can't see them at all)
+# These tests assert the gate now rejects them (and still admits real public
+# hosts unchanged). Written to FAIL against the original range check.
+
+class TestIsPrivateIpSSRFGate(unittest.TestCase):
+    """SSRF hardening for NATTraversal._is_private_ip."""
+
+    def setUp(self):
+        self.nat = NATTraversal(stun_server='stun.example.com:3478')
+
+    # -- Cloud-metadata / IPv4 link-local (169.254.0.0/16) --
+    def test_cloud_metadata_ip_is_private(self):
+        """169.254.169.254 is the AWS/GCP/Azure metadata endpoint — the whole
+        point of the gate. Must be refused."""
+        self.assertTrue(NATTraversal._is_private_ip('169.254.169.254'))
+
+    def test_link_local_range_is_private(self):
+        self.assertTrue(NATTraversal._is_private_ip('169.254.0.1'))
+        self.assertTrue(NATTraversal._is_private_ip('169.254.255.254'))
+
+    # -- CGNAT shared space (100.64.0.0/10, RFC 6598) --
+    def test_cgnat_range_is_private(self):
+        self.assertTrue(NATTraversal._is_private_ip('100.64.0.1'))
+        self.assertTrue(NATTraversal._is_private_ip('100.127.255.255'))
+
+    def test_cgnat_boundaries_stay_public(self):
+        """Just outside 100.64.0.0/10 is genuinely public and must dial."""
+        self.assertFalse(NATTraversal._is_private_ip('100.63.255.255'))
+        self.assertFalse(NATTraversal._is_private_ip('100.128.0.1'))
+
+    # -- Unspecified / "this network" 0.0.0.0/8 --
+    def test_unspecified_is_private(self):
+        self.assertTrue(NATTraversal._is_private_ip('0.0.0.0'))
+
+    # -- IPv6 (was completely invisible to the dotted-quad parser) --
+    def test_ipv6_loopback_is_private(self):
+        self.assertTrue(NATTraversal._is_private_ip('::1'))
+
+    def test_ipv6_link_local_is_private(self):
+        self.assertTrue(NATTraversal._is_private_ip('fe80::1'))
+
+    def test_ipv6_unique_local_is_private(self):
+        self.assertTrue(NATTraversal._is_private_ip('fd00::1'))
+
+    def test_ipv6_public_stays_public(self):
+        """A global IPv6 (Google public DNS) must still be dialable."""
+        self.assertFalse(NATTraversal._is_private_ip('2001:4860:4860::8888'))
+
+    def test_ipv4_mapped_ipv6_metadata_is_private(self):
+        """::ffff:169.254.169.254 smuggles the metadata IP through an IPv6
+        literal — classify by the embedded v4 address."""
+        self.assertTrue(NATTraversal._is_private_ip('::ffff:169.254.169.254'))
+
+    def test_ipv4_mapped_ipv6_public_stays_public(self):
+        self.assertFalse(NATTraversal._is_private_ip('::ffff:8.8.8.8'))
+
+    def test_bracketed_ipv6_as_peer_discovery_passes_it(self):
+        """peer_discovery calls _is_private_ip(echoed.strip('[]')); the
+        de-bracketed IPv6 must be recognised as private."""
+        self.assertTrue(NATTraversal._is_private_ip('fe80::1'.strip('[]')))
+
+    # -- Robustness: existing contract preserved for junk / empty / None --
+    def test_none_input_returns_false_without_raising(self):
+        """None must not blow up the gate (old code did str.split on None)."""
+        self.assertFalse(NATTraversal._is_private_ip(None))
+
+    def test_malformed_and_empty_still_false(self):
+        self.assertFalse(NATTraversal._is_private_ip('not_an_ip'))
+        self.assertFalse(NATTraversal._is_private_ip(''))
+        self.assertFalse(NATTraversal._is_private_ip('192.168.1'))
+
+    def test_documentation_and_public_ranges_still_public(self):
+        """Regression guard: the fix must NOT start refusing hosts the old
+        gate admitted — 203.0.113.x (which stdlib now marks is_private) and
+        real public IPs stay dialable."""
+        self.assertFalse(NATTraversal._is_private_ip('203.0.113.50'))
+        self.assertFalse(NATTraversal._is_private_ip('8.8.8.8'))
+        self.assertFalse(NATTraversal._is_private_ip('1.1.1.1'))
+        self.assertFalse(NATTraversal._is_private_ip('172.15.0.1'))
+
+    # -- Behavioural: the gate actually blocks the WAN dial --
+    @patch('core.peer_link.nat.socket.socket')
+    def test_try_direct_wan_refuses_metadata_no_socket_opened(self, mock_sock_cls):
+        """_try_direct_wan on a metadata IP must short-circuit BEFORE any
+        socket is created — the observable proof the SSRF gate fired."""
+        result = self.nat._try_direct_wan('169.254.169.254', 80)
+        self.assertIsNone(result)
+        mock_sock_cls.assert_not_called()
+
+    @patch('core.peer_link.nat.socket.socket')
+    def test_try_direct_wan_refuses_cgnat_no_socket_opened(self, mock_sock_cls):
+        result = self.nat._try_direct_wan('100.64.0.1', 6777)
+        self.assertIsNone(result)
+        mock_sock_cls.assert_not_called()
+
+    @patch('core.port_registry.get_port', return_value=6777)
+    @patch('core.peer_link.nat.socket.socket')
+    def test_observed_url_at_metadata_is_never_dialed(self, mock_sock_cls, _port):
+        """End-to-end through resolve_peer_address: a peer advertises a benign
+        private LAN URL but its observed_url points at the metadata endpoint.
+        The metadata host must never be connected to."""
+        dialed = []
+
+        def make_sock(*a, **k):
+            s = MagicMock()
+
+            def connect_ex(addr):
+                dialed.append(addr)
+                return 1  # every dial fails, so all rungs are attempted
+
+            s.connect_ex.side_effect = connect_ex
+            return s
+
+        mock_sock_cls.side_effect = make_sock
+
+        # Clear CBURL so the crossbar fallback doesn't matter either way.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('CBURL', None)
+            self.nat.resolve_peer_address({
+                'url': 'http://192.168.1.20:6777',
+                'observed_url': 'http://169.254.169.254:80',
+                'mesh_ip': '',
+            })
+
+        dialed_hosts = [addr[0] for addr in dialed]
+        self.assertNotIn('169.254.169.254', dialed_hosts)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TestCompleteHandshakeTrustGate
+# ═══════════════════════════════════════════════════════════════════
+#
+# _complete_handshake is the wire-facing trust gate for an INCOMING peer.
+# The remote fully controls hello_data, so the gate must:
+#   * never take trust_requested at face value;
+#   * grant SAME_USER ONLY when user_id_proof cryptographically verifies,
+#     otherwise DEMOTE the peer to PEER (E2E-encrypted);
+#   * REJECT (return False) a PEER whose pre-trust contract fails
+#     verify_trust_contract;
+#   * honour the G9 trust ratchet — a session already at SAME_USER must not
+#     be silently downgraded; the whole handshake is refused instead;
+#   * fail closed on bad/absent signatures under hard enforcement, and on a
+#     missing security module.
+# Neither _complete_handshake nor _verify_same_user_proof had a single test
+# reference before this file; only set_trust() in isolation was covered.
+#
+# Boundary mocked = the security helpers _complete_handshake imports
+# (signing/verification, x25519 pubkey, local-capability probe). The real
+# trust-gate control flow inside _complete_handshake runs unmocked.
+
+
+def _handshake_security_patches(verify_json=True, cap=None):
+    """ExitStack patching ONLY the security-module boundary the handshake
+    calls out to. Returns an un-entered stack for use as a context manager."""
+    stack = contextlib.ExitStack()
+    stack.enter_context(patch('security.node_integrity.get_public_key_hex',
+                              return_value='ourpub'))
+    stack.enter_context(patch('security.node_integrity.sign_json_payload',
+                              return_value='oursig'))
+    stack.enter_context(patch('security.node_integrity.verify_json_signature',
+                              return_value=verify_json))
+    stack.enter_context(patch('security.channel_encryption.get_x25519_public_hex',
+                              return_value='ourx25519'))
+    stack.enter_context(patch.object(PeerLink, '_get_local_capabilities',
+                                     return_value=cap if cap is not None
+                                     else {'cpu_count': 4}))
+    return stack
+
+
+_VALID_CONTRACT_DATA = {
+    'node_id': 'peer_abc12345',
+    'public_key_hex': 'bb' * 32,
+    'contract_fingerprint': 'fp',
+    'guardrail_hash': 'gh',
+    'origin_fingerprint': 'of',
+    'audit_compute_ratio': 0.8,
+    'signed_at': 123.0,
+    'signature_hex': 'contractsig',
+}
+
+
+class TestCompleteHandshakeTrustGate(unittest.TestCase):
+    """Wire-facing incoming-handshake trust determination."""
+
+    def setUp(self):
+        self.link = PeerLink('peer_abc12345', '10.0.0.1:6777', TrustLevel.PEER)
+        self.link._ws = MagicMock()
+
+    def tearDown(self):
+        self.link._ws = None
+
+    @staticmethod
+    def _hello(**overrides):
+        h = {
+            'type': 'hello',
+            'node_id': 'peer_abc12345',
+            'ed25519_public': 'aa' * 32,
+            'x25519_public': '',        # empty -> ECDH/session-key derive skipped
+            'trust_requested': 'peer',
+            'protocol_version': 1,
+            'timestamp': 123.0,
+            'signature': 'peersig',     # non-empty -> signature path exercised
+        }
+        h.update(overrides)
+        return h
+
+    # -- SAME_USER claim handling -----------------------------------------
+    def test_same_user_demoted_to_peer_when_proof_absent(self):
+        """same_user requested but NO user_id_proof -> silently demoted to
+        PEER, and the crypto verifier is never even consulted."""
+        proof_check = MagicMock()
+        self.link._verify_same_user_proof = proof_check
+        with _handshake_security_patches():
+            ok = self.link._complete_handshake(
+                self._hello(trust_requested='same_user'))
+        self.assertTrue(ok)
+        self.assertEqual(self.link.trust, TrustLevel.PEER)
+        self.assertEqual(self.link.min_trust_level, TrustLevel.PEER)
+        proof_check.assert_not_called()
+
+    def test_same_user_demoted_to_peer_when_proof_invalid(self):
+        """same_user requested WITH a proof that fails verification -> PEER."""
+        self.link._verify_same_user_proof = MagicMock(return_value=False)
+        with _handshake_security_patches():
+            ok = self.link._complete_handshake(
+                self._hello(trust_requested='same_user',
+                            user_id_proof='forged'))
+        self.assertTrue(ok)
+        self.assertEqual(self.link.trust, TrustLevel.PEER)
+        self.link._verify_same_user_proof.assert_called_once_with(
+            'forged', 'aa' * 32)
+
+    def test_same_user_granted_only_when_proof_valid(self):
+        """A cryptographically valid proof upgrades the peer to SAME_USER and
+        ratchets the floor up with it."""
+        self.link._verify_same_user_proof = MagicMock(return_value=True)
+        with _handshake_security_patches():
+            ok = self.link._complete_handshake(
+                self._hello(trust_requested='same_user',
+                            user_id_proof='genuine'))
+        self.assertTrue(ok)
+        self.assertEqual(self.link.trust, TrustLevel.SAME_USER)
+        self.assertEqual(self.link.min_trust_level, TrustLevel.SAME_USER)
+
+    def test_same_user_downgrade_blocked_by_ratchet_refuses_handshake(self):
+        """G9: a session already at SAME_USER that then can't prove SAME_USER
+        must NOT be quietly downgraded to PEER — the ratchet rejects the
+        set_trust(PEER) and the whole handshake fails closed."""
+        link = PeerLink('peer_ratchet', '10.0.0.2:6777', TrustLevel.SAME_USER)
+        link._ws = MagicMock()
+        link._verify_same_user_proof = MagicMock(return_value=False)
+        with _handshake_security_patches():
+            ok = link._complete_handshake(
+                self._hello(trust_requested='same_user',
+                            user_id_proof='forged'))
+        self.assertFalse(ok)
+        # Trust is left untouched at its ratcheted floor, never downgraded.
+        self.assertEqual(link.trust, TrustLevel.SAME_USER)
+        self.assertEqual(link.min_trust_level, TrustLevel.SAME_USER)
+
+    # -- PEER pre-trust contract enforcement ------------------------------
+    def test_peer_rejected_when_trust_contract_invalid(self):
+        """A PEER presenting a contract that fails verify_trust_contract is
+        refused outright (return False), and no ack is sent."""
+        with _handshake_security_patches(), \
+             patch('security.pre_trust_contract.verify_trust_contract',
+                   return_value=(False, 'guardrail hash mismatch')) as vtc:
+            ok = self.link._complete_handshake(
+                self._hello(trust_requested='peer',
+                            trust_contract=dict(_VALID_CONTRACT_DATA)))
+        self.assertFalse(ok)
+        vtc.assert_called_once()
+        self.link._ws.send.assert_not_called()
+
+    def test_peer_accepted_and_contract_registered_when_valid(self):
+        """A valid contract is accepted AND registered with the verifier."""
+        verifier = MagicMock()
+        with _handshake_security_patches(), \
+             patch('security.pre_trust_contract.verify_trust_contract',
+                   return_value=(True, 'ok')), \
+             patch('security.pre_trust_contract.get_pre_trust_verifier',
+                   return_value=verifier):
+            ok = self.link._complete_handshake(
+                self._hello(trust_requested='peer',
+                            trust_contract=dict(_VALID_CONTRACT_DATA)))
+        self.assertTrue(ok)
+        self.assertEqual(self.link.trust, TrustLevel.PEER)
+        verifier.register_contract.assert_called_once()
+
+    def test_peer_without_contract_allowed_legacy(self):
+        """No contract at all -> legacy connection is allowed (contract is
+        optional), trust stays PEER."""
+        with _handshake_security_patches():
+            ok = self.link._complete_handshake(
+                self._hello(trust_requested='peer'))
+        self.assertTrue(ok)
+        self.assertEqual(self.link.trust, TrustLevel.PEER)
+
+    def test_same_user_proof_bypasses_contract_check(self):
+        """A verified SAME_USER (own device) is exempt from the pre-trust
+        contract gate even if it carried a (bogus) contract."""
+        self.link._verify_same_user_proof = MagicMock(return_value=True)
+        with _handshake_security_patches(), \
+             patch('security.pre_trust_contract.verify_trust_contract',
+                   return_value=(False, 'should not be consulted')) as vtc:
+            ok = self.link._complete_handshake(
+                self._hello(trust_requested='same_user',
+                            user_id_proof='genuine',
+                            trust_contract=dict(_VALID_CONTRACT_DATA)))
+        self.assertTrue(ok)
+        self.assertEqual(self.link.trust, TrustLevel.SAME_USER)
+        vtc.assert_not_called()
+
+    # -- signature enforcement --------------------------------------------
+    def test_bad_signature_rejects_before_ack(self):
+        """A present-but-invalid signature fails the handshake before any ack
+        is emitted."""
+        with _handshake_security_patches(verify_json=False):
+            ok = self.link._complete_handshake(self._hello())
+        self.assertFalse(ok)
+        self.link._ws.send.assert_not_called()
+
+    def test_unsigned_handshake_rejected_in_hard_mode(self):
+        """No signature + hard enforcement -> refused."""
+        with _handshake_security_patches(), \
+             patch.dict(os.environ, {'HEVOLVE_ENFORCEMENT_MODE': 'hard'}):
+            ok = self.link._complete_handshake(self._hello(signature=''))
+        self.assertFalse(ok)
+
+    def test_unsigned_handshake_allowed_when_not_hard(self):
+        """No signature + soft enforcement -> allowed as a legacy PEER."""
+        with _handshake_security_patches(), \
+             patch.dict(os.environ, {'HEVOLVE_ENFORCEMENT_MODE': 'soft'}):
+            ok = self.link._complete_handshake(self._hello(signature=''))
+        self.assertTrue(ok)
+        self.assertEqual(self.link.trust, TrustLevel.PEER)
+
+    # -- observable side effects ------------------------------------------
+    def test_successful_handshake_sends_signed_ack(self):
+        """On success a signed hello_ack carrying OUR keys is written."""
+        with _handshake_security_patches():
+            ok = self.link._complete_handshake(self._hello())
+        self.assertTrue(ok)
+        self.assertTrue(self.link._ws.send.called)
+        sent = self.link._ws.send.call_args[0][0]
+        ack = json.loads(sent.decode('utf-8') if isinstance(sent, (bytes, bytearray))
+                         else sent)
+        self.assertEqual(ack['type'], 'hello_ack')
+        self.assertEqual(ack['ed25519_public'], 'ourpub')
+        self.assertEqual(ack['signature'], 'oursig')
+
+    def test_session_key_derived_for_peer_with_x25519(self):
+        """A PEER that supplies an x25519 pubkey triggers ECDH session-key
+        derivation (E2E encryption path)."""
+        self.link._derive_session_key = MagicMock()
+        with _handshake_security_patches():
+            ok = self.link._complete_handshake(
+                self._hello(x25519_public='cc' * 32))
+        self.assertTrue(ok)
+        self.link._derive_session_key.assert_called_once()
+
+    def test_import_error_returns_false(self):
+        """If a required security module is unavailable, the handshake fails
+        closed rather than raising."""
+        with patch.dict('sys.modules', {'security.channel_encryption': None}):
+            ok = self.link._complete_handshake(self._hello())
+        self.assertFalse(ok)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TestVerifySameUserProof
+# ═══════════════════════════════════════════════════════════════════
+#
+# _verify_same_user_proof is the crypto gate _complete_handshake leans on to
+# decide SAME_USER. Its boundary is security.node_integrity's message-signature
+# verifier; everything else (env guard, fail-closed on error) is the unit under
+# test. It had zero test references.
+
+class TestVerifySameUserProof(unittest.TestCase):
+
+    def setUp(self):
+        self.link = PeerLink('peerp', '10.0.0.3:6777', TrustLevel.PEER)
+
+    def test_returns_false_when_local_user_id_missing(self):
+        """No HEVOLVE_USER_ID -> we don't even have an identity to prove, so
+        the gate short-circuits False without touching the verifier."""
+        with patch('security.node_integrity.verify_message_signature',
+                   create=True) as verifier, \
+             patch.dict(os.environ, {'HEVOLVE_USER_ID': ''}):
+            out = self.link._verify_same_user_proof('proof', 'peerkey')
+        self.assertFalse(out)
+        verifier.assert_not_called()
+
+    def test_returns_false_when_peer_public_key_empty(self):
+        with patch('security.node_integrity.verify_message_signature',
+                   create=True) as verifier, \
+             patch.dict(os.environ, {'HEVOLVE_USER_ID': 'user1'}):
+            out = self.link._verify_same_user_proof('proof', '')
+        self.assertFalse(out)
+        verifier.assert_not_called()
+
+    def test_returns_true_when_verifier_accepts(self):
+        """Verifier is invoked with (peer_pubkey, our_user_id, proof) and its
+        verdict is returned."""
+        with patch('security.node_integrity.verify_message_signature',
+                   create=True, return_value=True) as verifier, \
+             patch.dict(os.environ, {'HEVOLVE_USER_ID': 'user1'}):
+            out = self.link._verify_same_user_proof('proof', 'peerkey')
+        self.assertTrue(out)
+        verifier.assert_called_once_with('peerkey', 'user1', 'proof')
+
+    def test_returns_false_when_verifier_rejects(self):
+        with patch('security.node_integrity.verify_message_signature',
+                   create=True, return_value=False) as verifier, \
+             patch.dict(os.environ, {'HEVOLVE_USER_ID': 'user1'}):
+            out = self.link._verify_same_user_proof('proof', 'peerkey')
+        self.assertFalse(out)
+        verifier.assert_called_once()
+
+    def test_verifier_exception_fails_closed(self):
+        """Any exception from the crypto layer is swallowed as False, never
+        raised into the handshake."""
+        with patch('security.node_integrity.verify_message_signature',
+                   create=True, side_effect=RuntimeError('boom')), \
+             patch.dict(os.environ, {'HEVOLVE_USER_ID': 'user1'}):
+            out = self.link._verify_same_user_proof('proof', 'peerkey')
+        self.assertFalse(out)
+
+    def test_missing_dependency_fails_closed(self):
+        """Regression/observation: security.node_integrity currently exposes NO
+        verify_message_signature symbol, so the import inside the gate raises
+        ImportError and it fails closed. Even once such a symbol exists, a
+        garbage proof must still not verify — so the observable result is False
+        either way. (See notes: SAME_USER can never be established over the
+        wire until that verifier is implemented.)"""
+        with patch.dict(os.environ, {'HEVOLVE_USER_ID': 'user1'}):
+            out = self.link._verify_same_user_proof('garbage', 'garbagekey')
+        self.assertFalse(out)

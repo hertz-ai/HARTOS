@@ -69,7 +69,13 @@ in
 
       with subtest("Backend responds on port 6777"):
           server.wait_for_open_port(6777, timeout=60)
-          result = server.succeed("curl -sf http://localhost:6777/status")
+          # The socket can be LISTENING before Flask is READY to serve /status
+          # (the app is still initialising -> a transient connection-refused or
+          # 503 that fails a one-shot `curl -sf`). Retry with a bounded wait so a
+          # startup-timing race on a cold/loaded runner is not a false red (#42:
+          # this subtest flaked non-deterministically between VM runs).
+          result = server.wait_until_succeeds(
+              "curl -sf http://localhost:6777/status", timeout=90)
           assert "success" in result or "uptime" in result, f"Unexpected status: {result}"
 
       with subtest("Discovery service starts"):
@@ -467,7 +473,10 @@ in
           # vanish.
           import json as _json
           edge.wait_for_open_port(6777, timeout=300)
-          body = _json.loads(edge.succeed("curl -sf http://localhost:6777/status"))
+          # Bounded retry, not a one-shot: the port opens before Flask serves
+          # /status, so a single curl races app init (#42).
+          body = _json.loads(edge.wait_until_succeeds(
+              "curl -sf http://localhost:6777/status", timeout=90))
           edge.log(f"/status: {body}")
 
           assert body.get("learning_active") is False, (

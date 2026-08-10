@@ -28,6 +28,73 @@ sys.excepthook = _safe_excepthook
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+
+def refuse_all_network(mp, reason='test suite: no peer services'):
+    """Patch requests + httpx to refuse instantly instead of dialing a real
+    socket. The ONE reusable network seal — a suite that wants hermetic
+    isolation installs it via a scoped fixture (see tests/e2e/conftest.py).
+
+    Why it matters beyond speed: a pooled requests.Session or the shared LLM
+    httpx.Client established by one test and reused by a LATER test — after the
+    target is gone — blackholes on recv until the pytest timeout, and the two
+    tests pass alone but hang in sequence (cross-test socket pollution). This
+    caps it at the class level so no test can open a real pooled connection
+    that pollutes another. Handlers hit the exact same ConnectionError degrade
+    path they take in CI (which has no network), just deterministically and in
+    microseconds.
+
+    `mp` is a pytest MonkeyPatch (fixture-provided or a manual instance);
+    caller owns undo(). The shell_surface conftest predates this and keeps its
+    own inline copy for now — a later DRY pass folds it onto this helper.
+    """
+    def _refuse(*a, **kw):
+        import requests as _rq
+        raise _rq.exceptions.ConnectionError(reason)
+
+    try:
+        import requests
+        for name in ('request', 'get', 'post', 'put', 'delete', 'patch', 'head'):
+            mp.setattr(requests, name, _refuse, raising=False)
+        # Session.request is the pooled path (core.http_pool) — class-level so
+        # every Session instance, including the shared pool, is covered.
+        mp.setattr(requests.Session, 'request', _refuse, raising=False)
+    except ImportError:
+        pass
+    try:
+        import httpx
+
+        def _refuse_httpx(*a, **kw):
+            raise httpx.ConnectError(reason)
+        for name in ('request', 'get', 'post', 'put', 'delete'):
+            mp.setattr(httpx, name, _refuse_httpx, raising=False)
+        # Client.request covers the shared autogen/openai LLM client.
+        mp.setattr(httpx.Client, 'request', _refuse_httpx, raising=False)
+    except ImportError:
+        pass
+
+    # The bulletproof floor: refuse OUTBOUND TCP at socket.create_connection.
+    # The high-level patches above miss anything that reaches the network by a
+    # path they don't name — the pooled httpx LLM client funnels through
+    # httpcore's transport, NOT Client.request, so a cross-test-polluted
+    # connection still blackholed on recv despite the httpx patch.
+    # create_connection is the ONE call every stdlib-based outbound dialer
+    # (httpcore's sync backend, urllib3/requests) goes through.
+    #
+    # ONLY create_connection — NOT socket.socket.connect. Patching the raw
+    # method breaks asyncio's event loop, which connects an internal self-pipe
+    # socket at startup (ProactorEventLoop._ssock on Windows / the self-pipe on
+    # Unix); an over-broad seal there turns every async test into an
+    # AttributeError. create_connection is outbound-client-only and asyncio
+    # does not use it for the self-pipe, so this seals peer dialing without
+    # touching the loop, and leaves socket()/bind()/listen()/accept() alone so
+    # a LOCAL server test still works.
+    import socket as _socket
+
+    def _refuse_connect(*a, **kw):
+        raise ConnectionError(reason)
+
+    mp.setattr(_socket, 'create_connection', _refuse_connect, raising=False)
+
 # ─── Exclude standalone scripts that crash pytest collection ───
 # These files have sys.exit() at module level or module-level assertions.
 # They are standalone test runners, not pytest test files.

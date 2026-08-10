@@ -1421,6 +1421,61 @@ SEED_BOOTSTRAP_GOALS = [
         'use_product': True,
     },
     {
+        'slug': 'bootstrap_herald_news_friend',
+        'goal_type': 'news',
+        'title': 'Herald',
+        'description': (
+            'You are Herald, the news-friend.  Every day, refresh the AI and '
+            'technology feeds the hevolve.ai news page already reads '
+            '(TechCrunch AI, VentureBeat AI, The Verge AI, Google AI Blog, '
+            'OpenAI, Hugging Face, MIT Technology Review) so the feed stays '
+            'agent-refreshed instead of a manual, stale dump.  Steps: '
+            '1) fetch_news_feeds over the configured feed_urls, and '
+            'subscribe_news_feed for any strong new source you discover.  '
+            '2) get_trending_news FIRST so you never re-push a story already '
+            'circulating.  '
+            '3) Keep only genuinely newsworthy AI and open-intelligence items. '
+            'No clickbait, no sensationalism, no rewriting a press release as '
+            'fact.  Every item keeps its source link and outlet attribution.  '
+            '4) send_news_notification for the few that truly matter, capped, '
+            'always with the source cited.  '
+            '5) For the two or three strongest items, CLOSE THE LOOP: use the '
+            'crawl4ai tool to open the source article and pull its full text '
+            'and its lead image (the og:image), so the published event is rich '
+            'and not a bare headline.  '
+            "6) mark_news_for_web on those items, passing image_url with the "
+            "og:image you crawled, so the 'seo' goal opens a PR to hevolve.ai "
+            'and the news card shows a real preview.  That PR is merged by a '
+            'human, so nothing reaches the public site without review.  You '
+            'FLAG for the web; you never post to the world yourself.  '
+            'Cite the source for every claim.  If you cannot cite it, drop it.'
+        ),
+        'config': {
+            'autonomous': True,
+            'continuous': True,
+            'persona_kind': 'news-friend',
+            'persona_name': 'Herald',
+            'audience': 'all',
+            'cadence': 'daily',
+            'scope': 'international',
+            'frequency': 'daily',
+            'categories': ['ai', 'machine-learning', 'open-source', 'technology'],
+            'feed_urls': [
+                'https://techcrunch.com/category/artificial-intelligence/feed/',
+                'https://venturebeat.com/category/ai/feed/',
+                'https://www.theverge.com/rss/ai-artificial-intelligence/index.xml',
+                'https://blog.google/technology/ai/rss/',
+                'https://openai.com/news/rss.xml',
+                'https://huggingface.co/blog/feed.xml',
+                'https://www.technologyreview.com/feed/',
+            ],
+            'channels': ['platform'],
+            'priority': 4,
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    {
         'slug': 'bootstrap_quest_contest_host',
         'goal_type': 'marketing',
         'title': 'Quest',

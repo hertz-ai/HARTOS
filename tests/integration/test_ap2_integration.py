@@ -15,11 +15,15 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from decimal import Decimal
+import base64
+import hashlib
+import hmac
 import json
 import pytest
 from integrations.ap2 import (
     PaymentStatus, PaymentMethod, PaymentGateway,
-    PaymentRequest, PaymentLedger, MockPaymentGateway,
+    PaymentRequest, PaymentLedger, PaymentGatewayConnector, MockPaymentGateway,
+    PhonePePaymentGateway,
     payment_ledger, create_payment_request_function,
     create_payment_authorization_function, create_payment_processing_function,
     get_ap2_tools_for_autogen
@@ -321,6 +325,469 @@ def test_complete_payment_workflow():
     # Cleanup
     if os.path.exists("agent_data/test_workflow_ledger.json"):
         os.remove("agent_data/test_workflow_ledger.json")
+
+
+# =============================================================================
+# process_payment() authorization gate, double-charge/replay guard, and
+# gateway-failure degrade paths.
+#
+# These are the security-critical branches the happy-path tests above never
+# exercise or assert: a weakened authorization gate = authorization bypass; a
+# weakened replay guard = silent double-charge; a mishandled gateway failure =
+# a payment stuck in a non-terminal state instead of FAILED.  Each test drives
+# the REAL PaymentLedger.process_payment and mocks only the gateway boundary,
+# asserting both the returned result AND the observable side effects (persisted
+# status, whether the gateway was actually invoked).
+# =============================================================================
+
+
+class _SpyGateway(PaymentGatewayConnector):
+    """Controllable gateway boundary double.
+
+    Records how many times create_payment / capture_payment are invoked so a
+    test can prove the ledger did (or crucially did NOT) attempt to charge the
+    gateway.  create/capture results and a create-time exception are all
+    injectable so every degrade branch of process_payment is reachable.
+    """
+
+    def __init__(self, create_result=None, capture_result=None, create_raises=None):
+        super().__init__(PaymentGateway.MOCK)
+        self._create_result = create_result if create_result is not None else {
+            'success': True, 'transaction_id': 'txn_spy_ok', 'status': 'authorized'
+        }
+        self._capture_result = capture_result if capture_result is not None else {
+            'success': True, 'status': 'captured'
+        }
+        self._create_raises = create_raises
+        self.create_calls = 0
+        self.capture_calls = 0
+        self.connected = True
+
+    def connect(self) -> bool:
+        self.connected = True
+        return True
+
+    def create_payment(self, payment_request):
+        self.create_calls += 1
+        if self._create_raises is not None:
+            raise self._create_raises
+        return self._create_result
+
+    def capture_payment(self, payment_id, gateway_transaction_id):
+        self.capture_calls += 1
+        return self._capture_result
+
+    def refund_payment(self, payment_id, gateway_transaction_id, amount=None):
+        return {'success': True, 'status': 'refunded'}
+
+
+def _ledger_with_gateway(tmp_path, spy):
+    """Fresh ledger with an isolated on-disk path and the MOCK gateway
+    slot replaced by the caller's spy (so a MOCK-routed payment hits it)."""
+    ledger = PaymentLedger(ledger_path=str(tmp_path / "spy_ledger.json"))
+    ledger.gateways[PaymentGateway.MOCK] = spy
+    return ledger
+
+
+def _authorized_payment(ledger, gateway=PaymentGateway.MOCK, amount="10.00"):
+    payment = ledger.create_payment_request(
+        amount=Decimal(amount),
+        currency="USD",
+        description="degrade-path test",
+        requester_agent_id="agent_degrade",
+        payment_method=PaymentMethod.INTERNAL_CREDITS,
+        gateway=gateway,
+    )
+    assert ledger.authorize_payment(payment.payment_id, "admin_approver") is True
+    return payment.payment_id
+
+
+class TestProcessPaymentAuthorizationGate:
+    """Refuse to process anything that is not currently AUTHORIZED."""
+
+    def test_unknown_payment_id_returns_not_found(self, tmp_path):
+        ledger = PaymentLedger(ledger_path=str(tmp_path / "l.json"))
+        result = ledger.process_payment("no-such-payment")
+        assert result == {'success': False, 'error': 'Payment not found'}
+
+    def test_pending_payment_refused_and_gateway_never_charged(self, tmp_path):
+        # A PENDING (un-authorized) payment must NOT reach the gateway — this
+        # is the authorization bypass guard.
+        spy = _SpyGateway()
+        ledger = _ledger_with_gateway(tmp_path, spy)
+        payment = ledger.create_payment_request(
+            amount=Decimal("42.00"), currency="USD", description="x",
+            requester_agent_id="agent_x", gateway=PaymentGateway.MOCK,
+        )
+        assert payment.status == PaymentStatus.PENDING
+
+        result = ledger.process_payment(payment.payment_id)
+
+        assert result['success'] is False
+        assert 'not authorized' in result['error'].lower()
+        # Boundary never touched -> no charge attempted.
+        assert spy.create_calls == 0
+        assert spy.capture_calls == 0
+        # Status must be untouched (still PENDING so it can be authorized later),
+        # NOT silently flipped to FAILED.
+        assert ledger.get_payment(payment.payment_id).status == PaymentStatus.PENDING
+
+    def test_failed_payment_cannot_be_reprocessed(self, tmp_path):
+        # After a gateway create-failure the payment is FAILED; re-processing
+        # must be refused (FAILED != AUTHORIZED), and must not re-hit the gateway.
+        spy = _SpyGateway(create_result={'success': False, 'error': 'declined'})
+        ledger = _ledger_with_gateway(tmp_path, spy)
+        pid = _authorized_payment(ledger)
+
+        first = ledger.process_payment(pid)
+        assert first['success'] is False
+        assert ledger.get_payment(pid).status == PaymentStatus.FAILED
+        assert spy.create_calls == 1
+
+        second = ledger.process_payment(pid)
+        assert second['success'] is False
+        assert 'not authorized' in second['error'].lower()
+        # No second charge attempt.
+        assert spy.create_calls == 1
+        assert spy.capture_calls == 0
+
+
+class TestProcessPaymentReplayGuard:
+    """A COMPLETED payment must never be charged a second time."""
+
+    def test_completed_payment_cannot_be_double_charged(self, tmp_path):
+        spy = _SpyGateway()
+        ledger = _ledger_with_gateway(tmp_path, spy)
+        pid = _authorized_payment(ledger)
+
+        first = ledger.process_payment(pid)
+        assert first['success'] is True
+        assert ledger.get_payment(pid).status == PaymentStatus.COMPLETED
+        assert spy.create_calls == 1
+        assert spy.capture_calls == 1
+
+        # Replay the exact same call — the double-charge guard must refuse.
+        second = ledger.process_payment(pid)
+        assert second['success'] is False
+        assert 'not authorized' in second['error'].lower()
+        # Critically: the gateway was NOT invoked a second time.
+        assert spy.create_calls == 1
+        assert spy.capture_calls == 1
+        # Terminal state preserved.
+        assert ledger.get_payment(pid).status == PaymentStatus.COMPLETED
+
+    def test_completed_payment_cannot_be_reauthorized(self, tmp_path):
+        # The replay guard rests on status leaving AUTHORIZED.  Prove it cannot
+        # be re-opened: authorize_payment refuses a non-PENDING payment, so a
+        # completed charge can't be re-armed for a second process_payment.
+        spy = _SpyGateway()
+        ledger = _ledger_with_gateway(tmp_path, spy)
+        pid = _authorized_payment(ledger)
+        assert ledger.process_payment(pid)['success'] is True
+        assert ledger.get_payment(pid).status == PaymentStatus.COMPLETED
+
+        assert ledger.authorize_payment(pid, "attacker") is False
+        assert ledger.get_payment(pid).status == PaymentStatus.COMPLETED
+        # And a follow-up process still refuses / never re-charges.
+        assert ledger.process_payment(pid)['success'] is False
+        assert spy.create_calls == 1
+
+
+class TestProcessPaymentGatewayDegradePaths:
+    """Every gateway-failure mode must degrade to a FAILED terminal state."""
+
+    def test_gateway_unavailable_marks_failed(self, tmp_path):
+        # Route to a gateway that is not registered (PAYPAL is never added by
+        # default) -> lookup returns None -> FAILED, no exception.
+        ledger = PaymentLedger(ledger_path=str(tmp_path / "l.json"))
+        assert ledger.gateways.get(PaymentGateway.PAYPAL) is None
+        pid = _authorized_payment(ledger, gateway=PaymentGateway.PAYPAL)
+
+        result = ledger.process_payment(pid)
+
+        assert result == {'success': False, 'error': 'Gateway not available'}
+        payment = ledger.get_payment(pid)
+        assert payment.status == PaymentStatus.FAILED
+        assert payment.error_message == "Gateway not available"
+
+    def test_create_failure_marks_failed_without_capture(self, tmp_path):
+        spy = _SpyGateway(create_result={'success': False, 'error': 'card declined'})
+        ledger = _ledger_with_gateway(tmp_path, spy)
+        pid = _authorized_payment(ledger)
+
+        result = ledger.process_payment(pid)
+
+        assert result['success'] is False
+        assert result['error'] == 'card declined'
+        # Capture must never run when create failed.
+        assert spy.create_calls == 1
+        assert spy.capture_calls == 0
+        payment = ledger.get_payment(pid)
+        assert payment.status == PaymentStatus.FAILED
+        assert payment.error_message == 'card declined'
+
+    def test_capture_failure_marks_failed(self, tmp_path):
+        spy = _SpyGateway(
+            create_result={'success': True, 'transaction_id': 'txn_created_1'},
+            capture_result={'success': False, 'error': 'capture timeout'},
+        )
+        ledger = _ledger_with_gateway(tmp_path, spy)
+        pid = _authorized_payment(ledger)
+
+        result = ledger.process_payment(pid)
+
+        # process_payment returns the capture result verbatim on capture failure.
+        assert result['success'] is False
+        assert result['error'] == 'capture timeout'
+        assert spy.create_calls == 1
+        assert spy.capture_calls == 1
+        payment = ledger.get_payment(pid)
+        assert payment.status == PaymentStatus.FAILED
+        assert payment.error_message == 'capture timeout'
+        # The gateway transaction id from create is still recorded for audit.
+        assert payment.gateway_transaction_id == 'txn_created_1'
+
+    def test_create_missing_error_key_uses_default_message(self, tmp_path):
+        # A gateway that reports failure without an 'error' key must still
+        # degrade cleanly (not KeyError) using the fallback message.
+        spy = _SpyGateway(create_result={'success': False})
+        ledger = _ledger_with_gateway(tmp_path, spy)
+        pid = _authorized_payment(ledger)
+
+        result = ledger.process_payment(pid)
+
+        assert result['success'] is False
+        payment = ledger.get_payment(pid)
+        assert payment.status == PaymentStatus.FAILED
+        assert payment.error_message == 'Gateway returned failure'
+
+    def test_gateway_exception_is_caught_and_marks_failed(self, tmp_path):
+        # An exception raised inside the gateway must be caught, recorded, and
+        # the payment marked FAILED — never propagate out of process_payment.
+        spy = _SpyGateway(create_raises=RuntimeError("network boom"))
+        ledger = _ledger_with_gateway(tmp_path, spy)
+        pid = _authorized_payment(ledger)
+
+        result = ledger.process_payment(pid)
+
+        assert result['success'] is False
+        assert result['error'] == 'network boom'
+        assert spy.capture_calls == 0
+        payment = ledger.get_payment(pid)
+        assert payment.status == PaymentStatus.FAILED
+        assert 'network boom' in (payment.error_message or '')
+
+    def test_failed_status_persisted_to_disk(self, tmp_path):
+        # The degrade path must survive a reload — a fresh ledger reading the
+        # same file must see FAILED, proving save_ledger ran on the failure path.
+        spy = _SpyGateway(create_raises=RuntimeError("boom"))
+        ledger_path = str(tmp_path / "persist_fail.json")
+        ledger = PaymentLedger(ledger_path=ledger_path)
+        ledger.gateways[PaymentGateway.MOCK] = spy
+        pid = _authorized_payment(ledger)
+        ledger.process_payment(pid)
+
+        reloaded = PaymentLedger(ledger_path=ledger_path)
+        assert reloaded.get_payment(pid).status == PaymentStatus.FAILED
+
+
+# =============================================================================
+# PhonePePaymentGateway.verify_callback() — S2S webhook signature verification.
+#
+# This is the trust boundary between the public internet and money settling in
+# the ledger.  PhonePe posts `{"response": "<base64>"}` with an
+# `X-VERIFY: sha256(base64_response + salt_key) + "###" + salt_index` header;
+# HARTOS must accept ONLY a callback whose header matches the digest computed
+# with the merchant's own secret salt.  A weakened digest/salt-index compare, or
+# a removed not-connected/empty-salt fail-closed guard, would let a forged or
+# tampered "PAYMENT_SUCCESS" callback verify and settle silently (revenue loss +
+# fraudulent tier grants).
+#
+# Every test below drives the REAL PhonePePaymentGateway.verify_callback and
+# asserts observable behaviour.  The only "boundary" touched is hmac.compare_digest
+# (patched in exactly one test to prove a constant-time compare is used, not `==`).
+# No network is involved — verify_callback is pure crypto over its two arguments.
+# =============================================================================
+
+_SALT_KEY = "s3cr3t_merchant_salt"
+_SALT_INDEX = "1"
+
+# A realistic PhonePe S2S "payment succeeded" body, base64-encoded exactly as it
+# arrives on the wire inside {"response": <this>}.
+_SUCCESS_B64 = base64.b64encode(json.dumps({
+    "success": True,
+    "code": "PAYMENT_SUCCESS",
+    "message": "Your payment is successful.",
+    "data": {
+        "merchantId": "MERCHANT_X",
+        "merchantTransactionId": "hartos_abc123",
+        "amount": 90000,
+        "state": "COMPLETED",
+    },
+}).encode("utf-8")).decode("utf-8")
+
+
+def _connected_phonepe(merchant_id="MERCHANT_X", salt_key=_SALT_KEY,
+                       salt_index=_SALT_INDEX, env="UAT"):
+    """A PhonePe gateway with explicit creds (env-independent) and connected."""
+    g = PhonePePaymentGateway(merchant_id=merchant_id, salt_key=salt_key,
+                              salt_index=salt_index, env=env)
+    assert g.connect() is True
+    assert g.connected is True
+    return g
+
+
+def _valid_header(b64_payload, salt_key=_SALT_KEY, salt_index=_SALT_INDEX):
+    """Compute the X-VERIFY header PhonePe would send for this payload+salt."""
+    digest = hashlib.sha256((b64_payload + salt_key).encode("utf-8")).hexdigest()
+    return f"{digest}###{salt_index}"
+
+
+class TestPhonePeVerifyCallbackAccepts:
+    """A genuine, correctly-signed callback must verify."""
+
+    def test_valid_signature_verifies(self):
+        g = _connected_phonepe()
+        header = _valid_header(_SUCCESS_B64)
+        assert g.verify_callback(_SUCCESS_B64, header) is True
+
+    def test_valid_with_non_default_salt_index(self):
+        # Merchant configured salt_index='2'; a header signed with ###2 must pass.
+        g = _connected_phonepe(salt_index="2")
+        header = _valid_header(_SUCCESS_B64, salt_index="2")
+        assert g.verify_callback(_SUCCESS_B64, header) is True
+
+
+class TestPhonePeVerifyCallbackRejectsForgery:
+    """The security core: reject anything not signed with the merchant secret."""
+
+    def test_forged_success_wrong_salt_key_rejected(self):
+        # Attacker crafts a PAYMENT_SUCCESS body and signs it — but does not know
+        # the merchant salt.  The signature must NOT verify.
+        g = _connected_phonepe()
+        forged_header = _valid_header(_SUCCESS_B64, salt_key="attacker_guess")
+        assert g.verify_callback(_SUCCESS_B64, forged_header) is False
+
+    def test_tampered_payload_with_stale_signature_rejected(self):
+        # Attacker captures a valid (b64, header) pair for a benign body, then
+        # swaps in a forged "success" body while replaying the old header.
+        benign_b64 = base64.b64encode(json.dumps({
+            "success": True, "code": "PAYMENT_PENDING",
+            "data": {"amount": 1},
+        }).encode("utf-8")).decode("utf-8")
+        g = _connected_phonepe()
+        stale_header = _valid_header(benign_b64)          # valid for benign body
+        assert g.verify_callback(_SUCCESS_B64, stale_header) is False  # not the success body
+
+    def test_wrong_salt_index_rejected_even_with_right_digest(self):
+        # Digest is correct, but the appended salt index does not match the
+        # merchant's configured index -> the salt-index compare must reject.
+        g = _connected_phonepe(salt_index="1")
+        digest = hashlib.sha256((_SUCCESS_B64 + _SALT_KEY).encode("utf-8")).hexdigest()
+        wrong_index_header = f"{digest}###9"
+        assert g.verify_callback(_SUCCESS_B64, wrong_index_header) is False
+
+    def test_bare_digest_without_index_rejected(self):
+        # A header that is just the digest (no "###index" suffix) must not pass —
+        # guards against a prefix/substring style weakened compare.
+        g = _connected_phonepe()
+        digest = hashlib.sha256((_SUCCESS_B64 + _SALT_KEY).encode("utf-8")).hexdigest()
+        assert g.verify_callback(_SUCCESS_B64, digest) is False
+
+    def test_salt_key_of_a_different_merchant_rejected(self):
+        # Signature valid for merchant A's salt must be rejected by merchant B's
+        # gateway — proves the digest actually binds to this gateway's secret.
+        gw_b = _connected_phonepe(salt_key="merchant_B_salt")
+        header_for_a = _valid_header(_SUCCESS_B64, salt_key=_SALT_KEY)
+        assert gw_b.verify_callback(_SUCCESS_B64, header_for_a) is False
+
+
+class TestPhonePeVerifyCallbackFailsClosed:
+    """Degrade / empty / malformed inputs must fail closed (return False)."""
+
+    def test_not_connected_rejects_forgery_signed_with_empty_salt(self, monkeypatch):
+        # THE critical fail-closed guard: with no credentials the gateway is
+        # disconnected and holds an EMPTY salt.  If the `not self.connected`
+        # guard were removed, an attacker could forge a valid signature using
+        # the empty key (no secret needed) and settle a fake payment.
+        for k in ("PHONEPE_MERCHANT_ID", "PHONEPE_SALT_KEY",
+                  "PHONEPE_SALT_INDEX", "PHONEPE_ENV"):
+            monkeypatch.delenv(k, raising=False)
+        g = PhonePePaymentGateway()
+        assert g.connect() is False
+        assert g.connected is False
+        assert g.api_key == ""  # no secret to protect the boundary
+        # Forge exactly what the gateway itself would compute with its empty key.
+        forged_header = _valid_header(_SUCCESS_B64, salt_key=g.api_key,
+                                      salt_index=g.salt_index)
+        assert g.verify_callback(_SUCCESS_B64, forged_header) is False
+
+    def test_none_and_empty_inputs_rejected(self):
+        g = _connected_phonepe()
+        assert g.verify_callback(None, "sig###1") is False
+        assert g.verify_callback(_SUCCESS_B64, None) is False
+        assert g.verify_callback("", "sig###1") is False
+        assert g.verify_callback(_SUCCESS_B64, "") is False
+        assert g.verify_callback("", "") is False
+        assert g.verify_callback(None, None) is False
+
+    def test_garbage_header_rejected(self):
+        g = _connected_phonepe()
+        assert g.verify_callback(_SUCCESS_B64, "not-a-signature") is False
+        assert g.verify_callback(_SUCCESS_B64, "###1") is False
+        assert g.verify_callback(_SUCCESS_B64, "deadbeef###1###extra") is False
+
+    def test_non_ascii_header_does_not_raise_and_rejects(self):
+        # hmac.compare_digest raises TypeError on non-ASCII str comparison; the
+        # method must catch it and fail closed, never propagate an exception out
+        # onto the webhook handler (which would 500 or, worse, be mishandled).
+        g = _connected_phonepe()
+        result = g.verify_callback(_SUCCESS_B64, "café_signature###1")
+        assert result is False
+
+
+class TestPhonePeVerifyCallbackContract:
+    """Lock in the exact crypto contract so a silent weakening is caught."""
+
+    def test_uses_constant_time_compare(self, monkeypatch):
+        # Prove the method routes through hmac.compare_digest (constant-time),
+        # not a naive `==`, which would leak the digest byte-by-byte via timing.
+        calls = []
+        real = hmac.compare_digest
+
+        def _spy(a, b):
+            calls.append((a, b))
+            return real(a, b)
+
+        monkeypatch.setattr(hmac, "compare_digest", _spy)
+        g = _connected_phonepe()
+        header = _valid_header(_SUCCESS_B64)
+        assert g.verify_callback(_SUCCESS_B64, header) is True
+        assert len(calls) == 1, "verify_callback must use hmac.compare_digest exactly once"
+        # It compared the fully-assembled expected header (digest###index), not
+        # just the bare digest — so the salt index is inside the constant-time compare.
+        expected_header, _received = calls[0]
+        assert expected_header == header
+        assert expected_header.endswith(f"###{_SALT_INDEX}")
+
+    def test_digest_binds_base64_payload_exactly(self):
+        # One trailing byte of difference in the payload must invalidate the
+        # signature — the digest covers the exact base64 string, no normalisation.
+        g = _connected_phonepe()
+        header = _valid_header(_SUCCESS_B64)
+        assert g.verify_callback(_SUCCESS_B64 + "=", header) is False
+
+    def test_replay_of_identical_valid_callback_still_verifies(self):
+        # HONEST CONTRACT: verify_callback authenticates the SIGNATURE only; it is
+        # not a freshness/replay oracle.  A byte-identical genuine callback verifies
+        # every time.  Replay defense lives upstream in the ledger's idempotent
+        # settlement keyed on merchantTransactionId (see process_payment replay
+        # guard tests above), NOT in this signature check.  This test documents
+        # that boundary so nobody mistakes signature validity for replay safety.
+        g = _connected_phonepe()
+        header = _valid_header(_SUCCESS_B64)
+        assert g.verify_callback(_SUCCESS_B64, header) is True
+        assert g.verify_callback(_SUCCESS_B64, header) is True
 
 
 def run_all_tests():

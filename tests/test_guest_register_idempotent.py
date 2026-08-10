@@ -136,6 +136,37 @@ def test_recovery_code_not_reissued_on_idempotent(flask_app):
     assert not code2, "Idempotent return must not issue new recovery code"
 
 
+def test_fresh_guest_signup_attributes_channel(flask_app, tmp_path):
+    """A fresh guest register carrying a channel referral_code records ONE
+    'signup' event against that channel (this is what feeds the
+    /marketing/growth 'toward-100/10K' funnel), and the idempotent device
+    re-register does NOT double-count it — a returning guest is not a new
+    organic user."""
+    import json
+    device = str(uuid.uuid4())
+    jsonl = os.path.join(str(tmp_path), 'marketing_clicks.jsonl')
+
+    def _signup_rows():
+        if not os.path.exists(jsonl):
+            return []
+        rows = [json.loads(l) for l in open(jsonl, encoding='utf-8').read().splitlines() if l.strip()]
+        return [x for x in rows if x.get('event') == 'signup' and x.get('code') == 'li_a']
+
+    with patch('core.platform_paths.get_data_dir', return_value=str(tmp_path)):
+        r1 = flask_app.post('/api/social/auth/guest-register',
+                            json={'guest_name': 'Sathish', 'device_id': device,
+                                  'referral_code': 'li_a'})
+        assert r1.status_code == 201, r1.get_json()
+        assert len(_signup_rows()) == 1, "fresh guest signup must record one channel signup"
+
+        # Idempotent re-register (same device) must NOT add a second signup.
+        r2 = flask_app.post('/api/social/auth/guest-register',
+                            json={'guest_name': 'Sathish', 'device_id': device,
+                                  'referral_code': 'li_a'})
+        assert r2.status_code == 200  # idempotent
+        assert len(_signup_rows()) == 1, "idempotent re-register must not double-count signup"
+
+
 def test_fresh_jwt_on_idempotent_return(flask_app):
     """The whole POINT of the 2026-04-15 fix: even when returning an
     existing user, issue a fresh JWT so client can resume with a

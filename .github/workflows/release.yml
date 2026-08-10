@@ -307,17 +307,12 @@ jobs:
       # (closure done in 30 min) and STILL hit the 5h wall. This is the
       # GitHub-documented KVM enable recipe (same one Android-emulator jobs
       # use); with -enable-kvm the image step is minutes, not hours.
-      # raw-desktop now builds via systemd-repart (no qemu VM) -> it needs neither
-      # KVM nor a disabled sandbox. This step stays only for the still-generators
-      # raw-server / raw-edge (not in the CI matrix today, kept correct for later).
-      - name: Enable KVM for the image-assembly VM (raw only, non-repart)
-        if: startsWith(matrix.target, 'raw-') && matrix.target != 'raw-desktop'
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          ls -l /dev/kvm
+      # DELETED (2026-08-08): the "Enable KVM (raw only, non-repart)" step.
+      # EVERY raw-* target now builds via systemd-repart (mkImage routes all
+      # raw-efi through mkRepartImage since server/edge gained the
+      # hartImageKind guard), so no raw leg runs make-disk-image's qemu VM and
+      # none needs /dev/kvm. The recipe above stays documented in case a
+      # future format genuinely needs a build-time VM.
 
       - uses: DeterminateSystems/nix-installer-action@v12
         with:
@@ -341,18 +336,13 @@ jobs:
       # the build aborts, and `nix build` fails. cache.nixos.org is
       # CDN-backed and has no such quota, so we rely on it exclusively.
 
-      # raw-* only, AFTER the installer: turn the sandbox off at the DAEMON
-      # level. The client-side `--option sandbox false` (attempt 5) is a
-      # RESTRICTED setting -- nix silently ignores it from a non-trusted user,
-      # so the image VM stayed sandboxed away from /dev/kvm and ground on TCG.
-      # A daemon-level nix.conf line cannot be ignored. Applied only on raw
-      # legs; ISO legs keep the sandbox.
-      - name: Disable nix sandbox daemon-wide (raw only, non-repart)
-        if: startsWith(matrix.target, 'raw-') && matrix.target != 'raw-desktop'
-        run: |
-          echo 'sandbox = false' | sudo tee -a /etc/nix/nix.conf
-          sudo systemctl restart nix-daemon || sudo systemctl restart determinate-nixd || true
-          nix config show 2>/dev/null | grep -E '^sandbox' || nix show-config 2>/dev/null | grep -E '^sandbox'
+      # DELETED (2026-08-08): the "Disable nix sandbox daemon-wide (raw only,
+      # non-repart)" step. Repart builds run INSIDE the sandbox by design
+      # (fakeroot systemd-repart, no loop device, no /dev/kvm), and all raw-*
+      # targets are repart now — so every leg keeps the sandbox. The hard-won
+      # lesson stays on record: client-side `--option sandbox false` is a
+      # RESTRICTED setting nix silently ignores from a non-trusted user; only
+      # a daemon-level nix.conf line works, should a future format need it.
 
       - name: Free disk space (aggressive)
         run: |
@@ -998,15 +988,49 @@ jobs:
           fi
           echo "Verified all ${#LOCAL_FILES[@]} artifact(s) present on '$TAG'."
 
-          echo "=== Publishing as latest (immutable after publish) ==="
-          gh release edit "$TAG" --repo "$REPO" --draft=false --latest=true --prerelease=false
+          # --- DESKTOP-PRESENCE gate for the LATEST pointer ---------------
+          # Observed 2026-08-08: two consecutive nightlies published with NO
+          # desktop artifacts at all (neither the ISO nor the raw image —
+          # their legs had failed; edge/server ISOs uploaded fine), and the
+          # newer one took --latest. Anyone clicking "Latest" — including the
+          # Nunba docs download button, which resolves /releases/latest —
+          # got a nightly with no desktop OS in it. The desktop is the
+          # product; edge/server are companions. So: a nightly without a
+          # desktop ISO still PUBLISHES (edge/server artifacts are real and
+          # the raw/desktop legs must never block them — that contract
+          # stands) but it is marked partial and NEVER takes the latest
+          # pointer, which keeps /releases/latest on the newest COMPLETE
+          # nightly.
+          HAS_DESKTOP=false
+          for f in "${LOCAL_FILES[@]}"; do
+            case "$(basename "$f")" in
+              hart-os-*-desktop-*.iso|hart-os-*-desktop-*.iso.part-00) HAS_DESKTOP=true ;;
+            esac
+          done
+
+          if [[ "$HAS_DESKTOP" == "true" ]]; then
+            echo "=== Publishing as latest (immutable after publish) ==="
+            gh release edit "$TAG" --repo "$REPO" --draft=false --latest=true --prerelease=false
+          else
+            echo "=== PARTIAL nightly (no desktop ISO) — publishing WITHOUT the latest pointer ==="
+            gh release edit "$TAG" --repo "$REPO" --draft=false --latest=false --prerelease=true \
+              --title "HART OS nightly ${SHORT_SHA} (partial: no desktop)"
+            echo "::warning title=Partial nightly::${TAG} has no desktop ISO; /releases/latest keeps pointing at the previous complete nightly"
+          fi
 
           echo "=== Pruning old nightly-* releases (keep newest 3) ==="
+          # Never prune the release the LATEST pointer resolves to. Partial
+          # nightlies (no desktop, published above without --latest) count
+          # against the newest-3 window, so a few partials in a row would
+          # otherwise age out the newest COMPLETE nightly — and with it the
+          # very release /releases/latest (and the docs download button)
+          # points at.
+          LATEST_TAG="$(gh api "repos/${REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
           gh api "repos/${REPO}/releases" --paginate \
             --jq '.[] | select(.tag_name | startswith("nightly-")) | {tag:.tag_name, created:.created_at}' \
             | jq -s 'sort_by(.created) | reverse | .[3:] | .[].tag' -r \
             | while read -r OLD_TAG; do
-              [[ -n "$OLD_TAG" && "$OLD_TAG" != "$TAG" ]] && {
+              [[ -n "$OLD_TAG" && "$OLD_TAG" != "$TAG" && "$OLD_TAG" != "$LATEST_TAG" ]] && {
                 echo "  pruning $OLD_TAG"
                 gh release delete "$OLD_TAG" --repo "$REPO" --yes --cleanup-tag 2>/dev/null || true
               }

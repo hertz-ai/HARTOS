@@ -76,6 +76,18 @@ def make_app():
         def prompts():
             return jsonify({'ok': True})
 
+        @app.route('/api/admin/reset', methods=['GET', 'POST'])
+        def admin_reset():
+            # Expose the auth provenance the middleware stamps on `g` so
+            # tests can assert the JWT branch actually ran (not just that
+            # the request was let through).
+            from flask import g
+            return jsonify({
+                'ok': True,
+                'auth_source': getattr(g, 'auth_source', None),
+                'jwt_payload': getattr(g, 'jwt_payload', None),
+            })
+
         return app.test_client(), app
     yield _make
 
@@ -481,3 +493,203 @@ class TestFullMiddlewareStack:
         resp = client.get('/status', headers={'Origin': 'https://hart.ai'})
         assert resp.headers.get('Access-Control-Allow-Origin') == 'https://hart.ai'
         assert resp.headers.get('X-Frame-Options') == 'DENY'
+
+
+# ── Admin Gate ───────────────────────────────────────────────────
+#
+# /api/admin/* modifies persistent state, so it ALWAYS requires auth on
+# every tier (flat / regional / central) — the tier model only relaxes
+# the *user-facing* API. The only bypass is bundled desktop
+# (NUNBA_BUNDLED), which is in-process single-user with no network
+# exposure. Before this class there was no /api/admin route in the
+# fixture and therefore NO test that admin auth is enforced — a
+# regression that dropped the admin gate would have shipped green.
+
+class TestAdminGate:
+    """Test that /api/admin/* is auth-gated regardless of node tier."""
+
+    def test_admin_no_key_flat_tier_still_gated(self, make_app):
+        """The core invariant: even flat/LAN-trusted tier with NO
+        HEVOLVE_API_KEY configured must reject an unauthenticated admin
+        request. LAN trust is explicitly not enough for admin ops."""
+        client, _ = make_app({'HEVOLVE_API_KEY': ''})  # flat is the default tier
+        resp = client.get('/api/admin/reset')
+        assert resp.status_code == 401, (
+            'admin ops mutate persistent state; a no-key flat node must '
+            'still refuse an unauthenticated admin request')
+        assert 'Bearer' in resp.get_json().get('error', '')
+
+    def test_admin_no_key_regional_tier_still_gated(self, make_app):
+        """Regional tier relaxes /chat (LAN-trusted) but NOT admin."""
+        client, _ = make_app({
+            'HEVOLVE_API_KEY': '',
+            'HEVOLVE_NODE_TIER': 'regional',
+        })
+        resp = client.get('/api/admin/reset')
+        assert resp.status_code == 401
+
+    def test_admin_no_key_central_tier_gated(self, make_app):
+        client, _ = make_app({
+            'HEVOLVE_API_KEY': '',
+            'HEVOLVE_NODE_TIER': 'central',
+        })
+        resp = client.get('/api/admin/reset')
+        assert resp.status_code == 401
+
+    def test_admin_gate_precedes_routing(self, make_app):
+        """A bare /api/admin (no matching view) must 401, not 404 —
+        proving the gate runs in before_request, ahead of the router,
+        so no admin subpath can slip through by simply not existing."""
+        client, _ = make_app({'HEVOLVE_API_KEY': ''})
+        resp = client.get('/api/admin')
+        assert resp.status_code == 401
+
+    def test_admin_valid_api_key_passes(self, make_app):
+        client, _ = make_app({'HEVOLVE_API_KEY': 'admin-secret-42'})
+        resp = client.get('/api/admin/reset',
+                          headers={'X-API-Key': 'admin-secret-42'})
+        assert resp.status_code == 200
+        assert resp.get_json().get('ok') is True
+
+    def test_admin_wrong_api_key_no_bearer_returns_401(self, make_app):
+        client, _ = make_app({'HEVOLVE_API_KEY': 'admin-secret-42'})
+        resp = client.get('/api/admin/reset',
+                          headers={'X-API-Key': 'nope'})
+        assert resp.status_code == 401
+
+    def test_admin_nunba_bundled_bypasses_gate(self, make_app):
+        """Bundled desktop is the single documented exception."""
+        client, _ = make_app({
+            'HEVOLVE_API_KEY': 'admin-secret-42',
+            'NUNBA_BUNDLED': '1',
+        })
+        resp = client.get('/api/admin/reset')
+        assert resp.status_code == 200
+
+    def test_admin_prefix_lookalike_not_gated(self, make_app):
+        """`/api/administrators` shares a string prefix with `/api/admin`
+        but is a DIFFERENT path segment — it must NOT be swept into the
+        admin gate. With no matching route it should 404 (public,
+        gate passes → router), never 401 (wrongly gated). Locks the
+        exact-segment matching in _path_matches_any."""
+        client, _ = make_app({'HEVOLVE_API_KEY': ''})
+        resp = client.get('/api/administrators')
+        assert resp.status_code == 404, (
+            'segment-precise matching regressed: a lookalike path is being '
+            'treated as an admin path')
+
+
+# ── Bearer JWT Verification ──────────────────────────────────────
+#
+# The admin/network gates accept a Bearer token ONLY after decode_jwt()
+# actually verifies it — a prefix-only "startswith('Bearer ')" check
+# would let `Bearer garbage` walk straight through the admin gate. These
+# tests pin that decode_jwt is genuinely invoked and its verdict honored,
+# in both the mocked (deterministic) and real end-to-end forms.
+
+class TestBearerJWTVerification:
+    """Test the Bearer-JWT branch of the admin/network auth gate."""
+
+    def test_valid_jwt_passes_admin_gate_and_stamps_g(self, make_app):
+        client, _ = make_app({'HEVOLVE_API_KEY': ''})
+        fake_payload = {'user_id': 7, 'scope': 'local'}
+        with patch('integrations.social.auth.decode_jwt',
+                   return_value=fake_payload) as mock_decode:
+            resp = client.post('/api/admin/reset',
+                               headers={'Authorization': 'Bearer good.jwt.token'})
+        assert resp.status_code == 200
+        # Proves the decode path ran on the EXACT token (not a prefix check).
+        mock_decode.assert_called_once_with('good.jwt.token')
+        body = resp.get_json()
+        assert body.get('auth_source') == 'jwt'
+        assert body.get('jwt_payload') == fake_payload
+
+    def test_garbage_bearer_rejected_on_admin_gate(self, make_app):
+        """THE regression guard: decode_jwt returns {} for a bad token,
+        and the gate must 401. If someone reverts to a prefix-only Bearer
+        check, decode_jwt would not be consulted and this would 200."""
+        client, _ = make_app({'HEVOLVE_API_KEY': ''})
+        with patch('integrations.social.auth.decode_jwt',
+                   return_value={}) as mock_decode:
+            resp = client.post('/api/admin/reset',
+                               headers={'Authorization': 'Bearer garbage'})
+        assert resp.status_code == 401
+        mock_decode.assert_called_once_with('garbage')
+        assert 'Invalid or expired' in resp.get_json().get('error', '')
+
+    def test_decode_jwt_raising_is_treated_as_invalid(self, make_app):
+        """A crashing decoder must fail closed (401), never fail open."""
+        client, _ = make_app({'HEVOLVE_API_KEY': ''})
+        with patch('integrations.social.auth.decode_jwt',
+                   side_effect=RuntimeError('boom')):
+            resp = client.post('/api/admin/reset',
+                               headers={'Authorization': 'Bearer x.y.z'})
+        assert resp.status_code == 401
+
+    def test_empty_bearer_token_rejected(self, make_app):
+        """`Authorization: Bearer ` (empty token) must not pass."""
+        client, _ = make_app({'HEVOLVE_API_KEY': ''})
+        with patch('integrations.social.auth.decode_jwt',
+                   return_value={}) as mock_decode:
+            resp = client.post('/api/admin/reset',
+                               headers={'Authorization': 'Bearer '})
+        assert resp.status_code == 401
+        # The empty string after "Bearer " is what gets handed to the decoder.
+        mock_decode.assert_called_once_with('')
+
+    def test_real_decode_jwt_rejects_garbage_end_to_end(self, make_app):
+        """No mock: the REAL decode_jwt chain must reject a bogus token on
+        the admin gate. Exercises the actual import + call the middleware
+        performs, so the mocked tests can't drift from reality."""
+        client, _ = make_app({'HEVOLVE_API_KEY': ''})
+        resp = client.post('/api/admin/reset',
+                           headers={'Authorization': 'Bearer not.a.real.jwt'})
+        assert resp.status_code == 401
+
+    def test_api_key_deploy_still_accepts_valid_jwt(self, make_app):
+        """When HEVOLVE_API_KEY is set, a request with NO X-API-Key but a
+        valid Bearer JWT still authenticates (admin UI / k8s probe case)."""
+        client, _ = make_app({'HEVOLVE_API_KEY': 'admin-secret-42'})
+        with patch('integrations.social.auth.decode_jwt',
+                   return_value={'user_id': 1}):
+            resp = client.get('/api/admin/reset',
+                              headers={'Authorization': 'Bearer valid.token'})
+        assert resp.status_code == 200
+        assert resp.get_json().get('auth_source') == 'jwt'
+
+    def test_wrong_api_key_but_valid_jwt_falls_through_to_pass(self, make_app):
+        """A wrong X-API-Key must not veto an otherwise-valid Bearer JWT —
+        the gate falls through from the key check to the JWT check."""
+        client, _ = make_app({'HEVOLVE_API_KEY': 'admin-secret-42'})
+        with patch('integrations.social.auth.decode_jwt',
+                   return_value={'user_id': 1}):
+            resp = client.get('/api/admin/reset',
+                              headers={'X-API-Key': 'wrong',
+                                       'Authorization': 'Bearer valid.token'})
+        assert resp.status_code == 200
+
+    def test_network_gate_central_tier_valid_jwt_passes(self, make_app):
+        """The same decode path guards the user-facing network gate on
+        central tier."""
+        client, _ = make_app({
+            'HEVOLVE_API_KEY': '',
+            'HEVOLVE_NODE_TIER': 'central',
+        })
+        with patch('integrations.social.auth.decode_jwt',
+                   return_value={'user_id': 3}) as mock_decode:
+            resp = client.post('/chat',
+                               json={'prompt': 'hi'},
+                               headers={'Authorization': 'Bearer good.token'})
+        assert resp.status_code == 200
+        mock_decode.assert_called_once_with('good.token')
+
+    def test_network_gate_central_tier_garbage_jwt_rejected(self, make_app):
+        client, _ = make_app({
+            'HEVOLVE_API_KEY': '',
+            'HEVOLVE_NODE_TIER': 'central',
+        })
+        with patch('integrations.social.auth.decode_jwt', return_value={}):
+            resp = client.post('/chat',
+                               json={'prompt': 'hi'},
+                               headers={'Authorization': 'Bearer garbage'})
+        assert resp.status_code == 401

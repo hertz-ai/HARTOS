@@ -50,7 +50,7 @@ class TestVRAMBudgetCheckFunctional:
         mgr._models['main'] = _make_model_state('main', vram_gb=4.5, pinned=True)
 
         mock_vm = MagicMock()
-        mock_vm.total_vram_gb = 4.0
+        mock_vm.get_total_vram.return_value = 4.0
 
         with patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._sync_from_rtm'), \
              patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._detect_tier'), \
@@ -74,7 +74,7 @@ class TestVRAMBudgetCheckFunctional:
         mgr._models['tts'] = _make_model_state('tts', vram_gb=0.5, pinned=False)
 
         mock_vm = MagicMock()
-        mock_vm.total_vram_gb = 4.0
+        mock_vm.get_total_vram.return_value = 4.0
 
         with patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._sync_from_rtm'), \
              patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._detect_tier'), \
@@ -96,7 +96,7 @@ class TestVRAMBudgetCheckFunctional:
         mgr._models['main'] = _make_model_state('main', vram_gb=2.0, pinned=False)
 
         mock_vm = MagicMock()
-        mock_vm.total_vram_gb = 8.0  # plenty
+        mock_vm.get_total_vram.return_value = 8.0  # plenty
 
         with patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._sync_from_rtm'), \
              patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._detect_tier'), \
@@ -112,12 +112,12 @@ class TestVRAMBudgetCheckFunctional:
         assert len(vram_related) == 0, f"Unexpected VRAM warnings: {[r.message for r in vram_related]}"
 
     def test_no_gpu_detected_skips_check(self, manager_with_models, caplog):
-        """When total_vram_gb=0 (no GPU), VRAM check is skipped."""
+        """When get_total_vram()=0 (no GPU), VRAM check is skipped."""
         mgr = manager_with_models
         mgr._models['draft'] = _make_model_state('draft', vram_gb=1.5, pinned=True)
 
         mock_vm = MagicMock()
-        mock_vm.total_vram_gb = 0  # No GPU detected
+        mock_vm.get_total_vram.return_value = 0  # No GPU detected
 
         with patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._sync_from_rtm'), \
              patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._detect_tier'), \
@@ -171,7 +171,7 @@ class TestVRAMBudgetCheckFunctional:
         # No models added
 
         mock_vm = MagicMock()
-        mock_vm.total_vram_gb = 4.0
+        mock_vm.get_total_vram.return_value = 4.0
 
         with patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._sync_from_rtm'), \
              patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._detect_tier'), \
@@ -191,7 +191,7 @@ class TestVRAMBudgetCheckFunctional:
         mgr._models['cpu_model'] = _make_model_state('cpu_model', vram_gb=0.0, pinned=True)
 
         mock_vm = MagicMock()
-        mock_vm.total_vram_gb = 4.0
+        mock_vm.get_total_vram.return_value = 4.0
 
         with patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._sync_from_rtm'), \
              patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._detect_tier'), \
@@ -222,9 +222,12 @@ class TestVRAMBudgetCheckNonFunctional:
         """Any exception in VRAM check is caught — start() completes."""
         manager._models['draft'] = _make_model_state('draft', vram_gb=2.0, pinned=True)
 
-        # Force an unexpected exception inside the VRAM check
+        # Force an unexpected exception inside the VRAM check. The code reads
+        # the budget via vm.get_total_vram() (a METHOD — model_lifecycle.py:337,
+        # whose own comment records that total_vram_gb never existed), so the
+        # crash must come from that call, not the dead attribute.
         mock_vm = MagicMock()
-        type(mock_vm).total_vram_gb = PropertyMock(side_effect=RuntimeError("gpu crash"))
+        mock_vm.get_total_vram.side_effect = RuntimeError("gpu crash")
 
         with patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._sync_from_rtm'), \
              patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._detect_tier'), \
@@ -242,7 +245,7 @@ class TestVRAMBudgetCheckNonFunctional:
         manager._models['b'] = _make_model_state('b', vram_gb=3.0, pinned=False)
 
         mock_vm = MagicMock()
-        mock_vm.total_vram_gb = 4.0
+        mock_vm.get_total_vram.return_value = 4.0
 
         with patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._sync_from_rtm'), \
              patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._detect_tier'), \
@@ -263,7 +266,7 @@ class TestVRAMBudgetCheckNonFunctional:
         manager._models['big'] = _make_model_state('big', vram_gb=6.0, pinned=True)
 
         mock_vm = MagicMock()
-        mock_vm.total_vram_gb = 4.0
+        mock_vm.get_total_vram.return_value = 4.0
 
         with patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._sync_from_rtm'), \
              patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._detect_tier'), \
@@ -284,7 +287,7 @@ class TestVRAMBudgetCheckNonFunctional:
         manager._models['big_pinned'] = _make_model_state('big_pinned', vram_gb=6.0, pinned=True)
 
         mock_vm = MagicMock()
-        mock_vm.total_vram_gb = 4.0
+        mock_vm.get_total_vram.return_value = 4.0
 
         with patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._sync_from_rtm'), \
              patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._detect_tier'), \
@@ -303,7 +306,7 @@ class TestVRAMBudgetCheckNonFunctional:
         manager._models['huge'] = _make_model_state('huge', vram_gb=100.0, pinned=True)
 
         mock_vm = MagicMock()
-        mock_vm.total_vram_gb = 1.0  # Absurdly small
+        mock_vm.get_total_vram.return_value = 1.0  # Absurdly small
 
         with patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._sync_from_rtm'), \
              patch('integrations.service_tools.model_lifecycle.ModelLifecycleManager._detect_tier'), \

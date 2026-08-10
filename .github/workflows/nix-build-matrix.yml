@@ -65,6 +65,30 @@ jobs:
             fallback = true
       # NOTE: magic-nix-cache-action intentionally REMOVED — see the build job.
 
+      # Un-brick the gate the post-mortem below already diagnosed but never
+      # fixed: 38 of 65 runs this week ended CANCELLED, SIGTERMed at ~3 min
+      # with 15 GB FREE. Free RAM at death means this was never true kernel
+      # OOM — it is systemd-oomd, Ubuntu 24's userspace killer, acting on a PSI
+      # memory-pressure STALL (a transient allocation/IO spike during eval),
+      # not exhaustion. So the dominant fix is to stop oomd; swap is insurance
+      # against a genuine spike now that its PSI-based killer is gone. Both are
+      # cheap and scoped to this ephemeral runner. Only the Nix jobs die here
+      # (Docker/security jobs on the same runners pass), which is consistent
+      # with eval being the one memory-pressure workload oomd reacts to.
+      - name: Relieve eval memory pressure (stop oomd + add swap)
+        run: |
+          echo "── stop systemd-oomd (kills on PSI stall despite free RAM) ──"
+          sudo systemctl stop systemd-oomd 2>/dev/null || true
+          sudo systemctl mask systemd-oomd 2>/dev/null || true
+          echo "── add 16 GB swap on /mnt (~70 GB free there on hosted runners) ──"
+          sudo swapoff -a 2>/dev/null || true
+          sudo fallocate -l 16G /mnt/swapfile 2>/dev/null \
+            || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=16384
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          echo "── memory after ──"; free -m
+
       - name: Evaluate all outputs (no build)
         working-directory: nixos
         run: nix flake check --no-build

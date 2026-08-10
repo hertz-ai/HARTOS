@@ -141,3 +141,69 @@ class TestMeasuredHotPaths:
         elapsed_ms = best_of(lambda: [latency_budget(k)
                                       for k in LATENCY_BUDGETS]) * 1000
         assert elapsed_ms < latency_budget("cache_lookup_ms")
+
+    def test_sense_gate_check_is_bounded_never_hangs_the_toast_path(self):
+        """sense_gate_s (0.5s): the cross-process ai_sensing authority check that
+        gates the toast/notification path must never HANG it. query_authority
+        FAIL-CLOSES (returns False) when the authority socket is unreachable, and
+        it must do so WITHIN budget — a blocking gate would stall every
+        notification behind it. Bounded on every platform: where AF_UNIX is
+        absent (Windows) the capability guard returns instantly; where present
+        (Linux/CI) connecting to an absent socket path fails fast (ENOENT/
+        ECONNREFUSED, not a timeout wait). Closes the gap where sense_gate_s was
+        defined in LATENCY_BUDGETS but asserted NOWHERE (2026-08-10)."""
+        from core.ai_sensing import query_authority
+        budget = latency_budget("sense_gate_s")
+        elapsed = best_of(lambda: query_authority(
+            "screen", path="/nonexistent/hart-ai-sensing.sock", timeout=budget))
+        assert elapsed < budget, (
+            f"query_authority fail-closed took {elapsed:.3f}s, budget {budget}s "
+            f"— a slow sense gate hangs the toast path it guards")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Completeness — every budget must be ENFORCED, not merely defined
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestNoOrphanBudget:
+    """The file's whole thesis is 'budgets are ENFORCED, not just documented.'
+    A budget in LATENCY_BUDGETS that no test asserts is exactly the state this
+    guard forbids — sense_gate_s and status_endpoint_ms were both orphaned that
+    way until 2026-08-10. Source-shape guard by necessity: it asserts a
+    cross-FILE property (every key is referenced by SOME enforcing test) that no
+    single behavioural test can see."""
+
+    def test_every_budget_key_has_an_enforcing_test(self):
+        import os
+        import glob
+        import re as _re
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        # Python enforcement: a test calls latency_budget('<key>').
+        py_refs = set()
+        for f in glob.glob(os.path.join(repo, 'tests', '**', '*.py'),
+                           recursive=True):
+            try:
+                with open(f, encoding='utf-8', errors='ignore') as fh:
+                    py_refs |= set(_re.findall(
+                        r"latency_budget\(\s*['\"]([a-z0-9_]+)['\"]", fh.read()))
+            except OSError:
+                continue
+        # VM enforcement: boot-latency.nix pulls a key from the ONE canonical
+        # table via budgetOf "<key>" (readFile + regex), so it enforces the same
+        # numbers on a real booted node — a mechanism this python guard would
+        # otherwise not see.
+        vm_refs = set()
+        vm = os.path.join(repo, 'nixos', 'tests', 'boot-latency.nix')
+        try:
+            with open(vm, encoding='utf-8', errors='ignore') as fh:
+                vm_refs = set(_re.findall(r'budgetOf\s+"([a-z0-9_]+)"', fh.read()))
+        except OSError:
+            pass
+        orphaned = sorted(set(LATENCY_BUDGETS) - (py_refs | vm_refs))
+        assert not orphaned, (
+            f"budgets defined in LATENCY_BUDGETS but enforced by NO test: "
+            f"{orphaned}. Every budget must be asserted somewhere — a python "
+            f"test via latency_budget('key'), or boot-latency.nix via "
+            f'budgetOf "key". A documented-but-unenforced budget is precisely '
+            f"what this file exists to forbid.")

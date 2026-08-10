@@ -684,5 +684,226 @@ class TestWebAdapterIntegration:
         assert result.raw["delivered"] is True
 
 
+def _ws_binary_frame(file_name=None, file_data=b"payload-bytes", *, metadata=None):
+    """Build a WebSocket binary upload frame the way a browser client would.
+
+    Wire format consumed by ``_handle_ws_binary``:
+        [4-byte big-endian metadata length][metadata JSON][raw file bytes]
+    """
+    if metadata is None:
+        metadata = {} if file_name is None else {"file_name": file_name}
+    meta_bytes = json.dumps(metadata).encode()
+    return len(meta_bytes).to_bytes(4, "big") + meta_bytes + file_data
+
+
+class TestWebAdapterBinaryUpload:
+    """Behavioural tests for ``_handle_ws_binary`` (WebSocket file uploads).
+
+    Exercises the REAL adapter method against a REAL temp upload directory,
+    mocking only the WebSocket boundary so we can capture the confirmation /
+    error frames the adapter emits. Focus: the path-traversal escape and the
+    malformed-frame degrade paths the happy-path suite never touched.
+    """
+
+    def _make_adapter(self, tmp_path):
+        import integrations.channels.web_adapter as wa
+
+        if not wa.HAS_AIOHTTP:
+            pytest.skip("aiohttp not installed; WebAdapter cannot be constructed")
+
+        upload_dir = tmp_path / "uploads"
+        config = ChannelConfig(extra={"port": 8765, "upload_dir": str(upload_dir)})
+        adapter = wa.WebAdapter(config)
+        # connect() would create this; we don't start a server in unit tests.
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        return adapter
+
+    def _connected_session(self, adapter, sid="sess-bin", uid="user-bin"):
+        """Register a session with a mock websocket so we can capture frames."""
+        from integrations.channels.web_adapter import WebSession
+
+        session = WebSession(session_id=sid, user_id=uid)
+        ws = MagicMock()
+        ws.send_json = AsyncMock()
+        session.websockets.add(ws)
+        adapter._sessions[sid] = session
+        return session, ws
+
+    @staticmethod
+    def _sent_frames(ws):
+        return [call.args[0] for call in ws.send_json.call_args_list]
+
+    @pytest.mark.asyncio
+    async def test_binary_upload_happy_path(self, tmp_path):
+        """A well-formed upload lands inside upload_dir and confirms."""
+        adapter = self._make_adapter(tmp_path)
+        session, ws = self._connected_session(adapter)
+
+        payload = b"%PDF-1.4 fake report bytes"
+        frame = _ws_binary_frame("report.pdf", payload)
+
+        await adapter._handle_ws_binary(session, frame)
+
+        written = list(adapter._upload_dir.glob("*_report.pdf"))
+        assert len(written) == 1, "file should be stored under upload_dir"
+        assert written[0].read_bytes() == payload
+
+        frames = self._sent_frames(ws)
+        assert len(frames) == 1
+        assert frames[0]["type"] == "upload_complete"
+        assert frames[0]["file_name"] == "report.pdf"
+        assert frames[0]["size"] == len(payload)
+
+    @pytest.mark.asyncio
+    async def test_binary_upload_path_traversal_is_contained(self, tmp_path):
+        """SECURITY: a crafted '../' file_name must NOT escape upload_dir.
+
+        Regression guard for the arbitrary-file-write over an unauthenticated
+        WebSocket. On Windows the OS normalises '..' lexically, so the raw
+        ``f"{uuid}_{file_name}"`` join wrote OUTSIDE upload_dir; on POSIX the
+        same name raised ENOENT and stored nothing. Either way the untrusted
+        name must be sanitised to a bare basename kept inside upload_dir.
+        """
+        adapter = self._make_adapter(tmp_path)
+        session, ws = self._connected_session(adapter)
+
+        payload = b"PWNED-CONTENTS"
+        frame = _ws_binary_frame("../../../pwned.txt", payload)
+
+        before = {p for p in tmp_path.rglob("*") if p.is_file()}
+        await adapter._handle_ws_binary(session, frame)
+        after = {p for p in tmp_path.rglob("*") if p.is_file()}
+
+        upload_dir = adapter._upload_dir.resolve()
+        new_files = after - before
+        escaped = [p for p in new_files if not p.resolve().is_relative_to(upload_dir)]
+        assert not escaped, f"upload escaped upload_dir to: {escaped}"
+
+        # Positive side: the payload is stored, sanitised, inside upload_dir.
+        stored = list(adapter._upload_dir.glob("*_pwned.txt"))
+        assert len(stored) == 1, "sanitised file should be kept inside upload_dir"
+        assert stored[0].read_bytes() == payload
+
+    @pytest.mark.asyncio
+    async def test_binary_upload_backslash_traversal_is_contained(self, tmp_path):
+        """SECURITY: Windows-style backslash traversal is sanitised too."""
+        adapter = self._make_adapter(tmp_path)
+        session, ws = self._connected_session(adapter)
+
+        frame = _ws_binary_frame("..\\..\\..\\pwn_bs.txt", b"bs-bytes")
+
+        before = {p for p in tmp_path.rglob("*") if p.is_file()}
+        await adapter._handle_ws_binary(session, frame)
+        after = {p for p in tmp_path.rglob("*") if p.is_file()}
+
+        upload_dir = adapter._upload_dir.resolve()
+        escaped = [p for p in (after - before) if not p.resolve().is_relative_to(upload_dir)]
+        assert not escaped, f"backslash upload escaped upload_dir to: {escaped}"
+
+        stored = list(adapter._upload_dir.glob("*_pwn_bs.txt"))
+        assert len(stored) == 1
+
+    @pytest.mark.asyncio
+    async def test_binary_upload_absolute_path_is_contained(self, tmp_path):
+        """SECURITY: an absolute-looking name stays inside upload_dir."""
+        adapter = self._make_adapter(tmp_path)
+        session, ws = self._connected_session(adapter)
+
+        frame = _ws_binary_frame("/etc/cron.d/evil", b"cronjob")
+
+        before = {p for p in tmp_path.rglob("*") if p.is_file()}
+        await adapter._handle_ws_binary(session, frame)
+        after = {p for p in tmp_path.rglob("*") if p.is_file()}
+
+        upload_dir = adapter._upload_dir.resolve()
+        escaped = [p for p in (after - before) if not p.resolve().is_relative_to(upload_dir)]
+        assert not escaped, f"absolute-path upload escaped upload_dir to: {escaped}"
+
+        # basename 'evil' is what survives sanitisation
+        stored = list(adapter._upload_dir.glob("*_evil"))
+        assert len(stored) == 1
+
+    @pytest.mark.asyncio
+    async def test_binary_upload_missing_file_name_defaults(self, tmp_path):
+        """Metadata with no file_name falls back to the 'upload' default."""
+        adapter = self._make_adapter(tmp_path)
+        session, ws = self._connected_session(adapter)
+
+        frame = _ws_binary_frame(metadata={"unrelated": "x"}, file_data=b"abc")
+
+        await adapter._handle_ws_binary(session, frame)
+
+        stored = list(adapter._upload_dir.glob("*_upload"))
+        assert len(stored) == 1
+        assert stored[0].read_bytes() == b"abc"
+
+    @pytest.mark.asyncio
+    async def test_binary_upload_dotdot_only_name_is_contained(self, tmp_path):
+        """A file_name that is purely '..' must not become a directory ref."""
+        adapter = self._make_adapter(tmp_path)
+        session, ws = self._connected_session(adapter)
+
+        frame = _ws_binary_frame("..", b"xyz")
+
+        before = {p for p in tmp_path.rglob("*") if p.is_file()}
+        await adapter._handle_ws_binary(session, frame)
+        after = {p for p in tmp_path.rglob("*") if p.is_file()}
+
+        upload_dir = adapter._upload_dir.resolve()
+        new_files = after - before
+        escaped = [p for p in new_files if not p.resolve().is_relative_to(upload_dir)]
+        assert not escaped, f"'..' name escaped upload_dir to: {escaped}"
+        # Something was still stored (fell back to a safe default name).
+        assert len(new_files) == 1
+
+    @pytest.mark.asyncio
+    async def test_binary_upload_invalid_json_metadata_degrades(self, tmp_path):
+        """Non-JSON metadata → no crash, upload_error emitted, nothing written."""
+        adapter = self._make_adapter(tmp_path)
+        session, ws = self._connected_session(adapter)
+
+        bad_meta = b"not-json-at-all"
+        frame = len(bad_meta).to_bytes(4, "big") + bad_meta + b"filebytes"
+
+        before = {p for p in tmp_path.rglob("*") if p.is_file()}
+        await adapter._handle_ws_binary(session, frame)  # must not raise
+        after = {p for p in tmp_path.rglob("*") if p.is_file()}
+
+        assert after == before, "malformed frame must not write any file"
+        frames = self._sent_frames(ws)
+        assert frames and frames[-1]["type"] == "upload_error"
+
+    @pytest.mark.asyncio
+    async def test_binary_upload_empty_frame_degrades(self, tmp_path):
+        """An empty binary frame degrades cleanly to upload_error."""
+        adapter = self._make_adapter(tmp_path)
+        session, ws = self._connected_session(adapter)
+
+        before = {p for p in tmp_path.rglob("*") if p.is_file()}
+        await adapter._handle_ws_binary(session, b"")  # must not raise
+        after = {p for p in tmp_path.rglob("*") if p.is_file()}
+
+        assert after == before
+        frames = self._sent_frames(ws)
+        assert frames and frames[-1]["type"] == "upload_error"
+
+    @pytest.mark.asyncio
+    async def test_binary_upload_truncated_metadata_length_degrades(self, tmp_path):
+        """A declared length longer than the buffer degrades to upload_error."""
+        adapter = self._make_adapter(tmp_path)
+        session, ws = self._connected_session(adapter)
+
+        # Claim 9999 bytes of metadata but supply only a few.
+        frame = (9999).to_bytes(4, "big") + b'{"file_name"'  # truncated JSON
+
+        before = {p for p in tmp_path.rglob("*") if p.is_file()}
+        await adapter._handle_ws_binary(session, frame)  # must not raise
+        after = {p for p in tmp_path.rglob("*") if p.is_file()}
+
+        assert after == before
+        frames = self._sent_frames(ws)
+        assert frames and frames[-1]["type"] == "upload_error"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

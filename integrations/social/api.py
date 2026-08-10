@@ -313,7 +313,33 @@ def guest_register():
             device_id=device_id or None,
         )
         db.add(gr)
+
+        # Attribute this FRESH guest signup to the referral channel/inviter,
+        # if the client captured one (useReferral → socialApi.withReferral).
+        # Mirrors /auth/register. Only the genuine-create path reaches here —
+        # the idempotent device re-registration returns earlier — so a
+        # returning guest is never double-counted as a new signup.
+        referral_code = data.get('referral_code', '').strip()
+        if referral_code:
+            try:
+                from .distribution_service import DistributionService
+                DistributionService.use_referral_code(db, str(user.id), referral_code)
+            except Exception as e:
+                logger.debug(f"Guest referral application skipped: {e}")
+
         db.commit()
+
+        if referral_code:
+            # Authoritative channel-attribution via the SAME single-source
+            # writer the click/download/signup events use. Independent session,
+            # so it runs after commit; skips silently for user-invite codes.
+            try:
+                _record_marketing_event(
+                    referral_code, 'signup', 'web',
+                    (request.remote_addr or '').encode(),
+                    (request.headers.get('User-Agent') or '')[:200])
+            except Exception:
+                pass
 
         token = generate_jwt(user.id, user.username, 'guest')
         return _ok({

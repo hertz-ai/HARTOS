@@ -524,33 +524,34 @@
 
     mkRepartImage = args: (mkRepartSystem args).config.system.build.image;
 
-    # Build an image via nixos-generators (for non-ISO formats).
+    # Build an image: systemd-repart owns EVERY raw-efi variant; nixos-generators
+    # owns every OTHER format (qcow/vmware/vbox/docker/cloud/sd). One builder per
+    # format — this is no longer a parallel path.
     #
-    # raw-efi for the DESKTOP now takes the no-VM systemd-repart path (mkRepartImage).
-    # Every other format (qcow/vmware/vbox/docker/cloud/sd) AND the not-yet-migrated
-    # raw-server / raw-edge keep nixos-generators unchanged (no regression) — those
-    # variants import the installation-CD profile + isoImage UNCONDITIONALLY, so
-    # routing them through repart would double-define fileSystems."/"; they migrate
-    # only after gaining desktop.nix's `hartImageKind == "iso"` import guard.
+    # ── THE TEMPORARY PARALLEL PATH IS CLOSED (Gate 4 exit met, 2026-08-08) ────
+    # The 2026-07-27 note here demanded two conditions before deleting the
+    # per-variant special case, and both now hold:
+    #   1. repart raw-desktop BUILT AND BOOTED: built by Nix Build Matrix run
+    #      30336832563 (2026-07-28, commit a870e1d9), flashed 2026-07-30 with a
+    #      full sha256 read-back verify (D:\hart_flash_tmp\hart_flash.log:
+    #      "FULL VERIFY: OK"), booting on the steward's device since.
+    #   2. server.nix + edge.nix now wrap their CD-profile import + isoImage
+    #      block (and, for server, the whole live-medium access story — the
+    #      permissive SSH / baked passwords / ssh-diag that "must NEVER reach
+    #      an installed system") in `lib.optionals (hartImageKind == "iso")`,
+    #      mirroring desktop.nix, so repart can own every raw-* variant.
     #
-    # ── THIS IS A PARALLEL PATH, AND IT IS TEMPORARY (Gate 4) ──────────────────
-    # Two ways to build one thing is exactly the drift this repo fights, so the
-    # exit condition is written down rather than left to memory:
-    #
-    #   DELETE the `else nixos-generators` branch below, and this whole `if`, when
-    #   BOTH hold:
-    #     1. repart raw-desktop has actually BUILT and BOOTED (eval green is not
-    #        enough; it has never been built or booted as of 2026-07-27), and
-    #     2. server.nix + edge.nix wrap their CD-profile import and `isoImage`
-    #        block in `lib.optionals (hartImageKind == "iso")`, mirroring
-    #        desktop.nix:65, so repart can own every raw-* variant.
-    #
-    # Until then the old path stays because it is the only PROVEN one, and the new
-    # one is scoped to the single variant that needs the speed. If (1) fails, the
-    # correct move is to delete mkRepartImage instead and keep generators: one
-    # path either way, never two forever.
+    # The `variant == "desktop"` clause is therefore gone: raw-server and
+    # raw-edge take the same proven no-VM repart path (no KVM, no sandbox-off,
+    # no 5h make-disk-image qemu leg). The generators branch below is NOT the
+    # old parallel path surviving under a new name — it builds formats repart
+    # does not implement (qcow/vmware/vbox/docker/amazon/sd), one artifact
+    # kind per builder. Those installed-disk formats also stop inheriting the
+    # CD profile + live passwords now that the variant guards exist: the
+    # hartImageKind = "raw" signal they always carried finally does what its
+    # comment says.
     mkImage = { system, variant, format, extraModules ? [] }:
-      if format == "raw-efi" && variant == "desktop"
+      if format == "raw-efi"
       then mkRepartImage { inherit system variant extraModules; }
       else nixos-generators.nixosGenerate {
         inherit system format;
@@ -1013,6 +1014,26 @@
       # lets an UNCLAIMED device pass. One node, many devices: a VM job costs
       # ~2h, so per-device nodes would buy the same coverage for 6x the clock.
       driverMatrix = import ./tests/driver-matrix.nix desktopTestArgs;
+      # The STORAGE-CONTROLLER slice driver-matrix.nix's header defers: attach a
+      # real NVMe controller + an ICH9 AHCI (SATA) controller (null-co disks, no
+      # backing file) and assert the kernel BINDS nvme / ahci — the INSTALLED raw
+      # image's primary boot media (internal M.2 / SATA SSD), which virtio-root VM
+      # boots never exercise. The source-shape half (those modules pinned in the
+      # repart initrd) is guarded by test_nixos_configs.py::TestRawImageSinglePath.
+      # Distinct attr name -> clean //; desktop-variant node (mkNode).
+      driverMatrixStorage = import ./tests/driver-matrix-storage.nix desktopTestArgs;
+      # RESIDENT CO-PILOT: the 2026-07-30 flash shipped hart.copilot.enable=true
+      # and the co-pilot did NOTHING — `enable` installs only the launcher, the
+      # bounded worker is a SECOND opt-in (copilot.daemon.enable) nobody had set.
+      # A comment in profiles/desktop.nix now records that, but a comment is not a
+      # gate. There is a quieter twin: the module gates the daemon on
+      # `claudePkg != null` where claudePkg = newPkgs.claude-code or null, so an
+      # upstream attr move DELETES the unit silently with the build still green.
+      # This node is built from the REAL desktop profile and sets no hart.copilot.*
+      # of its own, so it asserts what an IMAGE ships, not what a test opts into.
+      # Honest scope: no OAuth exists in a VM (§5 ships no key), so it asserts the
+      # unit is LOADED + BOUNDED, never ACTIVE. Distinct attr -> clean //.
+      copilotResident = import ./tests/copilot-resident.nix desktopTestArgs;
 
       # ORPHANS ADOPTED 2026-08-04. Both files existed, both defined a real
       # check (hart-app-install-verify, hart-llm-provision), and NEITHER was
@@ -1184,7 +1205,7 @@
       # 'screen' kill-switch is cut OR the authority is down, and ALLOWS when on.
       # Distinct attr -> clean //; desktop-variant node (mkNode).
       notify = import ./tests/notify.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // firmwareBootMatrix // bootLatency // driverMatrix // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify // hartInstaller // appInstallVerify // llmProvision;
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // firmwareBootMatrix // bootLatency // driverMatrix // driverMatrixStorage // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify // hartInstaller // appInstallVerify // llmProvision // copilotResident;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)

@@ -88,7 +88,23 @@ def get_or_create_keypair() -> Tuple[Ed25519PrivateKey, Ed25519PublicKey]:
             logger.info(f"Node keypair loaded from {key_dir}")
             return _private_key, _public_key
         except Exception as e:
-            logger.warning(f"Failed to load keypair, regenerating: {e}")
+            # An EXISTING private key that fails to load/decrypt is almost always
+            # a TRANSIENT problem (HEVOLVE_DATA_KEY missing/wrong, a partial write,
+            # a bad read) — NOT a signal to mint a fresh identity. Silently
+            # regenerating here would (a) rotate the node's peer trust anchor and
+            # (b) overwrite the on-disk key below, destroying identity material
+            # that was very likely recoverable. Fail loudly and leave the file
+            # untouched so a steward can restore the key or supply the right data
+            # key, rather than discovering the node became a stranger to its peers.
+            logger.error(
+                f"Existing node private key at {priv_path} failed to load: {e}. "
+                f"Refusing to regenerate (that would rotate/destroy the node identity)."
+            )
+            raise RuntimeError(
+                f"Node private key exists but could not be loaded: {e}. Refusing to "
+                f"overwrite the existing identity — check HEVOLVE_DATA_KEY or restore "
+                f"{priv_path}."
+            ) from e
 
     # Generate new keypair
     _private_key = Ed25519PrivateKey.generate()

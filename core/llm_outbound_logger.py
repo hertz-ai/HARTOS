@@ -499,10 +499,52 @@ def _trim_to_budget(body: dict) -> tuple:
 
     model = body.get('model') or None
     max_tokens = int(body.get('max_tokens') or body.get('max_completion_tokens') or 2048)
-    budget = _get_budget_per_slot() - max_tokens - WIRE_TRIM_SAFETY_MARGIN_TOKENS
+
+    # ─── The tool schema occupies n_ctx too — count it or the budget is a lie ───
+    # llama-server bills prompt tokens for the SERIALISED TOOL SCHEMA exactly like
+    # message content, but this function only ever walked body['messages'], so the
+    # single largest consumer was invisible to the "zero-tolerance context overflow"
+    # guard. Measured 2026-08-07 over 1,407 real requests: the 29 that carried a
+    # tools block carried 67 tools ≈ 10,713 tokens — 2.6x an entire 4096 window and
+    # 87% of a 12288 one — and ALL 29 overflowed. The guard reported them as fitting.
+    #
+    # CLAUDE.md records why nothing upstream caught it either: autogen attaches
+    # system_message + tools AFTER transform_messages runs, so the frozen_debug
+    # "FULL INPUT MESSAGES DEBUG" dump is a messages-only view. The wire layer is the
+    # ONLY place the tools block is observable before it hits the socket, which makes
+    # counting it here not an optimisation but the whole point of the layer.
+    tools_tokens = 0
+    if body.get('tools'):
+        try:
+            tools_tokens = count_tokens_for_text(
+                json.dumps(body['tools'], ensure_ascii=False), model)
+        except (TypeError, ValueError):
+            # A non-serialisable tools block is not ours to fix, but pretending it
+            # costs zero is how this bug shipped. Charge a conservative estimate
+            # from its repr rather than silently under-counting.
+            logger.warning(
+                "wire-trim: tools block is not JSON-serialisable; charging an "
+                "approximate cost so the budget is not silently overstated")
+            tools_tokens = count_tokens_for_text(repr(body['tools']), model)
+
+    budget = (_get_budget_per_slot() - max_tokens
+              - WIRE_TRIM_SAFETY_MARGIN_TOKENS - tools_tokens)
     if budget <= 0:
-        # max_tokens alone exceeds n_ctx — degrade gracefully so we
-        # still send SOMETHING instead of 500-failing.
+        # max_tokens (and/or the tool schema) alone exceeds n_ctx — degrade
+        # gracefully so we still send SOMETHING instead of 500-failing.
+        #
+        # Say so LOUDLY when the tools block is the cause: trimming messages cannot
+        # recover a schema that does not fit, so a quiet degrade here means the
+        # request goes out over-length and llama-server rejects it anyway. The fix
+        # is to prune the tool list for the persona, and an operator can only know
+        # that if this line names the cost.
+        if tools_tokens and tools_tokens >= _get_budget_per_slot() // 2:
+            logger.error(
+                "wire-trim: the TOOL SCHEMA alone is %d tokens against an n_ctx of "
+                "%d (%d tool(s)) — no amount of message trimming can make this fit. "
+                "Prune the tool list for this agent; the request will be rejected "
+                "as over-length.",
+                tools_tokens, _get_budget_per_slot(), len(body.get('tools') or []))
         budget = max(512, _get_budget_per_slot() // 4)
 
     est_before = count_tokens_for_messages(messages, model)

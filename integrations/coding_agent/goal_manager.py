@@ -17,8 +17,15 @@ class CodingGoalManager:
 
     @staticmethod
     def _sanitize_repo_url(repo_url: str) -> str:
-        """Validate and sanitize repo_url to prevent command injection."""
-        if not repo_url or not re.match(r'^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$', repo_url):
+        """Validate and sanitize repo_url to prevent command injection.
+
+        fullmatch, NOT match: re.match(r'...$', 'owner/repo\n') ACCEPTS a
+        trailing newline (the $ anchors before a terminal \n), so an
+        injection-prevention validator would pass 'owner/repo\n' straight into
+        the git operations this feeds. fullmatch requires the WHOLE string to
+        match, so the newline is rejected.
+        """
+        if not repo_url or not re.fullmatch(r'[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+', repo_url):
             raise ValueError(f'Invalid repo_url format: {repo_url}')
         if '..' in repo_url:
             raise ValueError('repo_url cannot contain path traversal')
@@ -26,8 +33,12 @@ class CodingGoalManager:
 
     @staticmethod
     def _sanitize_branch(branch: str) -> str:
-        """Validate branch name to prevent command injection."""
-        if not branch or not re.match(r'^[a-zA-Z0-9_./\\-]+$', branch):
+        """Validate branch name to prevent command injection.
+
+        fullmatch, NOT match: see _sanitize_repo_url — 'main\n' would otherwise
+        pass re.match(r'...$', ...) into `git checkout`.
+        """
+        if not branch or not re.fullmatch(r'[a-zA-Z0-9_./\\-]+', branch):
             raise ValueError(f'Invalid branch name: {branch}')
         if '..' in branch:
             raise ValueError('Branch name cannot contain path traversal')

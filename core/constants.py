@@ -847,3 +847,18 @@ assert all(isinstance(v, (int, float)) and 0 < v < 3600
     "LATENCY_BUDGETS values must be positive finite seconds/ms: "
     f"{ {k: v for k, v in LATENCY_BUDGETS.items() if not (isinstance(v, (int, float)) and 0 < v < 3600)} }"
 )
+
+
+#: Role name used when a prompt config declares NO personas.
+#:
+#: create_agents_for_role branches on `len(personas) > 1`, so the else covers
+#: BOTH one persona and NONE — and the empty case used to index personas[0] and
+#: raise IndexError, 500-ing the whole /chat request.
+#:
+#: Empty is normal on the hardware HART must run on. A 0.8B model on a CPU-only
+#: box routinely returns truncated or malformed persona JSON, so the config ends
+#: up with no 'personas' key. No personas simply means there is no role to
+#: choose between — a single-role agent — which is a state to name, not to crash
+#: on. 'assistant' matches the speaker name the rest of reuse_recipe already
+#: uses for the default agent.
+DEFAULT_SINGLE_ROLE = 'assistant'

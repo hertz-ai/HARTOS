@@ -50,8 +50,14 @@ class ExternalBotRegistry:
                 db, username, description or bot_name, agent_id,
                 skip_name_validation=not valid)
         except ValueError:
+            # A ValueError here usually means the username is already taken.
+            # Only treat that as an IDEMPOTENT re-registration when the existing
+            # row is THIS bot (same agent_id).  A collision with a different
+            # identity — another bot, or a human account that happens to own
+            # this 3-word name — must NOT hand its api_token back to this
+            # unauthenticated caller (account-takeover vector); re-raise instead.
             user = db.query(User).filter(User.username == username).first()
-            if not user:
+            if not user or user.agent_id != agent_id:
                 raise
 
         # Store bot metadata in settings JSON

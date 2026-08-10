@@ -686,6 +686,61 @@ class TestFraudDetection:
         assert peer.integrity_status != 'verified'
         assert peer.integrity_status == 'unverified'
 
+    def test_audit_dominance_shortfall_does_not_penalise_the_target(self, db):
+        """A thin auditor pool is not misconduct by the node being audited.
+
+        Regression (2026-08-07): observed on live hardware. A peer that had
+        just verified was fined 10.0 every audit round for
+        'Audit dominance violation: target compute (176.0) exceeds auditor
+        compute', reaching the 80.0 ban threshold in eleven rounds — one hour
+        — and was banned with no misbehaviour of any kind.
+
+        _get_node_compute() returns contribution_score, so "compute" here is
+        how much the node has CONTRIBUTED. Charging fraud for it means the
+        harder a node works the sooner it is banned, which inverts the
+        incentive the contribution model rests on. The shortfall is still
+        detected and reported; it just is not the target's fault.
+        """
+        from integrations.social.integrity_service import IntegrityService
+
+        target = _make_peer(db, status='active', integrity_status='verified')
+        target.contribution_score = 176.0
+        auditor = _make_peer(db, status='active', integrity_status='verified')
+        auditor.contribution_score = 100.0
+        db.flush()
+
+        result = IntegrityService.verify_audit_dominance(db, target.node_id)
+        db.refresh(target)
+
+        # the signal is preserved — this IS a real property of the network
+        assert result['dominant'] is False
+        assert result['target_compute'] == 176.0
+
+        # but the target is not charged for it
+        assert target.fraud_score == 0.0
+        assert target.integrity_status == 'verified'
+
+    def test_audit_dominance_shortfall_cannot_ban_by_repetition(self, db):
+        """The standing condition must not accumulate into a ban.
+
+        The live failure was not one penalty, it was the same unchanged
+        condition scored again every ~5 minutes until it crossed 80.0.
+        """
+        from integrations.social.integrity_service import IntegrityService
+
+        target = _make_peer(db, status='active', integrity_status='verified')
+        target.contribution_score = 500.0
+        auditor = _make_peer(db, status='active', integrity_status='verified')
+        auditor.contribution_score = 1.0
+        db.flush()
+
+        for _ in range(15):          # 15 rounds; 8 would have banned it before
+            IntegrityService.verify_audit_dominance(db, target.node_id)
+        db.refresh(target)
+
+        assert target.fraud_score == 0.0
+        assert target.integrity_status != 'banned'
+
     def test_decay_sweep_uses_the_same_transition(self, db):
         """The batch sweep and the single-peer path share one writer."""
         from integrations.social.integrity_service import (

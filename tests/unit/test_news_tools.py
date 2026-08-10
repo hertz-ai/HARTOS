@@ -551,6 +551,7 @@ class TestMarkNewsForWeb:
         mock_post.link_url = 'https://example.com/article'
         mock_post.source_channel = 'feed:example.com'
         mock_post.created_at = datetime(2026, 1, 15)
+        mock_post.media_urls = []   # canonical image column, empty here
 
         with patch('integrations.social.models.get_db') as mock_get_db:
             mock_db = MagicMock()
@@ -564,8 +565,90 @@ class TestMarkNewsForWeb:
             item = result['items'][0]
             assert item['title'] == 'Flagged story'
             assert item['link_url'] == 'https://example.com/article'
+            assert item['image_url'] is None   # no media -> no lead image
             # Marker is internal bookkeeping — never leaks to the agent
             assert PUBLISH_WEB_MARKER not in item['content']
+
+    def test_mark_stores_lead_image_in_media_urls(self):
+        """The crawled lead image lands in the CANONICAL Post.media_urls column
+        (at [0]) — the single home the feed/sharing/federation read — NOT a
+        private HTML-comment channel invisible to them (the parallel path this
+        replaced)."""
+        from integrations.agent_engine.news_tools import NEWS_IMAGE_PREFIX
+        mark = self._get_tools()['mark_news_for_web']
+
+        mock_post = MagicMock()
+        mock_post.id = 'post-1'
+        mock_post.title = 'Flag me'
+        mock_post.content = 'Body'
+        mock_post.media_urls = []
+
+        with patch('integrations.social.models.get_db') as mock_get_db:
+            mock_db = MagicMock()
+            mock_get_db.return_value = mock_db
+            mock_db.query.return_value.filter.return_value.first.return_value = mock_post
+
+            result = json.loads(mark(
+                post_id='post-1',
+                image_url='https://cdn.example.com/lead.jpg'))
+
+            assert result['success'] is True
+            assert mock_post.media_urls[0] == 'https://cdn.example.com/lead.jpg'
+            # No second storage channel: image is NOT written as a content marker.
+            assert NEWS_IMAGE_PREFIX not in mock_post.content
+            mock_db.commit.assert_called_once()
+
+    def test_list_reads_lead_image_from_media_urls(self):
+        """list_news_for_web surfaces media_urls[0] as the lead image."""
+        from integrations.agent_engine.news_tools import PUBLISH_WEB_MARKER
+        list_tool = self._get_tools()['list_news_for_web']
+
+        mock_post = MagicMock()
+        mock_post.id = 'post-1'
+        mock_post.title = 'Story with art'
+        mock_post.content = f'Body\n\n{PUBLISH_WEB_MARKER}'
+        mock_post.link_url = None
+        mock_post.source_channel = 'feed:x'
+        mock_post.created_at = datetime(2026, 1, 15)
+        mock_post.media_urls = ['https://cdn.example.com/lead.jpg',
+                                'https://cdn.example.com/other.jpg']
+
+        with patch('integrations.social.models.get_db') as mock_get_db:
+            mock_db = MagicMock()
+            mock_get_db.return_value = mock_db
+            (mock_db.query.return_value.filter.return_value
+             .order_by.return_value.limit.return_value.all.return_value) = [mock_post]
+
+            item = json.loads(list_tool())['items'][0]
+            assert item['image_url'] == 'https://cdn.example.com/lead.jpg'
+
+    def test_list_legacy_image_marker_still_read(self):
+        """Migration shim: a post written before the media_urls switch (image in
+        the legacy content marker, media_urls empty) still surfaces its image,
+        and the legacy marker never leaks into agent-visible content."""
+        from integrations.agent_engine.news_tools import (
+            PUBLISH_WEB_MARKER, NEWS_IMAGE_PREFIX)
+        list_tool = self._get_tools()['list_news_for_web']
+
+        mock_post = MagicMock()
+        mock_post.id = 'post-1'
+        mock_post.title = 'Legacy story'
+        mock_post.content = (f'Body\n\n{PUBLISH_WEB_MARKER}\n\n'
+                             f'{NEWS_IMAGE_PREFIX}https://legacy.example.com/i.png -->')
+        mock_post.link_url = None
+        mock_post.source_channel = 'feed:x'
+        mock_post.created_at = datetime(2026, 1, 15)
+        mock_post.media_urls = []
+
+        with patch('integrations.social.models.get_db') as mock_get_db:
+            mock_db = MagicMock()
+            mock_get_db.return_value = mock_db
+            (mock_db.query.return_value.filter.return_value
+             .order_by.return_value.limit.return_value.all.return_value) = [mock_post]
+
+            item = json.loads(list_tool())['items'][0]
+            assert item['image_url'] == 'https://legacy.example.com/i.png'
+            assert NEWS_IMAGE_PREFIX not in item['content']
 
     def test_list_handles_error(self):
         list_tool = self._get_tools()['list_news_for_web']

@@ -284,3 +284,56 @@ class TestTutorEndToEnd:
         b = prompt_id_for_goal('flagship-e2e-tutor-1')
         assert a == b
         assert a.isdigit()
+
+
+# ════════════════════════════════════════════════════════════════════
+# 4. Herald (news) — the seeded daily news-refresh agent
+#
+# Guards the exact chain that was BROKEN before this batch: the 'news'
+# goal type + news_tools.register_news_tools existed, but no bootstrap
+# goal was news-typed AND detect_goal_tags never emitted 'news', so the
+# recipe flows never called register_news_tools — the tools were dead
+# code and the feed was never agent-refreshed.  These pin every link so
+# the orphan can't silently return.
+# ════════════════════════════════════════════════════════════════════
+
+class TestHeraldNewsAgent:
+
+    def _herald(self):
+        return next((s for s in SEED_BOOTSTRAP_GOALS
+                     if s['slug'] == 'bootstrap_herald_news_friend'), None)
+
+    def test_herald_seed_exists_and_is_news_typed(self):
+        """The seeded news-friend must exist and be a daily 'news' goal."""
+        seed = self._herald()
+        assert seed is not None, 'bootstrap_herald_news_friend not seeded'
+        assert seed['goal_type'] == 'news'
+        assert seed['config'].get('cadence') == 'daily'
+        assert seed['config'].get('feed_urls'), 'Herald has no feeds to refresh'
+
+    def test_news_type_registered_with_news_tags(self):
+        """'news' goal type is registered and declares the news tool tags."""
+        assert 'news' in get_registered_types()
+        assert 'news' in get_tool_tags('news')
+
+    def test_herald_prompt_detects_news_tag(self):
+        """seed -> built prompt -> detect_goal_tags emits 'news', which is
+        what gates register_news_tools in create/reuse.  This is the link
+        that was severed."""
+        from integrations.agent_engine.marketing_tools import detect_goal_tags
+        seed = self._herald()
+        prompt = get_prompt_builder('news')(_goal_dict('news', seed['config']))
+        assert 'news' in detect_goal_tags(prompt), (
+            'news prompt no longer detected as a news task — '
+            'register_news_tools would be orphaned again')
+
+    def test_both_flows_wire_register_news_tools(self):
+        """create_recipe.py and reuse_recipe.py must both call
+        register_news_tools under a 'news' branch — parity, so a Herald
+        recipe authored in create replays with its tools in reuse."""
+        for filename in ('create_recipe.py', 'reuse_recipe.py'):
+            path = os.path.join(os.path.dirname(__file__), '..', '..', filename)
+            with open(path, encoding='utf-8') as fh:
+                src = fh.read()
+            assert "'news' in goal_tags" in src, f'{filename} missing news branch'
+            assert 'register_news_tools' in src, f'{filename} missing register_news_tools'

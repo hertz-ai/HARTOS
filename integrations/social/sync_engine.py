@@ -53,15 +53,67 @@ class SyncEngine:
     MAX_QUEUE_SIZE = 10000
 
     @staticmethod
+    def canonical_node_id() -> str:
+        """This node's identity for sync — the SAME id the rest of the system
+        uses (gossip, PeerNode, follows, bans): ``gossip.node_id``.
+
+        WHY THIS EXISTS (proven live 2026-08-08, fleet-wide 403):
+        sync used to stamp ``get_public_key_hex()[:16]`` — a public-key prefix
+        — while every other subsystem keys on the gossip UUID.  Central's
+        ``_verify_sync_sender`` looks the sender up with
+        ``PeerNode.filter_by(node_id=<what the batch declares>)``, so it
+        searched for '25cedaa441302f25' while its row for us was
+        '46329c87-cbb6-...'.  No row -> no public_key -> hard enforcement ->
+        403 on EVERY signed batch from EVERY node.  Central was holding the
+        correct key the whole time and simply could not find it.
+
+        The same mismatch broke the LOCAL drain: the prefix changes whenever
+        the keypair does (data-dir reset), so queued rows were stamped with
+        ids the drain filter no longer matched — 40 rows orphaned here across
+        three dead prefixes.  A UUID that survives restarts (that is
+        _load_or_create_node_id's entire stated purpose) has neither problem.
+
+        Falls back to the legacy prefix only if gossip is genuinely
+        unavailable (degraded cx_Freeze early boot); the receiver's legacy
+        branch still resolves that shape.
+        """
+        try:
+            from .peer_discovery import gossip
+            nid = getattr(gossip, 'node_id', '') or ''
+            if nid:
+                return nid
+            logger.warning(
+                "canonical_node_id: gossip is importable but carries no "
+                "node_id — falling back to the legacy key prefix")
+        except Exception:
+            logger.warning(
+                "canonical_node_id: gossip unavailable — falling back to the "
+                "legacy key prefix", exc_info=True)
+        try:
+            from security.node_integrity import get_public_key_hex
+            nid = get_public_key_hex()[:16]
+            # Loud on purpose: a receiver only resolves this shape via the
+            # legacy branch in _verify_sync_sender, and a node that changes
+            # keypairs silently orphans its own queued rows under the old
+            # prefix.  Both cost real outages on 2026-08-08.
+            logger.warning(
+                "canonical_node_id: using LEGACY key-prefix identity %s "
+                "(gossip UUID unavailable) — batches are resolvable only by "
+                "receivers carrying the legacy branch", nid)
+            return nid
+        except Exception:
+            logger.error(
+                "canonical_node_id: NO identity available — batches will "
+                "declare 'unknown' and every receiver in hard enforcement "
+                "will reject them with 403", exc_info=True)
+            return 'unknown'
+
+    @staticmethod
     def queue(db, target_tier: str, operation_type: str, payload: dict) -> Optional[str]:
         """Queue a sync operation for later delivery."""
         from .models import SyncQueue
-        from security.node_integrity import get_public_key_hex
 
-        try:
-            node_id = get_public_key_hex()[:16]
-        except Exception:
-            node_id = 'unknown'
+        node_id = SyncEngine.canonical_node_id()
 
         # Backpressure: reject if queue is too large for this node
         current_count = db.query(SyncQueue).filter(
@@ -127,7 +179,10 @@ class SyncEngine:
             on_notification(str(owner_id), {'type': 'sync_status',
                                             'entity': op, 'sync_status': status})
         except Exception:
-            pass
+            logger.warning(
+                "sync: could not emit sync_status=%s for entity=%s to owner "
+                "%s — the client's sync indicator will be stale",
+                status, op, owner_id, exc_info=True)
 
     @staticmethod
     def _signed_send_payload(node_id, batch) -> dict:
@@ -140,7 +195,14 @@ class SyncEngine:
             from security.node_integrity import sign_json_payload
             payload['signature'] = sign_json_payload(payload)
         except Exception:
-            pass
+            # An unsigned batch is a GUARANTEED 403 against any receiver in
+            # 'hard' enforcement.  Silently returning one here is what made
+            # the 2026-08-08 outage look like a receiver-side trust bug.
+            logger.error(
+                "sync: FAILED TO SIGN batch of %d item(s) for node_id=%s — "
+                "sending UNSIGNED; a receiver in 'hard' enforcement will "
+                "reject this with 403 'unverified node identity'",
+                len(batch), node_id, exc_info=True)
         return payload
 
     @staticmethod
@@ -200,9 +262,15 @@ class SyncEngine:
                     send_payload = {'encrypted': True,
                                     'envelope': encrypt_json_for_peer(send_payload, target_x25519)}
                 except Exception:
-                    pass  # Encryption unavailable, send plaintext
+                    # Silently downgrading confidentiality is never acceptable
+                    # — the operator must be able to see it in the log.
+                    logger.warning(
+                        "sync: E2E encryption to %s FAILED — falling back to "
+                        "PLAINTEXT for this batch", target_url, exc_info=True)
         except Exception:
-            pass
+            logger.warning(
+                "sync: could not resolve an X25519 key for %s — sending "
+                "plaintext", target_url, exc_info=True)
         try:
             resp = pooled_post(
                 f"{target_url}/api/social/hierarchy/sync",
@@ -263,7 +331,9 @@ class SyncEngine:
             if peer and getattr(peer, 'x25519_public', None):
                 return peer.x25519_public
         except Exception:
-            pass
+            logger.warning(
+                "sync: X25519 lookup failed for target %s — caller will send "
+                "plaintext", target_url, exc_info=True)
         return ''
 
     @staticmethod
@@ -676,11 +746,29 @@ class SyncEngine:
             return
 
         db = get_db()
+        node_id = SyncEngine.canonical_node_id()
+
+        # Adopt rows stamped with a PREVIOUS identity so they can finally
+        # drain.  sync_queue is this node's OUTBOUND queue — every row in it
+        # is ours by construction — but the drain filters on node_id, so any
+        # row written under an older id (legacy key-prefix, or a rotated key)
+        # was unreachable forever.  Measured here: 40 rows across three dead
+        # prefixes, none matching the current identity.  One idempotent
+        # re-stamp fixes the backlog and is a no-op once converged.
         try:
-            from security.node_integrity import get_public_key_hex
-            node_id = get_public_key_hex()[:16]
-        except Exception:
-            node_id = 'unknown'
+            from .models import SyncQueue
+            adopted = db.query(SyncQueue).filter(
+                SyncQueue.node_id != node_id,
+                SyncQueue.status.in_(['queued', 'failed']),
+            ).update({'node_id': node_id}, synchronize_session=False)
+            if adopted:
+                logger.info(
+                    "Sync: adopted %d queued row(s) from a previous node "
+                    "identity into %s", adopted, node_id)
+                db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.debug(f"Sync queue re-stamp skipped: {e}")
 
         try:
             result = self.drain_queue(db, node_id, target_url, self._batch_size)
@@ -698,9 +786,26 @@ class SyncEngine:
         """Canonical parent-tier node URL this node syncs UP to — central, else
         regional (empty on a flat/standalone node).  SINGLE resolver shared by
         the drain loop (_do_sync_drain) and federation's C4 content-retrieval
-        fallback, so "where is my parent" has one source, not two."""
-        return (os.environ.get('HEVOLVE_CENTRAL_URL', '')
-                or os.environ.get('HEVOLVE_REGIONAL_URL', ''))
+        fallback, so "where is my parent" has one source, not two.
+
+        Env always wins (explicit operator config).  When neither env var is
+        set — every flat desktop install — fall back to the first LIVE genesis
+        central (core.superadmins.resolve_reachable_central).  Measured
+        2026-08-07: queue_entity had been gating+queuing public posts on every
+        install while this returned '' fleet-wide, so nothing ever drained;
+        central's sync ingress (/api/social/hierarchy/sync via azurekong)
+        answers 200 and was simply never dialed.  Offline installs still get
+        '' (resolver returns '' when no central answers) and keep their exact
+        prior no-parent behaviour."""
+        explicit = (os.environ.get('HEVOLVE_CENTRAL_URL', '')
+                    or os.environ.get('HEVOLVE_REGIONAL_URL', ''))
+        if explicit:
+            return explicit
+        try:
+            from core.superadmins import resolve_reachable_central
+            return resolve_reachable_central()
+        except Exception:
+            return ''
 
     @staticmethod
     def get_queue_stats(db, node_id: str) -> Dict:

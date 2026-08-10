@@ -118,15 +118,22 @@ def test_get_stats_still_has_baseline_keys():
 
 # -- launch command must work with the Cython-compiled bundle ----------
 
-def test_build_cmd_uses_import_not_dash_m():
+def test_build_cmd_uses_import_not_dash_m(monkeypatch):
     """Regression for the rc=1 child crash in the bundled Nunba build.
 
     The bundled hevolveai package is Cython-compiled + source-stripped
     (api_server.cp312-win_amd64.pyd), so `python -m hevolveai.server.api_server`
-    fails with "No code object available ...". The launcher MUST import the
-    module and run uvicorn instead, which works for both .pyd and .py.
+    fails with "No code object available ...". The INSTALLED-boot launcher
+    MUST import the module and run uvicorn instead, which works for both
+    .pyd and .py.
+
+    2026-08-09: _build_cmd gained a REPO MODE (checkout + pinned
+    interpreter run the production entry run_server.py). Both modes are
+    pinned here; neither may ever use -m.
     """
-    # Build a supervisor instance without spawning (constructor is cheap).
+    # (a) INSTALLED boot: suppress repo mode so the -c contract is exercised
+    # regardless of whether this box carries a checkout.
+    monkeypatch.setattr(_sup, '_resolve_repo_root', lambda: None)
     sup = _sup._Supervisor()
     cmd = sup._build_cmd()
     # -c import form, never -m
@@ -136,3 +143,16 @@ def test_build_cmd_uses_import_not_dash_m():
     assert "from hevolveai.server.api_server import app" in boot
     assert "uvicorn.run(app" in boot
     assert "HEVOLVEAI_PORT" in boot
+
+    # (b) REPO mode: production entry, cwd at the repo root, never -m.
+    import pathlib
+    fake_root = pathlib.Path('C:/fake_hevolveai_repo')
+    monkeypatch.setattr(_sup, '_resolve_repo_root', lambda: fake_root)
+    monkeypatch.setattr(_sup, '_resolve_repo_python', lambda: 'C:/fake/python.exe')
+    sup2 = _sup._Supervisor()
+    cmd2 = sup2._build_cmd()
+    assert cmd2 == ['C:/fake/python.exe', str(fake_root / 'run_server.py')]
+    assert "-m" not in cmd2
+    _, kw = sup2._build_popen()
+    assert kw.get('cwd') == str(fake_root), (
+        "repo mode must run from the repo root (start.bat semantics)")

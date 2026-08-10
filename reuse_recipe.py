@@ -18,6 +18,7 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
     AUTOGEN_MESSAGE_TOKEN_BUDGET,
     AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
     AUTOGEN_HISTORY_LIMIT,
+    DEFAULT_SINGLE_ROLE,
 )
 
 from enum import Enum
@@ -1005,11 +1006,63 @@ def create_agents_for_role(user_id: str, prompt_id):
 
         return assistant, user_proxy, group_chat, manager, helper, False
     else:
-        agents_session[f"{user_id}_{prompt_id}"] = [
-            {'agentInstanceID': f'com.hertzai.hevolve.chat.{prompt_id}.{user_id}',
-             'user_id': user_id, 'role': personas[0]['name'], 'deviceID': 'something'}]
+        # ZERO personas lands here too, not just one.
+        #
+        # The branch above is `len(personas) > 1`, so this else covers BOTH the
+        # single-persona case AND the empty one — and the empty one used to run
+        # straight into personas[0]['name'] and raise IndexError, which 500s the
+        # whole /chat request.
+        #
+        # Empty is not exotic on the hardware this has to run on. A 0.8B model on
+        # a CPU-only potato routinely returns malformed or truncated JSON, so the
+        # config above ends up with no 'personas' key at all — and the read is
+        # wrapped in a try that only logs at .info, so the list silently stays [].
+        # Reported from a real box: "IndexError: list index out of range at
+        # reuse_recipe.py:913 (personas[0]) when the model returns empty personas".
+        #
+        # No personas simply means no role to choose between, which is a normal
+        # single-role agent — so name it and carry on. Crashing the request is the
+        # one response that cannot be right, and degrade-not-die is the standing
+        # rule for every path that depends on a model behaving.
+        # Through the CANONICAL registrar, not a third hand-rolled copy.
+        #
+        # core.persona_registry.register_persona_for_session already builds both
+        # maps, accepts dict OR string personas, skips a persona with no
+        # name/role instead of KeyError-ing, and never raises. Its own docstring
+        # names these inline blocks in reuse_recipe as the sites it was written
+        # to replace; this one was simply left behind, which is why the empty
+        # case still crashed here long after the helper existed.
+        #
+        # `personas or [default]` is the potato guard. A 0.8B model on a CPU-only
+        # box regularly returns truncated persona JSON, so the config read above
+        # (whose except only logs at .info) leaves this []. Registering ZERO
+        # personas would leave the session with no role at all; naming one keeps
+        # the agent usable, because "no personas" just means there is nothing to
+        # choose between — an ordinary single-role agent.
+        if not personas:
+            current_app.logger.warning(
+                "prompt %s has NO personas — running as a single '%s' role. On a "
+                "small local model this usually means the persona JSON came back "
+                "malformed or truncated. The agent still works; it just has no "
+                "role to select between.", prompt_id, DEFAULT_SINGLE_ROLE)
 
-        agents_roles[f"{user_id}_{prompt_id}"] = {user_id: personas[0]['name']}
+        # Check the COUNT it returns, don't assume the list registered.
+        #
+        # The helper skips any persona with no name/role, so a one-entry list of
+        # malformed JSON — say [{"description": "..."}] with the name truncated
+        # off, which is exactly what a 0.8B model produces — registers ZERO and
+        # leaves the session with no role at all. `personas or [default]` cannot
+        # catch that: the list is non-empty, its CONTENTS are unusable.
+        registered = register_persona_for_session(
+            user_id, prompt_id,
+            personas or [{'name': DEFAULT_SINGLE_ROLE}])
+        if not registered:
+            current_app.logger.warning(
+                "prompt %s: none of its %d persona(s) had a usable name — "
+                "falling back to a single '%s' role so the agent still runs.",
+                prompt_id, len(personas), DEFAULT_SINGLE_ROLE)
+            register_persona_for_session(
+                user_id, prompt_id, [{'name': DEFAULT_SINGLE_ROLE}])
         return 'TERMINATE', 'TERMINATE', 'TERMINATE', 'TERMINATE', 'TERMINATE', True
 
 
@@ -2793,6 +2846,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             from integrations.agent_engine.revenue_tools import register_revenue_tools
             register_revenue_tools(helper, assistant, user_id)
             current_app.logger.info("Revenue tools loaded (Tier 2) for reuse agent")
+        if 'news' in goal_tags:
+            # News tools parity with create_recipe.py — a Herald (news) recipe
+            # authored under the 'news' tag must replay with its feed tools,
+            # else fetch_news_feeds / mark_news_for_web 404 and the daily
+            # refresh step fails silently.
+            from integrations.agent_engine.news_tools import register_news_tools
+            register_news_tools(helper, assistant, user_id)
+            current_app.logger.info("News tools loaded (Tier 2) for reuse agent")
     except Exception as e:
         # Same observability promotion as create_recipe.py — a failure
         # here strips the agent of goal-specific tools, agent talks

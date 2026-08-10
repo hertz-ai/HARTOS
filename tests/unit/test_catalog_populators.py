@@ -805,3 +805,68 @@ class TestModelCatalogOverride:
         assert entry.tags[0].startswith('worker-')
         # idle_timeout_s must be an int-valued float in [0, 19].
         assert 0.0 <= entry.idle_timeout_s <= 19.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LLM seed ladder — the two invariants recommend_for_hardware() leans on
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestLlmSeedLadder:
+    """The LLM rung of the catalog, guarded at the point of the ORIGINAL defect.
+
+    History that makes these load-bearing: populate_from_subsystems seeded
+    tts/stt/vlm/embodied/videogen/audiogen and SKIPPED llm.  With the rung
+    empty, three ad-hoc ladders grew to fill the vacuum (model_registry.py,
+    model_onboarding.MODEL_TIERS, Nunba's models/catalog.py) and drifted a whole
+    generation apart -- Qwen2.5 vs Qwen3.5.  So the guard that matters is not
+    "no two writers", it is "no rung may be EMPTY": an empty rung is what
+    invites the duplicates in the first place.
+    """
+
+    def test_llm_rung_is_never_empty(self):
+        """THE root-cause guard. If this goes red, the vacuum that produced four
+        parallel model ladders has reopened, and the next person to need a model
+        list will write a fifth rather than find one here."""
+        cat = fresh_catalog()
+        cat._populate_llm_models()
+        llms = cat.list_by_type('llm')
+        assert llms, "the LLM rung is empty -- this is exactly how the four " \
+                     "parallel ladders came to exist"
+        mains = [e for e in llms if 'main' in (e.purposes or [])]
+        drafts = [e for e in llms if 'draft' in (e.purposes or [])]
+        assert mains, "no 'main' entry: recommend_for_hardware() would silently " \
+                      "fall through to its emergency literal on every box"
+        assert drafts, "no 'draft' entry: the speculative dispatcher has no " \
+                       "candidate to seed from"
+
+    @pytest.mark.parametrize('need_field', ['vram_gb', 'ram_gb'])
+    def test_llm_seed_priority_is_monotonic_with_size(self, need_field):
+        """recommend_for_hardware() selects by max(priority, quality_score), NOT
+        by size -- priority is an operator override that MAY outrank size (see
+        test_ai_setup_step::test_priority_is_allowed_to_outrank_size).
+
+        That flexibility is only safe while the SHIPPED data keeps priority
+        aligned with capability.  The moment a small model carries a high
+        priority, a 24GB box silently gets handed it instead of the large model
+        it could run -- with no error anywhere.  The old ladder could not have
+        this bug: its ordering was structurally guaranteed by VRAM thresholds.
+        This test is what replaces that structural guarantee.
+
+        Checked on BOTH requirement fields because the two arms key on different
+        ones: vram_gb on the GPU arm, ram_gb on the CPU arm.
+        """
+        cat = fresh_catalog()
+        cat._populate_llm_models()
+        mains = [e for e in cat.list_by_type('llm') if 'main' in (e.purposes or [])]
+        assert len(mains) >= 2, "need at least two entries for ordering to mean anything"
+
+        by_size = sorted(mains, key=lambda e: getattr(e, need_field))
+        prios = [e.priority for e in by_size]
+        assert prios == sorted(prios), (
+            f"priority must not decrease as {need_field} grows.\n"
+            + "\n".join(f"  {e.id:<26} {need_field}={getattr(e, need_field):<7} "
+                        f"priority={e.priority}" for e in by_size)
+            + "\nA higher-priority SMALLER model means a capable box gets "
+              "under-served with no error. Either re-order the priorities in "
+              "_populate_llm_models, or -- if the override is deliberate -- say "
+              "so here and in recommend_for_hardware()'s docstring.")

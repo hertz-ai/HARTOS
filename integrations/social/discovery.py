@@ -9,6 +9,13 @@ import logging
 import time as _time
 from flask import Blueprint, jsonify, request
 from core.port_registry import get_port
+# Module level ON PURPOSE: a decorator is resolved at def time, so the
+# lazy in-function import style used elsewhere in this file cannot work for
+# one (integrity_alerts did `from .auth import require_admin` inside its
+# body and never applied it — an import that decorates nothing).  Safe:
+# auth.py imports no social blueprint, and api.py / api_gamification.py
+# already import require_admin exactly this way.
+from .auth import require_admin
 
 logger = logging.getLogger('hevolve_social')
 
@@ -162,6 +169,31 @@ def discover_communities():
 # Decentralized Gossip Peer Discovery
 # ════════════════════════════════════════════════════════════════
 
+def _observed_ip() -> str:
+    """The IP this request ACTUALLY came from, as seen by us or our proxy.
+
+    Why: the peer registry is poisoned by claimed addresses — measured
+    2026-08-07 on central's live table, 147 peers, 67 advertising
+    ``localhost`` and 80 advertising private LAN IPs, zero routable.  A node
+    behind NAT cannot know its own public address, but the RECEIVER of its
+    announce can see it.  This is the one place that truth exists.
+
+    Proxy handling: behind Kong the socket peer is the gateway, and the real
+    client is in X-Forwarded-For.  We take the LAST entry — the one appended
+    by the outermost proxy we trust — never the first, which a direct client
+    can forge outright.  (A client-forged XFF still gets the real address
+    APPENDED by Kong, so last-wins survives spoofing; and on a direct LAN
+    request there is no XFF and remote_addr is already the truth.)  Worst
+    case this field is a wrong dial CANDIDATE, never a trust input.
+    """
+    xff = (request.headers.get('X-Forwarded-For') or '').strip()
+    if xff:
+        last_hop = xff.split(',')[-1].strip()
+        if last_hop:
+            return last_hop
+    return request.remote_addr or ''
+
+
 @discovery_bp.route('/api/social/peers/announce', methods=['POST'])
 def peer_announce():
     """Receive a peer announcement. Merge into local peer list."""
@@ -178,14 +210,24 @@ def peer_announce():
     # announce-signing defect stayed invisible across the whole network.
     # `accepted` and `reason` say what actually happened. Both are additive,
     # so existing clients are unaffected.
+    #
+    # observed_ip is derived HERE, beside the payload, never injected into
+    # it: announces are Ed25519-signed over every field except 'signature',
+    # so mutating `data` would invalidate every signed announce.
     reasons = []
-    is_new = gossip.handle_announce(data, reasons=reasons)
+    observed_ip = _observed_ip()
+    is_new = gossip.handle_announce(data, reasons=reasons,
+                                    observed_ip=observed_ip)
     body = {
         'success': True,
         'is_new': is_new,
         'accepted': not reasons,
         'node_id': gossip.node_id,
         'name': gossip.node_name,
+        # Echo: tell the announcer what address IT came from.  A NAT'd node
+        # has no other way to learn its public IP; with this echo it can
+        # advertise `observed_url` in its own self-info and become dialable.
+        'observed_ip': observed_ip,
     }
     if reasons:
         body['reason'] = reasons[0]
@@ -221,13 +263,17 @@ def peer_exchange():
     data = request.get_json(force=True, silent=True) or {}
     their_peers = data.get('peers', [])
     sender = data.get('sender', {})
+    observed_ip = _observed_ip()
     if sender.get('node_id') and sender.get('url'):
-        gossip.handle_announce(sender)
+        gossip.handle_announce(sender, observed_ip=observed_ip)
     my_peers = gossip.handle_exchange(their_peers)
     return jsonify({
         'success': True,
         'node_id': gossip.node_id,
         'peers': my_peers,
+        # Same echo contract as peer_announce — additive, ignored by old
+        # clients, lets the sender learn its own public address.
+        'observed_ip': observed_ip,
     })
 
 
@@ -643,6 +689,7 @@ def federation_follow_notification():
     data = request.get_json(force=True, silent=True) or {}
     follower_node = data.get('follower_node_id', '')
     follower_url = data.get('follower_url', '')
+    recorded = False
     if follower_node and follower_url:
         # Ensure the follower is in our peer list
         gossip.handle_announce({
@@ -650,8 +697,30 @@ def federation_follow_notification():
             'url': follower_url,
             'name': f'follower-{follower_node[:8]}',
         })
-        logger.info(f"Federation: instance {follower_node[:8]} now follows us")
-    return jsonify({'success': True, 'node_id': gossip.node_id})
+        # RECORD the follow — for this handler's whole life it logged "now
+        # follows us" while writing nothing, so get_followers() stayed empty
+        # on every node and push_to_followers never had a single target
+        # (found live 2026-08-07: log line present, instance_follows row
+        # absent).  record_follow is the one canonical writer, record-only —
+        # follow_instance would fire a wrong-direction notification back at
+        # the follower.  peer_url = the FOLLOWER's url: push_to_followers
+        # delivers new posts there.
+        from .models import get_db
+        from .federation import federation
+        db = get_db()
+        try:
+            recorded = federation.record_follow(
+                db, follower_node, gossip.node_id, follower_url)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.debug(f"Federation: follow record failed: {e}")
+        finally:
+            db.close()
+        logger.info(f"Federation: instance {follower_node[:8]} now follows us"
+                    f" (recorded={recorded})")
+    return jsonify({'success': True, 'node_id': gossip.node_id,
+                    'recorded': recorded})
 
 
 @discovery_bp.route('/api/social/federation/following')
@@ -947,9 +1016,9 @@ def integrity_trusted_keys():
 # ─── Admin Endpoints ───
 
 @discovery_bp.route('/api/social/integrity/alerts')
+@require_admin
 def integrity_alerts():
     """Admin: list fraud alerts."""
-    from .auth import require_admin
     from .models import get_db
     from .integrity_service import IntegrityService
     db = get_db()
@@ -968,6 +1037,7 @@ def integrity_alerts():
 
 
 @discovery_bp.route('/api/social/integrity/alerts/<alert_id>', methods=['PATCH'])
+@require_admin
 def integrity_alert_update(alert_id):
     """Admin: update fraud alert status."""
     from .models import get_db
@@ -990,6 +1060,7 @@ def integrity_alert_update(alert_id):
 
 
 @discovery_bp.route('/api/social/integrity/node/<node_id>/audit', methods=['POST'])
+@require_admin
 def integrity_node_audit(node_id):
     """Admin: trigger full audit on a specific node."""
     from .models import get_db
@@ -1008,8 +1079,17 @@ def integrity_node_audit(node_id):
 
 
 @discovery_bp.route('/api/social/integrity/node/<node_id>/ban', methods=['POST'])
+@require_admin
 def integrity_node_ban(node_id):
-    """Admin: ban or unban a node."""
+    """Admin: ban or unban a node.
+
+    Banning is a DENIAL-OF-FEDERATION primitive, which is why this is the
+    most important gate in the file: _merge_peer refuses a banned peer's
+    announces and receive_inbox refuses its posts, so an anonymous caller
+    able to reach this route could partition any node from the network
+    with one request per victim (and `unban` could clear penalties placed
+    for real fraud).
+    """
     from .models import get_db
     from .integrity_service import IntegrityService
     db = get_db()
@@ -1044,6 +1124,7 @@ def integrity_audit_coverage():
 
 
 @discovery_bp.route('/api/social/integrity/dashboard')
+@require_admin
 def integrity_dashboard():
     """Admin: integrity overview dashboard data."""
     from .models import get_db
@@ -1281,10 +1362,52 @@ def _verify_sync_sender(db, data: dict) -> bool:
             # clean, or update _signed_send_payload in lockstep.
             peer = db.query(PeerNode).filter_by(node_id=node_id).first()
             pk = getattr(peer, 'public_key', None) if peer else None
-            if pk and verify_json_signature(pk, data, sig):
-                return True
+            if not peer:
+                # LEGACY SENDERS (delete once the fleet has rolled past the
+                # 2026-08-08 identity unification): before that fix, sync
+                # stamped node_id = get_public_key_hex()[:16] — a public-key
+                # PREFIX — while PeerNode keys on the gossip UUID.  The lookup
+                # above therefore missed for every node, and hard enforcement
+                # turned that into a fleet-wide 403 (measured: 65 dead rows
+                # here, central holding our correct key on the UUID row the
+                # whole time).  An un-upgraded peer still declares the prefix,
+                # so resolve it by the only thing it can mean: the peer whose
+                # registered public_key STARTS WITH that prefix.  This proves
+                # exactly as much as the modern path — the signature is still
+                # verified against a key we already had on file — it just
+                # finds the row a second way.
+                if len(node_id) == 16 and all(
+                        c in '0123456789abcdef' for c in node_id.lower()):
+                    peer = db.query(PeerNode).filter(
+                        PeerNode.public_key.startswith(node_id)).first()
+                    pk = getattr(peer, 'public_key', None) if peer else None
+                    if pk:
+                        logger.info(
+                            "hierarchy_sync: resolved legacy key-prefix "
+                            "sender %s -> node %s", node_id, peer.node_id)
+            if pk:
+                if verify_json_signature(pk, data, sig):
+                    return True
+                # "Resolved but wrong key" is a COMPLETELY different fault from
+                # "unknown sender", and until 2026-08-08 both produced the same
+                # opaque 403.  A node whose keypair moved (the CWD-relative
+                # key-dir split) lands HERE, not in the else-branch — say so.
+                logger.warning(
+                    "hierarchy_sync: node_id=%s resolved to peer %s, but the "
+                    "batch signature does NOT match the public_key on file "
+                    "(%s...) — the sender is signing with a DIFFERENT keypair "
+                    "than this node has registered for it",
+                    node_id, getattr(peer, 'node_id', '?'), str(pk)[:16])
+            else:
+                logger.warning(
+                    "hierarchy_sync: NO peer row resolves node_id=%s (tried "
+                    "exact node_id, then the legacy key-prefix branch) — the "
+                    "sender is unknown to this node, cannot verify",
+                    node_id)
         except Exception:
-            pass
+            logger.warning(
+                "hierarchy_sync: sender verification RAISED for node_id=%s — "
+                "treating as unverified", node_id, exc_info=True)
     # No valid signature. Apply ONLY outside hard enforcement (migration path).
     # If the mode can't be determined, fail closed — this module's whole job.
     try:
@@ -1314,8 +1437,19 @@ def hierarchy_sync():
             decrypted = decrypt_json_from_peer(data['envelope'])
             if decrypted:
                 data = decrypted
+            else:
+                logger.warning(
+                    "hierarchy_sync: envelope decrypt returned empty — the "
+                    "un-decrypted wrapper carries no node_id, so this batch "
+                    "will be rejected as unverified")
         except Exception:
-            pass  # Decryption failed, try using data as-is
+            # Falling through leaves `data` as {'encrypted':.., 'envelope':..}
+            # — no node_id, so _verify_sync_sender fails and the caller 403s.
+            # Never let that look like a trust problem.
+            logger.warning(
+                "hierarchy_sync: envelope DECRYPT FAILED — falling back to the "
+                "raw body, which has no node_id and will be rejected as "
+                "unverified", exc_info=True)
     items = data.get('items', [])
     if not items:
         return jsonify({'success': True, 'processed': [], 'errors': []})

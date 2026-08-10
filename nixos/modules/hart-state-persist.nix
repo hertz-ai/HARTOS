@@ -243,16 +243,13 @@ let
       note_partial; return 1
     }
 
-    # ── 3a. HART state (themes, skins, HartSession, onboarding/identity seal). ──
-    # Perms match hart-base's tmpfiles for cfg.dataDir (0770 hart hart) so the
-    # hart service user keeps write access.
-    persist_dir "$DATA_DIR" "hart-state" "0770" "hart:hart"
-
-    # ── 3b. The admin user's home (settings / user data). ──
-    persist_dir "$ADMIN_HOME" "home-hart-admin" "0755" "hart-admin"
-
-    # ── 3c. WIFI credentials - THE "every boot asks for wifi" fix. SECURE: 0700
-    #    dir / 0600 files, root:root (NetworkManager's own perms). POSIX fs only. ──
+    # ── 3a. WIFI credentials FIRST - THE "every boot asks for wifi" fix, and the
+    #    most-critical, NON-regenerable secret. It persists BEFORE the bulky
+    #    HART-state seed (3c) so that a SPACE-CONSTRAINED HARTSTATE degrades the
+    #    regenerable state to PARTIAL rather than starving the Wi-Fi credentials
+    #    (the VM run 31347690532 proved the old order dropped wifi when the
+    #    /var/lib/hart cp -a seed filled the fs first). SECURE: 0700 dir / 0600
+    #    files, root:root (NetworkManager's own perms). POSIX fs only. ──
     if [ "$POSIX_FS" = "1" ]; then
       if persist_dir "$NM_CONN" "NetworkManager/system-connections" "0700" "root:root"; then
         # Belt-and-suspenders: force every stored keyfile to 0600 root:root so a
@@ -267,6 +264,16 @@ let
       log "SKIP wifi persist: '$LABEL' fstype '$FSTYPE' has no POSIX perms - refusing to store NM secrets world-readable (fail-secure). Reformat HARTSTATE ext4 to persist wifi."
       note_partial
     fi
+
+    # ── 3b. The admin user's home (settings / user data). ──
+    persist_dir "$ADMIN_HOME" "home-hart-admin" "0755" "hart-admin"
+
+    # ── 3c. HART state (themes, skins, HartSession, onboarding/identity seal).
+    #    LAST because its cp -a seed of /var/lib/hart is the BULKY one; putting it
+    #    after wifi + home means it (regenerable state) is what degrades to PARTIAL
+    #    under space pressure, never the non-regenerable wifi credentials above.
+    #    Perms match hart-base's tmpfiles for cfg.dataDir (0770 hart hart). ──
+    persist_dir "$DATA_DIR" "hart-state" "0770" "hart:hart"
 
     decide "$RESULT" "state bind-persisted from $LABEL ($DEV)"
     exit 0

@@ -348,13 +348,25 @@ class TestRelayedPeersAreHints:
             f'{joined}')
 
     def test_unsigned_direct_announce_is_still_refused(self):
-        """The relayed path must not weaken the direct path."""
+        """The relayed path must not weaken the direct path.
+
+        Enforcement is PINNED to hard: get_enforcement_mode() reads
+        HEVOLVE_ENFORCEMENT_MODE from the process env, and a dev machine
+        with e.g. `warn` exported (found live 2026-08-07: Windows user-level
+        env carried `warn`, making this the only local failure in an
+        otherwise green suite) silently turns the assertion into a test of
+        the MACHINE, not the code.  The hard-mode refusal contract is what
+        this test exists to state, so state it explicitly.
+        """
+        from unittest.mock import patch
         from integrations.social.peer_discovery import gossip
         reasons = []
-        assert gossip._merge_peer(self._db(), {
-            'node_id': 'direct-unsigned-1',
-            'url': 'http://192.0.2.78:5000',
-        }, reasons=reasons) is False
+        with patch('security.master_key.get_enforcement_mode',
+                   return_value='hard'):
+            assert gossip._merge_peer(self._db(), {
+                'node_id': 'direct-unsigned-1',
+                'url': 'http://192.0.2.78:5000',
+            }, reasons=reasons) is False
         assert any('no usable signature' in r for r in reasons), reasons
 
     def test_relayed_central_tier_without_certificate_is_not_refused(self):

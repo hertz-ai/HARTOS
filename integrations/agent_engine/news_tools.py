@@ -18,6 +18,16 @@ logger = logging.getLogger('hevolve_social')
 # Consumed by the 'seo' goal type (goal_manager._build_seo_prompt).
 PUBLISH_WEB_MARKER = '<!-- publish_web -->'
 
+# Marker carrying the lead image for a web-published news event. When the news
+# agent crawls a source article (crawl4ai) and pulls its og:image, it passes
+# that URL here so the hevolve.ai news card renders a real preview instead of a
+# generated cover. Same content-marker convention as PUBLISH_WEB_MARKER (no
+# schema change); list_news_for_web parses it back out, and the 'seo' goal
+# includes it in the published item.
+import re as _re
+NEWS_IMAGE_PREFIX = '<!-- news_image:'
+NEWS_IMAGE_RE = _re.compile(r'<!--\s*news_image:(\S+?)\s*-->')
+
 
 def register_news_tools(helper, assistant, user_id: str):
     """Register news curation and push notification tools with an AutoGen agent."""
@@ -227,8 +237,14 @@ def register_news_tools(helper, assistant, user_id: str):
     def mark_news_for_web(
         post_id: Annotated[str, "Post ID of the ingested news item"],
         publishable: Annotated[bool, "True to flag for web publication, False to clear the flag"] = True,
+        image_url: Annotated[str, "Optional lead image URL (og:image) from the crawled source article, so the web card renders a real preview instead of a generated cover"] = '',
     ) -> str:
-        """Flag an ingested news post for hevolve.ai web publication (publish_web)."""
+        """Flag an ingested news post for hevolve.ai web publication (publish_web).
+
+        To close the loop with a rich card: crawl the source article with
+        crawl4ai, pull its og:image, and pass it as image_url. The published
+        news event then shows a real preview.
+        """
         try:
             from integrations.social.models import get_db, Post
 
@@ -239,20 +255,45 @@ def register_news_tools(helper, assistant, user_id: str):
                     return json.dumps({'error': f'post not found: {post_id}'})
 
                 content = post.content or ''
+                changed = False
                 marked = PUBLISH_WEB_MARKER in content
                 if publishable and not marked:
-                    post.content = f"{content}\n\n{PUBLISH_WEB_MARKER}"
-                    db.commit()
+                    content = f"{content}\n\n{PUBLISH_WEB_MARKER}"
+                    changed = True
                 elif not publishable and marked:
-                    post.content = content.replace(
+                    content = content.replace(
                         f"\n\n{PUBLISH_WEB_MARKER}", '').replace(
                         PUBLISH_WEB_MARKER, '')
+                    changed = True
+
+                # Store the lead image in the CANONICAL column (Post.media_urls) —
+                # the single home every consumer reads (feed card in social/api.py,
+                # sharing, federation, export, to_dict). media_urls is a JSON list,
+                # so REASSIGN (SQLAlchemy does not track in-place list mutation). Put
+                # it at [0], the lead-image slot those consumers treat as primary. No
+                # second storage channel: the old '<!-- news_image -->' content marker
+                # was invisible to all of them (the parallel-path this replaces).
+                img = (image_url or '').strip()
+                if publishable and img:
+                    urls = list(post.media_urls or [])
+                    if not urls or urls[0] != img:
+                        post.media_urls = [img] + [u for u in urls if u != img]
+                        changed = True
+                # Migrate forward: strip any legacy news_image comment an earlier
+                # version wrote into content (read-only shim — delete after 2026-09).
+                if NEWS_IMAGE_PREFIX in content:
+                    content = NEWS_IMAGE_RE.sub('', content).rstrip()
+                    changed = True
+
+                if changed:
+                    post.content = content
                     db.commit()
 
                 return json.dumps({
                     'success': True,
                     'post_id': str(post.id),
                     'publish_web': bool(publishable),
+                    'image_url': img or None,
                     'title': post.title,
                 })
             finally:
@@ -278,11 +319,21 @@ def register_news_tools(helper, assistant, user_id: str):
                 )
                 items = []
                 for post in posts:
+                    _content = post.content or ''
+                    # Lead image from the canonical column; fall back to the legacy
+                    # content marker for posts written before the media_urls switch
+                    # (read-only migration shim — delete after 2026-09).
+                    _media = post.media_urls or []
+                    _legacy = NEWS_IMAGE_RE.search(_content)
+                    _img_url = _media[0] if _media else (
+                        _legacy.group(1) if _legacy else None)
+                    _clean = NEWS_IMAGE_RE.sub('', _content).replace(
+                        PUBLISH_WEB_MARKER, '').strip()
                     items.append({
                         'id': str(post.id),
                         'title': post.title,
-                        'content': (post.content or '').replace(
-                            PUBLISH_WEB_MARKER, '').strip(),
+                        'content': _clean,
+                        'image_url': _img_url,
                         'link_url': post.link_url,
                         'source_channel': post.source_channel,
                         'created_at': post.created_at.isoformat() if post.created_at else None,

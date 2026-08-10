@@ -108,18 +108,20 @@ def test_hevolveai_available_false_when_neither(monkeypatch):
     import importlib.util as ilu
     monkeypatch.setattr(ilu, 'find_spec', lambda name: None)
     monkeypatch.setattr(hs, '_resolve_hevolveai_pythonpath', lambda: None)
+    # 'neither' now includes the repo-mode probe (2026-08-09): no checkout.
+    monkeypatch.setattr(hs, '_resolve_repo_root', lambda: None)
     assert hs._hevolveai_available() is False
 
 
 # ── Defense-in-depth: fast-fail breaker in the _run loop ──────────
+#
+# CONTRACT CHANGE 2026-08-09: the breaker no longer DISABLES the
+# supervisor (the 2026-08-06 trip left the brain dead for 30+ hours with
+# nothing to re-arm it). It now COOLS DOWN AND RE-ARMS: on trip it
+# resets its counters and requests one long extra wait from the base
+# loop (extra_wait_once), then keeps supervising.
 
-def test_run_loop_disables_after_consecutive_fast_fails(monkeypatch):
-    """A child that's importable but exits rc=1 in <5s on every spawn
-    must DISABLE the supervisor after 5 consecutive fast-fails instead
-    of looping at the 60s cap forever.  We drive the real _run loop
-    with a fake Popen that returns instantly."""
-    from integrations.agent_engine import hevolveai_supervisor as hs
-
+def _mk_sup(hs):
     sup = hs._Supervisor.__new__(hs._Supervisor)
     sup.stop_event = __import__('threading').Event()
     sup.lock = __import__('threading').Lock()
@@ -132,8 +134,27 @@ def test_run_loop_disables_after_consecutive_fast_fails(monkeypatch):
     sup.python_exe = 'python'
     sup.api_url = 'http://localhost:8000'
     sup.proc = None
+    sup.repo_root = None
+    sup.repo_python = None
+    sup.extra_wait_once = 0.0
+    sup._consecutive_fast_fails = 0
+    sup._consecutive_unhealthy = 0
+    sup._current_pid = None
+    return sup
 
+
+def test_run_loop_cools_down_after_consecutive_fast_fails(monkeypatch):
+    """A child that's importable but exits rc=1 in <5s on every spawn
+    must trip the breaker after 5 consecutive fast-fails: counters
+    reset, ONE long cooldown wait is requested from the base loop, and
+    supervision continues (no permanent disable). We drive the real
+    _run loop with a fake Popen that returns instantly and stop it at
+    the cooldown wait."""
+    from integrations.agent_engine import hevolveai_supervisor as hs
+
+    sup = _mk_sup(hs)
     spawn_count = {'n': 0}
+    waits = []
 
     class _InstantDeadProc:
         """Popen stand-in: already-exited child (rc=1), no stdout."""
@@ -144,16 +165,10 @@ def test_run_loop_disables_after_consecutive_fast_fails(monkeypatch):
         def wait(self):
             return 1  # immediate rc=1
 
-    def _fake_popen_kwargs():
-        return {}
-    def _fake_build_cmd():
-        return ['python', '-c', 'raise SystemExit(1)']
-    def _fake_build_env():
-        return {}
-
-    monkeypatch.setattr(sup, '_popen_kwargs', _fake_popen_kwargs)
-    monkeypatch.setattr(sup, '_build_cmd', _fake_build_cmd)
-    monkeypatch.setattr(sup, '_build_env', _fake_build_env)
+    monkeypatch.setattr(sup, '_popen_kwargs', lambda: {})
+    monkeypatch.setattr(sup, '_build_cmd',
+                        lambda: ['python', '-c', 'raise SystemExit(1)'])
+    monkeypatch.setattr(sup, '_build_env', lambda: {})
     monkeypatch.setattr(sup, '_register_with_governor', lambda pid: None)
     monkeypatch.setattr(sup, '_unregister_from_governor', lambda pid: None)
 
@@ -162,47 +177,44 @@ def test_run_loop_disables_after_consecutive_fast_fails(monkeypatch):
         return _InstantDeadProc()
     monkeypatch.setattr(hs.subprocess, 'Popen', _fake_popen)
 
-    # Make stop_event.wait() a no-op (don't actually sleep the backoff)
-    # but still return False so the loop continues until the breaker.
-    monkeypatch.setattr(sup.stop_event, 'wait', lambda timeout=None: False)
+    # Record every backoff wait; STOP the loop the moment the cooldown
+    # (>= 1800s) is requested -- that is the observable breaker trip.
+    def _record_wait(timeout=None):
+        waits.append(timeout)
+        return timeout is not None and timeout >= 1800.0
+    monkeypatch.setattr(sup.stop_event, 'wait', _record_wait)
     # Keep last_started "now" so uptime is ~0 (<5s fast-fail).
     monkeypatch.setattr(hs.time, 'time', lambda: 1000.0)
 
-    # Run with a hard cap so a broken breaker can't hang the test.
     import threading
     t = threading.Thread(target=sup._run, daemon=True)
     t.start()
     t.join(timeout=5)
 
     assert not t.is_alive(), (
-        "the _run loop did not terminate — fast-fail breaker missing or "
-        "broken; it would spin forever on a permanently-crashing child")
-    # Breaker trips at 5 consecutive fast-fails (spawns 5, then returns).
+        "the _run loop never requested the cooldown wait — breaker "
+        "missing or broken; it would spin at the 60s cap forever")
+    # Breaker trips at 5 consecutive fast-fails (5 spawns, then cooldown).
     assert spawn_count['n'] == 5, (
-        f"expected exactly 5 spawns before disabling, got {spawn_count['n']}")
-    assert 'DISABLING' in (sup.last_error or '')
+        f"expected exactly 5 spawns before the cooldown, got {spawn_count['n']}")
+    assert waits and waits[-1] >= 1800.0, waits
+    assert 'cooling down' in (sup.last_error or '')
+    # Re-armed: counters reset and the one-shot wait consumed.
+    assert sup._consecutive_fast_fails == 0
+    assert sup._consecutive_unhealthy == 0
+    assert sup.extra_wait_once == 0.0
 
 
-def test_run_loop_disables_after_consecutive_SLOW_crashes(monkeypatch):
+def test_run_loop_cools_down_after_consecutive_SLOW_crashes(monkeypatch):
     """A child that loads, runs ~15s (NOT a sub-5s fast-fail), then crashes
-    EVERY time must ALSO disable — after _UNHEALTHY_LIMIT (6) consecutive
-    sub-60s exits — instead of respawning forever (the 2026-06-01 hevolveai
-    14-22s crash-loop that the old sub-5s-only breaker never caught)."""
+    EVERY time must ALSO trip — after _UNHEALTHY_LIMIT (6) consecutive
+    sub-60s exits — into the same cooldown-and-rearm (the 2026-06-01
+    hevolveai 14-22s crash-loop class)."""
     from integrations.agent_engine import hevolveai_supervisor as hs
 
-    sup = hs._Supervisor.__new__(hs._Supervisor)
-    sup.stop_event = __import__('threading').Event()
-    sup.lock = __import__('threading').Lock()
-    sup.last_error = None
-    sup.last_started = None
-    sup.restart_count = 0
-    sup.port = 8000
-    sup.pythonpath = None
-    sup.python_exe = 'python'
-    sup.api_url = 'http://localhost:8000'
-    sup.proc = None
-
+    sup = _mk_sup(hs)
     spawn_count = {'n': 0}
+    waits = []
 
     class _SlowDeadProc:
         def __init__(self):
@@ -222,7 +234,11 @@ def test_run_loop_disables_after_consecutive_SLOW_crashes(monkeypatch):
         spawn_count['n'] += 1
         return _SlowDeadProc()
     monkeypatch.setattr(hs.subprocess, 'Popen', _fake_popen)
-    monkeypatch.setattr(sup.stop_event, 'wait', lambda timeout=None: False)
+
+    def _record_wait(timeout=None):
+        waits.append(timeout)
+        return timeout is not None and timeout >= 1800.0
+    monkeypatch.setattr(sup.stop_event, 'wait', _record_wait)
 
     # Monotonic clock advancing 15s per call → each spawn's uptime computes to
     # ~15s: above the 5s fast-fail floor but below the 60s unhealthy floor.
@@ -238,9 +254,12 @@ def test_run_loop_disables_after_consecutive_SLOW_crashes(monkeypatch):
     t.join(timeout=5)
 
     assert not t.is_alive(), (
-        "the _run loop did not terminate — the SLOW-crash breaker is missing; "
-        "a child that crashes at 15s every time would respawn forever")
+        "the _run loop never requested the cooldown wait — the SLOW-crash "
+        "breaker is missing; a 15s crash-loop would respawn forever")
     # 15s uptime is NOT a fast-fail, so only the unhealthy breaker fires → 6.
     assert spawn_count['n'] == 6, (
-        f"expected 6 spawns before the unhealthy breaker disables, got {spawn_count['n']}")
-    assert 'DISABLING' in (sup.last_error or '')
+        f"expected 6 spawns before the cooldown, got {spawn_count['n']}")
+    assert waits and waits[-1] >= 1800.0, waits
+    assert 'cooling down' in (sup.last_error or '')
+    assert sup._consecutive_unhealthy == 0
+    assert sup.extra_wait_once == 0.0

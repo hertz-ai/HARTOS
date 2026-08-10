@@ -3929,3 +3929,186 @@ class TestOfflineVoiceFloorIsUnconditional:
             "no unconditional espeak-ng declaration before the voiceEnabled "
             "block — the offline voice floor is gone entirely, which is worse "
             "than it being gated")
+
+
+class TestNothingLostImportInvariant:
+    """The 'nothing lost' invariant (goal: none of the features implemented in
+    mkHart shd be lost). Every variant CONFIGURATION must import its feature
+    PROFILE. mkHartSystem AND this file's read_variant() both ASSUME it — they
+    read configuration+profile as one surface — so if the import were ever
+    dropped, the raw image built from configurations/<v>.nix would silently lose
+    EVERY hart.* feature the profile enables, while the whole suite (which reads
+    the union regardless) stayed green. This guard is the one thing that catches
+    that class. Source-shape by necessity: .nix does not evaluate on the dev box,
+    and this is a cross-file structural invariant no behavioural test can see."""
+
+    @pytest.mark.parametrize("variant", ["desktop", "server", "edge"])
+    def test_configuration_imports_its_profile(self, variant):
+        src = read_nix(os.path.join(CONFIGS_DIR, variant + ".nix"))
+        assert re.search(rf"\.\./profiles/{re.escape(variant)}\.nix", src), (
+            f"configurations/{variant}.nix no longer imports ../profiles/"
+            f"{variant}.nix — the raw image built from it would silently lose "
+            f"every hart.* feature the profile enables (the profile is the single "
+            f"source of the installed feature surface). Restore the import.")
+        assert os.path.exists(os.path.join(PROFILES_DIR, variant + ".nix")), (
+            f"profiles/{variant}.nix is missing — the import above dangles and "
+            f"the variant's feature surface has no home")
+
+
+class TestRawImageSinglePath:
+    """Task #13 closure: systemd-repart owns EVERY raw-efi variant; the
+    per-variant special case is gone; and no live-medium surface can reach
+    an installed (raw) system.
+
+    Written when the mkImage carve-out (`format == "raw-efi" && variant ==
+    "desktop"`) was deleted after its own written exit condition was met:
+    (1) the repart raw-desktop built (run 30336832563), flashed with a full
+    sha256 read-back verify (2026-07-30) and booted; (2) server.nix + edge.nix
+    gained desktop.nix's hartImageKind guard. These are source-shape guards on
+    Nix we cannot evaluate on this box; the flake's own eval gate + the
+    raw-server/raw-edge builds in Nix Build Matrix are the behavioural proof.
+    """
+
+    def _read(self, *parts):
+        return read_nix(os.path.join(*parts))
+
+    def test_every_raw_efi_routes_through_repart(self):
+        """mkImage must route raw-efi by FORMAT alone — a variant clause
+        reintroduces the parallel path (one artifact kind, two builders)."""
+        src = self._read(NIXOS_DIR, "flake.nix")
+        idx = src.index('if format == "raw-efi"')
+        window = src[idx:idx + 120]
+        assert 'variant ==' not in window, (
+            "mkImage routes raw-efi per-variant again — the deleted parallel "
+            "path is growing back: " + window)
+        assert 'mkRepartImage' in src[idx:idx + 200]
+
+    def test_server_and_edge_guard_the_cd_profile_like_desktop(self):
+        """The CD profile import must sit inside the hartImageKind == \"iso\"
+        branch in ALL THREE variants — an unconditional import makes the raw
+        build a live medium again (and double-defines fileSystems under
+        repart)."""
+        for cfg in ("desktop.nix", "server.nix", "edge.nix"):
+            src = self._read(CONFIGS_DIR, cfg)
+            assert 'hartImageKind ? "iso"' in src, (
+                f"{cfg} must take hartImageKind as a module arg (specialArg "
+                "plumbing — a bare config-fixpoint read is the b346adbb "
+                "infinite recursion)")
+            cd = src.index("installer/cd-dvd/installation-cd")
+            guard = src.index('lib.optionals (hartImageKind == "iso")')
+            assert guard < cd, (
+                f"{cfg}: the CD-profile import is OUTSIDE the hartImageKind "
+                "guard — raw builds will import the live-medium profile")
+
+    def test_server_live_medium_access_story_is_iso_only(self):
+        """The permissive-SSH / baked-password / ssh-diag surface 'must NEVER
+        reach an installed system' (server.nix's own words). The raw image IS
+        an installed system, so every piece must be inside the iso branch or
+        an explicit hartImageKind gate."""
+        src = self._read(CONFIGS_DIR, "server.nix")
+        guard = src.index('lib.optionals (hartImageKind == "iso")')
+        for marker in ("PermitRootLogin", "hashedPassword",
+                       "pam.services.sshd", "mutableUsers"):
+            pos = src.index(marker)
+            assert pos > guard, (
+                f"server.nix: {marker} sits before the iso guard — the raw "
+                "server image would ship live-medium credentials")
+        # ssh-diag is gated with mkIf (it is not an import-list member).
+        diag = src.index("systemd.services.ssh-diag")
+        assert 'lib.mkIf (hartImageKind == "iso")' in src[diag - 200:diag + 200], (
+            "ssh-diag (unauthenticated shadow/sshd dump on :8888) must be "
+            "hartImageKind-gated")
+        # And its firewall hole goes with it.
+        fw = src.index("allowedTCPPorts")
+        assert 'lib.optionals (hartImageKind == "iso")' in src[fw - 60:fw + 120], (
+            "port 8888 must open on the live medium only")
+
+    def test_repart_module_owns_bare_metal_storage_initrd(self):
+        """Every dd-able repart image needs the storage drivers of the disks
+        it may be dd'd onto — riding on the DESKTOP profile's enable left
+        raw-server/raw-edge open to the initrd-lacks-usb_storage VFS panic
+        the desktop already debugged. mkDefault, so profiles still win."""
+        src = self._read(MODULES_DIR, "hart-repart-image.nix")
+        assert "hart.bootRootInitrd.enable = lib.mkDefault true" in src
+
+    def test_repart_initrd_covers_internal_disk_roots_sata_and_nvme(self):
+        """The installed raw image's PRIMARY boot medium is an INTERNAL disk, not
+        a USB stick — that is the whole reason it exists next to the live ISO. Yet
+        the hart.bootRootInitrd guard only pins the USB-root set (usb_storage / uas
+        / sd_mod / xhci; criticalModules in hart-boot-root-initrd.nix). SATA (ahci)
+        and NVMe (nvme) coverage lives ONLY in THIS module's explicit
+        boot.initrd.availableKernelModules list, so this test is their sole guard:
+        drop them and an installed image on any modern NVMe laptop or SATA SSD
+        'VFS: unable to mount root fs' bricks on first boot, while CI stays green
+        because the eval guard never checks ahci/nvme.
+
+        Source-shape guard by necessity — .nix cannot be evaluated on the Windows
+        dev box, and this asserts a cross-module invariant (the bootRootInitrd
+        guard's module set does NOT overlap ahci/nvme, so the repart list must
+        carry them) that no single behavioural test can reach."""
+        src = self._read(MODULES_DIR, "hart-repart-image.nix")
+        m = re.search(r"boot\.initrd\.availableKernelModules\s*=\s*\[([^\]]*)\]", src)
+        assert m, ("hart-repart-image.nix no longer pins an explicit "
+                   "boot.initrd.availableKernelModules list — the installed "
+                   "image's SATA/NVMe root coverage is gone")
+        listed = set(re.findall(r'"([^"]+)"', m.group(1)))
+        # ahci = SATA controller (2.5\" SSD / HDD); nvme = NVMe SSD (M.2). Neither
+        # is in the bootRootInitrd guard's critical set, so ONLY this list carries
+        # them — usb_storage/uas/sd_mod are belt-and-suspenders with the guard.
+        for mod in ("usb_storage", "uas", "ahci", "nvme", "sd_mod"):
+            assert mod in listed, (
+                f"hart-repart-image.nix dropped '{mod}' from the installed-image "
+                f"initrd (have: {sorted(listed)}) — a raw image dd'd onto a disk "
+                f"that needs '{mod}' cannot mount its root and VFS-panics on boot")
+
+    def test_iso_branding_lives_inside_the_iso_branch(self):
+        """isoImage.* options exist only under the CD profile; an
+        unconditional block breaks the raw eval ('option does not exist')."""
+        for cfg in ("server.nix", "edge.nix"):
+            src = self._read(CONFIGS_DIR, cfg)
+            guard = src.index('lib.optionals (hartImageKind == "iso")')
+            decls = [i for i, ln in enumerate(src.splitlines())
+                     if ln.strip().startswith("isoImage = {")]
+            assert decls, f"{cfg}: isoImage branding vanished entirely"
+            # Position check: every isoImage decl is after the guard opens.
+            for line_no in decls:
+                pos = len("\n".join(src.splitlines()[:line_no]))
+                assert pos > guard, (
+                    f"{cfg}: isoImage block at line {line_no + 1} is outside "
+                    "the iso branch")
+
+    def test_bios_boot_preserved_for_every_iso_variant(self):
+        """makeBiosBootable must survive on ALL THREE ISO variants.
+
+        The standing goal names it: "All Bios compatibility like hyper v etc,
+        none of the feature native to Nix shd be lost." isoImage.makeBiosBootable
+        is what gives the ISO an El Torito BIOS boot catalog (isolinux) so a
+        legacy-BIOS machine — including a Hyper-V GENERATION 1 VM, which has no
+        UEFI at all — can boot the installer medium. Edge is the variant MOST
+        likely to be BIOS-only (old industrial boards; edge.nix says so), and
+        the repart refactor (63f07a98) moved this option into the
+        hartImageKind guard for server + edge — so a guard that it stays present
+        AND inside the iso branch is exactly the "not lost" invariant, and stops
+        a future edit dropping BIOS boot the way the desktop/edge ISOs once
+        lacked it (the gap firmware-boot-matrix.nix was written for).
+
+        (The RAW images are intentionally UEFI-only — systemd-repart's
+        Discoverable-Partitions + UKI model — so makeBiosBootable must NOT
+        appear outside the iso branch; that is asserted by position below.)
+        """
+        for cfg in ("desktop.nix", "server.nix", "edge.nix"):
+            src = self._read(CONFIGS_DIR, cfg)
+            lines = src.splitlines()
+            hits = [i for i, ln in enumerate(lines)
+                    if ln.strip().startswith("makeBiosBootable")
+                    and not ln.strip().startswith("#")]
+            assert hits, (
+                f"{cfg}: makeBiosBootable is gone — this ISO can no longer boot "
+                "a legacy-BIOS / Hyper-V Gen-1 machine (goal: all BIOS compat)")
+            guard = src.index('lib.optionals (hartImageKind == "iso")')
+            for line_no in hits:
+                pos = len("\n".join(lines[:line_no]))
+                assert pos > guard, (
+                    f"{cfg}: makeBiosBootable at line {line_no + 1} is OUTSIDE "
+                    "the iso branch — it would try to apply to the UEFI-only raw "
+                    "image and break the raw eval")

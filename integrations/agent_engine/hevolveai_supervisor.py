@@ -151,6 +151,10 @@ def _hevolveai_available() -> bool:
             return True
     except Exception:
         pass
+    # Repo mode: a checkout with run_server.py + its pinned interpreter
+    # can boot the brain regardless of what is (or is not) installed.
+    if _resolve_repo_root() is not None and _resolve_repo_python() is not None:
+        return True
     # Dev fallback: the sibling repo path that gets put on the child's
     # PYTHONPATH so it can import hevolveai even when not pip-installed.
     return _resolve_hevolveai_pythonpath() is not None
@@ -240,6 +244,58 @@ def _resolve_hevolveai_pythonpath() -> Optional[str]:
     return None
 
 
+def _resolve_repo_root() -> Optional[Path]:
+    """The hevolveai REPO checkout, run via its PRODUCTION entry
+    (``run_server.py`` -- start.bat semantics minus the Cython rebuild).
+
+    Preferred over the installed python-embed package whenever both a
+    checkout and its pinned interpreter exist, because the checkout is
+    the maintained brain: the installed copy on the 2026-08 incident box
+    was stale and crash-looped on import (ImportError:
+    SafeRotatingFileHandler at api_server.py:65, then a numpy circular
+    import), tripping the breaker on every boot while the checkout
+    booted fine under C:\\Python310.
+
+    Resolution order (first hit wins, each must contain run_server.py):
+      1. ``HEVOLVEAI_HOME``
+      2. the sibling checkout next to the HARTOS repo (dev runs)
+      3. ``~/PycharmProjects/hevolveai`` (the dev-box convention --
+         reachable from FROZEN Nunba too, where __file__ is inside the
+         bundle and the sibling probe cannot see the repo)
+    """
+    candidates = []
+    override = os.environ.get('HEVOLVEAI_HOME', '').strip()
+    if override:
+        candidates.append(Path(override))
+    if not getattr(sys, 'frozen', False):
+        here = Path(__file__).resolve()
+        hartos_root = here.parent.parent.parent
+        candidates.append(hartos_root.parent / 'hevolveai')
+    candidates.append(Path.home() / 'PycharmProjects' / 'hevolveai')
+    for cand in candidates:
+        try:
+            if (cand / 'run_server.py').is_file():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def _resolve_repo_python() -> Optional[str]:
+    """Interpreter for the repo-mode child. ``HEVOLVE_PYTHON`` wins;
+    default is the repo's own pinned server interpreter
+    (``C:\\Python310\\python.exe`` -- the exact exe start.bat hardcodes).
+    None when neither exists -> repo mode unavailable, installed-package
+    boot is used instead."""
+    override = os.environ.get('HEVOLVE_PYTHON', '').strip()
+    if override and os.path.isfile(override):
+        return override
+    pinned = r'C:\Python310\python.exe'
+    if os.path.isfile(pinned):
+        return pinned
+    return None
+
+
 # Cached verdict of the child-interpreter torch probe (see below).
 # None = not yet probed; True/False = the cached result for this process.
 _CHILD_TORCH_OK: Optional[bool] = None
@@ -280,8 +336,15 @@ def _child_can_import_torch() -> bool:
     verdict = False
     try:
         from core.subprocess_safe import run_bounded
+        # Probe the interpreter that will ACTUALLY run the child: the
+        # repo's pinned python in repo mode, the embed python otherwise.
+        _probe_exe = _resolve_python_exe()
+        if _resolve_repo_root() is not None:
+            _repo_py = _resolve_repo_python()
+            if _repo_py:
+                _probe_exe = _repo_py
         res = run_bounded(
-            [_resolve_python_exe(), '-c',
+            [_probe_exe, '-c',
              "import importlib.util as u, sys; "
              "sys.exit(0 if u.find_spec('torch') else 3)"],
             timeout=30.0,
@@ -533,6 +596,17 @@ class _Supervisor(ProcessSupervisor):
         self.pythonpath: Optional[str] = _resolve_hevolveai_pythonpath()
         self.port: int = _hevolveai_port()
         self.api_url: str = _hevolveai_api_url()
+        # Repo mode: prefer the maintained checkout via its production
+        # entry when both pieces exist (see _resolve_repo_root).
+        self.repo_root: Optional[Path] = _resolve_repo_root()
+        self.repo_python: Optional[str] = (
+            _resolve_repo_python() if self.repo_root is not None else None)
+        if self.repo_root is not None and self.repo_python is None:
+            logger.info(
+                "hevolveai_supervisor: checkout found at %s but no repo "
+                "interpreter (HEVOLVE_PYTHON / C:\\Python310); using the "
+                "installed-package boot", self.repo_root)
+            self.repo_root = None
         # Circuit-breaker state — persisted across respawns (see _on_child_exit).
         self._consecutive_fast_fails = 0
         self._consecutive_unhealthy = 0
@@ -632,6 +706,18 @@ class _Supervisor(ProcessSupervisor):
         on-disk package exactly as before — zero behaviour change without a
         bundle, armored .enc (never a stale .pyd) with one.
         """
+        # REPO MODE (2026-08-09): when a working checkout + its pinned
+        # interpreter exist, run the PRODUCTION entry -- run_server.py
+        # under the repo root, exactly start.bat's server line (the bat's
+        # Cython rebuild and TensorBoard spawn are dev/observability
+        # concerns, not supervision ones). Port still flows via
+        # HEVOLVEAI_PORT in _build_env. This is what un-wedged the
+        # 2026-08 crash-loop: the installed python-embed package was
+        # stale-broken while the checkout booted fine.
+        _repo_root = getattr(self, 'repo_root', None)
+        _repo_py = getattr(self, 'repo_python', None)
+        if _repo_root is not None and _repo_py is not None:
+            return [_repo_py, str(_repo_root / 'run_server.py')]
         boot = (
             _ARMOR_INSTALL_SNIPPET +
             "import uvicorn\n"
@@ -786,6 +872,11 @@ class _Supervisor(ProcessSupervisor):
         cmd = self._build_cmd()
         kw = self._popen_kwargs()
         kw['env'] = self._build_env()
+        if (getattr(self, 'repo_root', None) is not None
+                and getattr(self, 'repo_python', None) is not None):
+            # run_server.py resolves its src/ and data dirs relative to
+            # the repo root, exactly as start.bat's `cd /d %~dp0\..` does.
+            kw['cwd'] = str(self.repo_root)
         return cmd, kw
 
     def _on_started(self, proc) -> None:
@@ -807,8 +898,27 @@ class _Supervisor(ProcessSupervisor):
         SLOW: a child that loads its model (eating VRAM), runs 10-30s, then
         crashes every time churns VRAM/CPU without tripping the fast breaker
         (live 2026-06-01: 14-22s uptime, 8x, free VRAM 7.8->3.0GB starved the
-        flywheel). Disable after N consecutive unhealthy exits in a row. (The
-        backoff reset after a healthy run is the base's reset_backoff_after=60.)
+        flywheel). (The backoff reset after a healthy run is the base's
+        reset_backoff_after=60.)
+
+        COOL-DOWN-AND-REARM (2026-08-09, supersedes the terminal disable):
+        the old `return True` ended the supervise thread PERMANENTLY --
+        after the 2026-08-06 trip the brain never respawned for 30+ hours
+        while nothing re-armed it (only a fresh bootstrap could). A latched
+        breaker on a self-healing target (a stale install replaced, disk
+        freed, a port released) is worse than a bounded retry: now a trip
+        RESETS the counters and requests one LONG cooldown wait from the
+        base loop (extra_wait_once), so a genuinely broken child costs at
+        most ~6 spawn attempts per cooldown window instead of either a hot
+        60s crash-loop or an eternal outage. Override the window via
+        HEVOLVE_SUPERVISOR_BREAKER_COOLDOWN_S (default 1800).
+
+        NOTE ON HEALTH SEMANTICS: liveness is exit-code only -- there is NO
+        HTTP probe here BY DESIGN. The brain's import phase alone can take
+        tens of minutes (measured 35 min under a traced build) during which
+        /health does not answer; a probing supervisor would kill a healthy
+        child. A child that stays ALIVE is healthy by definition; only
+        sub-60s DEATHS count as unhealthy.
         """
         if self._current_pid is not None:
             self._unregister_from_governor(self._current_pid)
@@ -828,13 +938,21 @@ class _Supervisor(ProcessSupervisor):
             _window = (_FAST_FAIL_S
                        if self._consecutive_fast_fails >= _FAST_FAIL_LIMIT
                        else _UNHEALTHY_S)
+            try:
+                _cooldown = float(os.environ.get(
+                    'HEVOLVE_SUPERVISOR_BREAKER_COOLDOWN_S', '1800'))
+            except ValueError:
+                _cooldown = 1800.0
             self.last_error = (
                 f'hevolveai exited rc={rc} unhealthily {_n}x in a row '
-                f'(uptime <{_window:.0f}s each) -- DISABLING supervisor '
-                f'(broken install / crashing child / missing weights). '
-                f'Restart Nunba or fix the install to re-enable.')
+                f'(uptime <{_window:.0f}s each) -- breaker tripped: '
+                f'cooling down {_cooldown:.0f}s, then re-arming '
+                f'(broken install / crashing child / missing weights).')
             logger.error("hevolveai_supervisor: %s", self.last_error)
-            return True
+            self._consecutive_fast_fails = 0
+            self._consecutive_unhealthy = 0
+            self.extra_wait_once = _cooldown
+            return False
         return False
 
     def info(self) -> Dict[str, Any]:

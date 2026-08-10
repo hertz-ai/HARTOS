@@ -92,10 +92,29 @@ class TestFileSearch(unittest.TestCase):
                        environ_overrides={'REMOTE_ADDR': '203.0.113.7'})
         self.assertEqual(r.status_code, 403)
 
-    def test_sandbox_denied_outside_roots(self):
-        outside = 'C:\\Windows' if sys.platform == 'win32' else '/etc'
-        r = self.c.get('/api/shell/files/search?path=%s&q=x' % outside)
-        self.assertEqual(r.status_code, 403)
+    def test_read_browses_outside_sandbox_like_explorer(self):
+        """Option B parity: browse/search reach mounted-disk paths OUTSIDE the
+        user-owned sandbox roots, exactly like Explorer/Finder. Reads call
+        _is_path_allowed() with the browse default (mountpoints admitted); only
+        MUTATIONS stay confined -- see TestFileChmod.test_mutation_denied_outside_roots.
+        A confined read would 403 here; this asserts it does not, and that a real
+        file living outside the sandbox is genuinely listed."""
+        import integrations.agent_engine.shell_os_apis as soa
+        sysdir = 'C:\\Windows' if sys.platform == 'win32' else '/etc'
+        if not os.path.isdir(sysdir):
+            self.skipTest('%s not present on this host' % sysdir)
+        # Precondition: sysdir is genuinely OUTSIDE the confined (mutation) roots,
+        # so a 200 below can only mean reads are allowed to browse the mount.
+        self.assertFalse(soa._is_path_allowed(sysdir, include_mounts=False),
+                         'target must be outside the confined roots to be meaningful')
+        real = next((e.name for e in os.scandir(sysdir) if e.is_file()), None)
+        if real is None:
+            self.skipTest('no file under %s to search for' % sysdir)
+        r = self.c.get('/api/shell/files/search',
+                       query_string={'path': sysdir, 'q': real[:3], 'recursive': 'false'})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        names = [e['name'] for e in r.get_json()['entries']]
+        self.assertIn(real, names)  # genuinely listed a file outside the sandbox
 
 
 class TestFileThumbnail(unittest.TestCase):
@@ -162,11 +181,33 @@ class TestFileThumbnail(unittest.TestCase):
         # the auth gate still runs first, so this is 403 regardless.
         self.assertEqual(r.status_code, 403)
 
-    def test_sandbox_denied_outside_roots(self):
-        outside = ('C:\\Windows\\System32\\notepad.exe' if sys.platform == 'win32'
-                   else '/etc/hostname')
-        r = self.c.get('/api/shell/files/thumbnail?path=%s' % outside)
-        self.assertEqual(r.status_code, 403)
+    def test_read_reaches_outside_sandbox_like_explorer(self):
+        """Option B parity: the thumbnail route reaches file paths OUTSIDE the
+        user-owned sandbox (mounted disk), like Explorer's preview pane. A real
+        NON-image file there returns the 204 glyph-fallback -- which proves the
+        sandbox ADMITTED the read, because a confined read would 403 BEFORE the
+        fallback. The victim is discovered (and asserted to exist + be outside
+        the confined roots) so the 204 can only be the non-image branch, never
+        the missing-file branch. Mutations remain confined -- see
+        TestFileChmod.test_mutation_denied_outside_roots."""
+        import integrations.agent_engine.shell_os_apis as soa
+        sysdir = 'C:\\Windows' if sys.platform == 'win32' else '/etc'
+        if not os.path.isdir(sysdir):
+            self.skipTest('%s not present on this host' % sysdir)
+        imgexts = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff', '.ico'}
+        victim = next((e.path for e in os.scandir(sysdir)
+                       if e.is_file()
+                       and osp.splitext(e.name)[1].lower() not in imgexts), None)
+        if victim is None:
+            self.skipTest('no non-image file under %s to probe' % sysdir)
+        # Precondition: the file EXISTS and is outside the confined (mutation)
+        # roots, so 204 here is the non-image fallback (sandbox admitted), not 403.
+        self.assertTrue(os.path.isfile(victim))
+        self.assertFalse(soa._is_path_allowed(victim, include_mounts=False),
+                         'victim must be outside the confined roots to be meaningful')
+        r = self.c.get('/api/shell/files/thumbnail', query_string={'path': victim})
+        self.assertEqual(r.status_code, 204,
+                         'reads reach outside the sandbox: non-image -> 204, not 403')
 
 
 class TestFileChmod(unittest.TestCase):
@@ -224,12 +265,30 @@ class TestFileChmod(unittest.TestCase):
                         environ_overrides={'REMOTE_ADDR': '203.0.113.7'})
         self.assertEqual(r.status_code, 403)
 
-    def test_sandbox_denied_outside_roots(self):
-        outside = ('C:\\Windows\\System32\\notepad.exe' if sys.platform == 'win32'
-                   else '/etc/hostname')
+    def test_mutation_denied_outside_roots(self):
+        """The MUTATION boundary that stays confined under Option B: chmod (a
+        write) on a path outside the user-owned roots is denied, even though the
+        READ routes now browse the whole disk (TestFileSearch/TestFileThumbnail).
+        chmod calls _is_path_allowed(include_mounts=False) -- the confined roots.
+
+        The victim is DISCOVERED and asserted to exist so the route reaches the
+        sandbox gate (403) deterministically, never the missing-path 404 -- the
+        old hardcoded notepad.exe path could vanish under WOW64 redirection and
+        flip this to 404."""
+        import integrations.agent_engine.shell_os_apis as soa
+        sysdir = 'C:\\Windows' if sys.platform == 'win32' else '/etc'
+        if not os.path.isdir(sysdir):
+            self.skipTest('%s not present on this host' % sysdir)
+        victim = next((e.path for e in os.scandir(sysdir) if e.is_file()), None)
+        if victim is None:
+            self.skipTest('no file under %s to probe' % sysdir)
+        self.assertTrue(os.path.isfile(victim))  # exists -> route can't 404 out
+        self.assertFalse(soa._is_path_allowed(victim, include_mounts=False),
+                         'victim must be outside the confined roots to be meaningful')
         with patch('security.action_classifier.classify_action', return_value='safe'):
-            r = self.c.post('/api/shell/files/chmod', json={'path': outside, 'mode': '644'})
-        self.assertEqual(r.status_code, 403)
+            r = self.c.post('/api/shell/files/chmod', json={'path': victim, 'mode': '644'})
+        self.assertEqual(r.status_code, 403,
+                         'mutations stay confined: chmod outside user roots is denied')
 
     def test_writes_immutable_audit(self):
         """A successful chmod records a 'file_chmod' event on the audit log."""
