@@ -443,7 +443,12 @@ in
       with subtest("LiquidUI server is active and serves its shell (not a dead husk)"):
           paint.wait_for_unit("hart-liquid-ui.service", timeout=180)
           paint.wait_for_open_port(6800, timeout=60)
-          body = paint.succeed("curl -fs http://localhost:6800/shell/static/hartHero.js")
+          # Bounded retry, not one-shot: the port can listen before Flask serves the
+          # static route (a transient refused/503 fails a one-shot `curl -fs`) — the
+          # #42 race class. Keeps a #12 paint failure attributed to the paint stage,
+          # not a transient fetch. An EMPTY 200 still trips the dead-husk assert below.
+          body = paint.wait_until_succeeds(
+              "curl -fs http://localhost:6800/shell/static/hartHero.js", timeout=90)
           assert body.strip(), "/shell/static/hartHero.js served EMPTY — dead-husk"
 
       # ════════════════════════════════════════════════════════════════
