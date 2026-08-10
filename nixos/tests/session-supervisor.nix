@@ -651,10 +651,14 @@ in
           sup.wait_until_succeeds(
               "journalctl -t hart-session-supervisor -b --no-pager | "
               "grep -q 'tier degrade hart-comp -> sway'", timeout=90)
-          # The terminal outcome is the audited floor — never a silent stay above it.
-          tier = sup.succeed(f"cat {LATCH}").strip()
-          assert tier == "cage", \
-              f"a re-attempted broken Tier-1 must settle on the cage floor, got {tier!r}"
+          # The terminal outcome is the audited floor. BOUNDED, not one-shot: the
+          # drop to cage needs a SECOND degrade (sway -> cage) AFTER the hart-comp
+          # -> sway line synced on above, so the latch legitimately reads "sway" for
+          # a beat between the two — the SAME #42 one-shot race the sibling curl
+          # checks fixed; do not reintroduce it next door. Wait for the floor value
+          # (x-prefix `test` avoids Nix ''-string / shell-quote escaping); cage is
+          # terminal, so once reached it never moves.
+          sup.wait_until_succeeds(f"test x$(cat {LATCH}) = xcage", timeout=90)
     '';
   };
 
