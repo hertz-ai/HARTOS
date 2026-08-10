@@ -66,7 +66,7 @@ sandboxed) — recorded + guarded.
 
 | # | Item | Status / next step |
 |---|---|---|
-| `#42` | VM suite has FLAKY timing tests (`hart-server-boot` port-bind, `hart-session-supervisor-reboot-latch`) — different reds each run, blocks all-green | Make the timing subtests use bounded `wait_for_open_port`/`wait_for_unit` retries instead of one-shot asserts, then re-run for determinism |
+| `#42` | VM suite has FLAKY timing tests (`hart-server-boot` port-bind, `hart-session-supervisor-reboot-latch`) — different reds each run, blocks all-green | **ROOT-CAUSED + FIXED (verifying, run `31364337720`).** Two causes: (a) one-shot `curl` after `wait_for_open_port` raced socket-listening-before-Flask-serving → bounded `wait_until_succeeds` at all 4 sites (`8ef180d7`); (b) the reboot-latch subtest asserted a broken Tier-1 (`/bin/false`) FREEZES as `hart-comp` across a reboot — invalid: `greetd.service` is a NixOS-managed unit, so boot-time `/etc` regeneration undoes the runtime `systemctl mask`, greetd re-runs the selector and correctly re-drops. Now asserts the reboot READS+HONORS the durable re-arm via the supervisor's append-only journal (`f7eb7325`). Close when the re-run shows both absent from `--log-failed`. |
 | `#12` | `hart-layer-shell-host-paint` GTK4 SIGABRT on software GL (vulkan/GSK hang) | Known, deep, multi-session; GPU proven-good — the fix is root-causing the GSK-GL/layer-shell path, not another workaround |
 | `#29` | Python CI fleet red — harness inherits host machine identity (D-Bus/sysfs/abs paths) | Hermetic-harness fix; separate from the OS-parity VMs |
 | `#19` | Edge cgroup caps below the measured import floor | Edge backend would crash-loop on real edge HW; align caps to the import floor |
@@ -100,3 +100,11 @@ sandboxed) — recorded + guarded.
 3. Run `31347690532` VERIFIED the driver/BIOS/latency matrix on booted VMs and
    surfaced 3 real reds → `#40`/`#41` fixed + validated (`31354663901`), `#12`
    still open, `#42` flakiness identified.
+4. `#42` root-caused from the ACTUAL failure line (run `31354663901`,
+   `--log-failed`), not a guess: the reboot-latch red was the invalid
+   "broken Tier-1 freezes as hart-comp across a reboot" assert — greetd is
+   NixOS-managed, so the runtime mask cannot survive a boot and the supervisor
+   correctly re-drops. Fixed to assert the honored-read via the append-only
+   supervisor journal (`f7eb7325`); the one-shot-curl races bounded-retried at
+   all 4 sites (`8ef180d7`). Re-run `31364337720` dispatched to confirm both are
+   gone from `--log-failed`.
