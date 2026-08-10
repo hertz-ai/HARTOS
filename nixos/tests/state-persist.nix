@@ -44,7 +44,14 @@ in
         memorySize = 2048;
         cores = 2;
         # A spare raw disk standing in for the USB's HARTSTATE partition.
-        emptyDiskImages = [ 256 ];
+        # 1 GiB, not 256 MiB: the real USB HARTSTATE partition the flasher carves
+        # is GBs, and the first-boot persist SEEDS /var/lib/hart (cp -a) into it.
+        # 256 MiB was smaller than that seed, so the bulky hart-state copy filled
+        # the fs and the home + wifi backing dirs then failed on ENOSPC (VM run
+        # 31347690532). A realistic stand-in lets all three persist; the module's
+        # reordered wifi-first persist additionally guarantees the credentials
+        # survive even a genuinely space-constrained HARTSTATE.
+        emptyDiskImages = [ 1024 ];
       };
       hart.statePersist.enable = true;
       # The format/mount tooling the test drives the stand-in with (mkfs.ext4,
