@@ -247,6 +247,43 @@ def test_needs_setup_failsafe_offers_setup_on_error(monkeypatch):
     assert mo.needs_setup() is True  # fail toward offering, not skipping
 
 
+def test_display_name_is_present_on_both_paths(monkeypatch):
+    """The button caption reads display_name, so BOTH the catalog path and the
+    catalog-unavailable path must supply it -- otherwise the emergency path
+    captions the button with a raw repo id like 'unsloth/Qwen3.5-0.8B-GGUF'."""
+    _catalog(monkeypatch)
+    _gpu(monkeypatch, total_gb=8.0, free_gb=8.0, cuda_available=True, name='gpu')
+    assert mo.recommend_for_hardware()['display_name'] == 'Big 7B'
+
+    def _boom():
+        raise RuntimeError("catalog down")
+    monkeypatch.setattr(mo, "_get_catalog", _boom)
+    assert mo.recommend_for_hardware()['display_name'] == \
+        mo._CATALOG_UNAVAILABLE_FALLBACK['display_name']
+
+
+def test_setup_button_caption_does_not_use_the_guidance_label():
+    """SOURCE GUARD (the GTK4 ceremony cannot run on this box).
+
+    `label` is a full guidance sentence for the WRAPPING Gtk.Label -- 'Qwen3.5 4B
+    - a good fit for CPU (cpu, 9.6GB ram)'. A Gtk.Button caption does NOT wrap,
+    so embedding it there yielded 'Set up (Qwen3.5 4B - a good fit for CPU (cpu,
+    9.6GB ram))': 56 chars with nested parens on a fixed-width first-boot dialog.
+
+    Two display sites with different needs. If this goes red, someone has pointed
+    the button back at `label` and the setup dialog will stretch or ellipsize.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    src = open(os.path.join(root, "integrations", "agent_engine",
+                            "native_onboarding.py"), encoding="utf-8").read()
+    btn = src[src.index("setup_btn = Gtk.Button("):]
+    btn = btn[:btn.index("setup_btn.add_css_class")]
+    assert "display_name" in btn, "button caption must use display_name"
+    assert "'label'" not in btn and '"label"' not in btn, (
+        "button caption must NOT read rec['label'] -- that is the wrapping "
+        "guidance sentence, not a short identifier")
+
+
 def test_native_onboarding_wires_the_existing_backend_not_a_new_path():
     """Source guard (the GTK4 ceremony cannot be run on this box): the AI step in
     native_onboarding.py must call the EXISTING model_onboarding callables and
