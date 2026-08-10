@@ -681,11 +681,8 @@ class FlaskChannelIntegration:
             agent dispatch, which is what this gate exists to stop.
             """
             # (1) Kong-authenticated consumer.
-            if os.environ.get('HEVOLVE_TRUST_KONG', '').lower() == 'true':
-                if (request.headers.get('X-Consumer-ID')
-                        or request.headers.get('X-Consumer-Username')
-                        or request.headers.get('X-Consumer-Custom-ID')):
-                    return None
+            if _kong_stamped(request.headers):
+                return None
 
             # (2) Provider signature over the raw body.
             secret = (os.getenv(f'{channel_type.upper()}_APP_SECRET')
@@ -857,6 +854,19 @@ def get_channel_integration() -> FlaskChannelIntegration:
     return _integration
 
 
+def _kong_stamped(headers) -> bool:
+    """True if Kong authenticated the caller upstream and stamped its identity
+    on the request. Trusted ONLY when HEVOLVE_TRUST_KONG=true — otherwise any
+    client could forge the X-Consumer-* headers directly. Single source for the
+    Kong-vouch check shared by the webhook gate and the /channels/send gate
+    (was copy-pasted in both — DRY consolidation, behaviour-identical)."""
+    if os.environ.get('HEVOLVE_TRUST_KONG', '').lower() != 'true':
+        return False
+    return bool(headers.get('X-Consumer-ID')
+                or headers.get('X-Consumer-Username')
+                or headers.get('X-Consumer-Custom-ID'))
+
+
 def _channel_send_authenticated(req) -> bool:
     """Is the caller authorized to POST /channels/send?
 
@@ -893,11 +903,8 @@ def _channel_send_authenticated(req) -> bool:
         return True
 
     # (1) Kong authenticated the caller upstream and stamped its identity.
-    if os.environ.get('HEVOLVE_TRUST_KONG', '').lower() == 'true':
-        if (req.headers.get('X-Consumer-ID')
-                or req.headers.get('X-Consumer-Username')
-                or req.headers.get('X-Consumer-Custom-ID')):
-            return True
+    if _kong_stamped(req.headers):
+        return True
 
     # (2) Shared API key.
     expected_key = os.environ.get('HEVOLVE_API_KEY', '')
