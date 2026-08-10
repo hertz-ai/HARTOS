@@ -303,60 +303,12 @@ _active_tools_lock = threading.Lock()
 _inflight_turns = set()
 _inflight_turns_lock = threading.Lock()
 
-
-class _TracedMessageList(list):
-    """TEMP diagnostic: log a stack whenever the list is shortened/emptied.
-
-    Preserves any ``_hook`` already installed on the list it replaces (the
-    MemoryGraph ingest hook wraps group_chat.messages in its own subclass), so
-    installing this must not silently disable provenance tracking.
-    """
-
-    def __init__(self, data=(), hook=None):
-        super().__init__(data)
-        self._hook = hook
-
-    def append(self, msg):
-        super().append(msg)
-        try:
-            current_app.logger.error(
-                f'[GC-MUTATE] append -> len={len(self)} id={id(self)}')
-        except Exception:
-            pass
-        if self._hook is not None:
-            try:
-                self._hook(msg)
-            except Exception:
-                pass
-
-    def _trace(self, op):
-        try:
-            stack = ''.join(traceback.format_stack()[-9:-1])
-            current_app.logger.error(
-                f'[GC-MUTATE] {op} len_before={len(self)}\n{stack}')
-        except Exception:
-            pass
-
-    def clear(self):
-        self._trace('clear()')
-        return super().clear()
-
-    def __delitem__(self, key):
-        self._trace(f'__delitem__({key!r})')
-        return super().__delitem__(key)
-
-    def __setitem__(self, key, value):
-        if isinstance(key, slice):
-            self._trace(f'__setitem__(slice {key!r})')
-        return super().__setitem__(key, value)
-
-    def pop(self, *a):
-        self._trace(f'pop{a!r}')
-        return super().pop(*a)
-
-    def remove(self, v):
-        self._trace('remove()')
-        return super().remove(v)
+# Module logger for the GroupChat tracer below.  Deliberately NOT current_app:
+# the tracer must be able to report from any thread, with or without a Flask
+# app context.  Self-contained import so the careful io_guard-first ordering at
+# the top of this file is left alone.
+import logging as _logging  # noqa: E402  (intentional, see comment above)
+_LOG = _logging.getLogger(__name__)
 
 
 def _is_expert_dispatch_reentry() -> bool:
@@ -2846,20 +2798,34 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
 
 
-            # Process JSON responses from StatusVerifier
-            temp_message = messages[-1]["content"].replace("'", '"')
-            pattern = r'\{.*?\}'  # getting all json from text
-            matches = re.findall(pattern, temp_message, re.DOTALL)
-
+            # Process JSON responses from StatusVerifier.
+            #
+            # This used to be `content.replace("'", '"')` followed by a
+            # non-greedy `\{.*?\}` scrape.  Both were wrong:
+            #   * the replace corrupted every reply containing an apostrophe --
+            #     `{"reply": "Hello! It's great..."}` became `... "It"s great`,
+            #     which fails with `Expecting ',' delimiter` at exactly the
+            #     apostrophe's column;
+            #   * the non-greedy pattern truncates nested JSON at the first '}'.
+            # Together they made this block throw on essentially every natural
+            # assistant reply (14 parse errors / 26 empty extractions in a
+            # single turn), so `status == 'completed'` could never be observed,
+            # chat_instructor was never selected, TERMINATE never fired, and the
+            # reuse loop spun to exhaustion and returned ''.
+            #
+            # retrieve_json (helper.py) is the shared, hardened extractor:
+            # unicode-quote normalisation, json_repair, ast.literal_eval and
+            # regex fallbacks, plus an empty-input guard.
             try:
-                json_objects = [json.loads(match) for match in matches]
-                current_app.logger.info(f'Got Json as {len(json_objects)}')
+                last_json = retrieve_json(messages[-1]["content"])
+                if not isinstance(last_json, dict):
+                    last_json = None
+                current_app.logger.info(f'Got Json as {1 if last_json else 0}')
 
-                if json_objects:
-                    last_json = json_objects[-1]
+                if last_json:
                     current_app.logger.info(f'last json as {last_json}')
 
-                    if 'status' in last_json.keys() and last_json['status'].lower() == 'completed':
+                    if 'status' in last_json.keys() and str(last_json['status']).lower() == 'completed':
                         current_app.logger.info('GOT COMPLETED FOR ACTION in state_transition')
                         # Don't trust LLM's action_id — use known pipeline state
                         # The actual advancement happens in get_agent_response/chat_agent loops
@@ -3259,20 +3225,69 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             f"system_introspect autogen registration failed: {_ie}",
         )
 
-    # TEMP DIAGNOSTIC: installed LAST so it wraps the final list -- the
-    # MemoryGraph hook above replaces group_chat.messages, so anything
-    # installed earlier is orphaned and silently sees nothing.  Carries the
-    # existing hook forward so provenance ingest keeps working.
+    # THE FIX for the empty-GroupChat defect.  Must run AFTER every
+    # `.messages` reassignment above (the MemoryGraph/provenance hooks),
+    # because each one orphans the list autogen's registered run_chat config
+    # still points at.  See _resync_manager_reply_config for the full
+    # mechanism.
     try:
-        group_chat.messages = _TracedMessageList(
-            group_chat.messages, getattr(group_chat.messages, '_hook', None))
-        current_app.logger.error(
-            f'[GC-TRACE-INSTALLED] id(list)={id(group_chat.messages)} '
-            f'id(group_chat)={id(group_chat)} len={len(group_chat.messages)}')
-    except Exception:
-        pass
+        _resynced = 0
+        for _mgr, _gc in ((manager, group_chat),
+                          (manager_1, group_chat_1),
+                          (manager_2, group_chat_2)):
+            _resynced += _resync_manager_reply_config(_mgr, _gc)
+        current_app.logger.info(
+            f'[GC-RESYNC] re-pointed {_resynced} reply-config(s) at the live '
+            f'group-chat message list(s)')
+    except Exception as _rs_err:
+        current_app.logger.error(f'[GC-RESYNC] failed: {_rs_err}')
 
     return assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group
+
+
+def _extract_conversational_reply(messages) -> Optional[str]:
+    """Return the assistant's reply for a purely conversational turn, else None.
+
+    The reuse loop is built for TASK execution: it only returns an answer once
+    StatusVerifier emits ``status: "completed"``, which makes state_transition
+    pick ChatInstructor, which finally emits TERMINATE.  A greeting never goes
+    near that machinery -- StatusVerifier never speaks -- so the loop spun to
+    exhaustion and leaked an internal instruction string
+    ("You should complete this task independently...") as the user-facing
+    answer, even though the model had already produced a perfectly good reply.
+
+    The assistant already tells us which kind of turn this is: it sets
+    ``is_casual`` and ``delegate`` on every response.  Nothing read those flags
+    (zero references to is_casual in this module before this change).
+
+    Deliberately conservative -- a turn is only short-circuited when the
+    assistant itself marked it casual, delegated to nobody, is not creating an
+    agent, and supplied a non-empty reply.  Anything task-shaped falls through
+    to the normal loop untouched.
+    """
+    try:
+        for _msg in reversed(list(messages or [])):
+            if not isinstance(_msg, dict):
+                continue
+            if _msg.get('name') not in ('Assistant', 'assistant'):
+                continue
+            _obj = retrieve_json(_msg.get('content') or '')
+            if not isinstance(_obj, dict):
+                continue
+            _reply = _obj.get('reply')
+            if not isinstance(_reply, str) or not _reply.strip():
+                continue
+            _delegate = str(_obj.get('delegate') or 'none').strip().lower()
+            if not _obj.get('is_casual'):
+                return None          # task-shaped: let the normal loop run
+            if _delegate not in ('', 'none', 'null'):
+                return None
+            if _obj.get('is_create_agent'):
+                return None
+            return _reply.strip()
+    except Exception:
+        return None
+    return None
 
 
 def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autogen.UserProxyAgent,
@@ -3286,9 +3301,50 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
         result = user_proxy.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
                                           clear_history=False)
 
+        # Conversational turns (greetings, small talk) are answered directly.
+        # They have no action to verify, so the task loop below can never
+        # terminate for them.  See _extract_conversational_reply.
+        _conv_reply = _extract_conversational_reply(group_chat.messages)
+        if _conv_reply:
+            current_app.logger.info(
+                f'[CONVERSATIONAL] returning assistant reply directly for '
+                f'{user_prompt} ({len(_conv_reply)} chars)')
+            return _conv_reply
+
+        # Hard bounds on the task loop.
+        #
+        # The loop's only text-returning exit needs ChatInstructor to emit
+        # TERMINATE, which needs state_transition to see status="completed",
+        # which only StatusVerifier produces -- and StatusVerifier is selected
+        # only by a literal "@statusverifier" in the previous message.  The
+        # assistant emits structured JSON with a `delegate` field instead, which
+        # nothing reads, so that handshake never happens for task-shaped turns.
+        #
+        # Unbounded, such a turn does not merely fail to answer: it spins
+        # forever, holding a channel-agent worker and hammering the LLM.
+        # Observed live 2026-08-10 -- two task requests left 3 of 4 workers
+        # permanently occupied and every later message on the channel timed out.
+        # One bad request took the whole channel down until restart.
+        #
+        # These bounds do not fix task execution; they stop one request
+        # poisoning the channel.  Remove/raise once the delegate routing lands.
+        _loop_max_iters = int(os.environ.get('HEVOLVE_REUSE_LOOP_MAX_ITERS', '25'))
+        _loop_deadline = time.time() + float(
+            os.environ.get('HEVOLVE_REUSE_LOOP_MAX_SECONDS', '300'))
+
         count = 0
         while True:
             current_app.logger.info('inside reuse while1')
+
+            if count >= _loop_max_iters or time.time() > _loop_deadline:
+                current_app.logger.error(
+                    f'[REUSE-LOOP-ABORT] giving up for {user_prompt} after '
+                    f'{count} iteration(s) / '
+                    f'{int(time.time() - (_loop_deadline - float(os.environ.get("HEVOLVE_REUSE_LOOP_MAX_SECONDS", "300"))))}s '
+                    f'-- TERMINATE never fired (StatusVerifier never spoke). '
+                    f'Returning an honest failure instead of spinning.')
+                return ("I couldn't complete that request just now. "
+                        "Could you try rephrasing it?")
 
             # === LEDGER v2.0: Heartbeat + Budget/SLA using KNOWN state ===
             _reuse_current_action = user_tasks[user_prompt].current_action
@@ -3319,14 +3375,20 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                     _mgr_len = len(_mgr_chat.messages) if _mgr_chat is not None else -1
                 except Exception:
                     _same, _mgr_len = 'unknown', -1
+                _gcm = group_chat.messages
+                _mgr_list = getattr(_mgr_chat, 'messages', None)
                 current_app.logger.error(
                     f'[EMPTY-GROUPCHAT] group_chat.messages empty in reuse loop '
                     f'(user_prompt={user_prompt}, iteration={count}, '
                     f'manager_holds_same_object={_same}, '
                     f'len(manager.groupchat.messages)={_mgr_len}, '
-                    f'list_type={type(group_chat.messages).__name__}, '
-                    f'id(list)={id(group_chat.messages)}, '
-                    f'id(group_chat)={id(group_chat)})')
+                    f'id(list)={id(_gcm)}, id(group_chat)={id(group_chat)}, '
+                    # If these two ids ever differ again, the run_chat reply
+                    # config has been orphaned from the live list -- i.e. the
+                    # defect _resync_manager_reply_config exists to prevent has
+                    # regressed.  That comparison is the one worth keeping.
+                    f'id(manager.groupchat.messages)='
+                    f'{id(_mgr_list) if _mgr_list is not None else "n/a"})')
                 break
 
             if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
