@@ -656,8 +656,15 @@ in
           # -> sway line synced on above, so the latch legitimately reads "sway" for
           # a beat between the two — the SAME #42 one-shot race the sibling curl
           # checks fixed; do not reintroduce it next door. Wait for the floor value
-          # (x-prefix `test` avoids Nix ''-string / shell-quote escaping); cage is
-          # terminal, so once reached it never moves.
+          # (x-prefix `test` avoids indented-string / shell-quote escaping); cage
+          # is terminal, so once reached it never moves.
+          #
+          # NOTE: this comment lives INSIDE a Nix indented string, so it must not
+          # contain a literal two-single-quote sequence — that CLOSES the string
+          # and everything after it parses as Nix. Writing that sequence here (to
+          # name the very thing being avoided) is what broke the eval gate at
+          # 65d6a862: "syntax error, unexpected ')', expecting ';'" pointing at
+          # this line. Say "indented-string" in prose instead.
           sup.wait_until_succeeds(f"test x$(cat {LATCH}) = xcage", timeout=90)
     '';
   };
