@@ -74,6 +74,32 @@ def test_recommend_scales_up_with_vram(monkeypatch):
     assert mo.recommend_for_hardware()['model_id'] == 'mid'
 
 
+def test_priority_is_allowed_to_outrank_size(monkeypatch):
+    """PINS THE REAL SELECTION RULE, which is NOT "biggest that fits".
+
+    test_recommend_scales_up_with_vram above reads as though it guards that,
+    but its fixture is priority-monotonic (30/40/55 ascending with size), so it
+    cannot tell "biggest that fits" apart from "highest priority that fits" --
+    a guard that cannot fail for the thing it appears to check.
+
+    The implemented rule is max(priority, quality_score): `priority` is the
+    operator's editorial override and MAY outrank raw size, so a deliberately
+    preferred small model wins even when a larger one also fits. That is a
+    feature (an operator can pin a tuned or text-only model), but it was
+    undocumented and untested, which is how it would have drifted. A
+    non-monotonic fixture is the only thing that can hold this down.
+    """
+    preferred_small = _Entry('small-pref', 'Preferred 2B', vram=2.0, ram=4.0,
+                             prio=99)
+    _catalog(monkeypatch, entries=(preferred_small, _BIG))
+    _gpu(monkeypatch, total_gb=24.0, free_gb=24.0, cuda_available=True, name='RTX')
+    rec = mo.recommend_for_hardware()
+    assert rec['model_id'] == 'small-pref', (
+        "priority must win over size; if this now returns 'big', the selection "
+        "rule was changed to biggest-that-fits and the docstring in "
+        "recommend_for_hardware() is stale")
+
+
 def test_cpu_only_box_uses_RAM_not_just_vram(monkeypatch):
     """REGRESSION GUARD. The VRAM-only ladder this replaced collapsed every
     CPU-only box to the smallest model however much RAM it had. A no-GPU box
@@ -126,6 +152,73 @@ def test_recommend_survives_an_unavailable_catalog(monkeypatch):
     rec = mo.recommend_for_hardware()
     assert rec['model_name'], "must still name a fallback model"
     assert all(k in rec for k in ('model_name', 'quant', 'label', 'total_vram_gb'))
+
+
+def test_fallback_mirrors_the_catalog_row():
+    """The catalog-unavailable fallback restates catalog row 'llm-qwen3.5-0.8b'
+    -- unavoidably, because it has to answer when the catalog cannot be read.
+    A literal is therefore fine; DRIFT is not, and drift had already happened.
+
+    The fallback claimed quant 'Q4_K_M' while the row (and the only weights file
+    that repo publishes) is 'UD-Q4_K_XL', so the emergency path handed onboard()
+    a quant that does not exist. This pins every field against the row.
+    """
+    from tests.unit.test_catalog_populators import fresh_catalog
+    cat = fresh_catalog()
+    cat._populate_llm_models()
+    rows = {e.id: e for e in cat.list_by_type('llm')}
+
+    fb = mo._CATALOG_UNAVAILABLE_FALLBACK
+    row = rows.get(fb['catalog_id'])
+    assert row is not None, (
+        f"fallback names catalog id {fb['catalog_id']!r} but the populator "
+        "ships no such row -- one of the two was renamed")
+    assert fb['model_name'] == row.repo_id, "fallback repo drifted from the row"
+    assert fb['quant'] == (row.capabilities or {}).get('quant'), (
+        "fallback quant drifted from the row -- this is the exact defect the "
+        "constant was introduced to prevent")
+    assert fb['display_name'] == row.name, "fallback display name drifted"
+
+
+@pytest.mark.parametrize('need,avail,source,expect', [
+    (2.0, 24.0, 'vram', 'room to spare'),      # ratio 0.08  -> <=0.5 band
+    (7.5, 8.0, 'vram', 'little headroom'),     # ratio 0.94  -> >0.8 band
+    (2.6, 4.0, 'ram', 'good fit'),             # ratio 0.65  -> 0.5..0.8 band
+])
+def test_describe_fit_gives_guidance_not_just_specs(need, avail, source, expect):
+    """RESTORES what MODEL_TIERS' hand-written labels gave ('3B - balanced')
+    and its catalog replacement dropped when it fell back to restating the
+    box's specs ('cpu, 9.6GB ram'), which says nothing to a first-boot user."""
+    out = mo.describe_fit(need, {'budget_gb': avail, 'source': source,
+                                'run_mode': 'gpu' if source == 'vram' else 'cpu'},
+                          fits=True)
+    assert expect in out
+    assert ('your GPU' if source == 'vram' else 'CPU') in out
+
+
+def test_describe_fit_warns_when_nothing_fitted():
+    """When selection fell through to min(), the user is being handed something
+    the box cannot comfortably run. Say so rather than implying a clean fit."""
+    out = mo.describe_fit(8.0, {'budget_gb': 2.0, 'source': 'ram',
+                                'run_mode': 'cpu'}, fits=False)
+    assert 'smallest available' in out and 'slow' in out
+
+
+def test_describe_fit_survives_a_zero_budget():
+    """BOUNDARY: a fully failed probe yields budget_gb 0.0. Guidance must not
+    divide by zero on the path whose entire job is to survive probe failure."""
+    assert mo.describe_fit(1.0, {'budget_gb': 0.0, 'source': 'ram'}, fits=True)
+
+
+def test_label_carries_both_guidance_and_specs(monkeypatch):
+    """Best-of-both: the old ladder had guidance only and went a generation
+    stale; the replacement had specs only. The label must now carry both."""
+    _catalog(monkeypatch)
+    _gpu(monkeypatch, total_gb=24.0, free_gb=24.0, cuda_available=True, name='RTX')
+    label = mo.recommend_for_hardware()['label']
+    assert 'Big 7B' in label, "names the model"
+    assert 'your GPU' in label, "carries derived guidance"
+    assert '24.0GB vram' in label, "still carries the factual budget"
 
 
 def test_legacy_return_contract_is_preserved(monkeypatch):
