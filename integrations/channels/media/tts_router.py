@@ -1288,6 +1288,32 @@ class TTSRouter:
         except Exception as _e:  # never let normalization block synthesis
             logger.debug(f'tts normalization skipped: {_e}')
 
+        # Nothing SPEAKABLE left -> skip before engine selection.  Same
+        # converging-path rationale as normalization above: punctuation-only
+        # fragments ('.', '-', '...', a lone emoji) arrive from sentence
+        # splitting, and every engine answers them with zero audio.  Piper
+        # raised on it and its caller then logged "No synthesis method
+        # available", which read as a DEAD ENGINE and sent several debugging
+        # sessions after an install that was never broken (2026-08-10 17:09:37).
+        #
+        # Placed AFTER normalize_for_tts on purpose: normalization CREATES
+        # speakable content ('%' -> 'percent', '$5' -> 'five dollars'), so
+        # checking earlier would reject text that was about to become sayable.
+        #
+        # Placed BEFORE engine selection on purpose: otherwise the ladder picks
+        # an engine and can reserve VRAM for a GPU backend just to discover
+        # there is nothing to say.
+        #
+        # Content-based, NOT length-based — a 1-char '5' is speakable.
+        # isalnum() is unicode-aware, so CJK / Indic / Cyrillic pass unharmed.
+        if not any(ch.isalnum() for ch in text):
+            logger.debug('tts skipped - no speakable content in %r', text[:40])
+            return TTSResult(
+                path='', duration=0, engine_id='none', device='none',
+                location='none', latency_ms=0, sample_rate=0, voice='',
+                quality_score=0, error='No speakable content',
+            )
+
         require_clone = voice is not None and voice not in ('default', '', None)
 
         # Engine override
