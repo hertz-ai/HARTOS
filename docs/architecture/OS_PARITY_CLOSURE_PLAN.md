@@ -78,6 +78,7 @@ sandboxed) — recorded + guarded.
 |---|---|
 | `#38` | WebSocket handshake auth posture. The path-traversal *write* is fixed; authenticating the *handshake* changes the web-chat **client contract** (the UI's WS must send a token). Options: (a) token/JWT on connect + reject unauthenticated, (b) leave read-only + rely on local-only network, (c) same-origin + CSRF. |
 | Remote-desktop **control** | `/api/shell/remote-desktop/status` (read-only, credentials redacted) shipped. start/stop **control** stays a steward decision like firewall-write — expose from the local API, or agent-tool-only? |
+| `#28` | Federation-egress timing in `save_report`. The exception-safety bug is fixed and each peer POST is already bounded (5s + backoff); the residual ~37s is N-peers×5s **sequential** at end-of-background-autoresearch. Making it async/parallel changes semantics — `export_learning_delta` sets the session's `federation_broadcast_enforced`/`export_enforced` flags that tests assert synchronously, and concurrency needs `_peer_backoff` thread-safety. Recommend: fire-and-forget daemon egress (backend is long-lived) + poll the flags in tests. Not changed behind the prior session's documented deferral. |
 
 ## 🗓️ Multi-session closure (scope, not a single turn)
 
