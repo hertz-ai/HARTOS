@@ -625,9 +625,13 @@ class ChatQwen3VL(LLM):
             payload["stop"] = stop
 
         _log = logging.getLogger(__name__)
-        # Primary: HevolveAI embodied-ai on port 8000
+        # Primary: HevolveAI embodied-ai on port 8000.
+        # Route through _pooled_post_with_refusal_check (same helper CustomGPT
+        # uses) so this langchain wrapper gets the SAME refusal-override guard —
+        # previously only CustomGPT had it, so a draft refusal from THIS wrapper
+        # flowed straight to the user (the drifted parallel path).
         try:
-            response = pooled_post(
+            response = _pooled_post_with_refusal_check(
                 f"{self.base_url}/chat/completions",
                 json=payload,
                 timeout=60
@@ -644,7 +648,7 @@ class ChatQwen3VL(LLM):
         if _llm_url not in self.base_url:
             try:
                 _log.info(f"[LocalLLM] Falling back to llama.cpp at {_llm_url}")
-                response = pooled_post(
+                response = _pooled_post_with_refusal_check(
                     f"{_llm_url}/chat/completions",
                     json=payload,
                     timeout=120
@@ -7344,7 +7348,16 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
         from core.resonance_profile import get_or_create_profile
         from core.resonance_tuner import build_resonance_prompt, pre_tune_from_input
         _res_profile = get_or_create_profile(str(user_id))
-        _res_profile = pre_tune_from_input(_res_profile, prompt)
+        # `query` — the USER'S message — not `prompt`.  `prompt` is the
+        # LangChain template built 119 lines below (:7470
+        # ConversationalChatAgent.create_prompt), and because it is assigned
+        # anywhere in this function Python made it local for the WHOLE body, so
+        # this read raised UnboundLocalError on every single turn.  The enclosing
+        # except swallowed it, so pre_tune AND build_resonance_prompt below were
+        # both skipped and _resonance_block stayed '' forever — the resonance
+        # feature was silently dead on this path.  pre_tune_from_input's own
+        # signature says what it wants: `user_message: str`.
+        _res_profile = pre_tune_from_input(_res_profile, query)
         _resonance_block = build_resonance_prompt(_res_profile) or ''
     except Exception:
         logging.getLogger(__name__).exception("get_ans: swallowed Exception")
