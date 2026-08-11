@@ -588,3 +588,110 @@ def test_benchmark_dispatch_never_raises_into_the_event_bus(monkeypatch):
 
     monkeypatch.setattr(ab, 'broadcast_announcement', _boom)
     ab._on_benchmark_published('hive.benchmark.published', _BENCH_A)
+
+
+# ── on-platform publishing (federation) ───────────────────────
+#
+# announce_new_content pushes pages OFF platform into third-party rooms and
+# is consent-gated. publish_content_to_feed publishes to our OWN feed, from
+# which federation carries the post to following instances. Different act,
+# different gate: the consent flag exists to stop unsolicited posting into
+# other people's communities, not to stop us posting on our own.
+
+_FEED_PAGES = [
+    {'url': 'https://hevolve.ai/research/foo', 'title': 'Foo paper explained'},
+    {'url': 'https://hevolve.ai/answers/bar', 'title': 'Bar answered'},
+]
+
+
+def _stub_social(monkeypatch):
+    """Capture PostService.create instead of touching the database."""
+    import sys, types, contextlib
+    created = []
+
+    models = types.ModuleType('integrations.social.models')
+
+    @contextlib.contextmanager
+    def _db_session():
+        yield object()
+
+    models.db_session = _db_session
+
+    services = types.ModuleType('integrations.social.services')
+
+    class _UserService:
+        @staticmethod
+        def ensure_system_user(db, slug, display_name=None, bio=None):
+            return {'slug': slug, 'display_name': display_name}
+
+    class _PostService:
+        @staticmethod
+        def create(db, author, title=None, content=None, content_type=None):
+            created.append({'author': author, 'title': title,
+                            'content': content})
+            return types.SimpleNamespace(id='post-1')
+
+    services.UserService = _UserService
+    services.PostService = _PostService
+    monkeypatch.setitem(sys.modules, 'integrations.social.models', models)
+    monkeypatch.setitem(sys.modules, 'integrations.social.services', services)
+    return created
+
+
+def test_publish_content_creates_one_post_per_pass(monkeypatch):
+    import integrations.channels.announcement_broadcaster as ab
+    created = _stub_social(monkeypatch)
+    out = ab.publish_content_to_feed(pages=_FEED_PAGES, already_published=[])
+    assert len(out) == 1
+    assert len(created) == 1
+
+
+def test_publish_content_posts_as_the_prover_identity(monkeypatch):
+    """One publisher in the feed, not two lookalikes."""
+    import integrations.channels.announcement_broadcaster as ab
+    created = _stub_social(monkeypatch)
+    ab.publish_content_to_feed(pages=_FEED_PAGES, already_published=[])
+    assert created[0]['author']['slug'] == 'nunba'
+
+
+def test_publish_content_body_discloses_authorship_and_links(monkeypatch):
+    import integrations.channels.announcement_broadcaster as ab
+    created = _stub_social(monkeypatch)
+    ab.publish_content_to_feed(pages=_FEED_PAGES, already_published=[])
+    body = created[0]['content']
+    assert 'Posted by the Hevolve AI agent' in body
+    assert 'hevolve.ai/research/foo' in body
+
+
+def test_publish_content_does_not_repeat_a_published_page(monkeypatch):
+    import integrations.channels.announcement_broadcaster as ab
+    created = _stub_social(monkeypatch)
+    out = ab.publish_content_to_feed(
+        pages=_FEED_PAGES,
+        already_published=[p['url'] for p in _FEED_PAGES])
+    assert out == []
+    assert created == []
+
+
+def test_publish_content_empty_feed_is_a_noop(monkeypatch):
+    import integrations.channels.announcement_broadcaster as ab
+    _stub_social(monkeypatch)
+    assert ab.publish_content_to_feed(pages=[], already_published=[]) == []
+
+
+def test_publish_content_is_not_gated_on_public_exposure():
+    """On-platform publishing must not inherit the off-platform gate."""
+    import inspect
+    import integrations.channels.announcement_broadcaster as ab
+    src = inspect.getsource(ab.publish_content_to_feed)
+    assert '_public_exposure_granted' not in src
+
+
+def test_start_content_distribution_is_idempotent(monkeypatch):
+    import integrations.channels.announcement_broadcaster as ab
+    monkeypatch.setattr(ab, '_content_distribution_loop', lambda: None)
+    ab._content_thread = None
+    first = ab.start_content_distribution()
+    second = ab.start_content_distribution()
+    assert first is True
+    assert second is False

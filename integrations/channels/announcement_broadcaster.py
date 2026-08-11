@@ -691,3 +691,170 @@ def reset_for_tests() -> None:
     with _benchmark_throttle_lock:
         _last_benchmark_key = None
         _last_benchmark_at = 0.0
+
+
+# ── on-platform content distribution (federation) ───────────────────────
+#
+# announce_new_content above pushes pages OFF platform, into third-party
+# chat rooms, which is why it is consent-gated. It had no caller at all,
+# so no page had ever been distributed anywhere.
+#
+# This is the other half, and a different act: publishing Hevolve's own
+# pages to Hevolve's OWN feed. It adds no transport. PostService.create is
+# the canonical entry point and already fans a new post out three ways,
+# each privacy-gated on is_public:
+#
+#   _publish_realtime('on_new_post')  -> web SSE + WAMP-subscribed
+#                                        Android / iOS / desktop
+#   federation.sync_to_parent()       -> vertical rise to the central tier
+#   federation.push_to_followers()    -> horizontal P2P to the instances
+#                                        gossip discovered and auto-followed
+#
+# Underneath, MessageBus.publish routes to LOCAL, SSE, PEERLINK (encrypted
+# direct peer links) and CROSSBAR (WAMP relay) simultaneously, degrading
+# from offline-single-device up to full hive. So one PostService.create
+# reaches the node network. The research corpus was never on any of it,
+# because nothing ever created a post for a content page.
+#
+# That is why this is NOT behind public_exposure consent. That gate exists
+# to stop unsolicited posting into other people's communities. Posting to
+# our own feed is the same act the benchmark prover already performs
+# unGated (hive_benchmark_prover, PostService.create), and federation
+# applies its own is_public privacy gate on top.
+CONTENT_PUBLISH_INTERVAL_SEC = 3600
+
+_content_thread = None
+_content_thread_lock = threading.Lock()
+
+
+def _content_state_path() -> str:
+    """Where the published-URL ledger lives. Same convention as the
+    marketing funnel (core.platform_paths.get_data_dir, ~/.hartos fallback)."""
+    import os
+    try:
+        from core.platform_paths import get_data_dir
+        d = get_data_dir()
+    except Exception:
+        d = os.path.expanduser('~/.hartos')
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, 'content_published.json')
+
+
+def load_published_urls() -> List[str]:
+    """Read the ledger. A missing or corrupt file means 'nothing published',
+    which is the safe direction: worst case a page is posted once more."""
+    import json
+    try:
+        with open(_content_state_path(), encoding='utf-8') as f:
+            return [u for u in json.load(f) if isinstance(u, str)]
+    except Exception:
+        return []
+
+
+def save_published_urls(urls) -> None:
+    import json
+    try:
+        keep = sorted(set(u for u in urls if isinstance(u, str)))[-2000:]
+        with open(_content_state_path(), 'w', encoding='utf-8') as f:
+            json.dump(keep, f)
+    except Exception as exc:
+        logger.warning("could not persist published-content ledger: %s", exc)
+
+
+def publish_content_to_feed(limit: int = CONTENT_ANNOUNCE_LIMIT,
+                            pages=None,
+                            already_published=None) -> List[str]:
+    """Publish up to `limit` not-yet-published pages to the local social
+    feed, from which federation carries them to following instances.
+
+    Returns the URLs published. Persists the ledger itself unless the
+    caller passed `already_published`, so tests stay filesystem-free."""
+    candidates = pages if pages is not None else fetch_own_pages()
+    caller_supplied = already_published is not None
+    already = list(already_published) if caller_supplied else load_published_urls()
+
+    chosen = select_unannounced(candidates, already, limit)
+    if not chosen:
+        return []
+
+    try:
+        from integrations.social.models import db_session
+        from integrations.social.services import UserService, PostService
+    except Exception as exc:
+        logger.debug("social services unavailable, skipping feed publish: %s", exc)
+        return []
+
+    published = []
+    for page in chosen:
+        try:
+            with db_session() as db:
+                # Same system identity the benchmark prover posts under, so
+                # the feed has one publisher rather than two lookalikes.
+                author = UserService.ensure_system_user(
+                    db, 'nunba',
+                    display_name='Nunba',
+                    bio='Autonomous publisher of distributed-hive '
+                        'benchmark results.')
+                PostService.create(
+                    db, author,
+                    title=(page.get('title') or page.get('url') or '')[:200],
+                    content=format_content_announcement(page, 'web'),
+                    content_type='text',
+                )
+            published.append(page['url'])
+            logger.info("published %s to the local feed (federates to followers)",
+                        page['url'])
+        except Exception as exc:
+            logger.warning("feed publish failed for %s: %s",
+                           page.get('url'), exc)
+
+    if published and not caller_supplied:
+        save_published_urls(already + published)
+    return published
+
+
+def _content_distribution_loop() -> None:
+    """Periodic pass. Registers with the NodeWatchdog and heartbeats through
+    the sleep, the same way model_lifecycle and peer_discovery do, so a hung
+    pass is visible rather than silent."""
+    import time
+    name = 'content_distribution'
+    wd = None
+    try:
+        from security.node_watchdog import get_watchdog
+        wd = get_watchdog()
+        if wd is not None:
+            wd.register(name, CONTENT_PUBLISH_INTERVAL_SEC * 2)
+    except Exception:
+        wd = None
+
+    while True:
+        try:
+            publish_content_to_feed()
+        except Exception:
+            logger.exception("content distribution pass failed")
+        try:
+            if wd is not None:
+                wd.sleep_with_heartbeat(name, CONTENT_PUBLISH_INTERVAL_SEC)
+            else:
+                time.sleep(CONTENT_PUBLISH_INTERVAL_SEC)
+        except Exception:
+            time.sleep(CONTENT_PUBLISH_INTERVAL_SEC)
+
+
+def start_content_distribution() -> bool:
+    """Idempotent starter, mirroring register_announcement_subscriber.
+    Returns True if this call started the thread."""
+    global _content_thread
+    with _content_thread_lock:
+        if _content_thread is not None and _content_thread.is_alive():
+            return False
+        _content_thread = threading.Thread(
+            target=_content_distribution_loop,
+            name='content-distribution', daemon=True)
+        _content_thread.start()
+        logger.info(
+            "content distribution started: new pages publish to the local "
+            "feed every %ds and federate to following instances",
+            CONTENT_PUBLISH_INTERVAL_SEC)
+        return True
