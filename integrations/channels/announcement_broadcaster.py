@@ -53,27 +53,53 @@ _subscribed = False
 _subscribe_lock = threading.Lock()
 
 
+# Every outbound announcement ends with this link.  Disclosed by design:
+# the post names HART OS and points at Hevolve's own site, so a reader who
+# sees a benchmark proof has an obvious way to act on it.  Without it the
+# announcement was a dead end: a bare score in somebody else's chat room
+# with no way to reach the project, which cannot produce a single user.
+ANNOUNCEMENT_URL = 'https://hevolve.ai/hive'
+
+
 def _build_announcement_text(payload: Dict[str, Any]) -> str:
-    """Format the EventBus payload into a single string for outbound
-    posting.  Mirrors the structure hive_benchmark_prover constructs
-    for the internal social post, with a short header and the
-    pre-built `comparison` block (which already includes baseline
-    comparisons + the "distributed privacy, zero cloud cost" tag-
-    line).  If `comparison` is missing the caller didn't go through
-    _publish_results and we fall back to a minimal one-liner."""
+    """Format the EventBus payload into a single string for outbound posting.
+
+    KEY NAMES.  hive_benchmark_prover emits two different events with two
+    different shapes, and this builder is wired to the second one:
+
+        hive.benchmark.completed  ->  {..., 'num_nodes', 'comparison'}
+        hive.benchmark.published  ->  {'benchmark', 'text', 'score'}
+
+    The subscriber below listens for `published`, but this builder used to
+    read only `comparison` and `num_nodes`, neither of which that payload
+    carries.  So on every real event it discarded the prover's comparison
+    text and fell through to the minimal branch, emitting the literally
+    false "across 0 nodes".  Read `text` first, then `comparison`, so both
+    shapes work.
+    """
     if not isinstance(payload, dict):
         return str(payload)
-    comparison = payload.get('comparison')
-    if comparison:
-        return comparison
-    # Minimal fallback so something useful still lands externally.
-    bench = payload.get('benchmark', 'unknown')
-    score = payload.get('score', 0)
-    nodes = payload.get('num_nodes', 0)
-    return (
-        f"HIVE BENCHMARK PROOF — {bench}\n"
-        f"  Score {score:.1%} across {nodes} nodes."
-    )
+
+    # `text` is what hive.benchmark.published sends; `comparison` is the
+    # hive.benchmark.completed spelling.  Accept either.
+    body = payload.get('text') or payload.get('comparison')
+
+    if not body:
+        # Minimal fallback so something useful still lands externally.
+        bench = payload.get('benchmark', 'unknown')
+        try:
+            score = float(payload.get('score') or 0)
+        except (TypeError, ValueError):
+            score = 0.0
+        nodes = payload.get('num_nodes') or payload.get('node_count')
+        body = 'HIVE BENCHMARK PROOF - {0}\n  Score {1:.1f}%'.format(
+            bench, score * 100)
+        # Only claim a node count when one was actually reported.
+        if nodes:
+            body += ' across {0} nodes'.format(nodes)
+        body += '.'
+
+    return '{0}\n\n{1}'.format(body, ANNOUNCEMENT_URL)
 
 
 # Channels whose default surface is a conversation with one person rather

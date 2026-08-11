@@ -102,17 +102,38 @@ def test_build_text_uses_comparison_when_present():
         'num_nodes': 4,
         'comparison': 'HIVE BENCHMARK PROOF — MMLU\n  Hive: 87%',
     })
-    assert text == 'HIVE BENCHMARK PROOF — MMLU\n  Hive: 87%'
+    # The comparison block is preserved verbatim, and the announcement URL
+    # is appended so a reader who sees the proof can act on it.
+    assert text.startswith('HIVE BENCHMARK PROOF — MMLU\n  Hive: 87%')
+    assert text.endswith('https://hevolve.ai/hive')
 
 
-def test_build_text_falls_back_to_minimal_when_no_comparison():
+def test_build_text_reads_the_published_event_text_key():
+    """Regression: hive.benchmark.published sends `text`, not `comparison`.
+
+    The builder used to read only `comparison`, so every live event lost
+    the prover's block and fell through to the minimal branch, which then
+    printed the false "across 0 nodes" because `num_nodes` is absent too.
+    """
     from integrations.channels.announcement_broadcaster import (
         _build_announcement_text)
     text = _build_announcement_text({
-        'benchmark': 'gsm8k', 'score': 0.5, 'num_nodes': 2,
+        'benchmark': 'gsm8k',
+        'text': 'HART OS hive: 82.4% vs single-node 71.2%',
+        'score': 0.824,
     })
+    assert 'HART OS hive: 82.4% vs single-node 71.2%' in text
+    assert '0 nodes' not in text
+    assert 'https://hevolve.ai/hive' in text
+
+
+def test_build_text_omits_node_count_when_unknown():
+    from integrations.channels.announcement_broadcaster import (
+        _build_announcement_text)
+    text = _build_announcement_text({'benchmark': 'gsm8k', 'score': 0.5})
     assert 'gsm8k' in text
-    assert '50' in text  # 0.5 → 50%
+    assert '50' in text
+    assert 'nodes' not in text
 
 
 def test_build_text_handles_non_dict():
