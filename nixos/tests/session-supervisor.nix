@@ -100,25 +100,37 @@ in
       # ── 1b. SEAT / DRM preconditions for a compositor on real HW ──
       # The bare-metal "permission denied / device busy across all tiers" boot loop
       # was a SEAT-MANAGER conflict: an earlier fix forced seatd on top of systemd-
-      # logind (two seat managers fighting). The corrected preconditions:
+      # logind (two seat managers fighting). LIVE-CONFIRMED 2026-08-10 (a hung real
+      # boot's journal): seatd created its OWN VT-bound seat0 regardless of whether
+      # any client connected to it, so keeping `services.seatd.enable = true` as an
+      # "idle fallback" did NOT stop the fight — seatd and logind were BOTH managing
+      # seat0, and hart-comp's drmSetMaster got EACCES, forcing the pixman software-
+      # scanout floor and pegging the CPU. The corrected preconditions:
       #   - systemd-logind (THE seat manager on a systemd box) is up; the compositor
       #     rides greetd's active logind session to acquire the seat's DRM + input,
       #   - the session user is in the device groups the compositor needs to open
       #     /dev/dri (video/render = KMS + GPU) and /dev/input (input = libinput),
-      #   - greetd FORCES the logind backend (LIBSEAT_BACKEND=logind): the compositor
-      #     uses systemd-logind, the single seat manager, NOT seatd layered on top of
-      #     logind (two seat managers fighting = the real-HW boot loop / frozen input).
-      with subtest("logind is the seat manager + greetd forces the logind backend"):
+      #   - seatd is DISABLED (mkForce false) — NOT a second seat manager, not even
+      #     an "idle" one — so ONLY logind ever owns seat0,
+      #   - greetd FORCES the logind backend (LIBSEAT_BACKEND=logind) belt-and-
+      #     suspenders alongside seatd being off.
+      with subtest("logind is the seat manager + seatd is disabled + greetd forces the logind backend"):
           # systemd-logind is THE seat manager (always up on systemd); libseat-logind
           # rides greetd's active logind session to TakeDevice the seat's DRM + input.
           sup.wait_for_unit("systemd-logind.service", timeout=60)
-          # seatd stays enabled as an idle fallback (keeps the seat group valid) but is
-          # NOT the forced backend.
-          sup.wait_for_unit("seatd.service", timeout=60)
+          # seatd must NOT be active — a second seat manager on seat0 is the exact
+          # EACCES/pixman regression this fix corrects (see comment above).
+          seatd_active = sup.succeed("systemctl is-active seatd.service || true").strip()
+          assert seatd_active != "active", \
+              f"seatd.service is active ({seatd_active}) — two seat managers on seat0 reopens the EACCES/pixman regression"
           groups = sup.succeed("id -nG hart-admin").split()
-          for g in ("video", "render", "input", "seat"):
+          for g in ("video", "render", "input"):
               assert g in groups, \
                   f"hart-admin missing the '{g}' group ({groups}) — compositor can't open the seat's DRM/input"
+          # `seat` must be ABSENT: with seatd disabled the group doesn't exist, and
+          # extraGroups still listing it would fail NixOS module eval outright.
+          assert "seat" not in groups, \
+              f"hart-admin is in the 'seat' group ({groups}) — seatd must be fully disabled, not just stopped"
           # greetd's session command must FORCE LIBSEAT_BACKEND=logind so every tier
           # uses the logind seat manager (the canonical greetd-on-systemd path), and
           # must NOT force seatd-over-logind (the dual-seat-manager regression that

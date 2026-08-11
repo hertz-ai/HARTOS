@@ -1112,17 +1112,27 @@ in
     #   3. greetd on its OWN VT (vt=7, below) so its session is the seat's ACTIVE
     #      session — the precondition for logind to grant DRM master on the seat.
     #
-    # WHY NOT force seatd (the real-HW regression THIS corrects): an earlier fix
-    # (c6899df4) forced LIBSEAT_BACKEND=seatd on the false premise that "greetd's
-    # session is not a full logind session". It IS, on NixOS. Forcing seatd while
-    # systemd-logind is ALSO managing the seat/VTs is two seat managers fighting —
-    # the exact boot loop (DRM grabbed but input dead + EBUSY tier-drops, the cursor
-    # stuck at 0,0). It "passed" the VM nixosTest only because a QEMU guest's trivial
-    # single-VT seat never exposes the contention. seatd stays ENABLED below purely as
-    # an idle fallback (it keeps the `seat` group valid and is available for a future
-    # logind-less topology); with the env forcing logind, NO client ever connects to
-    # seatd, so the idle daemon never touches the seat. (See the command comment.)
-    services.seatd.enable = true;
+    # WHY seatd IS DISABLED (2026-08-10, live-confirmed real-HW regression THIS
+    # corrects): an earlier fix (c6899df4) forced LIBSEAT_BACKEND=seatd on the false
+    # premise that "greetd's session is not a full logind session". It IS, on NixOS.
+    # Forcing seatd while systemd-logind is ALSO managing the seat/VTs is two seat
+    # managers fighting — the exact boot loop (DRM grabbed but input dead + EBUSY
+    # tier-drops, the cursor stuck at 0,0). It "passed" the VM nixosTest only because
+    # a QEMU guest's trivial single-VT seat never exposes the contention.
+    #
+    # A follow-up kept `services.seatd.enable = true` anyway as a supposed "idle
+    # fallback," on the theory that forcing LIBSEAT_BACKEND=logind means no client
+    # ever connects to seatd so the idle daemon never touches the seat. A live
+    # journal off a hung boot FALSIFIED that theory: seatd created its own VT-bound
+    # seat0 (`[seatd/seat.c:39] Created VT-bound seat seat0`) independent of any
+    # client connecting, side-by-side with logind's `New seat seat0`. Two seat
+    # managers were on seat0 regardless, and hart-comp's drmSetMaster got EACCES
+    # (not EBUSY — the session simply isn't authorized as master), forcing it onto
+    # the pixman software-scanout floor and pegging the CPU. seatd is disabled
+    # (mkForce, so any lower-priority `enable = true` elsewhere cannot re-open the
+    # fight) until a future logind-less topology needs it — dropping it here costs
+    # nothing on this greetd+logind path.
+    services.seatd.enable = lib.mkForce false;
     # ── The selector USER must be able to PERSIST a tier drop (never-black guard) ──
     # greetd runs the selector as hart-admin (below). The latch dir /var/lib/hart is
     # 0770 hart:hart (group-writable, declared above), so the selector can WRITE the
@@ -1132,9 +1142,15 @@ in
     # list can never silently re-introduce the real-HW BOOT LOOP: a drop that cannot
     # persist (EPERM on the latch) leaves the selector re-attempting the SAME top tier
     # forever — the exact 0750-vs-0770 / missing-group failure the latch-dir comment
-    # above documents. `seat` (libseat/seatd) + `hart` (latch write) are both required;
-    # identical supplementary-group entries de-dupe cleanly with hart-base's list.
-    users.users.hart-admin.extraGroups = [ "hart" "seat" ];
+    # above documents.
+    #
+    # `seat` is intentionally NOT listed here: with `services.seatd.enable = false`
+    # (above) the `seat` group no longer exists, and referencing a nonexistent group
+    # in extraGroups fails NixOS module eval. DRM/input device access now flows
+    # entirely through the logind libseat backend (LIBSEAT_BACKEND=logind, forced on
+    # the greetd session below) plus hart-base.nix's direct video/render/input group
+    # membership — the `seat` group was only ever needed for the seatd path.
+    users.users.hart-admin.extraGroups = [ "hart" ];
 
     # ── Plymouth / fbcon must RELEASE DRM master before the compositor claims it ──
     # The boot splash (boot.plymouth, desktop.nix) holds DRM master on card0; if it
