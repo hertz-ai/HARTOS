@@ -263,7 +263,10 @@ jobs:
         # `if:` above already restricts this to dispatch-with-build_iso or a push,
         # so there is nothing left for the conditional to decide. Two identical
         # branches are where a future edit silently changes only one of them.
-        target: [iso-server, iso-desktop, iso-edge, raw-desktop]
+        # BUILD-ONLY BRANCH (build/seatfix-raw): trimmed to raw-desktop so a
+        # reflash build does not spin up three multi-hour ISO legs on a repo with
+        # documented runner starvation. This trim MUST NOT be merged to main.
+        target: [raw-desktop]
     steps:
       - uses: actions/checkout@v4
 
