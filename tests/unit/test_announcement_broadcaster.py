@@ -281,6 +281,10 @@ def test_event_published_triggers_broadcast(monkeypatch):
 
     from integrations.channels import announcement_broadcaster as ab
     ab.reset_for_tests()
+    # Benchmark announcements are now gated on the same standing
+    # public_exposure consent the new-content path requires, so grant it
+    # for this end-to-end assertion.
+    monkeypatch.setattr(ab, '_public_exposure_granted', lambda: True)
     registered = ab.register_announcement_subscriber()
     assert registered is True, (
         "registration should succeed when events registry is up")
@@ -687,11 +691,39 @@ def test_publish_content_is_not_gated_on_public_exposure():
     assert '_public_exposure_granted' not in src
 
 
-def test_start_content_distribution_is_idempotent(monkeypatch):
+def test_start_content_distribution_does_not_double_start(monkeypatch):
+    """A second call while the loop is alive must not spawn a rival thread."""
+    import threading as _t
+    import integrations.channels.announcement_broadcaster as ab
+    running, release = _t.Event(), _t.Event()
+
+    def _loop():
+        running.set()
+        release.wait(10)
+
+    monkeypatch.setattr(ab, '_content_distribution_loop', _loop)
+    ab._content_thread = None
+    try:
+        assert ab.start_content_distribution() is True
+        assert running.wait(2), 'loop thread never started'
+        assert ab.start_content_distribution() is False
+    finally:
+        release.set()
+        ab._content_thread = None
+
+
+def test_start_content_distribution_restarts_a_dead_loop(monkeypatch):
+    """If the loop has exited, starting again SHOULD spawn a new thread.
+    The guard is on liveness, not on 'has ever been started', so a crashed
+    distribution loop recovers on the next boot-path call instead of
+    staying silently dead."""
     import integrations.channels.announcement_broadcaster as ab
     monkeypatch.setattr(ab, '_content_distribution_loop', lambda: None)
     ab._content_thread = None
-    first = ab.start_content_distribution()
-    second = ab.start_content_distribution()
-    assert first is True
-    assert second is False
+    try:
+        assert ab.start_content_distribution() is True
+        if ab._content_thread is not None:
+            ab._content_thread.join(timeout=2)
+        assert ab.start_content_distribution() is True
+    finally:
+        ab._content_thread = None

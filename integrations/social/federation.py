@@ -75,7 +75,81 @@ class FederationManager:
             daemon=True,
         ).start()
 
+        # Pull what the peer already published. Without this a follow only
+        # ever yields future posts, which is why a freshly-installed node
+        # shows an empty feed despite auto-following every peer it finds.
+        threading.Thread(
+            target=self._backfill_async,
+            args=(peer_node_id, peer_url),
+            daemon=True,
+        ).start()
+
         return True
+
+    # Backfill depth on a new follow. 25 is one page of /feed/all and enough
+    # to make a feed look alive without pulling a peer's entire history.
+    BACKFILL_LIMIT = 25
+
+    def backfill_from_peer(self, db, peer_node_id: str, peer_url: str,
+                           limit: int = None) -> int:
+        """Pull a followed peer's recent public posts into our inbox.
+
+        A follow only subscribes to FUTURE posts: record_follow registers us
+        and the peer pushes from then on. Nothing historical arrives. Since
+        _auto_federate_peer follows every accepted peer on discovery, a fresh
+        node ends up following hundreds of instances and still shows an empty
+        feed until somebody, somewhere, happens to post. That is the first
+        thing a new user sees, so it is worth a round trip.
+
+        Reuses the pieces that already exist rather than adding protocol:
+        /feed/all is the peer's privacy-enforced public timeline, and
+        receive_inbox does the dedup (origin_node_id + post id), the banned
+        peer check and the FederatedPost write. Best-effort by contract: a
+        peer that is down, slow or on an older build must never break the
+        follow that triggered this.
+
+        Returns the number of posts newly stored.
+        """
+        limit = self.BACKFILL_LIMIT if limit is None else limit
+        url = '%s/api/social/feed/all' % (peer_url or '').rstrip('/')
+        try:
+            resp = pooled_get(url, params={'limit': limit, 'sort': 'new'},
+                              timeout=10)
+            posts = (resp.json() or {}).get('data') or []
+        except Exception as exc:
+            logger.debug("backfill: could not read %s: %s", url, exc)
+            return 0
+
+        stored = 0
+        for post in posts:
+            if not isinstance(post, dict) or not post.get('id'):
+                continue
+            try:
+                if self.receive_inbox(db, {
+                    'type': 'new_post',
+                    'post': post,
+                    'origin_node_id': peer_node_id,
+                    'origin_url': peer_url,
+                }):
+                    stored += 1
+            except Exception as exc:
+                # One malformed post must not abandon the rest of the page.
+                logger.debug("backfill: skipped a post from %s: %s",
+                             peer_node_id[:8] if peer_node_id else '?', exc)
+        if stored:
+            logger.info("backfill: stored %d post(s) from %s",
+                        stored, peer_node_id[:8] if peer_node_id else '?')
+        return stored
+
+    def _backfill_async(self, peer_node_id: str, peer_url: str) -> None:
+        """Backfill on its own session. follow_instance's caller owns `db`,
+        and that session must not be touched from this thread."""
+        try:
+            from .models import db_session
+            with db_session() as db:
+                self.backfill_from_peer(db, peer_node_id, peer_url)
+        except Exception as exc:
+            logger.debug("backfill thread failed for %s: %s", peer_url, exc)
 
     def unfollow_instance(self, db, local_node_id: str, peer_node_id: str):
         """Unfollow a remote instance."""
