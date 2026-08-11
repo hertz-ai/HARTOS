@@ -519,3 +519,72 @@ def test_a_telegram_group_id_is_accepted_without_any_flag(monkeypatch):
     from integrations.channels.announcement_broadcaster import (
         _collect_announcement_targets)
     assert _collect_announcement_targets() == [('telegram', '-1001234567890')]
+
+
+# ── benchmark announcements: consent, dedup, cooldown ─────────
+#
+# The new-content path was already guarded on all three. The benchmark
+# path was not: hive.benchmark.published dispatched straight to every
+# target, so proofs could post with consent ungranted and could repeat
+# without limit. Repetition is what turns an automated post into spam.
+
+_BENCH_A = {'benchmark': 'gsm8k', 'text': 'hive 82.4% vs 71.2%', 'score': 0.824}
+_BENCH_B = {'benchmark': 'mmlu', 'text': 'hive 87.0% vs 80.1%', 'score': 0.870}
+
+
+def _capture_benchmark_posts(monkeypatch, consented=True):
+    import integrations.channels.announcement_broadcaster as ab
+    ab.reset_for_tests()
+    sent = []
+    monkeypatch.setattr(ab, 'broadcast_announcement',
+                        lambda text: (sent.append(text) or 1))
+    monkeypatch.setattr(ab, '_public_exposure_granted', lambda: consented)
+    return ab, sent
+
+
+def test_benchmark_announcement_requires_consent(monkeypatch):
+    ab, sent = _capture_benchmark_posts(monkeypatch, consented=False)
+    ab._on_benchmark_published('hive.benchmark.published', _BENCH_A)
+    assert sent == []
+
+
+def test_benchmark_announcement_posts_once_when_consented(monkeypatch):
+    ab, sent = _capture_benchmark_posts(monkeypatch)
+    ab._on_benchmark_published('hive.benchmark.published', _BENCH_A)
+    assert len(sent) == 1
+    # carries the prover's text and the link a reader can act on
+    assert 'hive 82.4% vs 71.2%' in sent[0]
+    assert 'https://hevolve.ai/hive' in sent[0]
+
+
+def test_benchmark_identical_result_is_not_repeated(monkeypatch):
+    ab, sent = _capture_benchmark_posts(monkeypatch)
+    ab._on_benchmark_published('hive.benchmark.published', _BENCH_A)
+    ab._on_benchmark_published('hive.benchmark.published', _BENCH_A)
+    assert len(sent) == 1
+
+
+def test_benchmark_new_result_waits_for_the_cooldown(monkeypatch):
+    import time
+    ab, sent = _capture_benchmark_posts(monkeypatch)
+    ab._on_benchmark_published('hive.benchmark.published', _BENCH_A)
+    # a genuinely different result, but too soon
+    ab._on_benchmark_published('hive.benchmark.published', _BENCH_B)
+    assert len(sent) == 1
+    # once the cooldown has elapsed it is allowed through
+    ab._last_benchmark_at = time.time() - (ab._benchmark_min_interval() + 10)
+    ab._on_benchmark_published('hive.benchmark.published', _BENCH_B)
+    assert len(sent) == 2
+
+
+def test_benchmark_dispatch_never_raises_into_the_event_bus(monkeypatch):
+    """The EventBus emit chain must survive a broken broadcaster."""
+    import integrations.channels.announcement_broadcaster as ab
+    ab.reset_for_tests()
+    monkeypatch.setattr(ab, '_public_exposure_granted', lambda: True)
+
+    def _boom(_text):
+        raise RuntimeError('channel exploded')
+
+    monkeypatch.setattr(ab, 'broadcast_announcement', _boom)
+    ab._on_benchmark_published('hive.benchmark.published', _BENCH_A)

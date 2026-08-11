@@ -545,12 +545,95 @@ def announce_new_content(limit: int = CONTENT_ANNOUNCE_LIMIT,
     return sent
 
 
+# ── benchmark announcement throttling ───────────────────────────────────
+#
+# The new-content path above is deduped (select_unannounced), capped
+# (CONTENT_ANNOUNCE_LIMIT) and consent-gated (_public_exposure_granted).
+# The benchmark path had none of that: every hive.benchmark.published
+# event dispatched straight to every target.
+#
+# Benchmarks run on a schedule and the prover republishes, so the same
+# room could receive the same proof again and again.  That repetition is
+# what makes an automated post read as bot spam rather than as a useful
+# signal, and it is the fastest way to get a channel banned.  Being open
+# about automation is not the problem; being repetitive is.
+#
+# Three guards, all fail-closed:
+#   - the same standing consent the content path already requires
+#   - identical results are never announced twice
+#   - at most one benchmark announcement per BENCHMARK_MIN_INTERVAL_SEC
+BENCHMARK_MIN_INTERVAL_SEC = 6 * 3600
+
+_last_benchmark_key = None
+_last_benchmark_at = 0.0
+_benchmark_throttle_lock = threading.Lock()
+
+
+def _benchmark_min_interval() -> int:
+    """Read the cooldown at call time so an operator can retune it without
+    a restart."""
+    import os
+    try:
+        return int(os.environ.get(
+            'HEVOLVE_BENCHMARK_ANNOUNCE_INTERVAL_SEC',
+            BENCHMARK_MIN_INTERVAL_SEC))
+    except (TypeError, ValueError):
+        return BENCHMARK_MIN_INTERVAL_SEC
+
+
+def _benchmark_key(payload: Any) -> str:
+    """Identity of a result for dedup purposes.  The same benchmark at the
+    same score is the same news however often the prover republishes it."""
+    if not isinstance(payload, dict):
+        return str(payload)
+    raw = payload.get('score')
+    try:
+        score = round(float(raw or 0), 4)
+    except (TypeError, ValueError):
+        score = raw
+    return '%s:%s' % (payload.get('benchmark', 'unknown'), score)
+
+
+def _benchmark_announcement_allowed(payload: Any, now: float = None):
+    """Return (allowed, reason).  Records the decision when it allows, so
+    callers must not call this speculatively."""
+    import time as _time
+    now = _time.time() if now is None else now
+    key = _benchmark_key(payload)
+    global _last_benchmark_key, _last_benchmark_at
+    with _benchmark_throttle_lock:
+        if key == _last_benchmark_key:
+            return False, 'duplicate result (%s) already announced' % key
+        interval = _benchmark_min_interval()
+        waited = now - _last_benchmark_at
+        if _last_benchmark_at and waited < interval:
+            return False, ('cooldown: %ds since last announcement, %ds required'
+                           % (int(waited), interval))
+        _last_benchmark_key = key
+        _last_benchmark_at = now
+        return True, ''
+
+
 def _on_benchmark_published(_topic: str, data: Any) -> None:
     """EventBus callback.  Sync — schedules the async dispatch via
     run_coroutine_threadsafe.  Any exception is logged but never
     propagated so the EventBus emit chain stays intact for other
-    subscribers (federated_aggregator, etc.)."""
+    subscribers (federated_aggregator, etc.).
+
+    Gated the same way the new-content path is: standing public_exposure
+    consent, then dedup + cooldown.  Previously this fired unconditionally,
+    so proofs could post with consent ungranted and could repeat without
+    limit."""
     try:
+        if not _public_exposure_granted():
+            logger.info(
+                "benchmark announcement skipped: public_exposure consent "
+                "not granted")
+            return
+        allowed, reason = _benchmark_announcement_allowed(data or {})
+        if not allowed:
+            logger.info("benchmark announcement skipped: %s", reason)
+            return
         text = _build_announcement_text(data or {})
         count = broadcast_announcement(text)
         if count:
@@ -599,8 +682,12 @@ def register_announcement_subscriber() -> bool:
 
 def reset_for_tests() -> None:
     """Test helper — drops the _subscribed sentinel so tests can
-    re-register the listener against a fresh EventBus.  Not for
-    production code."""
-    global _subscribed
+    re-register the listener against a fresh EventBus, and clears the
+    benchmark throttle so one test's announcement does not suppress the
+    next test's.  Not for production code."""
+    global _subscribed, _last_benchmark_key, _last_benchmark_at
     with _subscribe_lock:
         _subscribed = False
+    with _benchmark_throttle_lock:
+        _last_benchmark_key = None
+        _last_benchmark_at = 0.0
