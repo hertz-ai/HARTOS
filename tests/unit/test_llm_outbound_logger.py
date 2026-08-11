@@ -126,12 +126,29 @@ def test_install_idempotent_and_returns_false_second_time(
     assert mod.is_installed() is True
 
 
-def test_install_returns_false_when_httpx_missing(tmp_path, monkeypatch):
+def test_install_still_patches_urllib_when_httpx_missing(tmp_path, monkeypatch):
+    """CONTRACT CHANGED 2026-08-11 — deliberately, and this is the record.
+
+    Previously this asserted ``install() is False`` and ``is_installed() is
+    False`` when httpx was unimportable: the hook patched NOTHING at all.  That
+    was wrong once urllib was recognised as a real LLM transport — hevolveai's
+    distillation engine reaches llama-server through
+    ``urllib.request.urlopen`` (qwen_llamacpp_wrapper.py:301), and urllib is
+    stdlib, so it is ALWAYS available.  Bailing out on a missing httpx left the
+    gate fully open for exactly the caller that was already escaping it.
+
+    Safe to change: the only production caller is
+    ``hart_intelligence_entry.py:873``, which invokes
+    ``_install_outbound_hook()`` and DISCARDS the return value — no branch
+    anywhere depends on the old False.  Verified by grep over both repos.
+    """
     _reset_module(monkeypatch, tmp_path)
     monkeypatch.setitem(sys.modules, 'httpx', None)
     import core.llm_outbound_logger as mod
-    assert mod.install() is False
-    assert mod.is_installed() is False
+    assert mod.install() is True, (
+        'a missing httpx must no longer abort the install — urllib is stdlib '
+        'and is itself an LLM transport, so the hook must still cover it')
+    assert mod.is_installed() is True
 
 
 def test_non_target_request_passes_through_untouched(
