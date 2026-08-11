@@ -7076,7 +7076,15 @@ function renderAgentOverlay(ev) {{
                 return jsonify({'error': str(e)}), 500
 
         # ── Shell APIs: Session ──
+        # Auth gate — this power/session route (lock/logout/suspend/shutdown/
+        # restart/firmware) was UNAUTHENTICATED while its sibling
+        # /api/shell/power/action carried @_require_shell_auth, a drifted power
+        # surface that let any reachable caller power off the box. Both surfaces
+        # now share the ONE canonical local-shell gate.
+        from integrations.agent_engine.shell_os_apis import _require_shell_auth
+
         @app.route('/api/shell/session/<action>', methods=['POST'])
+        @_require_shell_auth
         def shell_session(action):
             # #133 — NATIVE logind power actions, result-checked. The shell server
             # runs as the unprivileged `hart` service user; the old fire-and-forget
