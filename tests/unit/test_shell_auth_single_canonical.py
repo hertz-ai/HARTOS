@@ -53,6 +53,40 @@ def test_token_gates_nonlocal_requests(monkeypatch):
     assert _status(_call('10.0.0.5')) == 403  # no token
 
 
+def test_token_comparison_is_constant_time():
+    """A plain `==` short-circuits on the first wrong byte, so rejection time
+    leaks how many leading bytes were correct — turning a shared-secret guess
+    into a per-byte search for anyone who can time responses. The comparison must
+    go through hmac.compare_digest."""
+    import hmac as _hmac
+    from unittest.mock import patch
+    from integrations.agent_engine import shell_auth
+
+    with patch.object(_hmac, 'compare_digest', wraps=_hmac.compare_digest) as cd:
+        assert shell_auth._tokens_match('secret', 'secret') is True
+        assert cd.called, (
+            "token comparison did not use hmac.compare_digest — a plain == leaks "
+            "the length of the correct prefix through timing")
+
+
+def test_token_comparison_rejects_without_raising():
+    """The token is attacker-controlled and arrives from an HTTP header. A
+    non-ASCII or non-string value must FAIL the check, never raise out of the
+    auth boundary (hmac.compare_digest raises TypeError on non-ASCII str)."""
+    from integrations.agent_engine.shell_auth import _tokens_match
+    assert _tokens_match('wrong', 'secret') is False
+    assert _tokens_match('tokén-with-ünicode', 'secret') is False   # no TypeError
+    assert _tokens_match('', 'secret') is False
+    assert _tokens_match(None, 'secret') is False                   # no AttributeError
+
+
+def test_a_unicode_token_is_rejected_through_the_real_route(monkeypatch):
+    """End to end: the degenerate input above must surface as a clean 403, not a
+    500 from an exception escaping the decorator."""
+    monkeypatch.setenv('HART_SHELL_TOKEN', 'secret')
+    assert _status(_call('10.0.0.5', headers={'X-Shell-Token': 'tokén'})) == 403
+
+
 def test_all_three_surfaces_share_one_canonical_decorator():
     """The whole point of the fix: no more parallel paths."""
     from integrations.agent_engine import shell_auth

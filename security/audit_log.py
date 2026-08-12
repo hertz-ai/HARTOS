@@ -5,8 +5,9 @@ Prevents credential leakage via log files.
 """
 
 import re
+import sys
 import logging
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 # Vendor API-key / token / password / PEM redaction is delegated to the ONE
 # canonical pattern set in security/secret_redactor.py (see _redact below).
@@ -23,6 +24,29 @@ from typing import List, Tuple
 _AUDIT_EXTRA_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r'\b[0-9a-f]{40,}\b'), '[REDACTED_HEX_TOKEN]'),
 ]
+
+# ── Canonical-redactor health, surfaced instead of swallowed ────────────────
+# If the canonical redactor ever fails, the ONLY remaining coverage is the bare
+# long-hex pattern above — every vendor API key (sk-, sk-proj-, sk-ant-, AIza,
+# gsk_, AKIA, Bearer, PEM) would flow into the audit log verbatim. That is a
+# security-relevant degradation, so it must never be silent.
+#
+# WHY THIS DOES NOT CALL logger.warning(): this code runs INSIDE a logging.Filter.
+# Emitting a log record from a filter re-enters the logging machinery, which runs
+# the filters again — unbounded recursion on the very path that is already broken.
+# So the signal goes straight to stderr ONCE, and the state is left readable via
+# `canonical_redactor_status()` for health surfaces that poll rather than listen.
+_redactor_failure: Optional[str] = None
+_redactor_failure_count: int = 0
+
+
+def canonical_redactor_status() -> Tuple[bool, Optional[str], int]:
+    """Return ``(healthy, first_error_repr, failure_count)``.
+
+    ``healthy is False`` means audit-log redaction has DEGRADED to the local
+    long-hex pattern only and vendor keys are no longer being scrubbed.
+    """
+    return (_redactor_failure is None, _redactor_failure, _redactor_failure_count)
 
 
 class SensitiveFilter(logging.Filter):
@@ -50,14 +74,27 @@ class SensitiveFilter(logging.Filter):
     @staticmethod
     def _redact(text: str) -> str:
         # Canonical vendor-secret redaction — ONE source of truth
-        # (security/secret_redactor.py). Best-effort: a redaction filter must
-        # never raise and drop a log line, so fall through to the local
-        # supplemental if the import/scan ever fails.
+        # (security/secret_redactor.py). Still best-effort, because a redaction
+        # filter must never raise and drop a log line — but the failure is now
+        # RECORDED and announced once, never swallowed. See the module header for
+        # why this cannot use the logging system to report a logging fault.
+        global _redactor_failure, _redactor_failure_count
         try:
             from security.secret_redactor import redact_secrets
             text = redact_secrets(text)[0]
-        except Exception:
-            pass
+        except Exception as exc:            # noqa: BLE001 - see above; must not raise
+            _redactor_failure_count += 1
+            if _redactor_failure is None:
+                _redactor_failure = repr(exc)
+                try:
+                    sys.stderr.write(
+                        "[audit_log] CANONICAL REDACTOR FAILED (%r) — audit-log "
+                        "redaction has DEGRADED to the long-hex pattern only; "
+                        "vendor API keys are NO LONGER being scrubbed.\n" % (exc,))
+                except Exception:
+                    # stderr itself is gone (closed/detached). The flag above is
+                    # still set, so canonical_redactor_status() remains truthful.
+                    pass
         for pattern, replacement in _AUDIT_EXTRA_PATTERNS:
             text = pattern.sub(replacement, text)
         return text

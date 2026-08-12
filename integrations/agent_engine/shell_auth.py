@@ -13,6 +13,7 @@ This module is the single source of truth so the surfaces can never drift again:
 ``shell_os_apis._require_shell_auth``, ``shell_system_apis._require_system_auth``
 and ``shell_desktop_apis._require_desktop_auth`` all alias :func:`require_shell_auth`.
 """
+import hmac
 import os
 from functools import wraps
 
@@ -35,9 +36,31 @@ def shell_auth_ok():
         return True, None, None
     token = request.headers.get('X-Shell-Token', '')
     expected = os.environ.get('HART_SHELL_TOKEN', '')
-    if expected and token and token == expected:
+    if expected and token and _tokens_match(token, expected):
         return True, None, None
     return False, jsonify({'error': 'Shell API: local access only'}), 403
+
+
+def _tokens_match(token: str, expected: str) -> bool:
+    """CONSTANT-TIME token comparison.
+
+    A plain ``token == expected`` short-circuits on the first differing byte, so
+    the time it takes to reject leaks how many leading bytes were right. Against
+    an attacker who can time responses that turns guessing a shared secret from
+    infeasible into a per-byte search. ``hmac.compare_digest`` compares in time
+    that does not depend on where the mismatch is.
+
+    Both sides are encoded to bytes first: ``compare_digest`` raises TypeError on
+    ``str`` containing non-ASCII, and this token arrives from an attacker-controlled
+    HTTP header — so a non-ASCII header would otherwise raise inside the auth check
+    rather than simply failing it. Encoding makes a malformed token a clean False.
+    """
+    try:
+        return hmac.compare_digest(token.encode('utf-8'), expected.encode('utf-8'))
+    except (AttributeError, UnicodeError):
+        # Non-string input of any shape is a failed comparison, never an exception
+        # escaping the auth boundary.
+        return False
 
 
 def require_shell_auth(f):
