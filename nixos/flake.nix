@@ -152,6 +152,9 @@
       # the ladder exists (adds nothing to server/edge). FAIL-SAFE: missing markers
       # record their fail-safe value, the unit always succeeds (oneshot, exit 0).
       ./modules/hart-display-health.nix
+      # Thermal twin of display-health: reports kernel-forced idle (thermal
+      # throttling) so a thermal stall is never mistaken for a software hang.
+      ./modules/hart-thermal-health.nix
       # Leak attribution for a desktop that degrades OVER TIME (the 2026-07-20
       # drag hang). Read-only /proc sampling on a timer; opt-in, default OFF.
       ./modules/hart-shell-memwatch.nix

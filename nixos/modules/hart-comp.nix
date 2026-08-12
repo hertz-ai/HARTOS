@@ -351,6 +351,37 @@ let
   # ${hartCompPkg}/bin/hart-comp resolve identically either way.
   hartCompPkg = if hartCrane != null then hartCompPkgCrane else hartCompPkgBuildRust;
 
+  # ── The CAP_SYS_ADMIN-safe compositor binary (AT_SECURE RUNPATH fix) ──────────
+  # LIVE-CONFIRMED REGRESSION this exists to prevent (2026-08-12, real HW): putting a
+  # file capability on hart-comp makes the kernel set AT_SECURE=1, and glibc's loader
+  # then IGNORES LD_LIBRARY_PATH. The launcher exports LD_LIBRARY_PATH precisely so the
+  # compositor's RUNTIME dlopen("libEGL.so.1") (a bare soname, never in RUNPATH because
+  # Nix cannot capture a dlopen) resolves the GLVND dispatcher + the Mesa vendor. With
+  # the capability and no RUNPATH the journal read:
+  #   `Failed to load LibEGL: DlOpen { "libEGL.so.1: cannot open shared object file" }`
+  # i.e. the compositor WOULD take DRM master but lose GPU RENDERING and settle on the
+  # pixman floor -- trading one half of the bug for the other (the flat, non-vibrant
+  # shell stays flat).
+  #
+  # DT_RUNPATH is baked into the ELF and IS still honoured under AT_SECURE (only the
+  # LD_LIBRARY_PATH *environment* is dropped), so stamping the same two directories the
+  # launcher exports into the binary's RUNPATH makes the dlopen resolve WITH the
+  # capability set. Order mirrors the launcher exactly: libglvnd (the dispatcher soname
+  # hart-comp dlopens) FIRST, then /run/opengl-driver/lib (the Mesa vendor + DRI +
+  # libgbm that GLVND loads behind it). A copy, so the original package stays untouched.
+  hartCompCapBin = pkgs.runCommand "hart-comp-cap-runpath"
+    { nativeBuildInputs = [ pkgs.patchelf ]; }
+    ''
+      mkdir -p $out/bin
+      cp ${hartCompPkg}/bin/hart-comp $out/bin/hart-comp
+      chmod +w $out/bin/hart-comp
+      patchelf --add-rpath "${pkgs.libglvnd}/lib:/run/opengl-driver/lib" $out/bin/hart-comp
+      # Fail the BUILD (not the boot) if the stamp did not land -- a silent miss here
+      # would ship a capability binary that cannot load EGL, the exact regression above.
+      patchelf --print-rpath $out/bin/hart-comp | grep -q libglvnd \
+        || { echo "hart-comp-cap-runpath: RUNPATH stamp MISSING -- EGL would fail under AT_SECURE"; exit 1; }
+    '';
+
   # ── HART-comp session launcher ──
   # Forces the mandatory software path (paint on any GPU) and runs the glass shell
   # as the compositor's layer-shell client. The Phase-1 supervisor selects this as
@@ -702,7 +733,7 @@ in
       # /run/wrappers/bin/hart-comp. Scoped to the `hart` group (hart-admin is a member)
       # so a random local uid cannot grab the display.
       security.wrappers.hart-comp = {
-        source = "${hartCompPkg}/bin/hart-comp";
+        source = "${hartCompCapBin}/bin/hart-comp";
         capabilities = "cap_sys_admin+ep";
         owner = "root";
         group = "hart";
