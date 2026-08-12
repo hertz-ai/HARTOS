@@ -380,6 +380,32 @@ let
       # would ship a capability binary that cannot load EGL, the exact regression above.
       patchelf --print-rpath $out/bin/hart-comp | grep -q libglvnd \
         || { echo "hart-comp-cap-runpath: RUNPATH stamp MISSING -- EGL would fail under AT_SECURE"; exit 1; }
+
+      # ── ELF-CLASS GATE (real-HW 2026-08-12) ─────────────────────────────────
+      # Presence of "libglvnd" in the RUNPATH is NOT sufficient. A NixOS host with
+      # 32-bit GL support (hardware.graphics.enable32Bit) has TWO non-dev libglvnd
+      # outputs in the store, and the i686 one also ships a lib/libEGL.so.1. Point
+      # the RUNPATH at that one and the dlopen fails at RUNTIME with
+      #   Failed to load LibEGL: DlOpen { desc: "libEGL.so.1: wrong ELF class:
+      #   ELFCLASS32" }
+      # which smithay catch_unwind's into "GLES init PANICKED -- staying on the
+      # pixman software floor". The compositor then runs, scans out, and looks
+      # healthy while the iGPU is completely idle and the CPU carries every frame.
+      # That is a silent downgrade, so assert the CLASS here: walk the stamped
+      # RUNPATH in order and require the FIRST libEGL.so.1 the loader would find to
+      # be ELFCLASS64 (byte 4 of the ELF header == 2). ${pkgs.libglvnd} is the
+      # native output so this passes today; the check exists so a future refactor
+      # that reaches for a different attr cannot reintroduce the silent downgrade.
+      first_egl=""
+      for d in $(patchelf --print-rpath $out/bin/hart-comp | tr ':' ' '); do
+        if [ -e "$d/libEGL.so.1" ]; then first_egl="$d/libEGL.so.1"; break; fi
+      done
+      [ -n "$first_egl" ] \
+        || { echo "hart-comp-cap-runpath: no libEGL.so.1 anywhere on the stamped RUNPATH"; exit 1; }
+      cls=$(od -An -t x1 -N1 -j4 "$first_egl" | tr -d ' ')
+      [ "$cls" = "02" ] \
+        || { echo "hart-comp-cap-runpath: first libEGL.so.1 on the RUNPATH is NOT ELFCLASS64 ($first_egl class=$cls) -- EGL would silently fall back to the pixman software floor"; exit 1; }
+      echo "hart-comp-cap-runpath: EGL dispatcher OK (ELFCLASS64): $first_egl"
     '';
 
   # ── HART-comp session launcher ──
@@ -560,6 +586,29 @@ let
     HART_COMP_BIN=/run/wrappers/bin/hart-comp
     [ -x "$HART_COMP_BIN" ] || HART_COMP_BIN=${hartCompPkg}/bin/hart-comp
     echo "[hart-comp-session] launching compositor: $HART_COMP_BIN (cap_sys_admin wrapper = $([ "$HART_COMP_BIN" = /run/wrappers/bin/hart-comp ] && echo yes || echo NO-fallback))" >&2
+    # ── STALE-SOCKET EPOCH MARKER (real-HW Tier-1 falter RCA, 2026-08-12) ─────
+    # A Wayland socket is a filesystem inode that OUTLIVES the process that bound
+    # it: when the supervisor SIGKILLs a tier, /run/user/$UID/wayland-N is left
+    # behind as a DEAD inode. The wait loop below used to accept any path passing
+    # `-S`, which proves it is a socket FILE, not that anything is LISTENING -- so
+    # the loop matched the previous tier's corpse on its very first iteration and
+    # launched the glass shell at it ~400ms BEFORE hart-comp bound its own socket.
+    # The shell then died with "Gtk couldn't be initialized", never first-painted,
+    # and the supervisor's 45s paint watchdog killed a PERFECTLY HEALTHY compositor
+    # (it had already acquired DRM master and completed a page-flip vblank) and
+    # latched the session to sway. That is the whole "Tier-1 falters after a while"
+    # symptom: a startup race whose outcome depends on whether a stale socket
+    # happened to be lying around, i.e. on whether the PREVIOUS tier was killed
+    # rather than exiting cleanly -- which is exactly why it looked intermittent.
+    # Stamp an epoch file immediately BEFORE the compositor starts; the accept test
+    # below then additionally requires the socket to be NEWER than it, so a corpse
+    # from a dead tier can never be mistaken for a live compositor. This is a
+    # tightening of the EXISTING loop (no parallel discovery path); on the happy
+    # path where no stale socket exists the behaviour is byte-identical.
+    HART_SOCK_T0="$XDG_RUNTIME_DIR/.hart-comp-sock-t0"
+    rm -f "$HART_SOCK_T0" 2>/dev/null || true
+    : > "$HART_SOCK_T0"
+
     "$HART_COMP_BIN" --backend drm $HART_COMP_FORCE_SW_FLAG &
     HART_COMP_PID=$!
 
@@ -570,13 +619,16 @@ let
     for _ in $(seq 1 50); do
       # Newest wayland-N socket in the runtime dir (hart-comp's auto socket).
       SHELL_SOCK=$(ls -t "$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null | grep -v '\.lock$' | head -1 || true)
-      [ -n "$SHELL_SOCK" ] && [ -S "$SHELL_SOCK" ] && break
+      # -nt "$HART_SOCK_T0": it must have been bound AFTER we started the compositor.
+      # Without this, a stale socket left by a SIGKILLed tier satisfies -S and the
+      # shell is launched at a dead inode (see the epoch-marker note above).
+      [ -n "$SHELL_SOCK" ] && [ -S "$SHELL_SOCK" ] && [ "$SHELL_SOCK" -nt "$HART_SOCK_T0" ] && break
       # Bail early if the compositor died (the supervisor counts this as a crash).
       kill -0 "$HART_COMP_PID" 2>/dev/null || break
       sleep 0.2
     done
 
-    if [ -n "$SHELL_SOCK" ] && [ -S "$SHELL_SOCK" ]; then
+    if [ -n "$SHELL_SOCK" ] && [ -S "$SHELL_SOCK" ] && [ "$SHELL_SOCK" -nt "$HART_SOCK_T0" ]; then
       export WAYLAND_DISPLAY="$(basename "$SHELL_SOCK")"
       # Prefer the GTK4 wlr-layer-shell glass host (hart.layerShellHost) — the
       # SAME host Tier-2 sway runs, anchored BACKGROUND (exclusive zone 0) so it
@@ -631,6 +683,31 @@ let
         HART_GLASS_PID=$!
       else
         echo "hart-comp-session: no glass-shell host on PATH (enable hart.liquidUI / hart.layerShellHost)" >&2
+      fi
+
+      # ── ATTRIBUTE THE FAILURE TO THE RIGHT PROCESS (real-HW 2026-08-12) ─────
+      # When the glass shell dies before it first-paints, nothing here noticed:
+      # this wrapper blocks in `wait $HART_COMP_PID` and the compositor stays up
+      # and healthy, so 45s later the supervisor's paint watchdog reported
+      #   "tier 'hart-comp' is HUNG (compositor up, no first paint in 45s)"
+      # and latched the session down to sway. That message names hart-comp, but
+      # hart-comp had already acquired DRM master, set the mode and completed a
+      # page-flip vblank -- the SHELL was the casualty. Chasing that misattributed
+      # verdict cost a full debugging session (seat theories, capability theories,
+      # thermal theories) while the actual traceback sat in the journal.
+      # So: watch the shell child and, if it exits before the readiness marker
+      # exists, say plainly WHICH process died and with what status. Purely a
+      # diagnostic -- it does not kill or degrade anything, so it cannot introduce
+      # a new failure mode; the watchdog still owns the drop decision.
+      if [ -n "$HART_GLASS_PID" ]; then
+        (
+          # POLL, do not `wait`: inside this subshell the shell PID is a sibling,
+          # not a child, so `wait` would return 127 immediately and report nothing.
+          while kill -0 "$HART_GLASS_PID" 2>/dev/null; do sleep 1; done
+          if [ ! -e "$HART_SHELL_READY_FLAG" ]; then
+            echo "[hart-comp-session] GLASS SHELL (pid $HART_GLASS_PID) EXITED BEFORE FIRST PAINT — the compositor is healthy (DRM master + scanout held); the SHELL is the fault. The supervisor's imminent 'tier hart-comp is HUNG' verdict names the WRONG process; read the hart-glass-shell traceback above this line." >&2
+          fi
+        ) &
       fi
     else
       echo "hart-comp-session: hart-comp did not create a wayland socket — exiting so the supervisor drops a tier" >&2
