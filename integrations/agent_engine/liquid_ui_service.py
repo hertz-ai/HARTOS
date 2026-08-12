@@ -2673,6 +2673,56 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
                 '.lg-senses-ghost,.hart-desktop::before{display:none}'
             )
 
+        # ── IDLE MOTION COSTS A SOFTWARE REPAINT (real-HW 2026-08-12) ─────────
+        # Every rung except vulkan runs the GTK4 host on GSK_RENDERER=cairo, so the
+        # host blits the whole window through the CPU on every damage event. A
+        # CONTINUOUSLY running animation therefore forces a full software repaint
+        # ~60x a second forever, whatever the compositor is doing. Measured on the
+        # Samsung NP550P5C WITH hart-comp GPU-compositing and the iGPU fully engaged:
+        # the infinite animations alone cost 41% CPU (shell+WebKit 120% -> 79%) and
+        # held the package at 94C, which thermally throttled the CPU from 3.4GHz to
+        # ~1.7GHz. The box was slow because it was pretty.
+        #
+        # `webkit-flat` (flat_body_class, set right where blur_composites is decided)
+        # ALREADY means exactly "the host is painting in software", so key off that --
+        # no new mechanism, no second source of truth. Deliberately NOT is_potato:
+        # that keys off gpu_mode, the COMPOSITOR's verdict, so repairing the
+        # compositor's GPU path (as we did today) would switch these effects ON while
+        # the renderer that pays for them stays on cairo.
+        #
+        # Two mechanisms, both existing:
+        #  1. hartHome.css already gates its layers on --hart-motion-* custom
+        #     properties via animation-play-state, so flipping those to `paused` stops
+        #     the ambient blobs, orb float/breathe, ring spin and live dots centrally.
+        #     `paused` genuinely halts the animation (a redefined @keyframes does NOT
+        #     -- the machinery keeps running and repainting; that was measured too).
+        #  2. The handful of infinite animations with no such var are named here.
+        #     Only the ones that run AT IDLE: the state-driven ones (listening ring,
+        #     is-sensing, mic recording) stay, because they run for seconds during a
+        #     real interaction and they are what tells the user HART is doing
+        #     something. lg-comet likewise. A vulkan rung keeps everything as authored.
+        if not blur_composites:
+            _CSS_LIVING_GLASS += (
+                '/* sw-paint: idle motion stopped (see the note in liquid_ui_service.py) */'
+                'body.webkit-flat{--hart-motion-ambient:paused;--hart-motion-orb:paused;'
+                '--hart-motion-rings:paused;--hart-motion-detail:paused}'
+                # No --hart-motion-* var on these, and all of them animate transform
+                # on elements carrying large blurs/shadows (.hart-hero-orb alone has a
+                # 70px AND a 150px box-shadow, so each breathe frame re-rasterises two
+                # big blurs in software) or rotate a 300px dashed ring forever.
+                'body.webkit-flat .hart-orb-orbit,'
+                'body.webkit-flat .hart-orb-orbit2,'
+                'body.webkit-flat .hart-hero-orb,'
+                'body.webkit-flat .hart-hero-aura,'
+                'body.webkit-flat .hart-hero-aura .hha-r1,'
+                'body.webkit-flat .hart-hero-aura .hha-r2,'
+                'body.webkit-flat .hart-hero-aura .hha-halo,'
+                'body.webkit-flat .hart-hero-hevolve .dot,'
+                'body.webkit-flat .top-bar-orb,'
+                'body.webkit-flat .hart-hero-go,'
+                'body.webkit-flat .ds-skeleton{animation:none}'
+            )
+
         # ── Boot lock overlay (#166: FOUC + security) ─────────────────────────
         # The lock is a per-user SHELL lock (hartSessionUI.js / window.HartLock),
         # persisted in the SAME server-backed session blob the JS reads

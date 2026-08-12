@@ -155,6 +155,23 @@ in
         IOSchedulingClass = lib.mkDefault "idle";
         OOMScoreAdjust = lib.mkDefault 500;
       };
+
+      # DO NOT START clamd BEFORE A SIGNATURE DB EXISTS (real-HW 2026-08-12).
+      # A freshly flashed image has an EMPTY /var/lib/clamav until freshclam has
+      # completed once, and clamd refuses to start without one:
+      #   LibClamAV Error: cli_loaddbdir: No supported database files found in
+      #                    /var/lib/clamav
+      #   clamav-daemon.service: Failed with result 'exit-code'
+      # So every single boot of a new install showed a FAILED unit for a condition
+      # that is entirely normal and self-correcting. A permanently red unit is worse
+      # than useless: it trains everyone to ignore `systemctl --failed`, which is the
+      # first thing you look at when something IS actually broken.
+      # A Condition* that does not hold makes systemd skip the unit CLEANLY (it stays
+      # inactive and is reported as skipped, not failed), and the unit starts normally
+      # on the next boot or activation once freshclam has landed main/daily/bytecode.
+      # The glob matches both the compressed (.cvd) and uncompressed (.cld) forms.
+      systemd.services.clamav-daemon.unitConfig.ConditionPathExistsGlob =
+        lib.mkDefault "/var/lib/clamav/*.c?d";
     })
 
     # ── (2) Firewall hardening: defense-in-depth sysctls (additive) ──

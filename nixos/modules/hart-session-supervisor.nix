@@ -631,6 +631,30 @@ let
     export HART_SHELL_READY_FLAG="$READY"
     export HART_INPUT_ALIVE_FLAG="$INPUT_ALIVE"
 
+    # ── NUMERIC KEYPAD TYPES DIGITS (real-HW 2026-08-12: "numpad not working") ──
+    # NumLock boots OFF (/sys/class/leds/input0::numlock/brightness = 0) and nothing
+    # in the OS ever turned it on, so on a laptop with a real keypad every numpad key
+    # sent its NAVIGATION symbol -- KP_End instead of 1, KP_Down instead of 2 -- and
+    # the keypad looked broken. There is no xkb option that LOCKS NumLock, but
+    # `numpad:mac` fixes the actual problem by changing the keypad KEY TYPE so the
+    # digit level no longer depends on the NumLock modifier at all. Verified against
+    # the real keymap on the box with xkbcli compile-keymap:
+    #     -  modifiers= Shift+NumLock;   map[NumLock]= 2;
+    #     +  modifiers= none;            map[none]= 2;
+    # i.e. level 2 (the digit) is now selected unconditionally. The symbol list on
+    # each key is UNCHANGED, so nothing else about the layout moves.
+    #
+    # Set HERE, in the supervisor, because this is the one common parent of all three
+    # tiers -- hart-comp, sway and cage all inherit it, so the keypad behaves the same
+    # on every rung with a single declaration and nothing to keep in sync. It cannot
+    # go in the greetd unit environment: greetd builds a fresh environment for the
+    # session through PAM, so a systemd Environment= there never reaches the tier
+    # (measured today when a greetd drop-in failed to reach the shell). All three
+    # compositors build their keymap from xkbcommon's RMLVO env defaults
+    # (smithay's XkbConfig::default leaves options None), so the env var is the seam
+    # they genuinely share. `:-` so an operator override still wins.
+    export XKB_DEFAULT_OPTIONS="''${XKB_DEFAULT_OPTIONS:-numpad:mac}"
+
     # XDG_RUNTIME_DIR — DERIVED, never merely inherited.
     #
     # cage aborts immediately without it (`cage.c:299 XDG_RUNTIME_DIR is not set

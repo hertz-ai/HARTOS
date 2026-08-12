@@ -319,6 +319,23 @@ $_x"
 
       log "wrote $OUT to $DEV (phase=$PHASE)"
       WROTE=$((WROTE + 1))
+
+      # STOP AT THE FIRST SUCCESS (real-HW 2026-08-12). This loop used to write the
+      # journal to EVERY eligible partition, so on a stick with several vfat
+      # partitions it wrote the same dump again and again, ran past
+      # TimeoutStartSec=90s, and systemd SIGTERMed it -- leaving a permanently FAILED
+      # unit on a box where the export had in fact already SUCCEEDED:
+      #   wrote /run/hart/journal-mnt/hart-journal-hart-node.txt to /dev/sdb2
+      #   eligible external USB target: /dev/sdb11        <- kept going
+      #   start operation timed out. Terminating.
+      #   Consumed 1min 26.056s CPU time
+      # Two harms: a red unit that misreports a working export as broken, and ~30-90s
+      # of CPU per tick on a laptop that is already thermally throttled, which is
+      # exactly the kind of background burn that makes the desktop feel slow. One
+      # copy on one stick is the whole point of the feature, so take the first and
+      # leave. If that stick is later removed, the next tick simply picks the next
+      # eligible one -- the discovery order is unchanged.
+      break
     done < "$LISTF"
     rm -f "$LISTF" 2>/dev/null || true
 
