@@ -516,7 +516,20 @@ let
     # flag is empty => select_render_path reads the verdict and brings up GLES on the
     # iGPU. Unquoted expansion is intentional (the flag is "" or "--force-software",
     # no spaces/globs) and safe under set -u (always assigned above).
-    ${hartCompPkg}/bin/hart-comp --backend drm $HART_COMP_FORCE_SW_FLAG &
+    # hart-comp launches via the CAP_SYS_ADMIN file-capability wrapper
+    # (security.wrappers.hart-comp, defined in this module's config) so its EXISTING
+    # drmSetMaster retry (udev.rs::acquire_drm_master) can TAKE DRM master away from
+    # systemd-logind. On this greetd+logind seat path logind holds master and never
+    # hands it off, so the unprivileged compositor's drmSetMaster returns EACCES forever
+    # and it settles on the pixman SOFTWARE floor -- the CPU-stall + flat, non-vibrant
+    # cards. Live-confirmed 2026-08-12 on real HW that a CAP_SYS_ADMIN process CAN take
+    # master while logind holds it, and hart-comp already drops master on PauseSession +
+    # re-takes on ActivateSession, so VT switching still cooperates. Fall back to the
+    # bare binary if the wrapper is somehow absent (degrade to software, never no-launch).
+    HART_COMP_BIN=/run/wrappers/bin/hart-comp
+    [ -x "$HART_COMP_BIN" ] || HART_COMP_BIN=${hartCompPkg}/bin/hart-comp
+    echo "[hart-comp-session] launching compositor: $HART_COMP_BIN (cap_sys_admin wrapper = $([ "$HART_COMP_BIN" = /run/wrappers/bin/hart-comp ] && echo yes || echo NO-fallback))" >&2
+    "$HART_COMP_BIN" --backend drm $HART_COMP_FORCE_SW_FLAG &
     HART_COMP_PID=$!
 
     # Wait (bounded) for hart-comp to create its wayland socket, then point the glass
@@ -672,6 +685,29 @@ in
       ];
 
       environment.systemPackages = [ hartCompPkg compSessionLauncher ];
+
+      # ── CAP_SYS_ADMIN wrapper so the compositor can take DRM master from logind ──
+      # (2026-08-12 real-HW root cause of "usable, then stalls after a period" + the
+      # flat, non-vibrant agent cards.) On the greetd+logind seat path systemd-logind
+      # HOLDS DRM master (dri clients: `systemd-logind ... master y`) and never hands it
+      # off, so hart-comp's drmSetMaster retry (udev.rs::acquire_drm_master) loops EACCES
+      # and the compositor is pinned to the pixman SOFTWARE scanout floor: every frame is
+      # CPU-copied to the display (the stall) and the WebKit shell drops to its Cairo rung
+      # (flat cards). Live-confirmed that a CAP_SYS_ADMIN process CAN drmSetMaster while
+      # logind holds master (`/dev/dri/card1 SET_MASTER=OK` as root, EACCES unprivileged),
+      # and hart-comp already RELEASES master on PauseSession + re-takes on
+      # ActivateSession -- so it cooperates with VT switches; it only lacked the one
+      # capability to make its existing retry succeed. This grants exactly that (a file
+      # capability, NOT setuid-root) to the trusted compositor binary. The launcher execs
+      # /run/wrappers/bin/hart-comp. Scoped to the `hart` group (hart-admin is a member)
+      # so a random local uid cannot grab the display.
+      security.wrappers.hart-comp = {
+        source = "${hartCompPkg}/bin/hart-comp";
+        capabilities = "cap_sys_admin+ep";
+        owner = "root";
+        group = "hart";
+        permissions = "u+rx,g+rx";
+      };
 
       # Register the opt-in HART-comp session. desktop.nix keeps the default
       # session on cage ("hart-shell"); this is ADDITIVE — a selectable session +
