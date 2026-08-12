@@ -743,6 +743,11 @@ def recommend_for_hardware() -> Dict:
         return {'model_name': fb['model_name'], 'quant': fb['quant'],
                 'label': f"{fb['display_name']} - smallest available, "
                          "chosen because the model catalog could not be read",
+                # display_name on BOTH paths: native_onboarding's button caption
+                # reads it (a Gtk.Button does not wrap, so it must not fall back
+                # to `label`). Without it here the emergency path would caption
+                # the button with the raw repo path.
+                'display_name': fb['display_name'],
                 'total_vram_gb': budget['total_vram_gb'], **budget}
 
     quant = (chosen.capabilities or {}).get('quant', 'Q4_K_M')

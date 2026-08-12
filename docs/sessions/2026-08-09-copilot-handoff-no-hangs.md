@@ -26,7 +26,77 @@ This is the rewrite. The steward and I converged on a single hypothesis that
 ties together three separate-looking failures. **Chase this before anything
 else — if it holds, it collapses three tasks into one fix.**
 
-### The evidence (from the 6675-line journal export)
+### LIVE CONFIRMATION (2026-08-10, read off the hung stick's ext4 journal)
+
+A real hung boot was captured and its persistent journal read directly off the
+stick's ext4 (`/var/log/journal`), Windows-side, with a pure-Python ext4 reader.
+This UPGRADES the theory below to a confirmed root cause, and corrects one part:
+
+- The `drmSetMaster` failure carries a specific errno: **`Os { code: 13, kind:
+  PermissionDenied }` = EACCES, NOT EBUSY.** So it is NOT a holder conflict
+  (plymouth had already quit; nothing else holds card1). The compositor is simply
+  **not permitted** to become master. The log line: `HART-comp DRM: drmSetMaster
+  STILL refused (unprivileged) -- errno names the reason/holder; retrying every
+  tick` — and it retries in a busy-loop.
+- The compositor is launched by **greetd** (`session opened for user
+  hart-admin(uid=1000)`), through logind. So the real question is **why the
+  greetd/logind session is not the ACTIVE DRM-master session on the seat** — an
+  EACCES means the session isn't authorized to master card1, not that someone
+  holds it. Chase greetd↔logind↔libseat session *activation* (is the session
+  `Active=yes`? is libseat on the logind backend or seatd? does the session own
+  the foreground VT?), NOT "who holds the master."
+- Denied the master, the compositor correctly falls to its **pixman SOFTWARE
+  scanout floor** (`HART-comp DRM: output online (pixman scanout)`, `real-HW
+  scanout on the pixman floor`, first-scanout beacon written). The display goes
+  LIVE (cursor moves) but the ENTIRE display path is now CPU. That is the wedge:
+  pixman scanout + GSK cairo + degraded WebKit, all on the CPU.
+- **"Hung faster" is explained:** this machine is **Intel HD 4000 (Ivy Bridge)**,
+  an older/weaker CPU than the HD 620 machine. All-software rendering saturates it
+  faster. Same failure, slower silicon.
+- The boot reached the full graphical shell (greetd → compositor → glass-shell
+  GSK=CAIRO → XWayland → portals → PipeWire) over ~79s (20:47:18→20:48:37), then
+  the CPU-bound shell wedged — matching "cursor moves, nothing else responds."
+
+**PRIME SUSPECT for the EACCES (testable, from the same journal): seatd and
+logind are BOTH managing seat0.** The journal shows, side by side:
+`systemd-logind ... New seat seat0` AND `[seatd/seat.c:39] Created VT-bound seat
+seat0`. `services.seatd.enable = true` is set in THIS module
+(`hart-session-supervisor.nix:1125`) as a deliberate "idle fallback," on the
+stated assumption that forcing `LIBSEAT_BACKEND=logind` means "NO client connects
+to seatd, so the idle daemon never touches the seat." **The journal falsifies
+that assumption** — seatd created a VT-bound seat0 regardless of clients, so two
+seat managers are on seat0. That is verbatim the "two seat managers fighting …
+the exact boot loop (DRM grabbed but input dead + EBUSY/EACCES tier-drops, cursor
+stuck at 0,0)" that the module's own comment (lines 1115-1124) blames. Also seen:
+`All allocated VCs are currently busy, skipping initialization` — VT contention.
+FIRST THING TO TRY on the hardware:
+  1. `loginctl session-status 1` — is greetd's session `Active: yes` on seat0? If
+     `no`, that is the direct cause of the drmSetMaster EACCES.
+  2. `fgconsole` / `cat /sys/class/tty/tty0/active` — did the foreground VT
+     actually become tty7 (greetd's vt)? If it stuck on tty1, the vt7-becomes-
+     active design (lines 1112, 1169-1173) is not firing on this box.
+  3. Test `services.seatd.enable = false` (mkForce) and rebuild — remove the
+     second seat manager so ONLY logind owns seat0/VTs, then confirm
+     `drmSetMaster` succeeds and the compositor leaves the pixman floor for GPU
+     KMS scanout. seatd is only kept for a hypothetical future logind-less
+     topology, so dropping it here costs nothing and directly tests the fight.
+Corrected details from the live capture: the machine is an **i7-3630QM (Ivy
+Bridge quad-core) — NOT a weak CPU**; the "hung faster" is the single-threaded
+software render/scanout loop pegging a core + the older HD 4000 i915 path, not
+raw CPU speed. And the **2.4G wireless mouse DID enumerate** (`Watching system
+buttons on /dev/input/event1 (HS6209 2.4G Wireless Receiver)`) — it is not a
+driver/enumeration gap; the wedged/inactive compositor session simply isn't
+delivering its input. Generic USB HID is fine.
+
+**So the #1 fix is: get the compositor's greetd/logind session AUTHORIZED as the
+active DRM master, so it does GPU KMS scanout instead of the pixman software
+floor.** That frees the CPU and removes the wedge on both machines. The pixman
+fallback is working-as-designed (degrade-not-die) — the bug is upstream of it, in
+session activation. Secondary: the busy-retry on `drmSetMaster` should back off,
+and once master is held via libseat's active-session fd the explicit
+`drmSetMaster` call may be redundant entirely.
+
+### The earlier evidence (from the 6675-line journal export)
 
 - The compositor got a real GPU context: `HART-comp DRM: GLES GPU renderer
   initialised on the primary node`, Intel HD 620, Mesa 24.2.8, OpenGL ES 3.2, on

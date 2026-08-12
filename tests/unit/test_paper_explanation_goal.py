@@ -181,6 +181,17 @@ class TestBuildPaperExplanationPrompt:
         assert "'explanations' map" in prompt
         assert '<paper_url>' in prompt
 
+    def test_the_description_reaches_the_prompt_verbatim(self):
+        """Whatever the seed's description says, the agent reads.
+
+        The authorship requirement is asserted against the SEED text (see
+        TestPaperExplainerSeedGoal). That is only meaningful while the builder
+        passes the description straight through, so pin the pass-through here
+        rather than restating the requirement against a synthetic prompt.
+        """
+        marker = 'SENTINEL-DESCRIPTION-PASSTHROUGH'
+        assert marker in self._build(description=marker)
+
     def test_contains_topics_and_source(self):
         prompt = self._build()
         assert 'ai' in prompt and 'bci' in prompt
@@ -263,20 +274,53 @@ class TestPaperExplainerSeedGoal:
         assert cfg['requires_consent'] is True
         assert cfg['idle_only'] is True
 
-    def test_disabled_by_default(self):
-        """Seeded dormant: enabled=False, and the prompt builder must
-        decline the seed config as-is (daemon skips dispatch) until a
-        human arms it."""
+    def test_armed_and_the_builder_accepts_the_seed_as_shipped(self):
+        """Armed on 2026-08-11 (was seeded dormant).
+
+        This test had been RED since that flip and nobody noticed, because the
+        flip was never observable anywhere else either: a config-only seed edit
+        could not reach an already-seeded row until b860cbed, so the live goal
+        stayed disabled and `last_dispatched_at` was still NULL 23 days later.
+        The test was the only thing that knew, and it was failing quietly.
+
+        What keeps arming safe is asserted elsewhere in this class: every
+        publish is a gh_pr_open pull request, so a human merge is still the
+        only route to a live page.
+        """
         from integrations.agent_engine.goal_manager import get_prompt_builder
         goal = self._get_goal()
-        assert goal['config'].get('enabled') is False
+        assert goal['config'].get('enabled') is True
         builder = get_prompt_builder('paper_explanation')
         prompt = builder({
             'title': goal['title'],
             'description': goal['description'],
             'config': goal['config'],
         })
-        assert prompt is None
+        # Was `is None` — that assertion WAS the definition of dormant.
+        assert prompt is not None
+        assert 'gh_pr_open' in prompt
+
+    def test_seed_entry_shape_carries_agent_authorship(self):
+        """The published page says an agent wrote it — via this field.
+
+        researchExplanations.json takes a bare string (the 200 committed
+        human-written entries) or {text, by}. fetch-research.js promotes `by`
+        to explanation_by, and ResearchPaperPage renders the label ONLY when
+        that is present. So an agent writing the bare-string form publishes
+        prose that reads as a person's, beside 200 pages that genuinely are —
+        undisclosed by omission, with nothing failing anywhere to catch it.
+
+        The seed description is the agent's playbook and the only thing
+        standing between it and that outcome, so the requirement is pinned to
+        the seed text itself rather than to a synthetic prompt.
+        """
+        desc = self._get_goal()['description']
+        assert '"text"' in desc
+        assert '"by"' in desc
+        assert 'hevolve-ai-agent' in desc
+        # And it must say WHY, so a reword cannot drop it as boilerplate.
+        assert 'REQUIRED' in desc
+        assert 'bare string' in desc.lower()
 
     def test_description_names_canonical_tools_verbatim(self):
         """The LLM uses the description as its playbook — the tool

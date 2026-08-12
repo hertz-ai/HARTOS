@@ -449,7 +449,14 @@ SEED_BOOTSTRAP_GOALS = [
             're-score — queue REWORK, never publish a failing draft, '
             '5) NEVER push directly — every publish is a pull request and the '
             'human merge IS the consent gate; never auto-publish externally '
-            'without operator approval. '
+            'without operator approval, '
+            '6) DISCLOSE AUTHORSHIP on every page you publish: the registry '
+            'entry carries an explicit agent byline (e.g. author "Hevolve AI '
+            'agent") and the page states that it was written by an automated '
+            'agent and reviewed by a human before merge. Never present '
+            'agent-written copy as a named person\'s work, and never omit the '
+            'label to make it read as hand-written. The PR description must '
+            'say the same, so the reviewer sees it before merging. '
             'Aggregator etiquette: headline + snippet + attribution + link '
             'out to the original source; no full-article republication.'
         ),
@@ -457,10 +464,17 @@ SEED_BOOTSTRAP_GOALS = [
             'repo': 'hertz-ai/Hevolve',
             'base_branch': 'main',
             'min_seo_score': 90,
-            # Disabled by default: _build_seo_prompt returns None (daemon
-            # skips dispatch) until the operator flips enabled=True — the
-            # same config-gate pattern as the autoresearch goal type.
-            'enabled': False,
+            # Enabled 2026-08-12. This is the news -> hevolve.ai path: the
+            # news curation agents flag items with mark_news_for_web and
+            # nothing consumed them, because _build_seo_prompt returns None
+            # while enabled is false. Until b860cbed a seed flip could not
+            # reach an already-seeded row at all, so switching it here was
+            # inert — see that commit.
+            #
+            # Safe to arm: every publish is a gh_pr_open pull request, so the
+            # human merge remains the only path to a live page, and step 6
+            # requires the page to say an agent wrote it.
+            'enabled': True,
             'requires_consent': True,
             'continuous': True,
         },
@@ -491,11 +505,18 @@ SEED_BOOTSTRAP_GOALS = [
             'abstract and fetched text — state that it is based on the '
             'abstract and NEVER invent results, numbers, or findings the '
             'source does not contain, '
-            '4) Add a {"<paper_url>": "<explanation>"} entry to the '
+            '4) Add a {"<paper_url>": {"text": "<explanation>", "by": '
+            '"hevolve-ai-agent"}} entry to the '
             '"explanations" map in src/data/researchExplanations.json '
             '(preserve every existing entry) and open a pull request with '
             'gh_pr_open — the website merges it into '
-            'hevolve.ai/research/<slug> via npm run research:pull, '
+            'hevolve.ai/research/<slug> via npm run research:pull. '
+            'The "by" field is REQUIRED and is what makes the published page '
+            'say an agent wrote it: fetch-research.js carries it through and '
+            'ResearchPaperPage renders "Written by the Hevolve AI agent from '
+            'this paper\'s abstract". Writing a bare string instead publishes '
+            'agent prose that reads as a person\'s, alongside 200 pages that '
+            'genuinely are — never do that, '
             '5) NEVER push directly — every publish is a pull request and '
             'the human merge IS the consent gate; never auto-publish '
             'externally without operator approval. '
@@ -509,11 +530,12 @@ SEED_BOOTSTRAP_GOALS = [
             'topics': ['ai', 'bci'],
             'source': 'Nature + arXiv',
             'max_per_cycle': 1,
-            # Disabled by default: _build_paper_explanation_prompt returns
-            # None (daemon skips dispatch) until the operator flips
-            # enabled=True — the same config-gate pattern as the seo /
-            # autoresearch goal types.
-            'enabled': False,
+            # Enabled by the operator on 2026-08-11 so the queued papers
+            # drain into pages. The daemon still refuses to dispatch
+            # unless the machine is idle (idle_only) and consent is
+            # granted (requires_consent), and every explanation lands
+            # as a pull request for human review, never a direct push.
+            'enabled': True,
             # idle_only: the agent_daemon skips this goal unless the
             # ResourceGovernor reports MODE_IDLE (see agent_daemon
             # ._idle_only_blocked) — reuses the ONE existing idle detector,
@@ -2242,17 +2264,55 @@ def seed_bootstrap_goals(db, platform_product_id: Optional[str] = None) -> int:
             # overwrite runtime keys (status, completed_at, dispatch
             # counters) — only the human-authored description + the
             # config keys that came from the seed.
+            #
+            # CONFIG DRIFT COUNTS TOO.  This used to fire on a description
+            # change ALONE, which made a config-only seed edit unable to
+            # reach an already-seeded system by construction — the merge
+            # loop below sat inside a branch that a config edit could not
+            # open.  Cost, measured 2026-08-12: bootstrap_paper_explainer
+            # was flipped to `enabled: True` in the seed on 2026-08-11 to
+            # drain 100 fetched-but-unpublished research papers into pages.
+            # Its row (seeded 2026-07-20) kept `enabled: False`, so
+            # _build_paper_explanation_prompt returned None on every tick
+            # and last_dispatched_at was still NULL 23 days later. The
+            # switch had been thrown; nothing was listening.
+            #
+            # Compare the seed's OWN keys against the row rather than the
+            # whole config: runtime keys the daemon writes (completed_at,
+            # noop_dispatch_count, …) are absent from the seed and so can
+            # never register as drift, which is what keeps this from
+            # re-firing every boot.
             try:
+                _seed_cfg = goal_data.get('config') or {}
+                _row_cfg = existing.config_json or {}
+                _cfg_drift = any(
+                    _row_cfg.get(k) != v for k, v in _seed_cfg.items()
+                )
+                _desc_drift = existing.description != goal_data['description']
                 if (existing.created_by == 'system_bootstrap'
-                        and existing.description != goal_data['description']):
+                        and (_desc_drift or _cfg_drift)):
                     existing.description = goal_data['description']
                     # Merge seed config keys without nuking runtime state.
-                    cfg = existing.config_json or {}
-                    for k, v in (goal_data.get('config') or {}).items():
+                    #
+                    # dict(...) — a NEW object, deliberately.  `config_json`
+                    # is a plain JSON column, not a MutableDict, so mutating
+                    # the instance's own dict in place and assigning it back
+                    # leaves the attribute identical to itself: SQLAlchemy
+                    # sees no change, never flushes, and the sync silently
+                    # does nothing.  That is a second, independent reason the
+                    # paper-explainer flag never landed, and it would have
+                    # swallowed the fix above on its own.
+                    cfg = dict(existing.config_json or {})
+                    for k, v in _seed_cfg.items():
                         cfg[k] = v
                     cfg['bootstrap_slug'] = slug  # preserve the marker
                     existing.config_json = cfg
                     updated += 1
+                    if _cfg_drift:
+                        logger.info(
+                            f"Bootstrap goal '{slug}': seed config drift "
+                            f"synced to the existing row "
+                            f"({'+description' if _desc_drift else 'config only'})")
             except Exception as _sync_err:
                 logger.debug(
                     f"Bootstrap goal '{slug}' description sync skipped: {_sync_err}")

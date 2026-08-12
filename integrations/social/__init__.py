@@ -700,6 +700,20 @@ def init_social(app):
         except Exception as e:
             logger.debug(f"Announcement broadcaster wire-up skipped: {e}")
 
+        # On-platform content distribution.  announce_new_content pushes
+        # pages OFF platform and is consent-gated; it also had no caller,
+        # so no page was ever distributed anywhere.  This publishes new
+        # pages to our OWN feed, from which FederationManager pushes them
+        # to every instance that follows this one -- the research corpus
+        # reaches the node network instead of stopping at the website.
+        # Idempotent; the thread is a daemon so it never blocks shutdown.
+        try:
+            from integrations.channels.announcement_broadcaster import (
+                start_content_distribution)
+            start_content_distribution()
+        except Exception as e:
+            logger.debug(f"Content distribution wire-up skipped: {e}")
+
         watchdog.start()
         logger.info(f"NodeWatchdog started: monitoring "
                     f"{len(watchdog._threads)} threads")

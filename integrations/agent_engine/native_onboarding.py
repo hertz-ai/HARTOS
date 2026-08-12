@@ -727,7 +727,17 @@ class HARTOnboardingWindow(Adw.ApplicationWindow):
         self._ai_status.add_css_class('post-text')
         page.append(self._ai_status)
 
-        setup_btn = Gtk.Button(label='Set up (' + rec.get('label', 'local model') + ')')
+        # display_name, NOT label: `label` is a full guidance sentence meant for
+        # the wrapping Gtk.Label above ("Qwen3.5 4B - a good fit for CPU (cpu,
+        # 9.6GB ram)"). A Gtk.Button caption does not wrap, so putting it here
+        # produced 'Set up (Qwen3.5 4B - a good fit for CPU (cpu, 9.6GB ram))' --
+        # 56 chars with nested parens, stretching or ellipsizing a fixed-width
+        # first-boot dialog. Two display sites, two different needs: guidance
+        # above, short identifier on the button.
+        setup_btn = Gtk.Button(
+            label='Set up (' + (rec.get('display_name')
+                                or rec.get('model_name')
+                                or 'local model') + ')')
         setup_btn.add_css_class('action-btn')
         setup_btn.add_css_class('action-btn-primary')
         setup_btn.connect('clicked', self._on_ai_setup, rec)

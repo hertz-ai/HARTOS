@@ -128,6 +128,138 @@ class EncounterService:
         return enc.to_dict()
 
     @staticmethod
+    def _already_connected(db: Session, user_id: str) -> set:
+        """Everyone we should not suggest: self, plus anyone already followed."""
+        from .models import Follow
+        out = {user_id}
+        try:
+            rows = db.query(Follow.following_id).filter(
+                Follow.follower_id == user_id).all()
+            out.update(r[0] for r in rows if r and r[0])
+        except Exception as exc:
+            logger.debug("suggestions: follow lookup failed: %s", exc)
+        return out
+
+    @staticmethod
+    def _authors_of_engaged_content(db: Session, user_id: str,
+                                    exclude: set, limit: int) -> List[str]:
+        """Author ids of the content this user actually engaged with.
+
+        Upvotes first, then posts they commented on. Both are stronger
+        signals of "I want more of this person" than co-presence is.
+        """
+        from .models import Post, Vote, Comment
+        ranked = []
+
+        def _add(ids):
+            for pid in ids:
+                if pid and pid not in exclude and pid not in ranked:
+                    ranked.append(pid)
+
+        try:
+            voted = db.query(Post.author_id, func.count(Vote.id).label('n')).join(
+                Vote, and_(Vote.target_id == Post.id,
+                           Vote.target_type == 'post')
+            ).filter(
+                Vote.user_id == user_id, Vote.value > 0
+            ).group_by(Post.author_id).order_by(desc('n')).limit(limit * 3).all()
+            _add([r[0] for r in voted])
+        except Exception as exc:
+            logger.debug("suggestions: upvote affinity failed: %s", exc)
+
+        if len(ranked) < limit:
+            try:
+                commented = db.query(
+                    Post.author_id, func.count(Comment.id).label('n')
+                ).join(Comment, Comment.post_id == Post.id).filter(
+                    Comment.author_id == user_id
+                ).group_by(Post.author_id).order_by(desc('n')).limit(limit * 3).all()
+                _add([r[0] for r in commented])
+            except Exception as exc:
+                logger.debug("suggestions: comment affinity failed: %s", exc)
+
+        return ranked[:limit]
+
+    @staticmethod
+    def _authors_worth_reading(db: Session, exclude: set, limit: int) -> List[str]:
+        """Last resort for an account with no history at all: authors of
+        recent, well-received, public posts.
+
+        Without this a brand-new user is shown nobody, because every other
+        signal we have (encounters, votes, comments) is empty on day one.
+        That empty state is the moment they decide whether this is a live
+        network or an abandoned one.
+        """
+        from .models import Post
+        from .privacy import is_public
+        try:
+            rows = db.query(Post.author_id, Post.privacy,
+                            func.max(Post.score).label('best')).filter(
+                Post.is_hidden == False  # noqa: E712
+            ).group_by(Post.author_id, Post.privacy).order_by(
+                desc('best')).limit(limit * 5).all()
+        except Exception as exc:
+            logger.debug("suggestions: popular-author lookup failed: %s", exc)
+            return []
+        out = []
+        for author_id, privacy, _best in rows:
+            # Reuse the canonical predicate rather than re-deriving "public".
+            if not is_public(privacy):
+                continue
+            if author_id and author_id not in exclude and author_id not in out:
+                out.append(author_id)
+            if len(out) >= limit:
+                break
+        return out
+
+    @staticmethod
+    def _hydrate(db: Session, user_ids: List[str], reason: str) -> List[Dict]:
+        from .models import User
+        out = []
+        for uid in user_ids:
+            u = db.query(User).filter_by(id=uid).first()
+            if not u:
+                continue
+            out.append({
+                'user_id': u.id,
+                'username': u.username,
+                'display_name': u.display_name,
+                'avatar_url': u.avatar_url,
+                'user_type': u.user_type,
+                'total_encounters': 0,
+                'shared_contexts': 0,
+                'max_bond': 0,
+                'reason': reason,
+            })
+        return out
+
+    @staticmethod
+    def suggest_by_content(db: Session, user_id: str, limit: int = 10,
+                           exclude: set = None) -> List[Dict]:
+        """Who to follow, based on the content you liked rather than who you
+        bumped into.
+
+        get_suggestions needs >= 2 encounters with somebody, so a user who has
+        only READ things is shown nobody, and a brand-new account is shown
+        nobody at all. Search does not fix that: it asks the newcomer to
+        already know who they are looking for.
+        """
+        exclude = set(exclude or ())
+        exclude |= EncounterService._already_connected(db, user_id)
+
+        picks = EncounterService._authors_of_engaged_content(
+            db, user_id, exclude, limit)
+        out = EncounterService._hydrate(db, picks, 'you engaged with their posts')
+
+        if len(out) < limit:
+            exclude |= set(picks)
+            fallback = EncounterService._authors_worth_reading(
+                db, exclude, limit - len(out))
+            out.extend(EncounterService._hydrate(
+                db, fallback, 'widely read right now'))
+        return out[:limit]
+
+    @staticmethod
     def get_suggestions(db: Session, user_id: str, limit: int = 10) -> List[Dict]:
         """Get connection suggestions based on encounter patterns.
         Users with multiple encounters across different contexts."""
@@ -175,6 +307,17 @@ class EncounterService:
 
             if len(result) >= limit:
                 break
+
+        # Encounters need >= 2 co-occurrences, so this list is empty for a new
+        # account and thin for a quiet one. Top up from what they actually
+        # read and liked, so discovery does not depend on having already
+        # been in the same room as somebody.
+        if len(result) < limit:
+            try:
+                result.extend(EncounterService.suggest_by_content(
+                    db, user_id, limit - len(result), exclude=seen))
+            except Exception as exc:
+                logger.debug("suggestions: content affinity skipped: %s", exc)
 
         return result
 

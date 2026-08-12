@@ -53,27 +53,53 @@ _subscribed = False
 _subscribe_lock = threading.Lock()
 
 
+# Every outbound announcement ends with this link.  Disclosed by design:
+# the post names HART OS and points at Hevolve's own site, so a reader who
+# sees a benchmark proof has an obvious way to act on it.  Without it the
+# announcement was a dead end: a bare score in somebody else's chat room
+# with no way to reach the project, which cannot produce a single user.
+ANNOUNCEMENT_URL = 'https://hevolve.ai/hive'
+
+
 def _build_announcement_text(payload: Dict[str, Any]) -> str:
-    """Format the EventBus payload into a single string for outbound
-    posting.  Mirrors the structure hive_benchmark_prover constructs
-    for the internal social post, with a short header and the
-    pre-built `comparison` block (which already includes baseline
-    comparisons + the "distributed privacy, zero cloud cost" tag-
-    line).  If `comparison` is missing the caller didn't go through
-    _publish_results and we fall back to a minimal one-liner."""
+    """Format the EventBus payload into a single string for outbound posting.
+
+    KEY NAMES.  hive_benchmark_prover emits two different events with two
+    different shapes, and this builder is wired to the second one:
+
+        hive.benchmark.completed  ->  {..., 'num_nodes', 'comparison'}
+        hive.benchmark.published  ->  {'benchmark', 'text', 'score'}
+
+    The subscriber below listens for `published`, but this builder used to
+    read only `comparison` and `num_nodes`, neither of which that payload
+    carries.  So on every real event it discarded the prover's comparison
+    text and fell through to the minimal branch, emitting the literally
+    false "across 0 nodes".  Read `text` first, then `comparison`, so both
+    shapes work.
+    """
     if not isinstance(payload, dict):
         return str(payload)
-    comparison = payload.get('comparison')
-    if comparison:
-        return comparison
-    # Minimal fallback so something useful still lands externally.
-    bench = payload.get('benchmark', 'unknown')
-    score = payload.get('score', 0)
-    nodes = payload.get('num_nodes', 0)
-    return (
-        f"HIVE BENCHMARK PROOF — {bench}\n"
-        f"  Score {score:.1%} across {nodes} nodes."
-    )
+
+    # `text` is what hive.benchmark.published sends; `comparison` is the
+    # hive.benchmark.completed spelling.  Accept either.
+    body = payload.get('text') or payload.get('comparison')
+
+    if not body:
+        # Minimal fallback so something useful still lands externally.
+        bench = payload.get('benchmark', 'unknown')
+        try:
+            score = float(payload.get('score') or 0)
+        except (TypeError, ValueError):
+            score = 0.0
+        nodes = payload.get('num_nodes') or payload.get('node_count')
+        body = 'HIVE BENCHMARK PROOF - {0}\n  Score {1:.1f}%'.format(
+            bench, score * 100)
+        # Only claim a node count when one was actually reported.
+        if nodes:
+            body += ' across {0} nodes'.format(nodes)
+        body += '.'
+
+    return '{0}\n\n{1}'.format(body, ANNOUNCEMENT_URL)
 
 
 # Channels whose default surface is a conversation with one person rather
@@ -519,12 +545,95 @@ def announce_new_content(limit: int = CONTENT_ANNOUNCE_LIMIT,
     return sent
 
 
+# ── benchmark announcement throttling ───────────────────────────────────
+#
+# The new-content path above is deduped (select_unannounced), capped
+# (CONTENT_ANNOUNCE_LIMIT) and consent-gated (_public_exposure_granted).
+# The benchmark path had none of that: every hive.benchmark.published
+# event dispatched straight to every target.
+#
+# Benchmarks run on a schedule and the prover republishes, so the same
+# room could receive the same proof again and again.  That repetition is
+# what makes an automated post read as bot spam rather than as a useful
+# signal, and it is the fastest way to get a channel banned.  Being open
+# about automation is not the problem; being repetitive is.
+#
+# Three guards, all fail-closed:
+#   - the same standing consent the content path already requires
+#   - identical results are never announced twice
+#   - at most one benchmark announcement per BENCHMARK_MIN_INTERVAL_SEC
+BENCHMARK_MIN_INTERVAL_SEC = 6 * 3600
+
+_last_benchmark_key = None
+_last_benchmark_at = 0.0
+_benchmark_throttle_lock = threading.Lock()
+
+
+def _benchmark_min_interval() -> int:
+    """Read the cooldown at call time so an operator can retune it without
+    a restart."""
+    import os
+    try:
+        return int(os.environ.get(
+            'HEVOLVE_BENCHMARK_ANNOUNCE_INTERVAL_SEC',
+            BENCHMARK_MIN_INTERVAL_SEC))
+    except (TypeError, ValueError):
+        return BENCHMARK_MIN_INTERVAL_SEC
+
+
+def _benchmark_key(payload: Any) -> str:
+    """Identity of a result for dedup purposes.  The same benchmark at the
+    same score is the same news however often the prover republishes it."""
+    if not isinstance(payload, dict):
+        return str(payload)
+    raw = payload.get('score')
+    try:
+        score = round(float(raw or 0), 4)
+    except (TypeError, ValueError):
+        score = raw
+    return '%s:%s' % (payload.get('benchmark', 'unknown'), score)
+
+
+def _benchmark_announcement_allowed(payload: Any, now: float = None):
+    """Return (allowed, reason).  Records the decision when it allows, so
+    callers must not call this speculatively."""
+    import time as _time
+    now = _time.time() if now is None else now
+    key = _benchmark_key(payload)
+    global _last_benchmark_key, _last_benchmark_at
+    with _benchmark_throttle_lock:
+        if key == _last_benchmark_key:
+            return False, 'duplicate result (%s) already announced' % key
+        interval = _benchmark_min_interval()
+        waited = now - _last_benchmark_at
+        if _last_benchmark_at and waited < interval:
+            return False, ('cooldown: %ds since last announcement, %ds required'
+                           % (int(waited), interval))
+        _last_benchmark_key = key
+        _last_benchmark_at = now
+        return True, ''
+
+
 def _on_benchmark_published(_topic: str, data: Any) -> None:
     """EventBus callback.  Sync — schedules the async dispatch via
     run_coroutine_threadsafe.  Any exception is logged but never
     propagated so the EventBus emit chain stays intact for other
-    subscribers (federated_aggregator, etc.)."""
+    subscribers (federated_aggregator, etc.).
+
+    Gated the same way the new-content path is: standing public_exposure
+    consent, then dedup + cooldown.  Previously this fired unconditionally,
+    so proofs could post with consent ungranted and could repeat without
+    limit."""
     try:
+        if not _public_exposure_granted():
+            logger.info(
+                "benchmark announcement skipped: public_exposure consent "
+                "not granted")
+            return
+        allowed, reason = _benchmark_announcement_allowed(data or {})
+        if not allowed:
+            logger.info("benchmark announcement skipped: %s", reason)
+            return
         text = _build_announcement_text(data or {})
         count = broadcast_announcement(text)
         if count:
@@ -573,8 +682,179 @@ def register_announcement_subscriber() -> bool:
 
 def reset_for_tests() -> None:
     """Test helper — drops the _subscribed sentinel so tests can
-    re-register the listener against a fresh EventBus.  Not for
-    production code."""
-    global _subscribed
+    re-register the listener against a fresh EventBus, and clears the
+    benchmark throttle so one test's announcement does not suppress the
+    next test's.  Not for production code."""
+    global _subscribed, _last_benchmark_key, _last_benchmark_at
     with _subscribe_lock:
         _subscribed = False
+    with _benchmark_throttle_lock:
+        _last_benchmark_key = None
+        _last_benchmark_at = 0.0
+
+
+# ── on-platform content distribution (federation) ───────────────────────
+#
+# announce_new_content above pushes pages OFF platform, into third-party
+# chat rooms, which is why it is consent-gated. It had no caller at all,
+# so no page had ever been distributed anywhere.
+#
+# This is the other half, and a different act: publishing Hevolve's own
+# pages to Hevolve's OWN feed. It adds no transport. PostService.create is
+# the canonical entry point and already fans a new post out three ways,
+# each privacy-gated on is_public:
+#
+#   _publish_realtime('on_new_post')  -> web SSE + WAMP-subscribed
+#                                        Android / iOS / desktop
+#   federation.sync_to_parent()       -> vertical rise to the central tier
+#   federation.push_to_followers()    -> horizontal P2P to the instances
+#                                        gossip discovered and auto-followed
+#
+# Underneath, MessageBus.publish routes to LOCAL, SSE, PEERLINK (encrypted
+# direct peer links) and CROSSBAR (WAMP relay) simultaneously, degrading
+# from offline-single-device up to full hive. So one PostService.create
+# reaches the node network. The research corpus was never on any of it,
+# because nothing ever created a post for a content page.
+#
+# That is why this is NOT behind public_exposure consent. That gate exists
+# to stop unsolicited posting into other people's communities. Posting to
+# our own feed is the same act the benchmark prover already performs
+# unGated (hive_benchmark_prover, PostService.create), and federation
+# applies its own is_public privacy gate on top.
+CONTENT_PUBLISH_INTERVAL_SEC = 3600
+
+_content_thread = None
+_content_thread_lock = threading.Lock()
+
+
+def _content_state_path() -> str:
+    """Where the published-URL ledger lives. Same convention as the
+    marketing funnel (core.platform_paths.get_data_dir, ~/.hartos fallback)."""
+    import os
+    try:
+        from core.platform_paths import get_data_dir
+        d = get_data_dir()
+    except Exception:
+        d = os.path.expanduser('~/.hartos')
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, 'content_published.json')
+
+
+def load_published_urls() -> List[str]:
+    """Read the ledger. A missing or corrupt file means 'nothing published',
+    which is the safe direction: worst case a page is posted once more."""
+    import json
+    try:
+        with open(_content_state_path(), encoding='utf-8') as f:
+            return [u for u in json.load(f) if isinstance(u, str)]
+    except Exception:
+        return []
+
+
+def save_published_urls(urls) -> None:
+    import json
+    try:
+        keep = sorted(set(u for u in urls if isinstance(u, str)))[-2000:]
+        with open(_content_state_path(), 'w', encoding='utf-8') as f:
+            json.dump(keep, f)
+    except Exception as exc:
+        logger.warning("could not persist published-content ledger: %s", exc)
+
+
+def publish_content_to_feed(limit: int = CONTENT_ANNOUNCE_LIMIT,
+                            pages=None,
+                            already_published=None) -> List[str]:
+    """Publish up to `limit` not-yet-published pages to the local social
+    feed, from which federation carries them to following instances.
+
+    Returns the URLs published. Persists the ledger itself unless the
+    caller passed `already_published`, so tests stay filesystem-free."""
+    candidates = pages if pages is not None else fetch_own_pages()
+    caller_supplied = already_published is not None
+    already = list(already_published) if caller_supplied else load_published_urls()
+
+    chosen = select_unannounced(candidates, already, limit)
+    if not chosen:
+        return []
+
+    try:
+        from integrations.social.models import db_session
+        from integrations.social.services import UserService, PostService
+    except Exception as exc:
+        logger.debug("social services unavailable, skipping feed publish: %s", exc)
+        return []
+
+    published = []
+    for page in chosen:
+        try:
+            with db_session() as db:
+                # Same system identity the benchmark prover posts under, so
+                # the feed has one publisher rather than two lookalikes.
+                author = UserService.ensure_system_user(
+                    db, 'nunba',
+                    display_name='Nunba',
+                    bio='Autonomous publisher of distributed-hive '
+                        'benchmark results.')
+                PostService.create(
+                    db, author,
+                    title=(page.get('title') or page.get('url') or '')[:200],
+                    content=format_content_announcement(page, 'web'),
+                    content_type='text',
+                )
+            published.append(page['url'])
+            logger.info("published %s to the local feed (federates to followers)",
+                        page['url'])
+        except Exception as exc:
+            logger.warning("feed publish failed for %s: %s",
+                           page.get('url'), exc)
+
+    if published and not caller_supplied:
+        save_published_urls(already + published)
+    return published
+
+
+def _content_distribution_loop() -> None:
+    """Periodic pass. Registers with the NodeWatchdog and heartbeats through
+    the sleep, the same way model_lifecycle and peer_discovery do, so a hung
+    pass is visible rather than silent."""
+    import time
+    name = 'content_distribution'
+    wd = None
+    try:
+        from security.node_watchdog import get_watchdog
+        wd = get_watchdog()
+        if wd is not None:
+            wd.register(name, CONTENT_PUBLISH_INTERVAL_SEC * 2)
+    except Exception:
+        wd = None
+
+    while True:
+        try:
+            publish_content_to_feed()
+        except Exception:
+            logger.exception("content distribution pass failed")
+        try:
+            if wd is not None:
+                wd.sleep_with_heartbeat(name, CONTENT_PUBLISH_INTERVAL_SEC)
+            else:
+                time.sleep(CONTENT_PUBLISH_INTERVAL_SEC)
+        except Exception:
+            time.sleep(CONTENT_PUBLISH_INTERVAL_SEC)
+
+
+def start_content_distribution() -> bool:
+    """Idempotent starter, mirroring register_announcement_subscriber.
+    Returns True if this call started the thread."""
+    global _content_thread
+    with _content_thread_lock:
+        if _content_thread is not None and _content_thread.is_alive():
+            return False
+        _content_thread = threading.Thread(
+            target=_content_distribution_loop,
+            name='content-distribution', daemon=True)
+        _content_thread.start()
+        logger.info(
+            "content distribution started: new pages publish to the local "
+            "feed every %ds and federate to following instances",
+            CONTENT_PUBLISH_INTERVAL_SEC)
+        return True

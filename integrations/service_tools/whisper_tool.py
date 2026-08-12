@@ -118,6 +118,20 @@ _SHERPA_MODELS = {
 # Cached recognizers (avoid reloading on every call)
 # ═══════════════════════════════════════════════════════════════
 
+# Import names of every STT engine this module can actually drive, in
+# preference order. ONE source of truth: the startup availability gate reads
+# this, and a drift guard pins it against the loaders defined below, so the gate
+# can never again declare STT dead while an implemented engine is installed.
+#
+# WHY THIS EXISTS (2026-08-10): the gate probed only 'sherpa_onnx' and 'whisper'
+# and never 'faster_whisper' — which IS bundled and IS a first-class engine here
+# (see _get_faster_whisper_model). So it logged "STT engine NOT installed ...
+# EVERY transcribe returns ''" on every boot regardless of truth, and even
+# prescribed adding onnxruntime, which was already installed. Successive
+# sessions chased that message into the environment (torn ctranslate2, torn
+# numpy, torn torch) while the message was never contingent on any of it.
+STT_ENGINE_IMPORTS = ('sherpa_onnx', 'faster_whisper', 'whisper')
+
 _sherpa_recognizer = None
 _sherpa_model_name = None
 
@@ -1719,15 +1733,19 @@ def start_stt_stream_server(port: int = 0) -> Optional[int]:
     # cost of importing.
     try:
         import importlib.util as _ilu
-        if _ilu.find_spec('sherpa_onnx') is None:
-            _legacy_ok = _ilu.find_spec('whisper') is not None
+        _present = [m for m in STT_ENGINE_IMPORTS if _ilu.find_spec(m) is not None]
+        if _present:
+            # At least one implemented engine is importable, so streaming STT has
+            # something to decode with. Say WHICH — a bare "ok" is unfalsifiable.
+            logger.info(
+                "STT engines importable: %s (preferred: %s)",
+                ', '.join(_present), _present[0])
+        else:
             logger.error(
-                "STT engine NOT installed: sherpa-onnx is missing%s. The :8005 "
+                "STT engine NOT installed: none of %s is importable. The :%s "
                 "streaming STT server will bind but EVERY transcribe returns '' "
-                "(empty) — add sherpa-onnx>=1.11.0 (+ onnxruntime) to the bundle "
-                "deps.",
-                "" if _legacy_ok else
-                " AND the openai-whisper fallback is also missing")
+                "(empty) — bundle one of them.",
+                ', '.join(STT_ENGINE_IMPORTS), port)
     except Exception:
         logger.exception("start_stt_stream_server: swallowed Exception")
 

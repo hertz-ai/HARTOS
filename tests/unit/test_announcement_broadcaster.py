@@ -102,17 +102,38 @@ def test_build_text_uses_comparison_when_present():
         'num_nodes': 4,
         'comparison': 'HIVE BENCHMARK PROOF — MMLU\n  Hive: 87%',
     })
-    assert text == 'HIVE BENCHMARK PROOF — MMLU\n  Hive: 87%'
+    # The comparison block is preserved verbatim, and the announcement URL
+    # is appended so a reader who sees the proof can act on it.
+    assert text.startswith('HIVE BENCHMARK PROOF — MMLU\n  Hive: 87%')
+    assert text.endswith('https://hevolve.ai/hive')
 
 
-def test_build_text_falls_back_to_minimal_when_no_comparison():
+def test_build_text_reads_the_published_event_text_key():
+    """Regression: hive.benchmark.published sends `text`, not `comparison`.
+
+    The builder used to read only `comparison`, so every live event lost
+    the prover's block and fell through to the minimal branch, which then
+    printed the false "across 0 nodes" because `num_nodes` is absent too.
+    """
     from integrations.channels.announcement_broadcaster import (
         _build_announcement_text)
     text = _build_announcement_text({
-        'benchmark': 'gsm8k', 'score': 0.5, 'num_nodes': 2,
+        'benchmark': 'gsm8k',
+        'text': 'HART OS hive: 82.4% vs single-node 71.2%',
+        'score': 0.824,
     })
+    assert 'HART OS hive: 82.4% vs single-node 71.2%' in text
+    assert '0 nodes' not in text
+    assert 'https://hevolve.ai/hive' in text
+
+
+def test_build_text_omits_node_count_when_unknown():
+    from integrations.channels.announcement_broadcaster import (
+        _build_announcement_text)
+    text = _build_announcement_text({'benchmark': 'gsm8k', 'score': 0.5})
     assert 'gsm8k' in text
-    assert '50' in text  # 0.5 → 50%
+    assert '50' in text
+    assert 'nodes' not in text
 
 
 def test_build_text_handles_non_dict():
@@ -260,6 +281,10 @@ def test_event_published_triggers_broadcast(monkeypatch):
 
     from integrations.channels import announcement_broadcaster as ab
     ab.reset_for_tests()
+    # Benchmark announcements are now gated on the same standing
+    # public_exposure consent the new-content path requires, so grant it
+    # for this end-to-end assertion.
+    monkeypatch.setattr(ab, '_public_exposure_granted', lambda: True)
     registered = ab.register_announcement_subscriber()
     assert registered is True, (
         "registration should succeed when events registry is up")
@@ -498,3 +523,207 @@ def test_a_telegram_group_id_is_accepted_without_any_flag(monkeypatch):
     from integrations.channels.announcement_broadcaster import (
         _collect_announcement_targets)
     assert _collect_announcement_targets() == [('telegram', '-1001234567890')]
+
+
+# ── benchmark announcements: consent, dedup, cooldown ─────────
+#
+# The new-content path was already guarded on all three. The benchmark
+# path was not: hive.benchmark.published dispatched straight to every
+# target, so proofs could post with consent ungranted and could repeat
+# without limit. Repetition is what turns an automated post into spam.
+
+_BENCH_A = {'benchmark': 'gsm8k', 'text': 'hive 82.4% vs 71.2%', 'score': 0.824}
+_BENCH_B = {'benchmark': 'mmlu', 'text': 'hive 87.0% vs 80.1%', 'score': 0.870}
+
+
+def _capture_benchmark_posts(monkeypatch, consented=True):
+    import integrations.channels.announcement_broadcaster as ab
+    ab.reset_for_tests()
+    sent = []
+    monkeypatch.setattr(ab, 'broadcast_announcement',
+                        lambda text: (sent.append(text) or 1))
+    monkeypatch.setattr(ab, '_public_exposure_granted', lambda: consented)
+    return ab, sent
+
+
+def test_benchmark_announcement_requires_consent(monkeypatch):
+    ab, sent = _capture_benchmark_posts(monkeypatch, consented=False)
+    ab._on_benchmark_published('hive.benchmark.published', _BENCH_A)
+    assert sent == []
+
+
+def test_benchmark_announcement_posts_once_when_consented(monkeypatch):
+    ab, sent = _capture_benchmark_posts(monkeypatch)
+    ab._on_benchmark_published('hive.benchmark.published', _BENCH_A)
+    assert len(sent) == 1
+    # carries the prover's text and the link a reader can act on
+    assert 'hive 82.4% vs 71.2%' in sent[0]
+    assert 'https://hevolve.ai/hive' in sent[0]
+
+
+def test_benchmark_identical_result_is_not_repeated(monkeypatch):
+    ab, sent = _capture_benchmark_posts(monkeypatch)
+    ab._on_benchmark_published('hive.benchmark.published', _BENCH_A)
+    ab._on_benchmark_published('hive.benchmark.published', _BENCH_A)
+    assert len(sent) == 1
+
+
+def test_benchmark_new_result_waits_for_the_cooldown(monkeypatch):
+    import time
+    ab, sent = _capture_benchmark_posts(monkeypatch)
+    ab._on_benchmark_published('hive.benchmark.published', _BENCH_A)
+    # a genuinely different result, but too soon
+    ab._on_benchmark_published('hive.benchmark.published', _BENCH_B)
+    assert len(sent) == 1
+    # once the cooldown has elapsed it is allowed through
+    ab._last_benchmark_at = time.time() - (ab._benchmark_min_interval() + 10)
+    ab._on_benchmark_published('hive.benchmark.published', _BENCH_B)
+    assert len(sent) == 2
+
+
+def test_benchmark_dispatch_never_raises_into_the_event_bus(monkeypatch):
+    """The EventBus emit chain must survive a broken broadcaster."""
+    import integrations.channels.announcement_broadcaster as ab
+    ab.reset_for_tests()
+    monkeypatch.setattr(ab, '_public_exposure_granted', lambda: True)
+
+    def _boom(_text):
+        raise RuntimeError('channel exploded')
+
+    monkeypatch.setattr(ab, 'broadcast_announcement', _boom)
+    ab._on_benchmark_published('hive.benchmark.published', _BENCH_A)
+
+
+# ── on-platform publishing (federation) ───────────────────────
+#
+# announce_new_content pushes pages OFF platform into third-party rooms and
+# is consent-gated. publish_content_to_feed publishes to our OWN feed, from
+# which federation carries the post to following instances. Different act,
+# different gate: the consent flag exists to stop unsolicited posting into
+# other people's communities, not to stop us posting on our own.
+
+_FEED_PAGES = [
+    {'url': 'https://hevolve.ai/research/foo', 'title': 'Foo paper explained'},
+    {'url': 'https://hevolve.ai/answers/bar', 'title': 'Bar answered'},
+]
+
+
+def _stub_social(monkeypatch):
+    """Capture PostService.create instead of touching the database."""
+    import sys, types, contextlib
+    created = []
+
+    models = types.ModuleType('integrations.social.models')
+
+    @contextlib.contextmanager
+    def _db_session():
+        yield object()
+
+    models.db_session = _db_session
+
+    services = types.ModuleType('integrations.social.services')
+
+    class _UserService:
+        @staticmethod
+        def ensure_system_user(db, slug, display_name=None, bio=None):
+            return {'slug': slug, 'display_name': display_name}
+
+    class _PostService:
+        @staticmethod
+        def create(db, author, title=None, content=None, content_type=None):
+            created.append({'author': author, 'title': title,
+                            'content': content})
+            return types.SimpleNamespace(id='post-1')
+
+    services.UserService = _UserService
+    services.PostService = _PostService
+    monkeypatch.setitem(sys.modules, 'integrations.social.models', models)
+    monkeypatch.setitem(sys.modules, 'integrations.social.services', services)
+    return created
+
+
+def test_publish_content_creates_one_post_per_pass(monkeypatch):
+    import integrations.channels.announcement_broadcaster as ab
+    created = _stub_social(monkeypatch)
+    out = ab.publish_content_to_feed(pages=_FEED_PAGES, already_published=[])
+    assert len(out) == 1
+    assert len(created) == 1
+
+
+def test_publish_content_posts_as_the_prover_identity(monkeypatch):
+    """One publisher in the feed, not two lookalikes."""
+    import integrations.channels.announcement_broadcaster as ab
+    created = _stub_social(monkeypatch)
+    ab.publish_content_to_feed(pages=_FEED_PAGES, already_published=[])
+    assert created[0]['author']['slug'] == 'nunba'
+
+
+def test_publish_content_body_discloses_authorship_and_links(monkeypatch):
+    import integrations.channels.announcement_broadcaster as ab
+    created = _stub_social(monkeypatch)
+    ab.publish_content_to_feed(pages=_FEED_PAGES, already_published=[])
+    body = created[0]['content']
+    assert 'Posted by the Hevolve AI agent' in body
+    assert 'hevolve.ai/research/foo' in body
+
+
+def test_publish_content_does_not_repeat_a_published_page(monkeypatch):
+    import integrations.channels.announcement_broadcaster as ab
+    created = _stub_social(monkeypatch)
+    out = ab.publish_content_to_feed(
+        pages=_FEED_PAGES,
+        already_published=[p['url'] for p in _FEED_PAGES])
+    assert out == []
+    assert created == []
+
+
+def test_publish_content_empty_feed_is_a_noop(monkeypatch):
+    import integrations.channels.announcement_broadcaster as ab
+    _stub_social(monkeypatch)
+    assert ab.publish_content_to_feed(pages=[], already_published=[]) == []
+
+
+def test_publish_content_is_not_gated_on_public_exposure():
+    """On-platform publishing must not inherit the off-platform gate."""
+    import inspect
+    import integrations.channels.announcement_broadcaster as ab
+    src = inspect.getsource(ab.publish_content_to_feed)
+    assert '_public_exposure_granted' not in src
+
+
+def test_start_content_distribution_does_not_double_start(monkeypatch):
+    """A second call while the loop is alive must not spawn a rival thread."""
+    import threading as _t
+    import integrations.channels.announcement_broadcaster as ab
+    running, release = _t.Event(), _t.Event()
+
+    def _loop():
+        running.set()
+        release.wait(10)
+
+    monkeypatch.setattr(ab, '_content_distribution_loop', _loop)
+    ab._content_thread = None
+    try:
+        assert ab.start_content_distribution() is True
+        assert running.wait(2), 'loop thread never started'
+        assert ab.start_content_distribution() is False
+    finally:
+        release.set()
+        ab._content_thread = None
+
+
+def test_start_content_distribution_restarts_a_dead_loop(monkeypatch):
+    """If the loop has exited, starting again SHOULD spawn a new thread.
+    The guard is on liveness, not on 'has ever been started', so a crashed
+    distribution loop recovers on the next boot-path call instead of
+    staying silently dead."""
+    import integrations.channels.announcement_broadcaster as ab
+    monkeypatch.setattr(ab, '_content_distribution_loop', lambda: None)
+    ab._content_thread = None
+    try:
+        assert ab.start_content_distribution() is True
+        if ab._content_thread is not None:
+            ab._content_thread.join(timeout=2)
+        assert ab.start_content_distribution() is True
+    finally:
+        ab._content_thread = None

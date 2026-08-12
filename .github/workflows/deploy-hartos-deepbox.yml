@@ -47,7 +47,7 @@ jobs:
             cd ${{ secrets.DEPLOY_REPO_PATH }}
 
             echo "=== Sync latest main ==="
-            rm -f release_manifest.json
+            rm -rf release_manifest.json
             git fetch origin --prune
             git checkout main
             git reset --hard origin/main
