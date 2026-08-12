@@ -1871,15 +1871,21 @@ class HiveBenchmarkProver:
             task_id = str(uuid.uuid4())
             node_id = node.get('node_id', f'node_{i}')
 
-            # Record in ledger
-            self._ledger.record_assignment(
-                run_id=run_id,
-                task_id=task_id,
-                node_id=node_id,
-                shard_index=shard['shard_index'],
-                benchmark_name=benchmark_name,
-            )
-
+            # Dispatch FIRST, then record — the ledger must be keyed on the
+            # SAME task_id that results will later arrive under.
+            #
+            # The dispatcher reassigns `task_id` below (`task_id = task.task_id`).
+            # Recording the assignment before that point keyed the ledger entry
+            # on the local uuid4, while `_collect_results` and `on_shard_result`
+            # both report under the dispatcher's id. `record_result` looks the
+            # entry up by task_id, finds nothing, and falls out of its loop
+            # without error — so every result was silently discarded.
+            #
+            # Measured on the local Nunba instance 2026-08-13: 567 ledger
+            # entries, 0 with a result, across 395 benchmark runs since April.
+            # Nothing the prover did left any evidence behind, which is why
+            # there was nothing to show even when a run worked.
+            #
             # Dispatch via HiveTaskProtocol
             try:
                 from integrations.coding_agent.hive_task_protocol import (
@@ -1908,6 +1914,18 @@ class HiveBenchmarkProver:
                 logger.debug(
                     "HiveTask dispatch failed for shard %d: %s",
                     shard['shard_index'], exc)
+
+            # NOW record, with task_id settled. Covers both paths: the
+            # dispatcher's id when create_task succeeded, the local uuid4 when
+            # it raised. Either way this is the id results arrive under, so
+            # record_result can find the entry it needs to update.
+            self._ledger.record_assignment(
+                run_id=run_id,
+                task_id=task_id,
+                node_id=node_id,
+                shard_index=shard['shard_index'],
+                benchmark_name=benchmark_name,
+            )
 
             dispatched.append({
                 'task_id': task_id,
