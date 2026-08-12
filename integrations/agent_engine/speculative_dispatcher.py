@@ -1664,6 +1664,37 @@ class SpeculativeDispatcher:
             }
             self._evict_old_results()
 
+    def _build_dispatch_payload(self, model, prompt, user_id, prompt_id,
+                                goal_id, goal_type) -> dict:
+        """The ONE inner-/chat payload shared by _dispatch_to_model and
+        _dispatch_expert_langchain (their payloads were char-identical).
+
+        ``speculative``/``draft_first`` are False so the inner /chat reads them
+        and skips the dispatcher entirely — hard no-reentry, never recursively
+        re-enter. ``prompt_id`` is forwarded ONLY when the caller gave a real
+        on-disk agent id (never synthesised from request_id/goal_id — any
+        non-empty prompt_id is loaded as ``prompts/{prompt_id}.json``);
+        ``goal_id``/``goal_type`` travel separately as telemetry/budget
+        metadata, not as a routing key.
+        """
+        payload = {
+            'user_id': user_id,
+            'prompt': prompt,
+            'create_agent': True,
+            'autonomous': True,
+            'casual_conv': False,
+            'model_config': model.to_config_list(),
+            'speculative': False,
+            'draft_first': False,
+        }
+        if prompt_id:
+            payload['prompt_id'] = prompt_id
+        if goal_id:
+            payload['goal_id'] = goal_id
+        if goal_type and goal_type != 'general':
+            payload['goal_type'] = goal_type
+        return payload
+
     def _dispatch_expert_langchain(self, model, prompt: str, user_id: str,
                                    prompt_id: str, goal_type: str,
                                    goal_id: Optional[str]) -> str:
@@ -1752,26 +1783,8 @@ class SpeculativeDispatcher:
         # Goal/observability identifiers belong in ``goal_id``/
         # ``goal_type`` payload fields (which the inner /chat reads as
         # context metadata, not as a routing key), not in prompt_id.
-        payload = {
-            'user_id': user_id,
-            'prompt': prompt,
-            'create_agent': True,
-            'autonomous': True,
-            'casual_conv': False,
-            'model_config': model.to_config_list(),
-            # Hard no-reentry: inner /chat reads these and skips the
-            # dispatcher entirely so we never recursively re-enter.
-            'speculative': False,
-            'draft_first': False,
-        }
-        if prompt_id:
-            payload['prompt_id'] = prompt_id
-        # goal_id / goal_type carry forward as metadata for telemetry +
-        # budget tracking — separate from prompt_id (routing).
-        if goal_id:
-            payload['goal_id'] = goal_id
-        if goal_type and goal_type != 'general':
-            payload['goal_type'] = goal_type
+        payload = self._build_dispatch_payload(
+            model, prompt, user_id, prompt_id, goal_id, goal_type)
 
         import sys as _sys
         _bundled = bool(
@@ -1838,23 +1851,8 @@ class SpeculativeDispatcher:
         # goal_id / goal_type travel separately as observability metadata.
         # See ``_dispatch_expert_langchain`` for the rationale + live
         # regression that motivated this invariant.
-        payload = {
-            'user_id': user_id,
-            'prompt': prompt,
-            'create_agent': True,
-            'autonomous': True,
-            'casual_conv': False,
-            'model_config': model.to_config_list(),
-            # Hard no-reentry guard — inner dispatch never speculates
-            'speculative': False,
-            'draft_first': False,
-        }
-        if prompt_id:
-            payload['prompt_id'] = prompt_id
-        if goal_id:
-            payload['goal_id'] = goal_id
-        if goal_type and goal_type != 'general':
-            payload['goal_type'] = goal_type
+        payload = self._build_dispatch_payload(
+            model, prompt, user_id, prompt_id, goal_id, goal_type)
 
         # Bundled mode: call the model's llama-server directly on its port.
         # Do NOT use Flask test_client('/chat') — that re-enters the full

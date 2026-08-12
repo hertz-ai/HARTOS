@@ -132,39 +132,20 @@ def _is_path_allowed(path, include_mounts=True):
 # ─── Shell Auth (local-only, no social DB dependency) ─────────────
 
 def _shell_auth_check():
-    """Verify request is from local desktop session.
+    """Canonical local-shell auth check — see ``integrations.agent_engine.shell_auth``.
 
-    Returns (ok, error_response) — if ok is True, request is authorized.
-    Accepts:
-      1. Localhost origin (127.0.0.1, ::1, 0.0.0.0) — desktop is local
-      2. Valid X-Shell-Token header (for remote LiquidUI sessions)
+    Kept as a thin, backward-compatible alias. Returns ``(ok, error_json, status)``:
+    ``(True, None, None)`` on success, else ``(False, <json>, 403)``.
     """
-    from flask import request, jsonify
-
-    remote = request.remote_addr or ''
-    local_addrs = ('127.0.0.1', '::1', '0.0.0.0', 'localhost')
-    if remote in local_addrs:
-        return True, None
-
-    # Check shell token (set during desktop login)
-    token = request.headers.get('X-Shell-Token', '')
-    if token:
-        expected = os.environ.get('HART_SHELL_TOKEN', '')
-        if expected and token == expected:
-            return True, None
-
-    return False, jsonify({'error': 'Shell API: local access only'}), 403
+    from integrations.agent_engine.shell_auth import shell_auth_ok
+    return shell_auth_ok()
 
 
-def _require_shell_auth(f):
-    """Decorator: require local shell authentication."""
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        result = _shell_auth_check()
-        if not result[0]:
-            return result[1], result[2]
-        return f(*args, **kwargs)
-    return decorated
+# This decorator used to be a per-file copy that trusted ``0.0.0.0`` as a local
+# origin, while shell_system_apis/shell_desktop_apis did NOT — a drifted parallel
+# path (privilege-escalation gap). It is now the ONE shared implementation, so the
+# surfaces can never diverge again.
+from integrations.agent_engine.shell_auth import require_shell_auth as _require_shell_auth
 
 
 # ─── Audit helper ──────────────────────────────────────────────────

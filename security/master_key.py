@@ -51,11 +51,12 @@ def get_master_public_key() -> Ed25519PublicKey:
 def verify_master_signature(payload: dict, signature_hex: str) -> bool:
     """Verify that a JSON payload was signed by the master private key."""
     try:
-        clean = {k: v for k, v in payload.items() if k != 'master_signature'}
-        canonical = json.dumps(clean, sort_keys=True, separators=(',', ':'))
+        # ONE canonical serialization (node_integrity.canonical_payload); a drift
+        # here vs the signer = silent network-wide verification failure.
+        from security.node_integrity import canonical_payload
         pub = get_master_public_key()
         sig = bytes.fromhex(signature_hex)
-        pub.verify(sig, canonical.encode('utf-8'))
+        pub.verify(sig, canonical_payload(payload, exclude=('master_signature',)))
         return True
     except (InvalidSignature, ValueError, Exception):
         return False

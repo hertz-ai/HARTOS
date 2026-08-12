@@ -5,7 +5,7 @@ five unsynchronised readers:
   1. llama_config._read_preferred_lang()        (boot: reads JSON file)
   2. /chat request body data.get('preferred_lang')   (per-turn override)
   3. HART_USER_LANGUAGE env var                 (headless/CI override)
-  4. hart_onboarding.get_node_identity()        (first-run onboarding)
+  4. hart_onboarding.get_onboarding_identity()  (first-run onboarding)
   5. user_context.py cloud profile               (cross-device sync)
 
 And a single writer (hart_intelligence_entry._persist_language) with
@@ -98,8 +98,8 @@ def _load_from_node_identity() -> Optional[str]:
     Best-effort — returns None on any import/file failure rather than
     exploding a chat request."""
     try:
-        from hart_onboarding import get_node_identity
-        v = (get_node_identity() or {}).get('language', '')
+        from hart_onboarding import get_onboarding_identity
+        v = (get_onboarding_identity() or {}).get('language', '')
         if v and v[:2] in SUPPORTED_LANG_DICT:
             return v
     except Exception:

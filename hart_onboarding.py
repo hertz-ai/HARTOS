@@ -536,8 +536,15 @@ def _identity_path() -> str:
     return os.path.join(data_dir, _HART_IDENTITY_FILE)
 
 
-def get_node_identity() -> Dict:
-    """Load the node's HART identity from disk. Returns {} if not yet generated."""
+def get_onboarding_identity() -> Dict:
+    """Load the node's HART ONBOARDING identity from disk (node_tag / element /
+    spirit / tier / language). Returns {} if not yet generated.
+
+    Renamed from ``get_node_identity`` to disambiguate from the CRYPTO identity
+    ``security.node_integrity.get_node_identity`` (node_id / user_id / public
+    key) — both previously returned a dict carrying ``tier``, a name-collision
+    footgun where importing the wrong module silently returned the wrong dict.
+    """
     try:
         path = _identity_path()
         if os.path.isfile(path):
@@ -568,7 +575,7 @@ def generate_node_identity(tier: str, central_element: str = None,
     known_tags = known_tags or set()
 
     # Check if already generated
-    existing = get_node_identity()
+    existing = get_onboarding_identity()
     if existing and existing.get('node_tag'):
         # Re-apply env vars (process may have restarted)
         _apply_identity_env(existing)

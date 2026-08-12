@@ -150,12 +150,29 @@ def sign_message(message: bytes) -> bytes:
     return priv.sign(message)
 
 
+def canonical_payload(payload: dict, exclude=('signature',)) -> bytes:
+    """The ONE canonical serialization for every Ed25519 sign/verify in HART OS:
+    drop the signature field(s), then ``json.dumps`` with sorted keys and no
+    whitespace. Every signer AND verifier must emit byte-identical bytes here or
+    signatures silently fail network-wide — so this is the single source of truth
+    that master_key / key_delegation / origin_attestation / pre_trust_contract and
+    this module route through, instead of each re-implementing
+    ``json.dumps(..., sort_keys=True, separators=(',',':'))`` inline (any drift =
+    network-wide verification failure).
+
+    ``exclude`` (the signature key-name(s) to strip) differs per payload type
+    ('signature' / 'sig' / 'node_sig' / ...), so it stays a parameter — the
+    SERIALIZATION is what must never drift, not the exclude-set.
+    """
+    ex = (exclude,) if isinstance(exclude, str) else tuple(exclude)
+    clean = {k: v for k, v in payload.items() if k not in ex}
+    return json.dumps(clean, sort_keys=True, separators=(',', ':')).encode('utf-8')
+
+
 def sign_json_payload(payload: dict) -> str:
     """Canonicalize dict (sorted JSON, no spaces), sign it, return hex signature.
     The payload dict should NOT contain the 'signature' key itself."""
-    clean = {k: v for k, v in payload.items() if k != 'signature'}
-    canonical = json.dumps(clean, sort_keys=True, separators=(',', ':'))
-    sig = sign_message(canonical.encode('utf-8'))
+    sig = sign_message(canonical_payload(payload, exclude=('signature',)))
     return sig.hex()
 
 
@@ -174,10 +191,9 @@ def verify_json_signature(public_key_hex: str, payload: dict,
                           signature_hex: str) -> bool:
     """Verify signature on a JSON payload. Strips 'signature' key before verification."""
     try:
-        clean = {k: v for k, v in payload.items() if k != 'signature'}
-        canonical = json.dumps(clean, sort_keys=True, separators=(',', ':'))
         sig = bytes.fromhex(signature_hex)
-        return verify_signature(public_key_hex, canonical.encode('utf-8'), sig)
+        return verify_signature(public_key_hex,
+                                canonical_payload(payload, exclude=('signature',)), sig)
     except (ValueError, Exception):
         return False
 

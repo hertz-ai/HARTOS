@@ -8,25 +8,19 @@ import re
 import logging
 from typing import List, Tuple
 
-# Patterns to redact from logs
-_REDACTION_PATTERNS: List[Tuple[re.Pattern, str]] = [
-    # OpenAI API keys
-    (re.compile(r'sk-[a-zA-Z0-9]{20,}'), '[REDACTED_OPENAI_KEY]'),
-    # JWT tokens
-    (re.compile(r'eyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}'),
-     '[REDACTED_JWT]'),
-    # Google API keys
-    (re.compile(r'AIzaSy[a-zA-Z0-9_-]{33}'), '[REDACTED_GOOGLE_KEY]'),
-    # Groq API keys
-    (re.compile(r'gsk_[a-zA-Z0-9]{20,}'), '[REDACTED_GROQ_KEY]'),
-    # Generic Bearer tokens in logs
-    (re.compile(r'Bearer\s+[a-zA-Z0-9_.-]{20,}'), 'Bearer [REDACTED]'),
-    # Password values in key=value format
-    (re.compile(r'(password|passwd|pwd|secret|token|api_key|apikey)\s*[=:]\s*\S+', re.I),
-     r'\1=[REDACTED]'),
-    # AWS keys
-    (re.compile(r'AKIA[0-9A-Z]{16}'), '[REDACTED_AWS_KEY]'),
-    # Generic hex tokens (40+ chars)
+# Vendor API-key / token / password / PEM redaction is delegated to the ONE
+# canonical pattern set in security/secret_redactor.py (see _redact below).
+# This module used to carry its OWN copy of those regexes and they DRIFTED: its
+# Google pattern required an 'AIzaSy' prefix (AIzaSy…{33}) and its OpenAI pattern
+# was sk-[alnum]{20,}, so Google keys not starting 'Sy' and every sk-proj-/
+# sk-ant- key LEAKED into the audit log. Delegating to the canonical fixes that
+# and inherits its far broader vendor coverage.
+#
+# The ONE audit-log-specific supplemental below stays local on purpose: audit
+# logs deliberately over-redact bare long-hex tokens (SHA/HMAC/raw tokens with no
+# keyword prefix), whereas the canonical gates hex on a keyword to avoid mangling
+# hashes in the hive-privacy path.
+_AUDIT_EXTRA_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r'\b[0-9a-f]{40,}\b'), '[REDACTED_HEX_TOKEN]'),
 ]
 
@@ -55,7 +49,16 @@ class SensitiveFilter(logging.Filter):
 
     @staticmethod
     def _redact(text: str) -> str:
-        for pattern, replacement in _REDACTION_PATTERNS:
+        # Canonical vendor-secret redaction — ONE source of truth
+        # (security/secret_redactor.py). Best-effort: a redaction filter must
+        # never raise and drop a log line, so fall through to the local
+        # supplemental if the import/scan ever fails.
+        try:
+            from security.secret_redactor import redact_secrets
+            text = redact_secrets(text)[0]
+        except Exception:
+            pass
+        for pattern, replacement in _AUDIT_EXTRA_PATTERNS:
             text = pattern.sub(replacement, text)
         return text
 

@@ -424,20 +424,9 @@ _media_lock = threading.Lock()
 # Route registration
 # ═══════════════════════════════════════════════════════════════
 
-def _require_system_auth(f):
-    """Decorator: require local shell auth for destructive system ops."""
-    from functools import wraps
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        from flask import request, jsonify
-        remote = request.remote_addr or ''
-        if remote not in ('127.0.0.1', '::1', 'localhost'):
-            token = request.headers.get('X-Shell-Token', '')
-            expected = os.environ.get('HART_SHELL_TOKEN', '')
-            if not expected or token != expected:
-                return jsonify({'error': 'Unauthorized'}), 403
-        return f(*args, **kwargs)
-    return decorated
+# Canonical local-shell auth — the ONE shared implementation (was a per-file copy
+# of this decorator). See integrations.agent_engine.shell_auth.
+from integrations.agent_engine.shell_auth import require_shell_auth as _require_system_auth
 
 
 def _audit_system_op(action, detail=None):

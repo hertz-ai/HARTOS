@@ -7058,7 +7058,10 @@ function renderAgentOverlay(ev) {{
             return jsonify({'apps': apps[:100]})
 
         # ── Shell APIs: Launch ──
+        from integrations.agent_engine.shell_os_apis import _require_shell_auth
+
         @app.route('/api/shell/launch', methods=['POST'])
+        @_require_shell_auth
         def shell_launch():
             import re
             data = request.get_json(force=True, silent=True) or {}
@@ -7067,16 +7070,27 @@ function renderAgentOverlay(ev) {{
             # trailing newline; app_id drives a launch, so reject it outright.
             if not app_id or not re.fullmatch(r'[a-zA-Z0-9._-]+', app_id):
                 return jsonify({'error': 'Invalid app_id'}), 400
-            try:
-                subprocess.Popen(
-                    ['gtk-launch', app_id],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                return jsonify({'status': 'launched'})
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
+            # Delegate to the canonical, RESULT-CHECKED launcher instead of the
+            # old raw fire-and-forget process spawn that masked EVERY failure
+            # (missing app, denied, launcher absent) as {'status': 'launched'}.
+            # get_app_bridge().launch_app returns {ok, ...}; surface a real 500
+            # when the launch actually failed (the #133 anti-pattern).
+            from integrations.agent_engine.app_bridge_service import get_app_bridge
+            res = get_app_bridge().launch_app(app_id, 'linux') or {}
+            if not res.get('ok'):
+                return jsonify(res or {'error': 'launch failed'}), 500
+            return jsonify(res)
 
         # ── Shell APIs: Session ──
+        # Auth gate — this power/session route (lock/logout/suspend/shutdown/
+        # restart/firmware) was UNAUTHENTICATED while its sibling
+        # /api/shell/power/action carried @_require_shell_auth, a drifted power
+        # surface that let any reachable caller power off the box. Both surfaces
+        # now share the ONE canonical local-shell gate.
+        from integrations.agent_engine.shell_os_apis import _require_shell_auth
+
         @app.route('/api/shell/session/<action>', methods=['POST'])
+        @_require_shell_auth
         def shell_session(action):
             # #133 — NATIVE logind power actions, result-checked. The shell server
             # runs as the unprivileged `hart` service user; the old fire-and-forget

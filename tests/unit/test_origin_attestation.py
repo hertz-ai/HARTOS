@@ -125,8 +125,8 @@ class TestGuardrailBrandMarkers(unittest.TestCase):
     """Verify guardrail frozen values contain brand markers."""
 
     def test_guardrail_integrity(self):
-        from security.origin_attestation import verify_guardrail_integrity
-        ok, msg = verify_guardrail_integrity()
+        from security.origin_attestation import verify_guardrail_brand_integrity
+        ok, msg = verify_guardrail_brand_integrity()
         self.assertTrue(ok, msg)
 
     def test_guardian_principle_exists(self):
