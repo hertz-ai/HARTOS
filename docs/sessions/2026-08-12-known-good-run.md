@@ -176,9 +176,54 @@ stop and fix that before looking anywhere else.
 
 ---
 
+## The Tier-1 falter — SOLVED (was "root cause unknown")
+
+hart-comp dropping to sway on its own was a **startup race, not a compositor fault.**
+
+A Wayland socket is an inode that outlives its process. When the supervisor SIGKILLs a tier it
+leaves `/run/user/1000/wayland-N` behind, and the launcher's wait loop accepted it because
+`[ -S "$SHELL_SOCK" ]` proves the path is a socket *file*, not that anything is *listening*. So
+the glass shell was launched at a corpse ~400ms before hart-comp bound its own socket:
+
+```
+10:03:34.6  [hart-glass-shell-gtk4] render rung = webkit-cairo
+10:03:35.0  RuntimeError: Gtk couldn't be initialized.
+10:03:35.0  [hart-glass-shell-gtk4] window construction FAILED
+10:03:35.0  hart-comp: acquired DRM master ... first real scanout (page-flip vblank) completed
+10:04:19    tier 'hart-comp' is HUNG (compositor up, no first paint in 45s) — killing + dropping
+```
+
+The compositor was **healthy** — master, mode, vblank, XWayland all fine. The watchdog killed it
+because its UI client had already died. Intermittent because it depended on whether the previous
+tier was killed rather than exited cleanly.
+
+Fixed on `build/seatfix-raw` (`3154330`): an epoch marker stamped before the compositor starts,
+and the socket must be `-nt` it. The same commit makes the launcher name the process that actually
+died, so the journal can never again blame hart-comp for the shell's failure.
+
+**Second defect in the same commit:** the live RUNPATH stamp resolved `libglvnd` with `head -1`
+and got the **i686** output. `libEGL.so.1: wrong ELF class: ELFCLASS32` was caught by smithay's
+`catch_unwind` and turned into "staying on the pixman software floor" — the compositor looked
+healthy while the iGPU sat idle. The derivation now asserts the first `libEGL.so.1` on the stamped
+RUNPATH is ELFCLASS64.
+
+### Two things that were MEASURED and are not worth retrying
+
+* **GSK `ngl` is worse than `cairo` on HD 4000.** Tried because the ladder jumps vulkan -> cairo
+  with no GL rung. With `GDK_GL=gles` + `GSK_RENDERER=ngl` the host mapped 16 GL libs and burned
+  **245%** (shell+WebKit) against cairo's **133%**. `GSK_RENDERER=cairo` is correct; leave it.
+* **The infinite CSS animations cost 41% CPU.** Disabling all of them took shell+WebKit from
+  **120% -> 79%** and let the CPU climb from ~1.7GHz to **2.9GHz** (it had been thermally
+  throttled at 94C). The worst animate `transform` on elements carrying 70px+150px box-shadows,
+  which re-rasterises two large blurs per frame in software.
+  NOT fixed: redefining the `@keyframes` as no-ops does **not** work (the animation machinery
+  still runs every frame); only `animation:none` stops it. Doing that needs a decision about which
+  idle motion to keep, so it is a deliberate open item, not an oversight.
+  Note `is_potato` keys off `gpu_mode` — the *compositor's* verdict — so repairing the compositor's
+  GPU path actually switches these effects ON while the GTK host that pays for them stays on cairo.
+
 ## Still open (do not assume these are fixed)
 
-* hart-comp still **degrades to sway on its own** after running a while — root cause unknown.
 * `/chat` returns 500: `No module named 'autogen'` (deliberately unpackaged,
   `hart-app.nix:108`). This is the "retry connecting" on the agent cards.
 * Numpad — never committed.
