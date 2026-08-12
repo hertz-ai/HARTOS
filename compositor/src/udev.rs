@@ -378,7 +378,12 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     let xwayland_shell_state = XWaylandShellState::new::<State>(&dh);
     let mut seat_state = SeatState::<State>::new();
     let mut seat: Seat<State> = seat_state.new_wl_seat(&dh, "hart-seat");
-    let keyboard = seat.add_keyboard(Default::default(), 200, 25)?;
+    // Default::default() would look like it honours XKB_DEFAULT_*, but the empty
+    // options string it produces makes libxkbcommon skip the environment entirely
+    // (proved on real HW by reading the served keymap out of /memfd:smithay-keymap
+    // -- see shared::XkbEnv). Plumb the environment through ourselves.
+    let xkb_env = crate::shared::XkbEnv::from_env();
+    let keyboard = seat.add_keyboard(xkb_env.config(), 200, 25)?;
     let pointer = seat.add_pointer();
 
     // 5. The software-floor renderer (pixman) — the MANDATORY never-fail paint path.

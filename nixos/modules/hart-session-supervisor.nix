@@ -649,10 +649,18 @@ let
     # on every rung with a single declaration and nothing to keep in sync. It cannot
     # go in the greetd unit environment: greetd builds a fresh environment for the
     # session through PAM, so a systemd Environment= there never reaches the tier
-    # (measured today when a greetd drop-in failed to reach the shell). All three
-    # compositors build their keymap from xkbcommon's RMLVO env defaults
-    # (smithay's XkbConfig::default leaves options None), so the env var is the seam
-    # they genuinely share. `:-` so an operator override still wins.
+    # (measured today when a greetd drop-in failed to reach the shell).
+    #
+    # CAVEAT, and it cost a wrong "fixed" claim: exporting this is NECESSARY but was
+    # NOT SUFFICIENT for Tier-1. smithay's XkbConfig::default() looks like it defers
+    # to libxkbcommon's environment defaults and does not -- its `options: None`
+    # becomes an empty CString, and libxkbcommon only consults XKB_DEFAULT_OPTIONS
+    # when that pointer is NULL. Proved by reading the keymap hart-comp was actually
+    # serving clients (/memfd:smithay-keymap): the variable was in its environ and
+    # the served type was still `modifiers= Shift+NumLock`. hart-comp therefore reads
+    # these variables explicitly now (compositor/src/shared.rs::XkbEnv), which is what
+    # makes this export take effect on Tier-1. wlroots (sway/cage) is unaffected.
+    # `:-` so an operator override still wins.
     export XKB_DEFAULT_OPTIONS="''${XKB_DEFAULT_OPTIONS:-numpad:mac}"
 
     # XDG_RUNTIME_DIR — DERIVED, never merely inherited.
