@@ -173,6 +173,26 @@ class ChannelRegistry:
                     text=response,
                     reply_to=message.id,
                 )
+            elif response is None:
+                # None means the handler DELIBERATELY declined this message --
+                # currently a group message with no bot mention, skipped under
+                # adapter.config.require_mention_in_groups (see
+                # flask_integration._handle_message).  That is not a failure and
+                # must stay silent.
+                #
+                # The fallback below originally treated EVERY falsy response as
+                # "the agent produced nothing", so the bot answered "I wasn't
+                # able to put together a reply for that one." to every
+                # unmentioned message in a group -- it spoke on exactly the
+                # messages it was configured to ignore.  Seen on a real Discord
+                # channel 2026-08-12.
+                #
+                # '' still means the agent ran and returned nothing, which IS a
+                # genuine failure and still gets the fallback.
+                logger.debug(
+                    "handler declined %s from %s -- no reply intended",
+                    message.channel, message.sender_id,
+                )
             else:
                 logger.warning(
                     "empty agent response for %s from %s -- sending a fallback "
