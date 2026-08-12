@@ -440,6 +440,12 @@ in
         # first. Nice 19 + idle CPU/IO classes cost the export nothing that matters --
         # it is a background diagnostic, not a latency-sensitive path.
         Nice = 19;
+        # Nice only bites under CONTENTION. On an idle node a niced unit still
+        # takes every core, which is heat and battery on a fanless box that
+        # already sits at 93C under load. Measured 2026-08-12: this unit burned
+        # 86s of CPU in one invocation while walking every partition looking for
+        # a target. A hard bandwidth ceiling is what actually bounds it.
+        CPUQuota = "25%";
         CPUSchedulingPolicy = "idle";
         IOSchedulingClass = "idle";
       };

@@ -1203,7 +1203,13 @@ in
     # entirely through the logind libseat backend (LIBSEAT_BACKEND=logind, forced on
     # the greetd session below) plus hart-base.nix's direct video/render/input group
     # membership — the `seat` group was only ever needed for the seatd path.
-    users.users.hart-admin.extraGroups = [ "hart" ];
+    # "seat": seatd brokers /dev/dri and /dev/input. Without membership the
+    # compositor's seat open depends entirely on the logind path, and this node
+    # has already shown that path is fragile: five leaked greeter sessions stuck
+    # in state=closing on tty7, and no class=user session there at all. Group
+    # membership is the belt to logind's braces, and it is what
+    # TestSeatDrmBringUp::test_hart_admin_in_seat_group asserts.
+    users.users.hart-admin.extraGroups = [ "hart" "seat" ];
 
     # ── Plymouth / fbcon must RELEASE DRM master before the compositor claims it ──
     # The boot splash (boot.plymouth, desktop.nix) holds DRM master on card0; if it

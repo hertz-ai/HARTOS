@@ -95,6 +95,10 @@ in
         Restart = "always";
         RestartSec = 30;
         Nice = 19;
+        # Nice only bites under contention; on an idle node this still takes
+        # every core. A thermal HEALTH probe generating heat is self-defeating,
+        # and this node spent 5.9 hours thermally throttled today. Bound it.
+        CPUQuota = "20%";
         IOSchedulingClass = "idle";
         CPUSchedulingPolicy = "idle";
       };
