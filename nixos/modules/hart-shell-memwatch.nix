@@ -104,8 +104,15 @@ in
     '';
     intervalSec = lib.mkOption {
       type = lib.types.int;
-      default = 20;
-      description = "Seconds between samples. 20s resolves a multi-minute leak without spamming the journal.";
+      default = 300;
+      description = ''
+        Seconds between samples. Was 20s on the claim that it "resolves a
+        multi-minute leak without spamming the journal"; measured 2026-08-12 it
+        was 250 samples in the sampled window, each forking a shell pipeline,
+        against a journal that was uncapped on a 99%-full USB2 root. A leak
+        worth attributing shows up fine at 5-minute resolution, and the sampler
+        must not itself be part of the I/O load that freezes the compositor.
+      '';
     };
   };
 

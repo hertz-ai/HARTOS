@@ -308,5 +308,47 @@ in
         '')
       ];
     }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Journal must not be able to fill the root filesystem (2026-08-12)
+    #
+    # Measured on the live node: 19 GB written to the USB2 flash root SINCE
+    # BOOT, on a filesystem that had reached 99% with 513 MB free. Two things
+    # broke as a direct result, and neither reported the real reason:
+    #
+    #   1. The Firefox flatpak install died partway through the ~1 GB
+    #      org.freedesktop.Platform runtime. flatpak reports ENOSPC on stderr,
+    #      the UI discarded it, and the user saw a bare "retry" button that
+    #      could never succeed.
+    #   2. I/O starvation on that stick wedged kworker/u33 in
+    #      drm_atomic_helper_wait, so hart-comp's page-flip completion never
+    #      arrived and the desktop froze with a live cursor.
+    #
+    # An uncapped journal on a small flash root is a latent denial of service
+    # against the compositor. Cap it, and rate-limit so one runaway logger
+    # (e.g. 1028 pulseaudio autospawn failures) cannot consume the budget.
+    {
+      services.journald.extraConfig = ''
+        SystemMaxUse=200M
+        SystemMaxFileSize=20M
+        RuntimeMaxUse=64M
+        RateLimitIntervalSec=30s
+        RateLimitBurst=200
+      '';
+
+      # Let the liquid-ui service user traverse INTO the login user's runtime
+      # dir to reach the pulse socket. /run/user/1000 is mode 0700 and owned by
+      # the login user; the socket itself is already world-writable, so a single
+      # execute (traverse) ACL is the minimum that works. Without this, pactl
+      # gets "Connection refused" and the Audio settings page renders empty.
+      #
+      # This is only half the fix: ProtectHome=true in hart-liquid-ui.nix also
+      # masked /run/user inside the unit's own mount namespace, which no ACL can
+      # reach through. See the ProtectHome/BindPaths comment there.
+      systemd.tmpfiles.rules = [
+        "a+ /run/user/1000        - - - - u:hart:x"
+        "a+ /run/user/1000/pulse  - - - - u:hart:x"
+      ];
+    }
   ]);
 }

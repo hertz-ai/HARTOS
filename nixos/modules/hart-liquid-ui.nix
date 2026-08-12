@@ -545,7 +545,51 @@ in
         # Attr-guarded (the drm_info pattern) so a nixpkgs rev lacking any of them
         # cannot break evaluation -- the endpoint then degrades exactly as it does
         # today instead of failing the build.
-        path = (with pkgs; [ curl coreutils networkmanager ])
+        path =
+          # Guarded with `pkgs ? rustdesk`: I could not evaluate that attribute
+          # against the pinned nixpkgs from the built image (no channel on the
+          # node), so this must not be able to break the build. If rustdesk is
+          # absent from pkgs the guard is simply not added -- and nothing can be
+          # storming, because there is no binary for the bridge to find.
+          lib.optional (pkgs ? rustdesk) (
+          # FIRST on PATH so shutil.which('rustdesk') in
+          # integrations/remote_desktop/rustdesk_bridge.py resolves to this guard
+          # rather than the real binary.
+          #
+          # RustDesk 1.3.1 has no X11 DISPLAY to discover on a Wayland-only
+          # session, so its daemon modes retry session detection forever:
+          #   sh -c 'pgrep -a Xwayland | ps -u 1000 -f
+          #          | xargs cat /proc/*/environ | tr | sed | grep | awk | tail'
+          # Measured 2026-08-12: 2,374 of 2,410 processes created in 12 seconds
+          # (98.5% of ALL process creation on the box), 179 forks/sec, package
+          # pinned at 92C with 543ms of thermal throttling per 10s, and
+          # 5.9 hours of cumulative throttle. That was the second GUI hang, and
+          # it was NOT the compositor: hart-comp sat idle in do_epoll_wait
+          # throughout while every core was being force-idled by
+          # intel_powerclamp.
+          #
+          # pkill was not a fix: restarting hart-liquid-ui respawns it, because
+          # HART owns its lifecycle (rustdesk_bridge.py:251,257,268), not systemd.
+          # So refuse ONLY the self-daemonising modes, keep every query command,
+          # and log each refusal -- a blocked capability the operator cannot see
+          # is just a different silent failure.
+          (pkgs.writeShellScriptBin "rustdesk" ''
+            for a in "$@"; do
+              case "$a" in
+                --service|--server)
+                  echo "hart: refused 'rustdesk $a' - daemon mode is disabled on a" \
+                       "Wayland-only session (it fork-storms at ~179/sec and holds" \
+                       "the package at 92C). Query commands still work." >&2
+                  ${pkgs.util-linux}/bin/logger -t hart-rustdesk-guard \
+                    "refused rustdesk $a (Wayland fork-storm guard)" || true
+                  exit 0
+                  ;;
+              esac
+            done
+            exec ${pkgs.rustdesk}/bin/rustdesk "$@"
+          '')
+          )
+          ++ (with pkgs; [ curl coreutils networkmanager ])
           ++ lib.optional (pkgs ? pulseaudio)   pkgs.pulseaudio    # pactl   - audio
           ++ lib.optional (pkgs ? iproute2)     pkgs.iproute2      # ip      - network
           ++ lib.optional (pkgs ? upower)       pkgs.upower        # upower  - battery/power
@@ -572,6 +616,21 @@ in
           LIQUID_UI_PREFER_HW_GL = if ui.preferHardwareGL then "1" else "0";
           LIQUID_UI_CONTEXT_MS = toString ui.contextRefreshMs;
           LIQUID_UI_A2UI = if ui.enableA2UI then "1" else "0";
+          # Audio probe (wpctl-first, pactl fallback in _volume_get). pipewire-pulse
+          # serves the pulse socket in the LOGIN user's runtime dir; this unit runs as
+          # `hart` (uid 992), so it needs to be pointed at it explicitly AND allowed
+          # to traverse in (see ProtectHome/BindPaths + the tmpfiles ACL below).
+          XDG_RUNTIME_DIR = "/run/user/1000";
+          PULSE_SERVER = "unix:/run/user/1000/pulse/native";
+          # NEVER let pactl autospawn a PulseAudio daemon. PipeWire owns the
+          # devices, so an autospawned pulseaudio dies instantly with "Daemon
+          # startup without any loaded modules" -- and because the UI polls audio
+          # on a timer that measured 1028 failed startups and contributed to a
+          # ~200 fork/sec storm that held the package at 92C.
+          PULSE_CLIENTCONFIG = pkgs.writeText "hart-pulse-client.conf" ''
+            ; PipeWire owns audio on HART OS. Autospawn would fork a doomed daemon.
+            autospawn = no
+          '';
           MODEL_BUS_HTTP_PORT = toString (config.hart.modelBus.ports.http or 6790);
           HARTOS_BACKEND_PORT = toString cfg.ports.backend;
           HART_THEME_DIR = "/run/current-system/sw/share/hart/conky-themes";
@@ -663,7 +722,19 @@ in
           # Security hardening
           NoNewPrivileges = true;
           ProtectSystem = "strict";
-          ProtectHome = true;
+          # ProtectHome=true masks /run/user ENTIRELY inside this unit's mount
+          # namespace. Measured 2026-08-12: `nsenter -t $MAINPID -m ls /run/user`
+          # showed `d--------- root root`, so the Audio settings page returned
+          # {"sinks":[],"sources":[]} forever while `pactl` worked perfectly by
+          # hand. No ACL or PULSE_SERVER set from OUTSIDE can reach through a
+          # namespace mask -- that is why three earlier attempts failed.
+          #
+          # "tmpfs" keeps /home and /root hidden (the hardening that actually
+          # matters for a service running as `hart`) while BindPaths punches
+          # through exactly ONE socket directory. Least privilege preserved:
+          # the unit still cannot read the human's home.
+          ProtectHome = "tmpfs";
+          BindPaths = [ "/run/user/1000/pulse:/run/user/1000/pulse" ];
           ReadWritePaths = [
             cfg.dataDir
             cfg.logDir
