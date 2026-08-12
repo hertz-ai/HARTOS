@@ -14,7 +14,7 @@
 
 ---
 
-### What it is<p align="center"><strong>TL;DR;</strong> An AI that runs your computer, not a chatbot. Your hardware. BitTorrent-style. No middleman.</p>
+### What it is?
 
 An assistant that runs on your own machine, with no subscription, that works
 with the wifi off. What you type stays on the device because there is nowhere
@@ -31,6 +31,8 @@ Ready today: [Nunba](https://github.com/hertz-ai/Nunba) for Windows, Linux and
 Android. This repo is the runtime underneath it: it serves local inference as a
 system service, federates peer to peer, and is drivable end to end from
 `/v1/chat/completions` or the `hart` CLI.
+
+<p align="center"><strong>TL;DR;</strong> An AI that runs your computer, not a chatbot. Your hardware. BitTorrent-style. No middleman.</p>
 
 ## Start it
 
