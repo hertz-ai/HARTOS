@@ -3475,6 +3475,55 @@ def _is_template_echo(reply: str) -> bool:
     return bool(_TEMPLATE_PLACEHOLDER_RE.match((reply or '').strip()))
 
 
+def _salvage_assistant_reply(messages) -> Optional[str]:
+    """Return the assistant's own latest reply, whatever kind of turn this was.
+
+    Used ONLY on the failure path, where the alternative is the generic
+    "I couldn't complete that request just now." apology.
+
+    Why this exists
+    ---------------
+    Observed on a real Discord channel 2026-08-12: a user asked for help with
+    coding.  The model classified it correctly and confidently --
+    ``is_casual: true, delegate: 'local', confidence: 0.9`` -- and wrote a real
+    reply.  But ``delegate: 'local'`` is read by nothing for routing, so
+    StatusVerifier never spoke, TERMINATE never fired, the turn hit the wall
+    clock bound, and the user got the apology while the model's actual answer
+    sat unused in group_chat.messages.
+
+    That makes EVERY substantive request fail -- coding, research, anything
+    needing tools -- while only pure chit-chat (delegate 'none') works.
+
+    This does not fix routing: a request that genuinely needs a tool still does
+    not get the tool run, so the answer is the model's direct response rather
+    than a tool-backed one.  It is strictly better than an apology, and it
+    touches ONLY the path that was already returning failure -- a turn that
+    completes normally never reaches here.
+
+    Unlike _extract_conversational_reply this ignores is_casual/delegate/
+    is_create_agent (we are past the point where routing could have helped) but
+    keeps the template-echo guard, so the prompt skeleton is never surfaced.
+    """
+    try:
+        for _msg in reversed(list(messages or [])):
+            if not isinstance(_msg, dict):
+                continue
+            if _msg.get('name') not in ('Assistant', 'assistant'):
+                continue
+            _obj = retrieve_json(_msg.get('content') or '')
+            if not isinstance(_obj, dict):
+                continue
+            _reply = _obj.get('reply')
+            if not isinstance(_reply, str) or not _reply.strip():
+                continue
+            if _is_template_echo(_reply):
+                continue      # keep scanning: an echo is not an answer
+            return _reply.strip()
+    except Exception:
+        return None
+    return None
+
+
 def _extract_conversational_reply(messages) -> Optional[str]:
     """Return the assistant's reply for a purely conversational turn, else None.
 
@@ -3524,10 +3573,44 @@ def _extract_conversational_reply(messages) -> Optional[str]:
             _delegate = str(_obj.get('delegate') or 'none').strip().lower()
             if not _obj.get('is_casual'):
                 return None          # task-shaped: let the normal loop run
-            if _delegate not in ('', 'none', 'null'):
-                return None
             if _obj.get('is_create_agent'):
-                return None
+                return None          # creation needs its own flow, not this
+            if _delegate in ('', 'none', 'null'):
+                return _reply.strip()
+
+            # delegate is 'local' or 'hive' -- the model asked for a specialist.
+            #
+            # There is nowhere to send it.  state_transition routes only on a
+            # literal "@statusverifier"-style mention in the message text;
+            # `delegate` is read by NOTHING for routing.  So a turn that reaches
+            # here cannot ever complete: StatusVerifier never speaks, no
+            # status:"completed" appears, TERMINATE never fires, and the turn
+            # burns the full HEVOLVE_TURN_MAX_SECONDS before returning the
+            # generic apology -- with the model's own good answer sitting
+            # unused in group_chat.messages the whole time.
+            #
+            # Measured on a real Discord channel 2026-08-12: "i need a help in
+            # coding" was classified is_casual=true, delegate='local',
+            # confidence=0.9, and the user waited ~238s for
+            # "I couldn't complete that request just now."  Every substantive
+            # request behaves that way; only chit-chat (delegate 'none') works.
+            #
+            # Until delegate routing exists, entering the loop is strictly
+            # worse than answering: same information, 150s later, phrased as a
+            # failure.  So answer directly.  This is a DELIBERATE interim
+            # choice, not a claim that routing is unnecessary -- flip
+            # HEVOLVE_DELEGATE_ROUTING=1 the moment real routing lands and this
+            # falls back to the loop untouched.
+            if os.environ.get('HEVOLVE_DELEGATE_ROUTING', '0') == '1':
+                return None          # real routing exists: let it run
+            try:
+                current_app.logger.warning(
+                    f'[UNROUTABLE-DELEGATE] delegate={_delegate!r} has no '
+                    f'destination (delegate routing not implemented); '
+                    f'returning the assistant\'s own reply instead of spinning '
+                    f'to the turn deadline and apologising')
+            except Exception:
+                pass
             return _reply.strip()
     except Exception:
         return None
@@ -3622,6 +3705,20 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                     f'turn-deadline abort was spent inside autogen, not here). '
                     f'TERMINATE never fired (StatusVerifier never spoke). '
                     f'Returning an honest failure instead of spinning.')
+                # Before apologising, check whether the model already answered.
+                # It usually has: the turn fails for lack of ROUTING, not for
+                # lack of an answer, and that answer is sitting in
+                # group_chat.messages.  Sending the apology on top of a real
+                # reply is the worst of both -- the user waits the full bound
+                # AND is told nothing could be done.
+                _salvaged = _salvage_assistant_reply(group_chat.messages)
+                if _salvaged:
+                    current_app.logger.warning(
+                        f'[SALVAGED-REPLY] returning the assistant\'s own '
+                        f'answer for {user_prompt} ({len(_salvaged)} chars) '
+                        f'instead of the generic failure — the turn could not '
+                        f'complete, but the model did produce a reply')
+                    return _salvaged
                 return ("I couldn't complete that request just now. "
                         "Could you try rephrasing it?")
 
