@@ -192,6 +192,11 @@ class VRAMManager:
         self._allocations: Dict[str, float] = {}  # tool → GB reserved
         self._gpu_info: Optional[Dict] = None
         self._gpu_info_ts: float = 0.0  # timestamp of last nvidia-smi call
+        # None = not yet checked; True = neither nvidia-smi nor rocm-smi is on PATH,
+        # so the vendor probes are skipped PERMANENTLY (see detect_gpu). Survives the
+        # `refresh_gpu_info` TTL reset on purpose — that reset is what let the
+        # fork/exec storm restart every cycle on accelerator-less hosts.
+        self._vendor_tools_absent: Optional[bool] = None
         # Bundled mode: GPU state is stable (one model loaded at startup).
         # Poll every 120s not 30s to reduce subprocess overhead.
         _bundled = os.environ.get('NUNBA_BUNDLED') == '1'
@@ -349,12 +354,45 @@ class VRAMManager:
         if self._gpu_info is not None:
             return self._gpu_info
 
+        # ── ABSENT VENDOR TOOLS ARE A PERMANENT FACT — never re-probe them ──────
+        # (2026-08-12 real-HW finding on an Intel-only laptop.) `refresh_gpu_info`
+        # nulls `_gpu_info` every TTL, so WITHOUT this guard the full probe re-ran
+        # forever: three resident services (hart-backend, hart-liquid-ui,
+        # hart-agent-daemon) each fork/exec'd `nvidia-smi` AND `rocm-smi`, both
+        # raised FileNotFoundError, both were swallowed to a WARNING with a full
+        # traceback, and it repeated every refresh — MEASURED at 160 swallowed
+        # FileNotFoundErrors in 10 minutes on one box. That is a fork/exec storm and
+        # a journal flood on a machine that is already thermally throttled (every
+        # avoidable wakeup is heat), and it buries real errors in noise.
+        #
+        # A binary that is not on PATH does not appear at runtime, so the negative is
+        # cached PERMANENTLY here (not TTL'd) and the probes are skipped outright.
+        # `shutil.which` is a pure PATH stat — no subprocess, no timeout, no zombie.
+        # Logged ONCE per process at INFO (never swallowed silently): the operator
+        # sees exactly which accelerators are absent and that we stopped looking.
+        if self._vendor_tools_absent is None:
+            import shutil
+            missing = [t for t in ("nvidia-smi", "rocm-smi") if shutil.which(t) is None]
+            self._vendor_tools_absent = (len(missing) == 2)
+            if self._vendor_tools_absent:
+                logger.info(
+                    "detect_gpu: no vendor GPU tools on PATH (%s) — this host has no "
+                    "NVIDIA/AMD accelerator; caching that verdict and SKIPPING the "
+                    "probes from now on (they were re-running every refresh)",
+                    ", ".join(missing),
+                )
+
         info = {
             "name": None,
             "total_gb": 0.0,
             "free_gb": 0.0,
             "cuda_available": False,
         }
+
+        if self._vendor_tools_absent:
+            # Latch the negative so even a TTL refresh cannot restart the storm.
+            self._gpu_info = info
+            return info
 
         # run_bounded wraps Popen + explicit pipe close on timeout so the
         # child's _readerthread can't orphan — see core/subprocess_safe.py

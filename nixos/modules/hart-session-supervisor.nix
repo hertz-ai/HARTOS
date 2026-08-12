@@ -631,6 +631,38 @@ let
     export HART_SHELL_READY_FLAG="$READY"
     export HART_INPUT_ALIVE_FLAG="$INPUT_ALIVE"
 
+    # ── NUMERIC KEYPAD TYPES DIGITS (real-HW 2026-08-12: "numpad not working") ──
+    # NumLock boots OFF (/sys/class/leds/input0::numlock/brightness = 0) and nothing
+    # in the OS ever turned it on, so on a laptop with a real keypad every numpad key
+    # sent its NAVIGATION symbol -- KP_End instead of 1, KP_Down instead of 2 -- and
+    # the keypad looked broken. There is no xkb option that LOCKS NumLock, but
+    # `numpad:mac` fixes the actual problem by changing the keypad KEY TYPE so the
+    # digit level no longer depends on the NumLock modifier at all. Verified against
+    # the real keymap on the box with xkbcli compile-keymap:
+    #     -  modifiers= Shift+NumLock;   map[NumLock]= 2;
+    #     +  modifiers= none;            map[none]= 2;
+    # i.e. level 2 (the digit) is now selected unconditionally. The symbol list on
+    # each key is UNCHANGED, so nothing else about the layout moves.
+    #
+    # Set HERE, in the supervisor, because this is the one common parent of all three
+    # tiers -- hart-comp, sway and cage all inherit it, so the keypad behaves the same
+    # on every rung with a single declaration and nothing to keep in sync. It cannot
+    # go in the greetd unit environment: greetd builds a fresh environment for the
+    # session through PAM, so a systemd Environment= there never reaches the tier
+    # (measured today when a greetd drop-in failed to reach the shell).
+    #
+    # CAVEAT, and it cost a wrong "fixed" claim: exporting this is NECESSARY but was
+    # NOT SUFFICIENT for Tier-1. smithay's XkbConfig::default() looks like it defers
+    # to libxkbcommon's environment defaults and does not -- its `options: None`
+    # becomes an empty CString, and libxkbcommon only consults XKB_DEFAULT_OPTIONS
+    # when that pointer is NULL. Proved by reading the keymap hart-comp was actually
+    # serving clients (/memfd:smithay-keymap): the variable was in its environ and
+    # the served type was still `modifiers= Shift+NumLock`. hart-comp therefore reads
+    # these variables explicitly now (compositor/src/shared.rs::XkbEnv), which is what
+    # makes this export take effect on Tier-1. wlroots (sway/cage) is unaffected.
+    # `:-` so an operator override still wins.
+    export XKB_DEFAULT_OPTIONS="''${XKB_DEFAULT_OPTIONS:-numpad:mac}"
+
     # XDG_RUNTIME_DIR — DERIVED, never merely inherited.
     #
     # cage aborts immediately without it (`cage.c:299 XDG_RUNTIME_DIR is not set
@@ -860,7 +892,20 @@ in
 
     shellPaintTimeoutSeconds = lib.mkOption {
       type = lib.types.ints.unsigned;
-      default = 20;
+      # Raised 20 -> 120 on 2026-08-12. Measured on real hardware booting from a
+      # USB2 stick, the glass shell's first paint landed at 18:02:16.154 and the
+      # 45s watchdog fired at 18:02:16.138 -- it lost by 16 MILLISECONDS and a
+      # perfectly healthy tier-1 compositor was killed. Its own log for that boot:
+      #   acquired DRM master via drmSetMaster (session active); scanning out
+      #   first real scanout (page-flip vblank) completed - the display is LIVE
+      #   layer.composited (layers_painted=1)
+      # Nothing was hung. WebKit + GTK4 simply take ~45s to load off a 22 MB/s
+      # stick. A watchdog tuned so tightly that I/O speed decides whether the
+      # desktop comes up is not detecting hangs, it is causing them -- the same
+      # shape as the stale-socket race that killed tier 1 earlier the same day.
+      # 120s still catches a genuine hang quickly on any sane storage (the SSD
+      # path is ~10x faster) while leaving headroom for slow media.
+      default = 120;
       description = ''
         Shell-paint watchdog budget (seconds). After a tier's compositor is
         launched, the glass-shell host must signal its first painted frame (touch
@@ -1112,17 +1157,48 @@ in
     #   3. greetd on its OWN VT (vt=7, below) so its session is the seat's ACTIVE
     #      session — the precondition for logind to grant DRM master on the seat.
     #
-    # WHY NOT force seatd (the real-HW regression THIS corrects): an earlier fix
-    # (c6899df4) forced LIBSEAT_BACKEND=seatd on the false premise that "greetd's
-    # session is not a full logind session". It IS, on NixOS. Forcing seatd while
-    # systemd-logind is ALSO managing the seat/VTs is two seat managers fighting —
-    # the exact boot loop (DRM grabbed but input dead + EBUSY tier-drops, the cursor
-    # stuck at 0,0). It "passed" the VM nixosTest only because a QEMU guest's trivial
-    # single-VT seat never exposes the contention. seatd stays ENABLED below purely as
-    # an idle fallback (it keeps the `seat` group valid and is available for a future
-    # logind-less topology); with the env forcing logind, NO client ever connects to
-    # seatd, so the idle daemon never touches the seat. (See the command comment.)
-    services.seatd.enable = true;
+    # WHY seatd IS DISABLED (2026-08-10, live-confirmed real-HW regression THIS
+    # corrects): an earlier fix (c6899df4) forced LIBSEAT_BACKEND=seatd on the false
+    # premise that "greetd's session is not a full logind session". It IS, on NixOS.
+    # Forcing seatd while systemd-logind is ALSO managing the seat/VTs is two seat
+    # managers fighting — the exact boot loop (DRM grabbed but input dead + EBUSY
+    # tier-drops, the cursor stuck at 0,0). It "passed" the VM nixosTest only because
+    # a QEMU guest's trivial single-VT seat never exposes the contention.
+    #
+    # A follow-up kept `services.seatd.enable = true` anyway as a supposed "idle
+    # fallback," on the theory that forcing LIBSEAT_BACKEND=logind means no client
+    # ever connects to seatd so the idle daemon never touches the seat. A live
+    # journal off a hung boot FALSIFIED that theory: seatd created its own VT-bound
+    # seat0 (`[seatd/seat.c:39] Created VT-bound seat seat0`) independent of any
+    # client connecting, side-by-side with logind's `New seat seat0`. Two seat
+    # managers were on seat0 regardless, and hart-comp's drmSetMaster got EACCES
+    # (not EBUSY — the session simply isn't authorized as master), forcing it onto
+    # the pixman software-scanout floor and pegging the CPU. seatd is disabled
+    # (mkForce, so any lower-priority `enable = true` elsewhere cannot re-open the
+    # fight) until a future logind-less topology needs it — dropping it here costs
+    # nothing on this greetd+logind path.
+    services.seatd.enable = lib.mkForce false;
+
+    # ── NEVER-BLACK REPAIR: every tier must reach the logind seat backend ────────
+    # REGRESSION THIS FIXES (real HW, 2026-08-12, caused by the seatd disable above):
+    # wlroots' libseat probes the SEATD backend FIRST and only falls back to logind.
+    # With seatd gone, both fallback tiers died instantly:
+    #   hart-tier-sway[...]: [wlr] [backend/session/session.c:248] Failed to load session backend
+    #   hart-tier-cage[...]:       [backend/session/session.c:248] Failed to load session backend
+    # hart-comp survived (greetd's command wrapper exports LIBSEAT_BACKEND=logind, and
+    # it is the only tier launched through that wrapper), so the ladder looked healthy
+    # right up until Tier-1 faltered -- and then sway AND cage both failed in under
+    # 40ms and the screen went BLACK. That is precisely the never-black invariant the
+    # supervisor exists to guarantee, broken by a fix that only covered Tier-1.
+    #
+    # Setting it as a GLOBAL environment variable (not just on greetd's command line)
+    # makes the logind backend the default for EVERY seat client on the machine --
+    # sway, cage, and anything a future tier adds -- so the ladder degrades instead of
+    # going dark. This is the SAME single value the greetd wrapper already exports; it
+    # is not a parallel seat path, it is the same decision applied one level up so no
+    # tier can miss it. (The wrapper's explicit export stays: belt and braces, and it
+    # keeps the Tier-1 contract legible at the point of use.)
+    environment.variables.LIBSEAT_BACKEND = "logind";
     # ── The selector USER must be able to PERSIST a tier drop (never-black guard) ──
     # greetd runs the selector as hart-admin (below). The latch dir /var/lib/hart is
     # 0770 hart:hart (group-writable, declared above), so the selector can WRITE the
@@ -1132,8 +1208,20 @@ in
     # list can never silently re-introduce the real-HW BOOT LOOP: a drop that cannot
     # persist (EPERM on the latch) leaves the selector re-attempting the SAME top tier
     # forever — the exact 0750-vs-0770 / missing-group failure the latch-dir comment
-    # above documents. `seat` (libseat/seatd) + `hart` (latch write) are both required;
-    # identical supplementary-group entries de-dupe cleanly with hart-base's list.
+    # above documents.
+    #
+    # `seat` is intentionally NOT listed here: with `services.seatd.enable = false`
+    # (above) the `seat` group no longer exists, and referencing a nonexistent group
+    # in extraGroups fails NixOS module eval. DRM/input device access now flows
+    # entirely through the logind libseat backend (LIBSEAT_BACKEND=logind, forced on
+    # the greetd session below) plus hart-base.nix's direct video/render/input group
+    # membership — the `seat` group was only ever needed for the seatd path.
+    # "seat": seatd brokers /dev/dri and /dev/input. Without membership the
+    # compositor's seat open depends entirely on the logind path, and this node
+    # has already shown that path is fragile: five leaked greeter sessions stuck
+    # in state=closing on tty7, and no class=user session there at all. Group
+    # membership is the belt to logind's braces, and it is what
+    # TestSeatDrmBringUp::test_hart_admin_in_seat_group asserts.
     users.users.hart-admin.extraGroups = [ "hart" "seat" ];
 
     # ── Plymouth / fbcon must RELEASE DRM master before the compositor claims it ──

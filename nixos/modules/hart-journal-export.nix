@@ -109,6 +109,11 @@ let
     MNT="${mnt}"
     GPU_FILE="${gpuRenderFile}"
     JOURNAL_CAP_BYTES=5000000
+    # Tail bound for the full-journal section. `journalctl -n N` seeks from the END,
+    # so the capture cost is proportional to what we KEEP, not to how long the box has
+    # been up. Without this the capture grew without limit as the journal grew and
+    # eventually could never finish inside TimeoutStartSec (see the call site).
+    JOURNAL_CAP_LINES=20000
 
     log() { echo "[hart-journal-export] $*" >&2 ; }
 
@@ -281,8 +286,22 @@ $_x"
         echo "----- journalctl -b -p warning -n 200 (warnings and above) -----"
         journalctl -b -p warning -n 200 --no-pager 2>/dev/null || echo "(journalctl warnings unavailable)"
         echo ""
-        echo "----- journalctl -b --no-pager (full current boot, capped) -----"
-        journalctl -b --no-pager 2>/dev/null | head -c "$JOURNAL_CAP_BYTES" || true
+        echo "----- journalctl -b -n $JOURNAL_CAP_LINES --no-pager (current boot, tail-bounded) -----"
+        # LINE-bounded, not byte-bounded. THE BUG THIS REPLACES (real HW, 2026-08-12):
+        # `journalctl -b --no-pager | head -c 5000000` asks journalctl to FORMAT THE
+        # WHOLE BOOT from the beginning and merely truncates the output. On a box with
+        # a large journal on slow USB2 that takes far longer than TimeoutStartSec=90s,
+        # so systemd killed it at 90s, the timer refired 15s later, and the cycle
+        # repeated FOREVER: one core pinned at 99% permanently by
+        # `journalctl -b --no-pager`, the unit stuck in ActiveState=activating.
+        # MEASURED consequence on a Samsung NP550P5C: +18C of pure waste heat (94C ->
+        # 76C the moment it was stopped), which drove the CPU into intel_powerclamp
+        # forced-idle -- i.e. THIS is what froze the desktop while every userspace
+        # metric still looked healthy, and it is why the machine ran hot at "idle".
+        # `-n N` seeks from the END instead of formatting the entire boot, so the cost
+        # is bounded by what we actually keep. The byte cap stays as a belt-and-braces
+        # guard for pathologically long lines.
+        journalctl -b -n "$JOURNAL_CAP_LINES" --no-pager 2>/dev/null | head -c "$JOURNAL_CAP_BYTES" || true
         echo ""
         echo "===== end of export (phase=$PHASE) ====="
       } > "$TMP" 2>&1 || true
@@ -300,6 +319,23 @@ $_x"
 
       log "wrote $OUT to $DEV (phase=$PHASE)"
       WROTE=$((WROTE + 1))
+
+      # STOP AT THE FIRST SUCCESS (real-HW 2026-08-12). This loop used to write the
+      # journal to EVERY eligible partition, so on a stick with several vfat
+      # partitions it wrote the same dump again and again, ran past
+      # TimeoutStartSec=90s, and systemd SIGTERMed it -- leaving a permanently FAILED
+      # unit on a box where the export had in fact already SUCCEEDED:
+      #   wrote /run/hart/journal-mnt/hart-journal-hart-node.txt to /dev/sdb2
+      #   eligible external USB target: /dev/sdb11        <- kept going
+      #   start operation timed out. Terminating.
+      #   Consumed 1min 26.056s CPU time
+      # Two harms: a red unit that misreports a working export as broken, and ~30-90s
+      # of CPU per tick on a laptop that is already thermally throttled, which is
+      # exactly the kind of background burn that makes the desktop feel slow. One
+      # copy on one stick is the whole point of the feature, so take the first and
+      # leave. If that stick is later removed, the next tick simply picks the next
+      # eligible one -- the discovery order is unchanged.
+      break
     done < "$LISTF"
     rm -f "$LISTF" 2>/dev/null || true
 
@@ -393,6 +429,25 @@ in
         ExecStart = "${captureScript} periodic";
         # A slow USB stick must not wedge anything - bounded + best-effort.
         TimeoutStartSec = "90s";
+        # ── A DIAGNOSTIC MUST NEVER OUT-PRIORITISE THE DESKTOP IT DIAGNOSES ──────
+        # (real HW, 2026-08-12) This unit ran at NORMAL priority, so when its capture
+        # overran it competed head-to-head with the compositor and won often enough to
+        # stall the session: one core pinned at 99% by `journalctl -b`, the desktop
+        # frozen, and the machine +18C hotter (94C vs 76C) which then triggered
+        # intel_powerclamp forced idle. The capture is now bounded at the call site,
+        # and these make starvation structurally impossible even if a future capture
+        # regresses: the kernel will hand every one of these cycles to the compositor
+        # first. Nice 19 + idle CPU/IO classes cost the export nothing that matters --
+        # it is a background diagnostic, not a latency-sensitive path.
+        Nice = 19;
+        # Nice only bites under CONTENTION. On an idle node a niced unit still
+        # takes every core, which is heat and battery on a fanless box that
+        # already sits at 93C under load. Measured 2026-08-12: this unit burned
+        # 86s of CPU in one invocation while walking every partition looking for
+        # a target. A hard bandwidth ceiling is what actually bounds it.
+        CPUQuota = "25%";
+        CPUSchedulingPolicy = "idle";
+        IOSchedulingClass = "idle";
       };
     };
 

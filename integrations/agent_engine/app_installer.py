@@ -769,6 +769,26 @@ class AppInstaller:
         """Env pinning flatpak to the --user installation dir this service can write."""
         env = dict(os.environ)
         env['FLATPAK_USER_DIR'] = self._flatpak_dir
+        # ── Make `flatpak` FINDABLE from a systemd service ──────────────────────
+        # Real-HW bug this fixes (2026-08-12): clicking "install Firefox" answered
+        # "flatpak not available" INSTANTLY on a box where flatpak was fully working
+        # -- /run/current-system/sw/bin/flatpak present, the `flathub` remote already
+        # configured, DNS fine, and `flatpak remote-add` returning rc=0 from a shell.
+        # The installer runs inside a systemd unit whose PATH does NOT include
+        # /run/current-system/sw/bin, so `subprocess.run(['flatpak', ...])` raised
+        # FileNotFoundError -- which the caller reports verbatim as "flatpak not
+        # available". The message blamed the SYSTEM for what was purely a PATH gap in
+        # this process, sending the operator to debug a Flatpak install that was fine.
+        # Append (never replace) the standard NixOS command dirs so an inherited PATH
+        # still wins, and every flatpak call site gets this because they all route
+        # through this one env builder.
+        _extra = ['/run/current-system/sw/bin', '/run/wrappers/bin',
+                  os.path.expanduser('~/.nix-profile/bin')]
+        _path = [p for p in env.get('PATH', '').split(os.pathsep) if p]
+        for _d in _extra:
+            if _d not in _path and os.path.isdir(_d):
+                _path.append(_d)
+        env['PATH'] = os.pathsep.join(_path)
         return env
 
     def _ensure_flathub(self) -> None:
@@ -824,9 +844,22 @@ class AppInstaller:
                 success=False, platform='flatpak', name=name,
                 error=result.stderr.strip()[:500])
         except FileNotFoundError:
+            # Say WHICH failure this is. "flatpak not available" was reported on a box
+            # where flatpak worked perfectly and only this process's PATH was short
+            # (see _flatpak_env), which sent the operator to debug the wrong system.
+            # shutil.which uses the SAME env we just handed subprocess, so the two
+            # answers cannot disagree.
+            import shutil
+            _resolved = shutil.which('flatpak', path=self._flatpak_env().get('PATH'))
+            if _resolved:
+                _err = ("flatpak exists at %s but could not be executed from this "
+                        "service (check unit permissions/sandboxing)" % _resolved)
+            else:
+                _err = ("flatpak is not installed on this system (not found on PATH: %s)"
+                        % self._flatpak_env().get('PATH', ''))
+            logger.warning("_install_flatpak: %s", _err)
             return InstallResult(
-                success=False, platform='flatpak', name=name,
-                error='flatpak not available')
+                success=False, platform='flatpak', name=name, error=_err)
         except subprocess.TimeoutExpired:
             return InstallResult(
                 success=False, platform='flatpak', name=name,

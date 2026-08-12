@@ -8524,6 +8524,51 @@ except Exception:
     logging.getLogger(__name__).exception("<module>: swallowed Exception")
 
 
+@app.errorhandler(ImportError)
+def _optional_capability_missing(exc):
+    """An absent OPTIONAL dependency is a known state, not a server fault.
+
+    Real HW, 2026-08-12: /chat returned a bare 500 whose only readable cause was
+    buried in the journal --
+
+        autogen.AssistantAgent
+        ModuleNotFoundError: No module named 'autogen'
+        ImportError: Agent creation requires the 'pyautogen' package.
+
+    gather_agentdetails already raises that ImportError with a perfectly good
+    message (deliberately, so the cause is stated where it is still known), but
+    nothing turned it into a RESPONSE, so Flask produced a generic 500 and the
+    desktop agent cards just said "retry connecting" -- forever, for a condition
+    that will never resolve by retrying. The diagnosis existed and was thrown away
+    one layer above the user. That is the gulped-error pattern this codebase is
+    supposed to refuse.
+
+    pyautogen is not in nixpkgs (nor are flaml/diskcache/tiktoken beneath it), so
+    on a Nix-built image the package is genuinely absent and the honest answer is
+    to SAY so, with the actual missing dependency and a 503 (capability
+    unavailable) rather than a 500 (we broke). 503 also tells the client this is
+    not worth retrying on a timer, which is exactly what the cards were doing.
+
+    Scoped to ImportError only: every other exception keeps its existing
+    behaviour, and a route that already handles ImportError itself still wins,
+    because Flask only consults this handler for UNHANDLED exceptions.
+    """
+    msg = str(exc) or 'an optional capability is not installed'
+    missing = None
+    for _pkg in ('pyautogen', 'autogen'):
+        if _pkg in msg:
+            missing = _pkg
+            break
+    app.logger.warning('optional capability unavailable on this build: %s', msg)
+    return jsonify({
+        'error': msg,
+        'reason': 'optional_capability_missing',
+        'missing_package': missing,
+        'retryable': False,
+        'response': None,
+    }), 503
+
+
 @app.route('/chat', methods=['POST'])
 @_mark_foreground
 def chat():

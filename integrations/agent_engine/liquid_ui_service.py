@@ -1124,9 +1124,22 @@ class LiquidUIService:
         # overlay on top of AbstractChatActivity.
         try:
             from core.platform.events import emit_event
+            # Stamp the owning user so the P3a SSE guard ROUTES this push rather
+            # than refusing it.  Measured 2026-08-12: 38 refusals in two hours,
+            # which is every A2UI overlay push silently dropped.  Unlike
+            # agent.action.completed this emit stamped NOTHING at all.  None ->
+            # still refused, exactly as before: no leak, no regression.
+            # Import is local + guarded so an import problem degrades the
+            # user_id to None instead of killing the push entirely.
+            try:
+                from core.event_attribution import owner_user_id
+                _owner = owner_user_id()
+            except Exception:
+                _owner = None
             emit_event('agent.ui.update', {
                 'agent_id': agent_id,
                 'component': component,
+                'user_id': _owner,
             })
         except Exception:
             logger.exception("agent_ui_update: swallowed Exception")  # EventBus emission is best-effort
@@ -2671,6 +2684,70 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
                 '.lg-3{background:rgba(15,14,26,.95)}'
                 '.lg-4{background:rgba(12,11,22,.96)}'
                 '.lg-senses-ghost,.hart-desktop::before{display:none}'
+            )
+
+        # ── IDLE MOTION COSTS A SOFTWARE REPAINT (real-HW 2026-08-12) ─────────
+        # Every rung except vulkan runs the GTK4 host on GSK_RENDERER=cairo, so the
+        # host blits the whole window through the CPU on every damage event. A
+        # CONTINUOUSLY running animation therefore forces a full software repaint
+        # ~60x a second forever, whatever the compositor is doing. Measured on the
+        # Samsung NP550P5C WITH hart-comp GPU-compositing and the iGPU fully engaged:
+        # disabling ALL animation took shell+WebKit 120% -> 79% (the ceiling); the
+        # targeted rule below, which keeps state-driven motion, measured 126% -> 105%.
+        #
+        # What that buys is CLOCK, not a cooler chip. This chassis sat at 93-95C in
+        # EVERY state measured, animation on or off, so the package temperature is
+        # NOT attributable to the shell -- an earlier note here claimed the animations
+        # "held the package at 94C", and the measurements do not support that. What
+        # changes is what the CPU can deliver inside a fixed thermal envelope:
+        # 1197MHz -> 1596MHz with the rule below, and 1695MHz -> 2892MHz with all
+        # animation off. The box is thermally saturated either way; idle motion just
+        # spends the headroom repainting a desktop that is not changing.
+        #
+        # `webkit-flat` (flat_body_class, set right where blur_composites is decided)
+        # ALREADY means exactly "the host is painting in software", so key off that --
+        # no new mechanism, no second source of truth. Deliberately NOT is_potato:
+        # that keys off gpu_mode, the COMPOSITOR's verdict (/run/hart/gpu-render,
+        # written by hart-gpu-probe before greetd), which on this box has read
+        # `hardware` since boot -- so is_potato is False and can NEVER shed these
+        # effects here, no matter what the compositor is doing. (An earlier note
+        # claimed repairing the compositor's GPU path "switched these effects on".
+        # It did not: the verdict was already `hardware` at 10:04, four minutes
+        # before the compositor's EGL was fixed at 10:08. The effects were on the
+        # whole time.) The renderer that actually pays for a frame is the GTK host,
+        # and it is on cairo. Ask the renderer that pays, not the one that does not.
+        #
+        # Two mechanisms, both existing:
+        #  1. hartHome.css already gates its layers on --hart-motion-* custom
+        #     properties via animation-play-state, so flipping those to `paused` stops
+        #     the ambient blobs, orb float/breathe, ring spin and live dots centrally.
+        #     `paused` genuinely halts the animation (a redefined @keyframes does NOT
+        #     -- the machinery keeps running and repainting; that was measured too).
+        #  2. The handful of infinite animations with no such var are named here.
+        #     Only the ones that run AT IDLE: the state-driven ones (listening ring,
+        #     is-sensing, mic recording) stay, because they run for seconds during a
+        #     real interaction and they are what tells the user HART is doing
+        #     something. lg-comet likewise. A vulkan rung keeps everything as authored.
+        if not blur_composites:
+            _CSS_LIVING_GLASS += (
+                '/* sw-paint: idle motion stopped (see the note in liquid_ui_service.py) */'
+                'body.webkit-flat{--hart-motion-ambient:paused;--hart-motion-orb:paused;'
+                '--hart-motion-rings:paused;--hart-motion-detail:paused}'
+                # No --hart-motion-* var on these, and all of them animate transform
+                # on elements carrying large blurs/shadows (.hart-hero-orb alone has a
+                # 70px AND a 150px box-shadow, so each breathe frame re-rasterises two
+                # big blurs in software) or rotate a 300px dashed ring forever.
+                'body.webkit-flat .hart-orb-orbit,'
+                'body.webkit-flat .hart-orb-orbit2,'
+                'body.webkit-flat .hart-hero-orb,'
+                'body.webkit-flat .hart-hero-aura,'
+                'body.webkit-flat .hart-hero-aura .hha-r1,'
+                'body.webkit-flat .hart-hero-aura .hha-r2,'
+                'body.webkit-flat .hart-hero-aura .hha-halo,'
+                'body.webkit-flat .hart-hero-hevolve .dot,'
+                'body.webkit-flat .top-bar-orb,'
+                'body.webkit-flat .hart-hero-go,'
+                'body.webkit-flat .ds-skeleton{animation:none}'
             )
 
         # ── Boot lock overlay (#166: FOUC + security) ─────────────────────────

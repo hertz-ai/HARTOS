@@ -710,7 +710,11 @@ in
       wantedBy = [ "timers.target" ];
       timerConfig = {
         OnBootSec = "2min";
-        OnUnitActiveSec = "30s";
+        # Was 30s. On a USB2 flash root that is 250+ wakeups an hour for a health
+        # probe whose result changes on the scale of minutes, and it competes for
+        # I/O with the compositor's page flips (the 11:00 freeze mechanism).
+        OnUnitActiveSec = "5min";
+        AccuracySec = "30s";
       };
     };
 

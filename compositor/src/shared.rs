@@ -102,3 +102,81 @@ pub(crate) fn x11_app_id(x11: &X11Surface) -> Option<String> {
 pub(crate) fn x11_title(x11: &X11Surface) -> Option<String> {
     Some(x11.title()).filter(|s| !s.is_empty())
 }
+
+// ── KEYBOARD LAYOUT: read XKB_DEFAULT_* OURSELVES (real HW, 2026-08-12) ──────
+//
+// `XkbConfig::default()` looks like it defers to libxkbcommon's environment
+// defaults. IT DOES NOT, and the failure is completely silent.
+//
+// libxkbcommon fills a field from XKB_DEFAULT_* only when the pointer is NULL:
+//     if (isempty(rmlvo->rules))  rmlvo->rules = default_rules;   /* NULL or "" */
+//     if (!rmlvo->options)        rmlvo->options = default_options; /* NULL ONLY */
+// The Rust binding turns `options: None` into an empty CString, which is a
+// NON-NULL pointer to "\0" -- so libxkbcommon reads it as "the caller explicitly
+// asked for NO options" and never consults the environment.
+//
+// Measured on the box, three ways:
+//   * `XKB_DEFAULT_OPTIONS=numpad:mac` present in the compositor's
+//     /proc/PID/environ, yet the keymap it serves clients (read straight out of
+//     /memfd:smithay-keymap) still carried the stock type:
+//         type "KEYPAD" { modifiers= Shift+NumLock; map[NumLock]= 2; ... }
+//   * compiling the SAME empty-RMLVO names by hand reproduced it exactly:
+//         --options ''  -> modifiers= Shift+NumLock   (env ignored)
+//         (no --options) -> modifiers= none           (env applied)
+//   * setting XKB_DEFAULT_RULES to a custom ruleset changed nothing either, so
+//     it is not specific to `options`.
+//
+// The user-visible symptom was the whole numeric keypad typing navigation
+// (KP_End, KP_Down, …) instead of digits, because NumLock boots off and nothing
+// turns it on. `numpad:mac` fixes that properly by making the keypad key TYPE
+// stop consulting the NumLock modifier at all:
+//     type "KEYPAD" { modifiers= none; map[none]= 2; }
+// so the digit level is unconditional. The symbol lists on the keys are
+// untouched, and the NumLock key itself is unchanged (diffed, no regression).
+//
+// So: plumb the environment through EXPLICITLY. This keeps the seam the session
+// supervisor already exports (one declaration, inherited by hart-comp, sway and
+// cage) genuinely working for Tier-1 instead of silently dropped, and defaults
+// to numpad:mac when the operator sets nothing. Owned strings because
+// `XkbConfig<'a>` borrows; `config()` hands out a borrow that lives as long as
+// the holder.
+pub(crate) struct XkbEnv {
+    rules: String,
+    model: String,
+    layout: String,
+    variant: String,
+    options: Option<String>,
+}
+
+impl XkbEnv {
+    /// Read the standard XKB_DEFAULT_* variables, defaulting the OPTIONS to
+    /// `numpad:mac` so a keypad types digits out of the box. An empty value is
+    /// treated as unset for `options` (matching libxkbcommon's own `isempty`
+    /// handling of the other four fields); set `XKB_DEFAULT_OPTIONS` to any
+    /// other value to override, exactly as on a normal desktop.
+    pub(crate) fn from_env() -> Self {
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        Self {
+            rules: var("XKB_DEFAULT_RULES"),
+            model: var("XKB_DEFAULT_MODEL"),
+            layout: var("XKB_DEFAULT_LAYOUT"),
+            variant: var("XKB_DEFAULT_VARIANT"),
+            options: Some(
+                std::env::var("XKB_DEFAULT_OPTIONS")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "numpad:mac".to_string()),
+            ),
+        }
+    }
+
+    pub(crate) fn config(&self) -> smithay::input::keyboard::XkbConfig<'_> {
+        smithay::input::keyboard::XkbConfig {
+            rules: &self.rules,
+            model: &self.model,
+            layout: &self.layout,
+            variant: &self.variant,
+            options: self.options.clone(),
+        }
+    }
+}

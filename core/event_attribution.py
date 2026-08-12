@@ -68,4 +68,54 @@ def owner_user_id(user_prompt=None, goal_id=None, metadata=None) -> Optional[str
         except Exception:
             pass
 
+    # 4. Single-tenant fallback (HART OS appliance).  The P3a guard exists to
+    #    stop per-agent activity leaking ACROSS users on a multi-tenant node.
+    #    When the node has exactly ONE user there is no other user to leak to,
+    #    so the owner is unambiguous and returning it is safe by construction.
+    #    Nodes with 0 or >1 users fall through to None exactly as before, so
+    #    multi-tenant behaviour is unchanged.
+    #
+    #    Why this is needed: measured on the live appliance 2026-08-12,
+    #    agent_goals is EMPTY (0 rows), so step 3 above always resolves None and
+    #    EVERY agent.action.completed was refused -- 266 of them in two hours --
+    #    with a warning that blamed a missing user_id rather than an empty goals
+    #    table.  That is what left the agents panel showing "will appear once the
+    #    connection is restored".  Do NOT "fix" this by adding 'agent.' to
+    #    _SSE_GLOBAL_PREFIXES: the comment at core/platform/events.py:112 forbids
+    #    exactly that, because it would leak cross-user activity metadata.
+    uid = _sole_local_user_id()
+    if uid:
+        return uid
+
     return None
+
+
+_SOLE_USER_CACHE = []          # [] unknown, [None] known-not-single, [uid] known
+
+
+def _sole_local_user_id() -> Optional[str]:
+    """The id of the ONLY user on this node, or None if there are 0 or >1.
+
+    Cached after the first resolution: this is called on every agent event
+    (agent.action.completed alone runs ~4,882 times a day) and must not add a
+    DB round trip per emit.  A negative result is cached too, so a genuinely
+    multi-tenant node pays exactly one query.  Errors are NOT cached -- the DB
+    may just be busy, and caching a transient failure would permanently disable
+    per-user routing.
+    """
+    if _SOLE_USER_CACHE:
+        return _SOLE_USER_CACHE[0]
+    try:
+        from integrations.social.models import db_session, User
+        with db_session() as db:
+            rows = db.query(User).limit(2).all()
+            if len(rows) == 1:
+                uid = getattr(rows[0], 'id', None)
+                if uid:
+                    _SOLE_USER_CACHE.append(str(uid))
+                    return str(uid)
+            # 0 or >1 users: never fall back.  Cache the negative.
+            _SOLE_USER_CACHE.append(None)
+    except Exception:
+        return None
+    return _SOLE_USER_CACHE[0]

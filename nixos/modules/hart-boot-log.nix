@@ -561,13 +561,23 @@ in
 
     intervalSeconds = lib.mkOption {
       type = lib.types.ints.positive;
-      default = 20;
+      default = 300;
       description = ''
         The periodic re-capture interval (seconds). This is what makes a HUNG
         boot debuggable: the Tier-1 pointer-only hang never settles + never
         exits, so only a periodic capture leaves the journal-so-far on the
-        stick. Architecture default 20s (frequent enough to catch the hang,
-        infrequent enough not to thrash a slow USB stick).
+        stick.
+
+        Was 20s, raised to 300s on 2026-08-12. The 20s claim that it was
+        "infrequent enough not to thrash a slow USB stick" did not hold up when
+        measured: each tick read 14.3 MB and, on a node with no HARTLOG
+        partition, did nothing but log "nothing to write" -- 250 times in the
+        sampled window. Meanwhile the boot stick had taken 19 GB of writes since
+        boot on a 99%-full filesystem, and I/O starvation on that stick was the
+        confirmed cause of the 11:00 freeze (kworker/u33 wedged in
+        drm_atomic_helper_wait, so the compositor's page-flip completion never
+        arrived). A debug aid must not be able to cause the hang it exists to
+        diagnose. 300s still bounds data loss on a hang to five minutes.
       '';
     };
   };
