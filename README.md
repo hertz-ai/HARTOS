@@ -14,9 +14,7 @@
 
 ---
 
-### What it is
-
-<p align="center"><strong>TL;DR;</strong> An AI that runs your computer, not a chatbot. Your hardware. BitTorrent-style. No middleman.</p>
+### What it is<p align="center"><strong>TL;DR;</strong> An AI that runs your computer, not a chatbot. Your hardware. BitTorrent-style. No middleman.</p>
 
 An assistant that runs on your own machine, with no subscription, that works
 with the wifi off. What you type stays on the device because there is nowhere
