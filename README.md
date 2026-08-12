@@ -3,6 +3,7 @@
 <p align="center"><strong>Democratic frontier intelligence with zero lock-in, fronted by an agentic OS.</strong></p>
 <p align="center">An AI-native operating system. Models run on your own hardware, nodes federate directly with each other, and the API is OpenAI-compatible.</p>
 
+
 <p align="center">
   <a href="https://hevolve.ai"><img src="https://img.shields.io/badge/Live%20demo-hevolve.ai-FFD700?style=flat-square" alt="Live demo"></a>
   <a href="https://docs.hevolve.ai"><img src="https://img.shields.io/badge/Docs-docs.hevolve.ai-blueviolet?style=flat-square" alt="Docs"></a>
@@ -14,6 +15,8 @@
 ---
 
 ### What it is
+
+<p><strong>TL;DR</strong> An AI that runs your computer, not a chatbot. Your hardware. BitTorrent-style. No middleman.</p>
 
 An assistant that runs on your own machine, with no subscription, that works
 with the wifi off. What you type stays on the device because there is nowhere
