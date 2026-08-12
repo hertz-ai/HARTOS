@@ -527,7 +527,31 @@ in
         #     though the radio + NetworkManager are up. nmcli talks to the NM
         #     daemon over the system D-Bus (AF_UNIX is allowed; no PrivateNetwork),
         #     so read-only status works here without extra group membership.
-        path = with pkgs; [ curl coreutils networkmanager ];
+        # The shell's settings endpoints SHELL OUT to system tools, and a systemd
+        # unit gets ONLY this PATH -- not the login PATH the code was written
+        # against. Every tool missing here becomes a 500 on one settings page and,
+        # in the UI, the generic "couldn't load yet, it will appear once the
+        # connection is restored" card. Measured on real HW 2026-08-12, all four
+        # in one 15-minute window, each logged as a *swallowed Exception*:
+        #     shell_audio          -> FileNotFoundError: 'pactl'
+        #     shell_display        -> FileNotFoundError: 'xrandr'
+        #     shell_network_status -> FileNotFoundError: 'ip'
+        #     shell_power          -> FileNotFoundError: 'upower'
+        # so Audio, Display, Network and Power all read as "offline" on a machine
+        # whose audio, display, network and battery were all working perfectly.
+        # This is the SAME defect class as the Flatpak "not available" bug
+        # (aff3a8c): the capability is installed, the service just cannot see it.
+        #
+        # Attr-guarded (the drm_info pattern) so a nixpkgs rev lacking any of them
+        # cannot break evaluation -- the endpoint then degrades exactly as it does
+        # today instead of failing the build.
+        path = (with pkgs; [ curl coreutils networkmanager ])
+          ++ lib.optional (pkgs ? pulseaudio)   pkgs.pulseaudio    # pactl   - audio
+          ++ lib.optional (pkgs ? iproute2)     pkgs.iproute2      # ip      - network
+          ++ lib.optional (pkgs ? upower)       pkgs.upower        # upower  - battery/power
+          ++ lib.optional (pkgs ? wireplumber)  pkgs.wireplumber   # wpctl   - audio (sibling of pactl)
+          ++ lib.optional (pkgs ? alsa-utils)   pkgs.alsa-utils    # amixer  - the layer BELOW PipeWire
+          ++ lib.optional (pkgs ? xorg && pkgs.xorg ? xrandr) pkgs.xorg.xrandr;  # xrandr - display
 
         environment = {
           HEVOLVE_DATA_DIR = cfg.dataDir;
