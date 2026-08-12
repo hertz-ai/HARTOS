@@ -892,7 +892,20 @@ in
 
     shellPaintTimeoutSeconds = lib.mkOption {
       type = lib.types.ints.unsigned;
-      default = 20;
+      # Raised 20 -> 120 on 2026-08-12. Measured on real hardware booting from a
+      # USB2 stick, the glass shell's first paint landed at 18:02:16.154 and the
+      # 45s watchdog fired at 18:02:16.138 -- it lost by 16 MILLISECONDS and a
+      # perfectly healthy tier-1 compositor was killed. Its own log for that boot:
+      #   acquired DRM master via drmSetMaster (session active); scanning out
+      #   first real scanout (page-flip vblank) completed - the display is LIVE
+      #   layer.composited (layers_painted=1)
+      # Nothing was hung. WebKit + GTK4 simply take ~45s to load off a 22 MB/s
+      # stick. A watchdog tuned so tightly that I/O speed decides whether the
+      # desktop comes up is not detecting hangs, it is causing them -- the same
+      # shape as the stale-socket race that killed tier 1 earlier the same day.
+      # 120s still catches a genuine hang quickly on any sane storage (the SSD
+      # path is ~10x faster) while leaving headroom for slow media.
+      default = 120;
       description = ''
         Shell-paint watchdog budget (seconds). After a tier's compositor is
         launched, the glass-shell host must signal its first painted frame (touch
