@@ -132,8 +132,18 @@ class TrustContract:
     expelled: bool = False        # Whether node has been expelled
 
 
-def _contract_payload(contract: TrustContract) -> str:
-    """Canonical payload for signing/verification (excludes signature itself)."""
+def _contract_payload(contract: TrustContract) -> bytes:
+    """Canonical payload BYTES for signing/verification (excludes signature itself).
+
+    Routes through the ONE canonical serialization
+    (``security.node_integrity.canonical_payload``) instead of re-implementing
+    ``json.dumps(sort_keys=True, separators=(',', ':'))`` inline. This was the 6th
+    inline copy of that serialization in the codebase; any drift between a signer's
+    copy and a verifier's copy silently breaks every trust-contract signature
+    network-wide. The seven fields below ARE exactly the signed set, so nothing is
+    stripped at serialization time (``exclude=()``) — the field selection stays
+    local and explicit, only the byte-level serialization is delegated.
+    """
     payload = {
         'node_id': contract.node_id,
         'public_key_hex': contract.public_key_hex,
@@ -143,7 +153,8 @@ def _contract_payload(contract: TrustContract) -> str:
         'audit_compute_ratio': contract.audit_compute_ratio,
         'signed_at': contract.signed_at,
     }
-    return json.dumps(payload, sort_keys=True, separators=(',', ':'))
+    from security.node_integrity import canonical_payload
+    return canonical_payload(payload, exclude=())
 
 
 def sign_trust_contract(
@@ -192,9 +203,9 @@ def sign_trust_contract(
         signed_at=time.time(),
     )
 
-    # Sign the canonical payload
+    # Sign the canonical payload (already the canonical UTF-8 bytes)
     payload = _contract_payload(contract)
-    signature = priv_key.sign(payload.encode('utf-8'))
+    signature = priv_key.sign(payload)
     contract.signature_hex = signature.hex()
 
     logger.info(
@@ -259,7 +270,7 @@ def verify_trust_contract(contract: TrustContract) -> Tuple[bool, str]:
         pub_key = Ed25519PublicKey.from_public_bytes(pub_bytes)
         payload = _contract_payload(contract)
         sig_bytes = bytes.fromhex(contract.signature_hex)
-        pub_key.verify(sig_bytes, payload.encode('utf-8'))
+        pub_key.verify(sig_bytes, payload)
     except Exception as e:
         return False, f'Invalid contract signature: {e}'
 
