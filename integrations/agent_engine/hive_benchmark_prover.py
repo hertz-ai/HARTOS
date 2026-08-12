@@ -1553,6 +1553,24 @@ class HiveBenchmarkProver:
 
         Each problem is a dict with at minimum: {id, type, prompt}.
         """
+        # A REAL problem set on disk always wins over the generated stubs
+        # below. The stubs carry no `correct_answer`, so every run scored a
+        # tidy, plausible 0.0 that nothing downstream could distinguish from a
+        # measurement — 395 runs on one machine since April, none of them a
+        # number. Drop a file here and the same benchmark becomes gradable
+        # with no other change:
+        #
+        #   ~/.hevolve/benchmarks/<benchmark_name>.json
+        #   {"problems": [{"id","type","question","correct_answer"}, ...]}
+        #
+        # Same directory gaia_dataset.py already caches into, so there is one
+        # place to put benchmark data rather than two.
+        cached = self._load_cached_problems(benchmark_name)
+        if cached:
+            logger.info("Benchmark [%s]: loaded %d REAL problems with answer "
+                        "keys from cache", benchmark_name, len(cached))
+            return cached
+
         spec = config.get('spec') or BUILTIN_BENCHMARKS.get(benchmark_name)
         if not spec:
             # Try the benchmark registry for dynamic adapters
@@ -1734,6 +1752,45 @@ class HiveBenchmarkProver:
             })
 
         return problems
+
+    def _load_cached_problems(self, benchmark_name: str) -> List[dict]:
+        """Real problems with answer keys from ~/.hevolve/benchmarks/, or [].
+
+        Only entries carrying BOTH a question and a non-empty correct_answer
+        are returned: a cache file half-filled with unanswerable entries would
+        reintroduce exactly the silent-zero this exists to end, one layer down.
+        Returns [] on any problem so the caller falls back to the stubs and the
+        run is honestly reported as ungraded rather than failing outright.
+        """
+        try:
+            root = os.path.join(os.path.expanduser('~'), '.hevolve', 'benchmarks')
+            path = os.path.join(root, f'{benchmark_name}.json')
+            if not os.path.exists(path):
+                return []
+            data = _load_json(path) or {}
+            raw = data.get('problems') if isinstance(data, dict) else data
+            if not isinstance(raw, list):
+                return []
+            out = []
+            for i, p in enumerate(raw):
+                if not isinstance(p, dict):
+                    continue
+                q = p.get('question') or p.get('prompt')
+                a = p.get('correct_answer', p.get('answer'))
+                if not q or not str(a or '').strip():
+                    continue
+                out.append({
+                    'id': p.get('id') or f'{benchmark_name}_{i}',
+                    'type': p.get('type', 'math'),
+                    'question': q,
+                    'correct_answer': str(a),
+                    'index': i,
+                })
+            return out
+        except Exception as exc:
+            logger.debug("Cached problem load failed for %s: %s",
+                         benchmark_name, exc)
+            return []
 
     # ── Node Discovery ───────────────────────────────────────────────
 
