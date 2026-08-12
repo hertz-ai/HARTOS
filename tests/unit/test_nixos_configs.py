@@ -2084,13 +2084,23 @@ class TestSessionSupervisorModule:
         assert "default = 300" in m.group(1)
         assert "ints.positive" in m.group(1)
 
-    def test_paint_timeout_option_unsigned_default_20(self):
+    def test_paint_timeout_option_unsigned_default_120(self):
         """The shell-paint watchdog budget — the HUNG-tier guard the bare crash
-        detection is blind to. unsigned so 0 (disable) is a valid value."""
+        detection is blind to. unsigned so 0 (disable) is a valid value.
+
+        Was pinned at 20 until 2026-08-12. Raised to 120 after real hardware
+        showed the watchdog killing a HEALTHY tier-1: booting from a 22 MB/s USB2
+        stick the glass shell's first paint landed at 18:02:16.154 and the
+        watchdog fired at 18:02:16.138 — it lost by 16 milliseconds, and the
+        compositor had already acquired DRM master, completed a page-flip vblank
+        and composited a layer. The budget must exceed the SLOWEST supported
+        media's shell load time, otherwise storage speed decides whether the
+        desktop comes up and the watchdog causes the hang it exists to detect.
+        """
         assert "shellPaintTimeoutSeconds" in self.content
         m = re.search(r"shellPaintTimeoutSeconds\s*=\s*lib\.mkOption\s*\{(.*?)\};", self.content, re.S)
         assert m, "shellPaintTimeoutSeconds option block not found"
-        assert "default = 20" in m.group(1)
+        assert "default = 120" in m.group(1)
         assert "ints.unsigned" in m.group(1)
 
     def test_input_alive_timeout_option_unsigned_default_0_failsafe(self):
