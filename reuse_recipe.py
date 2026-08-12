@@ -312,6 +312,88 @@ import logging as _logging  # noqa: E402  (intentional, see comment above)
 _LOG = _logging.getLogger(__name__)
 
 
+# ── Wall-clock bound on a single turn's GroupChat round-robin ──────────────
+#
+# The reuse loop in get_agent_response already has iteration/second bounds,
+# but they guard the WRONG loop: get_agent_response calls
+# user_proxy.initiate_chat(...) FIRST, and the bounded `while True` runs only
+# after it returns.  The runaway lives inside autogen's own round-robin, which
+# those bounds never observe.
+#
+# Measured 2026-08-12: a plain "hello" ran 1408s (23m28s).  max_round=10 did
+# fire -- the tally was Assistant x10 -- but ten rounds of a local 4B at
+# ~90-140s each is 23 minutes, and the caller had long since timed out.  A
+# round cap cannot bound wall-clock when each round is unboundedly slow.
+#
+# autogen's contract: a custom speaker_selection_method returning None raises
+# NoEligibleSpeaker, which run_chat catches with a plain `break` (groupchat.py
+# ~1186).  So returning None ends the chat *gracefully* -- messages already
+# appended survive, and the existing conversational-reply extraction and
+# post-loop fallback still run.  That makes the selector the correct place to
+# enforce a deadline: it is called once per round, inside the loop that is
+# actually spinning.
+# Scope is the THREAD, not the session.  A session-keyed dict looks right and
+# is wrong: the speculative/expert-dispatch re-entry means two turns run
+# concurrently under the SAME user_prompt (observed 2026-08-12 --
+# "[REENTRANCY] concurrent non-speculative turn ... shared GroupChat may
+# interleave").  With one shared entry, whichever turn finished first ran its
+# finally: and disarmed the other, silently restoring unbounded behaviour for
+# the turn still running.  Caught by watching a real run, not by the tests.
+#
+# A thread is the right unit: autogen's initiate_chat, the speaker selectors
+# it calls, and the reuse loop afterwards all execute synchronously on the
+# thread that started the turn.
+_turn_deadline_state = threading.local()
+
+
+def _begin_turn_deadline(user_prompt: str, only_if_unset: bool = False) -> float:
+    """Arm the wall-clock deadline for this thread's turn.  Returns it.
+
+    ``only_if_unset`` keeps an already-running clock rather than restarting
+    it.  /chat arms the deadline at the request entry so the bound covers the
+    time a *user* actually waits; get_agent_response then arms with
+    only_if_unset=True so it extends nothing -- re-arming there would reset
+    the clock partway through and hand back the very overshoot the entry-point
+    arming exists to remove.  Measured 2026-08-12: ~84s elapses between a
+    Discord message arriving and initiate_chat starting, so a 150s bound armed
+    at initiate_chat let a real turn run 234s.
+    """
+    if only_if_unset and getattr(_turn_deadline_state, 'deadline', None) is not None:
+        return _turn_deadline_state.deadline
+    _seconds = float(os.environ.get('HEVOLVE_TURN_MAX_SECONDS', '150'))
+    _deadline = time.time() + _seconds
+    _turn_deadline_state.deadline = _deadline
+    _turn_deadline_state.user_prompt = user_prompt
+    return _deadline
+
+
+def _clear_turn_deadline(user_prompt: str) -> None:
+    """Disarm — only ever affects the calling thread's own turn."""
+    _turn_deadline_state.deadline = None
+    _turn_deadline_state.user_prompt = None
+
+
+def _turn_deadline_exceeded(user_prompt: str) -> bool:
+    """True once this thread's turn has outlived HEVOLVE_TURN_MAX_SECONDS.
+
+    Nothing armed => no deadline => never expired.  A turn that somehow
+    reaches a selector without going through _begin_turn_deadline keeps the
+    old unbounded behaviour rather than being killed by a stale entry.
+
+    ``user_prompt`` is still taken (and checked) so a selector belonging to a
+    different session than the armed turn can never be terminated by it --
+    cached agents are shared, and their closures capture their own
+    user_prompt.
+    """
+    _deadline = getattr(_turn_deadline_state, 'deadline', None)
+    if _deadline is None:
+        return False
+    _armed_for = getattr(_turn_deadline_state, 'user_prompt', None)
+    if _armed_for is not None and _armed_for != user_prompt:
+        return False
+    return time.time() > _deadline
+
+
 def _resync_manager_reply_config(manager, group_chat) -> int:
     """Re-point a GroupChatManager's registered run_chat config at the LIVE
     ``group_chat.messages`` list.  Returns the number of configs re-pointed.
@@ -2879,6 +2961,17 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     def state_transition(last_speaker, groupchat):
         messages = groupchat.messages
+        # Wall-clock bound.  See _turn_deadline_exceeded: max_round alone
+        # cannot bound a turn when each round is an unboundedly slow local
+        # LLM call.  None => NoEligibleSpeaker => run_chat breaks cleanly.
+        if _turn_deadline_exceeded(user_prompt):
+            current_app.logger.error(
+                f'[TURN-DEADLINE] ending group chat for {user_prompt} after '
+                f'{os.environ.get("HEVOLVE_TURN_MAX_SECONDS", "150")}s — '
+                f'{len(messages)} message(s) so far, last speaker '
+                f'{getattr(last_speaker, "name", last_speaker)}. Terminating '
+                f'so the caller gets an answer instead of waiting forever.')
+            return None
         try:
             request_id = f'{request_id_list[user_prompt]}'
             # Check for specific agent mentions FIRST - this should take precedence
@@ -3019,6 +3112,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     def state_transition1(last_speaker, groupchat):
         current_app.logger.info('INSIDE TIMER STATE TRANSITION')
         messages = groupchat.messages
+        if _turn_deadline_exceeded(user_prompt):
+            current_app.logger.error(
+                f'[TURN-DEADLINE] ending timer group chat for {user_prompt}')
+            return None
         # visual_context = helper_fun.get_visual_context(user_id)
         # if visual_context:
         #     groupchat.messages.insert(-1,{'content':visual_context,'role':'user','name':'helper'})
@@ -3081,6 +3178,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     def state_transition2(last_speaker, groupchat):
         current_app.logger.info('INSIDE VISUAL STATE TRANSITION')
         messages = groupchat.messages
+        if _turn_deadline_exceeded(user_prompt):
+            current_app.logger.error(
+                f'[TURN-DEADLINE] ending visual group chat for {user_prompt}')
+            return None
         # visual_context = helper_fun.get_visual_context(user_id)
         # if visual_context:
         #     groupchat.messages.insert(-1,{'content':visual_context,'role':'user','name':'helper'})
@@ -3350,6 +3451,30 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     return assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group
 
 
+# The dispatcher prompt (speculative_dispatcher.py ~1107) shows the model the
+# exact JSON shape to emit, using angle-bracketed placeholders --
+# "<your short reply to the user, 1-3 sentences>".  A 4B model sometimes
+# parrots that skeleton back instead of filling it in.  Observed live on
+# 2026-08-12, on the first turn after a cold start.
+#
+# An echo is well-formed JSON with is_casual set, so it sails through every
+# check in _extract_conversational_reply and gets delivered to the user
+# verbatim.  On 08-12 it was caught only by luck: the echoed `delegate`
+# parsed to the garbage string 'none" OR "local" OR "hive', which happened
+# to fail the delegate check.  A cleaner echo would have shipped.
+_TEMPLATE_PLACEHOLDER_RE = re.compile(r'^<[^<>]{2,}>$')
+
+
+def _is_template_echo(reply: str) -> bool:
+    """True when ``reply`` is the prompt's own placeholder, not a real answer.
+
+    Deliberately narrow: only a reply that is *wholly* one angle-bracketed
+    placeholder counts.  A genuine reply that merely contains angle brackets
+    (code, math, markup) is untouched.
+    """
+    return bool(_TEMPLATE_PLACEHOLDER_RE.match((reply or '').strip()))
+
+
 def _extract_conversational_reply(messages) -> Optional[str]:
     """Return the assistant's reply for a purely conversational turn, else None.
 
@@ -3382,6 +3507,20 @@ def _extract_conversational_reply(messages) -> Optional[str]:
             _reply = _obj.get('reply')
             if not isinstance(_reply, str) or not _reply.strip():
                 continue
+            if _is_template_echo(_reply):
+                # This turn's assistant message is the prompt skeleton, not an
+                # answer.  Do NOT keep scanning backwards -- an older message
+                # belongs to a previous turn, and returning it would answer the
+                # user's new question with a stale reply.  Fall through to the
+                # task loop, which is the conservative path.
+                try:
+                    current_app.logger.warning(
+                        f'[TEMPLATE-ECHO] assistant parroted the prompt '
+                        f'placeholder instead of answering '
+                        f'({_reply.strip()[:80]!r}); not returning it')
+                except Exception:
+                    pass
+                return None
             _delegate = str(_obj.get('delegate') or 'none').strip().lower()
             if not _obj.get('is_casual'):
                 return None          # task-shaped: let the normal loop run
@@ -3401,6 +3540,18 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                        user_id: int, prompt_id: int, request_id: str) -> str:
     """Get a single response from the agent for the given message."""
     user_prompt = f'{user_id}_{prompt_id}'
+    # Arm the wall-clock bound BEFORE initiate_chat -- that call is where the
+    # runaway lives, and the reuse loop's own bounds below only start counting
+    # once it has already returned.  Cleared in the finally so a cached agent's
+    # selector can never inherit a stale deadline from a previous turn.
+    #
+    # only_if_unset: /chat already armed this thread at the request entry, and
+    # that clock is the one that matches what the user waits.  Re-arming here
+    # would restart it and give back the ~84s of pre-turn routing the entry
+    # point arming exists to cover.  This call still matters for callers that
+    # reach get_agent_response without going through /chat.
+    _owns_deadline = getattr(_turn_deadline_state, 'deadline', None) is None
+    _begin_turn_deadline(user_prompt, only_if_unset=True)
     try:
 
         result = user_proxy.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
@@ -3441,12 +3592,35 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
         while True:
             current_app.logger.info('inside reuse while1')
 
-            if count >= _loop_max_iters or time.time() > _loop_deadline:
+            # The turn deadline is checked here too, not just in the speaker
+            # selector.  Without it a turn bounded at HEVOLVE_TURN_MAX_SECONDS
+            # inside initiate_chat would simply hand off to a fresh
+            # HEVOLVE_REUSE_LOOP_MAX_SECONDS budget here -- 150s + 300s = 450s,
+            # which is not a bound anyone asked for.  One deadline covers the
+            # whole turn; the loop's own counters remain as a backstop.
+            _hit_iters = count >= _loop_max_iters
+            _hit_loop_clock = time.time() > _loop_deadline
+            _hit_turn_clock = _turn_deadline_exceeded(user_prompt)
+            if _hit_iters or _hit_loop_clock or _hit_turn_clock:
+                # Name the bound that actually fired.  The original message
+                # reported only the reuse loop's own elapsed, so a turn killed
+                # by the turn deadline logged "after 0 iteration(s) / 0s" --
+                # true of this loop, and completely misleading about where the
+                # time went (observed 2026-08-12).  A diagnostic that misreports
+                # which limit tripped is how the earlier defects stayed hidden.
+                _which = ('turn-deadline' if _hit_turn_clock
+                          else 'loop-seconds' if _hit_loop_clock
+                          else 'loop-iterations')
+                _loop_elapsed = int(time.time() - (_loop_deadline - float(
+                    os.environ.get('HEVOLVE_REUSE_LOOP_MAX_SECONDS', '300'))))
                 current_app.logger.error(
-                    f'[REUSE-LOOP-ABORT] giving up for {user_prompt} after '
-                    f'{count} iteration(s) / '
-                    f'{int(time.time() - (_loop_deadline - float(os.environ.get("HEVOLVE_REUSE_LOOP_MAX_SECONDS", "300"))))}s '
-                    f'-- TERMINATE never fired (StatusVerifier never spoke). '
+                    f'[REUSE-LOOP-ABORT] giving up for {user_prompt} — bound '
+                    f'hit: {_which}. {count} loop iteration(s), {_loop_elapsed}s '
+                    f'in this loop (turn deadline = '
+                    f'{os.environ.get("HEVOLVE_TURN_MAX_SECONDS", "150")}s, '
+                    f'measured from before initiate_chat, so most of a '
+                    f'turn-deadline abort was spent inside autogen, not here). '
+                    f'TERMINATE never fired (StatusVerifier never spoke). '
                     f'Returning an honest failure instead of spinning.')
                 return ("I couldn't complete that request just now. "
                         "Could you try rephrasing it?")
@@ -3668,6 +3842,13 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
         error_message = traceback.format_exc()  # Capture full traceback
         current_app.logger.error(f"Error in get_agent_response:\n{error_message}")
         return f"Error getting response: {str(e)}"
+    finally:
+        # Only disarm what this call armed.  When /chat owns the clock it must
+        # survive until the request ends (cleared in teardown_request) --
+        # clearing it here would leave the rest of the request unbounded, which
+        # is the same class of hole as the concurrent-disarm bug.
+        if _owns_deadline:
+            _clear_turn_deadline(user_prompt)
 
 
 def get_flow_number(user_id, prompt_id):
@@ -4024,9 +4205,27 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 f'[REENTRANCY] dropped expert-dispatch /chat re-entry for '
                 f'{user_prompt} — a real turn is already in flight')
             return ''
+        # Identify the caller that got past _is_expert_dispatch_reentry.
+        # The detector matches on payload SHAPE, so a re-entry that omits
+        # model_config/speculative/draft_first is invisible to it and runs a
+        # full duplicate turn against the same cached GroupChat.  Logging the
+        # shape here is the only way to name that caller -- inferring it from
+        # the source was ambiguous (several /chat posters share the pattern).
+        try:
+            from flask import request as _rq_dbg
+            _body_dbg = _rq_dbg.get_json(silent=True) or {}
+            _keys_dbg = sorted(_body_dbg.keys()) if isinstance(_body_dbg, dict) else []
+            _src_dbg = (_body_dbg.get('task_source'),
+                        _body_dbg.get('autonomous'),
+                        _body_dbg.get('request_id'))
+            _ua_dbg = _rq_dbg.headers.get('User-Agent', '')
+        except Exception:
+            _keys_dbg, _src_dbg, _ua_dbg = ['<no request ctx>'], (None, None, None), ''
         current_app.logger.warning(
             f'[REENTRANCY] concurrent non-speculative turn for {user_prompt} '
-            f'— proceeding, shared GroupChat may interleave')
+            f'— proceeding, shared GroupChat may interleave. '
+            f'CALLER-SHAPE keys={_keys_dbg} '
+            f'task_source/autonomous/request_id={_src_dbg} ua={_ua_dbg!r}')
 
     request_id_list[user_prompt] = request_id
     try:

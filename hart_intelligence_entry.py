@@ -8601,6 +8601,23 @@ except Exception:
     logging.getLogger(__name__).exception("<module>: swallowed Exception")
 
 
+@app.teardown_request
+def _disarm_turn_deadline(_exc=None):
+    """Disarm this request's wall-clock turn deadline, whatever happened.
+
+    Flask reuses worker threads, and the deadline lives in thread-local state.
+    A deadline left armed would be inherited by the NEXT request on the same
+    thread and expire it instantly.  teardown_request runs on every exit path
+    -- return, abort, or exception -- which a try/finally inside chat() could
+    not cover without wrapping several hundred lines and many returns.
+    """
+    try:
+        from reuse_recipe import _clear_turn_deadline
+        _clear_turn_deadline('')
+    except Exception:
+        pass
+
+
 @app.route('/chat', methods=['POST'])
 @_mark_foreground
 def chat():
@@ -8796,6 +8813,25 @@ def chat():
     req_tool = data.get('tools', None)
     file_id = data.get('file_id', None)
     prompt_id = data.get('prompt_id', None)
+
+    # ── Wall-clock bound on this turn, armed HERE rather than deeper in ──
+    #
+    # reuse_recipe.get_agent_response also arms it, but only as a fallback for
+    # callers that never come through /chat.  Arming at the request entry is
+    # what makes the bound mean what a user experiences: measured 2026-08-12
+    # on real Discord traffic, ~84s elapses between the message arriving and
+    # initiate_chat starting (routing, identity resolution, agent setup), so a
+    # 150s bound armed at initiate_chat let a real turn run 234s end-to-end.
+    #
+    # Thread-local, so it covers exactly this request; the teardown_request
+    # hook below disarms it on every exit path (chat() has many returns and no
+    # single try/finally to hang it off).
+    try:
+        from reuse_recipe import _begin_turn_deadline as _arm_turn_deadline
+        _arm_turn_deadline(f'{user_id}_{prompt_id}')
+    except Exception as _dl_err:      # never block a turn on the bound itself
+        app.logger.debug(f'turn deadline not armed: {_dl_err}')
+
     create_agent = data.get('create_agent', None)
     casual_conv = data.get('casual_conv', False)
     autonomous = data.get('autonomous', False)
