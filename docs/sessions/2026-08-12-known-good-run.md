@@ -34,8 +34,18 @@ and was misread as a system fault. Read `/sys` and sleep; use `journalctl -n N` 
 Wi-Fi). The mouse keeps moving. No process is spinning. The CPU widget looks normal (~12%,
 because one saturated core averaged over 8 threads is invisible).
 
-**Cause:** `systemd-logind` holds DRM master and never yields it, so hart-comp's `drmSetMaster`
-returns `EACCES` forever. Every page-flip then fails and retries — a repaint can never land.
+**Cause:** hart-comp's `drmSetMaster` returns `EACCES` forever without `CAP_SYS_ADMIN`
+(A/B-proven on hardware, see below), so it never takes DRM master and retries every tick.
+
+> **Correction (2026-08-12).** This section used to continue: *"Every page-flip then fails and
+> retries — a repaint can never land."* That mechanism is **not supported**. In the no-capability
+> A/B run, with `drmSetMaster STILL refused` and never acquired, hart-comp still logged
+> `first real scanout (page-flip vblank) completed` and the shell still reached `shell-ready`.
+> Page-flips **can** land without `drmSetMaster` succeeding. Taking master is measurably real and
+> is what the capability buys, but the causal chain from "no master" to "the desktop freezes" was
+> asserted, never demonstrated, and one run at 15s is not long enough to demonstrate it either.
+> Treat the freeze mechanism as open. The falter that *was* nailed down is the stale-socket race
+> below, which is a different failure.
 
 **Two things are required, and fixing only the first breaks the second.**
 
