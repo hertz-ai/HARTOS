@@ -2428,6 +2428,85 @@ class TestBootstrapGoals:
         count = seed_bootstrap_goals(db)  # second
         assert count == 0
 
+    def test_seed_config_edit_reaches_an_already_seeded_row(self, db):
+        """A config-only seed change must reach rows seeded before it.
+
+        THE REGRESSION.  The sync branch used to open on a DESCRIPTION
+        change alone, so the config merge inside it was unreachable from a
+        config-only edit — by construction, not by accident.
+
+        Measured cost, 2026-08-12: bootstrap_paper_explainer was flipped to
+        ``enabled: True`` in the seed on 2026-08-11 so the 100 fetched-but-
+        unpublished research papers would drain into hevolve.ai pages.  The
+        live row (seeded 2026-07-20) kept ``enabled: False``, so
+        _build_paper_explanation_prompt returned None on every daemon tick
+        and ``last_dispatched_at`` was still NULL 23 days later.  The switch
+        had been thrown and nothing was listening.
+        """
+        from integrations.agent_engine.goal_seeding import (
+            seed_bootstrap_goals, SEED_BOOTSTRAP_GOALS)
+
+        seed_bootstrap_goals(db)
+
+        seed = next(g for g in SEED_BOOTSTRAP_GOALS
+                    if g['slug'] == 'bootstrap_paper_explainer')
+        row = next(
+            g for g in db.query(AgentGoal).all()
+            if (g.config_json or {}).get('bootstrap_slug')
+            == 'bootstrap_paper_explainer')
+
+        # Simulate the real history: a row seeded back when the flag was off,
+        # with the CURRENT description — so description-drift cannot be what
+        # rescues this.  Only the config differs.
+        cfg = dict(row.config_json or {})
+        cfg['enabled'] = False
+        row.config_json = cfg
+        row.description = seed['description']
+        row.created_by = 'system_bootstrap'
+        db.commit()
+
+        seed_bootstrap_goals(db)  # next boot
+
+        db.refresh(row)
+        assert (row.config_json or {}).get('enabled') is True, (
+            'a config-only seed edit never reached the existing row — '
+            'the exact failure that left the paper explainer dark for 23 days')
+        # Runtime state the daemon owns must survive the merge.
+        assert row.status == 'active'
+
+    def test_seed_config_sync_does_not_clobber_runtime_keys(self, db):
+        """The merge writes seed keys only — daemon bookkeeping is untouched.
+
+        Guards the other half: making the sync fire more often must not turn
+        it into a boot-time eraser of dispatch counters.  Runtime keys are
+        absent from the seed, so they cannot register as drift either, which
+        is what stops this re-firing on every boot.
+        """
+        from integrations.agent_engine.goal_seeding import seed_bootstrap_goals
+
+        seed_bootstrap_goals(db)
+        row = next(
+            g for g in db.query(AgentGoal).all()
+            if (g.config_json or {}).get('bootstrap_slug')
+            == 'bootstrap_paper_explainer')
+
+        cfg = dict(row.config_json or {})
+        cfg['enabled'] = False           # force one real drift
+        cfg['noop_dispatch_count'] = 7   # runtime key, not in the seed
+        cfg['completed_at'] = '2026-08-01T00:00:00Z'
+        row.config_json = cfg
+        row.created_by = 'system_bootstrap'
+        db.commit()
+
+        seed_bootstrap_goals(db)
+
+        db.refresh(row)
+        merged = row.config_json or {}
+        assert merged.get('enabled') is True
+        assert merged.get('noop_dispatch_count') == 7
+        assert merged.get('completed_at') == '2026-08-01T00:00:00Z'
+        assert merged.get('bootstrap_slug') == 'bootstrap_paper_explainer'
+
     def test_seed_with_product(self, db, test_product):
         """Marketing goals get product_id, non-marketing do not."""
         from integrations.agent_engine.goal_seeding import seed_bootstrap_goals

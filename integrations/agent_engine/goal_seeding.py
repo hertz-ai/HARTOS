@@ -2243,17 +2243,55 @@ def seed_bootstrap_goals(db, platform_product_id: Optional[str] = None) -> int:
             # overwrite runtime keys (status, completed_at, dispatch
             # counters) — only the human-authored description + the
             # config keys that came from the seed.
+            #
+            # CONFIG DRIFT COUNTS TOO.  This used to fire on a description
+            # change ALONE, which made a config-only seed edit unable to
+            # reach an already-seeded system by construction — the merge
+            # loop below sat inside a branch that a config edit could not
+            # open.  Cost, measured 2026-08-12: bootstrap_paper_explainer
+            # was flipped to `enabled: True` in the seed on 2026-08-11 to
+            # drain 100 fetched-but-unpublished research papers into pages.
+            # Its row (seeded 2026-07-20) kept `enabled: False`, so
+            # _build_paper_explanation_prompt returned None on every tick
+            # and last_dispatched_at was still NULL 23 days later. The
+            # switch had been thrown; nothing was listening.
+            #
+            # Compare the seed's OWN keys against the row rather than the
+            # whole config: runtime keys the daemon writes (completed_at,
+            # noop_dispatch_count, …) are absent from the seed and so can
+            # never register as drift, which is what keeps this from
+            # re-firing every boot.
             try:
+                _seed_cfg = goal_data.get('config') or {}
+                _row_cfg = existing.config_json or {}
+                _cfg_drift = any(
+                    _row_cfg.get(k) != v for k, v in _seed_cfg.items()
+                )
+                _desc_drift = existing.description != goal_data['description']
                 if (existing.created_by == 'system_bootstrap'
-                        and existing.description != goal_data['description']):
+                        and (_desc_drift or _cfg_drift)):
                     existing.description = goal_data['description']
                     # Merge seed config keys without nuking runtime state.
-                    cfg = existing.config_json or {}
-                    for k, v in (goal_data.get('config') or {}).items():
+                    #
+                    # dict(...) — a NEW object, deliberately.  `config_json`
+                    # is a plain JSON column, not a MutableDict, so mutating
+                    # the instance's own dict in place and assigning it back
+                    # leaves the attribute identical to itself: SQLAlchemy
+                    # sees no change, never flushes, and the sync silently
+                    # does nothing.  That is a second, independent reason the
+                    # paper-explainer flag never landed, and it would have
+                    # swallowed the fix above on its own.
+                    cfg = dict(existing.config_json or {})
+                    for k, v in _seed_cfg.items():
                         cfg[k] = v
                     cfg['bootstrap_slug'] = slug  # preserve the marker
                     existing.config_json = cfg
                     updated += 1
+                    if _cfg_drift:
+                        logger.info(
+                            f"Bootstrap goal '{slug}': seed config drift "
+                            f"synced to the existing row "
+                            f"({'+description' if _desc_drift else 'config only'})")
             except Exception as _sync_err:
                 logger.debug(
                     f"Bootstrap goal '{slug}' description sync skipped: {_sync_err}")
