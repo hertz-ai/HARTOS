@@ -6144,6 +6144,24 @@ function speakText(text, source) {{
     if(d.audio_url && !d.error) {{
       if('speechSynthesis' in window) speechSynthesis.cancel();
       _acAudio = new Audio(SHELL+d.audio_url);
+      // Feed the REAL TTS audio to the orb before playing it.
+      //
+      // Without this the orb was told to animate (setActive) but never given a
+      // source, so voiceOrbViz's analyser stayed null while speaking and it fell
+      // through to the synthetic branch:
+      //     s.bass = 0.25 + 0.15 * Math.sin(s.time * 2.3)   (and mid/treble)
+      // which is a slow fixed sine — smooth, periodic, and completely
+      // uncorrelated with what is actually being said. Listening already looked
+      // right because the record path calls connectStream with the mic; only
+      // speaking was simulated.
+      //
+      // Safe: connectAudioElement re-routes through analyser -> destination so
+      // the speech stays audible, guards on the element identity (a fresh Audio
+      // per reply, so it reconnects cleanly), and voiceOrbViz's render loop
+      // resumes a suspended AudioContext while active, so routing through the
+      // graph cannot leave the reply silent. Same-origin (SHELL), so CORS does
+      // not mute the analyser.
+      try {{ if(window._hartVoiceOrb) window._hartVoiceOrb.connectAudioElement(_acAudio); }} catch(e) {{}}
       _acAudio.play().catch(function(){{}});
     }}
   }}).catch(function(){{}});
