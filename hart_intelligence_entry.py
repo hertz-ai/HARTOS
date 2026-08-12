@@ -8395,19 +8395,44 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
             # after a chat reply is not obviously wanted, and changing it
             # changes what the user hears — that belongs with the engine
             # unification half of 3.5, which needs a listening test.
+            # timed_stage (core.tool_logging): this span was UNATTRIBUTABLE.
+            # Measured 2026-08-12: 33.4s and 46.0s elapsed between "TTS _bg:
+            # thread started" and "Synthesized audio", while Piper synthesizes
+            # the SAME text standalone in 0.38s (RTF 0.045-0.089).  The only
+            # expensive candidate in the span was this normalization — which
+            # logged NOTHING on success and only DEBUG on failure, so ~45s of
+            # user-visible delay had no owner in the logs.  Both stages are now
+            # timed with the canonical latency_ms= key.
+            #
+            # use_llm is True here for chat_response (SOURCE_URGENCY says
+            # 'normal', and use_llm = urgency != 'instant'), so this stage can
+            # make an LLM round-trip on the SAME contended server that just
+            # served the reply.  budget: the docstring's "never let
+            # normalization block speech" promise is about crashes; the
+            # warn_over_ms below makes it also true of LATENCY, which is the
+            # failure mode that actually bit us.
             try:
+                from core.tool_logging import timed_stage
                 from integrations.channels.media.tts_router import SOURCE_URGENCY
                 from integrations.channels.media.tts_text_normalizer import (
                     normalize_for_tts,
                 )
                 _urgency = SOURCE_URGENCY.get('chat_response', 'normal')
-                _clean = normalize_for_tts(
-                    _clean, language, use_llm=(_urgency != 'instant'),
-                )
+                _use_llm = (_urgency != 'instant')
+                with timed_stage('tts.normalize', logger=app.logger,
+                                 warn_over_ms=1500, use_llm=_use_llm,
+                                 chars=len(_clean), lang=language):
+                    _clean = normalize_for_tts(
+                        _clean, language, use_llm=_use_llm,
+                    )
             except Exception as _ne:  # never let normalization block speech
                 app.logger.debug(f"TTS: normalization skipped ({_ne})")
 
-            _raw = synthesize_text(_clean, language=language)
+            from core.tool_logging import timed_stage as _timed_stage
+            with _timed_stage('tts.synthesize', logger=app.logger,
+                              warn_over_ms=3000, chars=len(_clean),
+                              lang=language):
+                _raw = synthesize_text(_clean, language=language)
             app.logger.info(f"TTS async: synthesize_text returned: {_raw}")
             # synthesize_text may return a file path string OR a JSON dict/string
             # with {"path": "...", "duration": ...}. Normalize to a file path.
