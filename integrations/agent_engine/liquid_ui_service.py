@@ -2679,16 +2679,30 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
         # CONTINUOUSLY running animation therefore forces a full software repaint
         # ~60x a second forever, whatever the compositor is doing. Measured on the
         # Samsung NP550P5C WITH hart-comp GPU-compositing and the iGPU fully engaged:
-        # the infinite animations alone cost 41% CPU (shell+WebKit 120% -> 79%) and
-        # held the package at 94C, which thermally throttled the CPU from 3.4GHz to
-        # ~1.7GHz. The box was slow because it was pretty.
+        # disabling ALL animation took shell+WebKit 120% -> 79% (the ceiling); the
+        # targeted rule below, which keeps state-driven motion, measured 126% -> 105%.
+        #
+        # What that buys is CLOCK, not a cooler chip. This chassis sat at 93-95C in
+        # EVERY state measured, animation on or off, so the package temperature is
+        # NOT attributable to the shell -- an earlier note here claimed the animations
+        # "held the package at 94C", and the measurements do not support that. What
+        # changes is what the CPU can deliver inside a fixed thermal envelope:
+        # 1197MHz -> 1596MHz with the rule below, and 1695MHz -> 2892MHz with all
+        # animation off. The box is thermally saturated either way; idle motion just
+        # spends the headroom repainting a desktop that is not changing.
         #
         # `webkit-flat` (flat_body_class, set right where blur_composites is decided)
         # ALREADY means exactly "the host is painting in software", so key off that --
         # no new mechanism, no second source of truth. Deliberately NOT is_potato:
-        # that keys off gpu_mode, the COMPOSITOR's verdict, so repairing the
-        # compositor's GPU path (as we did today) would switch these effects ON while
-        # the renderer that pays for them stays on cairo.
+        # that keys off gpu_mode, the COMPOSITOR's verdict (/run/hart/gpu-render,
+        # written by hart-gpu-probe before greetd), which on this box has read
+        # `hardware` since boot -- so is_potato is False and can NEVER shed these
+        # effects here, no matter what the compositor is doing. (An earlier note
+        # claimed repairing the compositor's GPU path "switched these effects on".
+        # It did not: the verdict was already `hardware` at 10:04, four minutes
+        # before the compositor's EGL was fixed at 10:08. The effects were on the
+        # whole time.) The renderer that actually pays for a frame is the GTK host,
+        # and it is on cairo. Ask the renderer that pays, not the one that does not.
         #
         # Two mechanisms, both existing:
         #  1. hartHome.css already gates its layers on --hart-motion-* custom
