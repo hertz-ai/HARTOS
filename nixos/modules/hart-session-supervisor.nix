@@ -1133,6 +1133,27 @@ in
     # fight) until a future logind-less topology needs it — dropping it here costs
     # nothing on this greetd+logind path.
     services.seatd.enable = lib.mkForce false;
+
+    # ── NEVER-BLACK REPAIR: every tier must reach the logind seat backend ────────
+    # REGRESSION THIS FIXES (real HW, 2026-08-12, caused by the seatd disable above):
+    # wlroots' libseat probes the SEATD backend FIRST and only falls back to logind.
+    # With seatd gone, both fallback tiers died instantly:
+    #   hart-tier-sway[...]: [wlr] [backend/session/session.c:248] Failed to load session backend
+    #   hart-tier-cage[...]:       [backend/session/session.c:248] Failed to load session backend
+    # hart-comp survived (greetd's command wrapper exports LIBSEAT_BACKEND=logind, and
+    # it is the only tier launched through that wrapper), so the ladder looked healthy
+    # right up until Tier-1 faltered -- and then sway AND cage both failed in under
+    # 40ms and the screen went BLACK. That is precisely the never-black invariant the
+    # supervisor exists to guarantee, broken by a fix that only covered Tier-1.
+    #
+    # Setting it as a GLOBAL environment variable (not just on greetd's command line)
+    # makes the logind backend the default for EVERY seat client on the machine --
+    # sway, cage, and anything a future tier adds -- so the ladder degrades instead of
+    # going dark. This is the SAME single value the greetd wrapper already exports; it
+    # is not a parallel seat path, it is the same decision applied one level up so no
+    # tier can miss it. (The wrapper's explicit export stays: belt and braces, and it
+    # keeps the Tier-1 contract legible at the point of use.)
+    environment.variables.LIBSEAT_BACKEND = "logind";
     # ── The selector USER must be able to PERSIST a tier drop (never-black guard) ──
     # greetd runs the selector as hart-admin (below). The latch dir /var/lib/hart is
     # 0770 hart:hart (group-writable, declared above), so the selector can WRITE the

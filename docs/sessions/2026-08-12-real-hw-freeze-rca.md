@@ -1,5 +1,29 @@
 # Real-hardware RCA: the "instant freeze with the mouse still moving"
 
+> **CORRECTION (same session, after the fact).** The chain below is **partly wrong** and is
+> kept only because the measurements in it are real. Two later findings contradict it:
+>
+> 1. **The unbounded capture is NOT slow.** Timed on the affected box:
+>    `journalctl -b --no-pager | head -c 5000000` completes in **1 second** (the `head`
+>    closes the pipe and journalctl exits early). So "it cannot finish inside
+>    TimeoutStartSec=90s" is not the mechanism. A `journalctl -b` at 99% CPU for 33s+ WAS
+>    observed under this unit, and killing it DID drop 94C -> 76C, but the reason that
+>    particular invocation was slow is unexplained -- most likely it was already being
+>    thermally throttled, or blocked writing to the slow USB target, which inverts the
+>    cause and effect asserted below.
+> 2. **The machine returned to 94C with that timer still stopped**, so `hart-journal-export`
+>    is not the sole heat source. `WebKitWebProcess` was separately observed at **98.3% CPU**
+>    and is the better suspect.
+>
+> `b67480f` (tail-bound + `Nice=19`/idle scheduling) is still worth keeping as hygiene -- a
+> background diagnostic must never out-prioritise the desktop -- but it should NOT be cited
+> as the root cause. **The freeze is not solved.**
+>
+> What DOES stand on its own evidence: the seatd conflict (`211a6a1`) and the DRM-master
+> denial (`15411db`, confirmed by `acquired DRM master via drmSetMaster` plus real page-flip
+> vblanks). With DRM master held, every page-flip lands instead of returning EACCES into a
+> retry loop, and orb-hover stopped freezing the live machine.
+
 **Date:** 2026-08-12
 **Hardware:** Samsung NP550P5C-S05IN (550P5C/550P7C), i7-3630QM, Intel HD 4000, booting
 HART OS 1.0.0 from a USB2 stick.
