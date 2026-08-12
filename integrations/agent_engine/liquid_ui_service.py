@@ -1124,9 +1124,22 @@ class LiquidUIService:
         # overlay on top of AbstractChatActivity.
         try:
             from core.platform.events import emit_event
+            # Stamp the owning user so the P3a SSE guard ROUTES this push rather
+            # than refusing it.  Measured 2026-08-12: 38 refusals in two hours,
+            # which is every A2UI overlay push silently dropped.  Unlike
+            # agent.action.completed this emit stamped NOTHING at all.  None ->
+            # still refused, exactly as before: no leak, no regression.
+            # Import is local + guarded so an import problem degrades the
+            # user_id to None instead of killing the push entirely.
+            try:
+                from core.event_attribution import owner_user_id
+                _owner = owner_user_id()
+            except Exception:
+                _owner = None
             emit_event('agent.ui.update', {
                 'agent_id': agent_id,
                 'component': component,
+                'user_id': _owner,
             })
         except Exception:
             logger.exception("agent_ui_update: swallowed Exception")  # EventBus emission is best-effort
