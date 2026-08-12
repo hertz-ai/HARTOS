@@ -287,10 +287,24 @@ rather than dropping the entry (`dc26fd9`). What is genuinely still open:
 
 ### Claimed but NOT verified end-to-end (do not quote these as proven)
 
-* **Numpad typing digits.** `XKB_DEFAULT_OPTIONS=numpad:mac` is confirmed in hart-comp's
-  `/proc/PID/environ`, and `xkbcli compile-keymap` confirms the option flips the keypad key type
-  (`modifiers= Shift+NumLock; map[NumLock]=2` -> `modifiers= none; map[none]=2`). **Nobody has
-  pressed a numpad key.**
+* **Numpad typing digits — the env-only fix was WRONG and is now known broken.** Reported from
+  the hardware: the keypad still typed direction keys. Root cause: `XkbConfig::default()` looks
+  like it defers to libxkbcommon's environment defaults and does not. libxkbcommon fills a field
+  from `XKB_DEFAULT_*` only when the pointer is NULL, and the Rust binding turns `options: None`
+  into an empty **CString** — non-NULL — so the environment is never consulted. The variable sits
+  in `/proc/PID/environ` and is discarded silently.
+  Proof, taken from the keymap hart-comp was actually serving clients (read out of its
+  `/memfd:smithay-keymap` fd, which is the check to use for anything keyboard-related):
+  ```
+  served keymap :  type "KEYPAD" { modifiers= Shift+NumLock; map[NumLock]= 2; }   <- stock
+  --options ''  :  modifiers= Shift+NumLock    (environment ignored)
+  no --options  :  modifiers= none             (environment applied)
+  ```
+  Setting `XKB_DEFAULT_RULES` to a custom ruleset changed nothing either, so it is not specific to
+  the options field. Fixed properly in `58acd09` by reading `XKB_DEFAULT_*` explicitly
+  (`compositor/src/shared.rs::XkbEnv`). **That is a Rust change, never compiled here** — it needs
+  a CI build and then a human pressing a numpad key. Do not record the numpad as fixed until both
+  have happened.
 * **`security.wrappers.hart-comp`** (`/run/wrappers/bin/hart-comp`, commit `15411db`). Everything
   proven on hardware used a `mount --bind` of a `setcap`'d copy over the store path; the running
   image predates the wrapper and its launcher execs the store path directly. The wrapper route has
