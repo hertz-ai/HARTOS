@@ -219,20 +219,49 @@ class TestSeoSeedGoal:
         assert cfg['min_seo_score'] == 90
         assert cfg['requires_consent'] is True
 
-    def test_disabled_by_default(self):
-        """Seeded dormant: enabled=False, and the prompt builder must
-        decline the seed config as-is (daemon skips dispatch) until a
-        human arms it."""
+    def test_armed_and_the_builder_accepts_the_seed_as_shipped(self):
+        """Armed 2026-08-12 (was seeded dormant).
+
+        The news curation agents were flagging items with mark_news_for_web
+        and nothing consumed them: _build_seo_prompt returns None while
+        enabled is false, so the daemon skipped the goal and the
+        news -> hevolve.ai path was dead at the last hop. `last_dispatched_at`
+        was NULL.
+
+        What makes arming safe is unchanged and asserted elsewhere in this
+        file: every publish is a gh_pr_open pull request, so a human merge is
+        still the only route to a live page.
+        """
         from integrations.agent_engine.goal_manager import get_prompt_builder
         goal = self._get_goal()
-        assert goal['config'].get('enabled') is False
+        assert goal['config'].get('enabled') is True
         builder = get_prompt_builder('seo')
         prompt = builder({
             'title': goal['title'],
             'description': goal['description'],
             'config': goal['config'],
         })
-        assert prompt is None
+        # The seed config as shipped must now BUILD — the previous assertion
+        # here was `is None`, which is exactly what dormant meant.
+        assert prompt is not None
+        assert 'gh_pr_open' in prompt
+
+    def test_description_requires_agent_authorship_disclosure(self):
+        """Published pages must say an agent wrote them.
+
+        This goal publishes to a public website. Arming it without a
+        disclosure requirement would ship agent-written pages that read as
+        hand-written, which is a thing we do not do — so the requirement
+        rides in the same description the LLM uses as its playbook, and is
+        pinned here so a later description edit cannot quietly drop it.
+        """
+        desc = self._get_goal()['description'].lower()
+        assert 'disclose authorship' in desc
+        assert 'agent' in desc
+        # The reviewer has to see it before merging, not just the page.
+        assert 'pr description' in desc
+        # And the negative form — never pass agent copy off as a person's.
+        assert 'never present' in desc
 
     def test_description_names_canonical_tools_verbatim(self):
         """The LLM uses the description as its playbook — the tool

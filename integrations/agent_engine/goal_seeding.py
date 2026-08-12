@@ -449,7 +449,14 @@ SEED_BOOTSTRAP_GOALS = [
             're-score — queue REWORK, never publish a failing draft, '
             '5) NEVER push directly — every publish is a pull request and the '
             'human merge IS the consent gate; never auto-publish externally '
-            'without operator approval. '
+            'without operator approval, '
+            '6) DISCLOSE AUTHORSHIP on every page you publish: the registry '
+            'entry carries an explicit agent byline (e.g. author "Hevolve AI '
+            'agent") and the page states that it was written by an automated '
+            'agent and reviewed by a human before merge. Never present '
+            'agent-written copy as a named person\'s work, and never omit the '
+            'label to make it read as hand-written. The PR description must '
+            'say the same, so the reviewer sees it before merging. '
             'Aggregator etiquette: headline + snippet + attribution + link '
             'out to the original source; no full-article republication.'
         ),
@@ -457,10 +464,17 @@ SEED_BOOTSTRAP_GOALS = [
             'repo': 'hertz-ai/Hevolve',
             'base_branch': 'main',
             'min_seo_score': 90,
-            # Disabled by default: _build_seo_prompt returns None (daemon
-            # skips dispatch) until the operator flips enabled=True — the
-            # same config-gate pattern as the autoresearch goal type.
-            'enabled': False,
+            # Enabled 2026-08-12. This is the news -> hevolve.ai path: the
+            # news curation agents flag items with mark_news_for_web and
+            # nothing consumed them, because _build_seo_prompt returns None
+            # while enabled is false. Until b860cbed a seed flip could not
+            # reach an already-seeded row at all, so switching it here was
+            # inert — see that commit.
+            #
+            # Safe to arm: every publish is a gh_pr_open pull request, so the
+            # human merge remains the only path to a live page, and step 6
+            # requires the page to say an agent wrote it.
+            'enabled': True,
             'requires_consent': True,
             'continuous': True,
         },
