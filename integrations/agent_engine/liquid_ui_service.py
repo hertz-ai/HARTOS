@@ -31,6 +31,7 @@ import copy
 import json
 import logging
 import os
+from core.subprocess_safe import no_window_kwargs
 import re
 import subprocess
 import threading
@@ -184,7 +185,7 @@ def read_shell_render_mode() -> str:
 def _vol_run(cmd, timeout=4):
     try:
         return subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout)
+                              timeout=timeout, **no_window_kwargs())
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
 
@@ -268,7 +269,7 @@ class _ConnectivityCache:
             return None
         try:
             return subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=self.PROBE_TIMEOUT_S)
+                                  timeout=self.PROBE_TIMEOUT_S, **no_window_kwargs())
         except FileNotFoundError:
             self._absent.add(tool)
             return None

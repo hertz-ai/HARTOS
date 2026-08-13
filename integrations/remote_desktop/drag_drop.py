@@ -15,6 +15,7 @@ HARTOS transport fallback.
 
 import logging
 import os
+from core.subprocess_safe import no_window_kwargs
 import platform
 import subprocess
 import threading
@@ -321,7 +322,7 @@ class DragDropBridge:
         system = platform.system()
         try:
             if system == 'Windows':
-                subprocess.Popen(['explorer', path])
+                subprocess.Popen(['explorer', path], **no_window_kwargs())
             elif system == 'Darwin':
                 subprocess.Popen(['open', path])
             elif system == 'Linux':

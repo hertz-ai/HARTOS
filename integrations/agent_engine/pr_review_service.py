@@ -14,6 +14,7 @@ Decision Matrix:
 import json
 import logging
 import os
+from core.subprocess_safe import no_window_kwargs
 import subprocess
 from typing import Dict, List, Optional
 
@@ -108,7 +109,7 @@ class PRReviewService:
                  '{files_changed: .changed_files, '
                  'additions: .additions, '
                  'deletions: .deletions}'],
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=30, **no_window_kwargs())
 
             if result.returncode == 0:
                 return json.loads(result.stdout)
@@ -127,7 +128,7 @@ class PRReviewService:
         try:
             result = subprocess.run(
                 ['ruff', 'check', repo_path, '--select', 'E,W,F'],
-                capture_output=True, text=True, timeout=120)
+                capture_output=True, text=True, timeout=120, **no_window_kwargs())
             if result.returncode != 0:
                 issues.append({
                     'tool': 'ruff',
@@ -153,7 +154,7 @@ class PRReviewService:
                 [python, '-m', 'pytest', 'tests/', '-v', '-s',
                  '--tb=short', '-q'],
                 capture_output=True, text=True, timeout=600,
-                cwd=repo_path)
+                cwd=repo_path, **no_window_kwargs())
 
             # Parse pytest output
             output = result.stdout + result.stderr
@@ -331,6 +332,6 @@ class PRReviewService:
                  f'repos/{owner}/{repo}/pulls/{pr_number}/reviews',
                  '-f', f'event={event}',
                  '-f', f'body={body}'],
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=30, **no_window_kwargs())
         except Exception as e:
             logger.debug(f"Post review failed: {e}")

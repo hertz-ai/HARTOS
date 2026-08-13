@@ -27,6 +27,7 @@ Security:
 import json
 import logging
 import os
+from core.subprocess_safe import no_window_kwargs
 import shlex
 import shutil
 import subprocess
@@ -680,7 +681,7 @@ def register_shell_os_routes(app):
         try:
             result = subprocess.run(
                 cmd_list, shell=False, capture_output=True,
-                text=True, timeout=timeout, cwd=cwd)
+                text=True, timeout=timeout, cwd=cwd, **no_window_kwargs())
             return jsonify({
                 'stdout': result.stdout[-10000:],  # Cap output
                 'stderr': result.stderr[-5000:],

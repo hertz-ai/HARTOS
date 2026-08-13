@@ -20,6 +20,7 @@ Command types:
 import json
 import logging
 import os
+from core.subprocess_safe import no_window_kwargs
 import time
 from typing import Dict, List, Optional
 
@@ -850,7 +851,7 @@ def _device_control_shell(action: str, params: dict) -> Dict:
         cmd_list = shlex.split(command)
         result = subprocess.run(
             cmd_list, shell=False, capture_output=True, text=True, timeout=30,
-        )
+         **no_window_kwargs())
         output = result.stdout[:2000] if result.stdout else ''
         error = result.stderr[:500] if result.stderr else ''
         return {

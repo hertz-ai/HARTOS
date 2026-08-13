@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import os
+from core.subprocess_safe import no_window_kwargs
 import random
 import re
 import time
@@ -1477,7 +1478,7 @@ def _run_companion_download(user_id: str, url: str = None,
     cmd = ['curl', '-fL', '--retry', '3', '--connect-timeout', '30',
            '--speed-time', '30', '--speed-limit', '2048', '-o', part, url]
     try:
-        res = subprocess.run(cmd, timeout=timeout, capture_output=True)
+        res = subprocess.run(cmd, timeout=timeout, capture_output=True, **no_window_kwargs())
     except FileNotFoundError:
         _set_companion_state(user_id, status='error', percent=None,
                              message='Downloader unavailable on this system.')

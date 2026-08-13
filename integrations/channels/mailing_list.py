@@ -37,6 +37,7 @@ import logging
 import re
 import socket
 import subprocess
+from core.subprocess_safe import no_window_kwargs
 from typing import Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger('hevolve_channels')
@@ -174,7 +175,7 @@ def domain_has_mx(domain: str, timeout: int = 5) -> bool:
                     ['host', '-t', 'MX', domain]):
             try:
                 out = subprocess.run(cmd, capture_output=True, text=True,
-                                     timeout=timeout).stdout.lower()
+                                     timeout=timeout, **no_window_kwargs()).stdout.lower()
                 if 'mail exchanger' in out or 'handled by' in out:
                     ok = True
                     break

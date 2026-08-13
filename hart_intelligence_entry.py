@@ -1,5 +1,6 @@
 # Fix Windows encoding for non-ASCII characters (Telugu, emojis, etc.)
 import sys
+from core.subprocess_safe import no_window_kwargs
 import io
 if sys.platform == 'win32' and 'pytest' not in sys.modules:
     # Force UTF-8 encoding for stdout/stderr to prevent crashes with non-ASCII characters
@@ -3069,7 +3070,7 @@ def _handle_shell_command_tool(input_text: str) -> str:
             # Do NOT pass shell=True — argv already routes through the
             # chosen shell and shell=True would double-parse the string.
             shell=False,
-        )
+         **no_window_kwargs())
     except subprocess.TimeoutExpired:
         return (
             "Shell_Command timed out after 30s. For long-running work use "

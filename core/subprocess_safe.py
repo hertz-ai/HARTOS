@@ -106,6 +106,34 @@ class BoundedResult:
         self.timed_out = timed_out
 
 
+def no_window_kwargs() -> dict:
+    """Popen/run kwargs that stop Windows painting a console window.
+
+    THE ONE SOURCE for these flags in HARTOS.  `run_bounded` uses it, and so
+    must every direct `subprocess.run/Popen` that can execute on Windows.
+
+    Returns ``{}`` off win32, so `**no_window_kwargs()` is safe to splat at any
+    call site on any platform — callers never need a `sys.platform` branch.
+
+    WHY IT MATTERS HERE.  HARTOS is imported IN-PROCESS by Nunba.exe, which is
+    a GUI-subsystem binary owning no console.  Spawning a console-subsystem
+    child from such a parent without CREATE_NO_WINDOW makes Windows allocate a
+    fresh, VISIBLE console for the child's lifetime — the "brief cmd windows"
+    users report.  Measured 2026-08-13: visible top-level ConsoleWindowClass
+    windows go 1 -> 2 without the flag and stay at 1 with it.
+
+    conhost.exe appearing in the process tree proves NOTHING either way: a
+    CREATE_NO_WINDOW child still gets a conhost, just a headless one.  Judge by
+    window visibility, not by conhost's existence.
+    """
+    if sys.platform != "win32":
+        return {}
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0  # SW_HIDE
+    return {"startupinfo": si, "creationflags": subprocess.CREATE_NO_WINDOW}
+
+
 def run_bounded(
     cmd: Sequence[str],
     timeout: float = 5.0,
@@ -145,12 +173,7 @@ def run_bounded(
         "stdin": subprocess.DEVNULL,
         "text": True,
     }
-    if sys.platform == "win32":
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = 0
-        popen_kwargs_base["startupinfo"] = si
-        popen_kwargs_base["creationflags"] = subprocess.CREATE_NO_WINDOW
+    popen_kwargs_base.update(no_window_kwargs())
 
     # Caller overrides win over the defaults (cwd/env/stdin), but they
     # cannot silently drop the piping this function's contract depends on.
