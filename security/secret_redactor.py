@@ -94,16 +94,30 @@ _add('mailgun_key', r'\bkey-[A-Za-z0-9]{32}\b')
 # node_id / request_id / trace_id. Anchoring on the UUID shape ALONE redacted
 # every UUID in the logs and destroyed the "which node failed" diagnostic
 # (regression pinned by tests/unit/test_sync_failures_are_never_silent.py). A
-# UUID that is genuinely a secret (token=<uuid>, Authorization: <uuid>) is
-# already caught by `bearer_token` above, and identifier UUIDs are SHA-256'd in
-# Layer 2 — so here we anchor on a heroku context and leave a bare identifier
-# UUID visible.
+# UUID that is genuinely a secret is caught by context: `bearer_token` above
+# (token=/authorization=<uuid>) and `secret_assignment` above (api_key=/secret=
+# <uuid>). A bare UUID with NO secret-ish key in front is treated as an
+# identifier and left visible — that is the deliberate trade, and it is safe
+# ONLY because the secret_assignment/bearer_token context patterns cover the
+# cases where a UUID actually is a credential.
 _add('heroku_key',
      r'heroku[A-Za-z0-9_]*[\s:="\']+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})')
 
 # ── Generic bearer/auth tokens ──
 _add('bearer_token',
      r'(?:bearer|authorization|token|auth)[\s:=]+["\']?([A-Za-z0-9._~+/=-]{32,})["\']?')
+
+# ── Generic secret-assignment catch-all ──
+# The vendor patterns above each need a recognisable prefix or a 32+ char body,
+# so a short/odd-shaped value after a secret keyword (api_key=abcd, secret=hunter2,
+# token=shortvalue, api_key=<uuid>) would otherwise reach the audit log in clear
+# text — the exact gap the old audit_log.py catch-all covered before it was
+# collapsed onto this module (review feedback). Match ANY non-empty value after a
+# secret-ish key so nothing short or unrecognised slips through. In an audit log,
+# over-redaction is the safe failure.
+_add('secret_assignment',
+     r'\b(?:api[_-]?key|apikey|secret|token|auth[_-]?token|access[_-]?key)'
+     r'\s*[=:]\s*["\']?([^\s"\',;}]+)')
 
 # ── Passwords ──
 _add('password_assignment',
