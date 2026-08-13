@@ -482,5 +482,169 @@ class TestIdentityUnification(unittest.TestCase):
         self.assertEqual(parts[2], result['name'])
 
 
+
+# ═══════════════════════════════════════════════════════════════
+# seal_name persistence + idempotent repair
+# ═══════════════════════════════════════════════════════════════
+# These use a REAL in-memory SQLAlchemy session on purpose.  The defect
+# guarded here is SQLAlchemy's identity-based change detection:
+# `settings = user.settings or {}` hands back the ORM's OWN dict whenever
+# settings is non-empty, so mutating it and assigning it back is a no-op
+# and `settings['hart']` is silently dropped -- while the scalar
+# `user.handle = clean` on the neighbouring line persists fine.  A
+# hand-rolled fake session would happily "persist" both and the test
+# would pass against the broken code, proving nothing.
+#
+# Live evidence that motivated this (2026-08-13): a guest row showed
+# handle=None, settings={} after a completed ceremony, and
+# /api/hart/check returned has_hart:false forever.
+
+from contextlib import contextmanager  # noqa: E402
+
+try:
+    from sqlalchemy import Column, JSON, String, create_engine
+    from sqlalchemy.orm import sessionmaker
+    try:
+        from sqlalchemy.orm import declarative_base
+    except ImportError:  # SQLAlchemy 1.3
+        from sqlalchemy.ext.declarative import declarative_base
+    _HAVE_SQLA = True
+except ImportError:  # pragma: no cover
+    _HAVE_SQLA = False
+
+
+@unittest.skipUnless(_HAVE_SQLA, "SQLAlchemy required")
+class TestSealNamePersistence(unittest.TestCase):
+    """seal_name must persist BOTH handle AND settings['hart']."""
+
+    def setUp(self):
+        Base = declarative_base()
+
+        class _User(Base):
+            __tablename__ = 'users'
+            id = Column(String(64), primary_key=True)
+            username = Column(String(64))
+            handle = Column(String(64), unique=True)
+            display_name = Column(String(64))
+            settings = Column(JSON, default=dict)
+
+        self.User = _User
+        engine = create_engine('sqlite://')
+        Base.metadata.create_all(engine)
+        self.Session = sessionmaker(bind=engine)
+
+        _Session = self.Session
+
+        @contextmanager
+        def _db_session(commit=True):
+            s = _Session()
+            try:
+                yield s
+                if commit:
+                    s.commit()
+            except Exception:
+                s.rollback()
+                raise
+            finally:
+                s.close()
+
+        fake = MagicMock()
+        fake.db_session = _db_session
+        fake.User = _User
+        self._patcher = patch.dict(
+            sys.modules, {'integrations.social.models': fake})
+        self._patcher.start()
+        self.addCleanup(self._patcher.stop)
+
+        # Cloud uniqueness check does network I/O -- always available here.
+        self._cloud = patch.object(
+            HARTNameRegistry, '_check_cloud_available', return_value=True)
+        self._cloud.start()
+        self.addCleanup(self._cloud.stop)
+
+    def _add_user(self, uid='u1', settings=None, handle=None):
+        s = self.Session()
+        s.add(self.User(id=uid, username='guest_x', handle=handle,
+                        settings=settings if settings is not None else {}))
+        s.commit()
+        s.close()
+
+    def _row(self, uid='u1'):
+        s = self.Session()
+        try:
+            return s.query(self.User).filter_by(id=uid).first()
+        finally:
+            s.close()
+
+    @staticmethod
+    def _seal(uid, name, dims=None):
+        """Call seal_name the way the route does (chatbot_routes.py:4330)
+        -- all keywords, so a signature change surfaces here too."""
+        return HARTNameRegistry.seal_name(
+            user_id=uid, name=name, dimensions=dims or {},
+            emoji_combo='', language='en', locale='en_US',
+            passion_key='', escape_key='')
+
+    def test_seal_persists_handle(self):
+        self._add_user()
+        self.assertTrue(self._seal('u1', 'kalvaris'))
+        self.assertEqual(self._row().handle, 'kalvaris')
+
+    def test_seal_persists_hart_bucket_on_empty_settings(self):
+        self._add_user(settings={})
+        self.assertTrue(self._seal('u1', 'kalvaris'))
+        st = self._row().settings or {}
+        self.assertTrue(st.get('hart', {}).get('sealed') is True,
+                        f"hart bucket missing/unsealed: {st!r}")
+
+    def test_seal_persists_hart_bucket_when_settings_already_populated(self):
+        """THE regression: a user with prior settings (e.g. a theme) loses
+        the hart bucket because the dict is mutated in place."""
+        self._add_user(settings={'theme': 'dark'})
+        self.assertTrue(self._seal('u1', 'kalvaris'))
+        st = self._row().settings or {}
+        self.assertEqual(st.get('theme'), 'dark', "clobbered unrelated keys")
+        self.assertTrue(st.get('hart', {}).get('sealed') is True,
+                        f"hart bucket dropped by in-place mutation: {st!r}")
+
+    def test_has_hart_name_true_after_seal(self):
+        """End-to-end: the reader that gates onboarding must agree."""
+        self._add_user(settings={'theme': 'dark'})
+        self.assertTrue(self._seal('u1', 'kalvaris'))
+        self.assertTrue(has_hart_name('u1'))
+
+    def test_reseal_same_name_repairs_missing_bucket(self):
+        """Field-repair path: rows already corrupted by the bug have
+        handle set but no bucket.  Re-sealing the SAME name must heal
+        them, not 409 forever."""
+        self._add_user(handle='kalvaris', settings={'theme': 'dark'})
+        self.assertTrue(self._seal('u1', 'kalvaris'))
+        self.assertTrue(has_hart_name('u1'))
+
+    def test_reseal_same_name_does_not_rewrite_sealed_bucket(self):
+        """Permanence (docstring: 'Once sealed, it cannot be changed').
+        A second seal of the same name reports success WITHOUT mutating
+        the recorded dimensions/sealed_at."""
+        self._add_user()
+        self.assertTrue(self._seal('u1', 'kalvaris', {'creative': 0.9}))
+        first = dict(self._row().settings['hart'])
+        self.assertTrue(self._seal('u1', 'kalvaris', {'builder': 0.1}))
+        after = self._row().settings['hart']
+        self.assertEqual(first.get('sealed_at'), after.get('sealed_at'),
+                         "sealed_at rewritten -- permanence broken")
+        self.assertEqual(first.get('dimensions'), after.get('dimensions'),
+                         "dimensions rewritten -- permanence broken")
+
+    def test_different_name_when_already_sealed_is_rejected(self):
+        """The permanence guard stays: a DIFFERENT name is refused."""
+        self._add_user(handle='kalvaris')
+        self.assertFalse(self._seal('u1', 'othername'))
+        self.assertEqual(self._row().handle, 'kalvaris')
+
+    def test_missing_user_is_rejected(self):
+        self.assertFalse(self._seal('nope', 'kalvaris'))
+
+
+
 if __name__ == '__main__':
     unittest.main()
