@@ -12262,7 +12262,13 @@ def _serve_app(app, host: str, port: int) -> None:
         config.accesslog = None             # HARTOS emits its own access log
         config.errorlog = '-'
 
-        asgi_app = AsyncioWSGIMiddleware(app)
+        # AsyncioWSGIMiddleware is WSGI and cannot see a websocket scope, which
+        # is why ws://<this node>/peer_link 404s and why PeerLink.accept() has
+        # never once been called on any node.  peer_link_asgi serves exactly
+        # that one path and passes every other scope straight through, so the
+        # HTTP surface is unchanged.  See core/peer_link/server.py.
+        from core.peer_link.server import peer_link_asgi
+        asgi_app = peer_link_asgi(AsyncioWSGIMiddleware(app))
 
         async def _runner():
             loop = asyncio.get_running_loop()

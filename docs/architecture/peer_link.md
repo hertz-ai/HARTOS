@@ -244,6 +244,7 @@ core/peer_link/
 ├── __init__.py        # Exports: PeerLink, TrustLevel, get_link_manager, get_message_bus
 ├── link.py            # PeerLink: persistent WebSocket, trust-aware encryption
 ├── link_manager.py    # Manages all peer connections, auto-upgrade, HTTP fallback
+├── server.py          # Serves inbound /peer_link on the backend port (the ANSWER half)
 ├── channels.py        # Channel definitions, data classification, dispatch
 ├── nat.py             # NAT traversal orchestration
 ├── telemetry.py       # Crossbar telemetry + safety (kill switch delivery)
