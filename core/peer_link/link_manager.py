@@ -420,6 +420,11 @@ class PeerLinkManager:
             peers = gossip.get_peer_list()
             peer_info = next((p for p in peers if p.get('node_id') == peer_id), None)
             if not peer_info:
+                logger.info(
+                    "PeerLink upgrade for %s ABORTED: node_id not present in "
+                    "the gossip peer list (%d peers known). record_http_exchange "
+                    "fired for a peer gossip cannot resolve.",
+                    peer_id[:8], len(peers))
                 return
 
             # Resolve through NAT traversal, not by string-stripping the URL.
@@ -473,6 +478,17 @@ class PeerLinkManager:
                 address = (peer_info.get('url', '')
                            .replace('http://', '').replace('https://', '').rstrip('/'))
             if not address:
+                # Was a bare `return`. Every exit from this function was silent,
+                # so a hive that never formed looked identical to one that was
+                # never asked to: three machines discovered each other on the
+                # LAN, gossip knew all four peers, and connected_nodes stayed 0
+                # with nothing anywhere saying why. Six separate theories were
+                # eliminated by hand before this line could have answered it.
+                logger.info(
+                    "PeerLink upgrade for %s ABORTED: no dialable address "
+                    "(NAT traversal returned nothing and advertised url=%r). "
+                    "A peer advertising loopback is undialable from here.",
+                    peer_id[:8], peer_info.get('url', ''))
                 return
 
             # Determine trust level based on user identity, not network
@@ -501,6 +517,12 @@ class PeerLinkManager:
                 except Exception:
                     pass
 
+            # The success path logs too. "Attempted and failed to connect" and
+            # "never attempted" produced identical silence before this, which is
+            # why connected_nodes=0 was unattributable.
+            logger.info(
+                "PeerLink upgrade for %s ATTEMPTING: address=%s trust=%s",
+                peer_id[:8], address, getattr(trust, 'name', trust))
             self.upgrade_peer(
                 peer_id=peer_id,
                 address=address,
