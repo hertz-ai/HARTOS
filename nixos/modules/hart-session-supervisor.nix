@@ -1216,13 +1216,18 @@ in
     # entirely through the logind libseat backend (LIBSEAT_BACKEND=logind, forced on
     # the greetd session below) plus hart-base.nix's direct video/render/input group
     # membership — the `seat` group was only ever needed for the seatd path.
-    # "seat": seatd brokers /dev/dri and /dev/input. Without membership the
-    # compositor's seat open depends entirely on the logind path, and this node
-    # has already shown that path is fragile: five leaked greeter sessions stuck
-    # in state=closing on tty7, and no class=user session there at all. Group
-    # membership is the belt to logind's braces, and it is what
-    # TestSeatDrmBringUp::test_hart_admin_in_seat_group asserts.
-    users.users.hart-admin.extraGroups = [ "hart" "seat" ];
+    # DO NOT ADD "seat" HERE. It was added 2026-08-13 to satisfy
+    # TestSeatDrmBringUp::test_hart_admin_in_seat_group, directly against the
+    # comment above, and it BRICKED THE FLASHED IMAGE: with seatd force-disabled
+    # the `seat` group does not exist, the users activation script fails, and
+    # activation runs inside `init` -- so init exits 1 and stage 2 dies with
+    #     Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000100
+    #     CPU: 5 UID: 0 PID: 1 Comm: switch_root
+    # after stage 1 had already found, fsck'd and mounted root perfectly. The
+    # build is green either way: nothing statically checks that a group named in
+    # extraGroups exists. If that CI test wants `seat`, the test is wrong for this
+    # configuration -- fix the test, not this list.
+    users.users.hart-admin.extraGroups = [ "hart" ];
 
     # ── Plymouth / fbcon must RELEASE DRM master before the compositor claims it ──
     # The boot splash (boot.plymouth, desktop.nix) holds DRM master on card0; if it

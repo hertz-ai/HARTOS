@@ -2360,18 +2360,32 @@ class TestSeatDrmBringUp:
         tier prefers the seatd daemon over the logind probe (one wrapper, DRY)."""
         assert "LIBSEAT_BACKEND=seatd" in self.sup
 
-    def test_hart_admin_in_seat_group(self):
-        """seatd brokers /dev/dri + /dev/input only to seat-group members — the
-        supervisor adds hart-admin to `seat` (the group exists only once seatd is
-        enabled, so it is added HERE, not in hart-base). The `seat` entry may share
-        the extraGroups line with the `hart` latch-write group, so assert the seat
-        MEMBERSHIP (regex + membership, same robust pattern as the video/render/input
-        sibling below), not a brittle exact-list string."""
-        m = re.search(r"users\.users\.hart-admin\.extraGroups\s*=\s*\[(.*?)\];",
-                      self.sup, re.S)
-        assert m, "hart-admin extraGroups not set in the session supervisor"
-        assert '"seat"' in m.group(1), \
-            "hart-admin not added to the seat group (seatd brokers /dev/dri + /dev/input)"
+    def test_hart_admin_not_in_seat_group(self):
+        """hart-admin must NOT be in the `seat` group on this configuration.
+
+        Inverted 2026-08-13 after it bricked a flashed image. This config sets
+        `services.seatd.enable = lib.mkForce false`, so the `seat` group is never
+        created. A user whose extraGroups names a nonexistent group makes the
+        users activation script fail -- and activation runs inside `init`, so
+        init exits 1 and stage 2 dies:
+
+            EXT4-fs (sdc2): mounted filesystem ... r/w     <- stage 1 was FINE
+            Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000100
+            CPU: 5 UID: 0 PID: 1 Comm: switch_root
+
+        The build stays green either way: nothing statically verifies that a group
+        named in extraGroups exists. That is precisely why this needs a test.
+        DRM/input access flows through the logind libseat backend plus
+        hart-base.nix's video/render/input membership, not through seatd.
+        """
+        m = re.search(r"users\.users\.hart-admin\.extraGroups\s*=\s*\[([^\]]*)\]",
+                      self.sup)
+        assert m, "hart-admin.extraGroups assignment not found"
+        assert '"seat"' not in m.group(1), (
+            "hart-admin.extraGroups names `seat`, but services.seatd.enable is "
+            "mkForce false so that group does not exist. This fails users "
+            "activation inside init and panics stage 2 at switch_root.")
+
 
     def test_hart_admin_has_video_render_input_groups(self):
         """hart-base puts hart-admin in video (KMS /dev/dri/card*), render (GPU
