@@ -16,9 +16,23 @@ It proves, in order:
   5. the SERVER holds a live link            -> accept_inbound registered it
   6. a message crosses and reaches a channel handler on the far side
 
-Steps 4 and 5 are the ones that mattered: `PeerLinkManager._links` was empty on
-every node in the fleet, and skill broadcast, the distributed coder and shard
-fan-out all read that dict.
+and then, calling the production functions rather than re-implementing them:
+
+  7. `hive_benchmark_prover._discover_nodes()` returns the peer  -> shard
+     fan-out stops running single-node
+  8. `broadcast('dispatch', peer_announce)` — the exact call
+     `claude_hive_session._register_peer_link` makes — reaches 1 peer and
+     lands in a handler there
+
+`PeerLinkManager._links` was empty on every node in the fleet, and every one of
+those readers read that dict.
+
+Skill broadcast is NOT covered here and is not fixed by this. Its leg
+(`message_bus._route_peerlink`) filters on TrustLevel.SAME_USER, and SAME_USER
+cannot currently be granted to anyone: nothing writes the `user_id_proof` the
+handshake reads, and `_verify_same_user_proof` imports a
+`verify_message_signature` that does not exist in security/node_integrity.py,
+so it fails closed. Two independent breaks, both still open.
 
 Run:  python tests/standalone/peer_link_proof.py
 Exit code 0 = proven, 1 = not.
@@ -60,9 +74,13 @@ def serve(port: int) -> None:
     manager.start()
     # Registered BEFORE any peer connects, so accept_inbound's
     # _apply_channel_handlers has something to attach.
-    manager.register_channel_handler(
-        'gossip', lambda ch, data, peer: received.append({'ch': ch, 'd': data,
-                                                          'peer': peer}))
+    def record(ch, data, peer):
+        received.append({'ch': ch, 'd': data, 'peer': peer})
+
+    manager.register_channel_handler('gossip', record)
+    # 'dispatch' is the channel claude_hive_session announces the distributed
+    # coder on (_register_peer_link -> broadcast('dispatch', peer_announce)).
+    manager.register_channel_handler('dispatch', record)
 
     app = Flask('peer_link_proof_node')
 
@@ -208,6 +226,47 @@ def drive() -> int:
                             'server — the receive loop is not reading')
         elif got[0]['d'].get('proof') != 'hello-from-client':
             failures.append(f'payload corrupted in transit: {got[0]}')
+
+        # --- The subsystems that read this dict ------------------------
+        # Not a re-implementation: these are the production functions, called
+        # on the live link.
+
+        # Shard fan-out. _discover_nodes' first source is
+        # get_status()['links'] filtered on state == 'connected'. It returned
+        # [] on every node, so num_nodes = max(1, 0) and every "hive" benchmark
+        # ran on one machine.
+        from integrations.agent_engine.hive_benchmark_prover import (
+            get_benchmark_prover)
+        discovered = get_benchmark_prover()._discover_nodes()
+        peer_link_nodes = [n for n in discovered if n.get('type') == 'peer_link']
+        print(f'[6] prover._discover_nodes -> {len(discovered)} node(s), '
+              f'{len(peer_link_nodes)} via peer_link: {peer_link_nodes}')
+        if not peer_link_nodes:
+            failures.append('_discover_nodes still sees no peer_link node — '
+                            'shard fan-out would run single-node')
+
+        # Distributed coder. claude_hive_session._register_peer_link announces
+        # itself with exactly this call; it returned 0 sent, so no peer ever
+        # learned a coding agent existed.
+        announced = manager.broadcast('dispatch', {
+            'type': 'peer_announce',
+            'peer_type': 'coding_agent',
+            'capabilities': ['python'],
+        })
+        print(f'[7] broadcast(dispatch, peer_announce) -> {announced} peer(s)')
+        if announced < 1:
+            failures.append('broadcast() reached no peer — the distributed '
+                            'coder still cannot announce itself')
+
+        for _ in range(20):
+            state = _http_json(f'http://127.0.0.1:{port}/proof/state')
+            if any(r['ch'] == 'dispatch' for r in state['received']):
+                break
+            time.sleep(0.25)
+        dispatch_seen = [r for r in state['received'] if r['ch'] == 'dispatch']
+        print(f'[8] server saw dispatch announce: {dispatch_seen}')
+        if not dispatch_seen:
+            failures.append('peer_announce never arrived on the far side')
 
         return _report(failures, child)
     finally:
