@@ -193,7 +193,7 @@ class SunshineBridge:
                                capture_output=True, timeout=5, **no_window_kwargs())
             else:
                 subprocess.run(['pkill', '-f', 'sunshine'],
-                               capture_output=True, timeout=5)
+                               capture_output=True, timeout=5, **no_window_kwargs())
             return True
         except Exception:
             return False

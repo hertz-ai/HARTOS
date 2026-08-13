@@ -19,6 +19,7 @@ Task relay protocol:
 import hashlib
 import json
 import logging
+from core.subprocess_safe import no_window_kwargs
 import os
 import threading
 import time
@@ -608,7 +609,7 @@ class ComputeMeshService:
                 if sys.platform == 'darwin':
                     import subprocess
                     _o = subprocess.run(['sysctl', '-n', 'hw.memsize'],
-                                        capture_output=True, text=True, timeout=3)
+                                        capture_output=True, text=True, timeout=3, **no_window_kwargs())
                     if _o.returncode == 0 and _o.stdout.strip().isdigit():
                         ram_bytes = int(_o.stdout.strip())
             except Exception:

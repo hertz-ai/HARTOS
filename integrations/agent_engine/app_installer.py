@@ -24,6 +24,7 @@ Each installer type registers in AppRegistry after successful install.
 import hashlib
 import json
 import logging
+from core.subprocess_safe import no_window_kwargs
 import os
 import shutil
 import subprocess
@@ -489,7 +490,7 @@ class AppInstaller:
         try:
             result = subprocess.run(
                 ['nix-env', '-q', '--json'],
-                capture_output=True, text=True, timeout=10)
+                capture_output=True, text=True, timeout=10, **no_window_kwargs())
             if result.returncode == 0:
                 pkgs = json.loads(result.stdout) if result.stdout.strip() else {}
                 for name, info in pkgs.items():
@@ -505,7 +506,7 @@ class AppInstaller:
         try:
             result = subprocess.run(
                 ['flatpak', '--user', 'list', '--app', '--columns=name,application,version'],
-                capture_output=True, text=True, timeout=10, env=self._flatpak_env())
+                capture_output=True, text=True, timeout=10, env=self._flatpak_env(), **no_window_kwargs())
             if result.returncode == 0:
                 for line in result.stdout.strip().split('\n'):
                     parts = line.split('\t')
@@ -550,7 +551,7 @@ class AppInstaller:
             try:
                 result = subprocess.run(
                     ['nix', 'search', 'nixpkgs', query, '--json'],
-                    capture_output=True, text=True, timeout=30)
+                    capture_output=True, text=True, timeout=30, **no_window_kwargs())
                 if result.returncode == 0:
                     pkgs = json.loads(result.stdout) if result.stdout.strip() else {}
                     for attr, info in list(pkgs.items())[:20]:
@@ -569,7 +570,7 @@ class AppInstaller:
                 self._ensure_flathub()
                 result = subprocess.run(
                     ['flatpak', '--user', 'search', query, '--columns=name,application,version,description'],
-                    capture_output=True, text=True, timeout=15, env=self._flatpak_env())
+                    capture_output=True, text=True, timeout=15, env=self._flatpak_env(), **no_window_kwargs())
                 if result.returncode == 0:
                     for line in result.stdout.strip().split('\n')[:20]:
                         parts = line.split('\t')
@@ -748,7 +749,7 @@ class AppInstaller:
         try:
             result = subprocess.run(
                 ['nix-env', '-iA', f'nixpkgs.{pkg}'],
-                capture_output=True, text=True, timeout=300)
+                capture_output=True, text=True, timeout=300, **no_window_kwargs())
             if result.returncode == 0:
                 return InstallResult(
                     success=True, platform='nix', name=name,
@@ -802,7 +803,7 @@ class AppInstaller:
             subprocess.run(
                 ['flatpak', '--user', 'remote-add', '--if-not-exists', 'flathub',
                  'https://dl.flathub.org/repo/flathub.flatpakrepo'],
-                capture_output=True, text=True, timeout=30, env=self._flatpak_env())
+                capture_output=True, text=True, timeout=30, env=self._flatpak_env(), **no_window_kwargs())
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             pass
 
@@ -835,7 +836,7 @@ class AppInstaller:
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=300,
-                env=self._flatpak_env())
+                env=self._flatpak_env(), **no_window_kwargs())
             if result.returncode == 0:
                 return InstallResult(
                     success=True, platform='flatpak', name=name,
@@ -916,7 +917,7 @@ class AppInstaller:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=300,
                 env={**os.environ, 'WINEPREFIX': os.path.join(
-                    self._install_dir, 'wine', 'prefix')})
+                    self._install_dir, 'wine', 'prefix')}, **no_window_kwargs())
 
             # Wine's exit code is a WEAK success signal — GUI/interactive
             # installers often fork and return 0 before finishing — so 0 cannot
@@ -957,7 +958,7 @@ class AppInstaller:
             try:
                 out = subprocess.run(
                     [aapt, 'dump', 'badging', apk_path],
-                    capture_output=True, text=True, timeout=30)
+                    capture_output=True, text=True, timeout=30, **no_window_kwargs())
                 if out.returncode == 0:
                     for line in (out.stdout or '').splitlines():
                         if line.startswith('package:'):
@@ -1002,7 +1003,7 @@ class AppInstaller:
             try:
                 out = subprocess.run(
                     [waydroid, 'status'],
-                    capture_output=True, text=True, timeout=15)
+                    capture_output=True, text=True, timeout=15, **no_window_kwargs())
                 if out.returncode == 0 and 'RUNNING' in (out.stdout or '').upper():
                     return True
             except (subprocess.TimeoutExpired, OSError):
@@ -1051,7 +1052,7 @@ class AppInstaller:
         try:
             result = subprocess.run(
                 [waydroid, 'app', 'install', req.source],
-                capture_output=True, text=True, timeout=180)
+                capture_output=True, text=True, timeout=180, **no_window_kwargs())
         except subprocess.TimeoutExpired:
             return InstallResult(
                 success=False, platform='android', name=name, app_id=pkg,
@@ -1079,7 +1080,7 @@ class AppInstaller:
         try:
             listing = subprocess.run(
                 [waydroid, 'app', 'list'],
-                capture_output=True, text=True, timeout=60)
+                capture_output=True, text=True, timeout=60, **no_window_kwargs())
         except (subprocess.TimeoutExpired, OSError) as e:
             return InstallResult(
                 success=False, platform='android', name=name, app_id=pkg,
@@ -1141,7 +1142,7 @@ class AppInstaller:
         try:
             boot = subprocess.run(
                 [darling, 'shell', 'true'],
-                capture_output=True, text=True, timeout=120)
+                capture_output=True, text=True, timeout=120, **no_window_kwargs())
         except subprocess.TimeoutExpired:
             return InstallResult(
                 success=False, platform='macos', name=name,
@@ -1178,7 +1179,7 @@ class AppInstaller:
         try:
             run = subprocess.run(
                 [darling, 'shell', target],
-                capture_output=True, text=True, timeout=300)
+                capture_output=True, text=True, timeout=300, **no_window_kwargs())
         except subprocess.TimeoutExpired:
             return InstallResult(
                 success=False, platform='macos', name=name,
@@ -1412,7 +1413,7 @@ class AppInstaller:
         try:
             result = subprocess.run(
                 ['nix-env', '-e', pkg],
-                capture_output=True, text=True, timeout=60)
+                capture_output=True, text=True, timeout=60, **no_window_kwargs())
             return InstallResult(
                 success=result.returncode == 0, platform='nix',
                 name=pkg, error=result.stderr.strip()[:500])
@@ -1424,7 +1425,7 @@ class AppInstaller:
         try:
             result = subprocess.run(
                 ['flatpak', '--user', 'uninstall', '-y', app_id],
-                capture_output=True, text=True, timeout=60, env=self._flatpak_env())
+                capture_output=True, text=True, timeout=60, env=self._flatpak_env(), **no_window_kwargs())
             return InstallResult(
                 success=result.returncode == 0, platform='flatpak',
                 name=app_id, error=result.stderr.strip()[:500])
@@ -1449,7 +1450,7 @@ class AppInstaller:
             try:
                 subprocess.run(
                     [wine, 'uninstaller'],
-                    capture_output=True, timeout=10)
+                    capture_output=True, timeout=10, **no_window_kwargs())
             except Exception:
                 pass
         return InstallResult(
@@ -1482,7 +1483,7 @@ class AppInstaller:
         try:
             subprocess.run(
                 [waydroid, 'app', 'remove', pkg],
-                capture_output=True, text=True, timeout=120)
+                capture_output=True, text=True, timeout=120, **no_window_kwargs())
         except subprocess.TimeoutExpired:
             return InstallResult(
                 success=False, platform='android', name=pkg, app_id=pkg,
@@ -1496,7 +1497,7 @@ class AppInstaller:
         try:
             listing = subprocess.run(
                 [waydroid, 'app', 'list'],
-                capture_output=True, text=True, timeout=60)
+                capture_output=True, text=True, timeout=60, **no_window_kwargs())
         except (subprocess.TimeoutExpired, OSError) as e:
             return InstallResult(
                 success=False, platform='android', name=pkg, app_id=pkg,

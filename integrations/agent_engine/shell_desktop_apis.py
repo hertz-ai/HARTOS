@@ -10,6 +10,7 @@ All routes registered via register_shell_desktop_routes(app).
 import collections
 import json
 import logging
+from core.subprocess_safe import no_window_kwargs
 import os
 import shutil
 import subprocess
@@ -55,7 +56,7 @@ def _is_wayland():
     if sys.platform == 'linux':
         try:
             r = subprocess.run(['pgrep', '-x', 'sway|labwc|hyprland'],
-                              capture_output=True, text=True, timeout=3)
+                              capture_output=True, text=True, timeout=3, **no_window_kwargs())
             if r.returncode == 0:
                 return True
         except (FileNotFoundError, subprocess.TimeoutExpired) as e:
@@ -848,7 +849,7 @@ def register_shell_desktop_routes(app):
         else:
             subprocess.run(['xclip', '-selection', 'clipboard'],
                            input=content, text=True, timeout=5,
-                           capture_output=True)
+                           capture_output=True, **no_window_kwargs())
         with _clipboard_lock:
             _clipboard_counter += 1
             _clipboard_history.appendleft({
@@ -1206,7 +1207,7 @@ def register_shell_desktop_routes(app):
             if tool:
                 _run(['pkill', '-x', os.path.basename(tool)])
                 subprocess.Popen([tool, '-O', str(temp)],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **no_window_kwargs())
                 return jsonify({'enabled': True, 'active': True, 'temperature': temp})
             # 503: no gamma tool on this build = the nightlight SERVICE is
             # unavailable (controlled; the config change above still persisted),
@@ -1230,7 +1231,7 @@ def register_shell_desktop_routes(app):
         if tool:
             _run(['pkill', '-x', os.path.basename(tool)])
             subprocess.Popen([tool, '-O', str(temp)],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **no_window_kwargs())
         return jsonify({'set': True, 'temperature': temp})
 
     @app.route('/api/shell/nightlight/schedule', methods=['POST'])

@@ -9,6 +9,7 @@ NixOS: nixos/modules/hart-peripheral-bridge.nix loads these automatically.
 """
 
 import logging
+from core.subprocess_safe import no_window_kwargs
 import platform
 import subprocess
 from typing import List
@@ -33,7 +34,7 @@ class USBIPBackend:
                 timeout=5,
                 text=True,
                 stderr=subprocess.DEVNULL,
-            )
+             **no_window_kwargs())
             return self._parse_usbip_list(output)
         except Exception as e:
             logger.debug(f"USB discovery failed: {e}")
@@ -56,7 +57,7 @@ class USBIPBackend:
                 timeout=10,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-            )
+             **no_window_kwargs())
             self._forwarded[bus_id] = peripheral_info
             logger.info(f"USB device bound: {bus_id}")
 
@@ -89,7 +90,7 @@ class USBIPBackend:
                 timeout=10,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-            )
+             **no_window_kwargs())
             logger.info(f"USB device attached: {bus_id} from {host_ip}")
             return True
         except Exception as e:
@@ -104,7 +105,7 @@ class USBIPBackend:
                 timeout=10,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-            )
+             **no_window_kwargs())
             self._forwarded.pop(peripheral_id, None)
             logger.info(f"USB device unbound: {peripheral_id}")
             return True
@@ -128,7 +129,7 @@ class USBIPBackend:
                 timeout=5,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-            )
+             **no_window_kwargs())
             return True
         except Exception:
             return False

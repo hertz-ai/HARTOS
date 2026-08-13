@@ -324,8 +324,8 @@ class DragDropBridge:
             if system == 'Windows':
                 subprocess.Popen(['explorer', path], **no_window_kwargs())
             elif system == 'Darwin':
-                subprocess.Popen(['open', path])
+                subprocess.Popen(['open', path], **no_window_kwargs())
             elif system == 'Linux':
-                subprocess.Popen(['xdg-open', path])
+                subprocess.Popen(['xdg-open', path], **no_window_kwargs())
         except Exception as e:
             logger.debug(f"Could not open file location: {e}")

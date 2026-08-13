@@ -14,6 +14,7 @@ Same registration pattern as finance_tools.py / upgrade_tools.py.
 """
 import json
 import logging
+from core.subprocess_safe import no_window_kwargs
 import os
 import re
 import subprocess
@@ -31,7 +32,7 @@ def _is_nixos() -> bool:
     """Check if we're running on NixOS."""
     try:
         result = subprocess.run(
-            ['nixos-version'], capture_output=True, text=True, timeout=5)
+            ['nixos-version'], capture_output=True, text=True, timeout=5, **no_window_kwargs())
         return result.returncode == 0
     except Exception:
         return False
@@ -101,7 +102,7 @@ def _run_build(mode: str, timeout: int = 600) -> dict:
     try:
         result = subprocess.run(
             ['hart-self-build', mode],
-            capture_output=True, text=True, timeout=timeout)
+            capture_output=True, text=True, timeout=timeout, **no_window_kwargs())
         return {
             'success': result.returncode == 0,
             'mode': mode,
@@ -128,7 +129,7 @@ def register_self_build_tools(helper, assistant, user_id: str):
         info = {'self_build_available': _is_nixos()}
         try:
             result = subprocess.run(
-                ['nixos-version'], capture_output=True, text=True, timeout=5)
+                ['nixos-version'], capture_output=True, text=True, timeout=5, **no_window_kwargs())
             if result.returncode == 0:
                 info['nixos_version'] = result.stdout.strip()
         except Exception:
@@ -338,7 +339,7 @@ def register_self_build_tools(helper, assistant, user_id: str):
         try:
             result = subprocess.run(
                 ['sudo', 'nixos-rebuild', 'switch', '--rollback'],
-                capture_output=True, text=True, timeout=300)
+                capture_output=True, text=True, timeout=300, **no_window_kwargs())
             return json.dumps({
                 'success': result.returncode == 0,
                 'status': 'rolled_back' if result.returncode == 0 else 'failed',

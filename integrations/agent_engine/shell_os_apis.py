@@ -377,7 +377,7 @@ def register_shell_os_routes(app):
             result = subprocess.run(
                 ['notify-send', '-u', urgency, '-i', icon,
                  '-t', str(timeout), title, body],
-                capture_output=True, timeout=5)
+                capture_output=True, timeout=5, **no_window_kwargs())
             dbus_sent = result.returncode == 0
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
@@ -503,7 +503,7 @@ def register_shell_os_routes(app):
         try:
             result = subprocess.run(
                 ['gio', 'trash', path],
-                capture_output=True, timeout=10)
+                capture_output=True, timeout=10, **no_window_kwargs())
             trashed = result.returncode == 0
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
@@ -795,7 +795,7 @@ def register_shell_os_routes(app):
             group_str = ','.join(groups)
             result = subprocess.run(
                 ['useradd', '-m', '-G', group_str, '-s', '/bin/bash', username],
-                capture_output=True, text=True, timeout=10)
+                capture_output=True, text=True, timeout=10, **no_window_kwargs())
             if result.returncode != 0:
                 return jsonify({'error': result.stderr.strip()}), 400
 
@@ -803,7 +803,7 @@ def register_shell_os_routes(app):
                 proc = subprocess.run(
                     ['chpasswd'],
                     input=f'{username}:{password}',
-                    capture_output=True, text=True, timeout=10)
+                    capture_output=True, text=True, timeout=10, **no_window_kwargs())
                 if proc.returncode != 0:
                     return jsonify({'error': 'User created but password set failed'}), 500
 
@@ -832,7 +832,7 @@ def register_shell_os_routes(app):
             if remove_home:
                 cmd.append('-r')
             cmd.append(username)
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, **no_window_kwargs())
             if result.returncode != 0:
                 return jsonify({'error': result.stderr.strip()}), 400
             return jsonify({'deleted': username})
@@ -977,7 +977,7 @@ def register_shell_os_routes(app):
         try:
             result = subprocess.run(
                 ['powerprofilesctl', 'get'],
-                capture_output=True, text=True, timeout=5)
+                capture_output=True, text=True, timeout=5, **no_window_kwargs())
             if result.returncode == 0:
                 active = result.stdout.strip()
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -1016,7 +1016,7 @@ def register_shell_os_routes(app):
         try:
             result = subprocess.run(
                 ['powerprofilesctl', 'set', profile],
-                capture_output=True, text=True, timeout=5)
+                capture_output=True, text=True, timeout=5, **no_window_kwargs())
             return jsonify({
                 'set': profile,
                 'success': result.returncode == 0,
@@ -1221,7 +1221,7 @@ def register_shell_os_routes(app):
         ]:
             try:
                 result = subprocess.run(
-                    tool_cmd, capture_output=True, timeout=10)
+                    tool_cmd, capture_output=True, timeout=10, **no_window_kwargs())
                 if result.returncode == 0 and os.path.isfile(output_path):
                     captured = True
                     break
@@ -1553,7 +1553,7 @@ def register_shell_os_routes(app):
             return jsonify({'error': 'Path outside allowed directories'}), 403
         try:
             subprocess.Popen(['xdg-open', resolved],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **no_window_kwargs())
             return jsonify({'status': 'opened', 'path': resolved})
         except FileNotFoundError:
             return jsonify({'error': 'xdg-open not available'}), 500
@@ -1569,7 +1569,7 @@ def register_shell_os_routes(app):
 
         try:
             result = subprocess.run(
-                ['nixos-version'], capture_output=True, text=True, timeout=5)
+                ['nixos-version'], capture_output=True, text=True, timeout=5, **no_window_kwargs())
             if result.returncode == 0:
                 info['nixos_version'] = result.stdout.strip()
                 info['self_build_available'] = True
@@ -1697,7 +1697,7 @@ def register_shell_os_routes(app):
         try:
             result = subprocess.run(
                 ['hart-self-build', mode],
-                capture_output=True, text=True, timeout=600)
+                capture_output=True, text=True, timeout=600, **no_window_kwargs())
             return jsonify({
                 'status': 'completed' if result.returncode == 0 else 'failed',
                 'mode': mode,
@@ -1744,7 +1744,7 @@ def register_shell_os_routes(app):
         try:
             result = subprocess.run(
                 ['sudo', 'nixos-rebuild', 'switch', '--rollback'],
-                capture_output=True, text=True, timeout=300)
+                capture_output=True, text=True, timeout=300, **no_window_kwargs())
             return jsonify({
                 'status': 'rolled_back' if result.returncode == 0 else 'failed',
                 'output': result.stdout[-2000:] if result.stdout else '',
@@ -2088,7 +2088,7 @@ def register_shell_os_routes(app):
         try:
             r = subprocess.run(['nmcli', '-t', '-f', 'NAME,TYPE,DEVICE',
                                 'connection', 'show', '--active'],
-                               capture_output=True, text=True, timeout=5)
+                               capture_output=True, text=True, timeout=5, **no_window_kwargs())
             if r and r.returncode == 0:
                 for line in r.stdout.strip().split('\n'):
                     parts = line.split(':')
@@ -2096,7 +2096,7 @@ def register_shell_os_routes(app):
                         r2 = subprocess.run(
                             ['nmcli', '-t', '-f', '802-11-wireless.mode',
                              'connection', 'show', parts[0]],
-                            capture_output=True, text=True, timeout=5)
+                            capture_output=True, text=True, timeout=5, **no_window_kwargs())
                         if r2 and 'ap' in r2.stdout.lower():
                             active = {'name': parts[0],
                                       'device': parts[2] if len(parts) > 2 else ''}
@@ -2118,7 +2118,7 @@ def register_shell_os_routes(app):
         if band == 'a':
             cmd += ['band', 'a']
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=15, **no_window_kwargs())
             if r and r.returncode == 0:
                 _audit_shell_op('hotspot_start', {'ssid': ssid})
                 return jsonify({'started': True, 'ssid': ssid})
@@ -2132,7 +2132,7 @@ def register_shell_os_routes(app):
         """Stop the active hotspot."""
         try:
             r = subprocess.run(['nmcli', 'connection', 'down', 'Hotspot'],
-                               capture_output=True, text=True, timeout=10)
+                               capture_output=True, text=True, timeout=10, **no_window_kwargs())
             if r and r.returncode == 0:
                 _audit_shell_op('hotspot_stop', {})
                 return jsonify({'stopped': True})
@@ -2179,7 +2179,7 @@ def register_shell_os_routes(app):
         try:
             r = subprocess.run(['systemctl', '--user', 'is-active',
                                 'flatpak-auto-update.timer'],
-                               capture_output=True, text=True, timeout=5)
+                               capture_output=True, text=True, timeout=5, **no_window_kwargs())
             if r and r.returncode == 0:
                 flatpak_timer = True
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -2188,7 +2188,7 @@ def register_shell_os_routes(app):
         nix_auto = False
         try:
             r2 = subprocess.run(['systemctl', 'is-active', 'nixos-upgrade.timer'],
-                                capture_output=True, text=True, timeout=5)
+                                capture_output=True, text=True, timeout=5, **no_window_kwargs())
             if r2 and r2.returncode == 0:
                 nix_auto = True
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -2207,14 +2207,14 @@ def register_shell_os_routes(app):
         results = {}
         if target in ('flatpak', 'all'):
             r = subprocess.run(['flatpak', 'update', '-y', '--noninteractive'],
-                               capture_output=True, text=True, timeout=300)
+                               capture_output=True, text=True, timeout=300, **no_window_kwargs())
             results['flatpak'] = {
                 'success': r is not None and r.returncode == 0,
                 'output': (r.stdout[-500:] if r else '')
             }
         if target in ('nix', 'all'):
             r = subprocess.run(['nix-channel', '--update'],
-                               capture_output=True, text=True, timeout=120)
+                               capture_output=True, text=True, timeout=120, **no_window_kwargs())
             results['nix_channel'] = {
                 'success': r is not None and r.returncode == 0,
             }
@@ -2229,7 +2229,7 @@ def register_shell_os_routes(app):
         dns_info = {'servers': [], 'dnssec': False, 'dot': False}
         try:
             r = subprocess.run(['resolvectl', 'status'],
-                               capture_output=True, text=True, timeout=5)
+                               capture_output=True, text=True, timeout=5, **no_window_kwargs())
         except (FileNotFoundError, subprocess.TimeoutExpired):
             r = None
         if r and r.returncode == 0:
@@ -2262,10 +2262,10 @@ def register_shell_os_routes(app):
         # Set DNS via resolvectl
         for s in servers:
             subprocess.run(['resolvectl', 'dns', 'dns0', s],
-                           capture_output=True, text=True, timeout=5)
+                           capture_output=True, text=True, timeout=5, **no_window_kwargs())
         if dot:
             subprocess.run(['resolvectl', 'dnsovertls', 'dns0', 'yes'],
-                           capture_output=True, text=True, timeout=5)
+                           capture_output=True, text=True, timeout=5, **no_window_kwargs())
         _audit_shell_op('dns_set', {'provider': provider, 'dot': dot})
         return jsonify({'set': True, 'provider': provider, 'servers': servers, 'dot': dot})
 
@@ -2318,7 +2318,7 @@ def register_shell_os_routes(app):
         sssd_active = False
         try:
             r = subprocess.run(['systemctl', 'is-active', 'sssd'],
-                               capture_output=True, text=True, timeout=5)
+                               capture_output=True, text=True, timeout=5, **no_window_kwargs())
             if r and r.returncode == 0 and 'active' in r.stdout:
                 sssd_active = True
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -2334,7 +2334,7 @@ def register_shell_os_routes(app):
             except PermissionError:
                 pass
         try:
-            r_which = subprocess.run(['which', 'sssd'], capture_output=True, timeout=3)
+            r_which = subprocess.run(['which', 'sssd'], capture_output=True, timeout=3, **no_window_kwargs())
             sssd_installed = r_which.returncode == 0
         except (FileNotFoundError, subprocess.TimeoutExpired):
             sssd_installed = False
@@ -2358,7 +2358,7 @@ def register_shell_os_routes(app):
         cmd = ['realm', 'join', '--user', username, domain]
         try:
             r = subprocess.run(cmd, input=password + '\n', capture_output=True,
-                               text=True, timeout=60)
+                               text=True, timeout=60, **no_window_kwargs())
             if r.returncode == 0:
                 _audit_shell_op('sso_join', {'domain': domain})
                 return jsonify({'joined': True, 'domain': domain})
@@ -2376,7 +2376,7 @@ def register_shell_os_routes(app):
             return jsonify({'error': 'domain required'}), 400
         try:
             r = subprocess.run(['realm', 'leave', domain],
-                               capture_output=True, text=True, timeout=30)
+                               capture_output=True, text=True, timeout=30, **no_window_kwargs())
             if r.returncode == 0:
                 _audit_shell_op('sso_leave', {'domain': domain})
                 return jsonify({'left': True, 'domain': domain})
@@ -2397,7 +2397,7 @@ def register_shell_os_routes(app):
             r = subprocess.run(
                 ['ldapsearch', '-x', '-H', uri, '-b', base_dn,
                  '-s', 'base', '(objectclass=*)'],
-                capture_output=True, text=True, timeout=10)
+                capture_output=True, text=True, timeout=10, **no_window_kwargs())
             return jsonify({
                 'reachable': r.returncode == 0,
                 'output': r.stdout[:500] if r.returncode == 0 else r.stderr[:500],
@@ -2413,11 +2413,11 @@ def register_shell_os_routes(app):
         installed = False
         running = False
         r = subprocess.run(['which', 'thunderbird'], capture_output=True,
-                           text=True, timeout=3)
+                           text=True, timeout=3, **no_window_kwargs())
         if r and r.returncode == 0:
             installed = True
         r2 = subprocess.run(['pgrep', '-x', 'thunderbird'], capture_output=True,
-                            text=True, timeout=3)
+                            text=True, timeout=3, **no_window_kwargs())
         if r2 and r2.returncode == 0:
             running = True
         return jsonify({'installed': installed, 'running': running,
@@ -2432,10 +2432,10 @@ def register_shell_os_routes(app):
         try:
             if compose_to:
                 subprocess.Popen(['thunderbird', '-compose', f'to={compose_to}'],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **no_window_kwargs())
             else:
                 subprocess.Popen(['thunderbird'],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **no_window_kwargs())
             return jsonify({'launched': True})
         except FileNotFoundError:
             return jsonify({'error': 'thunderbird not installed'}), 404

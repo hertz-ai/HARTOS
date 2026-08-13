@@ -7081,7 +7081,7 @@ function renderAgentOverlay(ev) {{
                 result = subprocess.run(
                     ['journalctl', '--since', '1 hour ago', '-p', '0..5',
                      '--no-pager', '-o', 'short', '-n', '50'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 for line in result.stdout.strip().split('\n'):
                     if line.strip():
                         parts = line.split(None, 3)
@@ -7449,7 +7449,7 @@ function renderAgentOverlay(ev) {{
                 cmd = ['nmcli', 'device', 'wifi', 'connect', ssid]
                 if password:
                     cmd += ['password', password]
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, **no_window_kwargs())
                 if r.returncode == 0:
                     return jsonify({'success': True, 'message': f'Connected to {ssid}'})
                 return jsonify({'success': False, 'error': r.stderr.strip() or 'Connection failed'}), 400
@@ -7466,12 +7466,12 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['nmcli', 'device', 'disconnect', 'wlan0'],
-                    capture_output=True, text=True, timeout=10)
+                    capture_output=True, text=True, timeout=10, **no_window_kwargs())
                 # Try common interface names if wlan0 fails
                 if r.returncode != 0:
                     r = subprocess.run(
                         ['nmcli', 'device', 'disconnect', 'wlp0s20f3'],
-                        capture_output=True, text=True, timeout=10)
+                        capture_output=True, text=True, timeout=10, **no_window_kwargs())
                 if r.returncode == 0:
                     return jsonify({'success': True, 'message': 'Disconnected from WiFi'})
                 return jsonify({'success': False, 'error': r.stderr.strip() or 'Disconnect failed'}), 400
@@ -7485,7 +7485,7 @@ function renderAgentOverlay(ev) {{
                 r = subprocess.run(
                     ['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE,CONNECTION',
                      'device', 'status'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 for line in r.stdout.strip().split('\n'):
                     parts = line.split(':')
                     if len(parts) >= 4:
@@ -7498,7 +7498,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['ip', 'route', 'show', 'default'],
-                    capture_output=True, text=True, timeout=3)
+                    capture_output=True, text=True, timeout=3, **no_window_kwargs())
                 parts = r.stdout.strip().split()
                 if 'via' in parts:
                     status['gateway'] = parts[parts.index('via') + 1]
@@ -7507,7 +7507,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['resolvectl', 'status', '--no-pager'],
-                    capture_output=True, text=True, timeout=3)
+                    capture_output=True, text=True, timeout=3, **no_window_kwargs())
                 for line in r.stdout.split('\n'):
                     if 'DNS Servers' in line:
                         status['dns'] = line.split(':',1)[1].strip().split()
@@ -7536,14 +7536,14 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['pactl', 'get-default-sink'],
-                    capture_output=True, text=True, timeout=3)
+                    capture_output=True, text=True, timeout=3, **no_window_kwargs())
                 default_sink = r.stdout.strip()
             except Exception:
                 logger.exception("shell_audio: swallowed Exception")
             try:
                 r = subprocess.run(
                     ['pactl', '--format=json', 'list', 'sinks'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 if r.stdout.strip():
                     raw = json.loads(r.stdout)
                     sinks = [{
@@ -7558,7 +7558,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['pactl', '--format=json', 'list', 'sources'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 if r.stdout.strip():
                     raw = json.loads(r.stdout)
                     sources = [{
@@ -7584,7 +7584,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['pactl', 'set-sink-volume', sink_id, f'{volume}%'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 if r.returncode == 0:
                     return jsonify({'success': True, 'volume': volume})
                 return jsonify({'success': False, 'error': r.stderr.strip()}), 400
@@ -7602,7 +7602,7 @@ function renderAgentOverlay(ev) {{
                 val = '1' if muted else '0'
                 r = subprocess.run(
                     ['pactl', 'set-sink-mute', sink_id, val],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 if r.returncode == 0:
                     return jsonify({'success': True, 'muted': muted})
                 return jsonify({'success': False, 'error': r.stderr.strip()}), 400
@@ -7618,7 +7618,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['pactl', 'set-default-sink', sink_id],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 if r.returncode == 0:
                     return jsonify({'success': True, 'default_sink': sink_id})
                 return jsonify({'success': False, 'error': r.stderr.strip()}), 400
@@ -7641,7 +7641,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['pactl', 'set-source-volume', source_id, f'{volume}%'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 if r.returncode == 0:
                     return jsonify({'success': True, 'volume': volume})
                 return jsonify({'success': False, 'error': r.stderr.strip()}), 400
@@ -7655,7 +7655,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['bluetoothctl', 'devices'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 for line in r.stdout.strip().split('\n'):
                     parts = line.split(None, 2)
                     if len(parts) == 3:
@@ -7675,7 +7675,7 @@ function renderAgentOverlay(ev) {{
                 r = subprocess.run(
                     ['upower', '-i',
                      '/org/freedesktop/UPower/devices/battery_BAT0'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 for line in r.stdout.split('\n'):
                     line = line.strip()
                     if 'percentage:' in line:
@@ -7775,7 +7775,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['xrandr', '--current'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 current_display = None
                 for line in r.stdout.split('\n'):
                     if ' connected' in line:
@@ -7830,7 +7830,7 @@ function renderAgentOverlay(ev) {{
                 cmd = ['xrandr', '--output', output, '--mode', resolution]
                 if rate:
                     cmd += ['--rate', str(rate)]
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=10, **no_window_kwargs())
                 if r.returncode == 0:
                     return jsonify({'success': True, 'output': output, 'resolution': resolution})
                 return jsonify({'success': False, 'error': r.stderr.strip() or 'Failed to set resolution'}), 400
@@ -7851,7 +7851,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['xrandr', '--output', output, '--brightness', str(brightness)],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 if r.returncode == 0:
                     return jsonify({'success': True, 'brightness': brightness})
                 return jsonify({'success': False, 'error': r.stderr.strip()}), 400
@@ -7979,7 +7979,7 @@ function renderAgentOverlay(ev) {{
                     cmd += ['--since', since]
                 if grep_pattern:
                     cmd += ['-g', grep_pattern]
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=10, **no_window_kwargs())
                 entries = []
                 for line in r.stdout.strip().split('\n'):
                     if not line:
@@ -8010,7 +8010,7 @@ function renderAgentOverlay(ev) {{
                         ['journalctl', '--output=json', '--no-pager',
                          '-f', '-u', unit],
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        text=True)
+                        text=True, **no_window_kwargs())
                     for line in proc.stdout:
                         line = line.strip()
                         if not line:

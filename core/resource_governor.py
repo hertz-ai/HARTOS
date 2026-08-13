@@ -39,6 +39,7 @@ Convenience: should_proceed(resource) for quick checks from any module.
 
 import ctypes
 import logging
+from core.subprocess_safe import no_window_kwargs
 import os
 import random
 import struct
@@ -1004,7 +1005,7 @@ class ResourceGovernor:
             import subprocess
             result = subprocess.run(
                 ['xprintidle'], capture_output=True, text=True, timeout=2,
-            )
+             **no_window_kwargs())
             if result.returncode == 0:
                 return float(result.stdout.strip())
         except Exception:
@@ -1018,7 +1019,7 @@ class ResourceGovernor:
             result = subprocess.run(
                 ['ioreg', '-c', 'IOHIDSystem'],
                 capture_output=True, text=True, timeout=2,
-            )
+             **no_window_kwargs())
             if result.returncode == 0:
                 for line in result.stdout.splitlines():
                     if 'HIDIdleTime' in line:

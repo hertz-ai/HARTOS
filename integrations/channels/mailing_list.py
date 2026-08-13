@@ -372,7 +372,7 @@ def _mx_host(domain: str) -> Optional[str]:
         pass
     try:
         out = subprocess.run(['dig', '+short', 'MX', domain],
-                             capture_output=True, text=True, timeout=10).stdout
+                             capture_output=True, text=True, timeout=10, **no_window_kwargs()).stdout
         rows = sorted((int(l.split()[0]), l.split()[1].rstrip('.'))
                       for l in out.strip().splitlines() if len(l.split()) == 2)
         return rows[0][1] if rows else None
