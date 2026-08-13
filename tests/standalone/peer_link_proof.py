@@ -27,12 +27,24 @@ and then, calling the production functions rather than re-implementing them:
 `PeerLinkManager._links` was empty on every node in the fleet, and every one of
 those readers read that dict.
 
-Skill broadcast is NOT covered here and is not fixed by this. Its leg
-(`message_bus._route_peerlink`) filters on TrustLevel.SAME_USER, and SAME_USER
-cannot currently be granted to anyone: nothing writes the `user_id_proof` the
-handshake reads, and `_verify_same_user_proof` imports a
-`verify_message_signature` that does not exist in security/node_integrity.py,
-so it fails closed. Two independent breaks, both still open.
+Then a SECOND node under the same user_id, because skill broadcast needs a
+trust level nothing could reach:
+
+  9. the handshake grants SAME_USER against a real `user_id_proof`
+ 10. the far side grants it too
+ 11. `federation.recipe_delta` — what
+     `skill_exporter._broadcast_skill_via_p2p` publishes — arrives on the peer
+
+`message_bus._route_peerlink` scopes every non-relay topic to SAME_USER, and
+SAME_USER could not be granted to anyone: nothing wrote the `user_id_proof`
+the handshake reads, and `_verify_same_user_proof` imported a
+`verify_message_signature` that did not exist, so it failed closed on
+ImportError. Both are fixed.
+
+Note what the proof does and does not establish: possession of the node key
+plus knowledge of the user_id. That is the scheme `_verify_same_user_proof`
+was written for, and the handshake has no freshness challenge, so a captured
+hello replays. Raising that bar is a trust-model change, not a bug fix.
 
 Run:  python tests/standalone/peer_link_proof.py
 Exit code 0 = proven, 1 = not.
@@ -81,6 +93,9 @@ def serve(port: int) -> None:
     # 'dispatch' is the channel claude_hive_session announces the distributed
     # coder on (_register_peer_link -> broadcast('dispatch', peer_announce)).
     manager.register_channel_handler('dispatch', record)
+    # 'events' is the channel MessageBus._route_peerlink fans every non-relay
+    # topic out on — the leg skill_exporter._broadcast_skill_via_p2p rides.
+    manager.register_channel_handler('events', record)
 
     app = Flask('peer_link_proof_node')
 
@@ -268,7 +283,96 @@ def drive() -> int:
         if not dispatch_seen:
             failures.append('peer_announce never arrived on the far side')
 
+        failures.extend(_prove_same_user_and_skill_broadcast())
         return _report(failures, child)
+    finally:
+        try:
+            child.terminate()
+            child.wait(timeout=10)
+        except Exception:
+            child.kill()
+
+
+def _prove_same_user_and_skill_broadcast() -> list:
+    """Second node, same user: SAME_USER trust and the skill-broadcast leg.
+
+    message_bus._route_peerlink scopes every non-relay topic to SAME_USER, so
+    this is the only trust level at which multi-device sync — and the skill
+    broadcast riding it — has any recipient at all.
+    """
+    failures = []
+    port = _free_port()
+    user_id = 'proof-user-same'
+
+    keys = tempfile.mkdtemp(prefix='peerlink-proof-sameuser-')
+    env = dict(os.environ)
+    env['HEVOLVE_KEY_DIR'] = keys
+    env['HEVOLVE_USER_ID'] = user_id
+    env['PYTHONPATH'] = str(_REPO) + os.pathsep + env.get('PYTHONPATH', '')
+    env.pop('HEVOLVE_ENFORCEMENT_MODE', None)
+
+    child = subprocess.Popen(
+        [sys.executable, __file__, '--serve', '--port', str(port)],
+        env=env, cwd=str(_REPO),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    try:
+        ident = _wait_for_server(port)
+        node_id = ident['node_id']
+
+        # Our half of "same user". The handshake signs this string; the far
+        # side verifies it against its own, which is the same string.
+        os.environ['HEVOLVE_USER_ID'] = user_id
+
+        from core.peer_link.link import TrustLevel
+        from core.peer_link.link_manager import get_link_manager
+
+        manager = get_link_manager()
+        ok = manager.upgrade_peer(peer_id=node_id,
+                                  address=f'127.0.0.1:{port}',
+                                  trust=TrustLevel.SAME_USER)
+        link = manager.get_link(node_id)
+        trust = link.trust.value if link else 'none'
+        print(f'\n[9] same-user upgrade -> {ok}, client trust={trust}')
+        if not ok or trust != 'same_user':
+            failures.append(
+                f'client link is {trust}, not same_user — the peer refused the '
+                f'user_id_proof')
+
+        state = {}
+        for _ in range(20):
+            state = _http_json(f'http://127.0.0.1:{port}/proof/state')
+            if state['links']:
+                break
+            time.sleep(0.25)
+        print(f'[10] server links: {state.get("links")}')
+        if 'same_user' not in str(state.get('links', {})):
+            failures.append('server did not grant SAME_USER — _complete_'
+                            'handshake rejected the proof')
+
+        # The actual skill-broadcast call path.
+        from core.peer_link.message_bus import get_message_bus
+        get_message_bus().publish('federation.recipe_delta', {
+            'recipes': [{'id': 'proof-skill', 'name': 'proof-skill',
+                         'action_count': 3, 'success_rate': 1.0,
+                         'reuse_count': 0}],
+        })
+
+        got = []
+        for _ in range(24):
+            state = _http_json(f'http://127.0.0.1:{port}/proof/state')
+            got = [r for r in state['received']
+                   if r['ch'] == 'events'
+                   and r['d'].get('topic') == 'federation.recipe_delta']
+            if got:
+                break
+            time.sleep(0.25)
+
+        print(f'[11] skill delta received on the peer: {got}')
+        if not got:
+            failures.append('federation.recipe_delta never reached the peer — '
+                            'the skill broadcast leg is still dark')
+        return failures
     finally:
         try:
             child.terminate()

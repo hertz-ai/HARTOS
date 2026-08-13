@@ -216,6 +216,99 @@ class TestAcceptInbound(unittest.TestCase):
         self.assertIs(result, existing)
 
 
+class TestSameUserProof(unittest.TestCase):
+    """SAME_USER could never be granted to anyone, for two separate reasons.
+
+    `_complete_handshake` reads `user_id_proof` from the hello and nothing in
+    the codebase ever wrote it, so every peer asking for same_user was demoted
+    to PEER.  And `_verify_same_user_proof` imported
+    `security.node_integrity.verify_message_signature`, a symbol that did not
+    exist, so even a correct proof failed closed on ImportError.
+
+    That mattered because `message_bus._route_peerlink` scopes every non-relay
+    topic to SAME_USER — so multi-device sync, and the skill broadcast riding
+    it, had no possible recipient.
+    """
+
+    def test_verifier_round_trips_a_real_signature(self):
+        from security.node_integrity import (
+            get_public_key_hex, sign_message_hex, verify_message_signature)
+        proof = sign_message_hex('user-42')
+        self.assertTrue(
+            verify_message_signature(get_public_key_hex(), 'user-42', proof))
+
+    def test_verifier_rejects_a_different_message(self):
+        from security.node_integrity import (
+            get_public_key_hex, sign_message_hex, verify_message_signature)
+        proof = sign_message_hex('user-42')
+        self.assertFalse(
+            verify_message_signature(get_public_key_hex(), 'user-99', proof))
+
+    def test_verifier_rejects_a_foreign_key(self):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PrivateKey)
+        from cryptography.hazmat.primitives import serialization
+        from security.node_integrity import (
+            sign_message_hex, verify_message_signature)
+
+        other = Ed25519PrivateKey.generate().public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw).hex()
+        proof = sign_message_hex('user-42')
+        self.assertFalse(verify_message_signature(other, 'user-42', proof))
+
+    def test_verifier_fails_closed_on_garbage(self):
+        from security.node_integrity import verify_message_signature
+        self.assertFalse(verify_message_signature('zz', 'user-42', 'nothex'))
+
+    def test_handshake_attaches_the_proof_for_same_user(self):
+        import json
+        import os
+        sent = []
+        link = PeerLink('peerS', '10.0.0.7:6777', TrustLevel.SAME_USER)
+        with patch.object(PeerLink, '_ws_send', lambda s, d: sent.append(d)), \
+             patch.object(PeerLink, '_ws_recv', return_value=None), \
+             patch.dict(os.environ, {'HEVOLVE_USER_ID': 'user-42'}):
+            link._perform_handshake()
+
+        hello = json.loads(sent[0].decode('utf-8'))
+        self.assertIn('user_id_proof', hello)
+
+        from security.node_integrity import (
+            get_public_key_hex, verify_message_signature, verify_json_signature)
+        self.assertTrue(verify_message_signature(
+            get_public_key_hex(), 'user-42', hello['user_id_proof']))
+        # And it must be covered by the outer hello signature, or a MITM could
+        # graft someone else's proof onto a hello.
+        signature = hello.pop('signature')
+        self.assertTrue(verify_json_signature(
+            get_public_key_hex(), hello, signature))
+
+    def test_no_proof_when_the_link_is_not_claiming_same_user(self):
+        import json
+        import os
+        sent = []
+        link = PeerLink('peerP', '10.0.0.7:6777', TrustLevel.PEER)
+        with patch.object(PeerLink, '_ws_send', lambda s, d: sent.append(d)), \
+             patch.object(PeerLink, '_ws_recv', return_value=None), \
+             patch.dict(os.environ, {'HEVOLVE_USER_ID': 'user-42'}):
+            link._perform_handshake()
+        self.assertNotIn('user_id_proof',
+                         json.loads(sent[0].decode('utf-8')))
+
+    def test_no_proof_when_there_is_no_user_id_to_prove(self):
+        import json
+        import os
+        sent = []
+        link = PeerLink('peerS', '10.0.0.7:6777', TrustLevel.SAME_USER)
+        with patch.object(PeerLink, '_ws_send', lambda s, d: sent.append(d)), \
+             patch.object(PeerLink, '_ws_recv', return_value=None), \
+             patch.dict(os.environ, {'HEVOLVE_USER_ID': ''}):
+            link._perform_handshake()
+        self.assertNotIn('user_id_proof',
+                         json.loads(sent[0].decode('utf-8')))
+
+
 class TestAdmitDoesNotDeadlock(unittest.TestCase):
     """_evict_weakest_link takes the manager lock, and so does the close_link
     it calls. The budget check used to run while HOLDING that lock, so the

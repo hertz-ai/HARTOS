@@ -409,6 +409,33 @@ class PeerLink:
         except Exception:
             pass
 
+        # Prove SAME_USER instead of only asking for it.
+        #
+        # _complete_handshake on the far side reads 'user_id_proof' and grants
+        # SAME_USER only when it verifies — but nothing in the codebase ever
+        # WROTE that field, so every peer that asked for same_user was demoted
+        # to PEER with "SAME_USER trust requested but no valid proof".  Since
+        # message_bus._route_peerlink scopes every non-relay topic to
+        # SAME_USER, multi-device sync (and the skill broadcast riding it) had
+        # no recipients on any node.
+        #
+        # The signed value is the user_id itself, which is what
+        # _verify_same_user_proof checks against ITS local user_id: same user
+        # => same string => the signature verifies under our node key, which
+        # the outer hello signature already binds to this handshake.
+        if self.trust == TrustLevel.SAME_USER:
+            try:
+                from security.node_integrity import sign_message_hex
+                local_user_id = os.environ.get('HEVOLVE_USER_ID', '')
+                if local_user_id:
+                    hello['user_id_proof'] = sign_message_hex(local_user_id)
+                else:
+                    logger.debug(
+                        "SAME_USER requested but HEVOLVE_USER_ID is unset — "
+                        "no proof to send, peer will demote us to PEER")
+            except Exception as e:
+                logger.debug(f"user_id_proof not attached: {e}")
+
         # Attach pre-trust contract (proves we agreed to hive terms)
         try:
             from security.pre_trust_contract import get_pre_trust_verifier

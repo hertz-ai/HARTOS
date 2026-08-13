@@ -187,6 +187,37 @@ def verify_signature(public_key_hex: str, message: bytes, signature: bytes) -> b
         return False
 
 
+def sign_message_hex(message: str) -> str:
+    """Hex detached signature over a plain UTF-8 string (not a JSON payload).
+
+    Companion to sign_json_payload for the one case that signs a bare string
+    rather than a dict: PeerLink's SAME_USER proof, where the signed value is
+    the user_id itself.
+    """
+    return sign_message(message.encode('utf-8')).hex()
+
+
+def verify_message_signature(public_key_hex: str, message: str,
+                             signature_hex: str) -> bool:
+    """Verify a detached Ed25519 signature over a plain UTF-8 string.
+
+    The verifier `PeerLink._verify_same_user_proof` has always imported and
+    never found: the symbol did not exist anywhere in the repo, so that import
+    raised ImportError, the gate failed closed, and SAME_USER could not be
+    granted to any peer on any node.  That in turn left every link at PEER, and
+    `message_bus._route_peerlink` filters its per-user fan-out on SAME_USER —
+    so multi-device sync, and the skill broadcast riding it, reached nobody.
+
+    Argument order matches the call the gate makes and the tests pin:
+    (peer public key, the message we expect them to have signed, signature).
+    """
+    try:
+        return verify_signature(public_key_hex, message.encode('utf-8'),
+                                bytes.fromhex(signature_hex))
+    except (ValueError, Exception):
+        return False
+
+
 def verify_json_signature(public_key_hex: str, payload: dict,
                           signature_hex: str) -> bool:
     """Verify signature on a JSON payload. Strips 'signature' key before verification."""
