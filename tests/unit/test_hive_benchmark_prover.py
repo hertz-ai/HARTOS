@@ -631,8 +631,17 @@ class TestHiveBenchmarkProver(unittest.TestCase):
     # -- _aggregate_results --
 
     def test_aggregate_results_empty(self):
+        """No shards means NO SCORE — not a score of zero.
+
+        This used to assert 0.0, which is how the prover came to publish 416
+        "PROOF: 0.0%" posts: a run where nothing was dispatched aggregated to a
+        hard zero and went out looking exactly like a measured failure. None
+        with valid=False is the honest shape, and callers distinguish the two.
+        """
         result = self.prover._aggregate_results([])
-        self.assertEqual(result['score'], 0.0)
+        self.assertIsNone(result['score'])
+        self.assertFalse(result['valid'])
+        self.assertEqual(result['failure_reason'], 'no shards were dispatched')
         self.assertEqual(result['num_nodes'], 0)
 
     def test_aggregate_results_single_shard(self):
