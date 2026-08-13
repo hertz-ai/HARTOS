@@ -133,7 +133,23 @@ class TrustContract:
 
 
 def _contract_payload(contract: TrustContract) -> str:
-    """Canonical payload for signing/verification (excludes signature itself)."""
+    """Canonical payload STRING for signing/verification (excludes signature itself).
+
+    Routes through the ONE canonical serialization
+    (``security.node_integrity.canonical_payload``) instead of re-implementing
+    ``json.dumps(sort_keys=True, separators=(',', ':'))`` inline. This was the 6th
+    inline copy of that serialization in the codebase; any drift between a signer's
+    copy and a verifier's copy silently breaks every trust-contract signature
+    network-wide. The seven fields below ARE exactly the signed set, so nothing is
+    stripped at serialization time (``exclude=()``) — the field selection stays
+    local and explicit, only the byte-level serialization is delegated.
+
+    Returns a ``str`` (the caller then ``.encode('utf-8')`` before signing) to
+    keep this helper's long-standing return type — callers and tests that already
+    do ``.encode('utf-8')`` are unaffected. ``canonical_payload`` emits UTF-8
+    bytes, so ``.decode('utf-8')`` here then ``.encode('utf-8')`` at the call site
+    is byte-identical to the old inline ``json.dumps``.
+    """
     payload = {
         'node_id': contract.node_id,
         'public_key_hex': contract.public_key_hex,
@@ -143,7 +159,8 @@ def _contract_payload(contract: TrustContract) -> str:
         'audit_compute_ratio': contract.audit_compute_ratio,
         'signed_at': contract.signed_at,
     }
-    return json.dumps(payload, sort_keys=True, separators=(',', ':'))
+    from security.node_integrity import canonical_payload
+    return canonical_payload(payload, exclude=()).decode('utf-8')
 
 
 def sign_trust_contract(
