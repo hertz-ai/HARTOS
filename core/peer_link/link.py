@@ -80,6 +80,29 @@ from core.peer_link.channels import CHANNEL_IDS, CHANNEL_NAMES  # noqa: E402
 KEY_ROTATION_INTERVAL = 3600
 
 
+def provable_user_id() -> str:
+    """The user_id we can actually PROVE to a peer, or ''.
+
+    Deliberately env-only, and deliberately NOT unified with the broader
+    lookup in `link_manager._try_auto_upgrade`, which also falls back to
+    `get_node_identity()['user_id']`. Those two answer different questions:
+
+      * link_manager asks "is this peer mine?" — a local comparison, so the
+        widest identity view is right there.
+      * this asks "what can I demonstrate to a stranger?" — and the far side's
+        `_verify_same_user_proof` reads HEVOLVE_USER_ID and nothing else, by
+        design. `test_returns_false_when_local_user_id_missing` pins that
+        fail-closed behaviour: with no env var "we don't even have an identity
+        to prove". Widening this to match link_manager would only make us sign
+        a value no verifier will ever check.
+
+    So the divergence stays; what must not diverge is REQUESTING a trust level
+    we cannot substantiate. `_try_auto_upgrade` gates its SAME_USER request on
+    this function for that reason.
+    """
+    return os.environ.get('HEVOLVE_USER_ID', '')
+
+
 class PeerLink:
     """Persistent WebSocket connection to a single peer.
 
@@ -426,7 +449,7 @@ class PeerLink:
         if self.trust == TrustLevel.SAME_USER:
             try:
                 from security.node_integrity import sign_message_hex
-                local_user_id = os.environ.get('HEVOLVE_USER_ID', '')
+                local_user_id = provable_user_id()
                 if local_user_id:
                     hello['user_id_proof'] = sign_message_hex(local_user_id)
                 else:

@@ -24,7 +24,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from core.foreground import should_yield_to_user
 
-from .link import PeerLink, TrustLevel, LinkState
+from .link import PeerLink, TrustLevel, LinkState, provable_user_id
 
 logger = logging.getLogger('hevolve.peer_link')
 
@@ -572,6 +572,29 @@ class PeerLinkManager:
                             trust = TrustLevel.SAME_USER
                 except Exception:
                     pass
+
+            # Never REQUEST a trust level we cannot substantiate.
+            #
+            # The checks above answer "is this peer mine?" from the widest
+            # identity view we have, including get_node_identity()'s user_id.
+            # But the proof we put on the wire can only be signed over
+            # HEVOLVE_USER_ID (link.provable_user_id), because that is the sole
+            # value the far side's _verify_same_user_proof reads. When the two
+            # disagree we used to ask for SAME_USER with nothing to back it,
+            # and the peer logged "SAME_USER trust requested but no valid
+            # proof" and demoted us to PEER every single time.
+            #
+            # Asking for PEER here reaches the SAME final trust level with no
+            # false signal — and, more importantly, our local link object no
+            # longer believes it is SAME_USER (plaintext) while the far side
+            # treats it as PEER (encrypted), which is a real mismatch since
+            # the handshake ack never tells us what was actually granted.
+            if trust == TrustLevel.SAME_USER and not provable_user_id():
+                logger.info(
+                    "PeerLink %s: same-user match found, but HEVOLVE_USER_ID "
+                    "is unset so no proof can be signed — requesting PEER "
+                    "instead of an unprovable SAME_USER", peer_id[:8])
+                trust = TrustLevel.PEER
 
             # The success path logs too. "Attempted and failed to connect" and
             # "never attempted" produced identical silence before this, which is
