@@ -12,8 +12,9 @@ Connection budget (tier-based):
 Idle pruning: close links with <1 message in 5 minutes.
 Priority: keep links to peers with GPU, loaded models.
 
-HTTP fallback: send(peer_id, channel, data) tries PeerLink first,
-falls back to HTTP POST if no link available.
+HTTP fallback: send(peer_id, channel, data) tries PeerLink first, and WOULD
+fall back to HTTP POST if no link were available — but that leg has never been
+able to fire. See _http_fallback for why. Do not count on it as a transport.
 """
 import json
 import logging
@@ -615,7 +616,33 @@ class PeerLinkManager:
     @staticmethod
     def _http_fallback(peer_url: str, channel: str, data: dict,
                        timeout: float = 30.0) -> Optional[dict]:
-        """Send via HTTP when no PeerLink available."""
+        """Send via HTTP when no PeerLink available — UNREACHABLE today.
+
+        Kept because the spec is coherent and its tests pin it correctly, but
+        nothing here runs in production, for three independent reasons. Checked
+        2026-08-13; do not spend time debugging it as a live transport:
+
+        1. No caller can reach it. `send()` only gets here when `peer_url` is
+           truthy, and the ONLY production caller of `send()` is
+           `core/agent_tools.py:949` — which first requires
+           `get_link(...).trust == SAME_USER`, i.e. a link already exists, and
+           passes no `peer_url`. Every other `peer_url=` in the tree is either
+           a test or the InstanceFollow DB column of the same name.
+        2. Nothing serves the target. No route anywhere defines
+           `/api/peer-link/message`; the nearest neighbours
+           (`/api/social/peers/broadcast` and friends in
+           `integrations/social/discovery.py`) dispatch on `msg['type']`, not
+           on a channel, so they are a different contract — not a drop-in.
+        3. Nothing parses the wire format. `{'ch': ..., 'd': ...}` is read in
+           exactly one place, `link.py::_receive_loop`, over the WebSocket.
+
+        Wiring it up is a DESIGN decision, not a repair: the WebSocket path is
+        gated by the Ed25519 handshake in `PeerLink._complete_handshake`, so a
+        plain POST into the same `_channel_handlers` registry would be an
+        UNAUTHENTICATED injection point beside an authenticated one. It needs
+        equivalent peer authentication first. Leaving it inert is the safer
+        state, which is why this is a comment and not a new route.
+        """
         try:
             from core.http_pool import pooled_post
             resp = pooled_post(
