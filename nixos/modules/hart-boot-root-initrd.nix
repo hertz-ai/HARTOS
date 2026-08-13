@@ -98,6 +98,24 @@ in
     #    boot — never force-loaded, so a box without USB3 simply never loads xhci.
     boot.initrd.availableKernelModules = usbRootModules;
 
+    # 1b. GIVE THE CONTROLLER TIME TO RE-ENUMERATE. Having the modules is not
+    #     enough: firmware loads the UKI over its OWN USB stack, then the kernel
+    #     tears that down and re-enumerates from scratch. On a slow or flaky
+    #     controller the stick can take several seconds to reappear, and stage 1
+    #     gives up before it does -- "an error occurred in stage 1 ... must mount
+    #     the root filesystem on /mnt-root", with the root device provably present
+    #     and healthy on the stick.
+    #
+    #     Observed 2026-08-13 on the real node: freshly flashed stick, ext4
+    #     superblock CLEAN, LABEL=nixos, UUID matching what the initrd wants,
+    #     partition table byte-identical to the image -- and stage 1 still could
+    #     not find root. Same box whose usb-storage we caught wedged in D state
+    #     during normal operation, so the controller is known-slow.
+    #
+    #     rootdelay is a bounded WAIT, not a sleep: udev keeps probing and boot
+    #     continues the moment root appears, so a healthy box pays nothing.
+    boot.kernelParams = [ "rootdelay=15" ];
+
     # 2. ASSERT the critical subset actually survived into the merged list. If a
     #    mkForce elsewhere wiped it, this fails the BUILD (CI) — never a silent
     #    real-HW brick. (We read the merged config value, so the assertion sees
