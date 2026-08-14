@@ -104,9 +104,16 @@ class TestEnsureWhatsappLiveAdapter:
             )
 
         assert result['success'] is True
-        create_fn.assert_called_once_with(
-            api_url='http://127.0.0.1:3000', account_id='user_u1',
-        )
+        create_fn.assert_called_once()
+        call_kwargs = create_fn.call_args.kwargs
+        assert call_kwargs['api_url'] == 'http://127.0.0.1:3000'
+        assert call_kwargs['account_id'] == 'user_u1'
+        # phone_number/owner_lid carry the self-chat identity, which is fetched
+        # from the live gateway — their VALUES depend on whether one is
+        # reachable on :3000 (None when the fetch is refused). Assert they are
+        # passed through, not what they happen to resolve to here.
+        assert 'phone_number' in call_kwargs
+        assert 'owner_lid' in call_kwargs
         integration.registry.register.assert_called_once_with(fake_adapter)
         run_coro.assert_called_once()
         # scheduled coroutine must be adapter.start(), on the integration's loop
