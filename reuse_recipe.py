@@ -4323,6 +4323,21 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
             f'— proceeding, shared GroupChat may interleave. '
             f'CALLER-SHAPE keys={_keys_dbg} '
             f'task_source/autonomous/request_id={_src_dbg} ua={_ua_dbg!r}')
+        # TEMP DIAGNOSTIC (2026-08-14) -- name the duplicate caller.
+        # CALLER-SHAPE cannot: the duplicate replays the original request
+        # body verbatim, so payload shape is identical for both turns and
+        # _is_expert_dispatch_reentry() is blind to it.  The in-process
+        # call stack is the one thing that differs, and knowing which
+        # caller this is decides the fix: the duplicate cannot simply be
+        # queued behind the owner (see _inflight_turns above -- that
+        # deadlocks when the owner is what is blocked waiting on it), and
+        # dropping the wrong one returns silence to the user.
+        # Gated off by default; remove once the caller is identified.
+        if os.environ.get('HEVOLVE_REENTRANCY_STACK', '').lower() in ('1', 'true', 'yes'):
+            import traceback as _tb_dbg
+            current_app.logger.warning(
+                '[REENTRANCY-STACK] %s duplicate caller:\n%s',
+                user_prompt, ''.join(_tb_dbg.format_stack()[-25:]))
 
     request_id_list[user_prompt] = request_id
     try:
