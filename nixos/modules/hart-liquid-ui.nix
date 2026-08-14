@@ -509,7 +509,17 @@ in
         # the Model-Bus probe in ExecStart). `wants` STILL pulls the model bus in (the
         # generative UI activates once it appears), but it is DROPPED from `after` so
         # :PORT no longer waits behind model loading — they start concurrently.
-        after = [ ];  # NOT hart.target: wantedBy=hart.target + after=hart.target is a cycle (see hart-model-bus.nix 2026-08-14)
+        # NOT hart.target (wantedBy=hart.target + after=hart.target is the
+        # ordering cycle -- see hart-model-bus.nix 2026-08-14), but ALSO not
+        # empty: dropping ordering entirely started the shell server inside
+        # the backend/provision import-and-I/O storm and pushed the :6800
+        # bind past 60s -- three VM tests (desktop-boot, layer-shell-host,
+        # portal-screencast) went red on exactly that in the first gate run
+        # after the cycle fix. Order on the CONCRETE heavyweights the old
+        # target ordering effectively serialized behind: backend (started is
+        # enough) and the llm-provision oneshot (its completion ends the disk
+        # storm). Model bus stays deliberately OUT of after (see above).
+        after = [ "hart-backend.service" "hart-llm-provision.service" ];
         wants = [ "hart-model-bus.service" ];
         wantedBy = [ "hart.target" ];
 
