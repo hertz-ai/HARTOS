@@ -367,8 +367,43 @@ def register_marketing_tools(helper, assistant, user_id: str):
         except Exception as e:
             return json.dumps({'ok': False, 'error': str(e)})
 
+    def verify_facts(
+        claims_json: Annotated[str, "JSON list of {claim, source_url} — the source_url must be a page you actually fetched, not one you recall"],
+    ) -> str:
+        """Check each claim against text fetched live from its cited source.
+
+        Returns the grounded claims and, separately, every rejected one with
+        the reason it failed. Call this BEFORE composing anything for an
+        audience: a claim that does not appear here did not survive, and
+        publishing it anyway is the failure that put 416 fabricated posts on
+        this platform.
+
+        A rejection is a real result, not an obstacle to route around. If most
+        claims are rejected, the research step is inventing them, and that is
+        the thing worth reporting rather than quietly posting the remainder.
+        """
+        try:
+            from integrations.agent_engine.grounded_facts import verify_all
+            candidates = json.loads(claims_json)
+            if isinstance(candidates, dict):
+                candidates = [candidates]
+            grounded, rejected = verify_all(candidates)
+            return json.dumps({
+                'success': True,
+                'grounded': [f.to_dict() for f in grounded],
+                'rejected': rejected,
+                'grounded_count': len(grounded),
+                'rejected_count': len(rejected),
+            })
+        except Exception as e:
+            # Fail closed and say so: an error here must NOT read as "nothing
+            # was wrong with the claims".
+            return json.dumps({'success': False, 'error': str(e),
+                               'grounded': [], 'rejected': []})
+
     # Register all marketing tools
     tools = [
+        ('verify_facts', 'Ground claims against their cited sources before publishing; returns grounded facts and rejected ones with reasons', verify_facts),
         ('create_social_post', 'Create a post on the HART social platform for marketing', create_social_post),
         ('create_campaign', 'Create a marketing campaign with strategy, targeting, and budget', create_campaign),
         ('create_ad', 'Create a targeted ad unit with budget and audience targeting', create_ad),
