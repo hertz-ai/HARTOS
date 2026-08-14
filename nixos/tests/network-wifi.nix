@@ -325,9 +325,15 @@ in
               "runuser -u netprobe -- nmcli connection add type wifi "
               "con-name netprobe-denied ssid NOPE "
               "wifi-sec.key-mgmt wpa-psk wifi-sec.psk 'nopenopenope12' 2>&1")
-          assert "not authorized" in out.lower() or "not authorised" in out.lower(), \
+          # NetworkManager's denial wording changed across releases: older NM
+          # surfaces polkit's "not authorized", newer NM reports the same
+          # polkit denial as "Insufficient privileges". Both are the SCOPED
+          # denial this subtest exists to prove; accept either vocabulary.
+          _denied = out.lower()
+          assert ("not authorized" in _denied or "not authorised" in _denied
+                  or "insufficient privileges" in _denied), \
               ("sessionless netprobe nmcli add failed for a NON-polkit reason; "
-               "expected a polkit 'not authorized' denial, got:\n" + out)
+               "expected a polkit authorization denial, got:\n" + out)
           # Defensive: if NM somehow created it despite the expected denial, remove it.
           wifi.succeed(
               "runuser -u hart -- nmcli connection delete netprobe-denied "

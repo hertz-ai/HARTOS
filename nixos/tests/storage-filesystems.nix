@@ -170,8 +170,15 @@ in
           # filesystem" against a correctly formatted disk (run 30485906966).
           # Trigger an explicit change event so udisks re-probes the new fs.
           fs.succeed(f"udevadm trigger --action=change {disk} && udevadm settle")
-          # The udisks2 daemon must SEE the disk...
-          fs.succeed(f"udisksctl info -b {disk} >/dev/null")
+          # The udisks2 daemon must SEE the new FILESYSTEM — and `udevadm
+          # settle` only drains udev's queue, not udisksd's asynchronous D-Bus
+          # object refresh, so mounting straight after settle still raced the
+          # daemon's re-probe ("Object ... is not a mountable filesystem"
+          # against a correctly formatted disk, gate runs 2026-08-13/14).
+          # Wait on the REAL precondition: udisks reporting the vfat id.
+          fs.wait_until_succeeds(
+              f"udisksctl info -b {disk} | grep -Eq 'IdType:[[:space:]]*vfat'",
+              timeout=30)
           # ...and MOUNT it on demand (under /run/media/<user>/...).
           out = fs.succeed(f"udisksctl mount -b {disk} 2>&1")
           assert "Mounted" in out or "already mounted" in out, \
