@@ -999,6 +999,23 @@ class FlaskChannelIntegration:
             logger.warning("Channels already running")
             return
 
+        # Credential-in-environment channels.  Driven off _ENV_FALLBACKS —
+        # the same declarative map register_channel itself reads — rather than
+        # a second hardcoded list.  hartos_bootstrap keeps its own 5-entry
+        # dict whose names partly DISAGREE with this map (WHATSAPP_ACCESS_TOKEN
+        # vs WHATSAPP_API_URL, SIGNAL_SERVICE_URL vs SIGNAL_PHONE_NUMBER) and
+        # which omits google_chat entirely, so a GOOGLE_CHAT_WEBHOOK in the
+        # environment registered nothing on either boot path.  Using the map
+        # keeps one source of truth and covers every channel in it.
+        #
+        # register_channel resolves the env var itself, so passing no token is
+        # enough; the getenv here only decides whether it is worth attempting
+        # (heavy SDK modules must not be imported speculatively).
+        for _ct, _env in self._ENV_FALLBACKS.items():
+            if (_ct in self._ADAPTER_FACTORIES and os.environ.get(_env)
+                    and self.registry.get(_ct) is None):
+                self.register_channel(_ct)
+
         # `web` is in-process and credential-less, and hartos_bootstrap
         # registers it unconditionally ("in-process, cheap, always register")
         # as part of the bundled boot.  The standalone launcher never did, and

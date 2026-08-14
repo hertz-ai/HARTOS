@@ -12356,7 +12356,21 @@ def main():
         from integrations.channels.flask_integration import (
             get_channel_integration,
         )
-        get_channel_integration().start()
+        _channels = get_channel_integration()
+        # Inbound webhook seam, same omission as above: hartos_bootstrap and
+        # run_debug both call this, standalone never did — so the
+        # /channels/webhook/<channel_type> route did not exist here at all and
+        # EVERY webhook-based channel (google_chat, line, messenger,
+        # instagram, twitter, viber, wechat, zalo) was unreachable inbound,
+        # returning 404 to the provider. Must run before _serve_app.
+        try:
+            _channels.register_webhook_routes(app)
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "Inbound channel webhook routes not registered — webhook-based "
+                "channels cannot receive messages on this node: %s", e,
+                exc_info=True)
+        _channels.start()
     except Exception as e:
         logging.getLogger(__name__).warning(
             "Channel adapters not started — persisted channel bindings will "
