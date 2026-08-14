@@ -10,6 +10,7 @@ import logging
 import os
 import json
 import threading
+from datetime import datetime
 from typing import Optional, Dict, Any
 from functools import wraps
 
@@ -367,6 +368,28 @@ class FlaskChannelIntegration:
 
     # Channels that register without any external token/credential.
     _NO_TOKEN_CHANNELS = ('web', 'imessage', 'openprose')
+
+    # Credential keys a persisted UserChannelBinding may carry in
+    # metadata_json, in resolution order.  The binding API stores the
+    # credential under ITS OWN naming — discord rows hold 'bot_token' — which
+    # is not necessarily the factory's parameter name
+    # (create_discord_adapter takes 'token').  So whatever is found here is
+    # handed to register_channel as the generic `token` and mapped to the real
+    # parameter by _CHANNEL_SPECS / _credential_kwarg, reusing the one mapping
+    # layer the live-registration path already uses rather than duplicating it.
+    _BINDING_CREDENTIAL_KEYS = (
+        'bot_token', 'token', 'access_token', 'auth_token',
+        'personal_access_token', 'app_password', 'phone_number',
+        'api_url', 'webhook_url', 'private_key',
+    )
+
+    # WhatsApp is deliberately NOT restored generically: it already has a
+    # dedicated rehydration path (_ensure_whatsapp_live_adapter in
+    # hart_intelligence_entry) which additionally resolves the self-chat
+    # identity from the live gateway.  Restoring it here would build a second,
+    # identity-less adapter and silently replace that one, since
+    # registry.register keys on adapter.name.
+    _RESTORE_EXCLUDED = ('whatsapp',)
 
     # Declarative specs for channels that need more than the single generic
     # `token`: the token maps to a differently-named factory param
@@ -827,11 +850,160 @@ class FlaskChannelIntegration:
             self._loop.run_until_complete(self.registry.stop_all())
             self._loop.close()
 
+    @classmethod
+    def _binding_credentials(
+        cls, channel_type: str, meta: Dict[str, Any],
+    ) -> tuple:
+        """Extract ``(credential, extra_kwargs)`` from a binding's
+        metadata_json for the given channel type.
+
+        The credential is looked up under the channel's own ``token_param``
+        first (signal stores 'phone_number', slack 'bot_token'), then under
+        the generic key list.  For multi-input channels the declared `extra`
+        params are passed through when the binding carries them, so a stored
+        value beats the env fallback — matching register_channel's documented
+        "explicit kwarg wins over env/default" precedence.
+        """
+        spec = cls._CHANNEL_SPECS.get(channel_type)
+        keys = []
+        if spec and spec.get('token_param'):
+            keys.append(spec['token_param'])
+        keys.extend(k for k in cls._BINDING_CREDENTIAL_KEYS if k not in keys)
+
+        token = None
+        used_key = None
+        for k in keys:
+            v = meta.get(k)
+            if isinstance(v, str) and v.strip():
+                token, used_key = v.strip(), k
+                break
+
+        extras: Dict[str, str] = {}
+        if spec:
+            for p in spec.get('extra', ()):
+                name = p.get('param')
+                v = meta.get(name)
+                if name and name != used_key and isinstance(v, str) and v.strip():
+                    extras[name] = v.strip()
+        return token, extras
+
+    def restore_persisted_channels(self) -> Dict[str, Any]:
+        """Re-register channel adapters from persisted UserChannelBinding rows.
+
+        Bindings survive a restart — that is the table's stated purpose — but
+        the live adapters did not: nothing read them back at boot, so every
+        HARTOS restart left Discord/Telegram/Slack/Signal disconnected until
+        someone re-POSTed the binding by hand.  WhatsApp was the only channel
+        with a rehydration path; this generalises it to the rest.
+
+        Exactly ONE adapter can exist per channel_type (registry.register keys
+        on adapter.name), so where several bindings share a channel_type the
+        most recently updated active one wins — the same row a manual rebind
+        would pick.  Channels already registered are left alone, so explicit
+        env/code registration keeps precedence and this is idempotent.
+
+        Never raises: a binding that cannot be restored is logged and skipped,
+        because one bad row must not stop the server from booting.
+        """
+        summary: Dict[str, Any] = {'restored': [], 'skipped': {}}
+        if os.environ.get(
+            'HEVOLVE_CHANNEL_RESTORE', '1',
+        ).strip().lower() in ('0', 'false', 'no', 'off'):
+            logger.info("Channel restore disabled (HEVOLVE_CHANNEL_RESTORE)")
+            return summary
+
+        try:
+            from integrations.social.models import get_db, UserChannelBinding
+        except ImportError as e:
+            logger.debug(f"Channel restore unavailable (no social models): {e}")
+            return summary
+
+        try:
+            db = get_db()
+            try:
+                rows = db.query(UserChannelBinding).filter_by(
+                    is_active=True,
+                ).all()
+                # Newest first.  updated_at is NULL on legacy rows, so fall
+                # back to id, which is autoincrement and therefore monotonic.
+                rows.sort(
+                    key=lambda r: (r.updated_at or datetime.min, r.id or 0),
+                    reverse=True,
+                )
+
+                # Group by channel, preserving the newest-first order.  The
+                # newest row is NOT automatically the one to use: a channel
+                # commonly has several bindings and the most recent can be
+                # credential-less (an out-of-band pair, or a stale row from an
+                # ad-hoc script).  Picking it and stopping would skip the
+                # channel entirely and restore nothing, silently — so walk the
+                # candidates until one actually registers.
+                by_channel: Dict[str, list] = {}
+                for row in rows:
+                    ct = (row.channel_type or '').strip().lower()
+                    if ct:
+                        by_channel.setdefault(ct, []).append(row)
+
+                for ct, candidates in by_channel.items():
+                    if ct in self._RESTORE_EXCLUDED:
+                        summary['skipped'][ct] = 'dedicated restore path'
+                        continue
+                    if ct not in self._ADAPTER_FACTORIES:
+                        summary['skipped'][ct] = 'no adapter factory'
+                        continue
+                    if self.registry.get(ct) is not None:
+                        summary['skipped'][ct] = 'already registered'
+                        continue
+
+                    reason = 'no stored credential'
+                    for row in candidates:
+                        meta = row.metadata_json
+                        if not isinstance(meta, dict):
+                            meta = {}
+                        token, extras = self._binding_credentials(ct, meta)
+                        if not token and ct not in self._NO_TOKEN_CHANNELS:
+                            continue
+                        if self.register_channel(ct, token=token, **extras):
+                            summary['restored'].append(ct)
+                            reason = None
+                            break
+                        # register_channel already logged why; a stale token
+                        # on a newer row shouldn't mask an older working one.
+                        reason = 'registration failed'
+                    if reason:
+                        summary['skipped'][ct] = reason
+            finally:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"Channel restore failed: {e}")
+            return summary
+
+        if summary['restored']:
+            logger.info(
+                f"Restored {len(summary['restored'])} channel adapter(s) "
+                f"from persisted bindings: {', '.join(summary['restored'])}"
+            )
+        else:
+            logger.info(
+                f"No channel adapters restored from bindings "
+                f"(skipped: {summary['skipped'] or 'none'})"
+            )
+        return summary
+
     def start(self) -> None:
         """Start all channel adapters in background thread."""
         if self._thread and self._thread.is_alive():
             logger.warning("Channels already running")
             return
+
+        # Re-wire adapters persisted in UserChannelBinding BEFORE the loop
+        # thread starts: _run_async_loop's first act is registry.start_all(),
+        # which connects whatever is registered by then.  Registering here
+        # therefore needs no extra lifecycle machinery.
+        self.restore_persisted_channels()
 
         self._thread = threading.Thread(target=self._run_async_loop, daemon=True)
         self._thread.start()

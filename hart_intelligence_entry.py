@@ -12257,6 +12257,27 @@ def main():
             "Agent engine init failed — no seeded goal will ever execute on "
             "this node: %s", e, exc_info=True)
 
+    # Channel adapters: same class of gap as the agent engine above.
+    # hartos_bootstrap.py calls FlaskChannelIntegration.start() as part of the
+    # bundled boot sequence, but this standalone launcher never did — so
+    # `_loop` stayed None and every persisted UserChannelBinding sat dead
+    # until an unrelated WhatsApp code path happened to trigger start() on
+    # demand (see _ensure_whatsapp_live_adapter).  In practice that meant
+    # Discord/Telegram/Slack had to be re-bound by hand after every restart,
+    # even though the bindings table exists precisely to survive one.
+    #
+    # start() rehydrates adapters from those bindings and is idempotent, so a
+    # launcher that already started channels (Nunba) is unaffected.
+    try:
+        from integrations.channels.flask_integration import (
+            get_channel_integration,
+        )
+        get_channel_integration().start()
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "Channel adapters not started — persisted channel bindings will "
+            "stay disconnected on this node: %s", e, exc_info=True)
+
     from core.port_registry import get_port
     _serve_app(app, host='0.0.0.0', port=get_port('backend'))
 
