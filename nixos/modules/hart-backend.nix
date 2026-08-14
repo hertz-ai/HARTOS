@@ -109,6 +109,18 @@ in
         TimeoutStartSec = 600;
         TimeoutStopSec = 15;
 
+        # The backend's STARTUP legitimately logs hundreds of lines (the full
+        # ML-stack import narrates), and hart-security's global journald rate
+        # limit (RateLimitBurst=200/30s, added 2026-08-12 against runaway
+        # loggers) can swallow the tail of that burst -- including one-shot
+        # wiring proofs like "Local subscribers bootstrapped: ... ota-push"
+        # that vm-test-run-hart-ota-central greps for (red on every gate run
+        # since the cap landed). Exempting THIS unit keeps the global cap for
+        # everything else; a boot-time burst from the designed-noisy unit is
+        # not the runaway the cap exists to stop.
+        LogRateLimitIntervalSec = 30;
+        LogRateLimitBurst = 5000;
+
         # The canonical DB must be WRITABLE BY hart BEFORE the backend touches
         # it (real-HW 2026-08-14). Root-running importers (hart-ota's python
         # sets HEVOLVE_DB_PATH and imports the app) can be the FIRST to connect,
