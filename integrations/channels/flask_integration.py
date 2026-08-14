@@ -999,6 +999,22 @@ class FlaskChannelIntegration:
             logger.warning("Channels already running")
             return
 
+        # `web` is in-process and credential-less, and hartos_bootstrap
+        # registers it unconditionally ("in-process, cheap, always register")
+        # as part of the bundled boot.  The standalone launcher never did, and
+        # there is no `web` row in user_channel_bindings for the restore below
+        # to pick up — so outside the bundle the in-process channel simply did
+        # not exist.  Registering here makes the two boot paths equivalent; it
+        # no-ops under bootstrap, which has already registered it.
+        #
+        # Opt out with HEVOLVE_WEB_CHANNEL=0: connect() binds a real listening
+        # socket (WEB_ADAPTER_HOST, default 0.0.0.0:8765), so a deployment that
+        # does not want that port exposed needs a way to say so.
+        if self.registry.get('web') is None and os.environ.get(
+            'HEVOLVE_WEB_CHANNEL', '1',
+        ).strip().lower() not in ('0', 'false', 'no', 'off'):
+            self.register_channel('web')
+
         # Re-wire adapters persisted in UserChannelBinding BEFORE the loop
         # thread starts: _run_async_loop's first act is registry.start_all(),
         # which connects whatever is registered by then.  Registering here

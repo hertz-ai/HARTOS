@@ -328,6 +328,73 @@ class TestRestorePersistedChannels:
         assert out['restored'] == []
 
 
+class TestWebAlwaysOn:
+    """`web` is in-process and credential-less. hartos_bootstrap registers it
+    unconditionally, the standalone launcher never did, and no `web` binding
+    row exists for the restore to pick up — so outside the bundle the channel
+    did not exist at all."""
+
+    def test_start_registers_web_before_restoring_bindings(self):
+        import inspect
+
+        from integrations.channels.flask_integration import (
+            FlaskChannelIntegration,
+        )
+        src = inspect.getsource(FlaskChannelIntegration.start)
+        assert "register_channel('web')" in src, (
+            "standalone boot must register the in-process web channel"
+        )
+        web_at = src.index("register_channel('web')")
+        restore_at = src.index('restore_persisted_channels')
+        thread_at = src.index('threading.Thread')
+        assert web_at < restore_at < thread_at, (
+            "web must register before the loop thread starts, or "
+            "registry.start_all() will not connect it"
+        )
+
+    def _start_without_thread(self, fi):
+        """Run start() for real but stub the loop thread — the registration
+        work under test all happens before the thread is spawned."""
+        fi._thread = None
+        with patch(
+            'integrations.channels.flask_integration.threading.Thread',
+        ) as thread_cls:
+            thread_cls.return_value = Mock(is_alive=Mock(return_value=False))
+            fi.start()
+
+    def test_start_registers_web_when_absent(self):
+        fi = _integration()
+        with _patch_db([]), patch.object(
+            fi, 'register_channel', return_value=True,
+        ) as reg:
+            self._start_without_thread(fi)
+        assert any(c.args and c.args[0] == 'web' for c in reg.call_args_list), (
+            f"start() should register web; calls were {reg.call_args_list}"
+        )
+
+    def test_web_registration_is_skipped_when_already_registered(self):
+        """Under hartos_bootstrap web is already registered; re-registering
+        would replace a live adapter (registry.register keys on name)."""
+        fi = _integration()
+        fi.registry.get.return_value = Mock()  # everything already registered
+        with _patch_db([]), patch.object(
+            fi, 'register_channel', return_value=True,
+        ) as reg:
+            self._start_without_thread(fi)
+        assert not any(c.args and c.args[0] == 'web' for c in reg.call_args_list)
+
+    def test_web_channel_can_be_disabled_by_env(self, monkeypatch):
+        """connect() binds a real socket on 0.0.0.0:8765, so a deployment
+        must be able to refuse it."""
+        fi = _integration()
+        monkeypatch.setenv('HEVOLVE_WEB_CHANNEL', '0')
+        with _patch_db([]), patch.object(
+            fi, 'register_channel', return_value=True,
+        ) as reg:
+            self._start_without_thread(fi)
+        assert not any(c.args and c.args[0] == 'web' for c in reg.call_args_list)
+
+
 class TestStartWiring:
     """The restore is worthless if start() doesn't call it before the loop
     thread reaches registry.start_all()."""
