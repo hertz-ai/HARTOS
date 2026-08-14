@@ -109,6 +109,32 @@ in
         TimeoutStartSec = 600;
         TimeoutStopSec = 15;
 
+        # The canonical DB must be WRITABLE BY hart BEFORE the backend touches
+        # it (real-HW 2026-08-14). Root-running importers (hart-ota's python
+        # sets HEVOLVE_DB_PATH and imports the app) can be the FIRST to connect,
+        # and sqlite creates the file as root:root 0644. The backend (User=hart)
+        # then reads it fine but every write fails "attempt to write a readonly
+        # database", init_db/run_migrations die (swallowed as a non-fatal
+        # warning), tables added since the seed never exist, and every consumer
+        # ticks into `no such table: agent_goals` forever -- the constant
+        # SSE/log churn measured feeding the shell leak. The `+` prefix runs
+        # this ONE step as root; create-with-owner if missing, normalize if
+        # present. Idempotent, self-healing on every start, and ordering-proof
+        # against the state-persist bind mount (we run strictly before ExecStart).
+        ExecStartPre = "+" + pkgs.writeShellScript "hart-backend-db-owner" ''
+          db="${cfg.dataDir}/hevolve_database.db"
+          if [ ! -e "$db" ]; then
+            install -o hart -g hart -m 0660 /dev/null "$db"
+          else
+            chown hart:hart "$db" 2>/dev/null || true
+            chmod 0660 "$db" 2>/dev/null || true
+          fi
+          # sqlite sidecar files inherit badness the same way; normalize if present
+          for f in "$db-wal" "$db-shm" "$db-journal"; do
+            [ -e "$f" ] && chown hart:hart "$f" 2>/dev/null && chmod 0660 "$f" 2>/dev/null || true
+          done
+        '';
+
         # Security hardening
         NoNewPrivileges = true;
         ProtectSystem = "strict";
