@@ -509,7 +509,7 @@ in
         # the Model-Bus probe in ExecStart). `wants` STILL pulls the model bus in (the
         # generative UI activates once it appears), but it is DROPPED from `after` so
         # :PORT no longer waits behind model loading — they start concurrently.
-        after = [ "hart.target" ];
+        after = [ ];  # NOT hart.target: wantedBy=hart.target + after=hart.target is a cycle (see hart-model-bus.nix 2026-08-14)
         wants = [ "hart-model-bus.service" ];
         wantedBy = [ "hart.target" ];
 

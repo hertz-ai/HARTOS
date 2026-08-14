@@ -133,7 +133,7 @@ in
       systemd.services.hart-app-bridge = {
         description = "HART OS App Bridge — Cross-Subsystem Agent Routing";
         documentation = [ "https://github.com/hertz-ai/HARTOS" ];
-        after = [ "hart.target" "hart-model-bus.service" ];
+        after = [ "hart-model-bus.service" ];  # hart.target removed: ordering cycle (see hart-model-bus.nix 2026-08-14)
         wants = [ "hart-model-bus.service" ];
         wantedBy = [ "hart.target" ];
 

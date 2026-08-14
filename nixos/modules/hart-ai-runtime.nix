@@ -194,7 +194,7 @@ in
       # Model store management service
       systemd.services.hart-model-store = {
         description = "HART OS Model Store Manager";
-        after = [ "hart.target" ];
+        after = [ ];  # NOT hart.target: members of a target must not be After= it (cycle; see hart-model-bus.nix 2026-08-14)
         wantedBy = [ "hart.target" ];
 
         serviceConfig = {
@@ -252,7 +252,7 @@ in
       # GPU scheduler service: manages agent GPU access
       systemd.services.hart-gpu-scheduler = {
         description = "HART OS GPU Scheduler";
-        after = [ "hart.target" ];
+        after = [ ];  # NOT hart.target: members of a target must not be After= it (cycle; see hart-model-bus.nix 2026-08-14)
         wantedBy = [ "hart.target" ];
 
         # lspci (pciutils) + systemd-notify are NOT on the unit's minimal PATH;
@@ -340,7 +340,7 @@ in
       # Usage: systemctl start hart-agent@goal_123.service
       systemd.services."hart-agent@" = {
         description = "HART OS Agent: %i";
-        after = [ "hart.target" ];
+        after = [ ];  # NOT hart.target: members of a target must not be After= it (cycle; see hart-model-bus.nix 2026-08-14)
 
         serviceConfig = {
           Type = "simple";
@@ -391,7 +391,7 @@ in
       # Agent lifecycle monitor
       systemd.services.hart-agent-monitor = {
         description = "HART OS Agent Lifecycle Monitor";
-        after = [ "hart.target" ];
+        after = [ ];  # NOT hart.target: members of a target must not be After= it (cycle; see hart-model-bus.nix 2026-08-14)
         wantedBy = [ "hart.target" ];
 
         serviceConfig = {
@@ -496,7 +496,7 @@ in
 
       systemd.services.hart-service-intelligence = {
         description = "HART OS Service Intelligence (AI-aware self-healing)";
-        after = [ "hart.target" "hart-model-bus.service" ];
+        after = [ "hart-model-bus.service" ];  # hart.target removed: ordering cycle (see hart-model-bus.nix 2026-08-14)
         wants = [ "hart-model-bus.service" ];
         wantedBy = [ "hart.target" ];
 
@@ -586,7 +586,7 @@ in
 
       systemd.services.hart-smart-index = {
         description = "HART OS Smart Filesystem Index (semantic search)";
-        after = [ "hart.target" "hart-model-bus.service" ];
+        after = [ "hart-model-bus.service" ];  # hart.target removed: ordering cycle (see hart-model-bus.nix 2026-08-14)
         wants = [ "hart-model-bus.service" ];
         wantedBy = [ "hart.target" ];
 
@@ -766,7 +766,7 @@ in
 
       systemd.services.hart-predictive-prefetch = {
         description = "HART OS Predictive Model Prefetch";
-        after = [ "hart.target" "hart-model-bus.service" ];
+        after = [ "hart-model-bus.service" ];  # hart.target removed: ordering cycle (see hart-model-bus.nix 2026-08-14)
         wants = [ "hart-model-bus.service" ];
         wantedBy = [ "hart.target" ];
 
