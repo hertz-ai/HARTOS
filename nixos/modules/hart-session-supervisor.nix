@@ -1218,15 +1218,19 @@ in
     # membership — the `seat` group was only ever needed for the seatd path.
     # DO NOT ADD "seat" HERE. It was added 2026-08-13 to satisfy
     # TestSeatDrmBringUp::test_hart_admin_in_seat_group, directly against the
-    # comment above, and it BRICKED THE FLASHED IMAGE: with seatd force-disabled
-    # the `seat` group does not exist, the users activation script fails, and
-    # activation runs inside `init` -- so init exits 1 and stage 2 dies with
+    # comment above. With seatd force-disabled the `seat` group does not exist,
+    # and nothing statically checks that a group named in extraGroups exists, so
+    # the build stays green while the users activation script degrades at
+    # runtime. If that CI test wants `seat`, the test is wrong for this
+    # configuration -- fix the test, not this list.
+    # CORRECTION (2026-08-14): the 08-13 revert commit blamed this line for the
     #     Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000100
     #     CPU: 5 UID: 0 PID: 1 Comm: switch_root
-    # after stage 1 had already found, fsck'd and mounted root perfectly. The
-    # build is green either way: nothing statically checks that a group named in
-    # extraGroups exists. If that CI test wants `seat`, the test is wrong for this
-    # configuration -- fix the test, not this list.
+    # That attribution was WRONG on its own evidence: activation runs in stage 2
+    # under Comm "init", never "switch_root". The panic came from a different
+    # physical stick carrying a different build (see the resolved NOTE in
+    # hart-boot-root-initrd.nix). Keeping `seat` out remains correct for the
+    # eval-consistency reasons above; it just was not the brick.
     users.users.hart-admin.extraGroups = [ "hart" ];
 
     # ── Plymouth / fbcon must RELEASE DRM master before the compositor claims it ──

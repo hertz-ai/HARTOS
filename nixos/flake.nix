@@ -393,6 +393,16 @@
       hartVersion = "1.0.0";
       hartVariant = variant;
       hartSrc = ../.;  # repo root
+      # Short git revision of the tree being built, "dev" on a dirty local tree.
+      # Consumed by hart-repart-image.nix to stamp PER-BUILD filesystem labels.
+      # WHY (2026-08-14): these images build REPRODUCIBLY -- mkfs is seeded, so
+      # every build of every commit produces the SAME ext4 UUID and the same
+      # "nixos" label. Two sticks carrying different builds are therefore
+      # indistinguishable to stage 1's by-label (or by-uuid!) root lookup, and a
+      # day was lost to two identical Cruzer Blades where the freshly flashed
+      # good build sat unbooted while the stale broken one panicked on two
+      # laptops. A rev-derived label gives each build its own root identity.
+      hartRev = self.shortRev or self.dirtyShortRev or "dev";
       # The newer-Rust nixpkgs (25.05) — passed as the raw flake input so the Rust
       # modules can instantiate `rust_1_88` for THEIR system (the module knows its own
       # system via pkgs.stdenv). Only hart-comp.nix + hart-rust-precedent.nix consume
