@@ -405,6 +405,13 @@ jobs:
   nixos-tests:
     name: nixosTests shard ${{ matrix.shard }}/4
     runs-on: ubuntu-latest
+    # SEQUENCED AFTER the python shards (2026-08-14): the python verdict lands
+    # in ~8 minutes; these four shards burn ~4 runner-HOURS. Run 31812181058
+    # had every python shard red by 15:06 and still ground VM tests until
+    # 16:17 -- an hour of paid compute after the gate was already dead. The
+    # green path pays ~8 min of added latency; every red-python push saves
+    # the VM fleet entirely.
+    needs: unit-tests
     # Each shard runs ~1/4 of the checks (+ the shared closure build once). 5h
     # budget leaves wide headroom under the 6h cap even on a cold cache.
     timeout-minutes: 300
@@ -480,5 +487,29 @@ jobs:
           # nix still exits non-zero if ANY failed -> the shard (and thus the gate)
           # goes red. Building a check RUNS its VM testScript.
           echo "=== Building ${#SEL[@]} checks in shard ${{ matrix.shard }} ==="
-          nix build --keep-going --print-build-logs --max-jobs 2 --cores 2 "${SEL[@]}"
+          # pipefail is MANDATORY (same rule as compositor-nix): without it the
+          # pipeline reports tee's exit status and a red nix build goes green.
+          set -o pipefail
+          nix build --keep-going --print-build-logs --max-jobs 2 --cores 2 \
+            "${SEL[@]}" 2>&1 | tee /tmp/nixos-tests-shard.log
           echo "Shard ${{ matrix.shard }} nixosTests PASSED."
+
+      # SURFACE THE VERDICT (2026-08-14): finding which VM test failed used to
+      # mean fetching a multi-hundred-MB run log and grepping -- six separate
+      # excavations in one debugging night. On failure, the failing test names
+      # and their assertion lines land in the job summary + as annotations.
+      - name: Surface failing VM tests
+        if: failure()
+        run: |
+          LOG=/tmp/nixos-tests-shard.log
+          [ -f "$LOG" ] || { echo "no shard log captured"; exit 0; }
+          {
+            echo "## nixosTests shard ${{ matrix.shard }} — failures"
+            echo '```'
+            grep -E 'Test ".*" failed with error' "$LOG" | sort -u | head -40 \
+              || echo "(no per-test failure lines; likely a build/eval error)"
+            grep -E "error: builder for .* failed" "$LOG" | sort -u | head -10 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -E 'Test ".*" failed with error' "$LOG" | sort -u | head -10 | \
+            while IFS= read -r line; do echo "::error::${line}"; done
