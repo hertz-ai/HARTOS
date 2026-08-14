@@ -853,25 +853,46 @@ class TestShellScripts:
 
     @pytest.mark.parametrize('script', SHELL_SCRIPTS)
     def test_no_syntax_errors_basic(self, script):
-        """Basic syntax check: matched if/fi, for/done, while/done."""
-        content = read_file(script)
-        # Strip comment lines and inline comments before counting keywords.
-        # This avoids matching 'if' inside comments like "# Skip if already"
-        lines = []
-        for line in content.splitlines():
-            stripped = line.lstrip()
-            if stripped.startswith('#'):
-                continue
-            # Remove inline comments (best effort)
-            comment_pos = stripped.find(' #')
-            if comment_pos > 0:
-                stripped = stripped[:comment_pos]
-            lines.append(stripped)
-        cleaned = '\n'.join(lines)
-        # Match 'if' only at statement start (beginning of line or after ;)
-        ifs = len(re.findall(r'(?:^|;\s*)if\b', cleaned, re.MULTILINE))
-        fis = len(re.findall(r'(?:^|;\s*)fi\b', cleaned, re.MULTILINE))
-        assert ifs == fis, f"Unbalanced if/fi in {script}: {ifs} if, {fis} fi"
+        """Syntax-check each shipped script with the REAL parser (``bash -n``).
+
+        This used to count ``if`` vs ``fi`` with a regex and assert they match.
+        It reported `Unbalanced if/fi in hart-first-boot.sh: 23 if, 22 fi` on a
+        script that ``bash -n`` parses cleanly — a false failure on a file that
+        runs at FIRST BOOT of the OS, which is the worst place to be chasing a
+        phantom.
+
+        The heuristic could not have worked. It stripped inline comments with
+        ``stripped.find(' #')``, which truncates at the first ` #` even inside a
+        quoted string, so an ``echo "step # 2"`` silently eats whatever follows
+        on that line — including an ``fi``. It also counted ``if`` appearing
+        inside heredocs and strings. Counting keywords is not parsing; a second
+        regex over the same file gives 27/22 rather than 23/22, which is enough
+        to show the number was arbitrary.
+
+        ``bash -n`` parses without executing, so it is both safe and strictly
+        stronger: it catches every syntax error, not just one hand-picked pair.
+        Verified against all three scripts in SHELL_SCRIPTS at the time of the
+        change — all clean.
+
+        Skipped where bash is absent (a Windows dev box); the Linux CI runners
+        that gate the release always have it, so coverage is not lost where it
+        counts.
+        """
+        import shutil
+        import subprocess
+
+        bash = shutil.which('bash')
+        if not bash:
+            pytest.skip('bash not available; the Linux CI runners gate this')
+
+        full_path = os.path.join(REPO_ROOT, script)
+        proc = subprocess.run(
+            [bash, '-n', full_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert proc.returncode == 0, (
+            f"{script} is not valid shell:\n{proc.stderr.strip()}"
+        )
 
 
 # ──────────────────────────────────────────────────

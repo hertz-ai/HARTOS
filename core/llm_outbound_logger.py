@@ -919,8 +919,103 @@ def _install_async_patch(httpx_module) -> None:
     httpx_module.AsyncClient.send = _patched
 
 
+def _install_urllib_patch(urllib_request_module) -> None:
+    """Patch ``urllib.request.urlopen`` — the THIRD transport that reaches
+    llama-server, and the one that was escaping the gate entirely.
+
+    Why this exists (measured live 2026-08-11): hevolveai's distillation engine
+    calls llama-server from
+    ``hevolveai/embodied_ai/models/qwen_llamacpp_wrapper.py:301`` via
+    ``urllib.request.urlopen``.  That is neither httpx nor requests, so its
+    traffic was BOTH invisible to ``llm_outbound.jsonl`` and unscheduled:
+    1,166 records carried only ``autogen.create`` / ``dispatcher.draft`` /
+    ``autogen.gather`` while 191 synthetic distillation queries had been
+    generated and served.  Unscheduled calls consume real llama-server slots
+    OUTSIDE ``core.llama_scheduler``'s accounting, so "in-flight <= --parallel"
+    was unenforceable no matter how correct the scheduler itself is
+    (``/props`` reported ``total_slots = 2``).
+
+    The interception CRITERION is shared, not duplicated: ``_is_target_request``
+    is duck-typed on ``.port``/``.path`` and ``urllib.parse.urlsplit`` satisfies
+    both, so there is exactly ONE notion of "is this an LLM call".
+    Classification likewise reuses ``_is_background_call`` — it already falls
+    back to the request-id contextvar when the object has no ``.headers``, so no
+    per-transport "is user" rule is introduced.
+
+    Two deliberate scope limits, both pinned in
+    ``tests/unit/test_urllib_outbound_gating.py``:
+
+    * **No left-trim.**  ``_apply_trim_to_request`` drives httpx internals and
+      is not reusable for a urllib ``Request``.
+    * **No cancel_fn.**  ``close_bg_llm_http_client`` closes the httpx
+      background client; handing it to a urllib admission would preempt an
+      UNRELATED call while leaving this socket running.  urllib daemon calls are
+      therefore slot-bounded and yielding, but not mid-flight cancellable.
+    """
+    _orig_urlopen = urllib_request_module.urlopen
+
+    def _patched_urlopen(url, data=None, *args, **kwargs):
+        # Resolve target-ness defensively: ``url`` is either a str or a
+        # Request, and ANY failure here must fall through to the untouched
+        # call — a logging hook may never break an LLM request.
+        try:
+            from urllib.parse import urlsplit
+            _is_req = hasattr(url, 'full_url')
+            full_url = url.full_url if _is_req else url
+            payload = url.data if _is_req else data
+            try:
+                method = url.get_method() if _is_req else None
+            except Exception:
+                method = None
+            if not method:
+                method = 'POST' if payload is not None else 'GET'
+            target = _is_target_request(urlsplit(str(full_url)), method)
+        except Exception:
+            target = False
+        if not target:
+            return _orig_urlopen(url, data, *args, **kwargs)
+
+        body = None
+        try:
+            if payload:
+                body = json.loads(bytes(payload).decode('utf-8'))
+        except Exception:
+            body = None
+        # Stamp X-HARTOS-* before classifying, mirroring the httpx path's order
+        # so the discriminator reads the same header there and here.  A urllib
+        # Request.headers is a plain dict, the same mutation _annotate_request
+        # performs on an httpx request.
+        if _is_req:
+            _annotate_request(url, body)
+        try:
+            from core.llama_scheduler import get_scheduler
+            _kind = 'daemon' if _is_background_call(url) else 'user'
+            _slot_cm = get_scheduler().slot(_get_request_id(), _kind,
+                                            cancel_fn=None, timeout=120.0)
+        except Exception:
+            _slot_cm = contextlib.nullcontext()
+        start = time.time()
+        try:
+            with _slot_cm:
+                response = _orig_urlopen(url, data, *args, **kwargs)
+            elapsed = (time.time() - start) * 1000
+            log_outbound(body or {},
+                         source=(_get_source() or 'urllib'),
+                         response_status=getattr(response, 'status', None),
+                         latency_ms=round(elapsed, 1))
+            return response
+        except Exception as e:
+            elapsed = (time.time() - start) * 1000
+            log_outbound(body or {}, source=(_get_source() or 'urllib-exc'),
+                         response_status=type(e).__name__,
+                         latency_ms=round(elapsed, 1))
+            raise
+
+    urllib_request_module.urlopen = _patched_urlopen
+
+
 def install() -> bool:
-    """Idempotently install the httpx Client + AsyncClient patches.
+    """Idempotently install the httpx Client + AsyncClient + urllib patches.
     Returns True on first install, False otherwise.
 
     Kill switch: set ``HEVOLVE_LLM_OUTBOUND_DISABLE=1`` (or any
@@ -942,18 +1037,29 @@ def install() -> bool:
         try:
             import httpx
         except ImportError:
-            logger.debug("httpx not importable, skipping install")
-            return False
+            # NOT a bail-out any more.  urllib is stdlib and is the transport
+            # hevolveai's distillation engine uses, so a missing httpx must
+            # never leave the gate fully open (it previously returned False and
+            # patched nothing at all).
+            httpx = None
+            logger.debug("httpx not importable — patching urllib only")
+        patched = []
         try:
-            _install_sync_patch(httpx)
-            _install_async_patch(httpx)
+            if httpx is not None:
+                _install_sync_patch(httpx)
+                _install_async_patch(httpx)
+                patched.append('httpx (sync+async)')
+            import urllib.request as _urllib_request
+            _install_urllib_patch(_urllib_request)
+            patched.append('urllib.request')
         except Exception as e:
             logger.warning("[outbound-hook] install failed: %s", e)
             return False
         _installed = True
         logger.info(
-            "[outbound-hook] httpx (sync+async) patched — every POST to "
-            "ports %s path %s will be logged to %s",
+            "[outbound-hook] %s patched — every POST to ports %s path %s is "
+            "logged to %s and admitted through the llama slot scheduler",
+            ' + '.join(patched),
             sorted(_target_ports()), _TARGET_PATH, _get_log_path(),
         )
         return True

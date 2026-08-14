@@ -11,6 +11,7 @@ Any trained HART recipe can be exported:
 import json
 import logging
 import os
+from core.subprocess_safe import no_window_kwargs
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -225,7 +226,7 @@ def publish_skill(skill_dir: str, slug: Optional[str] = None) -> bool:
         cmd.extend(['--slug', slug])
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, **no_window_kwargs())
         if result.returncode == 0:
             logger.info("Published skill from %s", skill_dir)
             return True

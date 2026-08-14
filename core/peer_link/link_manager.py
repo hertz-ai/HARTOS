@@ -12,8 +12,9 @@ Connection budget (tier-based):
 Idle pruning: close links with <1 message in 5 minutes.
 Priority: keep links to peers with GPU, loaded models.
 
-HTTP fallback: send(peer_id, channel, data) tries PeerLink first,
-falls back to HTTP POST if no link available.
+HTTP fallback: send(peer_id, channel, data) tries PeerLink first, and WOULD
+fall back to HTTP POST if no link were available — but that leg has never been
+able to fire. See _http_fallback for why. Do not count on it as a transport.
 """
 import json
 import logging
@@ -24,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from core.foreground import should_yield_to_user
 
-from .link import PeerLink, TrustLevel, LinkState
+from .link import PeerLink, TrustLevel, LinkState, provable_user_id
 
 logger = logging.getLogger('hevolve.peer_link')
 
@@ -206,20 +207,9 @@ class PeerLinkManager:
 
         Called when auto-upgrade threshold reached or manually.
         """
-        with self._lock:
-            # Check budget
-            active = sum(1 for l in self._links.values() if l.is_connected)
-            if active >= self._max_links:
-                # Try to evict least useful link
-                if not self._evict_weakest_link():
-                    logger.debug(f"Link budget full ({active}/{self._max_links}), "
-                               f"cannot upgrade {peer_id[:8]}")
-                    return False
-
-            # Check if already linked
-            existing = self._links.get(peer_id)
-            if existing and existing.is_connected:
-                return True
+        admitted = self._admit(peer_id)
+        if admitted is not None:
+            return admitted
 
         # Create and connect
         link = PeerLink(
@@ -230,45 +220,112 @@ class PeerLinkManager:
             ed25519_public_hex=ed25519_public,
         )
 
-        # Register channel handlers
+        self._apply_channel_handlers(link)
+
+        if link.connect():
+            self._register_connected_link(peer_id, link)
+            return True
+        return False
+
+    def accept_inbound(self, peer_id: str, address: str, ws,
+                       hello: dict) -> Optional[PeerLink]:
+        """Adopt an INBOUND link a WebSocket server just received.
+
+        The mirror of upgrade_peer for the other direction, and deliberately
+        the same code either way: same budget check, same channel-handler
+        registration, same post-connect side effects.  The only difference is
+        `link.accept(ws, hello)` — the peer dialed us, so there is nothing to
+        dial back.
+
+        Trust is constructed at PEER on purpose and never taken from the wire.
+        `PeerLink._complete_handshake` ratchets it up to SAME_USER only on a
+        valid `user_id_proof`; starting at SAME_USER would let the ratchet
+        (which refuses downgrades) lock in a level the peer never proved.
+
+        Returns the live PeerLink, or None when the handshake failed or the
+        connection budget refused it.
+        """
+        admitted = self._admit(peer_id)
+        if admitted is not None:
+            # True = a live link to this peer already exists; hand it back so
+            # the caller does not tear down the healthy one.
+            return self.get_link(peer_id) if admitted else None
+
+        link = PeerLink(peer_id=peer_id, address=address, trust=TrustLevel.PEER)
+
+        # Before accept(), not after: accept() starts the receive thread, and a
+        # handler registered afterwards would miss whatever arrived first.
+        self._apply_channel_handlers(link)
+
+        if link.accept(ws, hello):
+            self._register_connected_link(peer_id, link)
+            return link
+        return None
+
+    def _admit(self, peer_id: str) -> Optional[bool]:
+        """Budget + duplicate check shared by the outbound and inbound paths.
+
+        Returns None when the caller should proceed with a new link, True when
+        a live link to this peer already exists, False when the budget refused.
+
+        _evict_weakest_link takes self._lock, and so does the close_link it
+        calls, so it MUST run with the lock released — threading.Lock is not
+        reentrant and the previous inline version deadlocked the moment the
+        budget filled.  That was unreachable while _links stayed empty on every
+        node; it stops being unreachable now that links actually form.
+        """
+        with self._lock:
+            existing = self._links.get(peer_id)
+            if existing and existing.is_connected:
+                return True
+            active = sum(1 for l in self._links.values() if l.is_connected)
+            over_budget = active >= self._max_links
+
+        if over_budget and not self._evict_weakest_link():
+            logger.debug(f"Link budget full ({self._max_links}), "
+                         f"cannot link {peer_id[:8]}")
+            return False
+        return None
+
+    def _apply_channel_handlers(self, link: PeerLink) -> None:
+        """Attach every registered channel handler to a fresh link."""
         for channel, handlers in self._channel_handlers.items():
             for handler in handlers:
                 link.on_message(channel, handler)
 
-        if link.connect():
-            with self._lock:
-                self._links[peer_id] = link
-            # On the flat-tier host (Nunba), a new persistent peer means
-            # the WAMP router is now needed for realtime push to this
-            # mobile device.  Safe no-op when Nunba boot already started
-            # the router or when wamp_router module isn't present (HARTOS
-            # core used in regional/central deployments that manage their
-            # own router elsewhere).
-            try:
-                from wamp_router import ensure_wamp_running  # type: ignore
-                ensure_wamp_running(reason=f"peer {peer_id[:8]} upgraded")
-            except ImportError:
-                pass
-            except Exception as e:
-                logger.debug(f"ensure_wamp_running skipped: {e}")
-            # Best-effort HiveMind enrolment for MoE consensus.  The
-            # bridge's `register_peer_agent` is a no-op when hevolveai
-            # isn't loaded (central HTTP-only tier) so this is safe
-            # everywhere and never blocks the link upgrade.
-            try:
-                from integrations.agent_engine.world_model_bridge import (
-                    get_world_model_bridge,
-                )
-                bridge = get_world_model_bridge()
-                if bridge and hasattr(bridge, 'register_peer_agent'):
-                    bridge.register_peer_agent(peer_id=peer_id)
-            except Exception as e:
-                logger.debug(
-                    f"hive register_peer_agent skipped for "
-                    f"{peer_id[:8] if peer_id else '?'}: {e}"
-                )
-            return True
-        return False
+    def _register_connected_link(self, peer_id: str, link: PeerLink) -> None:
+        """Store a live link and run the post-connect side effects."""
+        with self._lock:
+            self._links[peer_id] = link
+        # On the flat-tier host (Nunba), a new persistent peer means
+        # the WAMP router is now needed for realtime push to this
+        # mobile device.  Safe no-op when Nunba boot already started
+        # the router or when wamp_router module isn't present (HARTOS
+        # core used in regional/central deployments that manage their
+        # own router elsewhere).
+        try:
+            from wamp_router import ensure_wamp_running  # type: ignore
+            ensure_wamp_running(reason=f"peer {peer_id[:8]} upgraded")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"ensure_wamp_running skipped: {e}")
+        # Best-effort HiveMind enrolment for MoE consensus.  The
+        # bridge's `register_peer_agent` is a no-op when hevolveai
+        # isn't loaded (central HTTP-only tier) so this is safe
+        # everywhere and never blocks the link upgrade.
+        try:
+            from integrations.agent_engine.world_model_bridge import (
+                get_world_model_bridge,
+            )
+            bridge = get_world_model_bridge()
+            if bridge and hasattr(bridge, 'register_peer_agent'):
+                bridge.register_peer_agent(peer_id=peer_id)
+        except Exception as e:
+            logger.debug(
+                f"hive register_peer_agent skipped for "
+                f"{peer_id[:8] if peer_id else '?'}: {e}"
+            )
 
     def close_link(self, peer_id: str):
         """Close and remove a link."""
@@ -420,6 +477,11 @@ class PeerLinkManager:
             peers = gossip.get_peer_list()
             peer_info = next((p for p in peers if p.get('node_id') == peer_id), None)
             if not peer_info:
+                logger.info(
+                    "PeerLink upgrade for %s ABORTED: node_id not present in "
+                    "the gossip peer list (%d peers known). record_http_exchange "
+                    "fired for a peer gossip cannot resolve.",
+                    peer_id[:8], len(peers))
                 return
 
             # Resolve through NAT traversal, not by string-stripping the URL.
@@ -473,6 +535,17 @@ class PeerLinkManager:
                 address = (peer_info.get('url', '')
                            .replace('http://', '').replace('https://', '').rstrip('/'))
             if not address:
+                # Was a bare `return`. Every exit from this function was silent,
+                # so a hive that never formed looked identical to one that was
+                # never asked to: three machines discovered each other on the
+                # LAN, gossip knew all four peers, and connected_nodes stayed 0
+                # with nothing anywhere saying why. Six separate theories were
+                # eliminated by hand before this line could have answered it.
+                logger.info(
+                    "PeerLink upgrade for %s ABORTED: no dialable address "
+                    "(NAT traversal returned nothing and advertised url=%r). "
+                    "A peer advertising loopback is undialable from here.",
+                    peer_id[:8], peer_info.get('url', ''))
                 return
 
             # Determine trust level based on user identity, not network
@@ -501,6 +574,35 @@ class PeerLinkManager:
                 except Exception:
                     pass
 
+            # Never REQUEST a trust level we cannot substantiate.
+            #
+            # The checks above answer "is this peer mine?" from the widest
+            # identity view we have, including get_node_identity()'s user_id.
+            # But the proof we put on the wire can only be signed over
+            # HEVOLVE_USER_ID (link.provable_user_id), because that is the sole
+            # value the far side's _verify_same_user_proof reads. When the two
+            # disagree we used to ask for SAME_USER with nothing to back it,
+            # and the peer logged "SAME_USER trust requested but no valid
+            # proof" and demoted us to PEER every single time.
+            #
+            # Asking for PEER here reaches the SAME final trust level with no
+            # false signal — and, more importantly, our local link object no
+            # longer believes it is SAME_USER (plaintext) while the far side
+            # treats it as PEER (encrypted), which is a real mismatch since
+            # the handshake ack never tells us what was actually granted.
+            if trust == TrustLevel.SAME_USER and not provable_user_id():
+                logger.info(
+                    "PeerLink %s: same-user match found, but HEVOLVE_USER_ID "
+                    "is unset so no proof can be signed — requesting PEER "
+                    "instead of an unprovable SAME_USER", peer_id[:8])
+                trust = TrustLevel.PEER
+
+            # The success path logs too. "Attempted and failed to connect" and
+            # "never attempted" produced identical silence before this, which is
+            # why connected_nodes=0 was unattributable.
+            logger.info(
+                "PeerLink upgrade for %s ATTEMPTING: address=%s trust=%s",
+                peer_id[:8], address, getattr(trust, 'name', trust))
             self.upgrade_peer(
                 peer_id=peer_id,
                 address=address,
@@ -514,7 +616,33 @@ class PeerLinkManager:
     @staticmethod
     def _http_fallback(peer_url: str, channel: str, data: dict,
                        timeout: float = 30.0) -> Optional[dict]:
-        """Send via HTTP when no PeerLink available."""
+        """Send via HTTP when no PeerLink available — UNREACHABLE today.
+
+        Kept because the spec is coherent and its tests pin it correctly, but
+        nothing here runs in production, for three independent reasons. Checked
+        2026-08-13; do not spend time debugging it as a live transport:
+
+        1. No caller can reach it. `send()` only gets here when `peer_url` is
+           truthy, and the ONLY production caller of `send()` is
+           `core/agent_tools.py:949` — which first requires
+           `get_link(...).trust == SAME_USER`, i.e. a link already exists, and
+           passes no `peer_url`. Every other `peer_url=` in the tree is either
+           a test or the InstanceFollow DB column of the same name.
+        2. Nothing serves the target. No route anywhere defines
+           `/api/peer-link/message`; the nearest neighbours
+           (`/api/social/peers/broadcast` and friends in
+           `integrations/social/discovery.py`) dispatch on `msg['type']`, not
+           on a channel, so they are a different contract — not a drop-in.
+        3. Nothing parses the wire format. `{'ch': ..., 'd': ...}` is read in
+           exactly one place, `link.py::_receive_loop`, over the WebSocket.
+
+        Wiring it up is a DESIGN decision, not a repair: the WebSocket path is
+        gated by the Ed25519 handshake in `PeerLink._complete_handshake`, so a
+        plain POST into the same `_channel_handlers` registry would be an
+        UNAUTHENTICATED injection point beside an authenticated one. It needs
+        equivalent peer authentication first. Leaving it inert is the safer
+        state, which is why this is a comment and not a new route.
+        """
         try:
             from core.http_pool import pooled_post
             resp = pooled_post(

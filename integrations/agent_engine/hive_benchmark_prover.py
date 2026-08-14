@@ -357,6 +357,42 @@ def _save_json(path: str, data: Any) -> None:
         logger.error("Failed to save %s: %s", path, exc)
 
 
+# ─── Duplicate-question guard ────────────────────────────────────────
+
+# Statuses that mean "this question is still open" — the community has not
+# reached a decision, so re-asking it adds noise rather than information.
+_UNRESOLVED_STATUSES = ('proposed', 'discussing', 'voting', 'evaluating')
+
+
+def _open_experiment_exists(db, title: str) -> bool:
+    """True when an unresolved experiment with this exact title already exists.
+
+    An agent must not re-ask a question its own previous identical question
+    has not been answered yet. Without this check the prover asked the
+    community to prioritise a benchmark once every loop iteration forever:
+    832 experiments accumulated across 70 days from just 16 distinct titles,
+    one of them repeated 416 times, with zero votes cast on any of them.
+    Nothing consumed them, so the only effect was to bury any real proposal.
+
+    Fails CLOSED — if the check itself errors we skip creation rather than
+    risk resuming the duplication we are here to stop. A silent gap in
+    experiment creation is recoverable; another 800 duplicates is not.
+    """
+    try:
+        from integrations.social.models import ThoughtExperiment
+        existing = db.query(ThoughtExperiment).filter(
+            ThoughtExperiment.title == title,
+            ThoughtExperiment.status.in_(_UNRESOLVED_STATUSES),
+        ).first()
+        return existing is not None
+    except Exception as exc:
+        logger.warning(
+            "Open-experiment duplicate check failed (%s) — skipping creation "
+            "of %r to stay on the safe side. Experiment creation stays "
+            "blocked until this check works again.", exc, title[:80])
+        return True
+
+
 # ─── Distributed Ledger ──────────────────────────────────────────────
 
 class _BenchmarkLedger:
@@ -1277,30 +1313,37 @@ class HiveBenchmarkProver:
             from integrations.social.models import db_session
             from integrations.social.services import UserService
             with db_session() as db:
-                prover_user = UserService.ensure_system_user(
-                    db, 'nunba', display_name='Nunba')
-                experiment = ThoughtExperimentService.create_experiment(
-                    db=db,
-                    creator_id=prover_user.id,
-                    title=f"Should we optimize for {benchmark_name} next?",
-                    hypothesis=(
-                        f"The hive scored {score:.1%} on {benchmark_name} "
-                        f"using {num_nodes} nodes. "
-                        f"Speedup: {speedup:.1f}x vs single node. "
-                        "Should we focus our next optimization cycle on "
-                        "improving this benchmark, or pivot to a different "
-                        "one? Vote to guide the hive's next challenge."
-                    ),
-                    expected_outcome=(
-                        "Community consensus on benchmark priority for the "
-                        "next optimization cycle."
-                    ),
-                    intent_category='technology',
-                    decision_type='weighted',
-                )
-                if experiment:
-                    publish_info['thought_experiment_id'] = experiment.get(
-                        'id')
+                title = f"Should we optimize for {benchmark_name} next?"
+                if _open_experiment_exists(db, title):
+                    logger.info(
+                        "Skipping thought experiment %r — an unresolved one "
+                        "with the same title is already open.", title)
+                else:
+                    prover_user = UserService.ensure_system_user(
+                        db, 'nunba', display_name='Nunba')
+                    experiment = ThoughtExperimentService.create_experiment(
+                        db=db,
+                        creator_id=prover_user.id,
+                        title=title,
+                        hypothesis=(
+                            f"The hive scored {score:.1%} on {benchmark_name} "
+                            f"using {num_nodes} nodes. "
+                            f"Speedup: {speedup:.1f}x vs single node. "
+                            "Should we focus our next optimization cycle on "
+                            "improving this benchmark, or pivot to a "
+                            "different one? Vote to guide the hive's next "
+                            "challenge."
+                        ),
+                        expected_outcome=(
+                            "Community consensus on benchmark priority for "
+                            "the next optimization cycle."
+                        ),
+                        intent_category='technology',
+                        decision_type='weighted',
+                    )
+                    if experiment:
+                        publish_info['thought_experiment_id'] = experiment.get(
+                            'id')
         except Exception as exc:
             logger.debug("Thought experiment creation failed: %s", exc)
 
@@ -1510,6 +1553,24 @@ class HiveBenchmarkProver:
 
         Each problem is a dict with at minimum: {id, type, prompt}.
         """
+        # A REAL problem set on disk always wins over the generated stubs
+        # below. The stubs carry no `correct_answer`, so every run scored a
+        # tidy, plausible 0.0 that nothing downstream could distinguish from a
+        # measurement — 395 runs on one machine since April, none of them a
+        # number. Drop a file here and the same benchmark becomes gradable
+        # with no other change:
+        #
+        #   ~/.hevolve/benchmarks/<benchmark_name>.json
+        #   {"problems": [{"id","type","question","correct_answer"}, ...]}
+        #
+        # Same directory gaia_dataset.py already caches into, so there is one
+        # place to put benchmark data rather than two.
+        cached = self._load_cached_problems(benchmark_name)
+        if cached:
+            logger.info("Benchmark [%s]: loaded %d REAL problems with answer "
+                        "keys from cache", benchmark_name, len(cached))
+            return cached
+
         spec = config.get('spec') or BUILTIN_BENCHMARKS.get(benchmark_name)
         if not spec:
             # Try the benchmark registry for dynamic adapters
@@ -1692,6 +1753,45 @@ class HiveBenchmarkProver:
 
         return problems
 
+    def _load_cached_problems(self, benchmark_name: str) -> List[dict]:
+        """Real problems with answer keys from ~/.hevolve/benchmarks/, or [].
+
+        Only entries carrying BOTH a question and a non-empty correct_answer
+        are returned: a cache file half-filled with unanswerable entries would
+        reintroduce exactly the silent-zero this exists to end, one layer down.
+        Returns [] on any problem so the caller falls back to the stubs and the
+        run is honestly reported as ungraded rather than failing outright.
+        """
+        try:
+            root = os.path.join(os.path.expanduser('~'), '.hevolve', 'benchmarks')
+            path = os.path.join(root, f'{benchmark_name}.json')
+            if not os.path.exists(path):
+                return []
+            data = _load_json(path) or {}
+            raw = data.get('problems') if isinstance(data, dict) else data
+            if not isinstance(raw, list):
+                return []
+            out = []
+            for i, p in enumerate(raw):
+                if not isinstance(p, dict):
+                    continue
+                q = p.get('question') or p.get('prompt')
+                a = p.get('correct_answer', p.get('answer'))
+                if not q or not str(a or '').strip():
+                    continue
+                out.append({
+                    'id': p.get('id') or f'{benchmark_name}_{i}',
+                    'type': p.get('type', 'math'),
+                    'question': q,
+                    'correct_answer': str(a),
+                    'index': i,
+                })
+            return out
+        except Exception as exc:
+            logger.debug("Cached problem load failed for %s: %s",
+                         benchmark_name, exc)
+            return []
+
     # ── Node Discovery ───────────────────────────────────────────────
 
     def _discover_nodes(self) -> List[dict]:
@@ -1828,15 +1928,21 @@ class HiveBenchmarkProver:
             task_id = str(uuid.uuid4())
             node_id = node.get('node_id', f'node_{i}')
 
-            # Record in ledger
-            self._ledger.record_assignment(
-                run_id=run_id,
-                task_id=task_id,
-                node_id=node_id,
-                shard_index=shard['shard_index'],
-                benchmark_name=benchmark_name,
-            )
-
+            # Dispatch FIRST, then record — the ledger must be keyed on the
+            # SAME task_id that results will later arrive under.
+            #
+            # The dispatcher reassigns `task_id` below (`task_id = task.task_id`).
+            # Recording the assignment before that point keyed the ledger entry
+            # on the local uuid4, while `_collect_results` and `on_shard_result`
+            # both report under the dispatcher's id. `record_result` looks the
+            # entry up by task_id, finds nothing, and falls out of its loop
+            # without error — so every result was silently discarded.
+            #
+            # Measured on the local Nunba instance 2026-08-13: 567 ledger
+            # entries, 0 with a result, across 395 benchmark runs since April.
+            # Nothing the prover did left any evidence behind, which is why
+            # there was nothing to show even when a run worked.
+            #
             # Dispatch via HiveTaskProtocol
             try:
                 from integrations.coding_agent.hive_task_protocol import (
@@ -1865,6 +1971,18 @@ class HiveBenchmarkProver:
                 logger.debug(
                     "HiveTask dispatch failed for shard %d: %s",
                     shard['shard_index'], exc)
+
+            # NOW record, with task_id settled. Covers both paths: the
+            # dispatcher's id when create_task succeeded, the local uuid4 when
+            # it raised. Either way this is the id results arrive under, so
+            # record_result can find the entry it needs to update.
+            self._ledger.record_assignment(
+                run_id=run_id,
+                task_id=task_id,
+                node_id=node_id,
+                shard_index=shard['shard_index'],
+                benchmark_name=benchmark_name,
+            )
 
             dispatched.append({
                 'task_id': task_id,
@@ -1957,14 +2075,26 @@ class HiveBenchmarkProver:
 
             shard_time = time.time() - shard_start
 
+            # An UNGRADED shard is neither a success nor a failure: the node
+            # answered, but nothing it answered had an answer key. Give it its
+            # own status so _aggregate_results excludes it from the score
+            # instead of folding a fictitious 0.0 into the average.
+            if result and result.get('ungraded'):
+                shard_status = 'ungraded'
+            elif result:
+                shard_status = 'completed'
+            else:
+                shard_status = 'failed'
+
             shard_result = {
                 'shard_index': shard['shard_index'],
                 'node_id': dispatch_info['node_id'],
-                'status': 'completed' if result else 'failed',
+                'status': shard_status,
                 'problems_solved': result.get('problems_solved', 0)
                     if result else 0,
                 'problems_total': shard.get('problem_count', 0),
                 'score': result.get('score', 0.0) if result else 0.0,
+                'ungraded': bool(result and result.get('ungraded')),
                 'time_seconds': round(shard_time, 2),
                 'result': result,
             }
@@ -2057,6 +2187,19 @@ class HiveBenchmarkProver:
         total = len(problems)
         answers = []
         model_name = 'unknown'
+        # Count problems that can actually be GRADED — i.e. that carry a
+        # ground-truth answer to compare against.
+        #
+        # Why this counter exists: _fetch_problems generates synthetic stubs
+        # for the built-in benchmarks ("Multiple choice question #1. Evaluate
+        # using hive context.") with no `correct_answer` field. Scoring those
+        # compares the model's answer against '' — always False — so the run
+        # scored a clean 0.0 and every downstream check treated it as a real
+        # measurement. 416 "HIVE BENCHMARK PROOF — 0.0%" posts went out on
+        # schedule against a comparison table of real published Claude/GPT/
+        # Gemini scores. A benchmark with no answer key is not a benchmark
+        # that the hive failed; it is not a benchmark.
+        gradable = 0
 
         for prob in problems:
             prob_type = prob.get('type', 'mcq')
@@ -2066,6 +2209,18 @@ class HiveBenchmarkProver:
 
             if not question:
                 continue
+
+            # Ground truth present? For mcq/math the answer key IS the
+            # `correct_answer` field. For code, a real pass/fail needs test
+            # cases — `has_def and has_return` only asks whether the model
+            # emitted something function-shaped, which is not correctness.
+            if prob_type == 'code':
+                has_truth = bool(prob.get('tests') or prob.get('test_cases')
+                                 or prob.get('expected_output'))
+            else:
+                has_truth = bool(str(correct_answer).strip())
+            if has_truth:
+                gradable += 1
 
             # Build prompt based on problem type
             if prob_type == 'mcq':
@@ -2173,10 +2328,36 @@ class HiveBenchmarkProver:
                     'error': str(exc),
                 })
 
-        score = correct / max(1, total)
+        # No answer key anywhere in this shard → there is no score to report.
+        # Returning 0.0 here is what produced 416 published "0.0% proofs":
+        # downstream code cannot distinguish "answered everything wrong" from
+        # "was never asked a gradable question". Say the second one explicitly.
+        if gradable == 0:
+            logger.warning(
+                "Benchmark [%s]: none of %d problems carried a ground-truth "
+                "answer — shard is UNGRADED, not zero. These are synthetic "
+                "stubs from _fetch_problems; load a real dataset before "
+                "treating this benchmark as a measurement.",
+                benchmark_name, total)
+            return {
+                'problems_solved': 0,
+                'problems_total': total,
+                'gradable': 0,
+                'ungraded': True,
+                'score': None,
+                'answers': answers,
+                'model_name': model_name,
+                'note': 'no_ground_truth',
+            }
+
+        # Score over the GRADABLE subset only — a problem with no answer key
+        # must not dilute the denominator into a lower-looking score.
+        score = correct / max(1, gradable)
         return {
             'problems_solved': correct,
             'problems_total': total,
+            'gradable': gradable,
+            'ungraded': False,
             'score': round(score, 4),
             'answers': answers,
             'model_name': model_name,
@@ -2273,6 +2454,7 @@ class HiveBenchmarkProver:
         weighted_score_sum = 0.0
         per_node = []
         completed_count = 0
+        ungraded_count = 0
 
         for sr in shard_results:
             solved = sr.get('problems_solved', 0)
@@ -2289,6 +2471,9 @@ class HiveBenchmarkProver:
             # published it as a benchmark PROOF -- at the same cadence, with
             # the same shape of output, for weeks. The only signal that
             # anything had broken was the Azure bill going to nearly zero.
+            if sr.get('status') == 'ungraded' or sr.get('ungraded'):
+                ungraded_count += 1
+
             if completed:
                 completed_count += 1
                 total_solved += solved
@@ -2315,12 +2500,26 @@ class HiveBenchmarkProver:
         # much less alarming statement than "the hive never answered".
         valid = completed_count > 0 and total_problems > 0
 
+        if valid:
+            failure_reason = None
+        elif ungraded_count:
+            # The distinct and most common case: nodes answered fine, but the
+            # problem set carried no answer key, so nothing could be scored.
+            failure_reason = (
+                f'{ungraded_count}/{len(shard_results)} shards were UNGRADED — '
+                'the problem set has no ground-truth answers (synthetic stubs '
+                'from _fetch_problems). This is not a hive score of zero; '
+                'nothing was measured.')
+        elif completed_count == 0:
+            failure_reason = 'no shard completed'
+        else:
+            failure_reason = 'completed shards reported no problems'
+
         return {
             'score': round(combined_score, 4) if valid else None,
             'valid': valid,
-            'failure_reason': None if valid else (
-                'no shard completed' if completed_count == 0
-                else 'completed shards reported no problems'),
+            'failure_reason': failure_reason,
+            'ungraded_shards': ungraded_count,
             'num_nodes': len(shard_results),
             'nodes_completed': completed_count,
             'per_node': per_node,
@@ -2645,10 +2844,19 @@ class HiveBenchmarkProver:
                     "(rotation index %d)",
                     benchmark, self._rotation_index)
 
-                self.run_distributed_benchmark(benchmark)
+                result = self.run_distributed_benchmark(benchmark)
 
-                # Create thought experiment about what to benchmark next
-                self._suggest_next_benchmark()
+                # Only ask the community what to do next when this cycle
+                # actually measured something. Asking "which benchmark should
+                # we prioritise?" off the back of a run that scored nothing
+                # invites a vote on a number that does not exist.
+                if result.get('valid', True):
+                    self._suggest_next_benchmark()
+                else:
+                    logger.info(
+                        "Skipping next-benchmark suggestion — run [%s] was "
+                        "not a valid measurement (%s)",
+                        benchmark, result.get('failure_reason'))
 
             except Exception as exc:
                 logger.warning(
@@ -2684,13 +2892,21 @@ class HiveBenchmarkProver:
             from integrations.social.models import db_session
             from integrations.social.services import UserService
             with db_session() as db:
+                title = f"Benchmark priority: focus on {worst_bench}?"
+                # The worst benchmark rarely changes between cycles, so this
+                # title is stable — which is exactly why it was created 416
+                # times. Ask once; ask again only after the last one resolves.
+                if _open_experiment_exists(db, title):
+                    logger.info(
+                        "Skipping next-benchmark experiment %r — the previous "
+                        "identical question is still unresolved.", title)
+                    return
                 prover_user = UserService.ensure_system_user(
                     db, 'nunba', display_name='Nunba')
                 ThoughtExperimentService.create_experiment(
                     db=db,
                     creator_id=prover_user.id,
-                    title=(
-                        f"Benchmark priority: focus on {worst_bench}?"),
+                    title=title,
                     hypothesis=(
                         f"Our weakest benchmark is {worst_bench} at "
                         f"{worst_score:.1%}. Focusing optimization here "

@@ -145,41 +145,84 @@ class ImmutableAuditLog:
                 prev_hash, event_type, actor_id, action, timestamp, detail_json)
 
             if self._use_db:
-                try:
-                    from integrations.social.models import get_db, AuditLogEntry
-                    caller_session = db is not None
-                    session = db if caller_session else get_db()
+                # RETRY A TRANSIENT WRITER LOCK BEFORE GIVING UP (real HW,
+                # 2026-08-12). The shared engine sets busy_timeout=3000 on purpose
+                # (models.py: fail fast rather than block daemon threads 15-30s and
+                # trip watchdog restarts) — that is right for ordinary queries, but
+                # it means a concurrent writer can bounce an AUDIT write, and the
+                # fallback below then keeps the entry only IN MEMORY. Live evidence:
+                #   WARNING:hevolve_security:DB audit log failed, using memory:
+                #   (sqlite3.OperationalError) database is locked
+                # Those entries are gone at process exit, and every one of them is a
+                # gap in a HASH-CHAINED log — verify_chain cannot distinguish "never
+                # happened" from "we dropped it", so the tamper-evidence is what
+                # actually degrades. Losing security records to a lock that clears in
+                # milliseconds is not an acceptable trade.
+                #
+                # So retry the whole unit of work with a short backoff (~0.25s,
+                # 0.5s), which is far below the watchdog budget the 3s timeout was
+                # protecting, and keeps the fast-fail behaviour of the shared engine
+                # untouched — only this writer is more patient.
+                #
+                # ONLY when we own the session. A BORROWED session (db is not None)
+                # belongs to the caller's transaction: after a failure it is in an
+                # unusable state and rolling it back or re-flushing would corrupt
+                # THEIR unit of work, so a caller-supplied session still gets exactly
+                # one attempt and the existing behaviour.
+                _own_session = db is None
+                _attempts = 3 if _own_session else 1
+                for _attempt in range(_attempts):
                     try:
-                        entry = AuditLogEntry(
-                            event_type=event_type,
-                            actor_id=actor_id,
-                            target_id=target_id,
-                            action=action,
-                            detail_json=detail_json,
-                            prev_hash=prev_hash,
-                            entry_hash=entry_hash,
-                            created_at=now,  # #48: persist the hashed timestamp
+                        from integrations.social.models import get_db, AuditLogEntry
+                        caller_session = db is not None
+                        session = db if caller_session else get_db()
+                        try:
+                            entry = AuditLogEntry(
+                                event_type=event_type,
+                                actor_id=actor_id,
+                                target_id=target_id,
+                                action=action,
+                                detail_json=detail_json,
+                                prev_hash=prev_hash,
+                                entry_hash=entry_hash,
+                                created_at=now,  # #48: persist the hashed timestamp
+                            )
+                            session.add(entry)
+                            if caller_session:
+                                # NEVER commit/rollback/close a borrowed session —
+                                # the entry rides the caller's transaction. Flush
+                                # only, to obtain the id.
+                                session.flush()
+                            else:
+                                session.commit()
+                            entry_id = entry.id
+                            logger.debug(f"Audit log: {event_type} by {actor_id}: {action}")
+                            return entry_id, entry_hash
+                        except Exception:
+                            if not caller_session:
+                                session.rollback()
+                            raise
+                        finally:
+                            if not caller_session:
+                                session.close()
+                    except Exception as e:
+                        _last = (_attempt == _attempts - 1)
+                        if not _last and 'database is locked' in str(e).lower():
+                            _delay = 0.25 * (2 ** _attempt)
+                            logger.debug(
+                                "Audit log: SQLite busy, retry %d/%d in %.2fs",
+                                _attempt + 1, _attempts - 1, _delay,
+                            )
+                            time.sleep(_delay)
+                            continue
+                        # Out of retries, or an error retrying cannot help. Still
+                        # LOUD, and now it names how hard we tried so the warning
+                        # cannot be mistaken for a first-and-only attempt.
+                        logger.warning(
+                            "DB audit log failed after %d attempt(s), using memory: %s",
+                            _attempt + 1, e,
                         )
-                        session.add(entry)
-                        if caller_session:
-                            # NEVER commit/rollback/close a borrowed session —
-                            # the entry rides the caller's transaction. Flush
-                            # only, to obtain the id.
-                            session.flush()
-                        else:
-                            session.commit()
-                        entry_id = entry.id
-                        logger.debug(f"Audit log: {event_type} by {actor_id}: {action}")
-                        return entry_id, entry_hash
-                    except Exception:
-                        if not caller_session:
-                            session.rollback()
-                        raise
-                    finally:
-                        if not caller_session:
-                            session.close()
-                except Exception as e:
-                    logger.warning(f"DB audit log failed, using memory: {e}")
+                        break
 
             # Fallback: in-memory
             entry_id = len(self._memory_log) + 1

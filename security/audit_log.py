@@ -5,30 +5,48 @@ Prevents credential leakage via log files.
 """
 
 import re
+import sys
 import logging
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
-# Patterns to redact from logs
-_REDACTION_PATTERNS: List[Tuple[re.Pattern, str]] = [
-    # OpenAI API keys
-    (re.compile(r'sk-[a-zA-Z0-9]{20,}'), '[REDACTED_OPENAI_KEY]'),
-    # JWT tokens
-    (re.compile(r'eyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}'),
-     '[REDACTED_JWT]'),
-    # Google API keys
-    (re.compile(r'AIzaSy[a-zA-Z0-9_-]{33}'), '[REDACTED_GOOGLE_KEY]'),
-    # Groq API keys
-    (re.compile(r'gsk_[a-zA-Z0-9]{20,}'), '[REDACTED_GROQ_KEY]'),
-    # Generic Bearer tokens in logs
-    (re.compile(r'Bearer\s+[a-zA-Z0-9_.-]{20,}'), 'Bearer [REDACTED]'),
-    # Password values in key=value format
-    (re.compile(r'(password|passwd|pwd|secret|token|api_key|apikey)\s*[=:]\s*\S+', re.I),
-     r'\1=[REDACTED]'),
-    # AWS keys
-    (re.compile(r'AKIA[0-9A-Z]{16}'), '[REDACTED_AWS_KEY]'),
-    # Generic hex tokens (40+ chars)
+# Vendor API-key / token / password / PEM redaction is delegated to the ONE
+# canonical pattern set in security/secret_redactor.py (see _redact below).
+# This module used to carry its OWN copy of those regexes and they DRIFTED: its
+# Google pattern required an 'AIzaSy' prefix (AIzaSy…{33}) and its OpenAI pattern
+# was sk-[alnum]{20,}, so Google keys not starting 'Sy' and every sk-proj-/
+# sk-ant- key LEAKED into the audit log. Delegating to the canonical fixes that
+# and inherits its far broader vendor coverage.
+#
+# The ONE audit-log-specific supplemental below stays local on purpose: audit
+# logs deliberately over-redact bare long-hex tokens (SHA/HMAC/raw tokens with no
+# keyword prefix), whereas the canonical gates hex on a keyword to avoid mangling
+# hashes in the hive-privacy path.
+_AUDIT_EXTRA_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r'\b[0-9a-f]{40,}\b'), '[REDACTED_HEX_TOKEN]'),
 ]
+
+# ── Canonical-redactor health, surfaced instead of swallowed ────────────────
+# If the canonical redactor ever fails, the ONLY remaining coverage is the bare
+# long-hex pattern above — every vendor API key (sk-, sk-proj-, sk-ant-, AIza,
+# gsk_, AKIA, Bearer, PEM) would flow into the audit log verbatim. That is a
+# security-relevant degradation, so it must never be silent.
+#
+# WHY THIS DOES NOT CALL logger.warning(): this code runs INSIDE a logging.Filter.
+# Emitting a log record from a filter re-enters the logging machinery, which runs
+# the filters again — unbounded recursion on the very path that is already broken.
+# So the signal goes straight to stderr ONCE, and the state is left readable via
+# `canonical_redactor_status()` for health surfaces that poll rather than listen.
+_redactor_failure: Optional[str] = None
+_redactor_failure_count: int = 0
+
+
+def canonical_redactor_status() -> Tuple[bool, Optional[str], int]:
+    """Return ``(healthy, first_error_repr, failure_count)``.
+
+    ``healthy is False`` means audit-log redaction has DEGRADED to the local
+    long-hex pattern only and vendor keys are no longer being scrubbed.
+    """
+    return (_redactor_failure is None, _redactor_failure, _redactor_failure_count)
 
 
 class SensitiveFilter(logging.Filter):
@@ -55,7 +73,29 @@ class SensitiveFilter(logging.Filter):
 
     @staticmethod
     def _redact(text: str) -> str:
-        for pattern, replacement in _REDACTION_PATTERNS:
+        # Canonical vendor-secret redaction — ONE source of truth
+        # (security/secret_redactor.py). Still best-effort, because a redaction
+        # filter must never raise and drop a log line — but the failure is now
+        # RECORDED and announced once, never swallowed. See the module header for
+        # why this cannot use the logging system to report a logging fault.
+        global _redactor_failure, _redactor_failure_count
+        try:
+            from security.secret_redactor import redact_secrets
+            text = redact_secrets(text)[0]
+        except Exception as exc:            # noqa: BLE001 - see above; must not raise
+            _redactor_failure_count += 1
+            if _redactor_failure is None:
+                _redactor_failure = repr(exc)
+                try:
+                    sys.stderr.write(
+                        "[audit_log] CANONICAL REDACTOR FAILED (%r) — audit-log "
+                        "redaction has DEGRADED to the long-hex pattern only; "
+                        "vendor API keys are NO LONGER being scrubbed.\n" % (exc,))
+                except Exception:
+                    # stderr itself is gone (closed/detached). The flag above is
+                    # still set, so canonical_redactor_status() remains truthful.
+                    pass
+        for pattern, replacement in _AUDIT_EXTRA_PATTERNS:
             text = pattern.sub(replacement, text)
         return text
 

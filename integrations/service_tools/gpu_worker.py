@@ -74,6 +74,7 @@ Usage:
 import json
 import logging
 import os
+from core.subprocess_safe import no_window_kwargs
 import queue
 import subprocess
 import sys
@@ -535,7 +536,7 @@ class GPUWorker:
                 )
                 rc = subprocess.run(
                     pip_args, capture_output=True, text=True, timeout=180,
-                ).returncode
+                 **no_window_kwargs()).returncode
             except Exception as e:
                 logger.debug(
                     f"{self.name}: deterministic pip install for '{pkg}' "

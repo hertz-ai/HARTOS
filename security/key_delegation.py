@@ -208,13 +208,14 @@ def verify_certificate_signature(certificate: dict) -> bool:
         if not parent_sig or not parent_pub_hex:
             return False
 
-        clean = {k: v for k, v in certificate.items() if k != 'parent_signature'}
-        canonical = json.dumps(clean, sort_keys=True, separators=(',', ':'))
+        # ONE canonical serialization (node_integrity.canonical_payload); a drift
+        # here vs the signer = silent network-wide verification failure.
+        from security.node_integrity import canonical_payload
 
         pub_bytes = bytes.fromhex(parent_pub_hex)
         pub_key = Ed25519PublicKey.from_public_bytes(pub_bytes)
         sig_bytes = bytes.fromhex(parent_sig)
-        pub_key.verify(sig_bytes, canonical.encode('utf-8'))
+        pub_key.verify(sig_bytes, canonical_payload(certificate, exclude=('parent_signature',)))
         return True
     except (InvalidSignature, ValueError, Exception):
         return False

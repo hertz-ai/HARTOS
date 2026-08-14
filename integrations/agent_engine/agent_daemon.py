@@ -277,6 +277,21 @@ class AgentDaemon:
         if self._thread:
             self._thread.join(timeout=10)
 
+    def _advance_thought_experiments(self):
+        """Drive the experiment lifecycle off its own stored deadlines.
+
+        Never raises into the daemon loop: a lifecycle hiccup must not stop
+        goal dispatch, same contract as the proactive/home ticks above.
+        """
+        try:
+            from integrations.social.models import db_session
+            from integrations.social.thought_experiment_service import (
+                ThoughtExperimentService)
+            with db_session() as db:
+                ThoughtExperimentService.advance_due_experiments(db)
+        except Exception as exc:
+            logger.debug("Thought-experiment lifecycle tick skipped: %s", exc)
+
     def _try_parallel_dispatch(self, goal, idle_agents, dispatched, max_concurrent):
         """Check if a goal has parallel subtasks and dispatch them concurrently.
 
@@ -773,6 +788,18 @@ class AgentDaemon:
             # present or away.  The kill-switch + rate-cap are enforced inside
             # agent_ui_update; this only PACES the producer.
             self._spawn_home_compose_async()
+
+            # Thought-experiment lifecycle.  create_experiment stamps
+            # voting_opens_at / voting_closes_at / evaluation_deadline on every
+            # row and nothing ever read them back, so every experiment stayed
+            # at 'proposed' forever: cast_vote refuses anything outside
+            # ('discussing','voting') and auto_evolve gathers only
+            # ('voting','evaluating'), so the loop had no votable candidates
+            # and no dispatchable ones.  Cheap bounded DB work, so it runs
+            # inline rather than in a thread — and deliberately OUTSIDE _tick,
+            # which returns early when there are no active goals.  The
+            # lifecycle must not depend on whether a goal happens to exist.
+            self._advance_thought_experiments()
 
             try:
                 self._tick()

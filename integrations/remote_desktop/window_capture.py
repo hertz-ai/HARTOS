@@ -17,6 +17,7 @@ Reuses:
 
 import io
 import logging
+from core.subprocess_safe import no_window_kwargs
 import os
 import platform
 import re
@@ -360,7 +361,7 @@ class WindowEnumerator:
             ['xdotool', 'search', '--name', '.'],
             timeout=5,
             text=True,
-        )
+         **no_window_kwargs())
         results = []
         for line in output.strip().split('\n'):
             xid_str = line.strip()
@@ -383,7 +384,7 @@ class WindowEnumerator:
             name_out = subprocess.check_output(
                 ['xdotool', 'getwindowname', str(xid)],
                 timeout=2, text=True,
-            ).strip()
+             **no_window_kwargs()).strip()
         except Exception:
             return None
 
@@ -394,7 +395,7 @@ class WindowEnumerator:
             geo_out = subprocess.check_output(
                 ['xdotool', 'getwindowgeometry', '--shell', str(xid)],
                 timeout=2, text=True,
-            )
+             **no_window_kwargs())
         except Exception:
             return None
 
@@ -418,7 +419,7 @@ class WindowEnumerator:
             pid_out = subprocess.check_output(
                 ['xdotool', 'getwindowpid', str(xid)],
                 timeout=2, text=True,
-            ).strip()
+             **no_window_kwargs()).strip()
             pid = int(pid_out)
         except Exception:
             pass
@@ -430,7 +431,7 @@ class WindowEnumerator:
                 cmd_out = subprocess.check_output(
                     ['ps', '-p', str(pid), '-o', 'comm='],
                     timeout=2, text=True,
-                ).strip()
+                 **no_window_kwargs()).strip()
                 process_name = cmd_out
             except Exception:
                 pass
@@ -1081,7 +1082,7 @@ def _list_monitors_xrandr() -> List[dict]:
     and avoids the python-xlib dependency."""
     try:
         out = subprocess.check_output(
-            ['xrandr', '--listmonitors'], timeout=3, text=True)
+            ['xrandr', '--listmonitors'], timeout=3, text=True, **no_window_kwargs())
     except Exception:
         return []
     monitors: List[dict] = []

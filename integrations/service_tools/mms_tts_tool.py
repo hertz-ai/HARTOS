@@ -32,6 +32,7 @@ import logging
 from typing import Optional
 
 import os
+from core.subprocess_safe import no_window_kwargs
 import sys
 
 from integrations.service_tools.gpu_worker import ToolWorker
@@ -114,7 +115,7 @@ def _try_uromanize(text: str) -> Optional[str]:
                     input=text.encode('utf-8'),
                     capture_output=True,
                     timeout=15,
-                )
+                 **no_window_kwargs())
                 if proc.returncode == 0:
                     out = proc.stdout.decode('utf-8', errors='replace')
                     return out.rstrip('\n')

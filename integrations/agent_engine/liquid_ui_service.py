@@ -31,6 +31,7 @@ import copy
 import json
 import logging
 import os
+from core.subprocess_safe import no_window_kwargs
 import re
 import subprocess
 import threading
@@ -184,7 +185,7 @@ def read_shell_render_mode() -> str:
 def _vol_run(cmd, timeout=4):
     try:
         return subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout)
+                              timeout=timeout, **no_window_kwargs())
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
 
@@ -268,7 +269,7 @@ class _ConnectivityCache:
             return None
         try:
             return subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=self.PROBE_TIMEOUT_S)
+                                  timeout=self.PROBE_TIMEOUT_S, **no_window_kwargs())
         except FileNotFoundError:
             self._absent.add(tool)
             return None
@@ -1124,9 +1125,22 @@ class LiquidUIService:
         # overlay on top of AbstractChatActivity.
         try:
             from core.platform.events import emit_event
+            # Stamp the owning user so the P3a SSE guard ROUTES this push rather
+            # than refusing it.  Measured 2026-08-12: 38 refusals in two hours,
+            # which is every A2UI overlay push silently dropped.  Unlike
+            # agent.action.completed this emit stamped NOTHING at all.  None ->
+            # still refused, exactly as before: no leak, no regression.
+            # Import is local + guarded so an import problem degrades the
+            # user_id to None instead of killing the push entirely.
+            try:
+                from core.event_attribution import owner_user_id
+                _owner = owner_user_id()
+            except Exception:
+                _owner = None
             emit_event('agent.ui.update', {
                 'agent_id': agent_id,
                 'component': component,
+                'user_id': _owner,
             })
         except Exception:
             logger.exception("agent_ui_update: swallowed Exception")  # EventBus emission is best-effort
@@ -2671,6 +2685,70 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
                 '.lg-3{background:rgba(15,14,26,.95)}'
                 '.lg-4{background:rgba(12,11,22,.96)}'
                 '.lg-senses-ghost,.hart-desktop::before{display:none}'
+            )
+
+        # ── IDLE MOTION COSTS A SOFTWARE REPAINT (real-HW 2026-08-12) ─────────
+        # Every rung except vulkan runs the GTK4 host on GSK_RENDERER=cairo, so the
+        # host blits the whole window through the CPU on every damage event. A
+        # CONTINUOUSLY running animation therefore forces a full software repaint
+        # ~60x a second forever, whatever the compositor is doing. Measured on the
+        # Samsung NP550P5C WITH hart-comp GPU-compositing and the iGPU fully engaged:
+        # disabling ALL animation took shell+WebKit 120% -> 79% (the ceiling); the
+        # targeted rule below, which keeps state-driven motion, measured 126% -> 105%.
+        #
+        # What that buys is CLOCK, not a cooler chip. This chassis sat at 93-95C in
+        # EVERY state measured, animation on or off, so the package temperature is
+        # NOT attributable to the shell -- an earlier note here claimed the animations
+        # "held the package at 94C", and the measurements do not support that. What
+        # changes is what the CPU can deliver inside a fixed thermal envelope:
+        # 1197MHz -> 1596MHz with the rule below, and 1695MHz -> 2892MHz with all
+        # animation off. The box is thermally saturated either way; idle motion just
+        # spends the headroom repainting a desktop that is not changing.
+        #
+        # `webkit-flat` (flat_body_class, set right where blur_composites is decided)
+        # ALREADY means exactly "the host is painting in software", so key off that --
+        # no new mechanism, no second source of truth. Deliberately NOT is_potato:
+        # that keys off gpu_mode, the COMPOSITOR's verdict (/run/hart/gpu-render,
+        # written by hart-gpu-probe before greetd), which on this box has read
+        # `hardware` since boot -- so is_potato is False and can NEVER shed these
+        # effects here, no matter what the compositor is doing. (An earlier note
+        # claimed repairing the compositor's GPU path "switched these effects on".
+        # It did not: the verdict was already `hardware` at 10:04, four minutes
+        # before the compositor's EGL was fixed at 10:08. The effects were on the
+        # whole time.) The renderer that actually pays for a frame is the GTK host,
+        # and it is on cairo. Ask the renderer that pays, not the one that does not.
+        #
+        # Two mechanisms, both existing:
+        #  1. hartHome.css already gates its layers on --hart-motion-* custom
+        #     properties via animation-play-state, so flipping those to `paused` stops
+        #     the ambient blobs, orb float/breathe, ring spin and live dots centrally.
+        #     `paused` genuinely halts the animation (a redefined @keyframes does NOT
+        #     -- the machinery keeps running and repainting; that was measured too).
+        #  2. The handful of infinite animations with no such var are named here.
+        #     Only the ones that run AT IDLE: the state-driven ones (listening ring,
+        #     is-sensing, mic recording) stay, because they run for seconds during a
+        #     real interaction and they are what tells the user HART is doing
+        #     something. lg-comet likewise. A vulkan rung keeps everything as authored.
+        if not blur_composites:
+            _CSS_LIVING_GLASS += (
+                '/* sw-paint: idle motion stopped (see the note in liquid_ui_service.py) */'
+                'body.webkit-flat{--hart-motion-ambient:paused;--hart-motion-orb:paused;'
+                '--hart-motion-rings:paused;--hart-motion-detail:paused}'
+                # No --hart-motion-* var on these, and all of them animate transform
+                # on elements carrying large blurs/shadows (.hart-hero-orb alone has a
+                # 70px AND a 150px box-shadow, so each breathe frame re-rasterises two
+                # big blurs in software) or rotate a 300px dashed ring forever.
+                'body.webkit-flat .hart-orb-orbit,'
+                'body.webkit-flat .hart-orb-orbit2,'
+                'body.webkit-flat .hart-hero-orb,'
+                'body.webkit-flat .hart-hero-aura,'
+                'body.webkit-flat .hart-hero-aura .hha-r1,'
+                'body.webkit-flat .hart-hero-aura .hha-r2,'
+                'body.webkit-flat .hart-hero-aura .hha-halo,'
+                'body.webkit-flat .hart-hero-hevolve .dot,'
+                'body.webkit-flat .top-bar-orb,'
+                'body.webkit-flat .hart-hero-go,'
+                'body.webkit-flat .ds-skeleton{animation:none}'
             )
 
         # ── Boot lock overlay (#166: FOUC + security) ─────────────────────────
@@ -7003,7 +7081,7 @@ function renderAgentOverlay(ev) {{
                 result = subprocess.run(
                     ['journalctl', '--since', '1 hour ago', '-p', '0..5',
                      '--no-pager', '-o', 'short', '-n', '50'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 for line in result.stdout.strip().split('\n'):
                     if line.strip():
                         parts = line.split(None, 3)
@@ -7076,7 +7154,10 @@ function renderAgentOverlay(ev) {{
             return jsonify({'apps': apps[:100]})
 
         # ── Shell APIs: Launch ──
+        from integrations.agent_engine.shell_os_apis import _require_shell_auth
+
         @app.route('/api/shell/launch', methods=['POST'])
+        @_require_shell_auth
         def shell_launch():
             import re
             data = request.get_json(force=True, silent=True) or {}
@@ -7085,16 +7166,27 @@ function renderAgentOverlay(ev) {{
             # trailing newline; app_id drives a launch, so reject it outright.
             if not app_id or not re.fullmatch(r'[a-zA-Z0-9._-]+', app_id):
                 return jsonify({'error': 'Invalid app_id'}), 400
-            try:
-                subprocess.Popen(
-                    ['gtk-launch', app_id],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                return jsonify({'status': 'launched'})
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
+            # Delegate to the canonical, RESULT-CHECKED launcher instead of the
+            # old raw fire-and-forget process spawn that masked EVERY failure
+            # (missing app, denied, launcher absent) as {'status': 'launched'}.
+            # get_app_bridge().launch_app returns {ok, ...}; surface a real 500
+            # when the launch actually failed (the #133 anti-pattern).
+            from integrations.agent_engine.app_bridge_service import get_app_bridge
+            res = get_app_bridge().launch_app(app_id, 'linux') or {}
+            if not res.get('ok'):
+                return jsonify(res or {'error': 'launch failed'}), 500
+            return jsonify(res)
 
         # ── Shell APIs: Session ──
+        # Auth gate — this power/session route (lock/logout/suspend/shutdown/
+        # restart/firmware) was UNAUTHENTICATED while its sibling
+        # /api/shell/power/action carried @_require_shell_auth, a drifted power
+        # surface that let any reachable caller power off the box. Both surfaces
+        # now share the ONE canonical local-shell gate.
+        from integrations.agent_engine.shell_os_apis import _require_shell_auth
+
         @app.route('/api/shell/session/<action>', methods=['POST'])
+        @_require_shell_auth
         def shell_session(action):
             # #133 — NATIVE logind power actions, result-checked. The shell server
             # runs as the unprivileged `hart` service user; the old fire-and-forget
@@ -7357,7 +7449,7 @@ function renderAgentOverlay(ev) {{
                 cmd = ['nmcli', 'device', 'wifi', 'connect', ssid]
                 if password:
                     cmd += ['password', password]
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, **no_window_kwargs())
                 if r.returncode == 0:
                     return jsonify({'success': True, 'message': f'Connected to {ssid}'})
                 return jsonify({'success': False, 'error': r.stderr.strip() or 'Connection failed'}), 400
@@ -7374,12 +7466,12 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['nmcli', 'device', 'disconnect', 'wlan0'],
-                    capture_output=True, text=True, timeout=10)
+                    capture_output=True, text=True, timeout=10, **no_window_kwargs())
                 # Try common interface names if wlan0 fails
                 if r.returncode != 0:
                     r = subprocess.run(
                         ['nmcli', 'device', 'disconnect', 'wlp0s20f3'],
-                        capture_output=True, text=True, timeout=10)
+                        capture_output=True, text=True, timeout=10, **no_window_kwargs())
                 if r.returncode == 0:
                     return jsonify({'success': True, 'message': 'Disconnected from WiFi'})
                 return jsonify({'success': False, 'error': r.stderr.strip() or 'Disconnect failed'}), 400
@@ -7393,7 +7485,7 @@ function renderAgentOverlay(ev) {{
                 r = subprocess.run(
                     ['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE,CONNECTION',
                      'device', 'status'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 for line in r.stdout.strip().split('\n'):
                     parts = line.split(':')
                     if len(parts) >= 4:
@@ -7406,7 +7498,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['ip', 'route', 'show', 'default'],
-                    capture_output=True, text=True, timeout=3)
+                    capture_output=True, text=True, timeout=3, **no_window_kwargs())
                 parts = r.stdout.strip().split()
                 if 'via' in parts:
                     status['gateway'] = parts[parts.index('via') + 1]
@@ -7415,7 +7507,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['resolvectl', 'status', '--no-pager'],
-                    capture_output=True, text=True, timeout=3)
+                    capture_output=True, text=True, timeout=3, **no_window_kwargs())
                 for line in r.stdout.split('\n'):
                     if 'DNS Servers' in line:
                         status['dns'] = line.split(':',1)[1].strip().split()
@@ -7444,14 +7536,14 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['pactl', 'get-default-sink'],
-                    capture_output=True, text=True, timeout=3)
+                    capture_output=True, text=True, timeout=3, **no_window_kwargs())
                 default_sink = r.stdout.strip()
             except Exception:
                 logger.exception("shell_audio: swallowed Exception")
             try:
                 r = subprocess.run(
                     ['pactl', '--format=json', 'list', 'sinks'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 if r.stdout.strip():
                     raw = json.loads(r.stdout)
                     sinks = [{
@@ -7466,7 +7558,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['pactl', '--format=json', 'list', 'sources'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 if r.stdout.strip():
                     raw = json.loads(r.stdout)
                     sources = [{
@@ -7492,7 +7584,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['pactl', 'set-sink-volume', sink_id, f'{volume}%'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 if r.returncode == 0:
                     return jsonify({'success': True, 'volume': volume})
                 return jsonify({'success': False, 'error': r.stderr.strip()}), 400
@@ -7510,7 +7602,7 @@ function renderAgentOverlay(ev) {{
                 val = '1' if muted else '0'
                 r = subprocess.run(
                     ['pactl', 'set-sink-mute', sink_id, val],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 if r.returncode == 0:
                     return jsonify({'success': True, 'muted': muted})
                 return jsonify({'success': False, 'error': r.stderr.strip()}), 400
@@ -7526,7 +7618,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['pactl', 'set-default-sink', sink_id],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 if r.returncode == 0:
                     return jsonify({'success': True, 'default_sink': sink_id})
                 return jsonify({'success': False, 'error': r.stderr.strip()}), 400
@@ -7549,7 +7641,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['pactl', 'set-source-volume', source_id, f'{volume}%'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 if r.returncode == 0:
                     return jsonify({'success': True, 'volume': volume})
                 return jsonify({'success': False, 'error': r.stderr.strip()}), 400
@@ -7563,7 +7655,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['bluetoothctl', 'devices'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 for line in r.stdout.strip().split('\n'):
                     parts = line.split(None, 2)
                     if len(parts) == 3:
@@ -7583,7 +7675,7 @@ function renderAgentOverlay(ev) {{
                 r = subprocess.run(
                     ['upower', '-i',
                      '/org/freedesktop/UPower/devices/battery_BAT0'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 for line in r.stdout.split('\n'):
                     line = line.strip()
                     if 'percentage:' in line:
@@ -7683,7 +7775,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['xrandr', '--current'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 current_display = None
                 for line in r.stdout.split('\n'):
                     if ' connected' in line:
@@ -7738,7 +7830,7 @@ function renderAgentOverlay(ev) {{
                 cmd = ['xrandr', '--output', output, '--mode', resolution]
                 if rate:
                     cmd += ['--rate', str(rate)]
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=10, **no_window_kwargs())
                 if r.returncode == 0:
                     return jsonify({'success': True, 'output': output, 'resolution': resolution})
                 return jsonify({'success': False, 'error': r.stderr.strip() or 'Failed to set resolution'}), 400
@@ -7759,7 +7851,7 @@ function renderAgentOverlay(ev) {{
             try:
                 r = subprocess.run(
                     ['xrandr', '--output', output, '--brightness', str(brightness)],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **no_window_kwargs())
                 if r.returncode == 0:
                     return jsonify({'success': True, 'brightness': brightness})
                 return jsonify({'success': False, 'error': r.stderr.strip()}), 400
@@ -7887,7 +7979,7 @@ function renderAgentOverlay(ev) {{
                     cmd += ['--since', since]
                 if grep_pattern:
                     cmd += ['-g', grep_pattern]
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=10, **no_window_kwargs())
                 entries = []
                 for line in r.stdout.strip().split('\n'):
                     if not line:
@@ -7918,7 +8010,7 @@ function renderAgentOverlay(ev) {{
                         ['journalctl', '--output=json', '--no-pager',
                          '-f', '-u', unit],
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        text=True)
+                        text=True, **no_window_kwargs())
                     for line in proc.stdout:
                         line = line.strip()
                         if not line:

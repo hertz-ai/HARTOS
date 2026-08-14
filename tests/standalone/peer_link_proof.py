@@ -1,0 +1,412 @@
+"""
+Two-node proof that an inbound PeerLink actually forms.
+
+Not a mock. This starts a REAL second node in a subprocess — its own Ed25519
+identity (own HEVOLVE_KEY_DIR), real Hypercorn, the real
+`peer_link_asgi(AsyncioWSGIMiddleware(flask_app))` stack from
+hart_intelligence_entry — and dials it with the real
+`PeerLinkManager.upgrade_peer`, the same call `_try_auto_upgrade` makes after
+three gossip exchanges.
+
+It proves, in order:
+  1. the server answers a websocket upgrade on /peer_link          (was: 404)
+  2. the Ed25519 handshake verifies in both directions
+  3. X25519 ECDH derives a session key, so the link is encrypted
+  4. the CLIENT holds a live link            -> broadcast() has a peer
+  5. the SERVER holds a live link            -> accept_inbound registered it
+  6. a message crosses and reaches a channel handler on the far side
+
+and then, calling the production functions rather than re-implementing them:
+
+  7. `hive_benchmark_prover._discover_nodes()` returns the peer  -> shard
+     fan-out stops running single-node
+  8. `broadcast('dispatch', peer_announce)` — the exact call
+     `claude_hive_session._register_peer_link` makes — reaches 1 peer and
+     lands in a handler there
+
+`PeerLinkManager._links` was empty on every node in the fleet, and every one of
+those readers read that dict.
+
+Then a SECOND node under the same user_id, because skill broadcast needs a
+trust level nothing could reach:
+
+  9. the handshake grants SAME_USER against a real `user_id_proof`
+ 10. the far side grants it too
+ 11. `federation.recipe_delta` — what
+     `skill_exporter._broadcast_skill_via_p2p` publishes — arrives on the peer
+
+`message_bus._route_peerlink` scopes every non-relay topic to SAME_USER, and
+SAME_USER could not be granted to anyone: nothing wrote the `user_id_proof`
+the handshake reads, and `_verify_same_user_proof` imported a
+`verify_message_signature` that did not exist, so it failed closed on
+ImportError. Both are fixed.
+
+Note what the proof does and does not establish: possession of the node key
+plus knowledge of the user_id. That is the scheme `_verify_same_user_proof`
+was written for, and the handshake has no freshness challenge, so a captured
+hello replays. Raising that bar is a trust-model change, not a bug fix.
+
+Run:  python tests/standalone/peer_link_proof.py
+Exit code 0 = proven, 1 = not.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+_REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO))
+
+
+# --------------------------------------------------------------------------
+# The server node (child process)
+# --------------------------------------------------------------------------
+
+def serve(port: int) -> None:
+    """Run a node that accepts inbound PeerLinks, exactly as production does."""
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    from flask import Flask, jsonify
+    from hypercorn.asyncio import serve as hypercorn_serve
+    from hypercorn.config import Config
+    from hypercorn.middleware import AsyncioWSGIMiddleware
+
+    from core.peer_link.link_manager import get_link_manager
+    from core.peer_link.server import peer_link_asgi
+    from security.node_integrity import get_node_identity
+
+    received: list = []
+
+    manager = get_link_manager()
+    manager.start()
+    # Registered BEFORE any peer connects, so accept_inbound's
+    # _apply_channel_handlers has something to attach.
+    def record(ch, data, peer):
+        received.append({'ch': ch, 'd': data, 'peer': peer})
+
+    manager.register_channel_handler('gossip', record)
+    # 'dispatch' is the channel claude_hive_session announces the distributed
+    # coder on (_register_peer_link -> broadcast('dispatch', peer_announce)).
+    manager.register_channel_handler('dispatch', record)
+    # 'events' is the channel MessageBus._route_peerlink fans every non-relay
+    # topic out on — the leg skill_exporter._broadcast_skill_via_p2p rides.
+    manager.register_channel_handler('events', record)
+
+    app = Flask('peer_link_proof_node')
+
+    @app.get('/proof/identity')
+    def identity():
+        return jsonify({'node_id': get_node_identity().get('node_id', '')})
+
+    @app.get('/proof/state')
+    def state():
+        status = manager.get_status()
+        return jsonify({
+            'active_links': status['active_links'],
+            'encrypted_links': status['encrypted_links'],
+            'links': {pid[:8]: s['trust'] for pid, s in status['links'].items()},
+            'received': received,
+        })
+
+    config = Config()
+    config.bind = [f'127.0.0.1:{port}']
+    config.accesslog = None
+    config.errorlog = '-'
+
+    asgi_app = peer_link_asgi(AsyncioWSGIMiddleware(app))
+
+    async def _runner():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(
+            ThreadPoolExecutor(max_workers=16, thread_name_prefix='proof'))
+        await hypercorn_serve(asgi_app, config)
+
+    print(f'SERVE {port}', flush=True)
+    asyncio.run(_runner())
+
+
+# --------------------------------------------------------------------------
+# The client node (this process)
+# --------------------------------------------------------------------------
+
+def _http_json(url: str, timeout: float = 5.0):
+    import urllib.request
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.loads(resp.read().decode('utf-8'))
+
+
+def _wait_for_server(port: int, deadline: float = 60.0):
+    start = time.time()
+    last = None
+    while time.time() - start < deadline:
+        try:
+            return _http_json(f'http://127.0.0.1:{port}/proof/identity', 2.0)
+        except Exception as exc:
+            last = exc
+            time.sleep(0.5)
+    raise RuntimeError(f'server never came up on {port}: {last}')
+
+
+def _free_port() -> int:
+    import socket
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+def drive() -> int:
+    port = _free_port()
+
+    # A DIFFERENT node identity for the child, so the handshake verifies a
+    # genuinely foreign Ed25519 key rather than our own.
+    server_keys = tempfile.mkdtemp(prefix='peerlink-proof-server-')
+    env = dict(os.environ)
+    env['HEVOLVE_KEY_DIR'] = server_keys
+    env['PYTHONPATH'] = str(_REPO) + os.pathsep + env.get('PYTHONPATH', '')
+    env.pop('HEVOLVE_ENFORCEMENT_MODE', None)
+
+    child = subprocess.Popen(
+        [sys.executable, __file__, '--serve', '--port', str(port)],
+        env=env, cwd=str(_REPO),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    failures = []
+    try:
+        ident = _wait_for_server(port)
+        server_node_id = ident['node_id']
+        print(f'[1] server up on {port}, node_id={server_node_id[:8]}')
+
+        from core.peer_link.link import TrustLevel
+        from core.peer_link.link_manager import get_link_manager
+
+        manager = get_link_manager()
+        manager.start()
+
+        t0 = time.time()
+        ok = manager.upgrade_peer(
+            peer_id=server_node_id,
+            address=f'127.0.0.1:{port}',
+            trust=TrustLevel.PEER,
+        )
+        elapsed = time.time() - t0
+        print(f'[2] upgrade_peer -> {ok} in {elapsed:.2f}s')
+        if not ok:
+            failures.append('upgrade_peer returned False — no link formed')
+            return _report(failures, child)
+
+        link = manager.get_link(server_node_id)
+        if link is None or not link.is_connected:
+            failures.append('client has no connected link after upgrade_peer')
+        else:
+            print(f'[3] client link: trust={link.trust.value} '
+                  f'encrypted={link.is_encrypted}')
+            if not link.is_encrypted:
+                failures.append('PEER-trust link is not encrypted '
+                                '(X25519 ECDH did not derive a session key)')
+
+        # Give the far side a moment to finish registering.
+        for _ in range(20):
+            state = _http_json(f'http://127.0.0.1:{port}/proof/state')
+            if state['active_links'] >= 1:
+                break
+            time.sleep(0.25)
+
+        print(f'[4] server state: active_links={state["active_links"]} '
+              f'encrypted={state["encrypted_links"]} links={state["links"]}')
+        if state['active_links'] < 1:
+            failures.append('server registered no link — accept_inbound did '
+                            'not reach PeerLinkManager._links')
+
+        # Message across the wire, on a channel the server has a handler for.
+        link = manager.get_link(server_node_id)
+        if link is not None:
+            link.send('gossip', {'proof': 'hello-from-client'})
+
+        got = []
+        for _ in range(20):
+            state = _http_json(f'http://127.0.0.1:{port}/proof/state')
+            got = state['received']
+            if got:
+                break
+            time.sleep(0.25)
+
+        print(f'[5] server received: {got}')
+        if not got:
+            failures.append('message sent but no channel handler fired on the '
+                            'server — the receive loop is not reading')
+        elif got[0]['d'].get('proof') != 'hello-from-client':
+            failures.append(f'payload corrupted in transit: {got[0]}')
+
+        # --- The subsystems that read this dict ------------------------
+        # Not a re-implementation: these are the production functions, called
+        # on the live link.
+
+        # Shard fan-out. _discover_nodes' first source is
+        # get_status()['links'] filtered on state == 'connected'. It returned
+        # [] on every node, so num_nodes = max(1, 0) and every "hive" benchmark
+        # ran on one machine.
+        from integrations.agent_engine.hive_benchmark_prover import (
+            get_benchmark_prover)
+        discovered = get_benchmark_prover()._discover_nodes()
+        peer_link_nodes = [n for n in discovered if n.get('type') == 'peer_link']
+        print(f'[6] prover._discover_nodes -> {len(discovered)} node(s), '
+              f'{len(peer_link_nodes)} via peer_link: {peer_link_nodes}')
+        if not peer_link_nodes:
+            failures.append('_discover_nodes still sees no peer_link node — '
+                            'shard fan-out would run single-node')
+
+        # Distributed coder. claude_hive_session._register_peer_link announces
+        # itself with exactly this call; it returned 0 sent, so no peer ever
+        # learned a coding agent existed.
+        announced = manager.broadcast('dispatch', {
+            'type': 'peer_announce',
+            'peer_type': 'coding_agent',
+            'capabilities': ['python'],
+        })
+        print(f'[7] broadcast(dispatch, peer_announce) -> {announced} peer(s)')
+        if announced < 1:
+            failures.append('broadcast() reached no peer — the distributed '
+                            'coder still cannot announce itself')
+
+        for _ in range(20):
+            state = _http_json(f'http://127.0.0.1:{port}/proof/state')
+            if any(r['ch'] == 'dispatch' for r in state['received']):
+                break
+            time.sleep(0.25)
+        dispatch_seen = [r for r in state['received'] if r['ch'] == 'dispatch']
+        print(f'[8] server saw dispatch announce: {dispatch_seen}')
+        if not dispatch_seen:
+            failures.append('peer_announce never arrived on the far side')
+
+        failures.extend(_prove_same_user_and_skill_broadcast())
+        return _report(failures, child)
+    finally:
+        try:
+            child.terminate()
+            child.wait(timeout=10)
+        except Exception:
+            child.kill()
+
+
+def _prove_same_user_and_skill_broadcast() -> list:
+    """Second node, same user: SAME_USER trust and the skill-broadcast leg.
+
+    message_bus._route_peerlink scopes every non-relay topic to SAME_USER, so
+    this is the only trust level at which multi-device sync — and the skill
+    broadcast riding it — has any recipient at all.
+    """
+    failures = []
+    port = _free_port()
+    user_id = 'proof-user-same'
+
+    keys = tempfile.mkdtemp(prefix='peerlink-proof-sameuser-')
+    env = dict(os.environ)
+    env['HEVOLVE_KEY_DIR'] = keys
+    env['HEVOLVE_USER_ID'] = user_id
+    env['PYTHONPATH'] = str(_REPO) + os.pathsep + env.get('PYTHONPATH', '')
+    env.pop('HEVOLVE_ENFORCEMENT_MODE', None)
+
+    child = subprocess.Popen(
+        [sys.executable, __file__, '--serve', '--port', str(port)],
+        env=env, cwd=str(_REPO),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    try:
+        ident = _wait_for_server(port)
+        node_id = ident['node_id']
+
+        # Our half of "same user". The handshake signs this string; the far
+        # side verifies it against its own, which is the same string.
+        os.environ['HEVOLVE_USER_ID'] = user_id
+
+        from core.peer_link.link import TrustLevel
+        from core.peer_link.link_manager import get_link_manager
+
+        manager = get_link_manager()
+        ok = manager.upgrade_peer(peer_id=node_id,
+                                  address=f'127.0.0.1:{port}',
+                                  trust=TrustLevel.SAME_USER)
+        link = manager.get_link(node_id)
+        trust = link.trust.value if link else 'none'
+        print(f'\n[9] same-user upgrade -> {ok}, client trust={trust}')
+        if not ok or trust != 'same_user':
+            failures.append(
+                f'client link is {trust}, not same_user — the peer refused the '
+                f'user_id_proof')
+
+        state = {}
+        for _ in range(20):
+            state = _http_json(f'http://127.0.0.1:{port}/proof/state')
+            if state['links']:
+                break
+            time.sleep(0.25)
+        print(f'[10] server links: {state.get("links")}')
+        if 'same_user' not in str(state.get('links', {})):
+            failures.append('server did not grant SAME_USER — _complete_'
+                            'handshake rejected the proof')
+
+        # The actual skill-broadcast call path.
+        from core.peer_link.message_bus import get_message_bus
+        get_message_bus().publish('federation.recipe_delta', {
+            'recipes': [{'id': 'proof-skill', 'name': 'proof-skill',
+                         'action_count': 3, 'success_rate': 1.0,
+                         'reuse_count': 0}],
+        })
+
+        got = []
+        for _ in range(24):
+            state = _http_json(f'http://127.0.0.1:{port}/proof/state')
+            got = [r for r in state['received']
+                   if r['ch'] == 'events'
+                   and r['d'].get('topic') == 'federation.recipe_delta']
+            if got:
+                break
+            time.sleep(0.25)
+
+        print(f'[11] skill delta received on the peer: {got}')
+        if not got:
+            failures.append('federation.recipe_delta never reached the peer — '
+                            'the skill broadcast leg is still dark')
+        return failures
+    finally:
+        try:
+            child.terminate()
+            child.wait(timeout=10)
+        except Exception:
+            child.kill()
+
+
+def _report(failures, child) -> int:
+    print()
+    if failures:
+        print('NOT PROVEN:')
+        for f in failures:
+            print(f'  - {f}')
+        try:
+            child.terminate()
+            out = child.communicate(timeout=5)[0]
+            tail = '\n'.join((out or '').strip().splitlines()[-25:])
+            if tail:
+                print('\n--- server log tail ---')
+                print(tail)
+        except Exception:
+            pass
+        return 1
+    print('PROVEN: inbound PeerLink forms, is encrypted, and carries messages.')
+    return 0
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--serve', action='store_true')
+    parser.add_argument('--port', type=int, default=0)
+    args = parser.parse_args()
+    if args.serve:
+        serve(args.port)
+    else:
+        sys.exit(drive())

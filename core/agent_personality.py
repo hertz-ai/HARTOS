@@ -563,8 +563,8 @@ def get_regional_tone_prompt(language: str = '') -> str:
         language = os.environ.get('HART_USER_LANGUAGE', '')
     if not language:
         try:
-            from hart_onboarding import get_node_identity
-            language = get_node_identity().get('language', '')
+            from hart_onboarding import get_onboarding_identity
+            language = get_onboarding_identity().get('language', '')
         except Exception:
             pass
     if not language:

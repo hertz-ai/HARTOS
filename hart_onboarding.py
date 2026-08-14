@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import os
+from core.subprocess_safe import no_window_kwargs
 import random
 import re
 import time
@@ -536,8 +537,15 @@ def _identity_path() -> str:
     return os.path.join(data_dir, _HART_IDENTITY_FILE)
 
 
-def get_node_identity() -> Dict:
-    """Load the node's HART identity from disk. Returns {} if not yet generated."""
+def get_onboarding_identity() -> Dict:
+    """Load the node's HART ONBOARDING identity from disk (node_tag / element /
+    spirit / tier / language). Returns {} if not yet generated.
+
+    Renamed from ``get_node_identity`` to disambiguate from the CRYPTO identity
+    ``security.node_integrity.get_node_identity`` (node_id / user_id / public
+    key) — both previously returned a dict carrying ``tier``, a name-collision
+    footgun where importing the wrong module silently returned the wrong dict.
+    """
     try:
         path = _identity_path()
         if os.path.isfile(path):
@@ -568,7 +576,7 @@ def generate_node_identity(tier: str, central_element: str = None,
     known_tags = known_tags or set()
 
     # Check if already generated
-    existing = get_node_identity()
+    existing = get_onboarding_identity()
     if existing and existing.get('node_tag'):
         # Re-apply env vars (process may have restarted)
         _apply_identity_env(existing)
@@ -1225,15 +1233,52 @@ class HARTNameRegistry:
                 if not user:
                     return False
 
-                # Check if already sealed
-                if user.handle:
+                # Already-sealed handling.  THREE distinct cases; the old
+                # code collapsed them into one `if user.handle: return
+                # False`, which is what produced a one-way trap:
+                #
+                #  a) a DIFFERENT handle -> refuse.  This is the
+                #     permanence contract stated in the docstring above
+                #     ("Once sealed, it cannot be changed"), unchanged.
+                #  b) the SAME handle, bucket already sealed -> report
+                #     success WITHOUT rewriting, so re-entering the
+                #     ceremony can never re-stamp sealed_at / dimensions.
+                #     Permanence again — reporting success is not the same
+                #     as mutating permanent data.
+                #  c) the SAME handle, bucket missing or unsealed ->
+                #     REPAIR.  Rows in this state exist in the field: the
+                #     scalar `user.handle` below persists, while the JSON
+                #     mutation further down did NOT (see the `dict(...)`
+                #     comment there), so the user held a permanently
+                #     locked name that has_hart_name() reported as False
+                #     forever — and case (a) swallowed the retry, leaving
+                #     no way out.  This branch is the only path that
+                #     heals them.
+                _hart = (user.settings or {}).get('hart') or {}
+                _same = (user.handle == clean)
+
+                if user.handle and not _same:
                     logger.warning(f"User {user_id} already has HART name: {user.handle}")
                     return False
 
-                # Final uniqueness: check cloud before writing local DB
-                if not HARTNameRegistry._check_cloud_available(clean):
-                    logger.warning(f"HART name '{clean}' taken globally at seal time")
-                    return False
+                if _same and _hart.get('sealed') is True:
+                    logger.info(
+                        f"HART name @{clean} already sealed for {user_id} — "
+                        f"reporting success without rewriting")
+                    return True
+
+                if not _same:
+                    # New seal: the global uniqueness gate applies.
+                    # Deliberately NOT re-run on the repair path (c) — the
+                    # handle is already ours, so asking the cloud again can
+                    # only return "taken" (by us) and re-trap the user.
+                    if not HARTNameRegistry._check_cloud_available(clean):
+                        logger.warning(f"HART name '{clean}' taken globally at seal time")
+                        return False
+                else:
+                    logger.warning(
+                        f"Repairing HART settings bucket for {user_id} — "
+                        f"@{clean} was locked but never recorded as sealed")
 
                 # Local uniqueness via UNIQUE constraint
                 user.handle = clean
@@ -1249,7 +1294,23 @@ class HARTNameRegistry:
                 regional_sp = os.environ.get('HART_REGIONAL_SPIRIT')
                 hart_tag = build_hart_tag(clean, central_el, regional_sp)
 
-                settings = user.settings or {}
+                # `dict(...)` is load-bearing, not style.  `settings` is a
+                # plain `Column(JSON)` (_models_local.py:52) — NOT
+                # `MutableDict.as_mutable(JSON)` — so SQLAlchemy detects a
+                # change only when the attribute is assigned a DIFFERENT
+                # object.  `user.settings or {}` returns the ORM's OWN dict
+                # whenever settings is non-empty, so mutating it and
+                # assigning it back was a no-op: the hart bucket was
+                # silently dropped while the scalar `user.handle` above
+                # persisted fine.  That asymmetry is what created rows with
+                # a permanently locked name that has_hart_name() reported
+                # as False forever.  An explicit copy is always a new
+                # object, so the change is always recorded.
+                #
+                # Same idiom as integrations/social/api.py:1359
+                # (`dict(agent.settings or {}, ...)`) — the established
+                # house pattern for this exact SQLAlchemy trap.
+                settings = dict(user.settings or {})
                 settings['hart'] = {
                     'name': clean,
                     'element': element,
@@ -1417,7 +1478,7 @@ def _run_companion_download(user_id: str, url: str = None,
     cmd = ['curl', '-fL', '--retry', '3', '--connect-timeout', '30',
            '--speed-time', '30', '--speed-limit', '2048', '-o', part, url]
     try:
-        res = subprocess.run(cmd, timeout=timeout, capture_output=True)
+        res = subprocess.run(cmd, timeout=timeout, capture_output=True, **no_window_kwargs())
     except FileNotFoundError:
         _set_companion_state(user_id, status='error', percent=None,
                              message='Downloader unavailable on this system.')

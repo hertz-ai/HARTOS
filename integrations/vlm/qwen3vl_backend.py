@@ -15,6 +15,7 @@ Usage:
 """
 
 import os
+from core.subprocess_safe import no_window_kwargs
 import io
 import json
 import re
@@ -313,9 +314,9 @@ class Qwen3VLBackend:
             elif _os == 'Linux':
                 # Get foreground window
                 _fg = subprocess.run(['xdotool', 'getactivewindow', 'getwindowname'],
-                                     capture_output=True, text=True, timeout=3)
+                                     capture_output=True, text=True, timeout=3, **no_window_kwargs())
                 fg_title = _fg.stdout.strip() if _fg.returncode == 0 else ''
-                _r = subprocess.run(['wmctrl', '-l'], capture_output=True, text=True, timeout=3)
+                _r = subprocess.run(['wmctrl', '-l'], capture_output=True, text=True, timeout=3, **no_window_kwargs())
                 if _r.returncode == 0:
                     fg_info = f' FOREGROUND: "{fg_title}".' if fg_title else ''
                     return f'OS: Linux.{fg_info} Open windows: [{_r.stdout.strip()}]\n'
@@ -324,12 +325,12 @@ class Qwen3VLBackend:
                 _fg = subprocess.run(
                     ['osascript', '-e',
                      'tell application "System Events" to get name of first process whose frontmost is true'],
-                    capture_output=True, text=True, timeout=3)
+                    capture_output=True, text=True, timeout=3, **no_window_kwargs())
                 fg_title = _fg.stdout.strip() if _fg.returncode == 0 else ''
                 _r = subprocess.run(
                     ['osascript', '-e',
                      'tell application "System Events" to get name of every process whose visible is true'],
-                    capture_output=True, text=True, timeout=3)
+                    capture_output=True, text=True, timeout=3, **no_window_kwargs())
                 if _r.returncode == 0:
                     fg_info = f' FOREGROUND: "{fg_title}".' if fg_title else ''
                     return f'OS: macOS.{fg_info} Visible apps: [{_r.stdout.strip()}]\n'

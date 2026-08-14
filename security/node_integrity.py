@@ -150,12 +150,29 @@ def sign_message(message: bytes) -> bytes:
     return priv.sign(message)
 
 
+def canonical_payload(payload: dict, exclude=('signature',)) -> bytes:
+    """The ONE canonical serialization for every Ed25519 sign/verify in HART OS:
+    drop the signature field(s), then ``json.dumps`` with sorted keys and no
+    whitespace. Every signer AND verifier must emit byte-identical bytes here or
+    signatures silently fail network-wide — so this is the single source of truth
+    that master_key / key_delegation / origin_attestation / pre_trust_contract and
+    this module route through, instead of each re-implementing
+    ``json.dumps(..., sort_keys=True, separators=(',',':'))`` inline (any drift =
+    network-wide verification failure).
+
+    ``exclude`` (the signature key-name(s) to strip) differs per payload type
+    ('signature' / 'sig' / 'node_sig' / ...), so it stays a parameter — the
+    SERIALIZATION is what must never drift, not the exclude-set.
+    """
+    ex = (exclude,) if isinstance(exclude, str) else tuple(exclude)
+    clean = {k: v for k, v in payload.items() if k not in ex}
+    return json.dumps(clean, sort_keys=True, separators=(',', ':')).encode('utf-8')
+
+
 def sign_json_payload(payload: dict) -> str:
     """Canonicalize dict (sorted JSON, no spaces), sign it, return hex signature.
     The payload dict should NOT contain the 'signature' key itself."""
-    clean = {k: v for k, v in payload.items() if k != 'signature'}
-    canonical = json.dumps(clean, sort_keys=True, separators=(',', ':'))
-    sig = sign_message(canonical.encode('utf-8'))
+    sig = sign_message(canonical_payload(payload, exclude=('signature',)))
     return sig.hex()
 
 
@@ -170,14 +187,44 @@ def verify_signature(public_key_hex: str, message: bytes, signature: bytes) -> b
         return False
 
 
+def sign_message_hex(message: str) -> str:
+    """Hex detached signature over a plain UTF-8 string (not a JSON payload).
+
+    Companion to sign_json_payload for the one case that signs a bare string
+    rather than a dict: PeerLink's SAME_USER proof, where the signed value is
+    the user_id itself.
+    """
+    return sign_message(message.encode('utf-8')).hex()
+
+
+def verify_message_signature(public_key_hex: str, message: str,
+                             signature_hex: str) -> bool:
+    """Verify a detached Ed25519 signature over a plain UTF-8 string.
+
+    The verifier `PeerLink._verify_same_user_proof` has always imported and
+    never found: the symbol did not exist anywhere in the repo, so that import
+    raised ImportError, the gate failed closed, and SAME_USER could not be
+    granted to any peer on any node.  That in turn left every link at PEER, and
+    `message_bus._route_peerlink` filters its per-user fan-out on SAME_USER —
+    so multi-device sync, and the skill broadcast riding it, reached nobody.
+
+    Argument order matches the call the gate makes and the tests pin:
+    (peer public key, the message we expect them to have signed, signature).
+    """
+    try:
+        return verify_signature(public_key_hex, message.encode('utf-8'),
+                                bytes.fromhex(signature_hex))
+    except (ValueError, Exception):
+        return False
+
+
 def verify_json_signature(public_key_hex: str, payload: dict,
                           signature_hex: str) -> bool:
     """Verify signature on a JSON payload. Strips 'signature' key before verification."""
     try:
-        clean = {k: v for k, v in payload.items() if k != 'signature'}
-        canonical = json.dumps(clean, sort_keys=True, separators=(',', ':'))
         sig = bytes.fromhex(signature_hex)
-        return verify_signature(public_key_hex, canonical.encode('utf-8'), sig)
+        return verify_signature(public_key_hex,
+                                canonical_payload(payload, exclude=('signature',)), sig)
     except (ValueError, Exception):
         return False
 

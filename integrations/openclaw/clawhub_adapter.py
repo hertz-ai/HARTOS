@@ -15,6 +15,7 @@ Flow:
 import json
 import logging
 import os
+from core.subprocess_safe import no_window_kwargs
 import re
 import shutil
 import subprocess
@@ -246,7 +247,7 @@ def install_skill(slug: str, version: Optional[str] = None,
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=60,
                 env={**os.environ, 'CLAWHUB_SKILLS_DIR': str(OPENCLAW_HOME)}
-            )
+            , **no_window_kwargs())
             if result.returncode == 0:
                 logger.info("Installed skill %s via clawhub CLI", slug)
                 return parse_skill_md(str(dest))

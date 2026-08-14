@@ -10,6 +10,7 @@ This is a leaf tool — never re-dispatches to /chat.
 import json
 import logging
 import os
+from core.subprocess_safe import no_window_kwargs
 import shutil
 import subprocess
 import time
@@ -106,7 +107,7 @@ class CodingToolBackend(ABC):
                 timeout=timeout,
                 env=self.get_env(),
                 cwd=context.get('working_dir') if context else None,
-            )
+             **no_window_kwargs())
             elapsed = time.time() - start
             parsed = self.parse_output(result.stdout, result.stderr, result.returncode)
             parsed['tool'] = self.name

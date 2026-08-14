@@ -608,7 +608,25 @@ class TestAuraTokensDriveTheHome:
 
 @pytest.fixture
 def theme_app():
-    """Create Flask test app with theme blueprint."""
+    """Create Flask test app with theme blueprint.
+
+    This fixture registers ``theme_bp`` — the OS-WIDE appearance blueprint —
+    so the requests below must use its ``/api/appearance/*`` rules.
+
+    They used to request ``/api/social/theme/*`` and got 404 on all eight route
+    tests. Those paths belong to a DIFFERENT blueprint: ``social_bp`` serves the
+    per-user, ``@require_auth`` theme surface at ``/api/social/theme/*``
+    (``api.py:3989+``), which is still live and is what ``deploy/linux/hart-cli.py``
+    calls. Nothing was broken in production — the test was simply asserting
+    against a blueprint it had not registered.
+
+    Do NOT "fix" this by adding ``/api/social/theme/*`` rules to ``theme_bp``:
+    both blueprints registering ``/api/social/theme/apply`` is what killed the
+    palette (social_bp won), and ``tests/unit/test_customization_hub.py:161``
+    fails loudly if theme_bp ever re-registers that namespace. The split is the
+    fix — ``c6735dc0`` moved the OS-wide routes to ``/api/appearance/*`` to
+    un-shadow the OS palette.
+    """
     from flask import Flask
     from integrations.social.api_theme import theme_bp
     app = Flask(__name__)
@@ -622,7 +640,7 @@ class TestThemeAPI:
 
     def test_list_presets(self, theme_app):
         with theme_app.test_client() as client:
-            resp = client.get('/api/social/theme/presets')
+            resp = client.get('/api/appearance/presets')
         assert resp.status_code == 200
         data = resp.get_json()
         assert 'presets' in data
@@ -630,7 +648,7 @@ class TestThemeAPI:
 
     def test_get_active(self, theme_app):
         with theme_app.test_client() as client:
-            resp = client.get('/api/social/theme/active')
+            resp = client.get('/api/appearance/active')
         assert resp.status_code == 200
         data = resp.get_json()
         assert 'theme' in data
@@ -643,7 +661,7 @@ class TestThemeAPI:
              patch.object(ThemeService, '_notify_liquid_ui'):
             with theme_app.test_client() as client:
                 resp = client.post(
-                    '/api/social/theme/apply',
+                    '/api/appearance/apply',
                     json={'theme_id': 'cyberpunk'},
                 )
         assert resp.status_code == 200
@@ -653,13 +671,13 @@ class TestThemeAPI:
 
     def test_apply_theme_missing_id(self, theme_app):
         with theme_app.test_client() as client:
-            resp = client.post('/api/social/theme/apply', json={})
+            resp = client.post('/api/appearance/apply', json={})
         assert resp.status_code == 400
 
     def test_apply_theme_unknown_id(self, theme_app):
         with theme_app.test_client() as client:
             resp = client.post(
-                '/api/social/theme/apply',
+                '/api/appearance/apply',
                 json={'theme_id': 'does_not_exist'},
             )
         assert resp.status_code == 404
@@ -670,9 +688,9 @@ class TestThemeAPI:
              patch.object(ThemeService, '_notify_liquid_ui'):
             with theme_app.test_client() as client:
                 # Apply a base theme first
-                client.post('/api/social/theme/apply', json={'theme_id': 'hart-default'})
+                client.post('/api/appearance/apply', json={'theme_id': 'hart-default'})
                 resp = client.post(
-                    '/api/social/theme/customize',
+                    '/api/appearance/customize',
                     json={'font': {'size': 16}},
                 )
         assert resp.status_code == 200
@@ -682,7 +700,7 @@ class TestThemeAPI:
     def test_customize_empty_body(self, theme_app):
         with theme_app.test_client() as client:
             resp = client.post(
-                '/api/social/theme/customize',
+                '/api/appearance/customize',
                 data='',
                 content_type='application/json',
             )
@@ -690,15 +708,27 @@ class TestThemeAPI:
 
     def test_list_fonts(self, theme_app):
         with theme_app.test_client() as client:
-            resp = client.get('/api/social/theme/fonts')
+            resp = client.get('/api/appearance/fonts')
         assert resp.status_code == 200
         data = resp.get_json()
         assert 'fonts' in data
-        assert len(data['fonts']) == 8
+
+        # Assert the route serves the WHOLE catalogue, tied to its source of
+        # truth rather than a literal. This used to be `== 8` while the service
+        # shipped 9 (Space Grotesk was added as the display face); the count was
+        # simply never updated, and nobody saw it because the request 404'd on
+        # the wrong blueprint. A hard-coded count breaks on every legitimate
+        # font addition and proves nothing the comparison below does not.
+        from integrations.agent_engine.theme_service import ThemeService
+        assert len(data['fonts']) == len(ThemeService.get_font_options())
+
+        # Shape contract the customization UI relies on.
+        assert all('family' in f and 'category' in f for f in data['fonts']), \
+            f"every font needs family+category: {data['fonts']}"
 
     def test_get_css(self, theme_app):
         with theme_app.test_client() as client:
-            resp = client.get('/api/social/theme/css')
+            resp = client.get('/api/appearance/css')
         assert resp.status_code == 200
         assert 'text/css' in resp.content_type
         assert b':root' in resp.data

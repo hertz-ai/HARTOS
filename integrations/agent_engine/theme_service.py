@@ -11,6 +11,7 @@ to change the OS appearance on voice command ("make it darker", "bigger fonts").
 
 import json
 import logging
+from core.subprocess_safe import no_window_kwargs
 import os
 import subprocess
 from typing import Dict, List, Optional
@@ -517,7 +518,7 @@ class ThemeService:
                 ['gsettings', 'set', 'org.gnome.desktop.interface',
                  'color-scheme', scheme],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
+             **no_window_kwargs())
         except FileNotFoundError:
             pass  # gsettings not available (Windows dev, etc.)
 

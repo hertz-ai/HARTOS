@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+from core.subprocess_safe import no_window_kwargs
 import shutil
 import subprocess
 import threading
@@ -228,7 +229,7 @@ def get_openclaw_version() -> Optional[str]:
         result = subprocess.run(
             ['openclaw', '--version'],
             capture_output=True, text=True, timeout=5
-        )
+        , **no_window_kwargs())
         return result.stdout.strip() if result.returncode == 0 else None
     except Exception:
         return None
@@ -249,7 +250,7 @@ def start_openclaw_gateway(port: int = 18789) -> Optional[subprocess.Popen]:
             ['openclaw', 'gateway', '--port', str(port)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-        )
+         **no_window_kwargs())
         logger.info("Started OpenClaw gateway on port %d (PID %d)", port, proc.pid)
         return proc
     except Exception as e:

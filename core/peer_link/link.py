@@ -80,6 +80,29 @@ from core.peer_link.channels import CHANNEL_IDS, CHANNEL_NAMES  # noqa: E402
 KEY_ROTATION_INTERVAL = 3600
 
 
+def provable_user_id() -> str:
+    """The user_id we can actually PROVE to a peer, or ''.
+
+    Deliberately env-only, and deliberately NOT unified with the broader
+    lookup in `link_manager._try_auto_upgrade`, which also falls back to
+    `get_node_identity()['user_id']`. Those two answer different questions:
+
+      * link_manager asks "is this peer mine?" — a local comparison, so the
+        widest identity view is right there.
+      * this asks "what can I demonstrate to a stranger?" — and the far side's
+        `_verify_same_user_proof` reads HEVOLVE_USER_ID and nothing else, by
+        design. `test_returns_false_when_local_user_id_missing` pins that
+        fail-closed behaviour: with no env var "we don't even have an identity
+        to prove". Widening this to match link_manager would only make us sign
+        a value no verifier will ever check.
+
+    So the divergence stays; what must not diverge is REQUESTING a trust level
+    we cannot substantiate. `_try_auto_upgrade` gates its SAME_USER request on
+    this function for that reason.
+    """
+    return os.environ.get('HEVOLVE_USER_ID', '')
+
+
 class PeerLink:
     """Persistent WebSocket connection to a single peer.
 
@@ -408,6 +431,33 @@ class PeerLink:
             hello['node_id'] = identity.get('node_id', '')
         except Exception:
             pass
+
+        # Prove SAME_USER instead of only asking for it.
+        #
+        # _complete_handshake on the far side reads 'user_id_proof' and grants
+        # SAME_USER only when it verifies — but nothing in the codebase ever
+        # WROTE that field, so every peer that asked for same_user was demoted
+        # to PEER with "SAME_USER trust requested but no valid proof".  Since
+        # message_bus._route_peerlink scopes every non-relay topic to
+        # SAME_USER, multi-device sync (and the skill broadcast riding it) had
+        # no recipients on any node.
+        #
+        # The signed value is the user_id itself, which is what
+        # _verify_same_user_proof checks against ITS local user_id: same user
+        # => same string => the signature verifies under our node key, which
+        # the outer hello signature already binds to this handshake.
+        if self.trust == TrustLevel.SAME_USER:
+            try:
+                from security.node_integrity import sign_message_hex
+                local_user_id = provable_user_id()
+                if local_user_id:
+                    hello['user_id_proof'] = sign_message_hex(local_user_id)
+                else:
+                    logger.debug(
+                        "SAME_USER requested but HEVOLVE_USER_ID is unset — "
+                        "no proof to send, peer will demote us to PEER")
+            except Exception as e:
+                logger.debug(f"user_id_proof not attached: {e}")
 
         # Attach pre-trust contract (proves we agreed to hive terms)
         try:

@@ -20,6 +20,7 @@ Also unifies:
 import hashlib
 import json
 import logging
+from core.subprocess_safe import no_window_kwargs
 import os
 import re
 import subprocess
@@ -197,7 +198,7 @@ class SemanticRouter:
                 result = subprocess.run(
                     ['busctl', 'call', '--system', dbus_dest, '/', 'Execute', 's', data],
                     capture_output=True, text=True, timeout=30,
-                )
+                 **no_window_kwargs())
                 return {
                     'status': 'success' if result.returncode == 0 else 'error',
                     'subsystem': 'linux',
@@ -214,7 +215,7 @@ class SemanticRouter:
                 result = subprocess.run(
                     [cmd, data] if data else [cmd],
                     capture_output=True, text=True, timeout=30,
-                )
+                 **no_window_kwargs())
                 return {
                     'status': 'success' if result.returncode == 0 else 'error',
                     'subsystem': 'linux',
@@ -240,7 +241,7 @@ class SemanticRouter:
 
                 result = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=15,
-                )
+                 **no_window_kwargs())
                 return {
                     'status': 'success' if result.returncode == 0 else 'error',
                     'subsystem': 'android',
@@ -257,7 +258,7 @@ class SemanticRouter:
                 result = subprocess.run(
                     ['am', 'start', '-n', activity],
                     capture_output=True, text=True, timeout=15,
-                )
+                 **no_window_kwargs())
                 return {
                     'status': 'success' if result.returncode == 0 else 'error',
                     'subsystem': 'android',
@@ -279,7 +280,7 @@ class SemanticRouter:
                 result = subprocess.run(
                     ['wine', exe_path, data] if data else ['wine', exe_path],
                     capture_output=True, text=True, timeout=30,
-                )
+                 **no_window_kwargs())
                 return {
                     'status': 'success' if result.returncode == 0 else 'error',
                     'subsystem': 'windows',
@@ -444,7 +445,7 @@ class AppBridgeService:
         try:
             result = subprocess.run(
                 ['pgrep', '-f', 'zygote'], capture_output=True, timeout=5,
-            )
+             **no_window_kwargs())
             if result.returncode == 0:
                 subsystems.append('android')
         except Exception:
@@ -454,7 +455,7 @@ class AppBridgeService:
         try:
             result = subprocess.run(
                 ['which', 'wine'], capture_output=True, timeout=5,
-            )
+             **no_window_kwargs())
             if result.returncode == 0:
                 subsystems.append('windows')
         except Exception:
@@ -464,7 +465,7 @@ class AppBridgeService:
         try:
             result = subprocess.run(
                 ['which', 'chromium'], capture_output=True, timeout=5,
-            )
+             **no_window_kwargs())
             if result.returncode == 0:
                 subsystems.append('web')
         except Exception:

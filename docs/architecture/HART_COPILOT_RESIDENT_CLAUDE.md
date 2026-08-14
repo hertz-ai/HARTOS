@@ -174,6 +174,60 @@ does to a human one.
 | 7 | **MCP self-configuration on the node — task #48** | **The resident co-pilot currently has NO connection to the agent stack.** See §9. |
 | 6 | **Prove a task actually lands** | Carried over from item 1: `hart hive` was driven end to end against a stood-up blueprint, but a LIVE dispatcher sending this session a real task has still never been run. |
 
+## 8b. THREE runtimes, THREE roles — not three candidates (steward, 2026-08-13)
+
+The tree carries three things that each look like "an agent runtime on the node".
+They are **not** competing implementations and this is **not** a DRY violation. Each
+serves a different consumer:
+
+| runtime | drives | role |
+|---|---|---|
+| **`claude-code`** (`hart-copilot.nix`) | Anthropic's Claude, only | The official CLI. Not ours to shape — package it and move on. |
+| **`claw_native`** | hive API / other LLMs | The **same agentic-coding job without Anthropic**. This is the zero-lock-in path. |
+| **`openclaw`** (`hart-openclaw.nix`) | 20+ chat channels | Reach, not coding. **Optional** — in the OS only if the user wants it. |
+
+**Why this is written down.** A reader who greps for "agent runtime" finds three hits,
+two of them `enable = true` in the same profile, and concludes someone shipped
+duplicates. That conclusion was reached once already and produced a "pick one" ticket
+that had to be retracted. The roles are the answer; the overlap is apparent, not real.
+
+**The consequence for MCP self-configuration (§9, task #48):** the node should wire its
+own endpoint + token into the **agentic-coding** runtimes — `claude-code` today,
+`claw_native` when it is ready. **Not** `openclaw`: channels are a different surface and
+do not need to drive goals.
+
+**The gap this exposes, which is bigger than either defect below.** The README promises
+*"democratic frontier intelligence with zero lock-in"*. `claude-code` structurally cannot
+deliver that — it requires Anthropic. `claw_native` doing Claude-Code-like work against
+the hive API **is** that promise. So it is the most strategically important of the three,
+and (verified 2026-08-13) it cannot fill the role yet:
+
+- **Not provider-agnostic.** The only endpoint knob is `ANTHROPIC_BASE_URL`
+  (`rust/crates/runtime/src/remote.rs:80-81`); there is no provider abstraction in
+  `config.rs`. That variable *can* be pointed at an OpenAI-compatible server — likely the
+  intended hive-API route — but that is an override of an Anthropic-named path, not a
+  designed multi-provider surface, and the wire-format match is untested here.
+- **Its own `PARITY.md` says it is not ready:** *"not feature-parity with the TypeScript
+  CLI"* — plugins absent, hooks parsed but **not executed**, narrower CLI, skills
+  local-file only, and *"assistant orchestration lacks hook-aware orchestration and
+  remote/structured transports"*. Orchestration is exactly the job.
+
+So today: **`claude-code` works and locks you in; `claw_native` breaks the lock-in and
+cannot yet do the work.** Closing that is a programme, not a ticket. Fund it or defer it
+explicitly — but the front page should not claim what the tree cannot do.
+
+Two defects, orthogonal to the roles, tracked in #49:
+
+1. `openclaw.enable = true` in `profiles/desktop.nix:538` installs **nothing** — the
+   package is `lib.fakeHash` on both hashes with `# openclawPkg` commented out. An option
+   that is ON and delivers nothing reads as working. Since openclaw is optional by design,
+   default it **off** until the package really builds.
+2. `claw_native` has no module that builds it **as a runtime**. It is in the tree as the
+   first Rust-in-Nix `buildRustPackage` precedent (`hart-rust-precedent.nix`) for
+   hart-comp's Smithay work, which happens to contain an agent runtime.
+
+---
+
 ## 9. The Nunba integration page belongs to THIS plan (steward, 2026-08-08)
 
 > *"whatever Nunba page offers is to wire into `HART_COPILOT_RESIDENT_CLAUDE.md`"*

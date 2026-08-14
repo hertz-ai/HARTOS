@@ -301,6 +301,105 @@ toolchain class, a new bundle-accounting surface, and a new #70-VM-test-eval-gat
 
 ---
 
+### 3.4 The rendering layer: Wayland, pixman, GLES, cairo/GSK, WebKit
+
+§3.1–3.3 explain *which compositor* runs. This section explains *what actually draws
+pixels* underneath it, and why each library is in the tree. These are frequently confused
+because two independent render decisions happen per boot — one in the compositor, one in
+the shell — and they have different fallbacks and different failure modes.
+
+#### The pieces, and why each exists
+
+**Wayland** — the display *protocol*, not a program. Clients (the glass shell, XWayland,
+native apps) speak it to a compositor. It exists here because the alternative, X11, has no
+per-client isolation and no path to the AI-senses consent gate in §4.4: on Wayland a client
+cannot read another's pixels or input without the compositor handing it over, which is the
+precondition for the screencast/portal boundary. Nothing in the tree implements Wayland
+itself — the three compositors below do.
+
+**cage** — a kiosk compositor (single fullscreen surface, wlroots). Tier 3, the floor. It
+exists because it is the *exact* audited configuration that has always painted, including on
+broken GPUs via forced software GL. It is deliberately unambitious: no tiling, no IPC, no
+effects. Its job is to be the rung that cannot fail, so a regression anywhere above it
+degrades to a working desktop instead of a black screen.
+
+**sway** — a full wlroots WM. Tier 2. It exists to cover the case where **HART-comp**
+crashes but the GPU and Wayland stack are healthy — a strictly better fallback than dropping
+straight to kiosk. Agent window verbs (`tile`, `summon`) map onto `swaymsg`, so the moat
+narrows at Tier 2 but does not vanish.
+
+**hart-comp** — the Smithay (Rust) compositor, Tier 1, the eventual moat (§3.1). It exists
+so window management is an *AI-native* surface (`com.hart.Compositor` IPC, §L1) rather than
+something bolted onto a WM that was designed for humans with mice.
+
+**pixman** — a pure-CPU software rasterizer, and **hart-comp's renderer of record** on the
+DRM path (`smithay/renderer_pixman`, `src/wayland.rs`). It exists because the floor must not
+depend on a working GPU. Every claim about hart-comp painting is a claim about pixman
+painting; GLES is the *upgrade*, never the baseline.
+
+**GLES / EGL** (`smithay/renderer_gl`, `backend_egl`) — the opportunistic GPU path. It is
+used **only** when `/run/hart/gpu-render` reads `hardware` *and* the renderer initialises,
+with pixman as the fallback on **any** GLES init or runtime fault. Degrade, never die. The
+`winit` dev/WSL backend (`src/winit.rs`) is the one place GLES is mandatory rather than
+optional — `winit::init::<GlesRenderer>()` requires it, because pixman is not a winit
+renderer. That asymmetry is a Smithay API constraint, not a design choice.
+
+**cairo / GSK** — a *different* render decision, one layer up. The glass shell is a GTK4 +
+WebKitGTK window, and GTK4 renders through GSK, whose backend is selected by
+`GSK_RENDERER`. `GSK_RENDERER=cairo` is the proven software floor for the shell host.
+`vulkan` exists as a rung above it and is known to hang under GTK4 layer-shell (task #12) —
+which is survivable precisely because the watchdog drops to the cairo rung, making a known
+hang a self-healing step rather than a dead end.
+
+**WebKit compositing** — separate again, and easy to conflate with GSK. GSK paints the
+*host window*; WebKit's own compositor paints the *shell content* inside it, governed by the
+`WEBKIT_DISABLE_*` gate. So "the shell is on cairo" does **not** mean the UI is
+unaccelerated — the content path is independent of the host path.
+
+#### Hardware vs software is a RUNTIME VERDICT, not a build flag
+
+`nixos/modules/hart-gpu-probe.nix` binds `eglinfo` to the **Intel iGPU render node** (i915)
+at boot, requires that node to create a GL context *and* report an **Intel** hardware
+renderer (iris/crocus/i965) — not the dGPU, not a software rasterizer — and writes one line
+to `/run/hart/gpu-render`:
+
+| verdict | meaning |
+|---|---|
+| `hardware` | the iGPU passed; upper tiers may use GL |
+| `software` | probe failed / timed out / disabled / non-Intel / no i915 node → **force software** |
+
+**Why the iGPU specifically:** the target is an Optimus laptop (Intel iGPU + GeForce dGPU).
+The discrete GeForce faults under nouveau (MMIO PRIVRING) and is blacklisted with KMS off,
+so the iGPU is the only render path proven healthy. Requiring an *Intel* renderer string
+means an NVIDIA/AMD hardware line can never flip the verdict, and the compositor pins that
+same iGPU (it is the only DRM node once nouveau is out) — so the verdict provably describes
+the GPU that will actually composite.
+
+This is a runtime file rather than a Nix option on purpose: the same image ships to machines
+whose GPU health differs, and a machine's GPU can be healthy at build time and faulting at
+boot. One probe, one verdict, many consumers — hart-comp's GLES arming and the Tier-2
+layer-shell host both read the same file rather than each re-deciding.
+
+#### Which renderer runs where
+
+| tier | compositor | compositor renderer | shell host renderer |
+|---|---|---|---|
+| 1 | hart-comp (Smithay) | **pixman** always; GLES only if verdict=`hardware` and it inits | n/a (native surface) |
+| 2 | sway (wlroots) | wlroots; software GL forced unless verdict=`hardware` | GSK `cairo` (or `vulkan` rung) |
+| 3 | cage (wlroots) | **forced software GL, unconditionally** | GSK `cairo` |
+
+#### The trap this layering creates
+
+A node can reach the full graphical shell and *still* be unusable. If the compositor is
+denied DRM master it correctly falls to the pixman software scanout floor and the display
+goes live — cursor moves, everything paints — but the **entire** display path is now CPU.
+On weaker silicon that saturates and the desktop wedges. The failure presents as a hang,
+not as an error, and every health check reports green because every component *is* doing
+its job. Diagnosing this class means checking **which** path is live (`/run/hart/gpu-render`,
+`drmSetMaster` in the journal, whether GSK is on cairo), not whether things are running.
+
+---
+
 ## 4. Complete Migration Map
 
 Every capability in the system, its **disposition**, its **new home**, and **how** it gets

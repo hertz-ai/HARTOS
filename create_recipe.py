@@ -41,6 +41,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from core.http_pool import pooled_get, pooled_post, pooled_patch, pooled_request
 from core.port_registry import get_port as _get_llm_port, get_local_llm_url
+from core.file_cache import atomic_json_write  # canonical atomic write (tmp + fsync + os.replace)
 import txaio; txaio.use_asyncio()  # Must be before any autobahn import
 from autobahn.asyncio.component import Component, run
 import uuid
@@ -5144,23 +5145,20 @@ def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, j
                 with open(file_path, 'r') as f:
                     data = json.load(f)
                 data['actions_this_action_depends_on'] = action_ids
-                with open(file_path, 'w') as f:
-                    json.dump(data, f, indent=4)
+                atomic_json_write(file_path, data, indent=4)
             else:
                 file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
                 with open(file_path, 'r') as f:
                     data = json.load(f)
                 data['actions_this_action_depends_on'] = []
-                with open(file_path, 'w') as f:
-                    json.dump(data, f, indent=4)
+                atomic_json_write(file_path, data, indent=4)
         except (ValueError, SyntaxError) as e:
             current_app.logger.info(f'GOT ERROR AT EVAL OF LIST :{e}')
             file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
             with open(file_path, 'r') as f:
                 data = json.load(f)
             data['actions_this_action_depends_on'] = []
-            with open(file_path, 'w') as f:
-                json.dump(data, f, indent=4)
+            atomic_json_write(file_path, data, indent=4)
             continue
     individual_recipe = []
     set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
@@ -5205,15 +5203,13 @@ def after_all_actions_terminated_from_exception(assistant_agent, chat_instructor
             with open(file_path, 'r') as f:
                 data = json.load(f)
             data['actions_this_action_depends_on'] = action_ids
-            with open(file_path, 'w') as f:
-                json.dump(data, f, indent=4)
+            atomic_json_write(file_path, data, indent=4)
         else:
             file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
             with open(file_path, 'r') as f:
                 data = json.load(f)
             data['actions_this_action_depends_on'] = []
-            with open(file_path, 'w') as f:
-                json.dump(data, f, indent=4)
+            atomic_json_write(file_path, data, indent=4)
     individual_recipe = []
     set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
     status, updated_actions, cyc = topological_sort(individual_recipe)

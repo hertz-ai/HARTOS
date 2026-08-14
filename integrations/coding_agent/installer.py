@@ -11,6 +11,7 @@ Licenses:
 """
 import logging
 import os
+from core.subprocess_safe import no_window_kwargs
 import shutil
 import subprocess
 from typing import Dict, Optional
@@ -54,7 +55,7 @@ def get_versions() -> Dict[str, Optional[str]]:
             result = subprocess.run(
                 [binary, '--version'],
                 capture_output=True, text=True, timeout=10,
-            )
+             **no_window_kwargs())
             versions[name] = result.stdout.strip() or result.stderr.strip() or 'unknown'
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             versions[name] = 'installed (version unknown)'
@@ -88,7 +89,7 @@ def install(tool_name: str) -> Dict:
         result = subprocess.run(
             ['npm', 'install', '-g', package],
             capture_output=True, text=True, timeout=120,
-        )
+         **no_window_kwargs())
         if result.returncode == 0:
             return {'success': True, 'message': f'{tool_name} installed successfully'}
         else:
@@ -112,7 +113,7 @@ def pip_install(packages: str) -> Dict:
         result = subprocess.run(
             [sys.executable, '-m', 'pip', 'install'] + pkg_list,
             capture_output=True, text=True, timeout=120,
-        )
+         **no_window_kwargs())
         if result.returncode == 0:
             return {'success': True, 'message': f'Installed: {", ".join(pkg_list)}'}
         else:

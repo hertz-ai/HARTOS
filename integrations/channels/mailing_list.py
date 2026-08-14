@@ -37,6 +37,7 @@ import logging
 import re
 import socket
 import subprocess
+from core.subprocess_safe import no_window_kwargs
 from typing import Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger('hevolve_channels')
@@ -174,7 +175,7 @@ def domain_has_mx(domain: str, timeout: int = 5) -> bool:
                     ['host', '-t', 'MX', domain]):
             try:
                 out = subprocess.run(cmd, capture_output=True, text=True,
-                                     timeout=timeout).stdout.lower()
+                                     timeout=timeout, **no_window_kwargs()).stdout.lower()
                 if 'mail exchanger' in out or 'handled by' in out:
                     ok = True
                     break
@@ -371,7 +372,7 @@ def _mx_host(domain: str) -> Optional[str]:
         pass
     try:
         out = subprocess.run(['dig', '+short', 'MX', domain],
-                             capture_output=True, text=True, timeout=10).stdout
+                             capture_output=True, text=True, timeout=10, **no_window_kwargs()).stdout
         rows = sorted((int(l.split()[0]), l.split()[1].rstrip('.'))
                       for l in out.strip().splitlines() if len(l.split()) == 2)
         return rows[0][1] if rows else None

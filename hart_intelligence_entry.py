@@ -1,5 +1,6 @@
 # Fix Windows encoding for non-ASCII characters (Telugu, emojis, etc.)
 import sys
+from core.subprocess_safe import no_window_kwargs
 import io
 
 # Diagnostic escape hatch: `kill -USR1 <pid>` dumps every thread's stack to
@@ -638,9 +639,13 @@ class ChatQwen3VL(LLM):
             payload["stop"] = stop
 
         _log = logging.getLogger(__name__)
-        # Primary: HevolveAI embodied-ai on port 8000
+        # Primary: HevolveAI embodied-ai on port 8000.
+        # Route through _pooled_post_with_refusal_check (same helper CustomGPT
+        # uses) so this langchain wrapper gets the SAME refusal-override guard —
+        # previously only CustomGPT had it, so a draft refusal from THIS wrapper
+        # flowed straight to the user (the drifted parallel path).
         try:
-            response = pooled_post(
+            response = _pooled_post_with_refusal_check(
                 f"{self.base_url}/chat/completions",
                 json=payload,
                 timeout=60
@@ -657,7 +662,7 @@ class ChatQwen3VL(LLM):
         if _llm_url not in self.base_url:
             try:
                 _log.info(f"[LocalLLM] Falling back to llama.cpp at {_llm_url}")
-                response = pooled_post(
+                response = _pooled_post_with_refusal_check(
                     f"{_llm_url}/chat/completions",
                     json=payload,
                     timeout=120
@@ -3093,7 +3098,7 @@ def _handle_shell_command_tool(input_text: str) -> str:
             # Do NOT pass shell=True — argv already routes through the
             # chosen shell and shell=True would double-parse the string.
             shell=False,
-        )
+         **no_window_kwargs())
     except subprocess.TimeoutExpired:
         return (
             "Shell_Command timed out after 30s. For long-running work use "
@@ -7434,7 +7439,16 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
         from core.resonance_profile import get_or_create_profile
         from core.resonance_tuner import build_resonance_prompt, pre_tune_from_input
         _res_profile = get_or_create_profile(str(user_id))
-        _res_profile = pre_tune_from_input(_res_profile, prompt)
+        # `query` — the USER'S message — not `prompt`.  `prompt` is the
+        # LangChain template built 119 lines below (:7470
+        # ConversationalChatAgent.create_prompt), and because it is assigned
+        # anywhere in this function Python made it local for the WHOLE body, so
+        # this read raised UnboundLocalError on every single turn.  The enclosing
+        # except swallowed it, so pre_tune AND build_resonance_prompt below were
+        # both skipped and _resonance_block stayed '' forever — the resonance
+        # feature was silently dead on this path.  pre_tune_from_input's own
+        # signature says what it wants: `user_message: str`.
+        _res_profile = pre_tune_from_input(_res_profile, query)
         _resonance_block = build_resonance_prompt(_res_profile) or ''
     except Exception:
         logging.getLogger(__name__).exception("get_ans: swallowed Exception")
@@ -8472,19 +8486,44 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
             # after a chat reply is not obviously wanted, and changing it
             # changes what the user hears — that belongs with the engine
             # unification half of 3.5, which needs a listening test.
+            # timed_stage (core.tool_logging): this span was UNATTRIBUTABLE.
+            # Measured 2026-08-12: 33.4s and 46.0s elapsed between "TTS _bg:
+            # thread started" and "Synthesized audio", while Piper synthesizes
+            # the SAME text standalone in 0.38s (RTF 0.045-0.089).  The only
+            # expensive candidate in the span was this normalization — which
+            # logged NOTHING on success and only DEBUG on failure, so ~45s of
+            # user-visible delay had no owner in the logs.  Both stages are now
+            # timed with the canonical latency_ms= key.
+            #
+            # use_llm is True here for chat_response (SOURCE_URGENCY says
+            # 'normal', and use_llm = urgency != 'instant'), so this stage can
+            # make an LLM round-trip on the SAME contended server that just
+            # served the reply.  budget: the docstring's "never let
+            # normalization block speech" promise is about crashes; the
+            # warn_over_ms below makes it also true of LATENCY, which is the
+            # failure mode that actually bit us.
             try:
+                from core.tool_logging import timed_stage
                 from integrations.channels.media.tts_router import SOURCE_URGENCY
                 from integrations.channels.media.tts_text_normalizer import (
                     normalize_for_tts,
                 )
                 _urgency = SOURCE_URGENCY.get('chat_response', 'normal')
-                _clean = normalize_for_tts(
-                    _clean, language, use_llm=(_urgency != 'instant'),
-                )
+                _use_llm = (_urgency != 'instant')
+                with timed_stage('tts.normalize', logger=app.logger,
+                                 warn_over_ms=1500, use_llm=_use_llm,
+                                 chars=len(_clean), lang=language):
+                    _clean = normalize_for_tts(
+                        _clean, language, use_llm=_use_llm,
+                    )
             except Exception as _ne:  # never let normalization block speech
                 app.logger.debug(f"TTS: normalization skipped ({_ne})")
 
-            _raw = synthesize_text(_clean, language=language)
+            from core.tool_logging import timed_stage as _timed_stage
+            with _timed_stage('tts.synthesize', logger=app.logger,
+                              warn_over_ms=3000, chars=len(_clean),
+                              lang=language):
+                _raw = synthesize_text(_clean, language=language)
             app.logger.info(f"TTS async: synthesize_text returned: {_raw}")
             # synthesize_text may return a file path string OR a JSON dict/string
             # with {"path": "...", "duration": ...}. Normalize to a file path.
@@ -8616,6 +8655,51 @@ def _disarm_turn_deadline(_exc=None):
         _clear_turn_deadline('')
     except Exception:
         pass
+
+
+@app.errorhandler(ImportError)
+def _optional_capability_missing(exc):
+    """An absent OPTIONAL dependency is a known state, not a server fault.
+
+    Real HW, 2026-08-12: /chat returned a bare 500 whose only readable cause was
+    buried in the journal --
+
+        autogen.AssistantAgent
+        ModuleNotFoundError: No module named 'autogen'
+        ImportError: Agent creation requires the 'pyautogen' package.
+
+    gather_agentdetails already raises that ImportError with a perfectly good
+    message (deliberately, so the cause is stated where it is still known), but
+    nothing turned it into a RESPONSE, so Flask produced a generic 500 and the
+    desktop agent cards just said "retry connecting" -- forever, for a condition
+    that will never resolve by retrying. The diagnosis existed and was thrown away
+    one layer above the user. That is the gulped-error pattern this codebase is
+    supposed to refuse.
+
+    pyautogen is not in nixpkgs (nor are flaml/diskcache/tiktoken beneath it), so
+    on a Nix-built image the package is genuinely absent and the honest answer is
+    to SAY so, with the actual missing dependency and a 503 (capability
+    unavailable) rather than a 500 (we broke). 503 also tells the client this is
+    not worth retrying on a timer, which is exactly what the cards were doing.
+
+    Scoped to ImportError only: every other exception keeps its existing
+    behaviour, and a route that already handles ImportError itself still wins,
+    because Flask only consults this handler for UNHANDLED exceptions.
+    """
+    msg = str(exc) or 'an optional capability is not installed'
+    missing = None
+    for _pkg in ('pyautogen', 'autogen'):
+        if _pkg in msg:
+            missing = _pkg
+            break
+    app.logger.warning('optional capability unavailable on this build: %s', msg)
+    return jsonify({
+        'error': msg,
+        'reason': 'optional_capability_missing',
+        'missing_package': missing,
+        'retryable': False,
+        'response': None,
+    }), 503
 
 
 @app.route('/chat', methods=['POST'])
@@ -12326,7 +12410,13 @@ def _serve_app(app, host: str, port: int) -> None:
         config.accesslog = None             # HARTOS emits its own access log
         config.errorlog = '-'
 
-        asgi_app = AsyncioWSGIMiddleware(app)
+        # AsyncioWSGIMiddleware is WSGI and cannot see a websocket scope, which
+        # is why ws://<this node>/peer_link 404s and why PeerLink.accept() has
+        # never once been called on any node.  peer_link_asgi serves exactly
+        # that one path and passes every other scope straight through, so the
+        # HTTP surface is unchanged.  See core/peer_link/server.py.
+        from core.peer_link.server import peer_link_asgi
+        asgi_app = peer_link_asgi(AsyncioWSGIMiddleware(app))
 
         async def _runner():
             loop = asyncio.get_running_loop()

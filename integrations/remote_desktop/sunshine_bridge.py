@@ -25,6 +25,7 @@ Use cases:
 import json
 import logging
 import os
+from core.subprocess_safe import no_window_kwargs
 import platform
 import shutil
 import subprocess
@@ -189,10 +190,10 @@ class SunshineBridge:
         try:
             if system == 'Windows':
                 subprocess.run(['taskkill', '/f', '/im', 'sunshine.exe'],
-                               capture_output=True, timeout=5)
+                               capture_output=True, timeout=5, **no_window_kwargs())
             else:
                 subprocess.run(['pkill', '-f', 'sunshine'],
-                               capture_output=True, timeout=5)
+                               capture_output=True, timeout=5, **no_window_kwargs())
             return True
         except Exception:
             return False
@@ -283,7 +284,7 @@ class MoonlightBridge:
                 args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-            )
+             **no_window_kwargs())
             return True, f'Streaming {app} from {host} at {resolution}@{fps}fps (pid={proc.pid})'
         except Exception as e:
             return False, str(e)
@@ -296,7 +297,7 @@ class MoonlightBridge:
             result = subprocess.run(
                 [self._binary, 'pair', host],
                 capture_output=True, text=True, timeout=30,
-            )
+             **no_window_kwargs())
             return result.returncode == 0, result.stdout.strip()
         except Exception as e:
             return False, str(e)
@@ -309,7 +310,7 @@ class MoonlightBridge:
             result = subprocess.run(
                 [self._binary, 'list'],
                 capture_output=True, text=True, timeout=10,
-            )
+             **no_window_kwargs())
             if result.returncode == 0:
                 return [line.strip() for line in result.stdout.splitlines() if line.strip()]
         except Exception:

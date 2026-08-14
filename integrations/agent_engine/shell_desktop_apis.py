@@ -10,6 +10,7 @@ All routes registered via register_shell_desktop_routes(app).
 import collections
 import json
 import logging
+from core.subprocess_safe import no_window_kwargs
 import os
 import shutil
 import subprocess
@@ -55,7 +56,7 @@ def _is_wayland():
     if sys.platform == 'linux':
         try:
             r = subprocess.run(['pgrep', '-x', 'sway|labwc|hyprland'],
-                              capture_output=True, text=True, timeout=3)
+                              capture_output=True, text=True, timeout=3, **no_window_kwargs())
             if r.returncode == 0:
                 return True
         except (FileNotFoundError, subprocess.TimeoutExpired) as e:
@@ -423,20 +424,9 @@ _clipboard_counter = 0
 # Route registration
 # ═══════════════════════════════════════════════════════════════
 
-def _require_desktop_auth(f):
-    """Decorator: require local shell auth for destructive desktop ops."""
-    from functools import wraps
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        from flask import request, jsonify
-        remote = request.remote_addr or ''
-        if remote not in ('127.0.0.1', '::1', 'localhost'):
-            token = request.headers.get('X-Shell-Token', '')
-            expected = os.environ.get('HART_SHELL_TOKEN', '')
-            if not expected or token != expected:
-                return jsonify({'error': 'Unauthorized'}), 403
-        return f(*args, **kwargs)
-    return decorated
+# Canonical local-shell auth — the ONE shared implementation (was a per-file copy
+# of this decorator). See integrations.agent_engine.shell_auth.
+from integrations.agent_engine.shell_auth import require_shell_auth as _require_desktop_auth
 
 
 def _audit_desktop_op(action, detail=None):
@@ -859,7 +849,7 @@ def register_shell_desktop_routes(app):
         else:
             subprocess.run(['xclip', '-selection', 'clipboard'],
                            input=content, text=True, timeout=5,
-                           capture_output=True)
+                           capture_output=True, **no_window_kwargs())
         with _clipboard_lock:
             _clipboard_counter += 1
             _clipboard_history.appendleft({
@@ -1217,7 +1207,7 @@ def register_shell_desktop_routes(app):
             if tool:
                 _run(['pkill', '-x', os.path.basename(tool)])
                 subprocess.Popen([tool, '-O', str(temp)],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **no_window_kwargs())
                 return jsonify({'enabled': True, 'active': True, 'temperature': temp})
             # 503: no gamma tool on this build = the nightlight SERVICE is
             # unavailable (controlled; the config change above still persisted),
@@ -1241,7 +1231,7 @@ def register_shell_desktop_routes(app):
         if tool:
             _run(['pkill', '-x', os.path.basename(tool)])
             subprocess.Popen([tool, '-O', str(temp)],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **no_window_kwargs())
         return jsonify({'set': True, 'temperature': temp})
 
     @app.route('/api/shell/nightlight/schedule', methods=['POST'])

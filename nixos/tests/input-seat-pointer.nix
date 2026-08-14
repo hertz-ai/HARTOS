@@ -31,8 +31,8 @@
 #     device-less guard) ............................ session-supervisor.nix
 #   - the OFFLINE real-HW probe bundle (libinput list-devices into the
 #     HARTLOG log + the seat-capability classification line) ......... boot-log.nix
-#   - logind-is-the-seat-manager + greetd forces LIBSEAT_BACKEND=logind
-#     + the user is in video/render/input/seat ...... session-supervisor.nix
+#   - logind-is-the-seat-manager + seatd disabled + greetd forces
+#     LIBSEAT_BACKEND=logind + the user is in video/render/input ... session-supervisor.nix
 #
 # #70 discipline preserved: built from `hartModules` alone via the shared
 # `mkNode` (./lib.nix). No display manager / compositor needed — the seat layer
@@ -86,14 +86,17 @@ in
         [ pkgs.libinput pkgs.util-linux ]
         ++ pkgs.lib.optional (pkgs ? evemu) pkgs.evemu;
 
-      # The `seat` group this test asserts is GRANTED BY the session supervisor:
-      # seatd.enable (nixpkgs creates users.groups.seat) and hart-admin's
-      # extraGroups = [hart seat] both live inside hart-session-supervisor.nix's
-      # `mkIf (cfg.enable && sup.enable)`. Without it the node has no seat group
-      # to be in, and NixOS silently drops the unknown extraGroups entry -- the
-      # test then failed on 'seat' every run since 2026-07-26 while the SHIPPED
-      # desktop (profile enables the supervisor) granted it fine. Enable what the
-      # assertion assumes; defaults are the shipped ones (compCommand null).
+      # video/render/input group membership is GRANTED BY the session supervisor
+      # (hart-session-supervisor.nix's `mkIf (cfg.enable && sup.enable)`). Enable
+      # what the assertion below assumes; defaults are the shipped ones
+      # (compCommand null).
+      #
+      # NOTE (2026-08-10): `seat` is deliberately NOT asserted here anymore.
+      # services.seatd.enable is now `lib.mkForce false` (a live-confirmed real-HW
+      # fix: seatd created its own VT-bound seat0 independent of any client
+      # connecting, fighting logind for seat0 and causing hart-comp's drmSetMaster
+      # EACCES -> pixman software-scanout floor). Without seatd, the `seat` group
+      # does not exist; DRM/input access flows entirely through logind.
       hart.sessionSupervisor.enable = true;
     };
 
@@ -115,10 +118,10 @@ in
       # FM4 root cause: a user not in `input` boots dead-input (EACCES on
       # /dev/input). The grant mechanism is group membership (systemd's default
       # `SUBSYSTEM=="input", GROUP="input"` rule) + the logind seat lease. Assert
-      # the session user is in all four device groups the compositor seat needs.
-      with subtest("the session user is in the device groups that GRANT seat input (input/seat/video/render)"):
+      # the session user is in the device groups the compositor seat needs.
+      with subtest("the session user is in the device groups that GRANT seat input (input/video/render)"):
           groups = seat.succeed(f"id -nG {SESSION_USER}").split()
-          for g in ("input", "seat", "video", "render"):
+          for g in ("input", "video", "render"):
               assert g in groups, \
                   f"{SESSION_USER} missing the '{g}' group ({groups}) — the seat cannot open /dev/input (FM4 dead-input)"
 

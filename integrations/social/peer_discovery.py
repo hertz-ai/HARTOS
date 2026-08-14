@@ -454,10 +454,10 @@ class GossipProtocol:
         - Flat: no node tag needed (users get individual tags)
         """
         try:
-            from hart_onboarding import generate_node_identity, get_node_identity
+            from hart_onboarding import generate_node_identity, get_onboarding_identity
 
             # Check if already generated
-            existing = get_node_identity()
+            existing = get_onboarding_identity()
             if existing and existing.get('node_tag'):
                 self._hart_tag = existing['node_tag']
                 return

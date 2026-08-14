@@ -38,6 +38,8 @@ path.
 from __future__ import annotations
 
 import asyncio
+import time
+from contextlib import contextmanager
 import inspect
 import json
 import logging
@@ -192,8 +194,9 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
 
     tool_name = name or func.__name__
 
-    def _on_error(e):
-        tool_logger.error(f"TOOL EXECUTION ERROR: {tool_name} - {e}")
+    def _on_error(e, _t0=None):
+        _took = '' if _t0 is None else f" latency_ms={round((time.perf_counter() - _t0) * 1000, 1)}"
+        tool_logger.error(f"TOOL EXECUTION ERROR: {tool_name} - {e}{_took}")
         tool_logger.exception("Exception details:")
         if plain_errors:
             return f"Tool '{tool_name}' encountered an error: {str(e)[:200]}"
@@ -209,6 +212,7 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
             tool_logger.info(
                 f"Arguments: {args}, Keyword Arguments: {kwargs}")
             _emit_tool_call_stage(tool_name)
+            _t0 = time.perf_counter()
             try:
                 result = await func(*args, **kwargs)
                 if not isinstance(result, str):
@@ -217,14 +221,15 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
                         f"non-string type: {type(result)}")
                     result = str(result)
                 tool_logger.info(
-                    f"TOOL EXECUTION SUCCESS: {tool_name}")
+                    f"TOOL EXECUTION SUCCESS: {tool_name} "
+                    f"latency_ms={round((time.perf_counter() - _t0) * 1000, 1)}")
                 tool_logger.info(
                     f"Result: {result[:100]}..."
                     if len(result) > 100 else f"Result: {result}"
                 )
                 return result
             except Exception as e:
-                return _on_error(e)
+                return _on_error(e, _t0)
 
         _rebind_annotations(async_wrapper, func)
         return async_wrapper
@@ -235,6 +240,7 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
         tool_logger.info(
             f"Arguments: {args}, Keyword Arguments: {kwargs}")
         _emit_tool_call_stage(tool_name)
+        _t0 = time.perf_counter()
         try:
             result = func(*args, **kwargs)
             # If the sync function accidentally returned a coroutine,
@@ -251,17 +257,69 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
                     f"Tool function {tool_name} returned "
                     f"non-string type: {type(result)}")
                 result = str(result)
-            tool_logger.info(f"TOOL EXECUTION SUCCESS: {tool_name}")
+            tool_logger.info(
+                f"TOOL EXECUTION SUCCESS: {tool_name} "
+                f"latency_ms={round((time.perf_counter() - _t0) * 1000, 1)}")
             tool_logger.info(
                 f"Result: {result[:100]}..."
                 if len(result) > 100 else f"Result: {result}"
             )
             return result
         except Exception as e:
-            return _on_error(e)
+            return _on_error(e, _t0)
 
     _rebind_annotations(sync_wrapper, func)
     return sync_wrapper
 
 
-__all__ = ['log_tool_execution', 'tool_logger']
+@contextmanager
+def timed_stage(name: str, logger=None, warn_over_ms: float | None = None,
+                **fields):
+    """Time an INLINE stage that is not a decoratable function.
+
+    Same concern as ``log_tool_execution``'s clock, same ``latency_ms=``
+    key, deliberately in the same module so there is ONE format for "how
+    long did this step take" across the codebase.  Use the decorator when
+    the step IS a function; use this when it is a few statements inside a
+    larger one (the TTS ``_bg`` thread's clean / normalize / synthesize
+    stages are the motivating case — see below).
+
+    WHY THIS EXISTS (task #652 follow-up, 2026-08-12): a TTS background
+    thread took 33.4s and 46.0s between "thread started" and "Synthesized
+    audio", while Piper standalone synthesizes the SAME text in 0.38s
+    (RTF 0.045-0.089, measured).  The span contained exactly three steps
+    and the only expensive candidate — an LLM-backed text normalization —
+    logged NOTHING on success and only DEBUG on failure.  So ~45s of a
+    user-visible delay could not be attributed from the logs at all.
+    ``log_tool_execution`` already existed as the AOP seam but had no
+    clock, so even decorated code could not be attributed either.
+
+    Emits one line per stage.  ``warn_over_ms`` promotes the line to
+    WARNING past a threshold, so a stage that becomes slow announces
+    itself instead of waiting to be noticed by a human reading a log.
+
+    Never swallows: the exception propagates after being timed and logged,
+    because a stage that failed fast and a stage that hung are different
+    problems and must not print the same line.
+    """
+    _log = logger if logger is not None else tool_logger
+    _extra = (' ' + ' '.join(f'{k}={v}' for k, v in fields.items())) if fields else ''
+    _t0 = time.perf_counter()
+    try:
+        yield
+    except Exception as e:
+        _log.warning(
+            f"STAGE FAILED: {name} "
+            f"latency_ms={round((time.perf_counter() - _t0) * 1000, 1)}"
+            f"{_extra} error={type(e).__name__}: {str(e)[:160]}")
+        raise
+    else:
+        _ms = round((time.perf_counter() - _t0) * 1000, 1)
+        _line = f"STAGE: {name} latency_ms={_ms}{_extra}"
+        if warn_over_ms is not None and _ms > warn_over_ms:
+            _log.warning(f"{_line} SLOW (budget_ms={warn_over_ms})")
+        else:
+            _log.info(_line)
+
+
+__all__ = ['log_tool_execution', 'timed_stage', 'tool_logger']

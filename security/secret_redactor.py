@@ -82,6 +82,7 @@ _add('anthropic_key', r'\bsk-ant-[A-Za-z0-9_-]{40,}\b')
 _add('aws_access_key', r'\bAKIA[0-9A-Z]{16}\b')
 _add('aws_secret_key', r'(?:aws_secret_access_key|secret_key)\s*[=:]\s*["\']?([A-Za-z0-9/+=]{40})["\']?')
 _add('google_api_key', r'\bAIza[A-Za-z0-9_-]{35}\b')
+_add('groq_key', r'\bgsk_[A-Za-z0-9]{20,}\b')
 _add('stripe_key', r'\b[sr]k_(?:live|test)_[A-Za-z0-9]{24,}\b')
 _add('github_token', r'\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b')
 _add('slack_token', r'\bxox[baprs]-[A-Za-z0-9-]{10,}\b')
@@ -89,7 +90,16 @@ _add('discord_token', r'[MN][A-Za-z\d]{23,}\.[\w-]{6}\.[\w-]{27,}')
 _add('twilio_key', r'\bSK[a-f0-9]{32}\b')
 _add('sendgrid_key', r'\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b')
 _add('mailgun_key', r'\bkey-[A-Za-z0-9]{32}\b')
-_add('heroku_key', r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+# Heroku API tokens are bare UUIDs — shape-identical to a legitimate
+# node_id / request_id / trace_id. Anchoring on the UUID shape ALONE redacted
+# every UUID in the logs and destroyed the "which node failed" diagnostic
+# (regression pinned by tests/unit/test_sync_failures_are_never_silent.py). A
+# UUID that is genuinely a secret (token=<uuid>, Authorization: <uuid>) is
+# already caught by `bearer_token` above, and identifier UUIDs are SHA-256'd in
+# Layer 2 — so here we anchor on a heroku context and leave a bare identifier
+# UUID visible.
+_add('heroku_key',
+     r'heroku[A-Za-z0-9_]*[\s:="\']+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})')
 
 # ── Generic bearer/auth tokens ──
 _add('bearer_token',

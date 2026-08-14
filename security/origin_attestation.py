@@ -157,11 +157,18 @@ def verify_master_key_present() -> Tuple[bool, str]:
         return False, 'security.master_key module not found'
 
 
-def verify_guardrail_integrity() -> Tuple[bool, str]:
+def verify_guardrail_brand_integrity() -> Tuple[bool, str]:
     """Verify guardrail frozen values contain HART OS brand markers.
 
     The guardrails are structurally immutable (_FrozenValues + module __setattr__).
     A fork that modifies them breaks the hash chain AND fails brand verification.
+
+    Renamed from ``verify_guardrail_integrity`` to disambiguate from the
+    hash-chain check ``security.hive_guardrails.verify_guardrail_integrity``
+    (returns ``bool``) — they were DIFFERENT functions sharing one name with
+    DIFFERENT return types (``bool`` vs ``(bool, str)``), so importing the wrong
+    one broke ``ok, msg = ...`` unpacking or made ``if verify_…():`` always truthy
+    on the tuple.
     """
     try:
         from security.hive_guardrails import _FrozenValues
@@ -234,7 +241,7 @@ def verify_origin(code_root: str = None) -> Dict:
         details.append(key_msg)
 
     # Check 4: Guardrail brand markers
-    guard_ok, guard_msg = verify_guardrail_integrity()
+    guard_ok, guard_msg = verify_guardrail_brand_integrity()
     checks['guardrails'] = guard_ok
     if not guard_ok:
         details.append(guard_msg)
@@ -337,10 +344,11 @@ def verify_peer_attestation(attestation: Dict) -> Tuple[bool, str]:
     try:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
         pub_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(node_pub_hex))
-        # Verify signature over payload (excluding the signature itself)
-        payload_for_verify = {k: v for k, v in attestation.items() if k != 'node_signature'}
-        canonical = json.dumps(payload_for_verify, sort_keys=True, separators=(',', ':'))
-        pub_key.verify(bytes.fromhex(node_sig_hex), canonical.encode('utf-8'))
+        # ONE canonical serialization (node_integrity.canonical_payload); a drift
+        # here vs the signer = silent network-wide verification failure.
+        from security.node_integrity import canonical_payload
+        pub_key.verify(bytes.fromhex(node_sig_hex),
+                       canonical_payload(attestation, exclude=('node_signature',)))
     except Exception as e:
         return False, f'Invalid node signature: {e}'
 

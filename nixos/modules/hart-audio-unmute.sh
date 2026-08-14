@@ -142,6 +142,42 @@ fi
 # found, so a headless boot never burns it).
 claim_first_boot && first_boot=1
 
+# ── ALSA ELEMENT unmute — the layer BENEATH PipeWire ────────────────────────
+# REAL-HW GAP THIS CLOSES (2026-08-12, Samsung NP550P5C): this script only ever
+# unmuted at the PipeWire/Pulse layer (wpctl/pactl, below). On that laptop the
+# PipeWire sink was already healthy and UNMUTED at 40% -- while ALSA's own
+# `Headphone` element was [off] underneath, so the machine was SILENT and every
+# check here reported success. A rescue that cannot see the layer that is actually
+# muted is a silent failure of the rescue itself: `wpctl get-volume` showed a
+# perfectly good sink the whole time.
+#
+# PipeWire drives ALSA but does NOT un-mute individual mixer elements it did not
+# mute, so a muted-at-the-ALSA-level element (saved in alsactl state, or shipped
+# that way by the codec defaults) survives every wpctl/pactl unmute. Unmute the
+# standard output elements directly. Best-effort by design: `amixer` may be absent,
+# and a control that does not exist on this codec simply fails -- both are fine and
+# must never abort the rescue (hence `|| true` and the `have` guard). We only ever
+# UNMUTE here; volume levels stay the wpctl/pactl path's job, so this cannot clobber
+# a deliberate level.
+if have amixer; then
+  for _card in 0 1 2; do
+    amixer -c "$_card" scontrols >/dev/null 2>&1 || continue
+    for _ctl in Master Speaker Headphone PCM Front "Bass Speaker" Desktop; do
+      if amixer -c "$_card" get "$_ctl" >/dev/null 2>&1; then
+        if amixer -c "$_card" get "$_ctl" 2>/dev/null | grep -q '\[off\]'; then
+          amixer -c "$_card" set "$_ctl" unmute >/dev/null 2>&1 \
+            && log "alsa: card${_card} '${_ctl}' was MUTED at the ALSA layer -> unmuted (PipeWire could not see this)"
+        fi
+      fi
+    done
+    # 'Auto-Mute Mode' silences the speakers whenever the codec thinks something is
+    # jacked in; a false positive on a worn jack mutes the box permanently.
+    if amixer -c "$_card" get "Auto-Mute Mode" >/dev/null 2>&1; then
+      amixer -c "$_card" set "Auto-Mute Mode" Disabled >/dev/null 2>&1 || true
+    fi
+  done
+fi
+
 # ── wpctl (WirePlumber) path - preferred ───────────────────────────────────
 if have wpctl && wpctl get-volume @DEFAULT_AUDIO_SINK@ >/dev/null 2>&1; then
   VOLOUT=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null || true)  # "Volume: 0.00 [MUTED]"

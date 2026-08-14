@@ -7,6 +7,7 @@ GET /api/social/dashboard/system   — System-level dashboard (tier, resources, 
 GET /api/social/dashboard/topology — Network topology (peer graph for UI visualization)
 """
 import logging
+from core.subprocess_safe import no_window_kwargs
 import os
 import shutil
 import subprocess
@@ -209,7 +210,7 @@ def get_system_info():
                 result = subprocess.run(
                     ['systemctl', 'is-active', f'{svc}.service'],
                     capture_output=True, text=True, timeout=5
-                )
+                , **no_window_kwargs())
                 services[svc] = result.stdout.strip() or 'unknown'
             except Exception:
                 services[svc] = 'unavailable'

@@ -57,7 +57,14 @@ let
   # PipeWire-pulse system). coreutils gives sleep/printf/head/tr; gnugrep/gnused
   # the parse helpers. Attr-guarded so a nixpkgs rev lacking wireplumber cannot
   # break evaluation (the drm_info attr-guard pattern).
+  # alsa-utils gives `amixer` for the ALSA-ELEMENT unmute pass. Without it the
+  # script's `have amixer` guard fails and that pass silently does NOTHING — which
+  # is the exact real-HW bug it exists to fix (2026-08-12): the PipeWire sink read
+  # healthy and unmuted at 40% while ALSA's `Headphone` element was [off]
+  # underneath, so the box was silent and every check here reported success. A
+  # rescue tool that cannot reach the muted layer is a silent failure of the rescue.
   audioBins = (with pkgs; [ coreutils gnugrep gnused ])
+    ++ lib.optional (pkgs ? alsa-utils)  pkgs.alsa-utils
     ++ lib.optional (pkgs ? wireplumber) pkgs.wireplumber
     ++ lib.optional (pkgs ? pulseaudio)  pkgs.pulseaudio;
 in

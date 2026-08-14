@@ -627,3 +627,110 @@ class TestThoughtExperimentIntegration:
         from integrations.social.models import ThoughtExperiment, ExperimentVote
         assert ThoughtExperiment.__tablename__ == 'thought_experiments'
         assert ExperimentVote.__tablename__ == 'experiment_votes'
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 10. Lifecycle driver — the schedule had no reader
+# ═══════════════════════════════════════════════════════════════════
+#
+# create_experiment stamps voting_opens_at / voting_closes_at /
+# evaluation_deadline on every row from the duration constants above, and
+# nothing ever read them back. On the live instance all 142 experiments
+# carried a schedule, 132 were overdue to open voting (some since
+# 2026-04-06), and every one still sat at 'proposed'.
+#
+# Both ends of the loop refuse 'proposed': cast_vote returns
+# experiment_not_in_voting_phase outside ('discussing','voting'), and
+# auto_evolve._gather_candidates looks only at ('voting','evaluating').
+# So the loop was starved by a missing driver, not a missing policy.
+
+class TestAdvanceDueExperiments:
+
+    def _make(self, db, user, status, opens_delta_h, closes_delta_h):
+        now = datetime.utcnow()
+        exp = ThoughtExperiment(
+            id=str(uuid.uuid4()),
+            creator_id=user.id,
+            title=f'exp {uuid.uuid4().hex[:6]}',
+            hypothesis='h',
+            expected_outcome='o',
+            status=status,
+            voting_opens_at=now + timedelta(hours=opens_delta_h),
+            voting_closes_at=now + timedelta(hours=closes_delta_h),
+        )
+        db.add(exp)
+        db.flush()
+        return exp
+
+    def test_proposed_becomes_discussing_immediately(self, db, user):
+        """The discussion window opens at CREATION — voting_opens_at is when
+        it closes. Stuck at proposed, an experiment cannot be voted on."""
+        exp = self._make(db, user, 'proposed', 48, 120)
+        moved = ThoughtExperimentService.advance_due_experiments(db)
+        assert exp.status == 'discussing'
+        # >= 1, not == 1: the driver sweeps the whole table and this engine is
+        # shared across the module, so a sibling test's rows may ride along.
+        assert moved['discussing'] >= 1
+
+    def test_discussing_advances_only_once_voting_is_due(self, db, user):
+        due = self._make(db, user, 'discussing', -1, 72)
+        early = self._make(db, user, 'discussing', 24, 96)
+        ThoughtExperimentService.advance_due_experiments(db)
+        assert due.status == 'voting'
+        assert early.status == 'discussing'
+
+    def test_voting_advances_once_the_window_closes(self, db, user):
+        exp = self._make(db, user, 'voting', -72, -1)
+        ThoughtExperimentService.advance_due_experiments(db)
+        assert exp.status == 'evaluating'
+
+    def test_evaluating_is_never_auto_decided(self, db, user):
+        """'decided' is terminal and carries a rationale. Advancing into it on
+        a timer would manufacture an outcome nobody voted for — which is what
+        the super-majority gate exists to prevent."""
+        exp = self._make(db, user, 'evaluating', -96, -48)
+        moved = ThoughtExperimentService.advance_due_experiments(db)
+        assert exp.status == 'evaluating'
+        assert 'decided' not in moved
+
+    def test_a_paused_experiment_is_left_alone(self, db, user):
+        exp = self._make(db, user, 'proposed', 48, 120)
+        with patch('integrations.agent_engine.auto_evolve.is_experiment_paused',
+                   return_value=True):
+            moved = ThoughtExperimentService.advance_due_experiments(db)
+        assert exp.status == 'proposed'
+        assert moved['discussing'] == 0
+
+    def test_backlog_drains_gradually(self, db, user):
+        """Four months of overdue rows must not all move in one tick."""
+        for _ in range(12):
+            self._make(db, user, 'proposed', 48, 120)
+        moved = ThoughtExperimentService.advance_due_experiments(db, limit=5)
+        assert sum(moved.values()) == 5
+
+    def test_nothing_due_changes_nothing(self, db, user):
+        """Asserts about THIS experiment, not the table: the driver is a
+        sweep, and sibling tests share the module's in-memory engine."""
+        exp = self._make(db, user, 'discussing', 24, 96)
+        ThoughtExperimentService.advance_due_experiments(db)
+        assert exp.status == 'discussing'
+
+    def test_it_unblocks_cast_vote(self, db, user):
+        """The point of the driver: a vote that was impossible becomes
+        possible, with no change to cast_vote itself."""
+        exp = self._make(db, user, 'proposed', 48, 120)
+        refused = ThoughtExperimentService.cast_vote(db, exp.id, user.id, 1)
+        assert refused['error'] == 'experiment_not_in_voting_phase'
+
+        ThoughtExperimentService.advance_due_experiments(db)
+        accepted = ThoughtExperimentService.cast_vote(db, exp.id, user.id, 1)
+        assert not accepted.get('error')
+
+    def test_it_routes_through_the_one_status_writer(self, db, user):
+        """advance_status owns this column. Writing exp.status directly here
+        would be a second transition path that skips its ordering guard."""
+        self._make(db, user, 'proposed', 48, 120)
+        with patch.object(ThoughtExperimentService, 'advance_status',
+                          wraps=ThoughtExperimentService.advance_status) as adv:
+            ThoughtExperimentService.advance_due_experiments(db)
+        assert adv.called

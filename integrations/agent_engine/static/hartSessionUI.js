@@ -72,7 +72,14 @@
   function tick() {
     var d = new Date();
     var hh = d.getHours(), mm = pad(d.getMinutes());
-    var time12 = ((hh % 12) || 12) + ':' + mm + ' ' + (hh < 12 ? 'AM' : 'PM');
+    // Zero-PAD the 12-hour hour. The lock screen and the desktop widget are written
+    // by BOTH this ticker and the top-bar clock in liquid_ui_service.py, which uses
+    // toLocaleTimeString({hour:'2-digit'}) -> "08:36". This ticker emitted a bare
+    // getHours() -> "8:36", so the two formats ALTERNATED in the same element and the
+    // clock visibly flickered a leading zero in and out once a second (reported on
+    // real HW 2026-08-12: "08:36 AM vs 8:36 AM flickering"). Same padding as the
+    // minutes, and now identical to the other writer -- one format, no flicker.
+    var time12 = pad((hh % 12) || 12) + ':' + mm + ' ' + (hh < 12 ? 'AM' : 'PM');
     var date = d.toLocaleDateString(undefined,
       { weekday: 'long', month: 'long', day: 'numeric' });
     [['lock-clock', time12], ['lock-date', date],

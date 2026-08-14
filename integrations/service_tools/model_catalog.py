@@ -86,6 +86,37 @@ BACKENDS = {
     'in_process': 'In-process Python module',
 }
 
+# Backends whose runtime is positively known NOT to be PyTorch.  Anything else
+# — including an unrecognised or missing value — conservatively counts as
+# needing torch.
+#
+# WHY (R1, measured live 2026-08-11): CUDA-torch provisioning was gated on the
+# model's TYPE ("is this TTS/STT on a CUDA box?") instead of its RUNTIME.  A
+# sherpa-onnx STT engine (Moonshine) therefore blocked on a 221s pip resolve
+# plus a multi-GB CUDA PyTorch download for a runtime that never imports torch.
+# The deciding field already existed — `ModelEntry.backend`, set correctly by
+# whisper_tool.py — it just wasn't the thing being read.
+#
+# The set is deliberately an ALLOW-LIST of torch-free backends rather than a
+# deny-list of torch ones: an unclassified backend keeps today's behaviour
+# (install), so this can never under-install and break an engine at load time.
+# Over-installing wastes minutes; under-installing breaks the feature.
+TORCHLESS_BACKENDS = frozenset({'onnx', 'piper', 'llama.cpp', 'api'})
+
+
+def backend_requires_torch(backend) -> bool:
+    """True iff a model on this backend needs PyTorch installed to run.
+
+    SINGLE source for "does this engine need torch?" — both the language
+    bootstrap and the STT loader consult it, so the answer cannot diverge
+    between the pre-install path and the download path.
+
+    Unknown / empty / None => True (fail safe: install rather than risk an
+    engine that cannot load).
+    """
+    return (backend or 'torch') not in TORCHLESS_BACKENDS
+
+
 # Download sources
 SOURCES = {
     'huggingface': 'HuggingFace Hub',

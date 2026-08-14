@@ -41,6 +41,7 @@ DRY:
   No second updater, no parallel pointer protocol, no new socket.
 """
 import logging
+from core.subprocess_safe import no_window_kwargs
 import os
 import subprocess
 import threading
@@ -78,7 +79,7 @@ def _kick_ota_check() -> bool:
         r = subprocess.run(
             ['systemctl', 'start', OTA_CHECK_UNIT],
             timeout=30, capture_output=True, text=True,
-        )
+         **no_window_kwargs())
         if r.returncode == 0:
             logger.info("OTA push: kicked %s (central push → staged apply)",
                         OTA_CHECK_UNIT)

@@ -155,6 +155,87 @@ class ThoughtExperimentService:
         db.flush()
         return experiment.to_dict()
 
+    @staticmethod
+    def advance_due_experiments(db: Session, limit: int = 25,
+                                now: datetime = None) -> Dict:
+        """Advance every experiment whose OWN stamped deadline has passed.
+
+        `create_experiment` writes a full schedule onto every row —
+        `voting_opens_at` (+DISCUSS_DURATION_HOURS), `voting_closes_at`
+        (+VOTING_DURATION_HOURS), `evaluation_deadline`
+        (+EVALUATION_DURATION_HOURS).  Nothing ever read them back.  On the
+        local instance all 142 experiments carried a schedule and 132 were
+        overdue to open voting, some since 2026-04-06; every one still sat at
+        `proposed`.  `cast_vote` refuses anything outside
+        ('discussing', 'voting'), so no vote was castable, and `auto_evolve`
+        gathers only ('voting', 'evaluating'), so no candidate was ever
+        visible.  The whole loop was starved by a driver that was never
+        written — the policy was already decided and stored.
+
+        This reads that stored schedule and nothing else.  It invents no
+        policy: the durations are the module constants, eligibility stays with
+        `voting_rules.check_voter_eligibility` inside `cast_vote`, and the
+        approval gates stay in `auto_evolve._rank_by_votes`.
+
+        DELIBERATELY STOPS AT `evaluating`.  `decided` is terminal and carries
+        a `decision_rationale`; advancing into it on a timer would manufacture
+        an outcome for an experiment nobody voted on — which is what the
+        super-majority gate exists to prevent.  Deciding stays with the
+        explicit API/tool paths.
+
+        `limit` drains a long backlog gradually instead of moving four months
+        of rows in one tick.
+
+        Returns a per-transition count.
+        """
+        from .models import ThoughtExperiment
+
+        now = now or datetime.utcnow()
+        moved = {'discussing': 0, 'voting': 0, 'evaluating': 0}
+
+        # (from-status, deadline column, to-status). `proposed -> discussing`
+        # has no stamp of its own because the discussion window opens at
+        # creation — voting_opens_at is when it CLOSES.
+        transitions = (
+            ('proposed', None, 'discussing'),
+            ('discussing', ThoughtExperiment.voting_opens_at, 'voting'),
+            ('voting', ThoughtExperiment.voting_closes_at, 'evaluating'),
+        )
+
+        try:
+            from integrations.agent_engine.auto_evolve import is_experiment_paused
+        except Exception:
+            def is_experiment_paused(_):
+                return False
+
+        budget = limit
+        for from_status, deadline_col, to_status in transitions:
+            if budget <= 0:
+                break
+            query = db.query(ThoughtExperiment).filter(
+                ThoughtExperiment.status == from_status)
+            if deadline_col is not None:
+                query = query.filter(deadline_col <= now)
+            for experiment in query.limit(budget).all():
+                if is_experiment_paused(experiment.id):
+                    continue
+                # Route through advance_status — the ONE writer of this
+                # column. Setting experiment.status here instead would be a
+                # second transition path that skips its ordering guard, and
+                # the two would drift the first time that guard changed.
+                if ThoughtExperimentService.advance_status(
+                        db, experiment.id, to_status):
+                    moved[to_status] += 1
+                    budget -= 1
+
+        if any(moved.values()):
+            db.flush()
+            logger.info(
+                "Thought-experiment lifecycle: %d -> discussing, %d -> voting, "
+                "%d -> evaluating", moved['discussing'], moved['voting'],
+                moved['evaluating'])
+        return moved
+
     # ─── Voting ───
 
     @staticmethod

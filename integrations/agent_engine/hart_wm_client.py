@@ -36,9 +36,11 @@ def _run(cmd, timeout=10):
         return _shell_run(cmd, timeout=timeout)
     except Exception:
         import subprocess
+
+        from core.subprocess_safe import no_window_kwargs
         try:
             return subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=timeout)
+                                  timeout=timeout, **no_window_kwargs())
         except Exception:
             return None
 

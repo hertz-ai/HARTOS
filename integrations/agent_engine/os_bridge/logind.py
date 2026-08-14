@@ -26,6 +26,7 @@ actions) lives in nixos/modules/hart-base.nix ``security.polkit``.
 """
 
 import logging
+from core.subprocess_safe import no_window_kwargs
 import subprocess
 import threading
 
@@ -167,7 +168,7 @@ def _busctl_logind_call(method, busctl_args, timeout):
     cmd = ['busctl', 'call', '--system',
            _LOGIN1_DEST, _LOGIN1_PATH, _LOGIN1_IFACE, method, *busctl_args]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **no_window_kwargs())
     except FileNotFoundError:
         return False, 'busctl not available (systemd D-Bus tooling missing)'
     except subprocess.TimeoutExpired:

@@ -98,6 +98,19 @@ in
     #    boot — never force-loaded, so a box without USB3 simply never loads xhci.
     boot.initrd.availableKernelModules = usbRootModules;
 
+    # NOTE (2026-08-13): a rootdelay was added here on the theory that a slow USB
+    # controller was failing stage 1. That was WRONG and has been removed. The
+    # real console output showed stage 1 succeeding completely:
+    #     stage-1-init: checking /dev/disk/by-label/nixos...
+    #     nixos: clean, 473146/1818624 files, 4970844/7253243 blocks
+    #     EXT4-fs (sdc2): mounted filesystem 7981aaf4-... r/w
+    #     Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000100
+    #     CPU: 5 UID: 0 PID: 1 Comm: switch_root
+    # Root was found, fsck'd and mounted. The failure is in switch_root: stage 2's
+    # init exits 1 immediately, i.e. the UKI's baked init path does not work against
+    # the rootfs shipped in the SAME image. Do not add boot-timing workarounds for
+    # this class of failure -- read the console first.
+
     # 2. ASSERT the critical subset actually survived into the merged list. If a
     #    mkForce elsewhere wiped it, this fails the BUILD (CI) — never a silent
     #    real-HW brick. (We read the merged config value, so the assertion sees

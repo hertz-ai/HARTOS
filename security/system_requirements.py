@@ -48,6 +48,7 @@ Usage:
 """
 
 import logging
+from core.subprocess_safe import no_window_kwargs
 import os
 import platform
 import shutil
@@ -394,7 +395,7 @@ def _detect_ram_gb() -> float:
             import subprocess
             result = subprocess.run(
                 ['sysctl', '-n', 'hw.memsize'],
-                capture_output=True, text=True, timeout=5)
+                capture_output=True, text=True, timeout=5, **no_window_kwargs())
             if result.returncode == 0:
                 return round(int(result.stdout.strip()) / (1024 ** 3), 2)
     except Exception as e:

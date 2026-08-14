@@ -24,6 +24,7 @@ Each installer type registers in AppRegistry after successful install.
 import hashlib
 import json
 import logging
+from core.subprocess_safe import no_window_kwargs
 import os
 import shutil
 import subprocess
@@ -489,7 +490,7 @@ class AppInstaller:
         try:
             result = subprocess.run(
                 ['nix-env', '-q', '--json'],
-                capture_output=True, text=True, timeout=10)
+                capture_output=True, text=True, timeout=10, **no_window_kwargs())
             if result.returncode == 0:
                 pkgs = json.loads(result.stdout) if result.stdout.strip() else {}
                 for name, info in pkgs.items():
@@ -505,7 +506,7 @@ class AppInstaller:
         try:
             result = subprocess.run(
                 ['flatpak', '--user', 'list', '--app', '--columns=name,application,version'],
-                capture_output=True, text=True, timeout=10, env=self._flatpak_env())
+                capture_output=True, text=True, timeout=10, env=self._flatpak_env(), **no_window_kwargs())
             if result.returncode == 0:
                 for line in result.stdout.strip().split('\n'):
                     parts = line.split('\t')
@@ -550,7 +551,7 @@ class AppInstaller:
             try:
                 result = subprocess.run(
                     ['nix', 'search', 'nixpkgs', query, '--json'],
-                    capture_output=True, text=True, timeout=30)
+                    capture_output=True, text=True, timeout=30, **no_window_kwargs())
                 if result.returncode == 0:
                     pkgs = json.loads(result.stdout) if result.stdout.strip() else {}
                     for attr, info in list(pkgs.items())[:20]:
@@ -569,7 +570,7 @@ class AppInstaller:
                 self._ensure_flathub()
                 result = subprocess.run(
                     ['flatpak', '--user', 'search', query, '--columns=name,application,version,description'],
-                    capture_output=True, text=True, timeout=15, env=self._flatpak_env())
+                    capture_output=True, text=True, timeout=15, env=self._flatpak_env(), **no_window_kwargs())
                 if result.returncode == 0:
                     for line in result.stdout.strip().split('\n')[:20]:
                         parts = line.split('\t')
@@ -748,7 +749,7 @@ class AppInstaller:
         try:
             result = subprocess.run(
                 ['nix-env', '-iA', f'nixpkgs.{pkg}'],
-                capture_output=True, text=True, timeout=300)
+                capture_output=True, text=True, timeout=300, **no_window_kwargs())
             if result.returncode == 0:
                 return InstallResult(
                     success=True, platform='nix', name=name,
@@ -769,6 +770,26 @@ class AppInstaller:
         """Env pinning flatpak to the --user installation dir this service can write."""
         env = dict(os.environ)
         env['FLATPAK_USER_DIR'] = self._flatpak_dir
+        # ── Make `flatpak` FINDABLE from a systemd service ──────────────────────
+        # Real-HW bug this fixes (2026-08-12): clicking "install Firefox" answered
+        # "flatpak not available" INSTANTLY on a box where flatpak was fully working
+        # -- /run/current-system/sw/bin/flatpak present, the `flathub` remote already
+        # configured, DNS fine, and `flatpak remote-add` returning rc=0 from a shell.
+        # The installer runs inside a systemd unit whose PATH does NOT include
+        # /run/current-system/sw/bin, so `subprocess.run(['flatpak', ...])` raised
+        # FileNotFoundError -- which the caller reports verbatim as "flatpak not
+        # available". The message blamed the SYSTEM for what was purely a PATH gap in
+        # this process, sending the operator to debug a Flatpak install that was fine.
+        # Append (never replace) the standard NixOS command dirs so an inherited PATH
+        # still wins, and every flatpak call site gets this because they all route
+        # through this one env builder.
+        _extra = ['/run/current-system/sw/bin', '/run/wrappers/bin',
+                  os.path.expanduser('~/.nix-profile/bin')]
+        _path = [p for p in env.get('PATH', '').split(os.pathsep) if p]
+        for _d in _extra:
+            if _d not in _path and os.path.isdir(_d):
+                _path.append(_d)
+        env['PATH'] = os.pathsep.join(_path)
         return env
 
     def _ensure_flathub(self) -> None:
@@ -782,7 +803,7 @@ class AppInstaller:
             subprocess.run(
                 ['flatpak', '--user', 'remote-add', '--if-not-exists', 'flathub',
                  'https://dl.flathub.org/repo/flathub.flatpakrepo'],
-                capture_output=True, text=True, timeout=30, env=self._flatpak_env())
+                capture_output=True, text=True, timeout=30, env=self._flatpak_env(), **no_window_kwargs())
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             pass
 
@@ -815,7 +836,7 @@ class AppInstaller:
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=300,
-                env=self._flatpak_env())
+                env=self._flatpak_env(), **no_window_kwargs())
             if result.returncode == 0:
                 return InstallResult(
                     success=True, platform='flatpak', name=name,
@@ -824,9 +845,22 @@ class AppInstaller:
                 success=False, platform='flatpak', name=name,
                 error=result.stderr.strip()[:500])
         except FileNotFoundError:
+            # Say WHICH failure this is. "flatpak not available" was reported on a box
+            # where flatpak worked perfectly and only this process's PATH was short
+            # (see _flatpak_env), which sent the operator to debug the wrong system.
+            # shutil.which uses the SAME env we just handed subprocess, so the two
+            # answers cannot disagree.
+            import shutil
+            _resolved = shutil.which('flatpak', path=self._flatpak_env().get('PATH'))
+            if _resolved:
+                _err = ("flatpak exists at %s but could not be executed from this "
+                        "service (check unit permissions/sandboxing)" % _resolved)
+            else:
+                _err = ("flatpak is not installed on this system (not found on PATH: %s)"
+                        % self._flatpak_env().get('PATH', ''))
+            logger.warning("_install_flatpak: %s", _err)
             return InstallResult(
-                success=False, platform='flatpak', name=name,
-                error='flatpak not available')
+                success=False, platform='flatpak', name=name, error=_err)
         except subprocess.TimeoutExpired:
             return InstallResult(
                 success=False, platform='flatpak', name=name,
@@ -883,7 +917,7 @@ class AppInstaller:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=300,
                 env={**os.environ, 'WINEPREFIX': os.path.join(
-                    self._install_dir, 'wine', 'prefix')})
+                    self._install_dir, 'wine', 'prefix')}, **no_window_kwargs())
 
             # Wine's exit code is a WEAK success signal — GUI/interactive
             # installers often fork and return 0 before finishing — so 0 cannot
@@ -924,7 +958,7 @@ class AppInstaller:
             try:
                 out = subprocess.run(
                     [aapt, 'dump', 'badging', apk_path],
-                    capture_output=True, text=True, timeout=30)
+                    capture_output=True, text=True, timeout=30, **no_window_kwargs())
                 if out.returncode == 0:
                     for line in (out.stdout or '').splitlines():
                         if line.startswith('package:'):
@@ -969,7 +1003,7 @@ class AppInstaller:
             try:
                 out = subprocess.run(
                     [waydroid, 'status'],
-                    capture_output=True, text=True, timeout=15)
+                    capture_output=True, text=True, timeout=15, **no_window_kwargs())
                 if out.returncode == 0 and 'RUNNING' in (out.stdout or '').upper():
                     return True
             except (subprocess.TimeoutExpired, OSError):
@@ -1018,7 +1052,7 @@ class AppInstaller:
         try:
             result = subprocess.run(
                 [waydroid, 'app', 'install', req.source],
-                capture_output=True, text=True, timeout=180)
+                capture_output=True, text=True, timeout=180, **no_window_kwargs())
         except subprocess.TimeoutExpired:
             return InstallResult(
                 success=False, platform='android', name=name, app_id=pkg,
@@ -1046,7 +1080,7 @@ class AppInstaller:
         try:
             listing = subprocess.run(
                 [waydroid, 'app', 'list'],
-                capture_output=True, text=True, timeout=60)
+                capture_output=True, text=True, timeout=60, **no_window_kwargs())
         except (subprocess.TimeoutExpired, OSError) as e:
             return InstallResult(
                 success=False, platform='android', name=name, app_id=pkg,
@@ -1108,7 +1142,7 @@ class AppInstaller:
         try:
             boot = subprocess.run(
                 [darling, 'shell', 'true'],
-                capture_output=True, text=True, timeout=120)
+                capture_output=True, text=True, timeout=120, **no_window_kwargs())
         except subprocess.TimeoutExpired:
             return InstallResult(
                 success=False, platform='macos', name=name,
@@ -1145,7 +1179,7 @@ class AppInstaller:
         try:
             run = subprocess.run(
                 [darling, 'shell', target],
-                capture_output=True, text=True, timeout=300)
+                capture_output=True, text=True, timeout=300, **no_window_kwargs())
         except subprocess.TimeoutExpired:
             return InstallResult(
                 success=False, platform='macos', name=name,
@@ -1379,7 +1413,7 @@ class AppInstaller:
         try:
             result = subprocess.run(
                 ['nix-env', '-e', pkg],
-                capture_output=True, text=True, timeout=60)
+                capture_output=True, text=True, timeout=60, **no_window_kwargs())
             return InstallResult(
                 success=result.returncode == 0, platform='nix',
                 name=pkg, error=result.stderr.strip()[:500])
@@ -1391,7 +1425,7 @@ class AppInstaller:
         try:
             result = subprocess.run(
                 ['flatpak', '--user', 'uninstall', '-y', app_id],
-                capture_output=True, text=True, timeout=60, env=self._flatpak_env())
+                capture_output=True, text=True, timeout=60, env=self._flatpak_env(), **no_window_kwargs())
             return InstallResult(
                 success=result.returncode == 0, platform='flatpak',
                 name=app_id, error=result.stderr.strip()[:500])
@@ -1416,7 +1450,7 @@ class AppInstaller:
             try:
                 subprocess.run(
                     [wine, 'uninstaller'],
-                    capture_output=True, timeout=10)
+                    capture_output=True, timeout=10, **no_window_kwargs())
             except Exception:
                 pass
         return InstallResult(
@@ -1449,7 +1483,7 @@ class AppInstaller:
         try:
             subprocess.run(
                 [waydroid, 'app', 'remove', pkg],
-                capture_output=True, text=True, timeout=120)
+                capture_output=True, text=True, timeout=120, **no_window_kwargs())
         except subprocess.TimeoutExpired:
             return InstallResult(
                 success=False, platform='android', name=pkg, app_id=pkg,
@@ -1463,7 +1497,7 @@ class AppInstaller:
         try:
             listing = subprocess.run(
                 [waydroid, 'app', 'list'],
-                capture_output=True, text=True, timeout=60)
+                capture_output=True, text=True, timeout=60, **no_window_kwargs())
         except (subprocess.TimeoutExpired, OSError) as e:
             return InstallResult(
                 success=False, platform='android', name=pkg, app_id=pkg,

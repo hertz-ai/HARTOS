@@ -9,6 +9,7 @@ Tier 'http': HTTP to localhost:5001 (omnitool-gui Flask server)
 """
 
 import os
+from core.subprocess_safe import no_window_kwargs
 import io
 import sys
 import time
@@ -141,14 +142,14 @@ def get_active_window_info():
                 return r.stdout.strip()
         elif _os == 'Linux':
             r = subprocess.run(['xdotool', 'getactivewindow', 'getwindowname'],
-                             capture_output=True, text=True, timeout=3)
+                             capture_output=True, text=True, timeout=3, **no_window_kwargs())
             if r.returncode == 0:
                 return r.stdout.strip()
         elif _os == 'Darwin':
             r = subprocess.run(
                 ['osascript', '-e',
                  'tell application "System Events" to get name of first process whose frontmost is true'],
-                capture_output=True, text=True, timeout=3)
+                capture_output=True, text=True, timeout=3, **no_window_kwargs())
             if r.returncode == 0:
                 return r.stdout.strip()
     except Exception:

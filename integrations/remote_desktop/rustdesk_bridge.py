@@ -25,6 +25,7 @@ RustDesk capabilities:
 import json
 import logging
 import os
+from core.subprocess_safe import no_window_kwargs
 import platform
 import shutil
 import subprocess
@@ -236,10 +237,10 @@ class RustDeskBridge:
         try:
             if system == 'Windows':
                 subprocess.run(['taskkill', '/f', '/im', 'rustdesk.exe'],
-                               capture_output=True, timeout=5)
+                               capture_output=True, timeout=5, **no_window_kwargs())
             else:
                 subprocess.run(['pkill', '-f', 'rustdesk'],
-                               capture_output=True, timeout=5)
+                               capture_output=True, timeout=5, **no_window_kwargs())
             return True
         except Exception:
             return False
@@ -257,7 +258,7 @@ class RustDeskBridge:
                         [self._binary, '--service'],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
-                    )
+                     **no_window_kwargs())
                     return True
             except Exception:
                 pass
@@ -276,13 +277,13 @@ class RustDeskBridge:
                 result = subprocess.run(
                     ['tasklist', '/fi', 'imagename eq rustdesk.exe'],
                     capture_output=True, text=True, timeout=5,
-                )
+                 **no_window_kwargs())
                 return 'rustdesk.exe' in result.stdout.lower()
             else:
                 result = subprocess.run(
                     ['pgrep', '-f', 'rustdesk'],
                     capture_output=True, timeout=5,
-                )
+                 **no_window_kwargs())
                 return result.returncode == 0
         except Exception:
             return False

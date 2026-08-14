@@ -56,7 +56,6 @@ Relationship to integrations/social/consent_service.py:
 from __future__ import annotations
 
 import logging
-import uuid
 from datetime import datetime
 from typing import Any, Optional
 
@@ -64,6 +63,7 @@ from flask import Blueprint, g, jsonify, request
 
 from .auth import require_auth
 from .models import UserConsent
+from .consent_service import ConsentService
 
 logger = logging.getLogger('hevolve_social')
 
@@ -139,19 +139,17 @@ def grant_consent():
     if len(scope) > 100:
         return _err('scope exceeds 100 chars')
 
-    now = datetime.utcnow()
-    row = UserConsent(
-        id=str(uuid.uuid4()),
-        user_id=uid,
-        agent_id=None,
-        consent_type=consent_type,
-        scope=scope,
-        granted=True,
-        granted_at=now,
-        revoked_at=None,
-    )
-    g.db.add(row)
-    g.db.flush()  # assign defaults + surface IntegrityError before response
+    # Delegate the WRITE to the canonical ConsentService so this UI surface gets
+    # the SAME immutable-audit entry, `consent.granted` event, consent-type
+    # validation, and public_exposure up-sync that internal callers get. This
+    # route used to INSERT the UserConsent row inline, so UI-driven grants left
+    # NO audit trail, emitted NO event, skipped up-sync, and accepted arbitrary
+    # consent_type strings — a drifted parallel path (audit gap #4). grant is
+    # append-only in both, so the delegation is behaviour-preserving for the row.
+    try:
+        row = ConsentService.grant_consent(g.db, uid, consent_type, scope)
+    except ValueError as e:
+        return _err(str(e))  # unknown consent_type -> 400, not a masked 500
 
     logger.info(
         'consent.grant user=%s type=%s scope=%s id=%s',

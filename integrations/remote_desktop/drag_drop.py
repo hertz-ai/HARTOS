@@ -15,6 +15,7 @@ HARTOS transport fallback.
 
 import logging
 import os
+from core.subprocess_safe import no_window_kwargs
 import platform
 import subprocess
 import threading
@@ -321,10 +322,10 @@ class DragDropBridge:
         system = platform.system()
         try:
             if system == 'Windows':
-                subprocess.Popen(['explorer', path])
+                subprocess.Popen(['explorer', path], **no_window_kwargs())
             elif system == 'Darwin':
-                subprocess.Popen(['open', path])
+                subprocess.Popen(['open', path], **no_window_kwargs())
             elif system == 'Linux':
-                subprocess.Popen(['xdg-open', path])
+                subprocess.Popen(['xdg-open', path], **no_window_kwargs())
         except Exception as e:
             logger.debug(f"Could not open file location: {e}")

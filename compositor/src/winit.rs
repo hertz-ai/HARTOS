@@ -1036,7 +1036,10 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut seat = seat_state.new_wl_seat(&dh, "hart-winit");
     // M3: keep the keyboard + pointer handles â€” the loop routes winit input into them
     // and reads the cursor position for click-to-focus.
-    let keyboard = seat.add_keyboard(Default::default(), 200, 25)?;
+    // Same environment plumbing as the DRM backend -- see shared::XkbEnv for why
+    // Default::default() silently drops XKB_DEFAULT_*.
+    let xkb_env = crate::shared::XkbEnv::from_env();
+    let keyboard = seat.add_keyboard(xkb_env.config(), 200, 25)?;
     let pointer = seat.add_pointer();
 
     let mut space: Space<Window> = Space::default();
