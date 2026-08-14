@@ -101,6 +101,11 @@ in
     # onboarding ships in the image instead of requiring a post-boot install.
     nunba.enable = true;
 
+    # Designed power management, restored by the 2026-08-14 audit (see the
+    # CORRECTION note above): power profiles via power-profiles-daemon,
+    # thermald thermal mitigation, suspend with agent checkpoint + resume.
+    power.enable = true;
+
     # ── Unified Kernel Extensions ──
     kernel = {
       enable = true;
@@ -491,8 +496,18 @@ in
     # ═══════════════════════════════════════════════════════════════
     # Every hart.* feature that shipped OFF is now on. Audited first: these
     # were the 9 with an enable option that no consumer ever set, so the
-    # modules were dead weight in the tree. (luks/nvidia/power already
-    # default-ON in their own modules; `installer` stays ISO-only in
+    # modules were dead weight in the tree.
+    # CORRECTION (2026-08-14 design-vs-reality audit): this comment used to
+    # claim "luks/nvidia/power already default-ON in their own modules". All
+    # three are mkEnableOption (default FALSE), so power management shipped
+    # as dead code on every image: no power-profiles-daemon (the trial
+    # journal shows net.hadess.PowerProfiles dbus activation timing out
+    # because nothing provided it), no thermald (the DESIGNED mitigation for
+    # the 94C throttle RCA), no suspend-with-agent-checkpoint. `power` is
+    # now enabled below. `nvidia` is genuinely covered: hart-gpu-offload
+    # sets hart.nvidia.enable=true when the dGPU is armed. `luks` stays OFF
+    # deliberately: it needs a per-install passphrase decision and cannot be
+    # baked into a shared image. (`installer` stays ISO-only in
     # configurations/desktop.nix by design — an installed system carries no
     # installer.)
     #
@@ -1068,10 +1083,14 @@ in
   boot.kernel.sysctl."kernel.sysrq" = 1;
 
   # ─── Printing & Scanning ───
-  services.printing.enable = true;
-  services.avahi = {
+  # OWNED by hart-cups.nix (2026-08-14 design-vs-reality audit): the raw
+  # services.printing/avahi lines here bypassed the module, so its driver
+  # packs, print-to-PDF and the hart-print CLI never shipped despite being
+  # the designed printing surface. The module sets a strict superset of what
+  # the raw lines did (printing + avahi/nssmdns4 under `browsing`).
+  hart.printing = {
     enable = true;
-    nssmdns4 = true;  # mDNS for network printer discovery
+    browsing = true;
   };
   # (hardware.sane: OWNED by hart.scanner — enabled above. The module already
   # appends pkgs.sane-airscan unconditionally AND adds simple-scan + the

@@ -3030,7 +3030,9 @@ class TestParityMatrix:
     CLAIMED_NIX = {
         "networking.networkmanager": r'networking\.networkmanager\.enable',
         "pipewire": r'services\.pipewire',
-        "printing": r'services\.printing\.enable',
+        # both spellings define printing: the option path form and the attrset
+        # form hart-cups.nix uses (services.printing = { enable = true; ... })
+        "printing": r'services\.printing(\.enable|\s*=\s*\{)',
         "sane": r'hardware\.sane',
         "bluetooth": r'hardware\.bluetooth',
         "udisks2": r'services\.udisks2|hart\.storage',
