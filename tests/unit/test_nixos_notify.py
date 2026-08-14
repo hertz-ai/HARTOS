@@ -296,9 +296,19 @@ class TestEmitterExitContract:
         # Boundary (missing tool/dep): `core.ai_sensing` is not importable at all ->
         # ImportError is caught -> exit 77. A node without the brain's python on PATH
         # must SUPPRESS, never crash and never paint.
-        empty = tmp_path / "empty"   # deliberately NO core package inside
-        empty.mkdir()
-        res = _run_gate(empty, "allow", tmp_path / "sensor_missing.txt")
+        #
+        # NOT an empty dir: sys.path is stub -> site-packages, so on a runner
+        # where the repo is installed (pip install -e .) an EMPTY stub falls
+        # through and imports the REAL core -- the gate then exits 0 and this
+        # test fails for the wrong reason (seen on the release-gate runners).
+        # A poison package that raises on import simulates "unimportable core"
+        # hermetically, independent of the interpreter's site configuration.
+        poison = tmp_path / "poison"
+        (poison / "core").mkdir(parents=True)
+        (poison / "core" / "__init__.py").write_text(
+            "raise ImportError('core deliberately unimportable for the "
+            "fail-closed boundary test')\n", encoding="utf-8")
+        res = _run_gate(poison, "allow", tmp_path / "sensor_missing.txt")
         assert res.returncode == 77, (
             f"gate must fail-closed (77) when core.ai_sensing is missing, "
             f"got {res.returncode}: {res.stderr}")

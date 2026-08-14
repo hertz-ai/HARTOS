@@ -87,7 +87,18 @@ def test_panel_open_keeps_orb_active_and_reachable(shell):
     assert re.search(r"\.toggle\(\s*['\"]docked['\"]", js), \
         "hartHero.js no longer docks the orb on panel-open"
     # The orb is explicitly kept visible + clickable while panels are open.
-    assert re.search(r"opacity\s*=\s*['\"]1['\"]", js), \
-        "docked orb must stay visible (opacity:1), not fade to wallpaper"
+    # CONTRACT UPDATED for the place() single-writer design: opacity is
+    # composed (s.opacity = String(op)) from op initialised to 1, and the
+    # ONLY dim case (merged idle, op=0.34) explicitly excludes panelOpen /
+    # chatOpen — strictly stronger than the old literal opacity='1' this
+    # test used to grep for.
+    assert re.search(r"var\s+op\s*=\s*1\b", js), \
+        "place() must initialise opacity to full (var op = 1)"
+    assert re.search(
+        r"B\.merged\s*&&[^\n]*!B\.panelOpen\s*&&\s*!B\.chatOpen", js), \
+        "the merged-dim case must exclude panel/chat-open so the docked orb " \
+        "never fades while panels are up"
+    assert re.search(r"opacity\s*=\s*String\(\s*op\s*\)", js), \
+        "place() must remain the single writer of the orb's opacity"
     assert re.search(r"pointerEvents\s*=\s*['\"]auto['\"]", js), \
         "docked orb must stay reachable (pointer-events:auto)"

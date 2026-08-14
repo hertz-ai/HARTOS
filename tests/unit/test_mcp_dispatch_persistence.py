@@ -27,6 +27,19 @@ from unittest.mock import patch
 
 import pytest
 
+# The stdio MCP transport is OPTIONAL by design: integrations/mcp/mcp_server.py
+# raises a helpful ImportError without the `mcp` package and points at the
+# HTTP bridge as the no-install path. These tests exercise mcp_server's
+# dispatch persistence, so they need the optional package; where it is not
+# installed (the release-gate runners, per the module's own design) they skip
+# with the same message instead of failing collection.
+pytest.importorskip(
+    'mcp.server.fastmcp',
+    reason="optional stdio MCP transport not installed (pip install mcp); "
+           "the HTTP bridge path needs no extra install. Checked at the "
+           "submodule mcp_server actually imports, because an unrelated "
+           "package can squat the top-level `mcp` name.",
+)
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if ROOT not in sys.path:

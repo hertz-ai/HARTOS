@@ -190,32 +190,39 @@ class TestDraftFirstDelegateRouting:
             "— task #114 fix has been removed?"
         )
         block = match.group(1)
+        # Code-shape assertions must not trip on the branch's own prose: the
+        # block's comments narrate the OLD mechanism while explaining #118.
+        code_only = "\n".join(
+            line for line in block.splitlines()
+            if not line.lstrip().startswith("#")
+        )
 
-        # Must set create_agent=True so the autogen CREATE branch fires
-        assert re.search(r"\bcreate_agent\s*=\s*True\b", block), (
-            "delegate-routing branch must flip create_agent=True so "
-            "the create_agent block at hart_intelligence_entry.py:7049 "
-            "fires.  Without this, falls through to LangChain casual "
-            "and the user gets a polite ack with no execution."
+        # CONTRACT UPDATED to the #118 design (this test used to pin the
+        # pre-#118 mechanism and went red the moment the code was fixed).
+        # #118: forcing create_agent/autonomous on EVERY non-casual turn
+        # hijacked recall/Q&A ("what did we discuss 15 days back") into an
+        # 8-action execute_windows CREATE plan, bypassing get_ans — the ONLY
+        # path with the working FULL_HISTORY date-recall tool. The branch now
+        # deliberately falls through (no flags, no return) so get_ans answers
+        # recall directly and escalates genuine tasks via its own
+        # Create_Agent / Agentic_Router tools. The 2026-05-07 "open chrome
+        # and research" regression stays fixed BY get_ans, not by forced
+        # CREATE. So the branch must NOT set the old flags:
+        assert not re.search(r"\bcreate_agent\s*=\s*True\b", code_only), (
+            "delegate-routing branch must NOT force create_agent=True — "
+            "#118: that hijacked recall/Q&A into a CREATE plan and bypassed "
+            "get_ans (the only path with FULL_HISTORY date recall)."
         )
-        # Must set autonomous=True so we land in the autonomous block
-        # (find_matching_agent → REUSE → else _autonomous_gather_info
-        # → recipe() execution), not the interview-only gather_info.
-        assert re.search(r"\bautonomous\s*=\s*True\b", block), (
-            "delegate-routing branch must ALSO flip autonomous=True "
-            "(same shape as #105's missing-recipe fallback).  Without "
-            "this, the create_agent block enters the interview-only "
-            "gather_info path that asks 'name your agent?' instead of "
-            "auto-filling identity and executing via recipe()."
+        assert not re.search(r"\bautonomous\s*=\s*True\b", code_only), (
+            "delegate-routing branch must NOT force autonomous=True — see "
+            "the #118 note above; fall-through to get_ans is the contract."
         )
-        # Must also set _is_agentic_orchestration=True so any later
-        # draft-first guard at line 6605 correctly identifies this
-        # request as orchestration (not casual).
-        assert re.search(
-            r"\b_is_agentic_orchestration\s*=\s*True\b", block), (
-            "delegate-routing branch should set _is_agentic_orchestration "
-            "=True for consistency with the is_create_agent branch at "
-            "line 7008."
+        # And the branch must still be a documented, deliberate fall-through
+        # (the #118 marker comment), not an accidentally-emptied block.
+        assert re.search(r"#118 FIX", block), (
+            "the delegate-routing branch lost its #118 marker comment — if "
+            "the fall-through was changed on purpose, update this test's "
+            "contract alongside the code."
         )
 
 
