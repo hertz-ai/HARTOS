@@ -6,14 +6,14 @@
                    # "called with unexpected argument 'hartSrc'". The Nunba daemon
                    # is HARTOS-EXCLUDED — it fetches ONLY the Nunba repo, never the
                    # HART tree — so hartSrc is intentionally unused here.
-, nunbaRev ? "cb849ba96a6d103be3eb1c25f09d14a7324d3165"  # Nunba HEAD carrying the
+, nunbaRev ? "776c40797d702a62a78990efb1c39824c89e566f"  # Nunba HEAD carrying the
                    # HART_NUNBA_SOCKET bind (main.py, commit cb849ba9). nunbaHash +
                    # npmDepsHash are now BOTH pinned for THIS rev (CI hash-pin R3,
                    # 2026-07-12); if the rev is bumped, re-pin all three in ONE commit
                    # (npm ci fails the lock-vs-deps integrity check if the rev and the
                    # lock drift apart).
-, nunbaHash ? "sha256-vEVEuk8kTSKqc5zlCTj9MBjxP9/XLZp63zxeF0K91U4="  # pinned 2026-07-12 for nunbaRev cb849ba9 (CI hash-pin, R3)
-, npmDepsHash ? "sha256-QYp9XbZ+2q2mCZDiGS9kObEOPQXDZbE1s882st7+oqA="  # pinned 2026-07-12 for nunbaRev cb849ba9 (CI hash-pin round 2, R3); prefetch-npm-deps landing-page/package-lock.json
+, nunbaHash ? "sha256-vTg24p5EQbYBPJO5ek8z2l9JQ4YODewrYzHMrjswR38="  # pinned 2026-08-14 for nunbaRev 776c4079 (nunba-hash-pin run 31810930513, build verified GREEN)
+, npmDepsHash ? "sha256-IpqZKwHw5v9lO2H+Wq2Jptru+5a2bVwk8DP+xKEINXQ="  # pinned 2026-08-14 for nunbaRev 776c4079 (nunba-hash-pin run 31810930513 round B); prefetch-npm-deps landing-page/package-lock.json
 , backendUrl ? "http://127.0.0.1:6777"
 }:
 

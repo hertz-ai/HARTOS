@@ -88,17 +88,18 @@ in
     # (its default == nunba.enable), so LiquidUI reverse-proxies the daemon same-
     # origin with the SAME React store-path as the graceful static floor.
     #
-    # STAYS OFF until CI is green — flipping it before that would fail the desktop
-    # ISO. Two CI prerequisites (nixos/packages/nunba.nix):
-    #   1. Pin the FOD hashes: nunbaRev (current Nunba HEAD, has HART_NUNBA_SOCKET) +
-    #      nunbaHash (nix-prefetch-github hertz-ai Nunba --rev <rev>) + npmDepsHash
-    #      (prefetch-npm-deps landing-page/package-lock.json) — all in ONE commit.
-    #   2. `nix build .#packages.x86_64-linux.nunba` green — walk the import-domino
-    #      boot loop (add curated nixpkgs pkgs / guard Nunba ML imports until main.py
-    #      binds the socket), per hart-app.nix's method.
-    # Then set this to true (embedNunba follows automatically). Until then the
-    # React-static floor path is byte-for-byte the current behaviour.
-    nunba.enable = false;
+    # PROMOTED ON 2026-08-14 (steward: "pre installed nunba microfrontend").
+    # Both CI prerequisites are met at nunbaRev 776c4079:
+    #   1. FOD hashes pinned (nunbaRev + nunbaHash + npmDepsHash, all in the
+    #      same commit -- nixos/packages/nunba.nix).
+    #   2. `nix build .#packages.x86_64-linux.nunba` verified GREEN by the
+    #      nunba-hash-pin workflow, run 31810930513 ("packages.nunba builds
+    #      GREEN with the new pins" -- its push failed on token perms, the pin
+    #      was landed manually from that run's computed hashes).
+    # embedNunba follows automatically (its default == nunba.enable): LiquidUI
+    # reverse-proxies the daemon's unix socket same-origin, and LightYourHART
+    # onboarding ships in the image instead of requiring a post-boot install.
+    nunba.enable = true;
 
     # ── Unified Kernel Extensions ──
     kernel = {
