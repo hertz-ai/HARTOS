@@ -76,7 +76,13 @@ in
           # this subtest flaked non-deterministically between VM runs).
           result = server.wait_until_succeeds(
               "curl -sf http://localhost:6777/status", timeout=90)
-          assert "success" in result or "uptime" in result, f"Unexpected status: {result}"
+          # The /status document's vocabulary evolved: it now reports
+          # "status": "running" (with honest per-subsystem fields like the
+          # learning bridge being disabled on a coreless VM). Accept any of
+          # the three generations of the alive-signal; the subtest's intent
+          # is only "the backend serves its status document".
+          assert ("success" in result or "uptime" in result
+                  or '"running"' in result), f"Unexpected status: {result}"
 
       with subtest("Discovery service starts"):
           server.wait_for_unit("hart-discovery.service", timeout=60)
