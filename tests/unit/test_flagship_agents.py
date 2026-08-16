@@ -19,6 +19,7 @@ import os
 import sys
 
 import pytest
+from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
@@ -256,6 +257,17 @@ class TestTutorEndToEnd:
             return FakeResp()
 
         monkeypatch.setattr(dispatch_mod, 'pooled_post', fake_pooled_post)
+
+        # Neutralize the IN-PROCESS /chat leg: dispatch_goal tries it (through
+        # hart_intelligence_entry's own test client) BEFORE the pooled_post
+        # proxy this test feeds, and only falls through when it returns falsy.
+        # Unpatched it escapes into the real (down) LLM and the assertion reads
+        # the autonomous standby reply instead of the canned lesson. The falsy
+        # response IS the documented fall-through to the proxy.
+        import hart_intelligence_entry as _hie
+        _inproc = MagicMock()
+        _inproc.test_client.return_value.__enter__.return_value             .post.return_value.get_json.return_value = {}
+        monkeypatch.setattr(_hie, 'app', _inproc)
 
         # REAL dispatch_goal call.
         out = dispatch_mod.dispatch_goal(
