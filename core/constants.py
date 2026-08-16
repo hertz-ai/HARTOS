@@ -862,3 +862,42 @@ assert all(isinstance(v, (int, float)) and 0 < v < 3600
 #: on. 'assistant' matches the speaker name the rest of reuse_recipe already
 #: uses for the default agent.
 DEFAULT_SINGLE_ROLE = 'assistant'
+
+
+#: Values of ``AgentGoal.created_by`` that name a PROCESS, not a user.
+#:
+#: `created_by` is a provenance field: it records what produced the goal.
+#: For human-created goals that happens to be a user id, which is why
+#: core.event_attribution.goal_owner_user_id reads it as an ownership
+#: fallback.  For machine-seeded goals it is a daemon name, and treating
+#: one as an identity produces a user id that cannot exist.
+#:
+#: Measured live 2026-08-16 across 105 active goals: owner_id 0/105 and
+#: user_id 0/105 were populated, so `created_by` decided every case —
+#: 'error_advice' x52 and 'system_bootstrap' x32 against just 6 real
+#: uuids.  /api/social/users/system_bootstrap returns 404.  Events
+#: stamped with those labels passed the P3a SSE guard (a non-empty
+#: user_id) and were then delivered to nobody, with nothing logged.
+#:
+#: Derived by reading the producers, never guessed.  Each entry is a
+#: literal written at exactly one site:
+#:   error_advice           core/error_advice.py
+#:   system_bootstrap       integrations/agent_engine/goal_seeding.py
+#:   auto_remediation       integrations/agent_engine/goal_seeding.py
+#:   intelligence_milestone integrations/agent_engine/agent_daemon.py
+#:   self_healing_dispatcher integrations/agent_engine/self_healing_dispatcher.py
+#:   revenue_aggregator     integrations/agent_engine/revenue_aggregator.py
+#:   system_daemon          integrations/social/dashboard_service.py
+#:
+#: tests/unit/test_goal_owner_machine_authors.py AST-scans the tree and
+#: fails if a new bare-label `created_by=` literal appears unregistered,
+#: so this set cannot silently fall behind the producers.
+MACHINE_GOAL_AUTHORS = frozenset({
+    'error_advice',
+    'system_bootstrap',
+    'auto_remediation',
+    'intelligence_milestone',
+    'self_healing_dispatcher',
+    'revenue_aggregator',
+    'system_daemon',
+})
