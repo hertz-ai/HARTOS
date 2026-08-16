@@ -2612,8 +2612,16 @@ class TestBootstrapGoals:
         helper.register_for_llm.return_value = lambda f: f
         assistant.register_for_execution.return_value = lambda f: f
         register_marketing_tools(helper, assistant, 'test_user')
-        assert helper.register_for_llm.call_count == 6  # 6 marketing tools
-        assert assistant.register_for_execution.call_count == 6
+        # The tool set GROWS (demo-video, browser-posting etc. joined since
+        # this test froze the count at 6); the test's intent is that the
+        # referral/growth tools are REGISTERED, not that the catalog never
+        # expands. Assert the named tools and llm/execution parity instead.
+        registered = {c.kwargs.get('name') for c in
+                      helper.register_for_llm.call_args_list}
+        assert 'create_referral_campaign' in registered, registered
+        assert 'get_growth_metrics' in registered, registered
+        assert (helper.register_for_llm.call_count
+                == assistant.register_for_execution.call_count >= 6)
 
     def test_onboarding_has_invite_step(self):
         """Onboarding now has 8 steps including invite_friends."""

@@ -60,7 +60,7 @@ def test_inbound_payload_carries_both_prompt_and_text():
         pytest.skip(f"flask_integration unavailable: {e}")
     captured = {}
 
-    def fake_post(url, json=None, timeout=None):
+    def fake_post(url, json=None, timeout=None, **kwargs):  # headers= joined the call
         captured['payload'] = json
         return Mock(status_code=200, json=lambda: {'response': 'ok'})
 
@@ -80,7 +80,7 @@ def test_inbound_reads_reply_from_text_when_no_response_key():
     except Exception as e:
         pytest.skip(f"flask_integration unavailable: {e}")
 
-    def fake_post(url, json=None, timeout=None):
+    def fake_post(url, json=None, timeout=None, **kwargs):  # headers= joined the call
         return Mock(status_code=200,
                     json=lambda: {'text': 'the real agent reply', 'agent_id': 'a1'})
 
@@ -96,7 +96,7 @@ def test_inbound_reads_reply_from_response_key_standalone():
     except Exception as e:
         pytest.skip(f"flask_integration unavailable: {e}")
 
-    def fake_post(url, json=None, timeout=None):
+    def fake_post(url, json=None, timeout=None, **kwargs):  # headers= joined the call
         return Mock(status_code=200, json=lambda: {'response': 'pong'})
 
     with patch('integrations.channels.flask_integration.pooled_post', fake_post):

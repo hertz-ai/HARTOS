@@ -375,9 +375,22 @@ class TestApplyAggregatedEmitsEvent(unittest.TestCase):
 
 
 class TestReceivePeerDelta(unittest.TestCase):
-    """Delta validation: version, freshness, guardrail hash."""
+    """Delta validation: version, freshness, guardrail hash.
+
+    ARRANGES 'warn' enforcement: these tests exercise the delta-validation
+    LOGIC (version/freshness/hash/rejection reasons) with unsigned fixture
+    deltas from before signing existed. Enforcement has since hardened to
+    'hard' by default, where rejecting an unsigned delta is the CORRECT
+    behaviour -- the signature layer has its own coverage. Mode must be
+    arranged, not inherited from the environment (same principle as the
+    goal_manager warn-mode fix, 2026-08-16).
+    """
 
     def setUp(self):
+        _mk = patch('security.master_key.get_enforcement_mode',
+                    return_value='warn')
+        _mk.start()
+        self.addCleanup(_mk.stop)
         with patch.object(FederatedAggregator, '_subscribe_to_eventbus'):
             self.agg = FederatedAggregator()
 
