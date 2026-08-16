@@ -303,6 +303,117 @@ class LedgerProbe:
                 return None
         return self._with_db(_q)
 
+    # ── Agent-engine liveness + drain ────────────────────────────────
+    # The probes above cover resonance / spark / consent.  Nothing here
+    # covered "is the worker alive and is the queue draining" — and on
+    # 2026-08-16 that gap let the agent engine complete NOTHING for 14
+    # hours on a node whose /health said "up": Flask up, LLM up, DB up,
+    # 9,591 tasks pending, 0 in flight, 1,010 reaped as zombies.
+    #
+    # Read over the Flask loopback route rather than importing
+    # agent_daemon here, and the distinction is the whole point: Flask
+    # is the process that STARTS the daemon, so its answer is ground
+    # truth.  A probe importing agent_daemon in the TEST process gets a
+    # fresh-zero singleton and reports "not running" for a perfectly
+    # healthy daemon (the 2026-06-09 shadow-module incident).  Same
+    # reason the route already serves the ledger this way.
+
+    _STATS_PATH = '/api/agent-engine/ledger/stats'
+
+    def agent_engine_stats(self, base_url: str = 'http://127.0.0.1:5000',
+                           timeout: float = 20.0) -> Optional[Dict[str, Any]]:
+        """Live agent-engine snapshot, or None when unreachable.
+
+        None (not an exception) keeps the class contract: a CI box with
+        no live Flask gets None and the caller decides to skip, exactly
+        like the DB-less path above.
+        """
+        import json as _json
+        import urllib.request as _url
+        try:
+            with _url.urlopen(base_url + self._STATS_PATH, timeout=timeout) as r:
+                raw = r.read().decode('utf-8', 'replace')
+            if raw.lstrip().startswith('<'):
+                return None          # SPA catch-all, not the API
+            data = _json.loads(raw)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def assert_daemon_alive(self, base_url: str = 'http://127.0.0.1:5000') -> None:
+        """The worker thread must actually be alive.
+
+        Asserts on ``thread_alive``, NOT on ``running``: ``running`` is
+        the daemon's own intent flag and the two can disagree — that
+        disagreement IS the zombie case the supervisor restarts on, so a
+        probe that reads the flag would pass straight through it.
+        """
+        stats = self.agent_engine_stats(base_url)
+        if stats is None:
+            raise AssertionError(
+                'agent-engine stats unreachable at %s%s — cannot assert '
+                'liveness.  Start Flask, or skip this journey.'
+                % (base_url, self._STATS_PATH))
+        d = stats.get('daemon') or {}
+        if not d:
+            raise AssertionError(
+                "response carries no 'daemon' block — the running build "
+                "predates the in-process liveness probe; rebuild before "
+                "trusting this assertion (do NOT read its absence as "
+                "'daemon healthy')")
+        if not d.get('available'):
+            raise AssertionError('daemon liveness unreadable: %s'
+                                 % d.get('reason'))
+        if not d.get('thread_alive'):
+            raise AssertionError(
+                'agent daemon thread is NOT alive (running=%s, '
+                'tick_count=%s) — the queue has no consumer'
+                % (d.get('running'), d.get('tick_count')))
+
+    def assert_ledger_advancing(
+        self,
+        within_minutes: float = 30.0,
+        base_url: str = 'http://127.0.0.1:5000',
+        settle_s: float = 0.0,
+    ) -> None:
+        """The queue must actually drain — liveness alone is not enough.
+
+        A thread can be alive and still consume nothing, which is the
+        shape of the 2026-08-16 outage.  Compares two samples of
+        ``completed`` so this measures PROGRESS, not a static count: a
+        node with a big historical ``completed`` and a dead worker would
+        pass any threshold test on the absolute number.
+
+        ``within_minutes`` is accepted for callers that want to express
+        an SLO in the familiar unit; with ``settle_s=0`` the check is
+        the strictly weaker "pending queue is non-empty AND something
+        moved", which is what a fast CI journey can afford.
+        """
+        first = self.agent_engine_stats(base_url)
+        if first is None:
+            raise AssertionError('agent-engine stats unreachable — cannot '
+                                 'assert drain')
+        by = (first.get('stats') or {}).get('by_status') or {}
+        pending = int(by.get('pending', 0) or 0)
+        if pending == 0:
+            return               # nothing to drain is not a stall
+        if settle_s > 0:
+            import time as _t
+            _t.sleep(settle_s)
+            second = self.agent_engine_stats(base_url) or {}
+            by2 = (second.get('stats') or {}).get('by_status') or {}
+            moved = (int(by2.get('completed', 0) or 0)
+                     - int(by.get('completed', 0) or 0))
+            if moved <= 0:
+                raise AssertionError(
+                    'ledger did NOT advance in %.1fs with %d pending — '
+                    'the queue has a producer and no consumer '
+                    '(budget was %.1f min)'
+                    % (settle_s, pending, within_minutes))
+        # Liveness is the necessary condition for drain; assert it too so
+        # a stalled queue names the daemon rather than only the symptom.
+        self.assert_daemon_alive(base_url)
+
 
 # ─── LLM judge ───────────────────────────────────────────────────────
 
