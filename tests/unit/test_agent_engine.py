@@ -72,10 +72,20 @@ def db(engine, tables):
 
 @pytest.fixture
 def test_user(db):
-    user = User(username='testuser', email='test@test.com', password_hash='x',
-                user_type='human')
-    db.add(user)
-    db.flush()
+    # REUSE a leaked row instead of colliding on it. The `db` fixture isolates
+    # by rolling back an outer transaction, but production code exercised by
+    # these tests COMMITS on that connection (bootstrap seeding does), which
+    # ends the outer transaction and makes the rollback a no-op -- so
+    # 'testuser' survives into the next test on the session-scoped engine and
+    # the insert died with UNIQUE constraint failed: users.username (6 setup
+    # ERRORs, order-dependent). Idempotent get-or-create keeps every isolated
+    # run byte-identical and makes the leaked-row order survivable.
+    user = db.query(User).filter_by(username='testuser').first()
+    if user is None:
+        user = User(username='testuser', email='test@test.com', password_hash='x',
+                    user_type='human')
+        db.add(user)
+        db.flush()
     return user
 
 
@@ -501,7 +511,25 @@ class TestAgentDaemon:
 class TestDispatch:
     # Tier-1 in-process import must fail so dispatch falls through to Tier-2 HTTP.
     # Budget gate + guardrails must also be mocked to allow the dispatch path.
+    # NEUTRALIZE THE IN-PROCESS LEG so these tests still exercise the Tier-2
+    # HTTP proxy they assert on. dispatch_goal grew a Tier-1 in-process path
+    # (posts /chat through hart_intelligence_entry's OWN test client, skipping
+    # the loopback socket) that runs BEFORE the pooled_post proxy. These tests
+    # patch only pooled_post, so the in-process leg escaped and attempted a
+    # REAL LLM call -> "An error occurred: Connection error." A falsy in-process
+    # response is exactly the documented fall-through to the proxy, so this
+    # arranges the path under test without touching production.
+    _INPROC_APP = MagicMock()
+    _INPROC_APP.test_client.return_value.__enter__.return_value         .post.return_value.get_json.return_value = {}
+
     _DISPATCH_PATCHES = [
+        patch('hart_intelligence_entry.app', _INPROC_APP),
+        # ...and no hive peers, so dispatch takes the LOCAL leg these tests
+        # assert on. dispatch_goal also grew a DISTRIBUTED leg that runs first
+        # whenever a coordinator + peers are reachable and returns the submitted
+        # task id ('goal_abc') instead of the agent's reply. Distributed
+        # dispatch has its own coverage; this class is the local contract.
+        patch('integrations.agent_engine.dispatch._has_hive_peers', return_value=False),
         patch('integrations.agent_engine.dispatch.is_user_recently_active', return_value=False),
         patch('integrations.agent_engine.budget_gate.pre_dispatch_budget_gate',
               return_value=(True, 'OK')),
