@@ -91,11 +91,22 @@ class TestBrandMarkers(unittest.TestCase):
         self.assertTrue(ok, f"Brand marker verification failed: {msg}")
 
     def test_brand_markers_detect_missing_file(self):
-        from security.origin_attestation import verify_brand_markers
-        # Non-existent directory
-        ok, msg = verify_brand_markers('/nonexistent/path')
-        self.assertFalse(ok)
-        self.assertIn('Missing required file', msg)
+        from unittest.mock import patch
+        from security import origin_attestation as oa
+        # A BOGUS explicit root no longer fails, BY DESIGN: the resolver walks a
+        # candidate list (explicit -> env -> package parent -> sys.prefix/share
+        # -> bundled sibling) because a pip-installed HARTOS puts LICENSE in the
+        # venv's share/, which produced a false "Missing required file: LICENSE"
+        # warning on every bundled boot. Assert that documented fallback...
+        ok, _msg = oa.verify_brand_markers('/nonexistent/path')
+        self.assertTrue(ok)
+        # ...and prove the missing-file DETECTION still works, by requiring a
+        # marker that exists in no candidate root at all.
+        with patch.dict(oa.BRAND_MARKER_FILES,
+                        {'NO_SUCH_BRAND_MARKER.txt': 'HART'}, clear=False):
+            ok, msg = oa.verify_brand_markers()
+            self.assertFalse(ok)
+            self.assertIn('Missing required file', msg)
 
 
 class TestMasterKeyPresence(unittest.TestCase):

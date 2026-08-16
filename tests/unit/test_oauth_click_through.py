@@ -264,7 +264,13 @@ class TestOAuthStartRoute:
                 headers={'Authorization': 'Bearer faketoken'},
             )
         assert resp.status_code == 400
-        assert b'not configured' in resp.data
+        # Assert the STRUCTURED reason, not the prose. The human-facing message
+        # was deliberately rewritten to be kind and actionable ("Connecting
+        # Discord isn't switched on yet. The Hevolve team still has to enable
+        # it...") and no longer contains the machine phrase "not configured";
+        # the machine contract is the `reason` field, which is what a client
+        # should branch on anyway.
+        assert b'"reason":"not_configured"' in resp.data.replace(b', ', b',')
 
     def test_non_oauth_channel_returns_400(self, app_with_oauth, discord_env):
         # Email is not OAuth-capable.
@@ -277,7 +283,9 @@ class TestOAuthStartRoute:
                 headers={'Authorization': 'Bearer faketoken'},
             )
         assert resp.status_code == 400
-        assert b'not OAuth-capable' in resp.data
+        # Structured reason, not prose (see the note above): email's message is
+        # now "Add Email by pasting your IMAP Server." with reason=not_oauth.
+        assert b'"reason":"not_oauth"' in resp.data.replace(b', ', b',')
 
     def test_discord_start_builds_authorize_url(self, app_with_oauth, discord_env):
         # Patch _require_user so the route doesn't try to validate the

@@ -412,9 +412,24 @@ class TestGetHealth:
         wd = NodeWatchdog()
         wd._started_at = time.time()
         wd._running = True
+        # A LIVE loop thread, not just the intent flag: `watchdog` now reports
+        # real liveness (_watchdog_liveness) instead of echoing `_running`,
+        # precisely so a supervisor whose loop died cannot keep reporting
+        # healthy while restarting nothing. Setting _running alone therefore
+        # yields the honest 'dead' -- arrange an actually-alive thread so this
+        # STRUCTURE test exercises the healthy shape it is about.
+        import threading as _threading
+        _stop = _threading.Event()
+        _loop = _threading.Thread(target=_stop.wait, daemon=True)
+        _loop.start()
+        wd._thread = _loop
         wd.register("x", expected_interval=10, restart_fn=lambda: None)
-        h = wd.get_health()
-        assert h["watchdog"] == "healthy"
+        try:
+            h = wd.get_health()
+            assert h["watchdog"] == "healthy"
+        finally:
+            _stop.set()
+            _loop.join(timeout=2)
         assert "uptime_seconds" in h
         assert "threads" in h
         assert "restart_log" in h

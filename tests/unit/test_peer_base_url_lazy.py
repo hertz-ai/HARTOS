@@ -45,6 +45,12 @@ def _bare_gossip():
     g = object.__new__(GossipProtocol)
     g._base_url_cached = ''
     g._base_url_final = False
+    # _observed_public_ip joined the fields the URL path reads (peer_discovery
+    # learns the address peers echo back and prefers it when publishing).
+    # __init__ is deliberately skipped here, so a new field it initialises must
+    # be mirrored or the property under test dies with AttributeError instead
+    # of being exercised.
+    g._observed_public_ip = ''
     return g
 
 
