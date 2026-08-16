@@ -93,6 +93,11 @@ class FailureReason(str, Enum):
     DEPENDENCY_FAILED = "dependency_failed"      # Prerequisite task failed
     MAX_RETRIES_EXCEEDED = "max_retries_exceeded"  # Retry limit reached
     EXTERNAL_SERVICE_ERROR = "external_service_error"  # External API failed
+    # Force-abandoned while still unverified -- the surrounding flow finished
+    # and this unit never reached a verified state.  Distinct from ERROR
+    # (nothing threw) and from MAX_RETRIES_EXCEEDED (retries were not the
+    # limit).  Re-openable, so a peer can pick the work up later.
+    ABANDONED = "abandoned"
 
 
 class PendingReason(str, Enum):
