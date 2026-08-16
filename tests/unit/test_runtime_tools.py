@@ -183,6 +183,13 @@ class TestVRAMManager:
         # and exposed the latent test bug.
         mock_props.return_value = MagicMock(total_memory=8 * 1024**3)
         vm._gpu_info = None
+        # detect_gpu gained a fast path: when NEITHER nvidia-smi NOR rocm-smi is
+        # on PATH it returns cuda_available=False WITHOUT touching torch (added
+        # to stop repeated fork/exec of vendor tools on a GPU-less node). This
+        # test is about the torch/CUDA branch, so declare the vendor tools
+        # present -- otherwise it silently asserts the early return on every
+        # machine without an NVIDIA install (CI included).
+        vm._vendor_tools_absent = False
         info = vm.detect_gpu()
         assert info['cuda_available'] is True
         assert info['name'] == 'RTX 3070'

@@ -148,7 +148,12 @@ class TestGate1SessionRegistered:
         # *closure*: with GDM, sessionData puts the .desktop on the runtime search
         # path. Assert the test checks the materialized path + that it execs the
         # cage launcher (not some other compositor).
-        assert "/run/current-system/sw/share/wayland-sessions/hart-shell.desktop" in src
+        # The VM test now SEARCHES the DM session dirs at runtime
+        # (`for d in ...wayland-sessions ...; [ -f "$d/hart-shell.desktop" ]`)
+        # instead of hardcoding one concatenated path, so assert both halves:
+        # the DM-materialized search root, and the session file it looks for.
+        assert "/run/current-system/sw/share/wayland-sessions" in src
+        assert "hart-shell.desktop" in src
         assert "hart-shell-session" in src     # the cage launcher the .desktop Exec=
 
 

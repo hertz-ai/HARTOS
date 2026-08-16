@@ -263,7 +263,14 @@ def test_follow_instance_delegates_to_the_one_writer():
         assert federation.follow_instance(
             mock.MagicMock(), 'us', 'them', 'http://peer:5000') is True
     rec.assert_called_once_with(mock.ANY, 'us', 'them', 'http://peer:5000')
-    thread.assert_called_once()  # active side still notifies
+    # The active side still notifies -- and now ALSO backfills, deliberately: a
+    # follow used to yield only FUTURE posts, so a freshly-installed node showed
+    # an empty feed despite auto-following every peer. Assert the notification
+    # leg is among the spawned threads instead of pinning the count, so adding
+    # another async leg is a design change, not a false red.
+    targets = {c.kwargs.get('target') for c in thread.call_args_list}
+    assert federation._send_follow_notification in targets, targets
+    assert thread.call_count >= 1
 
 
 def test_follow_notification_handler_calls_record_follow():
