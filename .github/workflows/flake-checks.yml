@@ -271,26 +271,53 @@ jobs:
           # fast attributable failure instead of two silent hours. 900s is ~7x the
           # observed 118s, so a genuine slowdown still passes. -k SIGKILLs if SIGTERM
           # is ignored too, which it will be if a thread is stuck in C.
+          # PER-FILE INTERPRETERS (2026-08-16). One shard-wide interpreter made
+          # verdicts depend on shard COMPOSITION: any file that leaks state
+          # (env vars, sys.modules stubs, app/config singletons, a bound port)
+          # poisons every file after it. Measured on gate run 31828127465:
+          # test_auth_local_csrf (11 red, all 200-vs-401 = an auth gate
+          # disabled by a prior test's leaked state) and test_remote_desktop_cli
+          # (9 setup ERRORs) both pass 33/33 and 20/20 in a clean interpreter.
+          # This is also why "a fix cannot be told from a reshuffle" (comment
+          # above): the pollution graph, not the code, decided shard verdicts.
+          # A process per FILE makes each file's verdict self-contained -- the
+          # exact condition under which every file is locally green. Cost is
+          # interpreter+import startup per file; the per-file `timeout` keeps
+          # the hung-interpreter class (see the wall-clock note above) bounded
+          # per file instead of per shard.
           set +e
-          timeout -k 30 900 \
-            python -m pytest \
-              "${SEL[@]}" \
-              --deselect tests/unit/test_vlm_qwen3vl.py::TestFullActionLoop \
-              --deselect tests/unit/test_vlm_qwen3vl.py::TestVLMDeterministicActions::test_vlm_action_list_shared_by_legacy_and_unified \
-              --deselect tests/e2e/test_e2e_pipelines.py::TestVLMVisualAgentPayload \
-              --timeout=120 \
-              --durations=25 \
-              -q --tb=line
-          rc=$?
+          overall=0
+          declare -a REDFILES=()
+          for f in "${SEL[@]}"; do
+            timeout -k 30 600 \
+              python -m pytest "$f" \
+                --deselect tests/unit/test_vlm_qwen3vl.py::TestFullActionLoop \
+                --deselect tests/unit/test_vlm_qwen3vl.py::TestVLMDeterministicActions::test_vlm_action_list_shared_by_legacy_and_unified \
+                --deselect tests/e2e/test_e2e_pipelines.py::TestVLMVisualAgentPayload \
+                --timeout=120 \
+                -q --tb=line
+            rc=$?
+            # rc 5 = "no tests collected" (a file whose only tests are
+            # deselected/skipped here) -- not a failure of the gate.
+            if [ "$rc" -ne 0 ] && [ "$rc" -ne 5 ]; then
+              overall=1
+              REDFILES+=( "$f (rc=$rc)" )
+              if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+                echo "::error::$f: interpreter did not exit within 600s -- a"
+                echo "::error::non-daemon thread or unclosed listener; now"
+                echo "::error::attributable to THIS file."
+              fi
+            fi
+          done
           set -e
-          if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-            echo "::error::pytest did not EXIT within 900s. The tests themselves"
-            echo "::error::finish in ~2 minutes, so this is the interpreter refusing"
-            echo "::error::to shut down - a non-daemon thread or an unclosed listener"
-            echo "::error::left behind by a test. Look for a server started in a"
-            echo "::error::fixture without a matching teardown."
+          if [ "$overall" -ne 0 ]; then
+            {
+              echo "## Python shard ${{ matrix.shard }} — red files"
+              printf '%s\n' "${REDFILES[@]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            printf '::error::red file: %s\n' "${REDFILES[@]}"
           fi
-          exit $rc
+          exit $overall
 
       # Integration + e2e — cross-module flows. Best-effort: surfaced but
       # non-blocking (they exercise live-ish paths a hermetic runner can't fully

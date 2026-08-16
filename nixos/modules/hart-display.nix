@@ -142,7 +142,12 @@ in
       # (hart-sway-tier1 also ships it, but only when swayTier1 is on; shipping it
       # here makes the display panels work on any wlr-output-management session. The
       # closure de-dupes identical store paths.)
-      environment.systemPackages = [ pkgs.wlr-randr ];
+      # brightnessctl added 2026-08-16: the wlroots tiers had NO backlight
+      # control at all (no gsd, no handler, no CLI) -- Fn+brightness dead and
+      # nothing to type either. The sway tier binds the XF86 keys to it
+      # (hart-layer-shell-host.nix); cage cannot bind keys, so the CLI is the
+      # floor's control; udev rules grant the "video" group write access.
+      environment.systemPackages = [ pkgs.wlr-randr pkgs.brightnessctl ];
 
       # FONT SCALING — env lever (GTK/WebKitGTK text DPI). Same option path
       # (environment.variables.GDK_DPI_SCALE) hart-accessibility.nix uses, written

@@ -898,6 +898,17 @@ app.run(None)
     # activation) AND mic/camera/file-picker work. Starting the portal HERE too would
     # be a parallel starter racing the wrapper's, so it is intentionally NOT exec'd
     # from this sway config (DRY: one portal starter, in the host wrapper).
+    # Hardware brightness/volume keys (2026-08-16, steward: "brightness
+    # control via the keyboard"). GNOME handles XF86 keys via gsd; the
+    # wlroots tiers had NO handler, so Fn+brightness did NOTHING in the
+    # shipped desktop. --locked keeps them working on a lock screen. The
+    # video group covers the backlight sysfs write via brightnessctl's
+    # udev/logind path (hart-admin is in "video" per hart-base).
+    bindsym --locked XF86MonBrightnessUp   exec ${pkgs.brightnessctl}/bin/brightnessctl set +10%
+    bindsym --locked XF86MonBrightnessDown exec ${pkgs.brightnessctl}/bin/brightnessctl set 10%-
+    bindsym --locked XF86AudioRaiseVolume  exec ${pkgs.pulseaudio}/bin/pactl set-sink-volume @DEFAULT_SINK@ +5%
+    bindsym --locked XF86AudioLowerVolume  exec ${pkgs.pulseaudio}/bin/pactl set-sink-volume @DEFAULT_SINK@ -5%
+    bindsym --locked XF86AudioMute         exec ${pkgs.pulseaudio}/bin/pactl set-sink-mute @DEFAULT_SINK@ toggle
     # Launch the GTK4 layer-shell host as sway's startup client. It anchors itself
     # as the BACKGROUND layer (exclusive zone 0) via gtk4-layer-shell so it is the
     # desktop, not a fullscreen app. Native toplevels (Phase 5) map above it.
