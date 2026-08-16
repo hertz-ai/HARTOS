@@ -912,7 +912,20 @@ app.run(None)
     # Launch the GTK4 layer-shell host as sway's startup client. It anchors itself
     # as the BACKGROUND layer (exclusive zone 0) via gtk4-layer-shell so it is the
     # desktop, not a fullscreen app. Native toplevels (Phase 5) map above it.
-    exec ${layerShellHost}/bin/hart-glass-shell-gtk4
+    #
+    # ...AND TAKE SWAY DOWN WITH IT (2026-08-16, real-HW black screen).
+    # The host exits on purpose when its WebKitWebProcess dies -- its own code
+    # says "exiting so the supervisor relaunches the tier". But the supervisor
+    # watches the SESSION, and the session is sway; the host is only sway's
+    # client. So when the WebKit process crashed on the steward's box
+    # (WEBKIT_WEB_PROCESS_CRASHED, 2026-08-16 17:43) the host exited exactly as
+    # designed and sway stayed up with NO client: a black screen that nothing
+    # relaunched, the precise "never linger blank" outcome the host is written
+    # to prevent. Chaining `swaymsg exit` after the host makes the host's death
+    # end the session, which is what the supervisor actually watches -- it then
+    # relaunches the tier with a fresh WebKit process (seconds), and a crash
+    # LOOP walks down the ladder by design instead of hanging on black.
+    exec ${layerShellHost}/bin/hart-glass-shell-gtk4; ${pkgs.sway}/bin/swaymsg exit
   '';
 
   sessionDesktop = pkgs.writeText "hart-glass-gtk4.desktop" ''
