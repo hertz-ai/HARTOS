@@ -17,6 +17,24 @@ import time
 import pytest
 import threading
 from unittest.mock import patch, MagicMock, PropertyMock
+
+
+def _inproc_app():
+    """Stand-in for hart_intelligence_entry.app whose in-process /chat returns
+    nothing.
+
+    dispatch_goal tries an IN-PROCESS leg first (posts /chat through the app's
+    OWN test client, skipping the loopback socket) and only falls through to
+    the pooled_post proxy these tests patch when that returns falsy. Without
+    this the in-process leg escaped into a REAL LLM call and the tests read
+    'An error occurred: Connection error.' instead of the local result. A falsy
+    in-process response IS the documented fall-through, so this arranges the
+    path under test without touching production.
+    """
+    app = MagicMock()
+    app.test_client.return_value.__enter__.return_value \
+        .post.return_value.get_json.return_value = {}
+    return app
 from datetime import datetime
 
 # ── Environment setup (before any project imports) ──
@@ -173,7 +191,7 @@ class TestDistributedDispatch:
                 with patch.dict('sys.modules', {
                     'routes.hartos_backend_adapter': None,
                     'hartos_backend_adapter': None,
-                }):
+                }), patch('hart_intelligence_entry.app', _inproc_app()):
                     result = dispatch_goal(
                         'Test prompt', 'user_1', 'goal_abc', 'marketing')
                     assert result == 'local result'
@@ -196,7 +214,7 @@ class TestDistributedDispatch:
                     with patch.dict('sys.modules', {
                         'routes.hartos_backend_adapter': None,
                         'hartos_backend_adapter': None,
-                    }):
+                    }), patch('hart_intelligence_entry.app', _inproc_app()):
                         result = dispatch_goal(
                             'Test prompt', 'user_1', 'goal_abc', 'marketing')
                         assert result == 'local result'
@@ -225,7 +243,7 @@ class TestDistributedDispatch:
                     with patch.dict('sys.modules', {
                         'routes.hartos_backend_adapter': None,
                         'hartos_backend_adapter': None,
-                    }):
+                    }), patch('hart_intelligence_entry.app', _inproc_app()):
                         result = dispatch_goal(
                             'Test prompt', 'user_1', 'goal_abc', 'marketing')
                         assert result == 'local fallback'
