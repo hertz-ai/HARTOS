@@ -84,7 +84,11 @@ fs_available() {
   fi
 
   # 3. NTFS is also fully read/write via the ntfs-3g userspace FUSE helper.
-  if [ "$_fs" = ntfs ] && have mount.ntfs; then
+  # HART_NTFS_HELPER is a TEST SEAM in the same spirit as HART_PROC_FILESYSTEMS
+  # above: the unit tests probe the "helper absent" branch, but a CI runner
+  # with real ntfs-3g installed satisfies `have mount.ntfs` through the live
+  # PATH and turns the arranged missing-case into ok. Production never sets it.
+  if [ "$_fs" = ntfs ] && have "${HART_NTFS_HELPER:-mount.ntfs}"; then
     return 0
   fi
 

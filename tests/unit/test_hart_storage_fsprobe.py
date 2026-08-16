@@ -53,6 +53,7 @@ def _write_exec(path, body):
 class HartStorageFsprobeTest(unittest.TestCase):
 
     def setUp(self):
+        self._ntfs_stubbed = False
         self.tmp = tempfile.mkdtemp(prefix="hart-fsprobe-test-")
         self.bindir = os.path.join(self.tmp, "bin")
         os.makedirs(self.bindir)
@@ -90,6 +91,7 @@ class HartStorageFsprobeTest(unittest.TestCase):
         _write_exec(os.path.join(self.bindir, "modinfo"), body)
 
     def _add_mount_ntfs(self):
+        self._ntfs_stubbed = True
         """Presence of the ntfs-3g FUSE mount helper (the probe only `command -v`s it)."""
         _write_exec(os.path.join(self.bindir, "mount.ntfs"), "#!/bin/sh\nexit 0\n")
 
@@ -100,6 +102,12 @@ class HartStorageFsprobeTest(unittest.TestCase):
         # (grep/printf) still resolve later on PATH.
         env["PATH"] = self.bindir + os.pathsep + env.get("PATH", "")
         env["HART_PROC_FILESYSTEMS"] = self.procfs
+        # Hermetic ntfs-helper lookup (mirrors the PROCFS seam): the probe must
+        # see the helper ONLY when the test stubbed it, never the runner's real
+        # ntfs-3g (which made every arranged missing-case read ok on CI).
+        env.setdefault("HART_NTFS_HELPER",
+                       "mount.ntfs" if self._ntfs_stubbed
+                       else "hart-test-helper-absent")
         proc = subprocess.run(
             [_SH, _SCRIPT, *[str(a) for a in args]],
             env=env, capture_output=True, text=True, timeout=60)
