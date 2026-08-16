@@ -24,6 +24,13 @@ clickhouse-connect==0.6.4
 cmake==3.26.4
 colorama==0.4.6
 cryptography==43.0.0
+# autobahn (+ its txaio dep) is a MODULE-SCOPE import of production code
+# (reuse_recipe.py / create_recipe.py: `import txaio; txaio.use_asyncio()`
+# before autobahn) -- it was never declared here, so every dev box happened
+# to have it while the CI runner did not, and the whole WAMP-adjacent test
+# family failed collection there (gate run 31938229518). A hard production
+# import must be a declared dependency.
+autobahn==26.7.1
 coloredlogs==15.0.1
 config==0.5.1
 crossbarhttp3==1.1
