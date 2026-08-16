@@ -203,6 +203,54 @@ class ModelEntry:
         filtered = {k: v for k, v in d.items() if k in known}
         return cls(**filtered)
 
+    # Backends whose models are FETCHED as weight files.  Only these need
+    # the download fields below; an `api` / `in_process` model has nothing
+    # to download and must not be blocked by the rule.
+    _DOWNLOADED_BACKENDS = ('llama.cpp',)
+
+    def validate(self) -> list:
+        """Return a list of reasons this entry can never work, [] if sound.
+
+        Registering an entry that cannot be downloaded is worse than
+        refusing it: the caller sees success, the row persists, and the
+        failure only surfaces later somewhere unrelated.
+
+        2026-08-15 live: an entry was accepted with files={} and
+        repo_id='unsloth/Qwen3.8-27B-UD-Q4_K_XL.gguf' (a FILE name, not a
+        repo).  POST /api/admin/models returned 200 {"success": true} and
+        persisted it; the download then failed for the rest of the
+        install's life with
+
+            LLM download: no preset for Qwen3.8-27B-UD-Q4_K_XL.gguf
+
+        because Nunba's models/orchestrator.py::_entry_to_preset returns
+        None precisely when files['model'] is empty.  This method moves
+        that consumer-side requirement up to the producer, so the same
+        invariant is enforced once, wherever an entry is created (admin
+        register, hub install, catalog populator).
+        """
+        problems = []
+        if not self.id:
+            problems.append('id is required')
+        if not self.model_type:
+            problems.append('model_type is required')
+
+        if self.backend in self._DOWNLOADED_BACKENDS:
+            if not (self.files or {}).get('model'):
+                problems.append(
+                    f"files['model'] is required for backend "
+                    f"'{self.backend}' - without the weight file name the "
+                    f"model can never be downloaded or loaded")
+            # A HuggingFace repo id is 'org/repo'.  It never names a
+            # weight file, so a '.gguf' suffix means the file name was
+            # pasted where the repo belongs and can never resolve.
+            repo = (self.repo_id or '').strip()
+            if repo.lower().endswith(('.gguf', '.bin', '.safetensors')):
+                problems.append(
+                    f"repo_id '{repo}' looks like a FILE, not a repository "
+                    f"('org/repo') - put the file name in files['model']")
+        return problems
+
     def matches_compute(self, budget_vram_gb: float, budget_ram_gb: float,
                         gpu_available: bool) -> str:
         """Check if this model can run given current compute.
