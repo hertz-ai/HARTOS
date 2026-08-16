@@ -23,6 +23,24 @@ from sqlalchemy.orm import sessionmaker
 
 from integrations.social.models import Base, Product, AgentGoal, User
 
+# ── Deterministic schema against the tenant filter's runtime mutation ──
+# integrations.social.tenant_filter augments the SHARED Base.metadata at
+# runtime (append_column('tenant_id') + mapper.add_property) when anything in
+# this process initialises the social stack. That made THIS file's verdicts
+# order-dependent: if a test triggered the augmentation after the session
+# `engine` fixture's create_all, the users table existed WITHOUT tenant_id
+# while the mapper stamped it on INSERT -> "table users has no column named
+# tenant_id" (6 ERRORs + 2 FAILs, gate run 31938229518, reproduced locally).
+# Pre-adding the COLUMN to the metadata (guarded, DDL-only -- inserts carry it
+# only once the mapper property exists, and by then the column is there in
+# both orders) makes create_all deterministic. Same column spec as
+# tenant_filter's own append_column.
+from sqlalchemy import Column, String as _TenantStr
+for _cls in (User, Product, AgentGoal):
+    if 'tenant_id' not in _cls.__table__.c:
+        _cls.__table__.append_column(
+            Column('tenant_id', _TenantStr(64), nullable=True, index=True))
+
 
 # ─── Fixtures ───
 

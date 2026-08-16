@@ -483,7 +483,7 @@ class TestFileTracker:
             f.write("Content")
 
         # Use sync instead of watch to reliably record changes
-        asyncio.get_event_loop().run_until_complete(tracker.sync(watch_dir))
+        asyncio.run(tracker.sync(watch_dir))
 
         changes = tracker.get_changes(since=before)
 
@@ -501,7 +501,7 @@ class TestFileTracker:
                 f.write(f"Content {i}")
 
         # Sync to populate database
-        asyncio.get_event_loop().run_until_complete(tracker.sync(watch_dir))
+        asyncio.run(tracker.sync(watch_dir))
 
         files = tracker.get_tracked_files()
 
@@ -533,7 +533,7 @@ class TestFileTracker:
 
         # If watcher didn't catch it, use sync as fallback
         if len(changes) == 0:
-            asyncio.get_event_loop().run_until_complete(tracker.sync(watch_dir))
+            asyncio.run(tracker.sync(watch_dir))
             # After sync, callback should have been called
             assert len(changes) >= 1 or len(tracker.get_changes(since=datetime.utcnow() - timedelta(seconds=2))) >= 1
         else:
