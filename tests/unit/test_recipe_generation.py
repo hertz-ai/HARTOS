@@ -459,7 +459,11 @@ class TestModeSwitching:
 
     def test_database_update_before_mode_switch(self, test_prompt_id):
         """Test database is updated before mode switch"""
-        with patch('create_recipe.requests.patch') as mock_patch:
+        # create_recipe migrated off the bare `requests` module to the pooled
+        # HTTP client (core.http_pool.pooled_patch), so patching
+        # create_recipe.requests.patch died with AttributeError instead of
+        # intercepting the call. Patch the function the code actually calls.
+        with patch('create_recipe.pooled_patch') as mock_patch:
             mock_patch.return_value.status_code = 200
 
             try:
