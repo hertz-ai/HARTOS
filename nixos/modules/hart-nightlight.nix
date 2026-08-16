@@ -98,7 +98,21 @@ in
     # ── Systemd user service ──
     systemd.user.services.hart-nightlight = {
       description = "HART OS Night Light";
-      wantedBy = [ "graphical-session.target" ];
+      # AUTOSTART ONLY WHEN THE CONFIG CAN ACTUALLY SCHEDULE (2026-08-16).
+      # The ExecStart fallback below is `-O <night-temp>` -- a one-shot "warm
+      # NOW". At the shipped defaults (mode=sunset, latitude=0.0 = unset) the
+      # sunset branch is unreachable, so every graphical session started in
+      # PERMANENT 4500K night mode: a visibly dimmer, yellow screen from
+      # boot, day or night (steward hit this on the box 2026-08-15: "did we
+      # reduce the brightness"). It went unnoticed for weeks because the
+      # sway/cage tiers never activated graphical-session.target; the first
+      # tier that did switched night mode on around the clock. An unschedul-
+      # able config now means NO autostart -- the hart-nightlight CLI keeps
+      # working for deliberate on/off/temp -- instead of always-night.
+      wantedBy = lib.optionals
+        (cfg.schedule.mode == "manual"
+         || (cfg.schedule.mode == "sunset" && cfg.latitude != 0.0))
+        [ "graphical-session.target" ];
       partOf = [ "graphical-session.target" ];
       serviceConfig = {
         ExecStart = let
