@@ -210,7 +210,18 @@ class TestGatherInfo:
     def test_gather_info_raises_without_autogen(self):
         """gather_info raises ImportError when autogen is not installed."""
         from gather_agentdetails import gather_info
-        with patch('gather_agentdetails.autogen', None):
+
+        # `autogen` is a LAZY MODULE that never yields None (the module says so
+        # where it guards: the old `if autogen is None` check would silently
+        # stop guarding). Its real failure shape is ImportError raised on first
+        # attribute touch, which the code converts into the install hint --
+        # patching it to None instead produced AttributeError and tested a
+        # condition that cannot happen.
+        class _MissingAutogen:
+            def __getattr__(self, name):
+                raise ImportError("No module named 'autogen'")
+
+        with patch('gather_agentdetails.autogen', _MissingAutogen()):
             with pytest.raises(ImportError, match="pyautogen"):
                 gather_info("user1", "Build a weather bot", "prompt1")
 
@@ -250,7 +261,11 @@ class TestGatherInfo:
 
             # Verify autonomous instructions were added to system message
             sys_msg = mock_autogen.AssistantAgent.call_args[1]['system_message']
-            assert "AUTONOMOUS MODE" in sys_msg
+            # The "AUTONOMOUS MODE" banner was replaced by the instructions
+            # themselves (the prompt now spells out the behaviour instead of
+            # naming a mode). Assert the BEHAVIOUR the mode exists to produce.
+            assert "NEVER ask questions" in sys_msg, sys_msg[:200]
+            assert "NEVER request user input" in sys_msg, sys_msg[:200]
             assert "weather bot" in sys_msg
 
     def test_create_agents_interactive_mode(self):
@@ -876,11 +891,18 @@ class TestAgentLedger:
         assert "seed_goal_1" in ledger.tasks
         assert ledger.tasks["seed_goal_1"].context["goal_type"] == "proactive_monitoring"
 
-    def test_get_default_llm_client(self):
-        """get_default_llm_client returns an OpenAI-compatible client."""
+    def test_get_default_llm_client_is_removed(self):
+        """The ledger is framework-agnostic: it bundles NO default LLM client.
+
+        get_default_llm_client() was deliberately turned into a loud
+        NotImplementedError that tells the caller to pass llm_client=, rather
+        than quietly constructing an OpenAI-shaped client the ledger has no
+        business owning. Assert the removal contract AND that the message
+        still points at the fix.
+        """
         from helper_ledger import get_default_llm_client
-        client = get_default_llm_client()
-        # Just verify it doesn't crash
+        with pytest.raises(NotImplementedError, match="llm_client"):
+            get_default_llm_client()
 
 
 # ===========================================================================
@@ -896,15 +918,21 @@ class TestLifecycleHooks:
         action_states.clear()
         initialize_deterministic_actions()
 
-    def test_action_state_enum_has_all_15_states(self):
-        """ActionState enum must have exactly 15 states."""
+    def test_action_state_enum_has_all_states(self):
+        """ActionState enum must hold exactly the known states.
+
+        GAVE_UP (16) joined deliberately (#139): a force-abandoned terminal for
+        stalled/unverified work -- an HONEST failure (ledger FAILED), NOT a
+        verified success like TERMINATED -- and re-openable so a hive peer can
+        retry. Pinning 15 made that honesty a red test.
+        """
         from lifecycle_hooks import ActionState
-        assert len(ActionState) == 15
+        assert len(ActionState) == 16
         expected = {"assigned", "in_progress", "status_verification_requested",
                     "completed", "pending", "error", "fallback_requested",
                     "fallback_received", "recipe_requested", "recipe_received",
                     "terminated", "executing_motion", "sensor_confirm",
-                    "preview_pending", "preview_approved"}
+                    "preview_pending", "preview_approved", "gave_up"}
         actual = {s.value for s in ActionState}
         assert actual == expected
 
