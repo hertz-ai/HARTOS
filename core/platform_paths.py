@@ -235,13 +235,44 @@ def resolve_recipe_prompts_dir(override: str = None) -> str:
 
 
 def get_log_dir() -> str:
-    """Return the platform-appropriate log directory."""
-    if _IS_WINDOWS:
-        return os.path.join(get_data_dir(), 'logs')
-    elif _IS_MACOS:
-        return os.path.expanduser('~/Library/Logs/Nunba')
+    """Return the platform-appropriate log directory.
+
+    PROVENANCE SEPARATION — an INSTALLED (frozen) build and a developer
+    `python main.py` run get DIFFERENT roots.
+
+    Why (2026-08-16): both resolved here, so a dev run and the installed
+    Nunba.exe appended to the SAME server.log/gui_app.log.  One traceback
+    in that file drew frames from the dev repo AND the installed bundle,
+    which made every log-based diagnosis ambiguous and produced two false
+    root-cause reports before the collision itself was noticed.
+
+    NOTHING IS DROPPED by this split: every writer still writes
+    everything it wrote before.  Only the ROOT differs, by provenance —
+    so the two streams stop interleaving and each stays complete.
+
+    The INSTALLED build keeps the documented `logs/` path, so shipped
+    installs, support docs and log-collection tooling are unaffected;
+    only the dev run is diverted to `logs-dev/`.
+
+    NUNBA_LOG_DIR overrides both — the explicit escape hatch for CI,
+    tests, and operators who want the files somewhere else entirely.
+    """
+    override = os.environ.get('NUNBA_LOG_DIR', '').strip()
+    if override:
+        return override
+
+    if _IS_MACOS:
+        base = os.path.expanduser('~/Library/Logs/Nunba')
     else:
-        return os.path.join(get_data_dir(), 'logs')
+        # Windows + Linux both nest under the data dir.
+        base = os.path.join(get_data_dir(), 'logs')
+
+    # sys.frozen is set by cx_Freeze in the shipped build and is absent
+    # from every source run — the one discriminator that needs no config
+    # and cannot drift out of sync with how the app was started.
+    if not getattr(sys, 'frozen', False):
+        base += '-dev'
+    return base
 
 
 def get_memory_graph_dir(session_key: str = '') -> str:
