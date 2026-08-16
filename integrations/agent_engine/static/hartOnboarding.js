@@ -349,19 +349,54 @@
         focusEl(c[next]);
       }
     });
+    probe(0);
+  }
+
+  // BOUNDED RETRY, NOT ONE-SHOT (2026-08-16 — real-HW regression).
+  // The probe used to run exactly once at DOMContentLoaded and give up silently
+  // on any failure. The shell paints in SECONDS; the backend behind these
+  // endpoints imports the ML stack first and legitimately takes MINUTES on slow
+  // media (hart-backend.nix pins TimeoutStartSec=600 and documents ~170s of
+  // imports, "far slower on USB"). So on a real boot the ceremony asked before
+  // the backend could answer, returned silently, and never asked again: no
+  // "Light Your HART" screen, and therefore no first-run password setup after
+  // it (hartSessionUI.js) and no lock password. Both screens vanished, on a
+  // machine where everything was actually working — it was a RACE, not state.
+  // Retry on the not-ready answers only, keeping every existing guarantee:
+  // never block the desktop, and never open the overlay unless /start returned
+  // real content to render.
+  var PROBE_EVERY_MS = 5000, PROBE_MAX = 90;   // ~7.5 min, covers a cold USB boot
+
+  function reprobe(attempt, why) {
+    if (attempt + 1 >= PROBE_MAX) {
+      console.debug('hartOnboarding: backend never became ready; giving up', why);
+      return;
+    }
+    setTimeout(function () { probe(attempt + 1); }, PROBE_EVERY_MS);
+  }
+
+  function probe(attempt) {
     api('/api/onboarding/status?user_id=' + USER).then(function (st) {
       if (st && st.onboarded) return;             // already lit — no ceremony
+      if (!st) return reprobe(attempt, 'status empty');
       // Reveal the (full-screen, z-12000 modal) overlay ONLY once /start returns
       // content to render. Otherwise a backend hiccup leaves an INVISIBLE
       // full-screen overlay over the desktop that silently eats EVERY click
       // ("no button works"). If start fails or is empty, never show it — the
       // desktop stays fully interactive.
       api('/api/onboarding/start', 'POST', { user_id: USER }).then(function (resp) {
-        if (!resp || resp.already_onboarded || resp.onboarded) return;
+        if (resp && (resp.already_onboarded || resp.onboarded)) return;
+        if (!resp) return reprobe(attempt, 'start empty');
         show();
         handle(resp);
-      }).catch(function (e) { console.debug('hartOnboarding: /start failed (never block desktop)', e); });
-    }).catch(function (e) { console.debug('hartOnboarding: /status unreachable (never block desktop)', e); });
+      }).catch(function (e) {
+        console.debug('hartOnboarding: /start failed (never block desktop)', e);
+        reprobe(attempt, e);
+      });
+    }).catch(function (e) {
+      console.debug('hartOnboarding: /status unreachable (never block desktop)', e);
+      reprobe(attempt, e);
+    });
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
