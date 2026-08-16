@@ -144,13 +144,33 @@ LLM in the loop via `HEVOLVE_TEST_LLM_JUDGE=1`.
 `inspect.getsource` — that is a source-code test and violates B6.
 Replace with a runtime assertion against a real response.
 
-### P4 — Ledger records WHY (C9)
-`lifecycle_hooks.py:257-264` sets `set_blocked_reason` for BLOCKED and
-**nothing** for FAILED — the asymmetry is the bug, and it is why
-`failure_reason` is 0/1000 while `blocked_reason` is 44/1000.
-Symmetric fix at the same canonical site.
+### P4 — Ledger records WHY (C9) — DONE `3520d7aa`
+`lifecycle_hooks.py` set `set_blocked_reason` for BLOCKED and **nothing**
+for FAILED.  `failure_reason` 0/1000 vs `blocked_reason` 44/1000, and
+`Task.set_failure_reason()` had **zero callers in the whole tree** — a
+setter written and never wired.  Symmetric branch added at the same
+site; `FailureReason` gained `ABANDONED` in its canonical home for the
+GAVE_UP case (nothing threw, retries were not the limit, so neither
+ERROR nor MAX_RETRIES_EXCEEDED is true).  5 tests in the EXISTING
+`TestAutoSyncToLedger`; proven red pre-fix by reverting only the source.
 
-### P5 — Full regression (B2) + push (A13)
+### P5 — Full regression (B2) + push (A13) — DONE
+
+**Result: 20 failed / 174 passed / 211 skipped, ALL 20 pre-existing.**
+Proven, not assumed: `tests/e2e/test_e2e_pipelines.py` run ALONE — with
+the new journey file absent — reproduces 19 of them (19 failed / 62
+passed).  Both sampled failures PASS individually, so the file corrupts
+its own process: 16× `cv2.dnn has no attribute 'DictValue'` and 2×
+`torch ... already has a docstring` (a double-import under two module
+identities — the shadow-module family, not ordering).  Tracked as #655.
+
+Two tooling traps re-confirmed here, both mine:
+- `cmd | tail; echo $?` reports **tail's** status.  The regression
+  printed `exited with code 0` while pytest had 20 failures.
+- I grepped the captured output for my own modules, got 0, and nearly
+  read that as exoneration — but the capture was 27 summary lines with
+  **no tracebacks at all**.  A check that cannot fail is not a check.
+  The real attribution came from re-running the file without my code.
 
 ### Deferred, explicitly NOT silently dropped
 C8 (`APITimeoutError`), C13 (model P2P/federation sync), the #460
