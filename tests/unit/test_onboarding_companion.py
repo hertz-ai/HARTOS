@@ -31,7 +31,7 @@ import hart_onboarding as ho
 def _fake_curl_writes(nbytes):
     """A subprocess.run replacement that 'downloads' nbytes to the -o target
     file and reports success (returncode 0)."""
-    def _run(cmd, timeout=None, capture_output=False):
+    def _run(cmd, timeout=None, capture_output=False, **kwargs):  # **kwargs: no_window_kwargs() joined the call
         out = None
         for i, a in enumerate(cmd):
             if a == '-o' and i + 1 < len(cmd):
@@ -90,7 +90,7 @@ def test_run_download_offline_on_bad_returncode(monkeypatch, tmp_path):
     target = str(tmp_path / 'app.AppImage')
     monkeypatch.setattr(ho, '_probe_total_size', lambda url, timeout=20: 0)
 
-    def _fail(cmd, timeout=None, capture_output=False):
+    def _fail(cmd, timeout=None, capture_output=False, **kwargs):  # **kwargs: no_window_kwargs() joined the call
         return types.SimpleNamespace(returncode=22, stdout=b'', stderr=b'404')
 
     monkeypatch.setattr(subprocess, 'run', _fail)
@@ -107,7 +107,7 @@ def test_run_download_error_when_curl_missing(monkeypatch, tmp_path):
     target = str(tmp_path / 'app.AppImage')
     monkeypatch.setattr(ho, '_probe_total_size', lambda url, timeout=20: 0)
 
-    def _missing(cmd, timeout=None, capture_output=False):
+    def _missing(cmd, timeout=None, capture_output=False, **kwargs):  # **kwargs: no_window_kwargs() joined the call
         raise FileNotFoundError('curl')
 
     monkeypatch.setattr(subprocess, 'run', _missing)
@@ -122,7 +122,7 @@ def test_run_download_error_on_timeout(monkeypatch, tmp_path):
     target = str(tmp_path / 'app.AppImage')
     monkeypatch.setattr(ho, '_probe_total_size', lambda url, timeout=20: 0)
 
-    def _to(cmd, timeout=None, capture_output=False):
+    def _to(cmd, timeout=None, capture_output=False, **kwargs):  # **kwargs: no_window_kwargs() joined the call
         raise subprocess.TimeoutExpired(cmd, timeout)
 
     monkeypatch.setattr(subprocess, 'run', _to)
