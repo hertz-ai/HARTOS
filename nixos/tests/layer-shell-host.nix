@@ -327,6 +327,15 @@ in
           conf_src = host.succeed("cat " + sway_conf)
           assert "hart-glass-shell-gtk4" in conf_src, \
               "Tier-2 sway host config does not exec the hart-glass-shell-gtk4 host binary"
+          # NEVER LINGER BLANK (2026-08-16 real-HW): the host exits when its
+          # WebKitWebProcess dies, but the supervisor watches the SESSION (sway),
+          # not the host. Without chaining sway's exit to the host's, a WebKit
+          # crash left sway up with NO client -- a black screen nothing
+          # relaunched. Pin the chain so it cannot be dropped again.
+          assert "swaymsg exit" in conf_src, \
+              ("Tier-2 sway host config does not end the session when the shell "
+               "host exits -- a WebKit crash would leave sway running with no "
+               "client (black screen, no relaunch)")
     '';
   };
 
