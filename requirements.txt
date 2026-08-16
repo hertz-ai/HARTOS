@@ -31,6 +31,13 @@ cryptography==43.0.0
 # family failed collection there (gate run 31938229518). A hard production
 # import must be a declared dependency.
 autobahn==26.7.1
+# pyautogen: production imports `autogen` (core/labeled_autogen_function.py
+# at module scope; create_recipe lazily). It was only ever satisfied by a
+# LOOSE VENDORED autogen-0.2.37/ directory that was never committed, so
+# every fresh checkout (CI included) failed. 0.2.37 was never published to
+# PyPI under any name (pyautogen tops out at 0.2.35 in that line); 0.2.35
+# is the same 0.2 API and the full autogen test family passes against it.
+pyautogen==0.2.35
 coloredlogs==15.0.1
 config==0.5.1
 crossbarhttp3==1.1

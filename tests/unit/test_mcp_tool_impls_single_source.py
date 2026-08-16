@@ -23,6 +23,13 @@ import json
 import asyncio
 from unittest.mock import patch, MagicMock
 
+import pytest
+# The stdio MCP transport is optional BY DESIGN (mcp_server raises a helpful
+# ImportError; the HTTP bridge needs no install). Skip where absent; checked
+# at the exact submodule because an unrelated package can squat `mcp`.
+pytest.importorskip('mcp.server.fastmcp',
+    reason='optional stdio MCP transport not installed (pip install mcp)')
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
