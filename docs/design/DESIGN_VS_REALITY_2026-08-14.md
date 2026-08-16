@@ -44,15 +44,41 @@ reality; the Q-backlog remains the feature-level worklist.
 
 ## 3. Broken or gapped vs design — open, ranked
 
-1. **Release gate RED → no image can ship.** Pre-existing test failures (not
-   from tonight's work): draft-first chat route regex vs
-   hart_intelligence_entry.py, orb-docked opacity, optional `mcp` import in a
-   gate test, ai_sensing fail-closed exit-code test. Until green, every fix in
-   section 2 exists only in git.
+1. **Release gate — WORKED THROUGH 2026-08-16.** 25 red families were
+   enumerated and fixed (see the `test(gate)` / `fix(gate)` commits between
+   268c90c and 3aaa9e2). The composition is the finding: exactly ONE
+   production logic bug (dispatch.is_current_request_autonomous treated a
+   missing request_id as autonomous — the unsafe direction), ONE real
+   user-facing race (the onboarding probe, below), TWO undeclared
+   dependencies production imported anyway (autobahn, pyautogen), and 21
+   guards that had outlived their world: hardened security defaults the
+   tests never arranged, a designed dedup wire-stamp byte-compared against
+   pre-stamp literals, sharpened error messages grepped by their old vague
+   wording, runtime schema mutation racing table creation, and runner
+   environments leaking through test seams.
+   The REFEREE was reformed alongside (962bcf9): each test FILE now runs in
+   its own interpreter (cross-file pollution decided verdicts before —
+   test_auth_local_csrf 11 red / test_remote_desktop_cli 9 errors both pass
+   perfectly alone), red files land in the job summary + annotations, the VM
+   fleet waits on the Python verdict instead of burning ~4 runner-hours
+   after the run is already decided, and nightlies stamp the gate verdict in
+   their release notes so a red-gated preview is visible at download time.
 2. **Tier-1 hart-comp has never run on real hardware.** The latch carried
    sway/cage from GPU-less VM boots; now cleared. The box boot is the test.
    Design also promises latched-tier surfacing + `hartctl session reset-tier`;
    tonight required manual latch surgery — verify the designed reset path.
+2b. **Onboarding + first-run password screens never appeared (FIXED
+   e34486a).** hartOnboarding.js probed /api/onboarding/status + /start
+   exactly ONCE at DOMContentLoaded and gave up silently on failure. The
+   shell paints in seconds; the backend behind those endpoints imports the
+   ML stack first and takes minutes on this hardware (hart-backend.nix pins
+   TimeoutStartSec=600, documents ~170s, "far slower on USB"). So the
+   ceremony asked before the backend could answer and never asked again —
+   and because hartSessionUI.js adds the first-run password SETUP right
+   after the ceremony, BOTH screens vanished on a fully healthy machine. Now
+   a bounded retry (5s x 90) in the codebase's own documented
+   "bounded retry, not one-shot" idiom; the invisible-overlay guard stands.
+
 3. **Wi-Fi persistence gap.** state-persist's design names NetworkManager
    keyfiles as a persisted path, but the password entered via the shell UI on
    real HW left `/etc/NetworkManager/system-connections/` EMPTY. Find where
