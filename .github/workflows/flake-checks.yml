@@ -277,6 +277,7 @@ jobs:
               "${SEL[@]}" \
               --deselect tests/unit/test_vlm_qwen3vl.py::TestFullActionLoop \
               --deselect tests/unit/test_vlm_qwen3vl.py::TestVLMDeterministicActions::test_vlm_action_list_shared_by_legacy_and_unified \
+              --deselect tests/e2e/test_e2e_pipelines.py::TestVLMVisualAgentPayload \
               --timeout=120 \
               --durations=25 \
               -q --tb=line

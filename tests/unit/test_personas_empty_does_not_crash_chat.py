@@ -69,7 +69,13 @@ def _import_reuse_recipe():
     from unittest.mock import MagicMock
 
     added = []
-    for name in ('autobahn', 'autobahn.asyncio', 'autobahn.asyncio.component'):
+    # txaio joined the list when reuse_recipe grew `import txaio;
+    # txaio.use_asyncio()` at module scope (line ~108) -- same optional-WAMP
+    # family, same stub treatment (use_asyncio() on a MagicMock is a no-op).
+    # Without it, every test here fails collection on a runner without the
+    # WAMP stack installed (gate run 31828127465, all 7 tests).
+    for name in ('autobahn', 'autobahn.asyncio', 'autobahn.asyncio.component',
+                 'txaio'):
         if name not in sys.modules:
             m = MagicMock()
             m.__spec__ = types.SimpleNamespace()
