@@ -25,6 +25,13 @@ import importlib.util as ilu
 
 import pytest
 
+# The armor loader round-trips through the hevolvearmor NATIVE extension. A
+# runner whose install skipped building it (CI does `pip install -e .
+# --no-deps` without the ext toolchain) cannot execute the round-trip at all:
+# skip honestly rather than fail on the missing binary.
+pytest.importorskip('hevolvearmor._native',
+    reason='hevolvearmor native extension not built in this environment')
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 

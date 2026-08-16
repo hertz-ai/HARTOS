@@ -69,7 +69,7 @@ class TestEmptyGPTAPIGuard:
              patch('hart_intelligence_entry.GPT_API', ''), \
              patch('hart_intelligence_entry.app', mock_app), \
              patch('hart_intelligence_entry.time') as mock_time, \
-             patch('hart_intelligence_entry.encoding') as mock_enc, \
+             patch('hart_intelligence_entry.encoding', create=True) as mock_enc, \
              patch('hart_intelligence_entry.thread_local_data') as mock_tld:
             mock_time.time.return_value = 1000.0
             mock_enc.encode.return_value = [1, 2, 3]
@@ -92,7 +92,7 @@ class TestEmptyGPTAPIGuard:
              patch('hart_intelligence_entry.GPT_API', 'http://localhost:8080/chat/completions'), \
              patch('hart_intelligence_entry.app', mock_app), \
              patch('hart_intelligence_entry.time') as mock_time, \
-             patch('hart_intelligence_entry.encoding') as mock_enc, \
+             patch('hart_intelligence_entry.encoding', create=True) as mock_enc, \
              patch('hart_intelligence_entry.thread_local_data') as mock_tld:
             mock_time.time.return_value = 1000.0
             mock_enc.encode.return_value = [1, 2, 3]
