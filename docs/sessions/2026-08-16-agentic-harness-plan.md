@@ -172,9 +172,49 @@ Two tooling traps re-confirmed here, both mine:
   **no tracebacks at all**.  A check that cannot fail is not a check.
   The real attribution came from re-running the file without my code.
 
+### C8 — `openai.APITimeoutError` — NOT REPRODUCIBLE, do not "fix"
+
+I filed this as "16x APITimeoutError, fix it".  Re-checked today and
+**I cannot reproduce it**, so there is nothing to fix yet:
+
+| Search | Result |
+|---|---|
+| all `~/Documents/Nunba/logs` incl. rotated `.log.1` | **0** occurrences |
+| `HARTOS/logs` | 0 |
+| `git grep APITimeoutError` in HARTOS `*.py` | not referenced |
+| `git grep APITimeoutError` in Nunba `*.py` | not referenced |
+| positive control: `Traceback` in same logs | **4,906** |
+| positive control: `openai` in HARTOS source | found |
+
+Both controls pass, so the search machinery is sound and the zeros are
+real absence rather than a dead pattern (the `grep -E` `\|` lesson).
+Either the occurrences rotated out of retention, or my original count
+came from a window I no longer hold.  Either way, acting now would mean
+writing a fix for a phantom — the #620 pattern.
+
+NOT a claim that it never happened.  To act on it we need a fresh
+capture: the exception is raised by the `openai` SDK itself, so it can
+only be attributed from a live traceback naming the call site.
+
+Also worth noting but NOT concluded: `APITimeoutError` being unreferenced
+does **not** prove it is unhandled — a surrounding `except Exception`
+would still catch it.  That distinction needs checking at the real call
+seam before anyone files it as a gap.
+
 ### Deferred, explicitly NOT silently dropped
-C8 (`APITimeoutError`), C13 (model P2P/federation sync), the #460
-langchain probe fix, and the un-pinned daemon root cause (C11).
+C13 (model P2P/federation sync), the #460 langchain probe fix (in
+progress — the port literal is already resolved via `port_registry`;
+the REAL defect is that the probe unconditionally HTTP-dials a port that
+does not exist in bundled mode, where langchain is in-process), and the
+un-pinned daemon root cause (C11).
+
+### Live ledger, re-measured
+`completed` moved +35 and `pending` +432 between two readings, then
+**zero** terminal transitions across a 60s window.  So the engine is not
+dead — it works in bursts and the queue grows ~12:1 faster than it
+drains.  This also RETRACTS my earlier "nothing completed in 14 hours",
+which was a sampling artifact: `limit=1000` per status against 1,300
+completed rows could never have shown the newest ones.
 
 ---
 
