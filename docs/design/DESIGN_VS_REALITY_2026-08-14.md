@@ -79,10 +79,20 @@ reality; the Q-backlog remains the feature-level worklist.
    a bounded retry (5s x 90) in the codebase's own documented
    "bounded retry, not one-shot" idiom; the invisible-overlay guard stands.
 
-3. **Wi-Fi persistence gap.** state-persist's design names NetworkManager
-   keyfiles as a persisted path, but the password entered via the shell UI on
-   real HW left `/etc/NetworkManager/system-connections/` EMPTY. Find where
-   the shell's Wi-Fi flow writes credentials; until then every boot re-asks.
+3. **Wi-Fi persistence — NOT a gap (my error, corrected 2026-08-16).** The
+   credentials DO persist: the box holds
+   `/etc/NetworkManager/system-connections/Lawliet-Giga.nmconnection` dated
+   exactly when the steward typed the password, and the box is on Wi-Fi now.
+   The original "EMPTY" reading was taken inside the QEMU VM, not on the box,
+   and attributed to the box. On a raw-image install the whole root is
+   writable, so NM keyfiles persist without any help.
+   What IS inert here: `hart-state-persist` logs
+   `DECISION=NOOP reason=no 'HARTSTATE'` every boot, because
+   hart-repart-image.nix builds ESP + root only — there is no HARTSTATE
+   partition on a raw image. That module exists for the read-only LIVE ISO
+   case; on the installed image its job is already done by the writable root.
+   Decide: create the partition for raw images too, or scope the module to
+   the ISO and stop logging a NOOP that reads like a failure.
 4. **Copilot daemon config is decorative.** The daemon reads no env vars;
    the unit's `HART_COPILOT_BACKEND/REPO/STOP` settings are inert (python
    constants win). Also unverified on-image: `claude` binary + authed `gh`
