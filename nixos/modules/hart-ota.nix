@@ -448,7 +448,20 @@ in
                   REMOTE_REV="$C_COMMIT"
                   [[ -n "$C_FLAKE" && "$C_FLAKE" != "null" ]] && SWITCH_FLAKE="$C_FLAKE"
                   echo "[HART OTA] CENTRAL approved rev=$REMOTE_REV flake=$SWITCH_FLAKE"
+                else
+                  # REACHED CENTRAL, but the channel carries no release. This is
+                  # NOT "central unavailable" -- saying so sends whoever reads
+                  # this log to debug the network instead of the empty channel
+                  # (it cost a real debugging detour 2026-08-16: central was
+                  # serving 200 the whole time with
+                  # {"commit":"","flake_ref":"","published_at":null} on EVERY
+                  # channel, because nothing has ever been published to it --
+                  # /api/ota/publish is account-gated and no CI job calls it).
+                  CENTRAL_EMPTY=1
+                  echo "[HART OTA] CENTRAL reachable but channel '${ota.channel}' has NO published release"
                 fi
+              else
+                echo "[HART OTA] CENTRAL unreachable (no response from $CENTRAL)"
               fi
             fi
 
@@ -456,7 +469,11 @@ in
             # (keeps an air-gapped / central-unreachable node updatable; central
             #  stays the primary source of truth when present).
             if [[ "$REMOTE_REV" == "check_failed" ]]; then
-              echo "[HART OTA] CENTRAL unavailable, falling back to flake: ${ota.flakeRef}"
+              if [[ "''${CENTRAL_EMPTY:-0}" == "1" ]]; then
+                echo "[HART OTA] no central release; falling back to flake: ${ota.flakeRef}"
+              else
+                echo "[HART OTA] CENTRAL unavailable, falling back to flake: ${ota.flakeRef}"
+              fi
               REMOTE_REV=$(${pkgs.nix}/bin/nix flake metadata "${ota.flakeRef}" --json 2>/dev/null \
                 | ${pkgs.jq}/bin/jq -r '.revision // "unknown"') || REMOTE_REV="check_failed"
             fi
