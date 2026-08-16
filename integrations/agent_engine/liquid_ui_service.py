@@ -7072,21 +7072,36 @@ function renderAgentOverlay(ev) {{
             text = data.get('text', '').strip()
             if not text:
                 return jsonify({'error': 'No text provided'})
-            import requests as req
             # M1 — INTENT → DECOMPOSE → COMPOSE.  Route free-form intent through
             # the brain's EXISTING intent classifier (/chat → CREATE/REUSE/tool/
             # vision/casual — no parallel path) and COMPOSE the result onto the
             # desktop as an A2UI card pushed through agent_ui_update (the now-wired
             # B1/B2 push channel), instead of only narrating a chat bubble.  The
             # reply text is still returned so casual chat keeps speaking.
+            #
+            # THE DESKTOP INTENT BAR IS A USER TURN, AND MUST SAY SO.  This used to
+            # post a bare {user_id, prompt_id, prompt} with NO request_id, and
+            # hart_intelligence_entry does no defaulting — so
+            # dispatch.is_genuine_user_request read the empty id as BACKGROUND and
+            # the person sitting at the machine was classified as daemon work: the
+            # foreground gate never fired, the llama scheduler admitted the turn as
+            # kind='daemon' (never preempted FOR), and it ran on the CLOSABLE client
+            # so a later preempt could abort the user's own request.  core.chat_client
+            # mints the id (idempotently — an upstream id passes through untouched).
+            #
+            # The 30s budget is gone with it: /chat measured 49.2s then 76.5s under
+            # flywheel load, so the old timeout was shorter than the p50 and this
+            # loop could only ever time out.  post_chat's default is generous
+            # because a CPU-floor decomposition legitimately takes minutes.
+            from core.chat_client import post_chat
             try:
-                resp = req.post(
+                resp = post_chat(
                     f'http://localhost:{self.backend_port}/chat',
-                    json={
+                    {
                         'user_id': 'hart_desktop_user',
                         'prompt_id': 'desktop_agent',
                         'prompt': text,
-                    }, timeout=30)
+                    })
                 payload = resp.json()
             except Exception as e:
                 return jsonify({'error': str(e)})
