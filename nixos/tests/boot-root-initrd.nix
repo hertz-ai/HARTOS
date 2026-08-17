@@ -64,6 +64,25 @@ let
           type = lib.types.listOf lib.types.str;
           default = [ ];
         };
+        # Every option the module WRITES needs a stand-in here, not just the ones
+        # the guard reads: evalModules refuses an undeclared option outright, so a
+        # missing one is not a quiet no-op, it aborts this whole check's
+        # evaluation. The switch_root kmsg wrapper and the efi_pstore force-load
+        # added three writes and none of them were mirrored, which took the
+        # shard down with "The option `boot.initrd.extraUtilsCommands' does not
+        # exist" before a single VM booted.
+        options.boot.initrd.extraUtilsCommands = lib.mkOption {
+          type = lib.types.lines;
+          default = "";
+        };
+        options.boot.initrd.kernelModules = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ ];
+        };
+        options.boot.kernelModules = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ ];
+        };
         options.assertions = lib.mkOption {
           type = lib.types.listOf (lib.types.submodule {
             options.assertion = lib.mkOption { type = lib.types.bool; };
@@ -71,6 +90,11 @@ let
           });
           default = [ ];
         };
+        # ...and belt-and-braces so the NEXT write added to the module cannot
+        # take this check down again. This eval exists only to read the module's
+        # `assertions`; what else it writes is the full-system boot test's
+        # business, not this one's.
+        config._module.check = false;
         config._module.args.pkgs = pkgs;
         config.hart.enable = true;
         config.hart.bootRootInitrd.enable = true;
