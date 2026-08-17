@@ -138,6 +138,19 @@ in
           # Best-effort signature wipe (a just-lazy-unmounted device can briefly
           # report busy); the ext4 mkfs -F below overwrites regardless.
           sp.succeed(f"wipefs -a {disk} 2>/dev/null || true")
+          # ...and make the kernel FORGET the partition nodes, not just the
+          # on-disk signatures. mkfs.vfat on a bare whole disk leaves a FAT boot
+          # sector whose BPB + 0x55AA tail the partition scanner misreads as an
+          # MBR, so the kernel invents a phantom `vdb1` (visible in the VM log as
+          # "vdb: vdb1" right after the mkfs.vfat). wipefs does not remove that
+          # node. The next subtest then mkfs.ext4's the WHOLE disk, blkid
+          # resolves LABEL=HARTSTATE to the leftover vdb1, and the mount dies on
+          #   EXT4-fs (vdb1): bad geometry: block count 262144 exceeds size of
+          #   device (262143 blocks)
+          # -- one block short, because the phantom starts an offset in. Nothing
+          # binds and the subtest fails on mountpoint -q. blockdev is util-linux,
+          # already in systemPackages above.
+          sp.succeed(f"blockdev --rereadpt {disk} 2>/dev/null || true")
           sp.succeed("udevadm settle || true")
 
       # ── 3b. An EMPTY vfat HARTSTATE is upgraded to ext4 (the Windows-flash path) ──
@@ -180,6 +193,19 @@ in
                     "/home/hart-admin", "/run/hart/hartstate"]:
               sp.succeed(f"umount -l {p} 2>/dev/null || true")
           sp.succeed(f"wipefs -a {disk} 2>/dev/null || true")
+          # ...and make the kernel FORGET the partition nodes, not just the
+          # on-disk signatures. mkfs.vfat on a bare whole disk leaves a FAT boot
+          # sector whose BPB + 0x55AA tail the partition scanner misreads as an
+          # MBR, so the kernel invents a phantom `vdb1` (visible in the VM log as
+          # "vdb: vdb1" right after the mkfs.vfat). wipefs does not remove that
+          # node. The next subtest then mkfs.ext4's the WHOLE disk, blkid
+          # resolves LABEL=HARTSTATE to the leftover vdb1, and the mount dies on
+          #   EXT4-fs (vdb1): bad geometry: block count 262144 exceeds size of
+          #   device (262143 blocks)
+          # -- one block short, because the phantom starts an offset in. Nothing
+          # binds and the subtest fails on mountpoint -q. blockdev is util-linux,
+          # already in systemPackages above.
+          sp.succeed(f"blockdev --rereadpt {disk} 2>/dev/null || true")
           sp.succeed("udevadm settle || true")
 
       # ── 4. Positive: a real ext4 HARTSTATE bind-persists, SECURELY ──
