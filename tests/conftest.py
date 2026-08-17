@@ -504,3 +504,47 @@ def pytest_sessionfinish(session, exitstatus):
           + ", ".join(repr(t.name) for t in blocking), file=sys.stderr)
     sys.stderr.flush()
     os._exit(exitstatus)
+
+
+# ─── Hiding an import without nuking sys.modules ──────────────────────────
+#
+# The repo-wide idiom for "make this import fail so the fallback path runs" is
+#   with patch.dict('sys.modules', {'some.module': None}): ...
+# and it has a nasty side effect: mock's _unpatch_dict CLEARS sys.modules and
+# restores the snapshot it took on entry, so EVERY module imported inside the
+# block is evicted on exit. One of these blocks around a dispatch call evicts
+# ~3200 modules, torch and numpy among them.
+#
+# For pure-Python modules that is merely wasteful (they re-import). For a
+# package backed by a C extension it is fatal: the extension stays initialised
+# in the process while its Python layer re-executes, so the next `import torch`
+# dies with "function '_has_torch_function' already has a docstring" (or a
+# tensor_numpy.cpp INTERNAL ASSERT, depending on version) in whatever unrelated
+# test happens to touch torch next. That is the whole story behind the
+# test_distributed_bridge torch failures on CI.
+#
+# hidden_modules() does only the thing the tests actually want: hide these
+# names, restore exactly these names, leave the rest of sys.modules alone.
+import contextlib as _contextlib
+
+
+@_contextlib.contextmanager
+def hidden_modules(*names):
+    """Make ``import <name>`` raise ImportError for the duration of the block.
+
+    Restores only the named entries on exit, so modules imported inside the
+    block stay imported. Drop-in replacement for
+    ``patch.dict('sys.modules', {name: None, ...})``.
+    """
+    sentinel = object()
+    saved = {n: sys.modules.get(n, sentinel) for n in names}
+    for n in names:
+        sys.modules[n] = None
+    try:
+        yield
+    finally:
+        for n, old in saved.items():
+            if old is sentinel:
+                sys.modules.pop(n, None)
+            else:
+                sys.modules[n] = old
