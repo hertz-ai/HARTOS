@@ -3207,3 +3207,112 @@ def load_vlm_agent_files(prompt_id, role_number):
         current_app.logger.error(f"Error listing files in prompts directory: {e}")
 
     return vlm_actions
+
+
+# ── Canonical WAMP RPC helper — ONE implementation ──────────────────────────
+# Was duplicated VERBATIM in create_recipe.py:815 and reuse_recipe.py:338 (88
+# lines each) and had already DRIFTED: reuse_recipe computed `actual_timeout`
+# INSIDE the try, so a non-numeric `time` raised TypeError, hit the broad
+# `except Exception -> return None`, and the caller could not tell a bad argument
+# from a failed RPC. create_recipe computed it BEFORE the try, letting a
+# programming error surface loudly. THIS COPY KEEPS create_recipe's placement —
+# the drift was an instance of the silent-failure class, and the loud variant is
+# the correct one.
+#
+# Both call sites already delegate ~64 other helpers here via `helper_fun.`, so
+# this is the established home, not a new one.
+#
+# KNOWN, NOT FIXED HERE: the transport URL below is hardcoded, and the same
+# literal appears 21x across the repo. Routing it through core.port_registry /
+# a config seam is a separate change with 21 call sites and a behaviour risk;
+# consolidating first means that fix lands in ONE place instead of two.
+async def subscribe_and_return(message, topic, time=1800000):
+    """
+    Makes an RPC call to the specified topic using a component.
+    Waits for the full duration of the specified timeout for a response.
+
+    Args:
+        message: The message payload to send
+        topic: The topic to call
+        time: Timeout in milliseconds (default: 8000)
+
+    Returns:
+        The response from the RPC call, or None if there was an error or timeout
+    """
+    from autobahn.asyncio.component import Component
+    import asyncio
+    current_app.logger.info(f"Making RPC Call to {topic}...")
+
+    # Create a new component for this call
+    component = Component(
+        transports="ws://aws_rasa.hertzai.com:8088/ws",
+        realm="realm1",
+    )
+
+    response_future = asyncio.Future()
+
+    @component.on_join
+    async def join(session, details):
+        current_app.logger.info("Session joined, making RPC call...")
+        try:
+            # Convert time from milliseconds to seconds
+            timeout_seconds = time / 1000
+            current_app.logger.info(f"Using timeout of {timeout_seconds} seconds")
+
+            # Set actual timeout
+            try:
+                result = await asyncio.wait_for(
+                    session.call(topic, message),
+                    timeout=timeout_seconds
+                )
+
+                if not response_future.done():
+                    response_future.set_result(result)
+
+            except asyncio.TimeoutError:
+                if not response_future.done():
+                    response_future.set_exception(
+                        Exception(f"RPC call timed out after {timeout_seconds} seconds")
+                    )
+            except Exception as e:
+                if not response_future.done():
+                    response_future.set_exception(e)
+
+        finally:
+            # Stop the component regardless of success / failure
+            try:
+                await component.stop()
+            except Exception as e:
+                current_app.logger.error(f"Error stopping component: {e}")
+
+    # Calculate timeout with a small buffer
+    actual_timeout = (time / 1000) + 5  # Add 5 second buffer
+    try:
+        # Start the component
+        await component.start()
+
+        # Wait for the response or timeout
+        result = await asyncio.wait_for(response_future, timeout=actual_timeout)
+
+        # Return the result
+        return result
+
+    except asyncio.TimeoutError:
+        current_app.logger.error(f"Timed out waiting for response after {actual_timeout} seconds")
+        # Explicitlt cancel the future if it's still pending
+        if not response_future.done():
+            response_future.cancel()
+        return None
+    except Exception as e:
+        current_app.logger.error(f"Error in subscribe_and_return: {e}")
+        # Explicitly cancel the future if it's still pending
+        if not response_future.done():
+            response_future.cancel()
+        return None
+    finally:
+        # Ensure component is stopped
+        if hasattr(component, 'session') and component.session:
+            try:
+                await component.stop()
+            except Exception as e:
+                current_app.logger.error(f"Error stopping component in finally: {e}")

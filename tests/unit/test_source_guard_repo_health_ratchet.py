@@ -42,14 +42,27 @@ MAX_DUP_PUBLIC_NAMES = 122      # one public name defined in >1 SOURCE module
 #: files. P1 of the graph collapses each to one home in core/. Each name that
 #: reaches a single definition should be DELETED from this dict (not set to 1) so
 #: the list itself shrinks to nothing.
+#: MEASURED CORRECTION 2026-08-18: most of these are NOT copies. `create_recipe`
+#: and `reuse_recipe` hold 2-line DELEGATING SHIMS that forward to helper.py — a
+#: facade, not duplication. An AST diff (normalised for docstrings/whitespace)
+#: showed only ONE entry was real, live, 88-line duplication: `subscribe_and_return`,
+#: and it had ALREADY DRIFTED. The audit's "every fix must be made four times" was
+#: too strong for the rest; the numbers below are definition COUNTS, and a count
+#: above 1 is a question to ask, not automatically a defect.
 PIPELINE_DUP_BUDGET = {
-    'get_frame': 4,
-    'parse_date': 4,
-    'get_llm_config': 3,
-    'save_conversation_db': 3,
-    'publish_async': 3,
-    'get_action_user_details': 3,
-    'subscribe_and_return': 3,
+    'get_frame': 4,               # hie + helper are 2 REAL impls; create/reuse forward
+    'parse_date': 4,              # all four IDENTICAL 2-line forwarders
+    'get_llm_config': 3,          # helper implements; create/reuse forward
+    'save_conversation_db': 3,    # helper implements; create/reuse forward
+    'publish_async': 3,           # hie has a real 52-line one; create/reuse forward
+    'get_action_user_details': 3, # 3-line forwarders to core.user_context
+    # subscribe_and_return: COLLAPSED 2026-08-18 (was 3). The 88-line copy in
+    # create_recipe and reuse_recipe is gone; helper.py owns the one
+    # implementation and all four call sites route through it. The floor is 2,
+    # not 1, because crossbar_server.py defines a DIFFERENT 9-line function of
+    # the same name (global response_message/response_event) — a genuine separate
+    # concern, not a copy. Renaming that one would take this to 1.
+    'subscribe_and_return': 2,
 }
 
 

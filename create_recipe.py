@@ -812,94 +812,6 @@ class SubscriptionHandler:
         await component.stop()  # Stop the component after getting the response
 
 
-async def subscribe_and_return(message, topic, time=1800000):
-    """
-    Makes an RPC call to the specified topic using a component.
-    Waits for the full duration of the specified timeout for a response.
-
-    Args:
-        message: The message payload to send
-        topic: The topic to call
-        time: Timeout in milliseconds (default: 8000)
-
-    Returns:
-        The response from the RPC call, or None if there was an error or timeout
-    """
-    current_app.logger.info(f"Making RPC Call to {topic}...")
-
-    # Create a new component for this call
-    component = Component(
-        transports="ws://aws_rasa.hertzai.com:8088/ws",
-        realm="realm1",
-    )
-
-    response_future = asyncio.Future()
-
-    @component.on_join
-    async def join(session, details):
-        current_app.logger.info("Session joined, making RPC call...")
-        try:
-            # Convert time from milliseconds to seconds
-            timeout_seconds = time / 1000
-            current_app.logger.info(f"Using timeout of {timeout_seconds} seconds")
-
-            # Set actual timeout
-            try:
-                result = await asyncio.wait_for(
-                    session.call(topic, message),
-                    timeout=timeout_seconds
-                )
-
-                if not response_future.done():
-                    response_future.set_result(result)
-
-            except asyncio.TimeoutError:
-                if not response_future.done():
-                    response_future.set_exception(
-                        Exception(f"RPC call timed out after {timeout_seconds} seconds")
-                    )
-            except Exception as e:
-                if not response_future.done():
-                    response_future.set_exception(e)
-
-        finally:
-            # Stop the component regardless of success / failure
-            try:
-                await component.stop()
-            except Exception as e:
-                current_app.logger.error(f"Error stopping component: {e}")
-
-    # Calculate timeout with a small buffer
-    actual_timeout = (time / 1000) + 5  # Add 5 second buffer
-    try:
-        # Start the component
-        await component.start()
-
-        # Wait for the response or timeout
-        result = await asyncio.wait_for(response_future, timeout=actual_timeout)
-
-        # Return the result
-        return result
-
-    except asyncio.TimeoutError:
-        current_app.logger.error(f"Timed out waiting for response after {actual_timeout} seconds")
-        # Explicitlt cancel the future if it's still pending
-        if not response_future.done():
-            response_future.cancel()
-        return None
-    except Exception as e:
-        current_app.logger.error(f"Error in subscribe_and_return: {e}")
-        # Explicitly cancel the future if it's still pending
-        if not response_future.done():
-            response_future.cancel()
-        return None
-    finally:
-        # Ensure component is stopped
-        if hasattr(component, 'session') and component.session:
-            try:
-                await component.stop()
-            except Exception as e:
-                current_app.logger.error(f"Error stopping component in finally: {e}")
 
 
 llm_config = {
@@ -1429,7 +1341,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 tool_logger.info("VLM Tier 1/2 unavailable, falling back to Crossbar WAMP")
                 topic = f'com.hertzai.hevolve.action.{user_id}'
                 tool_logger.info(f'calling {topic} for 5 second')
-                response = await subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)
+                response = await helper_fun.subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)
                 tool_logger.info(f'Response from call of {topic}: {response}')
 
                 if not response:
@@ -1437,7 +1349,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
                 topic = 'com.hertzai.hevolve.action'
                 tool_logger.info(f'calling {topic} for 1800 seconds')
-                response = await subscribe_and_return(crossbar_message, topic, 1800000)
+                response = await helper_fun.subscribe_and_return(crossbar_message, topic, 1800000)
 
             execution_time = time.time() - start_time
             tool_logger.info(f'THIS IS RESPONSE type: {type(response)} value: {response}')
