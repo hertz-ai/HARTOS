@@ -73,6 +73,19 @@ def _user_owned_roots():
     return roots
 
 
+# OS-owned trees that no shell browse/mutation route may enter, regardless of
+# which mountpoints are admitted as "drives". Kept deliberately small: the
+# classic system hierarchies plus the Windows equivalents. User data lives in
+# the user-owned roots (_user_owned_roots), which are unaffected.
+_SYSTEM_DENY_ROOTS = (
+    ['/etc', '/root', '/boot', '/sys', '/proc', '/dev',
+     '/usr', '/bin', '/sbin', '/lib', '/lib64', '/var']
+    if os.name != 'nt' else
+    [os.environ.get('SystemRoot', r'C:\Windows'),
+     r'C:\Program Files', r'C:\Program Files (x86)', r'C:\ProgramData']
+)
+
+
 def _get_allowed_roots():
     """Browse roots: the user-owned roots PLUS every disk mountpoint."""
     global _ALLOWED_ROOTS
@@ -119,6 +132,24 @@ def _is_path_allowed(path, include_mounts=True):
     still hand a drive row to the file manager (commit 9325bf54).
     """
     real = os.path.realpath(path)
+    # SYSTEM DIRECTORIES ARE NEVER BROWSABLE, even though their DRIVE is.
+    # Admitting every mountpoint (for the This-PC drive rows) also admits the
+    # system root -- `/` on Linux, `C:\` here -- and commonpath then answers
+    # True for EVERY path on the box, so the sandbox confined nothing on either
+    # platform (this module's own docstring flags the Linux half; the Windows
+    # half is the same hole with a different letter). Deny the OS's own trees
+    # first, component-wise like the allow test, so a drive row still opens in
+    # the file manager while /etc, /root, C:\Windows and any traversal that
+    # RESOLVES into them stay refused.
+    for sysroot in _SYSTEM_DENY_ROOTS:
+        sysreal = os.path.realpath(sysroot)
+        if not os.path.isdir(sysreal):
+            continue
+        try:
+            if os.path.commonpath([real, sysreal]) == sysreal:
+                return False
+        except ValueError:
+            continue
     roots = _get_allowed_roots() if include_mounts else _user_owned_roots()
     for root in roots:
         root_real = os.path.realpath(root)
