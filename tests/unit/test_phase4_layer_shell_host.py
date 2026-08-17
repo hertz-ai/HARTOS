@@ -924,12 +924,38 @@ class TestTier1Tier2SameGlassHostBinary:
         return _read(MODULE)
 
     def test_tier2_sessions_exec_the_gtk4_host_binary(self, layer):
-        # Tier-2 = the layer-shell host module: its sway config execs the GTK4 host
+        # Tier-2 = the layer-shell host module: its sway config starts the GTK4 host
         # binary as sway's single startup client (the one source of the host).
+        #
+        # This used to require the literal `exec ${layerShellHost}/bin/...` on ONE
+        # line of the sway config. It cannot be inline any more: sway's config lexer
+        # splits commands on `;`, so chaining `swaymsg exit` after the host (needed so
+        # the host's death ends the SESSION the supervisor watches, rather than
+        # leaving sway up with no client) made sway reject the whole config and refuse
+        # to start. The chain lives in a wrapper script now. The INTENT here is
+        # unchanged and still pinned: Tier-2 runs the one `${layerShellHost}` host
+        # binary, and the sway config's exec reaches it.
         assert "hart-glass-shell-gtk4" in layer
-        assert "exec ${layerShellHost}/bin/hart-glass-shell-gtk4" in layer, (
-            "Tier-2 sway host config must exec the layerShellHost GTK4 binary."
+        assert "${layerShellHost}/bin/hart-glass-shell-gtk4" in layer, (
+            "Tier-2 must run the layerShellHost GTK4 binary (the one source)."
         )
+        # The sway config's startup client resolves to that binary — directly, or
+        # through the wrapper that also ends the session.
+        assert (
+            "exec ${layerShellHost}/bin/hart-glass-shell-gtk4" in layer
+            or "exec ${glassShellThenEndSession}" in layer
+        ), "Tier-2 sway host config does not exec the GTK4 host (directly or via the wrapper)."
+        # ...and if it goes through the wrapper, the wrapper must both run the host
+        # AND end the session — the black-screen guard from 2026-08-16.
+        if "exec ${glassShellThenEndSession}" in layer:
+            wrapper = layer.split("glassShellThenEndSession = ", 1)[1].split("'';", 1)[0]
+            assert "${layerShellHost}/bin/hart-glass-shell-gtk4" in wrapper, (
+                "the Tier-2 exec wrapper does not run the one GTK4 host binary."
+            )
+            assert "swaymsg exit" in wrapper, (
+                "the Tier-2 exec wrapper does not end the session when the host "
+                "exits — a WebKit crash would leave sway up with no client."
+            )
 
     def test_tier1_hartcomp_launches_the_same_gtk4_host_binary(self, comp):
         # Tier-1 = hart-comp: its session launcher must run the SAME

@@ -59,7 +59,20 @@ def _ask(client, audit, text='plan a weekend trip to Goa', halted=False,
     """POST an intent through the REAL route with ONLY the brain boundary +
     the two security boundaries mocked."""
     chat = chat if chat is not None else _fake_chat()
-    with patch('requests.post', return_value=chat), \
+    # The transport boundary moved. /api/agent/ask used to call requests.post
+    # directly; it now goes through core.chat_client.post_chat so the desktop's
+    # own turn is minted with a request id and admitted as FOREGROUND work (before
+    # that, the empty id read as BACKGROUND and the person at the machine was
+    # classified as daemon work, running on the closable client where a later
+    # preempt could abort their own request). post_chat routes via
+    # core.http_pool.pooled_post, so patching requests.post stopped intercepting
+    # anything and the route returned a payload with no 'composed' key.
+    #
+    # Patch pooled_post, NOT post_chat: that keeps normalize_chat_body — the
+    # id-minting this whole change exists for — inside the test rather than
+    # stubbed over it, and it is still the brain boundary this helper promises to
+    # be the only mock of.
+    with patch('core.http_pool.pooled_post', return_value=chat), \
          patch('security.immutable_audit_log.get_audit_log',
                return_value=audit), \
          patch('security.hive_guardrails.HiveCircuitBreaker.is_halted',
