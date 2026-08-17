@@ -74,8 +74,17 @@ class TestShellCommandHappyPath:
 
 
 class TestShellCommandShellSelector:
+    # Faking sys.platform = 'win32' on a Linux host also drags
+    # core.subprocess_safe.no_window_kwargs() down its Windows branch, where it
+    # calls subprocess.STARTUPINFO() -- a name that does not exist on Linux. The
+    # kwargs are splatted INTO the subprocess.run(...) call, so the AttributeError
+    # fires before run() is ever entered and the handler's `except Exception`
+    # swallows it: mock_run.call_args stayed None and the failure read as
+    # "'NoneType' object has no attribute 'args'". These two tests are about
+    # shell SELECTION, not about Windows console flags, so stub that helper out.
+    @patch('hart_intelligence_entry.no_window_kwargs', return_value={})
     @patch('hart_intelligence_entry.subprocess.run')
-    def test_default_on_windows_uses_cmd(self, mock_run):
+    def test_default_on_windows_uses_cmd(self, mock_run, _no_window):
         mock_run.return_value = MagicMock(returncode=0, stdout='x', stderr='')
         with patch.object(sys, 'platform', 'win32'):
             _handle_shell_command_tool('dir')
@@ -94,8 +103,9 @@ class TestShellCommandShellSelector:
         assert argv[1] == '-c'
         assert argv[2] == 'ls'
 
+    @patch('hart_intelligence_entry.no_window_kwargs', return_value={})
     @patch('hart_intelligence_entry.subprocess.run')
-    def test_powershell_selector_forces_powershell(self, mock_run):
+    def test_powershell_selector_forces_powershell(self, mock_run, _no_window):
         mock_run.return_value = MagicMock(returncode=0, stdout='x', stderr='')
         with patch.object(sys, 'platform', 'win32'):
             _handle_shell_command_tool('powershell: Get-Process')
