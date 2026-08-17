@@ -4138,3 +4138,64 @@ class TestRawImageSinglePath:
                     f"{cfg}: makeBiosBootable at line {line_no + 1} is OUTSIDE "
                     "the iso branch — it would try to apply to the UEFI-only raw "
                     "image and break the raw eval")
+
+
+class TestSilentlyOptionalDepsAreMirroredIntoTheImage:
+    """requirements.txt and hart-app.nix are two hand-maintained lists of the
+    same thing, and they have drifted twice.
+
+    The dangerous class is a dependency whose import site is wrapped in
+    ``try: ... except ImportError``. A loud ImportError reports itself the first
+    time anyone runs the code. A swallowed one does not: the feature quietly
+    takes a worse path forever and every test that would notice is skipped for
+    the same reason the feature is degraded.
+
+    - num2words: pinned in requirements.txt, never mirrored here, so the dev box
+      expanded "Rs.200" to speech and the shipped OS said "200 rupees" with the
+      digits handed to the TTS engine raw. Two normalizer tests were red for
+      exactly this and read as a normalizer bug.
+    - youtube-transcript-api: was in NEITHER list, so every YouTube transcript
+      request in the shipped OS skipped the caption fetch and downloaded the
+      media to run local Whisper instead.
+
+    Anything added here must be in both files.
+    """
+
+    # pip name -> nixpkgs attribute name (identical for all of these so far)
+    SILENTLY_OPTIONAL = {
+        'num2words': 'num2words',
+        'stripe': 'stripe',
+        'youtube-transcript-api': 'youtube-transcript-api',
+    }
+
+    def _read(self, rel):
+        import os
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        with open(os.path.join(root, rel), encoding='utf8') as fh:
+            return fh.read()
+
+    def test_pinned_in_requirements(self):
+        import re
+        req = self._read('requirements.txt')
+        pinned = set()
+        for line in req.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            m = re.match(r'^([A-Za-z0-9._-]+)', line)
+            if m:
+                pinned.add(m.group(1).lower().replace('_', '-'))
+        missing = [p for p in self.SILENTLY_OPTIONAL if p not in pinned]
+        assert not missing, f'not pinned in requirements.txt: {missing}'
+
+    def test_mirrored_into_hart_app_nix(self):
+        import re
+        nix = self._read('nixos/packages/hart-app.nix')
+        # Strip comments so a package NAMED only in prose does not count as
+        # present -- that is precisely how a missing mirror hides.
+        code = '\n'.join(re.sub(r'#.*$', '', ln) for ln in nix.splitlines())
+        missing = [pip for pip, attr in self.SILENTLY_OPTIONAL.items()
+                   if not re.search(r'(?m)^\s*%s\s*$' % re.escape(attr), code)]
+        assert not missing, (
+            f'in requirements.txt but NOT in the image: {missing}. Their import '
+            f'sites swallow ImportError, so the shipped OS degrades in silence.')

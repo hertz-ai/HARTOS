@@ -118,9 +118,11 @@ class ChatTTSPathUsesTheCanonicalNormalizer(unittest.TestCase):
 
     @unittest.skipUnless(
         importlib.util.find_spec('num2words') is not None,
-        "num2words absent — digit expansion cannot happen. NOTE: it is pinned "
-        "in requirements.txt but MISSING from nixos/packages/hart-app.nix, so "
-        "the shipped OS is in this same state")
+        "num2words absent — digit expansion cannot happen. It is pinned in "
+        "requirements.txt AND mirrored into nixos/packages/hart-app.nix, so "
+        "the shipped OS is not in this state; only a dev box without it is. "
+        "The mirror is guarded by TestSilentlyOptionalDepsAreMirroredIntoTheImage "
+        "in tests/unit/test_nixos_configs.py")
     def test_number_is_expanded_to_words(self):
         got = self._speak('The fare is Rs.200')['text']
         self.assertIn('two hundred', got)

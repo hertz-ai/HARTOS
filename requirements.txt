@@ -268,3 +268,13 @@ num2words>=0.5.13
 # dev; baked into the image so production rebuilds don't need a manual
 # `pip install stripe` on the central container).
 stripe>=7.0.0
+
+# YouTube caption fetch for the agent's browser_research transcript tool
+# (integrations/browser_research/scripts/youtube.py). Lazy-imported with an
+# ImportError fallthrough, so a missing install does not crash -- it silently
+# demotes every transcript request to the yt-dlp + local-Whisper path, which
+# downloads the media and runs STT for a video that already publishes captions.
+# It was in NEITHER requirements.txt nor hart-app.nix, so that demotion is what
+# every host has actually been doing, and the three tests covering the caption
+# path could not even import on CI.
+youtube-transcript-api>=1.0.0

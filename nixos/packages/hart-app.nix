@@ -90,6 +90,25 @@ let
     # does offline in under a millisecond.
     num2words
 
+    # Caption fetch for the agent's YouTube transcript tool
+    # (integrations/browser_research/scripts/youtube.py). Same mirror lesson as
+    # num2words directly above, one step worse: this one was in neither list.
+    # The import is wrapped in try/except ImportError, so its absence is silent
+    # -- every transcript request falls through to the yt-dlp + local-Whisper
+    # path, downloading the media and running STT even for videos that publish
+    # captions. Nothing is broken, it is just slow and wrong in a way no error
+    # ever reports.
+    youtube-transcript-api
+
+    # Stripe SDK for the commercial API's /upgrade card charges
+    # (integrations/ap2/ap2_protocol.py:StripePaymentGateway). requirements.txt
+    # says in so many words that it is "baked into the image so production
+    # rebuilds don't need a manual pip install" -- it was not, and connect()
+    # swallows the ImportError and sets connected = False, so the shipped OS
+    # silently served every upgrade through MockPaymentGateway. Revenue path,
+    # no error anywhere.
+    stripe
+
     # Utilities
     python-dateutil
     pyyaml
