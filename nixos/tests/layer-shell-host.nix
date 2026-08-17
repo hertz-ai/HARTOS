@@ -332,10 +332,35 @@ in
           # not the host. Without chaining sway's exit to the host's, a WebKit
           # crash left sway up with NO client -- a black screen nothing
           # relaunched. Pin the chain so it cannot be dropped again.
-          assert "swaymsg exit" in conf_src, \
-              ("Tier-2 sway host config does not end the session when the shell "
-               "host exits -- a WebKit crash would leave sway running with no "
-               "client (black screen, no relaunch)")
+          # The chain lives in a WRAPPER SCRIPT, not inline in the config: sway's
+          # config lexer splits commands on `;` itself, so an inline
+          # `exec <host>; <swaymsg> exit` made sway read the second half as a
+          # config command, reject it, and refuse to start at all. Follow the exec
+          # into the wrapper rather than substring-matching the config.
+          import re as _re
+          m = _re.search(r"exec\s+(/nix/store/\S+)", conf_src)
+          assert m, f"Tier-2 sway host config has no exec line:\n{conf_src}"
+          wrapper_src = host.succeed("cat " + m.group(1))
+          assert "swaymsg exit" in wrapper_src, \
+              ("Tier-2 session does not end when the shell host exits -- a WebKit "
+               "crash would leave sway running with no client (black screen, no "
+               f"relaunch). exec target:\n{wrapper_src}")
+
+          # ...and the config must PARSE. The assertion above used to be a
+          # substring check on the config text, which is why a config sway could
+          # not read shipped anyway: "swaymsg exit" was present, the assertion
+          # passed, and sway still died with
+          #   [ERROR] [sway/config.c:654] Error on line 'exec ...; ... swaymsg
+          #   exit': Unknown/invalid command
+          # so the whole Tier-2 session never came up. Validate the real file with
+          # sway's own parser. Asserted on the ERROR MARKER rather than the exit
+          # code, because --validate can be non-zero for benign VM reasons.
+          swaymsg_path = _re.search(r"(/nix/store/\S+)/bin/swaymsg", wrapper_src)
+          assert swaymsg_path, f"wrapper does not reference swaymsg:\n{wrapper_src}"
+          sway_bin = swaymsg_path.group(1) + "/bin/sway"
+          val = host.succeed(f"{sway_bin} --validate -c {sway_conf} 2>&1 || true")
+          assert "Error on line" not in val, \
+              f"sway REFUSES its own generated config:\n{val}\n--- config ---\n{conf_src}"
     '';
   };
 

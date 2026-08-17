@@ -859,6 +859,26 @@ app.run(None)
     exec ${pkgs.sway}/bin/sway -c ${swayHostConfig}
   '';
 
+  # The host, then take the session down with it — as ONE program, so the
+  # sequencing is SHELL syntax and never reaches sway's config parser.
+  #
+  # This was written inline as `exec <host>; <swaymsg> exit`. sway's config lexer
+  # splits commands on `;` ITSELF (it is a config-language separator, not a shell
+  # operator), so sway read `<swaymsg> exit` as a second CONFIG command, rejected
+  # it, and refused the config:
+  #   [ERROR] [sway/config.c:654] Error on line 'exec .../hart-glass-shell-gtk4;
+  #   .../swaymsg exit': Unknown/invalid command '.../bin/swaymsg'
+  # sway then never came up at all, so the Tier-2 session could not start and the
+  # supervisor had nothing to land on. A wrapper keeps the intent below intact
+  # while giving sway a single argument with no separator in it.
+  glassShellThenEndSession = pkgs.writeShellScript "hart-glass-shell-gtk4-then-exit" ''
+    ${layerShellHost}/bin/hart-glass-shell-gtk4
+    # The host has exited (by design, when its WebKitWebProcess dies). End the
+    # sway session so the supervisor — which watches the SESSION, not the client
+    # — relaunches the tier instead of leaving sway up with no client.
+    exec ${pkgs.sway}/bin/swaymsg exit
+  '';
+
   # sway single-output config whose ONLY client is the GTK4 layer-shell host. No
   # bars / launchers — sway exists to give the layer-shell surface a compositor
   # that implements zwlr_layer_shell_v1 (cage does not). Mirrors the sway-Tier-1
@@ -925,7 +945,10 @@ app.run(None)
     # end the session, which is what the supervisor actually watches -- it then
     # relaunches the tier with a fresh WebKit process (seconds), and a crash
     # LOOP walks down the ladder by design instead of hanging on black.
-    exec ${layerShellHost}/bin/hart-glass-shell-gtk4; ${pkgs.sway}/bin/swaymsg exit
+    #
+    # ONE argument, no `;` — sway's config lexer splits on `;` and would read the
+    # second half as a config command. See glassShellThenEndSession above.
+    exec ${glassShellThenEndSession}
   '';
 
   sessionDesktop = pkgs.writeText "hart-glass-gtk4.desktop" ''
