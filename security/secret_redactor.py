@@ -112,6 +112,31 @@ _add('password_assignment',
 _add('password_plaintext',
      r'(?:password|passwd|pwd)\s*[=:]\s*(\S{8,})')
 
+# Secret-NAMED assignments that the two patterns above miss. security/audit_log.py
+# deleted its own copy of this and delegated here (its generic rule was
+# `(password|passwd|pwd|secret|token|api_key|apikey)\s*[=:]\s*\S+`), but the
+# canonical set had no equivalent, so the delegation LOST coverage and these
+# reached the audit log in clear text:
+#
+#   api_key=abcd1234efgh   apikey: 9f8e7d6c   secret=hunter2
+#   token=shortvalue       api_key=<uuid>     X-Api-Key: <uuid>
+#
+# Three reasons they escaped:
+#   * password_assignment lists the right NAMES but demands a QUOTED value, and
+#     in JSON (`"secret": "v"`) the key's own closing quote breaks its
+#     `\s*[=:]` — hence the optional `["\']?` after the name here.
+#   * password_plaintext allows an unquoted value but only for password/passwd/pwd.
+#   * both require {8,}; `secret=hunter2` is 7.
+#
+# Floor of {6,} is deliberate: it covers `hunter2` while still refusing to eat
+# `auth=no` / `token=on`. Only SECRET-named keys are listed — node_id,
+# request_id and trace_id stay visible, because redacting identifiers is what
+# destroyed the "which node failed" diagnostic when heroku_key matched bare
+# UUIDs (see that pattern's comment). Widen the names, never the shape.
+_add('secret_assignment',
+     r'\b(?:api[_-]?key|apikey|secret|token|auth[_-]?token|access[_-]?key)'
+     r'["\']?\s*[=:]\s*["\']?([^\s"\',;}\)]{6,})')
+
 # ── PEM private keys ──
 _add('pem_private_key',
      r'-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'
