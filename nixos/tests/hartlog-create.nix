@@ -132,8 +132,22 @@ in
       # RETURNS -- without guard 1b the script would happily carve again, and guard 1
       # (already-exists) / guard 3 (no-free-space) cannot mask the verdict.
       with subtest("an existing HARTJRNL target makes the carve a clean no-op"):
+          # Remove the FILESYSTEM SIGNATURE before removing the partition. The
+          # script's guard 1 resolves by LABEL (`blkid -L "$LABEL"`), so the label
+          # has to be genuinely gone, not merely on a partition that is no longer
+          # in the table.
+          hc.succeed(f"wipefs -a {disk}2 2>/dev/null || true")
           hc.succeed(f"sgdisk --delete=2 {disk}")
-          hc.succeed(f"partx -u {disk} || udevadm settle || true")
+          # This was `partx -u {disk} || udevadm settle || true`, which had two
+          # faults in one line. `partx -u` UPDATES partitions that still exist; it
+          # does not remove one that was just deleted from the table, so the kernel
+          # kept /dev/vdb2 and blkid kept resolving HARTLOG on it. And because
+          # partx -u SUCCEEDS, the `||` chain meant udevadm settle never ran at all
+          # on the success path — the settle was dead code. Delete the node, force
+          # a partition-table re-read, then settle unconditionally.
+          hc.succeed(f"partx -d --nr 2 {disk} 2>/dev/null || true")
+          hc.succeed(f"blockdev --rereadpt {disk} 2>/dev/null || true")
+          hc.succeed("udevadm settle || true")
           hc.fail("blkid -L HARTLOG")
 
           # Stand up the dedicated journal sink (the opt-in "no spare USB stick" path).
