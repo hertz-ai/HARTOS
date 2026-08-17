@@ -871,6 +871,50 @@ class AgentDaemon:
         t.start()
         self._home_compose_thread = t
 
+    def _spawn_federation_tick_async(self) -> None:
+        """Run the federation epoch in a daemon thread, off the dispatch loop.
+
+        Same shape as _spawn_home_compose_async above, single-flight guard
+        included, because federation has exactly the failure mode that guard
+        exists for.  get_federated_aggregator() is a singleton holding 7 locks,
+        and tick() holds them across peer broadcast, embedding sync and
+        resonance sync.
+
+        Run inline, one stuck epoch stops _tick from returning.  2026-08-17:
+        nine agent_daemon threads were all parked at `fed.tick()`, 10,023
+        ledger tasks never dispatched, and the hive session stayed
+        disconnected.  The try/except that wrapped the inline call did not
+        help -- a hang is not an exception.
+
+        agent_daemon.py:756-763 records the same failure from 2026-04-29
+        (WorldModelBridge.record_interaction).  That fix moved the proactive
+        tick off the loop; federation stayed inline and reproduced it.
+
+        tick()'s return value only fed a log line, so nothing downstream needs
+        it in-band.  The log still happens, from the worker thread.
+        Covered by tests/unit/test_federation_tick_does_not_block_dispatch.py.
+        """
+        prior = getattr(self, '_federation_thread', None)
+        if prior is not None and prior.is_alive():
+            return
+
+        def _runner():
+            try:
+                from .federated_aggregator import get_federated_aggregator
+                fed = get_federated_aggregator()
+                fed_result = fed.tick()
+                if fed_result.get('aggregated'):
+                    logger.info(
+                        f"Federation: epoch={fed_result.get('epoch')}, "
+                        f"convergence={fed_result.get('convergence', 0):.3f}")
+            except Exception as e:
+                logger.debug(f"Federation tick: {e}")
+
+        t = threading.Thread(
+            target=_runner, daemon=True, name='federation_tick')
+        t.start()
+        self._federation_thread = t
+
     def _tick(self):
         """Find active goals, find idle agents, dispatch via /chat.
 
@@ -1582,18 +1626,10 @@ class AgentDaemon:
 
             self._wd_heartbeat()
 
-            # Federation: aggregate learning deltas across peers every 2nd tick
+            # Federation: aggregate learning deltas across peers every 2nd tick.
+            # Runs off-thread — see _spawn_federation_tick_async for why.
             if self._tick_count % 2 == 0:
-                try:
-                    from .federated_aggregator import get_federated_aggregator
-                    fed = get_federated_aggregator()
-                    fed_result = fed.tick()
-                    if fed_result.get('aggregated'):
-                        logger.info(
-                            f"Federation: epoch={fed_result.get('epoch')}, "
-                            f"convergence={fed_result.get('convergence', 0):.3f}")
-                except Exception as e:
-                    logger.debug(f"Federation tick: {e}")
+                self._spawn_federation_tick_async()
                 self._wd_heartbeat()
 
             # Monthly API quota reset
