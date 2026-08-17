@@ -124,6 +124,16 @@ class _RefShardBackend:
 
 @pytest.fixture
 def nodes():
+    # ARRANGE compute_contribute consent: the /shard relay route is opt-in and
+    # fail-closed (403 'consent_required' without an owner grant -- the designed
+    # rule that a peer's work never runs on this device unasked). These tests
+    # exercise the RELAY/orchestration mechanics between consenting nodes, so
+    # grant it hermetically (no DB coupling), exactly as the mesh matrix does.
+    from unittest.mock import patch as _patch
+    from integrations.agent_engine.compute_mesh_service import ComputeMeshService
+    _consent = _patch.object(
+        ComputeMeshService, '_compute_contribute_consented', lambda self: True)
+    _consent.start()
     made = []
 
     def _make(n):
@@ -132,6 +142,7 @@ def nodes():
         return ns
 
     yield _make
+    _consent.stop()
     for x in made:
         x.shutdown()
 

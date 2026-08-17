@@ -787,6 +787,23 @@ class TestPowerActionNativeLogind(unittest.TestCase):
 
     MOD = 'integrations.agent_engine.shell_os_apis'
 
+    def setUp(self):
+        # PIN THE TRANSPORT to the busctl fallback these tests patch.
+        # logind_call tries the NATIVE jeepney D-Bus transport first and only
+        # falls back to a bounded busctl subprocess. On a Linux runner the
+        # native attempt actually reaches a bus and returns its OWN error
+        # ("logind Reboot denied or failed: org.freedesktop.DBus...") before
+        # the patched subprocess is ever consulted -- so these tests passed on
+        # a machine without D-Bus and failed on CI, testing the transport
+        # instead of the result-checking they are about. Disabling the native
+        # opener (the same state as jeepney being absent) makes them exercise
+        # the seam they patch, identically on every platform.
+        self._np = patch(
+            'integrations.agent_engine.os_bridge.logind.open_dbus_connection',
+            None)
+        self._np.start()
+        self.addCleanup(self._np.stop)
+
     def _fake_run(self, returncode=0, stderr='', stdout=''):
         proc = MagicMock()
         proc.returncode = returncode
@@ -1441,6 +1458,32 @@ def _make_system_app():
     return app.test_client()
 
 
+class _TrashPatches:
+    """Context manager: temp HOME + `gio` reported absent (see _patch_trash_dir)."""
+
+    def __init__(self, tmpdir):
+        self._tmpdir = tmpdir
+        self._patches = []
+
+    def __enter__(self):
+        self._patches = [
+            patch('integrations.agent_engine.shell_system_apis.os.path.expanduser',
+                  return_value=self._tmpdir),
+            # _run returns None when the tool is missing -> the handler falls
+            # through to its own XDG trash implementation.
+            patch('integrations.agent_engine.shell_system_apis._run',
+                  return_value=None),
+        ]
+        for p in self._patches:
+            p.start()
+        return self
+
+    def __exit__(self, *exc):
+        for p in reversed(self._patches):
+            p.stop()
+        return False
+
+
 class TestShellTrash(unittest.TestCase):
     """Tests for the canonical /api/shell/trash routes (shell_system_apis).
 
@@ -1460,13 +1503,20 @@ class TestShellTrash(unittest.TestCase):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     def _patch_trash_dir(self):
-        """Redirect shell_system_apis' expanduser('~') to our temp home.
+        """Redirect shell_system_apis' expanduser('~') to our temp home AND pin
+        the XDG fallback path.
 
         `_trash_dir()` builds the trash root from `expanduser('~')`, so patching
-        it in the shell_system_apis module relocates the whole trash tree.
+        it relocates the whole trash tree. But the handler tries `gio trash`
+        FIRST, and on a desktop-ish Linux runner gio succeeds -- writing to the
+        session's REAL trash, which ignores our patched home. The assertions
+        then find nothing in the temp tree (and `trashed` reflects gio, not the
+        code under test). Reporting gio as absent pins the in-tree XDG
+        implementation these tests actually verify, identically on every
+        platform (on Windows gio is genuinely absent, which is why this passed
+        here and failed on CI).
         """
-        return patch('integrations.agent_engine.shell_system_apis.os.path.expanduser',
-                     return_value=self._tmpdir)
+        return _TrashPatches(self._tmpdir)
 
     def test_trash_list_empty(self):
         client = _make_system_app()
