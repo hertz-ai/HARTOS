@@ -40,8 +40,20 @@ _delegation_sub_started: bool = False
 _delegation_sub_lock = threading.Lock()
 _recent_delegations: "deque[dict]" = deque(maxlen=100)
 
+# Backoff between failed bootstrap attempts.  Kept separate from
+# _delegation_sub_started because that flag is returned to clients as
+# delegation_subscriber_active; setting it on failure would report a
+# subscriber that isn't running.
+#
+# The probe costs ~15s when Redis is unreachable, and the before_request hook
+# runs it on every /api/distributed/* request, ahead of @require_auth.
+# Measured 2026-08-16: unauthenticated requests took 13.8-15.0s to return 401;
+# control routes on the same app took ~20ms.
+_DELEGATION_RETRY_COOLDOWN_S: float = 300.0
+_delegation_sub_last_attempt: float = 0.0
 
-def _ensure_delegation_subscriber() -> bool:
+
+def _ensure_delegation_subscriber(blocking: bool = True) -> bool:
     """Lazy-start the CHANNEL_DELEGATION subscriber.
 
     Idempotent (the `_delegation_sub_started` flag prevents double
@@ -53,12 +65,41 @@ def _ensure_delegation_subscriber() -> bool:
     Fails silently at debug level.  Returns True iff the subscriber is
     active after the call; callers (endpoints, tests) can use the
     return value to surface status without raising.
+
+    A failed attempt is remembered for `_DELEGATION_RETRY_COOLDOWN_S`, so a
+    dead Redis costs one timeout per window instead of one per request.  It
+    is a backoff, not a permanent disable: Redis can appear after boot, and
+    the next window picks it up.
+
+    `blocking=False` returns False instead of waiting when another thread
+    holds the lock.  before_request uses that so concurrent requests don't
+    queue behind the thread paying the probe cost.  The cooldown alone isn't
+    enough -- the first attempt in each window would still block every
+    concurrent caller.
     """
-    global _delegation_sub_started
-    with _delegation_sub_lock:
+    global _delegation_sub_started, _delegation_sub_last_attempt
+    if _delegation_sub_started:
+        return True
+    if not _delegation_sub_lock.acquire(blocking=blocking):
+        return False
+    try:
+        # Re-check under the lock: another thread may have started it while
+        # we waited.
         if _delegation_sub_started:
             return True
-        redis_client = _get_redis_client()
+        now = time.monotonic()
+        if (_delegation_sub_last_attempt
+                and (now - _delegation_sub_last_attempt)
+                < _DELEGATION_RETRY_COOLDOWN_S):
+            return False
+        # Stamp BEFORE the probe: the cost we are guarding against is the
+        # probe itself, so an attempt that dies mid-timeout must still count.
+        _delegation_sub_last_attempt = now
+        try:
+            redis_client = _get_redis_client()
+        except Exception as e:
+            logger.debug(f"[delegation_subscriber] redis client failed: {e}")
+            return False
         if not redis_client:
             return False
         try:
@@ -102,15 +143,29 @@ def _ensure_delegation_subscriber() -> bool:
         except Exception as e:
             logger.debug(f"[delegation_subscriber] start failed: {e}")
             return False
+    finally:
+        _delegation_sub_lock.release()
 
 
 @distributed_agent_bp.before_request
 def _bp_before_request_ensure_subscriber():
-    """One-shot subscriber bootstrap on the first /api/distributed/*
-    request.  After it succeeds the guard short-circuits cheaply —
-    no per-request overhead in steady state."""
+    """Subscriber bootstrap attempt on /api/distributed/* requests.
+
+    Flask runs before_request ahead of view decorators, so this executes
+    before @require_auth and must stay cheap for unauthenticated callers.
+    Two things keep it cheap, and both are needed:
+
+      * blocking=False -- don't wait on the bootstrap lock, so concurrent
+        requests don't queue behind the thread paying a Redis timeout.
+      * the failure cooldown in _ensure_delegation_subscriber -- a dead Redis
+        is probed once per window, not once per request.
+
+    Without them this hook cost 13.8-15.0s per unauthenticated request
+    (measured 2026-08-16); control routes answered in ~20ms.
+    Covered by tests/unit/test_delegation_subscriber_cooldown.py.
+    """
     if not _delegation_sub_started:
-        _ensure_delegation_subscriber()
+        _ensure_delegation_subscriber(blocking=False)
 
 
 # ─── Shared helpers ───
