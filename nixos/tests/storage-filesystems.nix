@@ -202,16 +202,33 @@ in
           print("=== udev properties ===\n"
                 + fs.succeed(f"udevadm info --query=property --name={disk} 2>&1 || true"))
 
-          # ...and MOUNT it on demand (under /run/media/<user>/...).
-          out = fs.succeed(f"udisksctl mount -b {disk} 2>&1")
+          # ...and MOUNT what udisks actually OFFERS as a filesystem. When the
+          # whole-disk mkfs leaves a phantom MBR, udisks owns the fs on the
+          # PARTITION and exposes only a PartitionTable on the disk, so ask it
+          # which node to use rather than insisting on one. On a real stick (a
+          # genuine partition table) this picks the partition too, which is what
+          # auto-mount does in practice anyway.
+          target = disk
+          if "PartitionTable" in fs.succeed(f"udisksctl info -b {disk} 2>&1 || true"):
+              part = fs.succeed(
+                  f"lsblk -nrpo NAME,FSTYPE {disk} "
+                  f"| awk '$1 != \"{disk}\" && $2 != \"\" {{print $1; exit}}'").strip()
+              assert part, (
+                  f"{disk} carries a partition table but no partition with a "
+                  "filesystem was found:\n"
+                  + fs.succeed(f"lsblk -f {disk} 2>&1 || true"))
+              print(f"=== udisks owns the fs on {part}, not {disk} ===")
+              target = part
+
+          out = fs.succeed(f"udisksctl mount -b {target} 2>&1")
           assert "Mounted" in out or "already mounted" in out, \
               f"udisks must mount the removable disk, got {out!r}"
-          mp = fs.succeed(f"findmnt -nro TARGET {disk} | head -n1").strip()
-          assert mp, f"udisks reported a mount but findmnt sees none for {disk}"
+          mp = fs.succeed(f"findmnt -nro TARGET {target} | head -n1").strip()
+          assert mp, f"udisks reported a mount but findmnt sees none for {target}"
           fs.succeed(f"echo hart-udisks-rw > {mp}/probe.txt")
           assert fs.succeed(f"cat {mp}/probe.txt").strip() == "hart-udisks-rw", \
               "udisks-mounted disk must be writable+readable"
-          fs.succeed(f"udisksctl unmount -b {disk}")
+          fs.succeed(f"udisksctl unmount -b {target}")
 
       # ── 3. DEGRADE-NOT-DIE: an unmountable/corrupt disk fails clean + fast ──
       with subtest("an unmountable corrupt disk fails cleanly and never wedges the OS"):
