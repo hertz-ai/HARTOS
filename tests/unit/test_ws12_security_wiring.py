@@ -476,11 +476,43 @@ class TestActionClassifierShellOps(unittest.TestCase):
         """Terminal exec should return 403 when classified as destructive."""
         app = self._make_app()
         with app.test_client() as client:
+            # NOT 'echo': echo is in _READONLY_SAFE_BINS and is fast-pathed PAST
+            # the classifier on purpose, so this asserted 403 on a command the
+            # gate never sees. Use a binary that actually reaches the gate.
             resp = client.post('/api/shell/terminal/exec',
-                               json={'command': 'echo hello'})
+                               json={'command': 'systemctl stop hart'})
             self.assertEqual(resp.status_code, 403)
             data = resp.get_json()
             self.assertIn('destructive', data['error'])
+
+    @patch('integrations.agent_engine.shell_os_apis._shell_auth_check',
+           return_value=(True, None))
+    @patch('integrations.agent_engine.shell_os_apis._audit_shell_op')
+    @patch('security.action_classifier.classify_action',
+           return_value='destructive')
+    def test_readonly_bins_fastpath_past_classifier(self, mock_classify,
+                                                     mock_audit, mock_auth):
+        """Read-only diagnostic bins run even when the classifier says destructive.
+
+        This bypass is deliberate (a busy or down local LLM otherwise hangs the
+        classify call and aborts the Terminal fetch on EVERY command), but it had
+        no coverage at all, so nothing stopped the allowlist from being widened
+        into something that can write.
+        """
+        from integrations.agent_engine.shell_os_apis import _READONLY_SAFE_BINS
+
+        app = self._make_app()
+        with app.test_client() as client:
+            resp = client.post('/api/shell/terminal/exec',
+                               json={'command': 'echo hello'})
+            self.assertNotEqual(resp.status_code, 403)
+            mock_classify.assert_not_called()
+
+        # The allowlist must stay read-only. 'env'/'sh'/'bash'/'python' would each
+        # execute an arbitrary program and launder past the classifier.
+        for danger in ('env', 'sh', 'bash', 'zsh', 'python', 'python3', 'perl',
+                       'xargs', 'find', 'sudo', 'systemctl', 'cp', 'mv', 'rm'):
+            self.assertNotIn(danger, _READONLY_SAFE_BINS)
 
     @patch('integrations.agent_engine.shell_os_apis._shell_auth_check',
            return_value=(True, None))
@@ -683,9 +715,32 @@ class TestFederationDeltaSigning(unittest.TestCase):
             # No guardrail_hash — skips guardrail check
         }
 
-        ok, msg = agg.receive_peer_delta(delta)
+        # The Ed25519 gate now runs FIRST and rejects an unsigned delta outright
+        # under the default hard enforcement, so this never reached the HMAC
+        # check it is named for. Drop to soft so the HMAC gate is the one under
+        # test; HMAC verification itself is unconditional on enforcement mode.
+        with patch('security.master_key.get_enforcement_mode',
+                   return_value='soft'):
+            ok, msg = agg.receive_peer_delta(delta)
         self.assertFalse(ok)
         self.assertIn('HMAC', msg)
+
+    def test_receive_peer_delta_rejects_unsigned_under_hard_enforcement(self):
+        """An unsigned delta is refused before any HMAC check, in hard mode."""
+        from integrations.agent_engine.federated_aggregator import FederatedAggregator
+
+        agg = FederatedAggregator()
+        delta = {
+            'version': 1,
+            'node_id': 'peer-node',
+            'timestamp': time.time(),
+            'hmac_signature': 'bad-signature-value',
+        }
+        with patch('security.master_key.get_enforcement_mode',
+                   return_value='hard'):
+            ok, msg = agg.receive_peer_delta(delta)
+        self.assertFalse(ok)
+        self.assertIn('Ed25519', msg)
 
 
 # ═══════════════════════════════════════════════════════════════

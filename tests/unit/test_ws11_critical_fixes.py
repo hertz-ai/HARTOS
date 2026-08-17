@@ -19,6 +19,7 @@ Covers:
 """
 
 import json
+import importlib
 import os
 import sys
 import tempfile
@@ -1180,14 +1181,49 @@ class TestShellAuthEdgeCases(unittest.TestCase):
         self.app = _make_shell_app()
         self.app.config['TESTING'] = True
 
-    def test_zero_address_allowed(self):
-        """0.0.0.0 is treated as local (bind-all)."""
-        with self.app.test_request_context(
-                '/api/shell/notifications',
-                environ_base={'REMOTE_ADDR': '0.0.0.0'}):
-            from integrations.agent_engine.shell_os_apis import _shell_auth_check
-            ok, *rest = _shell_auth_check()
-            self.assertTrue(ok)
+    def test_zero_address_rejected_without_token(self):
+        """0.0.0.0 is NOT a local origin and must present a token.
+
+        This test used to assert the opposite. 0.0.0.0 is the "bind any
+        interface" sentinel, never a real loopback *client* address, and only
+        shell_os_apis ever trusted it -- shell_system_apis and
+        shell_desktop_apis did not. That drift was a privilege-escalation gap:
+        a request whose remote_addr reads 0.0.0.0 reached the os-shell routes
+        with no token. The surfaces were collapsed onto one shared
+        shell_auth.shell_auth_ok that excludes it, so pin the closed behaviour.
+        """
+        with patch.dict(os.environ, {'HART_SHELL_TOKEN': 'a-real-token'},
+                        clear=False):
+            with self.app.test_request_context(
+                    '/api/shell/notifications',
+                    environ_base={'REMOTE_ADDR': '0.0.0.0'}):
+                from integrations.agent_engine.shell_os_apis import _shell_auth_check
+                ok, *rest = _shell_auth_check()
+                self.assertFalse(ok)
+
+            # ...and is accepted once it carries the token, like any non-local peer.
+            with self.app.test_request_context(
+                    '/api/shell/notifications',
+                    environ_base={'REMOTE_ADDR': '0.0.0.0'},
+                    headers={'X-Shell-Token': 'a-real-token'}):
+                from integrations.agent_engine.shell_os_apis import _shell_auth_check
+                ok, *rest = _shell_auth_check()
+                self.assertTrue(ok)
+
+    def test_all_shell_surfaces_share_one_auth_check(self):
+        """os / system / desktop decorators are the SAME object, not copies."""
+        from integrations.agent_engine.shell_auth import require_shell_auth
+        from integrations.agent_engine.shell_os_apis import _require_shell_auth
+        self.assertIs(_require_shell_auth, require_shell_auth)
+        for mod_name, attr in (
+                ('integrations.agent_engine.shell_system_apis', '_require_system_auth'),
+                ('integrations.agent_engine.shell_desktop_apis', '_require_desktop_auth')):
+            try:
+                mod = importlib.import_module(mod_name)
+            except Exception:
+                continue
+            self.assertIs(getattr(mod, attr), require_shell_auth,
+                          f'{mod_name}.{attr} drifted off the shared check')
 
     def test_missing_remote_addr_rejected(self):
         """Empty remote_addr is rejected."""
