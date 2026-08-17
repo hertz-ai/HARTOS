@@ -4166,6 +4166,12 @@ class TestSilentlyOptionalDepsAreMirroredIntoTheImage:
         'num2words': 'num2words',
         'stripe': 'stripe',
         'youtube-transcript-api': 'youtube-transcript-api',
+        # httpx is the only client here that speaks unix-socket transport, so
+        # the LiquidUI shell's Nunba proxy cannot work without it. Its import
+        # was unguarded and missing from the image at the same time, which took
+        # hart-liquid-ui.service into a restart loop and left the desktop with
+        # no shell server at all. Now guarded AND mirrored; this pins the mirror.
+        'httpx': 'httpx',
     }
 
     def _read(self, rel):

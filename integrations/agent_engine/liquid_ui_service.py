@@ -6834,9 +6834,29 @@ function renderAgentOverlay(ev) {{
             return Response('Nunba UI unavailable', status=503,
                             mimetype='text/plain')
 
+        # The UDS proxy needs httpx. This import used to be unguarded, and it is
+        # reached only when hart_nunba_socket is set -- so preinstalling the
+        # Nunba microfrontend turned the path on, httpx was missing from
+        # nixos/packages/hart-app.nix (it is in nunba.nix, a different python
+        # env), and _create_flask_app() raised ModuleNotFoundError. That kills
+        # hart-liquid-ui.service outright: the OS shell server never binds, and
+        # three VM tests sat waiting on a unit that restart-looped forever.
+        #
+        # Every OTHER failure in this proxy already degrades to
+        # _serve_nunba_static() -- socket down, daemon still booting, request
+        # error. A missing client library is the same class of problem and must
+        # degrade the same way, not take the whole shell down with it.
+        _httpx = None
         if hart_nunba_socket:
-            import httpx as _httpx
+            try:
+                import httpx as _httpx
+            except ImportError:
+                logger.warning(
+                    'Nunba UDS proxy needs httpx and it is not installed — '
+                    'serving the static Nunba bundle instead')
+                _httpx = None
 
+        if hart_nunba_socket and _httpx is not None:
             # One pooled UDS client for the whole proxy — connection reuse,
             # no per-request socket setup.  read=None so Nunba SSE streams
             # never time out; a short connect timeout lets us fail fast to

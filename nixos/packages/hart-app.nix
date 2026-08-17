@@ -100,6 +100,15 @@ let
     # ever reports.
     youtube-transcript-api
 
+    # httpx — the LiquidUI shell's Nunba proxy talks to the Nunba daemon over a
+    # unix socket, and httpx is the only client here that does UDS transport
+    # (requests cannot). liquid_ui_service._create_flask_app() imports it as
+    # soon as hart_nunba_socket is set, so preinstalling Nunba made this a hard
+    # dependency of the SHELL SERVER: without it the import raised, the unit
+    # exited 1 and restart-looped, and the desktop never got a shell. It was in
+    # nunba.nix (that package's own python env) but never here.
+    httpx
+
     # Stripe SDK for the commercial API's /upgrade card charges
     # (integrations/ap2/ap2_protocol.py:StripePaymentGateway). requirements.txt
     # says in so many words that it is "baked into the image so production
