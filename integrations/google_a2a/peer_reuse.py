@@ -796,8 +796,15 @@ def try_peer_recipe_reuse(identity: Dict[str, str], local_prompt_id: str,
     key = str(local_prompt_id)
     now = time.monotonic()
     with _lock:
-        last = _attempt_cooldown.get(key, 0.0)
-        if now - last < _cooldown_s():
+        # Absence means "never attempted", NOT "attempted at t=0". time.monotonic()
+        # is seconds since boot on Linux, so `now - 0.0 < cooldown` is true on any
+        # host that has been up for less than the cooldown window -- and the whole
+        # feature silently returned None, never contacting a peer, for the first
+        # 600 seconds of every boot. That is exactly the window in which a node
+        # joining the hive most wants to pull a recipe, and nothing logged it:
+        # the caller cannot tell "cooling down" from "no peer had it".
+        last = _attempt_cooldown.get(key)
+        if last is not None and now - last < _cooldown_s():
             return None
         _attempt_cooldown[key] = now
 

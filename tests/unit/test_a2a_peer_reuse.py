@@ -603,3 +603,45 @@ class TestJsonRpcRouteUnauthenticated:
         assert body['jsonrpc'] == '2.0'
         assert body['error']['code'] == -32603
         assert body['id'] is None
+
+
+class TestCooldownSentinel:
+    """The per-goal cooldown must not swallow the FIRST attempt after boot.
+
+    time.monotonic() is seconds since boot on Linux. The gate used 0.0 as the
+    "never attempted" default and asked `now - last < cooldown`, so on a host
+    with less than 600s of uptime every first attempt was treated as a repeat
+    and peer reuse was off. It failed silently -- the caller cannot distinguish
+    "cooling down" from "no peer had it" -- and it hid on any dev box, which is
+    always up for days. It only ever showed on freshly-booted CI runners, where
+    it read as three unrelated A2A failures.
+    """
+
+    def test_first_attempt_runs_on_a_freshly_booted_host(self, harness):
+        calls = []
+        with patch.object(peer_reuse, 'admitted_peers',
+                          lambda *a, **k: (calls.append(1), [])[1]), \
+                patch.object(peer_reuse.time, 'monotonic', lambda: 12.0):
+            peer_reuse.try_peer_recipe_reuse(_identity(), LOCAL_PID)
+        assert calls, ('first attempt was swallowed by the cooldown on a host '
+                       'with 12s of uptime')
+
+    def test_cooldown_still_blocks_the_second_attempt_after_boot(self, harness):
+        calls = []
+        with patch.object(peer_reuse, 'admitted_peers',
+                          lambda *a, **k: (calls.append(1), [])[1]), \
+                patch.object(peer_reuse.time, 'monotonic', lambda: 12.0):
+            peer_reuse.try_peer_recipe_reuse(_identity(), LOCAL_PID)
+            peer_reuse.try_peer_recipe_reuse(_identity(), LOCAL_PID)
+        assert len(calls) == 1, 'cooldown must still suppress the repeat'
+
+    def test_attempt_runs_again_once_the_cooldown_elapses(self, harness):
+        calls = []
+        clock = [12.0]
+        with patch.object(peer_reuse, 'admitted_peers',
+                          lambda *a, **k: (calls.append(1), [])[1]), \
+                patch.object(peer_reuse.time, 'monotonic', lambda: clock[0]):
+            peer_reuse.try_peer_recipe_reuse(_identity(), LOCAL_PID)
+            clock[0] = 12.0 + peer_reuse._cooldown_s() + 1.0
+            peer_reuse.try_peer_recipe_reuse(_identity(), LOCAL_PID)
+        assert len(calls) == 2
