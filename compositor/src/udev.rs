@@ -887,6 +887,38 @@ fn device_added(
         // The PixmanRenderer's dmabuf formats are the DrmCompositor `renderer_formats`.
         let renderer_formats = state.renderer.dmabuf_formats();
 
+        // DIAGNOSTIC (2026-08-17): why Tier-1 can spin without ever painting.
+        // PixmanRenderer::bind accepts ONLY DrmModifier::Linear — it returns
+        // UnsupportedModifier for anything else. DrmCompositor picks its swapchain
+        // modifier from plane_formats ∩ renderer_formats, and when the PLANE
+        // advertises only the implicit modifier (Invalid — no IN_FORMATS blob) while
+        // the renderer advertises only Linear, Smithay takes its own special case:
+        //   "if a format supports explicit LINEAR (but no implicit Modifiers) and the
+        //    other doesn't support any modifier, force Implicit. This should at least
+        //    result in a working pipeline possibly with a linear buffer, but we cannot
+        //    be sure."
+        // It then allocates an Invalid-modifier buffer that its own PixmanRenderer
+        // refuses, so render_frame fails EVERY tick — 199 identical
+        // RenderFrame(UnsupportedModifier(Invalid)) faults in the VM run, no first
+        // paint, and the session supervisor drops the tier at 45s. Adding Invalid to
+        // renderer_formats cannot help: the plane offers only Invalid, so the
+        // intersection is Invalid either way.
+        // Smithay logs these sets at debug! only, which the session does not capture,
+        // so record them here. If the plane really is implicit-only this is an
+        // environment property (a real GPU advertises IN_FORMATS; qemu virtio-gpu may
+        // not) rather than anything this module can choose differently.
+        let plane_modifiers: Vec<_> = drm_surface
+            .plane_info()
+            .formats
+            .iter()
+            .map(|f| f.modifier)
+            .collect();
+        info!(
+            ?plane_modifiers,
+            renderer_formats = renderer_formats.iter().count(),
+            "HART-comp DRM: primary-plane modifiers vs pixman renderer formats (pixman binds LINEAR only)"
+        );
+
         let compositor = DrmCompositor::new(
             &output,
             drm_surface,
