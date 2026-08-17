@@ -111,10 +111,26 @@ in
               "HART OS journal export",
               "from /run/hart/gpu-render",
               "journalctl -b -p warning -n 200",
-              "journalctl -b --no-pager",
+              # NOT the literal "journalctl -b --no-pager" any more. That form was
+              # replaced on purpose: piping the WHOLE boot into `head -c` made
+              # journalctl format the journal from the beginning, which on a large
+              # journal over slow USB2 outran TimeoutStartSec=90, so systemd killed
+              # it, the timer refired, and one core stayed pinned at 99% forever --
+              # measured at +18C of waste heat on a Samsung NP550P5C, which is what
+              # actually froze the desktop. The section is tail-bounded with
+              # `-n $JOURNAL_CAP_LINES` now, so match the stable descriptive part
+              # rather than an exact flag order that a cap change would break again.
+              "(current boot, tail-bounded)",
               "end of export",
           ]:
               assert needle in dump, f"dump missing section: {needle!r}"
+
+          # ...and the unbounded form must STAY gone. This is the regression that
+          # cost a real machine its desktop, so assert its absence rather than
+          # trusting nobody re-adds it.
+          assert "journalctl -b --no-pager |" not in dump, (
+              "the full-boot journalctl pipe is back — that is the form that "
+              f"pinned a core at 99% and overheated the box:\n{dump[:400]}")
           # The full-journal section actually carries journal lines (not empty).
           assert len(dump) > 200, f"dump implausibly small ({len(dump)} bytes)"
           jx.succeed("umount /tmp/jx")

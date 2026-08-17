@@ -36,8 +36,12 @@
 #       existing signal, we do NOT add a second probe).
 #     - `journalctl -b -p warning -n 200`  - the last 200 warning-and-above lines
 #       (the quick "what went wrong" summary a human reads first).
-#     - `journalctl -b --no-pager`  - the FULL current-boot journal, capped at
-#       ~5 MB so a runaway log can never fill a small stick.
+#     - `journalctl -b -n $JOURNAL_CAP_LINES --no-pager`  - the current boot's
+#       journal, TAIL-bounded to the last 20000 lines (plus a byte cap as a
+#       belt-and-braces guard against pathologically long lines) so a runaway log
+#       can never fill a small stick. Deliberately NOT the full boot: see the
+#       long comment at the call site for why `journalctl -b --no-pager | head -c`
+#       pinned a core at 99% and cooked a real machine.
 #
 # THE never-touch / never-block contract (read carefully):
 #   - It NEVER writes to the live boot medium. The boot stick's vfat EFI partition
