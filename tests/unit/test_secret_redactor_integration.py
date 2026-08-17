@@ -42,6 +42,8 @@ class TestSecretRedactorFunction:
         'api_key=12345678-1234-1234-1234-123456789abc',
         'X-Api-Key: 12345678-1234-1234-1234-123456789abc',
         '"secret": "12345678-1234-1234-1234-123456789abc"',   # JSON: key's own quote
+        'secret=abc',            # 3 chars — a short secret is still a secret
+        'token=nonesuch',        # status-word exclusion is WHOLE-value only
     ])
     def test_redacts_secret_named_assignments(self, line):
         """security/audit_log.py delegated its redaction here and LOST coverage.
@@ -75,6 +77,15 @@ class TestSecretRedactorFunction:
         'auth=no',
         'token=on',
         'next_token_count=5',
+        # Status values are DIAGNOSTICS. In an auth-failure investigation
+        # "no token was present" and "a token was present" are different facts;
+        # redacting both collapses them. Named explicitly rather than protected
+        # by a length floor, which was only ever a proxy for this.
+        'token=null',
+        'auth_token=missing',
+        'secret=none',
+        'token=expired',
+        'token=invalid',
     ])
     def test_identifiers_stay_visible(self, line):
         """The counterpart guard: widening the NAMES must never widen the SHAPE.

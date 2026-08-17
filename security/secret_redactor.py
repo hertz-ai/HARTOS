@@ -128,14 +128,33 @@ _add('password_plaintext',
 #   * password_plaintext allows an unquoted value but only for password/passwd/pwd.
 #   * both require {8,}; `secret=hunter2` is 7.
 #
-# Floor of {6,} is deliberate: it covers `hunter2` while still refusing to eat
-# `auth=no` / `token=on`. Only SECRET-named keys are listed — node_id,
-# request_id and trace_id stay visible, because redacting identifiers is what
-# destroyed the "which node failed" diagnostic when heroku_key matched bare
-# UUIDs (see that pattern's comment). Widen the names, never the shape.
+# Only SECRET-named keys are listed — node_id, request_id and trace_id stay
+# visible, because redacting identifiers is what destroyed the "which node
+# failed" diagnostic when heroku_key matched bare UUIDs (see that pattern's
+# comment). WIDEN THE NAMES, NEVER THE SHAPE.
+#
+# RECONCILED with the independent fix on PR #113 (both landed for the same
+# review finding). Each version caught what the other missed, measured:
+#   this side  caught  "secret": "<uuid>"   — JSON; theirs lacked the optional
+#                                             quote AFTER the key, and the key's
+#                                             own closing " breaks \s*[=:]
+#   their side caught  secret=abc           — a 3-char secret is still a secret;
+#                                             a {6,} floor let it through
+# Union of both: optional quote after the key, and no length floor.
+#
+# The floor existed to protect status values, so it is replaced by naming them.
+# `token=null` / `auth_token=missing` / `token=on` are DIAGNOSTICS — in an
+# auth-failure investigation, "no token was present" and "a token was present"
+# are different facts, and redacting both collapses them. A literal allow-list is
+# exact where a length threshold was a proxy.
+_STATUS_WORDS = (r'null|none|nil|na|n/a|on|off|true|false|yes|no|unset|empty'
+                 r'|missing|expired|invalid|revoked|pending|unknown')
 _add('secret_assignment',
      r'\b(?:api[_-]?key|apikey|secret|token|auth[_-]?token|access[_-]?key)'
-     r'["\']?\s*[=:]\s*["\']?([^\s"\',;}\)]{6,})')
+     r'["\']?\s*[=:]\s*["\']?'
+     # not a status word (whole value only — `nonesuch` is still redacted)
+     r'(?!(?:' + _STATUS_WORDS + r')["\'\s,;}\)]|(?:' + _STATUS_WORDS + r')$)'
+     r'([^\s"\',;}\)]+)')
 
 # ── PEM private keys ──
 _add('pem_private_key',
