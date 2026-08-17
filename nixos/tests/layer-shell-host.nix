@@ -337,14 +337,28 @@ in
           # `exec <host>; <swaymsg> exit` made sway read the second half as a
           # config command, reject it, and refuse to start at all. Follow the exec
           # into the wrapper rather than substring-matching the config.
+          # Match the STARTUP CLIENT by name, not the first `exec` in the file: the
+          # config also has `bindsym ... exec <brightnessctl>` / `<pactl>`
+          # keybindings, and a bare `exec\s+(/nix/store/\S+)` matched brightnessctl,
+          # catted that, and reported the session-end chain missing. Name the wrapper.
           import re as _re
-          m = _re.search(r"exec\s+(/nix/store/\S+)", conf_src)
-          assert m, f"Tier-2 sway host config has no exec line:\n{conf_src}"
-          wrapper_src = host.succeed("cat " + m.group(1))
-          assert "swaymsg exit" in wrapper_src, \
-              ("Tier-2 session does not end when the shell host exits -- a WebKit "
-               "crash would leave sway running with no client (black screen, no "
-               f"relaunch). exec target:\n{wrapper_src}")
+          m = _re.search(r"exec\s+(/nix/store/\S*hart-glass-shell-gtk4-then-exit)",
+                         conf_src)
+          if m:
+              wrapper_src = host.succeed("cat " + m.group(1))
+              assert "/bin/hart-glass-shell-gtk4" in wrapper_src, \
+                  f"Tier-2 exec wrapper does not run the GTK4 host:\n{wrapper_src}"
+              assert "swaymsg exit" in wrapper_src, \
+                  ("Tier-2 session does not end when the shell host exits -- a "
+                   "WebKit crash would leave sway running with no client (black "
+                   f"screen, no relaunch). wrapper:\n{wrapper_src}")
+          else:
+              # Legacy inline form (kept accepted so this test pins the CONTRACT,
+              # not the mechanism).
+              assert "/bin/hart-glass-shell-gtk4" in conf_src and \
+                  "swaymsg exit" in conf_src, \
+                  ("Tier-2 neither execs the session-ending wrapper nor chains "
+                   f"swaymsg exit inline:\n{conf_src}")
 
           # ...and the config must PARSE. The assertion above used to be a
           # substring check on the config text, which is why a config sway could
@@ -539,10 +553,25 @@ in
           # The launcher runs sway onto the GTK4 host; the host script holds the
           # WebKit-side software-render contract. Follow it and assert the GTK4 host
           # pins HardwareAccelerationPolicy.NEVER + the DMABUF/compositing disables.
-          host_path = paint.succeed(
-              "grep -oE '/nix/store/[^ ]*/bin/hart-glass-shell-gtk4' "
-              f"$(grep -oE '/nix/store/[^ ]*hart-gtk4-layer-host.conf' {exec_path} | head -1) "
+          # The sway config's startup client is a WRAPPER (it runs the host, then
+          # ends the session so the supervisor relaunches the tier instead of
+          # leaving sway with no client). So the host binary path is one hop
+          # further in: grep the conf AND its exec target. If the wrapper grep
+          # finds nothing the $() expands away and this greps the conf alone,
+          # which keeps the legacy inline form working too.
+          sway_conf = paint.succeed(
+              f"grep -oE '/nix/store/[^ ]*hart-gtk4-layer-host.conf' {exec_path} "
               "| head -1").strip()
+          assert sway_conf, f"no sway conf referenced by the launcher {exec_path}"
+          host_path = paint.succeed(
+              "grep -hoE '/nix/store/[^ ]*/bin/hart-glass-shell-gtk4' "
+              f"{sway_conf} "
+              f"$(grep -oE '/nix/store/[^ ]*hart-glass-shell-gtk4-then-exit' {sway_conf} "
+              "| head -1) 2>/dev/null | head -1").strip()
+          assert host_path, (
+              "could not resolve the GTK4 host binary from the sway conf or its "
+              f"exec wrapper.\nconf: {sway_conf}\n"
+              + paint.succeed(f"cat {sway_conf}"))
           host_src = paint.succeed(f"cat {host_path}")
           assert "HardwareAccelerationPolicy.NEVER" in host_src, \
               "GTK4 host missing HardwareAccelerationPolicy.NEVER — GPU accel would crash on llvmpipe"
