@@ -439,8 +439,18 @@ in
           # existing 'fleet.command' bus topic and routes OTA pushes to the same
           # apply.  Its bootstrap log line proves the OTA leg was wired (no new
           # transport, no separate subscriber process).
-          jb = node.succeed("journalctl -u hart-backend --no-pager | "
-                            "grep -i 'Local subscribers bootstrapped' | tail -1")
+          # wait_until_succeeds, not succeed: wait_for_unit("hart-backend.service")
+          # above only means systemd considers the unit active, which happens long
+          # before hart_intelligence_entry finishes its module-level startup —
+          # bootstrap_local_subscribers() is near the END of that. Grepping for the
+          # line with a plain succeed() gave the backend zero time to reach it, and
+          # the last hart-backend line in the failing run's journal was still the
+          # vision init. Every other timing-sensitive assertion in this file already
+          # uses wait_until_succeeds; this one was the outlier.
+          jb = node.wait_until_succeeds(
+              "journalctl -u hart-backend --no-pager | "
+              "grep -i 'Local subscribers bootstrapped' | tail -1",
+              timeout=120)
           assert "ota-push" in jb, \
               f"OTA realtime push leg not wired into backend bootstrap:\n{jb}"
 

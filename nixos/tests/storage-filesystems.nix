@@ -179,6 +179,29 @@ in
           fs.wait_until_succeeds(
               f"udisksctl info -b {disk} | grep -Eq 'IdType:[[:space:]]*vfat'",
               timeout=30)
+          # DIAGNOSTIC, not a fix (2026-08-17). This has now failed three times
+          # with the SAME "not a mountable filesystem", and the two previous
+          # changes above both assumed a race — first the missing uevent, then
+          # udisksd's async refresh. Neither holds any more: in run 31986775018
+          # the IdType wait succeeded in 0.08s and the mount still failed, so
+          # udisks had already re-probed and STILL did not expose a Filesystem
+          # interface on the object. Guessing at a third sync step would just
+          # repeat the pattern. Capture what udisks actually thinks this device
+          # is, so the next failure names its own cause.
+          #
+          # (I first blamed a phantom `vdb1` from mkfs.vfat aliasing as an MBR —
+          # that IS real and does break state-persist, but the `vdb: vdb1` lines
+          # in this shard's log belong to hart-installer-dualboot, not to this
+          # test. No partition node appears in this VM.)
+          print("=== udisksctl info -b " + disk + " ===\n"
+                + fs.succeed(f"udisksctl info -b {disk} 2>&1 || true"))
+          print("=== lsblk -f ===\n"
+                + fs.succeed("lsblk -f 2>&1 || true"))
+          print("=== blkid ===\n"
+                + fs.succeed(f"blkid -p {disk} 2>&1 || true"))
+          print("=== udev properties ===\n"
+                + fs.succeed(f"udevadm info --query=property --name={disk} 2>&1 || true"))
+
           # ...and MOUNT it on demand (under /run/media/<user>/...).
           out = fs.succeed(f"udisksctl mount -b {disk} 2>&1")
           assert "Mounted" in out or "already mounted" in out, \
