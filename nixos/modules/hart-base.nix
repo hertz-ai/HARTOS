@@ -104,7 +104,22 @@ in
 
     # ── Branding ──
     environment.etc = {
-      "os-release".text = ''
+      # mkForce, because environment.etc.<name>.text is types.LINES: nixpkgs'
+      # own misc/version.nix defines "os-release".text too, and two lines
+      # definitions MERGE rather than one winning. /etc/os-release was getting
+      # both blocks concatenated -- duplicate NAME=, VERSION=, and an ID=nixos
+      # sitting next to our ID=hart-os. A standard os-release parser takes the
+      # last value for a repeated key, so the branding was decided by merge
+      # order, and hart-server-boot's "OS branding present (HART OS, not
+      # NixOS)" caught the leaked ID=nixos.
+      #
+      # This is also why system.nixos.distroId stays at its default below: with
+      # mkForce this block IS the file, so nothing nixpkgs derives from
+      # distroId can leak into it, and internal tooling that keys on distroId
+      # is left alone. ID=hart-os is load-bearing, not cosmetic --
+      # core/port_registry.py, deploy/distro/update/hart-update-service.py and
+      # deploy/linux/desktop/hart-tray.py all detect OS mode by reading it.
+      "os-release".text = lib.mkForce ''
         NAME="HART OS"
         PRETTY_NAME="HART OS ${cfg.version} (Sentient)"
         VERSION="${cfg.version}"
@@ -170,9 +185,13 @@ in
     # user-visible "NixOS" leak at boot (confirmed from a CI QEMU console dump;
     # isoImage.appendToMenuLabel only APPENDS, it can't drop the "NixOS"
     # prefix). distroName is the supported override the boot-menu + various
-    # system strings derive from. distroId is left as the default so tooling
-    # that keys on os-release ID=nixos still works; the user-facing NAME is
-    # already "HART OS" via the explicit os-release above.
+    # system strings derive from. distroId is left as the default so INTERNAL
+    # nixpkgs machinery that keys on it still works; /etc/os-release does not
+    # derive from it at all now, because the explicit block above is mkForce'd
+    # and replaces nixpkgs' generated one outright. (Before that mkForce the two
+    # were concatenated, so the claim that "the user-facing NAME is already HART
+    # OS via the explicit os-release" was only half true -- our lines were
+    # present, and so were nixpkgs', ID=nixos included.)
     system.nixos.distroName = lib.mkForce "HART OS";
 
     # Don't ship the NixOS manual / `nixos-help` — it's a "NixOS" reference a
