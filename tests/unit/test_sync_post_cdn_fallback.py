@@ -66,6 +66,13 @@ def test_no_fallback_when_flat_node_has_no_parent(monkeypatch):
     calls = _record(monkeypatch, {})
     monkeypatch.delenv('HEVOLVE_CENTRAL_URL', raising=False)
     monkeypatch.delenv('HEVOLVE_REGIONAL_URL', raising=False)
+    # Clearing the env vars is no longer enough to mean "no parent": the
+    # resolver falls through to DISCOVERY (resolve_reachable_central) when
+    # neither is set, because a fleet-wide install once had no env and drained
+    # nowhere. Arrange the actual flat-node condition -- no reachable central --
+    # instead of relying on the network being absent.
+    import core.superadmins as _sa
+    monkeypatch.setattr(_sa, 'resolve_reachable_central', lambda *a, **k: '')
     out = federation.pull_with_central_fallback('DB', 'http://peerA')
     assert out == 0
     assert calls == ['http://peerA']  # flat node: peer only, no parent to fall back to

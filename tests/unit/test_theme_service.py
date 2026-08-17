@@ -778,8 +778,13 @@ class TestShellManifest:
 
     def test_system_panels_have_apis(self):
         from integrations.agent_engine.shell_manifest import SYSTEM_PANELS
-        # Some panels are pure client-side (calculator, weather_widget) - no APIs needed
-        CLIENT_ONLY_PANELS = {'calculator', 'weather_widget'}
+        # Some panels are pure client-side - no APIs needed. `settings` joined
+        # them by design: it is a COMPOSED INDEX whose every tile opens an
+        # existing panel via openPanel (the section->ids map lives in
+        # SETTINGS_SECTIONS), explicitly so there is no parallel settings
+        # implementation. A panel that only routes to other panels owns no API
+        # of its own.
+        CLIENT_ONLY_PANELS = {'calculator', 'weather_widget', 'settings'}
         for pid, panel in SYSTEM_PANELS.items():
             assert 'apis' in panel, f"{pid} missing apis"
             if pid not in CLIENT_ONLY_PANELS:

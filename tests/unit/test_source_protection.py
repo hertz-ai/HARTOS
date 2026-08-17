@@ -845,6 +845,14 @@ class TestPerimeterEnforcement:
         from integrations.social.peer_discovery import GossipProtocol
         import security.release_hash_registry as rhm
         original = rhm._KNOWN_HASHES.copy()
+        # ARRANGE 'warn' enforcement: peer SIGNING became mandatory in hard
+        # mode, so an unsigned peer is now rejected ("Rejecting unsigned peer
+        # ... enforcement=hard") BEFORE the code-hash check this test is about.
+        # The signature rule has its own coverage; this one is the
+        # registry-hash acceptance path.
+        _mk = patch('security.master_key.get_enforcement_mode',
+                    return_value='warn')
+        _mk.start()
         try:
             rhm._KNOWN_HASHES['1.0.0'] = 'known_ga_hash'
             gp = GossipProtocol.__new__(GossipProtocol)
@@ -865,6 +873,7 @@ class TestPerimeterEnforcement:
             # We verify by ensuring db.add was called (new peer inserted)
             assert db.add.called
         finally:
+            _mk.stop()
             rhm._KNOWN_HASHES.clear()
             rhm._KNOWN_HASHES.update(original)
 
