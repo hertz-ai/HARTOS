@@ -171,14 +171,15 @@ def _bp_before_request_ensure_subscriber():
 # ─── Shared helpers ───
 
 def _get_redis_client():
-    """Get Redis client from environment or return None."""
+    """Get Redis client from environment or return None.
+
+    Routes through core.redis_client so the retry policy lives in one place.
+    This site used retry_on_timeout=False, which redis-py >= 6.0 ignores, so
+    a 1s timeout actually cost ~14s of retries.
+    """
     try:
-        import redis
-        host = os.environ.get('REDIS_HOST', 'localhost')
-        port = int(os.environ.get('REDIS_PORT', 6379))
-        return redis.Redis(host=host, port=port, decode_responses=True,
-                           socket_connect_timeout=1, socket_timeout=1,
-                           retry_on_timeout=False)
+        from core.redis_client import probe_client
+        return probe_client(socket_timeout=1)
     except Exception:
         return None
 
