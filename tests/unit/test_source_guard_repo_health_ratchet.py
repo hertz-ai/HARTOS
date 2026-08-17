@@ -31,7 +31,15 @@ SKIP = {'.git', '__pycache__', 'venv', '.venv', 'node_modules', 'claw_native',
 # ── BUDGETS — measured 2026-08-17. RATCHET DOWN ONLY. ────────────────────────
 # Raising a number here to make CI pass is the failure mode this guard exists to
 # prevent: it converts a regression into a silently accepted new normal.
-MAX_BARE_SWALLOWS = 1533        # `except ...: pass`
+MAX_BARE_SWALLOWS = 1528        # `except ...: pass` (was 1533)
+
+#: security/ gets its OWN, TIGHTER budget. A swallow here is worst: a control that
+#: fails without saying so still reports green, so the system cannot tell a working
+#: guardrail from a broken one. Drive this to zero first, ahead of the global count.
+#: Note 4 of the remainder are in hive_guardrails.py, which CLAUDE.md forbids
+#: modifying (circuit breaker / structural immutability) — they need the steward,
+#: not a refactor.
+MAX_SECURITY_SWALLOWS = 63      # was 68
 MAX_GOD_MODULES = 9             # SOURCE files > 3000 lines (tests excluded —
                                 # the first draft said 11 by counting
                                 # test_nixos_configs.py and test_agent_engine.py,
@@ -78,6 +86,7 @@ def _walk():
 def _measure():
     defs = collections.defaultdict(set)
     swallows = 0
+    sec_swallows = 0
     god = []
     for rel, p in _walk():
         try:
@@ -101,14 +110,26 @@ def _measure():
                 body = [n for n in node.body if not isinstance(n, ast.Expr)]
                 if len(body) == 1 and isinstance(body[0], ast.Pass):
                     swallows += 1
-    return defs, swallows, god
+                    if rel.split(os.sep)[0] == 'security':
+                        sec_swallows += 1
+    return defs, swallows, sec_swallows, god
 
 
 class RepoHealthRatchet(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.defs, cls.swallows, cls.god = _measure()
+        cls.defs, cls.swallows, cls.sec_swallows, cls.god = _measure()
+
+    def test_security_swallows_do_not_grow(self):
+        """Tighter than the global budget on purpose: in security/ a swallowed
+        failure means a control that is not working while everything reports
+        green. Drive this one to zero first."""
+        self.assertLessEqual(
+            self.sec_swallows, MAX_SECURITY_SWALLOWS,
+            "silent `except: pass` under security/ rose to %d (budget %d). A "
+            "security control that fails without saying so is indistinguishable "
+            "from one that works." % (self.sec_swallows, MAX_SECURITY_SWALLOWS))
 
     def test_silent_swallows_do_not_grow(self):
         """`except: pass` makes failure invisible. 1,533 of them is why the
@@ -157,6 +178,9 @@ class RepoHealthRatchet(unittest.TestCase):
         if self.swallows + 50 < MAX_BARE_SWALLOWS:
             stale.append("MAX_BARE_SWALLOWS=%d but actual is %d — lower it"
                          % (MAX_BARE_SWALLOWS, self.swallows))
+        if self.sec_swallows < MAX_SECURITY_SWALLOWS:
+            stale.append("MAX_SECURITY_SWALLOWS=%d but actual is %d — lower it"
+                         % (MAX_SECURITY_SWALLOWS, self.sec_swallows))
         if len(self.god) < MAX_GOD_MODULES:
             stale.append("MAX_GOD_MODULES=%d but actual is %d — lower it"
                          % (MAX_GOD_MODULES, len(self.god)))

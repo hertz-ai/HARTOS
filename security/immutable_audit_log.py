@@ -92,7 +92,17 @@ class ImmutableAuditLog:
                     if db is None:
                         session.close()
             except Exception:
-                pass
+                # NEVER silent: this is the hash-chain link. Falling through to the
+                # in-memory tail (or 'genesis') means the NEXT entry chains onto a
+                # different predecessor than the DB holds, so the chain silently
+                # stops being tamper-evident — the one property this class exists
+                # for. The read must still not raise (an audit write must not be
+                # lost because the chain head could not be read), so it degrades,
+                # but it says so.
+                logger.exception(
+                    "immutable_audit_log: could not read the chain head from the DB; "
+                    "falling back to the in-memory tail. The chain may FORK here and "
+                    "tamper-evidence is degraded until the DB read succeeds again.")
 
         # Fallback: in-memory
         if self._memory_log:
@@ -304,7 +314,16 @@ class ImmutableAuditLog:
                 finally:
                     db.close()
             except Exception:
-                pass
+                # NEVER silent: on failure this returns the in-memory tail, which
+                # for a fresh process is EMPTY. An auditor reading "no entries"
+                # cannot distinguish "nothing happened" from "the audit store is
+                # unreachable" — the difference between a clean record and a
+                # missing one. Degrade, but say so.
+                logger.exception(
+                    "immutable_audit_log: could not read entries from the DB; "
+                    "returning the in-memory tail (%d entries). A caller seeing an "
+                    "empty audit log here is seeing a READ FAILURE, not an empty "
+                    "history.", len(self._memory_log))
 
         return list(self._memory_log[:limit])
 

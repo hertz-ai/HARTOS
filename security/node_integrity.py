@@ -82,7 +82,17 @@ def get_or_create_keypair() -> Tuple[Ed25519PrivateKey, Ed25519PublicKey]:
                 from security.crypto import decrypt_data
                 raw = decrypt_data(raw)
             except ImportError:
-                pass
+                # NEVER silent: without security.crypto the key bytes are used
+                # EXACTLY as they sit on disk. If they are plaintext PEM this is
+                # the intended path and load_pem_private_key succeeds; if they are
+                # encrypted-at-rest, the load below fails with a confusing PEM
+                # error and the real cause (the crypto module is missing) is
+                # nowhere in the log. Name it once, here.
+                logger.warning(
+                    "node_integrity: security.crypto unavailable — the node private "
+                    "key is being read WITHOUT decrypt-at-rest. Fine for a plaintext "
+                    "PEM; if the key is encrypted, the PEM load below will fail and "
+                    "THIS is why.", exc_info=True)
             _private_key = serialization.load_pem_private_key(raw, password=None)
             _public_key = _private_key.public_key()
             logger.info(f"Node keypair loaded from {key_dir}")
@@ -331,7 +341,15 @@ def _collect_py_files(directory: Path, root: Path):
                 rel = str(entry.relative_to(root)).replace('\\', '/')
                 yield (rel, entry)
     except (PermissionError, OSError):
-        pass
+        # NEVER silent: an unreadable directory means its .py files are silently
+        # ABSENT from the code hash. The hash still computes and still compares —
+        # over a SUBSET of the tree — so integrity verification quietly covers less
+        # than it claims. Keep walking (one bad dir must not abort the scan), but
+        # make the reduced coverage visible.
+        logger.warning(
+            "node_integrity: cannot read %s — its .py files are EXCLUDED from the "
+            "code hash, so integrity verification covers less of the tree than it "
+            "appears to", directory, exc_info=True)
 
 
 def _hash_file(file_path: Path) -> str:
@@ -342,7 +360,14 @@ def _hash_file(file_path: Path) -> str:
             for chunk in iter(lambda: f.read(8192), b''):
                 h.update(chunk)
     except (IOError, OSError):
-        pass
+        # NEVER silent: an unreadable file yields the hash of EMPTY input, which is
+        # a real-looking sha256 that says nothing about the file. Two different
+        # unreadable files hash identically, and a file that becomes unreadable
+        # looks like a file that changed. Return it (callers expect a string) but
+        # do not let it pass unnoticed.
+        logger.warning(
+            "node_integrity: cannot read %s — hashing it as EMPTY, so this entry "
+            "does not reflect the file's real contents", file_path, exc_info=True)
     return h.hexdigest()
 
 
