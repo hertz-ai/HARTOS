@@ -165,8 +165,17 @@ in
           # in front of the real initrd, so the archive's own path strings sit
           # in the first few KiB of the file. Reading them back proves the
           # artifact was actually built — an eval-level option check could not.
+          # `strings` is binutils and is NOT on this node's PATH — vm-tests.nix
+          # declares no environment.systemPackages at all. The command used to be
+          # `... | strings || true`, so the pipeline exited 127 (command not
+          # found), `|| true` swallowed it, succeed() passed with EMPTY stdout, and
+          # the assertion below then reported "no early-microcode cpio" about a
+          # system that has one. Nothing about microcode was ever being tested.
+          #
+          # tr is coreutils, always present. And no `|| true`: a missing tool must
+          # fail loudly here rather than masquerade as a missing artifact.
           head = server.succeed(
-              "head -c 4096 /run/current-system/initrd | strings || true")
+              "head -c 4096 /run/current-system/initrd | tr -cd '[:print:][:space:]'")
           assert "kernel/x86/microcode" in head, (
               "no early-microcode cpio at the head of the initrd — "
               "hardware.cpu.{intel,amd}.updateMicrocode did not take effect")
