@@ -1548,7 +1548,8 @@ def get_post(post_id):
     from .privacy import can_view_post
     if not can_view_post(g.db, g.user, post):
         return _err("Post not found", 404)
-    PostService.increment_view(g.db, post)
+    # Build the response BEFORE touching the view counter, so a failed
+    # counter can never cost the reader the post.
     data = post.to_dict(include_author=True)
     # Include user's vote if authenticated
     if g.user:
@@ -1557,6 +1558,34 @@ def get_post(post_id):
             Vote.user_id == g.user.id, Vote.target_type == 'post',
             Vote.target_id == post_id).first()
         data['user_vote'] = vote.value if vote else 0
+
+    # A WRITE on a read path, so it is best-effort by construction.
+    #
+    # This ran first and unguarded, and it took the whole endpoint down with
+    # it. Live on 2026-08-17, every link to a post returned 500:
+    #
+    #   sqlalchemy.exc.OperationalError: (sqlite3.OperationalError)
+    #   database is locked
+    #   [SQL: UPDATE posts SET view_count=?, updated_at=CURRENT_TIMESTAMP ...]
+    #
+    # SQLite allows one writer at a time, and this node has agents writing
+    # continuously, so the lock is ordinary rather than exceptional. The post
+    # was found and authorised; only the counter failed. The reader still got
+    # nothing, and the UI reported it as "post not found", which sent us
+    # looking for a missing row that was there the whole time.
+    #
+    # The savepoint is the part that matters: without it a failed flush
+    # poisons the surrounding session and the already-built response cannot be
+    # returned either. With it, the failure is contained and rolled back to
+    # here, leaving the read intact.
+    #
+    # A lost view count is worth strictly less than a readable post.
+    try:
+        with g.db.begin_nested():
+            PostService.increment_view(g.db, post)
+    except Exception as exc:
+        logger.warning("view count not recorded for post %s: %s", post_id, exc)
+
     return _ok(data)
 
 
