@@ -414,6 +414,80 @@ class LedgerProbe:
         # a stalled queue names the daemon rather than only the symptom.
         self.assert_daemon_alive(base_url)
 
+    # ── Goal attainment ─────────────────────────────────────────────
+    #
+    # Whether agents actually MET their goals, as opposed to whether they
+    # were marked as having met them.
+    #
+    # `status == 'completed'` cannot answer that on its own. The daemon
+    # decides completion on one condition (agent_daemon.py, the dispatch
+    # tail):
+    #
+    #     elif spark_spent > 0:
+    #         goal.status = 'completed'
+    #
+    # Spend is the only evidence required, and spend is not attainment: a
+    # dispatch that burned tokens and produced nothing satisfies it. So the
+    # chain has to be read in full — dispatched, then worked, then completed
+    # — and the contradictions surfaced rather than summed into a percentage.
+    #
+    # Measured on production 2026-08-17: 127 goals, 50 never dispatched, and
+    # 43 of 53 'completed' rows had last_dispatched_at NULL. This repo has
+    # already published 416 fabricated proofs and kept a benchmark ledger of
+    # 567 rows with zero results; a completion counter with no side-effect
+    # check is the same failure a third time.
+
+    def goal_attainment(self) -> List[Dict[str, Any]]:
+        """One record per agent goal describing the attainment chain.
+
+        Returns [] when the model layer is not importable, matching this
+        class's existing "return empty and let the caller skip" contract.
+        """
+        def _q(db: Any) -> List[Dict[str, Any]]:
+            from integrations.social.models import AgentGoal
+            out: List[Dict[str, Any]] = []
+            for g in db.query(AgentGoal).all():
+                cfg = g.config_json or {}
+                dispatched = g.last_dispatched_at is not None
+                spent = int(g.spark_spent or 0)
+                out.append({
+                    'id': g.id,
+                    'goal_type': g.goal_type,
+                    'title': g.title,
+                    'status': g.status,
+                    'dispatched': dispatched,
+                    'spark_spent': spent,
+                    'noop_dispatches': int(cfg.get('noop_dispatch_count', 0) or 0),
+                    'pause_reason': cfg.get('pause_reason', ''),
+                    # The contradiction that matters: claimed done, never ran.
+                    'phantom_completion': g.status == 'completed' and not dispatched,
+                    # Ran repeatedly and produced no metered work.
+                    'dispatched_but_idle': dispatched and spent == 0,
+                })
+            return out
+
+        return self._with_db(_q) or []
+
+    def assert_no_phantom_completions(self) -> None:
+        """A goal may not be 'completed' without ever having been dispatched.
+
+        This is the weakest honest invariant available: it does not claim the
+        work was good, only that something ran. Anything laxer would have
+        passed on all 43 rows that triggered writing this.
+        """
+        records = self.goal_attainment()
+        if not records:
+            return                      # model layer unavailable; caller skips
+        phantoms = [r for r in records if r['phantom_completion']]
+        assert not phantoms, (
+            '%d of %d goals are marked completed but were never dispatched '
+            '(last_dispatched_at IS NULL). Completion is decided on '
+            'spark_spent > 0 alone, so spend is being read as attainment. '
+            'First few: %s'
+            % (len(phantoms), len(records),
+               [(r['goal_type'], r['title'][:40]) for r in phantoms[:5]])
+        )
+
 
 # ─── LLM judge ───────────────────────────────────────────────────────
 
@@ -453,7 +527,20 @@ class LLMJudge:
         min_len: int = 1,
         max_len: int = 20000,
         rubric: str = '',
+        strict: bool = False,
     ) -> JudgeVerdict:
+        # strict=False (the default, and every existing caller) keeps the
+        # fail-OPEN behaviour below: an unreachable model falls back to the
+        # heuristic and the assertion still passes. That is right for a test
+        # that is really asserting something else and only wants a sanity
+        # check on wording.
+        #
+        # strict=True is for MEASUREMENT rather than assertion. When the point
+        # of the run is "what fraction of our agents does the local model get
+        # right", a missing model must not be scored as a pass, or the report
+        # says 100% while having measured nothing. That is the same shape as
+        # the 416 fabricated "PROOF: 0.0%" posts this repo already published:
+        # a number produced by a path that never ran.
         text = str(output or '')
         n = len(text.strip())
         if n < min_len:
@@ -473,6 +560,11 @@ class LLMJudge:
                                     f'contained banned phrase: {banned!r}')
         heuristic_score = min(1.0, n / max(min_len * 4, 80))
         if not self._llm_enabled or not rubric:
+            if strict:
+                return JudgeVerdict(
+                    False, 0.0,
+                    'strict judging requested but no LLM backend: set '
+                    'HEVOLVE_TEST_LLM_JUDGE=1 and supply a rubric')
             return JudgeVerdict(True, heuristic_score, 'heuristic ok')
         # LLM backend — called only when explicitly enabled
         try:
@@ -482,6 +574,8 @@ class LLMJudge:
             bridge = get_world_model_bridge()
             provider = getattr(bridge, '_provider', None)
             if provider is None:
+                if strict:
+                    return JudgeVerdict(False, 0.0, 'llm unavailable')
                 return JudgeVerdict(True, heuristic_score,
                                     'llm unavailable; heuristic pass')
             messages = [
@@ -511,6 +605,8 @@ class LLMJudge:
                 pass
             return JudgeVerdict(score >= 0.5, score, reply.strip() or 'llm verdict')
         except Exception as exc:
+            if strict:
+                return JudgeVerdict(False, 0.0, f'llm judge failed: {exc}')
             return JudgeVerdict(True, heuristic_score,
                                 f'llm judge failed, heuristic pass: {exc}')
 
