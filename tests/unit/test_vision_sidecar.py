@@ -395,12 +395,28 @@ class TestVisionService:
     @patch('integrations.vision.vision_service.VisionService._run_ws_server')
     @patch('integrations.vision.vision_service.VisionService._description_loop')
     def test_start_sets_running(self, mock_desc, mock_ws, mock_start):
+        """With a backend available, start() marks the service running.
+
+        This used to arrange only the MiniCPM installer and then let start()
+        call the real get_vision_backend(), so the outcome depended on the
+        HOST: a dev box with a backend passed, and a GPU-less CI runner got
+        name='none', took the no-backend branch and failed. The contract that
+        branch implements is asserted deliberately in
+        test_start_without_gpu_stays_stopped, so this test simply has to supply
+        the backend whose presence it is about.
+        """
         from integrations.vision.vision_service import VisionService
+        backend = MagicMock()
+        backend.name = 'qwen-vl'
+        backend.requires_gpu = False
+        backend.ram_mb = 800
         svc = VisionService()
         # Pre-mark installer as installed
         svc._installer._installed = True
         svc._installer.is_installed = lambda: True
-        svc.start()
+        with patch('integrations.vision.vision_service.get_vision_backend',
+                   return_value=backend):
+            svc.start()
         assert svc._running is True
         svc.stop()
 
