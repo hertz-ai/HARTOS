@@ -387,6 +387,46 @@
       permittedInsecurePackages = [ "electron-33.4.11" ];
     };
 
+    # Single source of truth for overlays, for the SAME reason nixpkgsConfig is:
+    # a node module setting nixpkgs.overlays collides with runNixOSTest's
+    # read-only node.pkgs ("nodes.X.nixpkgs.overlays defined multiple times",
+    # #70). Real builds get these via mkHartSystem; the VM tests get them via
+    # their `pkgs` in `checks` — set at construction, so nothing is defined twice.
+    #
+    # ── libsciter mirror (2026-08-17) ──
+    # github.com/.../sciter-sdk/raw/<rev>/bin.lnx/x64/libsciter-gtk.so returns
+    # 404 to GitHub Actions runners — persistently, measured on two runs 30
+    # minutes apart — while the blob is plainly still there (authenticated
+    # contents API: size=10479944, at that exact rev). raw.githubusercontent also
+    # answers 429 from a normal client, so this is access throttling on that
+    # endpoint, not a deleted file. rustdesk is in the desktop profile and
+    # libsciter is its dependency, so EVERY nixosTest shard built it and all four
+    # went red on something nobody changed.
+    #
+    # This adds a MIRROR ONLY. The fixed-output sha256 is untouched, so nix still
+    # guarantees byte-identical output or a clean failure — a mirror cannot
+    # smuggle in different bytes. jsDelivr was verified to serve the identical
+    # file before this was written: HTTP 200, 10479944 bytes, ELF magic, sha256
+    # a1682fbf55e004f1862d6ace31b5220121d20906bdbf308d0a9237b451e4db86. The
+    # original GitHub URL is kept as the second entry, so once raw access is
+    # restored this heals itself and the overlay can simply be deleted.
+    #
+    # optionalAttrs-guarded like desktop.nix's `pkgs ? rustdesk`: a nixpkgs rev
+    # without libsciter must not break evaluation.
+    hartOverlays = [
+      (final: prev: nixpkgs.lib.optionalAttrs (prev ? libsciter) {
+        libsciter = prev.libsciter.overrideAttrs (_old: {
+          src = final.fetchurl {
+            urls = [
+              "https://cdn.jsdelivr.net/gh/c-smile/sciter-sdk@9f1724a45f5a53c4d513b02ed01cdbdab08fa0e5/bin.lnx/x64/libsciter-gtk.so"
+              "https://github.com/c-smile/sciter-sdk/raw/9f1724a45f5a53c4d513b02ed01cdbdab08fa0e5/bin.lnx/x64/libsciter-gtk.so"
+            ];
+            sha256 = "a1682fbf55e004f1862d6ace31b5220121d20906bdbf308d0a9237b451e4db86";
+          };
+        });
+      })
+    ];
+
     # Common specialArgs passed to all modules
     mkSpecialArgs = variant: {
       inherit llama-cpp mobile-nixos nixos-hardware;
@@ -461,7 +501,9 @@
         inherit system;
         specialArgs = mkSpecialArgs variant // { hartImageKind = imageKind; };
         modules = hartModules ++ [
-          { nixpkgs.config = nixpkgsConfig; }  # single source — #70
+          # single source — #70. Overlays ride the same module for the same
+          # reason: defined once here, never in a shared/node module.
+          { nixpkgs.config = nixpkgsConfig; nixpkgs.overlays = hartOverlays; }
         ] ++ modules;
       };
 
@@ -921,7 +963,13 @@
       # --no-build` only needs the nodes to EVALUATE; the testScript assertions
       # run in the build job.  Earlier landed #70 fixes: phosh +
       # services.modemManager removed, nixpkgs.config single-sourced (fd95368).
-      pkgs = import nixpkgs { system = "x86_64-linux"; config = nixpkgsConfig; };
+      # overlays go in HERE, at pkgs construction, not via a node module — a node
+      # module setting nixpkgs.overlays is exactly the #70 collision above.
+      pkgs = import nixpkgs {
+        system = "x86_64-linux";
+        config = nixpkgsConfig;
+        overlays = hartOverlays;
+      };
       vmTests = import ./tests/vm-tests.nix {
         inherit pkgs hartModules;
         specialArgs = mkSpecialArgs "server";
