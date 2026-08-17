@@ -4162,9 +4162,14 @@ class TestSilentlyOptionalDepsAreMirroredIntoTheImage:
     """
 
     # pip name -> nixpkgs attribute name (identical for all of these so far)
+    # NOTE: 'stripe' is deliberately NOT here. It is pinned in requirements.txt
+    # and its import IS swallowed, but the image it belongs in is the CENTRAL
+    # CONTAINER (where StripePaymentGateway's /upgrade card charges run), not the
+    # OS device image this file checks. I mirrored it into hart-app.nix on a
+    # misreading of that comment and reverted it; do not re-add it here, or the
+    # guard will demand a payment SDK on every device.
     SILENTLY_OPTIONAL = {
         'num2words': 'num2words',
-        'stripe': 'stripe',
         'youtube-transcript-api': 'youtube-transcript-api',
         # httpx is the only client here that speaks unix-socket transport, so
         # the LiquidUI shell's Nunba proxy cannot work without it. Its import

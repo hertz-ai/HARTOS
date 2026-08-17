@@ -109,14 +109,14 @@ let
     # nunba.nix (that package's own python env) but never here.
     httpx
 
-    # Stripe SDK for the commercial API's /upgrade card charges
-    # (integrations/ap2/ap2_protocol.py:StripePaymentGateway). requirements.txt
-    # says in so many words that it is "baked into the image so production
-    # rebuilds don't need a manual pip install" -- it was not, and connect()
-    # swallows the ImportError and sets connected = False, so the shipped OS
-    # silently served every upgrade through MockPaymentGateway. Revenue path,
-    # no error anywhere.
-    stripe
+    # NO stripe HERE, deliberately. I added it and was wrong. requirements.txt
+    # says it is "baked into the image so production rebuilds don't need a manual
+    # `pip install stripe` on the CENTRAL CONTAINER" -- that image is the
+    # commercial API server, which is where StripePaymentGateway's /upgrade card
+    # charges happen. This file is the OS DEVICE image; a laptop is not the
+    # commercial API, so the payment SDK has no reason to ship to every device.
+    # It also cost real gate time: python3.10-stripe has no cached build at this
+    # nixpkgs rev, so it compiled from source in the nixosTests shards.
 
     # Utilities
     python-dateutil
