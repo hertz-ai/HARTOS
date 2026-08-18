@@ -3244,8 +3244,20 @@ async def subscribe_and_return(message, topic, time=1800000):
     current_app.logger.info(f"Making RPC Call to {topic}...")
 
     # Create a new component for this call
+    # The relay/federation router, RESOLVED not hardcoded. WAMP carries central
+    # relay AND federation, so a fixed literal pinned every node to one box — it
+    # could not use a regional host, a LAN peer, or the router Nunba already ships
+    # locally on :8088. core.wamp_url is the single place that knows both WAMP_URL
+    # dialects (ws router vs http publish bridge).
+    #
+    # The default also corrects the NAME: this used to read aws_rasa while the run
+    # scripts export azurekong. Verified 2026-08-18 that both resolve to
+    # 106.51.181.24 and serve identical /ws and /publish responses, so this is a
+    # rename, not a redirect — and it ends the split where a node's RPC and its
+    # publish bridge could disagree about which host they mean.
+    from core.wamp_url import resolve_router_url
     component = Component(
-        transports="ws://aws_rasa.hertzai.com:8088/ws",
+        transports=resolve_router_url(),
         realm="realm1",
     )
 
