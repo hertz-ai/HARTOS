@@ -78,6 +78,58 @@ The `ComputeEscrow` table in the database provides persistent tracking of comput
 | `HEVOLVE_REGIONAL_URL` | This node's advertised URL for peer discovery | (none) |
 | `HEVOLVE_REGISTRY_URL` | Dynamic agent registry URL | (none) |
 
+### Transport: WAMP relay & federation
+
+WAMP is the **central relay AND federation transport**. These knobs decide which
+router a node talks to, and they are the difference between "federates through the
+cloud" and "runs entirely on its own".
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `WAMP_URL` | The crossbar router this node uses. Accepts **either dialect** — a `ws://host:8088/ws` router URL or an `http://host:8088/publish` bridge URL — and `core/wamp_url.py` converts between them, so both the RPC path and the publish path always agree on the host. | `ws://azurekong.hertzai.com:8088/ws` |
+| `HART_CROSSBAR_PORT` | Router port, resolved via `core/port_registry.py`. | `8088` |
+| `CBURL` | PeerLink's own router override (`core/peer_link/telemetry.py`, `nat.py`). **A second naming scheme** — see the note below. | `ws://aws_rasa.hertzai.com:8088/ws` |
+| `CBREALM` | WAMP realm for the PeerLink leg. | `realm1` |
+| `HEVOLVE_CENTRAL_DB_URL` | Central DB base URL for cross-device reads. **`''` (empty) disables** cross-device merge rather than falling back. | `https://azurekong.hertzai.com:8443/db` |
+
+**Run your own server.** Every one of these is independent, and the override always
+wins over the default:
+
+```bash
+# This node runs its OWN router (Nunba ships one: wamp_router.py on :8088).
+# Both the RPC path and the publish bridge follow — no split brain.
+WAMP_URL=ws://127.0.0.1:8088/ws
+
+# Or relay through a regional host instead of central.
+WAMP_URL=ws://regional-3.lan:8088/ws
+
+# Private central DB, independently of whatever the router is doing.
+HEVOLVE_CENTRAL_DB_URL=https://my-private-cloud:8443/db
+
+# Or no central reads at all.
+HEVOLVE_CENTRAL_DB_URL=
+```
+
+They are **deliberately separate knobs**: a node may run its own router while still
+reading the central DB, or the reverse. There is intentionally no single `HART_HOST`
+that moves everything — that would trade the flexibility for tidiness.
+
+**Where the default hostname comes from.** `core/constants.py:CENTRAL_HOST` is the
+one literal (`azurekong.hertzai.com`); `wamp_url` and `config_cache` compose their
+URLs from it plus their own port. It is a *default*, not a mandate — set the
+variables above and the constant is never consulted.
+
+`aws_rasa.hertzai.com` is a **legacy alias for the same machine** (both resolve to
+`106.51.181.24` and serve identical `/ws` and `/publish`). It still appears in ~14
+files and in `CBURL`'s default; prefer `azurekong`, which is what the run scripts
+export.
+
+> **Known rough edge.** `CBURL`/`CBREALM` are a second naming scheme for the same
+> thing as `WAMP_URL`, and PeerLink reads them directly rather than through
+> `core/wamp_url.py`. Setting `WAMP_URL` alone will **not** move PeerLink's relay.
+> Tracked in `docs/architecture/HARTOS_PARALLEL_PATH_AUDIT.md`; until it is
+> unified, set both if you are moving a node off central.
+
 ---
 
 ## Features
