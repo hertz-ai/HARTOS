@@ -115,7 +115,14 @@ class TestEventBusWAMPBridge(unittest.TestCase):
         bus._wamp_session = MagicMock()
         with patch.object(bus, '_publish_to_wamp') as mock_pub:
             bus.emit('test.event', {'value': 1})
-            mock_pub.assert_called_once_with('test.event', {'value': 1})
+            # The bus stamps a dedup msg_id on every payload (message_bus LRU
+            # dedup across transports); assert the CONTRACT (topic + caller
+            # data + a stamped id), not byte-equality with the input.
+            mock_pub.assert_called_once()
+            topic, payload = mock_pub.call_args[0]
+            assert topic == 'test.event'
+            assert payload['value'] == 1
+            assert payload.get('msg_id'), 'bus must stamp a dedup msg_id'
 
     def test_from_wamp_flag_prevents_echo(self):
         """Events from WAMP should NOT be re-published to WAMP."""
@@ -184,7 +191,11 @@ class TestEmitEventHelper(unittest.TestCase):
         events = []
         bus.on('helper.test', lambda t, d: events.append(d))
         emit_event('helper.test', {'x': 1}, async_=False)
-        self.assertEqual(events, [{'x': 1}])
+        # msg_id is the bus's own dedup stamp (see the WAMP test note);
+        # assert delivery of the caller's data, not byte-equality.
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].get('x'), 1)
+        self.assertTrue(events[0].get('msg_id'), 'bus must stamp msg_id')
 
         reset_registry()
 

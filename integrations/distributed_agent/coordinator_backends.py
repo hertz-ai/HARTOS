@@ -334,14 +334,13 @@ def create_coordinator(agent_id: str = None):
 def _try_redis_backend(agent_id: str):
     """Try to create coordinator with Redis backend."""
     try:
-        import redis
-        host = os.environ.get('REDIS_HOST', 'localhost')
-        port = int(os.environ.get('REDIS_PORT', 6379))
-
-        # Quick connectivity check — fail fast, no retries
-        r = redis.Redis(host=host, port=port, decode_responses=True,
-                        socket_connect_timeout=1, socket_timeout=1,
-                        retry_on_timeout=False)
+        # Quick connectivity check — fail fast, no retries.  Via
+        # core.redis_client: this site's retry_on_timeout=False was ignored by
+        # redis-py >= 6.0, so "fail fast" actually took ~14s.
+        from core.redis_client import probe_client
+        r = probe_client(socket_timeout=1)
+        if r is None:
+            raise ImportError("redis package unavailable")
         r.ping()
 
         from agent_ledger import SmartLedger, RedisBackend

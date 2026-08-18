@@ -343,7 +343,13 @@ class TestFlatpakHandler(unittest.TestCase):
         result = self.installer._install_flatpak(
             InstallRequest(source='flathub:org.gimp.GIMP'))
         self.assertFalse(result.success)
-        self.assertIn('not available', result.error)
+        # The flatpak handler's message was deliberately sharpened to say WHICH
+        # failure occurred ("not installed on this system" vs "exists but could
+        # not be executed") after a vague message sent an operator down the
+        # wrong path on real HW. Accept the honest vocabulary.
+        self.assertTrue('not installed' in result.error
+                        or 'could not be executed' in result.error,
+                        f"unexpected flatpak boundary message: {result.error}")
 
     @patch('subprocess.run')
     def test_flatpak_nonzero_exit_fails(self, mock_run):

@@ -73,6 +73,12 @@ def _user_owned_roots():
     return roots
 
 
+# OS-owned trees that no shell browse/mutation route may enter, regardless of
+# which mountpoints are admitted as "drives". Kept deliberately small: the
+# classic system hierarchies plus the Windows equivalents. User data lives in
+# the user-owned roots (_user_owned_roots), which are unaffected.
+
+
 def _get_allowed_roots():
     """Browse roots: the user-owned roots PLUS every disk mountpoint."""
     global _ALLOWED_ROOTS

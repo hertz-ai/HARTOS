@@ -121,7 +121,10 @@ def test_software_floor_keeps_ambient_drops_grain(svc):
     assert re.search(r'body\.gpu-software \.hart-grain\s*\{\s*display:\s*none', css)
     # ...but the ambient is NOT display:none'd (it is kept, static) - guard against
     # a regression back to gutting it.
-    assert not re.search(r'body\.gpu-software\s+\.hart-ambient[^{]*\{[^}]*display:\s*none', css)
+    # (?!::) so the guard reads the ELEMENT's rule, not its ::after sublayer:
+    # the decorative pseudo-element IS deliberately dropped on the floor, while
+    # .hart-ambient itself stays visible (static, blurred, opacity .42).
+    assert not re.search(r'body\.gpu-software\s+\.hart-ambient(?!::)[^{,]*\{[^}]*display:\s*none', css)
     assert re.search(r'body\.gpu-software\s+\.hart-ambient[^{]*\{[^}]*animation:\s*none', css)
 
 

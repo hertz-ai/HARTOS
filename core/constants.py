@@ -483,6 +483,45 @@ ENCOUNTER_DRAFT_MAX_CHARS: int = 220             # icebreaker length cap
 #
 # Do NOT inline duplicate topic strings; import from here.
 # ──────────────────────────────────────────────────────────────────────
+# CENTRAL HOST — ONE literal for the central instance's DNS name
+#
+# The same hostname was written out in FOUR places, in two spellings:
+#   core/config_cache.py    'https://azurekong.hertzai.com:8443/db'
+#   core/wamp_url.py        the WAMP router default
+#   15 call sites           'ws://aws_rasa.hertzai.com:8088/ws' (hardcoded)
+#   scripts/run*.sh|bat     WAMP_URL=ws://azurekong.hertzai.com:8088/ws
+#
+# `aws_rasa` and `azurekong` are the SAME MACHINE — verified 2026-08-18, both
+# resolve to 106.51.181.24 and serve byte-identical /ws (HTTP 200, 11280 bytes)
+# and /publish (405, POST-only bridge). `azurekong` is the correct name
+# (steward, 2026-08-18) and is what the run scripts already export.
+#
+# Consumers build their own URL from this plus the port that belongs to their
+# service — WAMP takes core.port_registry.get_port('crossbar'); the central DB
+# keeps its own 8443. Do NOT inline the hostname; import it from here.
+#
+# THIS IS A DEFAULT, NOT A MANDATE. Unifying the literal must never cost a system
+# the ability to run its OWN server (steward, 2026-08-18). Every consumer keeps
+# its own independent override and the override always wins:
+#
+#   own WAMP router     WAMP_URL=ws://127.0.0.1:8088/ws
+#   regional relay      WAMP_URL=ws://regional-3.lan:8088/ws
+#   private central DB  HEVOLVE_CENTRAL_DB_URL=https://my-private-cloud:8443/db
+#
+# They are deliberately SEPARATE knobs: a node may run its own router while still
+# reading the central DB, or the reverse. Do NOT collapse them into one
+# "HART_HOST" — that would trade the flexibility this constant was only ever
+# meant to de-duplicate. tests/unit/test_wamp_router_url_resolves.py asserts each
+# consumer stays independently steerable.
+# ──────────────────────────────────────────────────────────────────────
+CENTRAL_HOST: str = 'azurekong.hertzai.com'
+
+#: Legacy DNS alias for the SAME box. Recorded so a reader who greps the old
+#: literal lands on this explanation instead of reintroducing it.
+CENTRAL_HOST_LEGACY_ALIAS: str = 'aws_rasa.hertzai.com'
+
+
+# ──────────────────────────────────────────────────────────────────────
 CHAT_TOPIC_NEW: str = 'com.hertzai.hevolve.chat.new'
 CHAT_TOPIC_ACK: str = 'com.hertzai.hevolve.chat.ack'
 
@@ -862,3 +901,42 @@ assert all(isinstance(v, (int, float)) and 0 < v < 3600
 #: on. 'assistant' matches the speaker name the rest of reuse_recipe already
 #: uses for the default agent.
 DEFAULT_SINGLE_ROLE = 'assistant'
+
+
+#: Values of ``AgentGoal.created_by`` that name a PROCESS, not a user.
+#:
+#: `created_by` is a provenance field: it records what produced the goal.
+#: For human-created goals that happens to be a user id, which is why
+#: core.event_attribution.goal_owner_user_id reads it as an ownership
+#: fallback.  For machine-seeded goals it is a daemon name, and treating
+#: one as an identity produces a user id that cannot exist.
+#:
+#: Measured live 2026-08-16 across 105 active goals: owner_id 0/105 and
+#: user_id 0/105 were populated, so `created_by` decided every case —
+#: 'error_advice' x52 and 'system_bootstrap' x32 against just 6 real
+#: uuids.  /api/social/users/system_bootstrap returns 404.  Events
+#: stamped with those labels passed the P3a SSE guard (a non-empty
+#: user_id) and were then delivered to nobody, with nothing logged.
+#:
+#: Derived by reading the producers, never guessed.  Each entry is a
+#: literal written at exactly one site:
+#:   error_advice           core/error_advice.py
+#:   system_bootstrap       integrations/agent_engine/goal_seeding.py
+#:   auto_remediation       integrations/agent_engine/goal_seeding.py
+#:   intelligence_milestone integrations/agent_engine/agent_daemon.py
+#:   self_healing_dispatcher integrations/agent_engine/self_healing_dispatcher.py
+#:   revenue_aggregator     integrations/agent_engine/revenue_aggregator.py
+#:   system_daemon          integrations/social/dashboard_service.py
+#:
+#: tests/unit/test_goal_owner_machine_authors.py AST-scans the tree and
+#: fails if a new bare-label `created_by=` literal appears unregistered,
+#: so this set cannot silently fall behind the producers.
+MACHINE_GOAL_AUTHORS = frozenset({
+    'error_advice',
+    'system_bootstrap',
+    'auto_remediation',
+    'intelligence_milestone',
+    'self_healing_dispatcher',
+    'revenue_aggregator',
+    'system_daemon',
+})

@@ -194,3 +194,81 @@ def test_referenced_static_assets_exist():
     for asset in sorted(refs):
         assert os.path.exists(os.path.join(STATIC_DIR, asset.rstrip('/'))), \
             'referenced but missing on disk: ' + asset
+
+
+# ═══════════════════════════════════════════════════════════════
+# The orb's BLOOM must not survive onto the software floor
+# ═══════════════════════════════════════════════════════════════
+
+class TestOrbBloomIsStrippedOnTheSoftwareFloor:
+    """Hovering the orb froze a real machine (2026-08-18) with the ring
+    animations ALREADY disabled — which is the tell that the animations were
+    never the cost.
+
+    #hart-voice-orb is a <canvas> whose rAF loop re-arms unconditionally, and
+    whose idle term keeps undulating when inactive, so it repaints ~60x/s
+    forever. Every repaint invalidates the two large drop-shadow blurs layered
+    on it, so the cairo/pixman floor re-blurs a 300x300 surface with a 46px AND
+    a 64px kernel every frame; :hover then scales the wrapper and forces a
+    re-raster at the new scale. `animation: none` cannot stop any of it — rAF is
+    not a CSS animation.
+
+    The responsive floor's block-2 comment says the bloom is safe because the
+    depth is "already rastered once and stays". That is true of a static element
+    and false of a canvas, and this pins the distinction.
+    """
+
+    def _css(self):
+        import os
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        with open(os.path.join(root, 'integrations/agent_engine/static/'
+                                     'hartResponsive.css'), encoding='utf8') as f:
+            return f.read()
+
+    def test_orb_filter_is_none_on_both_software_classes(self):
+        css = self._css()
+        for cls in ('body.gpu-software #hart-voice-orb',
+                    'body.webkit-flat #hart-voice-orb'):
+            assert cls in css, (
+                f'{cls} has no rule — the orb bloom would keep re-blurring per '
+                'canvas frame on the CPU floor')
+        # The selector appears MORE THAN ONCE (block 2 stops `animation`, block
+        # 2b drops the `filter`), so check that SOME occurrence strips the
+        # filter rather than assuming which one comes first.
+        sel = 'body.gpu-software #hart-voice-orb'
+        stripped = False
+        start = 0
+        while True:
+            idx = css.find(sel, start)
+            if idx == -1:
+                break
+            if 'filter: none !important' in css[idx:idx + 600]:
+                stripped = True
+                break
+            start = idx + 1
+        assert stripped, (
+            'no `body.gpu-software #hart-voice-orb` rule strips `filter` — the '
+            'orb bloom would keep re-blurring on every canvas frame')
+
+    def test_listening_variant_is_stripped_too(self):
+        # .listening swaps in ANOTHER drop-shadow; stripping only the base rule
+        # would leave the expensive path alive exactly while the mic is hot.
+        css = self._css()
+        assert '.hart-hero-orbwrap.listening #hart-voice-orb' in css and \
+            css.count('filter: none !important') >= 1, (
+            'the listening-state orb bloom is not stripped on the software floor')
+
+    def test_viz_parks_its_raf_loop_when_idle_on_the_software_floor(self):
+        import os
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        with open(os.path.join(root, 'integrations/agent_engine/static/'
+                                     'voiceOrbViz.js'), encoding='utf8') as f:
+            js = f.read()
+        assert 'softwareFloor' in js and 'idleAtRest' in js, (
+            'voiceOrbViz no longer parks its rAF loop — an idle desktop would '
+            'repaint the orb canvas ~60x/s forever on the CPU floor')
+        # and it must be able to WAKE, or the orb freezes the first time it
+        # is asked to speak or listen
+        assert 'rafId === null) { render(); }' in js, (
+            'setActive does not restart a parked loop — the orb would stay '
+            'frozen after the first idle park')

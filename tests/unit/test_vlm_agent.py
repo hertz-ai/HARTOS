@@ -158,6 +158,11 @@ class TestVLMAgentCommandExecution:
         import integrations.vlm.local_computer_tool as lct
         mock_pyautogui = MagicMock()
         mock_img = Mock()
+        # take_screenshot now reads `w, h = img.size` (it scales the capture
+        # before encoding), so a bare Mock cannot be unpacked. Give the fake
+        # image real dimensions.
+        mock_img.size = (1920, 1080)
+        mock_img.resize = Mock(return_value=mock_img)
         mock_img.save = Mock(side_effect=lambda buf, **kw: buf.write(b'\x89PNG' + b'\x00' * 100))
         mock_pyautogui.screenshot.return_value = mock_img
 
@@ -302,8 +307,8 @@ class TestVLMAgentIntegration:
 
     def test_vlm_visual_task_call(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test calling visual task via API"""
-        with patch('create_recipe.requests.request') as mock_request:
-            with patch('create_recipe.requests.post') as mock_post:
+        with patch('create_recipe.pooled_request') as mock_request:
+            with patch('create_recipe.pooled_post') as mock_post:
                 # Mock API response
                 mock_response = Mock()
                 mock_response.status_code = 200
@@ -318,7 +323,7 @@ class TestVLMAgentIntegration:
 
     def test_vlm_visual_task_no_video_reasoning(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test visual task when no Video Reasoning entries found"""
-        with patch('create_recipe.requests.request') as mock_request:
+        with patch('create_recipe.pooled_request') as mock_request:
             # Mock API response without Video Reasoning
             mock_response = Mock()
             mock_response.status_code = 200
@@ -328,7 +333,7 @@ class TestVLMAgentIntegration:
             mock_request.return_value = mock_response
 
             # Should not call visual agent
-            with patch('create_recipe.requests.post') as mock_post:
+            with patch('create_recipe.pooled_post') as mock_post:
                 result = call_visual_task("Visual task", test_user_id, test_prompt_id)
                 # Should handle gracefully
 

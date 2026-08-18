@@ -60,7 +60,20 @@ def init_social(app):
         run_migrations()
         logger.info(f"HevolveSocial database initialized + migrated ({DB_PATH})")
     except Exception as e:
-        logger.warning(f"HevolveSocial DB init failed (non-fatal): {e}")
+        # A readonly database is NOT a shrug: it means migrations are dead and
+        # every table added since the file was stamped will raise `no such
+        # table` from every consumer, forever (real-HW 2026-08-14: root-created
+        # hevolve_database.db + User=hart backend). Keep it non-fatal, but say
+        # what is wrong and who fixes it, at a severity someone will see.
+        if 'readonly' in str(e).lower():
+            logger.critical(
+                "HevolveSocial DB init failed: %s -- the database file is not "
+                "writable by this process. Migrations did NOT run; expect "
+                "'no such table' from every model added since the file was "
+                "created. Fix ownership/mode of the DB file (hart-backend's "
+                "ExecStartPre normalizes this on HART OS).", e)
+        else:
+            logger.warning(f"HevolveSocial DB init failed (non-fatal): {e}")
 
     # Phase 7a / Phase 8 — install global tenant filter on Session.
     # Migration v40 added `tenant_id` columns to ~34 social tables;

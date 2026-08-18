@@ -254,9 +254,22 @@ in
     # paint. It can never block/fail the boot: oneshot + RemainAfterExit + the script
     # always exits 0, and a bounded TimeoutStartSec so even a wedged runtime probe
     # can't wedge boot (the inner per-probe `timeout`s are the first belt).
+    # DEFERRED off the boot path (2026-08-14): as a multi-user.target member the
+    # smoke-test initialized a cold Wine prefix DURING bring-up -- the real-HW
+    # trial showed its start timing out at 360s and winedevice.exe dying by
+    # SIGKILL while the desktop was still settling. A smoke-test's value is the
+    # STATUS FILE, not its timing; running 10 minutes after boot frees boot-time
+    # CPU/thermals and reports the same truth. The timer (below) is the only
+    # activation; probes and status semantics are unchanged.
+    systemd.timers.hart-compat-smoketest = {
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnBootSec = "10min";
+        AccuracySec = "1min";
+      };
+    };
     systemd.services.hart-compat-smoketest = {
       description = "HART OS — cross-OS runtime smoke-test (writes honest per-runtime status to ${statusFile})";
-      wantedBy = [ "multi-user.target" ];
       after = [ "hart.target" "hart-waydroid-init.service" "network-online.target" ];
       # network-online is WANTED (best-effort) not REQUIRED — a no-network boot must
       # still run the smoke-test (it just reports android=no-image etc. honestly).

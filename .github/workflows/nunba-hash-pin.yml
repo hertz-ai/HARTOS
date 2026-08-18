@@ -154,8 +154,23 @@ jobs:
           # main may have moved during the (long) build rounds -- rebase our single
           # pin commit onto current origin/main instead of failing non-FF.
           git pull --rebase origin main
-          git push origin HEAD:main
-          echo "Pinned nunba @ ${SHORT} and pushed."
+          # Direct push first; if the branch ruleset denies the Actions token
+          # (403 -- run 31810930513 lost its verified pins to exactly this),
+          # fall back to a PR, which is precisely what the ruleset asks for.
+          # The pins in the PR are already build-verified GREEN by the rounds
+          # above; merging stays a human/bypass-actor act.
+          if git push origin HEAD:main; then
+            echo "Pinned nunba @ ${SHORT} and pushed."
+          else
+            BR="ci/nunba-pin-${SHORT}"
+            git push -f origin "HEAD:refs/heads/${BR}"
+            gh pr create \
+              --head "${BR}" --base main \
+              --title "ci(nixos): re-pin nunba to ${SHORT} (build-verified)" \
+              --body "Automated pin from the nunba-hash-pin driver. \`packages.nunba\` built GREEN with these exact pins in this workflow run (${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Direct push was denied by the branch ruleset; merging is the human step." \
+              2>/dev/null || echo "PR may already exist for ${BR} — updated the branch."
+            echo "Pinned nunba @ ${SHORT} via PR branch ${BR} (ruleset denied direct push)."
+          fi
 
       - name: Dry-run summary
         if: env.NOOP != '1' && inputs.dry_run == true

@@ -34,6 +34,72 @@ class TestSecretRedactorFunction:
         result, count = redact_secrets(text)
         assert 'eyJhbGci' not in result
 
+    @pytest.mark.parametrize('line', [
+        'api_key=abcd1234efgh',
+        'apikey: 9f8e7d6c',
+        'secret=hunter2',                       # 7 chars — under the old {8,} floor
+        'token=shortvalue',                     # under bearer_token's {32,} floor
+        'api_key=12345678-1234-1234-1234-123456789abc',
+        'X-Api-Key: 12345678-1234-1234-1234-123456789abc',
+        '"secret": "12345678-1234-1234-1234-123456789abc"',   # JSON: key's own quote
+        'secret=abc',            # 3 chars — a short secret is still a secret
+        'token=nonesuch',        # status-word exclusion is WHOLE-value only
+    ])
+    def test_redacts_secret_named_assignments(self, line):
+        """security/audit_log.py delegated its redaction here and LOST coverage.
+
+        The block it deleted carried a generic
+        `(password|passwd|pwd|secret|token|api_key|apikey)\\s*[=:]\\s*\\S+`.
+        The canonical set had no equivalent, so every line below reached the
+        AUDIT LOG in clear text — the artifact whose whole purpose is being safe
+        to keep and hand over.
+
+        They escaped three ways: password_assignment lists the right names but
+        demands a QUOTED value (and in JSON the key's own closing quote breaks
+        its `\\s*[=:]`), password_plaintext allows unquoted but only for
+        password/passwd/pwd, and both require {8,} while `secret=hunter2` is 7.
+        """
+        from security.secret_redactor import redact_secrets
+        result, count = redact_secrets(line)
+        assert result != line, f'not redacted at all: {line!r} -> {result!r}'
+        assert count > 0
+        # the secret VALUE must be gone, not merely the key name
+        for leak in ('abcd1234efgh', '9f8e7d6c', 'hunter2', 'shortvalue',
+                     '123456789abc'):
+            if leak in line:
+                assert leak not in result, f'{leak!r} survived in {result!r}'
+
+    @pytest.mark.parametrize('line', [
+        'node_id=12345678-1234-1234-1234-123456789abc',
+        'request_id=abc123def',
+        'trace_id=9f8e7d6c',
+        'bare 12345678-1234-1234-1234-123456789abc in prose',
+        'auth=no',
+        'token=on',
+        'next_token_count=5',
+        # Status values are DIAGNOSTICS. In an auth-failure investigation
+        # "no token was present" and "a token was present" are different facts;
+        # redacting both collapses them. Named explicitly rather than protected
+        # by a length floor, which was only ever a proxy for this.
+        'token=null',
+        'auth_token=missing',
+        'secret=none',
+        'token=expired',
+        'token=invalid',
+    ])
+    def test_identifiers_stay_visible(self, line):
+        """The counterpart guard: widening the NAMES must never widen the SHAPE.
+
+        heroku_key once matched bare UUIDs and redacted every identifier in the
+        logs, destroying the "which node failed" diagnostic. Narrowing it was
+        correct. So a fix for the gap above must not reintroduce that: only
+        SECRET-named keys are redacted, and the {6,} floor keeps `auth=no` and
+        `token=on` readable.
+        """
+        from security.secret_redactor import redact_secrets
+        result, _ = redact_secrets(line)
+        assert result == line, f'over-redacted a diagnostic: {line!r} -> {result!r}'
+
     def test_no_redaction_for_clean_text(self):
         from security.secret_redactor import redact_secrets
         text = "Please help me write a function that sorts a list"

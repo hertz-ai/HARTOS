@@ -315,8 +315,12 @@ def test_cage_floor_still_forces_software_unconditionally():
         cage, re.S)
     assert m, "could not locate the cage kioskLauncher"
     launcher = m.group(1)
+    # NOTE: the forced-software string now also pins WLR_RENDERER=pixman in the
+    # SAME optionalString, so do not require the quote to close right after
+    # LIBGL_ALWAYS_SOFTWARE=1 -- the invariant is "build-time gated on
+    # !preferHardwareGL and forces software GL", not the string's exact length.
     assert re.search(
-        r'optionalString\s*\(!ui\.preferHardwareGL\)\s*"export LIBGL_ALWAYS_SOFTWARE=1"',
+        r'optionalString\s*\(!ui\.preferHardwareGL\)\s*"export LIBGL_ALWAYS_SOFTWARE=1',
         launcher), (
         "the cage Tier-3 floor must KEEP forcing LIBGL_ALWAYS_SOFTWARE via the "
         "build-time optionalString — the floor is the never-fail backstop and "
@@ -363,11 +367,23 @@ def test_gtk4_host_gsk_gates_vulkan_but_never_uses_gl():
         "(/run/hart/gpu-render).")
     # WebKit forces stay gated on !preferHardwareGL (NOT the probe) — WebKit GPU is a
     # separate later step, not part of the GSK fix.
-    assert re.search(
-        r'optionalString \(!ui\.preferHardwareGL\) "export WEBKIT_DISABLE_DMABUF_RENDERER=1',
-        host), (
-        "the GTK4 host must keep the WEBKIT_DISABLE_* forces on !preferHardwareGL "
-        "(WebKit GPU is a separate later step, not part of the GSK fix).")
+    # MECHANISM MOVED (2026-08): the WebKit forces are no longer a build-time
+    # optionalString on !preferHardwareGL -- they are gated at RUNTIME on the
+    # render RUNG (vulkan / webkit-cairo / software). WebKit accelerated
+    # compositing is what paints the glass on the GPU rungs, so it stays ON
+    # there and is disabled ONLY on the software floor. The invariant this
+    # guard exists for is unchanged and is what we assert: on the software
+    # rung, BOTH WebKit forces are exported.
+    _sw = re.search(
+        r'if \[ "\$HART_SHELL_RENDER" = "software" \]; then(.*?)\bfi\b',
+        host, re.S)
+    assert _sw, (
+        "the GTK4 host must gate the WebKit forces on the software render rung "
+        "(no software-rung branch found).")
+    assert ("WEBKIT_DISABLE_DMABUF_RENDERER=1" in _sw.group(1)
+            and "WEBKIT_DISABLE_COMPOSITING_MODE=1" in _sw.group(1)), (
+        "the GTK4 host must keep BOTH WEBKIT_DISABLE_* forces on the software "
+        "floor rung (a broken/absent GPU must never drive WebKit compositing).")
 
 
 def test_hart_comp_arms_gles_on_probe_verdict_with_gated_force_software():

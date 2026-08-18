@@ -309,6 +309,20 @@ class TestPullRecipe(unittest.TestCase):
             self.assertEqual(f.read(), '{"name":"Speech Therapy"}')
 
     def test_path_traversal_filenames_rejected(self):
+        # Give the prompts dir three levels of depth INSIDE our own tmp, so
+        # '../../../etc/passwd' resolves to <tmp>/etc/passwd rather than the
+        # real /etc/passwd. The previous version asserted on the real one, which
+        # exists on every Linux host whether or not the traversal was blocked --
+        # so it passed on Windows for the wrong reason and failed on CI for the
+        # wrong reason, and never once tested the guard.
+        prompts_dir = os.path.join(self.tmp, 'a', 'b', 'c')
+        os.makedirs(prompts_dir)
+        # The traversal target's parent MUST exist, or the write fails with
+        # FileNotFoundError and the test goes green with the guard ripped out --
+        # it would be measuring a missing directory, not the guard.
+        os.makedirs(os.path.join(self.tmp, 'etc'))
+        escaped = os.path.join(self.tmp, 'etc', 'passwd')
+
         envelope = {
             'schema_version': SCHEMA_VERSION,
             'prompt_id': '12345',
@@ -320,10 +334,14 @@ class TestPullRecipe(unittest.TestCase):
         }
         with patch('core.http_pool.get_http_session',
                    return_value=self._mock_session(200, envelope)):
-            pull_recipe(self.tmp, '12345', central_url='https://x')
-        # The path-traversal file must NOT have been written anywhere.
-        self.assertFalse(os.path.exists(
-            os.path.join(self.tmp, '..', '..', '..', 'etc', 'passwd')))
+            pull_recipe(prompts_dir, '12345', central_url='https://x')
+
+        self.assertFalse(os.path.exists(escaped),
+                         'path-traversal filename escaped the prompts dir')
+        # ...and the legitimate sibling in the same envelope still landed, so
+        # the guard rejects the one entry rather than dropping the whole bundle.
+        self.assertTrue(os.path.isfile(os.path.join(prompts_dir, 'normal.json')))
+        self.assertEqual(sorted(os.listdir(prompts_dir)), ['normal.json'])
 
     def test_no_central_url_returns_false(self):
         with patch('core.config_cache.get_central_db_url', return_value=''):

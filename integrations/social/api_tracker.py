@@ -48,10 +48,12 @@ def _get_goal_progress(goal_id):
     """Get distributed task progress for a goal (Redis-backed)."""
     try:
         from integrations.distributed_agent.task_coordinator import DistributedTaskCoordinator
-        import redis
-        r = redis.Redis(host='localhost', port=6379, decode_responses=True,
-                        socket_connect_timeout=1, socket_timeout=2,
-                        retry_on_timeout=False)
+        # Via core.redis_client: retry_on_timeout=False is ignored by
+        # redis-py >= 6.0, so this probe cost ~14s instead of ~1s.
+        from core.redis_client import probe_client
+        r = probe_client(host='localhost', port=6379)
+        if r is None:
+            return None
         r.ping()
         coordinator = DistributedTaskCoordinator(redis_client=r)
         return coordinator.get_goal_progress(goal_id)

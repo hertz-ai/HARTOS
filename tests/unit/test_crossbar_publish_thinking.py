@@ -116,7 +116,20 @@ def _capture_envelope(**kwargs) -> str:
         ok = publish_thinking_trace(**kwargs)
 
     assert ok is True, "helper must return True when publish_async is reachable"
-    return captured['topic'], captured['payload']
+    # NORMALIZE the dedup stamp (2026-08-16): the publish path now stamps a
+    # random msg_id into every envelope (message-bus LRU dedup across
+    # transports -- a DESIGNED wire change). The inline literals these tests
+    # compare against are the pre-stamp wire format; byte-comparing with a
+    # random field would fail every run for the wrong reason. Assert the stamp
+    # exists, strip it, and hand back the caller's wire bytes for the
+    # field-for-field comparison these tests exist for.
+    payload = captured['payload']
+    try:
+        d = json.loads(payload)
+    except Exception:
+        return captured['topic'], payload
+    assert d.pop('msg_id', None), "publish path must stamp a dedup msg_id"
+    return captured['topic'], json.dumps(d)
 
 
 # ── Caller 1 byte-equality ─────────────────────────────────────

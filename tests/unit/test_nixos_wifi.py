@@ -37,6 +37,7 @@ Usage:
 """
 
 import os
+import re
 import pytest
 
 # DRY (Gate 2): reuse the canonical comment/string-aware Nix reader rather than
@@ -56,8 +57,18 @@ NIXOS_DIR = os.path.join(REPO_ROOT, "nixos")
 MODULES_DIR = os.path.join(NIXOS_DIR, "modules")
 CONFIGS_DIR = os.path.join(NIXOS_DIR, "configurations")
 
+PROFILES_DIR = os.path.join(NIXOS_DIR, "profiles")
+
 LIQUID_UI_NIX = os.path.join(MODULES_DIR, "hart-liquid-ui.nix")
 DESKTOP_NIX = os.path.join(CONFIGS_DIR, "desktop.nix")
+# The desktop CLOSURE, not one file: the 2026-07/08 refactor moved "what a
+# desktop IS" into profiles/desktop.nix (networking.networkmanager lives there
+# now) and hoisted hardware.enableRedistributableFirmware into hart-base so
+# EVERY variant gets wifi firmware. The guards below are about the closure the
+# image actually gets, so they read all three -- otherwise a correct move reads
+# as a missing setting (it did: 3 red tests against a working Wi-Fi stack).
+DESKTOP_PROFILE_NIX = os.path.join(PROFILES_DIR, "desktop.nix")
+HART_BASE_NIX = os.path.join(MODULES_DIR, "hart-base.nix")
 
 
 def _unit_path_tokens(raw):
@@ -67,9 +78,35 @@ def _unit_path_tokens(raw):
     skel = nix_skeleton(raw)
     block = find_block(skel, r"path\s*=\s*with\s+pkgs\s*;\s*\[",
                        open_ch="[", close_ch="]")
-    if block is None:
+    if block is not None:
+        return block.split()
+    # CONCATENATED FORM (what the module uses today):
+    #   path = lib.optional (pkgs ? rustdesk) ... ++ (with pkgs; [ ... ]);
+    # The guard's intent is "nmcli is on the unit PATH", not which syntax puts
+    # it there -- the plain-form-only parser returned None and reported the
+    # block "not found" against a unit that has networkmanager on its PATH.
+    # Word boundary matters: without it this matches an unrelated
+    # `<something>_path =` earlier in the file and parses the wrong block.
+    m = re.search(r"(?:^|[^\w.])path\s*=", skel)
+    if m is None:
         return None
-    return block.split()
+    i, depth, end = m.end(), 0, None
+    while i < len(skel):
+        ch = skel[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == ";" and depth <= 0:
+            end = i
+            break
+        i += 1
+    if end is None:
+        return None
+    toks = []
+    for blk in re.findall(r"\[([^\[\]]*)\]", skel[m.end():end]):
+        toks.extend(blk.split())
+    return toks or None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -129,7 +166,8 @@ class TestDesktopWifiEnables:
 
     @pytest.fixture(autouse=True)
     def load(self):
-        self.raw = read(DESKTOP_NIX)
+        self.raw = "\n".join(
+            read(f) for f in (DESKTOP_NIX, DESKTOP_PROFILE_NIX, HART_BASE_NIX))
         self.code = strip_comments(self.raw)
 
     def test_networkmanager_enabled_explicitly(self):

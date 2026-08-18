@@ -146,7 +146,15 @@ in
       systemd.services.hart-model-bus = {
         description = "HART OS Model Bus — Unified AI Access";
         documentation = [ "https://github.com/hertz-ai/HARTOS" ];
-        after = [ "hart-backend.service" "hart.target" ];
+        # NEVER order a unit After= the target that Wants it (2026-08-14).
+        # A target implicitly orders itself After= its wanted units, so
+        # `wantedBy = hart.target` + `after = hart.target` is a guaranteed
+        # ordering cycle. On the real-HW boot this closed the loop
+        #   hart.target -> hart-wine-model-bridge -> hart-model-bus -> hart.target
+        # and systemd's cycle breaker DELETED hart-wine-model-bridge/start to
+        # recover -- a nondeterministic job execution every boot, and the
+        # deleted service silently never ran. Order on concrete services only.
+        after = [ "hart-backend.service" ];
         wants = [ "hart-backend.service" ];
         wantedBy = [ "hart.target" ];
 

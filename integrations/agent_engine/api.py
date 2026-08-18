@@ -465,6 +465,53 @@ def get_ledger_task(task_id):
                         'error': 'Internal server error'}), 500
 
 
+def _daemon_liveness() -> dict:
+    """Agent-daemon liveness, read IN THIS PROCESS.  Never raises.
+
+    WHY THIS LIVES HERE, not in a separate probe: Flask is the process
+    that actually starts the daemon, so ``_thread.is_alive()`` read from
+    a request handler is the ground truth.  A probe running in ANY other
+    process (the MCP server, a script) imports its own copy of
+    ``agent_daemon`` and reads a fresh-zero singleton — the 2026-06-09
+    "shadow module" incident.  ``mcp/agent_status`` already routes the
+    LEDGER through this route's loopback for exactly that reason, but
+    kept reading liveness off its own module attrs, so it reported
+    ``daemon_thread_alive=false`` and then appended a hint telling the
+    caller to disbelieve it.  Both halves now come from one authority.
+
+    The three fields together are what makes a diagnosis possible —
+    2026-08-16 cost six wrong root-cause attempts because no single
+    signal could separate these cases:
+
+        thread_alive=True,  tick_count rising  -> healthy
+        thread_alive=False                     -> genuinely stopped
+        thread_alive=True,  tick_count static  -> hung inside a tick
+
+    ``running`` is the daemon's own intent flag; a True/False split
+    against ``thread_alive`` is the zombie case the supervisor in
+    ``integrations.agent_engine.__init__`` restarts on.
+
+    Read-only by construction: no attribute is written, no thread is
+    started, nothing is timed.  Callers that predate this key are
+    unaffected — it is purely additive to the response.
+    """
+    try:
+        from integrations.agent_engine.agent_daemon import agent_daemon
+    except Exception as exc:
+        return {'available': False, 'reason': f'import failed: {exc}'}
+    try:
+        thread = getattr(agent_daemon, '_thread', None)
+        return {
+            'available': True,
+            'running': bool(getattr(agent_daemon, '_running', False)),
+            'thread_alive': bool(thread is not None and thread.is_alive()),
+            'tick_count': int(getattr(agent_daemon, '_tick_count', 0) or 0),
+            'source': 'flask_in_process',
+        }
+    except Exception as exc:
+        return {'available': False, 'reason': f'read failed: {exc}'}
+
+
 @agent_engine_bp.route('/api/agent-engine/ledger/stats', methods=['GET'])
 @require_local_or_token
 def get_ledger_stats():
@@ -475,6 +522,12 @@ def get_ledger_stats():
     string values (``pending``, ``in_progress``, ...) — the dict
     returned by ``SmartLedger.get_task_state_summary`` uses enum
     keys, so we coerce to ``.value`` for JSON serialization.
+
+    Also returns ``daemon`` — see ``_daemon_liveness``.  The ledger
+    says what HAS happened; the daemon block says whether anything
+    still CAN.  A stale ledger plus a dead thread is an outage; a
+    stale ledger plus a live thread is an empty queue.  They are only
+    distinguishable together, which is why they share one response.
     """
     try:
         total = 0
@@ -493,6 +546,7 @@ def get_ledger_stats():
                 'sessions': sessions,
                 'by_status': by_status,
             },
+            'daemon': _daemon_liveness(),
         })
     except ImportError:
         return jsonify({'success': False,

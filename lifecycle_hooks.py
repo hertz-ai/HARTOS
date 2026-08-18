@@ -263,6 +263,23 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
                 elif state == ActionState.PENDING:
                     task.set_blocked_reason('dependency')
 
+            # === FAILURE REASON: the same courtesy for the FAILED terminal ===
+            # BLOCKED recorded WHY; FAILED recorded nothing, so a reader could
+            # see THAT a unit failed and never why.  Measured on live data:
+            # blocked_reason 44/1000, failure_reason 0/1000 -- and
+            # set_failure_reason() had zero callers anywhere in the tree.
+            # Only ERROR and GAVE_UP map to FAILED (see STATE_MAP above), so
+            # these two branches are exhaustive for this terminal.
+            elif ledger_status == LedgerTaskStatus.FAILED:
+                if state == ActionState.ERROR:
+                    task.set_failure_reason('error')
+                elif state == ActionState.GAVE_UP:
+                    # #139: a force-give-up is an HONEST failure -- the action
+                    # never verified and the flow completed around it.  Not an
+                    # exception, and not retry-exhaustion, so neither ERROR nor
+                    # MAX_RETRIES_EXCEEDED would be true.
+                    task.set_failure_reason('abandoned')
+
             # === HEARTBEAT: every state change records liveness ===
             task.heartbeat()
 

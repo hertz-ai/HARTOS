@@ -769,6 +769,57 @@ class TestAutoSyncToLedger:
         _auto_sync_to_ledger(UP, 1, ActionState.PREVIEW_PENDING)
         task.set_blocked_reason.assert_called_with("approval_required")
 
+    # --- FAILED records WHY, symmetrically with BLOCKED -----------------
+    # BLOCKED recorded a reason; FAILED recorded nothing, which is why live
+    # data showed blocked_reason 44/1000 and failure_reason 0/1000, with
+    # set_failure_reason() carrying zero callers in the whole tree.
+
+    def _sync(self, state, status=_LedgerTaskStatus.PENDING):
+        task = self._make_task(status)
+        ledger = MagicMock()
+        ledger.tasks = {"action_1": task}
+        _ledger_registry[UP] = ledger
+        _auto_sync_to_ledger(UP, 1, state)
+        return task
+
+    def test_sets_failure_reason_for_error(self):
+        task = self._sync(ActionState.ERROR)
+        task.set_failure_reason.assert_called_with("error")
+
+    def test_sets_failure_reason_for_gave_up(self):
+        """#139: a force-give-up is an HONEST failure — the action never
+        verified and the flow completed around it.  It must NOT be recorded
+        as a generic 'error' (nothing threw) nor as retry-exhaustion."""
+        task = self._sync(ActionState.GAVE_UP)
+        task.set_failure_reason.assert_called_with("abandoned")
+
+    def test_failure_reason_literals_are_real_enum_members(self):
+        """Drift guard.  This file writes reason literals (matching the
+        BLOCKED branch's existing style); the ledger declares the vocabulary
+        as an enum.  Resolve each literal through the enum at RUNTIME so a
+        renamed member fails here instead of silently writing a value no
+        consumer understands."""
+        from agent_ledger.core import FailureReason
+        assert FailureReason("error") is FailureReason.ERROR
+        assert FailureReason("abandoned") is FailureReason.ABANDONED
+
+    def test_blocked_and_failed_reasons_are_mutually_exclusive(self):
+        """The two branches are elif-chained: a BLOCKED sync must never
+        stamp a failure reason, and a FAILED sync must never stamp a
+        blocked reason."""
+        blocked = self._sync(ActionState.PREVIEW_PENDING)
+        blocked.set_failure_reason.assert_not_called()
+        failed = self._sync(ActionState.ERROR)
+        failed.set_blocked_reason.assert_not_called()
+
+    def test_non_terminal_states_record_no_failure_reason(self):
+        """Only ERROR and GAVE_UP map to FAILED.  Every other ActionState
+        must leave failure_reason untouched — a reason on a live task would
+        be worse than none."""
+        for state in (ActionState.IN_PROGRESS, ActionState.COMPLETED,
+                      ActionState.TERMINATED, ActionState.RECIPE_RECEIVED):
+            self._sync(state).set_failure_reason.assert_not_called()
+
 
 # ===================================================================
 # 16. enforce functions

@@ -112,6 +112,13 @@ def test_config_gated_on_three_toggles():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_unit_runs_in_parallel_not_before_greetd():
+    # INTENT (unchanged since this test was written): the smoke-test runs on
+    # every boot cycle AND can never delay first paint. The MECHANISM changed
+    # 2026-08-14: as a multi-user.target member it cold-started a Wine prefix
+    # DURING bring-up (real-HW trial: start timed out at 360s, winedevice
+    # SIGKILLed while the desktop settled), so activation moved to a timer
+    # 10 minutes after boot. The timer is strictly stronger for this test's
+    # intent: off the boot transaction entirely, it CANNOT delay paint.
     src = _read(_SMOKE)
     m = re.search(
         r"systemd\.services\.hart-compat-smoketest\s*=\s*\{(.*?)\n    \};",
@@ -119,15 +126,27 @@ def test_unit_runs_in_parallel_not_before_greetd():
     assert m, "the module must define systemd.services.hart-compat-smoketest"
     svc = m.group(1)
 
-    # Runs on a normal multi-user boot…
-    assert 'wantedBy = [ "multi-user.target" ]' in svc, (
-        "the smoke-test must be wantedBy multi-user.target")
+    # The SERVICE must NOT be in any boot target: activation is the timer's job.
+    assert "wantedBy" not in svc, (
+        "the smoke-test service must have NO wantedBy — a boot-target membership "
+        "puts the Wine cold-start back inside bring-up, which is exactly what the "
+        "2026-08-14 real-HW trial showed timing out mid-boot")
 
-    # …but MUST NOT delay the desktop: never `before greetd`.
+    # A timer must exist and fire a bounded time after boot, so the probe still
+    # runs every boot cycle (the 'runs on a normal boot' half of the intent).
+    tm = re.search(
+        r"systemd\.timers\.hart-compat-smoketest\s*=\s*\{(.*?)\n    \};",
+        src, re.S)
+    assert tm, "the smoke-test must define its activation timer"
+    assert 'wantedBy = [ "timers.target" ]' in tm.group(1), (
+        "the timer must be wantedBy timers.target so it arms on every boot")
+    assert re.search(r'OnBootSec\s*=\s*"\d+min"', tm.group(1)), (
+        "the timer must fire a bounded number of minutes after boot")
+
+    # …and MUST NOT delay the desktop: never `before greetd`.
     assert "greetd" not in svc, (
-        "the smoke-test must NOT reference greetd at all — it runs in PARALLEL "
-        "with the desktop and must NEVER be `before greetd` (Wine/Waydroid/Darling "
-        "cold-start would delay first paint).")
+        "the smoke-test must NOT reference greetd at all — it must NEVER be "
+        "`before greetd` (Wine/Waydroid/Darling cold-start would delay first paint).")
     assert not re.search(r"before\s*=", svc), (
         "the smoke-test must declare NO `before =` ordering — it must never gate "
         "anything (especially not the greeter / desktop).")

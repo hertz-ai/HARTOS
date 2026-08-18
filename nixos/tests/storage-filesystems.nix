@@ -170,18 +170,65 @@ in
           # filesystem" against a correctly formatted disk (run 30485906966).
           # Trigger an explicit change event so udisks re-probes the new fs.
           fs.succeed(f"udevadm trigger --action=change {disk} && udevadm settle")
-          # The udisks2 daemon must SEE the disk...
-          fs.succeed(f"udisksctl info -b {disk} >/dev/null")
-          # ...and MOUNT it on demand (under /run/media/<user>/...).
-          out = fs.succeed(f"udisksctl mount -b {disk} 2>&1")
+          # The udisks2 daemon must SEE the new FILESYSTEM — and `udevadm
+          # settle` only drains udev's queue, not udisksd's asynchronous D-Bus
+          # object refresh, so mounting straight after settle still raced the
+          # daemon's re-probe ("Object ... is not a mountable filesystem"
+          # against a correctly formatted disk, gate runs 2026-08-13/14).
+          # Wait on the REAL precondition: udisks reporting the vfat id.
+          fs.wait_until_succeeds(
+              f"udisksctl info -b {disk} | grep -Eq 'IdType:[[:space:]]*vfat'",
+              timeout=30)
+          # DIAGNOSTIC, not a fix (2026-08-17). This has now failed three times
+          # with the SAME "not a mountable filesystem", and the two previous
+          # changes above both assumed a race — first the missing uevent, then
+          # udisksd's async refresh. Neither holds any more: in run 31986775018
+          # the IdType wait succeeded in 0.08s and the mount still failed, so
+          # udisks had already re-probed and STILL did not expose a Filesystem
+          # interface on the object. Guessing at a third sync step would just
+          # repeat the pattern. Capture what udisks actually thinks this device
+          # is, so the next failure names its own cause.
+          #
+          # (I first blamed a phantom `vdb1` from mkfs.vfat aliasing as an MBR —
+          # that IS real and does break state-persist, but the `vdb: vdb1` lines
+          # in this shard's log belong to hart-installer-dualboot, not to this
+          # test. No partition node appears in this VM.)
+          print("=== udisksctl info -b " + disk + " ===\n"
+                + fs.succeed(f"udisksctl info -b {disk} 2>&1 || true"))
+          print("=== lsblk -f ===\n"
+                + fs.succeed("lsblk -f 2>&1 || true"))
+          print("=== blkid ===\n"
+                + fs.succeed(f"blkid -p {disk} 2>&1 || true"))
+          print("=== udev properties ===\n"
+                + fs.succeed(f"udevadm info --query=property --name={disk} 2>&1 || true"))
+
+          # ...and MOUNT what udisks actually OFFERS as a filesystem. When the
+          # whole-disk mkfs leaves a phantom MBR, udisks owns the fs on the
+          # PARTITION and exposes only a PartitionTable on the disk, so ask it
+          # which node to use rather than insisting on one. On a real stick (a
+          # genuine partition table) this picks the partition too, which is what
+          # auto-mount does in practice anyway.
+          target = disk
+          if "PartitionTable" in fs.succeed(f"udisksctl info -b {disk} 2>&1 || true"):
+              part = fs.succeed(
+                  f"lsblk -nrpo NAME,FSTYPE {disk} "
+                  f"| awk '$1 != \"{disk}\" && $2 != \"\" {{print $1; exit}}'").strip()
+              assert part, (
+                  f"{disk} carries a partition table but no partition with a "
+                  "filesystem was found:\n"
+                  + fs.succeed(f"lsblk -f {disk} 2>&1 || true"))
+              print(f"=== udisks owns the fs on {part}, not {disk} ===")
+              target = part
+
+          out = fs.succeed(f"udisksctl mount -b {target} 2>&1")
           assert "Mounted" in out or "already mounted" in out, \
               f"udisks must mount the removable disk, got {out!r}"
-          mp = fs.succeed(f"findmnt -nro TARGET {disk} | head -n1").strip()
-          assert mp, f"udisks reported a mount but findmnt sees none for {disk}"
+          mp = fs.succeed(f"findmnt -nro TARGET {target} | head -n1").strip()
+          assert mp, f"udisks reported a mount but findmnt sees none for {target}"
           fs.succeed(f"echo hart-udisks-rw > {mp}/probe.txt")
           assert fs.succeed(f"cat {mp}/probe.txt").strip() == "hart-udisks-rw", \
               "udisks-mounted disk must be writable+readable"
-          fs.succeed(f"udisksctl unmount -b {disk}")
+          fs.succeed(f"udisksctl unmount -b {target}")
 
       # ── 3. DEGRADE-NOT-DIE: an unmountable/corrupt disk fails clean + fast ──
       with subtest("an unmountable corrupt disk fails cleanly and never wedges the OS"):

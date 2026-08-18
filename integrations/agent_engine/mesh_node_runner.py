@@ -169,7 +169,18 @@ def build_stdlib_server(mesh, host: str = '0.0.0.0', port: int = None):
     """Build (do not start) a ThreadingHTTPServer bound to mesh.route_table()."""
     from http.server import ThreadingHTTPServer
     bind_port = mesh.task_relay_port if port is None else port
-    server = ThreadingHTTPServer((host, bind_port), _make_handler(mesh))
+
+    class _MeshHTTPServer(ThreadingHTTPServer):
+        # socketserver's default listen backlog is 5. A shard pipeline fans out
+        # to peers in parallel, so more than five peers connecting in the same
+        # instant overflow the accept queue and the kernel RESETS the excess
+        # ones -- the relay sees ConnectionResetError(104) and the shard fails,
+        # even though the node is healthy and idle. Serving is threaded and each
+        # request is short, so the queue only needs to absorb the burst until
+        # accept() catches up.
+        request_queue_size = 128
+
+    server = _MeshHTTPServer((host, bind_port), _make_handler(mesh))
     return server
 
 

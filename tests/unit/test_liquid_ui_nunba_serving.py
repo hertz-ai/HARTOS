@@ -223,3 +223,46 @@ def test_source_guard_nunba_base_is_history_not_hash():
     assert "NUNBA_BASE = ''" in html, "NUNBA_BASE must be the empty history mount"
     assert "'/app/#'" not in html, "the old hash mount must be gone"
     assert '/app/#' not in html, "no '/app/#' hash route anywhere in the shell"
+
+
+# ─── The proxy's client library must not be able to kill the shell ───────────
+
+def test_missing_httpx_degrades_to_static_instead_of_killing_the_shell(
+        nunba_dist, monkeypatch):
+    """HART_NUNBA_SOCKET set + httpx absent must still build the app.
+
+    The UDS proxy needs httpx, and that import used to be unguarded. Because it
+    sits behind `if hart_nunba_socket:`, preinstalling Nunba switched the path
+    on while httpx was missing from nixos/packages/hart-app.nix (it lives in
+    nunba.nix, a different python env). _create_flask_app() then raised
+    ModuleNotFoundError, hart-liquid-ui.service exited 1 and restart-looped, and
+    the desktop had no shell server at all -- three VM tests timed out waiting
+    on the unit. Every other failure in that proxy already degrades to the
+    static floor; a missing client library has to degrade the same way.
+    """
+    import builtins
+    import sys as _sys
+
+    monkeypatch.setenv('NUNBA_STATIC_DIR', str(nunba_dist))
+    monkeypatch.setenv('HART_NUNBA_SOCKET', '/run/hart/nunba-test.sock')
+
+    _real_import = builtins.__import__
+
+    def _no_httpx(name, *args, **kwargs):
+        if name == 'httpx' or name.startswith('httpx.'):
+            raise ImportError("No module named 'httpx'")
+        return _real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, '__import__', _no_httpx)
+    monkeypatch.delitem(_sys.modules, 'httpx', raising=False)
+
+    svc = LiquidUIService()
+    app = svc._create_flask_app()          # must NOT raise
+    app.testing = True
+    client = app.test_client()
+
+    # ...and the static floor genuinely answers, so this is a real degrade and
+    # not just a shell that boots into nothing.
+    r = client.get('/some/history/route')
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert b'<!doctype html>' in r.data.lower() or b'<html' in r.data.lower()

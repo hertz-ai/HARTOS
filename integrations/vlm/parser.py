@@ -79,6 +79,8 @@ class ParsedAction:
     box_id: Optional[int] = None
     coordinate: Optional[List[int]] = None
     next_action: str = ''          # original 'Next Action' string
+    command: str = ''              # for 'shell' actions (the command to run)
+    path: str = ''                 # for 'open_file_gui' actions (the target)
     ui_elements: List[dict] = field(default_factory=list)
     parsed_content_list: List[dict] = field(default_factory=list)
 
@@ -100,6 +102,10 @@ class ParsedAction:
             out['coordinate'] = self.coordinate
         if self.box_id is not None:
             out['Box ID'] = self.box_id
+        if self.command:
+            out['command'] = self.command
+        if self.path:
+            out['path'] = self.path
         if self.ui_elements:
             out['UI_Elements'] = self.ui_elements
         if self.parsed_content_list:
@@ -262,6 +268,13 @@ def _parse_json_shape(raw: str, *, include_som: bool) -> ParsedAction:
     pa.status = parsed.get('Status', '') or ''
     pa.reasoning = parsed.get('Reasoning', '') or raw[:500]
     pa.text = parsed.get('value', '') or ''
+    # ACTION-SPECIFIC PAYLOADS. The unified parser ingests a fixed field set,
+    # so a VLM emitting {"Next Action": "shell", "command": "..."} or
+    # {"Next Action": "open_file_gui", "path": "..."} had its payload dropped
+    # on the floor -- the action arrived with nothing to act on and could not
+    # execute. Carry them through explicitly.
+    pa.command = parsed.get('command', '') or ''
+    pa.path = parsed.get('path', '') or ''
     pa.coordinate = parsed.get('coordinate')
     pa.box_id = parsed.get('Box ID')
     pa.done = pa.status.upper() == 'DONE'

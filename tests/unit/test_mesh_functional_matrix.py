@@ -92,6 +92,17 @@ class _Node:
 
 @pytest.fixture
 def nodes():
+    # ARRANGE compute_contribute consent: the shard/infer routes are opt-in +
+    # fail-closed (403 'consent_required' without an owner grant -- the
+    # designed consent rule). These tests exercise the RELAY mechanics between
+    # two consenting devices, so the fixture grants consent the hermetic way
+    # (no DB coupling) for every node it makes.
+    from unittest.mock import patch as _patch
+    from integrations.agent_engine.compute_mesh_service import ComputeMeshService
+    _consent = _patch.object(
+        ComputeMeshService, '_compute_contribute_consented',
+        lambda self: True)
+    _consent.start()
     made = []
 
     def _make(n=1):
@@ -100,6 +111,7 @@ def nodes():
         return ns if n > 1 else ns[0]
 
     yield _make
+    _consent.stop()
     for n in made:
         n.shutdown()
 

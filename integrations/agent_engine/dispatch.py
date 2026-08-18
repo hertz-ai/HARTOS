@@ -251,7 +251,13 @@ def is_current_request_autonomous() -> bool:
     """
     try:
         from threadlocal import thread_local_data
-        return not is_genuine_user_request(thread_local_data.get_request_id() or '')
+        rid = thread_local_data.get_request_id() or ''
+        # A MISSING request_id must mean INTERACTIVE (the docstring's "degrades
+        # safe" contract, and what the test suite pins). The previous bare
+        # `not is_genuine_user_request(rid)` inverted that for rid='' -- an
+        # unstamped context was treated as AUTONOMOUS, the unsafe direction
+        # (the agent stops asking clarifying questions it should ask).
+        return bool(rid) and not is_genuine_user_request(rid)
     except Exception:
         return False
 

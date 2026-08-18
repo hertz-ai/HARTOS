@@ -280,9 +280,16 @@ class TestEventBusSSEDenylist:
     The _topic_targets_sse helper returns True for any topic not in
     the denylist."""
 
-    def test_default_denylist_is_empty_tuple(self):
+    def test_default_denylist_holds_only_the_internal_bus_prefix(self):
         from core.platform.events import _SSE_DENYLIST_PREFIXES
-        assert _SSE_DENYLIST_PREFIXES == ()
+        # The instruction was "allow all UNLESS some events need not be
+        # published to SSE" -- `bus.*` is exactly that exception, and it was
+        # added on live evidence: the EventBus auto-bridge re-published every
+        # `bus.<topic>` alongside the canonical SSE leg, so one publish became
+        # two envelopes with divergent dedup keys and the SPA played TTS audio
+        # TWICE on a single chat turn (2026-05-10 20:28:29). Assert the narrow
+        # exception explicitly, so a BROAD denylist still fails this guard.
+        assert _SSE_DENYLIST_PREFIXES == ('bus.',)
 
     def test_topic_targets_sse_returns_true_by_default(self):
         from core.platform.events import _topic_targets_sse

@@ -24,6 +24,20 @@ clickhouse-connect==0.6.4
 cmake==3.26.4
 colorama==0.4.6
 cryptography==43.0.0
+# autobahn (+ its txaio dep) is a MODULE-SCOPE import of production code
+# (reuse_recipe.py / create_recipe.py: `import txaio; txaio.use_asyncio()`
+# before autobahn) -- it was never declared here, so every dev box happened
+# to have it while the CI runner did not, and the whole WAMP-adjacent test
+# family failed collection there (gate run 31938229518). A hard production
+# import must be a declared dependency.
+autobahn==26.7.1
+# pyautogen: production imports `autogen` (core/labeled_autogen_function.py
+# at module scope; create_recipe lazily). It was only ever satisfied by a
+# LOOSE VENDORED autogen-0.2.37/ directory that was never committed, so
+# every fresh checkout (CI included) failed. 0.2.37 was never published to
+# PyPI under any name (pyautogen tops out at 0.2.35 in that line); 0.2.35
+# is the same 0.2 API and the full autogen test family passes against it.
+pyautogen==0.2.35
 coloredlogs==15.0.1
 config==0.5.1
 crossbarhttp3==1.1
@@ -254,3 +268,13 @@ num2words>=0.5.13
 # dev; baked into the image so production rebuilds don't need a manual
 # `pip install stripe` on the central container).
 stripe>=7.0.0
+
+# YouTube caption fetch for the agent's browser_research transcript tool
+# (integrations/browser_research/scripts/youtube.py). Lazy-imported with an
+# ImportError fallthrough, so a missing install does not crash -- it silently
+# demotes every transcript request to the yt-dlp + local-Whisper path, which
+# downloads the media and runs STT for a video that already publishes captions.
+# It was in NEITHER requirements.txt nor hart-app.nix, so that demotion is what
+# every host has actually been doing, and the three tests covering the caption
+# path could not even import on CI.
+youtube-transcript-api>=1.0.0

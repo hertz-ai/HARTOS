@@ -88,17 +88,23 @@ in
     # (its default == nunba.enable), so LiquidUI reverse-proxies the daemon same-
     # origin with the SAME React store-path as the graceful static floor.
     #
-    # STAYS OFF until CI is green — flipping it before that would fail the desktop
-    # ISO. Two CI prerequisites (nixos/packages/nunba.nix):
-    #   1. Pin the FOD hashes: nunbaRev (current Nunba HEAD, has HART_NUNBA_SOCKET) +
-    #      nunbaHash (nix-prefetch-github hertz-ai Nunba --rev <rev>) + npmDepsHash
-    #      (prefetch-npm-deps landing-page/package-lock.json) — all in ONE commit.
-    #   2. `nix build .#packages.x86_64-linux.nunba` green — walk the import-domino
-    #      boot loop (add curated nixpkgs pkgs / guard Nunba ML imports until main.py
-    #      binds the socket), per hart-app.nix's method.
-    # Then set this to true (embedNunba follows automatically). Until then the
-    # React-static floor path is byte-for-byte the current behaviour.
-    nunba.enable = false;
+    # PROMOTED ON 2026-08-14 (steward: "pre installed nunba microfrontend").
+    # Both CI prerequisites are met at nunbaRev 776c4079:
+    #   1. FOD hashes pinned (nunbaRev + nunbaHash + npmDepsHash, all in the
+    #      same commit -- nixos/packages/nunba.nix).
+    #   2. `nix build .#packages.x86_64-linux.nunba` verified GREEN by the
+    #      nunba-hash-pin workflow, run 31810930513 ("packages.nunba builds
+    #      GREEN with the new pins" -- its push failed on token perms, the pin
+    #      was landed manually from that run's computed hashes).
+    # embedNunba follows automatically (its default == nunba.enable): LiquidUI
+    # reverse-proxies the daemon's unix socket same-origin, and LightYourHART
+    # onboarding ships in the image instead of requiring a post-boot install.
+    nunba.enable = true;
+
+    # Designed power management, restored by the 2026-08-14 audit (see the
+    # CORRECTION note above): power profiles via power-profiles-daemon,
+    # thermald thermal mitigation, suspend with agent checkpoint + resume.
+    power.enable = true;
 
     # ── Unified Kernel Extensions ──
     kernel = {
@@ -490,8 +496,18 @@ in
     # ═══════════════════════════════════════════════════════════════
     # Every hart.* feature that shipped OFF is now on. Audited first: these
     # were the 9 with an enable option that no consumer ever set, so the
-    # modules were dead weight in the tree. (luks/nvidia/power already
-    # default-ON in their own modules; `installer` stays ISO-only in
+    # modules were dead weight in the tree.
+    # CORRECTION (2026-08-14 design-vs-reality audit): this comment used to
+    # claim "luks/nvidia/power already default-ON in their own modules". All
+    # three are mkEnableOption (default FALSE), so power management shipped
+    # as dead code on every image: no power-profiles-daemon (the trial
+    # journal shows net.hadess.PowerProfiles dbus activation timing out
+    # because nothing provided it), no thermald (the DESIGNED mitigation for
+    # the 94C throttle RCA), no suspend-with-agent-checkpoint. `power` is
+    # now enabled below. `nvidia` is genuinely covered: hart-gpu-offload
+    # sets hart.nvidia.enable=true when the dGPU is armed. `luks` stays OFF
+    # deliberately: it needs a per-install passphrase decision and cannot be
+    # baked into a shared image. (`installer` stays ISO-only in
     # configurations/desktop.nix by design — an installed system carries no
     # installer.)
     #
@@ -1067,10 +1083,14 @@ in
   boot.kernel.sysctl."kernel.sysrq" = 1;
 
   # ─── Printing & Scanning ───
-  services.printing.enable = true;
-  services.avahi = {
+  # OWNED by hart-cups.nix (2026-08-14 design-vs-reality audit): the raw
+  # services.printing/avahi lines here bypassed the module, so its driver
+  # packs, print-to-PDF and the hart-print CLI never shipped despite being
+  # the designed printing surface. The module sets a strict superset of what
+  # the raw lines did (printing + avahi/nssmdns4 under `browsing`).
+  hart.printing = {
     enable = true;
-    nssmdns4 = true;  # mDNS for network printer discovery
+    browsing = true;
   };
   # (hardware.sane: OWNED by hart.scanner — enabled above. The module already
   # appends pkgs.sane-airscan unconditionally AND adds simple-scan + the

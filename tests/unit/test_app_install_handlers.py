@@ -233,7 +233,10 @@ def test_flatpak_missing_tool_graceful():
         res = inst._install_flatpak(InstallRequest(source='flathub:org.test.App'))
     assert res.success is False
     assert res.verified is False
-    assert 'not available' in res.error.lower()
+    # Sharpened handler message (see test_app_installer.py note): the honest
+    # which-failure vocabulary replaced the vague 'not available'.
+    assert ('not installed' in res.error.lower()
+            or 'could not be executed' in res.error.lower()), res.error
 
 
 def test_appimage_missing_source_graceful():

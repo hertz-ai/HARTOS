@@ -283,18 +283,21 @@ in
             "HART_COPILOT_BACKEND=http://127.0.0.1:6777"
             "HART_COPILOT_REPO=/var/lib/hart/copilot/HARTOS"
             "HART_COPILOT_STOP=/run/hart/copilot-stop"
+            # WorkingDirectory alone is NOT enough. Running "python
+            # scripts/hart_copilot_daemon.py" makes sys.path[0] the SCRIPT's dir
+            # (scripts/), not the app root, so `from security.hive_guardrails
+            # import HiveCircuitBreaker` raised ModuleNotFoundError on EVERY
+            # tick (measured 2026-08-12). hive_halted() fails OPEN by design,
+            # so the copilot kept running with its constitutional halt gate
+            # UNREADABLE: a halt the human set could not have been seen.
+            # CORRECTION (2026-08-14): the first fix wrote `PYTHONPATH = ...`
+            # as a DIRECT serviceConfig key -- systemd logged "Unknown key
+            # 'PYTHONPATH' in section [Service], ignoring" (real-HW journal)
+            # and the gate stayed unreadable for two more days. Env vars go IN
+            # Environment=; a misspelled serviceConfig key is a silent no-op.
+            "PYTHONPATH=${config.hart.package}"
           ];
           ExecStart = "${config.hart.package.python}/bin/python scripts/hart_copilot_daemon.py";
-          # WorkingDirectory alone is NOT enough. Running "python
-          # scripts/hart_copilot_daemon.py" makes sys.path[0] the SCRIPT's dir
-          # (scripts/), not the app root, so `from security.hive_guardrails
-          # import HiveCircuitBreaker` raised ModuleNotFoundError on EVERY tick
-          # (measured 2026-08-12). hive_halted() fails OPEN by design, so the
-          # copilot kept running with its constitutional halt gate UNREADABLE:
-          # a halt the human set could not have been seen. That is the worst
-          # possible direction for a gate to fail, and it was silent apart from
-          # one swallowed traceback per tick.
-          PYTHONPATH = "${config.hart.package}";
           # A crash must not take the node's co-pilot down permanently, but it must
           # not hot-loop either: back off hard between restarts.
           Restart = "on-failure";

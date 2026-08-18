@@ -32,6 +32,11 @@ class FakeGoal:
             setattr(self, k, v)
         if not hasattr(self, 'created_at'):
             self.created_at = '2026-01-01'
+        # update_goal emits goal-changed events carrying goal.goal_type
+        # (goal_manager.py:381); a fake without the attribute crashed three
+        # update tests once that emit landed. Default it like the ORM model.
+        if not hasattr(self, 'goal_type'):
+            self.goal_type = 'test_goal'
 
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
@@ -48,6 +53,11 @@ class FakeProduct:
             setattr(self, k, v)
         if not hasattr(self, 'created_at'):
             self.created_at = '2026-01-01'
+        # update_goal emits goal-changed events carrying goal.goal_type
+        # (goal_manager.py:381); a fake without the attribute crashed three
+        # update tests once that emit landed. Default it like the ORM model.
+        if not hasattr(self, 'goal_type'):
+            self.goal_type = 'test_goal'
 
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
@@ -610,7 +620,12 @@ class TestBuildPrompt(unittest.TestCase):
                 raise ImportError("mocked")
             return original_import(name, *args, **kwargs)
         sys.modules.pop('security.hive_guardrails', None)
-        with patch('builtins.__import__', side_effect=fail_guardrails):
+        # ARRANGE warn mode explicitly: this test exercises the WARN path, but
+        # it used to inherit the environment's enforcement default -- which has
+        # since been hardened to fail-closed ('hard'), where returning None is
+        # the CORRECT behaviour. Warn mode must be arranged, not assumed.
+        with patch('builtins.__import__', side_effect=fail_guardrails),                 patch('security.master_key.get_enforcement_mode',
+                      return_value='warn'):
             result = self.gm.GoalManager.build_prompt(
                 {'goal_type': 'unknown_xyz', 'title': 'T', 'description': 'D'})
         # Warn mode: returns a basic prompt with title + description

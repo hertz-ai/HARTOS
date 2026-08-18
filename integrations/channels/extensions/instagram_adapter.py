@@ -663,6 +663,234 @@ class InstagramAdapter(ChannelAdapter):
             logger.error(f"Failed to send reaction: {e}")
             return False
 
+    # ── Content Publishing (feed posts) ──────────────────────────────
+    #
+    # Everything above this line is MESSAGING: DMs, quick replies, reactions,
+    # webhooks. That is a different Meta product from putting a post on the
+    # feed, and the adapter had only the first one. `send_message` cannot
+    # publish, so "post to Instagram" had no code path at all.
+    #
+    # Feed publishing is a three-step dance, not a POST:
+    #   1. create a media CONTAINER per image        -> creation_id
+    #   2. (carousel) create a parent container      -> children=[ids]
+    #   3. publish the container                     -> permalink
+    #
+    # Instagram FETCHES the image from image_url, so the URL must be public
+    # HTTPS that Meta's crawler can reach. Bytes cannot be uploaded, and
+    # localhost or a signed-expiring URL will fail at step 1.
+    #
+    # Requires an Instagram Business/Creator account and the
+    # `instagram_content_publish` permission, which needs App Review to work
+    # outside dev mode. Without it every call here returns Meta's permission
+    # error rather than silently doing nothing.
+
+    # Meta's documented ceilings. Enforced locally so a bad post fails here,
+    # with a clear reason, instead of after N network round-trips.
+    CAROUSEL_MIN_ITEMS = 2
+    CAROUSEL_MAX_ITEMS = 10
+    CAPTION_MAX_CHARS = 2200
+
+    # A container is not immediately publishable. Images are usually instant,
+    # but the API still reports IN_PROGRESS, and publishing early fails with
+    # code 9007. Poll instead of sleeping a guessed constant.
+    _CONTAINER_POLL_INTERVAL_S = 2
+    _CONTAINER_POLL_MAX_ATTEMPTS = 15
+
+    async def publish_photo(
+        self,
+        image_url: str,
+        caption: str = "",
+    ) -> SendResult:
+        """Publish ONE image to the feed. Returns the media id on success."""
+        container = await self._create_media_container({
+            "image_url": image_url,
+            "caption": caption[:self.CAPTION_MAX_CHARS],
+        })
+        if not container.success:
+            return container
+        return await self._publish_container(container.message_id)
+
+    async def publish_carousel(
+        self,
+        image_urls: List[str],
+        caption: str = "",
+    ) -> SendResult:
+        """Publish a multi-slide carousel, the format of a facts post.
+
+        Each slide becomes its own container with is_carousel_item=true, then
+        one parent container ties them together. A slide that fails to build
+        aborts the whole post: publishing 6 of 9 slides would ship a broken
+        argument, which is worse than not posting.
+        """
+        if not (self.CAROUSEL_MIN_ITEMS <= len(image_urls) <= self.CAROUSEL_MAX_ITEMS):
+            return SendResult(
+                success=False,
+                error=(f"carousel needs {self.CAROUSEL_MIN_ITEMS}-"
+                       f"{self.CAROUSEL_MAX_ITEMS} images, got {len(image_urls)}"),
+            )
+
+        children: List[str] = []
+        for index, url in enumerate(image_urls):
+            item = await self._create_media_container({
+                "image_url": url,
+                "is_carousel_item": "true",
+            })
+            if not item.success:
+                return SendResult(
+                    success=False,
+                    error=f"slide {index + 1}/{len(image_urls)} failed: {item.error}",
+                )
+            children.append(item.message_id)
+
+        parent = await self._create_media_container({
+            "media_type": "CAROUSEL",
+            "children": ",".join(children),
+            "caption": caption[:self.CAPTION_MAX_CHARS],
+        })
+        if not parent.success:
+            return parent
+        return await self._publish_container(parent.message_id)
+
+    async def _create_media_container(
+        self,
+        params: Dict[str, Any],
+    ) -> SendResult:
+        """POST /{ig-user-id}/media. message_id carries the creation_id."""
+        if not self._session:
+            return SendResult(success=False, error="Not connected")
+        account_id = self.instagram_config.instagram_account_id
+        if not account_id:
+            return SendResult(
+                success=False,
+                error="No instagram_account_id; call connect() first",
+            )
+
+        try:
+            url = f"{self._api_base}/{account_id}/media"
+            payload = dict(params)
+            payload["access_token"] = self.instagram_config.page_access_token
+
+            async with self._session.post(url, data=payload) as response:
+                data = await response.json()
+                if response.status == 200 and data.get("id"):
+                    return SendResult(success=True, message_id=data["id"])
+                return self._publish_error(data)
+
+        except ChannelRateLimitError:
+            raise
+        except Exception as e:
+            logger.error(f"Instagram container create failed: {e}")
+            return SendResult(success=False, error=str(e))
+
+    async def _publish_container(self, creation_id: str) -> SendResult:
+        """Wait for the container to finish, then POST media_publish."""
+        ready = await self._wait_for_container(creation_id)
+        if not ready.success:
+            return ready
+
+        if not self._session:
+            return SendResult(success=False, error="Not connected")
+        account_id = self.instagram_config.instagram_account_id
+
+        try:
+            url = f"{self._api_base}/{account_id}/media_publish"
+            payload = {
+                "creation_id": creation_id,
+                "access_token": self.instagram_config.page_access_token,
+            }
+            async with self._session.post(url, data=payload) as response:
+                data = await response.json()
+                if response.status == 200 and data.get("id"):
+                    logger.info("Instagram post published: %s", data["id"])
+                    return SendResult(success=True, message_id=data["id"])
+                return self._publish_error(data)
+
+        except ChannelRateLimitError:
+            raise
+        except Exception as e:
+            logger.error(f"Instagram publish failed: {e}")
+            return SendResult(success=False, error=str(e))
+
+    async def _wait_for_container(self, creation_id: str) -> SendResult:
+        """Poll status_code until FINISHED, or report why it will never be.
+
+        ERROR is terminal: retrying a container Meta already rejected just
+        burns quota. EXPIRED means it sat unpublished past 24h.
+        """
+        if not self._session:
+            return SendResult(success=False, error="Not connected")
+
+        for _ in range(self._CONTAINER_POLL_MAX_ATTEMPTS):
+            try:
+                url = f"{self._api_base}/{creation_id}"
+                params = {
+                    "fields": "status_code,status",
+                    "access_token": self.instagram_config.page_access_token,
+                }
+                async with self._session.get(url, params=params) as response:
+                    data = await response.json()
+                    state = data.get("status_code")
+
+                    if state == "FINISHED":
+                        return SendResult(success=True, message_id=creation_id)
+                    if state in ("ERROR", "EXPIRED"):
+                        return SendResult(
+                            success=False,
+                            error=(f"container {creation_id} {state}: "
+                                   f"{data.get('status', 'no detail')}"),
+                        )
+            except Exception as e:
+                logger.debug("container poll error: %s", e)
+
+            await asyncio.sleep(self._CONTAINER_POLL_INTERVAL_S)
+
+        return SendResult(
+            success=False,
+            error=(f"container {creation_id} not ready after "
+                   f"{self._CONTAINER_POLL_MAX_ATTEMPTS} polls"),
+        )
+
+    async def get_publishing_limit(self) -> Dict[str, Any]:
+        """Remaining posts in the rolling 24h window (Meta allows 50).
+
+        Worth reading BEFORE composing: hitting the cap mid-carousel leaves
+        orphaned containers that count against nothing but confuse the logs.
+        """
+        if not self._session or not self.instagram_config.instagram_account_id:
+            return {"error": "Not connected"}
+        try:
+            url = (f"{self._api_base}/"
+                   f"{self.instagram_config.instagram_account_id}"
+                   f"/content_publishing_limit")
+            params = {
+                "fields": "config,quota_usage",
+                "access_token": self.instagram_config.page_access_token,
+            }
+            async with self._session.get(url, params=params) as response:
+                data = await response.json()
+                entries = data.get("data") or [{}]
+                return entries[0]
+        except Exception as e:
+            return {"error": str(e)}
+
+    @staticmethod
+    def _publish_error(data: Dict[str, Any]) -> SendResult:
+        """Turn a Graph API error body into a SendResult, or raise on throttle.
+
+        Codes 4/17/32 are the app/user/page throughput limits. They are
+        retryable and must NOT be reported as a content problem, or a caller
+        will keep rewriting a post that was never the issue.
+        """
+        error = data.get("error", {}) or {}
+        code = error.get("code")
+        if code in (4, 17, 32):
+            raise ChannelRateLimitError(3600)
+        message = error.get("message", "Unknown error")
+        subcode = error.get("error_subcode")
+        if subcode:
+            message = f"{message} (subcode {subcode})"
+        return SendResult(success=False, error=message)
+
     async def set_ice_breakers(self, ice_breakers: List[IceBreaker]) -> bool:
         """
         Set ice breakers (conversation starters) for the Instagram account.

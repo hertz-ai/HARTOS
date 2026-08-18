@@ -59,10 +59,23 @@ class UserPriorityGateTests(unittest.TestCase):
         """Bug fix from mid-session: mark_create_start MUST also call
         mark_user_chat_activity, else a CREATE that runs longer than
         the chat-cooldown window can let daemons hammer mid-pipeline."""
+        # Pass a GENUINE USER request id: stamping became conditional on
+        # is_genuine_user_request() so a DAEMON-initiated create can no longer
+        # re-arm the 10-min user cooldown (that fed the starvation-override ->
+        # forced tick -> daemon create -> re-stamp loop and kept the yield gate
+        # stuck on). The no-id call this test used is therefore NOT the user
+        # case it is about.
         before = self.dispatch._last_user_chat_at
-        self.dispatch.mark_create_start()
+        self.dispatch.mark_create_start(request_id='user_42_1700000000')
         after = self.dispatch._last_user_chat_at
         self.assertGreater(after, before)
+        self.dispatch.mark_create_end()
+
+    def test_daemon_create_start_does_not_rearm_user_cooldown(self):
+        """The other half of the same rule: a daemon create must NOT stamp."""
+        before = self.dispatch._last_user_chat_at
+        self.dispatch.mark_create_start(request_id='daemon_goal7')
+        self.assertEqual(self.dispatch._last_user_chat_at, before)
         self.dispatch.mark_create_end()
 
     def test_concurrent_create_sessions_counted_correctly(self):

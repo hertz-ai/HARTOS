@@ -76,7 +76,13 @@ in
           # this subtest flaked non-deterministically between VM runs).
           result = server.wait_until_succeeds(
               "curl -sf http://localhost:6777/status", timeout=90)
-          assert "success" in result or "uptime" in result, f"Unexpected status: {result}"
+          # The /status document's vocabulary evolved: it now reports
+          # "status": "running" (with honest per-subsystem fields like the
+          # learning bridge being disabled on a coreless VM). Accept any of
+          # the three generations of the alive-signal; the subtest's intent
+          # is only "the backend serves its status document".
+          assert ("success" in result or "uptime" in result
+                  or '"running"' in result), f"Unexpected status: {result}"
 
       with subtest("Discovery service starts"):
           server.wait_for_unit("hart-discovery.service", timeout=60)
@@ -159,8 +165,17 @@ in
           # in front of the real initrd, so the archive's own path strings sit
           # in the first few KiB of the file. Reading them back proves the
           # artifact was actually built — an eval-level option check could not.
+          # `strings` is binutils and is NOT on this node's PATH — vm-tests.nix
+          # declares no environment.systemPackages at all. The command used to be
+          # `... | strings || true`, so the pipeline exited 127 (command not
+          # found), `|| true` swallowed it, succeed() passed with EMPTY stdout, and
+          # the assertion below then reported "no early-microcode cpio" about a
+          # system that has one. Nothing about microcode was ever being tested.
+          #
+          # tr is coreutils, always present. And no `|| true`: a missing tool must
+          # fail loudly here rather than masquerade as a missing artifact.
           head = server.succeed(
-              "head -c 4096 /run/current-system/initrd | strings || true")
+              "head -c 4096 /run/current-system/initrd | tr -cd '[:print:][:space:]'")
           assert "kernel/x86/microcode" in head, (
               "no early-microcode cpio at the head of the initrd — "
               "hardware.cpu.{intel,amd}.updateMicrocode did not take effect")

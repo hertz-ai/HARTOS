@@ -448,7 +448,20 @@ in
                   REMOTE_REV="$C_COMMIT"
                   [[ -n "$C_FLAKE" && "$C_FLAKE" != "null" ]] && SWITCH_FLAKE="$C_FLAKE"
                   echo "[HART OTA] CENTRAL approved rev=$REMOTE_REV flake=$SWITCH_FLAKE"
+                else
+                  # REACHED CENTRAL, but the channel carries no release. This is
+                  # NOT "central unavailable" -- saying so sends whoever reads
+                  # this log to debug the network instead of the empty channel
+                  # (it cost a real debugging detour 2026-08-16: central was
+                  # serving 200 the whole time with
+                  # {"commit":"","flake_ref":"","published_at":null} on EVERY
+                  # channel, because nothing has ever been published to it --
+                  # /api/ota/publish is account-gated and no CI job calls it).
+                  CENTRAL_EMPTY=1
+                  echo "[HART OTA] CENTRAL reachable but channel '${ota.channel}' has NO published release"
                 fi
+              else
+                echo "[HART OTA] CENTRAL unreachable (no response from $CENTRAL)"
               fi
             fi
 
@@ -456,7 +469,11 @@ in
             # (keeps an air-gapped / central-unreachable node updatable; central
             #  stays the primary source of truth when present).
             if [[ "$REMOTE_REV" == "check_failed" ]]; then
-              echo "[HART OTA] CENTRAL unavailable, falling back to flake: ${ota.flakeRef}"
+              if [[ "''${CENTRAL_EMPTY:-0}" == "1" ]]; then
+                echo "[HART OTA] no central release; falling back to flake: ${ota.flakeRef}"
+              else
+                echo "[HART OTA] CENTRAL unavailable, falling back to flake: ${ota.flakeRef}"
+              fi
               REMOTE_REV=$(${pkgs.nix}/bin/nix flake metadata "${ota.flakeRef}" --json 2>/dev/null \
                 | ${pkgs.jq}/bin/jq -r '.revision // "unknown"') || REMOTE_REV="check_failed"
             fi
@@ -486,8 +503,30 @@ in
               # skips the local sign-verify + canary safety gates).
               ${hartApp.python}/bin/python ${otaOrchestratorDrive} stage "$REMOTE_REV" \
                 || echo "[HART OTA] Pipeline start failed"
+            elif [[ "$REMOTE_REV" == "check_failed" || "$REMOTE_REV" == "unknown" ]]; then
+              # DO NOT CALL A FAILED CHECK "up to date" (real HW 2026-08-16).
+              # Central was unreachable AND the flake fallback could not resolve
+              # a revision, so this node has NO IDEA whether it is current -- it
+              # printed "System is up to date" anyway, which is the same
+              # silent-success lie the canary health check told before
+              # (see the VERIFIED BROKEN note at the top of this module). A node
+              # that cannot check must SAY so, at a severity an operator sees,
+              # or an un-updatable fleet looks like a healthy one forever.
+              echo "[HART OTA] UPDATE CHECK FAILED - update state UNKNOWN" >&2
+              echo "[HART OTA]   central: ${ota.centralEndpoint} (unreachable?)" >&2
+              echo "[HART OTA]   flake:   ${ota.flakeRef} (revision unresolved)" >&2
+              echo "[HART OTA] This node is NOT known to be current; it is unchecked." >&2
+              exit 1
+            elif [[ "$LOCAL_REV" == "unknown" ]]; then
+              # Remote resolved but LOCAL did not: /etc/nixos is not a flake we
+              # can read a revision from (e.g. a dd'd image whose source tree is
+              # not a git checkout). Comparing against "unknown" silently means
+              # "equal" -> "up to date" forever. Say what is actually true.
+              echo "[HART OTA] LOCAL revision unknown (/etc/nixos is not a readable flake)" >&2
+              echo "[HART OTA] Cannot compare against approved $REMOTE_REV; node is unchecked." >&2
+              exit 1
             else
-              echo "[HART OTA] System is up to date"
+              echo "[HART OTA] System is up to date (local $LOCAL_REV == approved $REMOTE_REV)"
             fi
           elif [[ "$STAGE" == "completed" ]]; then
             echo "[HART OTA] Update completed."

@@ -242,8 +242,15 @@ function runHero(realm) {
   ok(minBtn.style.opacity !== '0.85' && minBtn.style.opacity !== '1',
      'hover/focus on the orb does NOT reveal the control (no hover affordance)  (got ' + JSON.stringify(minBtn.style.opacity) + ')');
 
-  // 2) Starting a DRAG of the spine reveals it.
+  // 2) A REAL drag of the spine reveals it -- press alone must NOT, because
+  // revealing on pointerdown made every plain click flash the control (the
+  // shell now waits for movement past a small threshold before it counts as a
+  // drag). Press, confirm nothing was revealed, then actually move.
   hero.dispatch('pointerdown', mkEv(orb, { button: 0, pointerId: 1 }));
+  ok(minBtn.style.opacity !== '0.85',
+     'a plain press does NOT reveal the control (no click flash)  (got ' +
+     JSON.stringify(minBtn.style.opacity) + ')');
+  hero.dispatch('pointermove', mkEv(orb, { pointerId: 1, clientX: 40, clientY: 40 }));
   eq(minBtn.style.opacity, '0.85', 'dragging the orb reveals the minimise control');
 
   // 3) Dropping the drag hides it again (not compact).

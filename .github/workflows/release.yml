@@ -787,7 +787,13 @@ jobs:
   # untested. Nightlies are previews; signed releases stay strict.
   publish-nightly:
     if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [build-iso, build-installers]
+    # gate-checks added to needs (2026-08-14) NOT to block publishing -- the
+    # `if: always()` keeps nightlies flowing as previews -- but to make the
+    # GATE VERDICT visible in the release itself. A week of debugging ran on
+    # nightly artifacts from red-gated runs with no way to tell at download
+    # time; "previews are understood as untested" failed in practice. The
+    # title/notes below stamp needs.gate-checks.result on every nightly.
+    needs: [build-iso, build-installers, gate-checks]
     runs-on: ubuntu-latest
     # Uploading ~6.5 GB of split ISO parts is comfortably under 90 min.
     # Without its own budget this job inherits GitHub's 6h hard wall, so a
@@ -869,13 +875,22 @@ jobs:
             done
 
           echo "=== Creating $TAG DRAFT (mutable while draft) ==="
+          # Stamp the gate verdict into the release (see the needs: comment):
+          # a consumer must be able to tell a green-gated preview from a
+          # red-gated one AT DOWNLOAD TIME, not after a day of debugging.
+          GATE="${{ needs.gate-checks.result }}"
+          if [[ "$GATE" == "success" ]]; then
+            GATE_BADGE="gate PASSED"
+          else
+            GATE_BADGE="gate ${GATE^^} - artifacts are from a build whose test gate did not pass"
+          fi
           gh release create "$TAG" \
             --repo "$REPO" \
             --target "$SHA" \
             --draft \
             --prerelease \
-            --title "HART OS nightly ${SHORT_SHA}" \
-            --notes "Rolling bleeding-edge ISOs built from \`main\` @ ${SHORT_SHA} on every push. Not signed by the master key — for stable signed releases see the [release archive](https://github.com/${REPO}/releases). Each ISO verifies against its companion \`.sha256\`."
+            --title "HART OS nightly ${SHORT_SHA} (${GATE_BADGE%% -*})" \
+            --notes "Rolling bleeding-edge ISOs built from \`main\` @ ${SHORT_SHA} on every push. **Release gate: ${GATE_BADGE}.** Not signed by the master key — for stable signed releases see the [release archive](https://github.com/${REPO}/releases). Each ISO verifies against its companion \`.sha256\`."
 
           # Ship the USB flasher with every release — one tool (CLI + GUI) to
           # write the split ISO to a USB without bespoke commands. See

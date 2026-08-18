@@ -327,6 +327,54 @@ in
           conf_src = host.succeed("cat " + sway_conf)
           assert "hart-glass-shell-gtk4" in conf_src, \
               "Tier-2 sway host config does not exec the hart-glass-shell-gtk4 host binary"
+          # NEVER LINGER BLANK (2026-08-16 real-HW): the host exits when its
+          # WebKitWebProcess dies, but the supervisor watches the SESSION (sway),
+          # not the host. Without chaining sway's exit to the host's, a WebKit
+          # crash left sway up with NO client -- a black screen nothing
+          # relaunched. Pin the chain so it cannot be dropped again.
+          # The chain lives in a WRAPPER SCRIPT, not inline in the config: sway's
+          # config lexer splits commands on `;` itself, so an inline
+          # `exec <host>; <swaymsg> exit` made sway read the second half as a
+          # config command, reject it, and refuse to start at all. Follow the exec
+          # into the wrapper rather than substring-matching the config.
+          # Match the STARTUP CLIENT by name, not the first `exec` in the file: the
+          # config also has `bindsym ... exec <brightnessctl>` / `<pactl>`
+          # keybindings, and a bare `exec\s+(/nix/store/\S+)` matched brightnessctl,
+          # catted that, and reported the session-end chain missing. Name the wrapper.
+          import re as _re
+          m = _re.search(r"exec\s+(/nix/store/\S*hart-glass-shell-gtk4-then-exit)",
+                         conf_src)
+          if m:
+              wrapper_src = host.succeed("cat " + m.group(1))
+              assert "/bin/hart-glass-shell-gtk4" in wrapper_src, \
+                  f"Tier-2 exec wrapper does not run the GTK4 host:\n{wrapper_src}"
+              assert "swaymsg exit" in wrapper_src, \
+                  ("Tier-2 session does not end when the shell host exits -- a "
+                   "WebKit crash would leave sway running with no client (black "
+                   f"screen, no relaunch). wrapper:\n{wrapper_src}")
+          else:
+              # Legacy inline form (kept accepted so this test pins the CONTRACT,
+              # not the mechanism).
+              assert "/bin/hart-glass-shell-gtk4" in conf_src and \
+                  "swaymsg exit" in conf_src, \
+                  ("Tier-2 neither execs the session-ending wrapper nor chains "
+                   f"swaymsg exit inline:\n{conf_src}")
+
+          # ...and the config must PARSE. The assertion above used to be a
+          # substring check on the config text, which is why a config sway could
+          # not read shipped anyway: "swaymsg exit" was present, the assertion
+          # passed, and sway still died with
+          #   [ERROR] [sway/config.c:654] Error on line 'exec ...; ... swaymsg
+          #   exit': Unknown/invalid command
+          # so the whole Tier-2 session never came up. Validate the real file with
+          # sway's own parser. Asserted on the ERROR MARKER rather than the exit
+          # code, because --validate can be non-zero for benign VM reasons.
+          swaymsg_path = _re.search(r"(/nix/store/\S+)/bin/swaymsg", wrapper_src)
+          assert swaymsg_path, f"wrapper does not reference swaymsg:\n{wrapper_src}"
+          sway_bin = swaymsg_path.group(1) + "/bin/sway"
+          val = host.succeed(f"{sway_bin} --validate -c {sway_conf} 2>&1 || true")
+          assert "Error on line" not in val, \
+              f"sway REFUSES its own generated config:\n{val}\n--- config ---\n{conf_src}"
     '';
   };
 
@@ -505,10 +553,25 @@ in
           # The launcher runs sway onto the GTK4 host; the host script holds the
           # WebKit-side software-render contract. Follow it and assert the GTK4 host
           # pins HardwareAccelerationPolicy.NEVER + the DMABUF/compositing disables.
-          host_path = paint.succeed(
-              "grep -oE '/nix/store/[^ ]*/bin/hart-glass-shell-gtk4' "
-              f"$(grep -oE '/nix/store/[^ ]*hart-gtk4-layer-host.conf' {exec_path} | head -1) "
+          # The sway config's startup client is a WRAPPER (it runs the host, then
+          # ends the session so the supervisor relaunches the tier instead of
+          # leaving sway with no client). So the host binary path is one hop
+          # further in: grep the conf AND its exec target. If the wrapper grep
+          # finds nothing the $() expands away and this greps the conf alone,
+          # which keeps the legacy inline form working too.
+          sway_conf = paint.succeed(
+              f"grep -oE '/nix/store/[^ ]*hart-gtk4-layer-host.conf' {exec_path} "
               "| head -1").strip()
+          assert sway_conf, f"no sway conf referenced by the launcher {exec_path}"
+          host_path = paint.succeed(
+              "grep -hoE '/nix/store/[^ ]*/bin/hart-glass-shell-gtk4' "
+              f"{sway_conf} "
+              f"$(grep -oE '/nix/store/[^ ]*hart-glass-shell-gtk4-then-exit' {sway_conf} "
+              "| head -1) 2>/dev/null | head -1").strip()
+          assert host_path, (
+              "could not resolve the GTK4 host binary from the sway conf or its "
+              f"exec wrapper.\nconf: {sway_conf}\n"
+              + paint.succeed(f"cat {sway_conf}"))
           host_src = paint.succeed(f"cat {host_path}")
           assert "HardwareAccelerationPolicy.NEVER" in host_src, \
               "GTK4 host missing HardwareAccelerationPolicy.NEVER — GPU accel would crash on llvmpipe"

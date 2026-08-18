@@ -14,7 +14,23 @@
 # Imported ONLY by mkRepartImage in flake.nix (never in hartModules), so the ISO
 # builds (mkSystem) and every nixosTest eval stay byte-identical. UEFI-ONLY by
 # design (the 2026-07-16 raw-image pivot).
-{ config, lib, pkgs, modulesPath, ... }:
+{ config, lib, pkgs, modulesPath, hartRev, ... }:
+let
+  # Per-build filesystem labels (2026-08-14). These images are REPRODUCIBLE:
+  # mkfs runs seeded, so every build of every commit used to produce the same
+  # ext4 UUID and the same "nixos"/"ESP" labels. Stage 1 mounts root by label,
+  # so with two HART sticks plugged in -- or one stale stick and one fresh one
+  # anywhere on the bus -- the by-label symlink is a per-boot coin toss between
+  # DIFFERENT BUILDS, and neither UUID nor label can tell them apart. That is
+  # not hypothetical: a freshly flashed good build sat unbooted while an
+  # identical-looking stick with a stale broken build panicked on two laptops,
+  # and every diagnostic pointed at the wrong filesystem. The rev-derived label
+  # gives each build its own root identity; two sticks of the SAME rev remain
+  # ambiguous, which the hart-hartlog-create boot-disk guard already documents.
+  # ext4 labels cap at 16 bytes, FAT32 at 11.
+  rootLabel = "hart-${builtins.substring 0 10 hartRev}";
+  espLabel  = "HART-${lib.toUpper (builtins.substring 0 6 hartRev)}";
+in
 {
   imports = [
     "${modulesPath}/image/repart.nix"
@@ -51,12 +67,12 @@
   # desktop.nix's hartImageKind=="raw" branch — identical values merge (bool
   # mergeEqualOption), so this module stays self-contained without conflicting.
   fileSystems."/" = {
-    device = "/dev/disk/by-label/nixos";
+    device = "/dev/disk/by-label/${rootLabel}";
     fsType = "ext4";
     autoResize = true;
   };
   fileSystems."/boot" = {
-    device = "/dev/disk/by-label/ESP";
+    device = "/dev/disk/by-label/${espLabel}";
     fsType = "vfat";
   };
   # First boot: growpart (initrd) expands the LAST partition (root) to fill the
@@ -87,7 +103,7 @@
         repartConfig = {
           Type = "esp";
           Format = "vfat";
-          Label = "ESP";
+          Label = espLabel;
           # Must fit the desktop UKI (kernel + full initrd in one .efi). Generous
           # to start; tighten after a real boot proves the UKI size.
           SizeMinBytes = "1G";
@@ -98,7 +114,7 @@
         repartConfig = {
           Type = "root";          # x86-64 root discoverable-partition GUID
           Format = "ext4";
-          Label = "nixos";
+          Label = rootLabel;
           # EXPLICIT size, deliberately NOT Minimize. `Minimize = "guess"` looked
           # right (size the image to the closure) and is what killed two builds:
           # with no upper bound, systemd-repart probes by creating a 1 TiB ext4

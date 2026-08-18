@@ -162,14 +162,55 @@ def probe_nunba_flask() -> Dict[str, Any]:
 
 
 def probe_langchain() -> Dict[str, Any]:
-    """Return langchain GPT API sidecar state.
+    """Return langchain state for the topology we are actually in.
 
     Resolves the port via the canonical ``core.port_registry.get_port
     ('langchain')`` resolver instead of the previously-hardcoded :6778
     literal (#460) — env override ``HART_LANGCHAIN_PORT`` is honored
     automatically.
+
+    #460 (second half): langchain is only a SIDECAR in standalone/Docker
+    mode.  In bundled mode Nunba imports it in-process
+    (``hart_intelligence_entry``) and exposes :5000 only, so nothing
+    listens on a langchain port at all.  Dialing one there asks a
+    question with no correct answer: the connect is always refused, so
+    the probe reported ``down`` about a perfectly healthy engine.
+
+    The bundled branch therefore reads the canonical in-process
+    readiness signal instead of a socket, and — importantly — does NOT
+    collapse "I can't see it from here" into ``down``.  A ``sys.modules``
+    read only describes THIS process; the stdio MCP server runs in a
+    separate one where the answer would be a fresh-zero false negative.
+    That is the same shadow-module trap that made a 14h agent-engine
+    outage undiagnosable, so the unknown case says ``unknown`` and names
+    why.
     """
     out: Dict[str, Any] = {}
+    try:
+        from core.config_cache import is_bundled
+        bundled = is_bundled()
+    except Exception:
+        bundled = False          # unknowable -> treat as sidecar, dial as before
+    if bundled:
+        out['mode'] = 'in_process'
+        try:
+            from core.safe_hartos_attr import hartos_loaded
+            loaded = hartos_loaded()
+        except Exception as e:
+            out['status'] = 'probe_error'
+            out['error'] = str(e)
+            return out
+        if loaded:
+            out['status'] = 'up'
+            out['source'] = 'sys.modules'
+        else:
+            out['status'] = 'unknown'
+            out['reason'] = ('bundled mode: langchain is in-process and has '
+                             'no port; it is not loaded in THIS process, and '
+                             'only the hosting process can answer. NOT down.')
+        return out
+
+    out['mode'] = 'sidecar'
     try:
         from core.port_registry import get_port
         port = get_port('langchain')

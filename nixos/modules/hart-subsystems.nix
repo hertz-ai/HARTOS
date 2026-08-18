@@ -375,7 +375,7 @@ in
         description = "HART OS — Waydroid first-boot image init (non-blocking)";
         # network-online is WANTED (best-effort) not REQUIRED — no-network boots
         # must still complete; the init just no-ops and retries on a later boot.
-        after = [ "hart.target" "network-online.target" ];
+        after = [ "network-online.target" ];  # hart.target removed: ordering cycle (see hart-model-bus.nix 2026-08-14)
         wants = [ "network-online.target" ];
         wantedBy = [ "hart.target" ];
         # Idempotent: skip once the images are present.

@@ -85,5 +85,10 @@ def test_a11y_state_is_consumed_by_the_render():
         assert 'html.a11y-rmotion *' in html
     finally:
         sapi._A11Y_SETTINGS.update({'high_contrast': False, 'reduced_motion': False})
-    # ...and OFF emits no a11y class.
-    assert '<html lang="en" class="">' in _render()
+    # ...and OFF emits no a11y class. Match the class attribute itself, not the
+    # whole <html> tag: the tag has since grown other state (data-multiws), so
+    # pinning the exact tag text made an unrelated feature a false a11y red.
+    _off = _render()
+    assert '<html lang="en" class=""' in _off
+    assert 'a11y-contrast' not in _off.split('<head>')[0]
+    assert 'a11y-rmotion' not in _off.split('<head>')[0]

@@ -26,6 +26,7 @@ import os
 import re
 import tarfile
 import urllib.request
+import wave
 from pathlib import Path
 from typing import Optional
 
@@ -982,6 +983,22 @@ def _transcribe_impl(audio_path: str, language: str = None) -> str:
     if 'text' not in payload:
         return raw                       # {"error": ...} — pass through verbatim
 
+    # Energy gate, ahead of the text gates: Whisper invents fluent prose from
+    # silence and scores it as confident speech, so neither
+    # _filter_speech_text (no_speech_prob / avg_logprob) nor
+    # _drop_non_speech_text (annotation shape) can see it.  Live 2026-08-17
+    # conv 730fa326 answered four phantom utterances on a voice turn
+    # ("I'm really happy with the reaction." and three more) whose audio
+    # measured 0-86 RMS against a threshold of 400.  Fails open on formats it
+    # cannot decode — see _audio_is_silent.
+    if payload.get('text') and _audio_is_silent(audio_path):
+        logger.info(
+            "STT silence gate: dropped %r — audio has no speech-level energy",
+            (payload.get('text') or '')[:80])
+        payload['text'] = ''
+        payload['language'] = 'unknown'
+        return json.dumps(payload)
+
     kept = _drop_non_speech_text(payload.get('text') or '')
     if kept == payload.get('text'):
         return raw                       # untouched → keep the engine's own bytes
@@ -1191,6 +1208,81 @@ def _pcm_rms(pcm: bytes) -> float:
     for s in samples:
         acc += s * s
     return math.sqrt(acc / len(samples))
+
+
+def _pcm_peak_rms(pcm: bytes, window_samples: int = STREAM_RMS_MAX_SAMPLES) -> float:
+    """Highest windowed RMS across ``pcm`` — "was there speech ANYWHERE?".
+
+    The whole-file counterpart to _pcm_rms, which answers a different question
+    and must not be used here: _pcm_rms reads only the trailing
+    STREAM_RMS_MAX_SAMPLES (~100ms), because end-of-utterance VAD only cares
+    about recent energy.  On a file, that would score speech ending in a quiet
+    tail as silence.
+
+    A single RMS over the whole file is also wrong: 2s of speech inside 30s of
+    silence averages below the threshold, so a real utterance would be dropped.
+    Peak-over-windows has neither failure — it asks whether ANY window carried
+    speech energy.
+
+    Same units and threshold as _pcm_rms (PCM16LE mono, compare against
+    STREAM_VAD_RMS_THRESHOLD), so there is one definition of "how loud is
+    silence" in this module.
+    """
+    n = len(pcm) - (len(pcm) % 2)
+    if n <= 0:
+        return 0.0
+    samples = array.array('h')
+    samples.frombytes(pcm[:n])
+    if not samples:
+        return 0.0
+    win = max(1, int(window_samples))
+    peak = 0.0
+    for start in range(0, len(samples), win):
+        chunk = samples[start:start + win]
+        if not chunk:
+            break
+        acc = 0
+        for s in chunk:
+            acc += s * s
+        rms = math.sqrt(acc / len(chunk))
+        if rms > peak:
+            peak = rms
+    return peak
+
+
+def _audio_is_silent(audio_path: str) -> bool:
+    """True when ``audio_path`` carries no speech-level energy in any window.
+
+    Whisper invents fluent, grammatical sentences from silence and scores them
+    as confident speech, so neither existing gate catches them:
+    _filter_speech_text keys on no_speech_prob / avg_logprob, and
+    _drop_non_speech_text keys on annotation shape (brackets, music notes).
+    Live 2026-08-17 conv 730fa326 answered four such phantom utterances on a
+    voice turn; the inputs measured 0-86 RMS against a threshold of 400.
+
+    FAILS OPEN.  Only WAV is decoded here (stdlib ``wave``); whisper_transcribe
+    also accepts WebM/MP3, and calling an undecodable container "silent" would
+    swallow real speech.  Anything unreadable returns False so the transcript
+    survives.  The realtime path already converts to WAV via ffmpeg
+    (_pcm_from_blob), and the file path writes WAV temp files, so the common
+    cases are covered.
+    """
+    try:
+        with wave.open(audio_path, 'rb') as w:
+            if w.getsampwidth() != 2:
+                return False          # not PCM16 — _pcm_peak_rms assumes it
+            channels = w.getnchannels() or 1
+            pcm = w.readframes(w.getnframes())
+    except Exception:
+        return False
+    if not pcm:
+        return False
+    if channels > 1:
+        # Take one channel; interleaved frames are channel-major per sample.
+        samples = array.array('h')
+        samples.frombytes(pcm[:len(pcm) - (len(pcm) % 2)])
+        pcm = samples[::channels].tobytes()
+    return _pcm_peak_rms(pcm) < STREAM_VAD_RMS_THRESHOLD
 
 
 class _StreamVadGate:

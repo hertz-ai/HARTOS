@@ -346,6 +346,10 @@ class TestNoMLTrainingCode:
         'gradient_tools', 'embedding_delta',
         # "weight" in "log-scale weighting", "aggregation weights" (federation docs)
         'weighting',
+        # "weighted"/"weights the" as VERBS in sensor_model's privacy comments:
+        # they describe HevolveAI (the native repo) weighting stream trust --
+        # routing semantics, exactly the division of labor this test enforces.
+        'weighted', 'weights the',
     ]
 
     def _scan_source(self, source: str) -> list:

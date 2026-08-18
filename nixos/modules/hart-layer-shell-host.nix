@@ -859,6 +859,26 @@ app.run(None)
     exec ${pkgs.sway}/bin/sway -c ${swayHostConfig}
   '';
 
+  # The host, then take the session down with it — as ONE program, so the
+  # sequencing is SHELL syntax and never reaches sway's config parser.
+  #
+  # This was written inline as `exec <host>; <swaymsg> exit`. sway's config lexer
+  # splits commands on `;` ITSELF (it is a config-language separator, not a shell
+  # operator), so sway read `<swaymsg> exit` as a second CONFIG command, rejected
+  # it, and refused the config:
+  #   [ERROR] [sway/config.c:654] Error on line 'exec .../hart-glass-shell-gtk4;
+  #   .../swaymsg exit': Unknown/invalid command '.../bin/swaymsg'
+  # sway then never came up at all, so the Tier-2 session could not start and the
+  # supervisor had nothing to land on. A wrapper keeps the intent below intact
+  # while giving sway a single argument with no separator in it.
+  glassShellThenEndSession = pkgs.writeShellScript "hart-glass-shell-gtk4-then-exit" ''
+    ${layerShellHost}/bin/hart-glass-shell-gtk4
+    # The host has exited (by design, when its WebKitWebProcess dies). End the
+    # sway session so the supervisor — which watches the SESSION, not the client
+    # — relaunches the tier instead of leaving sway up with no client.
+    exec ${pkgs.sway}/bin/swaymsg exit
+  '';
+
   # sway single-output config whose ONLY client is the GTK4 layer-shell host. No
   # bars / launchers — sway exists to give the layer-shell surface a compositor
   # that implements zwlr_layer_shell_v1 (cage does not). Mirrors the sway-Tier-1
@@ -898,10 +918,37 @@ app.run(None)
     # activation) AND mic/camera/file-picker work. Starting the portal HERE too would
     # be a parallel starter racing the wrapper's, so it is intentionally NOT exec'd
     # from this sway config (DRY: one portal starter, in the host wrapper).
+    # Hardware brightness/volume keys (2026-08-16, steward: "brightness
+    # control via the keyboard"). GNOME handles XF86 keys via gsd; the
+    # wlroots tiers had NO handler, so Fn+brightness did NOTHING in the
+    # shipped desktop. --locked keeps them working on a lock screen. The
+    # video group covers the backlight sysfs write via brightnessctl's
+    # udev/logind path (hart-admin is in "video" per hart-base).
+    bindsym --locked XF86MonBrightnessUp   exec ${pkgs.brightnessctl}/bin/brightnessctl set +10%
+    bindsym --locked XF86MonBrightnessDown exec ${pkgs.brightnessctl}/bin/brightnessctl set 10%-
+    bindsym --locked XF86AudioRaiseVolume  exec ${pkgs.pulseaudio}/bin/pactl set-sink-volume @DEFAULT_SINK@ +5%
+    bindsym --locked XF86AudioLowerVolume  exec ${pkgs.pulseaudio}/bin/pactl set-sink-volume @DEFAULT_SINK@ -5%
+    bindsym --locked XF86AudioMute         exec ${pkgs.pulseaudio}/bin/pactl set-sink-mute @DEFAULT_SINK@ toggle
     # Launch the GTK4 layer-shell host as sway's startup client. It anchors itself
     # as the BACKGROUND layer (exclusive zone 0) via gtk4-layer-shell so it is the
     # desktop, not a fullscreen app. Native toplevels (Phase 5) map above it.
-    exec ${layerShellHost}/bin/hart-glass-shell-gtk4
+    #
+    # ...AND TAKE SWAY DOWN WITH IT (2026-08-16, real-HW black screen).
+    # The host exits on purpose when its WebKitWebProcess dies -- its own code
+    # says "exiting so the supervisor relaunches the tier". But the supervisor
+    # watches the SESSION, and the session is sway; the host is only sway's
+    # client. So when the WebKit process crashed on the steward's box
+    # (WEBKIT_WEB_PROCESS_CRASHED, 2026-08-16 17:43) the host exited exactly as
+    # designed and sway stayed up with NO client: a black screen that nothing
+    # relaunched, the precise "never linger blank" outcome the host is written
+    # to prevent. Chaining `swaymsg exit` after the host makes the host's death
+    # end the session, which is what the supervisor actually watches -- it then
+    # relaunches the tier with a fresh WebKit process (seconds), and a crash
+    # LOOP walks down the ladder by design instead of hanging on black.
+    #
+    # ONE argument, no `;` — sway's config lexer splits on `;` and would read the
+    # second half as a config command. See glassShellThenEndSession above.
+    exec ${glassShellThenEndSession}
   '';
 
   sessionDesktop = pkgs.writeText "hart-glass-gtk4.desktop" ''

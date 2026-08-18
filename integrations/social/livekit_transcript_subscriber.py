@@ -186,6 +186,13 @@ class LiveKitTranscriptSubscriber(_LiveKitRoomThread):
         """
         if self._stop_evt.is_set():
             return False
+        # No call_id => nothing to attribute this audio to. The STT hook keys
+        # every segment on ?call_id=&user_id=, so streaming with an empty one
+        # would push a participant's voice into the pipeline UNATTRIBUTED (and
+        # the downstream enqueue_stt_segment(call_id, ...) has no row to join).
+        # Refuse at the seam rather than letting the socket layer decide.
+        if not self.call_id:
+            return False
         if not participant_identity or not pcm:
             return False
         out = _resample_to_16k_mono(pcm, src_rate, src_channels)

@@ -373,6 +373,20 @@ class TestDockerDistributedDispatch:
 class TestNoCoordinatorLocalFallback:
     """Test 6: No shared coordinator → all dispatch goes through local /chat."""
 
+    @pytest.fixture(autouse=True)
+    def _neutralize_in_process_leg(self):
+        """dispatch_goal tries an IN-PROCESS /chat leg (through the app's own
+        test client) BEFORE the pooled_post proxy these tests patch, and only
+        falls through when it returns falsy. Unpatched, that leg escapes into a
+        real LLM call and the tests read the autonomous standby reply instead
+        of 'local result'. A falsy in-process response IS the documented
+        fall-through, so arrange it for every test in this class.
+        """
+        app = MagicMock()
+        app.test_client.return_value.__enter__.return_value             .post.return_value.get_json.return_value = {}
+        with patch('hart_intelligence_entry.app', app):
+            yield
+
     def test_no_coordinator_dispatches_locally(self):
         """Without Redis coordinator, dispatch_goal falls through to local /chat."""
         from integrations.agent_engine.dispatch import dispatch_goal

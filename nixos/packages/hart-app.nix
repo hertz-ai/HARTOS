@@ -90,6 +90,34 @@ let
     # does offline in under a millisecond.
     num2words
 
+    # Caption fetch for the agent's YouTube transcript tool
+    # (integrations/browser_research/scripts/youtube.py). Same mirror lesson as
+    # num2words directly above, one step worse: this one was in neither list.
+    # The import is wrapped in try/except ImportError, so its absence is silent
+    # -- every transcript request falls through to the yt-dlp + local-Whisper
+    # path, downloading the media and running STT even for videos that publish
+    # captions. Nothing is broken, it is just slow and wrong in a way no error
+    # ever reports.
+    youtube-transcript-api
+
+    # httpx — the LiquidUI shell's Nunba proxy talks to the Nunba daemon over a
+    # unix socket, and httpx is the only client here that does UDS transport
+    # (requests cannot). liquid_ui_service._create_flask_app() imports it as
+    # soon as hart_nunba_socket is set, so preinstalling Nunba made this a hard
+    # dependency of the SHELL SERVER: without it the import raised, the unit
+    # exited 1 and restart-looped, and the desktop never got a shell. It was in
+    # nunba.nix (that package's own python env) but never here.
+    httpx
+
+    # NO stripe HERE, deliberately. I added it and was wrong. requirements.txt
+    # says it is "baked into the image so production rebuilds don't need a manual
+    # `pip install stripe` on the CENTRAL CONTAINER" -- that image is the
+    # commercial API server, which is where StripePaymentGateway's /upgrade card
+    # charges happen. This file is the OS DEVICE image; a laptop is not the
+    # commercial API, so the payment SDK has no reason to ship to every device.
+    # It also cost real gate time: python3.10-stripe has no cached build at this
+    # nixpkgs rev, so it compiled from source in the nixosTests shards.
+
     # Utilities
     python-dateutil
     pyyaml

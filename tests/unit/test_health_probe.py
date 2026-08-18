@@ -129,29 +129,93 @@ class ProbeNunbaFlaskTest(unittest.TestCase):
 
 
 class ProbeLangchainTest(unittest.TestCase):
-    """#460 — uses get_port('langchain') instead of hardcoded 6778."""
+    """#460 — uses get_port('langchain') instead of hardcoded 6778, AND
+    answers for the topology it is actually in.
+
+    The two sidecar tests now pin ``is_bundled`` False explicitly.  They
+    used to rely on the ambient environment being un-bundled, which made
+    them silently env-dependent — a runner exporting NUNBA_BUNDLED would
+    have flipped them.  Pinning is strictly more deterministic.
+    """
 
     def test_up_uses_resolved_port(self):
         from core import health_probe
-        with patch('core.port_registry.get_port',
+        with patch('core.config_cache.is_bundled', return_value=False), \
+             patch('core.port_registry.get_port',
                    return_value=7000) as mock_port, \
              patch('core.http_pool.pooled_get',
                    return_value=_make_response(200)) as mock_get:
             out = health_probe.probe_langchain()
         self.assertEqual(out['status'], 'up')
         self.assertEqual(out['port'], 7000)
+        self.assertEqual(out['mode'], 'sidecar')
         mock_port.assert_called_once_with('langchain')
         called_url = mock_get.call_args.args[0]
         self.assertIn(':7000/', called_url)
         self.assertNotIn(':6778/', called_url)
 
     def test_down_swallows_exception(self):
+        """A refused dial is still 'down' — but ONLY in sidecar mode,
+        where a port genuinely should be listening."""
         from core import health_probe
-        with patch('core.port_registry.get_port', return_value=6778), \
+        with patch('core.config_cache.is_bundled', return_value=False), \
+             patch('core.port_registry.get_port', return_value=6778), \
              patch('core.http_pool.pooled_get',
                    side_effect=ConnectionResetError('reset')):
             out = health_probe.probe_langchain()
         self.assertEqual(out['status'], 'down')
+
+    # --- bundled mode: langchain is in-process, no port exists ---------
+
+    def test_bundled_loaded_reports_up_without_dialing(self):
+        """The defect: bundled mode has no langchain listener, so the old
+        unconditional dial could only ever answer 'down' about a healthy
+        in-process engine."""
+        from core import health_probe
+        with patch('core.config_cache.is_bundled', return_value=True), \
+             patch('core.safe_hartos_attr.hartos_loaded', return_value=True), \
+             patch('core.http_pool.pooled_get') as mock_get:
+            out = health_probe.probe_langchain()
+        self.assertEqual(out['status'], 'up')
+        self.assertEqual(out['mode'], 'in_process')
+        mock_get.assert_not_called()          # no socket may be touched
+
+    def test_bundled_not_loaded_is_unknown_not_down(self):
+        """Cross-process honesty.  A sys.modules read describes only THIS
+        process; the stdio MCP server runs in another one.  Reporting
+        'down' there would be a fresh-zero false negative — the exact
+        shadow-module trap that made the 14h outage undiagnosable."""
+        from core import health_probe
+        with patch('core.config_cache.is_bundled', return_value=True), \
+             patch('core.safe_hartos_attr.hartos_loaded', return_value=False):
+            out = health_probe.probe_langchain()
+        self.assertEqual(out['status'], 'unknown')
+        self.assertNotEqual(out['status'], 'down')
+        self.assertIn('reason', out)
+
+    def test_bundled_never_reports_a_port(self):
+        """There IS no langchain port in bundled mode.  Emitting one would
+        invite a reader to dial it."""
+        from core import health_probe
+        for loaded in (True, False):
+            with patch('core.config_cache.is_bundled', return_value=True), \
+                 patch('core.safe_hartos_attr.hartos_loaded',
+                       return_value=loaded):
+                out = health_probe.probe_langchain()
+            self.assertNotIn('port', out)
+
+    def test_unknowable_topology_falls_back_to_sidecar(self):
+        """If is_bundled() itself cannot be resolved, keep the historical
+        behaviour rather than inventing a verdict."""
+        from core import health_probe
+        with patch('core.config_cache.is_bundled',
+                   side_effect=RuntimeError('boom')), \
+             patch('core.port_registry.get_port', return_value=6778), \
+             patch('core.http_pool.pooled_get',
+                   return_value=_make_response(200)):
+            out = health_probe.probe_langchain()
+        self.assertEqual(out['mode'], 'sidecar')
+        self.assertEqual(out['status'], 'up')
 
 
 class PortRegistryDriftGuardTest(unittest.TestCase):

@@ -57,16 +57,17 @@ class LightningStore:
         """Initialize storage backend"""
         if self.backend == 'redis':
             try:
-                import redis
+                # Via core.redis_client: retry_on_timeout=False is ignored by
+                # redis-py >= 6.0, so this probe cost ~14s instead of ~1s.
+                from core.redis_client import probe_client
                 redis_config = AGENT_LIGHTNING_CONFIG.get('redis', {})
-                self._backend_client = redis.Redis(
+                self._backend_client = probe_client(
                     host=redis_config.get('host', 'localhost'),
                     port=redis_config.get('port', 6379),
                     db=redis_config.get('db', 0),
-                    decode_responses=True,
-                    socket_connect_timeout=1, socket_timeout=2,
-                    retry_on_timeout=False,
                 )
+                if self._backend_client is None:
+                    raise ImportError("redis package unavailable")
                 # Test connection
                 self._backend_client.ping()
                 logger.info("Connected to Redis backend")

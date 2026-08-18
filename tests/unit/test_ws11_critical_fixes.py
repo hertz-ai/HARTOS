@@ -19,6 +19,7 @@ Covers:
 """
 
 import json
+import importlib
 import os
 import sys
 import tempfile
@@ -470,31 +471,44 @@ class TestPathSandbox(unittest.TestCase):
             _is_path_allowed(tmp),
             f"Temp dir {tmp} should be allowed")
 
-    def test_system_dir_rejected(self):
-        """System directories outside home and tmp are rejected."""
-        from integrations.agent_engine.shell_os_apis import _is_path_allowed
-        if sys.platform == 'win32':
-            self.assertFalse(_is_path_allowed('C:\\Windows\\System32'))
-        else:
-            self.assertFalse(_is_path_allowed('/etc'))
+    # Read/mutation split (steward decision on #35, commit 4fa59a2): the
+    # file-explorer READ routes browse the whole disk like Explorer/Finder --
+    # they call _is_path_allowed() with the browse default, include_mounts=True,
+    # every disk mountpoint admitted -- while chmod/move/copy/delete/mkdir pass
+    # include_mounts=False and stay confined to the user-owned roots. The three
+    # tests below asserted the pre-9325bf54 contract, in which reads were
+    # confined too. They are rewritten against the boundary that is actually
+    # enforced, the same way the file-explorer tests were in 4fa59a2.
 
-    def test_root_dir_rejected(self):
+    def test_system_dir_rejected_for_mutation(self):
+        """System directories are outside the roots any MUTATION may touch."""
         from integrations.agent_engine.shell_os_apis import _is_path_allowed
-        if sys.platform == 'win32':
-            self.assertFalse(_is_path_allowed('C:\\Windows'))
-        else:
-            self.assertFalse(_is_path_allowed('/root'))
+        sysdir = 'C:\\Windows\\System32' if sys.platform == 'win32' else '/etc'
+        self.assertFalse(_is_path_allowed(sysdir, include_mounts=False))
+
+    def test_root_dir_rejected_for_mutation(self):
+        from integrations.agent_engine.shell_os_apis import _is_path_allowed
+        sysdir = 'C:\\Windows' if sys.platform == 'win32' else '/root'
+        self.assertFalse(_is_path_allowed(sysdir, include_mounts=False))
 
     def test_traversal_attack_resolved_and_rejected(self):
-        """Path traversal is resolved via realpath and rejected if outside roots."""
+        """Traversal is RESOLVED before the check, so it cannot smuggle a
+        mutation out of the user-owned roots by starting inside one."""
         from integrations.agent_engine.shell_os_apis import _is_path_allowed
         if sys.platform == 'win32':
             # Resolves to C:\Windows\System32\drivers\etc\hosts
-            self.assertFalse(
-                _is_path_allowed('C:\\Windows\\..\\Windows\\System32\\drivers\\etc\\hosts'))
+            attack = 'C:\\Windows\\..\\Windows\\System32\\drivers\\etc\\hosts'
         else:
-            # /tmp/../../etc/passwd -> /etc/passwd (outside roots)
-            self.assertFalse(_is_path_allowed('/tmp/../../etc/passwd'))
+            # /tmp/../../etc/passwd -> /etc/passwd (outside the roots)
+            attack = '/tmp/../../etc/passwd'
+        self.assertFalse(_is_path_allowed(attack, include_mounts=False))
+        # The point is the resolution, not the string: starting from a root that
+        # IS allowed and climbing out of it must still be refused.
+        home = os.path.expanduser('~')
+        self.assertTrue(_is_path_allowed(home, include_mounts=False))
+        climbed = os.path.join(home, '..', '..', '..', '..')
+        if os.path.realpath(climbed) != os.path.realpath(home):
+            self.assertFalse(_is_path_allowed(climbed, include_mounts=False))
 
     def test_extra_roots_via_env(self):
         """HART_SHELL_ALLOWED_PATHS env var adds extra allowed roots."""
@@ -531,15 +545,21 @@ class TestPathSandboxOnRoutes(unittest.TestCase):
     def tearDown(self):
         _reset_allowed_roots()
 
-    def test_browse_outside_roots_returns_403(self):
-        """GET /api/shell/files/browse for system dir returns 403."""
-        if sys.platform == 'win32':
-            path = 'C:\\Windows\\System32'
-        else:
-            path = '/etc'
+    def test_browse_outside_roots_is_allowed_like_explorer(self):
+        """GET /api/shell/files/browse reaches a system dir: read parity.
+
+        This asserted 403. /browse is a READ route and passes the browse
+        default, so under the #35 read/mutation split it lists the whole disk
+        exactly like Explorer/Finder. The mutation boundary is covered by
+        test_delete_outside_roots_returns_403 immediately below, which is the
+        assertion that actually protects anything.
+        """
+        path = 'C:\\Windows\\System32' if sys.platform == 'win32' else '/etc'
+        if not os.path.isdir(path):
+            self.skipTest(f'{path} not present on this host')
         r = self.client.get(f'/api/shell/files/browse?path={path}',
                             environ_base={'REMOTE_ADDR': '127.0.0.1'})
-        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
 
     def test_delete_outside_roots_returns_403(self):
         """POST /api/shell/files/delete for system path returns 403."""
@@ -1180,14 +1200,49 @@ class TestShellAuthEdgeCases(unittest.TestCase):
         self.app = _make_shell_app()
         self.app.config['TESTING'] = True
 
-    def test_zero_address_allowed(self):
-        """0.0.0.0 is treated as local (bind-all)."""
-        with self.app.test_request_context(
-                '/api/shell/notifications',
-                environ_base={'REMOTE_ADDR': '0.0.0.0'}):
-            from integrations.agent_engine.shell_os_apis import _shell_auth_check
-            ok, *rest = _shell_auth_check()
-            self.assertTrue(ok)
+    def test_zero_address_rejected_without_token(self):
+        """0.0.0.0 is NOT a local origin and must present a token.
+
+        This test used to assert the opposite. 0.0.0.0 is the "bind any
+        interface" sentinel, never a real loopback *client* address, and only
+        shell_os_apis ever trusted it -- shell_system_apis and
+        shell_desktop_apis did not. That drift was a privilege-escalation gap:
+        a request whose remote_addr reads 0.0.0.0 reached the os-shell routes
+        with no token. The surfaces were collapsed onto one shared
+        shell_auth.shell_auth_ok that excludes it, so pin the closed behaviour.
+        """
+        with patch.dict(os.environ, {'HART_SHELL_TOKEN': 'a-real-token'},
+                        clear=False):
+            with self.app.test_request_context(
+                    '/api/shell/notifications',
+                    environ_base={'REMOTE_ADDR': '0.0.0.0'}):
+                from integrations.agent_engine.shell_os_apis import _shell_auth_check
+                ok, *rest = _shell_auth_check()
+                self.assertFalse(ok)
+
+            # ...and is accepted once it carries the token, like any non-local peer.
+            with self.app.test_request_context(
+                    '/api/shell/notifications',
+                    environ_base={'REMOTE_ADDR': '0.0.0.0'},
+                    headers={'X-Shell-Token': 'a-real-token'}):
+                from integrations.agent_engine.shell_os_apis import _shell_auth_check
+                ok, *rest = _shell_auth_check()
+                self.assertTrue(ok)
+
+    def test_all_shell_surfaces_share_one_auth_check(self):
+        """os / system / desktop decorators are the SAME object, not copies."""
+        from integrations.agent_engine.shell_auth import require_shell_auth
+        from integrations.agent_engine.shell_os_apis import _require_shell_auth
+        self.assertIs(_require_shell_auth, require_shell_auth)
+        for mod_name, attr in (
+                ('integrations.agent_engine.shell_system_apis', '_require_system_auth'),
+                ('integrations.agent_engine.shell_desktop_apis', '_require_desktop_auth')):
+            try:
+                mod = importlib.import_module(mod_name)
+            except Exception:
+                continue
+            self.assertIs(getattr(mod, attr), require_shell_auth,
+                          f'{mod_name}.{attr} drifted off the shared check')
 
     def test_missing_remote_addr_rejected(self):
         """Empty remote_addr is rejected."""

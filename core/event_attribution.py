@@ -17,6 +17,8 @@ than each re-deriving the owner.
 """
 from typing import Optional
 
+from core.constants import MACHINE_GOAL_AUTHORS
+
 
 def goal_owner_user_id(goal) -> Optional[str]:
     """Canonical goal-owner precedence: owner_id > created_by > user_id.
@@ -28,8 +30,25 @@ def goal_owner_user_id(goal) -> Optional[str]:
     """
     if goal is None:
         return None
+    # `created_by` is PROVENANCE, not identity.  For a human-created goal
+    # it happens to hold a user id, which is why it sits in the precedence
+    # -- but machine-seeded goals put a daemon name there, and returning
+    # one yields a "user" that cannot exist.  Skip it so precedence falls
+    # THROUGH to user_id rather than stopping on a label.
+    #
+    # Measured live 2026-08-16: owner_id 0/105 and user_id 0/105 populated,
+    # so created_by decided every case -- 'error_advice' x52 and
+    # 'system_bootstrap' x32 vs 6 real uuids.  Those 99 goals produced a
+    # truthy user_id, PASSED the P3a SSE guard, and were broadcast at a
+    # non-existent user: delivered to nobody, nothing logged.  Only the 15
+    # with created_by=None hit the visible "refused" warning, so the loud
+    # failure was the rare one.  Returning None routes them into that same
+    # already-correct refusal path -- no new path, no privacy change.
+    created_by = getattr(goal, 'created_by', None)
+    if created_by in MACHINE_GOAL_AUTHORS:
+        created_by = None
     uid = (getattr(goal, 'owner_id', None)
-           or getattr(goal, 'created_by', None)
+           or created_by
            or getattr(goal, 'user_id', None))
     return str(uid) if uid else None
 

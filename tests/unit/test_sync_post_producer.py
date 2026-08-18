@@ -21,7 +21,12 @@ from integrations.social.federation import federation  # noqa: E402
 
 
 def test_public_post_queued_to_central_as_new_post():
-    post_dict = {'id': 'p1', 'privacy': 'public', 'title': 'hi'}
+    # The unified producer matches entities from the SYNC_ENTITIES registry, and
+    # the post matcher requires content_type + author_id (that IS what makes a
+    # dict a post now). The old three-key fixture matched nothing, so
+    # queue_entity returned None before any gate or serialize ran.
+    post_dict = {'id': 'p1', 'privacy': 'public', 'title': 'hi',
+                 'content_type': 'text', 'author_id': 'u1'}
     with patch('integrations.social.peer_discovery.gossip') as g, \
             patch('integrations.social.sync_engine.SyncEngine.queue') as q:
         g.node_id = 'nodeA'

@@ -15,8 +15,28 @@ import sys
 import json
 import time
 import pytest
+
+from tests.conftest import hidden_modules
 import threading
 from unittest.mock import patch, MagicMock, PropertyMock
+
+
+def _inproc_app():
+    """Stand-in for hart_intelligence_entry.app whose in-process /chat returns
+    nothing.
+
+    dispatch_goal tries an IN-PROCESS leg first (posts /chat through the app's
+    OWN test client, skipping the loopback socket) and only falls through to
+    the pooled_post proxy these tests patch when that returns falsy. Without
+    this the in-process leg escaped into a REAL LLM call and the tests read
+    'An error occurred: Connection error.' instead of the local result. A falsy
+    in-process response IS the documented fall-through, so this arranges the
+    path under test without touching production.
+    """
+    app = MagicMock()
+    app.test_client.return_value.__enter__.return_value \
+        .post.return_value.get_json.return_value = {}
+    return app
 from datetime import datetime
 
 # ── Environment setup (before any project imports) ──
@@ -170,10 +190,8 @@ class TestDistributedDispatch:
                    return_value=None):
             with patch('integrations.agent_engine.dispatch.pooled_post',
                        return_value=mock_resp):
-                with patch.dict('sys.modules', {
-                    'routes.hartos_backend_adapter': None,
-                    'hartos_backend_adapter': None,
-                }):
+                with hidden_modules('routes.hartos_backend_adapter',
+                                    'hartos_backend_adapter'),                         patch('hart_intelligence_entry.app', _inproc_app()):
                     result = dispatch_goal(
                         'Test prompt', 'user_1', 'goal_abc', 'marketing')
                     assert result == 'local result'
@@ -193,10 +211,8 @@ class TestDistributedDispatch:
                        return_value=False):
                 with patch('integrations.agent_engine.dispatch.pooled_post',
                            return_value=mock_resp):
-                    with patch.dict('sys.modules', {
-                        'routes.hartos_backend_adapter': None,
-                        'hartos_backend_adapter': None,
-                    }):
+                    with hidden_modules('routes.hartos_backend_adapter',
+                                        'hartos_backend_adapter'),                             patch('hart_intelligence_entry.app', _inproc_app()):
                         result = dispatch_goal(
                             'Test prompt', 'user_1', 'goal_abc', 'marketing')
                         assert result == 'local result'
@@ -222,10 +238,8 @@ class TestDistributedDispatch:
                        return_value=True):
                 with patch('integrations.agent_engine.dispatch.pooled_post',
                            return_value=mock_resp):
-                    with patch.dict('sys.modules', {
-                        'routes.hartos_backend_adapter': None,
-                        'hartos_backend_adapter': None,
-                    }):
+                    with hidden_modules('routes.hartos_backend_adapter',
+                                        'hartos_backend_adapter'),                             patch('hart_intelligence_entry.app', _inproc_app()):
                         result = dispatch_goal(
                             'Test prompt', 'user_1', 'goal_abc', 'marketing')
                         assert result == 'local fallback'
@@ -544,3 +558,48 @@ class TestModuleExports:
         """_is_distributed_mode no longer exists — replaced by auto-detection."""
         import integrations.agent_engine.dispatch as dispatch_mod
         assert not hasattr(dispatch_mod, '_is_distributed_mode')
+
+
+class TestHiddenModulesHelper:
+    """Pin the helper these dispatch tests depend on.
+
+    patch.dict('sys.modules', {...}) restores by CLEARING the dict, so every
+    module imported inside the block is evicted on exit. Around a dispatch call
+    that is ~3200 modules, and re-importing a C-extension package afterwards
+    (torch) blows up in an unrelated test. hidden_modules must hide only what it
+    was asked to hide.
+    """
+
+    def test_hides_only_the_named_module(self):
+        with hidden_modules('routes.hartos_backend_adapter'):
+            with pytest.raises(ImportError):
+                import routes.hartos_backend_adapter  # noqa: F401
+
+    def test_does_not_evict_modules_imported_inside(self):
+        hidden = 'routes.hartos_backend_adapter'
+        before = set(sys.modules)
+        with hidden_modules(hidden):
+            import base64  # noqa: F401
+            import binascii  # noqa: F401
+            # The hidden name is itself a sys.modules key (mapped to None) for
+            # the duration, so it is expected to be gone afterwards.
+            inside = set(sys.modules) - {hidden}
+        after = set(sys.modules)
+        assert not (inside - after),             f'hidden_modules evicted on exit: {sorted(inside - after)[:10]}'
+        assert 'base64' in sys.modules
+        assert not (before - after), 'hidden_modules evicted pre-existing modules'
+
+    def test_restores_previous_value_and_absence(self):
+        sentinel = object()
+        had = sys.modules.get('routes.hartos_backend_adapter', sentinel)
+        with hidden_modules('routes.hartos_backend_adapter'):
+            pass
+        now = sys.modules.get('routes.hartos_backend_adapter', sentinel)
+        assert now is had
+
+    def test_restores_even_when_the_block_raises(self):
+        with pytest.raises(ValueError):
+            with hidden_modules('routes.hartos_backend_adapter'):
+                raise ValueError('boom')
+        assert sys.modules.get('routes.hartos_backend_adapter') is not None or \
+            'routes.hartos_backend_adapter' not in sys.modules

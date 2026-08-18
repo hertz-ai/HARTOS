@@ -355,6 +355,42 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 200,
         'use_product': False,
     },
+    {
+        'slug': 'bootstrap_marketing_grounded_facts',
+        'goal_type': 'marketing',
+        'title': 'Grounded Science Facts Carousel',
+        'description': (
+            'Publish carousels of little-known science, AI and biology facts that people '
+            'want to share, where EVERY fact is traceable to a source that was fetched. '
+            'Viral social media content, but sourced. The order matters: '
+            '1) Use google_search for recent findings in neuroscience, biology or AI — '
+            'prefer the surprising and the little-known over the already-famous, '
+            '2) Use crawl4ai on each promising result to get the actual source text, '
+            '3) Use verify_facts with the {claim, source_url} pairs — this fetches each '
+            'source and checks the claim against what comes back, '
+            '4) Report the grounded and rejected counts, with every rejection reason, '
+            'before composing anything — if most claims were rejected the research is '
+            'inventing them, and that is the finding worth reporting, '
+            '5) For each GROUNDED fact only, name the human problem it bears on, using '
+            'the evidence text the verifier stored rather than your memory of the fact, '
+            '6) Use text_2_image for one slide per grounded fact, '
+            '7) Use post_to_channel with channel=instagram to publish the carousel. '
+            'NEVER compose or post a claim that verify_facts did not return in its '
+            'grounded list. A rejected claim is not a draft to reword — the number was '
+            'not in the source. Publishing fewer facts is the correct outcome; this '
+            'platform has already shipped 416 fabricated posts and it cost more than '
+            'the posts were worth. Cite the source domain on every slide so a reader '
+            'can check you, and say plainly that an agent assembled the post.'
+        ),
+        'config': {
+            'topics': ['neuroscience', 'biology', 'artificial intelligence'],
+            'slides_per_post': 8,
+            'channel': 'instagram',
+            'require_grounding': True,
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
     # ─── News Push Notification Agents ───
     {
         'slug': 'bootstrap_news_regional',

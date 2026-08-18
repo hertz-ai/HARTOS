@@ -54,7 +54,11 @@ def test_ensure_job_windows_is_idempotent_no_recreate():
     from core.resource_governor import ResourceEnforcer
     e = ResourceEnforcer()
     e._job_handle = 4242  # already created
-    with patch('ctypes.windll') as wd:
+    # create=True: ctypes has no `windll` attribute on Linux runners, and
+    # patch() refuses to patch a missing attribute without it. The test
+    # drives the Windows-only path directly, so the mock must exist on
+    # every platform.
+    with patch('ctypes.windll', create=True) as wd:
         e._ensure_job_windows()
         wd.kernel32.CreateJobObjectW.assert_not_called()
 

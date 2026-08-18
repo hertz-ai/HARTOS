@@ -2,6 +2,7 @@
 
 import sys
 import os
+import time
 import unittest
 from unittest.mock import Mock, patch, MagicMock
 
@@ -388,7 +389,22 @@ class TestSDKIntegration(unittest.TestCase):
         client = EventClient()
         received = []
         client.on('sdk.test', lambda topic, d: received.append(d))
-        client.emit('sdk.test', {'value': 42})
+        self.assertTrue(client.emit('sdk.test', {'value': 42}),
+                        'emit() returned False — the bus was not reachable at '
+                        'all, which is a different failure from slow delivery')
+
+        # Delivery is ASYNCHRONOUS. EventClient.emit goes through
+        # core.platform.events.emit_event, whose async_ defaults to True, and
+        # that calls EventBus.emit_async — a daemon thread per emit, explicitly
+        # "fire-and-forget ... to avoid blocking the caller". Asserting
+        # len(received) on the very next line was a race that happened to win on
+        # an idle dev box and lost under CI load (shard 6, run 31994910770).
+        # Wait for the delivery the SDK actually promises instead of assuming a
+        # guarantee it never made.
+        deadline = time.monotonic() + 10.0
+        while not received and time.monotonic() < deadline:
+            time.sleep(0.01)
+
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0]['value'], 42)
 

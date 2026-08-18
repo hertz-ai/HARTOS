@@ -98,18 +98,59 @@ in
     #    boot — never force-loaded, so a box without USB3 simply never loads xhci.
     boot.initrd.availableKernelModules = usbRootModules;
 
-    # NOTE (2026-08-13): a rootdelay was added here on the theory that a slow USB
-    # controller was failing stage 1. That was WRONG and has been removed. The
-    # real console output showed stage 1 succeeding completely:
-    #     stage-1-init: checking /dev/disk/by-label/nixos...
-    #     nixos: clean, 473146/1818624 files, 4970844/7253243 blocks
-    #     EXT4-fs (sdc2): mounted filesystem 7981aaf4-... r/w
+    # NOTE (2026-08-14, resolved): the 2026-08-13 switch_root panic
     #     Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000100
     #     CPU: 5 UID: 0 PID: 1 Comm: switch_root
-    # Root was found, fsck'd and mounted. The failure is in switch_root: stage 2's
-    # init exits 1 immediately, i.e. the UKI's baked init path does not work against
-    # the rootfs shipped in the SAME image. Do not add boot-timing workarounds for
-    # this class of failure -- read the console first.
+    # was chased through rootdelay (wrong), a seat-group activation theory
+    # (wrong: activation runs in stage 2 under Comm: init), closure truncation
+    # (wrong: the closure was present), and a phantom duplicate-label disk
+    # (wrong trail). The decisive instrument was booting the extracted UKI
+    # kernel+initrd against the raw image in qemu with console=ttyS0: the image
+    # booted cleanly to stage 2, proving the build was healthy -- and the fsck
+    # totals on the failing laptop (1818624 inodes / 7253243 blocks vs this
+    # build's 1703936 / 6815744) then proved the panicking machine was running a
+    # DIFFERENT build: two identical-looking USB sticks, and the freshly flashed
+    # good one was never the one being booted. Reproducible builds made every
+    # image share one ext4 UUID and label, so no on-screen identifier could
+    # distinguish the sticks; hart-repart-image.nix now stamps per-build labels.
+    # Lessons pinned here because this file is where boot-timing "fixes" get
+    # reached for: (1) fsck's file/block TOTALS fingerprint which filesystem
+    # actually ran -- compare them against the image before trusting any deeper
+    # theory; (2) busybox switch_root reports its fatal reason on stderr, which
+    # dies invisibly under splash -- the wrapper below routes it to the printk
+    # ring so a stage-1 death is never silent again.
+
+    # 1b. switch_root must never die silently (2026-08-14). busybox switch_root
+    #     reports its fatal reason on STDERR -> /dev/console. Under `quiet
+    #     splash` the VT can be in graphics mode when it dies: the write renders
+    #     nowhere, the panic then repaints the framebuffer from the printk ring,
+    #     and the reason is gone -- which is exactly how the 08-13 panic stayed
+    #     unexplained across two laptops. The wrapper routes stderr into the
+    #     printk ring through the devtmpfs stage 1 mount --move'd into the
+    #     target root two script lines earlier (the initramfs /dev is empty by
+    #     then, so $1/dev/kmsg is the only kmsg still openable). The reason then
+    #     shows inside the panic scroll and any pstore capture. Guarded [ -w ]
+    #     so a missing kmsg degrades to the old behaviour instead of failing the
+    #     exec. tests/boot-root-initrd.nix exercises this on every CI boot: a
+    #     broken wrapper cannot reach a green build.
+    boot.initrd.extraUtilsCommands = ''
+      rm $out/bin/switch_root
+      cat > $out/bin/switch_root <<EOF
+      #!$out/bin/sh
+      [ -w "\$1/dev/kmsg" ] && exec 2>"\$1/dev/kmsg"
+      exec $out/bin/busybox switch_root "\$@"
+      EOF
+      chmod 555 $out/bin/switch_root
+    '';
+
+    # 1c. Capture stage-1 panics across reboots: efi-pstore persists the panic
+    #     dmesg into UEFI NVRAM, readable at /sys/fs/pstore on ANY later boot of
+    #     the machine. Force-loaded in the initrd (availableKernelModules would
+    #     never autoload it -- there is no hardware match event). modprobe of a
+    #     built-in or absent module is non-fatal in stage 1, so this cannot
+    #     regress a boot; kmsg-wrapper output above lands in these captures.
+    boot.initrd.kernelModules = [ "efi_pstore" ];
+    boot.kernelModules = [ "efi_pstore" ];
 
     # 2. ASSERT the critical subset actually survived into the merged list. If a
     #    mkForce elsewhere wiped it, this fails the BUILD (CI) — never a silent
