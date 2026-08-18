@@ -137,11 +137,27 @@ jobs:
 
           # Sample memory every 10s so the peak is visible even if the
           # process is killed without a chance to report.
+          #
+          # STREAM IT (2026-08-18, run 32113023595). A file the log only reads
+          # AFTERWARDS is not evidence that survives: that run lost the RUNNER,
+          # not just the step, so "Memory + OOM evidence (survives cancellation)"
+          # was SKIPPED along with every Post step, and the samples it had been
+          # faithfully collecting went into /tmp and died there. `if: always()`
+          # covers cancellation, NOT a runner that stops existing -- the same
+          # trap this sampler was written to escape, one level up.
+          # tee keeps the file for the peak/sort below AND puts every sample in
+          # the step log AS IT IS TAKEN, so the last line before the runner
+          # disappears is the measurement. Interleaving with the nix output is
+          # the point: it timestamps the death against the eval that caused it.
+          # Process substitution, NOT a pipe: in a pipeline `$!` is the LAST
+          # command (tee), so `kill "$SAMPLER"` below would kill the writer and
+          # leave the loop running until its next SIGPIPE. This keeps $! meaning
+          # the sampler itself, which is what that kill has always assumed.
           ( while true; do
               printf '[mem] %s %s\n' "$(date -u +%H:%M:%S)" \
                 "$(free -m | awk '/^Mem:/{printf "used=%sMB avail=%sMB", $3, $7}')"
               sleep 10
-            done ) > /tmp/memsample.log 2>&1 &
+            done ) > >(tee /tmp/memsample.log) 2>&1 &
           SAMPLER=$!
 
           # WHY A timeout WRAPPER (2026-08-03, run 30781405882): the step died
