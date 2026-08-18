@@ -125,11 +125,34 @@ jobs:
           #
           # Ruled out already: concurrency cancellation (3f5ee290, log shows
           # zero cancels) and the job timeout (dee36039, raised to 45min).
-          # Leading hypothesis is RUNNER MEMORY: `nix flake check` evaluates
-          # dozens of full nixosConfigurations in one process. Note the
-          # classic OOM signal is 137/SIGKILL, not 143, so this must be
-          # MEASURED rather than assumed — hence the sampler instead of a
-          # speculative `--max-jobs` tweak.
+          #
+          # ── MEMORY: NO LONGER A HYPOTHESIS. MEASURED 2026-08-18 ──────────
+          # The sampler was made to STREAM (see the note above it) and the very
+          # next run, 32125200674, finally caught the death in the log:
+          #     [mem] 10:09:54 used=15253MB avail=735MB
+          #     [mem] 10:10:04 used=15767MB avail=220MB
+          #     [mem] 10:10:15 used=15816MB avail=172MB
+          #     [mem] 10:10:25 used=15969MB avail=18MB
+          #     [mem] 10:10:41 used=15983MB avail=5MB
+          #     ##[error]Process completed with exit code 143
+          # 16GB runner walked to 5MB available and died at 4m02s. The last
+          # gap is 16s against a 10s sleep, i.e. the SAMPLER ITSELF could not
+          # be scheduled. That also settles the 143-not-137 question this
+          # comment used to raise: there was never an OOM kill to find,
+          # because nothing got cleanly killed. The runner thrashed itself
+          # unresponsive and GitHub terminated the job, exactly as the
+          # timeout-wrapper note below guessed.
+          #
+          # THE FIX IS TO SPLIT, NOT TO RAISE ANYTHING. `nix flake check`
+          # evaluates every output in ONE process and holds the whole graph:
+          # ~40 VM checks plus full nixosConfigurations. The diagnose job at
+          # the bottom of this file already proves the shape of the answer:
+          # evaluating attribute by attribute, a FRESH `nix eval` per attr,
+          # releases memory between them and COMPLETES in ~15 minutes on the
+          # same runner. Whoever does that split must keep the coverage
+          # identical: a split that quietly evaluates fewer outputs than
+          # `nix flake check` did would be a false green, which is strictly
+          # worse than the honest red it replaced.
           set +e
           echo "::group::Runner capacity"
           free -m; nproc; df -h /
@@ -189,7 +212,7 @@ jobs:
             0)   echo "All flake outputs evaluate successfully." ;;
             137) echo "::error::eval SIGKILLed (137) — OOM killer. Confirms the memory hypothesis; split the check or raise the runner." ;;
             124) echo "::error::eval hit OUR 25-minute wrapper (124) — it stalled rather than failed. The memory table above is now the evidence; a flat curve exonerates memory and points at the Nix daemon." ;;
-            143) echo "::error::eval SIGTERMed (143) — NOT the job cap and NOT concurrency. If memory above looks healthy, suspect the Nix daemon or the installer post-hook." ;;
+            143) echo "::error::eval SIGTERMed (143) — the KNOWN, MEASURED failure: the runner ran out of memory and was terminated (run 32125200674 hit avail=5MB of 16GB). Read the [mem] samples above to confirm; if they walk to near zero this is it. Fix is to SPLIT the evaluation per attribute (see the note on this step), not to raise a cap." ;;
             *)   echo "::error::eval failed rc=$RC — a real evaluation failure; the summary above names the outputs." ;;
           esac
           exit "$RC"
