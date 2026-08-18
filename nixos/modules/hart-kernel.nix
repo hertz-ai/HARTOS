@@ -336,7 +336,14 @@ in
       # OpenGL + Vulkan + compute
       hardware.graphics = {
         enable = true;
-        enable32Bit = lib.mkDefault true;
+        # x86_64 ONLY. nixpkgs asserts "`hardware.graphics.enable32Bit` is only
+        # supported on an x86_64 system", and there is no 32-bit userland to
+        # support anywhere else, so an unconditional `true` here is not a
+        # preference that goes unused off x86, it is an eval FAILURE: it took
+        # down every ARM and RISC-V configuration (hart-server-arm,
+        # hart-desktop-arm/rpi, hart-edge-arm/riscv, hart-phone, ...). Same
+        # platform gate the open-vm-tools default already uses in hart-base.nix.
+        enable32Bit = lib.mkDefault pkgs.stdenv.hostPlatform.isx86_64;
       };
     })
 

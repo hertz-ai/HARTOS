@@ -485,7 +485,11 @@ in
       # Vulkan + 32-bit graphics (required for DXVK/Proton)
       hardware.graphics = {
         enable = true;
-        enable32Bit = true;
+        # x86_64 ONLY, and harmless to gate: the DXVK/Proton layer this exists
+        # for is x86 anyway. nixpkgs asserts enable32Bit is x86_64-only, so an
+        # unconditional `true` eval-FAILS every ARM/RISC-V target rather than
+        # merely going unused there (see the same gate in hart-kernel.nix).
+        enable32Bit = pkgs.stdenv.hostPlatform.isx86_64;
       };
 
       # Steam + Proton
