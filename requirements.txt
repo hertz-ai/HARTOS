@@ -30,7 +30,11 @@ cryptography==43.0.0
 # to have it while the CI runner did not, and the whole WAMP-adjacent test
 # family failed collection there (gate run 31938229518). A hard production
 # import must be a declared dependency.
-autobahn==26.7.1
+# Pinned to 23.1.2, NOT the latest: both images install `autobahn==23.1.2`
+# explicitly right after this file (Dockerfile:61, deploy/cloud/Dockerfile.prod:37),
+# so 23.1.2 is what actually runs -- and autobahn >=25.9 requires Python >=3.11,
+# which the py3.10 image cannot satisfy at all (it failed the whole build here).
+autobahn==23.1.2
 # pyautogen: production imports `autogen` (core/labeled_autogen_function.py
 # at module scope; create_recipe lazily). It was only ever satisfied by a
 # LOOSE VENDORED autogen-0.2.37/ directory that was never committed, so
