@@ -718,21 +718,60 @@ def get_queue_stats():
 @api_response
 def clear_queue():
     """Clear all pending messages from queue."""
-    return {"cleared": True, "messages_removed": 0}
+    # The queue subsystem these endpoints were written against
+    # (integrations/channels/queue/) has ZERO production importers -- only
+    # tests import it, verified 2026-08-18 with a positive control.  So there
+    # is nothing here to pause/resume/clear or measure.  Returning a cheerful
+    # literal made the admin UI report success for an action that never
+    # happened, and made /metrics/* serve invented numbers as if measured.
+    # 501 is the honest answer until the subsystem is wired.
+    _resp = jsonify(APIResponse(
+        success=False,
+        error="Queue clear is not available: the channel queue subsystem is not wired in this build",
+    ).to_dict())
+    _resp.status_code = 501
+    return _resp
+
 
 
 @admin_bp.route("/queue/pause", methods=["POST"])
 @api_response
 def pause_queue():
     """Pause queue processing."""
-    return {"paused": True}
+    # The queue subsystem these endpoints were written against
+    # (integrations/channels/queue/) has ZERO production importers -- only
+    # tests import it, verified 2026-08-18 with a positive control.  So there
+    # is nothing here to pause/resume/clear or measure.  Returning a cheerful
+    # literal made the admin UI report success for an action that never
+    # happened, and made /metrics/* serve invented numbers as if measured.
+    # 501 is the honest answer until the subsystem is wired.
+    _resp = jsonify(APIResponse(
+        success=False,
+        error="Queue pause is not available: the channel queue subsystem is not wired in this build",
+    ).to_dict())
+    _resp.status_code = 501
+    return _resp
+
 
 
 @admin_bp.route("/queue/resume", methods=["POST"])
 @api_response
 def resume_queue():
     """Resume queue processing."""
-    return {"resumed": True}
+    # The queue subsystem these endpoints were written against
+    # (integrations/channels/queue/) has ZERO production importers -- only
+    # tests import it, verified 2026-08-18 with a positive control.  So there
+    # is nothing here to pause/resume/clear or measure.  Returning a cheerful
+    # literal made the admin UI report success for an action that never
+    # happened, and made /metrics/* serve invented numbers as if measured.
+    # 501 is the honest answer until the subsystem is wired.
+    _resp = jsonify(APIResponse(
+        success=False,
+        error="Queue resume is not available: the channel queue subsystem is not wired in this build",
+    ).to_dict())
+    _resp.status_code = 501
+    return _resp
+
 
 
 @admin_bp.route("/queue/debounce", methods=["GET"])
@@ -1964,13 +2003,20 @@ def get_command_metrics():
 @api_response
 def get_queue_metrics():
     """Get queue performance metrics."""
-    return {
-        "throughput_per_second": 10.0,
-        "avg_wait_time_ms": 50.0,
-        "avg_processing_time_ms": 100.0,
-        "queue_depth": 0,
-        "rejected_count": 0,
-    }
+    # The queue subsystem these endpoints were written against
+    # (integrations/channels/queue/) has ZERO production importers -- only
+    # tests import it, verified 2026-08-18 with a positive control.  So there
+    # is nothing here to pause/resume/clear or measure.  Returning a cheerful
+    # literal made the admin UI report success for an action that never
+    # happened, and made /metrics/* serve invented numbers as if measured.
+    # 501 is the honest answer until the subsystem is wired.
+    _resp = jsonify(APIResponse(
+        success=False,
+        error="Queue metrics is not available: the channel queue subsystem is not wired in this build",
+    ).to_dict())
+    _resp.status_code = 501
+    return _resp
+
 
 
 @admin_bp.route("/metrics/errors", methods=["GET"])
@@ -1978,25 +2024,31 @@ def get_queue_metrics():
 def get_error_metrics():
     """Get error metrics and recent errors."""
     api = get_api()
-    return {
-        "total_errors": api._error_count,
-        "error_rate": 0.0,
-        "recent_errors": [],
-    }
+    # total_errors is real (api._error_count).  error_rate and recent_errors
+    # were hardcoded 0.0 / [] -- a partially-real payload is worse than an
+    # absent one, because the real field lends credibility to the invented
+    # ones.  Report only what is actually measured.
+    return {"total_errors": api._error_count}
 
 
 @admin_bp.route("/metrics/latency", methods=["GET"])
 @api_response
 def get_latency_metrics():
     """Get latency distribution metrics."""
-    return {
-        "p50_ms": 45.0,
-        "p75_ms": 75.0,
-        "p90_ms": 100.0,
-        "p95_ms": 125.0,
-        "p99_ms": 150.0,
-        "max_ms": 500.0,
-    }
+    # The queue subsystem these endpoints were written against
+    # (integrations/channels/queue/) has ZERO production importers -- only
+    # tests import it, verified 2026-08-18 with a positive control.  So there
+    # is nothing here to pause/resume/clear or measure.  Returning a cheerful
+    # literal made the admin UI report success for an action that never
+    # happened, and made /metrics/* serve invented numbers as if measured.
+    # 501 is the honest answer until the subsystem is wired.
+    _resp = jsonify(APIResponse(
+        success=False,
+        error="Latency metrics is not available: the channel queue subsystem is not wired in this build",
+    ).to_dict())
+    _resp.status_code = 501
+    return _resp
+
 
 
 # ============================================================================
