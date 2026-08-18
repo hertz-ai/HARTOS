@@ -196,8 +196,89 @@ jobs:
           #
           # An explicit timeout turns that into a self-naming 124 instead of a
           # mystery cancellation, and — crucially — lets the lines BELOW run.
-          timeout --signal=TERM --kill-after=60 1500 nix flake check --no-build 2>&1
-          RC=$?
+          #
+          # THE WRAPPER IS NOW PER-ATTRIBUTE (2026-08-18). Per the measurement
+          # at the top of this step, ONE `nix flake check` process holds the
+          # whole eval graph and walks a 16GB runner down to 5MB available.
+          # Every attribute now gets its OWN `nix eval`, so the kernel takes
+          # the memory back between them, and its own timeout, so a single
+          # pathological attribute can no longer eat the job the way one
+          # opaque process did. Same verdict, bounded footprint.
+          SYS=x86_64-linux
+          RC=0
+          fail() { echo "::error::$1"; RC=1; }
+
+          # COVERAGE GUARD. `nix flake check` walked EVERY output class by
+          # construction. A hand-listed loop does not, and a hand-list goes
+          # stale silently -- which is precisely how e2e check #17 reported
+          # PASS for months against a .desktop file that did not exist. So the
+          # class list is read from the FLAKE, and anything this loop does not
+          # handle FAILS here instead of being skipped into a false green.
+          CLASSES=$(nix eval --impure --raw --expr '
+            let f = builtins.getFlake (toString ./.);
+                meta = [ "_type" "outPath" "narHash" "sourceInfo" "inputs" "outputs"
+                         "lastModified" "lastModifiedDate" "revCount" "rev" "shortRev"
+                         "dirtyRev" "dirtyShortRev" "submodules" "description" ];
+            in builtins.concatStringsSep " "
+                 (builtins.filter (n: !(builtins.elem n meta)) (builtins.attrNames f))' 2>/dev/null)
+          if [ -z "$CLASSES" ]; then
+            fail "could not enumerate the flake's output classes -- refusing to report a pass on an unknown surface"
+          fi
+          echo "flake output classes: $CLASSES"
+          for c in $CLASSES; do
+            case " checks packages apps nixosConfigurations nixosModules " in
+              *" $c "*) ;;
+              *) fail "flake grew output class '$c' and this split does NOT evaluate it. nix flake check used to cover it. Add it below or this gate silently under-tests." ;;
+            esac
+          done
+
+          # attrs <path> -> space-separated attribute names under that path.
+          attrs() {
+            nix eval --impure --raw --expr \
+              "builtins.concatStringsSep \" \" (builtins.attrNames (builtins.getFlake (toString ./.)).$1)" 2>/dev/null
+          }
+          # force <flake-attr> -> evaluate it in a FRESH process. .drvPath
+          # forces the full derivation without building, the same trick the
+          # diagnose job uses, so an eval error surfaces per attribute with a
+          # NAME attached instead of inside one anonymous summary at the end.
+          force() {
+            FOUT=$(timeout --signal=TERM --kill-after=30 600 nix eval ".#$1" --raw 2>&1)
+            FRC=$?
+            if [ $FRC -ne 0 ]; then
+              fail "eval FAILED (rc=$FRC): $1"
+              printf '%s\n' "$FOUT" | tail -40
+            fi
+          }
+
+          for cls in checks packages; do
+            LIST=$(attrs "$cls.$SYS")
+            echo "::group::$cls.$SYS ($(printf '%s' "$LIST" | wc -w) attrs)"
+            for a in $LIST; do force "$cls.$SYS.$a.drvPath"; done
+            echo "::endgroup::"
+          done
+
+          LIST=$(attrs "apps.$SYS")
+          echo "::group::apps.$SYS ($(printf '%s' "$LIST" | wc -w) attrs)"
+          for a in $LIST; do force "apps.$SYS.$a.program"; done
+          echo "::endgroup::"
+
+          LIST=$(attrs nixosConfigurations)
+          echo "::group::nixosConfigurations ($(printf '%s' "$LIST" | wc -w) attrs)"
+          for a in $LIST; do
+            force "nixosConfigurations.$a.config.system.build.toplevel.drvPath"
+          done
+          echo "::endgroup::"
+
+          # Modules are cheap: forcing them to a value is what proves they are
+          # importable at all, which is all `nix flake check` asserts for this
+          # class without instantiating them into a system.
+          LIST=$(attrs nixosModules)
+          echo "::group::nixosModules ($(printf '%s' "$LIST" | wc -w) attrs)"
+          for a in $LIST; do
+            MOUT=$(timeout 120 nix eval ".#nixosModules.$a" --apply 'x: "ok"' --raw 2>&1) \
+              || { fail "eval FAILED: nixosModules.$a"; printf '%s\n' "$MOUT" | tail -20; }
+          done
+          echo "::endgroup::"
 
           kill "$SAMPLER" 2>/dev/null || true
           echo "::group::Memory during evaluation (peak last)"
@@ -206,15 +287,18 @@ jobs:
           free -m
           echo "::endgroup::"
 
-          # 143 = 128+15 (SIGTERM), 137 = 128+9 (SIGKILL/OOM). Naming them
-          # means the NEXT failure is self-describing instead of a bare code.
-          case "$RC" in
-            0)   echo "All flake outputs evaluate successfully." ;;
-            137) echo "::error::eval SIGKILLed (137) — OOM killer. Confirms the memory hypothesis; split the check or raise the runner." ;;
-            124) echo "::error::eval hit OUR 25-minute wrapper (124) — it stalled rather than failed. The memory table above is now the evidence; a flat curve exonerates memory and points at the Nix daemon." ;;
-            143) echo "::error::eval SIGTERMed (143) — the KNOWN, MEASURED failure: the runner ran out of memory and was terminated (run 32125200674 hit avail=5MB of 16GB). Read the [mem] samples above to confirm; if they walk to near zero this is it. Fix is to SPLIT the evaluation per attribute (see the note on this step), not to raise a cap." ;;
-            *)   echo "::error::eval failed rc=$RC — a real evaluation failure; the summary above names the outputs." ;;
-          esac
+          # RC is now an AGGREGATE of the per-attribute evals above, not the
+          # exit code of one opaque process, so the old 137/124/143 branches
+          # can no longer appear here: each attribute reports its own rc
+          # (including 124 from its own timeout) against its own NAME, which is
+          # the whole point of the split. A bare signal death now means the
+          # RUNNER died, and in that case this line never executes at all --
+          # read the streamed [mem] samples instead, which is what they are for.
+          if [ "$RC" -eq 0 ]; then
+            echo "All flake outputs evaluate successfully (per-attribute)."
+          else
+            echo "::error::flake evaluation FAILED — every failing attribute is named by an ::error:: line above, with its own rc and the tail of its own eval output."
+          fi
           exit "$RC"
 
       # The sampler above only ever printed when `nix flake check` RETURNED.
