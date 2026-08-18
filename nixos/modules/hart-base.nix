@@ -316,7 +316,19 @@ in
 
     # ── Networking ──
     networking = {
-      hostName = lib.mkDefault "hart-node";
+      # mkOptionDefault, NOT mkDefault: same collision as firewall.enable just
+      # below, one priority step further. The cloud image formats (nixpkgs
+      # virtualisation/amazon-image.nix and its gce/azure siblings) set
+      # networking.hostName = mkDefault "" so the instance takes its name from
+      # cloud metadata. mkDefault here is the SAME priority (1000), and two
+      # equal definitions do not resolve, they conflict -- which eval-failed
+      # amazon-server, gce-server and azure-server with "The option
+      # `networking.hostName' has conflicting definition values". Invisible
+      # until the flake eval was split per attribute, because the old single
+      # `nix flake check` process died of memory before it ever reported.
+      # mkOptionDefault (1500) yields to their mkDefault, while every variant
+      # with no competing definition still resolves to hart-node unchanged.
+      hostName = lib.mkOptionDefault "hart-node";
       firewall = {
         # mkDefault: the docker-server image format (nixpkgs docker-image.nix)
         # sets networking.firewall.enable = false at normal priority for the OCI

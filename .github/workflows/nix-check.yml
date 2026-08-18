@@ -226,7 +226,7 @@ jobs:
           fi
           echo "flake output classes: $CLASSES"
           for c in $CLASSES; do
-            case " checks packages apps nixosConfigurations nixosModules " in
+            case " checks packages apps nixosConfigurations nixosModules lib " in
               *" $c "*) ;;
               *) fail "flake grew output class '$c' and this split does NOT evaluate it. nix flake check used to cover it. Add it below or this gate silently under-tests." ;;
             esac
@@ -271,14 +271,25 @@ jobs:
 
           # Modules are cheap: forcing them to a value is what proves they are
           # importable at all, which is all `nix flake check` asserts for this
-          # class without instantiating them into a system.
-          LIST=$(attrs nixosModules)
-          echo "::group::nixosModules ($(printf '%s' "$LIST" | wc -w) attrs)"
-          for a in $LIST; do
-            MOUT=$(timeout 120 nix eval ".#nixosModules.$a" --apply 'x: "ok"' --raw 2>&1) \
-              || { fail "eval FAILED: nixosModules.$a"; printf '%s\n' "$MOUT" | tail -20; }
+          # class without instantiating them into a system. `lib` is the same
+          # shape (hartModules / mkHartSystem / mkInstalledSystem: a module list
+          # and two functions, never derivations), so it gets the same force.
+          #
+          # `lib` is here BECAUSE THE GUARD CAUGHT IT. The first run of this
+          # split, 32129306158, failed with "flake grew output class 'lib'" --
+          # I had hand-listed five classes and the flake has six. That is the
+          # guard doing exactly its job on its author, which is the argument
+          # for keeping it: without it this gate would have quietly evaluated
+          # five sixths of the flake and called it a pass.
+          for cls in nixosModules lib; do
+            LIST=$(attrs "$cls")
+            echo "::group::$cls ($(printf '%s' "$LIST" | wc -w) attrs)"
+            for a in $LIST; do
+              MOUT=$(timeout 120 nix eval ".#$cls.$a" --apply 'x: "ok"' --raw 2>&1) \
+                || { fail "eval FAILED: $cls.$a"; printf '%s\n' "$MOUT" | tail -20; }
+            done
+            echo "::endgroup::"
           done
-          echo "::endgroup::"
 
           kill "$SAMPLER" 2>/dev/null || true
           echo "::group::Memory during evaluation (peak last)"
