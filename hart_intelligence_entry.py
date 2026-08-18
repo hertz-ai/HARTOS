@@ -6769,13 +6769,20 @@ def parse_visual_context(inp: str):
         #       the local — see scripts/start_cloud.sh + start_regional.sh)
         #   (b) get_vision_api() returns a non-default URL → user
         #       configured a custom endpoint, that's their explicit opt-in
-        #   (c) ConsentService.check_consent(user_id, 'cloud_egress',
-        #       scope='vision') == True → user previously granted
-        #   (d) Otherwise: ConsentService.request_consent(...) creates a
-        #       pending row and emits a notification (consent.request
-        #       topic → frontend renders a consent dialog).  Return a
-        #       holding message; once user grants, NEXT vision request
-        #       proceeds without prompting.  Never silently uploads.
+        #   (c) Otherwise: ConsentService.auto_grant_with_notice(...)
+        #       creates a granted record on first use and emits
+        #       consent.auto_granted, so the user is told cloud was
+        #       used and can revoke in one tap.  A prior explicit
+        #       revoke returns False and we refuse rather than
+        #       silently re-grant.  Never silently uploads.
+        # There is NO request-then-wait branch here.  ConsentService.
+        # request_consent() has zero production callers tree-wide and
+        # emits nothing (its siblings grant_consent /
+        # auto_grant_with_notice / announce_revocation all call _emit;
+        # request_consent does not), so routing through it would
+        # neither prompt the user nor notify any device.  The only live
+        # producer of the consent.request topic is
+        # security/ai_governance.py:695.
         from core.config_cache import get_vision_api
         _user_vision_url = (get_vision_api() or '').strip()
         _allow_cloud = (
