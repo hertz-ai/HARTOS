@@ -46,22 +46,32 @@ _HTTP_TO_WS = {'http': 'ws', 'https': 'wss'}
 # exists to reconcile. `/publish` is the HTTP bridge; `/ws` is the router itself.
 _ROUTER_PATH = '/ws'
 
-# The canonical router host (steward, 2026-08-18: "azurekong is the correct url").
+# The canonical router URL, BUILT from the single sources of truth rather than
+# spelled out here:
+#   host -> core.constants.CENTRAL_HOST        (one literal for the whole repo)
+#   port -> core.port_registry.get_port(...)   (registered as 'crossbar': 8088;
+#           it was MISSING once and get_port returned 0, making the bridge URL
+#           ws://localhost:0/ws — so resolving it beats re-typing it)
 #
-# 15 call sites hardcoded `ws://aws_rasa.hertzai.com:8088/ws` instead, while the
-# run scripts (scripts/run.sh:49 and friends) export the azurekong name. VERIFIED
-# 2026-08-18 that switching the default is a functional NO-OP, because the two
-# names are the SAME MACHINE:
-#     aws_rasa.hertzai.com   -> 106.51.181.24   /ws HTTP 200 (11280 bytes)
-#     azurekong.hertzai.com  -> 106.51.181.24   /ws HTTP 200 (11280 bytes)
-#     both: /publish -> 405 (POST-only bridge present)
-# So this rename fixes the NAME without moving the destination, and it makes the
-# unset-env default agree with what the run scripts already set — removing the
-# split where a node's RPC and its publish bridge could disagree about the host.
-DEFAULT_ROUTER_URL = 'ws://azurekong.hertzai.com:8088/ws'
+# This module previously carried its own copy of both, which made it the FOURTH
+# place the hostname was written out. Composing keeps the literal in one place
+# while leaving WAMP_URL as the override knob.
+def _default_router_url() -> str:
+    from core.constants import CENTRAL_HOST
+    try:
+        from core.port_registry import get_port
+        port = get_port('crossbar') or 8088
+    except Exception:
+        # port_registry unavailable (trimmed install / early boot): fall back to
+        # the registered value rather than failing to produce a URL at all.
+        port = 8088
+    return 'ws://%s:%d%s' % (CENTRAL_HOST, port, _ROUTER_PATH)
 
-#: The legacy alias, kept ONLY so a reader who greps the old literal lands here
-#: and learns it resolves to the same box. Not used as a default.
+
+DEFAULT_ROUTER_URL = _default_router_url()
+
+#: Legacy DNS alias for the SAME box (see core.constants.CENTRAL_HOST_LEGACY_ALIAS).
+#: Kept so a reader who greps the old literal lands on the explanation.
 LEGACY_ROUTER_ALIAS = 'ws://aws_rasa.hertzai.com:8088/ws'
 
 

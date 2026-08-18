@@ -483,6 +483,45 @@ ENCOUNTER_DRAFT_MAX_CHARS: int = 220             # icebreaker length cap
 #
 # Do NOT inline duplicate topic strings; import from here.
 # ──────────────────────────────────────────────────────────────────────
+# CENTRAL HOST — ONE literal for the central instance's DNS name
+#
+# The same hostname was written out in FOUR places, in two spellings:
+#   core/config_cache.py    'https://azurekong.hertzai.com:8443/db'
+#   core/wamp_url.py        the WAMP router default
+#   15 call sites           'ws://aws_rasa.hertzai.com:8088/ws' (hardcoded)
+#   scripts/run*.sh|bat     WAMP_URL=ws://azurekong.hertzai.com:8088/ws
+#
+# `aws_rasa` and `azurekong` are the SAME MACHINE — verified 2026-08-18, both
+# resolve to 106.51.181.24 and serve byte-identical /ws (HTTP 200, 11280 bytes)
+# and /publish (405, POST-only bridge). `azurekong` is the correct name
+# (steward, 2026-08-18) and is what the run scripts already export.
+#
+# Consumers build their own URL from this plus the port that belongs to their
+# service — WAMP takes core.port_registry.get_port('crossbar'); the central DB
+# keeps its own 8443. Do NOT inline the hostname; import it from here.
+#
+# THIS IS A DEFAULT, NOT A MANDATE. Unifying the literal must never cost a system
+# the ability to run its OWN server (steward, 2026-08-18). Every consumer keeps
+# its own independent override and the override always wins:
+#
+#   own WAMP router     WAMP_URL=ws://127.0.0.1:8088/ws
+#   regional relay      WAMP_URL=ws://regional-3.lan:8088/ws
+#   private central DB  HEVOLVE_CENTRAL_DB_URL=https://my-private-cloud:8443/db
+#
+# They are deliberately SEPARATE knobs: a node may run its own router while still
+# reading the central DB, or the reverse. Do NOT collapse them into one
+# "HART_HOST" — that would trade the flexibility this constant was only ever
+# meant to de-duplicate. tests/unit/test_wamp_router_url_resolves.py asserts each
+# consumer stays independently steerable.
+# ──────────────────────────────────────────────────────────────────────
+CENTRAL_HOST: str = 'azurekong.hertzai.com'
+
+#: Legacy DNS alias for the SAME box. Recorded so a reader who greps the old
+#: literal lands on this explanation instead of reintroducing it.
+CENTRAL_HOST_LEGACY_ALIAS: str = 'aws_rasa.hertzai.com'
+
+
+# ──────────────────────────────────────────────────────────────────────
 CHAT_TOPIC_NEW: str = 'com.hertzai.hevolve.chat.new'
 CHAT_TOPIC_ACK: str = 'com.hertzai.hevolve.chat.ack'
 

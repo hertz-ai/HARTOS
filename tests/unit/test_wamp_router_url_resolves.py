@@ -133,3 +133,108 @@ class TheRpcHelperUsesTheResolver(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TheCentralHostIsCanonicalised(unittest.TestCase):
+    """Steward 2026-08-18: "canonicalise the url host centrally from constants if
+    exists rather than maintaining multiple copies, or a getter method if from
+    config."
+
+    The hostname was written out in FOUR places in two spellings (config_cache's
+    central DB URL, wamp_url's router default, 15 hardcoded call sites, and the run
+    scripts). core.constants.CENTRAL_HOST is now the one literal; consumers compose
+    their own URL from it plus the port that belongs to their service.
+    """
+
+    def test_constants_owns_the_one_hostname(self):
+        from core.constants import CENTRAL_HOST, CENTRAL_HOST_LEGACY_ALIAS
+        self.assertEqual('azurekong.hertzai.com', CENTRAL_HOST)
+        self.assertEqual('aws_rasa.hertzai.com', CENTRAL_HOST_LEGACY_ALIAS,
+                         "the legacy alias is recorded so a reader who greps the "
+                         "old literal finds the explanation, not a dead end")
+
+    def test_the_router_url_is_COMPOSED_not_retyped(self):
+        from core.constants import CENTRAL_HOST
+        self.assertIn(CENTRAL_HOST, DEFAULT_ROUTER_URL)
+
+    def test_the_router_port_comes_from_the_registry_not_a_literal(self):
+        """port_registry registers 'crossbar': 8088. It was MISSING once and
+        get_port returned 0, making the bridge URL ws://localhost:0/ws — resolving
+        it beats re-typing it."""
+        from core.port_registry import get_port
+        self.assertIn(':%d/' % (get_port('crossbar') or 8088), DEFAULT_ROUTER_URL)
+
+    def test_the_central_db_url_uses_the_same_host(self):
+        """Different service, different port, SAME hostname — so a rename lands in
+        one place instead of drifting between the DB and the router."""
+        from core.constants import CENTRAL_HOST
+        from core.config_cache import get_central_db_url
+        self.assertIn(CENTRAL_HOST, get_central_db_url())
+
+    def test_no_regression_in_either_composed_value(self):
+        from core.config_cache import _DEFAULT_CENTRAL_DB_URL
+        self.assertEqual('ws://azurekong.hertzai.com:8088/ws', DEFAULT_ROUTER_URL)
+        self.assertEqual('https://azurekong.hertzai.com:8443/db', _DEFAULT_CENTRAL_DB_URL)
+
+
+class UnifyingTheHostDidNotCostTheFlexibility(unittest.TestCase):
+    """Steward 2026-08-18: "keep it flexible for individual systems to have their
+    own server, unifying shd not strip away that flexibility."
+
+    CENTRAL_HOST de-duplicates a literal that was written out four times. It is a
+    DEFAULT, not a mandate. These tests fail if a later "simplification" collapses
+    the per-service overrides into the constant.
+    """
+
+    def test_a_node_can_run_its_OWN_wamp_server(self):
+        self.assertEqual('ws://127.0.0.1:8088/ws',
+                         resolve_router_url({'WAMP_URL': 'ws://127.0.0.1:8088/ws'}),
+                         "a node can no longer point at its own router — the "
+                         "constant became a mandate instead of a default")
+
+    def test_router_and_publish_BOTH_follow_the_node_s_own_server(self):
+        """Overriding must move the whole transport, not half of it: a node whose
+        RPC is local but whose publish still goes to central is a split brain."""
+        own = {'WAMP_URL': 'ws://127.0.0.1:8088/ws'}
+        self.assertIn('127.0.0.1', resolve_router_url(own))
+        self.assertIn('127.0.0.1', resolve_publish_url(own))
+
+    def test_a_regional_relay_is_still_selectable(self):
+        self.assertEqual('ws://regional-3.lan:8088/ws',
+                         resolve_router_url({'WAMP_URL': 'ws://regional-3.lan:8088/ws'}))
+
+    def test_the_db_and_the_router_are_INDEPENDENT_knobs(self):
+        """A node may run its own router while still reading the central DB, or the
+        reverse. Collapsing them into one HART_HOST would break that."""
+        import importlib
+        import core.config_cache as cc
+        prev = os.environ.get('HEVOLVE_CENTRAL_DB_URL')
+        os.environ['HEVOLVE_CENTRAL_DB_URL'] = 'https://my-private-cloud:8443/db'
+        try:
+            importlib.reload(cc)
+            self.assertEqual('https://my-private-cloud:8443/db', cc.get_central_db_url())
+            # the router default is untouched by the DB override
+            self.assertIn('azurekong', resolve_router_url({}))
+        finally:
+            if prev is None:
+                os.environ.pop('HEVOLVE_CENTRAL_DB_URL', None)
+            else:
+                os.environ['HEVOLVE_CENTRAL_DB_URL'] = prev
+            importlib.reload(cc)
+
+    def test_an_empty_db_override_still_means_disabled(self):
+        """config_cache documents '' as "no central available — skip cross-device
+        merge". Composing the default must not have broken that."""
+        import importlib
+        import core.config_cache as cc
+        prev = os.environ.get('HEVOLVE_CENTRAL_DB_URL')
+        os.environ['HEVOLVE_CENTRAL_DB_URL'] = ''
+        try:
+            importlib.reload(cc)
+            self.assertEqual('', cc.get_central_db_url())
+        finally:
+            if prev is None:
+                os.environ.pop('HEVOLVE_CENTRAL_DB_URL', None)
+            else:
+                os.environ['HEVOLVE_CENTRAL_DB_URL'] = prev
+            importlib.reload(cc)

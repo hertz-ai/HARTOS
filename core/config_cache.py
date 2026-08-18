@@ -32,6 +32,8 @@ import os
 import logging
 import threading
 
+from core.constants import CENTRAL_HOST as _CENTRAL_HOST
+
 logger = logging.getLogger('hevolve_core')
 
 _config = None
@@ -150,7 +152,11 @@ def get_db_url() -> str:
 # running against a private Hevolve installation.  Resolves to '' if
 # the env override is set to empty, which callers must treat as
 # "no central available — skip cross-device merge".
-_DEFAULT_CENTRAL_DB_URL = 'https://azurekong.hertzai.com:8443/db'
+# Host comes from the ONE literal (core.constants.CENTRAL_HOST); the 8443/db
+# path is this service's own and stays here. Composing keeps the hostname from
+# being written out a second time — it was in four places before.
+_CENTRAL_DB_PORT = 8443
+_DEFAULT_CENTRAL_DB_URL = 'https://%s:%d/db' % (_CENTRAL_HOST, _CENTRAL_DB_PORT)
 
 
 def get_central_db_url() -> str:
