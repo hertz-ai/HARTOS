@@ -452,7 +452,20 @@ in
     services.openssh = {
       enable = true;
       settings = {
-        PermitRootLogin = lib.mkDefault "no";
+        # 1250, the THIRD option in this file to need it, so treat it as the
+        # rule rather than three coincidences: any opinion hart-base holds that
+        # a nixpkgs image or cloud module ALSO holds at mkDefault has to sit
+        # between mkDefault (1000) and mkOptionDefault (1500), because equal
+        # priorities conflict instead of resolving. gce-server eval-failed on
+        # hostName, then on firewall.enable, then here, each one only becoming
+        # visible once the previous was fixed:
+        #   The option `services.openssh.settings.PermitRootLogin' has
+        #   conflicting definition values:
+        #   - hart-base.nix: "no"
+        #   - virtualisation/google-compute-config.nix: "prohibit-password"
+        # A cloud image that has decided how root logs in should win; every
+        # other variant has no competing definition and still gets "no".
+        PermitRootLogin = lib.mkOverride 1250 "no";
         PasswordAuthentication = true;  # For first login; disable after key setup
       };
     };
