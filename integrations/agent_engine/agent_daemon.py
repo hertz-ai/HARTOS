@@ -250,6 +250,29 @@ class AgentDaemon:
         with self._lock:
             if self._running:
                 return
+            # Never replace a worker that is still alive.  This used to
+            # reassign self._thread unconditionally, so a predecessor that
+            # was still running became an untracked orphan: it kept
+            # executing while _thread pointed at the new one, and the
+            # supervisor's is_alive() check -- which only ever inspects the
+            # CURRENT _thread -- could not see it.  Measured in one process
+            # 2026-08-17, successive thread dumps: 5, 6, 7, 8, 9, 10, 11, 12
+            # threads named agent_daemon, +1 per supervisor tick.
+            #
+            # Re-arm the live worker instead of spawning beside it: its
+            # `while self._running` reads True again and it continues.  If it
+            # had already left the loop it dies, and the supervisor's next
+            # tick sees a dead _thread with _running=True and takes the
+            # zombie-recovery branch (integrations/agent_engine/__init__.py),
+            # which spawns cleanly.  One tracked worker is diagnosable; N
+            # orphans are not.
+            if self._thread is not None and self._thread.is_alive():
+                self._running = True
+                logger.warning(
+                    "agent daemon start(): worker %s still alive with "
+                    "_running=False -- re-arming it instead of spawning a "
+                    "second (orphan-leak guard)", self._thread.name)
+                return
             self._running = True
             self._consecutive_failures = 0
         self._thread = threading.Thread(target=self._loop, daemon=True,
