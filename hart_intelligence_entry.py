@@ -462,7 +462,16 @@ try:
     from create_recipe import recipe, time_based_execution as time_execution, visual_execution
     from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution, visual_based_execution
 except ImportError as e:
-    print(f"Could not import recipe modules: {e}")
+    # print() went nowhere: frozen windowed builds have no real stdout, so the
+    # ONE line explaining why agent creation is dead was invisible.  MEASURED
+    # 2026-08-19: "Could not import recipe modules" appears 0 times across
+    # langchain.log/gui_app.log/server.log while recipe=None caused 54
+    # `TypeError: 'NoneType' object is not callable` at the two unguarded call
+    # sites (:9351, :9578), each one a 500 on /chat.  Same logger idiom this
+    # file already uses at line 261; exc_info keeps the real ImportError cause.
+    logging.getLogger(__name__).error(
+        "Could not import recipe modules -- agent creation and recipe "
+        "execution are DISABLED for this process: %s", e, exc_info=True)
     recipe = None
     time_execution = None
     visual_execution = None
