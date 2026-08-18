@@ -1146,6 +1146,62 @@ def _channel_send_authenticated(req) -> bool:
     return False
 
 
+def register_status_routes(app, integration: FlaskChannelIntegration) -> None:
+    """Register GET /channels/status and POST /channels/send for an EXISTING
+    integration instance, without touching the ``_integration`` singleton.
+
+    Split out of init_channels() so a caller that already holds the live
+    integration (e.g. standalone main()'s get_channel_integration(), which
+    may have been lazily created earlier by an on-demand path like
+    _ensure_whatsapp_live_adapter) can get these two routes wired up too,
+    instead of going through init_channels() — which unconditionally
+    constructs a NEW FlaskChannelIntegration and overwrites the global,
+    orphaning whatever the existing singleton had already set up. Same
+    "standalone launcher never did X" gap as the webhook routes and the web
+    channel registration (see the callers in hart_intelligence_entry.py).
+    """
+    if not app:
+        return
+
+    @app.route("/channels/status", methods=["GET"])
+    def channel_status():
+        return integration.get_status()
+
+    @app.route("/channels/send", methods=["POST"])
+    def channel_send():
+        from flask import request, jsonify
+
+        # AUTHENTICATE FIRST — before the body is read or any message is
+        # sent. Unauthenticated, this route is an outbound spoof/spam relay
+        # (see _channel_send_authenticated). Fail closed on every exposed
+        # tier; only bundled single-user desktop is trusted.
+        if not _channel_send_authenticated(request):
+            return jsonify({"error": "Authentication required"}), 401
+
+        data = request.json
+        channel = data.get("channel")
+        chat_id = data.get("chat_id")
+        text = data.get("text")
+
+        if not all([channel, chat_id, text]):
+            return jsonify({"error": "Missing required fields"}), 400
+
+        # Run async send in the event loop
+        if integration._loop:
+            future = asyncio.run_coroutine_threadsafe(
+                integration.registry.send_to_channel(channel, chat_id, text),
+                integration._loop,
+            )
+            result = future.result(timeout=30)
+            return jsonify({
+                "success": result.success,
+                "message_id": result.message_id,
+                "error": result.error,
+            })
+        else:
+            return jsonify({"error": "Channels not running"}), 503
+
+
 def init_channels(app=None, config: Dict[str, Any] = None) -> FlaskChannelIntegration:
     """
     Initialize channel integrations.
@@ -1180,44 +1236,6 @@ def init_channels(app=None, config: Dict[str, Any] = None) -> FlaskChannelIntegr
     global _integration
     _integration = integration
 
-    # Add Flask routes if app provided
-    if app:
-        @app.route("/channels/status", methods=["GET"])
-        def channel_status():
-            return integration.get_status()
-
-        @app.route("/channels/send", methods=["POST"])
-        def channel_send():
-            from flask import request, jsonify
-
-            # AUTHENTICATE FIRST — before the body is read or any message is
-            # sent. Unauthenticated, this route is an outbound spoof/spam relay
-            # (see _channel_send_authenticated). Fail closed on every exposed
-            # tier; only bundled single-user desktop is trusted.
-            if not _channel_send_authenticated(request):
-                return jsonify({"error": "Authentication required"}), 401
-
-            data = request.json
-            channel = data.get("channel")
-            chat_id = data.get("chat_id")
-            text = data.get("text")
-
-            if not all([channel, chat_id, text]):
-                return jsonify({"error": "Missing required fields"}), 400
-
-            # Run async send in the event loop
-            if integration._loop:
-                future = asyncio.run_coroutine_threadsafe(
-                    integration.registry.send_to_channel(channel, chat_id, text),
-                    integration._loop,
-                )
-                result = future.result(timeout=30)
-                return jsonify({
-                    "success": result.success,
-                    "message_id": result.message_id,
-                    "error": result.error,
-                })
-            else:
-                return jsonify({"error": "Channels not running"}), 503
+    register_status_routes(app, integration)
 
     return integration
