@@ -136,6 +136,45 @@ class TestUnknownModalityDegrades(unittest.TestCase):
         self.assertIn('error', out)
 
 
+class TestImageGenDegrades(unittest.TestCase):
+    """image_gen has no backend, so it must degrade like every other modality.
+
+    It previously returned {'response': 'Image generation not yet implemented',
+    'backend': 'stub'} with NO 'error' key. route_request computes
+    success='error' not in result, so every image request emitted an
+    inference.completed event claiming success, and the caller received that
+    sentence in the field that carries generated content.
+    """
+
+    def test_image_gen_returns_error_not_a_fabricated_success(self):
+        svc = ModelBusService()
+        with patch.object(svc, '_check_guardrails', return_value=True):
+            out = svc.infer(ModelType.IMAGE_GEN, 'a fish')
+        self.assertIn('error', out)
+
+    def test_image_gen_does_not_return_the_stub_sentence_as_content(self):
+        svc = ModelBusService()
+        with patch.object(svc, '_check_guardrails', return_value=True):
+            out = svc.infer(ModelType.IMAGE_GEN, 'a fish')
+        self.assertNotIn('not yet implemented', (out.get('response') or ''))
+        self.assertNotEqual(out.get('backend'), 'stub')
+
+    def test_image_gen_telemetry_reports_failure(self):
+        """The emitted inference.completed event must not claim success."""
+        seen = []
+
+        def _capture(name, payload):
+            seen.append((name, payload))
+
+        svc = ModelBusService()
+        with patch.object(svc, '_check_guardrails', return_value=True),                 patch('core.platform.events.emit_event', _capture):
+            svc.infer(ModelType.IMAGE_GEN, 'a fish')
+
+        completed = [p for n, p in seen if n == 'inference.completed']
+        self.assertTrue(completed, 'no inference.completed event emitted')
+        self.assertFalse(completed[0]['success'])
+
+
 class TestAdvertisesModalities(unittest.TestCase):
     """list_models() always advertises the always-local TTS + STT modalities so a
     caller can discover the bus serves them even with no LLM/vision backend up."""
