@@ -316,19 +316,29 @@ in
 
     # ── Networking ──
     networking = {
-      # mkOptionDefault, NOT mkDefault: same collision as firewall.enable just
-      # below, one priority step further. The cloud image formats (nixpkgs
-      # virtualisation/amazon-image.nix and its gce/azure siblings) set
-      # networking.hostName = mkDefault "" so the instance takes its name from
-      # cloud metadata. mkDefault here is the SAME priority (1000), and two
-      # equal definitions do not resolve, they conflict -- which eval-failed
-      # amazon-server, gce-server and azure-server with "The option
-      # `networking.hostName' has conflicting definition values". Invisible
-      # until the flake eval was split per attribute, because the old single
-      # `nix flake check` process died of memory before it ever reported.
-      # mkOptionDefault (1500) yields to their mkDefault, while every variant
-      # with no competing definition still resolves to hart-node unchanged.
-      hostName = lib.mkOptionDefault "hart-node";
+      # 1250: this option is squeezed between TWO nixpkgs definitions, and the
+      # only correct answer is a priority strictly between them. Same family of
+      # collision as firewall.enable just below, but that one had a free step
+      # and this one does not.
+      #   1000 mkDefault       cloud image formats (virtualisation/amazon-image
+      #                        .nix and its gce/azure siblings) set hostName =
+      #                        mkDefault "" so the instance is named from cloud
+      #                        metadata. We must LOSE to this.
+      #   1500 mkOptionDefault tasks/network-interfaces.nix contributes the
+      #                        stock "nixos". We must BEAT this.
+      # Two definitions at the SAME priority do not resolve, they conflict, so
+      # both mkDefault and mkOptionDefault are wrong here and each was measured
+      # to be wrong: plain mkDefault tied with the cloud modules and eval-failed
+      # amazon/gce/azure-server, and mkOptionDefault (b6286d0) tied with
+      # network-interfaces.nix and eval-failed every ordinary image instead
+      # (iso-*, raw-*, qcow2-*, vbox-*, docker-server, default). 1250 ties with
+      # neither: cloud images take their metadata name, everything else still
+      # resolves to hart-node exactly as it always did.
+      #
+      # None of this was visible until the flake eval was split per attribute
+      # (cc0eb60) -- the single `nix flake check` process died of memory before
+      # it ever reported an attribute name.
+      hostName = lib.mkOverride 1250 "hart-node";
       firewall = {
         # mkDefault: the docker-server image format (nixpkgs docker-image.nix)
         # sets networking.firewall.enable = false at normal priority for the OCI
