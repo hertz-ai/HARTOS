@@ -9366,6 +9366,17 @@ def chat():
                     # escalates (Computer_Action/Shell are casual-only, so tasks
                     # route via Create_Agent -> CREATE).
                 else:
+                    # Only now — having decided to serve the draft's reply
+                    # as the final answer — fire the background expert.
+                    # The three branches above this one fall through to
+                    # their OWN synchronous full turn for this same prompt
+                    # instead of returning here; scheduling unconditionally
+                    # at classification time (the old behaviour) ran that
+                    # same turn again in the background for those cases —
+                    # the root cause of the 2026-08 duplicate-turn
+                    # investigation. See
+                    # speculative_dispatcher.schedule_expert_for_draft.
+                    dispatcher.schedule_expert_for_draft(result)
                     return _chat_reply(
                         user_id, request_id, result['response'],
                         Agent_status='Draft-First Mode',
@@ -12354,7 +12365,7 @@ def main():
     # launcher that already started channels (Nunba) is unaffected.
     try:
         from integrations.channels.flask_integration import (
-            get_channel_integration,
+            get_channel_integration, register_status_routes,
         )
         _channels = get_channel_integration()
         # Inbound webhook seam, same omission as above: hartos_bootstrap and
@@ -12369,6 +12380,21 @@ def main():
             logging.getLogger(__name__).warning(
                 "Inbound channel webhook routes not registered — webhook-based "
                 "channels cannot receive messages on this node: %s", e,
+                exc_info=True)
+        # Same class of gap again: hartos_bootstrap/run_debug reach these two
+        # routes via init_channels(app), which standalone never called — so
+        # GET /channels/status and POST /channels/send 404'd here even
+        # though _channels itself is live. register_status_routes wires them
+        # onto the SAME get_channel_integration() singleton rather than
+        # going through init_channels(), which would construct a second,
+        # separate FlaskChannelIntegration and orphan whatever this one
+        # already has running (e.g. a WhatsApp adapter started early by
+        # _ensure_whatsapp_live_adapter).
+        try:
+            register_status_routes(app, _channels)
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "/channels/status and /channels/send not registered: %s", e,
                 exc_info=True)
         _channels.start()
     except Exception as e:

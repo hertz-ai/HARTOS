@@ -770,25 +770,38 @@ class SpeculativeDispatcher:
             escalation_reason=recorded_reason,
         )
 
-        # ── 4. Schedule expert if the draft self-delegated ──
+        # ── 4. Prepare (but do NOT submit) the background expert if the
+        # draft self-delegated. Submission is deferred to
+        # schedule_expert_for_draft(), called by the caller ONLY when it
+        # is actually serving draft_reply as the final answer. Callers
+        # that instead fall through to their own synchronous full turn
+        # for this same prompt (delegate routed to get_ans, is_create_agent
+        # CREATE routing, the vision-keyword override) must never reach
+        # that call — submitting here unconditionally used to run the
+        # identical agent turn a second time in the background for those
+        # callers, which is the duplicate-turn defect this indirection
+        # exists to close (see hart_intelligence_entry.chat()'s
+        # draft-first dispatch block and schedule_expert_for_draft below).
         expert_pending = False
         hive_consult_scheduled = False
+        _expert_schedule_kwargs = None
         if delegate in ('local', 'hive'):
             expert_model = self._pick_expert_for_delegate(
                 delegate, user_pref=user_pref)
-            expert_pending = self._schedule_expert_background(
-                speculation_id=speculation_id,
-                prompt=prompt,
-                fast_response=draft_reply,
-                expert_model=expert_model,
-                user_id=user_id, prompt_id=prompt_id,
-                goal_id=goal_id, goal_type=goal_type,
-                origin_model_id=draft_model.model_id,
-                origin_model_role='draft_model',
-                delegate=delegate,
-                escalation_reason=escalation_reason,
-                user_pref=user_pref,
-            )
+            if expert_model is not None:
+                _expert_schedule_kwargs = dict(
+                    speculation_id=speculation_id,
+                    prompt=prompt,
+                    fast_response=draft_reply,
+                    expert_model=expert_model,
+                    user_id=user_id, prompt_id=prompt_id,
+                    goal_id=goal_id, goal_type=goal_type,
+                    origin_model_id=draft_model.model_id,
+                    origin_model_role='draft_model',
+                    delegate=delegate,
+                    escalation_reason=escalation_reason,
+                    user_pref=user_pref,
+                )
             # When the user explicitly asked for `hive_preferred` AND the
             # draft self-delegated to hive, also fire a best-effort MoE
             # HiveMind fusion consult in the background.  The consult
@@ -840,6 +853,10 @@ class SpeculativeDispatcher:
             'channel_connect': _channel.strip().lower(),
             'language_change': _lang.strip().lower(),
             'expert_pending': expert_pending,
+            # Private — consumed and popped by schedule_expert_for_draft().
+            # Never read by any other caller; not JSON-safe (holds a live
+            # ModelBackend), so it must never be passed to jsonify() as-is.
+            '_expert_schedule_kwargs': _expert_schedule_kwargs,
             # Additive field: observers (J282, telemetry, admin/diag) can
             # tell a hive fusion consult was fired in background.  Legacy
             # callers that don't read this field are unaffected.
@@ -853,6 +870,37 @@ class SpeculativeDispatcher:
             'energy_kwh': round(
                 self._registry.get_total_energy_kwh(hours=0.01), 6),
         }
+
+    def schedule_expert_for_draft(self, result: dict) -> bool:
+        """Actually submit the background expert task prepared by
+        dispatch_draft_first(), for THIS result.
+
+        Call this ONLY when the caller is serving ``result['response']``
+        (the draft's reply) to the user as the final answer for this
+        request — the standby-then-bubble-replace design this dispatcher
+        exists for. A caller that instead falls through to run its own
+        synchronous full turn for the same prompt (delegate routed to
+        get_ans, is_create_agent CREATE routing, a vision-keyword
+        override, ...) must NOT call this: that synchronous turn already
+        produces a real answer, so scheduling the background expert too
+        would run the identical agent turn a second time for nothing.
+        That double-submission — both sides finishing minutes apart with
+        the same reply, one thrown away — was the root cause of the
+        2026-08 duplicate-turn investigation (one speculation_id, two
+        independent [CONVERSATIONAL] turns for one user message).
+
+        Mutates ``result['expert_pending']`` to reflect whether the
+        expert was actually scheduled (the guards inside
+        _schedule_expert_background — budget, same-model check — can
+        still say no). Idempotent: a second call on the same result is a
+        no-op (the kwargs are popped on first use).
+        """
+        kwargs = result.pop('_expert_schedule_kwargs', None)
+        if not kwargs:
+            return False
+        scheduled = self._schedule_expert_background(**kwargs)
+        result['expert_pending'] = scheduled
+        return scheduled
 
     # ─── SRP helpers extracted from dispatch_draft_first ───
 

@@ -232,6 +232,7 @@ class TestDispatchDraftFirstDelegation:
              patch.object(dispatcher._expert_pool, 'submit') as mock_submit:
             result = dispatcher.dispatch_draft_first(
                 'what did we discuss earlier today', user_id='u1', prompt_id='p1')
+            dispatcher.schedule_expert_for_draft(result)
 
         assert result['delegate'] == 'local'        # escalated for the real query
         mock_submit.assert_called_once()
@@ -248,6 +249,7 @@ class TestDispatchDraftFirstDelegation:
              patch.object(dispatcher._expert_pool, 'submit') as mock_submit:
             result = dispatcher.dispatch_draft_first(
                 'write a function to reverse a list', user_id='u1', prompt_id='p1')
+            dispatcher.schedule_expert_for_draft(result)
 
         assert result['delegate'] == 'local'
         assert result['response'] == 'Working on it...'
@@ -271,6 +273,7 @@ class TestDispatchDraftFirstDelegation:
              patch.object(dispatcher._expert_pool, 'submit') as mock_submit:
             result = dispatcher.dispatch_draft_first(
                 'prove the Riemann hypothesis', user_id='u1', prompt_id='p1')
+            dispatcher.schedule_expert_for_draft(result)
 
         assert result['delegate'] == 'hive'
         assert result['expert_pending'] is True
@@ -304,6 +307,7 @@ class TestDispatchDraftFirstDelegation:
              patch.object(d, '_check_and_reserve_budget', return_value=True), \
              patch.object(d._expert_pool, 'submit') as mock_submit:
             result = d.dispatch_draft_first('hard question', user_id='u1', prompt_id='p1')
+            d.schedule_expert_for_draft(result)
 
         assert result['delegate'] == 'hive'
         assert result['expert_pending'] is True
@@ -323,10 +327,117 @@ class TestDispatchDraftFirstDelegation:
              patch.object(dispatcher._expert_pool, 'submit') as mock_submit:
             result = dispatcher.dispatch_draft_first(
                 'whatever', user_id='u1', prompt_id='p1')
+            dispatcher.schedule_expert_for_draft(result)
 
         assert result['delegate'] == 'local'
         assert result['response'].startswith('I think')
         mock_submit.assert_called_once()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Deferred expert scheduling — 2026-08 duplicate-turn fix
+#
+# dispatch_draft_first() must never submit the background expert on its
+# own. A caller (chat()) that is about to run its OWN synchronous full
+# turn for the same prompt (delegate routed to get_ans, is_create_agent
+# CREATE routing, vision override) must be free to call
+# dispatch_draft_first without ALSO triggering a redundant background
+# turn for the exact same prompt — that double-submission (one turn in
+# the background via the expert pool, one synchronous in the caller) is
+# what produced two independent [CONVERSATIONAL] replies for one user
+# message, with only one ever reaching the user.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestDeferredExpertScheduling:
+
+    def test_dispatch_draft_first_alone_never_submits(
+            self, dispatcher, monkeypatch):
+        """The classify call, by itself, must not touch the expert pool —
+        regardless of delegate. This is what lets a caller fall through
+        to its own synchronous turn without paying for a redundant
+        background one."""
+        _mock_guardrails(monkeypatch)
+        draft_raw = '{"reply": "Working on it...", "delegate": "local", "confidence": 0.4}'
+        with patch.object(dispatcher, '_dispatch_to_model',
+                          return_value=draft_raw), \
+             patch.object(dispatcher, '_record_interaction_safely'), \
+             patch.object(dispatcher, '_check_and_reserve_budget',
+                          return_value=True), \
+             patch.object(dispatcher._expert_pool, 'submit') as mock_submit:
+            result = dispatcher.dispatch_draft_first(
+                'write a function to reverse a list', user_id='u1', prompt_id='p1')
+
+        assert result['delegate'] == 'local'
+        assert result['expert_pending'] is False  # not scheduled yet
+        mock_submit.assert_not_called()
+
+    def test_schedule_expert_for_draft_fires_the_deferred_submission(
+            self, dispatcher, monkeypatch):
+        """The caller that decides to serve the draft reply as final calls
+        schedule_expert_for_draft(result) — only THEN does the expert
+        actually get submitted, and expert_pending flips to True."""
+        _mock_guardrails(monkeypatch)
+        draft_raw = '{"reply": "Working on it...", "delegate": "local", "confidence": 0.4}'
+        with patch.object(dispatcher, '_dispatch_to_model',
+                          return_value=draft_raw), \
+             patch.object(dispatcher, '_record_interaction_safely'), \
+             patch.object(dispatcher, '_check_and_reserve_budget',
+                          return_value=True), \
+             patch.object(dispatcher._expert_pool, 'submit') as mock_submit:
+            result = dispatcher.dispatch_draft_first(
+                'write a function to reverse a list', user_id='u1', prompt_id='p1')
+            mock_submit.assert_not_called()
+
+            scheduled = dispatcher.schedule_expert_for_draft(result)
+
+        assert scheduled is True
+        assert result['expert_pending'] is True
+        mock_submit.assert_called_once()
+
+    def test_schedule_expert_for_draft_is_idempotent(
+            self, dispatcher, monkeypatch):
+        """Calling schedule_expert_for_draft twice on the same result must
+        submit the expert only once — a caller that (mis)calls it from two
+        branches must not resurrect the duplicate-turn bug."""
+        _mock_guardrails(monkeypatch)
+        draft_raw = '{"reply": "Working on it...", "delegate": "local", "confidence": 0.4}'
+        with patch.object(dispatcher, '_dispatch_to_model',
+                          return_value=draft_raw), \
+             patch.object(dispatcher, '_record_interaction_safely'), \
+             patch.object(dispatcher, '_check_and_reserve_budget',
+                          return_value=True), \
+             patch.object(dispatcher._expert_pool, 'submit') as mock_submit:
+            result = dispatcher.dispatch_draft_first(
+                'write a function to reverse a list', user_id='u1', prompt_id='p1')
+            dispatcher.schedule_expert_for_draft(result)
+            second_call = dispatcher.schedule_expert_for_draft(result)
+
+        assert second_call is False
+        mock_submit.assert_called_once()
+
+    def test_not_calling_schedule_never_runs_expert(
+            self, dispatcher, monkeypatch):
+        """Simulates the fall-through callers (get_ans routing,
+        is_create_agent CREATE routing, vision override): they call
+        dispatch_draft_first and never call schedule_expert_for_draft at
+        all. No background turn must ever be submitted for them."""
+        _mock_guardrails(monkeypatch)
+        draft_raw = ('{"reply": "Working on it...", "delegate": "local", '
+                     '"confidence": 0.4, "is_create_agent": true}')
+        with patch.object(dispatcher, '_dispatch_to_model',
+                          return_value=draft_raw), \
+             patch.object(dispatcher, '_record_interaction_safely'), \
+             patch.object(dispatcher, '_check_and_reserve_budget',
+                          return_value=True), \
+             patch.object(dispatcher._expert_pool, 'submit') as mock_submit:
+            result = dispatcher.dispatch_draft_first(
+                'build me an agent that reads my email', user_id='u1', prompt_id='p1')
+            # Caller (chat()'s is_create_agent branch) falls through to its
+            # own CREATE flow here and never calls schedule_expert_for_draft.
+
+        mock_submit.assert_not_called()
+        assert result['expert_pending'] is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -832,6 +943,7 @@ class TestConfidenceFloor:
             result = dispatcher.dispatch_draft_first(
                 'what is the capital of Burkina Faso',
                 user_id='u1', prompt_id='p1')
+            dispatcher.schedule_expert_for_draft(result)
         # Draft reply still delivered as standby
         assert result['response'] == 'I think so?'
         # But delegate was promoted + expert scheduled
@@ -867,6 +979,7 @@ class TestConfidenceFloor:
              patch.object(dispatcher._expert_pool, 'submit') as mock_submit:
             result = dispatcher.dispatch_draft_first(
                 'yes or no', user_id='u1', prompt_id='p1')
+            dispatcher.schedule_expert_for_draft(result)
         assert result['delegate'] == 'local'
         mock_submit.assert_called_once()
 
@@ -883,5 +996,6 @@ class TestConfidenceFloor:
              patch.object(dispatcher._expert_pool, 'submit') as mock_submit:
             result = dispatcher.dispatch_draft_first(
                 'hi', user_id='u1', prompt_id='p1')
+            dispatcher.schedule_expert_for_draft(result)
         assert result['delegate'] == 'local'
         mock_submit.assert_called_once()
