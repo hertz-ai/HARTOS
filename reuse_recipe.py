@@ -105,8 +105,11 @@ transforms = lazy_module(
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import traceback
-import txaio; txaio.use_asyncio()  # Must be before any autobahn import
-from autobahn.asyncio.component import Component
+# NOTE: the module-level `import txaio; from autobahn... import Component` was
+# removed — the WAMP RPC path (subscribe_and_return) now lives in helper_fun, so
+# reuse_recipe no longer references autobahn/Component. The import was dead here
+# and hard-failed `import reuse_recipe` wherever autobahn isn't installed (CI base
+# install); tests/unit/test_lazy_autogen_import.py guards that import.
 
 from threadlocal import thread_local_data
 # #509: canonical tool-logging decorator — wraps each autogen tool with

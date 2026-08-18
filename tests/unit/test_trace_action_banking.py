@@ -39,8 +39,16 @@ def _load_bank_fn(tmp_path):
     helper_fun = SimpleNamespace(
         safe_prompt_path=lambda pid, flow, aid: str(
             tmp_path / f'{pid}_{flow}_{aid}.json'))
+    # create_recipe now banks the recipe via the canonical crash-safe writer
+    # (core.file_cache.atomic_json_write) instead of a bare open()+json.dump, so
+    # the extracted function needs that collaborator injected too — otherwise it
+    # NameErrors on the write and banking silently returns False.
+    if _ROOT not in sys.path:
+        sys.path.insert(0, _ROOT)
+    from core.file_cache import atomic_json_write
     ns = {
         'json': json,
+        'atomic_json_write': atomic_json_write,
         'user_tasks': {'u_test': _FakeTask()},
         'helper_fun': helper_fun,
         'current_app': SimpleNamespace(logger=MagicMock()),

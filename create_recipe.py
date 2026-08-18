@@ -42,8 +42,12 @@ from apscheduler.triggers.interval import IntervalTrigger
 from core.http_pool import pooled_get, pooled_post, pooled_patch, pooled_request
 from core.port_registry import get_port as _get_llm_port, get_local_llm_url
 from core.file_cache import atomic_json_write  # canonical atomic write (tmp + fsync + os.replace)
-import txaio; txaio.use_asyncio()  # Must be before any autobahn import
-from autobahn.asyncio.component import Component, run
+# NOTE: the module-level `import txaio; from autobahn... import Component, run`
+# was removed. The WAMP RPC path (subscribe_and_return) now lives in helper_fun,
+# so create_recipe no longer references autobahn/Component at all — the import was
+# dead here and it hard-failed `import create_recipe` wherever autobahn isn't
+# installed (e.g. CI base install, which does not carry the optional WAMP deps).
+# tests/unit/test_lazy_autogen_import.py guards against that import regressing.
 import uuid
 import asyncio
 import traceback
@@ -1494,9 +1498,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             "actions_this_action_depends_on": []
                         }
 
-                        # Save the recipe
-                        with open(vlm_agent_path, 'w') as json_file:
-                            json.dump(recipe_data, json_file, indent=4)
+                        # Save the recipe (atomic: tmp + fsync + os.replace)
+                        atomic_json_write(vlm_agent_path, recipe_data, indent=4)
 
                         tool_logger.info(f"Generated recipe data saved to {vlm_agent_path}")
 
@@ -2549,8 +2552,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                                 _ri[_rk], _ = redact_secrets(_ri[_rk])
                                 except ImportError:
                                     pass
-                                with open(name, "w") as json_file:
-                                    json.dump(json_obj, json_file)
+                                atomic_json_write(name, json_obj)
                                 #setting the action from response as current action
                                 user_tasks[user_prompt].current_action = int(json_obj['action_id'])
                                 individual_json[user_prompt] = json_obj
@@ -2597,8 +2599,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                                         _ri[_rk], _ = redact_secrets(_ri[_rk])
                                         except ImportError:
                                             pass
-                                        with open(name, "w") as json_file:
-                                            json.dump(json_obj, json_file)
+                                        atomic_json_write(name, json_obj)
                                         current_app.logger.info(f'Saved Individual recipe (late) at: {name}')
                                         user_tasks[user_prompt].current_action = int(json_obj['action_id'])
                                         individual_json[user_prompt] = json_obj
@@ -4749,8 +4750,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                             _step['agent_to_perform_this_action'] = 'Executor'
                                         else:
                                             _step['agent_to_perform_this_action'] = 'Assistant'
-                                    with open(_rfile, 'w') as _rf:
-                                        json.dump(_rj, _rf)
+                                    atomic_json_write(_rfile, _rj)
                                     current_app.logger.info(f'[FALLBACK-SAVE] Saved recipe from messages at: {_rfile}')
                                     break
                     else:
@@ -5401,8 +5401,7 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         except ImportError:
             pass
         name = helper_fun.safe_prompt_path(prompt_id, flow, action_id)
-        with open(name, 'w') as f:
-            json.dump(json_obj, f)
+        atomic_json_write(name, json_obj)
         current_app.logger.info(
             f"[TRACE-BANKED] action {action_id} recipe derived from "
             f"{len(steps)} executed step(s) -> {name}")
@@ -5946,14 +5945,12 @@ def update_agent_creation_to_db(prompt_id):
 
 def create_final_recipe_for_current_flow(flow, merged_dict, prompt_id):
     name = helper_fun.safe_prompt_path(prompt_id, flow, 'recipe')
-    # Atomic write (M3 in post-shipment review): write to temp + rename
-    # so concurrent prompts_backup.snapshot_prompts can never capture
-    # a half-written recipe file.  os.replace is atomic on the same
-    # filesystem on both Windows and POSIX.
-    tmp = name + '.tmp'
-    with open(tmp, "w") as json_file:
-        json.dump(merged_dict, json_file)
-    os.replace(tmp, name)
+    # Atomic write (M3 in post-shipment review) via the canonical helper:
+    # tmp + fsync + os.replace so concurrent prompts_backup.snapshot_prompts
+    # can never capture a half-written recipe file, and a crash mid-write leaves
+    # no stray .tmp behind (the old inline copy fsync'd nothing). os.replace is
+    # atomic on the same filesystem on both Windows and POSIX.
+    atomic_json_write(name, merged_dict)
     current_app.logger.info(f"create_final_recipe_for_current_flow Dictionary saved to {name}")
 
 
