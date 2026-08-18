@@ -340,14 +340,23 @@ in
       # it ever reported an attribute name.
       hostName = lib.mkOverride 1250 "hart-node";
       firewall = {
-        # mkDefault: the docker-server image format (nixpkgs docker-image.nix)
-        # sets networking.firewall.enable = false at normal priority for the OCI
+        # 1250, for the SAME reason as hostName above, and discovered the same
+        # way. The docker-server image format (nixpkgs docker-image.nix) sets
+        # networking.firewall.enable = false at NORMAL priority for the OCI
         # container; a plain `true` here (this base module is included by EVERY
         # variant) collided with it ("conflicting definition values"), eval-
-        # failing only the docker-server target. mkDefault yields to the
-        # container's false, while ISO/host variants — which have no competing
-        # definition — still resolve to true (unchanged firewall behaviour).
-        enable = lib.mkDefault true;
+        # failing only the docker-server target. mkDefault fixed THAT, because
+        # normal (100) beats mkDefault (1000).
+        #
+        # But virtualisation/google-compute-config.nix also disables the
+        # firewall and does it at mkDefault, which is the priority mkDefault
+        # had just moved us to, so gce-server kept eval-failing on this option
+        # even after hostName was resolved. Equal priorities conflict rather
+        # than resolve. mkOverride 1250 loses to BOTH the container's normal
+        # false and GCE's mkDefault false, and still wins on every variant that
+        # has no competing definition, so the firewall stays on exactly where
+        # it always was.
+        enable = lib.mkOverride 1250 true;
         allowedTCPPorts = [ cfg.ports.backend 22 ];
         allowedUDPPorts = [ cfg.ports.discovery ];
       };
