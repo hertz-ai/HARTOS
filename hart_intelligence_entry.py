@@ -5952,7 +5952,28 @@ class CustomGPT(LLM):
                 _err = resp_json['error']
                 _msg = _err.get('message', str(_err)) if isinstance(_err, dict) else str(_err)
                 app.logger.error(f"LLM server error: {_msg}")
-                _err_reply = f"I couldn't process that request — {_msg}"
+                # Do NOT put the upstream message in the reply.  llama-server
+                # answers 200 with {"error": {"message": "Loading model"}}
+                # while weights load, and that reached the user verbatim as
+                # "I couldn't process that request - Loading model" (live
+                # 2026-08-18, twice on "Hi!").  It leaks internal wording,
+                # reads as permanent when the state is transient, and is
+                # returned as a normal assistant turn, so it landed in
+                # conversation history and was replayed to the model as a
+                # prior turn.  The detail is already in the log line above.
+                from core.constants import (
+                    LLM_GENERIC_ERROR_REPLY,
+                    LLM_LOADING_REPLY,
+                    LLM_TRANSIENT_LOADING_MARKERS,
+                )
+                _low = (_msg or '').strip().lower()
+                if any(_m in _low for _m in LLM_TRANSIENT_LOADING_MARKERS):
+                    # Same wording routes/chatbot_routes.py sends when the
+                    # server is unreachable, so "down" and "warming up" read
+                    # identically to the user.
+                    _err_reply = LLM_LOADING_REPLY
+                else:
+                    _err_reply = LLM_GENERIC_ERROR_REPLY
                 # G12: drain SSM student future and feed distillation engine
                 _g12_finalize(prompt, _err_reply, _g12_student_future)
                 return _err_reply

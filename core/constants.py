@@ -618,6 +618,34 @@ RECIPE_SEMANTIC_TOPIC: str = 'com.hertzai.hevolve.recipe.{semantic_class}.{slug}
 # point of Tool() construction so their tools also get a friendly label.
 # Unknown tools fall back to "Running {name}…" at the emit site.
 # Keep values <= 60 chars (UI bubble truncates).
+# ── Upstream LLM states that are TRANSIENT, not failures ──────────────
+# llama-server answers HTTP 200 with {"error": {"message": "Loading model"}}
+# while weights load.  That was surfaced to the user verbatim as
+# "I couldn't process that request - Loading model" (live 2026-08-18, twice
+# in a row on "Hi!"), which leaks llama.cpp's internal wording, reads as a
+# permanent failure, and was returned as a normal assistant turn -- so it
+# was persisted into conversation history and fed back to the model as a
+# prior turn.
+#
+# The copy below is the same wording routes/chatbot_routes.py already sends
+# when the server is unreachable, so both "engine down" and "engine warming
+# up" tell the user the same thing.  Detail stays in the log, not the reply.
+LLM_TRANSIENT_LOADING_MARKERS: tuple = (
+    'loading model',
+    'model is loading',
+    'model loading',
+)
+
+LLM_LOADING_REPLY: str = (
+    "Starting the local AI engine for you now. "
+    "Give it a few seconds and send your message again."
+)
+
+LLM_GENERIC_ERROR_REPLY: str = (
+    "I ran into a problem handling that. Please try again."
+)
+
+
 TOOL_LABELS: dict = {
     # Memory + history
     'FULL_HISTORY':                'Searching your message history…',
