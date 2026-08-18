@@ -24,6 +24,25 @@ APP_TEMP_DIR = os.environ.get("APP_TEMP_DIR", "/app/temp")
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/app/uploads")
 
 
+def public_media_base() -> str:
+    """Origin that Instagram, Meta and any other fetcher can reach.
+
+    Composed from the ONE central hostname rather than a second literal, so a
+    rename lands in a single place. Overridable per node.
+    """
+    override = os.environ.get("HEVOLVE_MEDIA_BASE_URL", "").strip()
+    if override:
+        return override.rstrip("/")
+    try:
+        from core.constants import CENTRAL_HOST
+        return f"https://{CENTRAL_HOST}"
+    except Exception:
+        # A node without the constants package still returns something
+        # absolute, because a relative URL is the bug this function exists to
+        # remove.
+        return "https://azurekong.hertzai.com"
+
+
 class FileStatus(Enum):
     """File operation status."""
     PENDING = "pending"
@@ -366,8 +385,28 @@ class FileManager:
         with open(dest_path, 'wb') as f:
             f.write(content)
 
-        # Return local file URL (would be served by web server)
-        return f"/files/{file_id}/{filename}"
+        # An ABSOLUTE url on the public API origin, not "/files/...".
+        #
+        # This used to return a relative path that nothing served. Verified
+        # 2026-08-19: /files/, /api/files/ and /media/ all 404 on both
+        # azurekong.hertzai.com and hevolve.ai, and no route registered that
+        # prefix anywhere in the codebase. So every caller received a URL that
+        # could not be fetched, and the one caller that matters most fetches by
+        # URL from someone else's servers: Instagram's Content Publishing API
+        # downloads the image itself, so a relative path or a fake host means
+        # the publish fails at their fetch while publish_photo/publish_carousel
+        # look like they worked.
+        #
+        # The path rides the /api/social prefix Kong already routes publicly,
+        # which is why this needs no gateway change. A new top-level /files
+        # route would have needed one, and would have walked into the
+        # host-header trap where host-scoped Kong routes 404 from outside
+        # because the fronting nginx sends Host: 127.0.0.1.
+        #
+        # The origin is composed from core.constants.CENTRAL_HOST, the one
+        # literal for this box, rather than a second hardcoded hostname.
+        # HEVOLVE_MEDIA_BASE_URL overrides it for a node serving its own media.
+        return f"{public_media_base()}/api/social/media/{file_id}/{filename}"
 
     async def _upload_s3(
         self,
