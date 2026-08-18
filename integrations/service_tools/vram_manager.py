@@ -22,6 +22,17 @@ VRAM_BUDGETS: Dict[str, Tuple[float, float]] = {
     "wan2gp":               (8.0,  8.0),
     "ltx2":                 (6.0,  4.0),
     "minicpm":              (6.0,  4.0),
+    # Primary LLM (llama-server, Qwen3.5-4B Q4).  It is served by
+    # llama_config/llamacpp_manager, not RuntimeToolManager, so nothing
+    # calls allocate() for it -- but every OTHER selector must still
+    # subtract it or boot order decides quality.  MEASURED 2026-08-18:
+    # STT was selected 6s before llama-server started, took 3.0 GB as
+    # stt-faster-whisper-large, and the LLM ladder then computed
+    # 3.1 - 2.8 = 0.2 GB free and set n_ctx=4096 -- under the ~6.5k
+    # tokens a tool-carrying turn needs, so every agentic request failed
+    # with "request (6477 tokens) exceeds the available context size".
+    # model 2.8 GB + ~1.5 GB KV at the 12288 ctx cap = 4.3 GB min_vram.
+    "llm_main":             (4.3,  2.8),
     # STT engines
     "whisper":              (2.0,  1.5),
     "whisper_base":         (0.5,  0.2),    # faster-whisper base (CPU-friendly)
