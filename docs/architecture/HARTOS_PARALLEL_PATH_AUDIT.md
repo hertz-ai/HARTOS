@@ -67,6 +67,58 @@ palette is *shadowed* by an OLDER dup). The SEVERE findings are **long-standing 
 CLEAN.
 
 ---
+## NEW HIGH (2026-08-18) — the relay/federation endpoint has THREE names, 15 hardcodes, and ignores the router we ship
+
+WAMP is the **central relay AND federation transport** here (steward, 2026-08-18).
+That makes "where is the router" a load-bearing question, and it currently has four
+different answers:
+
+| how a caller finds the router | where | default |
+|---|---|---|
+| `WAMP_URL` via `core/wamp_url.py` | the module that calls itself *"the single place that knows both vocabularies"* | `http://localhost:8088/publish` |
+| `CBURL` | `core/peer_link/telemetry.py:98`, `core/peer_link/nat.py:217` | `ws://aws_rasa.hertzai.com:8088/ws` |
+| `CBREALM` | `telemetry.py:100` | `realm1` |
+| **hardcoded literal** | **15 files** incl. `helper.py`, `hart_intelligence_entry.py`, `create_recipe.py`, `reuse_recipe.py`, `core/peer_link/telemetry.py`, `integrations/remote_desktop/transport.py` | `ws://aws_rasa.hertzai.com:8088/ws` |
+
+**And we ship a local router.** `Nunba-HART-Companion/wamp_router.py` (37 KB,
+declared in `setup_freeze_nunba.py:527`) is an *"Embedded WAMP Router — lightweight
+pub/sub + RPC for local/bundled mode"*, `start_wamp_router(port=8088,
+host='127.0.0.1')`. So on a bundled node a router is running on `:8088` and the 15
+hardcoded call sites reach past it to an AWS box.
+
+**Why this is HIGH, not cosmetic.** In flat mode — central off, the configuration
+the charter's honesty bar demands ("pull central and watch it keep working") — the
+RPC path cannot reach the local router at all. It is not that central is preferred;
+it is that central is the *only* reachable option, in a system whose thesis is that
+it must not be. `core/peer_link/link_manager.py` already models `'regional': 50`
+relay capacity, so the mesh concept exists above a transport that cannot point at it.
+
+Observed live 2026-08-17 while bringing the shell up on a dev box:
+`crossbarhttp.ClientBadHost: <urlopen error timed out>` — the publish path timing
+out against a remote router on a machine that had a local one available.
+
+**NOT FIXED, deliberately.** A first attempt routed `helper.subscribe_and_return`
+through a new `resolve_router_url()`. It was **reverted before commit**: the run
+scripts (`scripts/run.sh:49` and friends) already export
+`WAMP_URL=ws://azurekong.hertzai.com:8088/ws`, so that change would have silently
+redirected the RPC from `aws_rasa` to `azurekong` — a different router, possibly a
+different realm — and surfaced as a timeout on the CREATE/REUSE path. Getting the
+precedence right needs the topology rules (flat → local router; regional → regional
+host; central → cloud), not a one-line resolver, and it needs a test that actually
+exercises the shipped local router. Nothing does today.
+
+**Prerequisite that is now done:** `subscribe_and_return` was consolidated to ONE
+implementation (`4b39e2d5`), so when this is fixed the change lands in one place
+instead of two.
+
+**Adjacent, unverified, same shape:** `crossbarhttp` is EXCLUDED from the frozen
+build (`setup_freeze_nunba.py:465`, "circular import issue with cx_Freeze") while
+`hart_intelligence_entry` imports it to publish. That is the same shape as the
+missing-`yaml` bug that silently disabled the langchain path in every shipped
+build. Verify against a real frozen build rather than by reading.
+
+---
+
 ## MECHANICAL BASELINE (2026-08-17) — exhaustive, not eyeballed
 
 The 2026-07-01 pass was 5 agents reading code. Reading misses things at this scale
