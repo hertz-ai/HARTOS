@@ -565,6 +565,36 @@ body.webkit-flat .hart-ambient::after {
   display: none;
 }
 
+/* 2b) ...AND THE ORB'S BLOOM WITH THEM (2026-08-18, real-HW: hovering the orb
+   froze the whole box even with the ring animations already off).
+
+   Block 2 above keeps the orb bloom on purpose -- "the colour + depth already
+   rastered once and stay". That premise holds for a static element. It does NOT
+   hold for #hart-voice-orb, because that element is a <canvas> driven by a rAF
+   loop: voiceOrbViz render() re-arms requestAnimationFrame UNCONDITIONALLY, and
+   its idle term (6*sin(2a+t*.6) + 4*sin(3a-t*.45) + 3*sin(5a+t*.7)) keeps
+   undulating even when inactive. So the canvas repaints ~60x/s forever, and each
+   repaint invalidates the two large drop-shadow blurs layered on it -- the
+   cairo/pixman floor re-blurs a 300x300 surface with a 46px AND a 64px kernel,
+   every frame. :hover then scales .hart-hero-orbwrap, enlarging that filtered
+   surface and forcing a re-raster at the new scale on top of the per-frame cost.
+
+   `animation: none` cannot stop any of this: rAF is not a CSS animation. That is
+   exactly why turning off the rotating rings did not help -- the rings WERE
+   stopped; the bloom was never the animation, it was the per-frame filter.
+
+   Same treatment, same reasoning as `body.webkit-flat .desktop-icon .di-glyph
+   .mi { filter: none }` further down, and consistent with block 3's rule that a
+   big blurred shadow must never be re-rastered per frame. The orb keeps its
+   canvas-drawn colour and glow (drawn INTO the bitmap by voiceOrbViz), so it
+   still reads as a lit orb -- only the CSS-composited halo is dropped. */
+body.gpu-software #hart-voice-orb,
+body.webkit-flat #hart-voice-orb,
+body.gpu-software .hart-hero-orbwrap.listening #hart-voice-orb,
+body.webkit-flat .hart-hero-orbwrap.listening #hart-voice-orb {
+  filter: none !important;
+}
+
 /* 3) INTERACTION FEEDBACK STAYS ALIVE ON THE SOFTWARE FLOOR (2026-07-15).
    Previously this block killed EVERY hover/focus lift on the CPU (transition:none
    + transform:none), so the desktop felt DEAD on cairo/pixman: no card lift, no
