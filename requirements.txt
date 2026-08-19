@@ -218,6 +218,23 @@ hpack==4.0.0
 hyperframe==6.0.1
 priority==2.0.0
 wsproto==1.2.0
+# hypercorn ALSO has python_version < "3.11" conditionals, and central runs
+# Python 3.10.20 -- so these are required there, not optional. Adding only the
+# unconditional five above was an incomplete fix: after they landed, central's
+# log moved from "No module named 'h2'" to "No module named 'taskgroup'" and it
+# still fell back to Waitress. Verified live in container `langchain`
+# 2026-08-19: h2/hpack/hyperframe/priority/wsproto/h11 all PRESENT,
+# `from hypercorn.asyncio import serve` still ModuleNotFoundError on taskgroup.
+#
+# exceptiongroup (L52) and typing_extensions (L184) are already pinned, so only
+# these two were missing. tomli was present by luck, not by declaration --
+# under --no-deps that is a latent break, so declare it.
+#
+# taskgroup is left unpinned deliberately: its PyPI releases are
+# prerelease-versioned, and guessing a pin blind is the riskier error than
+# letting the marker resolve it. The marker means neither installs on 3.11+.
+taskgroup ; python_version < "3.11"
+tomli==2.0.1 ; python_version < "3.11"
 watchfiles==0.19.0
 websockets==14.2
 Werkzeug==2.3.6
