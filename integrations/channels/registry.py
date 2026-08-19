@@ -70,6 +70,22 @@ class ChannelRegistry:
 
         logger.info(f"Registered channel adapter: {adapter.name}")
 
+        # Wake the realtime router for channels registered AFTER boot.
+        # Nunba's _wamp_is_needed() gate runs once at startup, so a channel
+        # added later (admin UI, adapter auto-start) left cross-process push
+        # on the SSE fallback until restart.  wamp_router.ensure_wamp_running()
+        # was written for exactly this and had zero callers, because HARTOS
+        # cannot import Nunba -- the shared EventBus is the seam that can
+        # cross that boundary.  Same 'web is exempt' rule the boot gate uses.
+        # emit_event is best-effort and no-ops when the platform is not
+        # bootstrapped, so this stays safe on cloud/regional topologies too.
+        if adapter.name != 'web':
+            try:
+                from core.platform.events import emit_event
+                emit_event('channel.registered', {'name': adapter.name})
+            except Exception as _e:
+                logger.debug("channel.registered emit skipped: %s", _e)
+
     def unregister(self, channel_name: str) -> None:
         """Unregister a channel adapter."""
         if channel_name in self._adapters:

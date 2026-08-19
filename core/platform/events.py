@@ -80,7 +80,15 @@ def _wamp_to_local(uri: str) -> Optional[str]:
 # this dual-bridge race (bus.chat.pupit + chat.pupit + message all
 # fired in 10ms).  Adding the denylist entry keeps `bus.*` events
 # HARTOS-internal while preserving the canonical SSE leg.
-_SSE_DENYLIST_PREFIXES: tuple = ('bus.',)
+_SSE_DENYLIST_PREFIXES: tuple = (
+    'bus.',
+    # Internal control signals, never a UI feed.  'channel.registered'
+    # exists so Nunba can re-evaluate whether the WAMP router should be
+    # running (main.py _wamp_ensure_if_needed).  No SSE client consumes
+    # it, and without this it trips the P3a no-user_id guard and logs a
+    # warning on every channel registration.
+    'channel.',
+)
 
 
 # P3a (2026-05-26) — topics that are INTENTIONALLY broadcast to every
