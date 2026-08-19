@@ -1310,6 +1310,15 @@ fn present_surfaces<R>(
     elements: &[HartRenderElement<R>],
     clear: Color32F,
     now: std::time::Instant,
+    // Diagnostic context for the silent-freeze beacon ONLY (never a render input).
+    // These are the two collections the frame-callback loop in run_udev walks, so
+    // they answer the question the first beacon could not: is the client starving
+    // because we are sending it nothing? A client that never receives a frame
+    // callback stops committing, and then "render_frame says nothing changed" is
+    // TRUE but is a SYMPTOM, not the cause. layer_count == 0 means the glass shell's
+    // wlr-layer surface is not in the map we send callbacks to.
+    space_count: usize,
+    layer_count: usize,
 ) -> bool
 where
     R: Renderer + Bind<Dmabuf>,
@@ -1389,15 +1398,24 @@ where
                         warn!(
                             ?crtc,
                             elements = elements.len(),
+                            // The two collections run_udev's frame-callback loop walks.
+                            // THE question the first beacon could not answer: a client
+                            // that receives no frame callback stops committing, and then
+                            // "nothing changed" is TRUE but is the SYMPTOM. If
+                            // layer_surfaces == 0 while the glass shell is on screen, we
+                            // are starving it and the freeze starts here, not in damage.
+                            space_windows = space_count,
+                            layer_surfaces = layer_count,
                             // `as u64`: Duration::as_millis is u128, which does NOT
                             // implement tracing::Value — it would not compile as a field.
                             frozen_for_ms = frozen_for.map(|d| d.as_millis() as u64).unwrap_or(0),
                             awaiting_vblank = surface.awaiting_vblank,
                             master = device_master,
                             "HART-comp DRM: SILENT FREEZE — render_frame reports \"nothing changed\" \
-                             but this CRTC has not presented in a long time. elements=0 means the \
-                             scene collapsed upstream (build_frame_elements); elements>0 means the \
-                             DrmCompositor's damage tracking is wedged."
+                             but this CRTC has not presented in a long time. layer_surfaces=0 means \
+                             the shell is being sent NO frame callbacks (it can never commit again, \
+                             so this is a symptom); layer_surfaces>0 with elements>0 means the scene \
+                             is intact and reaching the client, and the damage tracking is wedged."
                         );
                     }
                     continue;
@@ -1509,11 +1527,20 @@ fn render_all(
     // disjointly. GlesRenderer satisfies the builder's `Renderer + ImportAll + ImportMem`
     // bounds (proven by winit.rs) AND `present_surfaces`'s `Bind<Dmabuf>` bound, so the
     // GPU desktop gets the SAME cursor / kill-switch / fades with ZERO parallel render code.
+    // Diagnostic counts for the silent-freeze beacon: EXACTLY the two collections
+    // run_udev's frame-callback loop walks, sampled here where `state` is borrowable.
+    // The layer-map guard is scoped so it is dropped before the render borrows below.
+    let space_count = state.space.elements().count();
+    let layer_count = {
+        let map = layer_map_for_output(&state.output);
+        map.layers().count()
+    };
+
     let mut demote_gles = false;
     if let Some(renderer) = gles.as_mut() {
         let elements: Vec<HartRenderElement<GlesRenderer>> =
             comp_core::build_frame_elements(state, renderer, size);
-        demote_gles = present_surfaces(devices, renderer, &elements, clear, now);
+        demote_gles = present_surfaces(devices, renderer, &elements, clear, now, space_count, layer_count);
     } else {
         // ── Pixman software-floor path (the never-fail renderer of record) ── The renderer
         // lives ON `state`, but `build_frame_elements` needs BOTH `&mut state` (reads the
@@ -1534,7 +1561,7 @@ fn render_all(
         // The pixman floor has NO lower renderer to demote to, so its renderer-fault return
         // is ignored (a pixman RenderFrame fault is a transient retried next tick — there is
         // no GL context to lose on the CPU path).
-        let _ = present_surfaces(devices, &mut renderer, &elements, clear, now);
+        let _ = present_surfaces(devices, &mut renderer, &elements, clear, now, space_count, layer_count);
         // Restore the real renderer (keeping the ORIGINAL instance avoids re-allocating its
         // internal caches every tick).
         state.renderer = renderer;
