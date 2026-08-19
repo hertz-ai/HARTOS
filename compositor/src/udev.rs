@@ -736,10 +736,11 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     info!(socket = %socket_name, "HART-comp DRM compositor initialized — entering the loop (real-HW scanout on the pixman floor)");
 
-    // Monotonic base for the frame-callback timestamps sent below. See the note there:
-    // this backend used to send a CONSTANT 0, which is what froze the desktop on any
-    // interaction. winit.rs has always derived its timestamp from `state.start_time`;
-    // the udev State has no such field, so the base is captured here instead.
+    // Monotonic base for the frame-callback timestamps sent below. This backend used to
+    // send a CONSTANT 0, which is wrong per the wl_callback protocol (see the note there,
+    // including the correction that it was NOT the cause of the desktop freeze).
+    // winit.rs has always derived its timestamp from `state.start_time`; the udev State
+    // has no such field, so the base is captured here instead.
     let frame_clock_base = std::time::Instant::now();
 
     while state.running {
@@ -779,28 +780,24 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         //
         // A REAL MONOTONIC TIMESTAMP, NOT 0 (real-HW 2026-08-19). This line used to read
         // `let now_ms = 0u32;` with the comment "monotonic ms is unused by the shell; 0 is
-        // a valid now". That assumption is wrong, and it is what froze the desktop on
-        // every orb hover / click-drag.
+        // a valid now". That assumption is wrong on its own terms, and this fixes it.
+        //
+        // CORRECTION, so the next reader is not misled the way I was: the original commit
+        // message for this change (79391a6) claimed it was THE fix for the orb-hover /
+        // click-drag desktop freeze. IT IS NOT. With this change in place and verified
+        // live on the box, the freeze still reproduces on the first orb click. It was
+        // later reproduced with the GStreamer audio path removed entirely, and on wholly
+        // stock code, so the freeze has a different cause that is still open. What
+        // remains true of this line is only the protocol point below.
         //
         // wl_callback.done carries the frame time in MILLISECONDS, and GTK4's Wayland
-        // backend feeds it straight into its frame clock, which derives the refresh
-        // interval and the predicted presentation time from successive values. Hand it a
-        // constant and no time ever passes: an animation started by an interaction (the
-        // orb's :hover scale transition, the 1:1 transform of a drag) can never advance,
-        // so the client stops requesting frames and stops committing buffers ALTOGETHER.
-        // The compositor is then correct but useless -- it reports "nothing changed"
-        // forever because genuinely nothing does.
+        // backend feeds it into its frame clock, which derives the refresh interval and
+        // the predicted presentation time from successive values. A constant is simply
+        // wrong to send, whatever else is or is not true about it.
         //
-        // The evidence chain, since three earlier theories died on this freeze:
-        //   * the silent-freeze beacon reported elements=2, awaiting_vblank=false,
-        //     master=true, frozen_for 58s -- the scene INTACT and the compositor healthy,
-        //     which is what ruled out the render path and pointed back at the client
-        //   * hart-comp's loop kept running at 66 wakeups/sec; the GTK host's main thread
-        //     sat in poll() at ~0% CPU, alive and waiting rather than deadlocked
-        //   * a fresh unrelated Wayland client could still connect and open a toplevel
-        //   * winit.rs, the DEV/VM backend, has ALWAYS sent
-        //     `state.start_time.elapsed().as_millis()`. Only this hardware path sent 0 --
-        //     which is exactly why every VM test in CI passes and only the real box hangs.
+        // winit.rs, the dev/VM backend, has ALWAYS sent
+        // `state.start_time.elapsed().as_millis()`; only this hardware path sent 0. The
+        // udev State has no start_time field, so the base is captured at the loop above.
         let now_ms = frame_clock_base.elapsed().as_millis() as u32;
         let surfaces: Vec<_> = state
             .space
