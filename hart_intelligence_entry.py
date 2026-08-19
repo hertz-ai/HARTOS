@@ -12289,24 +12289,20 @@ def _serve_app(app, host: str, port: int) -> None:
     try:
         import asyncio
         from concurrent.futures import ThreadPoolExecutor
+        from core.serve import build_asgi_app, make_hypercorn_config
         from hypercorn.asyncio import serve as _hcserve
-        from hypercorn.config import Config
-        from hypercorn.middleware import AsyncioWSGIMiddleware
 
-        config = Config()
-        config.bind = [f'{host}:{port}']
-        config.keep_alive_timeout = 120     # SSE-friendly long polls
-        config.h11_max_incomplete_size = 16 * 1024 * 1024  # 16MB request bodies
-        config.accesslog = None             # HARTOS emits its own access log
-        config.errorlog = '-'
-
-        # AsyncioWSGIMiddleware is WSGI and cannot see a websocket scope, which
-        # is why ws://<this node>/peer_link 404s and why PeerLink.accept() has
-        # never once been called on any node.  peer_link_asgi serves exactly
-        # that one path and passes every other scope straight through, so the
-        # HTTP surface is unchanged.  See core/peer_link/server.py.
-        from core.peer_link.server import peer_link_asgi
-        asgi_app = peer_link_asgi(AsyncioWSGIMiddleware(app))
+        # core.serve owns what all three entry points share: these four Config
+        # settings and the peer_link-capable ASGI wrapping.  This one, Nunba
+        # app.py and Nunba main.py each carried their own copy, which is how
+        # the peer_link mount ended up on one of the three while the other two
+        # answered 403 on /peer_link.  What this function legitimately varies
+        # stays here: bind, HEVOLVE_WORKER_THREADS=256, thread prefix 'hartos',
+        # and the ImportError fallback to Waitress below.  Config and
+        # AsyncioWSGIMiddleware are imported inside core.serve, so a missing
+        # hypercorn still raises ImportError in this try block.
+        config = make_hypercorn_config([f'{host}:{port}'])
+        asgi_app = build_asgi_app(app)
 
         async def _runner():
             loop = asyncio.get_running_loop()
