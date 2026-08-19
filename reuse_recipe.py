@@ -3414,25 +3414,86 @@ def _salvage_assistant_reply(messages) -> Optional[str]:
     Unlike _extract_conversational_reply this ignores is_casual/delegate/
     is_create_agent (we are past the point where routing could have helped) but
     keeps the template-echo guard, so the prompt skeleton is never surfaced.
+
+    Two message shapes reach this function, and both are salvageable:
+    structured JSON (``{"reply": ..., "delegate": ...}``, the draft/
+    classifier-style format) and plain prose (the recipe/task-execution
+    GroupChat's own persona replies, e.g. "auto.agent8888").  Only the JSON
+    shape was handled until 2026-08-19 -- confirmed live on a real REUSE-loop
+    abort (agent 8888, "what is the weather in chennai today"): the model
+    produced a good, honestly-hedged answer twice in plain prose
+    ("I can't access real-time data right now... likely warm and humid...")
+    and the loop still discarded it for the generic apology, because
+    retrieve_json() cannot parse prose and the function silently skipped
+    every candidate. Plain prose is tried as a fallback ONLY after the JSON
+    shape fails for a given message, so a message that legitimately contains
+    a JSON envelope is still read from its 'reply' field, never its raw
+    (JSON-shaped) text.
+
+    Unverified-claim caveat (2026-08-19): confirmed live on a second
+    REUSE-loop abort, same agent, "what is the latest news in chennai
+    politics today" -- the Assistant stated a specific, wrong headline
+    ("CM E. Vaiko's health scare") BEFORE any tool had run at all. A
+    subtask then dispatched a real tool (crawl4ai_crawl, a genuine fetch of
+    timesofindia.indiatimes.com that succeeded) trying to verify/replace it,
+    but the turn deadline hit before the Assistant got another turn to
+    synthesize an answer from that real data -- so the premature, unverified
+    guess is what survived to be salvaged. If a tool call happened AFTER the
+    candidate reply with no later Assistant message answering from its
+    result, that reply was never confirmed -- say so, rather than presenting
+    a guess as settled fact. This is strictly a phrasing safeguard: it does
+    not change WHICH reply is chosen, only whether it is honestly labelled.
     """
     try:
-        for _msg in reversed(list(messages or [])):
+        _msgs = list(messages or [])
+        for _idx in range(len(_msgs) - 1, -1, -1):
+            _msg = _msgs[_idx]
             if not isinstance(_msg, dict):
                 continue
             if _msg.get('name') not in ('Assistant', 'assistant'):
                 continue
-            _obj = retrieve_json(_msg.get('content') or '')
-            if not isinstance(_obj, dict):
+            # A tool's OWN response is attributed name="Assistant" too (the
+            # tool call was Assistant's), role="tool" -- confirmed live in a
+            # real transcript. That's tool output, never an Assistant reply;
+            # without this check a raw scraped-page dump could be salvaged
+            # as if the model had said it.
+            if _msg.get('role') == 'tool':
                 continue
-            _reply = _obj.get('reply')
+            _content = _msg.get('content') or ''
+            _obj = retrieve_json(_content)
+            if isinstance(_obj, dict):
+                _reply = _obj.get('reply')
+            elif isinstance(_content, str):
+                _reply = _content
+            else:
+                continue
             if not isinstance(_reply, str) or not _reply.strip():
                 continue
             if _is_template_echo(_reply):
                 continue      # keep scanning: an echo is not an answer
-            return _reply.strip()
+            _reply = _reply.strip()
+            if _tool_activity_after(_msgs, _idx):
+                _reply += (
+                    "\n\n(Note: I couldn't fully verify this before running "
+                    "out of time -- treat it as a best guess, not a "
+                    "confirmed fact.)")
+            return _reply
     except Exception:
         return None
     return None
+
+
+def _tool_activity_after(messages: list, index: int) -> bool:
+    """True if any tool call/response appears strictly after ``index`` in
+    ``messages`` -- evidence a verification attempt started but the
+    candidate reply at ``index`` predates (and was never updated by) it."""
+    for _later in messages[index + 1:]:
+        if not isinstance(_later, dict):
+            continue
+        if _later.get('role') == 'tool' or _later.get('tool_calls') or \
+                _later.get('tool_responses'):
+            return True
+    return False
 
 
 def _extract_conversational_reply(messages) -> Optional[str]:

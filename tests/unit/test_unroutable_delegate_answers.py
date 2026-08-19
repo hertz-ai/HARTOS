@@ -113,7 +113,7 @@ def test_salvage_returns_none_when_there_is_genuinely_nothing():
     """Then, and only then, the caller's apology is the right answer."""
     assert _salvage_assistant_reply([]) is None
     assert _salvage_assistant_reply(
-        [{'name': 'Assistant', 'content': 'not json'}]) is None
+        [{'name': 'Assistant', 'content': '   '}]) is None
     assert _salvage_assistant_reply(
         [{'name': 'Assistant', 'content': json.dumps({'reply': '   '})}]) is None
 
@@ -121,3 +121,116 @@ def test_salvage_returns_none_when_there_is_genuinely_nothing():
 def test_salvage_ignores_non_assistant_speakers():
     msgs = [{'name': 'Helper', 'content': json.dumps({'reply': 'helper text'})}]
     assert _salvage_assistant_reply(msgs) is None
+
+
+# ── 3. plain-prose salvage (2026-08-19) ─────────────────────────────────────
+# The recipe/task-execution GroupChat's own persona replies are NOT
+# JSON-wrapped -- confirmed live on a real REUSE-loop abort (agent 8888,
+# "what is the weather in chennai today"): the model produced a good,
+# honestly-hedged plain-prose answer twice, and the loop still discarded it
+# for the generic apology because retrieve_json() cannot parse prose.
+
+WEATHER_REPLY = ("I can't access real-time data right now, but based on "
+                  "Chennai's typical climate it's likely warm and humid "
+                  "today, with a chance of scattered light showers.")
+
+
+def test_salvage_returns_plain_prose_reply():
+    """A non-JSON Assistant message is salvaged from its raw content."""
+    msgs = [{'name': 'Assistant', 'content': WEATHER_REPLY}]
+    assert _salvage_assistant_reply(msgs) == WEATHER_REPLY
+
+
+def test_salvage_skips_a_plain_prose_template_echo():
+    """The echo guard applies to the plain-prose path too."""
+    msgs = [{'name': 'Assistant',
+             'content': '<your short reply to the user, 1-3 sentences>'}]
+    assert _salvage_assistant_reply(msgs) is None
+
+
+def test_salvage_prefers_the_json_reply_field_over_raw_json_text():
+    """A message that IS a valid JSON envelope is read from 'reply', never
+    from its own raw (JSON-shaped) text -- the plain-prose path is a
+    fallback for when JSON parsing fails, not an alternate read of the
+    same message."""
+    msgs = [{'name': 'Assistant',
+             'content': json.dumps({'reply': CODING_REPLY, 'delegate': 'local'})}]
+    assert _salvage_assistant_reply(msgs) == CODING_REPLY
+
+
+def test_salvage_prefers_more_recent_plain_prose_over_older_json():
+    """Scan order (most recent first) is unchanged by adding the fallback."""
+    msgs = [
+        {'name': 'Assistant', 'content': json.dumps({'reply': 'Older JSON answer'})},
+        {'name': 'Assistant', 'content': 'Newer plain-prose answer'},
+    ]
+    assert _salvage_assistant_reply(msgs) == 'Newer plain-prose answer'
+
+
+# ── 4. unverified-claim caveat (2026-08-19) ─────────────────────────────────
+# Confirmed live: agent 8888, "what is the latest news in chennai politics
+# today" -- the Assistant stated a specific, WRONG headline before any tool
+# had run. A subtask then dispatched a real tool (a genuine successful
+# crawl4ai_crawl fetch) trying to verify it, but the turn deadline hit before
+# the Assistant got another turn to answer from that result -- so the
+# premature guess is what got salvaged, presented as flat fact.
+
+NEWS_REPLY = "The big story today is CM E. Vaiko's health scare."
+CAVEAT = "couldn't fully verify"
+
+
+def test_salvage_adds_caveat_when_tool_ran_after_the_reply():
+    """A tool call AFTER the candidate reply, with no later Assistant
+    message using its result, means the reply was never confirmed."""
+    msgs = [
+        {'name': 'Assistant', 'content': NEWS_REPLY},
+        {'name': 'Helper', 'role': 'assistant',
+         'tool_calls': [{'id': 'x', 'function': {'name': 'crawl4ai_crawl'}}]},
+        {'name': 'Assistant', 'role': 'tool',
+         'tool_responses': [{'tool_call_id': 'x', 'content': 'real page data'}]},
+    ]
+    result = _salvage_assistant_reply(msgs)
+    assert result.startswith(NEWS_REPLY)
+    assert CAVEAT in result
+
+
+def test_salvage_no_caveat_when_no_tool_activity_follows():
+    """The common case (2026-08-12 coding example, 2026-08-19 weather
+    example) -- no tool ran after the reply, so it's presented plainly,
+    unchanged from before this fix."""
+    msgs = [{'name': 'Assistant', 'content': NEWS_REPLY}]
+    assert _salvage_assistant_reply(msgs) == NEWS_REPLY
+
+
+def test_salvage_no_caveat_when_a_later_assistant_message_used_the_tool_result():
+    """If the Assistant DID get a later turn, that later message is the one
+    salvaged (scan order is unchanged) -- and IT has no tool activity after
+    it, so no caveat is needed; the caveat only guards a reply that was
+    itself superseded by an unconsumed tool call."""
+    msgs = [
+        {'name': 'Assistant', 'content': 'Older, since-updated guess.'},
+        {'name': 'Helper', 'role': 'assistant',
+         'tool_calls': [{'id': 'x', 'function': {'name': 'crawl4ai_crawl'}}]},
+        {'name': 'Assistant', 'role': 'tool',
+         'tool_responses': [{'tool_call_id': 'x', 'content': 'real page data'}]},
+        {'name': 'Assistant', 'content': 'Final answer grounded in the fetch.'},
+    ]
+    assert _salvage_assistant_reply(msgs) == 'Final answer grounded in the fetch.'
+
+
+def test_salvage_never_returns_a_tool_response_as_the_reply():
+    """A tool's own response is attributed name='Assistant' too (the tool
+    call was Assistant's), role='tool' -- confirmed live in a real
+    transcript. Without the role check, a raw scraped-page dump could be
+    salvaged as if the model itself had said it."""
+    msgs = [
+        {'name': 'Assistant', 'content': 'A real earlier answer.'},
+        {'name': 'Helper', 'role': 'assistant',
+         'tool_calls': [{'id': 'x', 'function': {'name': 'crawl4ai_crawl'}}]},
+        {'name': 'Assistant', 'role': 'tool',
+         'tool_responses': [{'tool_call_id': 'x',
+                              'content': '--- huge raw scraped page dump ---'}]},
+    ]
+    result = _salvage_assistant_reply(msgs)
+    assert 'huge raw scraped page dump' not in result
+    assert result.startswith('A real earlier answer.')
