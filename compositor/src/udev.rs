@@ -177,6 +177,13 @@ struct SurfaceData {
     /// retries, so one dropped vblank degrades to a stutter — NOT a permanent freeze that
     /// the paint watchdog would turn into a boot loop (#166 + #186 robustness).
     flip_queued_at: Option<std::time::Instant>,
+    /// When this CRTC last actually PRESENTED (a flip was queued successfully). `None`
+    /// until the first. Diagnostic only: it feeds the silent-freeze beacon below and
+    /// changes no scheduling decision.
+    last_flip_at: Option<std::time::Instant>,
+    /// Rate-limiter for that beacon, so a frozen CRTC logs once every
+    /// `SILENT_FREEZE_LOG_EVERY` instead of 60 times a second.
+    last_stall_log_at: Option<std::time::Instant>,
 }
 
 /// If a queued page-flip's vblank has not arrived within this long, assume it was lost
@@ -184,6 +191,30 @@ struct SurfaceData {
 /// comfortably past a real vblank (16.7ms) so we never pre-empt a healthy flip, but short
 /// enough that a dropped vblank is an imperceptible stutter rather than a frozen screen.
 const VBLANK_STALL_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// SILENT-FREEZE BEACON (real-HW 2026-08-19). The box froze on an orb click+drag and
+/// left NO evidence: hart-comp's loop kept running at its full 66 wakeups/sec, the
+/// Wayland side stayed healthy (a fresh client connected, and a brand-new toplevel was
+/// accepted and logged as window.opened), the cursor still moved, the GPU was awake with
+/// zero i915 errors — and yet nothing was ever presented again, for ANY client. The new
+/// window never appeared either, which is what rules the shell out as the cause.
+///
+/// Every FAILURE path in `present_surfaces` already logs (queue_frame errors,
+/// render_frame faults, the lost-vblank recovery). None of them fired. By elimination
+/// the tick is taking the ONE silent path, `Ok(true) => continue` ("render_frame says
+/// nothing changed"), on every tick forever — which cannot be a scheduling stall,
+/// because RepaintScheduler's 200ms IDLE_HEARTBEAT forces a paint attempt 5x/sec
+/// regardless of damage.
+///
+/// So the question this beacon exists to answer is precisely: when the screen is frozen
+/// but the loop is healthy, what does the render path actually SEE? It reports the
+/// element count it was handed, the per-CRTC flip state, and how long since this CRTC
+/// last presented. Diagnostic ONLY: it never changes a scheduling decision, so it cannot
+/// perturb the thing it is measuring.
+const SILENT_FREEZE_AFTER: Duration = Duration::from_secs(3);
+/// Rate-limit for the beacon: once per this interval per CRTC, so a permanently frozen
+/// output produces a readable trail instead of flooding the journal at 60Hz.
+const SILENT_FREEZE_LOG_EVERY: Duration = Duration::from_secs(5);
 
 /// One opened DRM device (the GPU) + its per-CRTC scanout surfaces. Held in the loop
 /// data so the VBlank handler can find the right surface to mark submitted + re-queue.
@@ -933,7 +964,18 @@ fn device_added(
         .map_err(|e| format!("DrmCompositor::new failed: {e}"))?;
         surfaces.insert(
             crtc,
-            SurfaceData { compositor, awaiting_vblank: false, flip_queued_at: None },
+            SurfaceData {
+                compositor,
+                awaiting_vblank: false,
+                flip_queued_at: None,
+                // Seeded at construction, NOT None: the beacon measures "how long since
+                // anything reached this CRTC's screen", and a surface that never presents
+                // AT ALL is the most serious version of that, not a case to stay silent
+                // on. Seeding makes never-first-paint report after SILENT_FREEZE_AFTER
+                // instead of being swallowed by an `unwrap_or(false)`.
+                last_flip_at: Some(std::time::Instant::now()),
+                last_stall_log_at: None,
+            },
         );
         info!(crtc = ?crtc, "HART-comp DRM: output online (pixman scanout)");
     }
@@ -1257,6 +1299,10 @@ where
         if !device.master {
             acquire_drm_master(device);
         }
+        // Copied out BEFORE the surfaces loop: the loop takes `device.surfaces` mutably,
+        // so reading `device.master` inside it would be a second borrow. Diagnostic only
+        // (the silent-freeze beacon reports whether we still hold DRM master).
+        let device_master = device.master;
         for (crtc, surface) in device.surfaces.iter_mut() {
             // F1 (#166): never start a new flip while the prior one is still in flight to
             // this CRTC — wait for its vblank (which clears `awaiting_vblank` in
@@ -1290,6 +1336,39 @@ where
             match render_outcome {
                 Ok(true) => {
                     // Nothing changed — no flip to schedule, no vblank to await.
+                    //
+                    // This is the ONLY silent path in this match, and the 2026-08-19
+                    // freeze proved it can also be the WRONG answer: taken forever while
+                    // a real client (and even a freshly mapped toplevel) is on screen and
+                    // never gets presented. Report it when it persists, with the state
+                    // that decides which of the two it is: `elements` is what the render
+                    // path was actually handed, so elements=0 means the scene collapsed
+                    // upstream in build_frame_elements, while a NON-zero count means the
+                    // scene is intact and the DrmCompositor's own damage tracking is
+                    // wedged. Those need opposite fixes, which is the whole reason this
+                    // logs rather than guesses.
+                    let frozen_for = surface.last_flip_at.map(|t| now.saturating_duration_since(t));
+                    let overdue = frozen_for.map(|d| d >= SILENT_FREEZE_AFTER).unwrap_or(false);
+                    let due_to_log = surface
+                        .last_stall_log_at
+                        .map(|t| now.saturating_duration_since(t) >= SILENT_FREEZE_LOG_EVERY)
+                        .unwrap_or(true);
+                    if overdue && due_to_log {
+                        surface.last_stall_log_at = Some(now);
+                        warn!(
+                            ?crtc,
+                            elements = elements.len(),
+                            // `as u64`: Duration::as_millis is u128, which does NOT
+                            // implement tracing::Value — it would not compile as a field.
+                            frozen_for_ms = frozen_for.map(|d| d.as_millis() as u64).unwrap_or(0),
+                            awaiting_vblank = surface.awaiting_vblank,
+                            master = device_master,
+                            "HART-comp DRM: SILENT FREEZE — render_frame reports \"nothing changed\" \
+                             but this CRTC has not presented in a long time. elements=0 means the \
+                             scene collapsed upstream (build_frame_elements); elements>0 means the \
+                             DrmCompositor's damage tracking is wedged."
+                        );
+                    }
                     continue;
                 }
                 Ok(false) => match surface.compositor.queue_frame(()) {
@@ -1297,6 +1376,9 @@ where
                     Ok(()) => {
                         surface.awaiting_vblank = true;
                         surface.flip_queued_at = Some(now);
+                        // This CRTC just presented. Sole input to the silent-freeze
+                        // beacon's "how long since anything reached the screen".
+                        surface.last_flip_at = Some(now);
                     }
                     Err(err) => {
                         // A flip/commit ioctl error (the real-HW EACCES/EBUSY/ENODEV/
