@@ -385,6 +385,34 @@ jobs:
           echo ""
           echo "Build successful!"
 
+      # ── hart-comp binary, downloadable, for a LIVE BINARY SWAP (2026-08-19) ──
+      # The compositor is the ONE component that cannot be iterated on the real
+      # box. Everything else in the shell is served text (CSS/JS), so a bind-mount
+      # over the store path plus a shell restart is enough to test a fix in
+      # seconds. hart-comp is Rust, and the HART box can neither build it nor host
+      # a build: cargo/rustc there are rustup SHIMS with no default toolchain
+      # installed, and it has 3.3G free against a 23G store.
+      #
+      # So publish the built binary. The change that motivated this is source-only
+      # against the same nixpkgs pin, so the binary's RUNPATH resolves entirely
+      # against store paths the box already has -- which is what makes dropping it
+      # in (bind-mount over the wrapper's target, restart the tier) viable without
+      # importing a closure or reflashing a 28G image to test one diagnostic.
+      - name: Stage hart-comp binary for download
+        if: matrix.target == 'hart-comp'
+        run: |
+          set -o pipefail
+          out=$(tail -1 /tmp/build-output.txt)
+          echo "store path: $out"
+          mkdir -p /tmp/hart-comp-bin
+          cp -v "$out/bin/hart-comp" /tmp/hart-comp-bin/
+          printf '%s\n' "$out" > /tmp/hart-comp-bin/STORE_PATH
+          # The receiving side verifies this before swapping anything in: a
+          # truncated or wrong-arch download must fail loudly at the box, not
+          # silently produce a compositor that will not start.
+          sha256sum /tmp/hart-comp-bin/hart-comp | tee /tmp/hart-comp-bin/SHA256
+          ls -l /tmp/hart-comp-bin/
+
       # Five raw-desktop builds died silently after ~50 minutes, each time straight
       # after the filesystem was written, with the builder printing NOTHING even
       # under -L. Silence is not evidence, and guessing a cause per 50-minute
@@ -472,6 +500,7 @@ jobs:
           path: |
             /tmp/build-output.txt
             /tmp/*.torrent
+            /tmp/hart-comp-bin/**
           retention-days: 7
 
   # ─── Summary ───────────────────────────────────────────────
