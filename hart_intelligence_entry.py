@@ -8705,6 +8705,20 @@ def _optional_capability_missing(exc):
 @app.route('/chat', methods=['POST'])
 @_mark_foreground
 def chat():
+    # TEMP DIAGNOSTIC (2026-08-19) -- pin the exact double-entry point.
+    # Gated off by default; remove once the caller is identified.
+    if os.environ.get('HEVOLVE_CHAT_ENTRY_TRACE', '').lower() in ('1', 'true', 'yes'):
+        import uuid as _uuid_dbg
+        import threading as _th_dbg
+        _entry_id = _uuid_dbg.uuid4().hex[:8]
+        try:
+            _raw_body = request.get_data(cache=True, as_text=True)
+        except Exception as _rb_e:
+            _raw_body = f'<unreadable: {_rb_e}>'
+        app.logger.warning(
+            f'[CHAT-ENTRY-TRACE] id={_entry_id} thread={_th_dbg.current_thread().name} '
+            f'remote={request.remote_addr!r} body_len={len(_raw_body)} '
+            f'body={_raw_body[:200]!r}')
     # ── G6: Authentication gate ──
     # Three-layer auth: API key > JWT > body user_id (backward compat)
     # HEVOLVE_API_KEY env var: if set, all requests MUST provide it.

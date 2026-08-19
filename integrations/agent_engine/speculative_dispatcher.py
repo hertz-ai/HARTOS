@@ -1746,6 +1746,15 @@ class SpeculativeDispatcher:
     def _dispatch_expert_langchain(self, model, prompt: str, user_id: str,
                                    prompt_id: str, goal_type: str,
                                    goal_id: Optional[str]) -> str:
+        # TEMP DIAGNOSTIC (2026-08-19) -- capture the call stack of whoever
+        # invokes this, to pin the exact duplicate-turn caller.
+        import os as _os_dbg
+        if _os_dbg.environ.get('HEVOLVE_CHAT_ENTRY_TRACE', '').lower() in ('1', 'true', 'yes'):
+            import traceback as _tb_dbg
+            logger.warning(
+                '[EXPERT-DISPATCH-CALLER] user_id=%r prompt_id=%r model=%r\n%s',
+                user_id, prompt_id, getattr(model, 'model_id', model),
+                ''.join(_tb_dbg.format_stack()[-15:]))
         """Send the expert turn through the right transport for its tier.
 
         - ``model.is_local=True``:  route through the FULL HARTOS /chat
@@ -1880,103 +1889,90 @@ class SpeculativeDispatcher:
     def _dispatch_to_model(self, model: 'ModelBackend', prompt: str,
                            user_id: str, prompt_id: Optional[str],
                            goal_type: str, goal_id: str = None) -> str:
-        """Send prompt to a specific model via /chat endpoint with config override.
+        """Send prompt directly to the draft/fast model's own server.
 
-        Always passes ``speculative=False`` and ``draft_first=False`` on the
-        inner call so the dispatcher can never recursively re-enter itself
-        when HEVOLVE_DRAFT_FIRST or the legacy speculative flag is enabled
-        upstream. The outer chat route triggered us, and that's where the
-        decision to speculate was made.
+        MUST NOT round-trip through /chat, in ANY deployment mode.  Until
+        2026-08-19 the HTTP (non-bundled/standalone) branch here did exactly
+        that — POSTed to ``{base_url}/chat`` with ``create_agent=True,
+        autonomous=True`` (see ``_build_dispatch_payload``), which re-enters
+        the FULL HARTOS pipeline: auth, guardrails, and — for any agent-bound
+        prompt_id — a complete ``chat_agent()`` autogen turn.  So every
+        "cheap" draft classification call was, in standalone mode, exactly as
+        expensive as a real turn: confirmed live via a chat-entry trace
+        showing the self-POST land back in ``chat()`` ~13ms after the
+        original request, well before draft-tier work could plausibly have
+        finished, and account for one of the two full agent turns previously
+        measured per user message. Bundled/desktop mode already avoided this
+        (calls the model's llama-server directly, with an explicit comment
+        warning against the test_client('/chat') re-entrancy this caused) —
+        this fix makes standalone mode do the same thing, since the draft
+        server is reachable at ``127.0.0.1:<port>`` regardless of deployment
+        mode; there was never a reason for the two modes to differ here.
 
-        ``prompt_id`` is intentionally Optional and only included in the
-        payload when truthy — see ``_dispatch_expert_langchain`` for the
-        same invariant + the live regression that motivated it.
-
-        In bundled/in-process mode (Nunba desktop), uses Flask test_client()
-        instead of HTTP — port 6777 is never bound in bundled mode.
+        ``goal_id``/``goal_type``/``prompt_id`` are accepted for signature
+        compatibility with callers but are not needed once the call goes
+        straight to the model server — that's a plain completion request,
+        not a routed HARTOS turn.
         """
-        # prompt_id: only forward when the caller gave a real one;
-        # goal_id / goal_type travel separately as observability metadata.
-        # See ``_dispatch_expert_langchain`` for the rationale + live
-        # regression that motivated this invariant.
-        payload = self._build_dispatch_payload(
-            model, prompt, user_id, prompt_id, goal_id, goal_type)
-
-        # Bundled mode: call the model's llama-server directly on its port.
-        # Do NOT use Flask test_client('/chat') — that re-enters the full
-        # HARTOS pipeline (autogen, agent creation, etc.) causing re-entrancy.
-        _bundled = bool(os.environ.get('NUNBA_BUNDLED') or getattr(__import__('sys'), 'frozen', False))
-        if _bundled:
+        # Resolve the model's direct port from the catalog/port_registry.
+        _port = None
+        if hasattr(model, 'port') and model.port:
+            _port = model.port
+        if not _port:
             try:
-                # Resolve the model's direct port from the catalog/port_registry
-                _port = None
-                if hasattr(model, 'port') and model.port:
-                    _port = model.port
-                if not _port:
-                    try:
-                        from core.port_registry import get_local_draft_url, get_local_llm_url
-                        _url = get_local_draft_url() or get_local_llm_url()
-                        if _url:
-                            # Extract port from URL like http://127.0.0.1:8081/v1
-                            import re as _re
-                            _m = _re.search(r':(\d+)', _url)
-                            _port = int(_m.group(1)) if _m else 8081
-                    except Exception:
-                        _port = 8081  # draft default
-                # ONE transport (task #10): pooled_post is port-scoped — a
-                # true draft-port call passes straight through (the draft
-                # server has its own slots), but when no draft server exists
-                # and _port fell back to the MAIN llama port, the call is
-                # admitted through the slot-aware scheduler like every other
-                # main-server call. The old raw requests.post here hit the
-                # main server UNSCHEDULED on draft-less boxes — invisible to
-                # inflight() and unpreemptable by a user turn (#162 hazard).
-                from core.http_pool import pooled_post as _pooled_post
-                # Manual log_outbound call here because the requests
-                # transport bypasses the global httpx hook installed in
-                # ``core.llm_outbound_logger.install()``; this is the only
-                # place draft-classifier prompts get a record.
-                _draft_body = {
-                    'model': 'llama',
-                    'messages': [{'role': 'user', 'content': prompt}],
-                    'max_tokens': 500,
-                    'temperature': 0.7,
-                }
-                _draft_start = time.time()
-                resp = _pooled_post(
-                    f'http://127.0.0.1:{_port}/v1/chat/completions',
-                    json=_draft_body,
-                    timeout=15,
-                )
-                try:
-                    from core.llm_outbound_logger import log_outbound as _log_ob
-                    _log_ob(
-                        _draft_body,
-                        source='dispatcher.draft',
-                        response_status=resp.status_code,
-                        latency_ms=round((time.time() - _draft_start) * 1000, 1),
-                    )
-                except Exception:
-                    pass
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if 'choices' in data:
-                        return data['choices'][0]['message']['content']
-                    elif 'error' in data:
-                        logger.debug(f"Draft model error: {data['error']}")
-            except Exception as e:
-                logger.debug(f"Direct draft dispatch failed ({model.model_id}): {e}")
-            return ''
-
-        # HTTP mode: external HARTOS server
-        import requests as req
-        base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
+                from core.port_registry import get_local_draft_url, get_local_llm_url
+                _url = get_local_draft_url() or get_local_llm_url()
+                if _url:
+                    # Extract port from URL like http://127.0.0.1:8081/v1
+                    import re as _re
+                    _m = _re.search(r':(\d+)', _url)
+                    _port = int(_m.group(1)) if _m else 8081
+            except Exception:
+                _port = 8081  # draft default
         try:
-            resp = req.post(f'{base_url}/chat', json=payload, timeout=30)
+            # ONE transport (task #10): pooled_post is port-scoped — a true
+            # draft-port call passes straight through (the draft server has
+            # its own slots), but when no draft server exists and _port fell
+            # back to the MAIN llama port, the call is admitted through the
+            # slot-aware scheduler like every other main-server call. A raw
+            # requests.post here would hit the main server UNSCHEDULED on
+            # draft-less boxes — invisible to inflight() and unpreemptable by
+            # a user turn (#162 hazard).
+            from core.http_pool import pooled_post as _pooled_post
+            # Manual log_outbound call here because the requests transport
+            # bypasses the global httpx hook installed in
+            # ``core.llm_outbound_logger.install()``; this is the only place
+            # draft-classifier prompts get a record.
+            _draft_body = {
+                'model': 'llama',
+                'messages': [{'role': 'user', 'content': prompt}],
+                'max_tokens': 500,
+                'temperature': 0.7,
+            }
+            _draft_start = time.time()
+            resp = _pooled_post(
+                f'http://127.0.0.1:{_port}/v1/chat/completions',
+                json=_draft_body,
+                timeout=15,
+            )
+            try:
+                from core.llm_outbound_logger import log_outbound as _log_ob
+                _log_ob(
+                    _draft_body,
+                    source='dispatcher.draft',
+                    response_status=resp.status_code,
+                    latency_ms=round((time.time() - _draft_start) * 1000, 1),
+                )
+            except Exception:
+                pass
             if resp.status_code == 200:
-                return resp.json().get('response', '')
-        except req.RequestException as e:
-            logger.debug(f"Model dispatch failed ({model.model_id}): {e}")
+                data = resp.json()
+                if 'choices' in data:
+                    return data['choices'][0]['message']['content']
+                elif 'error' in data:
+                    logger.debug(f"Draft model error: {data['error']}")
+        except Exception as e:
+            logger.debug(f"Direct draft dispatch failed ({model.model_id}): {e}")
         return ''
 
     def _deliver_expert_response(self, user_id: str, prompt_id: str,

@@ -447,29 +447,60 @@ class TestDeferredExpertScheduling:
 
 class TestLoopPrevention:
 
-    def test_inner_dispatch_forbids_speculative(
+    def test_inner_dispatch_never_round_trips_through_chat(
             self, dispatcher, monkeypatch):
-        """_dispatch_to_model's recursive /chat call MUST include
-        speculative=False and draft_first=False in the request body, or
-        draft-first would re-enter itself via the inner call."""
-        _mock_guardrails(monkeypatch)
-        captured_body = {}
-        def fake_post(url, **kwargs):
-            captured_body.update(kwargs.get('json', {}))
-            resp = MagicMock()
-            resp.status_code = 200
-            resp.json.return_value = {'response': '{}'}
-            return resp
+        """_dispatch_to_model MUST NOT POST to /chat, in any deployment mode.
 
-        with patch('requests.post', side_effect=fake_post):
+        Until 2026-08-19 the standalone/HTTP branch here self-POSTed to
+        {base_url}/chat with create_agent=True, autonomous=True (see
+        _build_dispatch_payload) — which re-enters the full HARTOS pipeline
+        (auth, guardrails, and a complete chat_agent() autogen turn for any
+        agent-bound prompt_id). That made every "cheap" draft classification
+        call, in standalone mode, exactly as expensive as a real turn —
+        confirmed live via a chat-entry trace showing the self-POST land
+        back in chat() ~13ms after the original request. requests.post is
+        the only transport that can reach /chat here, so asserting it is
+        never called is a direct regression guard against this exact
+        re-entrancy coming back."""
+        _mock_guardrails(monkeypatch)
+        with patch('requests.post') as mock_chat_post:
             dispatcher._dispatch_to_model(
                 dispatcher._registry.get_draft_model(),
                 'some prompt', user_id='u1', prompt_id='p1',
                 goal_type='general', goal_id=None,
             )
 
-        assert captured_body.get('speculative') is False
-        assert captured_body.get('draft_first') is False
+        mock_chat_post.assert_not_called()
+
+    def test_inner_dispatch_goes_straight_to_the_model_server(
+            self, dispatcher, monkeypatch):
+        """The draft call must hit the model's own /v1/chat/completions
+        endpoint directly — the bundled-mode behavior, now unconditional."""
+        _mock_guardrails(monkeypatch)
+        captured = {}
+        def fake_pooled_post(url, **kwargs):
+            captured['url'] = url
+            captured['json'] = kwargs.get('json', {})
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {
+                'choices': [{'message': {'content': 'draft reply'}}]}
+            return resp
+
+        with patch('core.http_pool.pooled_post', side_effect=fake_pooled_post):
+            result = dispatcher._dispatch_to_model(
+                dispatcher._registry.get_draft_model(),
+                'some prompt', user_id='u1', prompt_id='p1',
+                goal_type='general', goal_id=None,
+            )
+
+        assert result == 'draft reply'
+        assert '/v1/chat/completions' in captured['url']
+        # No HARTOS routing fields — this is a plain completion request,
+        # not a /chat-shaped payload (that shape only matters when the
+        # target is /chat, which it no longer is).
+        assert 'speculative' not in captured['json']
+        assert 'create_agent' not in captured['json']
 
 
 # ═══════════════════════════════════════════════════════════════════════════
