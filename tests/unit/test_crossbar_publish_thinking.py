@@ -23,6 +23,7 @@ Caller sites:
      MINIMAL schema, request_id or '', bot_type='ComputeRouter'
 """
 import json
+import os
 from unittest.mock import patch
 
 import pytest
@@ -301,3 +302,58 @@ def test_zoom_stub_keys_match_inline_shape():
         'top_left', 'top_right', 'bottom_right', 'bottom_left'}
     for corner in _ZOOM_STUB.values():
         assert corner == {'x': 0, 'y': 0}
+
+
+# ── #649: internal text must never reach the user-visible bubble ───────────
+# publish_to_crossbar_new_action_start feeds ChatMessageList's thinkingSteps.
+# It used to append ".\n please evaluate the response i am giving to check if
+# it meets the current action" to EVERY bubble — an instruction aimed at the
+# model, shown to the user — and two of its three callers passed the RAW model
+# prompt as `message` ('Execute Action N: <prompt> ,Latest User message: ...'
+# plus the [Expert Tip from ...] hint).
+#
+# NOTE the byte-equality tests above are NOT affected and are deliberately left
+# alone: they compare helper-vs-historical-inline for the SAME text, so they
+# pin the wire ENVELOPE (the migration proof), not this wording. That is also
+# why they could not have caught this leak — hence the guards below.
+
+_LEAK_SENTENCE = "please evaluate the response i am giving"
+_CREATE_RECIPE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    'create_recipe.py')
+
+
+def _production_lines():
+    """create_recipe.py with comment lines removed (prose may cite the leak)."""
+    with open(_CREATE_RECIPE, encoding='utf-8') as fh:
+        return [ln for ln in fh if not ln.lstrip().startswith('#')]
+
+
+def test_internal_instruction_is_not_published_to_users():
+    offenders = [i + 1 for i, ln in enumerate(_production_lines())
+                 if _LEAK_SENTENCE in ln]
+    assert not offenders, (
+        f"create_recipe.py line(s) {offenders} put the model-facing sentence "
+        f"'{_LEAK_SENTENCE}...' into a user-visible thinking bubble (#649)")
+
+
+def test_raw_model_prompt_is_not_passed_to_the_thinking_publisher():
+    """Only human progress text may reach the bubble.
+
+    The two leaking callers passed the variable `message`, which at those
+    points held the model instruction.  `_push_thinking` is the intended
+    entry point; the publisher itself should have no other caller.
+    """
+    src = ''.join(_production_lines())
+    calls = src.count('publish_to_crossbar_new_action_start(')
+    # one def + exactly one call (from _push_thinking)
+    assert calls == 2, (
+        f"expected the publisher to have exactly ONE caller (_push_thinking); "
+        f"found {calls - 1}. A new caller must pass human-readable progress "
+        f"text, never the model prompt (#649).")
+
+
+def test_push_thinking_is_the_single_entry_point():
+    src = ''.join(_production_lines())
+    assert 'def _push_thinking(' in src
+    assert '_push_thinking(user_id,' in src

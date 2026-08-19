@@ -4119,7 +4119,13 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
             message = f'Execute Action {user_tasks[user_prompt].current_action}: {message} '+f',Latest User message: {text}' + _action_expert_hint
             _push_thinking(user_id, f'Executing action {user_tasks[user_prompt].current_action} of {_action_count}...')
-            publish_to_crossbar_new_action_start(message, user_id)
+            # No second publish here.  `message` at this point is the raw model
+            # instruction — 'Execute Action N: <prompt> ,Latest User message:
+            # <...>' plus the [Expert Tip from ...] hint — and publishing it put
+            # the whole internal prompt in the user's thinking bubble, right
+            # after the clean line above (task #649).  The user got two bubbles
+            # per action: one readable, one internal.  The readable one already
+            # carries the signal, so the internal one is pure leak.
             task_time[prompt_id] = {'timer':time.time(),'times':[]}
 
             # Only transition if we're in ASSIGNED state (first time)
@@ -4640,7 +4646,11 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     else:
                         # user_tasks[user_prompt].current_action = user_tasks[user_prompt].current_action+1
                         message = get_execute_next_action_message(prompt_id, user_prompt)
-                        publish_to_crossbar_new_action_start(message, user_id)
+                        # `message` is the model instruction, not a user-facing
+                        # line — publishing it put the internal prompt in the
+                        # thinking bubble (task #649).  Announce the action in
+                        # words instead; `message` still goes to the model below.
+                        _push_thinking(user_id, f'Starting action {current_action_id}...')
                         safe_set_state(user_prompt, current_action_id, ActionState.IN_PROGRESS, "action start")
 
                     result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
@@ -5150,9 +5160,20 @@ def set_fallback_flags_and_request_recipe(chat_instructor, current_action_id, ma
 
 
 def publish_to_crossbar_new_action_start(message, user_id):
-    text = (
-        "Working on " + message
-        + ".\n please evaluate the response i am giving to check if it meets the current action")
+    # `message` reaches a USER-VISIBLE bubble (ChatMessageList thinkingSteps),
+    # so it must read as progress, not as machinery.
+    #
+    # The old text appended ".\n please evaluate the response i am giving to
+    # check if it meets the current action" to EVERY bubble — including the
+    # clean ones from _push_thinking.  That sentence is an instruction aimed at
+    # the model, and users were reading the system talk to itself (task #649).
+    # Nothing consumes it: the React and Android handlers render this field as
+    # text, and tests/unit/test_crossbar_publish_thinking.py pins the ENVELOPE
+    # (helper vs the historical inline literal), not this wording.
+    # Deliberately NOT str(message): concatenation raises on a non-str, and
+    # that is the desired failure.  #649 names "raw dict repr" as a symptom —
+    # coercing here would RENDER a dict to the user instead of failing loudly.
+    text = "Working on " + message
     # Pull real request_id from threadlocal — see publish_agent_thought
     # for the full failure-mode analysis (drain key miss, React daemon
     # filter, Android orphan bucket).  Single source via thread_local_data.
