@@ -1799,12 +1799,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     try:
         from integrations.service_tools import (
             service_tool_registry, Crawl4AITool, AceStepTool,
-            SeoAuditTool, GhPrTool)
+            SeoAuditTool, GhPrTool, TimeTool, CalculatorTool)
 
         Crawl4AITool.register()   # port 11235
         AceStepTool.register()    # port 8001
         SeoAuditTool.register()   # native in-process (no port)
         GhPrTool.register()       # native in-process (no port)
+        TimeTool.register()       # native in-process (no port)
+        CalculatorTool.register() # native in-process (no port)
         service_tool_registry.load_config()  # load any user-added tools from service_tools.json
 
         svc_tools = service_tool_registry.get_all_tool_functions()

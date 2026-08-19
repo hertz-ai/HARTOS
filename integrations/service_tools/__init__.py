@@ -21,6 +21,8 @@ from .whisper_tool import WhisperTool
 from .omniparser_tool import OmniParserTool
 from .seo_audit_tool import SeoAuditTool
 from .gh_pr_tool import GhPrTool
+from .time_tool import TimeTool
+from .calculator_tool import CalculatorTool
 from .model_storage import ModelStorageManager, model_storage
 from .vram_manager import VRAMManager, vram_manager
 from .runtime_manager import RuntimeToolManager, runtime_tool_manager
@@ -40,6 +42,8 @@ __all__ = [
     "OmniParserTool",
     "SeoAuditTool",
     "GhPrTool",
+    "TimeTool",
+    "CalculatorTool",
     "ModelStorageManager",
     "model_storage",
     "VRAMManager",
