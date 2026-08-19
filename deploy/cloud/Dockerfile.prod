@@ -24,18 +24,22 @@
 #      bootstrap.  The root ./Dockerfile (`python hart_intelligence_entry.py`)
 #      runs all of them.  If you need the agentic runtime, use that CMD.
 #
-#   2. NO WEBSOCKETS.  `--worker-class gevent` serves a plain WSGI app, and
-#      WSGI cannot represent a websocket scope.  So ws://<node>/peer_link is
-#      unavailable here -- not merely unmounted but unservable -- and
-#      PeerLink.accept() can never fire, which leaves PeerLinkManager._links
-#      empty for skill broadcast, claude_hive_session._publish_via_peer_link
-#      and collect() shard fan-out.  core/peer_link/server.py mounts the
-#      listener on the hypercorn path only.  Note that
-#      core.peer_link.server.peer_link_enabled() reads only
-#      HEVOLVE_PEER_LINK_SERVER, so it still reports True here even though the
-#      capability is absent -- do not use it as proof a node accepts peers.
-#      Switching to an ASGI worker (uvicorn) or hypercorn is what would give
-#      this image websockets; a wrapper cannot.
+#   2. WEBSOCKETS: fixed, but only because the target changed.  This image
+#      used to run `--worker-class gevent hart_intelligence_entry:app`, i.e. a
+#      plain WSGI app, and WSGI cannot represent a websocket scope -- so
+#      ws://<node>/peer_link was unservable, PeerLink.accept() never fired, and
+#      PeerLinkManager._links stayed empty for skill broadcast,
+#      claude_hive_session._publish_via_peer_link and collect() shard fan-out.
+#      The CMD now uses `--worker-class uvicorn.workers.UvicornWorker` against
+#      `asgi:application`, which IS the peer_link-capable ASGI stack (see
+#      asgi.py -> core.serve.build_asgi_app).  If you change the worker class
+#      back to a WSGI one, or repoint it at `hart_intelligence_entry:app`, you
+#      silently remove /peer_link again.
+#
+#      Caveat that survives the fix: core.peer_link.server.peer_link_enabled()
+#      reads only HEVOLVE_PEER_LINK_SERVER, so it reports True regardless of
+#      whether the running server can actually serve a websocket.  Never use it
+#      as proof that a node accepts peers -- probe the path.
 #
 # Optimized for cloud deployment with gunicorn
 
@@ -208,8 +212,18 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Run with gunicorn.  This imports `app` directly, so main() does not run and
-# there are no websockets (no /peer_link).  See the header of this file before
-# assuming this is how production boots -- the root ./Dockerfile serves the
-# same app through main() + hypercorn and does have both.
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:8000 --workers ${WORKERS} --threads ${THREADS} --timeout ${TIMEOUT} --worker-class gevent --access-logfile - --error-logfile - --capture-output hart_intelligence_entry:app"]
+# Run with gunicorn driving uvicorn ASGI workers against asgi:application.
+#
+# `--worker-class uvicorn.workers.UvicornWorker` + `asgi:application` is what
+# gives this image /peer_link; the previous `--worker-class gevent
+# hart_intelligence_entry:app` was WSGI and silently had none.  uvicorn comes
+# from requirements.txt (this Dockerfile does NOT use --no-deps, so its subtree
+# resolves normally).
+#
+# `--threads` is dropped on purpose: it applies to sync/gthread workers, not to
+# an async worker, where concurrency comes from the event loop.
+#
+# main() still does NOT run here -- see this file's header.  If the node needs
+# the full agentic boot (guardrails, EventBus, daemon supervisor), use the root
+# ./Dockerfile's `python hart_intelligence_entry.py` instead.
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:8000 --workers ${WORKERS} --timeout ${TIMEOUT} --worker-class uvicorn.workers.UvicornWorker --access-logfile - --error-logfile - --capture-output asgi:application"]
