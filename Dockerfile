@@ -130,4 +130,16 @@ VOLUME ["/app/data"]
 # 50000-60000 for media.  Operators expose only what their NAT requires.
 EXPOSE 6777 7880 7881
 
+# This CMD runs main(), which is the FULL boot: hevolve_verify_boot(),
+# guardrail hash enforcement, _validate_startup(), EventBus, local Crossbar
+# subscribers, runtime-tools restoration, HART skill registry, the agent-engine
+# daemon supervisor + Phase-2 goal bootstrap, then _serve_app -> hypercorn with
+# the /peer_link websocket listener mounted.
+#
+# This is what the live central node (192.168.0.9, container `langchain`,
+# port 6777) actually runs as of 2026-08-19.
+#
+# deploy/cloud/Dockerfile.prod is the OTHER variant: it serves
+# `hart_intelligence_entry:app` through gunicorn, which skips main() entirely
+# and cannot serve websockets.  Read its header before switching between them.
 CMD [ "python", "hart_intelligence_entry.py" ]

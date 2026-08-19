@@ -194,6 +194,30 @@ waitress==2.1.2
 # singletons (EventBus, ResourceGovernor, agent_daemon, watchdog) are
 # sharded for fork-safety.  Waitress kept above as a fallback path.
 hypercorn==0.17.3
+# hypercorn's own dependency subtree, listed EXPLICITLY because the root
+# ./Dockerfile installs with `pip install --no-deps -r requirements.txt`
+# (Dockerfile:56).  Under --no-deps pip resolves nothing, so anything not named
+# here is simply absent from the image.
+#
+# This was not theoretical.  On central (192.168.0.9, container `langchain`,
+# 2026-08-19) hypercorn imported but `from hypercorn.asyncio import serve`
+# raised, and the node logged:
+#     Hypercorn unavailable (No module named 'h2') - falling back to Waitress
+# Waitress is pure WSGI, so that silently cost the node every websocket:
+# ws://<node>/peer_link was unservable and PeerLink.accept() could never fire,
+# leaving PeerLinkManager._links empty for skill broadcast,
+# claude_hive_session._publish_via_peer_link and collect() shard fan-out.
+# The degradation is logged once at boot and looks like a normal fallback.
+#
+# hypercorn 0.17.3 requires: h11, h2>=3.1.0, priority, wsproto>=0.14.0.
+# h2 in turn requires hpack>=4.0,<5 and hyperframe>=6.0,<7; wsproto requires
+# h11 (already pinned above at 0.16.0).  Keep this block in step with the
+# hypercorn pin -- if hypercorn moves, re-check `importlib.metadata.requires`.
+h2==4.1.0
+hpack==4.0.0
+hyperframe==6.0.1
+priority==2.0.0
+wsproto==1.2.0
 watchfiles==0.19.0
 websockets==14.2
 Werkzeug==2.3.6
