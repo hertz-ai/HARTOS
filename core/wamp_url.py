@@ -32,8 +32,13 @@ import os
 from urllib.parse import urlsplit, urlunsplit
 
 # Same literal both consumers used before this module existed; kept so the
-# no-env behaviour is byte-identical to what shipped.
+# no-env behaviour is byte-identical to what shipped -- OFF a container.
+# Inside one, see _container_publish_url(): localhost is provably wrong there.
 DEFAULT_PUBLISH_URL = 'http://localhost:8088/publish'
+
+# Fallback only for when core.port_registry cannot be imported. The registry is
+# the source of truth for this port ('crossbar', 8088 in both app and OS mode).
+_CROSSBAR_PORT_FALLBACK = 8088
 
 # crossbar's HTTP bridge always terminates at /publish; the router socket
 # path (/ws) is what we translate away from.
@@ -75,6 +80,66 @@ DEFAULT_ROUTER_URL = _default_router_url()
 LEGACY_ROUTER_ALIAS = 'ws://aws_rasa.hertzai.com:8088/ws'
 
 
+def _in_container(environ=None):
+    """True when this process is running inside a container.
+
+    Same three signals integrations/social/models.py:_IS_DOCKER already uses.
+    Kept here rather than imported from there because core must not import from
+    integrations (layering); if a canonical core-level predicate is ever added,
+    both should move onto it.
+    """
+    env = os.environ if environ is None else environ
+    return (
+        os.path.exists('/.dockerenv')
+        or env.get('DOCKER_CONTAINER') == 'true'
+        or env.get('HEVOLVE_CLOUD_MODE') == 'true'
+    )
+
+
+def _default_route_gateway():
+    """The container's default-route gateway (i.e. the host), or None.
+
+    Read from /proc/net/route instead of hardcoding 172.17.0.1. That literal is
+    only correct for Docker's default bridge -- it is wrong on a user-defined
+    network, and wrong again if the daemon runs with a custom --bip. Asking the
+    kernel costs one file read and is right on any of them.
+
+    /proc/net/route stores the gateway as little-endian hex, so 172.17.0.1
+    appears as '010011AC' and the octets come back out low byte first.
+    """
+    try:
+        with open('/proc/net/route', encoding='ascii') as fh:
+            fh.readline()  # header row
+            for line in fh:
+                fields = line.split()
+                # fields[1] is Destination; 00000000 marks the default route.
+                if len(fields) > 2 and fields[1] == '00000000':
+                    packed = int(fields[2], 16)
+                    return '.'.join(
+                        str((packed >> shift) & 0xFF) for shift in (0, 8, 16, 24))
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _container_publish_url():
+    """Publish URL aimed at the host's crossbar, or None if undeterminable.
+
+    Only consulted when WAMP_URL is unset AND we are in a container. Both parts
+    are derived, not declared: the host from the default route, the port from
+    core.port_registry (which already owns 'crossbar').
+    """
+    gateway = _default_route_gateway()
+    if not gateway:
+        return None
+    try:
+        from core.port_registry import get_port
+        port = get_port('crossbar') or _CROSSBAR_PORT_FALLBACK
+    except Exception:
+        port = _CROSSBAR_PORT_FALLBACK
+    return f'http://{gateway}:{port}{_PUBLISH_PATH}'
+
+
 def resolve_publish_url(environ=None):
     """Return an HTTP publish-bridge URL regardless of which dialect is set.
 
@@ -90,6 +155,18 @@ def resolve_publish_url(environ=None):
     env = os.environ if environ is None else environ
     raw = (env.get('WAMP_URL') or '').strip()
     if not raw:
+        # No explicit setting. Off a container, localhost is right and this is
+        # unchanged. Inside one, localhost is the CONTAINER's loopback, not the
+        # host -- crossbar runs as a sibling container (nothing in this repo
+        # starts one in the app image), so the publish is refused and every
+        # telemetry/federation message is dropped with only "Couldn't publish
+        # message" in the log. Measured on central 2026-08-19: from inside the
+        # langchain container 127.0.0.1:8088 refused while the default-route
+        # gateway answered HTTP 200.
+        if _in_container(env):
+            derived = _container_publish_url()
+            if derived:
+                return derived
         return DEFAULT_PUBLISH_URL
 
     try:
