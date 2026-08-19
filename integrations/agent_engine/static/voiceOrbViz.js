@@ -151,9 +151,6 @@
     function setActive(v) {
       active = !!v;
       if (active && audioCtx && audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) { console.debug('voiceOrbViz: audioCtx resume failed', e); } }
-      // Restart the loop if the software-floor idle park stopped it. Without this
-      // the orb would stay frozen the first time it is asked to speak/listen.
-      if (active && rafId === null) { render(); }
     }
     // FIX B: the persisted orb-breathing pref (hartHero owns the localStorage key)
     // gates the slow idle "breathe" modulation of the glow + core. When OFF the orb
@@ -177,36 +174,7 @@
       ctx.strokeStyle = color; ctx.lineWidth = lw; ctx.stroke();
     }
 
-    // SOFTWARE-FLOOR IDLE PARK (2026-08-18, real-HW hover freeze).
-    // This loop re-arms unconditionally, so the canvas repaints ~60x/s FOREVER --
-    // even inactive, because the idle term below keeps undulating. On a GPU that
-    // is free. On the cairo/pixman floor every repaint also re-rasters whatever
-    // CSS filter sits on the canvas, and hovering scales it, which is what froze
-    // the box. The CSS floor now drops the orb's drop-shadows; this drops the
-    // needless frames too, so an idle desktop costs nothing at all.
-    //
-    // Gated to the software floor ONLY (body.gpu-software / body.webkit-flat,
-    // the same verdict classes the CSS floor keys on) so the designed idle
-    // undulation is untouched wherever compositing can actually pay for it.
-    // Parking is safe: setActive(true) restarts the loop, and the amplitudes are
-    // decayed to ~0 before we stop, so the parked frame IS the resting orb.
-    function softwareFloor() {
-      try {
-        var b = global.document && global.document.body;
-        return !!(b && (b.classList.contains('gpu-software') ||
-                        b.classList.contains('webkit-flat')));
-      } catch (e) { return false; }
-    }
-
-    function idleAtRest() {
-      return !active &&
-        s.bassCur < 0.002 && s.midCur < 0.002 && s.trebleCur < 0.002;
-    }
-
     function render() {
-      // Park instead of re-arming once everything has settled, on the floor where
-      // a spare frame is expensive. Any setActive(true) kicks it back off.
-      if (softwareFloor() && idleAtRest()) { rafId = null; return; }
       rafId = global.requestAnimationFrame(render);
       s.time += 0.02;
       if (active && analyser) {
