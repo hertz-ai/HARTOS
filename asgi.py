@@ -45,7 +45,16 @@ EXECUTOR NOTE
     `python hart_intelligence_entry.py` instead, which runs `_serve_app`.
 """
 from core.serve import build_asgi_app
-from hart_intelligence_entry import app
+
+# TID251 bans importing hart_intelligence_entry so that WORKER code cannot
+# reach around the singleton accessor (core.safe_hartos_attr.safe_hartos_attr).
+# This module is not worker code: it is the server target, and its whole job is
+# to hand one specific Flask app to a server. gunicorn already does exactly
+# this as `hart_intelligence_entry:app` -- ruff never saw that because it is a
+# config string, not an import. safe_hartos_attr is the wrong tool here: it
+# tolerates the module being absent, whereas a server pointed at this file must
+# either get the real routed app or fail to start.
+from hart_intelligence_entry import app  # noqa: TID251
 
 # The name servers target. Built once at import, against a fully-routed app:
 # every register_blueprint()/init_social() call in hart_intelligence_entry runs
