@@ -1670,6 +1670,93 @@ def get_post_likes(post_id):
     return _ok(voters)
 
 
+@social_bp.route('/publish/staged', methods=['GET'])
+@require_admin
+def list_staged_posts_route():
+    """Posts an agent composed, waiting for a person to send.
+
+    The read half of the operator gate. integrations/channels/publish_tools.py
+    lets an agent STAGE a post and deliberately gives it no way to send one;
+    this and the route below are the human half, and they are @require_admin so
+    an agent holding an ordinary session token cannot reach them.
+    """
+    from integrations.channels.publish_tools import read_staged_posts
+    status = (request.args.get('status') or 'staged').strip()
+    rows = read_staged_posts(None if status == 'all' else status)
+    return _ok({'posts': rows, 'count': len(rows)})
+
+
+@social_bp.route('/publish/<post_id>/send', methods=['POST'])
+@require_admin
+def send_staged_post(post_id):
+    """Publish one staged post. THE human-triggered action.
+
+    This is the only place in the codebase that turns a composed post into a
+    public one, and it is reachable only by an admin session. That is the whole
+    design: an agent can write the thing and cannot publish it, because a post
+    is outward-facing, irreversible, and the standing rule on this project is
+    that agent-authored public content is disclosed and operator-gated.
+
+    It refuses rather than guesses. A post with no images cannot go to
+    Instagram, a post already sent is not sent twice, and a missing page token
+    is reported as configuration rather than swallowed -- the failure that hid
+    this whole area for weeks was publish_photo looking like it worked while
+    Meta could not fetch the image.
+    """
+    import asyncio as _asyncio
+    from integrations.channels.publish_tools import read_staged_posts, _append
+
+    rows = read_staged_posts(None)
+    post = next((r for r in rows if r.get('id') == post_id), None)
+    if not post:
+        return _err('staged post not found', 404)
+    if post.get('status') != 'staged':
+        return _err("post is '%s', not 'staged'" % post.get('status'), 409)
+
+    urls = post.get('image_urls') or []
+    if not urls:
+        return _err('Instagram requires at least one image; this post has none', 422)
+
+    adapter = None
+    try:
+        from integrations.channels.registry import get_registry
+        adapter = get_registry().get(post.get('platform') or 'instagram')
+    except Exception as exc:
+        logger.warning('publish: registry unavailable: %s', exc)
+    if adapter is None:
+        return _err('no connected %s adapter' % post.get('platform'), 503)
+    if not getattr(getattr(adapter, 'instagram_config', None), 'page_access_token', ''):
+        return _err(
+            'the adapter has no page_access_token, so Meta cannot be called. '
+            'Connect a Facebook Page with a linked Instagram Business account.',
+            503)
+
+    caption = post.get('caption') or ''
+    try:
+        if len(urls) > 1:
+            result = _asyncio.run(adapter.publish_carousel(urls, caption))
+        else:
+            result = _asyncio.run(adapter.publish_photo(urls[0], caption))
+    except Exception as exc:
+        logger.exception('publish failed for %s', post_id)
+        return _err('publish failed: %s' % exc, 502)
+
+    ok = bool(getattr(result, 'success', False))
+    # Append rather than rewrite: the staging store is an append-only log, so
+    # the original composition stays readable next to what happened to it.
+    _append({
+        **post,
+        'status': 'sent' if ok else 'failed',
+        'sent_at': datetime.utcnow().isoformat() + 'Z',
+        'sent_by_user_id': getattr(g.user, 'id', None),
+        'result': str(getattr(result, 'message', '') or getattr(result, 'error', '') or ''),
+    })
+    if not ok:
+        return _err('platform rejected the post: %s' % getattr(result, 'error', 'unknown'), 502)
+    return _ok({'published': True, 'post_id': post_id,
+                'media_id': getattr(result, 'message_id', None)})
+
+
 @social_bp.route('/media/<file_id>/<filename>', methods=['GET'])
 def get_media(file_id, filename):
     """Serve an uploaded file so an outside fetcher can actually get it.
