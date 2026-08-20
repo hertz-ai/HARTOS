@@ -2374,6 +2374,23 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     except Exception as e:
         tool_logger.debug(f"Channel tools registration skipped: {e}")
 
+    # Publish tools: stage a social post for a person to review and send.
+    #
+    # Registered here, beside the channel tools, and NOT behind
+    # detect_goal_tags. That gate keyword-matches the prompt ('market',
+    # 'campaign', 'viral'), so a family behind it is reachable only when the
+    # wording happens to match -- which is how register_news_tools ended up
+    # orphaned. An agent told "post this to Instagram" should be able to
+    # without saying a magic word first.
+    #
+    # These tools STAGE only. There is no publish tool: sending is a human
+    # action. See integrations/channels/publish_tools.py for why.
+    try:
+        from integrations.channels.publish_tools import register_publish_tools
+        register_publish_tools(helper1, time_agent, _tool_ctx)
+    except Exception as e:
+        tool_logger.debug(f"Publish tools registration skipped: {e}")
+
     def connect_time_main(message: Annotated[str, "The message time agent want to send to main agent"]) -> str:
         message = f"Role: Time Agent\n Message: {message}"
         print(f'user_id {user_id}')
@@ -2413,6 +2430,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     try:
         from integrations.channels.agent_tools import register_channel_tools
         register_channel_tools(helper2, visual_agent, _tool_ctx)
+    except Exception:
+        pass
+
+    # Same for visual_agent, so which agent handled the turn does not decide
+    # whether a post can be composed.
+    try:
+        from integrations.channels.publish_tools import register_publish_tools
+        register_publish_tools(helper2, visual_agent, _tool_ctx)
     except Exception:
         pass
 
