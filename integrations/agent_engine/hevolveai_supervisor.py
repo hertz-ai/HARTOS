@@ -257,11 +257,26 @@ def _resolve_repo_root() -> Optional[Path]:
     booted fine under C:\\Python310.
 
     Resolution order (first hit wins, each must contain run_server.py):
-      1. ``HEVOLVEAI_HOME``
-      2. the sibling checkout next to the HARTOS repo (dev runs)
-      3. ``~/PycharmProjects/hevolveai`` (the dev-box convention --
-         reachable from FROZEN Nunba too, where __file__ is inside the
-         bundle and the sibling probe cannot see the repo)
+      1. ``HEVOLVEAI_HOME`` -- explicit, and honoured EVEN WHEN FROZEN.
+         This is the deliberate dev opt-in: point an installed build at a
+         checkout to try changes without push+clone.
+      2. the sibling checkout next to the HARTOS repo (dev runs only)
+      3. ``~/PycharmProjects/hevolveai``, the dev-box convention (dev runs
+         only)
+
+    2 and 3 are IMPLICIT discovery and are both gated on ``not sys.frozen``.
+    Until 2026-08-20 candidate 3 was NOT gated, and the docstring called
+    that deliberate ("reachable from FROZEN Nunba too"). The effect on any
+    box with that directory -- measured here -- was that an INSTALLED Nunba
+    spawned ``C:\\Python310\\python.exe ~/PycharmProjects/hevolveai/run_server.py``
+    instead of the bundle. ``_build_cmd`` returns early in repo mode, so the
+    armor hook and every bundled .pyd were skipped, and the app silently ran
+    code that is not what ships.
+
+    The wedge candidate 3 was added for is spent: the bundled package now
+    imports clean (99/99 hevolveai modules via ArmoredLoader, 2026-08-20).
+    Repo mode stays what it was meant to be -- a dev affordance -- and an
+    install runs what it shipped.
     """
     candidates = []
     override = os.environ.get('HEVOLVEAI_HOME', '').strip()
@@ -271,7 +286,7 @@ def _resolve_repo_root() -> Optional[Path]:
         here = Path(__file__).resolve()
         hartos_root = here.parent.parent.parent
         candidates.append(hartos_root.parent / 'hevolveai')
-    candidates.append(Path.home() / 'PycharmProjects' / 'hevolveai')
+        candidates.append(Path.home() / 'PycharmProjects' / 'hevolveai')
     for cand in candidates:
         try:
             if (cand / 'run_server.py').is_file():
