@@ -148,8 +148,18 @@ def next_task():
         r = requests.get(f'{backend()}/api/hive/session/tasks', timeout=10)
         if r.status_code != 200:
             return None
-        tasks = (r.json() or {}).get('tasks') or []
+        # The endpoint is ClaudeHiveSession.get_tasks(), which returns
+        # {'pending': [...], 'completed': [...]} -- there is no 'tasks' key and
+        # never was. Reading one made this return None on EVERY tick, so the
+        # daemon logged "no task assigned by the hive" forever, indistinguishable
+        # from a genuinely idle hive even with work queued and dispatched.
+        # Verified on the real node 2026-08-20: the live endpoint answers
+        # {"completed":[],"pending":[]}.
+        tasks = (r.json() or {}).get('pending') or []
         for t in tasks:
+            # get_tasks() projects pending entries down to task_id/description/
+            # received_at, so 'status' is absent here -- None is accepted below,
+            # and the richer shapes stay accepted for any other caller.
             if t.get('status') in (None, '', 'assigned', 'pending', 'queued'):
                 return t
         return None
