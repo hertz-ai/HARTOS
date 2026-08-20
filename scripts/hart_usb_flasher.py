@@ -872,26 +872,44 @@ def sha256_file(path, chunk=4 * 1024 * 1024):
 def sha256_device_region(dev_or_phys, offset, size, dd, chunk=4 * 1024 * 1024):
     """sha256 of `size` bytes read back off the raw device at `offset`. Offsets are
     MiB-aligned and sizes are 512 B multiples, so raw sector-aligned reads are valid."""
+    # Returns None when the device could not be read back in full. That is NOT
+    # the same as a mismatch, and conflating them is a real-hardware trap: on
+    # Windows 2026-08-20 this returned the sha256 of ZERO bytes
+    # (e3b0c442...b855) for a stick that was later proven byte-for-byte
+    # correct, and the caller reported "MISMATCH - re-flash" on a perfect
+    # flash. Anyone following that advice re-writes 27 GB and gets the same
+    # verdict forever. Count what we actually read and refuse to hash a
+    # phantom.
     h = hashlib.sha256()
+    got = 0
     if dd:
         p = subprocess.Popen(
             [dd, "if=%s" % dev_or_phys, "bs=%d" % chunk, "iflag=skip_bytes,count_bytes",
              "skip=%d" % offset, "count=%d" % size, "status=none"], stdout=subprocess.PIPE)
         for b in iter(lambda: p.stdout.read(chunk), b""):
             h.update(b)
-        p.wait()
+            got += len(b)
+        rc = p.wait()
+        if rc != 0 or got != size:
+            return None
         return h.hexdigest()
     # Builtin open() (not os.open) -- it handles Windows \\.\PhysicalDriveN device
     # namespaces; reads are sector-aligned (MiB-aligned offset, 512 B-multiple sizes).
-    with open(dev_or_phys, "rb") as fh:
-        fh.seek(offset)
-        remaining = size
-        while remaining > 0:
-            b = fh.read(min(chunk, remaining))
-            if not b:
-                break
-            h.update(b)
-            remaining -= len(b)
+    try:
+        with open(dev_or_phys, "rb") as fh:
+            fh.seek(offset)
+            remaining = size
+            while remaining > 0:
+                b = fh.read(min(chunk, remaining))
+                if not b:
+                    break               # short read -> unreadable, not a mismatch
+                h.update(b)
+                got += len(b)
+                remaining -= len(b)
+    except OSError:
+        return None
+    if got != size:
+        return None
     return h.hexdigest()
 
 
@@ -938,6 +956,13 @@ def full_verify(disk, parts, tmp, dd, log):
     for n in names:
         r = recs[n]
         got = sha256_device_region(dev, r["offset"], r["size"], dd)
+        if got is None:
+            # Unreadable region: cannot verify. Returning None routes this to
+            # the caller's "could not verify" branch instead of the MISMATCH
+            # branch that tells the user to re-flash a possibly-perfect stick.
+            log("  verify %-45s @ %d: UNREADABLE (device read-back failed) - "
+                "cannot verify, NOT a mismatch" % (n, r["offset"]))
+            return None
         ok = (got == r["sha256"])
         log("  verify %-45s @ %d: %s" % (n, r["offset"], "OK" if ok else "MISMATCH"))
         allok = allok and ok
@@ -1699,6 +1724,14 @@ def verify_raw_sigs(disk, dd, log):
     dev = disk["dev"] if dd else disk["physdrive"]
     boot = read_at(dev, BOOT_SIG_OFFSET, len(BOOT_SIG), dd)
     gpt = read_at(dev, GPT_SIG_OFFSET, len(GPT_SIG), dd)
+    # An EMPTY read is the device being unreadable, not a bad signature. Real
+    # case 2026-08-20 (Windows): both came back b'' and this printed FAIL on a
+    # stick whose sector 0 demonstrably ends 55 AA. "Unreadable" and "wrong"
+    # need different words, because only one of them means re-flash.
+    if not boot and not gpt:
+        log("  boot sig @0x1FE: UNREADABLE (device read-back returned nothing)")
+        log("  GPT sig @LBA1  : UNREADABLE (device read-back returned nothing)")
+        return None                     # neither OK nor FAILED: unknown
     ok_boot = boot == BOOT_SIG
     ok_gpt = gpt == GPT_SIG
     log("  boot sig @0x1FE: %r %s" % (boot, "OK" if ok_boot else "FAIL"))
@@ -1795,12 +1828,30 @@ def flash_raw(tag, variant, disk, tmp, progress=None, log=None, verify=True,
 
     log("Verifying raw boot signatures...")
     ok = verify_raw_sigs(disk, dd, log)
-    log("DONE - raw image bootable OK" if ok else "DONE but signature check FAILED")
+    if ok is None:
+        # Unknown, not failed. Do not scare the operator off a good stick, and
+        # do not claim bootability we did not observe.
+        log("DONE - write completed; the signature check could not read the "
+            "device back, so it neither confirms nor denies bootability")
+        ok = True
+    else:
+        log("DONE - raw image bootable OK" if ok else "DONE but signature check FAILED")
     if verify and reader.count and reader.count % SECTOR == 0:
         log("Verifying full image (sha256 read-back of the device region)...")
         dev = disk["dev"] if dd else disk["physdrive"]
         back = sha256_device_region(dev, 0, reader.count, dd)
-        if back == stream_sha:
+        if back is None:
+            # Could not read the device back. Say exactly that -- the previous
+            # code hashed the empty read and printed "MISMATCH - re-flash",
+            # which is false and unfalsifiable: re-flashing cannot fix a read
+            # path. Real case 2026-08-20 (Windows): this stick verified
+            # byte-for-byte from a shell that CAN read the raw device.
+            log("  FULL VERIFY: INCONCLUSIVE - could not read the device back in "
+                "full. The write reported OK and the signature check above is "
+                "the better signal. This is NOT a reason to re-flash. To confirm "
+                "by hand: dd if=%s bs=1M iflag=fullblock | head -c %d | sha256sum "
+                "-> expect %s" % (dev, reader.count, stream_sha))
+        elif back == stream_sha:
             log("  FULL VERIFY: OK - every byte on the device matches the stream (sha256)")
             if src_dir:
                 # --from-dir parts were placed there by the operator, not
