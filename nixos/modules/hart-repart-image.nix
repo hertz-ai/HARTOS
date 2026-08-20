@@ -61,6 +61,30 @@ in
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = false;
 
+  # ── Load the store DB on first boot (pairs with /nix-path-registration) ──
+  # The image ships the closure's FILES plus a registration manifest (see the
+  # "20-root" partition below); this is the half that makes nix believe them.
+  # Without it every store path on a dd'd stick is "not valid" to nix, which
+  # takes out `nixos-rebuild switch`, the system-profile rollback anchor, and
+  # OTA as a whole — measured on real HW 2026-08-20, where the DB knew 1 path.
+  #
+  # Runs ONCE: the manifest is deleted after a successful load, so this is a
+  # no-op on every later boot. `|| true` and the -f guard are deliberate — a
+  # box that cannot register its store must still BOOT (it simply stays as
+  # un-updatable as it is today), which is the never-fail posture the rest of
+  # this image is built on. Same contract as nixpkgs' sd-image.nix.
+  boot.postBootCommands = ''
+    if [ -f /nix-path-registration ]; then
+      echo "[HART OS] registering the initial Nix store (first boot)..."
+      if ${config.nix.package.out}/bin/nix-store --load-db < /nix-path-registration; then
+        rm -f /nix-path-registration
+        echo "[HART OS] store registered — nixos-rebuild/OTA can now reference it."
+      else
+        echo "[HART OS] store registration FAILED — OTA stays unavailable; boot continues." >&2
+      fi
+    fi
+  '';
+
   # ── Installed-system filesystems (previously supplied by nixos-generators) ──
   # device is a stable by-label path so no root= cmdline is needed; the labels are
   # set on the partitions below. autoResize + growPartition are ALSO set by
@@ -111,6 +135,30 @@ in
       };
       "20-root" = {
         storePaths = [ config.system.build.toplevel ];
+        # ── The store DB registration, without which NOTHING nix works ──
+        # `storePaths` copies the closure's FILES into the partition but ships no
+        # database: systemd-repart has no notion of nix's sqlite. Verified on the
+        # flashed box 2026-08-20 — the DB knew exactly ONE path, db.sqlite was an
+        # empty 45KB schema, and even the RUNNING system answered:
+        #   error: path '/nix/store/...-nixos-system-hart-node-...' is not valid
+        #
+        # Consequences, all of which were live on that machine:
+        #   * `nixos-rebuild switch` can reference nothing it already has, so an
+        #     OTA would try to fetch an entire system closure (~22 GiB measured
+        #     below) into the 3.1G the stick had free. OTA could never work.
+        #   * `nix-env --set` on the system profile fails outright ("don't know
+        #     how to build these paths"), so the rollback anchor cannot even be
+        #     created — hart-first-boot's registration step needs this to succeed.
+        #   * a `nix-collect-garbage` would consider the whole store unreachable.
+        #
+        # This is the standard NixOS image contract (sd-image.nix ships the same
+        # file and loads it in postBootCommands); the repart path simply never
+        # adopted it. closureInfo computes the registration for the SAME closure
+        # storePaths already copies, so it adds a manifest, not another copy.
+        contents = {
+          "/nix-path-registration".source =
+            "${pkgs.closureInfo { rootPaths = [ config.system.build.toplevel ]; }}/registration";
+        };
         repartConfig = {
           Type = "root";          # x86-64 root discoverable-partition GUID
           Format = "ext4";
