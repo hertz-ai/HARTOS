@@ -280,7 +280,7 @@ class TestEventBusSSEDenylist:
     The _topic_targets_sse helper returns True for any topic not in
     the denylist."""
 
-    def test_default_denylist_holds_only_the_internal_bus_prefix(self):
+    def test_denylist_holds_only_justified_internal_prefixes(self):
         from core.platform.events import _SSE_DENYLIST_PREFIXES
         # The instruction was "allow all UNLESS some events need not be
         # published to SSE" -- `bus.*` is exactly that exception, and it was
@@ -289,7 +289,33 @@ class TestEventBusSSEDenylist:
         # two envelopes with divergent dedup keys and the SPA played TTS audio
         # TWICE on a single chat turn (2026-05-10 20:28:29). Assert the narrow
         # exception explicitly, so a BROAD denylist still fails this guard.
-        assert _SSE_DENYLIST_PREFIXES == ('bus.',)
+        #
+        # 'channel.' added 2026-08-19 by e3015199, which is what turned this
+        # assertion red. Justified, and the CODE is right: `channel.*` is an
+        # internal control namespace (only emit today is 'channel.registered',
+        # integrations/channels/registry.py:85) that exists so Nunba can
+        # re-evaluate whether the WAMP router should run. It carries no
+        # user_id, so without the entry every channel registration trips the
+        # P3a no-user_id guard and logs a warning.
+        #
+        # Deliberately the PREFIX, not the single topic: narrowing this to
+        # 'channel.registered' would let the next internal channel event
+        # (deregistered/error) trip P3a all over again. The namespace is
+        # internal by design, so the prefix is the correct unit.
+        #
+        # This guard keeps its teeth via the user-facing assertions below:
+        # its purpose is to stop a denylist that silences UI traffic, not to
+        # freeze the tuple. Any future entry still has to be justified here.
+        assert _SSE_DENYLIST_PREFIXES == ('bus.', 'channel.')
+
+    def test_denylist_never_silences_user_facing_topics(self):
+        """The real intent of the guard above -- a denylist that swallows UI
+        traffic must fail, no matter how the tuple is spelled."""
+        from core.platform.events import _topic_targets_sse
+        for topic in ('chat.pupit', 'chat.response', 'chat.thinking',
+                      'agent.ui.update', 'notification.new', 'theme.changed'):
+            assert _topic_targets_sse(topic) is True, (
+                f'{topic!r} is user-facing and must reach SSE')
 
     def test_topic_targets_sse_returns_true_by_default(self):
         from core.platform.events import _topic_targets_sse
