@@ -92,7 +92,20 @@ jobs:
                 echo "CUSTOM_LLM_BASE_URL=$LLM_GATEWAY"
                 echo "HEVOLVE_NODE_TIER=${{ secrets.HEVOLVE_NODE_TIER || 'central' }}"
                 echo "HEVOLVE_ENFORCEMENT_MODE=${{ secrets.HEVOLVE_ENFORCEMENT_MODE || 'hard' }}"
-                echo "ALLOWED_HOSTS=${{ secrets.ALLOWED_HOSTS || '*' }}"
+                # OTA_HOST is APPENDED, never replaced: /api/ota/latest is the
+                # PUBLIC pointer every fleet node polls with
+                # `Host: etime.hertzai.com`, and security/middleware.py resolves
+                # a NAME against this allowlist (only literal RFC1918 addresses
+                # bypass it). The deployed secret is a specific list that omits
+                # that name, so every node poll answered 400 {"error":"Invalid
+                # host"} and OTA delivery was silently dead fleet-wide -- exactly
+                # the failure the middleware's own wildcard comment warns about.
+                # Verified on real HW 2026-08-20: same URL, same node,
+                # `Host: etime.hertzai.com` -> 400 while `Host: 192.168.0.9`
+                # -> 200. Appending keeps whatever the operator set (including
+                # '*', which still short-circuits to allow-all) and only ADDS
+                # the one host OTA cannot function without.
+                echo "ALLOWED_HOSTS=${{ secrets.ALLOWED_HOSTS || '*' }},${{ secrets.HART_OTA_HOST || 'etime.hertzai.com' }}"
                 echo "CORS_ORIGINS=${{ secrets.CORS_ORIGINS || '*' }}"
                 echo "LANGCHAIN_PROJECT=${{ secrets.LANGCHAIN_PROJECT || 'hartos' }}"
               } > .env
