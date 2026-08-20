@@ -137,7 +137,19 @@ in
       # Windows: native Wine API (not an emulator)
       windows = {
         enable = true;
-        gaming = true;                 # Steam + Proton + DXVK
+        # Steam + Proton + DXVK, x86_64 ONLY. This was an unconditional `true`,
+        # which turned programs.steam on for hart-desktop-arm, hart-desktop-rpi,
+        # hart-edge-arm and sd-phone — platforms Steam and Proton do not run on.
+        #
+        # It surfaced as an option collision rather than as a broken Steam,
+        # because nixpkgs' own programs/steam.nix sets
+        # `hardware.graphics.enable32Bit = true` whenever steam is enabled, and
+        # that contradicted this repo's x86_64 gate on the same option. Nix
+        # Lint & Evaluate 32354609218 named nixpkgs steam.nix as one half of the
+        # pair. Gating the enable32Bit copies (baa33510, dc0d5874) settled the
+        # three definitions inside this repo; this line is the producer upstream
+        # of all of them.
+        gaming = pkgs.stdenv.hostPlatform.isx86_64;
       };
 
       # Web: PWA as native windows
