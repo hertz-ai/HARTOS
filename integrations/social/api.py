@@ -1670,6 +1670,71 @@ def get_post_likes(post_id):
     return _ok(voters)
 
 
+def _publish_recipe_path(platform):
+    """Where a recorded posting recipe lives for one platform.
+
+    Under get_data_dir() so it inherits NUNBA_DATA_DIR and survives a container
+    rebuild, the same as the staging log. A recipe that vanishes on deploy would
+    silently drop delivery back to the API path nobody configured.
+    """
+    import os as _os
+    try:
+        from core.platform_paths import get_data_dir
+        d = get_data_dir()
+    except Exception:
+        d = _os.path.expanduser('~/.hartos')
+    _os.makedirs(_os.path.join(d, 'publish_recipes'), exist_ok=True)
+    safe = ''.join(c for c in str(platform or '') if c.isalnum() or c in '-_')[:32]
+    return _os.path.join(d, 'publish_recipes', '%s.json' % (safe or 'unknown'))
+
+
+def _load_publish_recipe(platform):
+    """The recorded recipe for a platform, or None. Never raises."""
+    import os as _os
+    path = _publish_recipe_path(platform)
+    if not _os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            r = json.load(fh)
+        return r if (r.get('steps') or []) else None
+    except Exception as exc:
+        logger.warning('publish: recipe for %s unreadable: %s', platform, exc)
+        return None
+
+
+@social_bp.route('/publish/recipe/<platform>', methods=['PUT'])
+@require_admin
+def put_publish_recipe(platform):
+    """Store the recorded posting recipe for a platform.
+
+    The operator records themselves posting ONCE (remote-desktop capture, which
+    integrations/remote_desktop/recipe_hooks.py turns into a recipe), and PUTs
+    it here. Every later send replays it. No Meta app, no App Review, no page
+    token anywhere in that path.
+
+    Put the literal {{caption}} as the text of whichever `type` step enters the
+    caption; the send endpoint substitutes the staged post's own words there and
+    replays everything else exactly as recorded.
+    """
+    body = _get_json() or {}
+    steps = body.get('steps')
+    if not isinstance(steps, list) or not steps:
+        return _err('recipe needs a non-empty steps list', 400)
+    if not any(str((st.get('parameters') or {}).get('text', '')).strip() == '{{caption}}'
+               for st in steps):
+        return _err(
+            "no step types {{caption}}, so every post would carry the words "
+            "recorded that one time. Mark the caption step and PUT it again.",
+            422)
+    path = _publish_recipe_path(platform)
+    with open(path, 'w', encoding='utf-8') as fh:
+        json.dump({'recipe_type': 'remote_desktop', 'platform': platform,
+                    'steps': steps, 'step_count': len(steps)}, fh)
+    logger.info('publish: stored %d-step recipe for %s', len(steps), platform)
+    return _ok({'stored': True, 'platform': platform, 'steps': len(steps)})
+
+
 @social_bp.route('/publish/staged', methods=['GET'])
 @require_admin
 def list_staged_posts_route():
@@ -1717,6 +1782,56 @@ def send_staged_post(post_id):
     if not urls:
         return _err('Instagram requires at least one image; this post has none', 422)
 
+    caption = post.get('caption') or ''
+
+    # DELIVERY PATH 1: computer use, replaying a recorded recipe.
+    #
+    # Tried first, and on purpose. It needs no Meta app, no App Review and no
+    # page access token: the operator records themselves posting once, and that
+    # session becomes a recipe the agent replays. That is the same CREATE-once /
+    # REUSE-forever pattern the rest of this codebase runs on, and
+    # integrations/remote_desktop/recipe_hooks.py already implements both
+    # halves -- capture_session_as_recipe() and replay_recipe_on_device().
+    #
+    # A recorded recipe types a FIXED caption, which would post the same words
+    # every time. So any `type` step whose text is the literal {{caption}} gets
+    # the staged post's caption substituted at replay. Nothing else in the
+    # recipe is rewritten; the clicks and the navigation are replayed exactly as
+    # recorded, because guessing at somebody's UI is how this breaks silently.
+    recipe = _load_publish_recipe(post.get('platform') or 'instagram')
+    if recipe:
+        steps = []
+        for st in recipe.get('steps', []):
+            st = dict(st)
+            params = dict(st.get('parameters') or {})
+            if str(params.get('text', '')).strip() == '{{caption}}':
+                params['text'] = caption
+            st['parameters'] = params
+            steps.append(st)
+        try:
+            from integrations.remote_desktop.recipe_hooks import get_recipe_bridge
+            outcome = get_recipe_bridge().replay_recipe_on_device(
+                {**recipe, 'steps': steps}, device_id=None)
+        except Exception as exc:
+            logger.exception('publish: recipe replay failed for %s', post_id)
+            return _err('computer-use replay failed: %s' % exc, 502)
+        ok = bool(outcome.get('success'))
+        _append({
+            **post,
+            'status': 'sent' if ok else 'failed',
+            'delivery': 'computer_use',
+            'sent_at': datetime.utcnow().isoformat() + 'Z',
+            'sent_by_user_id': getattr(g.user, 'id', None),
+            'result': 'steps_executed=%s errors=%s' % (
+                outcome.get('steps_executed'), outcome.get('errors')),
+        })
+        if not ok:
+            return _err('replay did not complete: %s' % outcome.get('errors'), 502)
+        return _ok({'published': True, 'post_id': post_id,
+                    'delivery': 'computer_use',
+                    'steps_executed': outcome.get('steps_executed')})
+
+    # DELIVERY PATH 2: the platform API. Only reachable when no recipe exists.
     adapter = None
     try:
         from integrations.channels.registry import get_registry
@@ -1724,14 +1839,17 @@ def send_staged_post(post_id):
     except Exception as exc:
         logger.warning('publish: registry unavailable: %s', exc)
     if adapter is None:
-        return _err('no connected %s adapter' % post.get('platform'), 503)
+        return _err(
+            'no recorded computer-use recipe for %s and no connected adapter. '
+            'Record one with the remote-desktop recipe bridge, or connect a '
+            'Page with a linked Instagram Business account.' % post.get('platform'),
+            503)
     if not getattr(getattr(adapter, 'instagram_config', None), 'page_access_token', ''):
         return _err(
             'the adapter has no page_access_token, so Meta cannot be called. '
             'Connect a Facebook Page with a linked Instagram Business account.',
             503)
 
-    caption = post.get('caption') or ''
     try:
         if len(urls) > 1:
             result = _asyncio.run(adapter.publish_carousel(urls, caption))
