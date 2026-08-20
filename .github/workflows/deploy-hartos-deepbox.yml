@@ -140,6 +140,44 @@ jobs:
               fi
             fi
 
+            # ── The OTA host, guaranteed on EVERY deploy (not just a fresh box) ──
+            # The block above writes .env only when it is ABSENT, which is the
+            # right rule (a live .env carries values this workflow does not
+            # know). The consequence: adding the OTA host to that block fixed
+            # nothing here. Deepbox's .env is dated 2026-07-21, so the block has
+            # been skipped on every deploy since, and ALLOWED_HOSTS still read
+            #   localhost,127.0.0.1,172.17.0.1,azurekong...,hevolve.ai,...
+            # with no etime.hertzai.com. Verified 2026-08-20 against the LIVE
+            # container and the file on disk: `Host: 192.168.0.9` -> 200
+            # {"channel":"stable",...}, `Host: etime.hertzai.com` -> 400
+            # {"error":"Invalid host"} -- and that name is exactly what every
+            # fleet node polls (hart-ota.nix defaults to
+            # http://etime.hertzai.com:6777/api/ota/latest). OTA delivery was
+            # dead fleet-wide at the first request.
+            #
+            # So ensure it separately and idempotently. This does NOT rewrite
+            # .env: it appends ONE host to ONE key, only when missing, which is
+            # the same additive contract the create-block comment describes.
+            # Re-running is a no-op, and an operator's '*' is left alone.
+            _OTA_HOST="${{ secrets.HART_OTA_HOST || 'etime.hertzai.com' }}"
+            if [ -n "$_OTA_HOST" ] && [ -f .env ]; then
+              if ! grep -q '^ALLOWED_HOSTS=' .env; then
+                echo "ALLOWED_HOSTS=$_OTA_HOST" >> .env
+                echo "  ALLOWED_HOSTS absent — created it with $_OTA_HOST"
+              else
+                _CUR="$(grep -E '^ALLOWED_HOSTS=' .env | head -1 | cut -d= -f2-)"
+                case ",$_CUR," in
+                  *",$_OTA_HOST,"*)
+                    echo "  ALLOWED_HOSTS already allows $_OTA_HOST" ;;
+                  *"*"*)
+                    echo "  ALLOWED_HOSTS is allow-all — nothing to add" ;;
+                  *)
+                    sed -i "s|^ALLOWED_HOSTS=.*|ALLOWED_HOSTS=$_CUR,$_OTA_HOST|" .env
+                    echo "  appended $_OTA_HOST to ALLOWED_HOSTS (OTA polls by that name)" ;;
+                esac
+              fi
+            fi
+
             DEPLOY_COMMIT="$(git rev-parse HEAD)"
             DEPLOY_COMMIT_SHORT="$(git rev-parse --short HEAD)"
 
