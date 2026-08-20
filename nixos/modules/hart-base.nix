@@ -211,6 +211,22 @@ in
     # "nixpkgs". (Android hides Linux; HART OS hides NixOS — down to the console.)
     nix.channel.enable = lib.mkForce false;
 
+    # ── …and therefore FLAKES must be on (real-HW 2026-08-20) ──
+    # The line above is half a decision: HART OS is flake-based and never uses
+    # channels. But nothing enabled the flake machinery for the OS itself, so
+    # /etc/nix/nix.conf shipped with NO experimental-features and every flake
+    # command on a flashed node died with:
+    #   error: experimental Nix feature 'nix-command' is disabled
+    # Only hart-installer.nix ever set it, and a flashed image does not include
+    # that module. Everything the OS offers for updating itself is a flake
+    # command — hart-ota (`nixos-rebuild switch --flake`), hart-self-build (same,
+    # plus `nix store diff-closures`), and a user's own `nixos-rebuild --flake`.
+    # A node with ota.enable and autoApply BOTH true still could not have
+    # applied anything. Declared HERE, once, because it is a property of the OS
+    # rather than of any one feature: the alternative is each consumer
+    # re-declaring the same requirement and none of them owning it.
+    nix.settings.experimental-features = [ "nix-command" "flakes" ];
+
     # ── Users ──
     users.users.hart = {
       isSystemUser = true;
