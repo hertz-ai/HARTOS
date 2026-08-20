@@ -2391,6 +2391,37 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     except Exception as e:
         tool_logger.debug(f"Publish tools registration skipped: {e}")
 
+    # Media and news, the other two families a channel conversation should
+    # reach. Both were wired nowhere on this path: create_recipe registers
+    # media, /chat does not, so "make me an image" worked in one runtime and
+    # not the other. News has been orphaned since it was written.
+    try:
+        from integrations.service_tools.media_agent import register_media_tools
+        register_media_tools(helper1, time_agent)
+    except Exception as e:
+        tool_logger.debug(f"Media tools registration skipped: {e}")
+    try:
+        from integrations.agent_engine.news_tools import register_news_tools
+        register_news_tools(helper1, time_agent, user_id)
+    except Exception as e:
+        tool_logger.debug(f"News tools registration skipped: {e}")
+
+    # DELIBERATELY NOT REGISTERED HERE: self_build and remote_desktop.
+    #
+    # This runtime answers messages from Discord, Telegram, WhatsApp, Slack and
+    # every other connected channel, so anything registered here is reachable
+    # by anyone who can send the bot a message.
+    #
+    #   self_build     install_package, remove_package, apply_build
+    #                  -> mutates the installation the agent runs on
+    #   remote_desktop cast_to_tv, forward_peripheral, disconnect_remote
+    #                  -> drives the operator's physical devices
+    #
+    # Those need an authenticated operator, not a chat turn. They stay on the
+    # paths that already have one. finance, revenue, outreach, journey and mcp
+    # are left out pending the same review rather than swept in because they
+    # were next in the list.
+
     def connect_time_main(message: Annotated[str, "The message time agent want to send to main agent"]) -> str:
         message = f"Role: Time Agent\n Message: {message}"
         print(f'user_id {user_id}')
