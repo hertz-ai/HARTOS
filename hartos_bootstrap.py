@@ -176,6 +176,10 @@ def _run_bootstrap(app, cfg: dict) -> None:
       4. consumer routes (Nunba: kids_media / kids_recommendation /
          upload_routes / db_routes)
       5. blueprint_registry.register_all_blueprints
+      5b. A2A protocol routes (/a2a/*) — added 2026-08-22; previously only
+          the standalone hart_intelligence_entry path registered these,
+          so bundled nodes served the SPA shell to every peer directory
+          fetch (see _init_a2a_server)
       6. init_db + run_migrations
       7. channel adapters (config + env-var + web)
       8. init_agent_engine
@@ -196,6 +200,10 @@ def _run_bootstrap(app, cfg: dict) -> None:
             _register_core_blueprints(app)
             _run_consumer_hook(app, cfg)
             _register_hive_blueprints(app)
+            # Route registration — must stay inside the setup-lock-bypass
+            # window with the other route steps.  See _init_a2a_server for
+            # why the bundle needs this (peers got the SPA shell for /a2a/*).
+            _init_a2a_server(app, cfg)
             _init_database(cfg)
             _init_channel_adapters(app, cfg)
             # IMPORTANT: spawn hevolveai BEFORE the agent-engine subsystem
@@ -370,6 +378,63 @@ def _register_hive_blueprints(app) -> None:
         )
     except Exception as e:
         logger.warning(f"HARTOS blueprint registry failed: {e}")
+
+
+def _init_a2a_server(app, cfg: dict) -> None:
+    """Register the Google A2A surface (``/a2a/agents``, ``/a2a/<id>/...``).
+
+    Until 2026-08-22 these routes were registered ONLY at
+    ``hart_intelligence_entry.py:1572`` — module-level code the bundled build
+    never imports — so a bundled Nunba served the SPA shell (200 text/html)
+    for every ``/a2a/*`` path.  Peers then failed exactly as measured on the
+    LAN: ``peer_reuse.discover_peer_agent`` got HTML where it expected the
+    agent directory and raised ``Expecting value: line 1 column 1`` from
+    ``resp.json()`` (its ``status_code != 200`` guard cannot catch an HTML
+    200).  Net effect: cross-node agent/recipe exchange never worked from a
+    bundled node — this node advertised agents nobody could fetch.
+
+    Zero-regression by construction:
+      * Skips when an A2A server already exists in-process (the standalone
+        ``hart_intelligence_entry`` path registered it first — do not
+        double-register).
+      * Skips when the app already carries any ``/a2a/`` rule, so a repeat
+        bootstrap call can never hit Flask's duplicate-endpoint error.
+      * Same degrade-on-failure contract as every other step here.
+
+    ``base_url`` feeds only the agent-card ``url`` field.  The routes live on
+    the CONSUMER app, which serves on ``NUNBA_PORT`` (main.py:560, default
+    5000) — not on ``get_port('backend')``, which is the standalone HARTOS
+    port and is exactly the drift that filled the peer table with dead
+    ``localhost:6777`` rows.  ``a2a_base_url`` in cfg lets a consumer that
+    fronts itself (proxy, tunnel) advertise the outward URL instead.
+    """
+    try:
+        from integrations.google_a2a import (
+            initialize_a2a_server, get_a2a_server, register_all_agents,
+        )
+    except Exception as e:
+        logger.warning(f"A2A protocol unavailable (import failed): {e}")
+        return
+    try:
+        if get_a2a_server() is not None:
+            logger.info("A2A server already initialized — skipping")
+            return
+        if any(str(r.rule).startswith('/a2a/') for r in app.url_map.iter_rules()):
+            logger.info("A2A routes already present on app — skipping")
+            return
+        base_url = (cfg.get('a2a_base_url')
+                    or f"http://localhost:{os.environ.get('NUNBA_PORT', '5000')}")
+        initialize_a2a_server(app, base_url=base_url)
+        logger.info(f"A2A protocol routes registered (base_url={base_url})")
+        try:
+            register_all_agents()
+            logger.info("A2A dynamic agents registered")
+        except Exception as e:
+            # Directory routes still serve with zero cards; peers see an
+            # empty-but-valid JSON directory rather than the SPA shell.
+            logger.warning(f"A2A agent registration failed (routes still up): {e}")
+    except Exception as e:
+        logger.warning(f"A2A protocol init failed: {e}")
 
 
 # ─── Step 6: DB + migrations ────────────────────────────────────────────
