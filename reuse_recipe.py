@@ -2383,14 +2383,6 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     # orphaned. An agent told "post this to Instagram" should be able to
     # without saying a magic word first.
     #
-    # These tools STAGE only. There is no publish tool: sending is a human
-    # action. See integrations/channels/publish_tools.py for why.
-    try:
-        from integrations.channels.publish_tools import register_publish_tools
-        register_publish_tools(helper1, time_agent, _tool_ctx)
-    except Exception as e:
-        tool_logger.debug(f"Publish tools registration skipped: {e}")
-
     # Media and news, the other two families a channel conversation should
     # reach. Both were wired nowhere on this path: create_recipe registers
     # media, /chat does not, so "make me an image" worked in one runtime and
@@ -2461,14 +2453,6 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     try:
         from integrations.channels.agent_tools import register_channel_tools
         register_channel_tools(helper2, visual_agent, _tool_ctx)
-    except Exception:
-        pass
-
-    # Same for visual_agent, so which agent handled the turn does not decide
-    # whether a post can be composed.
-    try:
-        from integrations.channels.publish_tools import register_publish_tools
-        register_publish_tools(helper2, visual_agent, _tool_ctx)
     except Exception:
         pass
 
