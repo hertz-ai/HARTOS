@@ -86,9 +86,19 @@ def build_asgi_app(wsgi_app: Any) -> Any:
     """
     from hypercorn.middleware import AsyncioWSGIMiddleware
 
+    from core.constants import MAX_PAYLOAD_BYTES
     from core.peer_link.server import peer_link_asgi
 
-    return peer_link_asgi(AsyncioWSGIMiddleware(wsgi_app))
+    # Without an explicit max_body_size the middleware's library default of
+    # 2**16 (64 KB) rejects every larger POST body with an empty 400 before
+    # the WSGI app runs — measured live 2026-08-21: 50 KB reached the Flask
+    # handler, 200 KB never did, so batch voice transcribe and real uploads
+    # were transport-dead while Flask's MAX_CONTENT_LENGTH said 2 MB was
+    # fine.  The +1 headroom lets a body at exactly the app cap through the
+    # transport so Flask's own 413 (with a JSON body) owns the boundary
+    # error instead of the middleware's bare 400.
+    return peer_link_asgi(
+        AsyncioWSGIMiddleware(wsgi_app, max_body_size=MAX_PAYLOAD_BYTES + 1))
 
 
 def shared_config_values() -> dict:

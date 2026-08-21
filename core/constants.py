@@ -968,3 +968,16 @@ MACHINE_GOAL_AUTHORS = frozenset({
     'revenue_aggregator',
     'system_daemon',
 })
+
+
+# ── HTTP payload policy (ONE source, two consumers) ──────────────────────
+# hart_intelligence_entry sets Flask's MAX_CONTENT_LENGTH from this, and
+# core.serve passes it to Hypercorn's AsyncioWSGIMiddleware as max_body_size.
+# Before 2026-08-21 the transport side was never set, so the middleware's
+# library default of 2**16 (64 KB) silently rejected every POST body larger
+# than that with an empty 400 — measured live: a 50 KB multipart reached the
+# Flask handler, a 200 KB one never did.  A 5-second voice recording is
+# ~150 KB; batch /voice/transcribe and any real upload were unreachable
+# while the app-level policy said 2 MB was fine.
+import os as _os
+MAX_PAYLOAD_BYTES = int(_os.environ.get('HEVOLVE_MAX_PAYLOAD_BYTES', 2 * 1024 * 1024))

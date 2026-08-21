@@ -868,7 +868,11 @@ if _is_bundled:
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
-app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('HEVOLVE_MAX_PAYLOAD_BYTES', 2 * 1024 * 1024))  # 2MB default
+# One payload policy for app AND transport: core.serve passes the same
+# constant to Hypercorn's WSGI middleware (whose 64 KB library default
+# otherwise transport-rejects bodies Flask's own cap here would accept).
+from core.constants import MAX_PAYLOAD_BYTES
+app.config['MAX_CONTENT_LENGTH'] = MAX_PAYLOAD_BYTES  # 2MB default, HEVOLVE_MAX_PAYLOAD_BYTES to override
 
 # ── LLM outbound logger ───────────────────────────────────────────────
 # Monkey-patches httpx.Client.send (+ AsyncClient) to (a) inject the
@@ -9297,6 +9301,38 @@ def chat():
         except ImportError:
             logging.getLogger(__name__).debug("chat: swallowed ImportError")
 
+    # Resume an in-progress creation before the gate below can drop it.
+    #
+    # `create_agent` is a PER-MESSAGE guess: it comes from the request payload
+    # (Nunba sets it while a creation conversation is open) or from the draft
+    # classifier.  Neither survives a mid-flow approval — "Approved, generate
+    # the recipe" does not read as a create REQUEST, so the classifier returns
+    # False, the whole creation block below is skipped, and the turn falls
+    # through to the reuse path.  Reuse loads {prompt_id}_0_recipe.json, which
+    # for an agent still IN REVIEW does not exist yet
+    # (reuse_recipe.create_schedule:3367), so the turn 500s and the agent is
+    # left permanently half-built: config on disk, no recipe, and every later
+    # message a 500 with no way for the user to tell what went wrong.
+    # Reproduced live 2026-08-21 on prompt_id 1 and again on 7101.
+    #
+    # review_agents[...] is the AUTHORITATIVE "this user+prompt is mid-creation"
+    # flag — _save_and_enter_review sets it when the details are captured, and
+    # only the review phase clears it.  Trust that state over the per-message
+    # guess; recipe() at the end of Phase 2 is what the flow is waiting for.
+    if not create_agent and prompt_id:
+        try:
+            _resume_lock = _get_user_lock(user_id)
+            with _resume_lock:
+                _resuming = review_agents.get(f'{user_id}_{prompt_id}', False)
+        except Exception:
+            _resuming = False
+        if _resuming:
+            app.logger.info(
+                f'chat: resuming in-progress creation for {user_id}_{prompt_id} '
+                f'— review_agents is set, but this message did not classify as '
+                f'a create request. Staying in the creation flow.')
+            create_agent = True
+
     if create_agent:
         # Generate prompt_id server-side if not provided
         if not prompt_id:
@@ -9638,6 +9674,39 @@ def chat():
                 'Agent reuse module is unavailable. Please check server dependencies.',
                 intent=['FINAL_ANSWER'],
                 req_token_count=0, res_token_count=0, history_request_id=[],
+            )
+
+        # A config can exist with NO recipe.  The gather phase writes
+        # {prompt_id}.json with status 'completed', which means "details
+        # gathered" — NOT "recipe built".  Reuse then loads
+        # {prompt_id}_0_recipe.json unconditionally
+        # (reuse_recipe.create_schedule:3367), so that gap surfaced as a
+        # 500 on EVERY message to such an agent, forever: the agent was
+        # bricked at birth and the user got an opaque Internal Server
+        # Error with no way to tell what was wrong.  Observed live
+        # 2026-08-21 on research.local.scout (prompt_id 1):
+        #     FileNotFoundError: prompts\1_0_recipe.json
+        # _flow_recipe_exists is the daemon's existing CREATE-vs-REUSE
+        # test (agent_daemon.py:36) — the classifier this route simply
+        # never consulted.  Reused rather than re-implemented.
+        try:
+            from integrations.agent_engine.agent_daemon import _flow_recipe_exists
+        except Exception:
+            _flow_recipe_exists = None
+        if _flow_recipe_exists is not None and not _flow_recipe_exists(prompt_id):
+            app.logger.warning(
+                f'chat: agent {prompt_id} has a config but no flow-0 recipe — '
+                f'refusing the reuse path (it would raise FileNotFoundError '
+                f'in create_schedule). Agent needs its recipe generated.')
+            _agent_label = created_json.get('name') or created_json.get('agent_name') or prompt_id
+            return _chat_reply(
+                user_id, request_id,
+                f'"{_agent_label}" was saved but its recipe was never generated, '
+                f'so there are no steps to run yet. Finish creating it (or '
+                f'recreate it) and I can run it.',
+                intent=['FINAL_ANSWER'],
+                req_token_count=0, res_token_count=0, history_request_id=[],
+                Agent_status='Recipe Missing', prompt_id=prompt_id,
             )
 
         response = chat_agent(user_id,prompt,prompt_id,file_id,request_id)
