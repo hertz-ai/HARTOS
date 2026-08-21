@@ -9,6 +9,40 @@ Provides:
 - platform: OS platform layer (ServiceRegistry, EventBus, AppRegistry, etc.)
 """
 
+# Make the vendored `agent_ledger` importable in EVERY execution mode.
+#
+# agent_ledger is first-party HARTOS code living in-tree at
+# agent-ledger-opensource/agent_ledger, and it is an essential agent building
+# block (task memory, delegation, the Smart Ledger) rather than an optional
+# extra.  pyproject.toml already declares that directory as a package root
+# TWICE — `[tool.setuptools.packages.find] where = [".", "agent-ledger-opensource"]`
+# for the installed wheel, and `pythonpath = [".", "agent-ledger-opensource"]`
+# for pytest.  Neither covers the third mode: plain `python <script>.py` from a
+# source checkout, which is how ad-hoc runs and the desktop app's in-process
+# imports happen.  There, the 13+ `from agent_ledger import ...` call sites
+# raise ImportError.
+#
+# This makes the runtime honour the same single declaration, so the package
+# resolves from ONE canonical in-tree location in all three modes instead of
+# two of three.  An installed wheel or frozen bundle already has it on the
+# path and wins — find_spec short-circuits before we touch sys.path.
+def _ensure_vendored_agent_ledger() -> None:
+    import importlib.util
+    import os
+    import sys
+    try:
+        if importlib.util.find_spec('agent_ledger') is not None:
+            return          # installed / frozen — leave resolution alone
+    except (ImportError, ValueError):
+        pass                # treat an unresolvable spec as "not importable"
+    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _vendored = os.path.join(_repo_root, 'agent-ledger-opensource')
+    if os.path.isdir(_vendored) and _vendored not in sys.path:
+        sys.path.insert(0, _vendored)
+
+
+_ensure_vendored_agent_ledger()
+
 # Install transformers `_LazyModule.__getattr__` recursion guard FIRST.
 # Any `from core.X import Y` path triggers this package init, so the guard
 # is in place before any submodule pulls in langchain/transformers.  Mirrors

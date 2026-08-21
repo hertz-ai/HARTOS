@@ -8,7 +8,7 @@
 from __future__ import annotations
 # Guard: cx_Freeze frozen builds close stdout/stderr.
 import sys, os
-from core.io_guard import silence_stdio; silence_stdio()
+from core.io_guard import silence_stdio, install_autogen_iostream; silence_stdio()
 # #170 — autogen budget constants live in core.constants (single source
 # of truth, was hardcoded as max_tokens=3500 in 3 sites here and 4 in
 # create_recipe.py).  See AUTOGEN_MESSAGE_TOKEN_BUDGET comment for why
@@ -31,7 +31,7 @@ import random
 # autogen).  Deferring keeps autogen off the backend-boot import path.
 # Same proxy + test as create_recipe.py — see tests/unit/test_lazy_autogen_import.py.
 from core.optional_import import lazy_module
-autogen = lazy_module("autogen")
+autogen = lazy_module("autogen", on_import=install_autogen_iostream)
 import os
 import pytz
 from core.http_pool import pooled_get, pooled_post, pooled_request

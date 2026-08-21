@@ -1,7 +1,7 @@
 """create_recipe.py"""
 # Guard: cx_Freeze frozen builds close stdout/stderr. Must be BEFORE autogen imports.
 import sys, os
-from core.io_guard import silence_stdio; silence_stdio()
+from core.io_guard import silence_stdio, install_autogen_iostream; silence_stdio()
 # #170 — autogen budget constants live in core.constants (single source
 # of truth, was hardcoded as max_tokens=3500 in 4 sites here and 3 in
 # reuse_recipe.py).  See AUTOGEN_MESSAGE_TOKEN_BUDGET comment for why
@@ -23,7 +23,7 @@ import ast
 # actually constructed — saving ~11-24s off `import create_recipe` and
 # therefore off the backend boot.  See tests/unit/test_lazy_autogen_import.py.
 from core.optional_import import lazy_module
-autogen = lazy_module("autogen")
+autogen = lazy_module("autogen", on_import=install_autogen_iostream)
 
 # Qwen3.5's Jinja chat template rejects system messages mid-conversation:
 #   "System message must be at the beginning"
@@ -222,16 +222,27 @@ def publish_agent_thought(last_speaker, messages, user_id):
         except Exception:
             pass
 
-# Add Smart Ledger for persistent task tracking - using agent_ledger package (from gpt4.1)
-try:
-    from agent_ledger import (
-        SmartLedger, Task, TaskType, TaskStatus, ExecutionMode,
-        create_ledger_from_actions, get_production_backend
-    )
-    from agent_ledger.factory import create_production_ledger, get_or_create_ledger
-    HAS_SMART_LEDGER = True
-except ImportError:
-    HAS_SMART_LEDGER = False
+# Smart Ledger — task memory, prerequisites and delegation for every agent.
+#
+# Imported UNCONDITIONALLY on purpose.  This used to be wrapped in
+# `try: ... except ImportError: HAS_SMART_LEDGER = False`, and that flag was
+# then read by NOTHING — so a failed import did not disable the ledger, it
+# just deferred the failure: create_action_with_ledger went on to call
+# get_production_backend() and died with `NameError: name
+# 'get_production_backend' is not defined` on the agent-creation path
+# (reproduced 2026-08-21 building the assistant for 1_7101).
+#
+# agent_ledger is first-party HARTOS code vendored in-tree, not a third-party
+# extra, and an agent without task memory is not a degraded agent — it is a
+# broken one.  So there is nothing to feature-flag: if this import fails the
+# build is wrong and it should say so here, loudly, instead of producing
+# agents that lose their tasks.  core/__init__.py guarantees the in-tree
+# package resolves in a source checkout as well as installed and frozen.
+from agent_ledger import (
+    SmartLedger, Task, TaskType, TaskStatus, ExecutionMode,
+    create_ledger_from_actions, get_production_backend
+)
+from agent_ledger.factory import create_production_ledger, get_or_create_ledger
 # Add to your create_recipe.py after imports
 from lifecycle_hooks import (
     initialize_deterministic_actions,
@@ -3137,12 +3148,49 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
         except Exception:
             pass
 
+    # The agent's GOAL, put where the executing agent can actually see it.
+    #
+    # ChatInstructor sends one line per step — "Execute Action 1: Write the
+    # awareness hook" (create_recipe.py:5204) — and that line carries no
+    # SUBJECT.  Nothing else in this system message names what the agent is
+    # for either, so the model fills the hole by inventing one.  Live
+    # 2026-08-21: marketing.local.funnel, whose stored goal is "a complete
+    # marketing funnel for Nunba, the local-first AI agent", spent three
+    # attempts writing about "sustainable urban gardening for busy city
+    # professionals" and called google_search with "urban gardening messaging
+    # hooks trends 2024".  The goal and every flow's sub_goal were on disk in
+    # prompts/{id}.json the whole time.
+    #
+    # load_agent_config is the canonical mtime-cached reader (cache_loaders.py:158),
+    # so this is a dict lookup on the hot path, and it returns None for
+    # autonomous agents that have no config — hence the empty-block default.
+    _goal_block = ''
+    try:
+        from core.cache_loaders import load_agent_config
+        _pid = str(user_prompt).split('_', 1)[1] if '_' in str(user_prompt) else user_prompt
+        _cfg = load_agent_config(_pid) or {}
+        _goal = (_cfg.get('goal') or '').strip()
+        _subs = [str(f.get('sub_goal') or '').strip() for f in (_cfg.get('flows') or [])]
+        _subs = [s for s in _subs if s]
+        if _goal or _subs:
+            _goal_block = (
+                "\n        •THIS AGENT'S GOAL - every action you are given serves THIS,\n"
+                "         and nothing else.  Do NOT invent a different subject,\n"
+                "         product, or audience.  If an action names no subject,\n"
+                "         the subject is the goal below.\n"
+                + (f"         Goal: {_goal}\n" if _goal else '')
+                + ''.join(f"         Sub-goal: {s}\n" for s in _subs)
+            )
+    except Exception:
+        tool_logger.debug('goal block unavailable for %s', user_prompt, exc_info=True)
+
     assistant = autogen.AssistantAgent(
         name="Assistant",
         llm_config=llm_config,
         code_execution_config={"last_n_messages": 2, "work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f"""{'AUTONOMOUS MODE: Do NOT ask the user questions. Use sensible defaults. Complete actions immediately without clarification.' if autonomous else 'INTERACTIVE MODE: You may ask the user clarifying questions to understand their vision before proceeding.'}
         Plain ASCII only in code and output — no emoji or non-ASCII characters.
+{_goal_block}
 
         •HELPER IS YOUR SUPERMAN — DELEGATE EVERYTHING:
             The Helper agent has ALL the tools.  You have NONE.  For ANY task —

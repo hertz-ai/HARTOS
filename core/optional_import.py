@@ -40,7 +40,7 @@ from __future__ import annotations
 import importlib
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -149,11 +149,12 @@ class _LazyModule:
 
     # Slots keep the proxy lean and ensure __getattr__ is the ONLY way
     # to reach module attributes (no accidental shadowing).
-    __slots__ = ("_name", "_mod", "_lock")
+    __slots__ = ("_name", "_mod", "_lock", "_on_import")
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, on_import: Optional[Callable[[], None]] = None):
         object.__setattr__(self, "_name", name)
         object.__setattr__(self, "_mod", None)
+        object.__setattr__(self, "_on_import", on_import)
         import threading
         object.__setattr__(self, "_lock", threading.Lock())
 
@@ -168,6 +169,22 @@ class _LazyModule:
                 name = object.__getattribute__(self, "_name")
                 mod = importlib.import_module(name)
                 object.__setattr__(self, "_mod", mod)
+                # Fire the post-import hook ONCE, under the same lock that
+                # guards the import, so concurrent first-callers can't both
+                # run it.  Swallowing here is deliberate: the hook is a
+                # nicety (e.g. installing autogen's crash-proof IOStream);
+                # a broken hook must never turn a working import into an
+                # ImportError at a call site that only asked for a module.
+                hook = object.__getattribute__(self, "_on_import")
+                if hook is not None:
+                    object.__setattr__(self, "_on_import", None)
+                    try:
+                        hook()
+                    except Exception:
+                        logger.info(
+                            "lazy_module(%s): on_import hook failed", name,
+                            exc_info=True,
+                        )
             return mod
 
     # The three private slot names — set/get/del of these stay LOCAL to the
@@ -176,7 +193,7 @@ class _LazyModule:
     # ``patch('mod.autogen.SomeAttr')`` which does getattr/setattr/delattr on
     # the proxy to install + restore the mock — those must land on the REAL
     # module so call sites (and the patched code) see the mock.
-    __slot_names = ("_name", "_mod", "_lock")
+    __slot_names = ("_name", "_mod", "_lock", "_on_import")
 
     def __getattr__(self, item: str) -> Any:
         # __getattr__ only fires for names NOT found normally; with
@@ -207,7 +224,7 @@ class _LazyModule:
         )
 
 
-def lazy_module(name: str) -> Any:
+def lazy_module(name: str, on_import: Optional[Callable[[], None]] = None) -> Any:
     """Return a proxy that imports ``name`` on first attribute access.
 
     Args:
@@ -215,6 +232,12 @@ def lazy_module(name: str) -> Any:
             expensive to import and only used inside functions, e.g.
             ``"autogen"`` or
             ``"autogen.agentchat.contrib.capabilities.transform_messages"``.
+        on_import: Optional zero-arg callable run ONCE, immediately after
+            the real import succeeds.  For setup that needs the module
+            loaded but must not itself force the import — the case this
+            exists for is installing autogen's crash-proof IOStream (see
+            :func:`core.io_guard.install_autogen_iostream`).  Exceptions
+            from the hook are logged and swallowed.
 
     Returns:
         A :class:`_LazyModule` proxy.  Accessing any attribute on it
@@ -225,7 +248,7 @@ def lazy_module(name: str) -> Any:
     module should degrade gracefully with a fallback.  ``lazy_module``
     only defers *when* a present module is imported, never *whether*.
     """
-    return _LazyModule(name)
+    return _LazyModule(name, on_import=on_import)
 
 
 def list_degradations() -> List[Dict[str, Any]]:
