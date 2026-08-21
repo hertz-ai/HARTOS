@@ -254,6 +254,8 @@ def run_local_agentic_loop(
 
     extracted_responses = []
     start_time = time.time()
+    # One taskbar shortcut per run — see the pre-check call site below.
+    _taskbar_shortcut_used = False
 
     # Register this session in the stop registry so /api/vlm/stop can
     # signal it.  Cleanup happens just before the final return below
@@ -307,7 +309,15 @@ def run_local_agentic_loop(
                 except Exception:
                     _sw_pre = _sh_pre = None
                 _taskbar_action = None
-                if _sw_pre and _sh_pre:
+                # At most ONE taskbar shortcut per run.  _is_taskbar_task
+                # is a bare substring test, so a multi-step task that
+                # merely NAMES an app ("the Chrome window on the left")
+                # classifies as a taskbar task on EVERY iteration — the
+                # shortcut would then re-click the taskbar forever and
+                # the real steps would never run.  The shortcut exists to
+                # make the LAUNCH step cheap; once it has fired, the
+                # combined prompt owns the rest of the run.
+                if _sw_pre and _sh_pre and not _taskbar_shortcut_used:
                     try:
                         _taskbar_action = qwen3vl.try_taskbar_pre_check(
                             screenshot_b64, enhanced,
@@ -322,6 +332,11 @@ def run_local_agentic_loop(
                     # 14 lines duplicating the dict construction.
                     action_json = _point_action_to_action_json(_taskbar_action)
                     raw = _taskbar_action.get('raw', '')
+                    # Keep the RESOLVED normalized pair for logging —
+                    # the click-handling block below must not re-derive
+                    # it from `raw` (see the taskbar_list branch there).
+                    _taskbar_norm = (_taskbar_action.get('norm_x'),
+                                     _taskbar_action.get('norm_y'))
                     logger.info(
                         f"Loop: taskbar_list shortcut → "
                         f"({_taskbar_action.get('screen_x')},"
@@ -331,8 +346,10 @@ def run_local_agentic_loop(
                     # below (which executes action_json + records it).
                     # Skip the combined_prompt + _call_api block.
                     _skip_combined_prompt = True
+                    _taskbar_shortcut_used = True
                 else:
                     _skip_combined_prompt = False
+                    _taskbar_norm = None
 
                 # Skip the heavy combined-prompt VLM call entirely when
                 # taskbar_pre_check above already produced a click —
@@ -397,32 +414,57 @@ def run_local_agentic_loop(
                                   'middle_click', 'hover', 'mouse_move'}
 
                 if next_action in _CLICK_ACTIONS:
-                    # Phase 5 follow-through: was a 4th inline <point>
-                    # regex parser duplicating parser._parse_point_shape.
-                    # Now delegates to the canonical parser so the
-                    # action_json JSON-coordinate vs the raw <point>
-                    # tag agree (they previously could disagree when
-                    # the JSON had Box ID + the raw text had a point).
-                    nx, ny = _extract_click_coord(raw, action_json)
+                    if action_json.get('_strategy') == 'taskbar_list':
+                        # taskbar_list already RESOLVED the target: its
+                        # coordinate is screen-space and matched to the
+                        # right list entry by _taskbar_list_lookup's
+                        # second pass.  Re-parsing `raw` here would be
+                        # actively wrong — for this strategy `raw` is
+                        # the WHOLE enumerated taskbar ("1. [Start]
+                        # <point>..</point>\n2. [Chrome] ..."), and
+                        # _extract_click_coord returns the FIRST
+                        # <point> it finds, i.e. entry 1, discarding
+                        # the matched entry.  Live 2026-08-21: every
+                        # taskbar click landed on Start instead of the
+                        # requested app, which opened the Start menu
+                        # and made the loop ping-pong (click taskbar →
+                        # Start menu opens → VLM presses Escape →
+                        # shortcut fires again) until max_iterations.
+                        # Same reasoning as the `!= 'taskbar_list'`
+                        # guard on the bias retry just below.
+                        screen_x, screen_y = action_json['coordinate']
+                        nx, ny = _taskbar_norm or (screen_x, screen_y)
+                        logger.info(f"Action: {next_action} at "
+                                    f"({screen_x},{screen_y}) "
+                                    f"norm=({nx},{ny}) [taskbar_list, "
+                                    f"coordinate kept as resolved]")
+                    else:
+                        # Phase 5 follow-through: was a 4th inline <point>
+                        # regex parser duplicating parser._parse_point_shape.
+                        # Now delegates to the canonical parser so the
+                        # action_json JSON-coordinate vs the raw <point>
+                        # tag agree (they previously could disagree when
+                        # the JSON had Box ID + the raw text had a point).
+                        nx, ny = _extract_click_coord(raw, action_json)
 
-                    # Scale from 1000-normalized or image space to screen space
-                    try:
-                        import pyautogui as _pag
-                        _sw, _sh = _pag.size()
-                        if nx <= 1000 and ny <= 1000:
-                            # Normalized 0-1000 coords
-                            screen_x = int(nx * _sw / 1000)
-                            screen_y = int(ny * _sh / 1000)
-                        else:
-                            # Image pixel coords
-                            screen_x = int(nx * _sw / VLM_IMG_W)
-                            screen_y = int(ny * _sh / VLM_IMG_H)
-                    except Exception as _scale_err:
-                        logger.debug(f"coord scale to screen failed: {_scale_err}")
-                        screen_x, screen_y = nx, ny
-                    action_json['coordinate'] = [screen_x, screen_y]
-                    logger.info(f"Action: {next_action} at ({screen_x},{screen_y}) "
-                                f"norm=({nx},{ny})")
+                        # Scale from 1000-normalized or image space to screen space
+                        try:
+                            import pyautogui as _pag
+                            _sw, _sh = _pag.size()
+                            if nx <= 1000 and ny <= 1000:
+                                # Normalized 0-1000 coords
+                                screen_x = int(nx * _sw / 1000)
+                                screen_y = int(ny * _sh / 1000)
+                            else:
+                                # Image pixel coords
+                                screen_x = int(nx * _sw / VLM_IMG_W)
+                                screen_y = int(ny * _sh / VLM_IMG_H)
+                        except Exception as _scale_err:
+                            logger.debug(f"coord scale to screen failed: {_scale_err}")
+                            screen_x, screen_y = nx, ny
+                        action_json['coordinate'] = [screen_x, screen_y]
+                        logger.info(f"Action: {next_action} at ({screen_x},{screen_y}) "
+                                    f"norm=({nx},{ny})")
 
                     # Bias-detection + elimination retry — additive
                     # restoration of point_and_act's strategy 3 that
