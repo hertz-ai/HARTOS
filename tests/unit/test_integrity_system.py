@@ -978,3 +978,72 @@ class TestMigrationV11:
         assert 'fraud_score' in columns
         assert 'last_challenge_at' in columns
         assert 'last_attestation_at' in columns
+
+
+# =====================================================================
+# code_hash_check vs LEGITIMATE updates (the fleet-bans-itself bug)
+# =====================================================================
+# Any hash change used to fail the challenge — but a changed hash is also
+# what a successful OTA update looks like, fleet-wide, at once. Measured
+# 2026-08-21: a peer collected offenses #1-#4 ('Code hash changed since
+# last exchange') during a day of legitimate deploys and the escalating
+# ban ladder took it to ~30 days. The guard now asks the release-hash
+# registry whether the NEW hash came from the release pipeline: shipped
+# updates pass (and advance the baseline); unknown hashes fail exactly as
+# before.
+
+class TestCodeHashCheckVsUpdates:
+
+    def _challenge(self, db, peer, nonce='ch_nonce'):
+        ch = IntegrityChallenge(
+            challenger_node_id='myself', target_node_id=peer.node_id,
+            challenge_type='code_hash_check', challenge_nonce=nonce,
+        )
+        db.add(ch)
+        db.flush()
+        return ch
+
+    def test_known_release_hash_passes_and_advances_baseline(self, db):
+        from integrations.social.integrity_service import IntegrityService
+        peer = _make_peer(db, code_hash='old_release_hash')
+        ch = self._challenge(db, peer)
+        with patch('security.release_hash_registry.get_release_hash_registry') as reg:
+            reg.return_value.is_known_release_hash.return_value = True
+            result = IntegrityService.evaluate_challenge_response(
+                db, ch.id, {'nonce': 'ch_nonce', 'code_hash': 'new_release_hash'}, '')
+        assert result['passed'] is True, \
+            'a hash from the release pipeline is an UPDATE, not fraud'
+        assert peer.code_hash == 'new_release_hash', \
+            'the baseline must advance or the next challenge re-flags the same release'
+
+    def test_unknown_hash_still_fails(self, db):
+        from integrations.social.integrity_service import IntegrityService
+        peer = _make_peer(db, code_hash='old_release_hash')
+        ch = self._challenge(db, peer)
+        with patch('security.release_hash_registry.get_release_hash_registry') as reg:
+            reg.return_value.is_known_release_hash.return_value = False
+            result = IntegrityService.evaluate_challenge_response(
+                db, ch.id, {'nonce': 'ch_nonce', 'code_hash': 'tampered_hash'}, '')
+        assert result['passed'] is False
+        assert 'Code hash changed' in result['details']
+        assert peer.code_hash == 'old_release_hash', \
+            'a REJECTED hash must not advance the baseline'
+
+    def test_registry_unavailable_keeps_old_behaviour(self, db):
+        from integrations.social.integrity_service import IntegrityService
+        peer = _make_peer(db, code_hash='old_release_hash')
+        ch = self._challenge(db, peer)
+        with patch('security.release_hash_registry.get_release_hash_registry',
+                   side_effect=ImportError('no registry')):
+            result = IntegrityService.evaluate_challenge_response(
+                db, ch.id, {'nonce': 'ch_nonce', 'code_hash': 'anything_else'}, '')
+        assert result['passed'] is False, \
+            'without a trust basis the guard must stay as strict as before'
+
+    def test_unchanged_hash_still_passes(self, db):
+        from integrations.social.integrity_service import IntegrityService
+        peer = _make_peer(db, code_hash='same_hash')
+        ch = self._challenge(db, peer)
+        result = IntegrityService.evaluate_challenge_response(
+            db, ch.id, {'nonce': 'ch_nonce', 'code_hash': 'same_hash'}, '')
+        assert result['passed'] is True

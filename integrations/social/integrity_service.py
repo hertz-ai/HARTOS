@@ -334,8 +334,41 @@ class IntegrityService:
             peer = db.query(PeerNode).filter_by(
                 node_id=challenge.target_node_id).first()
             if peer and peer.code_hash and reported_hash != peer.code_hash:
-                passed = False
-                details = 'Code hash changed since last exchange'
+                # A changed hash is ALSO what a successful update looks like --
+                # the entire point of OTA is that every node's code hash
+                # changes, fleet-wide, at once. Treating any change as fraud
+                # meant the guard banned the fleet it had just updated:
+                # measured on the real deployment 2026-08-21, a peer collected
+                # offenses #1-#4 for 'Code hash changed since last exchange' /
+                # 'Challenge timeout: code_hash_check' during a day of
+                # legitimate deploys, and the escalating ban ladder took it to
+                # a ~30-day ban. Every future rollout would repeat that.
+                #
+                # The distinction the guard needs already exists:
+                # release_hash_registry.is_known_release_hash() answers whether
+                # a hash came from the release pipeline (hardcoded GA table,
+                # SIGNED release manifest, or a verified peer's runtime
+                # discovery). An attacker's tampered build is not in any of
+                # those, so this accepts exactly the updates the operator
+                # shipped and still fails everything else -- and the baseline
+                # ADVANCES on acceptance, so the next challenge compares
+                # against the new release rather than re-flagging it.
+                known = False
+                try:
+                    from security.release_hash_registry import (
+                        get_release_hash_registry,
+                    )
+                    known = get_release_hash_registry() \
+                        .is_known_release_hash(reported_hash)
+                except Exception:
+                    known = False       # no registry -> old behaviour exactly
+                if known:
+                    peer.code_hash = reported_hash
+                    details = ('Code hash advanced to a known signed release '
+                               '(peer updated)')
+                else:
+                    passed = False
+                    details = 'Code hash changed since last exchange'
 
         elif challenge.challenge_type == 'guardrail_verify':
             reported_hash = response_data.get('guardrail_hash', '')
