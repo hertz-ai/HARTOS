@@ -124,6 +124,9 @@ def build_publish_tool_closures(ctx: Dict[str, Any]) -> List[tuple]:
     """
     ctx = ctx or {}
     user_id = ctx.get("user_id")
+    # The visual agent is keyed by (user_id, prompt_id), so the send path needs
+    # both to hand the job back to the same session that composed the post.
+    prompt_id = ctx.get("prompt_id")
     log_tool_execution = ctx.get("log_tool_execution") or (lambda f: f)
 
     tools: List[tuple] = []
@@ -195,6 +198,7 @@ def build_publish_tool_closures(ctx: Dict[str, Any]) -> List[tuple]:
             # hand-written is the thing this project refuses to build.
             "authored_by": "agent",
             "staged_by_user_id": user_id,
+            "staged_by_prompt_id": prompt_id,
             "staged_at": datetime.now(timezone.utc).isoformat(),
         })
         logger.info("staged %s post %s (%d image(s))", platform, post_id, len(urls))

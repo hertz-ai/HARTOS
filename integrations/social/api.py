@@ -1670,71 +1670,6 @@ def get_post_likes(post_id):
     return _ok(voters)
 
 
-def _publish_recipe_path(platform):
-    """Where a recorded posting recipe lives for one platform.
-
-    Under get_data_dir() so it inherits NUNBA_DATA_DIR and survives a container
-    rebuild, the same as the staging log. A recipe that vanishes on deploy would
-    silently drop delivery back to the API path nobody configured.
-    """
-    import os as _os
-    try:
-        from core.platform_paths import get_data_dir
-        d = get_data_dir()
-    except Exception:
-        d = _os.path.expanduser('~/.hartos')
-    _os.makedirs(_os.path.join(d, 'publish_recipes'), exist_ok=True)
-    safe = ''.join(c for c in str(platform or '') if c.isalnum() or c in '-_')[:32]
-    return _os.path.join(d, 'publish_recipes', '%s.json' % (safe or 'unknown'))
-
-
-def _load_publish_recipe(platform):
-    """The recorded recipe for a platform, or None. Never raises."""
-    import os as _os
-    path = _publish_recipe_path(platform)
-    if not _os.path.exists(path):
-        return None
-    try:
-        with open(path, 'r', encoding='utf-8') as fh:
-            r = json.load(fh)
-        return r if (r.get('steps') or []) else None
-    except Exception as exc:
-        logger.warning('publish: recipe for %s unreadable: %s', platform, exc)
-        return None
-
-
-@social_bp.route('/publish/recipe/<platform>', methods=['PUT'])
-@require_admin
-def put_publish_recipe(platform):
-    """Store the recorded posting recipe for a platform.
-
-    The operator records themselves posting ONCE (remote-desktop capture, which
-    integrations/remote_desktop/recipe_hooks.py turns into a recipe), and PUTs
-    it here. Every later send replays it. No Meta app, no App Review, no page
-    token anywhere in that path.
-
-    Put the literal {{caption}} as the text of whichever `type` step enters the
-    caption; the send endpoint substitutes the staged post's own words there and
-    replays everything else exactly as recorded.
-    """
-    body = _get_json() or {}
-    steps = body.get('steps')
-    if not isinstance(steps, list) or not steps:
-        return _err('recipe needs a non-empty steps list', 400)
-    if not any(str((st.get('parameters') or {}).get('text', '')).strip() == '{{caption}}'
-               for st in steps):
-        return _err(
-            "no step types {{caption}}, so every post would carry the words "
-            "recorded that one time. Mark the caption step and PUT it again.",
-            422)
-    path = _publish_recipe_path(platform)
-    with open(path, 'w', encoding='utf-8') as fh:
-        json.dump({'recipe_type': 'remote_desktop', 'platform': platform,
-                    'steps': steps, 'step_count': len(steps)}, fh)
-    logger.info('publish: stored %d-step recipe for %s', len(steps), platform)
-    return _ok({'stored': True, 'platform': platform, 'steps': len(steps)})
-
-
 @social_bp.route('/publish/staged', methods=['GET'])
 @require_admin
 def list_staged_posts_route():
@@ -1767,6 +1702,11 @@ def send_staged_post(post_id):
     is reported as configuration rather than swallowed -- the failure that hid
     this whole area for weeks was publish_photo looking like it worked while
     Meta could not fetch the image.
+
+    Delivery is computer use first: the job goes to /visual_agent, which acts on
+    the browser tab the operator already has open and signed in. No Meta app, no
+    App Review, no page token on that path. The Meta API is the fallback, for
+    tenants who have actually connected a Page.
     """
     import asyncio as _asyncio
     from integrations.channels.publish_tools import read_staged_posts, _append
@@ -1784,54 +1724,76 @@ def send_staged_post(post_id):
 
     caption = post.get('caption') or ''
 
-    # DELIVERY PATH 1: computer use, replaying a recorded recipe.
+    # DELIVERY PATH 1: hand the job to the visual agent.
     #
-    # Tried first, and on purpose. It needs no Meta app, no App Review and no
-    # page access token: the operator records themselves posting once, and that
-    # session becomes a recipe the agent replays. That is the same CREATE-once /
-    # REUSE-forever pattern the rest of this codebase runs on, and
-    # integrations/remote_desktop/recipe_hooks.py already implements both
-    # halves -- capture_session_as_recipe() and replay_recipe_on_device().
+    # An earlier version of this route replayed a recorded list of clicks
+    # through integrations/remote_desktop/recipe_hooks.py. That was a second
+    # path built alongside the real one, and it was wrong twice over. Its
+    # capture half, capture_session_as_recipe(), had no callers anywhere. And
+    # "recipe" has never meant recorded coordinates in this codebase:
+    # create_recipe.py and reuse_recipe.py both reach computer use by POSTing a
+    # natural-language task_description to /visual_agent, which reads the screen
+    # through get_frame() -- FrameStore first, Redis fallback -- and works out
+    # the clicks itself.
     #
-    # A recorded recipe types a FIXED caption, which would post the same words
-    # every time. So any `type` step whose text is the literal {{caption}} gets
-    # the staged post's caption substituted at replay. Nothing else in the
-    # recipe is rewritten; the clicks and the navigation are replayed exactly as
-    # recorded, because guessing at somebody's UI is how this breaks silently.
-    recipe = _load_publish_recipe(post.get('platform') or 'instagram')
-    if recipe:
-        steps = []
-        for st in recipe.get('steps', []):
-            st = dict(st)
-            params = dict(st.get('parameters') or {})
-            if str(params.get('text', '')).strip() == '{{caption}}':
-                params['text'] = caption
-            st['parameters'] = params
-            steps.append(st)
-        try:
-            from integrations.remote_desktop.recipe_hooks import get_recipe_bridge
-            outcome = get_recipe_bridge().replay_recipe_on_device(
-                {**recipe, 'steps': steps}, device_id=None)
-        except Exception as exc:
-            logger.exception('publish: recipe replay failed for %s', post_id)
-            return _err('computer-use replay failed: %s' % exc, 502)
-        ok = bool(outcome.get('success'))
-        _append({
-            **post,
-            'status': 'sent' if ok else 'failed',
-            'delivery': 'computer_use',
-            'sent_at': datetime.utcnow().isoformat() + 'Z',
-            'sent_by_user_id': getattr(g.user, 'id', None),
-            'result': 'steps_executed=%s errors=%s' % (
-                outcome.get('steps_executed'), outcome.get('errors')),
-        })
-        if not ok:
-            return _err('replay did not complete: %s' % outcome.get('errors'), 502)
-        return _ok({'published': True, 'post_id': post_id,
-                    'delivery': 'computer_use',
-                    'steps_executed': outcome.get('steps_executed')})
+    # Coordinate replay also invented a blocker that does not exist. It cannot
+    # ship until an operator sits down and records a posting session. This can
+    # ship now, because the agent looks at the tab that is already open and
+    # already signed in, which is the whole point of having computer use.
+    #
+    # DISPATCH, NOT DELIVERY. /visual_agent returns once it has accepted the
+    # job, so what is known at this line is that the work was handed over, not
+    # that a post exists. The row below says 'sending' and the response says
+    # dispatched. Reporting 'published' here would be a guess, and a publish
+    # path that merely looked like it had worked is what hid this whole area
+    # for weeks.
+    platform = post.get('platform') or 'instagram'
+    task = (
+        'Post to %s using the browser tab that is already open and signed in. '
+        'Do not create an account, and do not change any account setting.\n\n'
+        'Image(s) to attach:\n%s\n\n'
+        'Use this caption exactly as written, changing nothing:\n%s'
+    ) % (platform, '\n'.join(urls), caption)
 
-    # DELIVERY PATH 2: the platform API. Only reachable when no recipe exists.
+    dispatch_err = None
+    try:
+        from core.port_registry import get_port
+        from core.http_pool import pooled_post
+        resp = pooled_post(
+            'http://localhost:%s/visual_agent' % get_port('backend'),
+            data=json.dumps({
+                'task_description': task,
+                'user_id': post.get('staged_by_user_id'),
+                'prompt_id': post.get('staged_by_prompt_id'),
+                'request_from': 'Publish',
+            }),
+            headers={'Content-Type': 'application/json'},
+        )
+        if resp.status_code < 400:
+            _append({
+                **post,
+                'status': 'sending',
+                'delivery': 'computer_use',
+                'dispatched_at': datetime.utcnow().isoformat() + 'Z',
+                'sent_by_user_id': getattr(g.user, 'id', None),
+                'result': 'handed to visual_agent (HTTP %s)' % resp.status_code,
+            })
+            return _ok({
+                'dispatched': True, 'post_id': post_id,
+                'delivery': 'computer_use',
+                'note': 'the visual agent has the job; it acts on the open tab',
+            })
+        dispatch_err = 'HTTP %s' % resp.status_code
+    except Exception as exc:
+        dispatch_err = str(exc)
+
+    # Falling through rather than failing: a tenant who HAS connected a Page
+    # should still be able to publish when the visual agent is not reachable.
+    logger.warning('publish: visual agent unavailable (%s); trying the platform API',
+                   dispatch_err)
+
+    # DELIVERY PATH 2: the platform API, reached only when the visual agent
+    # could not take the job. Needs a connected Page, which path 1 does not.
     adapter = None
     try:
         from integrations.channels.registry import get_registry
@@ -1840,9 +1802,10 @@ def send_staged_post(post_id):
         logger.warning('publish: registry unavailable: %s', exc)
     if adapter is None:
         return _err(
-            'no recorded computer-use recipe for %s and no connected adapter. '
-            'Record one with the remote-desktop recipe bridge, or connect a '
-            'Page with a linked Instagram Business account.' % post.get('platform'),
+            'the visual agent could not be reached for %s (%s) and no adapter '
+            'is connected. Computer use is the primary path; the Meta API is '
+            'only for tenants who have connected a Page.'
+            % (post.get('platform'), dispatch_err),
             503)
     if not getattr(getattr(adapter, 'instagram_config', None), 'page_access_token', ''):
         return _err(
