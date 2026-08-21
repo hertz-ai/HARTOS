@@ -131,6 +131,35 @@ def _reddit_submit(subreddit: str, title: str, url: str) -> str:
             f'type=LINK&title={quote(title)}&url={quote(url)}')
 
 
+# ─── Facebook ──────────────────────────────────────────────────────
+
+
+def _facebook_share(landing_url: str) -> str:
+    """Facebook's share dialog — link only, like LinkedIn's.
+
+    sharer.php takes NO body/quote parameter any more (the `quote=` field was
+    removed in 2017 and is silently dropped), so the composer opens empty and
+    the agent types body_text into it.
+    """
+    return f'https://www.facebook.com/sharer/sharer.php?u={quote(landing_url)}'
+
+
+# ─── Instagram ─────────────────────────────────────────────────────
+
+
+_INSTAGRAM_COMPOSER = 'https://www.instagram.com/'
+"""Instagram has NO share-intent URL at all — not for the link, not for the
+caption. The web composer is only reachable by clicking Create in the logged-in
+UI, which is precisely the kind of step the VLM loop exists to do: it can see
+the page and click through. So the intent URL is just the site root, and
+`notes` carries the rest of the instruction.
+
+NOT covered by channels/extensions/instagram_adapter.py — that adapter is
+Instagram *Direct Messages* over the Meta Graph API (DMs, ice breakers,
+quick replies) and needs Graph credentials. It cannot publish a feed post.
+"""
+
+
 # ─── WhatsApp ──────────────────────────────────────────────────────
 
 
@@ -202,6 +231,31 @@ def _build_intents() -> List[MarketingIntent]:
             rd_landing),
         landing_url=rd_landing,
         notes='Reddit accepts type=LINK + title via URL params.'))
+
+    # Facebook — share dialog opens with the link attached, body typed in.
+    fb_landing = _with_ref(_DOWNLOAD, 'fb_a')
+    out.append(MarketingIntent(
+        platform='facebook', code='fb_a',
+        intent_url=_facebook_share(fb_landing),
+        landing_url=fb_landing,
+        body_text=_LI_A_BODY.format(landing=fb_landing, download=_DOWNLOAD),
+        notes=('sharer.php carries the LINK only — it ignores any quote/body '
+               'param. The composer opens empty; paste body_text into it.')))
+
+    # Instagram — no intent URL exists; the agent opens the site and drives
+    # the Create flow visually.  Feed posts need an image, so the caller must
+    # pass one (browser_poster puts image URLs in the instruction).
+    ig_landing = _with_ref(_DOWNLOAD, 'ig_a')
+    out.append(MarketingIntent(
+        platform='instagram', code='ig_a',
+        intent_url=_INSTAGRAM_COMPOSER,
+        landing_url=ig_landing,
+        body_text=_WA_BROADCAST_BODY.format(landing=ig_landing),
+        notes=('No share-intent URL exists on Instagram. Opens the logged-in '
+               'site; the agent must click Create, attach the image, then type '
+               'the caption. Instagram captions are not clickable, so the '
+               'landing URL belongs in the bio, not the caption. '
+               'instagram_adapter.py is DM-only and cannot post to the feed.')))
 
     # WhatsApp Business broadcast — no URL composer; agent dispatches
     # the body via whatsapp_adapter to a curated contact list
