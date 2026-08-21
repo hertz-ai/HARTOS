@@ -151,6 +151,20 @@ in
           PYTHONPATH = "${hartApp}";
           PYTHONDONTWRITEBYTECODE = "1";
           PYTHONUNBUFFERED = "1";
+          # The ONE node database, same value as hart-backend/hart-agent/
+          # hart-discovery/hart-compute-mesh/hart-app-bridge. This unit was the
+          # only HARTOS-importing service WITHOUT it, so every DB read inside
+          # this process auto-detected some other (empty) path. Measured on the
+          # real box 2026-08-22: hart-backend saw users=1 while THIS process
+          # resolved 0 users, so core/event_attribution's single-tenant
+          # fallback returned None and the P3a guard refused every
+          # agent.action.completed this process emitted -- 1404 refusals in
+          # 5 minutes -- which is exactly the agents panel sitting on its
+          # "reconnecting / retry" button while /api/social/dashboard/agents
+          # (served by hart-backend, which HAS the variable) answered 200.
+          # One writer + readers is SQLite-safe here: WAL is enabled and the
+          # sibling services already share this path.
+          HEVOLVE_DB_PATH = "${cfg.dataDir}/hevolve_database.db";
         };
 
         serviceConfig = {
