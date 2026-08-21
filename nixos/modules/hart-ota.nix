@@ -17,6 +17,40 @@
 # Two modes:
 #   - Pull: timer-based check against upstream (default)
 #   - Push: gossip-received upgrade from peer (via upgrade_orchestrator)
+#
+# ── OPEN BLOCKER: nodes have no binary cache for HART's OWN derivations ──────
+# Measured end-to-end on the real Samsung box 2026-08-21/22, and this is why
+# OTA has never actually delivered, independent of the transport bugs fixed in
+# 4d68528 (CENTRAL rejected the hostname every node polls) and bb0bc45
+# (activation aborted into Emergency Mode on the second switch).
+#
+# The node trusts exactly one substituter:
+#
+#   substituters = https://cache.nixos.org/
+#
+# That serves nixpkgs. It does NOT serve anything this repo builds -- the
+# system closure, hart-comp, the session/shell scripts, every generated unit.
+# So `nixos-rebuild switch --flake` cannot FETCH the new system; each node must
+# BUILD it. A one-line change to a shell script dry-ran as "151 paths,
+# 352.94 MiB download" and then pulled 153 derivations to build, whose
+# build-time closure (stdenv, compilers) is gigabytes. With 3.0 GB free it
+# died: `error: writing to file: No space left on device`.
+#
+# A HART OS desktop closure is ~21 GiB on a 28 GiB medium, so a constrained
+# node can never win that race, and adding disk only postpones it: the cost
+# scales with the BUILD inputs, not with the size of the change.
+#
+# The fix is a binary cache the fleet trusts, which is what makes OTA cheap
+# everywhere else in the Nix world: have CI push the built closure (it already
+# builds hart-desktop in Nix Build Matrix) to a store nodes can substitute
+# from -- nix-serve on CENTRAL, S3, or Cachix -- and add it plus its public key
+# to nix.settings.substituters / trusted-public-keys. Then an update is a
+# download of the changed paths (small), not a local build (huge), and
+# hart-ota's existing pipeline works unmodified on the smallest node.
+#
+# Until that exists, treat autoApply as unsafe on constrained hardware: the
+# node will poll, try, exhaust its disk, and fail the apply -- and it cannot
+# roll back what it never finished building.
 
 let
   cfg = config.hart;
