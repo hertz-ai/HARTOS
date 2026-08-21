@@ -227,6 +227,34 @@ in
     # re-declaring the same requirement and none of them owning it.
     nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
+    # ── The fleet binary cache — what makes OTA a DOWNLOAD, not a build ──
+    # With only cache.nixos.org (nixpkgs), a node applying an update had to
+    # BUILD everything this repo defines: measured on real HW 2026-08-22, a
+    # one-line change queued 153 derivations and died on "No space left on
+    # device" with 3.0 GB free, because the build closure drags in stdenv and
+    # compilers. The desktop closure is ~21 GiB on a 28 GiB stick; no disk
+    # budget survives that, so OTA delivery was impossible by construction
+    # (ed0090b names this as the root blocker).
+    #
+    # CI (nix-build-matrix "Push system closure to the fleet cache") signs the
+    # built hart-desktop toplevel with the fleet key and rsyncs it to CENTRAL:
+    # nginx on deepbox :8093 serving /solidstate/hart-cache/cache (the signing
+    # key lives at /solidstate/hart-cache/key on that box, and its PUBLIC half
+    # is what is pinned here). etime.hertzai.com is the same name every node
+    # already polls for /api/ota/latest, so cache reachability equals OTA
+    # reachability -- no second hostname to keep alive.
+    #
+    # extra-*, not the bare options: the defaults (cache.nixos.org and its
+    # key) must survive, since nixpkgs paths still substitute from there.
+    # Order matters at fetch time: nix tries substituters as listed and this
+    # cache 404s for anything it does not hold, which then falls through to
+    # cache.nixos.org -- so a missing path costs one HTTP miss, never a
+    # failure. If the cache is DOWN entirely, substitution falls back to
+    # building exactly as before this existed: strictly additive.
+    nix.settings.extra-substituters = [ "http://etime.hertzai.com:8093" ];
+    nix.settings.extra-trusted-public-keys =
+      [ "hart-cache-1:NEkaZ0DGf9mv+annJ/RamQzXzbnuOTodiq+/W063FDQ=" ];
+
     # ── Users ──
     users.users.hart = {
       isSystemUser = true;

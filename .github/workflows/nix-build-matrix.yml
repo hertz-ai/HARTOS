@@ -413,6 +413,61 @@ jobs:
           sha256sum /tmp/hart-comp-bin/hart-comp | tee /tmp/hart-comp-bin/SHA256
           ls -l /tmp/hart-comp-bin/
 
+      # ── Push the system closure to the fleet binary cache (OTA delivery) ─────
+      # WHY: nodes trust only cache.nixos.org, which serves nixpkgs and nothing
+      # this repo builds, so `nixos-rebuild switch --flake` on a node had to
+      # BUILD the new system locally. Measured on the real Samsung box
+      # 2026-08-22: a one-line shell-script change queued 153 derivations whose
+      # build closure (stdenv, compilers) blew past 3.0 GB free with "No space
+      # left on device". OTA delivery is impossible that way (ed0090b).
+      #
+      # This step signs the just-built toplevel closure with the fleet cache
+      # key and rsyncs it to CENTRAL's static cache (nginx on deepbox :8093,
+      # /solidstate/hart-cache/cache, key at /solidstate/hart-cache/key).
+      # Nodes list that cache in nix.settings (hart-base.nix) and then an
+      # update is a DOWNLOAD of the changed paths, not a local build. rsync
+      # makes repeat pushes incremental: unchanged nars are not re-sent.
+      #
+      # iso-desktop pushes hart-desktop (the attr hart-ota's apply actually
+      # switches to: `--flake "$FLAKE#hart-desktop"`); raw-desktop additionally
+      # pushes hart-desktop-raw (the flashed-image closure). continue-on-error:
+      # a cache-push hiccup must never fail the build that produced the
+      # artifacts; the worst case is yesterday's cache, i.e. exactly the
+      # pre-cache world, and the step says loudly what it skipped.
+      - name: Push system closure to the fleet cache (deepbox)
+        if: matrix.target == 'iso-desktop' || matrix.target == 'raw-desktop'
+        continue-on-error: true
+        working-directory: nixos
+        env:
+          CACHE_KEY: ${{ secrets.HART_CACHE_SECRET_KEY }}
+          SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          set -o pipefail
+          if [ -z "$CACHE_KEY" ]; then
+            echo "HART_CACHE_SECRET_KEY secret absent — skipping cache push"; exit 0
+          fi
+          case "${{ matrix.target }}" in
+            iso-desktop) cfg="hart-desktop" ;;
+            raw-desktop) cfg="hart-desktop-raw" ;;
+          esac
+          umask 077; printf '%s' "$CACHE_KEY" > /tmp/cache-key
+          top=$(nix build ".#nixosConfigurations.$cfg.config.system.build.toplevel" \
+                  --no-link --print-out-paths)
+          echo "signing + packing closure of $top"
+          nix copy --to "file:///tmp/hart-cache?secret-key=/tmp/cache-key&compression=zstd" "$top"
+          du -sh /tmp/hart-cache
+          sudo apt-get install -y -qq sshpass >/dev/null 2>&1 || true
+          # nar/ first, then narinfos: a reader that sees a narinfo must find its
+          # nar already present, so a mid-push poll cannot 404 on the data half.
+          RS="sshpass -e rsync -a -e 'ssh -p ${DEPLOY_PORT} -o StrictHostKeyChecking=no'"
+          eval $RS /tmp/hart-cache/nar "$DEPLOY_USER@$DEPLOY_HOST:/solidstate/hart-cache/cache/"
+          eval $RS --exclude nar /tmp/hart-cache/ "$DEPLOY_USER@$DEPLOY_HOST:/solidstate/hart-cache/cache/"
+          rm -f /tmp/cache-key
+          echo "cache push complete for $cfg"
+
       # Five raw-desktop builds died silently after ~50 minutes, each time straight
       # after the filesystem was written, with the builder printing NOTHING even
       # under -L. Silence is not evidence, and guessing a cause per 50-minute
