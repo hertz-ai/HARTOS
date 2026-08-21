@@ -289,56 +289,9 @@ let
     # the shell's CSS animations to the GPU (the whole point of the GPU rungs). Keep
     # it ON for vulkan + webkit-cairo; disable it ONLY on the software floor rung
     # (where the WebView paints on cairo and a live blur would peg a core).
-    # SEPARATE from that: WHICH BUFFERS WebKit hands over. Compositing on/off is a
-    # look decision; dmabuf-vs-shared-memory is a plumbing decision, and it must
-    # match what the host can actually consume (below).
-    # ── WHAT THE HOST WILL COMPOSITE WITH — decided ONCE, consumed twice ─────────
-    # Both the WebKit buffer type (right below) and GSK_RENDERER (further down) hang
-    # off this one answer, because they are the two halves of ONE handoff: WebKit
-    # produces buffers, the GTK4 host consumes them. Deciding them independently is
-    # what produced the pathological pairing measured below. Same verdict file and
-    # same fail-safe as hart-comp.nix (absent/garbled -> software), so the shell and
-    # the compositor can never disagree about whether this box has a usable GPU.
-    _HART_GPU_VERDICT="$(cat /run/hart/gpu-render 2>/dev/null || echo software)"
-    if [ "$HART_SHELL_RENDER" = "vulkan" ] || \
-       { [ "$HART_SHELL_RENDER" = "webkit-cairo" ] && [ "$_HART_GPU_VERDICT" = "hardware" ]; }; then
-      _HART_HOST_RENDERER=vulkan
-    else
-      _HART_HOST_RENDERER=cairo
-    fi
     if [ "$HART_SHELL_RENDER" = "software" ]; then
       export WEBKIT_DISABLE_DMABUF_RENDERER=1
       export WEBKIT_DISABLE_COMPOSITING_MODE=1
-    elif [ "$_HART_HOST_RENDERER" = "cairo" ]; then
-      # A CPU-side compositor must not be handed GPU buffers. Compositing stays ON,
-      # so the glass and the micro-animations are untouched: only the buffer TYPE
-      # changes, not the look.
-      #
-      # Measured on the real Samsung box (i915 Ivy Bridge, 8 cores, 2026-08-20),
-      # idle desktop, nobody touching it:
-      #   WebKit  13348 ioctls/6s @   55us  -- GPU submission, healthy
-      #   host     3615 ioctls/6s @  738us  -- 2.67s of a 6s window INSIDE ioctl
-      #   host CPU 1.03 cores, WebKit 0.74, ~303 i915 IRQ/s, load ~3.5
-      # The host's calls on /dev/dri/renderD128 were PRIME_FD_TO_HANDLE,
-      # GEM_SET_TILING, GEM_WAIT, GEM_BUSY: it re-imports WebKit's dmabuf, de-tiles
-      # it and waits on the GPU -- every frame. It has no choice. This rung runs
-      # GSK cairo with GDK_GL=disable (above), so there is NO GPU path to composite
-      # an imported dmabuf; it must come back to the CPU. Exporting GPU buffers to
-      # a consumer that can only read them on the CPU is the worst of both paths.
-      #
-      # It also explains the orb-hover freeze that survived seven other theories:
-      # GEM_WAIT BLOCKS on GPU completion, so a fence that does not signal parks
-      # the host at 0% CPU in a syscall -- exactly the wedge state measured on this
-      # box (both shell processes idle, compositor healthy, elements=2, frame
-      # callbacks flowing, cursor still moving because sway draws it). Not a
-      # deadlock in our code: a readback that never completes.
-      #
-      # With this set WebKit hands over shared MEMORY buffers instead: ordinary
-      # cached RAM, no PRIME import, no de-tiling, no blocking GEM_WAIT. Measured
-      # on the same box: host CPU 1.03 cores -> 0.09, ioctls 3788/6s -> 359. It
-      # costs frame rate (a cairo host is slow either way), which is why this is
-      # only the FALLBACK -- a GPU host below keeps DMABUF and is better at both.
-      export WEBKIT_DISABLE_DMABUF_RENDERER=1
     fi
     # ── GTK4/GSK SOFTWARE RENDERER (the real-HW paint-hang fix) ──────────────────
     # THE difference between this GTK4 host and the GTK3 cage floor: GTK4 draws via
@@ -402,34 +355,12 @@ let
     #   via cairo; WebKit's OWN compositing -- governed by the WEBKIT_DISABLE_* gate
     #   above, ON for webkit-cairo -- is what accelerates the shell CONTENT). hart-comp's
     #   GLES compositing + prime-run app GPU are separate paths, untouched.
-    # webkit-cairo now ALSO asks for vulkan when the boot probe says `hardware`.
-    # Measured on the real Samsung box (i915 Ivy Bridge), on a REAL layer-shell
-    # BACKGROUND surface -- the exact surface type the comment above says hangs --
-    # same page, same compositor, one variable:
-    #     GSK cairo   1.03 cores, 2654 ioctls/4s,  53 frames/3s
-    #     GSK vulkan  0.13 core,                   96 frames/3s
-    #     GSK gl      0.18 core,  1656 ioctls/4s,  87 frames/3s
-    # 8x less CPU AND ~1.8x the frames: strictly better on both axes, because the
-    # host imports WebKit's dmabuf as a GPU texture instead of dragging it back
-    # across the bus. GDK_GL stays disabled (above), so this is the no-GL vulkan
-    # path, NOT the GL context that hung. GSK confirmed it really ran vulkan
-    # ("Using renderer 'GskVulkanRenderer'"), so this is not a silent fallback.
-    # The 2026-07-08 "vulkan HUNG first-paint on layer-shell" result did NOT
-    # reproduce here in three runs; it is kept as the reason for the safety net,
-    # not as a reason to stay on cairo, because cairo is not a safe floor -- it is
-    # the readback path whose blocking GEM_WAIT is the orb-hover freeze.
-    # THREE layers of safety, all pre-existing: GSK itself falls back to cairo if
-    # vulkan cannot init; the paint-watchdog drops the tier if first paint never
-    # lands; and a `software` probe verdict never gets here at all. Mesa warns
-    # "Ivy Bridge Vulkan support is incomplete" on THIS box -- it rendered
-    # correctly through every run, and the watchdog covers the case where a
-    # different box's driver does not.
-    if [ "$_HART_HOST_RENDERER" = "vulkan" ]; then
+    if [ "$HART_SHELL_RENDER" = "vulkan" ]; then
       export GSK_RENDERER=vulkan
-      echo "[hart-glass-shell-gtk4] GSK = VULKAN (rung=$HART_SHELL_RENDER, gpu-render=$_HART_GPU_VERDICT; GL disabled; GSK falls back to cairo if vulkan cannot init; watchdog drops the tier if first paint never lands)" >&2
+      echo "[hart-glass-shell-gtk4] GSK = VULKAN (rung=vulkan; GL disabled; watchdog drops to webkit-cairo if it hangs)" >&2
     else
       export GSK_RENDERER=cairo
-      echo "[hart-glass-shell-gtk4] GSK = CAIRO (rung=$HART_SHELL_RENDER, gpu-render=$_HART_GPU_VERDICT; CPU compositor, so WebKit was put on shared-memory buffers above)" >&2
+      echo "[hart-glass-shell-gtk4] GSK = CAIRO (rung=$HART_SHELL_RENDER; proven GTK4 host floor; WebKit compositing carries the shell content)" >&2
     fi
     export HART_SHELL_URL="$URL"
     # Shell-paint readiness marker (the session-supervisor's HUNG-tier guard): the
