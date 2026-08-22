@@ -9738,14 +9738,37 @@ def chat():
             # (update_agent_creation_to_db), and adverts to peers.
             _agent_label = created_json.get('name') or created_json.get('agent_name') or prompt_id
             if recipe is None:
-                return _chat_reply(
-                    user_id, request_id,
-                    f'"{_agent_label}" has no recipe yet and the creation '
-                    f'module is unavailable on this node.',
-                    intent=['FINAL_ANSWER'],
-                    req_token_count=0, res_token_count=0, history_request_id=[],
-                    Agent_status='Recipe Missing', prompt_id=prompt_id,
-                )
+                # The defensive import at :461 failed at MODULE LOAD.  That
+                # guard exists for a reason (steward, 2026-08-22): frozen and
+                # partial environments have boot-order import landmines, and
+                # a chat-serving node beats a dead one.  But "failed at boot"
+                # is not "unavailable forever" — by the time a user turn gets
+                # here the process is fully initialised, so retry the import
+                # LAZILY at first use.  A transient boot-order failure heals
+                # itself and the autonomous routing below proceeds; only a
+                # persistent failure surfaces, and then it NAMES the cause
+                # instead of a vague "module is unavailable".
+                try:
+                    import importlib as _il
+                    recipe = getattr(_il.import_module('create_recipe'), 'recipe')
+                    globals()['recipe'] = recipe
+                    app.logger.info(
+                        'chat: create_recipe imported lazily at first use '
+                        '(the boot-time import had failed).')
+                except Exception as _late_imp_err:
+                    app.logger.error(
+                        f'chat: create_recipe still not importable at use '
+                        f'time: {_late_imp_err}', exc_info=True)
+                    return _chat_reply(
+                        user_id, request_id,
+                        f'"{_agent_label}" has no recipe yet, and this node '
+                        f'could not load the creation runtime '
+                        f'(create_recipe import failed: {_late_imp_err}). '
+                        f'Check the boot log.',
+                        intent=['FINAL_ANSWER'],
+                        req_token_count=0, res_token_count=0, history_request_id=[],
+                        Agent_status='Recipe Missing', prompt_id=prompt_id,
+                    )
             app.logger.info(
                 f'chat: agent {prompt_id} has a config but no flow-0 recipe — '
                 f'routing this reuse turn into creation to finish it '
