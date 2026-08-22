@@ -34,23 +34,65 @@ def get_git_tags() -> list:
 
 
 def compute_hash_for_tag(tag: str, code_root: str) -> str:
-    """Compute code hash for a specific Git tag.
+    """Compute the NODE-INTEGRITY code hash for a specific Git tag.
 
-    Checks out the tag in a temporary worktree, computes the hash,
-    then cleans up.  Falls back to current tree hash if worktree fails.
+    Checks the tag out into a temporary git worktree, runs
+    ``security.node_integrity.compute_code_hash`` over it, then cleans up.
+
+    It MUST be that hash and no other: peers advertise
+    ``compute_code_hash()`` of their running tree
+    (peer_discovery.py:976), and admission compares that value against
+    this registry.  The previous implementation returned
+    ``git rev-parse <tag>^{tree}`` — a git TREE SHA, a different hash
+    universe entirely — so even a fully populated registry could never
+    have matched any peer, and every officially shipped version would
+    still have been admitted as untrusted.  (The intent is that ALL
+    shipped versions verify, not just the latest: peers legitimately
+    run older official builds.)
+
+    Returns '' on any failure; the caller skips that tag.
     """
+    import shutil
+    import tempfile
+
+    from security.node_integrity import compute_code_hash
+
+    # A stray precomputed-hash env var would make every tag "hash" to the
+    # same value — computation must be real here.
+    os.environ.pop('HEVOLVE_CODE_HASH_PRECOMPUTED', None)
+
+    worktree = tempfile.mkdtemp(prefix=f'relhash_{tag.replace("/", "_")}_')
     try:
-        from security.node_integrity import compute_code_hash
-        # Try to get the tree hash from git directly (no checkout needed)
         result = subprocess.run(
-            ['git', 'rev-parse', f'{tag}^{{tree}}'],
-            capture_output=True, text=True, timeout=10,
+            ['git', 'worktree', 'add', '--detach', worktree, tag],
+            capture_output=True, text=True, timeout=300, cwd=code_root,
         )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except Exception:
-        pass
-    return ''
+        if result.returncode != 0:
+            print(f"  {tag}: worktree checkout failed: "
+                  f"{result.stderr.strip()[:200]}", file=sys.stderr)
+            return ''
+        return compute_code_hash(worktree)
+    except Exception as e:
+        print(f"  {tag}: hash computation failed: {e}", file=sys.stderr)
+        return ''
+    finally:
+        # Cleanup must never mask the computed result.  `git worktree remove
+        # --force` already deletes the directory; the rmtree is only for
+        # leftovers, and even ignore_errors=True cannot contain a broken
+        # stdlib (observed live: a 3.13 shutil on a 3.12 interpreter raising
+        # AttributeError inside os.walk itself, which then propagated out of
+        # this finally and threw away a successfully computed hash).
+        try:
+            subprocess.run(
+                ['git', 'worktree', 'remove', '--force', worktree],
+                capture_output=True, text=True, timeout=120, cwd=code_root,
+            )
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(worktree, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def compute_current_hash(code_root: str) -> str:
@@ -111,11 +153,15 @@ def main():
             hashes[version] = h
             print(f"  {tag}: {h[:16]}...")
 
-    # Always include current HEAD hash
-    current = compute_current_hash(args.code_root)
-    if current:
-        hashes['_current'] = current
-        print(f"  current: {current[:16]}...")
+    # NOTE: no '_current' entry, deliberately.  Writing the registry changes
+    # security/release_hash_registry.py, which is itself part of the tree
+    # compute_code_hash hashes — so a "current tree" hash recorded here is
+    # stale the moment this file is written, and could never match any
+    # running node.  Tag hashes don't have that problem: they are computed
+    # over the tag's own frozen tree.  Consequence to know: the NEWEST
+    # release verifies every release before it, and becomes verifiable to
+    # others one release later — inherent to any self-hashing tree, same
+    # reason a git commit cannot contain its own sha.
 
     if hashes:
         update_registry_file(hashes, registry_path)

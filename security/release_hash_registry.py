@@ -31,9 +31,7 @@ logger = logging.getLogger('hevolve_security')
 # Updated automatically by scripts/update_release_hashes.py before
 # each release signing.  Do NOT edit manually.
 _KNOWN_HASHES: Dict[str, str] = {
-    # CI/CD will append entries here, e.g.:
-    # '1.0.0': 'abc123...',
-    # '1.1.0': 'def456...',
+    '1.0.0': '0fee15efe05f3a0fac3973a89980e9213c78c7e05710ef6ae950c60c7534afad',
 }
 
 # Maximum runtime-discovered hashes to keep (prevents unbounded growth)

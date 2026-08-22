@@ -72,3 +72,34 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: release_manifest.json
+
+      # Populate the release-hash registry that SHIPS with every build.
+      #
+      # The signed manifest above is central-only; desktops trust peers via
+      # security/release_hash_registry.py:_KNOWN_HASHES — and that dict
+      # shipped EMPTY because nothing ever ran update_release_hashes.py
+      # (its docstring always said this workflow should, before signing).
+      # Result, measured on the LAN 2026-08-22: every same-network peer
+      # admitted as untrusted (master_key_verified=False) because no node
+      # had any trust basis at all.
+      #
+      # ALL official tags are hashed, not just this one — peers legitimately
+      # run older shipped versions and every one of them must verify.  The
+      # updated registry is committed back to main so the NEXT builds carry
+      # it; this tag's own hash becomes verifiable to the fleet from the
+      # next release on (a self-hashing tree cannot contain its own hash,
+      # same reason a git commit cannot contain its own sha).
+      - name: Update release-hash registry on main
+        run: |
+          git config user.name "hartos-release-bot"
+          git config user.email "release-bot@hertzai.com"
+          git fetch origin main
+          git checkout main
+          python scripts/update_release_hashes.py
+          if git diff --quiet security/release_hash_registry.py; then
+            echo "registry unchanged — nothing to commit"
+          else
+            git add security/release_hash_registry.py
+            git commit -m "chore(security): registry knows release ${{ github.ref_name }} (all official tags rehashed)"
+            git push origin main
+          fi

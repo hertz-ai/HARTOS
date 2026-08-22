@@ -33,16 +33,18 @@ def registry():
 class TestTrustBasis:
     """has_trust_basis decides whether the code-hash gate can be enforced."""
 
-    def test_bare_node_has_no_basis(self, registry):
-        """Ships empty: no GA table entries, no manifest.
+    def test_bare_node_has_no_basis(self, registry, monkeypatch):
+        """A node with no GA table entries and no manifest has no basis.
 
-        This is the shipping state. _KNOWN_HASHES is an empty dict, nothing
-        populates it, and no signed manifest is bundled. Enforcing a hash gate
-        here rejected every peer on the network.
+        Bareness is CONSTRUCTED here, no longer assumed: since 2026-08-22 the
+        registry ships populated (release-sign.yml runs
+        scripts/update_release_hashes.py and commits the result — the empty
+        dict was the bug that left every LAN peer untrusted, not the design).
+        What this test still guards is the property: a node that genuinely
+        knows nothing must not enforce a hash gate, because it would reject
+        every peer on the network.
         """
-        assert not rhr._KNOWN_HASHES, (
-            'if GA hashes are now published, this test documents the old '
-            'state and the bootstrap path below needs rechecking')
+        monkeypatch.setattr(rhr, '_KNOWN_HASHES', {})
         assert registry.has_trust_basis() is False
 
     def test_manifest_creates_a_basis(self, registry):
@@ -53,13 +55,16 @@ class TestTrustBasis:
         monkeypatch.setattr(rhr, '_KNOWN_HASHES', {'1.2.3': 'b' * 64})
         assert registry.has_trust_basis() is True
 
-    def test_runtime_hashes_do_not_create_a_basis(self, registry):
+    def test_runtime_hashes_do_not_create_a_basis(self, registry, monkeypatch):
         """Learned-from-peers hashes must not switch the gate on.
 
         Otherwise the first hash a node happens to learn becomes the standard
         every later peer is judged against, and the gate bootstraps itself
-        from hearsay rather than from the release pipeline.
+        from hearsay rather than from the release pipeline.  GA table emptied
+        here to isolate the runtime-hash property (the shipped table is
+        populated by release-sign.yml since 2026-08-22).
         """
+        monkeypatch.setattr(rhr, '_KNOWN_HASHES', {})
         registry.add_runtime_hash('9.9.9', 'c' * 64)
         assert registry.is_known_release_hash('c' * 64) is True
         assert registry.has_trust_basis() is False
