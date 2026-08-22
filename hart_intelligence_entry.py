@@ -458,21 +458,27 @@ load_dotenv()
 
 #autogen requirements
 
-# Imported UNCONDITIONALLY on purpose (steward rule, 2026-08-22: first-party
-# essentials are never feature-flagged).  create_recipe and reuse_recipe ARE
-# the agent runtime — a process that cannot import them is not a degraded
-# node, it is a broken build, and it must fail HERE, loudly, at boot.
-#
-# The previous try/except set all six symbols to None and kept serving.  Its
-# own comment measured what that bought on a frozen build where the import
-# really did fail: the explanatory log line appeared 0 times while
-# recipe=None produced 54 `TypeError: 'NoneType' object is not callable`
-# 500s on /chat — a half-alive node answering chat with agent creation
-# silently dead.  An ImportError at module load names the actual cause in
-# the boot log and stops a broken build from shipping agents that lose
-# their purpose.
-from create_recipe import recipe, time_based_execution as time_execution, visual_execution
-from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution, visual_based_execution
+try:
+    from create_recipe import recipe, time_based_execution as time_execution, visual_execution
+    from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution, visual_based_execution
+except ImportError as e:
+    # print() went nowhere: frozen windowed builds have no real stdout, so the
+    # ONE line explaining why agent creation is dead was invisible.  MEASURED
+    # 2026-08-19: "Could not import recipe modules" appears 0 times across
+    # langchain.log/gui_app.log/server.log while recipe=None caused 54
+    # `TypeError: 'NoneType' object is not callable` at the two unguarded call
+    # sites (:9351, :9578), each one a 500 on /chat.  Same logger idiom this
+    # file already uses at line 261; exc_info keeps the real ImportError cause.
+    logging.getLogger(__name__).error(
+        "Could not import recipe modules -- agent creation and recipe "
+        "execution are DISABLED for this process: %s", e, exc_info=True)
+    recipe = None
+    time_execution = None
+    visual_execution = None
+    chat_agent = None
+    crossbar_multiagent = None
+    time_based_execution = None
+    visual_based_execution = None
 
 try:
     from autobahn.asyncio.component import Component, run
@@ -9692,6 +9698,14 @@ def chat():
             created_json = json.load(file)
 
 
+        if chat_agent is None:
+            return _chat_reply(
+                user_id, request_id,
+                'Agent reuse module is unavailable. Please check server dependencies.',
+                intent=['FINAL_ANSWER'],
+                req_token_count=0, res_token_count=0, history_request_id=[],
+            )
+
         # A config can exist with NO recipe.  The gather phase writes
         # {prompt_id}.json with status 'completed', which means "details
         # gathered" — NOT "recipe built".  Reuse then loads
@@ -9723,6 +9737,15 @@ def chat():
             # the one that banks {pid}_{flow}_recipe.json, syncs to central
             # (update_agent_creation_to_db), and adverts to peers.
             _agent_label = created_json.get('name') or created_json.get('agent_name') or prompt_id
+            if recipe is None:
+                return _chat_reply(
+                    user_id, request_id,
+                    f'"{_agent_label}" has no recipe yet and the creation '
+                    f'module is unavailable on this node.',
+                    intent=['FINAL_ANSWER'],
+                    req_token_count=0, res_token_count=0, history_request_id=[],
+                    Agent_status='Recipe Missing', prompt_id=prompt_id,
+                )
             app.logger.info(
                 f'chat: agent {prompt_id} has a config but no flow-0 recipe — '
                 f'routing this reuse turn into creation to finish it '
@@ -10016,6 +10039,13 @@ def chat():
 
 
 def evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_id, user_id):
+    if chat_agent is None:
+        return _chat_reply(
+            user_id, request_id,
+            'Agent reuse module is unavailable. Please check server dependencies.',
+            intent=['FINAL_ANSWER'], req_token_count=0, res_token_count=0,
+            history_request_id=[], Agent_status='Evaluation Mode',
+        )
     response = chat_agent(user_id, prompt, prompt_id, file_id, request_id)
     _record_lifecycle('Evaluation Mode', user_id, prompt_id, 'Agent being evaluated after creation')
     _resonance = _tune_resonance_after_chat(user_id, prompt, response)
