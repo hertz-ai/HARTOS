@@ -114,6 +114,22 @@ class TestPostToolGuard(unittest.TestCase):
         self.assertIsNotNone(m, "TEMPLATE_TOOL_RESPONSE template not found")
         self.assertIn(_SCAFFOLD, m.group(0))
 
+    def test_template_instructs_alternative_tool_on_empty_result(self):
+        """Directive 2026-08-22: an empty/failed tool observation must send
+        the model to a DIFFERENT tool before it may conclude the information
+        is unavailable (live weather turn: one empty google_search → give-up;
+        with the a95bb0ad guard the give-up now stands unoverridden, so the
+        fallback instruction is what turns it into a second attempt)."""
+        src = _HIE_PATH.read_text(encoding='utf-8')
+        m = re.search(r'TEMPLATE_TOOL_RESPONSE = """.*?"""', src, re.DOTALL)
+        self.assertIsNotNone(m)
+        block = m.group(0)
+        self.assertIn('DIFFERENT tool', block, (
+            "TEMPLATE_TOOL_RESPONSE carries no empty-result fallback "
+            "instruction — the model gives up after one empty tool result"))
+        self.assertIn(_SCAFFOLD, block,
+                      "fallback extension must not reword the scaffold anchor")
+
 
 if __name__ == '__main__':
     unittest.main()

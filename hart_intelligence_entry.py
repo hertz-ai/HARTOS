@@ -7546,7 +7546,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
         USER'S INPUT
         --------------------
 
-        Okay, so what is response for this tool. If using information obtained from the tools you must mention it explicitly without mentioning the tool names - I have forgotten all TOOL RESPONSES! Remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else."""
+        Okay, so what is response for this tool. If using information obtained from the tools you must mention it explicitly without mentioning the tool names - I have forgotten all TOOL RESPONSES! Remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else. If the TOOL RESPONSE above is empty, an error, or unhelpful, do NOT conclude the information is unavailable yet - emit an action for a DIFFERENT tool that could obtain it (for example Data_Extraction_From_URL on a relevant site when a search returned nothing). Only give a Final Answer saying it is unavailable after alternative tools have also failed."""
 
     prompt = ConversationalChatAgent.create_prompt(
         tools,
