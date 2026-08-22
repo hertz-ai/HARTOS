@@ -193,10 +193,13 @@ let
               echo "[HART OTA apply] running pre-update hook..."
               ${ota.preUpdateHook}
             ''}
-            echo "[HART OTA apply] switching to $FLAKE#hart-${cfg.variant} ..."
+            # ota.flakeAttr, NOT hart-${cfg.variant}: the config names itself.
+            # The inline construction sent a raw-flashed node to the ISO-kind
+            # closure, which cannot mount a raw root (real HW 2026-08-22).
+            echo "[HART OTA apply] switching to $FLAKE#${ota.flakeAttr} ..."
             # if-form on purpose: the source sync runs on SUCCESS alone — a
             # rolled-back switch must not advance /etc/hart/src (task #20).
-            if nixos-rebuild switch --flake "$FLAKE#hart-${cfg.variant}"; then
+            if nixos-rebuild switch --flake "$FLAKE#${ota.flakeAttr}"; then
               STATUS="applied"
               ${otaSyncSrc}/bin/hart-ota-sync-src "$FLAKE" \
                 || echo "[HART OTA apply] source sync failed unexpectedly — /etc/hart/src may be stale"
@@ -343,6 +346,31 @@ in
         that value supersedes this one as the switch target (central can
         pin an exact commit, e.g. github:hertz-ai/HARTOS/<sha>). This
         remains the build target's repo and the offline fallback.
+      '';
+    };
+
+    flakeAttr = lib.mkOption {
+      type = lib.types.str;
+      default = "hart-${config.hart.variant}";
+      defaultText = lib.literalExpression ''"hart-''${config.hart.variant}"'';
+      description = ''
+        The nixosConfigurations attribute this node switches to on apply
+        (`nixos-rebuild switch --flake <ref>#<flakeAttr>`). The config NAMES
+        ITSELF here, because the same variant exists in several image kinds
+        and only the config knows which one it is: hart-<variant> is the
+        ISO-kind closure, hart-<variant>-raw the dd-able raw image, and an
+        installer-written local flake calls its attr plain `hart`.
+
+        Why this exists (real HW, 2026-08-22): hart-ota hardcoded
+        hart-''${variant}, so a raw-flashed node OTA-applied the ISO-kind
+        config, whose initrd cannot mount a raw root -- stage 1 stopped at
+        "must mount the root filesystem on /mnt-root" and the node needed a
+        human at the boot menu. The repart image module overrides this to
+        hart-<variant>-raw; mkInstalledSystem overrides it to `hart`. The
+        default preserves the previous behaviour everywhere else.
+
+        hart-self-build consumes the same option, so a node's manual
+        self-rebuild and its OTA apply can never target different configs.
       '';
     };
 

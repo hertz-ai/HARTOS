@@ -4210,3 +4210,56 @@ class TestSilentlyOptionalDepsAreMirroredIntoTheImage:
         assert not missing, (
             f'in requirements.txt but NOT in the image: {missing}. Their import '
             f'sites swallow ImportError, so the shipped OS degrades in silence.')
+
+
+class TestOtaBootableOnRawNodes:
+    """The 2026-08-22 real-HW contract: an OTA-applied generation must be able
+    to BOOT the raw-flashed disk it lands on. Photo evidence of the failure:
+    stage 1 stopped at "must mount the root filesystem on /mnt-root" because
+    (a) hart-ota applied the ISO-kind attr and (b) per-rev fs labels meant any
+    cross-rev generation referenced a label the flashed disk does not carry.
+    The eval-side twin of this class lives in flake.nix's
+    checks.ota-target-boots-raw; these pin the SOURCE so a refactor cannot
+    quietly reintroduce either half."""
+
+    def test_raw_image_labels_are_stable_not_per_rev(self):
+        src = read_nix(os.path.join(MODULES_DIR, "hart-repart-image.nix"))
+        assert 'rootLabel = "hart-root"' in src, (
+            "root label must be STABLE: per-rev labels make every cross-rev "
+            "OTA generation unmountable at stage 1 (real HW 2026-08-22)")
+        assert 'espLabel  = "HART-ESP"' in src or 'espLabel = "HART-ESP"' in src, (
+            "/boot has the identical per-rev trap as /")
+        assert "hartRev" not in src.split("rootLabel")[1].split("\n")[0], (
+            "rootLabel must not be derived from hartRev")
+
+    def test_build_identity_moved_to_image_rev_file(self):
+        """Stable labels trade away the on-label build identity; the file is
+        the replacement. Losing BOTH would blind dual-stick forensics."""
+        src = read_nix(os.path.join(MODULES_DIR, "hart-repart-image.nix"))
+        assert '"hart/image-rev"' in src and "hartRev" in src, (
+            "/etc/hart/image-rev must carry the build rev now that labels are stable")
+
+    def test_esp_has_a_generation_cap(self):
+        src = read_nix(os.path.join(MODULES_DIR, "hart-repart-image.nix"))
+        assert "boot.loader.systemd-boot.configurationLimit = 2" in src, (
+            "~90M of kernel+initrd per generation against a 1G ESP: unbounded "
+            "generations brick entry-writing after ~10 OTA applies")
+
+    def test_ota_switches_to_the_self_named_attr(self):
+        src = read_nix(os.path.join(MODULES_DIR, "hart-ota.nix"))
+        assert "flakeAttr" in src, "hart.ota.flakeAttr option must exist"
+        assert 'hart-${cfg.variant}"' not in src, (
+            "the apply path must consume ota.flakeAttr, not rebuild the attr "
+            "inline from the variant — the inline form sent raw nodes to the "
+            "unbootable ISO closure")
+
+    def test_raw_image_self_names_its_raw_attr(self):
+        src = read_nix(os.path.join(MODULES_DIR, "hart-repart-image.nix"))
+        assert 'hart.ota.flakeAttr = lib.mkDefault "hart-${config.hart.variant}-raw"' in src
+
+    def test_self_build_uses_the_same_attr_as_ota(self):
+        src = read_nix(os.path.join(MODULES_DIR, "hart-self-build.nix"))
+        assert "config.hart.ota.flakeAttr" in src, (
+            "self-build and OTA must target the SAME config; divergence means "
+            "a manual rebuild and an OTA apply can produce different systems")
+        assert "#hart-$VARIANT" not in src, "inline attr construction must be gone"

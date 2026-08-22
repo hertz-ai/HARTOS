@@ -449,15 +449,27 @@ jobs:
           if [ -z "$CACHE_KEY" ]; then
             echo "HART_CACHE_SECRET_KEY secret absent — skipping cache push"; exit 0
           fi
+          # iso-desktop pushes BOTH closures: hart-desktop (what ISO/installed
+          # nodes apply) AND hart-desktop-raw (what raw-flashed nodes apply,
+          # per hart.ota.flakeAttr). raw-desktop is dispatch-only in the
+          # matrix, so riding the raw closure on the every-push iso leg is the
+          # only way nodes can substitute it; the store is already warm from
+          # the ISO build, so the raw toplevel's delta is config-tier drvs,
+          # not a second 22G build. Real-HW context: a raw node OTA-applying
+          # the iso-kind closure cannot mount its root (2026-08-22), which is
+          # why the raw closure must be fetchable at all.
           case "${{ matrix.target }}" in
-            iso-desktop) cfg="hart-desktop" ;;
-            raw-desktop) cfg="hart-desktop-raw" ;;
+            iso-desktop) cfgs="hart-desktop hart-desktop-raw" ;;
+            raw-desktop) cfgs="hart-desktop-raw" ;;
+            *) echo "::error::cache-push reached with unmapped target '${{ matrix.target }}'"; exit 1 ;;
           esac
           umask 077; printf '%s' "$CACHE_KEY" > /tmp/cache-key
-          top=$(nix build ".#nixosConfigurations.$cfg.config.system.build.toplevel" \
-                  --no-link --print-out-paths)
-          echo "signing + packing closure of $top"
-          nix copy --to "file:///tmp/hart-cache?secret-key=/tmp/cache-key&compression=zstd" "$top"
+          for cfg in $cfgs; do
+            top=$(nix build ".#nixosConfigurations.$cfg.config.system.build.toplevel" \
+                    --no-link --print-out-paths)
+            echo "signing + packing closure of $cfg -> $top"
+            nix copy --to "file:///tmp/hart-cache?secret-key=/tmp/cache-key&compression=zstd" "$top"
+          done
           du -sh /tmp/hart-cache
           sudo apt-get install -y -qq sshpass >/dev/null 2>&1 || true
           # nar/ first, then narinfos: a reader that sees a narinfo must find its
@@ -466,7 +478,7 @@ jobs:
           eval $RS /tmp/hart-cache/nar "$DEPLOY_USER@$DEPLOY_HOST:/solidstate/hart-cache/cache/"
           eval $RS --exclude nar /tmp/hart-cache/ "$DEPLOY_USER@$DEPLOY_HOST:/solidstate/hart-cache/cache/"
           rm -f /tmp/cache-key
-          echo "cache push complete for $cfg"
+          echo "cache push complete for: $cfgs"
 
       # Five raw-desktop builds died silently after ~50 minutes, each time straight
       # after the filesystem was written, with the builder printing NOTHING even

@@ -174,6 +174,25 @@ print(signature.hex())
       fi
     fi
 
+    # ─── Give the dd'd ESP bootctl's install marker (what nixos-install does) ───
+    # The image bakes only /EFI/BOOT/BOOTX64.EFI plus one UKI; bootctl's own
+    # /EFI/systemd copy and install marker are absent, so every later
+    # `switch-to-configuration boot` complained "systemd-boot not installed in
+    # ESP" (real HW 2026-08-21) and generation entries depended on luck.
+    # `--graceful` makes a re-run (or an already-correct ESP) a no-op;
+    # `--no-variables` matches boot.loader.efi.canTouchEfiVariables=false (a
+    # portable stick must not write firmware NVRAM). Same never-fatal posture
+    # as everything else here: a box whose ESP cannot be blessed still boots
+    # exactly as it did before -- it just keeps the old complaint.
+    if [[ -d /boot/EFI ]]; then
+      if ${pkgs.systemd}/bin/bootctl install --graceful --no-variables \
+           --esp-path=/boot >>"$LOG" 2>&1; then
+        echo "[Bootctl] systemd-boot installed/refreshed on the ESP (entries now register natively)."
+      else
+        echo "[Bootctl] bootctl install failed — boot entries keep the pre-existing behaviour." >&2
+      fi
+    fi
+
     # ─── Mark completion ───
     touch "$MARKER"
     chown hart:hart "$MARKER"
