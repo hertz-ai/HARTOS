@@ -644,6 +644,13 @@ class SpeculativeDispatcher:
                 prompt_id,
             )
             delegate = 'local'
+            # Same rationale as the ACTIONABLE-INTENT swap below: on an
+            # agent-bound turn the draft has no tools, so its in-band
+            # reply can only describe work, never do it — the 13:30
+            # live turn shipped "saved and confirmed" while nothing had
+            # run.  The expert's real answer replaces the standby via
+            # the existing speculation_id bubble path (#204).
+            draft_reply = _REFUSAL_STANDBY_REPLY
             escalation_reason = EscalationReason.AGENT_BOUND
 
         # ACTIONABLE-INTENT GUARD: when the draft's own classifier
@@ -1677,11 +1684,20 @@ class SpeculativeDispatcher:
         ``goal_id``/``goal_type`` travel separately as telemetry/budget
         metadata, not as a routing key.
         """
+        # create_agent/autonomous: ONLY for goal-driven daemon dispatch
+        # (goal_id set) — that work IS autonomous creation.  A user
+        # conversational turn (goal_id None) must reach the agent as a
+        # CONVERSATION: hardcoded True routed the 2026-08-22 13:30 live
+        # turn (prompt_id 90916249292, completed agent) into
+        # creation-RESUME, which auto-completed the agent's stale plan
+        # ("resumed - action complete" ×4) with zero LLM calls and never
+        # executed the user's request (recall("BLUEFIN") → count 0).
+        # Guard: tests/unit/test_expert_dispatch_mode.py.
         payload = {
             'user_id': user_id,
             'prompt': prompt,
-            'create_agent': True,
-            'autonomous': True,
+            'create_agent': bool(goal_id),
+            'autonomous': bool(goal_id),
             'casual_conv': False,
             'model_config': model.to_config_list(),
             'speculative': False,
