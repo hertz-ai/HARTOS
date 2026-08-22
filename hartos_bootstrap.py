@@ -416,9 +416,24 @@ def _init_a2a_server(app, cfg: dict) -> None:
         logger.warning(f"A2A protocol unavailable (import failed): {e}")
         return
     try:
-        if get_a2a_server() is not None:
-            logger.info("A2A server already initialized — skipping")
+        _srv = get_a2a_server()
+        if _srv is not None and getattr(_srv, 'app', None) is app:
+            logger.info("A2A server already initialized on this app — skipping")
             return
+        if _srv is not None:
+            # A server exists but on a DIFFERENT Flask app.  Measured live
+            # 2026-08-22: hart_intelligence_entry's module-level init (Tier-1
+            # chat adapter import, HIE:1572) registered /a2a on HIE's own
+            # internal app — which no port serves in bundled mode — and set
+            # the singleton first.  Skipping here on the bare singleton left
+            # :5000 answering the SPA shell for /a2a/* on any boot where the
+            # import won the race (it lost it on the previous boot, which is
+            # why the same build served JSON then).  The app being SERVED
+            # wins: register there too, and let initialize_a2a_server point
+            # the singleton at it.
+            logger.info(
+                "A2A server exists on a different app — registering on the "
+                "served app as well")
         if any(str(r.rule).startswith('/a2a/') for r in app.url_map.iter_rules()):
             logger.info("A2A routes already present on app — skipping")
             return

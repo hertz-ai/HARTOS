@@ -107,15 +107,39 @@ def test_preexisting_a2a_rule_is_respected(a2a_singleton_reset):
     assert len(list(app.url_map.iter_rules())) == n_before
 
 
-def test_existing_singleton_short_circuits(a2a_singleton_reset):
-    """When another path already initialized A2A in-process, the step skips
-    without touching the app at all."""
+def test_singleton_on_this_app_short_circuits(a2a_singleton_reset):
+    """A server already bound to THIS app means nothing to do."""
     gi = a2a_singleton_reset
-    gi._a2a_server = object()          # sentinel: 'already initialized'
     app = _consumer_style_app()
+    _run_step(app)                      # registers + binds singleton to app
     rules_before = sorted(str(r) for r in app.url_map.iter_rules())
     _run_step(app)
     assert sorted(str(r) for r in app.url_map.iter_rules()) == rules_before
+
+
+def test_singleton_on_another_app_does_not_block_the_served_app(a2a_singleton_reset):
+    """The race that re-broke /a2a on 2026-08-22: hart_intelligence_entry's
+    module-level init registered on ITS OWN internal app first (which no port
+    serves in bundled mode) and set the singleton.  The step must still
+    register on the app that is actually served."""
+    gi = a2a_singleton_reset
+    other = Flask('hie_internal')
+    bypass = hb._enable_setup_lock_bypass(other)
+    try:
+        hb._init_a2a_server(other, {})   # simulates HIE winning the race
+    finally:
+        if bypass:
+            hb._disable_setup_lock_bypass(other)
+    assert gi._a2a_server is not None
+    assert gi._a2a_server.app is other
+
+    served = _consumer_style_app()
+    _run_step(served)
+    r = served.test_client().get('/a2a/agents')
+    assert r.content_type.startswith('application/json'), (
+        'the served app must carry the directory even when another app '
+        'grabbed the singleton first: %r' % r.content_type)
+    assert gi._a2a_server.app is served
 
 
 def test_cfg_base_url_override_wins(a2a_singleton_reset):
