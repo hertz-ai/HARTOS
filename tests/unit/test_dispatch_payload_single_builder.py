@@ -21,11 +21,25 @@ def _build(prompt_id=None, goal_id=None, goal_type='general'):
 def test_base_payload_fields_and_no_reentry():
     p = _build()
     assert p['user_id'] == 'user-1' and p['prompt'] == 'the-prompt'
-    assert p['create_agent'] is True and p['autonomous'] is True
+    # 0ce26b9: create_agent/autonomous follow bool(goal_id). A USER
+    # conversational turn (goal_id None, this case) must reach the agent as a
+    # CONVERSATION — the old hardcoded True routed a live turn into
+    # creation-RESUME, which auto-completed a stale plan with zero LLM calls
+    # and fabricated a completion claim (prompt_id 90916249292). This file
+    # previously pinned that old behaviour; the deliberate contract lives in
+    # test_expert_dispatch_mode.py and this assertion now matches it.
+    assert p['create_agent'] is False and p['autonomous'] is False
     assert p['casual_conv'] is False
     assert p['model_config'] == [{'model': 'x'}]
     # hard no-reentry: the inner /chat must skip the dispatcher
     assert p['speculative'] is False and p['draft_first'] is False
+
+
+def test_goal_driven_dispatch_keeps_creation_flags():
+    """The other half of the 0ce26b9 contract: goal-driven daemon dispatch
+    (goal_id set) IS autonomous creation work and keeps the flags."""
+    p = _build(goal_id='gid')
+    assert p['create_agent'] is True and p['autonomous'] is True
 
 
 def test_optional_fields_only_when_meaningful():
