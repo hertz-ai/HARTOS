@@ -5568,6 +5568,15 @@ def _g12_finalize(prompt: str, teacher_response: str, student_future) -> None:
         logging.getLogger(__name__).exception("_g12_finalize: swallowed Exception")
 
 
+# First words of TEMPLATE_TOOL_RESPONSE's post-observation instruction (the
+# LangChain tool-response human message, ~line 7519).  Its presence in an
+# outbound prompt proves a tool already ran this turn.  The template cannot
+# interpolate this constant (its braces are format-escaped), so
+# tests/unit/test_refusal_override_post_tool_guard.py pins the two copies
+# byte-identical.
+TOOL_RESPONSE_SCAFFOLD = 'Okay, so what is response for this tool'
+
+
 def _pooled_post_with_refusal_check(api_url, json=None, app_logger=None, **kwargs):
     """Post to llama-server and apply REFUSAL_OVERRIDE to the response.
 
@@ -5619,6 +5628,27 @@ def _pooled_post_with_refusal_check(api_url, json=None, app_logger=None, **kwarg
     except Exception:
         return response
     if not reply_text or not _REFUSAL_PATTERN.search(reply_text):
+        return response
+    # A refusal-shaped reply AFTER a tool observation is a truthful report,
+    # not a refusal to try.  Live 2026-08-22 11:34 (weather-in-chennai):
+    # google_search returned nothing, the model said "the tool didn't return
+    # any weather data, I can't give you the specific forecast", the
+    # directive below re-prompted "Never assert data is unavailable without
+    # first attempting a tool call" — and the retry FABRICATED a forecast
+    # (sunny, 32°C) that reached the user as fact.  The directive's own
+    # contract is "force ONE tool attempt", so it stands down when the
+    # outbound prompt proves an attempt already ran.
+    try:
+        _prompt_blob = ' '.join(
+            str(_m.get('content') or '')
+            for _m in (body.get('messages') or [])
+            if isinstance(_m, dict))
+    except Exception:
+        _prompt_blob = ''
+    if TOOL_RESPONSE_SCAFFOLD in _prompt_blob:
+        (app_logger or app.logger).info(
+            "[REFUSAL-OVERRIDE-LANGCHAIN] skip: prompt carries a tool "
+            "observation — reply is a post-tool report, not a refusal")
         return response
     _logger = app_logger or app.logger
     _logger.info(
