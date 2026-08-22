@@ -71,6 +71,11 @@ class TestBootBaselineMode:
     def test_arms_without_a_manifest(self, tree):
         mon = RuntimeIntegrityMonitor(None, code_root=str(tree))
         assert mon._baseline_mode is True
+        # __init__ must stay cheap — the walk happens on the monitor's own
+        # thread (it wedged hartos-bootstrap for minutes when it ran on the
+        # caller's).  Before preparation there is no expected hash yet.
+        assert mon._expected_hash == ''
+        mon._prepare_baseline()
         assert len(mon._expected_hash) == 64
 
     def test_baseline_ignores_the_bundle_constant(self, tree, monkeypatch):
@@ -78,6 +83,7 @@ class TestBootBaselineMode:
         the baseline must come from real bytes, not that constant."""
         monkeypatch.setenv('HEVOLVE_CODE_HASH_PRECOMPUTED', 'a' * 64)
         mon = RuntimeIntegrityMonitor(None, code_root=str(tree))
+        mon._prepare_baseline()
         assert mon._expected_hash != 'a' * 64
         assert mon._expected_hash == ni.compute_code_hash(
             str(tree), force_walk=True)
@@ -89,6 +95,9 @@ class TestBootBaselineMode:
 
     def test_one_letter_edit_is_detected(self, tree):
         mon = RuntimeIntegrityMonitor(None, code_root=str(tree))
+        # Baseline BEFORE the edit — prepared lazily at check time it would
+        # absorb the tampered state as "boot".
+        mon._prepare_baseline()
         p = tree / 'main.py'
         p.write_text(p.read_text(encoding='utf-8').replace('hello', 'hellp'),
                      encoding='utf-8')
@@ -106,10 +115,12 @@ class TestStatSweepTier:
 
     def test_quiet_tree_reports_no_change(self, tree):
         mon = RuntimeIntegrityMonitor(None, code_root=str(tree))
+        mon._prepare_baseline()
         assert mon._stat_sweep() == mon._stat_baseline
 
     def test_edit_moves_the_sweep(self, tree):
         mon = RuntimeIntegrityMonitor(None, code_root=str(tree))
+        mon._prepare_baseline()
         p = tree / 'pkg' / 'mod.py'
         p.write_text(p.read_text(encoding='utf-8') + '# changed\n',
                      encoding='utf-8')
@@ -117,6 +128,7 @@ class TestStatSweepTier:
 
     def test_new_file_moves_the_sweep(self, tree):
         mon = RuntimeIntegrityMonitor(None, code_root=str(tree))
+        mon._prepare_baseline()
         (tree / 'injected.py').write_text('EVIL = True\n', encoding='utf-8')
         assert mon._stat_sweep() != mon._stat_baseline
 

@@ -37,30 +37,49 @@ class RuntimeIntegrityMonitor:
             os.environ.get('HEVOLVE_TAMPER_FULL_EVERY', '12')))
         self._cycles = 0
         self._baseline_mode = not self._expected_hash
+        self._baseline_ready = False
+        self._stat_baseline = {}
+
+    def _prepare_baseline(self) -> None:
+        """Take the boot snapshot + baselines.  Runs INSIDE the monitor's own
+        daemon thread, never on the caller's.
+
+        This used to live in __init__, and on the first bundle that armed the
+        monitor it wedged the whole hartos-bootstrap thread for minutes: the
+        new bundle layout imports HARTOS from python-embed's site-packages,
+        so _CODE_ROOT resolves there and the snapshot hashes ~10,900 .py
+        (torch and friends included) under the AV scanner — with A2A
+        registration and everything after it queued behind the walk.
+        Arming must cost the caller nothing; the walk is the monitor's own
+        business, on its own thread, once.
+        """
+        if self._baseline_ready:
+            return
+        t0 = time.time()
         if not self._baseline_mode:
             # Purge __pycache__ before snapshot - blocks bytecode injection.
             # Manifest mode (central containers) only: on a bundled desktop
             # this would force recompilation of everything imported after
-            # init_social, a boot-time cost the baseline mode refuses to add.
+            # boot, a cost the baseline mode refuses to add.
             try:
                 from security.node_integrity import purge_pycache
-                purge_pycache(code_root)
+                purge_pycache(self._code_root)
             except Exception:
                 pass
-        # Snapshot file manifest at boot for diff on tamper
+        # Snapshot file manifest for diff on tamper
         try:
             from security.node_integrity import compute_file_manifest
-            self._boot_manifest_snapshot = compute_file_manifest(code_root)
+            self._boot_manifest_snapshot = compute_file_manifest(self._code_root)
         except Exception:
             pass
         # Boot-baseline mode: no signed manifest to compare against — the
         # manifest is CENTRAL-ONLY by policy, so every bundled desktop lands
         # here (and until 2026-08-22 was simply never monitored).  The
-        # expected hash is DERIVED from the boot snapshot just taken —
-        # zero additional IO — and means "the code as it was at boot":
-        # the monitor then answers "did the code change since boot", which
-        # is exactly what a periodic tamper check is for.  What it cannot
-        # see is a modification made while the app was closed — that is a
+        # expected hash is DERIVED from the snapshot just taken — zero
+        # additional IO — and means "the code as it was at boot": the
+        # monitor then answers "did the code change since boot", which is
+        # exactly what a periodic tamper check is for.  What it cannot see
+        # is a modification made while the app was closed — that is a
         # provenance question, and self-reported hashes cannot answer it on
         # central either (see release_hash_registry.has_trust_basis); it
         # belongs to the challenge/attestation endpoints.
@@ -75,6 +94,12 @@ class RuntimeIntegrityMonitor:
         # Stat baseline for the cheap per-cycle sweep: {rel: (mtime_ns, size)}.
         # One os.stat per file, no reads.
         self._stat_baseline = self._stat_sweep()
+        self._baseline_ready = True
+        logger.info(
+            f"Runtime integrity baseline ready: "
+            f"{len(self._boot_manifest_snapshot or {})} files hashed in "
+            f"{time.time() - t0:.1f}s "
+            f"(mode={'boot-baseline' if self._baseline_mode else 'signed-manifest'})")
 
     def _stat_sweep(self) -> dict:
         """{rel_path: (mtime_ns, size)} for every tracked .py — metadata only."""
@@ -124,6 +149,13 @@ class RuntimeIntegrityMonitor:
 
     def _check_loop(self) -> None:
         """Background loop: periodic code hash + guardrail hash verification."""
+        # First thing on the monitor's OWN thread: the boot snapshot and
+        # baselines.  See _prepare_baseline for why this must never run on
+        # the arming caller's thread.
+        try:
+            self._prepare_baseline()
+        except Exception as e:
+            logger.warning(f"Runtime monitor baseline preparation failed: {e}")
         while self._running:
             time.sleep(self._check_interval)
             if not self._running:
@@ -219,6 +251,7 @@ class RuntimeIntegrityMonitor:
     def _check_loop_once_for_test(self) -> None:
         """Run a single integrity check (for testing only)."""
         try:
+            self._prepare_baseline()
             from security.node_integrity import compute_code_hash
             current_hash = compute_code_hash(self._code_root, force_walk=True)
             if self._expected_hash and current_hash != self._expected_hash:
