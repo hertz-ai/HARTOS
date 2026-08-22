@@ -505,14 +505,25 @@ def init_social(app):
             except Exception as e:
                 logger.debug(f"HevolveSocial auto-discovery skipped: {e}")
 
-        # Start runtime integrity monitor if we have a signed manifest
-        if _boot_manifest:
-            try:
-                from security.runtime_monitor import start_monitor
-                start_monitor(_boot_manifest)
-                logger.info("HevolveSocial runtime integrity monitor started")
-            except Exception as e:
-                logger.debug(f"HevolveSocial runtime monitor start skipped: {e}")
+        # Start the runtime integrity monitor — on EVERY node, in one of two
+        # modes.  With a signed manifest (central containers) the expected
+        # hash is the release's.  Without one — every bundled desktop, since
+        # the manifest is central-only BY POLICY — the monitor arms in
+        # boot-baseline mode: expected = a real walked hash taken at start,
+        # so code edited after boot still gets named file-by-file and gossip
+        # still stops.  Until 2026-08-22 this line was gated on
+        # `if _boot_manifest:`, which meant the periodic tamper check had
+        # never run anywhere on the desktop fleet — combined with the
+        # bundle's constant HEVOLVE_CODE_HASH_PRECOMPUTED it was doubly
+        # blind (see compute_code_hash(force_walk=...)).
+        try:
+            from security.runtime_monitor import start_monitor
+            start_monitor(_boot_manifest)
+            logger.info(
+                "HevolveSocial runtime integrity monitor started "
+                f"({'signed-manifest' if _boot_manifest else 'boot-baseline'} mode)")
+        except Exception as e:
+            logger.debug(f"HevolveSocial runtime monitor start skipped: {e}")
     else:
         logger.critical("HevolveSocial: gossip NOT started - boot verification failed (hard mode)")
 
@@ -610,17 +621,19 @@ def init_social(app):
         except Exception:
             pass
 
-        # Register runtime monitor
-        if _boot_manifest:
-            try:
-                from security.runtime_monitor import get_monitor
-                mon = get_monitor()
-                if mon and mon._running:
-                    watchdog.register('runtime_monitor',
-                                      expected_interval=mon._check_interval,
-                                      restart_fn=mon.start, stop_fn=mon.stop)
-            except Exception:
-                pass
+        # Register runtime monitor.  Gated on the monitor actually running,
+        # not on `_boot_manifest` — the monitor now also arms in
+        # boot-baseline mode on nodes with no manifest, and those heartbeats
+        # need watching just the same.
+        try:
+            from security.runtime_monitor import get_monitor
+            mon = get_monitor()
+            if mon and mon._running:
+                watchdog.register('runtime_monitor',
+                                  expected_interval=mon._check_interval,
+                                  restart_fn=mon.start, stop_fn=mon.stop)
+        except Exception:
+            pass
 
         # Register sync engine
         try:
