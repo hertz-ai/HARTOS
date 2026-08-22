@@ -90,3 +90,67 @@ class TestKnownHashLookup:
         for i in range(rhr._MAX_RUNTIME_HASHES + 10):
             registry.add_runtime_hash(f'v{i}', f'{i:064d}')
         assert len(registry._runtime_hashes) <= rhr._MAX_RUNTIME_HASHES
+
+
+class TestSelfHashLayer:
+    """Own-hash source (fleet policy 2026-08-22): every nightly and every
+    machine in the central network is trustworthy by design.  A peer whose
+    hash equals MY running hash is my build — identical nightlies verify each
+    other with no registry round-trip, frozen bundles included, whose trees
+    never match any repo-tag entry.
+    """
+
+    def _with_own_hash(self, monkeypatch, value):
+        import security.node_integrity as ni
+        monkeypatch.setattr(ni, 'compute_code_hash', lambda code_root=None: value)
+
+    def test_peer_on_my_exact_build_is_known(self, registry, monkeypatch):
+        self._with_own_hash(monkeypatch, 'e' * 64)
+        assert registry.is_known_release_hash('e' * 64) is True
+
+    def test_peer_on_a_different_build_is_still_unknown(self, registry, monkeypatch):
+        """One changed letter changes the hash — and the peer drops out of
+        the own-hash layer exactly as it should."""
+        self._with_own_hash(monkeypatch, 'e' * 64)
+        assert registry.is_known_release_hash('f' * 64) is False
+
+    def test_own_hash_is_computed_once(self, registry, monkeypatch):
+        calls = {'n': 0}
+        import security.node_integrity as ni
+
+        def counting(code_root=None):
+            calls['n'] += 1
+            return 'e' * 64
+
+        monkeypatch.setattr(ni, 'compute_code_hash', counting)
+        registry.is_known_release_hash('e' * 64)
+        registry.is_known_release_hash('e' * 64)
+        registry.is_known_release_hash('x' * 64)
+        assert calls['n'] == 1
+
+    def test_own_hash_failure_leaves_layer_inert(self, registry, monkeypatch):
+        """A box where compute_code_hash raises must not crash lookups —
+        the layer goes quiet and other sources still answer."""
+        import security.node_integrity as ni
+
+        def broken(code_root=None):
+            raise RuntimeError('no code root')
+
+        monkeypatch.setattr(ni, 'compute_code_hash', broken)
+        assert registry.is_known_release_hash('e' * 64) is False
+        registry.add_runtime_hash('9.9.9', 'c' * 64)
+        assert registry.is_known_release_hash('c' * 64) is True
+
+    def test_self_hash_does_not_create_a_trust_basis(self, registry, monkeypatch):
+        """NFT: every node trivially knows its own hash.  If that counted as
+        a basis, HEVOLVE_REQUIRE_KNOWN_CODE_HASH would arm on every box and
+        strict mode would mean "only my exact build may join" on nodes whose
+        operator never published anything."""
+        monkeypatch.setattr(rhr, '_KNOWN_HASHES', {})
+        self._with_own_hash(monkeypatch, 'e' * 64)
+        assert registry.is_known_release_hash('e' * 64) is True
+        assert registry.has_trust_basis() is False
+
+    def test_diagnostics_show_the_self_hash(self, registry, monkeypatch):
+        self._with_own_hash(monkeypatch, 'e' * 64)
+        assert registry.get_known_versions().get('_self') == 'e' * 64

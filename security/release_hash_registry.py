@@ -10,7 +10,8 @@ Populated by:
   1. _KNOWN_HASHES dict — hardcoded by CI/CD at release time
      (scripts/update_release_hashes.py writes this dict)
   2. Current release manifest — always trusted
-  3. Runtime discovery — hashes from verified peers (bounded, thread-safe)
+  3. This node's OWN running code hash — same build as me is my build
+  4. Runtime discovery — hashes from verified peers (bounded, thread-safe)
 
 Usage at perimeter:
   from security.release_hash_registry import ReleaseHashRegistry
@@ -52,7 +53,22 @@ class ReleaseHashRegistry:
         # Runtime hashes: bounded OrderedDict (FIFO eviction)
         self._runtime_hashes: OrderedDict = OrderedDict()
         self._manifest_hash: Optional[str] = None
+        # Own-hash layer: computed lazily on first lookup (compute_code_hash
+        # is mtime-cached after first boot, but first computation walks every
+        # .py — keep it off the constructor).  '' = tried and failed, so the
+        # layer stays inert without retry storms.
+        self._self_hash: Optional[str] = None
         self._load_from_manifest()
+
+    def _own_hash(self) -> str:
+        """This node's running code hash, computed once, '' on failure."""
+        if self._self_hash is None:
+            try:
+                from security.node_integrity import compute_code_hash
+                self._self_hash = compute_code_hash() or ''
+            except Exception:
+                self._self_hash = ''
+        return self._self_hash
 
     def _load_from_manifest(self) -> None:
         """Load the current release manifest's code_hash as always-trusted."""
@@ -72,7 +88,8 @@ class ReleaseHashRegistry:
         Returns True if the hash matches:
           1. Any hardcoded GA release hash
           2. The current release manifest's hash
-          3. Any runtime-discovered hash from a verified peer
+          3. This node's OWN running code hash
+          4. Any runtime-discovered hash from a verified peer
         """
         if not code_hash:
             return False
@@ -85,7 +102,23 @@ class ReleaseHashRegistry:
         if self._manifest_hash and code_hash == self._manifest_hash:
             return True
 
-        # 3. Runtime-discovered
+        # 3. Same build as me.  Fleet policy (steward, 2026-08-22): every
+        #    nightly and every machine in the central network is trustworthy
+        #    by design.  A peer whose reported hash equals the hash of the
+        #    code I am running IS my build — the strongest provenance signal
+        #    this registry has, and the only one that needs no pipeline:
+        #    identical nightlies verify each other the moment they boot,
+        #    frozen bundles included (whose trees never match a repo-tag
+        #    entry), on every platform, with no registry round-trip and no
+        #    self-reference lag.  Security is unchanged: code_hash is
+        #    self-reported everywhere (see has_trust_basis), so claiming MY
+        #    hash is the same spoof as claiming a GA hash — provenance proof
+        #    stays with the challenge/attestation endpoints.
+        _own = self._own_hash()
+        if _own and code_hash == _own:
+            return True
+
+        # 4. Runtime-discovered
         with self._lock:
             if code_hash in self._runtime_hashes.values():
                 return True
@@ -97,6 +130,9 @@ class ReleaseHashRegistry:
         result = dict(_KNOWN_HASHES)
         if self._manifest_hash:
             result['_current_manifest'] = self._manifest_hash
+        _own = self._own_hash()
+        if _own:
+            result['_self'] = _own
         with self._lock:
             result.update(self._runtime_hashes)
         return result
@@ -141,6 +177,13 @@ class ReleaseHashRegistry:
         belongs in the trust signals (integrity_status, master_key_verified,
         fraud_score, the challenge/attestation endpoints), not in a gate that
         cannot be enforced meaningfully without a basis.
+
+        The own-hash layer (is_known_release_hash source 3) deliberately does
+        NOT count either.  Every node trivially knows its own hash, so
+        counting it would arm HEVOLVE_REQUIRE_KNOWN_CODE_HASH on every node
+        — turning strict mode into "only my exact build may join" on boxes
+        whose operator never published anything.  Strict enforcement stays
+        tied to hashes the release pipeline actually vouched for.
         """
         return bool(_KNOWN_HASHES) or bool(self._manifest_hash)
 
