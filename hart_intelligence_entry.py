@@ -9724,19 +9724,66 @@ def chat():
         except Exception:
             _flow_recipe_exists = None
         if _flow_recipe_exists is not None and not _flow_recipe_exists(prompt_id):
-            app.logger.warning(
-                f'chat: agent {prompt_id} has a config but no flow-0 recipe — '
-                f'refusing the reuse path (it would raise FileNotFoundError '
-                f'in create_schedule). Agent needs its recipe generated.')
+            # A config with no flow recipe means creation is UNFINISHED —
+            # and _flow_recipe_exists is the CREATE-vs-REUSE classifier, so
+            # this turn belongs to CREATE.  Steward rule (2026-08-22): the
+            # state machine finishes the recipe AUTONOMOUSLY rather than
+            # handing the user a "recipe missing" message about a decision
+            # the classifier already made.  This is also the resume path
+            # for creations cut mid-flow (GroupChat max_round exhaustion at
+            # ~30 rounds ≈ 300s on the local 4B): recipe() rebuilds
+            # flow/action state via initialize_with_resume — banked
+            # per-action recipes count as done — and its completion path is
+            # the one that banks {pid}_{flow}_recipe.json, syncs to central
+            # (update_agent_creation_to_db), and adverts to peers.
             _agent_label = created_json.get('name') or created_json.get('agent_name') or prompt_id
+            if recipe is None:
+                return _chat_reply(
+                    user_id, request_id,
+                    f'"{_agent_label}" has no recipe yet and the creation '
+                    f'module is unavailable on this node.',
+                    intent=['FINAL_ANSWER'],
+                    req_token_count=0, res_token_count=0, history_request_id=[],
+                    Agent_status='Recipe Missing', prompt_id=prompt_id,
+                )
+            app.logger.info(
+                f'chat: agent {prompt_id} has a config but no flow-0 recipe — '
+                f'routing this reuse turn into creation to finish it '
+                f'autonomously (resume-aware).')
+            _rr_lock = _get_user_lock(user_id)
+            with _rr_lock:
+                # Mark mid-creation so follow-up turns classify as create
+                # (the resume guard above keys on review_agents).
+                review_agents[_ak] = True
+                conversation_agent[_ak] = False
+                _touch_agent_timestamp(_ak)
+            response = recipe(user_id, prompt, prompt_id, file_id, request_id)
+            if response in ('Agent Created Successfully',
+                            'Agent Already Created Successfully'):
+                with _rr_lock:
+                    conversation_agent[_ak] = True
+                    _touch_agent_timestamp(_ak)
+                try:
+                    _create_social_agent_from_prompt(user_id, prompt_id)
+                except Exception as e:
+                    app.logger.debug(f"Social agent bridge skipped: {e}")
+                _record_lifecycle('completed', user_id, prompt_id,
+                                  'Recipe finished autonomously from reuse routing')
+                return _chat_reply(
+                    user_id, request_id,
+                    f'"{_agent_label}" is ready — its recipe is now complete. '
+                    f'Ask it again and it will run.',
+                    intent=['FINAL_ANSWER'],
+                    req_token_count=0, res_token_count=0, history_request_id=[],
+                    Agent_status='completed', prompt_id=prompt_id,
+                )
+            _record_lifecycle('Creation Mode', user_id, prompt_id,
+                              'Autonomous recipe generation in progress (from reuse routing)')
             return _chat_reply(
-                user_id, request_id,
-                f'"{_agent_label}" was saved but its recipe was never generated, '
-                f'so there are no steps to run yet. Finish creating it (or '
-                f'recreate it) and I can run it.',
+                user_id, request_id, response,
                 intent=['FINAL_ANSWER'],
                 req_token_count=0, res_token_count=0, history_request_id=[],
-                Agent_status='Recipe Missing', prompt_id=prompt_id,
+                Agent_status='Creation Mode', prompt_id=prompt_id,
             )
 
         response = chat_agent(user_id,prompt,prompt_id,file_id,request_id)
