@@ -6885,6 +6885,18 @@ function renderAgentOverlay(ev) {{
                     url += '?' + request.query_string.decode('latin-1')
                 fwd = {k: v for k, v in request.headers
                        if k.lower() not in _HOP}
+                # Host MUST be exactly 'Nunba' (capital N). The daemon's
+                # Hypercorn config sets server_names = ['Nunba'], and
+                # Hypercorn treats that as a CASE-SENSITIVE Host allowlist
+                # that answers 404 to everything else -- before the Flask app
+                # ever sees the request. httpx derives Host from the URL
+                # ('nunba', lowercase), so every proxied request 404'd and the
+                # whole preinstalled microfrontend read as absent. Measured on
+                # the flashed box 2026-08-23: identical UDS request,
+                # Host: nunba -> 404, Host: Nunba -> 200 (and / -> 302, the
+                # SPA redirect). _HOP already strips the inbound Host; this
+                # sets the one the daemon's allowlist accepts.
+                fwd['Host'] = 'Nunba'
                 try:
                     client = _nunba_client()
                     upstream = client.build_request(
