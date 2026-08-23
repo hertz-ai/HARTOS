@@ -4887,6 +4887,12 @@ def get_tools(req_tool, is_first: bool = False):
                 ui_label='Looking up user details…',
             ),
             labeled_tool(
+                name="List_Agents",
+                func=_parse_list_agents,
+                description="List the agents available on this device: built-in expert agents and the user's own created agents, with name, category, and description. Use whenever the user asks what agents exist, what agents they have, or which agent could handle a task — never say there are no separate agents without calling this. Input: an optional search term to filter by name or skill, or an empty string for the full list.",
+                ui_label='Listing your agents…',
+            ),
+            labeled_tool(
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
                 description="To see user or if there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input. Only if last 16 seconds Visual Context information is present & is enough, then use that to craft a better creative, better, cohesive, correlated , summarised natural response, format this tool response togather with Previous 15 minutes Visual Context information if you are seeing the scene via videocall from the other end. If there are more than 1 person try to give an identity to each across frames to track the subjects through time by framing the tool input accordingly.",
@@ -6896,6 +6902,19 @@ def parse_visual_context(inp: str):
             fh.close()
 
     return "No visual context available — camera not active."
+
+
+def _parse_list_agents(inp: str = ''):
+    """Chat-tool wrapper over the canonical agent enumeration.
+
+    Delegates to integrations.mcp._tool_impls.list_agents — the same
+    implementation the MCP bridge serves — so there is ONE enumeration.
+    Before this wrapper the chat model answered "I do not have separate
+    agents" while 4 expert + 2,633 dynamic recipes sat in the registry
+    (live 2026-08-23 15:02, #688 P3)."""
+    from integrations.mcp._tool_impls import list_agents
+    q = (inp or '').strip()
+    return list_agents(query=q or None)
 
 
 def parse_user_id(inp: str):
