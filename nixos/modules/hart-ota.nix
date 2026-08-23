@@ -339,13 +339,20 @@ in
 
     flakeRef = lib.mkOption {
       type = lib.types.str;
-      default = "github:hertz-ai/HARTOS";
+      default = "github:hertz-ai/HARTOS?dir=nixos";
       description = ''
         Nix flake reference for building/switching the system. When
         centralEndpoint returns an approved flake_ref for this channel,
         that value supersedes this one as the switch target (central can
-        pin an exact commit, e.g. github:hertz-ai/HARTOS/<sha>). This
-        remains the build target's repo and the offline fallback.
+        pin an exact commit, e.g. github:hertz-ai/HARTOS/<sha>?dir=nixos).
+        This remains the build target's repo and the offline fallback.
+
+        ?dir=nixos is LOAD-BEARING: this repo's flake lives under nixos/,
+        not the root. Without it the first real fallback resolution on a
+        flashed node (2026-08-23) fetched the rev fine and then died on
+        "path .../flake.nix does not exist", so the check exited UNKNOWN
+        and no update could ever stage. A central-published flake_ref must
+        carry ?dir=nixos for the same reason.
       '';
     };
 
@@ -540,13 +547,34 @@ in
                 | ${pkgs.jq}/bin/jq -r '.revision // "unknown"') || REMOTE_REV="check_failed"
             fi
 
-            LOCAL_REV=$(${pkgs.nix}/bin/nix flake metadata /etc/nixos --json 2>/dev/null \
-              | ${pkgs.jq}/bin/jq -r '.revision // "unknown"') || LOCAL_REV="unknown"
+            # The node's own revision. /etc/hart/image-rev is the raw image's
+            # identity file (written at build from hartRev, hart-repart-image
+            # module) -- a dd'd node has no /etc/nixos at all, which left
+            # LOCAL_REV "unknown" forever on exactly the nodes OTA exists for
+            # (first real check on flashed HW, 2026-08-23). /etc/nixos stays
+            # as the fallback for installer-written systems, where it is a
+            # real flake checkout with a readable revision.
+            LOCAL_REV=$(cat /etc/hart/image-rev 2>/dev/null | tr -d '[:space:]')
+            if [[ -z "$LOCAL_REV" ]]; then
+              LOCAL_REV=$(${pkgs.nix}/bin/nix flake metadata /etc/nixos --json 2>/dev/null \
+                | ${pkgs.jq}/bin/jq -r '.revision // "unknown"') || LOCAL_REV="unknown"
+            fi
+            [[ -z "$LOCAL_REV" ]] && LOCAL_REV="unknown"
 
             echo "[HART OTA] Local: $LOCAL_REV"
             echo "[HART OTA] Approved: $REMOTE_REV"
 
-            if [[ "$REMOTE_REV" != "check_failed" && "$REMOTE_REV" != "$LOCAL_REV" && "$REMOTE_REV" != "unknown" ]]; then
+            # Prefix-aware sameness: image-rev is the SHORT rev (hartRev =
+            # shortRev, 7-10 chars) while central/github resolve the FULL sha.
+            # Exact string compare would call a perfectly current node stale on
+            # every check -- an endless self-reapply loop under autoApply.
+            _same_rev() {
+              [[ -n "$1" && -n "$2" ]] || return 1
+              [[ "$1" == "$2" || "$1" == "$2"* || "$2" == "$1"* ]]
+            }
+
+            if [[ "$REMOTE_REV" != "check_failed" && "$REMOTE_REV" != "unknown" ]] \
+               && ! _same_rev "$REMOTE_REV" "$LOCAL_REV"; then
               echo "[HART OTA] New version available: $REMOTE_REV"
 
               # Persist update metadata INCLUDING the central-approved switch flake
