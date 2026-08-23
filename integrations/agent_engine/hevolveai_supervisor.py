@@ -589,6 +589,37 @@ _JOB = _JobHandle()
 from core.process_supervisor import ProcessSupervisor
 
 
+def run_learning_yield_loop(gate, post, sleep, stop):
+    """Post learning pause/resume to the child on gate TRANSITIONS only.
+
+    #687: the child's synthetic distillation loop pauses only around its
+    OWN /v1/chat/completions — Nunba user chat rides llama :8080 directly,
+    invisible to it (live 2026-08-23: 108 synthetic teacher queries in
+    40 min; an 11:53 user turn starved into the bare-llama fallback).
+    This loop bridges the canonical dispatch.should_yield_to_user gate
+    across the process boundary to the child's EXISTING pause actuators.
+
+    Failure semantics: a raising gate fails OPEN (not-yielding); a failed
+    POST leaves the state unchanged so the next tick retries.
+    """
+    paused = False
+    while not stop():
+        try:
+            yielding = bool(gate())
+        except Exception:
+            yielding = False
+        try:
+            if yielding and not paused:
+                post('pause')
+                paused = True
+            elif not yielding and paused:
+                post('resume')
+                paused = False
+        except Exception:
+            pass  # child booting/restarting — retry on the next tick
+        sleep()
+
+
 class _Supervisor(ProcessSupervisor):
     """Owns the HevolveAI uvicorn subprocess for the lifetime of HARTOS.
 
@@ -640,6 +671,9 @@ class _Supervisor(ProcessSupervisor):
             logger.info("hevolveai_supervisor: %s", self.last_error)
             # Still expose the URL so the bridge picks HTTP mode.
             os.environ['HEVOLVEAI_API_URL'] = self.api_url
+            # An operator-managed child grinds the shared llama just the
+            # same — arm the learning-yield bridge for it too (#687).
+            self._start_learning_yield_poller()
             return self.info()
 
         # Surface the URL to the parent env BEFORE the bridge constructs
@@ -666,7 +700,40 @@ class _Supervisor(ProcessSupervisor):
         # Best-effort -- never aborts startup if the EventBus isn't up yet
         # (the governor itself starts later in some boot orders).
         self._subscribe_governor_modes()
+        self._start_learning_yield_poller()
         return self.info()
+
+    def _start_learning_yield_poller(self, poll_seconds: float = 5.0) -> None:
+        """Bridge the canonical user-yield gate to the child (#687).
+
+        Polls dispatch.should_yield_to_user (same gate every background
+        daemon consults, #505) and posts /v1/learning/pause|resume to the
+        child on transitions via run_learning_yield_loop.  Idempotent —
+        one poller thread per supervisor lifetime; stops with stop_event.
+        """
+        existing = getattr(self, '_yield_poller_thread', None)
+        if existing is not None and existing.is_alive():
+            return
+
+        def _gate() -> bool:
+            from .dispatch import should_yield_to_user
+            return should_yield_to_user()
+
+        def _post(action: str) -> None:
+            import requests
+            requests.post(f'{self.api_url}/v1/learning/{action}', timeout=3.0)
+            logger.info('hevolveai_supervisor: learning %s posted to child', action)
+
+        def _run() -> None:
+            run_learning_yield_loop(
+                _gate, _post,
+                sleep=lambda: self.stop_event.wait(poll_seconds),
+                stop=self.stop_event.is_set)
+
+        t = threading.Thread(target=_run, name='hevolveai-learning-yield',
+                             daemon=True)
+        self._yield_poller_thread = t
+        t.start()
 
     def stop(self) -> None:
         """Graceful stop -- used on clean HARTOS shutdown."""
