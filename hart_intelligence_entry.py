@@ -9131,7 +9131,7 @@ def chat():
                         app.logger.info(f'GOT LEN OF FLOW AS {no_of_flow}')
                     if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_{no_of_flow}_recipe.json')):
                         # All flows complete → REUSE
-                        create_agent = set_flags_to_enter_review_mode(no_of_flow, user_id, prompt_id) #returns false
+                        create_agent = set_flags_to_enter_reuse_mode(no_of_flow, user_id, prompt_id) #returns false
                     else:
                         # Some flows complete, some not.
                         # Enter CREATE — recipe() has resume logic (initialize_with_resume)
@@ -9678,7 +9678,8 @@ def chat():
                     _mce()
                 except ImportError:
                     logging.getLogger(__name__).debug("chat: swallowed ImportError")
-            if response =='Agent Created Successfully':
+            if response in ('Agent Created Successfully',
+                            'Agent Already Created Successfully'):
                 with _user_lock:
                     conversation_agent[_ak] = True
                 _touch_agent_timestamp(_ak)
@@ -10066,12 +10067,18 @@ def evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_
     )
 
 
-def set_flags_to_enter_review_mode(no_of_flow, user_id, prompt_id=''):
+def set_flags_to_enter_reuse_mode(no_of_flow, user_id, prompt_id=''):
     app.logger.info(f'{no_of_flow} Recipe Json exist Going to reuse')
     create_agent = False
     _ak = f'{user_id}_{prompt_id}'
-    review_agents[_ak] = True
-    conversation_agent[_ak] = False
+    # All flow recipes exist -> the agent is BUILT; this turn is a
+    # conversation.  review=True here sent every first turn on a
+    # completed agent into Phase-2 recipe(), which short-circuited
+    # 'Agent Already Created Successfully' — raw 34-char stub as the
+    # visible reply, message never executed, 'resumed - action
+    # complete' churn 16x (live 2026-08-23 09:42, #684).
+    review_agents[_ak] = False
+    conversation_agent[_ak] = True
     _touch_agent_timestamp(_ak)
     return create_agent
 

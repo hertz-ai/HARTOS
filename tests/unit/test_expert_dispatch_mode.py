@@ -90,3 +90,51 @@ def test_agent_bound_delegation_swaps_standby_reply():
         "live 13:30 turn shipped 'saved and confirmed' as the visible "
         "answer while nothing had run; swap the standby like "
         "ACTIONABLE_INTENT does")
+
+
+def test_completed_agent_classifier_flags_conversation():
+    """Live 2026-08-23 09:42 (user validate-0823, agent 90916249292,
+    status 'completed'): the classifier's all-recipes-exist branch called
+    set_flags_to_enter_review_mode, which — despite logging "Going to
+    reuse" — set review=True/convo=False.  Phase 2 then routed the turn
+    into recipe(), which short-circuited 'Agent Already Created
+    Successfully' (34 chars): raw stub shipped as the reply, TTS'd 3x,
+    'resumed - action complete' churned 16x, and the user's message was
+    never executed.  A completed agent's turn must be flagged as
+    CONVERSATION.  The function is renamed to say what it does."""
+    import hart_intelligence_entry as hie
+    assert not hasattr(hie, 'set_flags_to_enter_review_mode'), (
+        "old misnomer still exists — rename, don't fork (parallel path)")
+    create_agent = hie.set_flags_to_enter_reuse_mode('0', 'val-user', 'val-prompt')
+    assert create_agent is False
+    assert hie.review_agents['val-user_val-prompt'] is False, (
+        "review=True on a completed agent routes Phase 2 into recipe() "
+        "and eats the user's message (live 09:42 turn)")
+    assert hie.conversation_agent['val-user_val-prompt'] is True
+
+
+def test_review_phase_wraps_already_created():
+    """Defense in depth at the Phase-2 recipe() handler: a genuine
+    mid-creation resume that turns out already complete must be treated
+    like completion — not fall through to the generic return that ships
+    the raw 34-char stub with Agent_status='Review Mode' forever."""
+    hie_src = (Path(__file__).resolve().parents[2] /
+               'hart_intelligence_entry.py').read_text(encoding='utf-8')
+    m = re.search(r'# Phase 2: Review Phase.*?# Phase 3: Evaluation Phase',
+                  hie_src, re.DOTALL)
+    assert m, "Phase 2 block not found"
+    assert "'Agent Already Created Successfully'" in m.group(0), (
+        "Phase-2 handler special-cases only 'Agent Created Successfully' — "
+        "the Already variant falls through and ships the raw stub")
+
+
+def test_classifier_prompt_bans_live_data_none():
+    """Live 2026-08-23 09:41 weather turn: draft answered 'hot and humid,
+    monsoon clouds' with delegate=none @ confidence 0.95 — a fabricated
+    forecast as the FINAL answer (no expert leg).  The prompt's criteria
+    block bans live data, but the trailing delegate summary says 'factual
+    questions you can fully answer yourself' — the door the 0.8B took.
+    The delegate summary must name live/current data as never-none."""
+    assert 'Never \\"none\\" for live/current data' in _SRC, (
+        "delegate summary lacks the live-data ban — the criteria block "
+        "and the summary disagree, and the draft follows the summary")
