@@ -9328,6 +9328,24 @@ def chat():
                         f"recall/Q&A directly or escalates a genuine task via "
                         f"its own tools."
                     )
+                    # Restore get_ans's declared contract (its comment says
+                    # casual_conv IS the classifier's is_casual — the route
+                    # actually sends `not bool(prompt_id)`, chatbot_routes:486,
+                    # so EVERY default-agent turn arrives casual_conv=True).
+                    # casual_conv=True strips all langchain tools and routes
+                    # CustomGPT to the 0.8B draft.  Live 2026-08-24 00:28:
+                    # 'What agents do you have' -> tools stripped -> model
+                    # fabricated "I don't have agents" while List_Agents sat
+                    # registered; same mechanism starved P7's five live-data
+                    # turns of google_search (#689).  One-way override: the
+                    # classifier's not-casual wins; a prompt_id agent chat
+                    # (route sends False) is never upgraded to casual.
+                    if casual_conv:
+                        app.logger.info(
+                            'chat: classifier is_casual=False overrides route '
+                            'casual_conv=True — get_ans runs with tools on the '
+                            'main model')
+                        casual_conv = False
                     # #118 FIX: do NOT force create_agent/autonomous here.
                     # Forcing CREATE on EVERY non-casual turn hijacked recall/
                     # Q&A ("what did we discuss 15 days back") into an 8-action
