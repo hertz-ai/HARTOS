@@ -260,7 +260,25 @@ except ImportError as _lc_err:
     import logging as _logging
     _logging.getLogger(__name__).error(
         "langchain_classic unavailable (%s) — backend boots WITHOUT the langchain "
-        "chat path; social/sync/status/daemon still serve (#99).", _lc_err)
+        "chat path; social/sync/status/daemon still serve (#99).", _lc_err,
+        exc_info=True)
+    # 2026-08-24: the message alone cannot be root-caused — the frozen
+    # install failed with "No module named 'yaml.error'" while every yaml
+    # copy on every path (frozen lib/, python-embed site-packages, user
+    # site, ~/.nunba) had a complete package incl. error.py, and the same
+    # import block passed on bare python-embed.  Whatever yaml object the
+    # app actually resolved is the evidence; capture it.
+    try:
+        import sys as _lc_sys
+        _lc_y = _lc_sys.modules.get('yaml')
+        _logging.getLogger(__name__).error(
+            "langchain import-failure context: yaml=%r file=%s path=%s "
+            "spec=%s | sys.path[:6]=%s",
+            _lc_y, getattr(_lc_y, '__file__', None),
+            getattr(_lc_y, '__path__', None),
+            getattr(_lc_y, '__spec__', None), _lc_sys.path[:6])
+    except Exception:
+        pass
     _LANGCHAIN_OK = False
 
     class _LangchainUnavailable:
