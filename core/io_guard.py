@@ -13,18 +13,30 @@ import sys
 
 
 def silence_stdio():
-    """Redirect stdout/stderr to devnull if they're broken (frozen builds)."""
+    """Redirect stdout/stderr to devnull if they're broken (frozen builds).
+
+    Every devnull here opens with encoding='utf-8', errors='replace', and
+    that is load-bearing: on Windows a bare open(os.devnull, 'w') is cp1252,
+    and a cp1252 stream ENCODES BEFORE DISCARDING — so print('…→…') raises
+    UnicodeEncodeError even though the output goes nowhere.  Measured live
+    2026-08-23 on the bundle: agent_lightning's generate_reply printed a
+    reply containing '\\u2192', the charmap encode blew up, and the whole
+    creation turn died with "An error occurred: 'charmap' codec can't
+    encode character" — the final action of a six-action flow failed on
+    every retry because the model likes arrows.  A discard stream must
+    accept ALL of Unicode.
+    """
     try:
         if sys.stdout is None or sys.stdout.closed:
-            sys.stdout = open(os.devnull, 'w')
+            sys.stdout = open(os.devnull, 'w', encoding='utf-8', errors='replace')
     except Exception:
-        sys.stdout = open(os.devnull, 'w')
+        sys.stdout = open(os.devnull, 'w', encoding='utf-8', errors='replace')
 
     try:
         if sys.stderr is None or sys.stderr.closed:
-            sys.stderr = open(os.devnull, 'w')
+            sys.stderr = open(os.devnull, 'w', encoding='utf-8', errors='replace')
     except Exception:
-        sys.stderr = open(os.devnull, 'w')
+        sys.stderr = open(os.devnull, 'w', encoding='utf-8', errors='replace')
 
 
 class _SafeIOStream:
@@ -58,7 +70,7 @@ class _SafeIOStream:
             # stdout was closed under us. Re-arm it so the NEXT line has
             # somewhere to go, then drop this one.
             try:
-                sys.stdout = open(os.devnull, 'w')
+                sys.stdout = open(os.devnull, 'w', encoding='utf-8', errors='replace')
             except Exception:
                 pass
 

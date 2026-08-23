@@ -804,14 +804,14 @@ handler.setLevel(logging.INFO)
 # In cx_Freeze frozen builds, stdout/stderr may be closed — redirect to devnull.
 try:
     if sys.stdout is None or sys.stdout.closed:
-        sys.stdout = open(os.devnull, 'w')
+        sys.stdout = open(os.devnull, 'w', encoding='utf-8', errors='replace')
     else:
         sys.stdout.reconfigure(errors='replace')
 except Exception:
-    sys.stdout = open(os.devnull, 'w')
+    sys.stdout = open(os.devnull, 'w', encoding='utf-8', errors='replace')
 try:
     if sys.stderr is None or sys.stderr.closed:
-        sys.stderr = open(os.devnull, 'w')
+        sys.stderr = open(os.devnull, 'w', encoding='utf-8', errors='replace')
 except Exception:
     logging.getLogger(__name__).exception("<module>: swallowed Exception")
 stream_handler = logging.StreamHandler(sys.stdout)
