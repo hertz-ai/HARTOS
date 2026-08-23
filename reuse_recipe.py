@@ -821,6 +821,15 @@ def create_agents_for_role(user_id: str, prompt_id):
             llm_config={"cache_seed": None, "config_list": config_list}
         )
 
+        # Write half of the seed/write contract: without this the group is
+        # seeded FROM the shared buffer but its own turns never persist —
+        # the next turn truthfully denies the conversation happened (#686).
+        try:
+            from integrations.channels.memory.shared_history import install_history_writeback
+            install_history_writeback(group_chat, user_id)
+        except Exception:
+            current_app.logger.debug('role-group history write-back skipped', exc_info=True)
+
         return assistant, user_proxy, group_chat, manager, helper, False
     else:
         # ZERO personas lands here too, not just one.
