@@ -4051,6 +4051,37 @@ def send_retry(group_chat, sender, manager, tag, message, logger=None):
         recipient=manager, message=f'{marker} {message}', clear_history=False)
 
 
+# The memory-injection sites (2406/2659/2711 above) append this hint to the
+# LAST group-chat message.  It is model-facing text; it must never reach the
+# user, and its presence on a terminate message defeats an exact
+# == 'TERMINATE' comparison (live 2026-08-23 21:52: the user's reply was
+# 'TERMINATE' plus six accumulated skeleton lines).
+_MEMORY_SKELETON_PREFIX = 'Metadata/skeleton of all keys'
+
+
+def _strip_memory_skeleton(text):
+    lines = [ln for ln in str(text).splitlines()
+             if not ln.lstrip().startswith(_MEMORY_SKELETON_PREFIX)]
+    return '\n'.join(lines).strip()
+
+
+def _is_terminate(content):
+    # Narrower than helper._is_terminate_msg on purpose: that one is autogen's
+    # is_termination_msg predicate and matches TERMINATE anywhere in the
+    # content (cheap false positives — a round just ends).  Here a false
+    # positive SKIPS a legitimate user-bound reply, so only a message that IS
+    # the terminate token (after removing the skeleton suffix) qualifies.
+    return _strip_memory_skeleton(content).upper().startswith('TERMINATE')
+
+
+def _needs_input_reply(action_id, action_text):
+    step = f' ("{action_text}")' if action_text else ''
+    return (f"I need your input to finish building this agent. Step {action_id}"
+            f"{step} isn't coming together from what I have so far — tell me "
+            f"more about how this step should work, and I'll continue building "
+            f"from there.")
+
+
 def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     """
     Handles the response generation process for an agent group.
@@ -4887,12 +4918,23 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     _attempt = user_tasks[user_prompt]._exec_retries[_ca_pending]
 
                     if _attempt > 3:
-                        # Action keeps failing — it likely needs user input.
-                        # Break out and return control so user can respond on next /chat call.
+                        # Action keeps failing — it needs user input.  Reset the
+                        # counter so the NEXT turn (whose text is threaded into
+                        # _exec_msg as `Latest User message`) actually re-attempts:
+                        # live 2026-08-23 21:55 the counter climbed 5->9 across four
+                        # turns, each exiting at iteration #1, so the user's answers
+                        # were never consumed.  And return a QUESTION — breaking out
+                        # here fell through to the tail-message return, which handed
+                        # the user the raw 'TERMINATE\n Metadata/skeleton...' text.
+                        user_tasks[user_prompt]._exec_retries[_ca_pending] = 0
+                        try:
+                            _stuck_action_text = user_tasks[user_prompt].get_action(_ca_pending - 1)
+                        except Exception:
+                            _stuck_action_text = ''
                         current_app.logger.info(
                             f'[NEEDS-INPUT] action {_ca_pending} not completing after {_attempt-1} attempts, '
                             f'returning control to user')
-                        break
+                        return _needs_input_reply(_ca_pending, _stuck_action_text)
 
                     actions_prompt = user_tasks[user_prompt].get_action(_ca_pending - 1)
                     current_app.logger.info(f'[EXECUTE-PENDING] Starting action {_ca_pending} (attempt {_attempt}): {actions_prompt}')
@@ -4922,7 +4964,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
                     continue
 
-                if last_message['content'] == 'TERMINATE':
+                if _is_terminate(last_message['content']) and len(group_chat.messages) > 1:
                     last_message = group_chat.messages[-2]
 
                 if f'message2user'.lower() in last_message['content'].lower():
@@ -4969,7 +5011,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     return "I encountered an issue processing your request. Please try again."
 
                 last_message = group_chat.messages[-1]
-                if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
+                if _is_terminate(last_message['content']) and len(group_chat.messages) > 1:
                     last_message = group_chat.messages[-2]
 
                 if f'message2user'.lower() in last_message['content'].lower():
@@ -5030,7 +5072,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             return "I encountered an issue processing your request. Please try again."
 
         last_message = group_chat.messages[-1]
-        if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
+        if _is_terminate(last_message['content']) and len(group_chat.messages) > 1:
             last_message = group_chat.messages[-2]
 
         if f'message2user'.lower() in last_message['content'].lower():
@@ -5055,7 +5097,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 if match:
                     last_message['content'] = match.group(1)
                     return last_message['content']
-        return last_message['content']
+        return _strip_memory_skeleton(last_message['content'])
     except Exception as e:
         current_app.logger.error(f"Unhandled exception in get_response_group: {e}")
         safe_set_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.ERROR, "Unhandled exception in get_response_group")
