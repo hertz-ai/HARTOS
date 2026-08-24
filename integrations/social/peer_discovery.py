@@ -580,13 +580,34 @@ class GossipProtocol:
             return
 
         targets = random.sample(peers, min(self.gossip_fanout, len(peers)))
-        for peer in targets:
+
+        # Central seeds join the target set EVERY round, not only when the
+        # node is peerless.  Measured live 2026-08-24: a fresh desktop's
+        # PeerNode table carries hundreds of stale rows (dead localhost:6777
+        # from port drift), all marked `active`, so `peers` is never empty —
+        # which meant the `if not peers:` bootstrap-exchange above never ran
+        # and the node NEVER exchanged with azurekong.  Result: zero central
+        # contacts across an entire boot, the node absent from the hive
+        # census, no federation.  Losing the census/federation hub is far
+        # worse than one extra request per round to a seed that is, by
+        # definition, the aggregation point.  Deduped against `targets` by
+        # URL so a seed already sampled isn't hit twice; backoff still
+        # applies, so a genuinely down seed is skipped after failures.
+        _target_urls = {p.get('url') for p in targets}
+        _seed_targets = [{'url': u, 'node_id': None}
+                         for u in self.seed_peers if u not in _target_urls]
+
+        for peer in targets + _seed_targets:
             if not self._running:
                 return
             peer_url = peer['url']
             if self._is_peer_backed_off(peer_url):
                 continue
             try:
+                # Seeds get an announce too, so central always relearns us
+                # even if our row aged out on its side.
+                if peer in _seed_targets:
+                    self._announce_to_peer(peer_url)
                 their_peers = self._exchange_with_peer(peer_url)
                 if their_peers:
                     self._merge_peer_list(their_peers)
