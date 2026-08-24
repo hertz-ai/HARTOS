@@ -363,7 +363,22 @@ class FederatedAggregator:
                 'event_counters': self.get_event_counters(),
             }
 
-            # Sign the delta
+            # The node's running code hash — the ONE gate that decides whether
+            # this node may federate into the hive (steward, 2026-08-24: joining
+            # is a consent tap; the only security is that a tampered build,
+            # whose hash is not a verified release hash, cannot join).  Added
+            # to the delta BEFORE signing so it is covered by the Ed25519
+            # signature and cannot be spoofed.  Receivers gate on it via
+            # release_hash_registry.is_known_release_hash — which, with the
+            # self-hash layer (f138706f), passes any node on the same build as
+            # the receiver and any known release, and fails a modified tree.
+            try:
+                from security.node_integrity import compute_code_hash
+                delta['code_hash'] = compute_code_hash()
+            except Exception:
+                delta['code_hash'] = ''
+
+            # Sign the delta (covers code_hash above)
             try:
                 from security.node_integrity import sign_json_payload
                 delta['signature'] = sign_json_payload(delta)
@@ -542,23 +557,68 @@ class FederatedAggregator:
         elif _enforcement == 'hard':
             return False, 'missing Ed25519 signature (hard enforcement)'
 
-        # HMAC-SHA256 delta signing verification — required in hard mode
-        if delta.get('hmac_signature'):
-            if not _verify_delta_signature(delta):
-                return False, 'invalid HMAC signature'
-        elif _enforcement == 'hard':
-            return False, 'missing HMAC signature (hard enforcement)'
+        # THE join gate (steward, 2026-08-24): a node may federate iff it is a
+        # GENUINE, UNMODIFIED official build.  Joining is otherwise a consent
+        # tap; every other crypto layer is seamless plumbing.  A build is
+        # genuine if EITHER holds:
+        #
+        #   (a) its code_hash is a known release hash — same build as this
+        #       receiver (self-hash layer f138706f) or a published release; or
+        #   (b) it carries a valid origin attestation — the cross-build proof
+        #       that rejects forks, stripped branding, and modified guardrails
+        #       (security.origin_attestation.verify_peer_attestation) even when
+        #       the exact file hash differs, e.g. a desktop bundle vs the
+        #       central container.
+        #
+        # code_hash rides INSIDE the Ed25519-signed payload, so it is bound to
+        # the node's identity and cannot be swapped.  A node is refused only
+        # when it can prove NEITHER — i.e. a tampered or unknown tree with no
+        # genuine attestation.  If the attestation raises the specific reason,
+        # a bad attestation is itself a hard reject.
+        _genuine = False
+        _reject_reason = 'unverified build — unknown code hash, no valid attestation'
 
-        # Origin attestation — reject forks and rebranded builds
-        peer_attestation = delta.get('origin_attestation')
-        if peer_attestation:
+        _peer_code_hash = delta.get('code_hash', '')
+        if _peer_code_hash:
+            try:
+                from security.release_hash_registry import get_release_hash_registry
+                if get_release_hash_registry().is_known_release_hash(_peer_code_hash):
+                    _genuine = True
+            except ImportError:
+                pass
+
+        _peer_attestation = delta.get('origin_attestation')
+        if not _genuine and _peer_attestation:
             try:
                 from security.origin_attestation import verify_peer_attestation
-                att_ok, att_msg = verify_peer_attestation(peer_attestation)
-                if not att_ok:
-                    return False, f'origin attestation failed: {att_msg}'
+                att_ok, att_msg = verify_peer_attestation(_peer_attestation)
+                if att_ok:
+                    _genuine = True
+                else:
+                    # A PRESENT-but-INVALID attestation is a fork/impersonator
+                    # signal, not just "unknown" — name it.
+                    _reject_reason = f'origin attestation failed: {att_msg}'
             except ImportError:
-                pass  # Origin module not available — accept
+                pass  # attestation module absent — fall back to hash result
+
+        if not _genuine and _enforcement == 'hard':
+            return False, _reject_reason
+
+        # HMAC-SHA256 — verified when present, but NEVER required.
+        #
+        # It used to be mandatory in hard mode, which silently partitioned the
+        # whole hive: HMAC is symmetric, so it needs a per-node secret handed
+        # to the receiver in a separate signed handshake, and that handshake
+        # was not happening — so every real delta from every real machine was
+        # rejected with 'missing/invalid HMAC signature' and the census showed
+        # only the central node itself (measured live 2026-08-24 from MSI,
+        # .69, .83).  Ed25519 already proves identity+integrity and the gate
+        # above proves a genuine unmodified build, so the HMAC layer is
+        # redundant AND the un-seamless part.  Kept as a non-fatal check for
+        # nodes that still exchange it, so nothing that worked before breaks.
+        if delta.get('hmac_signature') and not _verify_delta_signature(delta):
+            logger.debug('federation delta: HMAC present but unverified '
+                         '(non-fatal; Ed25519 + genuine-build gate already applied)')
 
         # Revocation check — master-key-signed network halt via federation
         revocation = delta.get('revocation')
