@@ -58,6 +58,20 @@ def test_launcher_is_cpu_only():
         "CPU-only, so the old renderD128/icd.d GPU gate must be removed.")
 
 
+def test_llama_binary_is_published_on_path_for_hartos_finders():
+    # HARTOS's own ModelLifecycleManager._find_llama_server_binary() falls back to
+    # shutil.which('llama-server'). If this module keeps the binary to itself (only
+    # in hart-llm.service's ExecStart), that finder returns None on HART OS and its
+    # consumers degrade silently: lightweight_backend disables captioning, and
+    # model_onboarding takes its "binary not found, downloading..." branch, which
+    # pulls a GENERIC avx2 build and SIGILLs on the fleet CPU. Publishing the same
+    # ISA-correct derivation on PATH is what makes the OS the supplier.
+    assert "environment.systemPackages" in _LLM and "llama-server" in _LLM, (
+        "hart-llm must put its llama.cpp build on PATH (environment.systemPackages) "
+        "so HARTOS's _find_llama_server_binary() finds the ISA-correct binary "
+        "instead of nothing (caption disabled) or a downloaded avx2 one (SIGILL).")
+
+
 def test_cpu_inference_does_not_starve_the_os():
     # CPU inference must NOT starve the interactive desktop/shell: the LLM is a
     # BACKGROUND citizen (CPUWeight below the UI's default 100) and the launcher

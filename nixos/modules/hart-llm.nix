@@ -153,6 +153,30 @@ in
 
   config = lib.mkIf (cfg.enable && config.hart.llm.enable) {
 
+    # Publish the ISA-correct llama.cpp on PATH — the discovery point HARTOS's
+    # OWN model machinery already looks at, instead of this module being the only
+    # thing that knows where the binary lives.
+    #
+    # `ModelLifecycleManager._find_llama_server_binary()` searches ~/.nunba and
+    # ~/.trueflow, then falls back to `shutil.which('llama-server')`. On HART OS
+    # neither app dir exists and, before this, PATH had no llama-server either —
+    # `command -v llama-server` on the box returned nothing — so every HARTOS
+    # consumer of that finder was silently degraded even while hart-llm.service
+    # itself ran fine off its baked ExecStart path:
+    #   • integrations/vision/lightweight_backend.py (which explicitly comments
+    #     "reuse model_lifecycle's finder") got None -> "caption disabled";
+    #   • integrations/service_tools/model_onboarding.py takes its "binary not
+    #     found, downloading..." branch, which would fetch a GENERIC upstream
+    #     build — i.e. an avx2/fma one that SIGILLs on this CPU, reintroducing the
+    #     exact crash this module's cmakeFlags exist to prevent;
+    #   • model_lifecycle's own G3 _launch_llama_server_direct supervision and
+    #     mcp_server's runtime model switch had nothing to launch.
+    # Putting the SAME derivation on PATH makes the OS the supplier of the
+    # binary and leaves *which flags / which port* to the code that already owns
+    # those decisions (model_onboarding's "optimal params", core.port_registry),
+    # rather than duplicating them here.
+    environment.systemPackages = [ llama-server ];
+
     # NVIDIA GPU support (declarative — the NixOS way)
     hardware.nvidia = lib.mkIf (builtins.pathExists "/dev/nvidia0") {
       open = true;  # Use open-source kernel modules (Turing+)
