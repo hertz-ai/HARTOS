@@ -107,6 +107,40 @@ def test_stateless_probe_alive_registers_active():
     assert mgr._models['llm'].priority == ModelPriority.ACTIVE
 
 
+def test_direct_launch_adopts_instead_of_starting_a_second_engine():
+    """G3's direct launch must NOT start a second main llama-server when one is
+    already serving.
+
+    It spawns on port_registry.get_port('llm') — the very port a running engine
+    holds — and checks nothing before Popen. On HART OS systemd owns that engine
+    (hart-llm.service). This could not fire while _find_llama_server_binary()
+    found nothing on HART OS, but once the OS published llama-server on PATH
+    (2026-08-24, so the captioner and model_onboarding could find it) that
+    accident stopped protecting anything.
+    """
+    from integrations.service_tools.model_lifecycle import ModelLifecycleManager
+    mgr = ModelLifecycleManager()
+    spawned = []
+    with patch('subprocess.Popen', lambda *a, **k: spawned.append(a) or None):
+        with patch('core.health_probe.probe_llm', lambda *a, **k: {'status': 'up'}):
+            ok = mgr._launch_llama_server_direct('cpu')
+    assert ok is True, "an already-serving engine must count as success"
+    assert spawned == [], f"must not spawn a second llama-server: {spawned}"
+
+
+def test_direct_launch_still_proceeds_when_nothing_is_serving():
+    """The guard may only prevent a DUPLICATE. With no engine up, the launch path
+    must still run (and fail honestly here on the missing binary/model, not on
+    the guard)."""
+    from integrations.service_tools.model_lifecycle import ModelLifecycleManager
+    mgr = ModelLifecycleManager()
+    with patch('core.health_probe.probe_llm', lambda *a, **k: {'status': 'down'}):
+        with patch.object(ModelLifecycleManager, '_find_llama_server_binary',
+                          staticmethod(lambda: None)):
+            ok = mgr._launch_llama_server_direct('cpu')
+    assert ok is False, "with nothing serving, the guard must not short-circuit"
+
+
 def test_already_loaded_adopted_is_idempotent():
     """An adopted server already marked GPU/ACTIVE stays put — no churn."""
     from integrations.service_tools.model_lifecycle import (

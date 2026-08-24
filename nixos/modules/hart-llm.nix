@@ -355,9 +355,10 @@ in
         Type = "simple";
         User = "hart";
         Group = "hart";
-        # The GPU-aware launcher (see `llamaLauncher` in the `let` above): offloads to the
-        # Vulkan GPU when one is present, pure-CPU otherwise. Replaces the old bare
-        # llama-server call that passed NO --n-gpu-layers, so every layer ran on the CPU.
+        # The launcher (see `llamaLauncher` in the `let` above). It supplies the
+        # model path, the declared port and the pinned ctx-size, then execs the
+        # per-CPU dispatcher, so this unit and anything that finds `llama-server`
+        # on PATH run the same binary choice.
         ExecStart = "${llamaLauncher}/bin/hart-llm-server";
 
         EnvironmentFile = lib.mkIf (builtins.pathExists "/etc/hart/hart.env") "/etc/hart/hart.env";
