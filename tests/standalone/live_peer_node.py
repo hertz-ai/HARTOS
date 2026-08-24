@@ -61,6 +61,13 @@ os.environ['NUNBA_DATA_DIR'] = data_dir
 # census merges them into a single local entry.
 os.environ['HEVOLVE_KEY_DIR'] = os.path.join(data_dir, 'keys')
 os.environ['HEVOLVE_AGENT_DATA'] = os.path.join(data_dir, 'agent_data')
+# The social DB is the FOURTH thing to isolate. Without a per-node path both
+# processes open the SAME sqlite file, and their concurrent writers (each node's
+# health check + gossip + the announce/delta INSERTs) collide past the 3s
+# busy_timeout with "database is locked" — which fails the announce and looks
+# like a federation bug. Each node gets its own DB, exactly as two separate
+# machines would in production.
+os.environ['HEVOLVE_DB_PATH'] = os.path.join(data_dir, 'social.db')
 os.environ['HEVOLVE_ENFORCEMENT_MODE'] = 'hard'   # production default
 os.environ.setdefault('HEVOLVE_BASE_URL', f'http://127.0.0.1:{port}')
 
@@ -71,6 +78,13 @@ import requests  # noqa: E402
 from flask import Flask, jsonify, request  # noqa: E402
 from integrations.social.discovery import discovery_bp  # noqa: E402
 from integrations.social.api_hive_census import hive_census_bp  # noqa: E402
+from integrations.social.models import init_db  # noqa: E402
+
+# Create the schema in THIS node's isolated DB (HEVOLVE_DB_PATH, set above).
+# Without an explicit init the fresh per-node sqlite file has no tables and the
+# announce INSERT fails with "no such table: peer_nodes" — the shared-default-DB
+# path only worked because a prior run had already created the tables there.
+init_db()
 
 app = Flask(__name__)
 app.register_blueprint(discovery_bp)
