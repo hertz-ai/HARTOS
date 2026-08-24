@@ -108,12 +108,39 @@ def test_llama_binary_is_published_on_path_for_hartos_finders():
 
 
 def test_cpu_inference_does_not_starve_the_os():
-    # CPU inference must NOT starve the interactive desktop/shell: the LLM is a
-    # BACKGROUND citizen (CPUWeight below the UI's default 100) and the launcher
-    # leaves one core for the OS (nproc - 1).
+    # CPUWeight is necessary but NOT sufficient: it only arbitrates once
+    # contention has begun. Measured on the box 2026-08-24 at CPUWeight=50, the
+    # LLM still reached 457% CPU with the compositor at 94% and load average
+    # 10.26, and a 16-token request returned nothing in 200s.
     assert "CPUWeight = 50" in _CODE, (
         "hart-llm CPUWeight must be BELOW the UI services' default 100 (was 150 = above "
         "it, so CPU inference out-prioritised and stalled the desktop).")
-    assert "nproc) - 1" in _CODE, (
-        "the launcher must size CPU threads to nproc - 1 (leave one core for the OS) so "
-        "CPU inference never saturates every core.")
+    # The real bound is core affinity, pinned by the launcher.
+    assert "taskset" in _CODE, (
+        "the launcher must PIN inference with taskset -- CPUWeight alone does not bound "
+        "anything, so the desktop only wins after it has already started losing.")
+    assert "cpuSharePercent" in _CODE, (
+        "how much of the machine inference may take must be an option, not a constant.")
+
+
+def test_cpu_budget_is_computed_on_the_node_not_baked():
+    # HART OS is installed on hardware nobody has seen, with no operator to tune
+    # it, so the budget must be derived at boot from THIS machine's topology.
+    # A static AllowedCPUs=/thread count would be correct only on the machine it
+    # was written for.
+    assert "topology/core_id" in _CODE, (
+        "core count must come from the running machine's topology (physical cores), "
+        "not from a baked constant.")
+    assert "nproc) - 1" not in _CODE, (
+        "must NOT size threads as nproc-1: nproc counts SMT siblings, so on a 4-core/"
+        "8-thread CPU that asked for 7 threads on 4 real cores and slowed BOTH the "
+        "desktop and inference.")
+
+
+def test_parallel_slots_are_capped():
+    # llama.cpp's auto value is 4, and the slots share the kv_unified pool, so
+    # 4 slots against ctx-size 12288 give each request a quarter of the budget
+    # while the wire-layer trim computes against the full n_ctx.
+    assert "--parallel" in _CODE and "parallelSlots" in _CODE, (
+        "the launcher must pass an explicit --parallel cap; llama.cpp's auto (=4) "
+        "over-subscribes the shared kv_unified pool.")

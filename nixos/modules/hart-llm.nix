@@ -94,17 +94,73 @@ let
   # is incomplete. Re-add it behind a probe that proves the GPU actually works.
   llamaLauncher = pkgs.writeShellScriptBin "hart-llm-server" ''
     set -eu
-    THREADS="${toString config.hart.llm.threads}"
-    if [ "$THREADS" -le 0 ]; then
-      THREADS=$(( $(${pkgs.coreutils}/bin/nproc) - 1 ))
-      [ "$THREADS" -lt 1 ] && THREADS=1
+    # ── Work out the CPU budget FROM THIS MACHINE, at boot ────────────────────
+    # This must be computed here, not baked by whoever built the image and not
+    # hand-tuned per box: a user installs HART OS on hardware nobody has seen,
+    # and it has to divide its own cores sensibly with no operator present.
+    #
+    # Count PHYSICAL cores, not nproc. nproc counts SMT siblings, so on the fleet
+    # box (i7-3630QM: 4 cores / 8 threads) the old `nproc - 1` asked for SEVEN
+    # threads on FOUR real cores. Measured 2026-08-24 with the desktop in use:
+    # load average 10.26, llama-server at 457% CPU, the compositor fighting it at
+    # 94%, and a trivial 16-token request returning NOTHING in 200s. A second
+    # sibling on the same physical core adds contention and cache thrash to
+    # llama.cpp's compute-bound GEMM rather than throughput, so that setting made
+    # the desktop AND inference slower at once.
+    CPUDIR=/sys/devices/system/cpu
+    CORE_IDS=$(${pkgs.coreutils}/bin/cat $CPUDIR/cpu[0-9]*/topology/core_id 2>/dev/null \
+                 | ${pkgs.coreutils}/bin/sort -n -u || true)
+    NCORES=$(printf '%s\n' "$CORE_IDS" | ${pkgs.gnugrep}/bin/grep -c . || true)
+    # Explicit if/fi, not `[ x ] && y`: this runs under `set -e`, and a trailing
+    # test that evaluates false makes the enclosing list fail. A boot-critical
+    # launcher must not be able to exit because a machine had a normal core count.
+    if [ -z "$NCORES" ] || [ "$NCORES" -lt 1 ]; then
+      NCORES=$(${pkgs.coreutils}/bin/nproc)
     fi
-    echo "hart-llm: starting llama-server ($THREADS threads, one core left for the OS)" >&2
-    exec ${llamaDispatch}/bin/llama-server \
+
+    # Give inference a MINORITY of the machine so interactive work keeps real
+    # headroom rather than merely higher priority.
+    NINFER=$(( NCORES * ${toString config.hart.llm.cpuSharePercent} / 100 ))
+    if [ "$NINFER" -lt 1 ]; then NINFER=1; fi
+    if [ "$NINFER" -gt "$NCORES" ]; then NINFER=$NCORES; fi
+
+    # Take the LAST cores and leave the FIRST ones alone: the desktop and most
+    # kernel work gravitate to low-numbered CPUs (the compositor was measured on
+    # CPU 0), so counting from the top keeps inference off them. Include each
+    # chosen core's SMT siblings, otherwise a sibling stays free to be scheduled
+    # against us on the very core we are trying to own.
+    PICK=$(printf '%s\n' "$CORE_IDS" | ${pkgs.coreutils}/bin/tail -n "$NINFER")
+    CPUS=""
+    for c in $CPUDIR/cpu[0-9]*; do
+      cid=$(${pkgs.coreutils}/bin/cat "$c/topology/core_id" 2>/dev/null || echo "")
+      if [ -z "$cid" ]; then continue; fi
+      for p in $PICK; do
+        if [ "$cid" = "$p" ]; then
+          n=$(${pkgs.coreutils}/bin/basename "$c" | ${pkgs.gnugrep}/bin/grep -oE '[0-9]+')
+          CPUS="''${CPUS:+$CPUS,}$n"
+        fi
+      done
+    done
+
+    THREADS="${toString config.hart.llm.threads}"
+    if [ "$THREADS" -le 0 ]; then THREADS=$NINFER; fi
+
+    echo "hart-llm: ''${NCORES} physical cores; inference gets ''${NINFER} (cpus ''${CPUS:-all}), ''${THREADS} threads" >&2
+
+    # taskset pins the affinity from inside the unit, so the budget follows the
+    # hardware instead of a static AllowedCPUs= that would be wrong on every
+    # machine except the one it was written for.
+    if [ -n "$CPUS" ] && [ "$NINFER" -lt "$NCORES" ]; then
+      set -- ${pkgs.util-linux}/bin/taskset -c "$CPUS" ${llamaDispatch}/bin/llama-server
+    else
+      set -- ${llamaDispatch}/bin/llama-server
+    fi
+    exec "$@" \
       --model "${config.hart.llm.modelPath}" \
       --port "${toString cfg.ports.llm}" \
       --ctx-size "${toString config.hart.llm.contextSize}" \
-      --threads "$THREADS"
+      --threads "$THREADS" \
+      --parallel ${toString config.hart.llm.parallelSlots}
   '';
 in
 {
@@ -160,6 +216,66 @@ in
         "CPU threads for inference. 0 = AUTO: leave one core for the rest of the OS "
         + "(nproc - 1, min 1) so CPU-fallback inference never starves the interactive "
         + "desktop/shell. Set a positive value to pin it.";
+    };
+
+    parallelSlots = lib.mkOption {
+      type = lib.types.int;
+      default = 1;
+      description = ''
+        Concurrent request slots passed to llama-server as --parallel.
+
+        MUST be set explicitly. llama.cpp's "auto" is 4, and the slots SHARE the
+        kv_unified pool, so 4 slots against --ctx-size 12288 give each request a
+        quarter of the budget while the wire-layer trim in llm_outbound_logger.py
+        is computing against the full n_ctx. Nunba's own launcher already caps
+        this for the same reason ("overrides llama.cpp's auto (=4) that
+        over-subscribed the shared kv_unified pool"); this module had simply
+        never passed the flag.
+
+        1 is right for the CPU floor: a node that can only run one request at a
+        time in useful latency should queue the second rather than halve both.
+        Raise it on a node with real parallel headroom.
+      '';
+    };
+
+    cpuSharePercent = lib.mkOption {
+      type = lib.types.int;
+      default = 50;
+      description = ''
+        Percentage of the machine's PHYSICAL cores inference may use, resolved on
+        the node at boot rather than baked into the image.
+
+        This has to be computed per machine: HART OS gets installed on hardware
+        nobody has seen, with no operator to tune it. 50 means "at most half the
+        cores", which on the 4-core fleet box is 2 and on a 16-core workstation
+        is 8. The launcher takes the HIGHEST-numbered cores (plus their SMT
+        siblings) and pins with taskset, leaving the low-numbered CPUs, where the
+        compositor and most kernel work land, untouched.
+
+        Raise toward 100 on a dedicated inference node; lower it on a machine
+        whose interactive feel matters more than local token rate.
+      '';
+    };
+
+    cpuQuota = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "200%";
+      description = ''
+        OPTIONAL extra systemd CPUQuota ceiling (100% = one core).
+
+        Normally unnecessary and deliberately null: `cpuSharePercent` already
+        bounds inference by pinning it to a subset of cores computed on the node,
+        and a quota written here would be a fixed number chosen by whoever edited
+        this file, which is wrong on every machine except theirs.
+
+        Kept because a quota bounds differently from affinity: affinity says
+        WHICH cores, a quota says HOW MUCH of them, so a steward who wants
+        inference to use half of two cores can say so. Note CPUWeight alone
+        bounds nothing at all -- it only arbitrates once contention has already
+        started, which is why the desktop was still losing at CPUWeight=50 while
+        llama-server sat at 457% CPU (measured 2026-08-24).
+      '';
     };
 
     autoProvision = lib.mkOption {
@@ -409,6 +525,9 @@ in
         # CPUWeight 150 -- ABOVE the UI -- which would let CPU-fallback inference stall the
         # whole desktop, the very thing the steward flagged.)
         MemoryMax = "8G";
+        # Optional hard ceiling; null by default because the launcher already
+        # bounds inference by pinning it to a node-computed subset of cores.
+        CPUQuota = lib.mkIf (config.hart.llm.cpuQuota != null) config.hart.llm.cpuQuota;
         CPUWeight = 50;
         TasksMax = 64;
         IOWeight = 50;
