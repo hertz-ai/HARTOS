@@ -99,12 +99,28 @@ class TestSourceGuardAndroidWaydroid:
             "misconfig fails eval LOUDLY instead of booting an inert runtime"
         )
 
-    def test_source_guard_waydroid_init_is_never_fail_oneshot(self):
+    def test_source_guard_waydroid_init_cannot_block_activation(self):
         src = _subsystems()
-        # The first-boot image init must not be able to wedge boot.
+        # The first-boot image init must not be able to wedge boot OR an OTA.
         assert "hart-waydroid-init" in src, "missing the Waydroid first-boot image init"
-        assert 'Type = "oneshot"' in src
+        # Type=simple, NOT oneshot. This guard used to demand oneshot and call it
+        # non-blocking, which is backwards: a oneshot start job only completes when
+        # ExecStart exits, and switch-to-configuration waits on the units it starts.
+        # Measured on the box 2026-08-24: a ~10-minute sourceforge image download
+        # held the OTA activation open until systemd killed the unit at its start
+        # timeout, and that single failure made nixos-rebuild report the whole
+        # switch as failed and roll back a healthy generation.
+        assert 'Type = "simple"' in src, (
+            "waydroid init must be Type=simple so its start job completes on fork; "
+            "oneshot blocks activation for the whole image download and fails OTAs")
+        assert 'Type = "oneshot"' not in src.split("hart-waydroid-init")[1][:1200], (
+            "the waydroid init unit must not be oneshot")
         assert "RemainAfterExit = true" in src
+        # A start timeout is what actually broke the OTA (SIGTERM at the deadline
+        # never reaches the script's own `exit 0`), so bound the process instead.
+        assert "RuntimeMaxSec" in src, (
+            "waydroid init must bound a hung mirror with RuntimeMaxSec, not "
+            "TimeoutStartSec — the latter kills the unit and fails the transaction")
         # Pulled in by hart.target (a plain HART child), NOT graphical (the
         # ordering-cycle lesson the old Android runtime learned).
         assert 'wantedBy = [ "hart.target" ]' in src

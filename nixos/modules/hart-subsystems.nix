@@ -381,11 +381,33 @@ in
         # Idempotent: skip once the images are present.
         unitConfig.ConditionPathExists = "!/var/lib/waydroid/images/system.img";
         serviceConfig = {
-          Type = "oneshot";
+          # `simple`, NOT `oneshot` -- this is what actually makes it non-blocking.
+          # A oneshot unit's START JOB does not complete until ExecStart exits, and
+          # switch-to-configuration waits on the units it starts, so a slow image
+          # fetch pins the whole activation. Measured on the box 2026-08-24: an OTA
+          # switch started this unit at 12:16:57, the sourceforge download was still
+          # running at 12:26:47, systemd killed it at TimeoutStartSec ("start
+          # operation timed out. Terminating."), and that one failure made
+          # nixos-rebuild report "error(s) occurred while switching to the new
+          # configuration" -- so hart-ota-apply treated the whole OTA as failed and
+          # rolled back a generation that was otherwise fine. Every OTA on a node
+          # without the images yet would have failed the same way.
+          #
+          # The timeout also defeated this script's own "never fail the transaction"
+          # design: the `|| echo ...` and trailing `exit 0` only help when the script
+          # RUNS to completion; a SIGTERM at the timeout never reaches them, and the
+          # unit ends Result=timeout.
+          #
+          # With `simple` the start job completes as soon as the process forks, so
+          # hart.target is reached immediately and the download continues in the
+          # background. RemainAfterExit keeps the "active (exited)" idempotence the
+          # ConditionPathExists guard above depends on.
+          Type = "simple";
           RemainAfterExit = true;
-          # Downloads can be slow; cap so a hung mirror can't pin the unit
-          # forever, and never let a failure fail the boot transaction.
-          TimeoutStartSec = "600";
+          # Bound a hung mirror WITHOUT blocking activation. RuntimeMaxSec caps the
+          # running process; TimeoutStartSec would be meaningless here (the start job
+          # is already done) and was the thing that broke the OTA.
+          RuntimeMaxSec = "3600";
           ExecStart = pkgs.writeShellScript "hart-waydroid-init" ''
             set -uo pipefail
             echo "[HART OS] Waydroid first-boot init (best-effort, non-blocking)..."
