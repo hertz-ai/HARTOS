@@ -447,7 +447,11 @@ def init_social(app):
             logger.critical(f"HevolveSocial boot verification FAILED: {verification['details']}")
     except Exception as e:
         _boot_verified = True  # Allow if master_key module unavailable
-        logger.debug(f"HevolveSocial boot verification skipped: {e}")
+        # WARNING, not debug: on the 2026-08-24 deepbox container the boot
+        # block emitted NO verdict at any visible level — every outcome here
+        # was either INFO (hidden at WARNING log level) or a debug swallow,
+        # so a dead peering stack was indistinguishable from a healthy one.
+        logger.warning(f"HevolveSocial boot verification skipped: {e}")
 
     # ── Tier authorization (central must prove master key) ──
     try:
@@ -492,7 +496,10 @@ def init_social(app):
             logger.info(f"HevolveSocial gossip started: node={gossip.node_id[:8]}, "
                         f"seeds={len(gossip.seed_peers)}")
         except Exception as e:
-            logger.debug(f"HevolveSocial gossip start skipped: {e}")
+            # WARNING, not debug: a node whose gossip never starts silently
+            # drops out of the hive — no announces, no exchange, no federation
+            # targets.  Fires once at boot, so there is no spam cost.
+            logger.warning(f"HevolveSocial gossip start FAILED: {e}")
 
         # Start zero-config LAN auto-discovery (additive to seed peers)
         import os as _os_disc
@@ -503,7 +510,8 @@ def init_social(app):
                 logger.info(f"HevolveSocial auto-discovery started "
                             f"(UDP port {auto_discovery._port})")
             except Exception as e:
-                logger.debug(f"HevolveSocial auto-discovery skipped: {e}")
+                # WARNING for the same reason as the gossip except above.
+                logger.warning(f"HevolveSocial auto-discovery FAILED: {e}")
 
         # Start the runtime integrity monitor — on EVERY node, in one of two
         # modes.  With a signed manifest (central containers) the expected
