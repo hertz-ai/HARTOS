@@ -928,9 +928,10 @@ class GossipProtocol:
             db.close()
 
     def broadcast(self, message: dict, targets: list = None) -> int:
-        """Broadcast a message to active peers via gossip.
+        """Broadcast a message to active peers via bounded gossip.
 
-        Used by RALT skill distribution and skill queries.
+        Used by RALT skill distribution, skill queries, resonance deltas,
+        upgrade adverts, and world-model events.
         Posts to /api/social/peers/broadcast on each target node.
 
         Returns number of peers that responded with HTTP 2xx.
@@ -940,19 +941,43 @@ class GossipProtocol:
         the broadcast endpoint. Callers thought they succeeded when
         they hadn't. Now only 2xx counts, and non-2xx is recorded as
         a peer failure so the back-off path kicks in.
+
+        Bounded fan-out (2026-08-25): this was a SERIAL walk over every
+        non-dead peer row at timeout=5 each.  On a node with a polluted
+        peer table (desktop: 557 active rows) one call took 30+ minutes,
+        and resonance_tick calls it synchronously inside the federation
+        tick — the tick thread sat parked in one connect for 80+ minutes
+        (py-spy, installed build 13) while agent_daemon's single-flight
+        guard blocked every subsequent tick.  Same defect class b8523319
+        fixed for broadcast_delta, on the shared primitive it missed.
+        Now: class-unroutable rows are skipped, targets=None samples
+        gossip_fanout rows (gossip converges over rounds — unsampled
+        peers get the next round), delivery is concurrent under one hard
+        deadline, and stragglers are abandoned (loss-tolerant).  Explicit
+        `targets` skips the sampling — a directed send still reaches
+        every named target — but keeps the concurrency and deadline.
         """
         peers = self._load_peers_from_db(exclude_dead=True)
         if targets:
             target_set = set(targets)
             peers = [p for p in peers if p.get('node_id') in target_set]
 
-        sent = 0
+        rows = []
         for peer in peers:
             url = peer.get('url', '')
             if not url or peer.get('node_id') == self.node_id:
                 continue
+            unroutable, _reason = is_unroutable_peer_url(url)
+            if unroutable:
+                continue
             if self._is_peer_backed_off(url):
                 continue
+            rows.append(url)
+
+        if targets is None and len(rows) > self.gossip_fanout:
+            rows = random.sample(rows, self.gossip_fanout)
+
+        def _deliver_one(url):
             try:
                 resp = pooled_post(
                     f"{url}/api/social/peers/broadcast",
@@ -965,14 +990,33 @@ class GossipProtocol:
                 # payload did NOT land, so don't tell callers it did.
                 if 200 <= resp.status_code < 300:
                     self._record_peer_success(url)
-                    sent += 1
-                else:
-                    self._record_peer_failure(url)
-                    logger.debug(
-                        f"gossip.broadcast to {url}: HTTP "
-                        f"{resp.status_code} (type={message.get('type')})")
+                    return True
+                self._record_peer_failure(url)
+                logger.debug(
+                    f"gossip.broadcast to {url}: HTTP "
+                    f"{resp.status_code} (type={message.get('type')})")
             except requests.RequestException:
                 self._record_peer_failure(url)
+            return False
+
+        sent = 0
+        if rows:
+            from concurrent.futures import ThreadPoolExecutor
+            from concurrent.futures import wait as _fwait
+            ex = ThreadPoolExecutor(max_workers=min(8, len(rows)))
+            try:
+                futures = [ex.submit(_deliver_one, u) for u in rows]
+                done, not_done = _fwait(futures, timeout=15)
+                for f in done:
+                    if f.result():
+                        sent += 1
+                if not_done:
+                    logger.debug(
+                        f"gossip.broadcast abandoned {len(not_done)} "
+                        f"straggler(s) at the 15s deadline "
+                        f"(type={message.get('type')})")
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
         return sent
 
     def handle_exchange(self, their_peers):
