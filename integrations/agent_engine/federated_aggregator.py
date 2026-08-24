@@ -412,11 +412,20 @@ class FederatedAggregator:
         return results
 
     def broadcast_delta(self, delta: dict):
-        """POST delta to all known active peers.
+        """Gossip the delta to central seeds + a bounded sample of peers.
 
-        Privacy enforcement: ScopeGuard.check_egress() runs before any data
-        leaves this node.  Only FEDERATED-scoped aggregate stats are sent.
-        Raw user data, PII, and secrets are structurally blocked.
+        This is the authoritative egress gate: ScopeGuard.check_egress() runs
+        before any data leaves this node — only FEDERATED-scoped aggregate
+        stats are sent; raw user data, PII, and secrets are structurally
+        blocked.
+
+        Delivery (2026-08-24): the central seeds always receive the delta
+        (they are the census projection point), plus a random gossip_fanout
+        sample of reachable peers. This is gossip, not broadcast-to-all — an
+        epidemic converges over rounds, and 'all active peers' in practice is
+        hundreds of unreachable rows (loopback / other-LAN). The whole fan-out
+        shares one hard deadline and runs concurrently, so a dead or slow peer
+        can never hang the background tick.
         """
         # ── Edge privacy gate: block PII / secrets from leaving ──
         try:
@@ -448,40 +457,111 @@ class FederatedAggregator:
         try:
             from integrations.social.models import get_db, PeerNode
             from core.http_pool import pooled_post
+            from urllib.parse import urlparse
+            from concurrent.futures import ThreadPoolExecutor
 
             db = get_db()
             try:
-                # Get our own backend port to detect self-connections
-                try:
-                    from core.port_registry import get_port
-                    _own_port = get_port('backend')
-                except Exception:
-                    _own_port = 6777
-                _self_urls = {
-                    f'http://localhost:{_own_port}',
-                    f'http://127.0.0.1:{_own_port}',
-                    f'http://0.0.0.0:{_own_port}',
-                }
-
                 peers = db.query(PeerNode).filter_by(status='active').all()
-                now = time.time()
-                for peer in peers:
-                    if not peer.url or peer.node_id == delta.get('node_id'):
-                        continue
-                    _peer_url = peer.url.rstrip('/')
-                    # Skip our own node (bundled mode has no HTTP listener)
-                    if _peer_url in _self_urls:
-                        continue
-                    if self._peer_backoff.is_backed_off(_peer_url):
-                        continue
-                    try:
-                        url = f"{_peer_url}/api/social/peers/federation-delta"
-                        pooled_post(url, json=delta, timeout=5)
-                        self._peer_backoff.record_success(_peer_url)
-                    except Exception:
-                        self._peer_backoff.record_failure(_peer_url)
+                # Snapshot node_id + url INSIDE the session; the delivery runs
+                # after db.close(), and touching a detached ORM row there would
+                # raise. Only these two scalars are needed downstream.
+                _rows = [(p.node_id, (p.url or '').rstrip('/'))
+                         for p in peers if p.url]
             finally:
                 db.close()
+
+            # Turn a 656-row / 55-minute serial walk (measured live 2026-08-24)
+            # into a bounded, concurrent GOSSIP fan-out — which is what this
+            # method's own docstring already says it is ("aggregation ... via
+            # gossip"). The prior loop POSTed to ALL active peers; a gossip
+            # epidemic propagates over ROUNDS from a small fanout, it does not
+            # broadcast to everyone every tick, and "everyone" here is mostly
+            # unreachable rows (359 are http://localhost:6777 — every flat node
+            # published its own backend loopback; plus other-LAN private IPs).
+            #
+            # Targets = SEEDS (always) + a bounded random sample of reachable
+            # peers:
+            #   * Seeds/central are the census COLLECTION + PROJECTION point
+            #     (api_hive_census docstring), so they must receive every
+            #     delta directly and are tried regardless of backoff — a node
+            #     absent from central's aggregate is absent from /hive.
+            #   * Peer fanout is capped at gossip_fanout and skips loopback
+            #     (a peer's own address, never reachable from here) and
+            #     backed-off peers. Unsampled peers get this delta next round
+            #     or via a neighbour — standard gossip convergence, no data
+            #     lost.
+            #
+            # NOT a new path and NOT a semantic regression: same ScopeGuard
+            # egress gate above, same /federation-delta endpoint, same backoff,
+            # same FedAvg-over-gossip intent — only the fan-out is bounded and
+            # concurrent instead of an unbounded serial broadcast.
+            _self_node = delta.get('node_id')
+            try:
+                from integrations.social.peer_discovery import gossip as _gossip
+                _seeds = [u.rstrip('/') for u in getattr(_gossip, 'seed_peers', [])]
+                _fanout = int(getattr(_gossip, 'gossip_fanout', 3))
+            except Exception:
+                _seeds, _fanout = [], 3
+
+            _reachable = []
+            for _nid, _url in _rows:
+                if _nid == _self_node or _url in _seeds:
+                    continue
+                try:
+                    _host = (urlparse(_url).hostname or '').lower()
+                except Exception:
+                    continue
+                if _host in ('localhost', '127.0.0.1', '0.0.0.0', '::1', ''):
+                    continue
+                if self._peer_backoff.is_backed_off(_url):
+                    continue
+                _reachable.append(_url)
+
+            import random as _random
+            from concurrent.futures import wait as _fwait
+
+            def _post_one(_peer_url):
+                try:
+                    pooled_post(
+                        f"{_peer_url}/api/social/peers/federation-delta",
+                        json=delta, timeout=3)
+                    return (_peer_url, True)
+                except Exception:
+                    return (_peer_url, False)
+
+            # ONE bounded, concurrent delivery for BOTH seeds and the peer
+            # sample.  Nothing is synchronous: a single row — even a seed —
+            # can ignore its per-request timeout on Windows (unroutable SYN,
+            # session retries), so ANY blocking step could hang a background
+            # gossip tick for minutes (measured live 2026-08-24). The whole
+            # fan-out therefore shares one HARD DEADLINE; stragglers are
+            # backed off and abandoned (gossip is loss-tolerant — they
+            # converge next round). Seeds are submitted FIRST so they win the
+            # worker slots, and included in every round because central is the
+            # census projection point.
+            _sample = (_random.sample(_reachable, _fanout)
+                       if len(_reachable) > _fanout else _reachable)
+            _targets = list(dict.fromkeys(_seeds + _sample))  # seeds first, deduped
+
+            if _targets:
+                _ex = ThreadPoolExecutor(max_workers=min(12, len(_targets)))
+                try:
+                    _futs = {_ex.submit(_post_one, u): u for u in _targets}
+                    _done, _pending = _fwait(_futs, timeout=8)
+                    for _f in _done:
+                        try:
+                            _u, _ok = _f.result()
+                            (self._peer_backoff.record_success if _ok
+                             else self._peer_backoff.record_failure)(_u)
+                        except Exception:
+                            pass
+                    for _f in _pending:
+                        self._peer_backoff.record_failure(_futs[_f])
+                finally:
+                    # Non-blocking: never wait on a straggler. Its worker
+                    # thread finishes when its own socket times out.
+                    _ex.shutdown(wait=False, cancel_futures=True)
         except Exception as e:
             logger.debug(f"Federation broadcast error: {e}")
 

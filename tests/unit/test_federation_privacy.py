@@ -46,6 +46,11 @@ class TestDeltaStructure:
             'timestamp', 'experience_stats', 'ralt_stats', 'hivemind_state',
             'quality_metrics', 'benchmark_results', 'capability_tier',
             'contribution_score', 'event_counters', 'signature',
+            # code_hash: the node's build hash — a PUBLIC identifier (SHA-256
+            # of the .py manifest), already broadcast in every gossip announce,
+            # not user data. Added 2026-08-24 so central can gate federation on
+            # a genuine/unmodified build (receive_peer_delta). Privacy-safe.
+            'code_hash',
         }
         for key in delta:
             assert key in allowed_keys, f"Unexpected key in delta: {key}"
