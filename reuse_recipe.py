@@ -2985,6 +2985,13 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         # The actual advancement happens in get_agent_response/chat_agent loops
                         return chat_instructor
 
+                    # See should_delegate_route_to_helper for why this exists.
+                    if should_delegate_route_to_helper(last_json, last_speaker.name):
+                        current_app.logger.info(
+                            f"[DELEGATE-ROUTE] delegate={last_json.get('delegate')!r} -> "
+                            f"Helper (hive not yet peer-dispatched; using the local path)")
+                        return helper
+
                     # Use known pipeline state, not LLM's claimed action_id
                     _known_aid = user_tasks[user_prompt].current_action
                     try:
@@ -3539,6 +3546,37 @@ def _tool_activity_after(messages: list, index: int) -> bool:
                 _later.get('tool_responses'):
             return True
     return False
+
+
+def should_delegate_route_to_helper(last_json, last_speaker_name: str) -> bool:
+    """True if state_transition should hand this turn to Helper.
+
+    `delegate` routing (2026-08-24): the assistant sets is_casual/delegate on
+    every response (see _extract_conversational_reply), but until this change
+    nothing read `delegate` in state_transition, so a substantive request
+    classified 'local'/'hive' had nowhere to go and spun to the turn
+    deadline. Helper already has the registered tools
+    (delegate_to_specialist, service-tool registry) and the existing
+    "last_speaker == helper -> assistant" edge already hands control back to
+    Assistant afterwards, so this is the one missing edge, not new machinery.
+
+    'hive' has no peer/federation dispatch wired yet -- routed through the
+    same local Helper path for now rather than left unroutable; this is a
+    deliberate interim scoping choice, not a claim that local and hive should
+    stay identical long-term.
+
+    A pure predicate (no autogen agent objects) so it can be unit-tested
+    directly -- state_transition itself is a closure that needs a live
+    autogen/LLM setup to construct, same reasoning as
+    lifecycle_hooks.is_recipe_creation_request for create_recipe's
+    state_transition.
+    """
+    if not isinstance(last_json, dict):
+        return False
+    delegate = str(last_json.get('delegate') or '').strip().lower()
+    if delegate not in ('local', 'hive'):
+        return False
+    return last_speaker_name not in ('helper', 'Executor', 'ChatInstructor')
 
 
 def _extract_conversational_reply(messages) -> Optional[str]:
