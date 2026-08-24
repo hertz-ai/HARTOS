@@ -346,28 +346,27 @@ def nixos_rebuild_test(timeout_s=NIXOS_REBUILD_TIMEOUT_S):
 
 
 def run_claude(prompt, timeout_s=TASK_TIMEOUT_S, cwd=REPO):
-    """One bounded, headless Claude Code run. -p is print/non-interactive mode.
+    """One bounded, headless Claude Code run (the copilot's AGENTIC branch work).
 
-    A hard timeout is the point: an agent that wedges must not hold the node. The
-    subprocess is killed on timeout (never left orphaned) and the outcome reported
-    honestly, including failure.
+    Delegates to the SHARED claude-code invocation primitive
+    (integrations.coding_agent.claude_code_backend.invoke_claude) — the single
+    `claude -p` call site, also used by the autogen EXPERT-tier inference shim,
+    so the frontier tier never becomes a second, parallel invocation. Behavior
+    is unchanged: bounded timeout, subprocess killed on timeout (never
+    orphaned), truncated capture, outcome reported honestly including failure.
     """
-    cmd = [CLAUDE_BIN, '-p', prompt]
-    try:
-        proc = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout_s)
+    from integrations.coding_agent.claude_code_backend import invoke_claude
+    r = invoke_claude(prompt, mode='agentic', cwd=cwd, timeout_s=timeout_s)
+    if 'returncode' in r:                       # the run completed (any exit code)
         return {
-            'ok': proc.returncode == 0,
-            'returncode': proc.returncode,
-            'stdout': (proc.stdout or '')[-4000:],
-            'stderr': (proc.stderr or '')[-2000:],
+            'ok': r['ok'],
+            'returncode': r['returncode'],
+            'stdout': (r.get('stdout') or '')[-4000:],
+            'stderr': (r.get('stderr') or '')[-2000:],
         }
-    except FileNotFoundError:
+    if r.get('category') == 'notfound':          # preserve the daemon's hint
         return {'ok': False, 'error': 'claude not on PATH (hart.copilot.enable?)'}
-    except subprocess.TimeoutExpired:
-        return {'ok': False, 'error': f'timed out after {timeout_s}s'}
-    except Exception as e:  # never let one bad run kill the daemon
-        return {'ok': False, 'error': str(e)}
+    return {'ok': False, 'error': r.get('error', 'claude run failed')}
 
 
 # ─── The tick ────────────────────────────────────────────────────────────────

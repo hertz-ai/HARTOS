@@ -1049,6 +1049,20 @@ except Exception as e:
 # in ``integrations/social/__init__.py`` registers the new blueprint;
 # no extra wiring is required here.
 
+# Claude Code frontier endpoint — OpenAI-compatible /chat/completions backed by
+# the authorized `claude -p` (flow #3: HARTOS wears Claude as its EXPERT tier).
+# The EXPERT ModelBackend (model_registry) points its base_url here; autogen
+# calls it like any local llama.cpp endpoint. Failures degrade to the in-house
+# LLM via dispatch.py's existing fallback ladder.
+try:
+    from integrations.providers.claude_code_endpoint import claude_code_bp
+    app.register_blueprint(claude_code_bp)
+    app.logger.info("Claude Code frontier endpoint registered at /api/claude/v1")
+except ImportError:
+    app.logger.info("Claude Code endpoint not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Claude Code endpoint init skipped: {e}")
+
 # MCP HTTP Bridge — exposes local MCP tools via REST for Nunba/external clients
 try:
     from integrations.mcp.mcp_http_bridge import mcp_local_bp, auto_register_local_mcp
