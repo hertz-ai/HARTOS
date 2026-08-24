@@ -6947,12 +6947,14 @@ def parse_visual_context(inp: str):
 # turn (the branch enumeration questions actually reach since 15ed5874)
 # got a registry WITHOUT it and the model truthfully denied having it.
 _LIST_AGENTS_TOOL_DESCRIPTION = (
-    "List the agents available on this device: built-in expert agents and "
-    "the user's own created agents, with name, category, and description. "
-    "Use whenever the user asks what agents exist, what agents they have, "
-    "or which agent could handle a task — never say there are no separate "
-    "agents without calling this. Input: an optional search term to filter "
-    "by name or skill, or an empty string for the full list.")
+    "List every agent available here: built-in expert agents, the user's "
+    "own created agents, and hive agents shared from peer nodes or pulled "
+    "from central (marked origin='hive'), with name, category, and "
+    "description. Use whenever the user asks what agents exist, what "
+    "agents they have, or which agent could handle a task — never say "
+    "there are no separate agents without calling this. Input: an optional "
+    "search term to filter by name or skill, or an empty string for the "
+    "full list.")
 
 
 def _parse_list_agents(inp: str = ''):

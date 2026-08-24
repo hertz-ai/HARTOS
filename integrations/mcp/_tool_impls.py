@@ -115,11 +115,56 @@ def list_agents(category: Optional[str] = None, query: Optional[str] = None) -> 
             except Exception:
                 pass
 
+    # Trained + hive agents: user_type='agent' rows in the social DB (the
+    # same query DashboardService._get_trained_agents runs).  The sync
+    # engine lands peer/central agents here (_handle_sync_agent) as
+    # DISCOVERABLE MIRRORS with api_token=None — the credential stays on
+    # the home node — so that existing security contract is also the
+    # origin marker: api_token set = registered on THIS node, api_token
+    # None = hive agent exchanged from a peer or pulled from central.
+    trained, hive = [], []
+    try:
+        from integrations.social.models import User as _SocialUser
+        db = _get_db()
+        try:
+            rows = db.query(_SocialUser).filter(
+                _SocialUser.user_type == 'agent').all()
+            for u in rows:
+                name = getattr(u, 'display_name', None) or u.username
+                if query and query.lower() not in (
+                        name + ' ' + (u.username or '')).lower():
+                    continue
+                entry = {
+                    "agent_id": getattr(u, 'agent_id', None) or str(u.id),
+                    "name": name,
+                    "category": "trained_agent",
+                    "description": (getattr(u, 'bio', '') or '')[:200],
+                    "model_type": "llm",
+                }
+                handle = getattr(u, 'handle', None)
+                if handle:
+                    entry["handle"] = handle
+                if getattr(u, 'api_token', None):
+                    trained.append(entry)
+                else:
+                    entry["origin"] = "hive"
+                    hive.append(entry)
+        finally:
+            db.close()
+    except Exception:
+        # DB-less contexts (bare MCP unit runs) — counts stay 0, the
+        # local registry + recipes above still enumerate.
+        pass
+
     return json.dumps({
         "expert_agents": len(result),
         "dynamic_agents": len(dynamic),
+        "trained_agents": len(trained),
+        "hive_agents": len(hive),
         "agents": result[:50],  # cap at 50 to avoid token overflow
         "dynamic": dynamic[:20],
+        "trained": trained[:30],
+        "hive": hive[:30],
     }, indent=2)
 
 

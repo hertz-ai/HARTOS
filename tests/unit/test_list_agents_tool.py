@@ -25,6 +25,23 @@ def test_impl_enumerates_real_agents():
     assert isinstance(data.get('agents'), list) and data['agents']
 
 
+def test_impl_reports_hive_and_trained_buckets():
+    """Owner design 2026-08-24: 'list agents shd give local agents and
+    hive agents that are peerlink exchanged or pulled from central'.
+    The sync engine lands those as user_type='agent' User rows with
+    api_token=None (_handle_sync_agent: 'never credential a synced
+    mirror'), so that existing contract is the origin marker.  The keys
+    must ALWAYS be present — zero counts when nothing was exchanged yet
+    or the DB is unavailable, never absent."""
+    from integrations.mcp._tool_impls import list_agents
+    data = json.loads(list_agents())
+    for key in ('trained_agents', 'hive_agents', 'trained', 'hive'):
+        assert key in data, f'missing {key} — hive enumeration dropped'
+    assert isinstance(data['hive'], list)
+    for entry in data['hive']:
+        assert entry.get('origin') == 'hive'
+
+
 def test_langchain_registry_carries_list_agents_tool():
     """The fix: a List_Agents labeled_tool wired to the SAME canonical
     impl (no parallel enumeration) must exist in the chat registry."""
