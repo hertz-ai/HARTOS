@@ -49,8 +49,9 @@ sudo docker build -t langchain_gpt:latest .
 #
 # The CANONICAL deploy is .github/workflows/deploy-hartos-deepbox.yml
 # (sha-tagged build + signed release manifest + /status-gated rollback);
-# this script only provisions a box the workflow has not adopted yet, and
-# its run invocation mirrors the workflow's so the two cannot drift.
+# this script only provisions a box the workflow has not adopted yet.  Its
+# run invocation is a COPY of the workflow's — when you change one, change
+# the other (the workflow is the authority).
 #
 # Networking: bridge + published 6777, same as the workflow.  A central-
 # tier node is found by URL over HTTP and needs no UDP beacon.  Set
