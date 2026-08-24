@@ -3799,9 +3799,9 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                             current_app.logger.warning(
                                 f"[HALLUCINATION?] LLM claims action_id={_llm_action_id} "
                                 f"but pipeline assigned {_reuse_current_action}")
-                        _next, _ok = _advance_reuse_action(user_prompt, _reuse_current_action, "reuse-w1", prompt_id)
+                        _next, _ok, _done = _advance_reuse_action(user_prompt, _reuse_current_action, "reuse-w1", prompt_id)
                         if not _ok:
-                            return ''
+                            return _finish_reuse_recipe(user_id, prompt_id, json_obj) if _done else ''
                         user_message = _build_reuse_action_message(user_prompt, _next)
                         chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,
                                                       silent=False)
@@ -3821,9 +3821,9 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                                     current_app.logger.warning(
                                         f"[HALLUCINATION?] LLM claims action_id={_llm_claimed} "
                                         f"but pipeline has {_known}")
-                                _next2, _ok2 = _advance_reuse_action(user_prompt, _known, "reuse-w1-regex", prompt_id)
+                                _next2, _ok2, _done2 = _advance_reuse_action(user_prompt, _known, "reuse-w1-regex", prompt_id)
                                 if not _ok2:
-                                    return ''
+                                    return _finish_reuse_recipe(user_id, prompt_id, json_obj) if _done2 else ''
                                 user_message = _build_reuse_action_message(user_prompt, _next2)
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                               clear_history=False, silent=False)
@@ -4062,7 +4062,10 @@ creation_signals = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_creation
 def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt_id=None):
     """
     Mark action COMPLETED → TERMINATED, advance to next action, set ASSIGNED → IN_PROGRESS.
-    Returns (next_action_id, True) if advanced, or (None, False) if all actions done or state error.
+    Returns (next_action_id, True, False) if advanced.
+    Returns (None, False, True) if that was the last action and all actions are now complete
+    (current_action_id itself terminated fine — callers should still deliver its message).
+    Returns (None, False, False) if a state error prevented advancing at all.
     """
     # Mark current action done
     ok1 = force_state_through_valid_path(user_prompt, current_action_id,
@@ -4077,7 +4080,7 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             current_app.logger.error(
                 f"[REUSE] Cannot advance action {current_action_id}: "
                 f"state is {actual.value}, not TERMINATED — aborting advance")
-            return None, False
+            return None, False, False
         current_app.logger.info(
             f"[REUSE] Action {current_action_id} already TERMINATED (idempotent)")
 
@@ -4099,11 +4102,11 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             except Exception as _spark_err:
                 current_app.logger.debug(
                     f'[REUSE] completed-work spark charge skipped: {_spark_err}')
-        return None, False
+        return None, False, True
 
     safe_set_state(user_prompt, next_id, ActionState.ASSIGNED, f"{reason}: next assigned")
     safe_set_state(user_prompt, next_id, ActionState.IN_PROGRESS, f"{reason}: starting")
-    return next_id, True
+    return next_id, True, False
 
 
 def _build_reuse_action_message(user_prompt, action_id):
@@ -4118,6 +4121,21 @@ def _build_reuse_action_message(user_prompt, action_id):
         steps = []
         current_app.logger.warning(f"[REUSE] No recipe for action {action_id} — executing without steps")
     return f"Perform this action -> Action #{action_id}:{action_message}\n follow these steps: {steps}"
+
+
+def _finish_reuse_recipe(user_id, prompt_id, json_obj):
+    """
+    All actions in a recipe just completed (_advance_reuse_action returned
+    all_done=True). Extract the StatusVerifier's completion message and
+    deliver it — previously the caller returned '' here unconditionally,
+    discarding a correct, verified answer (e.g. a completed arithmetic
+    task shipped an empty response despite StatusVerifier confirming the
+    right result).
+    """
+    message = json_obj.get('message', '') if isinstance(json_obj, dict) else ''
+    if message:
+        send_message_to_user1(user_id, message, '', prompt_id)
+    return message
 
 
 # =============================================================================
@@ -4441,9 +4459,9 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                     current_app.logger.warning(
                                         f"[HALLUCINATION?] LLM claims action_id={_llm_aid} "
                                         f"but pipeline has {_w2_current}")
-                                _w2_next, _w2_ok = _advance_reuse_action(user_prompt, _w2_current, "reuse-w2", prompt_id)
+                                _w2_next, _w2_ok, _w2_done = _advance_reuse_action(user_prompt, _w2_current, "reuse-w2", prompt_id)
                                 if not _w2_ok:
-                                    return ''
+                                    return _finish_reuse_recipe(user_id, prompt_id, json_obj) if _w2_done else ''
                                 user_message = _build_reuse_action_message(user_prompt, _w2_next)
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                               clear_history=False, silent=False)
@@ -4459,9 +4477,9 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                             current_app.logger.warning(
                                                 f"[HALLUCINATION?] LLM claims action_id={_llm_aid2} "
                                                 f"but pipeline has {_w2_current}")
-                                        _w2_next2, _w2_ok2 = _advance_reuse_action(user_prompt, _w2_current, "reuse-w2-regex", prompt_id)
+                                        _w2_next2, _w2_ok2, _w2_done2 = _advance_reuse_action(user_prompt, _w2_current, "reuse-w2-regex", prompt_id)
                                         if not _w2_ok2:
-                                            return ''
+                                            return _finish_reuse_recipe(user_id, prompt_id, json_obj) if _w2_done2 else ''
                                         user_message = _build_reuse_action_message(user_prompt, _w2_next2)
                                         chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                                       clear_history=False, silent=False)
