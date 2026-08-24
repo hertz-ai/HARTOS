@@ -35,14 +35,52 @@ cd /opt/
 # sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit && sudo apt-get install -y nvidia-docker2
 # sudo systemctl restart docker
 
-#clone repo
+#clone repo (default branch — this script used to pin -b sahil, deploying a
+#stale personal branch on every fresh VM)
 cd /opt/
-git clone -b sahil https://$TOKEN@github.com/hertz-ai/HARTOS.git
+git clone https://$TOKEN@github.com/hertz-ai/HARTOS.git
 cd HARTOS
 
 sudo docker build -t langchain_gpt:latest .
 
-sudo docker run langchain_gpt
+# Canonical container start.  Until 2026-08-24 this line was a bare
+# `docker run langchain_gpt` (foreground, unnamed, no ports) and the real
+# invocation lived only in operators' shell history — every box drifted.
+#
+# Networking: deploy/deployment-manifest.json declares
+# hart-discovery {port 6780, udp, always_enabled}.  Docker bridge NAT
+# cannot deliver subnet-broadcast beacons (DNAT matches the host IP, not
+# 192.168.0.255), so bridge mode silently disables LAN peer discovery —
+# --network host is the only mode where it works.  Default host; set
+# HART_DOCKER_NETWORK=bridge on shared multi-service VMs to keep today's
+# published-port behavior instead.
+NETWORK_MODE="${HART_DOCKER_NETWORK:-host}"
+if [ "$NETWORK_MODE" = "host" ]; then
+    NET_ARGS="--network host"
+else
+    NET_ARGS="-p 6777:6777"
+fi
+KEY_ARGS=""
+if sudo test -f /etc/hevolve/master_private_key.hex; then
+    KEY_ARGS="-e HEVOLVE_MASTER_PRIVATE_KEY=$(sudo cat /etc/hevolve/master_private_key.hex)"
+fi
+MOUNT_ARGS=""
+# -v creates a DIRECTORY for a missing host path, wedging the container's
+# config.json — mount only what exists.
+[ -f "$(pwd)/config.json" ] && MOUNT_ARGS="$MOUNT_ARGS -v $(pwd)/config.json:/app/config.json:ro"
+[ -f "$(pwd)/release_manifest.json" ] && MOUNT_ARGS="$MOUNT_ARGS -v $(pwd)/release_manifest.json:/app/release_manifest.json:ro"
+sudo mkdir -p /opt/hzai-LLM-Langchain-Chatbot-Agent/logs /opt/hzai-LLM-Langchain-Chatbot-Agent/mount/images
+ENV_FILE_ARGS=""
+[ -f "$(pwd)/.env" ] && ENV_FILE_ARGS="--env-file $(pwd)/.env"
+sudo docker rm -f langchain 2>/dev/null || true
+sudo docker run -d --name langchain --restart unless-stopped \
+    $NET_ARGS \
+    $ENV_FILE_ARGS \
+    $KEY_ARGS \
+    $MOUNT_ARGS \
+    -v /opt/hzai-LLM-Langchain-Chatbot-Agent/logs:/app/logs \
+    -v /opt/hzai-LLM-Langchain-Chatbot-Agent/mount/images:/app/output_images \
+    langchain_gpt:latest
 
 docker start $(docker ps -a -q)
 sudo tee /etc/systemd/system/restart-docker-containers.service > /dev/null <<EOL
