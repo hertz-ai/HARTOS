@@ -2436,9 +2436,21 @@ def _evict_draft_on_non_latin_switch(old_lang, new_lang) -> None:
     try:
         _mgr = get_model_lifecycle_manager()
         if _mgr and hasattr(_mgr, 'request_swap'):
+            # Was target=/reason= -- neither is a parameter of request_swap,
+            # whose signature is (needed_model, needed_type='gpu',
+            # evict_target=None).  Every call raised TypeError, and the
+            # except-Exception below swallowed it, so the draft was NEVER
+            # evicted on a non-Latin switch.  The hasattr() guard above did
+            # not catch it either: the method exists, it was the ARGUMENTS
+            # that were wrong.
+            # evict_target is the real "evict this one" parameter (:1889 sets
+            # candidates=[evict_target]).  needed_model is descriptive when
+            # evict_target is given -- it only feeds the log line (:1916),
+            # 'evicted_for' in the swap queue (:1922) and the model.swapped
+            # event (:1931) -- so the reason string belongs there.
             _mgr.request_swap(
-                target='draft',
-                reason=f'language_switch_to_{_new_key}',
+                needed_model=f'language_switch_to_{_new_key}',
+                evict_target='draft',
             )
     except Exception:
         logger.exception("_evict_draft_on_non_latin_switch: swallowed Exception")

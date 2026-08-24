@@ -39,6 +39,42 @@ let
   # transitively bundled again into Nunba"). hartApp is already in the closure (the
   # backend uses it), so this adds no build.
   hartApp = config.hart.package;
+  # ── `nunba` ON PATH: the install-time half of the native-app contract ──
+  # core/platform/bootstrap.py:_register_native_apps registers a NATIVE_APPS entry
+  # ONLY when `shutil.which(entry['exec'])` resolves, and Nunba's manifest sets
+  # exec='nunba'. tests/unit/test_platform_apps.py guards the BOOTSTRAP half and
+  # names e2e-os-smoke.sh #16/#17 as the INSTALL half. The daemon above starts from
+  # an ABSOLUTE store path, so nothing was ever named `nunba` on PATH: on a booted
+  # desktop AppRegistry silently never registered Nunba (it is not a "first-class
+  # native agentic client the runtime can dispatch to" at all), and #16 has been red
+  # on every E2E run since desktop.nix PROMOTED nunba.enable on 2026-08-14.
+  #
+  # In OS mode the daemon binds a unix socket with NO host TCP port and
+  # hart-liquid-ui reverse-proxies it same-origin, so the Nunba surface IS the shell
+  # URL. Read the ONE option (hart.liquidUI.port) instead of repeating the number,
+  # and honour HART_SHELL_URL: the same override both glass-shell renderers read.
+  nunbaLauncher = pkgs.writeShellScriptBin "nunba" ''
+    exec ${pkgs.xdg-utils}/bin/xdg-open \
+      "''${HART_SHELL_URL:-http://localhost:${toString (config.hart.liquidUI.port or 6800)}}"
+  '';
+  # share/applications/nunba.desktop, which is what the shell catalog launches Nunba
+  # from outside LiquidUI (e2e #17 looks for exactly this filename under
+  # /run/current-system/sw/share/applications). Same writeTextDir pattern as
+  # hart-onboarding.nix's identityDesktop, and Exec is the ABSOLUTE store path for
+  # the same reason the cage floor launcher is (a bare name is not on the session's
+  # PATH, which is how that floor once died rc=127).
+  nunbaDesktopItem = pkgs.writeTextDir
+    "share/applications/nunba.desktop"
+    ''
+      [Desktop Entry]
+      Type=Application
+      Name=Nunba
+      Comment=HART OS companion: chat, communities, agents
+      Exec=${nunbaLauncher}/bin/nunba
+      Icon=hart
+      Categories=Network;Chat;
+      Terminal=false
+    '';
 in
 {
   # ─── Options ──────────────────────────────────────────────
@@ -82,6 +118,11 @@ in
       # enabled (idempotent with the other modules' identical rule).
       systemd.tmpfiles.rules = [ "d /run/hart 0750 hart hart -" ];
 
+      # Gated on the SAME condition as the daemon: `nunba` only appears on PATH on a
+      # system that actually runs Nunba, so AppRegistry's which() probe stays honest
+      # (it must not register the app on a variant where the daemon is absent).
+      environment.systemPackages = [ nunbaLauncher nunbaDesktopItem ];
+
       systemd.services.hart-nunba = {
         description = "Nunba native daemon (full Python + React, unix socket)";
         documentation = [ "https://github.com/hertz-ai/Nunba" ];
@@ -110,6 +151,20 @@ in
           PYTHONPATH = "${hartApp}";
           PYTHONDONTWRITEBYTECODE = "1";
           PYTHONUNBUFFERED = "1";
+          # The ONE node database, same value as hart-backend/hart-agent/
+          # hart-discovery/hart-compute-mesh/hart-app-bridge. This unit was the
+          # only HARTOS-importing service WITHOUT it, so every DB read inside
+          # this process auto-detected some other (empty) path. Measured on the
+          # real box 2026-08-22: hart-backend saw users=1 while THIS process
+          # resolved 0 users, so core/event_attribution's single-tenant
+          # fallback returned None and the P3a guard refused every
+          # agent.action.completed this process emitted -- 1404 refusals in
+          # 5 minutes -- which is exactly the agents panel sitting on its
+          # "reconnecting / retry" button while /api/social/dashboard/agents
+          # (served by hart-backend, which HAS the variable) answered 200.
+          # One writer + readers is SQLite-safe here: WAL is enabled and the
+          # sibling services already share this path.
+          HEVOLVE_DB_PATH = "${cfg.dataDir}/hevolve_database.db";
         };
 
         serviceConfig = {

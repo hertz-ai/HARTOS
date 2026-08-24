@@ -95,7 +95,17 @@ in
       # OpenGL + Vulkan
       hardware.graphics = {
         enable = true;
-        enable32Bit = true;
+        # The last of four copies of this gate. Do NOT assume the enclosing
+        # `lib.mkIf (cfg.enable && nv.enable)` at :69 keeps this off ARM — it
+        # does not. Nix Lint & Evaluate 32352558901 named THIS line against
+        # hart-desktop-arm, hart-desktop-rpi, hart-edge-arm and sd-phone, so
+        # nv.enable is true on those targets and the block does evaluate there.
+        # It stayed invisible only while desktop.nix also said an unconditional
+        # `true` and the two agreed; gating desktop.nix alone exposed it.
+        # All three normal-priority definitions (here, desktop.nix,
+        # hart-subsystems.nix) must evaluate alike or nix reports conflicting
+        # definition values. hart-kernel.nix is lib.mkDefault and yields.
+        enable32Bit = pkgs.stdenv.hostPlatform.isx86_64;
       };
     }
 

@@ -204,7 +204,15 @@
   # GPU: Vulkan + 32-bit (required for DXVK/Proton)
   hardware.graphics = {
     enable = true;
-    enable32Bit = true;
+    # Same x86_64 gate as hart-subsystems.nix and hart-kernel.nix. This copy of
+    # the hardware.graphics block was missed when those two were gated, so on
+    # ARM/RISC-V hart-subsystems evaluated to `false` while this one still said
+    # `true` — two normal-priority definitions that disagree, which nix reports
+    # as "The option `hardware.graphics.enable32Bit' has conflicting definition
+    # values" rather than picking one. That eval-failed hart-desktop-arm,
+    # hart-desktop-rpi, hart-edge-arm and sd-phone in Nix Lint & Evaluate.
+    # DXVK/Proton is x86-only anyway, so the gate changes nothing on x86_64.
+    enable32Bit = pkgs.stdenv.hostPlatform.isx86_64;
   };
 
   # ─── GPU: drive the desktop on the Intel iGPU; blacklist nouveau ───

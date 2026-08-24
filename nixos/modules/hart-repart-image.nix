@@ -16,20 +16,39 @@
 # design (the 2026-07-16 raw-image pivot).
 { config, lib, pkgs, modulesPath, hartRev, ... }:
 let
-  # Per-build filesystem labels (2026-08-14). These images are REPRODUCIBLE:
-  # mkfs runs seeded, so every build of every commit used to produce the same
-  # ext4 UUID and the same "nixos"/"ESP" labels. Stage 1 mounts root by label,
-  # so with two HART sticks plugged in -- or one stale stick and one fresh one
-  # anywhere on the bus -- the by-label symlink is a per-boot coin toss between
-  # DIFFERENT BUILDS, and neither UUID nor label can tell them apart. That is
-  # not hypothetical: a freshly flashed good build sat unbooted while an
-  # identical-looking stick with a stale broken build panicked on two laptops,
-  # and every diagnostic pointed at the wrong filesystem. The rev-derived label
-  # gives each build its own root identity; two sticks of the SAME rev remain
-  # ambiguous, which the hart-hartlog-create boot-disk guard already documents.
-  # ext4 labels cap at 16 bytes, FAT32 at 11.
-  rootLabel = "hart-${builtins.substring 0 10 hartRev}";
-  espLabel  = "HART-${lib.toUpper (builtins.substring 0 6 hartRev)}";
+  # STABLE filesystem labels (2026-08-22) -- the second half of a story that
+  # started with PER-BUILD labels (2026-08-14).
+  #
+  # Round 1: these images are REPRODUCIBLE (seeded mkfs), so every build used
+  # to carry the same "nixos"/"ESP" labels. With a stale stick and a fresh one
+  # both on the bus, stage 1's by-label mount was a per-boot coin toss between
+  # DIFFERENT BUILDS -- a good build sat unbooted while a broken one panicked,
+  # and every diagnostic pointed at the wrong filesystem. Fix: rev-derived
+  # labels, one identity per build.
+  #
+  # Round 2, measured on real HW 2026-08-22 (photo of the stage-1 prompt):
+  # rev-derived labels make every CROSS-REV mount impossible. An OTA-applied
+  # generation built from rev N+1 bakes fileSystems."/" =
+  # by-label/hart-<revN+1>, but the flashed disk is labeled hart-<revN>.
+  # Stage 1: "must mount the root filesystem on /mnt-root" -- unbootable, on
+  # every OTA apply, by construction. /boot has the identical trap via
+  # HART-<REV6>. Per-rev labels and self-updating are mutually exclusive.
+  #
+  # Resolution: the LABELS go stable (the mount reference must outlive the
+  # rev), and BUILD IDENTITY moves to /etc/hart/image-rev (written below from
+  # hartRev). What this consciously trades away: (a) the on-screen fsck line
+  # no longer names the build, and (b) the two-sticks-of-different-revs coin
+  # toss RETURNS at the root-mount level. Both accepted: dual-stick debugging
+  # now has /etc/hart/image-rev + HARTJRNL once booted, and a fleet that can
+  # never update is the worse failure. The hart-hartlog-create boot-disk guard
+  # keys on the disk, not the label, and is unaffected.
+  #
+  # Name collisions checked 2026-08-22: HARTLOG + HARTSTATE are the flasher's
+  # (hart_usb_flasher.py), HART-ROOT + HART-SWAP are reserved by hart-luks.nix
+  # by-partlabel defaults for a future encrypted layout. hart-root / HART-ESP
+  # collide with none of them. ext4 labels cap at 16 bytes, FAT32 at 11.
+  rootLabel = "hart-root";
+  espLabel  = "HART-ESP";
 in
 {
   imports = [
@@ -60,6 +79,52 @@ in
   boot.loader.grub.enable = false;
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = false;
+  # Two generations, no more: the ESP is 1G ("10-esp" below) and every
+  # generation parks its own kernel+initrd there (~90M measured on the real
+  # box). Unbounded, ~10 OTA applies brick entry-writing on a full ESP.
+  # Two = the running system plus exactly one rollback target, which is all
+  # hart-ota's canary auto-revert needs.
+  boot.loader.systemd-boot.configurationLimit = 2;
+
+  # Build identity, now that the fs labels are stable (see the label comment
+  # at the top): which build this image was, readable after boot and from a
+  # mounted stick, without depending on the label.
+  environment.etc."hart/image-rev".text = hartRev;
+
+  # ── OTA self-naming: a raw node updates to the RAW config ──
+  # hart-ota switches to `$FLAKE#${hart.ota.flakeAttr}`. The default is
+  # hart-<variant>, which for this image would be the ISO-kind closure --
+  # measured on real HW 2026-08-22: it cannot mount a raw root, so every OTA
+  # apply staged an unbootable generation. The raw image must name its raw
+  # sibling. mkDefault so an operator override still wins. NOTE: only
+  # hart-desktop-raw exists as a nixosConfiguration today; a raw server/edge
+  # fleet needs real `hart-<variant>-raw` attrs added to flake.nix first
+  # (raw-server/raw-edge are currently anonymous packages).
+  hart.ota.flakeAttr = lib.mkDefault "hart-${config.hart.variant}-raw";
+
+  # ── Load the store DB on first boot (pairs with /nix-path-registration) ──
+  # The image ships the closure's FILES plus a registration manifest (see the
+  # "20-root" partition below); this is the half that makes nix believe them.
+  # Without it every store path on a dd'd stick is "not valid" to nix, which
+  # takes out `nixos-rebuild switch`, the system-profile rollback anchor, and
+  # OTA as a whole — measured on real HW 2026-08-20, where the DB knew 1 path.
+  #
+  # Runs ONCE: the manifest is deleted after a successful load, so this is a
+  # no-op on every later boot. `|| true` and the -f guard are deliberate — a
+  # box that cannot register its store must still BOOT (it simply stays as
+  # un-updatable as it is today), which is the never-fail posture the rest of
+  # this image is built on. Same contract as nixpkgs' sd-image.nix.
+  boot.postBootCommands = ''
+    if [ -f /nix-path-registration ]; then
+      echo "[HART OS] registering the initial Nix store (first boot)..."
+      if ${config.nix.package.out}/bin/nix-store --load-db < /nix-path-registration; then
+        rm -f /nix-path-registration
+        echo "[HART OS] store registered — nixos-rebuild/OTA can now reference it."
+      else
+        echo "[HART OS] store registration FAILED — OTA stays unavailable; boot continues." >&2
+      fi
+    fi
+  '';
 
   # ── Installed-system filesystems (previously supplied by nixos-generators) ──
   # device is a stable by-label path so no root= cmdline is needed; the labels are
@@ -111,6 +176,30 @@ in
       };
       "20-root" = {
         storePaths = [ config.system.build.toplevel ];
+        # ── The store DB registration, without which NOTHING nix works ──
+        # `storePaths` copies the closure's FILES into the partition but ships no
+        # database: systemd-repart has no notion of nix's sqlite. Verified on the
+        # flashed box 2026-08-20 — the DB knew exactly ONE path, db.sqlite was an
+        # empty 45KB schema, and even the RUNNING system answered:
+        #   error: path '/nix/store/...-nixos-system-hart-node-...' is not valid
+        #
+        # Consequences, all of which were live on that machine:
+        #   * `nixos-rebuild switch` can reference nothing it already has, so an
+        #     OTA would try to fetch an entire system closure (~22 GiB measured
+        #     below) into the 3.1G the stick had free. OTA could never work.
+        #   * `nix-env --set` on the system profile fails outright ("don't know
+        #     how to build these paths"), so the rollback anchor cannot even be
+        #     created — hart-first-boot's registration step needs this to succeed.
+        #   * a `nix-collect-garbage` would consider the whole store unreachable.
+        #
+        # This is the standard NixOS image contract (sd-image.nix ships the same
+        # file and loads it in postBootCommands); the repart path simply never
+        # adopted it. closureInfo computes the registration for the SAME closure
+        # storePaths already copies, so it adds a manifest, not another copy.
+        contents = {
+          "/nix-path-registration".source =
+            "${pkgs.closureInfo { rootPaths = [ config.system.build.toplevel ]; }}/registration";
+        };
         repartConfig = {
           Type = "root";          # x86-64 root discoverable-partition GUID
           Format = "ext4";

@@ -1813,3 +1813,67 @@ def test_jobs_default_is_strictly_serial(monkeypatch, tmp_path):
                        jobs=1, log=lambda m: None)
     assert ok is True
     assert live["max"] == 1                                        # strictly serial
+
+
+# ── Unreadable device is NOT a mismatch (the false "re-flash" verdict) ────────
+# Same principle the post-carve re-verify above already encodes: could-not-read
+# is indeterminate, never a false brick. verify_raw_sigs and
+# sha256_device_region were still two-state, so on Windows 2026-08-20 a stick
+# that was later proven byte-for-byte correct reported "boot sig b'' FAIL" and
+# "FULL VERIFY: MISMATCH - re-flash". Re-flashing cannot fix a read path, so
+# that advice loops forever on a perfect stick.
+
+
+def test_verify_raw_sigs_none_when_device_unreadable(monkeypatch):
+    """Empty reads mean the device could not be read, NOT a bad signature."""
+    monkeypatch.setattr(flasher, "read_at",
+                        _reads({flasher.BOOT_SIG_OFFSET: b"",
+                                flasher.GPT_SIG_OFFSET: b""}))
+    logs = []
+    v = flasher.verify_raw_sigs(
+        {"physdrive": r"\.\PhysicalDrive1"}, None, logs.append)
+    assert v is None, "unreadable must be indeterminate, not FAIL"
+    assert any("UNREADABLE" in m for m in logs)
+    assert not any("FAIL" in m for m in logs), "must not report a failure it did not observe"
+
+
+def test_verify_raw_sigs_false_when_signature_actually_wrong(monkeypatch):
+    """A real read with the wrong bytes is still a definitive FAIL."""
+    monkeypatch.setattr(flasher, "read_at",
+                        _reads({flasher.BOOT_SIG_OFFSET: b"\x00\x00",
+                                flasher.GPT_SIG_OFFSET: b"EFI PART"}))
+    logs = []
+    v = flasher.verify_raw_sigs(
+        {"physdrive": r"\.\PhysicalDrive1"}, None, logs.append)
+    assert v is False
+    assert any("FAIL" in m for m in logs)
+
+
+def test_verify_raw_sigs_true_when_both_signatures_present(monkeypatch):
+    """The good path is unchanged."""
+    monkeypatch.setattr(flasher, "read_at",
+                        _reads({flasher.BOOT_SIG_OFFSET: flasher.BOOT_SIG,
+                                flasher.GPT_SIG_OFFSET: flasher.GPT_SIG}))
+    v = flasher.verify_raw_sigs(
+        {"physdrive": r"\.\PhysicalDrive1"}, None, lambda m: None)
+    assert v is True
+
+
+def test_sha256_device_region_none_on_short_read(tmp_path):
+    """Reading fewer bytes than asked returns None (unverifiable), never the
+    sha256 of what little came back -- hashing a phantom is what produced the
+    empty-string digest e3b0c442...b855 and the false MISMATCH."""
+    p = tmp_path / "shortdev.bin"
+    p.write_bytes(b"\xAB" * 4096)
+    got = flasher.sha256_device_region(str(p), 0, 1024 * 1024, None)
+    assert got is None
+
+
+def test_sha256_device_region_hashes_a_full_read(tmp_path):
+    """The good path still returns the real digest."""
+    import hashlib as _h
+    payload = b"\xCD" * 8192
+    p = tmp_path / "fulldev.bin"
+    p.write_bytes(payload)
+    got = flasher.sha256_device_region(str(p), 0, len(payload), None)
+    assert got == _h.sha256(payload).hexdigest()

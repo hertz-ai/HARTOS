@@ -2200,6 +2200,13 @@ class TestRuntimeMonitorGuardrailCheck:
         monitor = RuntimeIntegrityMonitor(
             manifest={'code_hash': 'original_hash'},
             check_interval=1)
+        # 439ff36's tiered check only FULL-verifies every _full_every-th cycle
+        # (12 by default); the cycles between are whole-repo stat sweeps, and
+        # twelve of those on a CI checkout blew the 120s pytest-timeout budget
+        # (shard 5, 2026-08-22). This test's contract is "a hash mismatch is
+        # DETECTED", not the sweep cadence — force the full verify on the
+        # first cycle so detection is exercised in one pass.
+        monitor._full_every = 1
         with patch('security.node_integrity.compute_code_hash', return_value='tampered_hash'):
             monitor._running = True
             monitor._check_interval = 0

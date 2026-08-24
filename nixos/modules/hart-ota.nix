@@ -17,6 +17,40 @@
 # Two modes:
 #   - Pull: timer-based check against upstream (default)
 #   - Push: gossip-received upgrade from peer (via upgrade_orchestrator)
+#
+# ── OPEN BLOCKER: nodes have no binary cache for HART's OWN derivations ──────
+# Measured end-to-end on the real Samsung box 2026-08-21/22, and this is why
+# OTA has never actually delivered, independent of the transport bugs fixed in
+# 4d68528 (CENTRAL rejected the hostname every node polls) and bb0bc45
+# (activation aborted into Emergency Mode on the second switch).
+#
+# The node trusts exactly one substituter:
+#
+#   substituters = https://cache.nixos.org/
+#
+# That serves nixpkgs. It does NOT serve anything this repo builds -- the
+# system closure, hart-comp, the session/shell scripts, every generated unit.
+# So `nixos-rebuild switch --flake` cannot FETCH the new system; each node must
+# BUILD it. A one-line change to a shell script dry-ran as "151 paths,
+# 352.94 MiB download" and then pulled 153 derivations to build, whose
+# build-time closure (stdenv, compilers) is gigabytes. With 3.0 GB free it
+# died: `error: writing to file: No space left on device`.
+#
+# A HART OS desktop closure is ~21 GiB on a 28 GiB medium, so a constrained
+# node can never win that race, and adding disk only postpones it: the cost
+# scales with the BUILD inputs, not with the size of the change.
+#
+# The fix is a binary cache the fleet trusts, which is what makes OTA cheap
+# everywhere else in the Nix world: have CI push the built closure (it already
+# builds hart-desktop in Nix Build Matrix) to a store nodes can substitute
+# from -- nix-serve on CENTRAL, S3, or Cachix -- and add it plus its public key
+# to nix.settings.substituters / trusted-public-keys. Then an update is a
+# download of the changed paths (small), not a local build (huge), and
+# hart-ota's existing pipeline works unmodified on the smallest node.
+#
+# Until that exists, treat autoApply as unsafe on constrained hardware: the
+# node will poll, try, exhaust its disk, and fail the apply -- and it cannot
+# roll back what it never finished building.
 
 let
   cfg = config.hart;
@@ -159,10 +193,13 @@ let
               echo "[HART OTA apply] running pre-update hook..."
               ${ota.preUpdateHook}
             ''}
-            echo "[HART OTA apply] switching to $FLAKE#hart-${cfg.variant} ..."
+            # ota.flakeAttr, NOT hart-${cfg.variant}: the config names itself.
+            # The inline construction sent a raw-flashed node to the ISO-kind
+            # closure, which cannot mount a raw root (real HW 2026-08-22).
+            echo "[HART OTA apply] switching to $FLAKE#${ota.flakeAttr} ..."
             # if-form on purpose: the source sync runs on SUCCESS alone — a
             # rolled-back switch must not advance /etc/hart/src (task #20).
-            if nixos-rebuild switch --flake "$FLAKE#hart-${cfg.variant}"; then
+            if nixos-rebuild switch --flake "$FLAKE#${ota.flakeAttr}"; then
               STATUS="applied"
               ${otaSyncSrc}/bin/hart-ota-sync-src "$FLAKE" \
                 || echo "[HART OTA apply] source sync failed unexpectedly — /etc/hart/src may be stale"
@@ -302,13 +339,45 @@ in
 
     flakeRef = lib.mkOption {
       type = lib.types.str;
-      default = "github:hertz-ai/HARTOS";
+      default = "github:hertz-ai/HARTOS?dir=nixos";
       description = ''
         Nix flake reference for building/switching the system. When
         centralEndpoint returns an approved flake_ref for this channel,
         that value supersedes this one as the switch target (central can
-        pin an exact commit, e.g. github:hertz-ai/HARTOS/<sha>). This
-        remains the build target's repo and the offline fallback.
+        pin an exact commit, e.g. github:hertz-ai/HARTOS/<sha>?dir=nixos).
+        This remains the build target's repo and the offline fallback.
+
+        ?dir=nixos is LOAD-BEARING: this repo's flake lives under nixos/,
+        not the root. Without it the first real fallback resolution on a
+        flashed node (2026-08-23) fetched the rev fine and then died on
+        "path .../flake.nix does not exist", so the check exited UNKNOWN
+        and no update could ever stage. A central-published flake_ref must
+        carry ?dir=nixos for the same reason.
+      '';
+    };
+
+    flakeAttr = lib.mkOption {
+      type = lib.types.str;
+      default = "hart-${config.hart.variant}";
+      defaultText = lib.literalExpression ''"hart-''${config.hart.variant}"'';
+      description = ''
+        The nixosConfigurations attribute this node switches to on apply
+        (`nixos-rebuild switch --flake <ref>#<flakeAttr>`). The config NAMES
+        ITSELF here, because the same variant exists in several image kinds
+        and only the config knows which one it is: hart-<variant> is the
+        ISO-kind closure, hart-<variant>-raw the dd-able raw image, and an
+        installer-written local flake calls its attr plain `hart`.
+
+        Why this exists (real HW, 2026-08-22): hart-ota hardcoded
+        hart-''${variant}, so a raw-flashed node OTA-applied the ISO-kind
+        config, whose initrd cannot mount a raw root -- stage 1 stopped at
+        "must mount the root filesystem on /mnt-root" and the node needed a
+        human at the boot menu. The repart image module overrides this to
+        hart-<variant>-raw; mkInstalledSystem overrides it to `hart`. The
+        default preserves the previous behaviour everywhere else.
+
+        hart-self-build consumes the same option, so a node's manual
+        self-rebuild and its OTA apply can never target different configs.
       '';
     };
 
@@ -478,13 +547,34 @@ in
                 | ${pkgs.jq}/bin/jq -r '.revision // "unknown"') || REMOTE_REV="check_failed"
             fi
 
-            LOCAL_REV=$(${pkgs.nix}/bin/nix flake metadata /etc/nixos --json 2>/dev/null \
-              | ${pkgs.jq}/bin/jq -r '.revision // "unknown"') || LOCAL_REV="unknown"
+            # The node's own revision. /etc/hart/image-rev is the raw image's
+            # identity file (written at build from hartRev, hart-repart-image
+            # module) -- a dd'd node has no /etc/nixos at all, which left
+            # LOCAL_REV "unknown" forever on exactly the nodes OTA exists for
+            # (first real check on flashed HW, 2026-08-23). /etc/nixos stays
+            # as the fallback for installer-written systems, where it is a
+            # real flake checkout with a readable revision.
+            LOCAL_REV=$(cat /etc/hart/image-rev 2>/dev/null | tr -d '[:space:]')
+            if [[ -z "$LOCAL_REV" ]]; then
+              LOCAL_REV=$(${pkgs.nix}/bin/nix flake metadata /etc/nixos --json 2>/dev/null \
+                | ${pkgs.jq}/bin/jq -r '.revision // "unknown"') || LOCAL_REV="unknown"
+            fi
+            [[ -z "$LOCAL_REV" ]] && LOCAL_REV="unknown"
 
             echo "[HART OTA] Local: $LOCAL_REV"
             echo "[HART OTA] Approved: $REMOTE_REV"
 
-            if [[ "$REMOTE_REV" != "check_failed" && "$REMOTE_REV" != "$LOCAL_REV" && "$REMOTE_REV" != "unknown" ]]; then
+            # Prefix-aware sameness: image-rev is the SHORT rev (hartRev =
+            # shortRev, 7-10 chars) while central/github resolve the FULL sha.
+            # Exact string compare would call a perfectly current node stale on
+            # every check -- an endless self-reapply loop under autoApply.
+            _same_rev() {
+              [[ -n "$1" && -n "$2" ]] || return 1
+              [[ "$1" == "$2" || "$1" == "$2"* || "$2" == "$1"* ]]
+            }
+
+            if [[ "$REMOTE_REV" != "check_failed" && "$REMOTE_REV" != "unknown" ]] \
+               && ! _same_rev "$REMOTE_REV" "$LOCAL_REV"; then
               echo "[HART OTA] New version available: $REMOTE_REV"
 
               # Persist update metadata INCLUDING the central-approved switch flake

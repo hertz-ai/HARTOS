@@ -1670,6 +1670,65 @@ def get_post_likes(post_id):
     return _ok(voters)
 
 
+@social_bp.route('/media/<file_id>/<filename>', methods=['GET'])
+def get_media(file_id, filename):
+    """Serve an uploaded file so an outside fetcher can actually get it.
+
+    WHY THIS EXISTS
+
+    MediaFileManager._upload_local writes real bytes to UPLOAD_DIR and used to
+    hand back "/files/<id>/<name>", a path nothing served. Verified 2026-08-19:
+    /files/, /api/files/ and /media/ all 404 on azurekong.hertzai.com and on
+    hevolve.ai, and no blueprint registered that prefix. Every caller therefore
+    held a URL that could not be fetched.
+
+    That is fatal for exactly one caller. Instagram's Content Publishing API
+    does not accept bytes, it takes a URL and downloads the image from us. So
+    publish_photo and publish_carousel would build their containers, Meta would
+    fail to fetch, and the code path would look correct the whole way.
+
+    It lives under /api/social because Kong already routes that prefix
+    publicly. A top-level /files route would have needed a gateway change and
+    would have hit the host-header trap: the fronting nginx sends
+    Host: 127.0.0.1, so host-scoped Kong routes 404 from outside.
+
+    DELIBERATELY UNAUTHENTICATED. The whole point is that Meta's servers can
+    fetch it, and they arrive with no session. The id is a uuid4 from
+    MediaFileManager, so the URL is unguessable, and that is the access
+    control. Do not put anything here that is not intended to be publicly
+    fetchable by whoever is handed the link.
+    """
+    from flask import send_from_directory, abort
+    try:
+        from integrations.channels.media.files import UPLOAD_DIR
+    except Exception:
+        UPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/app/uploads')
+
+    # Path traversal is the obvious way to turn a public file route into a
+    # public filesystem. Both segments are checked rather than trusting
+    # send_from_directory alone: a file_id is a uuid and a filename is a leaf,
+    # so anything with a separator or a dot-dot in it is not one.
+    for seg in (file_id, filename):
+        if (not seg or '..' in seg or '/' in seg or '\\' in seg
+                or seg.startswith('.') or len(seg) > 255):
+            abort(404)
+
+    directory = os.path.join(UPLOAD_DIR, file_id)
+    if not os.path.isdir(directory):
+        abort(404)
+    resolved = os.path.realpath(os.path.join(directory, filename))
+    if not resolved.startswith(os.path.realpath(UPLOAD_DIR) + os.sep):
+        abort(404)
+    if not os.path.isfile(resolved):
+        abort(404)
+
+    # Long cache: the id is content-addressed by uuid, so a given URL never
+    # changes what it points at.
+    resp = send_from_directory(directory, filename, conditional=True)
+    resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+    return resp
+
+
 @social_bp.route('/posts/<post_id>/pin', methods=['POST'])
 @require_auth
 def pin_post(post_id):

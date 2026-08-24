@@ -174,9 +174,24 @@ class ModelOrchestrator:
         re-implementing the loop.
         """
         cs = self._get_compute_state()
+        budget_vram_gb = cs['vram_free_gb']
+        if model_type != 'llm':
+            # Reserve the primary LLM's footprint.  It is not a
+            # RuntimeToolManager tool so allocate() is never called for it,
+            # which means cs['vram_free_gb'] counts VRAM the LLM needs and
+            # whichever subsystem boots FIRST wins.  See the "llm_main" row
+            # in vram_manager.VRAM_BUDGETS for the measured incident.  Same
+            # idiom as llamacpp_manager.py reserving for TTS in reverse.
+            try:
+                from integrations.service_tools.vram_manager import vram_manager
+                _llm = vram_manager.get_effective_budget('llm_main')
+                if _llm:
+                    budget_vram_gb = max(0.0, budget_vram_gb - _llm[0])
+            except ImportError:
+                logger.debug('select_best: swallowed ImportError on llm reserve')
         return self._catalog.select_best(
             model_type=model_type,
-            budget_vram_gb=cs['vram_free_gb'],
+            budget_vram_gb=budget_vram_gb,
             budget_ram_gb=cs['ram_free_gb'],
             gpu_available=cs['gpu_available'],
             language=language,

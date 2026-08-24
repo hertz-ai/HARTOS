@@ -146,6 +146,53 @@ print(signature.hex())
 
     echo "[BootAudit] Entry written and log set to append-only."
 
+    # ─── Register the system profile (what nixos-install would have done) ───
+    # A dd'd image never runs nixos-install, so /nix/var/nix/profiles/system is
+    # never created — verified on real HW 2026-08-20, where the profiles dir
+    # held only `per-user`. That breaks updating in BOTH directions:
+    #   * `nixos-rebuild switch` has no profile to move, and
+    #   * `--rollback` has no target, so the OTA canary's auto-revert — the
+    #     thing that makes autoApply safe to leave on — was a silent no-op.
+    # A node was running ota.enable + autoApply with no way back.
+    # hart-ota-gc (--delete-generations), `hart-ota history` and hart-self-build
+    # (`nix store diff-closures … profiles/system`) all already ASSUME this
+    # profile; nothing created it. Seeding it here rather than in a new unit
+    # keeps one owner for "things nixos-install would have done on first boot",
+    # alongside the node identity and DB init above.
+    # Never fatal: the marker below must still be written, and a node that
+    # cannot register a profile is exactly as updatable as it was before.
+    if [[ -e /nix/var/nix/profiles/system ]]; then
+      echo "[Profile] System profile already registered — leaving it alone."
+    else
+      CURRENT_SYSTEM=$(readlink -f /run/current-system 2>/dev/null) || CURRENT_SYSTEM=""
+      if [[ -n "$CURRENT_SYSTEM" && -e "$CURRENT_SYSTEM" ]] && \
+         ${pkgs.nix}/bin/nix-env --profile /nix/var/nix/profiles/system \
+           --set "$CURRENT_SYSTEM" 2>/dev/null; then
+        echo "[Profile] Registered generation 1 -> $CURRENT_SYSTEM (the rollback target OTA needs)."
+      else
+        echo "[Profile] Could not register the system profile — OTA apply/rollback stay unavailable." >&2
+      fi
+    fi
+
+    # ─── Give the dd'd ESP bootctl's install marker (what nixos-install does) ───
+    # The image bakes only /EFI/BOOT/BOOTX64.EFI plus one UKI; bootctl's own
+    # /EFI/systemd copy and install marker are absent, so every later
+    # `switch-to-configuration boot` complained "systemd-boot not installed in
+    # ESP" (real HW 2026-08-21) and generation entries depended on luck.
+    # `--graceful` makes a re-run (or an already-correct ESP) a no-op;
+    # `--no-variables` matches boot.loader.efi.canTouchEfiVariables=false (a
+    # portable stick must not write firmware NVRAM). Same never-fatal posture
+    # as everything else here: a box whose ESP cannot be blessed still boots
+    # exactly as it did before -- it just keeps the old complaint.
+    if [[ -d /boot/EFI ]]; then
+      if ${pkgs.systemd}/bin/bootctl install --graceful --no-variables \
+           --esp-path=/boot >>"$LOG" 2>&1; then
+        echo "[Bootctl] systemd-boot installed/refreshed on the ESP (entries now register natively)."
+      else
+        echo "[Bootctl] bootctl install failed — boot entries keep the pre-existing behaviour." >&2
+      fi
+    fi
+
     # ─── Mark completion ───
     touch "$MARKER"
     chown hart:hart "$MARKER"

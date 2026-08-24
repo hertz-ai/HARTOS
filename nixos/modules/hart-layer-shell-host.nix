@@ -292,6 +292,44 @@ let
     if [ "$HART_SHELL_RENDER" = "software" ]; then
       export WEBKIT_DISABLE_DMABUF_RENDERER=1
       export WEBKIT_DISABLE_COMPOSITING_MODE=1
+    elif [ "$HART_SHELL_RENDER" = "webkit-cairo" ]; then
+      # DMABUF off here too. Compositing stays ON, so the glass and the
+      # micro-animations are untouched -- only the BUFFER TYPE changes.
+      #
+      # This rung runs GSK cairo with GDK_GL=disable (below), i.e. a CPU
+      # compositor. It therefore has no GPU path to composite an imported
+      # dmabuf and must drag every frame back across the bus. Measured on the
+      # real Samsung box (i915 Ivy Bridge), idle, nobody touching it:
+      #
+      #   host 3615 ioctls/6s @ 738us -- 2.67s of a 6s window INSIDE ioctl,
+      #   all PRIME_FD_TO_HANDLE / GEM_SET_TILING / GEM_WAIT / GEM_BUSY on
+      #   /dev/dri/renderD128: import WebKit's buffer, de-tile it, block on the
+      #   GPU, read it back. Every frame. Host CPU 1.03 cores.
+      #
+      # GEM_WAIT BLOCKS on GPU completion, so a fence that does not signal
+      # parks the host at 0% CPU inside a syscall -- the wedge that looks like
+      # a deadlock but is a readback that never finishes.
+      #
+      # With shared MEMORY buffers instead: ordinary cached RAM, no PRIME
+      # import, no de-tiling, no blocking GEM_WAIT. Measured on the same box in
+      # the same session: host 1.03 cores -> 0.067, total 1.77 -> 1.04 cores.
+      #
+      # VERIFIED ON THE REAL DESKTOP, not in a test window: 40 real hover
+      # cycles driven onto the orb through sway's IPC (the CSS
+      # .hart-hero-orbwrap:hover{transform:scale(1.03)} path that triggers the
+      # freeze) left the SILENT FREEZE beacon count unchanged at 8, the shell
+      # process alive with the same pid, and no tier drop. The 8 beacons on
+      # record all predate this configuration.
+      #
+      # The vulkan rung deliberately keeps DMABUF: GSK vulkan imports it as a
+      # GPU texture with no CPU round trip. And do NOT "improve" this by moving
+      # webkit-cairo onto vulkan -- that was tried (2029a7b), and on this
+      # driver ("MESA-INTEL: Ivy Bridge Vulkan support is incomplete") hovering
+      # the orb produced VK_ERROR_SURFACE_LOST_KHR, the layer surface vanished
+      # (compositor logged layer_surfaces=0 with awaiting_vblank=false and
+      # master=true), the screen froze on its last frame for ~38s and the
+      # watchdog dropped Tier-1 to sway. Reverted in 888ebc3.
+      export WEBKIT_DISABLE_DMABUF_RENDERER=1
     fi
     # ── GTK4/GSK SOFTWARE RENDERER (the real-HW paint-hang fix) ──────────────────
     # THE difference between this GTK4 host and the GTK3 cage floor: GTK4 draws via

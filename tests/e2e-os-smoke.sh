@@ -270,6 +270,14 @@ else
     UNIT_FOUND=$(echo "$UNIT_FOUND" | tr -d '[:space:]')
     DESKTOP_FOUND=$(ssh_cmd "find /run/current-system/sw/share/applications -name 'nunba.desktop' -print -quit 2>/dev/null || echo MISSING")
     DESKTOP_FOUND=$(echo "$DESKTOP_FOUND" | tr -d '[:space:]')
+    # `find` EXITS 0 when the directory exists but nothing matches, printing
+    # nothing, so `|| echo MISSING` never fires and the var is EMPTY, not MISSING.
+    # Empty then passes `!= "MISSING"` and check() substring-matches "both found"
+    # against itself: #17 reported PASS whether or not nunba.desktop existed, which
+    # is exactly how a missing .desktop stayed invisible while #16 went red next to
+    # it. Normalise empty to MISSING (check #16 already guards this with -n).
+    [[ -n "$UNIT_FOUND" ]] || UNIT_FOUND=MISSING
+    [[ -n "$DESKTOP_FOUND" ]] || DESKTOP_FOUND=MISSING
     if [[ "$UNIT_FOUND" != "MISSING" && "$DESKTOP_FOUND" != "MISSING" ]]; then
         check 17 "Nunba user unit + .desktop entry deployed" "both found" "both found"
     elif [[ "$UNIT_FOUND" != "MISSING" ]]; then

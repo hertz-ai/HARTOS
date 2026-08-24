@@ -92,7 +92,20 @@ jobs:
                 echo "CUSTOM_LLM_BASE_URL=$LLM_GATEWAY"
                 echo "HEVOLVE_NODE_TIER=${{ secrets.HEVOLVE_NODE_TIER || 'central' }}"
                 echo "HEVOLVE_ENFORCEMENT_MODE=${{ secrets.HEVOLVE_ENFORCEMENT_MODE || 'hard' }}"
-                echo "ALLOWED_HOSTS=${{ secrets.ALLOWED_HOSTS || '*' }}"
+                # OTA_HOST is APPENDED, never replaced: /api/ota/latest is the
+                # PUBLIC pointer every fleet node polls with
+                # `Host: etime.hertzai.com`, and security/middleware.py resolves
+                # a NAME against this allowlist (only literal RFC1918 addresses
+                # bypass it). The deployed secret is a specific list that omits
+                # that name, so every node poll answered 400 {"error":"Invalid
+                # host"} and OTA delivery was silently dead fleet-wide -- exactly
+                # the failure the middleware's own wildcard comment warns about.
+                # Verified on real HW 2026-08-20: same URL, same node,
+                # `Host: etime.hertzai.com` -> 400 while `Host: 192.168.0.9`
+                # -> 200. Appending keeps whatever the operator set (including
+                # '*', which still short-circuits to allow-all) and only ADDS
+                # the one host OTA cannot function without.
+                echo "ALLOWED_HOSTS=${{ secrets.ALLOWED_HOSTS || '*' }},${{ secrets.HART_OTA_HOST || 'etime.hertzai.com' }}"
                 echo "CORS_ORIGINS=${{ secrets.CORS_ORIGINS || '*' }}"
                 echo "LANGCHAIN_PROJECT=${{ secrets.LANGCHAIN_PROJECT || 'hartos' }}"
               } > .env
@@ -124,6 +137,44 @@ jobs:
                 echo "::error::synthesised .env is missing required secret(s):$_absent"
                 echo "::error::add them under Settings > Secrets and variables > Actions, then re-run"
                 exit 1
+              fi
+            fi
+
+            # ── The OTA host, guaranteed on EVERY deploy (not just a fresh box) ──
+            # The block above writes .env only when it is ABSENT, which is the
+            # right rule (a live .env carries values this workflow does not
+            # know). The consequence: adding the OTA host to that block fixed
+            # nothing here. Deepbox's .env is dated 2026-07-21, so the block has
+            # been skipped on every deploy since, and ALLOWED_HOSTS still read
+            #   localhost,127.0.0.1,172.17.0.1,azurekong...,hevolve.ai,...
+            # with no etime.hertzai.com. Verified 2026-08-20 against the LIVE
+            # container and the file on disk: `Host: 192.168.0.9` -> 200
+            # {"channel":"stable",...}, `Host: etime.hertzai.com` -> 400
+            # {"error":"Invalid host"} -- and that name is exactly what every
+            # fleet node polls (hart-ota.nix defaults to
+            # http://etime.hertzai.com:6777/api/ota/latest). OTA delivery was
+            # dead fleet-wide at the first request.
+            #
+            # So ensure it separately and idempotently. This does NOT rewrite
+            # .env: it appends ONE host to ONE key, only when missing, which is
+            # the same additive contract the create-block comment describes.
+            # Re-running is a no-op, and an operator's '*' is left alone.
+            _OTA_HOST="${{ secrets.HART_OTA_HOST || 'etime.hertzai.com' }}"
+            if [ -n "$_OTA_HOST" ] && [ -f .env ]; then
+              if ! grep -q '^ALLOWED_HOSTS=' .env; then
+                echo "ALLOWED_HOSTS=$_OTA_HOST" >> .env
+                echo "  ALLOWED_HOSTS absent — created it with $_OTA_HOST"
+              else
+                _CUR="$(grep -E '^ALLOWED_HOSTS=' .env | head -1 | cut -d= -f2-)"
+                case ",$_CUR," in
+                  *",$_OTA_HOST,"*)
+                    echo "  ALLOWED_HOSTS already allows $_OTA_HOST" ;;
+                  *"*"*)
+                    echo "  ALLOWED_HOSTS is allow-all — nothing to add" ;;
+                  *)
+                    sed -i "s|^ALLOWED_HOSTS=.*|ALLOWED_HOSTS=$_CUR,$_OTA_HOST|" .env
+                    echo "  appended $_OTA_HOST to ALLOWED_HOSTS (OTA polls by that name)" ;;
+                esac
               fi
             fi
 

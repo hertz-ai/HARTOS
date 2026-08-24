@@ -2,7 +2,7 @@
   "mcpServers": {
     "hartos": {
       "command": "python",
-      "args": ["-m", "integrations.mcp.mcp_server"],
+      "args": ["-m", "integrations.mcp.mcp_stdio_bridge"],
       "env": {
         "PYTHONPATH": "."
       }

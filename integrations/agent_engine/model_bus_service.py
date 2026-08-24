@@ -752,11 +752,28 @@ class ModelBusService:
                              "Try again in a moment or pair a GPU device.")}
 
     def _route_image_gen(self, prompt: str, options: dict) -> dict:
-        """Route image generation inference."""
+        """Route image generation inference.
+
+        No image backend is wired yet. This returns the same
+        ``{'error': ..., 'response': ...}`` shape every sibling route uses on
+        exhaustion. Without the 'error' key, route_request computed
+        ``success='error' not in result`` as True and emitted an
+        inference.completed event claiming the request succeeded, while the
+        caller received the literal string "Image generation not yet
+        implemented" in the field that carries generated content.
+
+        When a backend lands, reuse the three legs of _route_video_gen
+        (local GPU -> hive peer -> cloud); ComfyUI on
+        get_port('comfyui', 8188) is already in that local list and
+        generates images natively.
+        """
         return {
-            'response': 'Image generation not yet implemented',
+            'error': 'No image generation backend available',
+            'response': ("I couldn't generate the image - no image generation "
+                         "backend is available on this device or on the hive "
+                         "network right now."),
             'model': 'none',
-            'backend': 'stub',
+            'backend': 'none',
         }
 
     # ─── Guardrail Gate ──────────────────────────────────────

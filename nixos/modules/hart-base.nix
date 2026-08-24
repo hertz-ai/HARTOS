@@ -211,6 +211,50 @@ in
     # "nixpkgs". (Android hides Linux; HART OS hides NixOS — down to the console.)
     nix.channel.enable = lib.mkForce false;
 
+    # ── …and therefore FLAKES must be on (real-HW 2026-08-20) ──
+    # The line above is half a decision: HART OS is flake-based and never uses
+    # channels. But nothing enabled the flake machinery for the OS itself, so
+    # /etc/nix/nix.conf shipped with NO experimental-features and every flake
+    # command on a flashed node died with:
+    #   error: experimental Nix feature 'nix-command' is disabled
+    # Only hart-installer.nix ever set it, and a flashed image does not include
+    # that module. Everything the OS offers for updating itself is a flake
+    # command — hart-ota (`nixos-rebuild switch --flake`), hart-self-build (same,
+    # plus `nix store diff-closures`), and a user's own `nixos-rebuild --flake`.
+    # A node with ota.enable and autoApply BOTH true still could not have
+    # applied anything. Declared HERE, once, because it is a property of the OS
+    # rather than of any one feature: the alternative is each consumer
+    # re-declaring the same requirement and none of them owning it.
+    nix.settings.experimental-features = [ "nix-command" "flakes" ];
+
+    # ── The fleet binary cache — what makes OTA a DOWNLOAD, not a build ──
+    # With only cache.nixos.org (nixpkgs), a node applying an update had to
+    # BUILD everything this repo defines: measured on real HW 2026-08-22, a
+    # one-line change queued 153 derivations and died on "No space left on
+    # device" with 3.0 GB free, because the build closure drags in stdenv and
+    # compilers. The desktop closure is ~21 GiB on a 28 GiB stick; no disk
+    # budget survives that, so OTA delivery was impossible by construction
+    # (ed0090b names this as the root blocker).
+    #
+    # CI (nix-build-matrix "Push system closure to the fleet cache") signs the
+    # built hart-desktop toplevel with the fleet key and rsyncs it to CENTRAL:
+    # nginx on deepbox :8093 serving /solidstate/hart-cache/cache (the signing
+    # key lives at /solidstate/hart-cache/key on that box, and its PUBLIC half
+    # is what is pinned here). etime.hertzai.com is the same name every node
+    # already polls for /api/ota/latest, so cache reachability equals OTA
+    # reachability -- no second hostname to keep alive.
+    #
+    # extra-*, not the bare options: the defaults (cache.nixos.org and its
+    # key) must survive, since nixpkgs paths still substitute from there.
+    # Order matters at fetch time: nix tries substituters as listed and this
+    # cache 404s for anything it does not hold, which then falls through to
+    # cache.nixos.org -- so a missing path costs one HTTP miss, never a
+    # failure. If the cache is DOWN entirely, substitution falls back to
+    # building exactly as before this existed: strictly additive.
+    nix.settings.extra-substituters = [ "http://etime.hertzai.com:8093" ];
+    nix.settings.extra-trusted-public-keys =
+      [ "hart-cache-1:NEkaZ0DGf9mv+annJ/RamQzXzbnuOTodiq+/W063FDQ=" ];
+
     # ── Users ──
     users.users.hart = {
       isSystemUser = true;
@@ -316,16 +360,47 @@ in
 
     # ── Networking ──
     networking = {
-      hostName = lib.mkDefault "hart-node";
+      # 1250: this option is squeezed between TWO nixpkgs definitions, and the
+      # only correct answer is a priority strictly between them. Same family of
+      # collision as firewall.enable just below, but that one had a free step
+      # and this one does not.
+      #   1000 mkDefault       cloud image formats (virtualisation/amazon-image
+      #                        .nix and its gce/azure siblings) set hostName =
+      #                        mkDefault "" so the instance is named from cloud
+      #                        metadata. We must LOSE to this.
+      #   1500 mkOptionDefault tasks/network-interfaces.nix contributes the
+      #                        stock "nixos". We must BEAT this.
+      # Two definitions at the SAME priority do not resolve, they conflict, so
+      # both mkDefault and mkOptionDefault are wrong here and each was measured
+      # to be wrong: plain mkDefault tied with the cloud modules and eval-failed
+      # amazon/gce/azure-server, and mkOptionDefault (b6286d0) tied with
+      # network-interfaces.nix and eval-failed every ordinary image instead
+      # (iso-*, raw-*, qcow2-*, vbox-*, docker-server, default). 1250 ties with
+      # neither: cloud images take their metadata name, everything else still
+      # resolves to hart-node exactly as it always did.
+      #
+      # None of this was visible until the flake eval was split per attribute
+      # (cc0eb60) -- the single `nix flake check` process died of memory before
+      # it ever reported an attribute name.
+      hostName = lib.mkOverride 1250 "hart-node";
       firewall = {
-        # mkDefault: the docker-server image format (nixpkgs docker-image.nix)
-        # sets networking.firewall.enable = false at normal priority for the OCI
+        # 1250, for the SAME reason as hostName above, and discovered the same
+        # way. The docker-server image format (nixpkgs docker-image.nix) sets
+        # networking.firewall.enable = false at NORMAL priority for the OCI
         # container; a plain `true` here (this base module is included by EVERY
         # variant) collided with it ("conflicting definition values"), eval-
-        # failing only the docker-server target. mkDefault yields to the
-        # container's false, while ISO/host variants — which have no competing
-        # definition — still resolve to true (unchanged firewall behaviour).
-        enable = lib.mkDefault true;
+        # failing only the docker-server target. mkDefault fixed THAT, because
+        # normal (100) beats mkDefault (1000).
+        #
+        # But virtualisation/google-compute-config.nix also disables the
+        # firewall and does it at mkDefault, which is the priority mkDefault
+        # had just moved us to, so gce-server kept eval-failing on this option
+        # even after hostName was resolved. Equal priorities conflict rather
+        # than resolve. mkOverride 1250 loses to BOTH the container's normal
+        # false and GCE's mkDefault false, and still wins on every variant that
+        # has no competing definition, so the firewall stays on exactly where
+        # it always was.
+        enable = lib.mkOverride 1250 true;
         allowedTCPPorts = [ cfg.ports.backend 22 ];
         allowedUDPPorts = [ cfg.ports.discovery ];
       };
@@ -421,7 +496,20 @@ in
     services.openssh = {
       enable = true;
       settings = {
-        PermitRootLogin = lib.mkDefault "no";
+        # 1250, the THIRD option in this file to need it, so treat it as the
+        # rule rather than three coincidences: any opinion hart-base holds that
+        # a nixpkgs image or cloud module ALSO holds at mkDefault has to sit
+        # between mkDefault (1000) and mkOptionDefault (1500), because equal
+        # priorities conflict instead of resolving. gce-server eval-failed on
+        # hostName, then on firewall.enable, then here, each one only becoming
+        # visible once the previous was fixed:
+        #   The option `services.openssh.settings.PermitRootLogin' has
+        #   conflicting definition values:
+        #   - hart-base.nix: "no"
+        #   - virtualisation/google-compute-config.nix: "prohibit-password"
+        # A cloud image that has decided how root logs in should win; every
+        # other variant has no competing definition and still gets "no".
+        PermitRootLogin = lib.mkOverride 1250 "no";
         PasswordAuthentication = true;  # For first login; disable after key setup
       };
     };

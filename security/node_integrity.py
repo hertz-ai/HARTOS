@@ -239,7 +239,7 @@ def verify_json_signature(public_key_hex: str, payload: dict,
         return False
 
 
-def compute_code_hash(code_root: str = None) -> str:
+def compute_code_hash(code_root: str = None, force_walk: bool = False) -> str:
     """Compute SHA-256 manifest hash of all .py files in the project.
 
     Deterministic across identical deployments.
@@ -249,34 +249,59 @@ def compute_code_hash(code_root: str = None) -> str:
             Set at build time from a known-good hash.
         File cache (agent_data/code_hash_cache.json): Reuse cached hash if
             no .py file has a newer mtime than the cache timestamp.
-    """
-    # Tier 1: Precomputed hash (ROM/read-only deployments)
-    precomputed = os.environ.get('HEVOLVE_CODE_HASH_PRECOMPUTED', '')
-    if precomputed:
-        logger.debug(f"Code hash: using precomputed {precomputed[:16]}...")
-        return precomputed
 
+    force_walk: bypass BOTH shortcut tiers and hash the actual bytes.
+        Exists for the runtime integrity monitor, whose entire job is
+        detecting that the bytes changed: the Nunba bundle sets
+        HEVOLVE_CODE_HASH_PRECOMPUTED to sha256(exe_path|exe_mtime) as a
+        cheap stable identity (Nunba app.py:230), so without this flag the
+        monitor's periodic re-check compared that constant against itself
+        every cycle — an edited .py could never move either side of the
+        comparison.  The mtime cache is skipped for the same reason: an
+        attacker who back-dates a file's mtime keeps the cache warm.  A
+        forced walk is also a pure read — it does not refresh the cache.
+    """
     root = Path(code_root or _CODE_ROOT)
 
-    # Tier 2: File-based cache (skip recompute if .py files unchanged)
-    cached = _load_code_hash_cache(root)
-    if cached:
-        return cached
+    if not force_walk:
+        # Tier 1: Precomputed hash (ROM/read-only deployments)
+        precomputed = os.environ.get('HEVOLVE_CODE_HASH_PRECOMPUTED', '')
+        if precomputed:
+            logger.debug(f"Code hash: using precomputed {precomputed[:16]}...")
+            return precomputed
+
+        # Tier 2: File-based cache (skip recompute if .py files unchanged)
+        cached = _load_code_hash_cache(root)
+        if cached:
+            return cached
 
     # Tier 3: Full computation
-    manifest_lines = []
     py_files = sorted(_collect_py_files(root, root))
-    for rel_path, file_path in py_files:
-        file_hash = _hash_file(file_path)
-        manifest_lines.append(f"{rel_path}:{file_hash}")
+    file_manifest = {rel_path: _hash_file(file_path)
+                     for rel_path, file_path in py_files}
+    result = manifest_to_code_hash(file_manifest)
 
-    manifest = '\n'.join(manifest_lines)
-    result = hashlib.sha256(manifest.encode('utf-8')).hexdigest()
-
-    # Save to cache for next boot
-    _save_code_hash_cache(root, result)
+    if not force_walk:
+        # Save to cache for next boot
+        _save_code_hash_cache(root, result)
 
     return result
+
+
+def manifest_to_code_hash(file_manifest: Dict[str, str]) -> str:
+    """Fold a {relative_path: sha256} file manifest into THE code hash.
+
+    Single source of truth for the fold format ("rel:hash" lines, sorted,
+    sha256).  compute_code_hash's full walk goes through here, and so does
+    the runtime monitor's boot-baseline mode, which derives its expected
+    hash from the boot snapshot it already takes — one walk at boot, not
+    two.  If the fold ever drifted between those two call sites, every
+    baseline-mode node would false-positive as tampered on its first full
+    verify.
+    """
+    manifest = '\n'.join(f"{rel}:{file_manifest[rel]}"
+                         for rel in sorted(file_manifest))
+    return hashlib.sha256(manifest.encode('utf-8')).hexdigest()
 
 
 def _load_code_hash_cache(root: Path) -> Optional[str]:

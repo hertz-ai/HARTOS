@@ -313,6 +313,20 @@ class ConsentService:
         consent.revoked_at = datetime.utcnow()
         db.flush()
 
+        ConsentService.announce_revocation(user_id, consent_type, scope, agent_id)
+        return consent
+
+    @staticmethod
+    def announce_revocation(user_id: str, consent_type: str,
+                            scope: str = '*', agent_id=None):
+        """Fire the immutable-audit entry + ``consent.revoked`` broadcast for a
+        revocation. PUBLIC on purpose: a surface that revokes by its own row
+        model (the append-only ``consent_api`` UI path cannot delegate the WRITE
+        without corrupting its audit trail) still gets IDENTICAL observability by
+        calling this, instead of reaching into this module's underscore-private
+        ``_audit``/``_emit``. That keeps the grant/revoke side-effect parity
+        STRUCTURAL — a caller cannot get the row and silently skip the audit +
+        broadcast. Best-effort (never raises)."""
         _audit('consent', actor_id=user_id,
                action=f'consent.revoked:{consent_type}',
                detail={'scope': scope, 'agent_id': agent_id})
@@ -322,7 +336,6 @@ class ConsentService:
             'scope': scope,
             'agent_id': agent_id,
         })
-        return consent
 
     @staticmethod
     def check_consent(db, user_id: str, consent_type: str,

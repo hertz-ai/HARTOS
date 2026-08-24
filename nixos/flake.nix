@@ -548,6 +548,15 @@
               nixos-hardware.outPath mobile-nixos.outPath
             ];
           }
+          ({ lib, ... }: {
+            # The installer writes the local flake's attr as plain `hart`
+            # (hart-installer.nix), so hart-self-build's old inline
+            # `#hart-<variant>` could never resolve on an installed node.
+            # Self-name accordingly (same option hart-ota consumes; the
+            # repart image overrides it to hart-<variant>-raw for the same
+            # reason). mkDefault: an operator override still wins.
+            hart.ota.flakeAttr = lib.mkDefault "hart";
+          })
         ] ++ hardwareModules ++ extraModules;
       };
 
@@ -1266,7 +1275,46 @@
       # 'screen' kill-switch is cut OR the authority is down, and ALLOWS when on.
       # Distinct attr -> clean //; desktop-variant node (mkNode).
       notify = import ./tests/notify.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // firmwareBootMatrix // bootLatency // driverMatrix // driverMatrixStorage // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify // hartInstaller // appInstallVerify // llmProvision // copilotResident;
+      # ── The OTA-target-must-boot-the-raw-disk gate (eval-time, no VM) ──
+      # Real HW 2026-08-22: hart-ota applied `#hart-desktop` (the ISO-kind
+      # closure) on a raw-flashed node; its initrd cannot mount a raw root and
+      # stage 1 stopped at "must mount the root filesystem on /mnt-root". A
+      # second latent form of the same bug: per-rev fs labels, where any
+      # cross-rev generation referenced a label the flashed disk doesn't have.
+      # This check pins the WHOLE contract at evaluation time: the raw config's
+      # self-named OTA attr exists in nixosConfigurations, resolves back to a
+      # raw-mountable config (stable labels on / and /boot), and can register
+      # boot entries (systemd-boot on, generation-capped for the 1G ESP).
+      # Eval-cheap on purpose: the full boot-the-raw-image-in-qemu test is
+      # tracked separately; THIS class of regression dies at `nix flake check`.
+      otaTargetBootsRaw = let
+        inherit (pkgs) lib;
+        rawCfg = self.nixosConfigurations.hart-desktop-raw.config;
+        attr = rawCfg.hart.ota.flakeAttr;
+        target = self.nixosConfigurations.${attr} or
+          (throw "hart.ota.flakeAttr='${attr}' names a nixosConfiguration that does not exist");
+        tCfg = target.config;
+      in {
+        ota-target-boots-raw =
+          assert lib.assertMsg (attr == "hart-desktop-raw")
+            "raw image must self-name its raw sibling, got '${attr}'";
+          assert lib.assertMsg
+            (tCfg.fileSystems."/".device == "/dev/disk/by-label/hart-root")
+            "OTA target mounts / by '${tCfg.fileSystems."/".device}' — a raw stick carries hart-root";
+          assert lib.assertMsg
+            (tCfg.fileSystems."/boot".device == "/dev/disk/by-label/HART-ESP")
+            "OTA target mounts /boot by '${tCfg.fileSystems."/boot".device}' — a raw stick carries HART-ESP";
+          assert lib.assertMsg tCfg.boot.loader.systemd-boot.enable
+            "OTA target has no systemd-boot — applied generations could never register a boot entry";
+          assert lib.assertMsg
+            (tCfg.boot.loader.systemd-boot.configurationLimit != null
+             && tCfg.boot.loader.systemd-boot.configurationLimit <= 3)
+            "configurationLimit unset/too high — ~90M per generation fills the 1G ESP";
+          pkgs.runCommand "ota-target-boots-raw" { } ''
+            echo "OTA target ${attr}: raw-mountable, entry-registering — contract holds" > $out
+          '';
+      };
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // firmwareBootMatrix // bootLatency // driverMatrix // driverMatrixStorage // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify // hartInstaller // appInstallVerify // llmProvision // copilotResident // otaTargetBootsRaw;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)

@@ -102,8 +102,44 @@ RUN set -eux; \
     install -m 0755 /tmp/livekit-server /usr/local/bin/livekit-server && \
     rm -f /tmp/lk.tgz /tmp/livekit-server
 
+# Durable state gets a named, mountable path. It used to have neither.
+#
+# core.platform_paths.get_data_dir() falls through to a platform default, which
+# inside this image is /root/.config/nunba. That is the container's writable
+# layer, so everything written there dies with the container. Nothing in the
+# Dockerfile, .env.example or any doc said so, which is how it went unnoticed.
+#
+# It was not theoretical. The marketing funnel counts every click, download,
+# install and signup into <data_dir>/marketing_clicks.jsonl, and the rebuild on
+# 2026-08-18 took the total from 29 events to 0. Channel attribution is the one
+# number that cannot be reconstructed after the fact: you cannot go back and
+# ask where those people came from. A campaign run against this would report
+# honest-looking zeros the morning after any deploy.
+#
+# NUNBA_DATA_DIR is read first by get_data_dir(), so pointing it at a path
+# under /app makes the location predictable and mountable. VOLUME declares the
+# intent and keeps the data out of the image layer even when an operator
+# forgets the -v; it is NOT a substitute for one, because a fresh container
+# gets a fresh anonymous volume. Bind it:
+#
+#   -v /opt/hzai-LLM-Langchain-Chatbot-Agent/data:/app/data
+ENV NUNBA_DATA_DIR=/app/data
+VOLUME ["/app/data"]
+
 # LiveKit RTC ports: WS signaling 7880, TCP fallback 7881, UDP range
 # 50000-60000 for media.  Operators expose only what their NAT requires.
 EXPOSE 6777 7880 7881
 
+# This CMD runs main(), which is the FULL boot: hevolve_verify_boot(),
+# guardrail hash enforcement, _validate_startup(), EventBus, local Crossbar
+# subscribers, runtime-tools restoration, HART skill registry, the agent-engine
+# daemon supervisor + Phase-2 goal bootstrap, then _serve_app -> hypercorn with
+# the /peer_link websocket listener mounted.
+#
+# This is what the live central node (192.168.0.9, container `langchain`,
+# port 6777) actually runs as of 2026-08-19.
+#
+# deploy/cloud/Dockerfile.prod is the OTHER variant: it serves
+# `hart_intelligence_entry:app` through gunicorn, which skips main() entirely
+# and cannot serve websockets.  Read its header before switching between them.
 CMD [ "python", "hart_intelligence_entry.py" ]

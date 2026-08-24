@@ -177,6 +177,13 @@ struct SurfaceData {
     /// retries, so one dropped vblank degrades to a stutter — NOT a permanent freeze that
     /// the paint watchdog would turn into a boot loop (#166 + #186 robustness).
     flip_queued_at: Option<std::time::Instant>,
+    /// When this CRTC last actually PRESENTED (a flip was queued successfully). `None`
+    /// until the first. Diagnostic only: it feeds the silent-freeze beacon below and
+    /// changes no scheduling decision.
+    last_flip_at: Option<std::time::Instant>,
+    /// Rate-limiter for that beacon, so a frozen CRTC logs once every
+    /// `SILENT_FREEZE_LOG_EVERY` instead of 60 times a second.
+    last_stall_log_at: Option<std::time::Instant>,
 }
 
 /// If a queued page-flip's vblank has not arrived within this long, assume it was lost
@@ -184,6 +191,30 @@ struct SurfaceData {
 /// comfortably past a real vblank (16.7ms) so we never pre-empt a healthy flip, but short
 /// enough that a dropped vblank is an imperceptible stutter rather than a frozen screen.
 const VBLANK_STALL_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// SILENT-FREEZE BEACON (real-HW 2026-08-19). The box froze on an orb click+drag and
+/// left NO evidence: hart-comp's loop kept running at its full 66 wakeups/sec, the
+/// Wayland side stayed healthy (a fresh client connected, and a brand-new toplevel was
+/// accepted and logged as window.opened), the cursor still moved, the GPU was awake with
+/// zero i915 errors — and yet nothing was ever presented again, for ANY client. The new
+/// window never appeared either, which is what rules the shell out as the cause.
+///
+/// Every FAILURE path in `present_surfaces` already logs (queue_frame errors,
+/// render_frame faults, the lost-vblank recovery). None of them fired. By elimination
+/// the tick is taking the ONE silent path, `Ok(true) => continue` ("render_frame says
+/// nothing changed"), on every tick forever — which cannot be a scheduling stall,
+/// because RepaintScheduler's 200ms IDLE_HEARTBEAT forces a paint attempt 5x/sec
+/// regardless of damage.
+///
+/// So the question this beacon exists to answer is precisely: when the screen is frozen
+/// but the loop is healthy, what does the render path actually SEE? It reports the
+/// element count it was handed, the per-CRTC flip state, and how long since this CRTC
+/// last presented. Diagnostic ONLY: it never changes a scheduling decision, so it cannot
+/// perturb the thing it is measuring.
+const SILENT_FREEZE_AFTER: Duration = Duration::from_secs(3);
+/// Rate-limit for the beacon: once per this interval per CRTC, so a permanently frozen
+/// output produces a readable trail instead of flooding the journal at 60Hz.
+const SILENT_FREEZE_LOG_EVERY: Duration = Duration::from_secs(5);
 
 /// One opened DRM device (the GPU) + its per-CRTC scanout surfaces. Held in the loop
 /// data so the VBlank handler can find the right surface to mark submitted + re-queue.
@@ -705,6 +736,13 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     info!(socket = %socket_name, "HART-comp DRM compositor initialized — entering the loop (real-HW scanout on the pixman floor)");
 
+    // Monotonic base for the frame-callback timestamps sent below. This backend used to
+    // send a CONSTANT 0, which is wrong per the wl_callback protocol (see the note there,
+    // including the correction that it was NOT the cause of the desktop freeze).
+    // winit.rs has always derived its timestamp from `state.start_time`; the udev State
+    // has no such field, so the base is captured here instead.
+    let frame_clock_base = std::time::Instant::now();
+
     while state.running {
         // Dispatch calloop sources (libinput, session, udev, the client socket, and the
         // per-device DRM VBlank sources) + a 16ms housekeeping tick, then the Display.
@@ -739,7 +777,28 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Send frame callbacks so clients (the glass shell) draw their next frame.
-        let now_ms = 0u32; // monotonic ms is unused by the shell; 0 is a valid "now".
+        //
+        // A REAL MONOTONIC TIMESTAMP, NOT 0 (real-HW 2026-08-19). This line used to read
+        // `let now_ms = 0u32;` with the comment "monotonic ms is unused by the shell; 0 is
+        // a valid now". That assumption is wrong on its own terms, and this fixes it.
+        //
+        // CORRECTION, so the next reader is not misled the way I was: the original commit
+        // message for this change (79391a6) claimed it was THE fix for the orb-hover /
+        // click-drag desktop freeze. IT IS NOT. With this change in place and verified
+        // live on the box, the freeze still reproduces on the first orb click. It was
+        // later reproduced with the GStreamer audio path removed entirely, and on wholly
+        // stock code, so the freeze has a different cause that is still open. What
+        // remains true of this line is only the protocol point below.
+        //
+        // wl_callback.done carries the frame time in MILLISECONDS, and GTK4's Wayland
+        // backend feeds it into its frame clock, which derives the refresh interval and
+        // the predicted presentation time from successive values. A constant is simply
+        // wrong to send, whatever else is or is not true about it.
+        //
+        // winit.rs, the dev/VM backend, has ALWAYS sent
+        // `state.start_time.elapsed().as_millis()`; only this hardware path sent 0. The
+        // udev State has no start_time field, so the base is captured at the loop above.
+        let now_ms = frame_clock_base.elapsed().as_millis() as u32;
         let surfaces: Vec<_> = state
             .space
             .elements()
@@ -933,7 +992,18 @@ fn device_added(
         .map_err(|e| format!("DrmCompositor::new failed: {e}"))?;
         surfaces.insert(
             crtc,
-            SurfaceData { compositor, awaiting_vblank: false, flip_queued_at: None },
+            SurfaceData {
+                compositor,
+                awaiting_vblank: false,
+                flip_queued_at: None,
+                // Seeded at construction, NOT None: the beacon measures "how long since
+                // anything reached this CRTC's screen", and a surface that never presents
+                // AT ALL is the most serious version of that, not a case to stay silent
+                // on. Seeding makes never-first-paint report after SILENT_FREEZE_AFTER
+                // instead of being swallowed by an `unwrap_or(false)`.
+                last_flip_at: Some(std::time::Instant::now()),
+                last_stall_log_at: None,
+            },
         );
         info!(crtc = ?crtc, "HART-comp DRM: output online (pixman scanout)");
     }
@@ -1237,6 +1307,15 @@ fn present_surfaces<R>(
     elements: &[HartRenderElement<R>],
     clear: Color32F,
     now: std::time::Instant,
+    // Diagnostic context for the silent-freeze beacon ONLY (never a render input).
+    // These are the two collections the frame-callback loop in run_udev walks, so
+    // they answer the question the first beacon could not: is the client starving
+    // because we are sending it nothing? A client that never receives a frame
+    // callback stops committing, and then "render_frame says nothing changed" is
+    // TRUE but is a SYMPTOM, not the cause. layer_count == 0 means the glass shell's
+    // wlr-layer surface is not in the map we send callbacks to.
+    space_count: usize,
+    layer_count: usize,
 ) -> bool
 where
     R: Renderer + Bind<Dmabuf>,
@@ -1257,6 +1336,10 @@ where
         if !device.master {
             acquire_drm_master(device);
         }
+        // Copied out BEFORE the surfaces loop: the loop takes `device.surfaces` mutably,
+        // so reading `device.master` inside it would be a second borrow. Diagnostic only
+        // (the silent-freeze beacon reports whether we still hold DRM master).
+        let device_master = device.master;
         for (crtc, surface) in device.surfaces.iter_mut() {
             // F1 (#166): never start a new flip while the prior one is still in flight to
             // this CRTC — wait for its vblank (which clears `awaiting_vblank` in
@@ -1290,6 +1373,48 @@ where
             match render_outcome {
                 Ok(true) => {
                     // Nothing changed — no flip to schedule, no vblank to await.
+                    //
+                    // This is the ONLY silent path in this match, and the 2026-08-19
+                    // freeze proved it can also be the WRONG answer: taken forever while
+                    // a real client (and even a freshly mapped toplevel) is on screen and
+                    // never gets presented. Report it when it persists, with the state
+                    // that decides which of the two it is: `elements` is what the render
+                    // path was actually handed, so elements=0 means the scene collapsed
+                    // upstream in build_frame_elements, while a NON-zero count means the
+                    // scene is intact and the DrmCompositor's own damage tracking is
+                    // wedged. Those need opposite fixes, which is the whole reason this
+                    // logs rather than guesses.
+                    let frozen_for = surface.last_flip_at.map(|t| now.saturating_duration_since(t));
+                    let overdue = frozen_for.map(|d| d >= SILENT_FREEZE_AFTER).unwrap_or(false);
+                    let due_to_log = surface
+                        .last_stall_log_at
+                        .map(|t| now.saturating_duration_since(t) >= SILENT_FREEZE_LOG_EVERY)
+                        .unwrap_or(true);
+                    if overdue && due_to_log {
+                        surface.last_stall_log_at = Some(now);
+                        warn!(
+                            ?crtc,
+                            elements = elements.len(),
+                            // The two collections run_udev's frame-callback loop walks.
+                            // THE question the first beacon could not answer: a client
+                            // that receives no frame callback stops committing, and then
+                            // "nothing changed" is TRUE but is the SYMPTOM. If
+                            // layer_surfaces == 0 while the glass shell is on screen, we
+                            // are starving it and the freeze starts here, not in damage.
+                            space_windows = space_count,
+                            layer_surfaces = layer_count,
+                            // `as u64`: Duration::as_millis is u128, which does NOT
+                            // implement tracing::Value — it would not compile as a field.
+                            frozen_for_ms = frozen_for.map(|d| d.as_millis() as u64).unwrap_or(0),
+                            awaiting_vblank = surface.awaiting_vblank,
+                            master = device_master,
+                            "HART-comp DRM: SILENT FREEZE — render_frame reports \"nothing changed\" \
+                             but this CRTC has not presented in a long time. layer_surfaces=0 means \
+                             the shell is being sent NO frame callbacks (it can never commit again, \
+                             so this is a symptom); layer_surfaces>0 with elements>0 means the scene \
+                             is intact and reaching the client, and the damage tracking is wedged."
+                        );
+                    }
                     continue;
                 }
                 Ok(false) => match surface.compositor.queue_frame(()) {
@@ -1297,6 +1422,9 @@ where
                     Ok(()) => {
                         surface.awaiting_vblank = true;
                         surface.flip_queued_at = Some(now);
+                        // This CRTC just presented. Sole input to the silent-freeze
+                        // beacon's "how long since anything reached the screen".
+                        surface.last_flip_at = Some(now);
                     }
                     Err(err) => {
                         // A flip/commit ioctl error (the real-HW EACCES/EBUSY/ENODEV/
@@ -1396,11 +1524,20 @@ fn render_all(
     // disjointly. GlesRenderer satisfies the builder's `Renderer + ImportAll + ImportMem`
     // bounds (proven by winit.rs) AND `present_surfaces`'s `Bind<Dmabuf>` bound, so the
     // GPU desktop gets the SAME cursor / kill-switch / fades with ZERO parallel render code.
+    // Diagnostic counts for the silent-freeze beacon: EXACTLY the two collections
+    // run_udev's frame-callback loop walks, sampled here where `state` is borrowable.
+    // The layer-map guard is scoped so it is dropped before the render borrows below.
+    let space_count = state.space.elements().count();
+    let layer_count = {
+        let map = layer_map_for_output(&state.output);
+        map.layers().count()
+    };
+
     let mut demote_gles = false;
     if let Some(renderer) = gles.as_mut() {
         let elements: Vec<HartRenderElement<GlesRenderer>> =
             comp_core::build_frame_elements(state, renderer, size);
-        demote_gles = present_surfaces(devices, renderer, &elements, clear, now);
+        demote_gles = present_surfaces(devices, renderer, &elements, clear, now, space_count, layer_count);
     } else {
         // ── Pixman software-floor path (the never-fail renderer of record) ── The renderer
         // lives ON `state`, but `build_frame_elements` needs BOTH `&mut state` (reads the
@@ -1421,7 +1558,7 @@ fn render_all(
         // The pixman floor has NO lower renderer to demote to, so its renderer-fault return
         // is ignored (a pixman RenderFrame fault is a transient retried next tick — there is
         // no GL context to lose on the CPU path).
-        let _ = present_surfaces(devices, &mut renderer, &elements, clear, now);
+        let _ = present_surfaces(devices, &mut renderer, &elements, clear, now, space_count, layer_count);
         // Restore the real renderer (keeping the ORIGINAL instance avoids re-allocating its
         // internal caches every tick).
         state.renderer = renderer;

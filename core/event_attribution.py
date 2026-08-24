@@ -15,6 +15,7 @@ exactly as before: no regression, no leak.
 Single source: every publisher that needs per-user routing calls this, rather
 than each re-deriving the owner.
 """
+import time
 from typing import Optional
 
 from core.constants import MACHINE_GOAL_AUTHORS
@@ -111,19 +112,37 @@ def owner_user_id(user_prompt=None, goal_id=None, metadata=None) -> Optional[str
 
 _SOLE_USER_CACHE = []          # [] unknown, [None] known-not-single, [uid] known
 
+# Zero-user results are re-checked rather than cached (see _sole_local_user_id):
+# a fresh appliance has 0 users only until the human signs up, and pinning that
+# answer leaves every agent panel dark until a backend restart.  This throttles
+# the re-query so the healing path costs at most one DB hit per interval.
+_ZERO_USER_RECHECK_S = 60.0
+_ZERO_USER_LAST_CHECK = [0.0]
+
 
 def _sole_local_user_id() -> Optional[str]:
     """The id of the ONLY user on this node, or None if there are 0 or >1.
 
     Cached after the first resolution: this is called on every agent event
     (agent.action.completed alone runs ~4,882 times a day) and must not add a
-    DB round trip per emit.  A negative result is cached too, so a genuinely
-    multi-tenant node pays exactly one query.  Errors are NOT cached -- the DB
-    may just be busy, and caching a transient failure would permanently disable
-    per-user routing.
+    DB round trip per emit.
+
+    The two negatives are cached DIFFERENTLY, on purpose:
+      * >1 users  -- stable, cached forever: a multi-tenant node pays one query.
+      * 0 users   -- TRANSIENT (a fresh appliance before the human signs up),
+                     so it is re-checked every _ZERO_USER_RECHECK_S instead of
+                     pinned.  Caching it was what left the agents panel dark
+                     after signup until a backend restart.
+      * errors    -- never cached: the DB may just be busy, and caching a
+                     transient failure would permanently disable per-user
+                     routing.
     """
     if _SOLE_USER_CACHE:
         return _SOLE_USER_CACHE[0]
+    # A recent zero-user answer: hold it briefly rather than querying per emit.
+    last = _ZERO_USER_LAST_CHECK[0]
+    if last and (time.monotonic() - last) < _ZERO_USER_RECHECK_S:
+        return None
     try:
         from integrations.social.models import db_session, User
         with db_session() as db:
@@ -133,8 +152,30 @@ def _sole_local_user_id() -> Optional[str]:
                 if uid:
                     _SOLE_USER_CACHE.append(str(uid))
                     return str(uid)
-            # 0 or >1 users: never fall back.  Cache the negative.
-            _SOLE_USER_CACHE.append(None)
+            if len(rows) > 1:
+                # Genuinely multi-tenant: stable, never falls back.  Cache it.
+                _SOLE_USER_CACHE.append(None)
+                return None
+            # ZERO users is NOT the same negative, and must not be cached the
+            # same way.  It is the normal state of a FRESH appliance for the
+            # minutes between first boot and the human signing up -- while the
+            # daemons are already emitting (agent.action.completed fires from
+            # daemon-seeded goals immediately).  Caching it pinned this to None
+            # for the life of the process, so the moment the human DID create
+            # their account the events kept being refused and the agents panel
+            # stayed dark until someone restarted the backend.
+            #
+            # Measured on the reflashed Samsung box 2026-08-22: users=1,
+            # agent_goals=0, and yet 666+ "SSE broadcast refused ... has no
+            # user_id" per boot, with the panel showing a reconnect/retry
+            # button.  The account existed; the cache still said None.
+            #
+            # Re-query instead, throttled, so an appliance heals within
+            # _ZERO_USER_RECHECK_S of signup while a node nobody ever signs
+            # into still costs at most one query per interval -- which keeps
+            # the no-DB-round-trip-per-emit property this cache exists for
+            # (agent.action.completed alone runs ~4,882 times a day).
+            _ZERO_USER_LAST_CHECK[0] = time.monotonic()
     except Exception:
         return None
-    return _SOLE_USER_CACHE[0]
+    return None

@@ -443,6 +443,45 @@ def _register_defaults():
             cost_per_1k_tokens=1.5,
         ))
 
+    # 5a2. Claude Code (the SUBSCRIPTION path — NOT the API key above). The
+    #      resident, already-authorized `claude -p` served as an
+    #      OpenAI-compatible endpoint by integrations.providers
+    #      .claude_code_endpoint (/api/claude/v1). This is how HARTOS "wears
+    #      Claude as its engine" using the ONE credential the copilot logged in
+    #      with — no ANTHROPIC_API_KEY, no per-token cost. It is a LOCAL expert
+    #      (is_local=True) in the same registry the hive uses for remote experts.
+    #
+    #      Gated on claude_code_available(): a node without Claude Code logged in
+    #      simply lacks THIS frontier tier and falls back to the hive experts /
+    #      local models — it never registers a backend that 503s every call.
+    #      Higher latency + lower nominal accuracy-vs-cost than the API path is
+    #      deliberate: `claude -p` is the agent binary in print mode, so it is
+    #      the frontier/background tier, never the hot draft path.
+    try:
+        from integrations.coding_agent.claude_code_backend import claude_code_available
+        if claude_code_available():
+            from core.port_registry import get_port
+            _cc_base = 'http://127.0.0.1:%s/api/claude/v1' % get_port('backend')
+            model_registry.register(ModelBackend(
+                model_id='claude-code',
+                display_name='Claude Code (Frontier, subscription)',
+                tier=ModelTier.EXPERT,
+                config_list_entry={
+                    'model': 'claude-code',
+                    'api_key': 'dummy',            # local shim; auth is the sub
+                    'base_url': _cc_base,
+                    'price': [0, 0],               # subscription, not per-token
+                },
+                avg_latency_ms=6000.0,             # agent binary in print mode
+                accuracy_score=0.95,
+                cost_per_1k_tokens=0.0,
+                is_local=True,
+                hardware_dependent=False,
+            ))
+    except Exception as _cc_err:                    # never break registry init
+        import logging as _l
+        _l.getLogger(__name__).debug("claude-code backend not registered: %s", _cc_err)
+
     # 5b. GLM 5.2 (Zhipu / Z.ai — expert tier, OpenAI-compatible API — if key set)
     #     Zhipu exposes an OpenAI-compatible endpoint, so this registers exactly
     #     like Groq/DeepSeek/Claude above (no special client). GLM_API_KEY is the

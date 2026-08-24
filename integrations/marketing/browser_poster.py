@@ -54,9 +54,22 @@ def post_to_platform_via_browser(platform, body=None, code=None,
                          f'channel adapter (e.g. whatsapp_adapter) instead'}
 
     text = (body or intent.body_text or '').strip()
+    # Carry the intent's own notes into the instruction.
+    #
+    # The line below used to assert flatly that the URL "opens the <platform>
+    # post composer".  That holds for twitter/reddit, whose intent URLs ARE
+    # composers, and is simply false for the ones where it isn't: Instagram
+    # has no share-intent URL at all, so its intent_url is the site root and
+    # the agent has to click Create itself.  Told the composer was already
+    # open, the agent looks for a text box that isn't there.
+    #
+    # `notes` is the single place each intent already records that caveat
+    # (intents.py), so pass it through instead of restating per platform here.
+    notes = (intent.notes or '').strip()
     instruction = (
         f"Open this URL in the web browser: {intent.intent_url}\n"
-        f"It opens the {platform} post composer; the user is already logged in.\n"
+        f"This is the {platform} posting surface; the user is already logged in.\n"
+        + (f"Important notes about {platform}: {notes}\n" if notes else "")
         + (f"If the composer text is empty, type EXACTLY this and change nothing:\n{text}\n"
            if text else "")
         + "Then click the Post / Tweet / Submit button to publish it. "

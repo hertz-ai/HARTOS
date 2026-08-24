@@ -263,11 +263,27 @@ def verify_all(candidates: Sequence[Dict[str, str]],
 
 
 def assert_publishable(facts: Sequence[Any]) -> List[GroundedFact]:
-    """Last gate before anything leaves the machine.
+    """Raise unless every item is a GroundedFact. NOT WIRED as of 2026-08-19.
 
-    Call this at the publish boundary. It raises rather than filtering,
-    because a publisher that quietly drops unverified items still lets a
-    caller believe it published what it was given.
+    ZERO production callers. It was written to be the last gate before
+    anything leaves the machine, and it raises rather than filters so a
+    publisher cannot quietly drop unverified items while letting its caller
+    believe it published what it was given. None of that is in force today:
+    nothing calls it, so publishing is NOT grounded-gated.
+
+    It cannot simply be called at the publish boundary, because GroundedFact
+    does not survive the trip. verify_facts (marketing_tools.py:390) runs
+    verify_all and returns ``[f.to_dict() for f in grounded]`` as JSON TO THE
+    LLM; the LLM then composes free text and calls create_social_post(
+    content: str) / post_to_channel. By the boundary there are no
+    GroundedFact objects left to assert on, only prose. Wiring this needs
+    fact-ids carried through the tool round trip and re-hydrated at publish
+    time, or re-verification at the boundary -- new machinery, not a call
+    site.
+
+    Until then treat "the publish path is grounded" as FALSE. The grounding
+    contract lives only in verify_facts' docstring, which instructs the
+    model; it is not enforced in code.
     """
     bad = [f for f in facts if not isinstance(f, GroundedFact)]
     if bad:

@@ -162,14 +162,51 @@ in
         KERNEL=="vndbinder", MODE="0660", GROUP="hart"
       '';
 
-      # SELinux-compatible properties filesystem (Android expects this)
-      boot.specialFileSystems = {
-        "/dev/binderfs" = {
-          device = "binder";
-          fsType = "binder";
-          options = [ "stats=global" ];
-        };
-      };
+      # SELinux-compatible properties filesystem (Android expects this).
+      #
+      # A systemd mount unit, NOT boot.specialFileSystems. specialFileSystems
+      # runs through NixOS's specialMount on EVERY activation, and specialMount
+      # turns an already-mounted target into a REMOUNT:
+      #
+      #   if mountpoint -q "$mountPoint"; then options="remount,$options"; fi
+      #   mount -t "$fsType" -o "$options" "$device" "$mountPoint"
+      #
+      # binderfs does not support remount. So the FIRST activation (boot) mounts
+      # it fine and every activation AFTER that fails:
+      #
+      #   mount: /dev/binderfs: mount point not mounted or bad option   (rc=32)
+      #   Activation script snippet 'specialfs' failed (32)
+      #
+      # specialfs is early in the activation script, so its failure aborts the
+      # rest ("Failed to run activate script") mid-switch. Measured on the real
+      # Samsung box 2026-08-21: a `nixos-rebuild switch` did exactly this, the
+      # switch then asked systemd to re-exec, and the machine landed in
+      # Emergency Mode -- with root locked, so the console could not even be
+      # used ("cannot open access to console, root account is locked"). Recovery
+      # needed a human choosing the previous generation at the boot menu.
+      #
+      # That makes this an OTA-APPLY blocker, not a cosmetic warning: hart-ota
+      # applies updates with `nixos-rebuild switch --flake`, autoApply is on by
+      # default, and the canary's auto-revert cannot save the node because
+      # Emergency Mode stops the very units that would perform the rollback. Any
+      # node with hart.kernel android support enabled would brick itself on the
+      # first published update. It also stacked a duplicate binderfs mount per
+      # successful pass (2 were present on the box).
+      #
+      # systemd mount units are idempotent: an already-mounted target leaves the
+      # unit active and systemd does not re-issue the mount, so activation stops
+      # depending on a filesystem that cannot be remounted. systemd creates the
+      # mount point itself. Ordering is late enough -- nothing in stage 2 needs
+      # binderfs before systemd; the Android/waydroid consumers are all units.
+      systemd.mounts = [
+        {
+          what = "binder";
+          where = "/dev/binderfs";
+          type = "binder";
+          options = "stats=global";
+          wantedBy = [ "local-fs.target" ];
+        }
+      ];
 
       # Kernel params for Android subsystem
       boot.kernelParams = [
@@ -336,7 +373,14 @@ in
       # OpenGL + Vulkan + compute
       hardware.graphics = {
         enable = true;
-        enable32Bit = lib.mkDefault true;
+        # x86_64 ONLY. nixpkgs asserts "`hardware.graphics.enable32Bit` is only
+        # supported on an x86_64 system", and there is no 32-bit userland to
+        # support anywhere else, so an unconditional `true` here is not a
+        # preference that goes unused off x86, it is an eval FAILURE: it took
+        # down every ARM and RISC-V configuration (hart-server-arm,
+        # hart-desktop-arm/rpi, hart-edge-arm/riscv, hart-phone, ...). Same
+        # platform gate the open-vm-tools default already uses in hart-base.nix.
+        enable32Bit = lib.mkDefault pkgs.stdenv.hostPlatform.isx86_64;
       };
     })
 

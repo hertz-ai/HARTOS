@@ -1,5 +1,5 @@
 [Unit]
-Description=HART OS Backend (Flask/Waitress)
+Description=HART OS Backend (Flask over Hypercorn/ASGI)
 Documentation=https://github.com/hertz-ai/HARTOS
 After=network-online.target
 Wants=network-online.target
@@ -9,7 +9,24 @@ Type=simple
 User=hart
 Group=hart
 WorkingDirectory=/opt/hart
-ExecStart=/opt/hart/venv/bin/python -m waitress --port=${HARTOS_BACKEND_PORT:-6777} --threads=50 hart_intelligence_entry:app
+# Serves asgi:application, not hart_intelligence_entry:app.
+#
+# waitress is pure WSGI and has no websocket support, so the previous
+# ExecStart served HTTP correctly and silently dropped ws://<node>/peer_link --
+# PeerLink.accept() never fired and PeerLinkManager._links stayed empty for
+# skill broadcast, _publish_via_peer_link and collect() shard fan-out. waitress
+# is in this stack because it is the only WSGI server that runs on Windows
+# (where the Nunba desktop lives); on Linux it had no platform justification.
+#
+# asgi:application is peer_link_asgi(AsyncioWSGIMiddleware(app)) built by the
+# canonical core.serve.build_asgi_app. It does NOT run main(), so boot
+# integrity checks, guardrail hash enforcement, the EventBus, Crossbar
+# subscribers and the agent daemon supervisor are unchanged by this line --
+# enabling those is a separate decision (see asgi.py).
+#
+# If hypercorn or its h2/wsproto subtree is missing, this fails to start rather
+# than degrading to a peer-invisible server. That is intended.
+ExecStart=/opt/hart/venv/bin/python -m hypercorn asgi:application --bind 0.0.0.0:${HARTOS_BACKEND_PORT:-6777} --keep-alive 120
 EnvironmentFile=/etc/hart/hart.env
 Restart=on-failure
 RestartSec=5

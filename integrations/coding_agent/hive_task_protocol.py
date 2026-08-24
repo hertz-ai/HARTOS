@@ -130,6 +130,20 @@ class HiveTask:
     requires_review: bool = True
     origin_node_id: str = ''              # Who created this task
     origin_signature: str = ''            # Ed25519 signature for verification
+    # How the RECEIVER should trust this origin. Both readers already expect it
+    # on the payload -- ClaudeHiveSession._verify_task_origin() accepts an
+    # unsigned task only at 'same_user', and _apply_shard_filter() widens scope
+    # for it -- but nothing ever set it, so every locally created task arrived
+    # with trust '' and was rejected as "invalid origin signature". Default is
+    # empty (least privilege): a task is trusted only where an origin says so.
+    trust_level: str = ''                 # 'same_user' | 'full_file' | 'peer' | 'relay'
+    # Same story for scope: ClaudeHiveSession._check_scope_match() decides on
+    # 'scope_level' and 'repo_owner', and a session scoped to 'own_repos' (the
+    # default) refuses anything that matches neither. Absent from the model,
+    # they could not be set even deliberately -- HiveTask(**kwargs) would raise
+    # -- so every task failed scope on arrival right after passing origin.
+    scope_level: str = 'any'              # 'any' | 'public' | 'own_repos'
+    repo_owner: str = ''                  # user_id owning repo_url, if any
     assigned_session_id: str = ''
     status: str = 'pending'               # HiveTaskStatus value
     result: Dict[str, Any] = field(default_factory=dict)
@@ -358,6 +372,20 @@ class HiveTaskDispatcher:
             except ValueError:
                 lo, hi = 5, 50
             kwargs['spark_reward'] = max(lo, min(hi, complexity))
+
+        # A task created here originates ON this node, from its owner: the
+        # "own devices" case _verify_task_origin() accepts unsigned. It has to
+        # be unsigned -- signing needs the master PRIVATE key, which is the
+        # vendor's and is never on a node, so a locally created task can never
+        # carry a signature. Remote tasks never pass through create_task(); they
+        # arrive as already-signed payloads on EVENT_TASK_DISPATCHED, so this
+        # cannot widen trust for anything off-node. setdefault, not assignment:
+        # an explicit trust_level in kwargs still wins.
+        kwargs.setdefault('trust_level', 'same_user')
+        # Locally created work is this owner's own work, which is what an
+        # 'own_repos' session (the default scope) is for. Both are setdefault:
+        # a caller creating public or third-party work overrides them.
+        kwargs.setdefault('scope_level', 'own_repos')
 
         task = HiveTask(
             task_id=task_id,

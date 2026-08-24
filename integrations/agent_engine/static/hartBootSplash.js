@@ -18,7 +18,25 @@
   var box = document.getElementById('hart-boot-lottie');
   if (!el) return;
 
-  function remove() { if (el && el.parentNode) el.parentNode.removeChild(el); el = null; }
+  var anim = null;
+
+  // Destroying the player is NOT optional. lottie-web keeps every animation it
+  // has loaded in its OWN registry and drives them all from a global rAF, so
+  // detaching the container stops the hourglass being SEEN, never being
+  // COMPUTED. The return value here was discarded, so nothing could ever stop
+  // it: a 60-second, 30fps, 15-layer animation kept recomputing and writing SVG
+  // attributes into a detached tree for the entire life of the shell session,
+  // on a login screen that looks perfectly static. It survives every screen
+  // because it outlived the element it belonged to.
+  function remove() {
+    if (anim) {
+      try { anim.destroy(); }
+      catch (e) { console.debug('hartBootSplash: lottie destroy failed (non-fatal)', e); }
+      anim = null;
+    }
+    if (el && el.parentNode) el.parentNode.removeChild(el);
+    el = null;
+  }
 
   // Show once per shell session — a soft reload shouldn't replay the splash.
   try {
@@ -43,7 +61,7 @@
 
   try {
     if (box && window.lottie && typeof window.lottie.loadAnimation === 'function') {
-      window.lottie.loadAnimation({
+      anim = window.lottie.loadAnimation({
         container: box, renderer: 'svg',
         loop: !reduce, autoplay: !reduce,
         path: '/shell/static/hevolve-anim.json'

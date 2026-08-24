@@ -618,6 +618,34 @@ RECIPE_SEMANTIC_TOPIC: str = 'com.hertzai.hevolve.recipe.{semantic_class}.{slug}
 # point of Tool() construction so their tools also get a friendly label.
 # Unknown tools fall back to "Running {name}…" at the emit site.
 # Keep values <= 60 chars (UI bubble truncates).
+# ── Upstream LLM states that are TRANSIENT, not failures ──────────────
+# llama-server answers HTTP 200 with {"error": {"message": "Loading model"}}
+# while weights load.  That was surfaced to the user verbatim as
+# "I couldn't process that request - Loading model" (live 2026-08-18, twice
+# in a row on "Hi!"), which leaks llama.cpp's internal wording, reads as a
+# permanent failure, and was returned as a normal assistant turn -- so it
+# was persisted into conversation history and fed back to the model as a
+# prior turn.
+#
+# The copy below is the same wording routes/chatbot_routes.py already sends
+# when the server is unreachable, so both "engine down" and "engine warming
+# up" tell the user the same thing.  Detail stays in the log, not the reply.
+LLM_TRANSIENT_LOADING_MARKERS: tuple = (
+    'loading model',
+    'model is loading',
+    'model loading',
+)
+
+LLM_LOADING_REPLY: str = (
+    "Starting the local AI engine for you now. "
+    "Give it a few seconds and send your message again."
+)
+
+LLM_GENERIC_ERROR_REPLY: str = (
+    "I ran into a problem handling that. Please try again."
+)
+
+
 TOOL_LABELS: dict = {
     # Memory + history
     'FULL_HISTORY':                'Searching your message history…',
@@ -940,3 +968,16 @@ MACHINE_GOAL_AUTHORS = frozenset({
     'revenue_aggregator',
     'system_daemon',
 })
+
+
+# ── HTTP payload policy (ONE source, two consumers) ──────────────────────
+# hart_intelligence_entry sets Flask's MAX_CONTENT_LENGTH from this, and
+# core.serve passes it to Hypercorn's AsyncioWSGIMiddleware as max_body_size.
+# Before 2026-08-21 the transport side was never set, so the middleware's
+# library default of 2**16 (64 KB) silently rejected every POST body larger
+# than that with an empty 400 — measured live: a 50 KB multipart reached the
+# Flask handler, a 200 KB one never did.  A 5-second voice recording is
+# ~150 KB; batch /voice/transcribe and any real upload were unreachable
+# while the app-level policy said 2 MB was fine.
+import os as _os
+MAX_PAYLOAD_BYTES = int(_os.environ.get('HEVOLVE_MAX_PAYLOAD_BYTES', 2 * 1024 * 1024))

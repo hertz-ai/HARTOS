@@ -1,7 +1,7 @@
 """create_recipe.py"""
 # Guard: cx_Freeze frozen builds close stdout/stderr. Must be BEFORE autogen imports.
 import sys, os
-from core.io_guard import silence_stdio; silence_stdio()
+from core.io_guard import silence_stdio, install_autogen_iostream; silence_stdio()
 # #170 — autogen budget constants live in core.constants (single source
 # of truth, was hardcoded as max_tokens=3500 in 4 sites here and 3 in
 # reuse_recipe.py).  See AUTOGEN_MESSAGE_TOKEN_BUDGET comment for why
@@ -23,7 +23,7 @@ import ast
 # actually constructed — saving ~11-24s off `import create_recipe` and
 # therefore off the backend boot.  See tests/unit/test_lazy_autogen_import.py.
 from core.optional_import import lazy_module
-autogen = lazy_module("autogen")
+autogen = lazy_module("autogen", on_import=install_autogen_iostream)
 
 # Qwen3.5's Jinja chat template rejects system messages mid-conversation:
 #   "System message must be at the beginning"
@@ -42,8 +42,12 @@ from apscheduler.triggers.interval import IntervalTrigger
 from core.http_pool import pooled_get, pooled_post, pooled_patch, pooled_request
 from core.port_registry import get_port as _get_llm_port, get_local_llm_url
 from core.file_cache import atomic_json_write  # canonical atomic write (tmp + fsync + os.replace)
-import txaio; txaio.use_asyncio()  # Must be before any autobahn import
-from autobahn.asyncio.component import Component, run
+# NOTE: the module-level `import txaio; from autobahn... import Component, run`
+# was removed. The WAMP RPC path (subscribe_and_return) now lives in helper_fun,
+# so create_recipe no longer references autobahn/Component at all — the import was
+# dead here and it hard-failed `import create_recipe` wherever autobahn isn't
+# installed (e.g. CI base install, which does not carry the optional WAMP deps).
+# tests/unit/test_lazy_autogen_import.py guards against that import regressing.
 import uuid
 import asyncio
 import traceback
@@ -218,16 +222,27 @@ def publish_agent_thought(last_speaker, messages, user_id):
         except Exception:
             pass
 
-# Add Smart Ledger for persistent task tracking - using agent_ledger package (from gpt4.1)
-try:
-    from agent_ledger import (
-        SmartLedger, Task, TaskType, TaskStatus, ExecutionMode,
-        create_ledger_from_actions, get_production_backend
-    )
-    from agent_ledger.factory import create_production_ledger, get_or_create_ledger
-    HAS_SMART_LEDGER = True
-except ImportError:
-    HAS_SMART_LEDGER = False
+# Smart Ledger — task memory, prerequisites and delegation for every agent.
+#
+# Imported UNCONDITIONALLY on purpose.  This used to be wrapped in
+# `try: ... except ImportError: HAS_SMART_LEDGER = False`, and that flag was
+# then read by NOTHING — so a failed import did not disable the ledger, it
+# just deferred the failure: create_action_with_ledger went on to call
+# get_production_backend() and died with `NameError: name
+# 'get_production_backend' is not defined` on the agent-creation path
+# (reproduced 2026-08-21 building the assistant for 1_7101).
+#
+# agent_ledger is first-party HARTOS code vendored in-tree, not a third-party
+# extra, and an agent without task memory is not a degraded agent — it is a
+# broken one.  So there is nothing to feature-flag: if this import fails the
+# build is wrong and it should say so here, loudly, instead of producing
+# agents that lose their tasks.  core/__init__.py guarantees the in-tree
+# package resolves in a source checkout as well as installed and frozen.
+from agent_ledger import (
+    SmartLedger, Task, TaskType, TaskStatus, ExecutionMode,
+    create_ledger_from_actions, get_production_backend
+)
+from agent_ledger.factory import create_production_ledger, get_or_create_ledger
 # Add to your create_recipe.py after imports
 from lifecycle_hooks import (
     initialize_deterministic_actions,
@@ -1494,9 +1509,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             "actions_this_action_depends_on": []
                         }
 
-                        # Save the recipe
-                        with open(vlm_agent_path, 'w') as json_file:
-                            json.dump(recipe_data, json_file, indent=4)
+                        # Save the recipe (atomic: tmp + fsync + os.replace)
+                        atomic_json_write(vlm_agent_path, recipe_data, indent=4)
 
                         tool_logger.info(f"Generated recipe data saved to {vlm_agent_path}")
 
@@ -2551,8 +2565,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                                 _ri[_rk], _ = redact_secrets(_ri[_rk])
                                 except ImportError:
                                     pass
-                                with open(name, "w") as json_file:
-                                    json.dump(json_obj, json_file)
+                                atomic_json_write(name, json_obj)
                                 #setting the action from response as current action
                                 user_tasks[user_prompt].current_action = int(json_obj['action_id'])
                                 individual_json[user_prompt] = json_obj
@@ -2599,8 +2612,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                                         _ri[_rk], _ = redact_secrets(_ri[_rk])
                                         except ImportError:
                                             pass
-                                        with open(name, "w") as json_file:
-                                            json.dump(json_obj, json_file)
+                                        atomic_json_write(name, json_obj)
                                         current_app.logger.info(f'Saved Individual recipe (late) at: {name}')
                                         user_tasks[user_prompt].current_action = int(json_obj['action_id'])
                                         individual_json[user_prompt] = json_obj
@@ -3138,12 +3150,49 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
         except Exception:
             pass
 
+    # The agent's GOAL, put where the executing agent can actually see it.
+    #
+    # ChatInstructor sends one line per step — "Execute Action 1: Write the
+    # awareness hook" (create_recipe.py:5204) — and that line carries no
+    # SUBJECT.  Nothing else in this system message names what the agent is
+    # for either, so the model fills the hole by inventing one.  Live
+    # 2026-08-21: marketing.local.funnel, whose stored goal is "a complete
+    # marketing funnel for Nunba, the local-first AI agent", spent three
+    # attempts writing about "sustainable urban gardening for busy city
+    # professionals" and called google_search with "urban gardening messaging
+    # hooks trends 2024".  The goal and every flow's sub_goal were on disk in
+    # prompts/{id}.json the whole time.
+    #
+    # load_agent_config is the canonical mtime-cached reader (cache_loaders.py:158),
+    # so this is a dict lookup on the hot path, and it returns None for
+    # autonomous agents that have no config — hence the empty-block default.
+    _goal_block = ''
+    try:
+        from core.cache_loaders import load_agent_config
+        _pid = str(user_prompt).split('_', 1)[1] if '_' in str(user_prompt) else user_prompt
+        _cfg = load_agent_config(_pid) or {}
+        _goal = (_cfg.get('goal') or '').strip()
+        _subs = [str(f.get('sub_goal') or '').strip() for f in (_cfg.get('flows') or [])]
+        _subs = [s for s in _subs if s]
+        if _goal or _subs:
+            _goal_block = (
+                "\n        •THIS AGENT'S GOAL - every action you are given serves THIS,\n"
+                "         and nothing else.  Do NOT invent a different subject,\n"
+                "         product, or audience.  If an action names no subject,\n"
+                "         the subject is the goal below.\n"
+                + (f"         Goal: {_goal}\n" if _goal else '')
+                + ''.join(f"         Sub-goal: {s}\n" for s in _subs)
+            )
+    except Exception:
+        tool_logger.debug('goal block unavailable for %s', user_prompt, exc_info=True)
+
     assistant = autogen.AssistantAgent(
         name="Assistant",
         llm_config=llm_config,
         code_execution_config={"last_n_messages": 2, "work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f"""{'AUTONOMOUS MODE: Do NOT ask the user questions. Use sensible defaults. Complete actions immediately without clarification.' if autonomous else 'INTERACTIVE MODE: You may ask the user clarifying questions to understand their vision before proceeding.'}
         Plain ASCII only in code and output — no emoji or non-ASCII characters.
+{_goal_block}
 
         •HELPER IS YOUR SUPERMAN — DELEGATE EVERYTHING:
             The Helper agent has ALL the tools.  You have NONE.  For ANY task —
@@ -4120,7 +4169,13 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
             message = f'Execute Action {user_tasks[user_prompt].current_action}: {message} '+f',Latest User message: {text}' + _action_expert_hint
             _push_thinking(user_id, f'Executing action {user_tasks[user_prompt].current_action} of {_action_count}...')
-            publish_to_crossbar_new_action_start(message, user_id)
+            # No second publish here.  `message` at this point is the raw model
+            # instruction — 'Execute Action N: <prompt> ,Latest User message:
+            # <...>' plus the [Expert Tip from ...] hint — and publishing it put
+            # the whole internal prompt in the user's thinking bubble, right
+            # after the clean line above (task #649).  The user got two bubbles
+            # per action: one readable, one internal.  The readable one already
+            # carries the signal, so the internal one is pure leak.
             task_time[prompt_id] = {'timer':time.time(),'times':[]}
 
             # Only transition if we're in ASSIGNED state (first time)
@@ -4641,7 +4696,11 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     else:
                         # user_tasks[user_prompt].current_action = user_tasks[user_prompt].current_action+1
                         message = get_execute_next_action_message(prompt_id, user_prompt)
-                        publish_to_crossbar_new_action_start(message, user_id)
+                        # `message` is the model instruction, not a user-facing
+                        # line — publishing it put the internal prompt in the
+                        # thinking bubble (task #649).  Announce the action in
+                        # words instead; `message` still goes to the model below.
+                        _push_thinking(user_id, f'Starting action {current_action_id}...')
                         safe_set_state(user_prompt, current_action_id, ActionState.IN_PROGRESS, "action start")
 
                     result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
@@ -4751,8 +4810,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                             _step['agent_to_perform_this_action'] = 'Executor'
                                         else:
                                             _step['agent_to_perform_this_action'] = 'Assistant'
-                                    with open(_rfile, 'w') as _rf:
-                                        json.dump(_rj, _rf)
+                                    atomic_json_write(_rfile, _rj)
                                     current_app.logger.info(f'[FALLBACK-SAVE] Saved recipe from messages at: {_rfile}')
                                     break
                     else:
@@ -5152,9 +5210,20 @@ def set_fallback_flags_and_request_recipe(chat_instructor, current_action_id, ma
 
 
 def publish_to_crossbar_new_action_start(message, user_id):
-    text = (
-        "Working on " + message
-        + ".\n please evaluate the response i am giving to check if it meets the current action")
+    # `message` reaches a USER-VISIBLE bubble (ChatMessageList thinkingSteps),
+    # so it must read as progress, not as machinery.
+    #
+    # The old text appended ".\n please evaluate the response i am giving to
+    # check if it meets the current action" to EVERY bubble — including the
+    # clean ones from _push_thinking.  That sentence is an instruction aimed at
+    # the model, and users were reading the system talk to itself (task #649).
+    # Nothing consumes it: the React and Android handlers render this field as
+    # text, and tests/unit/test_crossbar_publish_thinking.py pins the ENVELOPE
+    # (helper vs the historical inline literal), not this wording.
+    # Deliberately NOT str(message): concatenation raises on a non-str, and
+    # that is the desired failure.  #649 names "raw dict repr" as a symptom —
+    # coercing here would RENDER a dict to the user instead of failing loudly.
+    text = "Working on " + message
     # Pull real request_id from threadlocal — see publish_agent_thought
     # for the full failure-mode analysis (drain key miss, React daemon
     # filter, Android orphan bucket).  Single source via thread_local_data.
@@ -5403,8 +5472,7 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         except ImportError:
             pass
         name = helper_fun.safe_prompt_path(prompt_id, flow, action_id)
-        with open(name, 'w') as f:
-            json.dump(json_obj, f)
+        atomic_json_write(name, json_obj)
         current_app.logger.info(
             f"[TRACE-BANKED] action {action_id} recipe derived from "
             f"{len(steps)} executed step(s) -> {name}")
@@ -5948,14 +6016,12 @@ def update_agent_creation_to_db(prompt_id):
 
 def create_final_recipe_for_current_flow(flow, merged_dict, prompt_id):
     name = helper_fun.safe_prompt_path(prompt_id, flow, 'recipe')
-    # Atomic write (M3 in post-shipment review): write to temp + rename
-    # so concurrent prompts_backup.snapshot_prompts can never capture
-    # a half-written recipe file.  os.replace is atomic on the same
-    # filesystem on both Windows and POSIX.
-    tmp = name + '.tmp'
-    with open(tmp, "w") as json_file:
-        json.dump(merged_dict, json_file)
-    os.replace(tmp, name)
+    # Atomic write (M3 in post-shipment review) via the canonical helper:
+    # tmp + fsync + os.replace so concurrent prompts_backup.snapshot_prompts
+    # can never capture a half-written recipe file, and a crash mid-write leaves
+    # no stray .tmp behind (the old inline copy fsync'd nothing). os.replace is
+    # atomic on the same filesystem on both Windows and POSIX.
+    atomic_json_write(name, merged_dict)
     current_app.logger.info(f"create_final_recipe_for_current_flow Dictionary saved to {name}")
 
 

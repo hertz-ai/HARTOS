@@ -211,6 +211,22 @@ def revoke_consent():
     row.revoked_at = now
     g.db.flush()
 
+    # Parallel-path parity (audit #4): this UI surface keeps its OWN append-only
+    # row model on purpose — granted stays True and revoked_at is the tombstone
+    # (see the module docstring), which is deliberately NOT the same as
+    # ConsentService.revoke_consent's granted=False + agent_id-keyed row model,
+    # so we do not delegate the WRITE (that would corrupt the append-only audit
+    # trail). But the observable SIDE EFFECTS must not drift between the two
+    # writers, so fire them through the service's PUBLIC announce_revocation —
+    # the same entry point ConsentService.revoke_consent uses — rather than
+    # reaching into its underscore-private _audit/_emit. Previously a UI revoke
+    # left no audit entry and never reached WAMP/SSE listeners or the user's
+    # other devices. announce_revocation is best-effort (never raises), so this
+    # cannot fail the revoke.
+    from .consent_service import ConsentService
+    ConsentService.announce_revocation(
+        uid, consent_type, scope, getattr(row, 'agent_id', None))
+
     logger.info(
         'consent.revoke user=%s type=%s scope=%s id=%s',
         uid, consent_type, scope, row.id,

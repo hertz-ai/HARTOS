@@ -385,6 +385,101 @@ jobs:
           echo ""
           echo "Build successful!"
 
+      # ── hart-comp binary, downloadable, for a LIVE BINARY SWAP (2026-08-19) ──
+      # The compositor is the ONE component that cannot be iterated on the real
+      # box. Everything else in the shell is served text (CSS/JS), so a bind-mount
+      # over the store path plus a shell restart is enough to test a fix in
+      # seconds. hart-comp is Rust, and the HART box can neither build it nor host
+      # a build: cargo/rustc there are rustup SHIMS with no default toolchain
+      # installed, and it has 3.3G free against a 23G store.
+      #
+      # So publish the built binary. The change that motivated this is source-only
+      # against the same nixpkgs pin, so the binary's RUNPATH resolves entirely
+      # against store paths the box already has -- which is what makes dropping it
+      # in (bind-mount over the wrapper's target, restart the tier) viable without
+      # importing a closure or reflashing a 28G image to test one diagnostic.
+      - name: Stage hart-comp binary for download
+        if: matrix.target == 'hart-comp'
+        run: |
+          set -o pipefail
+          out=$(tail -1 /tmp/build-output.txt)
+          echo "store path: $out"
+          mkdir -p /tmp/hart-comp-bin
+          cp -v "$out/bin/hart-comp" /tmp/hart-comp-bin/
+          printf '%s\n' "$out" > /tmp/hart-comp-bin/STORE_PATH
+          # The receiving side verifies this before swapping anything in: a
+          # truncated or wrong-arch download must fail loudly at the box, not
+          # silently produce a compositor that will not start.
+          sha256sum /tmp/hart-comp-bin/hart-comp | tee /tmp/hart-comp-bin/SHA256
+          ls -l /tmp/hart-comp-bin/
+
+      # ── Push the system closure to the fleet binary cache (OTA delivery) ─────
+      # WHY: nodes trust only cache.nixos.org, which serves nixpkgs and nothing
+      # this repo builds, so `nixos-rebuild switch --flake` on a node had to
+      # BUILD the new system locally. Measured on the real Samsung box
+      # 2026-08-22: a one-line shell-script change queued 153 derivations whose
+      # build closure (stdenv, compilers) blew past 3.0 GB free with "No space
+      # left on device". OTA delivery is impossible that way (ed0090b).
+      #
+      # This step signs the just-built toplevel closure with the fleet cache
+      # key and rsyncs it to CENTRAL's static cache (nginx on deepbox :8093,
+      # /solidstate/hart-cache/cache, key at /solidstate/hart-cache/key).
+      # Nodes list that cache in nix.settings (hart-base.nix) and then an
+      # update is a DOWNLOAD of the changed paths, not a local build. rsync
+      # makes repeat pushes incremental: unchanged nars are not re-sent.
+      #
+      # iso-desktop pushes hart-desktop (the attr hart-ota's apply actually
+      # switches to: `--flake "$FLAKE#hart-desktop"`); raw-desktop additionally
+      # pushes hart-desktop-raw (the flashed-image closure). continue-on-error:
+      # a cache-push hiccup must never fail the build that produced the
+      # artifacts; the worst case is yesterday's cache, i.e. exactly the
+      # pre-cache world, and the step says loudly what it skipped.
+      - name: Push system closure to the fleet cache (deepbox)
+        if: matrix.target == 'iso-desktop' || matrix.target == 'raw-desktop'
+        continue-on-error: true
+        working-directory: nixos
+        env:
+          CACHE_KEY: ${{ secrets.HART_CACHE_SECRET_KEY }}
+          SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          set -o pipefail
+          if [ -z "$CACHE_KEY" ]; then
+            echo "HART_CACHE_SECRET_KEY secret absent — skipping cache push"; exit 0
+          fi
+          # iso-desktop pushes BOTH closures: hart-desktop (what ISO/installed
+          # nodes apply) AND hart-desktop-raw (what raw-flashed nodes apply,
+          # per hart.ota.flakeAttr). raw-desktop is dispatch-only in the
+          # matrix, so riding the raw closure on the every-push iso leg is the
+          # only way nodes can substitute it; the store is already warm from
+          # the ISO build, so the raw toplevel's delta is config-tier drvs,
+          # not a second 22G build. Real-HW context: a raw node OTA-applying
+          # the iso-kind closure cannot mount its root (2026-08-22), which is
+          # why the raw closure must be fetchable at all.
+          case "${{ matrix.target }}" in
+            iso-desktop) cfgs="hart-desktop hart-desktop-raw" ;;
+            raw-desktop) cfgs="hart-desktop-raw" ;;
+            *) echo "::error::cache-push reached with unmapped target '${{ matrix.target }}'"; exit 1 ;;
+          esac
+          umask 077; printf '%s' "$CACHE_KEY" > /tmp/cache-key
+          for cfg in $cfgs; do
+            top=$(nix build ".#nixosConfigurations.$cfg.config.system.build.toplevel" \
+                    --no-link --print-out-paths)
+            echo "signing + packing closure of $cfg -> $top"
+            nix copy --to "file:///tmp/hart-cache?secret-key=/tmp/cache-key&compression=zstd" "$top"
+          done
+          du -sh /tmp/hart-cache
+          sudo apt-get install -y -qq sshpass >/dev/null 2>&1 || true
+          # nar/ first, then narinfos: a reader that sees a narinfo must find its
+          # nar already present, so a mid-push poll cannot 404 on the data half.
+          RS="sshpass -e rsync -a -e 'ssh -p ${DEPLOY_PORT} -o StrictHostKeyChecking=no'"
+          eval $RS /tmp/hart-cache/nar "$DEPLOY_USER@$DEPLOY_HOST:/solidstate/hart-cache/cache/"
+          eval $RS --exclude nar /tmp/hart-cache/ "$DEPLOY_USER@$DEPLOY_HOST:/solidstate/hart-cache/cache/"
+          rm -f /tmp/cache-key
+          echo "cache push complete for: $cfgs"
+
       # Five raw-desktop builds died silently after ~50 minutes, each time straight
       # after the filesystem was written, with the builder printing NOTHING even
       # under -L. Silence is not evidence, and guessing a cause per 50-minute
@@ -472,6 +567,7 @@ jobs:
           path: |
             /tmp/build-output.txt
             /tmp/*.torrent
+            /tmp/hart-comp-bin/**
           retention-days: 7
 
   # ─── Summary ───────────────────────────────────────────────

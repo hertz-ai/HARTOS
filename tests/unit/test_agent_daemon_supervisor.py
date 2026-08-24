@@ -219,3 +219,111 @@ def test_supervisor_function_exists_in_init_py():
         'Deferred-init block re-introduced a second agent_daemon.start() '
         'call — parallel-path violation (CLAUDE.md Gate 4).  Remove it; '
         'the supervisor is the single dispatch path.')
+
+
+# ── start() must never orphan a live worker ──────────────────────────────
+# The branches above use _FakeDaemon to exercise the supervisor's logic.
+# These use the REAL AgentDaemon, because the leak lives in start() itself.
+#
+# start() reassigned self._thread unconditionally.  When it ran while a
+# previous worker was still alive, that worker kept executing while _thread
+# pointed at the new one — untracked, and invisible to the supervisor, whose
+# is_alive() check only ever inspects the CURRENT _thread.  Measured in one
+# process 2026-08-17, successive dumps: 5, 6, 7, 8, 9, 10, 11, 12 threads
+# named agent_daemon, +1 per supervisor tick.
+#
+# Re-arming the live thread (rather than spawning beside it) keeps exactly one
+# tracked worker.  If that thread had already left its loop it dies, and the
+# next supervisor tick takes the pinned zombie-recovery branch above.
+
+def _real_daemon():
+    from integrations.agent_engine.agent_daemon import AgentDaemon
+    return AgentDaemon()
+
+
+def test_start_does_not_spawn_beside_a_live_worker():
+    """THE LEAK: _running cleared while the worker is still alive."""
+    d = _real_daemon()
+    stop = threading.Event()
+    victim = threading.Thread(target=stop.wait, daemon=True, name='agent_daemon')
+    victim.start()
+    try:
+        d._thread = victim
+        d._running = False          # the state the supervisor acts on
+
+        before = threading.active_count()
+        d.start()
+        after = threading.active_count()
+
+        assert d._thread is victim, (
+            '_thread was reassigned while the previous worker was alive — '
+            'that worker is now an untracked orphan')
+        assert after == before, (
+            f'start() spawned a second worker beside a live one '
+            f'({before} -> {after} threads)')
+    finally:
+        stop.set()
+        victim.join(timeout=5)
+
+
+def test_start_rearms_the_live_worker_so_its_loop_continues():
+    """Re-arming must set _running back to True — the live loop reads it."""
+    d = _real_daemon()
+    stop = threading.Event()
+    victim = threading.Thread(target=stop.wait, daemon=True, name='agent_daemon')
+    victim.start()
+    try:
+        d._thread = victim
+        d._running = False
+        d.start()
+        assert d._running is True, (
+            'a re-armed worker whose `while self._running` reads False will '
+            'exit immediately, leaving no daemon at all')
+    finally:
+        stop.set()
+        victim.join(timeout=5)
+
+
+def test_start_spawns_when_there_is_no_thread_yet():
+    """Zero-regression: the fresh-boot path is unchanged."""
+    d = _real_daemon()
+    with patch.object(d, '_loop', lambda: None):
+        d.start()
+        assert d._thread is not None
+        assert d._running is True
+        d._thread.join(timeout=5)
+
+
+def test_start_spawns_when_the_previous_thread_is_dead():
+    """Zero-regression: zombie recovery still replaces a dead worker."""
+    d = _real_daemon()
+    dead = threading.Thread(target=lambda: None, daemon=True, name='agent_daemon')
+    dead.start()
+    dead.join(timeout=5)
+    assert not dead.is_alive()
+
+    d._thread = dead
+    d._running = False
+    with patch.object(d, '_loop', lambda: None):
+        d.start()
+        assert d._thread is not dead, 'a dead worker must be replaced'
+        assert d._running is True
+        d._thread.join(timeout=5)
+
+
+def test_start_is_still_a_noop_when_already_running():
+    """Zero-regression: the original guard is untouched."""
+    d = _real_daemon()
+    stop = threading.Event()
+    live = threading.Thread(target=stop.wait, daemon=True, name='agent_daemon')
+    live.start()
+    try:
+        d._thread = live
+        d._running = True
+        before = threading.active_count()
+        d.start()
+        assert threading.active_count() == before
+        assert d._thread is live
+    finally:
+        stop.set()
+        live.join(timeout=5)

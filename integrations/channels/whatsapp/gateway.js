@@ -151,6 +151,7 @@ async function connectSocket(ctx) {
       ctx.authenticated = true;
       ctx.state = 'connected';
       ctx.qr = null;
+      ctx._reconnects = 0;  // healthy connection — reset the backoff counter
       broadcast(ctx, { type: 'authenticated' });
     } else if (connection === 'close') {
       // Intentional teardown (a newer request replaced this ctx with a
@@ -172,13 +173,44 @@ async function connectSocket(ctx) {
 
       const loggedOut = DisconnectReason && code === DisconnectReason.loggedOut;
       if (!loggedOut) {
-        connectSocket(ctx).catch((e) => {
+        // Backoff + cap so a repeatedly-rejected handshake cannot hot-loop
+        // connectSocket() and hammer WhatsApp into rate-limiting/blocking the
+        // number.  Previously this reconnected IMMEDIATELY with no delay and
+        // no limit, so a fresh-registration "Connection Failure" produced 60+
+        // attempts a minute and got the device temporarily blocked.
+        // restartRequired (515) right after pairing is the normal fast path
+        // and is not counted; every other close backs off exponentially and
+        // gives up after MAX_RECONNECTS consecutive failures (call /start
+        // again to retry a stopped session).
+        const MAX_RECONNECTS = 5;
+        const restartRequired = DisconnectReason
+          && code === DisconnectReason.restartRequired;
+        ctx._reconnects = restartRequired ? 0 : ((ctx._reconnects || 0) + 1);
+        if (ctx._reconnects > MAX_RECONNECTS) {
+          ctx.state = 'disconnected';
           console.error(JSON.stringify({
-            event: 'reconnect_failed',
+            event: 'reconnect_giveup',
             accountId: ctx.accountId,
-            error: String(e && e.message),
+            code,
+            attempts: ctx._reconnects,
+            detail: 'stopped reconnecting to avoid WhatsApp rate-limit; '
+              + 'POST /start again to retry',
           }));
-        });
+          broadcast(ctx, { type: 'disconnected', code, gaveUp: true });
+          return;
+        }
+        const delay = restartRequired
+          ? 1000
+          : Math.min(2000 * (2 ** (ctx._reconnects - 1)), 60000);
+        setTimeout(() => {
+          connectSocket(ctx).catch((e) => {
+            console.error(JSON.stringify({
+              event: 'reconnect_failed',
+              accountId: ctx.accountId,
+              error: String(e && e.message),
+            }));
+          });
+        }, delay);
       } else {
         // A real logout (the phone removed this linked device, or the
         // user unlinked it) — the socket is permanently dead and the

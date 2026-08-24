@@ -390,7 +390,19 @@ class TestFileManager:
         )
 
         assert url is not None
-        assert "/files/" in url
+        # 9c0efed9 moved uploads onto the route that actually serves them.
+        # '/files/' was measured 404 against the live hosts on 2026-08-19
+        # (so were /api/files/ and /media/), so this assertion was pinning a
+        # DEAD path -- the upload wrote real bytes and handed back a URL that
+        # served nothing.  files.py:409 now builds
+        #   {public_media_base()}/api/social/media/{file_id}/{filename}
+        #
+        # Assert the PATH shape only.  The host comes from
+        # public_media_base() and HEVOLVE_MEDIA_BASE_URL overrides it
+        # (files.py:33) for a node serving its own media, so pinning a
+        # hostname here would fail every self-hosting deployment.
+        assert "/api/social/media/" in url
+        assert url.endswith("/upload_test.pdf")
 
     @pytest.mark.asyncio
     async def test_upload_validates_channel(self, manager, tmp_path):

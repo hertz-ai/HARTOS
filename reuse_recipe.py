@@ -8,7 +8,7 @@
 from __future__ import annotations
 # Guard: cx_Freeze frozen builds close stdout/stderr.
 import sys, os
-from core.io_guard import silence_stdio; silence_stdio()
+from core.io_guard import silence_stdio, install_autogen_iostream; silence_stdio()
 # #170 — autogen budget constants live in core.constants (single source
 # of truth, was hardcoded as max_tokens=3500 in 3 sites here and 4 in
 # create_recipe.py).  See AUTOGEN_MESSAGE_TOKEN_BUDGET comment for why
@@ -31,7 +31,7 @@ import random
 # autogen).  Deferring keeps autogen off the backend-boot import path.
 # Same proxy + test as create_recipe.py — see tests/unit/test_lazy_autogen_import.py.
 from core.optional_import import lazy_module
-autogen = lazy_module("autogen")
+autogen = lazy_module("autogen", on_import=install_autogen_iostream)
 import os
 import pytz
 from core.http_pool import pooled_get, pooled_post, pooled_request
@@ -105,8 +105,11 @@ transforms = lazy_module(
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import traceback
-import txaio; txaio.use_asyncio()  # Must be before any autobahn import
-from autobahn.asyncio.component import Component
+# NOTE: the module-level `import txaio; from autobahn... import Component` was
+# removed — the WAMP RPC path (subscribe_and_return) now lives in helper_fun, so
+# reuse_recipe no longer references autobahn/Component. The import was dead here
+# and hard-failed `import reuse_recipe` wherever autobahn isn't installed (CI base
+# install); tests/unit/test_lazy_autogen_import.py guards that import.
 
 from threadlocal import thread_local_data
 # #509: canonical tool-logging decorator — wraps each autogen tool with
@@ -2549,6 +2552,46 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         register_channel_tools(helper1, time_agent, _tool_ctx)
     except Exception as e:
         tool_logger.debug(f"Channel tools registration skipped: {e}")
+
+    # Publish tools: stage a social post for a person to review and send.
+    #
+    # Registered here, beside the channel tools, and NOT behind
+    # detect_goal_tags. That gate keyword-matches the prompt ('market',
+    # 'campaign', 'viral'), so a family behind it is reachable only when the
+    # wording happens to match -- which is how register_news_tools ended up
+    # orphaned. An agent told "post this to Instagram" should be able to
+    # without saying a magic word first.
+    #
+    # Media and news, the other two families a channel conversation should
+    # reach. Both were wired nowhere on this path: create_recipe registers
+    # media, /chat does not, so "make me an image" worked in one runtime and
+    # not the other. News has been orphaned since it was written.
+    try:
+        from integrations.service_tools.media_agent import register_media_tools
+        register_media_tools(helper1, time_agent)
+    except Exception as e:
+        tool_logger.debug(f"Media tools registration skipped: {e}")
+    try:
+        from integrations.agent_engine.news_tools import register_news_tools
+        register_news_tools(helper1, time_agent, user_id)
+    except Exception as e:
+        tool_logger.debug(f"News tools registration skipped: {e}")
+
+    # DELIBERATELY NOT REGISTERED HERE: self_build and remote_desktop.
+    #
+    # This runtime answers messages from Discord, Telegram, WhatsApp, Slack and
+    # every other connected channel, so anything registered here is reachable
+    # by anyone who can send the bot a message.
+    #
+    #   self_build     install_package, remove_package, apply_build
+    #                  -> mutates the installation the agent runs on
+    #   remote_desktop cast_to_tv, forward_peripheral, disconnect_remote
+    #                  -> drives the operator's physical devices
+    #
+    # Those need an authenticated operator, not a chat turn. They stay on the
+    # paths that already have one. finance, revenue, outreach, journey and mcp
+    # are left out pending the same review rather than swept in because they
+    # were next in the list.
 
     def connect_time_main(message: Annotated[str, "The message time agent want to send to main agent"]) -> str:
         message = f"Role: Time Agent\n Message: {message}"

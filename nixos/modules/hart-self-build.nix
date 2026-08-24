@@ -88,6 +88,12 @@ let
     RUNTIME_NIX="/etc/hart/runtime.nix"
     FLAKE_DIR="/etc/nixos"
     VARIANT="${cfg.variant}"
+    # The SAME self-naming attr hart-ota switches to (hart.ota.flakeAttr):
+    # hart-<variant> on ISO nodes, hart-<variant>-raw on raw images, plain
+    # `hart` on installer-written local flakes. The old inline hart-$VARIANT
+    # could not resolve on installed nodes at all (their attr IS `hart`) and
+    # sent raw nodes to the unbootable ISO closure (real HW 2026-08-22).
+    FLAKE_ATTR="${config.hart.ota.flakeAttr}"
 
     mkdir -p "$(dirname "$LOG")"
     exec > >(tee -a "$LOG") 2>&1
@@ -126,7 +132,7 @@ let
 
         # Build and switch atomically
         if ${pkgs.nixos-rebuild}/bin/nixos-rebuild switch \
-            --flake "$FLAKE_DIR#hart-$VARIANT" \
+            --flake "$FLAKE_DIR#$FLAKE_ATTR" \
             --impure 2>&1; then
           NEW_GEN=$(readlink /nix/var/nix/profiles/system 2>/dev/null || echo "unknown")
           echo "[SelfBuild] SUCCESS — switched to generation: $NEW_GEN"
@@ -151,7 +157,7 @@ let
       dry-run|test)
         echo "[SelfBuild] Dry-run (build only, no switch)..."
         if ${pkgs.nixos-rebuild}/bin/nixos-rebuild build \
-            --flake "$FLAKE_DIR#hart-$VARIANT" \
+            --flake "$FLAKE_DIR#$FLAKE_ATTR" \
             --impure 2>&1; then
           echo "[SelfBuild] Dry-run SUCCESS — build is valid"
         else
@@ -163,7 +169,7 @@ let
       diff)
         echo "[SelfBuild] Showing what would change..."
         ${pkgs.nixos-rebuild}/bin/nixos-rebuild build \
-          --flake "$FLAKE_DIR#hart-$VARIANT" \
+          --flake "$FLAKE_DIR#$FLAKE_ATTR" \
           --impure 2>/dev/null || true
         ${pkgs.nix}/bin/nix store diff-closures \
           /nix/var/nix/profiles/system ./result 2>/dev/null || \

@@ -475,7 +475,16 @@ try:
     from create_recipe import recipe, time_based_execution as time_execution, visual_execution
     from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution, visual_based_execution
 except ImportError as e:
-    print(f"Could not import recipe modules: {e}")
+    # print() went nowhere: frozen windowed builds have no real stdout, so the
+    # ONE line explaining why agent creation is dead was invisible.  MEASURED
+    # 2026-08-19: "Could not import recipe modules" appears 0 times across
+    # langchain.log/gui_app.log/server.log while recipe=None caused 54
+    # `TypeError: 'NoneType' object is not callable` at the two unguarded call
+    # sites (:9351, :9578), each one a 500 on /chat.  Same logger idiom this
+    # file already uses at line 261; exc_info keeps the real ImportError cause.
+    logging.getLogger(__name__).error(
+        "Could not import recipe modules -- agent creation and recipe "
+        "execution are DISABLED for this process: %s", e, exc_info=True)
     recipe = None
     time_execution = None
     visual_execution = None
@@ -872,7 +881,11 @@ if _is_bundled:
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
-app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('HEVOLVE_MAX_PAYLOAD_BYTES', 2 * 1024 * 1024))  # 2MB default
+# One payload policy for app AND transport: core.serve passes the same
+# constant to Hypercorn's WSGI middleware (whose 64 KB library default
+# otherwise transport-rejects bodies Flask's own cap here would accept).
+from core.constants import MAX_PAYLOAD_BYTES
+app.config['MAX_CONTENT_LENGTH'] = MAX_PAYLOAD_BYTES  # 2MB default, HEVOLVE_MAX_PAYLOAD_BYTES to override
 
 # ── LLM outbound logger ───────────────────────────────────────────────
 # Monkey-patches httpx.Client.send (+ AsyncClient) to (a) inject the
@@ -1063,6 +1076,20 @@ except Exception as e:
 # append-only, mounted at ``/api/social/consent``).  ``init_social``
 # in ``integrations/social/__init__.py`` registers the new blueprint;
 # no extra wiring is required here.
+
+# Claude Code frontier endpoint — OpenAI-compatible /chat/completions backed by
+# the authorized `claude -p` (flow #3: HARTOS wears Claude as its EXPERT tier).
+# The EXPERT ModelBackend (model_registry) points its base_url here; autogen
+# calls it like any local llama.cpp endpoint. Failures degrade to the in-house
+# LLM via dispatch.py's existing fallback ladder.
+try:
+    from integrations.providers.claude_code_endpoint import claude_code_bp
+    app.register_blueprint(claude_code_bp)
+    app.logger.info("Claude Code frontier endpoint registered at /api/claude/v1")
+except ImportError:
+    app.logger.info("Claude Code endpoint not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Claude Code endpoint init skipped: {e}")
 
 # MCP HTTP Bridge — exposes local MCP tools via REST for Nunba/external clients
 try:
@@ -5645,6 +5672,15 @@ def _g12_finalize(prompt: str, teacher_response: str, student_future) -> None:
         logging.getLogger(__name__).exception("_g12_finalize: swallowed Exception")
 
 
+# First words of TEMPLATE_TOOL_RESPONSE's post-observation instruction (the
+# LangChain tool-response human message, ~line 7519).  Its presence in an
+# outbound prompt proves a tool already ran this turn.  The template cannot
+# interpolate this constant (its braces are format-escaped), so
+# tests/unit/test_refusal_override_post_tool_guard.py pins the two copies
+# byte-identical.
+TOOL_RESPONSE_SCAFFOLD = 'Okay, so what is response for this tool'
+
+
 def _pooled_post_with_refusal_check(api_url, json=None, app_logger=None, **kwargs):
     """Post to llama-server and apply REFUSAL_OVERRIDE to the response.
 
@@ -5696,6 +5732,27 @@ def _pooled_post_with_refusal_check(api_url, json=None, app_logger=None, **kwarg
     except Exception:
         return response
     if not reply_text or not _REFUSAL_PATTERN.search(reply_text):
+        return response
+    # A refusal-shaped reply AFTER a tool observation is a truthful report,
+    # not a refusal to try.  Live 2026-08-22 11:34 (weather-in-chennai):
+    # google_search returned nothing, the model said "the tool didn't return
+    # any weather data, I can't give you the specific forecast", the
+    # directive below re-prompted "Never assert data is unavailable without
+    # first attempting a tool call" — and the retry FABRICATED a forecast
+    # (sunny, 32°C) that reached the user as fact.  The directive's own
+    # contract is "force ONE tool attempt", so it stands down when the
+    # outbound prompt proves an attempt already ran.
+    try:
+        _prompt_blob = ' '.join(
+            str(_m.get('content') or '')
+            for _m in (body.get('messages') or [])
+            if isinstance(_m, dict))
+    except Exception:
+        _prompt_blob = ''
+    if TOOL_RESPONSE_SCAFFOLD in _prompt_blob:
+        (app_logger or app.logger).info(
+            "[REFUSAL-OVERRIDE-LANGCHAIN] skip: prompt carries a tool "
+            "observation — reply is a post-tool report, not a refusal")
         return response
     _logger = app_logger or app.logger
     _logger.info(
@@ -6042,7 +6099,28 @@ class CustomGPT(LLM):
                 _err = resp_json['error']
                 _msg = _err.get('message', str(_err)) if isinstance(_err, dict) else str(_err)
                 app.logger.error(f"LLM server error: {_msg}")
-                _err_reply = f"I couldn't process that request — {_msg}"
+                # Do NOT put the upstream message in the reply.  llama-server
+                # answers 200 with {"error": {"message": "Loading model"}}
+                # while weights load, and that reached the user verbatim as
+                # "I couldn't process that request - Loading model" (live
+                # 2026-08-18, twice on "Hi!").  It leaks internal wording,
+                # reads as permanent when the state is transient, and is
+                # returned as a normal assistant turn, so it landed in
+                # conversation history and was replayed to the model as a
+                # prior turn.  The detail is already in the log line above.
+                from core.constants import (
+                    LLM_GENERIC_ERROR_REPLY,
+                    LLM_LOADING_REPLY,
+                    LLM_TRANSIENT_LOADING_MARKERS,
+                )
+                _low = (_msg or '').strip().lower()
+                if any(_m in _low for _m in LLM_TRANSIENT_LOADING_MARKERS):
+                    # Same wording routes/chatbot_routes.py sends when the
+                    # server is unreachable, so "down" and "warming up" read
+                    # identically to the user.
+                    _err_reply = LLM_LOADING_REPLY
+                else:
+                    _err_reply = LLM_GENERIC_ERROR_REPLY
                 # G12: drain SSM student future and feed distillation engine
                 _g12_finalize(prompt, _err_reply, _g12_student_future)
                 return _err_reply
@@ -6829,13 +6907,20 @@ def parse_visual_context(inp: str):
         #       the local — see scripts/start_cloud.sh + start_regional.sh)
         #   (b) get_vision_api() returns a non-default URL → user
         #       configured a custom endpoint, that's their explicit opt-in
-        #   (c) ConsentService.check_consent(user_id, 'cloud_egress',
-        #       scope='vision') == True → user previously granted
-        #   (d) Otherwise: ConsentService.request_consent(...) creates a
-        #       pending row and emits a notification (consent.request
-        #       topic → frontend renders a consent dialog).  Return a
-        #       holding message; once user grants, NEXT vision request
-        #       proceeds without prompting.  Never silently uploads.
+        #   (c) Otherwise: ConsentService.auto_grant_with_notice(...)
+        #       creates a granted record on first use and emits
+        #       consent.auto_granted, so the user is told cloud was
+        #       used and can revoke in one tap.  A prior explicit
+        #       revoke returns False and we refuse rather than
+        #       silently re-grant.  Never silently uploads.
+        # There is NO request-then-wait branch here.  ConsentService.
+        # request_consent() has zero production callers tree-wide and
+        # emits nothing (its siblings grant_consent /
+        # auto_grant_with_notice / announce_revocation all call _emit;
+        # request_consent does not), so routing through it would
+        # neither prompt the user nor notify any device.  The only live
+        # producer of the consent.request topic is
+        # security/ai_governance.py:695.
         from core.config_cache import get_vision_api
         _user_vision_url = (get_vision_api() or '').strip()
         _allow_cloud = (
@@ -7565,7 +7650,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
         USER'S INPUT
         --------------------
 
-        Okay, so what is response for this tool. If using information obtained from the tools you must mention it explicitly without mentioning the tool names - I have forgotten all TOOL RESPONSES! Remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else."""
+        Okay, so what is response for this tool. If using information obtained from the tools you must mention it explicitly without mentioning the tool names - I have forgotten all TOOL RESPONSES! Remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else. If the TOOL RESPONSE above is empty, an error, or unhelpful, do NOT conclude the information is unavailable yet - emit an action for a DIFFERENT tool that could obtain it (for example Data_Extraction_From_URL on a relevant site when a search returned nothing). Only give a Final Answer saying it is unavailable after alternative tools have also failed."""
 
     prompt = ConversationalChatAgent.create_prompt(
         tools,
@@ -9411,6 +9496,38 @@ def chat():
         except ImportError:
             logging.getLogger(__name__).debug("chat: swallowed ImportError")
 
+    # Resume an in-progress creation before the gate below can drop it.
+    #
+    # `create_agent` is a PER-MESSAGE guess: it comes from the request payload
+    # (Nunba sets it while a creation conversation is open) or from the draft
+    # classifier.  Neither survives a mid-flow approval — "Approved, generate
+    # the recipe" does not read as a create REQUEST, so the classifier returns
+    # False, the whole creation block below is skipped, and the turn falls
+    # through to the reuse path.  Reuse loads {prompt_id}_0_recipe.json, which
+    # for an agent still IN REVIEW does not exist yet
+    # (reuse_recipe.create_schedule:3367), so the turn 500s and the agent is
+    # left permanently half-built: config on disk, no recipe, and every later
+    # message a 500 with no way for the user to tell what went wrong.
+    # Reproduced live 2026-08-21 on prompt_id 1 and again on 7101.
+    #
+    # review_agents[...] is the AUTHORITATIVE "this user+prompt is mid-creation"
+    # flag — _save_and_enter_review sets it when the details are captured, and
+    # only the review phase clears it.  Trust that state over the per-message
+    # guess; recipe() at the end of Phase 2 is what the flow is waiting for.
+    if not create_agent and prompt_id:
+        try:
+            _resume_lock = _get_user_lock(user_id)
+            with _resume_lock:
+                _resuming = review_agents.get(f'{user_id}_{prompt_id}', False)
+        except Exception:
+            _resuming = False
+        if _resuming:
+            app.logger.info(
+                f'chat: resuming in-progress creation for {user_id}_{prompt_id} '
+                f'— review_agents is set, but this message did not classify as '
+                f'a create request. Staying in the creation flow.')
+            create_agent = True
+
     if create_agent:
         # Generate prompt_id server-side if not provided
         if not prompt_id:
@@ -9752,6 +9869,82 @@ def chat():
                 'Agent reuse module is unavailable. Please check server dependencies.',
                 intent=['FINAL_ANSWER'],
                 req_token_count=0, res_token_count=0, history_request_id=[],
+            )
+
+        # A config can exist with NO recipe.  The gather phase writes
+        # {prompt_id}.json with status 'completed', which means "details
+        # gathered" — NOT "recipe built".  Reuse then loads
+        # {prompt_id}_0_recipe.json unconditionally
+        # (reuse_recipe.create_schedule:3367), so that gap surfaced as a
+        # 500 on EVERY message to such an agent, forever: the agent was
+        # bricked at birth and the user got an opaque Internal Server
+        # Error with no way to tell what was wrong.  Observed live
+        # 2026-08-21 on research.local.scout (prompt_id 1):
+        #     FileNotFoundError: prompts\1_0_recipe.json
+        # _flow_recipe_exists is the daemon's existing CREATE-vs-REUSE
+        # test (agent_daemon.py:36) — the classifier this route simply
+        # never consulted.  Reused rather than re-implemented.
+        try:
+            from integrations.agent_engine.agent_daemon import _flow_recipe_exists
+        except Exception:
+            _flow_recipe_exists = None
+        if _flow_recipe_exists is not None and not _flow_recipe_exists(prompt_id):
+            # A config with no flow recipe means creation is UNFINISHED —
+            # and _flow_recipe_exists is the CREATE-vs-REUSE classifier, so
+            # this turn belongs to CREATE.  Steward rule (2026-08-22): the
+            # state machine finishes the recipe AUTONOMOUSLY rather than
+            # handing the user a "recipe missing" message about a decision
+            # the classifier already made.  This is also the resume path
+            # for creations cut mid-flow (GroupChat max_round exhaustion at
+            # ~30 rounds ≈ 300s on the local 4B): recipe() rebuilds
+            # flow/action state via initialize_with_resume — banked
+            # per-action recipes count as done — and its completion path is
+            # the one that banks {pid}_{flow}_recipe.json, syncs to central
+            # (update_agent_creation_to_db), and adverts to peers.
+            _agent_label = created_json.get('name') or created_json.get('agent_name') or prompt_id
+            # No importability speculation here (steward, 2026-08-22): a
+            # missing recipe FILE is agent state, and this branch's whole
+            # job is routing that state into recipe().  Whether the module
+            # imported is the import guard's concern, at :461, where it is
+            # already logged.
+            app.logger.info(
+                f'chat: agent {prompt_id} has a config but no flow-0 recipe — '
+                f'routing this reuse turn into creation to finish it '
+                f'autonomously (resume-aware).')
+            _rr_lock = _get_user_lock(user_id)
+            with _rr_lock:
+                # Mark mid-creation so follow-up turns classify as create
+                # (the resume guard above keys on review_agents).
+                review_agents[_ak] = True
+                conversation_agent[_ak] = False
+                _touch_agent_timestamp(_ak)
+            response = recipe(user_id, prompt, prompt_id, file_id, request_id)
+            if response in ('Agent Created Successfully',
+                            'Agent Already Created Successfully'):
+                with _rr_lock:
+                    conversation_agent[_ak] = True
+                    _touch_agent_timestamp(_ak)
+                try:
+                    _create_social_agent_from_prompt(user_id, prompt_id)
+                except Exception as e:
+                    app.logger.debug(f"Social agent bridge skipped: {e}")
+                _record_lifecycle('completed', user_id, prompt_id,
+                                  'Recipe finished autonomously from reuse routing')
+                return _chat_reply(
+                    user_id, request_id,
+                    f'"{_agent_label}" is ready — its recipe is now complete. '
+                    f'Ask it again and it will run.',
+                    intent=['FINAL_ANSWER'],
+                    req_token_count=0, res_token_count=0, history_request_id=[],
+                    Agent_status='completed', prompt_id=prompt_id,
+                )
+            _record_lifecycle('Creation Mode', user_id, prompt_id,
+                              'Autonomous recipe generation in progress (from reuse routing)')
+            return _chat_reply(
+                user_id, request_id, response,
+                intent=['FINAL_ANSWER'],
+                req_token_count=0, res_token_count=0, history_request_id=[],
+                Agent_status='Creation Mode', prompt_id=prompt_id,
             )
 
         response = chat_agent(user_id,prompt,prompt_id,file_id,request_id)
@@ -12453,24 +12646,20 @@ def _serve_app(app, host: str, port: int) -> None:
     try:
         import asyncio
         from concurrent.futures import ThreadPoolExecutor
+        from core.serve import build_asgi_app, make_hypercorn_config
         from hypercorn.asyncio import serve as _hcserve
-        from hypercorn.config import Config
-        from hypercorn.middleware import AsyncioWSGIMiddleware
 
-        config = Config()
-        config.bind = [f'{host}:{port}']
-        config.keep_alive_timeout = 120     # SSE-friendly long polls
-        config.h11_max_incomplete_size = 16 * 1024 * 1024  # 16MB request bodies
-        config.accesslog = None             # HARTOS emits its own access log
-        config.errorlog = '-'
-
-        # AsyncioWSGIMiddleware is WSGI and cannot see a websocket scope, which
-        # is why ws://<this node>/peer_link 404s and why PeerLink.accept() has
-        # never once been called on any node.  peer_link_asgi serves exactly
-        # that one path and passes every other scope straight through, so the
-        # HTTP surface is unchanged.  See core/peer_link/server.py.
-        from core.peer_link.server import peer_link_asgi
-        asgi_app = peer_link_asgi(AsyncioWSGIMiddleware(app))
+        # core.serve owns what all three entry points share: these four Config
+        # settings and the peer_link-capable ASGI wrapping.  This one, Nunba
+        # app.py and Nunba main.py each carried their own copy, which is how
+        # the peer_link mount ended up on one of the three while the other two
+        # answered 403 on /peer_link.  What this function legitimately varies
+        # stays here: bind, HEVOLVE_WORKER_THREADS=256, thread prefix 'hartos',
+        # and the ImportError fallback to Waitress below.  Config and
+        # AsyncioWSGIMiddleware are imported inside core.serve, so a missing
+        # hypercorn still raises ImportError in this try block.
+        config = make_hypercorn_config([f'{host}:{port}'])
+        asgi_app = build_asgi_app(app)
 
         async def _runner():
             loop = asyncio.get_running_loop()

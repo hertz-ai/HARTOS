@@ -30,7 +30,11 @@ cryptography==43.0.0
 # to have it while the CI runner did not, and the whole WAMP-adjacent test
 # family failed collection there (gate run 31938229518). A hard production
 # import must be a declared dependency.
-autobahn==26.7.1
+# Pinned to 23.1.2, NOT the latest: both images install `autobahn==23.1.2`
+# explicitly right after this file (Dockerfile:61, deploy/cloud/Dockerfile.prod:37),
+# so 23.1.2 is what actually runs -- and autobahn >=25.9 requires Python >=3.11,
+# which the py3.10 image cannot satisfy at all (it failed the whole build here).
+autobahn==23.1.2
 # pyautogen: production imports `autogen` (core/labeled_autogen_function.py
 # at module scope; create_recipe lazily). It was only ever satisfied by a
 # LOOSE VENDORED autogen-0.2.37/ directory that was never committed, so
@@ -190,6 +194,47 @@ waitress==2.1.2
 # singletons (EventBus, ResourceGovernor, agent_daemon, watchdog) are
 # sharded for fork-safety.  Waitress kept above as a fallback path.
 hypercorn==0.17.3
+# hypercorn's own dependency subtree, listed EXPLICITLY because the root
+# ./Dockerfile installs with `pip install --no-deps -r requirements.txt`
+# (Dockerfile:56).  Under --no-deps pip resolves nothing, so anything not named
+# here is simply absent from the image.
+#
+# This was not theoretical.  On central (192.168.0.9, container `langchain`,
+# 2026-08-19) hypercorn imported but `from hypercorn.asyncio import serve`
+# raised, and the node logged:
+#     Hypercorn unavailable (No module named 'h2') - falling back to Waitress
+# Waitress is pure WSGI, so that silently cost the node every websocket:
+# ws://<node>/peer_link was unservable and PeerLink.accept() could never fire,
+# leaving PeerLinkManager._links empty for skill broadcast,
+# claude_hive_session._publish_via_peer_link and collect() shard fan-out.
+# The degradation is logged once at boot and looks like a normal fallback.
+#
+# hypercorn 0.17.3 requires: h11, h2>=3.1.0, priority, wsproto>=0.14.0.
+# h2 in turn requires hpack>=4.0,<5 and hyperframe>=6.0,<7; wsproto requires
+# h11 (already pinned above at 0.16.0).  Keep this block in step with the
+# hypercorn pin -- if hypercorn moves, re-check `importlib.metadata.requires`.
+h2==4.1.0
+hpack==4.0.0
+hyperframe==6.0.1
+priority==2.0.0
+wsproto==1.2.0
+# hypercorn ALSO has python_version < "3.11" conditionals, and central runs
+# Python 3.10.20 -- so these are required there, not optional. Adding only the
+# unconditional five above was an incomplete fix: after they landed, central's
+# log moved from "No module named 'h2'" to "No module named 'taskgroup'" and it
+# still fell back to Waitress. Verified live in container `langchain`
+# 2026-08-19: h2/hpack/hyperframe/priority/wsproto/h11 all PRESENT,
+# `from hypercorn.asyncio import serve` still ModuleNotFoundError on taskgroup.
+#
+# exceptiongroup (L52) and typing_extensions (L184) are already pinned, so only
+# these two were missing. tomli was present by luck, not by declaration --
+# under --no-deps that is a latent break, so declare it.
+#
+# taskgroup is left unpinned deliberately: its PyPI releases are
+# prerelease-versioned, and guessing a pin blind is the riskier error than
+# letting the marker resolve it. The marker means neither installs on 3.11+.
+taskgroup ; python_version < "3.11"
+tomli==2.0.1 ; python_version < "3.11"
 watchfiles==0.19.0
 websockets==14.2
 Werkzeug==2.3.6

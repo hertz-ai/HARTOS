@@ -404,3 +404,114 @@ class TestCoordinateNormalization:
         }
         payload = _build_action_payload(action_json, parsed_screen)
         assert "coordinate" not in payload
+
+
+# ---------------------------------------------------------------------------
+# Taskbar shortcut: the resolved coordinate must survive, and fire once
+#
+# Live failure 2026-08-21: every taskbar click landed on the Start button
+# instead of the requested app, which opened the Start menu; the VLM then
+# correctly reasoned "the Start menu is blocking the view" and pressed Escape,
+# the shortcut fired again, and the loop ping-ponged for 14 iterations / 318s
+# without performing a single real step of the task.
+#
+# Two independent causes, one test class each way:
+#   1. try_taskbar_pre_check RESOLVES a screen coordinate, but the loop then
+#      called _extract_click_coord(raw, action_json).  For this strategy `raw`
+#      is the WHOLE enumerated taskbar, and that parser returns the FIRST
+#      <point> it finds -- entry 1, i.e. Start -- discarding the match.
+#   2. _is_taskbar_task is a bare substring test, so a task that merely NAMES
+#      an app ("the Chrome window on the left") classified as a taskbar task on
+#      EVERY iteration and the shortcut re-fired forever.
+# ---------------------------------------------------------------------------
+
+# The enumeration try_taskbar_pre_check hands back: entry 1 is Start (top of
+# the list), the actual match is entry 3.
+_TASKBAR_RAW = (
+    '1. [Start] <point>24,10</point>\n'
+    '2. [Search] <point>60,960</point>\n'
+    '3. [Google Chrome] <point>500,960</point>\n'
+)
+
+_SCREEN_W, _SCREEN_H = 2560, 1440
+# What try_taskbar_pre_check computes for the MATCHED entry (norm 500,960).
+_RESOLVED = [int(500 * _SCREEN_W / 1000), int(960 * _SCREEN_H / 1000)]  # [1280, 1382]
+# What re-parsing `raw` would wrongly produce (norm 24,10 -> the Start button).
+_START_BUTTON = [int(24 * _SCREEN_W / 1000), int(10 * _SCREEN_H / 1000)]  # [61, 14]
+
+
+def _fake_pyautogui():
+    m = MagicMock()
+    m.size.return_value = (_SCREEN_W, _SCREEN_H)
+    return m
+
+
+def _taskbar_backend(call_api_responses):
+    b = MagicMock()
+    b.route_task.return_value = 'multi_step'
+    b.try_taskbar_pre_check.return_value = {
+        'action': 'left_click',
+        'screen_x': _RESOLVED[0], 'screen_y': _RESOLVED[1],
+        'norm_x': 500, 'norm_y': 960,
+        'text': '', 'done': False,
+        'reasoning': 'taskbar_list: 3. [Google Chrome] <point>500,960</point>',
+        'raw': _TASKBAR_RAW,
+        'latency': 0.1, 'strategy': 'taskbar_list',
+    }
+    b.detect_grounding_bias.return_value = None
+    b._call_api.side_effect = list(call_api_responses)
+    return b
+
+
+class TestTaskbarShortcutCoordinateSurvives:
+    def test_click_uses_resolved_entry_not_first_point_in_raw(self):
+        """The click must land on the MATCHED taskbar entry, not entry 1."""
+        executed = []
+        backend = _taskbar_backend([_vlm_json(status='DONE', reasoning='done')])
+
+        with patch.dict(sys.modules, {'pyautogui': _fake_pyautogui()}), \
+             patch.dict(os.environ, {'HEVOLVE_VLM_UNIFIED': 'true'}), \
+             patch(_PATCH_SCREENSHOT, return_value=FAKE_SCREENSHOT_B64), \
+             patch(_PATCH_EXECUTE,
+                   side_effect=lambda p, t, **kw: executed.append(p) or {'output': 'ok'}), \
+             patch(_PATCH_SLEEP), \
+             patch('integrations.vlm.qwen3vl_backend.get_qwen3vl_backend',
+                   return_value=backend):
+            run_local_agentic_loop(_DEFAULT_MESSAGE, tier='inprocess', max_iterations=1)
+
+        assert executed, 'the shortcut produced no action at all'
+        assert executed[0]['coordinate'] == _RESOLVED, (
+            'taskbar click was re-derived from the raw list instead of using '
+            'the resolved match: got %s, expected %s (the Start-button '
+            'coordinate is %s)' % (executed[0]['coordinate'], _RESOLVED,
+                                   _START_BUTTON))
+        assert executed[0]['coordinate'] != _START_BUTTON
+
+
+class TestTaskbarShortcutFiresOnce:
+    def test_shortcut_does_not_refire_every_iteration(self):
+        """A multi-step task that merely names an app must not be hijacked
+        into clicking the taskbar on every iteration."""
+        backend = _taskbar_backend([
+            _vlm_json(status='IN_PROGRESS', action='type', value='hello'),
+            _vlm_json(status='DONE', reasoning='done'),
+        ])
+
+        with patch.dict(sys.modules, {'pyautogui': _fake_pyautogui()}), \
+             patch.dict(os.environ, {'HEVOLVE_VLM_UNIFIED': 'true'}), \
+             patch(_PATCH_SCREENSHOT, return_value=FAKE_SCREENSHOT_B64), \
+             patch(_PATCH_EXECUTE, return_value={'output': 'ok'}), \
+             patch(_PATCH_SLEEP), \
+             patch('integrations.vlm.qwen3vl_backend.get_qwen3vl_backend',
+                   return_value=backend):
+            result = run_local_agentic_loop(
+                {**_DEFAULT_MESSAGE,
+                 'enhanced_instruction': 'Fill the form in the Chrome window on the left'},
+                tier='inprocess', max_iterations=3)
+
+        assert backend.try_taskbar_pre_check.call_count == 1, (
+            'taskbar shortcut fired %d times in one run — it is a launch '
+            'optimisation and must not re-fire, or the loop ping-pongs'
+            % backend.try_taskbar_pre_check.call_count)
+        # And the run got past the shortcut into real steps.
+        assert result['exit_reason'] == 'done'
