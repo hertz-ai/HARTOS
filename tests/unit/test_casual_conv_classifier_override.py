@@ -38,9 +38,22 @@ def test_no_classifier_override_of_casual_conv():
 
 
 def test_route_hint_is_the_authority_in_nunba():
-    """chatbot_routes:486 stays the single producer of the session-shape
-    flag: no prompt_id -> casual, prompt_id -> agent-bound."""
+    """Pins BOTH producers of the session-shape flag (review finding #3:
+    the earlier version pinned only the legacy gpt_lang helper while the
+    LIVE producer is chat_route's `_needs_tools`).
+
+    Legacy helper (gpt_lang, :486): `not bool(prompt_id or create_agent)`.
+    Live producer (chat_route, ~:2979): `_needs_tools = bool(
+    langchain_prompt_id or create_agent or agentic_execute or
+    agentic_plan or autonomous_creation)` — where langchain_prompt_id is
+    digit-gated.  The two formulas DIVERGE for non-numeric prompt_ids
+    (iq_* recipes): those sessions route through the autogen reuse path
+    before get_ans matters, but the divergence is an owner design
+    question, tracked separately — this pin documents what IS."""
     nunba = open(os.path.join(
         os.path.dirname(ROOT), 'Nunba-HART-Companion', 'routes',
         'chatbot_routes.py'), encoding='utf-8').read()
     assert '"casual_conv": not bool(prompt_id or create_agent)' in nunba
+    assert '_needs_tools = bool(langchain_prompt_id or create_agent' in nunba, (
+        'live session-shape producer (chat_route _needs_tools) changed — '
+        're-audit casual_conv derivation end to end')

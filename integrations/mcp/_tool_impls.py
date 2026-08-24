@@ -144,7 +144,16 @@ def list_agents(category: Optional[str] = None, query: Optional[str] = None) -> 
                 handle = getattr(u, 'handle', None)
                 if handle:
                     entry["handle"] = handle
-                if getattr(u, 'api_token', None):
+                # Local rows registered via UserService.register_agent
+                # carry an api_token; synced mirrors never do
+                # (_handle_sync_agent: credential stays on the home node).
+                # ONE known local row also lacks a token: the boot-time
+                # 'hevolve_system_agent' bootstrap
+                # (integrations/agent_engine/__init__.py) — it is local,
+                # not hive (review finding #4: it was the '1 hive' my own
+                # validation cited as proof).
+                if (getattr(u, 'api_token', None)
+                        or u.username == 'hevolve_system_agent'):
                     trained.append(entry)
                 else:
                     entry["origin"] = "hive"

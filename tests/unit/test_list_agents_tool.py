@@ -40,6 +40,17 @@ def test_impl_reports_hive_and_trained_buckets():
     assert isinstance(data['hive'], list)
     for entry in data['hive']:
         assert entry.get('origin') == 'hive'
+    # FALSIFIABLE against the real dev DB (review finding #5: the earlier
+    # version passed even with the DB leg dead).  The dev DB carries 100+
+    # agent-type users; zero trained here means the leg silently threw.
+    assert data['trained_agents'] >= 1, (
+        'DB leg returned zero trained agents on a DB that has them — '
+        'the except/pass swallowed a real failure')
+    # Review finding #4: the boot-time hevolve_system_agent bootstrap has
+    # no api_token but is LOCAL — it must never be labeled hive.
+    hive_names = {e['name'] for e in data['hive']}
+    assert 'HART System Agent' not in hive_names, (
+        'local bootstrap row mislabeled as a hive mirror')
 
 
 def test_langchain_registry_carries_list_agents_tool():
