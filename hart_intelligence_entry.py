@@ -7431,11 +7431,15 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     start_time = time.time()
     _stage_req_id = str(thread_local_data.get_request_id() or '')
     publish_chat_stage('loading_context', user_id=str(user_id), request_id=_stage_req_id)
-    # casual_conv is the draft classifier's `is_casual` flag propagated
-    # from the /chat handler — when True we skip the action+profile
-    # fetch entirely because a casual acknowledgement doesn't consult
-    # either. No Python-side classification of `query` happens anywhere
-    # in the user_context module; the draft 0.8B is the only classifier.
+    # casual_conv is the SESSION-SHAPE flag from the route (chatbot_routes:486
+    # `not bool(prompt_id or create_agent)`): no prompt_id = casual companion
+    # session (light path), prompt_id = agent-bound session (full tool path).
+    # It is NOT the draft classifier's per-turn `is_casual` verdict — a
+    # 2026-08-24 change treated it as such and overrode it in the /chat
+    # handler; the owner reverted that same day. When True we skip the
+    # action+profile fetch entirely because a casual acknowledgement doesn't
+    # consult either. No Python-side classification of `query` happens
+    # anywhere in the user_context module.
     if casual_conv:
         user_details = "Casual conversation mode."
         actions = ""
@@ -9379,24 +9383,16 @@ def chat():
                         f"recall/Q&A directly or escalates a genuine task via "
                         f"its own tools."
                     )
-                    # Restore get_ans's declared contract (its comment says
-                    # casual_conv IS the classifier's is_casual — the route
-                    # actually sends `not bool(prompt_id)`, chatbot_routes:486,
-                    # so EVERY default-agent turn arrives casual_conv=True).
-                    # casual_conv=True strips all langchain tools and routes
-                    # CustomGPT to the 0.8B draft.  Live 2026-08-24 00:28:
-                    # 'What agents do you have' -> tools stripped -> model
-                    # fabricated "I don't have agents" while List_Agents sat
-                    # registered; same mechanism starved P7's five live-data
-                    # turns of google_search (#689).  One-way override: the
-                    # classifier's not-casual wins; a prompt_id agent chat
-                    # (route sends False) is never upgraded to casual.
-                    if casual_conv:
-                        app.logger.info(
-                            'chat: classifier is_casual=False overrides route '
-                            'casual_conv=True — get_ans runs with tools on the '
-                            'main model')
-                        casual_conv = False
+                    # casual_conv is DELIBERATELY left as the route sent it
+                    # (chatbot_routes:486 `not bool(prompt_id or
+                    # create_agent)`): it is a SESSION-SHAPE flag — no
+                    # prompt_id = casual companion session (draft-first,
+                    # light get_ans), prompt_id = agent-bound session — NOT
+                    # the classifier's per-turn is_casual verdict.  A
+                    # 2026-08-24 change overrode it to False here whenever
+                    # the classifier said not-casual; the owner reverted it
+                    # the same day: default-agent turns must keep the casual
+                    # shape, and only prompt_id sessions run agent-bound.
                     # #118 FIX: do NOT force create_agent/autonomous here.
                     # Forcing CREATE on EVERY non-casual turn hijacked recall/
                     # Q&A ("what did we discuss 15 days back") into an 8-action
