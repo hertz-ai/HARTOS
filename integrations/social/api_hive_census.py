@@ -36,6 +36,38 @@ hive_census_bp = Blueprint(
 )
 
 
+import os
+import time
+
+# TensorBoard link surfaced on /hive, liveness-gated.  The page renders the
+# link ONLY when this returns a URL, so it can never show a dead link — the
+# same honesty contract the rest of this endpoint keeps.  Set
+# HEVOLVE_TENSORBOARD_URL on the node that fronts TensorBoard (central runs
+# `tensorboard --logdir <runs>` behind a Kong /tensorboard route); until then
+# the field is absent and the card stays hidden.  Probe result cached so a
+# down TB doesn't add a 2s stall to every census poll.
+_TB_CACHE = {'url': None, 'ok': False, 'ts': 0.0}
+_TB_TTL = 60.0
+
+
+def _tensorboard_url():
+    """Configured TensorBoard URL if it is actually answering, else None."""
+    url = (os.environ.get('HEVOLVE_TENSORBOARD_URL') or '').strip()
+    if not url:
+        return None
+    now = time.time()
+    if _TB_CACHE['url'] == url and now - _TB_CACHE['ts'] < _TB_TTL:
+        return url if _TB_CACHE['ok'] else None
+    ok = False
+    try:
+        from core.http_pool import pooled_get
+        ok = pooled_get(url, timeout=2).status_code < 400
+    except Exception as e:
+        logger.debug('tensorboard probe failed for %s: %s', url, e)
+    _TB_CACHE.update(url=url, ok=ok, ts=now)
+    return url if ok else None
+
+
 def _aggregator():
     """The live aggregator, or None if federation is not running here.
 
@@ -73,6 +105,7 @@ def get_census():
             'status': 'not_federating',
             'reason': 'no federated aggregator on this node',
             'nodes_reporting': 0,
+            **({'tensorboard_url': _tb} if (_tb := _tensorboard_url()) else {}),
         })
 
     try:
@@ -86,6 +119,12 @@ def get_census():
             'status': 'no_peers',
             'reason': 'federating, but no peer deltas received yet',
             **census,
+            **({'tensorboard_url': _tb} if (_tb := _tensorboard_url()) else {}),
         })
 
-    return jsonify({'status': 'ok', **census})
+    _tb = _tensorboard_url()
+    return jsonify({
+        'status': 'ok',
+        **census,
+        **({'tensorboard_url': _tb} if _tb else {}),
+    })
