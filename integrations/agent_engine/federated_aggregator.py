@@ -277,10 +277,24 @@ class FederatedAggregator:
     def extract_local_delta(self) -> Optional[dict]:
         """Pull learning metrics from WorldModelBridge + HiveMind."""
         try:
-            from .world_model_bridge import get_world_model_bridge
-            bridge = get_world_model_bridge()
-            stats = bridge.get_stats()
-            learning_stats = bridge.get_learning_stats()
+            # Learning metrics — degrade to empty on failure so the node still
+            # federates a signed PRESENCE delta. A genuine INSTALL must reach the
+            # census even before its learning bridge has data, and on a frozen
+            # build with no hevolveai where the bridge import raises. Previously
+            # a bridge error returned None (tick() at ~line 220 broadcasts only
+            # on a truthy delta), so a fresh install NEVER reached the census
+            # (#694 "installed but not federating"). The delta below is built
+            # entirely from .get(default) calls, so empty stats yield a valid
+            # zeroed presence delta rather than a KeyError.
+            stats, learning_stats = {}, {}
+            try:
+                from .world_model_bridge import get_world_model_bridge
+                _b = get_world_model_bridge()
+                stats = _b.get_stats() or {}
+                learning_stats = _b.get_learning_stats() or {}
+            except Exception as _be:
+                logger.debug("Federation extract: bridge unavailable, "
+                             "sending presence delta (%s)", _be)
 
             # Get node identity for signing
             node_id = ''

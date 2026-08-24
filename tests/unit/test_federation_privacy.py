@@ -64,6 +64,27 @@ class TestDeltaStructure:
         assert 'prompt' not in delta_str.lower() or 'prompt_id' in delta_str.lower()
 
     @patch('integrations.agent_engine.world_model_bridge.get_world_model_bridge')
+    def test_presence_delta_when_bridge_unavailable(self, mock_bridge):
+        """A fresh/frozen node whose learning bridge raises must STILL produce a
+        signed presence delta, not None.
+
+        tick() broadcasts only on a truthy delta, so returning None here means a
+        genuine INSTALL never federates and never reaches the census (#694
+        "installed but not federating"). On a frozen build with no hevolveai the
+        bridge import raises; the extract must degrade to zeroed stats + a signed
+        presence delta rather than swallowing the whole node.
+        """
+        mock_bridge.side_effect = RuntimeError('no hevolveai in frozen build')
+        agg = self._make_aggregator()
+        delta = agg.extract_local_delta()
+        assert delta is not None, 'bridge failure must degrade to a presence delta'
+        assert delta.get('node_id') is not None
+        assert 'signature' in delta
+        # Stats degrade to zeros, not missing keys (no KeyError building the delta).
+        assert delta['experience_stats']['total_recorded'] == 0
+        assert delta['experience_stats']['flush_rate'] == 0.0
+
+    @patch('integrations.agent_engine.world_model_bridge.get_world_model_bridge')
     def test_no_user_text_in_delta(self, mock_bridge):
         """Ensure no raw user text ends up in federation delta."""
         bridge = MagicMock()
