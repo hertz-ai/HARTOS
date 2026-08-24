@@ -314,10 +314,30 @@ jobs:
             echo "rollback target: $ROLLBACK_IMAGE"
             docker rm -f langchain 2>/dev/null || true
 
+            # The URL this node hands to peers.  core/port_registry
+            # .get_advertisable_base_url treats HEVOLVE_BASE_URL as precedence
+            # 1 — "how Docker Compose and remote SSH installs publish a
+            # routable name".  Without it, a bridge-mode container resolves
+            # its OWN NIC and advertises its docker-internal address: measured
+            # 2026-08-24, this node's row in a LAN peer's table read
+            # http://172.17.0.4:6777 — undialable, the localhost:6777 phantom
+            # family again.  Derived from the host's default route (the same
+            # semantics as get_lan_ip's UDP-connect trick), overridable via
+            # the DEPLOY_ADVERTISE_URL secret for a public name.
+            ADVERTISE_URL="${{ secrets.DEPLOY_ADVERTISE_URL }}"
+            if [ -z "$ADVERTISE_URL" ]; then
+              _HOST_IP="$(ip route get 1 2>/dev/null | awk '{for(i=1;i<NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+              [ -n "$_HOST_IP" ] && ADVERTISE_URL="http://${_HOST_IP}:6777"
+            fi
+            echo "advertise URL: ${ADVERTISE_URL:-<unset — container will self-resolve>}"
+            ADV_ARGS=""
+            [ -n "$ADVERTISE_URL" ] && ADV_ARGS="-e HEVOLVE_BASE_URL=$ADVERTISE_URL"
+
             sudo docker run -d --name langchain --restart unless-stopped \
               -p 6777:6777 \
               --env-file .env \
               --env-file oauth.env \
+              $ADV_ARGS \
               -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${{ secrets.DEPLOY_MASTER_KEY_PATH }})" \
               -e HARTOS_GIT_SHA="$DEPLOY_COMMIT" \
               -e HARTOS_IMAGE_TAG="$DEPLOY_COMMIT_SHORT" \
@@ -438,6 +458,7 @@ jobs:
                    -p 6777:6777 \
                    --env-file .env \
                    --env-file oauth.env \
+                   $ADV_ARGS \
                    -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${{ secrets.DEPLOY_MASTER_KEY_PATH }})" \
                    -e WHATSAPP_API_URL="http://172.17.0.1:3000" \
                    -v "$(pwd)/config.json:/app/config.json:ro" \

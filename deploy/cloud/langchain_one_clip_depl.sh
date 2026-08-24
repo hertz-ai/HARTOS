@@ -77,10 +77,25 @@ MOUNT_ARGS=""
 sudo mkdir -p /opt/hzai-LLM-Langchain-Chatbot-Agent/logs /opt/hzai-LLM-Langchain-Chatbot-Agent/mount/images
 ENV_FILE_ARGS=""
 [ -f "$(pwd)/.env" ] && ENV_FILE_ARGS="--env-file $(pwd)/.env"
+# Routable self-URL for peers — get_advertisable_base_url precedence 1.
+# A bridge container otherwise advertises its docker-internal NIC
+# (measured 2026-08-24: http://172.17.0.4:6777 in a LAN peer's table).
+# Same derivation as deploy-hartos-deepbox.yml; export HEVOLVE_BASE_URL
+# before running to override.
+ADV_ARGS=""
+if [ "$NETWORK_MODE" != "host" ]; then
+    _ADV="${HEVOLVE_BASE_URL}"
+    if [ -z "$_ADV" ]; then
+        _HOST_IP="$(ip route get 1 2>/dev/null | awk '{for(i=1;i<NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+        [ -n "$_HOST_IP" ] && _ADV="http://${_HOST_IP}:6777"
+    fi
+    [ -n "$_ADV" ] && ADV_ARGS="-e HEVOLVE_BASE_URL=$_ADV"
+fi
 sudo docker rm -f langchain 2>/dev/null || true
 sudo docker run -d --name langchain --restart unless-stopped \
     $NET_ARGS \
     $ENV_FILE_ARGS \
+    $ADV_ARGS \
     $KEY_ARGS \
     $MOUNT_ARGS \
     -v /opt/hzai-LLM-Langchain-Chatbot-Agent/logs:/app/logs \
