@@ -18,6 +18,10 @@ from cryptography.exceptions import InvalidSignature
 
 logger = logging.getLogger('hevolve_security')
 
+_PRIVATE_KEY_FILE = 'node_private_key.pem'
+_PUBLIC_KEY_FILE = 'node_public_key.pem'
+
+
 def _resolve_key_dir():
     explicit = os.environ.get('HEVOLVE_KEY_DIR')
     if explicit:
@@ -25,11 +29,42 @@ def _resolve_key_dir():
     db_path = os.environ.get('HEVOLVE_DB_PATH', '')
     if db_path and db_path != ':memory:' and os.path.isabs(db_path):
         return os.path.dirname(db_path)
-    return 'agent_data'
+    # The last resort used to be a RELATIVE 'agent_data': the same machine
+    # minted a DIFFERENT Ed25519 identity per working directory, and under
+    # a read-only install root (Program Files) the key write failed
+    # outright (#632).  Anchor to the stable user data dir instead, and
+    # adopt a legacy CWD-relative keypair once so no node changes identity.
+    try:
+        from core.platform_paths import get_data_dir
+        stable = os.path.join(get_data_dir(), 'agent_data')
+    except Exception:
+        return 'agent_data'  # bare checkout without core: old behaviour
+    legacy_priv = os.path.join('agent_data', _PRIVATE_KEY_FILE)
+    stable_priv = os.path.join(stable, _PRIVATE_KEY_FILE)
+    if os.path.isfile(legacy_priv) and not os.path.isfile(stable_priv):
+        try:
+            os.makedirs(stable, exist_ok=True)
+            shutil.copy2(legacy_priv, stable_priv)
+            legacy_pub = os.path.join('agent_data', _PUBLIC_KEY_FILE)
+            if os.path.isfile(legacy_pub):
+                shutil.copy2(legacy_pub,
+                             os.path.join(stable, _PUBLIC_KEY_FILE))
+            logger.warning('Adopted legacy CWD-relative node keypair '
+                           '%s -> %s (#632)',
+                           os.path.abspath(legacy_priv), stable_priv)
+        except OSError as e:
+            logger.warning('Legacy keypair adoption failed (%s); '
+                           'using stable dir %s', e, stable)
+    return stable
+
 
 _KEY_DIR = _resolve_key_dir()
-_PRIVATE_KEY_FILE = 'node_private_key.pem'
-_PUBLIC_KEY_FILE = 'node_public_key.pem'
+
+# Canonical resolver for "where does this node's key material live".
+# channel_encryption (X25519 persists alongside Ed25519) and
+# key_delegation (node_certificate.json) import THIS — their own copies
+# had already drifted (key_delegation missed the HEVOLVE_DB_PATH branch).
+resolve_key_dir = _resolve_key_dir
 _CODE_ROOT = os.environ.get('HEVOLVE_CODE_ROOT', os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))))
 

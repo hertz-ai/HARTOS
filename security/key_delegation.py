@@ -37,8 +37,29 @@ from cryptography.exceptions import InvalidSignature
 
 logger = logging.getLogger('hevolve_security')
 
-_DEFAULT_CERT_PATH = os.path.join(
-    os.environ.get('HEVOLVE_KEY_DIR', 'agent_data'), 'node_certificate.json')
+# The certificate lives with the node's key material.  The old inline
+# default had drifted from the key resolver twice over: it missed the
+# HEVOLVE_DB_PATH branch entirely, and its 'agent_data' last resort was
+# CWD-relative (#632).  node_integrity.resolve_key_dir is the one
+# authority; a legacy CWD-relative cert is adopted once so no node
+# loses its tier authorization on upgrade.
+from security.node_integrity import resolve_key_dir as _resolve_key_dir
+
+_CERT_FILE = 'node_certificate.json'
+_DEFAULT_CERT_PATH = os.path.join(_resolve_key_dir(), _CERT_FILE)
+_legacy_cert = os.path.join('agent_data', _CERT_FILE)
+if (not os.path.isfile(_DEFAULT_CERT_PATH)
+        and os.path.isfile(_legacy_cert)):
+    try:
+        import shutil as _shutil
+        os.makedirs(os.path.dirname(_DEFAULT_CERT_PATH), exist_ok=True)
+        _shutil.copy2(_legacy_cert, _DEFAULT_CERT_PATH)
+        logger.warning('Adopted legacy CWD-relative node certificate '
+                       '%s -> %s (#632)',
+                       os.path.abspath(_legacy_cert), _DEFAULT_CERT_PATH)
+    except OSError:
+        # Read-only or contended: keep serving the cert that works.
+        _DEFAULT_CERT_PATH = _legacy_cert
 
 # Trusted Hevolve infrastructure domains.  HARDCODED — not configurable via
 # env var because this repo is open-sourced and env vars are trivially spoofed.
