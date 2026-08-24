@@ -5476,9 +5476,18 @@ def get_tools(req_tool, is_first: bool = False):
             elif hasattr(t, '_run') and callable(t._run):
                 t._run = _with_tool_logging(t._run, t.name)
 
-        tool_strings = "\n".join(
-            f"\n> {tool.name}: {tool.description}" for tool in tools)
-        return tool_strings
+        # Return the Tool objects, symmetric with the is_first=True branch.
+        # This branch used to return a rendered "> name: description" STRING
+        # (shaped for the CustomGPT <TOOLS_START> splice, which now renders
+        # at its own call site).  get_ans passes this value to
+        # ConversationalChatAgent.create_prompt + CustomAgentExecutor, and
+        # the string crashed both: live 2026-08-24 08:23:44, hie:7608
+        # "AttributeError: 'str' object has no attribute 'name'" — every
+        # casual_conv=False turn died there and the tool-less '_tier':
+        # 'direct' fallback answered.  Unreachable dead code until the
+        # classifier override (15ed5874) made this branch live; all 3
+        # logged crashes are the 3 override-fired turns.
+        return tools
 
 # custom GPT
 
@@ -5767,9 +5776,13 @@ class CustomGPT(LLM):
 
         if self.count > 1 and thread_local_data.get_global_intent() != self.previous_intent:
             tools = get_tools(thread_local_data.get_global_intent())
+            # get_tools returns Tool objects; this splice needs text, so
+            # render here (the only consumer that wants the string form).
+            tool_strings = "\n".join(
+                f"\n> {t.name}: {t.description}" for t in tools)
             start_index = prompt.find("<TOOLS_START>")
             end_index = prompt.find("<TOOLS_END>") + len("<TOOLS_END>")
-            prompt = prompt[:start_index] + tools + prompt[end_index:]
+            prompt = prompt[:start_index] + tool_strings + prompt[end_index:]
             app.logger.info(f"second time calling {len(prompt)}")
 
             # prompt = create_prompt(tools)
