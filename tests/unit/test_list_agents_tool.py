@@ -34,6 +34,23 @@ def test_langchain_registry_carries_list_agents_tool():
         "'I have no separate agents' while 2,637 sit in the registry")
 
 
+def test_both_get_tools_branches_carry_list_agents():
+    """get_tools has TWO tool lists (is_first=True labeled_tool registry +
+    the is_first=False exhaustive list).  Live 2026-08-24 07:01: the tool
+    was registered only in the first, so every casual_conv=False turn —
+    the branch enumeration questions actually reach since the classifier
+    override — got a registry WITHOUT it and the model truthfully said
+    'I do not have access to a List_Agents tool'.  Pin: one registration
+    per branch, both reading the shared description constant (the
+    _CREATE_AGENT_TOOL_DESCRIPTION pattern)."""
+    assert _HIE_SRC.count('name="List_Agents"') >= 2, (
+        "List_Agents registered in only one get_tools branch — "
+        "casual_conv=False turns get a registry without it")
+    # definition + >=2 uses; a copy-pasted literal in one branch would drift
+    assert _HIE_SRC.count('_LIST_AGENTS_TOOL_DESCRIPTION') >= 3, (
+        "both registrations must share _LIST_AGENTS_TOOL_DESCRIPTION")
+
+
 def test_wrapper_delegates_to_canonical_impl():
     """The wrapper must import the mcp impl, not re-implement it."""
     m = re.search(r'def _parse_list_agents.*?(?=\ndef |\nclass )', _HIE_SRC, re.DOTALL)

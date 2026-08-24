@@ -4907,7 +4907,7 @@ def get_tools(req_tool, is_first: bool = False):
             labeled_tool(
                 name="List_Agents",
                 func=_parse_list_agents,
-                description="List the agents available on this device: built-in expert agents and the user's own created agents, with name, category, and description. Use whenever the user asks what agents exist, what agents they have, or which agent could handle a task — never say there are no separate agents without calling this. Input: an optional search term to filter by name or skill, or an empty string for the full list.",
+                description=_LIST_AGENTS_TOOL_DESCRIPTION,
                 ui_label='Listing your agents…',
             ),
             labeled_tool(
@@ -5388,6 +5388,11 @@ def get_tools(req_tool, is_first: bool = False):
                 name="User_details_tool",
                 func=parse_user_id,
                 description="Utilize this functionality to retrieve information about students or users, requiring the current user_id as the only acceptable input; access to other user details is not allowed."
+            ),
+            Tool(
+                name="List_Agents",
+                func=_parse_list_agents,
+                description=_LIST_AGENTS_TOOL_DESCRIPTION,
             ),
             Tool(
                 name="Visual_Context_Camera",
@@ -6920,6 +6925,21 @@ def parse_visual_context(inp: str):
             fh.close()
 
     return "No visual context available — camera not active."
+
+
+# Shared by BOTH get_tools branches (is_first=True labeled_tool and the
+# is_first=False exhaustive list) — same single-source shape as
+# _CREATE_AGENT_TOOL_DESCRIPTION.  Live 2026-08-24 07:01: the tool was
+# registered only in the is_first=True branch, so every casual_conv=False
+# turn (the branch enumeration questions actually reach since 15ed5874)
+# got a registry WITHOUT it and the model truthfully denied having it.
+_LIST_AGENTS_TOOL_DESCRIPTION = (
+    "List the agents available on this device: built-in expert agents and "
+    "the user's own created agents, with name, category, and description. "
+    "Use whenever the user asks what agents exist, what agents they have, "
+    "or which agent could handle a task — never say there are no separate "
+    "agents without calling this. Input: an optional search term to filter "
+    "by name or skill, or an empty string for the full list.")
 
 
 def _parse_list_agents(inp: str = ''):
