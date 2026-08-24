@@ -314,16 +314,9 @@ jobs:
             echo "rollback target: $ROLLBACK_IMAGE"
             docker rm -f langchain 2>/dev/null || true
 
-            # The URL this node hands to peers.  core/port_registry
-            # .get_advertisable_base_url treats HEVOLVE_BASE_URL as precedence
-            # 1 — "how Docker Compose and remote SSH installs publish a
-            # routable name".  Without it, a bridge-mode container resolves
-            # its OWN NIC and advertises its docker-internal address: measured
-            # 2026-08-24, this node's row in a LAN peer's table read
-            # http://172.17.0.4:6777 — undialable, the localhost:6777 phantom
-            # family again.  Derived from the host's default route (the same
-            # semantics as get_lan_ip's UDP-connect trick), overridable via
-            # the DEPLOY_ADVERTISE_URL secret for a public name.
+            # Routable self-URL for peers (get_advertisable_base_url prec. 1).
+            # Without it a bridge container advertises its docker-internal NIC
+            # (measured 2026-08-24: 172.17.0.4 in a LAN peer's table).
             ADVERTISE_URL="${{ secrets.DEPLOY_ADVERTISE_URL }}"
             if [ -z "$ADVERTISE_URL" ]; then
               _HOST_IP="$(ip route get 1 2>/dev/null | awk '{for(i=1;i<NF;i++) if ($i=="src") {print $(i+1); exit}}')"
