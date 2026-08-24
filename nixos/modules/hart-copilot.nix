@@ -283,6 +283,16 @@ in
             "HART_COPILOT_BACKEND=http://127.0.0.1:6777"
             "HART_COPILOT_REPO=/var/lib/hart/copilot/HARTOS"
             "HART_COPILOT_STOP=/run/hart/copilot-stop"
+            # Pin a currently-resolvable model. claude-code ships a baked
+            # default model id in its bundle; the 1.0.85 build defaults to
+            # claude-opus-4-1-20250805, which the API now 404s
+            # ("model: claude-opus-4-1-20250805 not_found") -- so the resident
+            # copilot's every `claude -p` failed at the model layer even once
+            # authenticated (measured on the box 2026-08-23, right after login
+            # succeeded). ANTHROPIC_MODEL is claude-code's documented override
+            # and decouples the copilot from whatever default a bundled
+            # version happens to carry. Bump this as the frontier tier moves.
+            "ANTHROPIC_MODEL=claude-sonnet-5"
             # WorkingDirectory alone is NOT enough. Running "python
             # scripts/hart_copilot_daemon.py" makes sys.path[0] the SCRIPT's dir
             # (scripts/), not the app root, so `from security.hive_guardrails
