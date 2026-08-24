@@ -426,6 +426,15 @@ class FederatedAggregator:
         hundreds of unreachable rows (loopback / other-LAN). The whole fan-out
         shares one hard deadline and runs concurrently, so a dead or slow peer
         can never hang the background tick.
+
+        Each sampled peer is delivered PeerLink-first: if this node holds a
+        live, authenticated link to that peer's node_id, the delta rides the
+        'learning' channel (0x0A) over that encrypted, NAT-traversing socket —
+        the only way two peers behind separate NATs can federate. Absent or
+        failed link falls back to the SAME authenticated /federation-delta HTTP
+        receiver. Seeds (central) are always HTTP: public URL, no NAT to cross.
+        Both transports land on receive_peer_delta and its genuine-build gate;
+        this is a second transport, not a second (weaker) path.
         """
         # ── Edge privacy gate: block PII / secrets from leaving ──
         try:
@@ -516,12 +525,44 @@ class FederatedAggregator:
                     continue
                 if self._peer_backoff.is_backed_off(_url):
                     continue
-                _reachable.append(_url)
+                # Keep (node_id, url): node_id drives the PeerLink-first
+                # attempt below; url is the HTTP fallback + backoff key.
+                _reachable.append((_nid, _url))
 
             import random as _random
             from concurrent.futures import wait as _fwait
 
-            def _post_one(_peer_url):
+            # Resolve the PeerLink manager ONCE on this thread. A peer we hold a
+            # live link to gets the delta over that authenticated, encrypted,
+            # NAT-traversing socket — the whole reason two peers behind separate
+            # NATs can federate at all. Absent or failed link → the SAME
+            # authenticated, genuine-build-gated HTTP /federation-delta receiver
+            # (never link_manager._http_fallback, which is deliberately inert
+            # and unauthenticated). One receiver, two authenticated transports.
+            try:
+                from core.peer_link.link_manager import get_link_manager
+                _mgr = get_link_manager()
+            except Exception:
+                _mgr = None
+
+            def _deliver_one(_node_id, _peer_url):
+                # PeerLink first, but ONLY when a live link to this node exists.
+                if _mgr is not None and _node_id and _node_id != _self_node:
+                    try:
+                        _link = _mgr.get_link(_node_id)  # connected link or None
+                    except Exception:
+                        _link = None
+                    if _link is not None:
+                        try:
+                            _link.send('learning', delta)  # fire-and-forget
+                            # send() returns None on both success and a dead
+                            # link, but a failed send trips _handle_disconnect,
+                            # so a still-connected link means the frame went out.
+                            if _link.is_connected:
+                                return (_peer_url, True)
+                        except Exception:
+                            pass  # fall through to HTTP
+                # HTTP fallback — the authenticated, genuine-build-gated endpoint.
                 try:
                     pooled_post(
                         f"{_peer_url}/api/social/peers/federation-delta",
@@ -542,12 +583,23 @@ class FederatedAggregator:
             # census projection point.
             _sample = (_random.sample(_reachable, _fanout)
                        if len(_reachable) > _fanout else _reachable)
-            _targets = list(dict.fromkeys(_seeds + _sample))  # seeds first, deduped
+            # Targets are (node_id, url).  Seeds carry no node_id — seed_peers
+            # is a URL list and central has a public URL that needs no PeerLink,
+            # so seeds deliver over HTTP.  The peer sample carries node_id for
+            # the PeerLink-first attempt.  Dedup by URL, seeds first (central is
+            # the census projection point and must get every delta).
+            _targets_by_url = {}
+            for _s in _seeds:
+                _targets_by_url.setdefault(_s, (None, _s))
+            for _nid, _url in _sample:
+                _targets_by_url.setdefault(_url, (_nid, _url))
+            _targets = list(_targets_by_url.values())
 
             if _targets:
                 _ex = ThreadPoolExecutor(max_workers=min(12, len(_targets)))
                 try:
-                    _futs = {_ex.submit(_post_one, u): u for u in _targets}
+                    _futs = {_ex.submit(_deliver_one, _nid, _url): _url
+                             for (_nid, _url) in _targets}
                     _done, _pending = _fwait(_futs, timeout=8)
                     for _f in _done:
                         try:
@@ -1403,3 +1455,89 @@ def get_federated_aggregator() -> FederatedAggregator:
             if _aggregator is None:
                 _aggregator = FederatedAggregator()
     return _aggregator
+
+
+# ── PeerLink inbound transport for learning deltas ─────────────────────────
+# A learning delta reaches this node's aggregator by exactly ONE of two
+# AUTHENTICATED transports, both landing on the SAME receiver
+# (receive_peer_delta, which runs the full genuine-build join gate):
+#
+#   * HTTP   — POST /api/social/peers/federation-delta (discovery.py:425).
+#              The only transport central needs (it has a public URL); the
+#              only one a peer behind NAT can offer to a public seed.
+#   * PeerLink — the 'learning' channel (0x0A) over the persistent, Ed25519-
+#              authenticated, encrypted link.  This is what lets a delta cross
+#              between two NAT'd peers, where neither can HTTP-POST the other.
+#
+# This is NOT a parallel path: it is a second transport into the one existing
+# receiver, mirroring how 'events' (message_bus.bootstrap_peerlink_ingress) and
+# 'federation' (social posts) already ride PeerLink alongside HTTP.  The link
+# is authenticated at the transport layer AND the delta re-verifies its own
+# Ed25519 signature + attestation in receive_peer_delta — defence in depth, and
+# never weaker than the HTTP path.
+
+_learning_ingress_wired = False
+_learning_ingress_lock = threading.Lock()
+
+
+def handle_learning_delta(channel, data, sender_peer_id):
+    """PeerLink 'learning' (0x0A) receiver — hand the delta to the aggregator.
+
+    Signature is the ON-LINK handler contract that ``PeerLink._receive_loop``
+    invokes: ``handler(channel, data, sender_peer_id)`` (link.py:754) — three
+    positional args, NOT the two-arg ChannelDispatcher shape.  (The dispatcher
+    is not on the inbound link path; only ``register_channel_handler`` →
+    ``link.on_message`` → ``_message_handlers`` is.)
+
+    ``receive_peer_delta`` already performs the entire join gate (freshness,
+    Ed25519 signature over code_hash, known-release-hash OR origin attestation,
+    guardrail hash), so this wrapper only guards the payload type and delegates.
+    The return value is informational: ``_receive_loop`` ignores it, and this
+    protocol constructs no response frame, so delivery is fire-and-forget.
+    """
+    if not isinstance(data, dict):
+        logger.debug(
+            "learning delta from %s not a dict: %s",
+            (sender_peer_id or '?')[:8], type(data).__name__)
+        return None
+    try:
+        accepted, reason = get_federated_aggregator().receive_peer_delta(data)
+        if not accepted:
+            logger.debug("learning delta from %s rejected: %s",
+                         (sender_peer_id or '?')[:8], reason)
+        return {'accepted': accepted, 'reason': reason}
+    except Exception as e:
+        logger.debug("learning delta handler error from %s: %s",
+                     (sender_peer_id or '?')[:8], e)
+        return None
+
+
+def bootstrap_learning_delta_ingress() -> bool:
+    """Register the 'learning' channel handler on every PeerLink.
+
+    Idempotent — returns ``True`` on the first successful wiring, ``False`` on
+    any later call or when PeerLink is unavailable.  Called once per process
+    from ``local_subscribers.bootstrap_local_subscribers`` (the single boot that
+    runs on BOTH the central/regional server, hart_intelligence_entry.py:12463,
+    and the flat/Nunba node, embedded_main.py:392), so one wiring covers every
+    tier.  ``register_channel_handler`` applies the handler to all present and
+    future links, so a delta pushed over any link reaches receive_peer_delta.
+    """
+    global _learning_ingress_wired
+    with _learning_ingress_lock:
+        if _learning_ingress_wired:
+            return False
+        try:
+            from core.peer_link.link_manager import get_link_manager
+        except ImportError:
+            logger.debug("learning ingress: peer_link not importable")
+            return False
+        try:
+            get_link_manager().register_channel_handler(
+                'learning', handle_learning_delta)
+        except Exception as e:
+            logger.debug("learning ingress registration skipped: %s", e)
+            return False
+        _learning_ingress_wired = True
+        logger.info("Federation learning-delta (0x0A) PeerLink ingress registered")
+        return True

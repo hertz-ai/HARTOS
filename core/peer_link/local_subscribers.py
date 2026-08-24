@@ -389,7 +389,28 @@ def bootstrap_local_subscribers() -> None:
         logger.debug(f"PeerLink ingress not wired: {e}")
         _ingress_leg = ""
 
+    # 9. PeerLink inbound 'learning' channel → FederatedAggregator.receive_peer_delta.
+    #    The peer transport for federation learning deltas: without this handler
+    #    a delta pushed over a link is dropped, and two peers behind separate
+    #    NATs (who cannot HTTP-POST each other's /federation-delta) can never
+    #    exchange training-time metrics — only the public seeds would ever
+    #    aggregate.  Wiring it in THIS bootstrap (the one boot that runs on both
+    #    the central/regional server and the flat/Nunba node) arms every tier
+    #    from a single place, the same way #8 arms the 'events' relay.
+    try:
+        from integrations.agent_engine.federated_aggregator import (
+            bootstrap_learning_delta_ingress,
+        )
+        if bootstrap_learning_delta_ingress():
+            _learning_leg = ", learning-ingress"
+        else:
+            _learning_leg = ""
+    except Exception as e:
+        logger.debug(f"Learning-delta ingress not wired: {e}")
+        _learning_leg = ""
+
     logger.info(
         "Local subscribers bootstrapped: confirmation, longrunning, "
-        "intermediate, exception, timeout, probe" + _ota_leg + _ingress_leg
+        "intermediate, exception, timeout, probe"
+        + _ota_leg + _ingress_leg + _learning_leg
     )

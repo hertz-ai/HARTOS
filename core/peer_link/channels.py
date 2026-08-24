@@ -96,6 +96,20 @@ CHANNEL_REGISTRY = {
         'reliable': True,
         'description': 'P2P DMs, channel messages, reactions, read receipts, edits',
     },
+    'learning': {
+        'id': 0x0A,
+        # Federation learning deltas are aggregate stats only (experience
+        # counters, quality metrics, benchmark scores) + the node's PUBLIC
+        # code_hash — never raw user data (the test_federation_privacy
+        # invariant).  So OPEN, like 'federation'/'ralt', not PRIVATE: no
+        # per-user E2E needed, and the payload already carries its own
+        # Ed25519 signature + origin attestation for the genuine-build gate.
+        'data_class': DataClass.OPEN,
+        'priority': 3,      # Background training-time sync, below interactive
+        'reliable': True,   # A dropped delta is a lost training round
+        'description': 'Federation learning deltas — FedAvg metric sync '
+                       '(peer transport for FederatedAggregator.receive_peer_delta)',
+    },
 }
 
 # Reverse lookup: id -> name
