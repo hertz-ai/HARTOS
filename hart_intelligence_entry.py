@@ -10218,10 +10218,23 @@ def evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_
 
 
 def set_flags_to_enter_review_mode(no_of_flow, user_id, prompt_id=''):
+    """Despite the name, this only ever runs from the "all flows complete
+    -> REUSE" branch (its one call site) -- it has never actually meant
+    "enter review mode". It used to set review_agents[_ak] = True
+    unconditionally, which poisoned the SAME request's own outcome: the
+    "resuming in-progress creation" check a few lines later in chat()
+    reads that same key and stomps this function's correct
+    create_agent=False return value back to True, permanently trapping
+    every later message for this (user, prompt) in the creation flow even
+    though the agent was already fully built. Found 2026-08-24 testing a
+    brand-new Slack binding against prompt_id=8888 -- every single
+    message, including the very first one from a user who had never
+    touched this agent before, got stuck this way.
+    """
     app.logger.info(f'{no_of_flow} Recipe Json exist Going to reuse')
     create_agent = False
     _ak = f'{user_id}_{prompt_id}'
-    review_agents[_ak] = True
+    review_agents[_ak] = False
     conversation_agent[_ak] = False
     _touch_agent_timestamp(_ak)
     return create_agent
