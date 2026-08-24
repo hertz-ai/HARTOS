@@ -72,3 +72,43 @@ def test_uninstall_and_search_are_also_user_scoped():
         assert cmd[1] == '--user', f"flatpak call not --user scoped: {cmd}"
         assert env.get('FLATPAK_USER_DIR', '').endswith('flatpak'), \
             f"flatpak call missing FLATPAK_USER_DIR env: {cmd}"
+
+
+# ── the other half: an installed app must be REACHABLE from the desktop ──────
+
+def test_nixos_makes_the_hart_flatpak_root_usable_by_the_desktop():
+    """Installing at --user scope into the backend's own dir is correct (the
+    service is sandboxed as `hart` and cannot write /var/lib/flatpak without
+    polkit), but on its own it makes a SUCCESSFUL install unusable.
+
+    Measured end to end on the box 2026-08-24 after a real Flathub install of
+    Firefox, three separate faults, all of which had to be fixed:
+
+      1. the installer created the root 0700 hart:hart, and the desktop session
+         runs as a different user, so reading the exported .desktop was
+         "Permission denied";
+      2. the session's XDG_DATA_DIRS/PATH never list that root, so even a
+         readable .desktop is not indexed;
+      3. the exported .desktop runs `flatpak run ...`, and plain flatpak searches
+         only its DEFAULT roots, so it answered "error: app/org.mozilla.firefox/
+         x86_64/stable not installed" for an app that WAS installed.
+
+    Fixing 1 and 2 alone still leaves the app unlaunchable, which is why this
+    guard checks all three.
+    """
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[2]
+           / "nixos" / "modules" / "hart-apps.nix").read_text(encoding="utf-8")
+    code = "\n".join(line.split("#")[0] for line in src.splitlines())
+    assert "systemd.tmpfiles.rules" in code and "2750" in code, (
+        "the flatpak root must be created group-traversable (setgid) so the "
+        "desktop session user can read what the installer wrote")
+    assert "XDG_DATA_DIRS" in code and "exports/share" in code, (
+        "the session must index the HART flatpak exports, or installed apps "
+        "never appear in the launcher")
+    assert "FLATPAK_USER_DIR" in code, (
+        "the session must point flatpak at the SAME root the installer used, or "
+        "`flatpak run` reports an installed app as not installed")
+    assert "extraInit" in code, (
+        "use extraInit to APPEND: sessionVariables would clobber XDG_DATA_DIRS "
+        "and PATH wholesale")

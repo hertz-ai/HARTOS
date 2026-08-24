@@ -48,6 +48,13 @@ let
 
   catalogFile = ./hart-app-catalog.json;
 
+  # Where the app store installs to. MUST match app_installer.py's
+  # `HART_APP_DIR` default ('${cfg.dataDir}/apps'), because that module creates
+  # the flatpak root and this one has to make the DESKTOP able to see and launch
+  # what it put there. Derived from cfg.dataDir rather than written out, so the
+  # two cannot drift when the data dir moves.
+  appsDir = "${cfg.dataDir}/apps";
+
   # Parse the canonical catalog. `or []` keeps eval safe if the schema is ever
   # reshaped; builtins.fromJSON on the committed file yields { apps = [ ... ]; }.
   catalog = builtins.fromJSON (builtins.readFile catalogFile);
@@ -141,5 +148,45 @@ in
     # read it). The Python backend ALSO resolves the catalog repo-relative, so
     # this is a convenience, never the sole path.
     environment.sessionVariables.HART_APP_CATALOG = "${catalogFile}";
+
+    # ── Make an INSTALLED app reachable from the desktop ────────────────────────
+    # app_installer.py installs flatpaks at --user scope into
+    # ${appsDir}/flatpak (FLATPAK_USER_DIR), because the backend runs sandboxed
+    # as `hart` and cannot write /var/lib/flatpak without root/polkit. That is
+    # correct, but on its own it makes a successful install UNUSABLE, and all
+    # three reasons had to be fixed for "type firefox, get firefox" to work.
+    # Measured end to end on the box 2026-08-24 after a real Flathub install:
+    #
+    #   1. PERMISSIONS. The installer created ${appsDir}/flatpak mode 0700
+    #      hart:hart. The desktop session runs as a DIFFERENT user (hart-admin),
+    #      so reading the exported .desktop was "Permission denied" — the app was
+    #      invisible to the launcher that is supposed to start it. hart-admin is
+    #      already in the `hart` group, so group-traversable dirs are enough; the
+    #      setgid bit keeps that true for anything the installer creates later.
+    #   2. DISCOVERY. The session's XDG_DATA_DIRS/PATH list ~/.local/share/flatpak
+    #      and /var/lib/flatpak but NOT this root, so even a readable .desktop is
+    #      never indexed.
+    #   3. RESOLUTION (the one that still bit after 1 and 2). The exported
+    #      .desktop runs `flatpak run ... org.mozilla.firefox`, and plain flatpak
+    #      searches only its DEFAULT roots, so it answered
+    #      "error: app/org.mozilla.firefox/x86_64/stable not installed" for an app
+    #      that was installed. Exporting FLATPAK_USER_DIR points the launcher at
+    #      the same root the installer used; verified by launching the exported
+    #      binary as the session user (exit 0).
+    #
+    # extraInit rather than sessionVariables: these APPEND to variables the rest
+    # of the session already set, and sessionVariables would clobber XDG_DATA_DIRS
+    # and PATH wholesale.
+    systemd.tmpfiles.rules = [
+      "d ${appsDir} 2750 hart hart -"
+      "d ${appsDir}/flatpak 2750 hart hart -"
+    ];
+
+    environment.extraInit = ''
+      # One flatpak root for the OS: the one the app store installs into.
+      export FLATPAK_USER_DIR="${appsDir}/flatpak"
+      export XDG_DATA_DIRS="''${XDG_DATA_DIRS:+$XDG_DATA_DIRS:}${appsDir}/flatpak/exports/share"
+      export PATH="$PATH:${appsDir}/flatpak/exports/bin"
+    '';
   };
 }
