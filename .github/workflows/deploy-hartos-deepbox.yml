@@ -314,17 +314,17 @@ jobs:
             echo "rollback target: $ROLLBACK_IMAGE"
             docker rm -f langchain 2>/dev/null || true
 
-            # Routable self-URL for peers (get_advertisable_base_url prec. 1).
-            # Without it a bridge container advertises its docker-internal NIC
-            # (measured 2026-08-24: 172.17.0.4 in a LAN peer's table).
+            # Routable self-URL; a bridge NIC leaks otherwise (172.17.0.4, 2026-08-24).
             ADVERTISE_URL="${{ secrets.DEPLOY_ADVERTISE_URL }}"
             if [ -z "$ADVERTISE_URL" ]; then
               _HOST_IP="$(ip route get 1 2>/dev/null | awk '{for(i=1;i<NF;i++) if ($i=="src") {print $(i+1); exit}}')"
               [ -n "$_HOST_IP" ] && ADVERTISE_URL="http://${_HOST_IP}:6777"
             fi
-            echo "advertise URL: ${ADVERTISE_URL:-<unset — container will self-resolve>}"
+            echo "advertise URL: ${ADVERTISE_URL:-unset}"
             ADV_ARGS=""
             [ -n "$ADVERTISE_URL" ] && ADV_ARGS="-e HEVOLVE_BASE_URL=$ADVERTISE_URL"
+            # Flywheel state (goals DB, prospects, node keys) must survive rebuilds.
+            AD="${{ secrets.DEPLOY_AGENT_DATA_PATH }}"; [ -z "$AD" ] && AD=/opt/hzai-LLM-Langchain-Chatbot-Agent/agent_data; sudo mkdir -p "$AD"
 
             sudo docker run -d --name langchain --restart unless-stopped \
               -p 6777:6777 \
@@ -339,6 +339,8 @@ jobs:
               -v "$(pwd)/release_manifest.json:/app/release_manifest.json:ro" \
               -v ${{ secrets.DEPLOY_LOGS_PATH }}:/app/logs \
               -v ${{ secrets.DEPLOY_IMAGES_PATH }}:/app/output_images \
+              -v "$AD":/app/agent_data \
+              -e HEVOLVE_KEY_DIR=/app/agent_data \
               langchain_gpt:"$DEPLOY_COMMIT_SHORT"
 
             echo "=== Wait for service ==="
@@ -457,6 +459,8 @@ jobs:
                    -v "$(pwd)/config.json:/app/config.json:ro" \
                    -v ${{ secrets.DEPLOY_LOGS_PATH }}:/app/logs \
                    -v ${{ secrets.DEPLOY_IMAGES_PATH }}:/app/output_images \
+                   -v "$AD":/app/agent_data \
+                   -e HEVOLVE_KEY_DIR=/app/agent_data \
                    "$ROLLBACK_IMAGE"; then
                 echo "rolled back to $ROLLBACK_IMAGE"
               else

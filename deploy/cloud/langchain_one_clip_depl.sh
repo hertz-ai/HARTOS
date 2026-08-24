@@ -76,6 +76,10 @@ MOUNT_ARGS=""
 [ -f "$(pwd)/config.json" ] && MOUNT_ARGS="$MOUNT_ARGS -v $(pwd)/config.json:/app/config.json:ro"
 [ -f "$(pwd)/release_manifest.json" ] && MOUNT_ARGS="$MOUNT_ARGS -v $(pwd)/release_manifest.json:/app/release_manifest.json:ro"
 sudo mkdir -p /opt/hzai-LLM-Langchain-Chatbot-Agent/logs /opt/hzai-LLM-Langchain-Chatbot-Agent/mount/images
+# Flywheel state (goals DB, outreach prospects, node keys) lives in
+# /app/agent_data.  Unmounted, a rebuild wiped it — the 2026-04-28 wipe
+# in FLYWHEEL_RECOVERY_BRIEF.md.  Same mount as the workflow.
+sudo mkdir -p /opt/hzai-LLM-Langchain-Chatbot-Agent/agent_data
 ENV_FILE_ARGS=""
 [ -f "$(pwd)/.env" ] && ENV_FILE_ARGS="--env-file $(pwd)/.env"
 # Routable self-URL for peers — get_advertisable_base_url precedence 1.
@@ -101,6 +105,8 @@ sudo docker run -d --name langchain --restart unless-stopped \
     $MOUNT_ARGS \
     -v /opt/hzai-LLM-Langchain-Chatbot-Agent/logs:/app/logs \
     -v /opt/hzai-LLM-Langchain-Chatbot-Agent/mount/images:/app/output_images \
+    -v /opt/hzai-LLM-Langchain-Chatbot-Agent/agent_data:/app/agent_data \
+    -e HEVOLVE_KEY_DIR=/app/agent_data \
     langchain_gpt:latest
 
 docker start $(docker ps -a -q)
