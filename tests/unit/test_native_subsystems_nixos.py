@@ -127,6 +127,34 @@ class TestSourceGuardAndroidWaydroid:
         # Idempotency guard on the system image.
         assert "ConditionPathExists = \"!/var/lib/waydroid/images/system.img\"" in src
 
+
+    def test_source_guard_waydroid_cannot_fill_the_disk(self):
+        """Android is optional; the OS is not.
+
+        The system image is ~700MB compressed and is staged under
+        /var/lib/waydroid/cache_http before unpacking, so an attempt needs
+        several GB of headroom. Measured on the 28G fleet stick 2026-08-24:
+        repeated attempts left 0.8-1.7GB of partials behind and drove the
+        filesystem to 100%, which broke the OTA request writer with "No space
+        left on device" and made a user's app install fail. Making the unit
+        non-blocking (Type=simple) made this WORSE, because the download gained
+        the full RuntimeMaxSec window instead of dying at a 600s start timeout.
+
+        So the unit must refuse to start the fetch below a free-space floor, and
+        must not leave partials behind when it gives up.
+        """
+        src = _subsystems()
+        assert "minFreeMB" in src, (
+            "waydroid init must have a free-space floor option; without one an "
+            "optional subsystem can fill the disk and take the node down")
+        code = "\n".join(l.split("#")[0] for l in src.splitlines())
+        assert "NEED_MB" in code and "FREE_MB" in code, (
+            "the init script must compare free space against the floor BEFORE "
+            "fetching, and skip (exit 0) rather than fill the disk")
+        assert "cache_http" in code, (
+            "the init script must clear /var/lib/waydroid/cache_http so aborted "
+            "downloads cannot accumulate across boots")
+
     def test_source_guard_waydroid_init_tolerates_no_network(self):
         src = _subsystems()
         # Must not fail the boot transaction when the image download is impossible
