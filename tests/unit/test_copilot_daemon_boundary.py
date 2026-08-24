@@ -266,3 +266,34 @@ def test_daemon_can_reach_the_unit_it_needs():
     assert 'polkit.addRule' in nix
     assert 'hart-copilot-verify.service' in nix
     assert 'pkgs.systemd' in nix, 'systemctl must be on the daemon unit path'
+
+
+# ── the copilot must be able to REACH the hive ───────────────────────────────
+
+def test_copilot_unit_carries_the_backend_port():
+    """The daemon resolves its backend through core.port_registry's
+    get_port('backend') deliberately, as "the ONE canonical port source rather
+    than an env override that can drift". That registry reads
+    HARTOS_BACKEND_PORT, and hart-copilot.nix was the ONLY HART unit that did
+    not set it (hart-backend, hart-liquid-ui, hart-model-bus, hart-app-bridge
+    and hart-conky all do), so it fell through to the OS-mode default of 677 --
+    a port nothing binds.
+
+    Measured on the box 2026-08-24: the daemon logged
+    `backend=http://127.0.0.1:677`; curl :677 returned 000 while :6777 returned
+    200; every tick for a day said {"action": "idle", "reason": "no task
+    assigned by the hive"}; and `claude` was invoked exactly zero times. An
+    unreachable hive is reported as an idle hive, so the daemon looked healthy
+    while being structurally unable to do anything.
+    """
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[2]
+           / "nixos" / "modules" / "hart-copilot.nix").read_text(encoding="utf-8")
+    code = "\n".join(line.split("#")[0] for line in src.splitlines())
+    assert "HARTOS_BACKEND_PORT" in code, (
+        "hart-copilot.nix must set HARTOS_BACKEND_PORT in the daemon's unit "
+        "environment; without it get_port('backend') resolves to a dead port and "
+        "the copilot can never receive a task.")
+    assert "127.0.0.1:6777" not in code, (
+        "the backend port must come from config.hart.ports.backend, not a "
+        "hardcoded 6777 that can drift from what the backend actually binds.")
