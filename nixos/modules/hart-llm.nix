@@ -8,36 +8,40 @@
 let
   cfg = config.hart;
 
-  # ── llama.cpp built for the fleet's REAL cpu floor ────────────────────────────
-  # The Samsung/Lenovo HART box is an Intel i7-3630QM (Ivy Bridge, 2012): it has
-  # avx + f16c + sse4.2 but NO avx2, NO fma, NO bmi2. Stock nixpkgs `llama-cpp`
-  # ships a SINGLE libggml-cpu.so compiled WITH avx2/fma and no runtime fallback,
-  # so on this CPU llama-server hits an illegal instruction (SIGILL, status 4/ILL)
-  # and core-dumps at startup -- before it can bind cfg.ports.llm. Under
-  # Restart=on-failure that became a crash loop (measured: 6760+ restarts / ~19h,
-  # 2026-08-24), which is why the local LLM was never reachable and every goal
-  # agent stalled with no inference engine. The "Ivy Bridge Vulkan incomplete"
-  # journal lines were a red herring -- only libggml-cpu.so carried the bad insns
-  # (1028 of them); the Vulkan/base libs had zero.
+  # ── llama.cpp: keep the fleet baseline, ADD a floor for pre-Haswell nodes ────
+  # nixpkgs' stock llama-cpp is a DELIBERATE avx2 baseline, not an accident of
+  # whichever machine built it: the derivation passes `-DGGML_NATIVE:BOOL=FALSE`
+  # (verified with `nix derivation show`), and in ggml's CMakeLists NATIVE=OFF
+  # while NATIVE_DEFAULT=ON sets `INS_ENB=ON`, which turns GGML_AVX2 and GGML_FMA
+  # ON (AVX512 stays off). For most of the fleet -- Haswell (2013) and newer --
+  # those kernels are a large speedup and MUST be kept.
   #
-  # Fix: build llama.cpp for THIS ISA -- disable avx2/fma/bmi2/avx512 (keep avx +
-  # f16c, which Ivy Bridge has) and turn NATIVE off for reproducibility. Proven on
-  # the box: the resulting libggml-cpu.so has ZERO avx2/fma insns and serves a real
-  # completion on :808 (objdump + a live /v1/chat/completions round trip,
-  # 2026-08-24). Guarded by tests/unit/test_nixos_hart_llm_gpu.py.
+  # They are also fatal on anything older. The HART box is an i7-3630QM (Ivy
+  # Bridge, 2012): avx + f16c + sse4.2, but NO avx2/fma/bmi2. Its libggml-cpu.so
+  # carried 1028 avx2/fma instructions, so llama-server took an illegal
+  # instruction (SIGILL, status 4/ILL) and core-dumped at startup, before binding
+  # cfg.ports.llm. Under Restart=on-failure that was a crash loop: 6762 restarts
+  # over ~19h (2026-08-24), the node had no local inference, and every goal agent
+  # stalled. Note the "Ivy Bridge Vulkan incomplete" journal lines above each dump
+  # are a RED HERRING -- every one of those crashes also loaded the avx2
+  # libggml-cpu.so, and `llama-server --version` alone dies, so the SIGILL
+  # explains them all. Do not blame Vulkan without testing a Vulkan build that
+  # HAS the ISA fix.
   #
-  # Vulkan is REMOVED (vulkanSupport = false). The only GPU on the real fleet
-  # hardware is the Intel HD 4000, whose Mesa ANV driver is "incomplete" on Ivy
-  # Bridge (Mesa's own warning) and makes ggml's Vulkan backend abort at device
-  # init regardless of --n-gpu-layers -- a second crash vector, not a speed-up. A
-  # CPU-only binary cannot take that path at all. The earlier Vulkan build "fixed"
-  # a June slowness but never actually ran on real hardware; CPU-that-runs beats
-  # GPU-that-crashes, and HART's speed story is network-distributed inference (the
-  # frontier/EXPERT tier), not this local floor.
-  #   FUTURE: -DGGML_CPU_ALL_VARIANTS=ON + -DGGML_BACKEND_DL=ON gives one binary
-  #   that runtime-selects avx2 kernels on capable nodes AND avx-only on the potato;
-  #   deferred until a healthy-GPU / newer-CPU node actually joins the fleet.
-  llama-server = (pkgs.llama-cpp.override { vulkanSupport = false; }).overrideAttrs (o: {
+  # llama.cpp b4154 has no runtime CPU dispatch (GGML_CPU_ALL_VARIANTS and
+  # GGML_BACKEND_DL do not exist in this source tree -- checked), so ONE binary
+  # cannot serve both CPUs. Hence two variants and a per-boot choice. Building
+  # only the portable one would fix this 2012 laptop by taking avx2/fma AND GPU
+  # offload away from every capable node in the fleet, which is a far bigger
+  # regression than the bug.
+  llamaFast = pkgs.llama-cpp.override { vulkanSupport = true; };
+
+  # The floor: exactly the configuration PROVEN to run on the box (avx/f16c only,
+  # no Vulkan). Vulkan is dropped HERE ONLY -- the sole GPU on this class of
+  # hardware is the Intel HD 4000, whose Mesa ANV driver announces itself as
+  # "incomplete" on Ivy Bridge, so a GPU backend buys that node nothing. Capable
+  # nodes keep Vulkan via llamaFast above.
+  llamaPortable = (pkgs.llama-cpp.override { vulkanSupport = false; }).overrideAttrs (o: {
     cmakeFlags = (o.cmakeFlags or [ ]) ++ [
       "-DGGML_NATIVE=OFF"
       "-DGGML_AVX2=OFF"
@@ -49,11 +53,35 @@ let
     ];
   });
 
-  # CPU-only launcher. The binary above has NO GPU backend, so there is no
-  # --n-gpu-layers here (a CPU-only llama-server would reject it). THREADS = nproc
-  # - 1 by default (0 = AUTO) so inference leaves one core for the OS; paired with
-  # the systemd CPUWeight/Nice below it stays a background citizen and never starves
-  # the interactive desktop.
+  # THE dispatcher, and it is deliberately named `llama-server`: HARTOS's own
+  # ModelLifecycleManager._find_llama_server_binary() falls back to
+  # shutil.which('llama-server'), so putting this on PATH means every existing
+  # consumer (vision/lightweight_backend's captioner, model_onboarding, the G3
+  # direct-launch supervisor, mcp_server's model switch) transparently gets a
+  # binary that is correct for the CPU it is running on. One decision point,
+  # every caller, no per-node configuration and no second copy of the choice.
+  #
+  # Selection is on the CPU's ACTUAL advertised flags rather than a model name or
+  # a build-time guess, so a fleet image boots correctly on hardware nobody has
+  # tested yet. Adding a further tier later (e.g. pre-AVX) is one more branch.
+  llamaDispatch = pkgs.writeShellScriptBin "llama-server" ''
+    set -eu
+    if ${pkgs.gnugrep}/bin/grep -qw avx2 /proc/cpuinfo \
+       && ${pkgs.gnugrep}/bin/grep -qw fma /proc/cpuinfo; then
+      exec ${llamaFast}/bin/llama-server "$@"
+    fi
+    exec ${llamaPortable}/bin/llama-server "$@"
+  '';
+
+  # Service launcher: supplies only what the OS owns (model path, declared port,
+  # the ctx-size pinned to core/constants.py::LLAMA_CTX_SIZE_DEFAULT) and defers
+  # the binary choice to the dispatcher. THREADS = nproc - 1 by default (0 = AUTO)
+  # so inference leaves one core for the OS; with the systemd CPUWeight/Nice below
+  # it stays a background citizen and never starves the interactive desktop.
+  # No --n-gpu-layers: on a capable node llamaFast can still offload, but that is
+  # a separate decision from "which binary runs" and the old presence-only gate
+  # (renderD128 + an ICD file exists) was what put -ngl 999 on a GPU whose driver
+  # is incomplete. Re-add it behind a probe that proves the GPU actually works.
   llamaLauncher = pkgs.writeShellScriptBin "hart-llm-server" ''
     set -eu
     THREADS="${toString config.hart.llm.threads}"
@@ -61,8 +89,8 @@ let
       THREADS=$(( $(${pkgs.coreutils}/bin/nproc) - 1 ))
       [ "$THREADS" -lt 1 ] && THREADS=1
     fi
-    echo "hart-llm: CPU inference ($THREADS threads, one core left for the OS)" >&2
-    exec ${llama-server}/bin/llama-server \
+    echo "hart-llm: starting llama-server ($THREADS threads, one core left for the OS)" >&2
+    exec ${llamaDispatch}/bin/llama-server \
       --model "${config.hart.llm.modelPath}" \
       --port "${toString cfg.ports.llm}" \
       --ctx-size "${toString config.hart.llm.contextSize}" \
@@ -171,11 +199,11 @@ in
     #     exact crash this module's cmakeFlags exist to prevent;
     #   • model_lifecycle's own G3 _launch_llama_server_direct supervision and
     #     mcp_server's runtime model switch had nothing to launch.
-    # Putting the SAME derivation on PATH makes the OS the supplier of the
-    # binary and leaves *which flags / which port* to the code that already owns
-    # those decisions (model_onboarding's "optimal params", core.port_registry),
-    # rather than duplicating them here.
-    environment.systemPackages = [ llama-server ];
+    # Publishing the DISPATCHER (not a fixed variant) makes the OS the supplier of
+    # the binary and leaves *which flags / which port* to the code that already
+    # owns those decisions (model_onboarding's "optimal params",
+    # core.port_registry), rather than duplicating them here.
+    environment.systemPackages = [ llamaDispatch ];
 
     # NVIDIA GPU support (declarative — the NixOS way)
     hardware.nvidia = lib.mkIf (builtins.pathExists "/dev/nvidia0") {
