@@ -130,8 +130,24 @@ in
               return host.succeed(
                   "systemctl show -p " + prop
                   + " --value hart-waydroid-init.service").strip()
-          assert unit_prop("Type") == "oneshot", "waydroid init must be Type=oneshot (non-blocking)"
-          assert unit_prop("RemainAfterExit") == "yes", "waydroid init must RemainAfterExit (idempotent oneshot)"
+          # Type=simple, NOT oneshot. This assertion used to demand oneshot and
+          # call it "non-blocking", which is backwards: a oneshot START JOB only
+          # completes when ExecStart exits, and switch-to-configuration waits on
+          # the units it starts. On the box (2026-08-24) that pinned an entire OTA
+          # activation behind a ~10-minute sourceforge image download, systemd
+          # killed the unit at its start timeout, and that single failure made
+          # nixos-rebuild report the whole switch as failed and roll back a healthy
+          # generation. The offline case this test was written for still passed,
+          # because there the download fails fast and the script exits 0 — the
+          # online case was never covered.
+          assert unit_prop("Type") == "simple", (
+              "waydroid init must be Type=simple so its start job completes on fork "
+              "and a slow image download cannot block boot or an OTA activation")
+          assert unit_prop("RemainAfterExit") == "yes", "waydroid init must RemainAfterExit (idempotent)"
+          # A start timeout is exactly what broke the OTA, and it is meaningless for
+          # a simple unit anyway; a hung mirror is bounded by RuntimeMaxSec instead.
+          assert unit_prop("RuntimeMaxSec") not in ("", "infinity"), \
+              "waydroid init must bound a hung mirror with RuntimeMaxSec"
           # Pulled in by hart.target (a plain HART child) — NOT multi-user ->
           # graphical, which formed the ordering cycle the old runtime hit.
           wanted_by = unit_prop("WantedBy")

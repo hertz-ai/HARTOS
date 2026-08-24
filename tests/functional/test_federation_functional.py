@@ -331,29 +331,50 @@ class TestHmacRoundTrip:
             if old_key:
                 os.environ['HART_NODE_KEY'] = old_key
 
-    def test_receive_peer_delta_rejects_bad_hmac(self):
-        """Integration: receive_peer_delta checks HMAC and rejects tampered deltas."""
+    def test_receive_peer_delta_rejects_tampered_delta(self):
+        """Integration: a delta tampered after signing is rejected.
+
+        HMAC stopped being the fatal integrity layer in 7c430eb8 (symmetric,
+        never handshaked, was partitioning the real hive — see the aggregator's
+        HMAC comment and test_ws12's test_invalid_hmac_is_nonfatal). Under hard
+        enforcement (the production default), Ed25519 is the mandatory layer and
+        catches tampering unconditionally, so this asserts the REAL guarantee:
+        tamper a properly Ed25519-signed delta and it is rejected at the
+        signature check. Verified empirically under hard: bad Ed25519 →
+        'invalid signature'; an HMAC-only delta → 'missing Ed25519 signature'.
+        """
+        from security.node_integrity import sign_json_payload, get_public_key_hex
+
         old_key = os.environ.get('HART_NODE_KEY', '')
+        old_mode = os.environ.get('HEVOLVE_ENFORCEMENT_MODE', '')
         try:
             os.environ['HART_NODE_KEY'] = 'test-secret-key-for-hmac-functional'
+            os.environ['HEVOLVE_ENFORCEMENT_MODE'] = 'hard'  # production default
 
             agg = FederatedAggregator()
 
-            delta = _make_delta('hmac_peer')
-            _sign_delta(delta)
+            delta = _make_delta('tamper_peer')
+            delta['public_key'] = get_public_key_hex()
+            delta['signature'] = sign_json_payload(delta)  # real Ed25519 over clean payload
+            _sign_delta(delta)                             # + HMAC layer
 
-            # Tamper after signing
+            # Tamper AFTER both signatures are computed.
             delta['experience_stats']['total_recorded'] = 777
 
             ok, msg = agg.receive_peer_delta(delta)
-            assert not ok, "Tampered HMAC delta should be rejected"
-            assert 'hmac' in msg.lower(), f"Expected HMAC rejection, got: {msg}"
+            assert not ok, "Tampered delta must be rejected"
+            assert 'signature' in msg.lower(), \
+                f"Expected Ed25519 signature rejection, got: {msg}"
 
         finally:
             if old_key:
                 os.environ['HART_NODE_KEY'] = old_key
             else:
                 os.environ.pop('HART_NODE_KEY', None)
+            if old_mode:
+                os.environ['HEVOLVE_ENFORCEMENT_MODE'] = old_mode
+            else:
+                os.environ.pop('HEVOLVE_ENFORCEMENT_MODE', None)
 
 
 # ─── Test 6: Convergence score increases ───

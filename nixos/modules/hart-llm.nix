@@ -8,43 +8,159 @@
 let
   cfg = config.hart;
 
-  # GPU-accelerated llama.cpp. Vulkan is the UNIVERSAL GPU backend -- Intel iGPU (mesa
-  # ANV), AMD (RADV), NVIDIA (its Vulkan ICD) -- so ONE build offloads on any GPU and
-  # cleanly falls back to CPU. The old flake `.default` was CPU-only, so EVERY layer ran
-  # on the CPU = the "assistant keeps thinking" slowness. The Vulkan RUNTIME is already
-  # present (desktop.nix `hardware.graphics.enable` -> mesa ICDs in /run/opengl-driver).
-  # This is the NixOS analogue of the Nunba companion's "CPU prebundled, GPU when present"
-  # bootstrap: one universal binary, GPU-or-CPU decided at launch, no runtime download.
-  llama-server = pkgs.llama-cpp.override { vulkanSupport = true; };
+  # ── llama.cpp: keep the fleet baseline, ADD a floor for pre-Haswell nodes ────
+  # nixpkgs' stock llama-cpp is a DELIBERATE avx2 baseline, not an accident of
+  # whichever machine built it: the derivation passes `-DGGML_NATIVE:BOOL=FALSE`
+  # (verified with `nix derivation show`), and in ggml's CMakeLists NATIVE=OFF
+  # while NATIVE_DEFAULT=ON sets `INS_ENB=ON`, which turns GGML_AVX2 and GGML_FMA
+  # ON (AVX512 stays off). For most of the fleet -- Haswell (2013) and newer --
+  # those kernels are a large speedup and MUST be kept.
+  #
+  # They are also fatal on anything older. The HART box is an i7-3630QM (Ivy
+  # Bridge, 2012): avx + f16c + sse4.2, but NO avx2/fma/bmi2. Its libggml-cpu.so
+  # carried 1028 avx2/fma instructions, so llama-server took an illegal
+  # instruction (SIGILL, status 4/ILL) and core-dumped at startup, before binding
+  # cfg.ports.llm. Under Restart=on-failure that was a crash loop: 6762 restarts
+  # over ~19h (2026-08-24), the node had no local inference, and every goal agent
+  # stalled.
+  #
+  # The "Ivy Bridge Vulkan incomplete" journal lines sitting above each dump are
+  # only a PARTIAL red herring, and the difference is worth stating because it
+  # was measured rather than assumed. Building the Vulkan variant WITH this ISA
+  # fix and running it on the box (2026-08-24) separates the two:
+  #   * `llama-server --version`, which used to core-dump, now prints normally
+  #     -- so the STARTUP crash was the avx2 libggml-cpu.so, not Vulkan;
+  #   * but that same binary still cannot SERVE here: it fails model load and
+  #     dies with "vkDestroyFence: Invalid device", because the HD 4000's Mesa
+  #     ANV driver is incomplete on Ivy Bridge.
+  # So there are TWO independent faults on this hardware and neither explanation
+  # covers the other. Fixing the ISA alone would still leave this node unable to
+  # serve; dropping Vulkan alone would still leave it SIGILLing.
+  #
+  # llama.cpp b4154 has no runtime CPU dispatch (GGML_CPU_ALL_VARIANTS and
+  # GGML_BACKEND_DL do not exist in this source tree -- checked), so ONE binary
+  # cannot serve both CPUs. Hence two variants and a per-boot choice. Building
+  # only the portable one would fix this 2012 laptop by taking avx2/fma AND GPU
+  # offload away from every capable node in the fleet, which is a far bigger
+  # regression than the bug.
+  llamaFast = pkgs.llama-cpp.override { vulkanSupport = true; };
 
-  # GPU-aware launcher. A Vulkan-built llama-server with --n-gpu-layers>0 but NO Vulkan
-  # device ERRORS out at load (and would crash-loop under Restart=on-failure), so gate
-  # -ngl on a real render node + a Vulkan ICD actually being present; otherwise pure-CPU.
+  # The floor: exactly the configuration PROVEN to run on the box (avx/f16c only,
+  # no Vulkan). Vulkan is dropped HERE ONLY, and by experiment rather than by
+  # assumption -- see above: with the ISA fix applied, a Vulkan build STILL fails
+  # model load on this hardware ("vkDestroyFence: Invalid device"). Capable nodes
+  # keep Vulkan via llamaFast above; this variant is the one that has to boot on
+  # a machine whose GPU driver cannot be trusted.
+  llamaPortable = (pkgs.llama-cpp.override { vulkanSupport = false; }).overrideAttrs (o: {
+    cmakeFlags = (o.cmakeFlags or [ ]) ++ [
+      "-DGGML_NATIVE=OFF"
+      "-DGGML_AVX2=OFF"
+      "-DGGML_FMA=OFF"
+      "-DGGML_BMI2=OFF"
+      "-DGGML_AVX512=OFF"
+      "-DGGML_AVX=ON"
+      "-DGGML_F16C=ON"
+    ];
+  });
+
+  # THE dispatcher, and it is deliberately named `llama-server`: HARTOS's own
+  # ModelLifecycleManager._find_llama_server_binary() falls back to
+  # shutil.which('llama-server'), so putting this on PATH means every existing
+  # consumer (vision/lightweight_backend's captioner, model_onboarding, the G3
+  # direct-launch supervisor, mcp_server's model switch) transparently gets a
+  # binary that is correct for the CPU it is running on. One decision point,
+  # every caller, no per-node configuration and no second copy of the choice.
+  #
+  # Selection is on the CPU's ACTUAL advertised flags rather than a model name or
+  # a build-time guess, so a fleet image boots correctly on hardware nobody has
+  # tested yet. Adding a further tier later (e.g. pre-AVX) is one more branch.
+  llamaDispatch = pkgs.writeShellScriptBin "llama-server" ''
+    set -eu
+    if ${pkgs.gnugrep}/bin/grep -qw avx2 /proc/cpuinfo \
+       && ${pkgs.gnugrep}/bin/grep -qw fma /proc/cpuinfo; then
+      exec ${llamaFast}/bin/llama-server "$@"
+    fi
+    exec ${llamaPortable}/bin/llama-server "$@"
+  '';
+
+  # Service launcher: supplies only what the OS owns (model path, declared port,
+  # the ctx-size pinned to core/constants.py::LLAMA_CTX_SIZE_DEFAULT) and defers
+  # the binary choice to the dispatcher. THREADS = nproc - 1 by default (0 = AUTO)
+  # so inference leaves one core for the OS; with the systemd CPUWeight/Nice below
+  # it stays a background citizen and never starves the interactive desktop.
+  # No --n-gpu-layers: on a capable node llamaFast can still offload, but that is
+  # a separate decision from "which binary runs" and the old presence-only gate
+  # (renderD128 + an ICD file exists) was what put -ngl 999 on a GPU whose driver
+  # is incomplete. Re-add it behind a probe that proves the GPU actually works.
   llamaLauncher = pkgs.writeShellScriptBin "hart-llm-server" ''
     set -eu
-    # CPU-thread budget. 0 = AUTO = leave one core for the rest of the OS (nproc - 1, min
-    # 1) so CPU-FALLBACK inference never saturates every core and starves the interactive
-    # desktop/shell. (The systemd CPUWeight + Nice below keep it a background citizen on the
-    # SHARED cores too -- the desktop always wins under contention, spare CPU is still used
-    # when it is idle.)
+    # ── Work out the CPU budget FROM THIS MACHINE, at boot ────────────────────
+    # This must be computed here, not baked by whoever built the image and not
+    # hand-tuned per box: a user installs HART OS on hardware nobody has seen,
+    # and it has to divide its own cores sensibly with no operator present.
+    #
+    # Count PHYSICAL cores, not nproc. nproc counts SMT siblings, so on the fleet
+    # box (i7-3630QM: 4 cores / 8 threads) the old `nproc - 1` asked for SEVEN
+    # threads on FOUR real cores. Measured 2026-08-24 with the desktop in use:
+    # load average 10.26, llama-server at 457% CPU, the compositor fighting it at
+    # 94%, and a trivial 16-token request returning NOTHING in 200s. A second
+    # sibling on the same physical core adds contention and cache thrash to
+    # llama.cpp's compute-bound GEMM rather than throughput, so that setting made
+    # the desktop AND inference slower at once.
+    CPUDIR=/sys/devices/system/cpu
+    CORE_IDS=$(${pkgs.coreutils}/bin/cat $CPUDIR/cpu[0-9]*/topology/core_id 2>/dev/null \
+                 | ${pkgs.coreutils}/bin/sort -n -u || true)
+    NCORES=$(printf '%s\n' "$CORE_IDS" | ${pkgs.gnugrep}/bin/grep -c . || true)
+    # Explicit if/fi, not `[ x ] && y`: this runs under `set -e`, and a trailing
+    # test that evaluates false makes the enclosing list fail. A boot-critical
+    # launcher must not be able to exit because a machine had a normal core count.
+    if [ -z "$NCORES" ] || [ "$NCORES" -lt 1 ]; then
+      NCORES=$(${pkgs.coreutils}/bin/nproc)
+    fi
+
+    # Give inference a MINORITY of the machine so interactive work keeps real
+    # headroom rather than merely higher priority.
+    NINFER=$(( NCORES * ${toString config.hart.llm.cpuSharePercent} / 100 ))
+    if [ "$NINFER" -lt 1 ]; then NINFER=1; fi
+    if [ "$NINFER" -gt "$NCORES" ]; then NINFER=$NCORES; fi
+
+    # Take the LAST cores and leave the FIRST ones alone: the desktop and most
+    # kernel work gravitate to low-numbered CPUs (the compositor was measured on
+    # CPU 0), so counting from the top keeps inference off them. Include each
+    # chosen core's SMT siblings, otherwise a sibling stays free to be scheduled
+    # against us on the very core we are trying to own.
+    PICK=$(printf '%s\n' "$CORE_IDS" | ${pkgs.coreutils}/bin/tail -n "$NINFER")
+    CPUS=""
+    for c in $CPUDIR/cpu[0-9]*; do
+      cid=$(${pkgs.coreutils}/bin/cat "$c/topology/core_id" 2>/dev/null || echo "")
+      if [ -z "$cid" ]; then continue; fi
+      for p in $PICK; do
+        if [ "$cid" = "$p" ]; then
+          n=$(${pkgs.coreutils}/bin/basename "$c" | ${pkgs.gnugrep}/bin/grep -oE '[0-9]+')
+          CPUS="''${CPUS:+$CPUS,}$n"
+        fi
+      done
+    done
+
     THREADS="${toString config.hart.llm.threads}"
-    if [ "$THREADS" -le 0 ]; then
-      THREADS=$(( $(${pkgs.coreutils}/bin/nproc) - 1 ))
-      [ "$THREADS" -lt 1 ] && THREADS=1
-    fi
-    NGL=""
-    if [ -e /dev/dri/renderD128 ] && ls /run/opengl-driver/share/vulkan/icd.d/*.json >/dev/null 2>&1; then
-      NGL="--n-gpu-layers ${toString config.hart.llm.gpuLayers}"
-      echo "hart-llm: Vulkan GPU present -> offloading ${toString config.hart.llm.gpuLayers} layers ($THREADS CPU threads)" >&2
+    if [ "$THREADS" -le 0 ]; then THREADS=$NINFER; fi
+
+    echo "hart-llm: ''${NCORES} physical cores; inference gets ''${NINFER} (cpus ''${CPUS:-all}), ''${THREADS} threads" >&2
+
+    # taskset pins the affinity from inside the unit, so the budget follows the
+    # hardware instead of a static AllowedCPUs= that would be wrong on every
+    # machine except the one it was written for.
+    if [ -n "$CPUS" ] && [ "$NINFER" -lt "$NCORES" ]; then
+      set -- ${pkgs.util-linux}/bin/taskset -c "$CPUS" ${llamaDispatch}/bin/llama-server
     else
-      echo "hart-llm: no Vulkan GPU -> CPU inference ($THREADS threads, one core left for the OS)" >&2
+      set -- ${llamaDispatch}/bin/llama-server
     fi
-    exec ${llama-server}/bin/llama-server \
+    exec "$@" \
       --model "${config.hart.llm.modelPath}" \
       --port "${toString cfg.ports.llm}" \
       --ctx-size "${toString config.hart.llm.contextSize}" \
       --threads "$THREADS" \
-      $NGL
+      --parallel ${toString config.hart.llm.parallelSlots}
   '';
 in
 {
@@ -102,13 +218,64 @@ in
         + "desktop/shell. Set a positive value to pin it.";
     };
 
-    gpuLayers = lib.mkOption {
+    parallelSlots = lib.mkOption {
       type = lib.types.int;
-      default = 999;
-      description =
-        "Layers to offload to the (Vulkan) GPU when one is present. 999 = offload ALL "
-        + "(llama.cpp clamps to the model's real layer count). The launcher only passes "
-        + "this when a Vulkan device actually exists, else it runs pure-CPU.";
+      default = 1;
+      description = ''
+        Concurrent request slots passed to llama-server as --parallel.
+
+        MUST be set explicitly. llama.cpp's "auto" is 4, and the slots SHARE the
+        kv_unified pool, so 4 slots against --ctx-size 12288 give each request a
+        quarter of the budget while the wire-layer trim in llm_outbound_logger.py
+        is computing against the full n_ctx. Nunba's own launcher already caps
+        this for the same reason ("overrides llama.cpp's auto (=4) that
+        over-subscribed the shared kv_unified pool"); this module had simply
+        never passed the flag.
+
+        1 is right for the CPU floor: a node that can only run one request at a
+        time in useful latency should queue the second rather than halve both.
+        Raise it on a node with real parallel headroom.
+      '';
+    };
+
+    cpuSharePercent = lib.mkOption {
+      type = lib.types.int;
+      default = 50;
+      description = ''
+        Percentage of the machine's PHYSICAL cores inference may use, resolved on
+        the node at boot rather than baked into the image.
+
+        This has to be computed per machine: HART OS gets installed on hardware
+        nobody has seen, with no operator to tune it. 50 means "at most half the
+        cores", which on the 4-core fleet box is 2 and on a 16-core workstation
+        is 8. The launcher takes the HIGHEST-numbered cores (plus their SMT
+        siblings) and pins with taskset, leaving the low-numbered CPUs, where the
+        compositor and most kernel work land, untouched.
+
+        Raise toward 100 on a dedicated inference node; lower it on a machine
+        whose interactive feel matters more than local token rate.
+      '';
+    };
+
+    cpuQuota = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "200%";
+      description = ''
+        OPTIONAL extra systemd CPUQuota ceiling (100% = one core).
+
+        Normally unnecessary and deliberately null: `cpuSharePercent` already
+        bounds inference by pinning it to a subset of cores computed on the node,
+        and a quota written here would be a fixed number chosen by whoever edited
+        this file, which is wrong on every machine except theirs.
+
+        Kept because a quota bounds differently from affinity: affinity says
+        WHICH cores, a quota says HOW MUCH of them, so a steward who wants
+        inference to use half of two cores can say so. Note CPUWeight alone
+        bounds nothing at all -- it only arbitrates once contention has already
+        started, which is why the desktop was still losing at CPUWeight=50 while
+        llama-server sat at 457% CPU (measured 2026-08-24).
+      '';
     };
 
     autoProvision = lib.mkOption {
@@ -139,6 +306,30 @@ in
   };
 
   config = lib.mkIf (cfg.enable && config.hart.llm.enable) {
+
+    # Publish the ISA-correct llama.cpp on PATH — the discovery point HARTOS's
+    # OWN model machinery already looks at, instead of this module being the only
+    # thing that knows where the binary lives.
+    #
+    # `ModelLifecycleManager._find_llama_server_binary()` searches ~/.nunba and
+    # ~/.trueflow, then falls back to `shutil.which('llama-server')`. On HART OS
+    # neither app dir exists and, before this, PATH had no llama-server either —
+    # `command -v llama-server` on the box returned nothing — so every HARTOS
+    # consumer of that finder was silently degraded even while hart-llm.service
+    # itself ran fine off its baked ExecStart path:
+    #   • integrations/vision/lightweight_backend.py (which explicitly comments
+    #     "reuse model_lifecycle's finder") got None -> "caption disabled";
+    #   • integrations/service_tools/model_onboarding.py takes its "binary not
+    #     found, downloading..." branch, which would fetch a GENERIC upstream
+    #     build — i.e. an avx2/fma one that SIGILLs on this CPU, reintroducing the
+    #     exact crash this module's cmakeFlags exist to prevent;
+    #   • model_lifecycle's own G3 _launch_llama_server_direct supervision and
+    #     mcp_server's runtime model switch had nothing to launch.
+    # Publishing the DISPATCHER (not a fixed variant) makes the OS the supplier of
+    # the binary and leaves *which flags / which port* to the code that already
+    # owns those decisions (model_onboarding's "optimal params",
+    # core.port_registry), rather than duplicating them here.
+    environment.systemPackages = [ llamaDispatch ];
 
     # NVIDIA GPU support (declarative — the NixOS way)
     hardware.nvidia = lib.mkIf (builtins.pathExists "/dev/nvidia0") {
@@ -280,9 +471,10 @@ in
         Type = "simple";
         User = "hart";
         Group = "hart";
-        # The GPU-aware launcher (see `llamaLauncher` in the `let` above): offloads to the
-        # Vulkan GPU when one is present, pure-CPU otherwise. Replaces the old bare
-        # llama-server call that passed NO --n-gpu-layers, so every layer ran on the CPU.
+        # The launcher (see `llamaLauncher` in the `let` above). It supplies the
+        # model path, the declared port and the pinned ctx-size, then execs the
+        # per-CPU dispatcher, so this unit and anything that finds `llama-server`
+        # on PATH run the same binary choice.
         ExecStart = "${llamaLauncher}/bin/hart-llm-server";
 
         EnvironmentFile = lib.mkIf (builtins.pathExists "/etc/hart/hart.env") "/etc/hart/hart.env";
@@ -333,6 +525,9 @@ in
         # CPUWeight 150 -- ABOVE the UI -- which would let CPU-fallback inference stall the
         # whole desktop, the very thing the steward flagged.)
         MemoryMax = "8G";
+        # Optional hard ceiling; null by default because the launcher already
+        # bounds inference by pinning it to a node-computed subset of cores.
+        CPUQuota = lib.mkIf (config.hart.llm.cpuQuota != null) config.hart.llm.cpuQuota;
         CPUWeight = 50;
         TasksMax = 64;
         IOWeight = 50;

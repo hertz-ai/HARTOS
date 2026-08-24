@@ -683,6 +683,7 @@ TOOL_LABELS: dict = {
     # Data extraction + user lookup
     'Data_Extraction_From_URL':    'Extracting data from URL…',
     'User_details_tool':           'Looking up user details…',
+    'List_Agents':                 'Listing your agents…',
     'OpenAPI_Specification':       'Calling the OpenAPI service…',
     # Resource requests + self-improvement
     'Request_Resource':            'Requesting a resource…',

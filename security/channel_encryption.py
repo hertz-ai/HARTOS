@@ -47,14 +47,10 @@ _x25519_private: Optional[X25519PrivateKey] = None
 _x25519_public_bytes: Optional[bytes] = None
 
 
-def _resolve_key_dir() -> str:
-    explicit = os.environ.get('HEVOLVE_KEY_DIR')
-    if explicit:
-        return explicit
-    db_path = os.environ.get('HEVOLVE_DB_PATH', '')
-    if db_path and db_path != ':memory:' and os.path.isabs(db_path):
-        return os.path.dirname(db_path)
-    return 'agent_data'
+# X25519 keys persist alongside the Ed25519 identity keys, so the dir
+# MUST come from the same resolver — the byte-copy this replaced could
+# drift them into different dirs (#632).
+from security.node_integrity import resolve_key_dir as _resolve_key_dir
 
 
 def get_x25519_keypair() -> Tuple[X25519PrivateKey, bytes]:

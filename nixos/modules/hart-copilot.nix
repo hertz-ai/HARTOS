@@ -230,7 +230,7 @@ in
       # means driving the live local runtime (the ONE /chat pipeline + dispatch),
       # not a remote guess.
       environment.sessionVariables = {
-        HART_COPILOT_BACKEND = "http://127.0.0.1:6777";
+        HART_COPILOT_BACKEND = "http://127.0.0.1:${toString config.hart.ports.backend}";
         # Belt and braces for the OAuth login. xdg-open above is the general path,
         # but tools differ in what they try first, and $BROWSER is the one every
         # one of them honours. Firefox is preinstalled and is already the
@@ -280,7 +280,26 @@ in
           WorkingDirectory = config.hart.package;
           Environment = [
             "HART_OS_MODE=1"
-            "HART_COPILOT_BACKEND=http://127.0.0.1:6777"
+            # THE port the backend actually listens on, same expression every
+            # other HART unit uses (hart-backend, hart-liquid-ui, hart-model-bus,
+            # hart-app-bridge, hart-conky all set exactly this). The copilot was
+            # the only one that did NOT, and that single omission meant it never
+            # ran a task.
+            #
+            # The daemon resolves its backend through core.port_registry
+            # get_port("backend") on purpose ("the ONE canonical port source
+            # rather than an env override that can drift"). That registry reads
+            # HARTOS_BACKEND_PORT and, with the variable absent from this unit,
+            # fell through to the OS-mode DEFAULT of 677 -- a port nothing binds.
+            # So the canonical source was the thing that drifted. Measured on the
+            # box 2026-08-24: the daemon logged
+            # `backend=http://127.0.0.1:677`, curl to :677 returned 000 while
+            # :6777 returned 200, and every single tick for a day reported
+            # {"action": "idle", "reason": "no task assigned by the hive"} with
+            # zero claude invocations ever. An unreachable hive is reported as an
+            # idle hive, so it looked healthy while doing nothing.
+            "HARTOS_BACKEND_PORT=${toString config.hart.ports.backend}"
+            "HART_COPILOT_BACKEND=http://127.0.0.1:${toString config.hart.ports.backend}"
             "HART_COPILOT_REPO=/var/lib/hart/copilot/HARTOS"
             "HART_COPILOT_STOP=/run/hart/copilot-stop"
             # Pin a currently-resolvable model. claude-code ships a baked

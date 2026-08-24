@@ -1174,7 +1174,9 @@ class SpeculativeDispatcher:
             # ── delegate ────────────────────────────────────────────────
             "delegate: Use \"none\" for greetings, small-talk, factual "
             "questions you can fully answer yourself, or anything that needs "
-            "no external tools. Use \"local\" if the request needs tools, "
+            "no external tools. Never \"none\" for live/current data "
+            "(weather, news, prices, scores, anything 'right now') — you "
+            "cannot know it; that ALWAYS delegates. Use \"local\" if the request needs tools, "
             "code, reasoning, or multi-step work the 4B model can handle. "
             "Use \"hive\" if it needs large-model expertise, long-context "
             "research, or specialized skill distribution.\n\n"

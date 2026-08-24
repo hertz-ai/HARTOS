@@ -314,10 +314,23 @@ jobs:
             echo "rollback target: $ROLLBACK_IMAGE"
             docker rm -f langchain 2>/dev/null || true
 
+            # Routable self-URL for peers (get_advertisable_base_url prec. 1).
+            # Without it a bridge container advertises its docker-internal NIC
+            # (measured 2026-08-24: 172.17.0.4 in a LAN peer's table).
+            ADVERTISE_URL="${{ secrets.DEPLOY_ADVERTISE_URL }}"
+            if [ -z "$ADVERTISE_URL" ]; then
+              _HOST_IP="$(ip route get 1 2>/dev/null | awk '{for(i=1;i<NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+              [ -n "$_HOST_IP" ] && ADVERTISE_URL="http://${_HOST_IP}:6777"
+            fi
+            echo "advertise URL: ${ADVERTISE_URL:-<unset — container will self-resolve>}"
+            ADV_ARGS=""
+            [ -n "$ADVERTISE_URL" ] && ADV_ARGS="-e HEVOLVE_BASE_URL=$ADVERTISE_URL"
+
             sudo docker run -d --name langchain --restart unless-stopped \
               -p 6777:6777 \
               --env-file .env \
               --env-file oauth.env \
+              $ADV_ARGS \
               -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${{ secrets.DEPLOY_MASTER_KEY_PATH }})" \
               -e HARTOS_GIT_SHA="$DEPLOY_COMMIT" \
               -e HARTOS_IMAGE_TAG="$DEPLOY_COMMIT_SHORT" \
@@ -438,6 +451,7 @@ jobs:
                    -p 6777:6777 \
                    --env-file .env \
                    --env-file oauth.env \
+                   $ADV_ARGS \
                    -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${{ secrets.DEPLOY_MASTER_KEY_PATH }})" \
                    -e WHATSAPP_API_URL="http://172.17.0.1:3000" \
                    -v "$(pwd)/config.json:/app/config.json:ro" \

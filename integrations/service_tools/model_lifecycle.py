@@ -1743,6 +1743,36 @@ class ModelLifecycleManager:
         """
         import subprocess as _sp
 
+        # ADOPT, never duplicate.  This spawns on `port_registry.get_port('llm')`
+        # — the SAME port an already-running main engine holds — with no check of
+        # its own, so without this guard a second main llama-server gets launched
+        # against the one that is already serving.  On HART OS that owner is
+        # systemd (hart-llm.service): the OS builds llama.cpp and supervises it,
+        # per "HART OS owns the model+VRAM stack natively" (nixos/packages/
+        # nunba.nix, Gate 4).  Until 2026-08-24 this could not fire only because
+        # _find_llama_server_binary() found nothing on HART OS, and the moment the
+        # OS started publishing llama-server on PATH (so the captioner and
+        # model_onboarding could find it) that accident stopped protecting us.
+        # An accident is not a guard, so state the rule.
+        #
+        # Reuses what this file already does elsewhere: the canonical prober and
+        # the existing "adopted server" bookkeeping (_record_llm_alive), the same
+        # single source the stateless-probe and adopted-server branches of
+        # _check_llm_health use.  Returning True is correct — the caller asked for
+        # a live main engine, and there is one.
+        try:
+            from core.health_probe import probe_llm
+            if (probe_llm() or {}).get('status') == 'up':
+                logger.info(
+                    "[G3] a main llama-server is already serving — adopting it "
+                    "instead of launching a second one")
+                self._record_llm_alive()
+                return True
+        except ImportError:
+            pass          # no canonical prober here; fall through to launching
+        except Exception as e:
+            logger.debug(f"[G3] adopt-probe skipped: {e!r}")
+
         # Find llama-server binary
         server_bin = self._find_llama_server_binary()
         if not server_bin:

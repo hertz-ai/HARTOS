@@ -158,3 +158,45 @@ def create_autogen_history_hook(
         return hooked_append
 
     return _make_hook
+
+
+class HookedMessageList(list):
+    """A list whose append also feeds a per-message hook.
+
+    autogen's GroupChat.messages is a plain list, and ``list.append`` is a
+    read-only slot — the usage shown on create_autogen_history_hook
+    (assigning to messages.append) raises AttributeError.  Replacing the
+    list with this subclass is the working install (first proven at the
+    visual-group site in reuse_recipe)."""
+
+    def __init__(self, data, hook):
+        super().__init__(data)
+        self._hook = hook
+
+    def append(self, msg):
+        super().append(msg)
+        try:
+            self._hook(msg)
+        except Exception:
+            logger.debug("history write-back hook failed", exc_info=True)
+
+
+def install_history_writeback(group_chat, user_id, simplemem_store=None):
+    """Wrap group_chat.messages so every appended message is written back to
+    the shared PersistentChatHistory (dedup-aware, seeds skipped).
+
+    This is the write half of the seed/write contract: a group seeded via
+    seed_autogen_from_shared_history but never write-back-hooked loses its
+    whole conversation (#686 — live 2026-08-23, the role group's BLUEFIN6
+    exchange never reached the buffer the next turn read).
+
+    Returns True when the write-back is active, False when no history store
+    is available for the user."""
+    factory = create_autogen_history_hook(user_id, simplemem_store)
+    if factory is None:
+        return False
+    # The factory wraps an append callable; the list subclass already did
+    # the append, so hand it a no-op and keep only the write-back side.
+    buffer_hook = factory(lambda _msg: None)
+    group_chat.messages = HookedMessageList(group_chat.messages, buffer_hook)
+    return True

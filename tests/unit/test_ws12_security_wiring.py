@@ -701,8 +701,19 @@ class TestFederationDeltaSigning(unittest.TestCase):
             # Delta should now have hmac_signature
             self.assertIn('hmac_signature', delta)
 
-    def test_receive_peer_delta_rejects_invalid_hmac(self):
-        """receive_peer_delta should reject deltas with invalid HMAC."""
+    def test_invalid_hmac_is_nonfatal(self):
+        """A present-but-invalid HMAC no longer rejects the delta (7c430eb8).
+
+        HMAC is symmetric and needs a per-node secret that was never handshaked,
+        so a mismatched HMAC is a benign key-config artifact, not tampering —
+        and making it fatal in hard mode partitioned the real hive to a census
+        of one (measured 2026-08-24 from MSI / .69 / .83). Ed25519 + the
+        genuine-build join gate are the enforced integrity layers now; HMAC is
+        kept only as a non-fatal back-compat check (federated_aggregator.py:739,
+        'verified when present, but NEVER required'). This test locks in that
+        the HMAC layer ALONE can no longer reject a delta that already cleared
+        the Ed25519 / genuine-build gates.
+        """
         from integrations.agent_engine.federated_aggregator import FederatedAggregator
 
         agg = FederatedAggregator()
@@ -715,15 +726,15 @@ class TestFederationDeltaSigning(unittest.TestCase):
             # No guardrail_hash — skips guardrail check
         }
 
-        # The Ed25519 gate now runs FIRST and rejects an unsigned delta outright
-        # under the default hard enforcement, so this never reached the HMAC
-        # check it is named for. Drop to soft so the HMAC gate is the one under
-        # test; HMAC verification itself is unconditional on enforcement mode.
+        # Soft enforcement isolates the HMAC layer: the Ed25519 / genuine-build
+        # gates only reject in hard mode, so under soft the invalid HMAC is the
+        # ONLY layer that could reject here. It must not — the delta is accepted
+        # despite the bad HMAC (that is the whole point of the change).
         with patch('security.master_key.get_enforcement_mode',
                    return_value='soft'):
             ok, msg = agg.receive_peer_delta(delta)
-        self.assertFalse(ok)
-        self.assertIn('HMAC', msg)
+        self.assertTrue(ok, f'invalid HMAC must be non-fatal now, got reject: {msg}')
+        self.assertEqual(msg, 'accepted')
 
     def test_receive_peer_delta_rejects_unsigned_under_hard_enforcement(self):
         """An unsigned delta is refused before any HMAC check, in hard mode."""

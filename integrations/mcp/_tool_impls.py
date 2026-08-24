@@ -28,6 +28,13 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+# Recipes are SAVED to the deployment-aware dir (bundled desktop → user data
+# dir; Docker/dev → code-relative prompts/).  The old module-relative
+# '../../prompts' resolved to site-packages/prompts in the frozen layout —
+# a folder that does not exist — so installed builds listed 0 of 2,633
+# recipes (task #692).
+from core.platform_paths import get_recipe_prompts_dir
+
 logger = logging.getLogger('hartos_mcp.tools')
 
 # ─── Lazy resources (deferred to avoid import-time side effects) ───
@@ -98,7 +105,7 @@ def list_agents(category: Optional[str] = None, query: Optional[str] = None) -> 
         })
 
     # Also include dynamically discovered agents (trained recipes)
-    prompts_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'prompts')
+    prompts_dir = get_recipe_prompts_dir()
     dynamic = []
     if os.path.isdir(prompts_dir):
         for f in _glob.glob(os.path.join(prompts_dir, '*.json')):
@@ -115,11 +122,65 @@ def list_agents(category: Optional[str] = None, query: Optional[str] = None) -> 
             except Exception:
                 pass
 
+    # Trained + hive agents: user_type='agent' rows in the social DB (the
+    # same query DashboardService._get_trained_agents runs).  The sync
+    # engine lands peer/central agents here (_handle_sync_agent) as
+    # DISCOVERABLE MIRRORS with api_token=None — the credential stays on
+    # the home node — so that existing security contract is also the
+    # origin marker: api_token set = registered on THIS node, api_token
+    # None = hive agent exchanged from a peer or pulled from central.
+    trained, hive = [], []
+    try:
+        from integrations.social.models import User as _SocialUser
+        db = _get_db()
+        try:
+            rows = db.query(_SocialUser).filter(
+                _SocialUser.user_type == 'agent').all()
+            for u in rows:
+                name = getattr(u, 'display_name', None) or u.username
+                if query and query.lower() not in (
+                        name + ' ' + (u.username or '')).lower():
+                    continue
+                entry = {
+                    "agent_id": getattr(u, 'agent_id', None) or str(u.id),
+                    "name": name,
+                    "category": "trained_agent",
+                    "description": (getattr(u, 'bio', '') or '')[:200],
+                    "model_type": "llm",
+                }
+                handle = getattr(u, 'handle', None)
+                if handle:
+                    entry["handle"] = handle
+                # Local rows registered via UserService.register_agent
+                # carry an api_token; synced mirrors never do
+                # (_handle_sync_agent: credential stays on the home node).
+                # ONE known local row also lacks a token: the boot-time
+                # 'hevolve_system_agent' bootstrap
+                # (integrations/agent_engine/__init__.py) — it is local,
+                # not hive (review finding #4: it was the '1 hive' my own
+                # validation cited as proof).
+                if (getattr(u, 'api_token', None)
+                        or u.username == 'hevolve_system_agent'):
+                    trained.append(entry)
+                else:
+                    entry["origin"] = "hive"
+                    hive.append(entry)
+        finally:
+            db.close()
+    except Exception:
+        # DB-less contexts (bare MCP unit runs) — counts stay 0, the
+        # local registry + recipes above still enumerate.
+        pass
+
     return json.dumps({
         "expert_agents": len(result),
         "dynamic_agents": len(dynamic),
+        "trained_agents": len(trained),
+        "hive_agents": len(hive),
         "agents": result[:50],  # cap at 50 to avoid token overflow
         "dynamic": dynamic[:20],
+        "trained": trained[:30],
+        "hive": hive[:30],
     }, indent=2)
 
 
@@ -394,7 +455,7 @@ def recall(query: str, top_k: int = 5) -> str:
 
 def list_recipes() -> str:
     """List trained agent recipes (prompts/*.json files)."""
-    prompts_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'prompts')
+    prompts_dir = get_recipe_prompts_dir()
     recipes = []
     if os.path.isdir(prompts_dir):
         for f in sorted(_glob.glob(os.path.join(prompts_dir, '*.json'))):

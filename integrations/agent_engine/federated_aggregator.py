@@ -363,7 +363,22 @@ class FederatedAggregator:
                 'event_counters': self.get_event_counters(),
             }
 
-            # Sign the delta
+            # The node's running code hash — the ONE gate that decides whether
+            # this node may federate into the hive (steward, 2026-08-24: joining
+            # is a consent tap; the only security is that a tampered build,
+            # whose hash is not a verified release hash, cannot join).  Added
+            # to the delta BEFORE signing so it is covered by the Ed25519
+            # signature and cannot be spoofed.  Receivers gate on it via
+            # release_hash_registry.is_known_release_hash — which, with the
+            # self-hash layer (f138706f), passes any node on the same build as
+            # the receiver and any known release, and fails a modified tree.
+            try:
+                from security.node_integrity import compute_code_hash
+                delta['code_hash'] = compute_code_hash()
+            except Exception:
+                delta['code_hash'] = ''
+
+            # Sign the delta (covers code_hash above)
             try:
                 from security.node_integrity import sign_json_payload
                 delta['signature'] = sign_json_payload(delta)
@@ -397,11 +412,29 @@ class FederatedAggregator:
         return results
 
     def broadcast_delta(self, delta: dict):
-        """POST delta to all known active peers.
+        """Gossip the delta to central seeds + a bounded sample of peers.
 
-        Privacy enforcement: ScopeGuard.check_egress() runs before any data
-        leaves this node.  Only FEDERATED-scoped aggregate stats are sent.
-        Raw user data, PII, and secrets are structurally blocked.
+        This is the authoritative egress gate: ScopeGuard.check_egress() runs
+        before any data leaves this node — only FEDERATED-scoped aggregate
+        stats are sent; raw user data, PII, and secrets are structurally
+        blocked.
+
+        Delivery (2026-08-24): the central seeds always receive the delta
+        (they are the census projection point), plus a random gossip_fanout
+        sample of reachable peers. This is gossip, not broadcast-to-all — an
+        epidemic converges over rounds, and 'all active peers' in practice is
+        hundreds of unreachable rows (loopback / other-LAN). The whole fan-out
+        shares one hard deadline and runs concurrently, so a dead or slow peer
+        can never hang the background tick.
+
+        Each sampled peer is delivered PeerLink-first: if this node holds a
+        live, authenticated link to that peer's node_id, the delta rides the
+        'learning' channel (0x0A) over that encrypted, NAT-traversing socket —
+        the only way two peers behind separate NATs can federate. Absent or
+        failed link falls back to the SAME authenticated /federation-delta HTTP
+        receiver. Seeds (central) are always HTTP: public URL, no NAT to cross.
+        Both transports land on receive_peer_delta and its genuine-build gate;
+        this is a second transport, not a second (weaker) path.
         """
         # ── Edge privacy gate: block PII / secrets from leaving ──
         try:
@@ -433,40 +466,154 @@ class FederatedAggregator:
         try:
             from integrations.social.models import get_db, PeerNode
             from core.http_pool import pooled_post
+            from urllib.parse import urlparse
+            from concurrent.futures import ThreadPoolExecutor
 
             db = get_db()
             try:
-                # Get our own backend port to detect self-connections
-                try:
-                    from core.port_registry import get_port
-                    _own_port = get_port('backend')
-                except Exception:
-                    _own_port = 6777
-                _self_urls = {
-                    f'http://localhost:{_own_port}',
-                    f'http://127.0.0.1:{_own_port}',
-                    f'http://0.0.0.0:{_own_port}',
-                }
-
                 peers = db.query(PeerNode).filter_by(status='active').all()
-                now = time.time()
-                for peer in peers:
-                    if not peer.url or peer.node_id == delta.get('node_id'):
-                        continue
-                    _peer_url = peer.url.rstrip('/')
-                    # Skip our own node (bundled mode has no HTTP listener)
-                    if _peer_url in _self_urls:
-                        continue
-                    if self._peer_backoff.is_backed_off(_peer_url):
-                        continue
-                    try:
-                        url = f"{_peer_url}/api/social/peers/federation-delta"
-                        pooled_post(url, json=delta, timeout=5)
-                        self._peer_backoff.record_success(_peer_url)
-                    except Exception:
-                        self._peer_backoff.record_failure(_peer_url)
+                # Snapshot node_id + url INSIDE the session; the delivery runs
+                # after db.close(), and touching a detached ORM row there would
+                # raise. Only these two scalars are needed downstream.
+                _rows = [(p.node_id, (p.url or '').rstrip('/'))
+                         for p in peers if p.url]
             finally:
                 db.close()
+
+            # Turn a 656-row / 55-minute serial walk (measured live 2026-08-24)
+            # into a bounded, concurrent GOSSIP fan-out — which is what this
+            # method's own docstring already says it is ("aggregation ... via
+            # gossip"). The prior loop POSTed to ALL active peers; a gossip
+            # epidemic propagates over ROUNDS from a small fanout, it does not
+            # broadcast to everyone every tick, and "everyone" here is mostly
+            # unreachable rows (359 are http://localhost:6777 — every flat node
+            # published its own backend loopback; plus other-LAN private IPs).
+            #
+            # Targets = SEEDS (always) + a bounded random sample of reachable
+            # peers:
+            #   * Seeds/central are the census COLLECTION + PROJECTION point
+            #     (api_hive_census docstring), so they must receive every
+            #     delta directly and are tried regardless of backoff — a node
+            #     absent from central's aggregate is absent from /hive.
+            #   * Peer fanout is capped at gossip_fanout and skips loopback
+            #     (a peer's own address, never reachable from here) and
+            #     backed-off peers. Unsampled peers get this delta next round
+            #     or via a neighbour — standard gossip convergence, no data
+            #     lost.
+            #
+            # NOT a new path and NOT a semantic regression: same ScopeGuard
+            # egress gate above, same /federation-delta endpoint, same backoff,
+            # same FedAvg-over-gossip intent — only the fan-out is bounded and
+            # concurrent instead of an unbounded serial broadcast.
+            _self_node = delta.get('node_id')
+            try:
+                from integrations.social.peer_discovery import gossip as _gossip
+                _seeds = [u.rstrip('/') for u in getattr(_gossip, 'seed_peers', [])]
+                _fanout = int(getattr(_gossip, 'gossip_fanout', 3))
+            except Exception:
+                _seeds, _fanout = [], 3
+
+            _reachable = []
+            for _nid, _url in _rows:
+                if _nid == _self_node or _url in _seeds:
+                    continue
+                try:
+                    _host = (urlparse(_url).hostname or '').lower()
+                except Exception:
+                    continue
+                if _host in ('localhost', '127.0.0.1', '0.0.0.0', '::1', ''):
+                    continue
+                if self._peer_backoff.is_backed_off(_url):
+                    continue
+                # Keep (node_id, url): node_id drives the PeerLink-first
+                # attempt below; url is the HTTP fallback + backoff key.
+                _reachable.append((_nid, _url))
+
+            import random as _random
+            from concurrent.futures import wait as _fwait
+
+            # Resolve the PeerLink manager ONCE on this thread. A peer we hold a
+            # live link to gets the delta over that authenticated, encrypted,
+            # NAT-traversing socket — the whole reason two peers behind separate
+            # NATs can federate at all. Absent or failed link → the SAME
+            # authenticated, genuine-build-gated HTTP /federation-delta receiver
+            # (never link_manager._http_fallback, which is deliberately inert
+            # and unauthenticated). One receiver, two authenticated transports.
+            try:
+                from core.peer_link.link_manager import get_link_manager
+                _mgr = get_link_manager()
+            except Exception:
+                _mgr = None
+
+            def _deliver_one(_node_id, _peer_url):
+                # PeerLink first, but ONLY when a live link to this node exists.
+                if _mgr is not None and _node_id and _node_id != _self_node:
+                    try:
+                        _link = _mgr.get_link(_node_id)  # connected link or None
+                    except Exception:
+                        _link = None
+                    if _link is not None:
+                        try:
+                            _link.send('learning', delta)  # fire-and-forget
+                            # send() returns None on both success and a dead
+                            # link, but a failed send trips _handle_disconnect,
+                            # so a still-connected link means the frame went out.
+                            if _link.is_connected:
+                                return (_peer_url, True)
+                        except Exception:
+                            pass  # fall through to HTTP
+                # HTTP fallback — the authenticated, genuine-build-gated endpoint.
+                try:
+                    pooled_post(
+                        f"{_peer_url}/api/social/peers/federation-delta",
+                        json=delta, timeout=3)
+                    return (_peer_url, True)
+                except Exception:
+                    return (_peer_url, False)
+
+            # ONE bounded, concurrent delivery for BOTH seeds and the peer
+            # sample.  Nothing is synchronous: a single row — even a seed —
+            # can ignore its per-request timeout on Windows (unroutable SYN,
+            # session retries), so ANY blocking step could hang a background
+            # gossip tick for minutes (measured live 2026-08-24). The whole
+            # fan-out therefore shares one HARD DEADLINE; stragglers are
+            # backed off and abandoned (gossip is loss-tolerant — they
+            # converge next round). Seeds are submitted FIRST so they win the
+            # worker slots, and included in every round because central is the
+            # census projection point.
+            _sample = (_random.sample(_reachable, _fanout)
+                       if len(_reachable) > _fanout else _reachable)
+            # Targets are (node_id, url).  Seeds carry no node_id — seed_peers
+            # is a URL list and central has a public URL that needs no PeerLink,
+            # so seeds deliver over HTTP.  The peer sample carries node_id for
+            # the PeerLink-first attempt.  Dedup by URL, seeds first (central is
+            # the census projection point and must get every delta).
+            _targets_by_url = {}
+            for _s in _seeds:
+                _targets_by_url.setdefault(_s, (None, _s))
+            for _nid, _url in _sample:
+                _targets_by_url.setdefault(_url, (_nid, _url))
+            _targets = list(_targets_by_url.values())
+
+            if _targets:
+                _ex = ThreadPoolExecutor(max_workers=min(12, len(_targets)))
+                try:
+                    _futs = {_ex.submit(_deliver_one, _nid, _url): _url
+                             for (_nid, _url) in _targets}
+                    _done, _pending = _fwait(_futs, timeout=8)
+                    for _f in _done:
+                        try:
+                            _u, _ok = _f.result()
+                            (self._peer_backoff.record_success if _ok
+                             else self._peer_backoff.record_failure)(_u)
+                        except Exception:
+                            pass
+                    for _f in _pending:
+                        self._peer_backoff.record_failure(_futs[_f])
+                finally:
+                    # Non-blocking: never wait on a straggler. Its worker
+                    # thread finishes when its own socket times out.
+                    _ex.shutdown(wait=False, cancel_futures=True)
         except Exception as e:
             logger.debug(f"Federation broadcast error: {e}")
 
@@ -542,23 +689,68 @@ class FederatedAggregator:
         elif _enforcement == 'hard':
             return False, 'missing Ed25519 signature (hard enforcement)'
 
-        # HMAC-SHA256 delta signing verification — required in hard mode
-        if delta.get('hmac_signature'):
-            if not _verify_delta_signature(delta):
-                return False, 'invalid HMAC signature'
-        elif _enforcement == 'hard':
-            return False, 'missing HMAC signature (hard enforcement)'
+        # THE join gate (steward, 2026-08-24): a node may federate iff it is a
+        # GENUINE, UNMODIFIED official build.  Joining is otherwise a consent
+        # tap; every other crypto layer is seamless plumbing.  A build is
+        # genuine if EITHER holds:
+        #
+        #   (a) its code_hash is a known release hash — same build as this
+        #       receiver (self-hash layer f138706f) or a published release; or
+        #   (b) it carries a valid origin attestation — the cross-build proof
+        #       that rejects forks, stripped branding, and modified guardrails
+        #       (security.origin_attestation.verify_peer_attestation) even when
+        #       the exact file hash differs, e.g. a desktop bundle vs the
+        #       central container.
+        #
+        # code_hash rides INSIDE the Ed25519-signed payload, so it is bound to
+        # the node's identity and cannot be swapped.  A node is refused only
+        # when it can prove NEITHER — i.e. a tampered or unknown tree with no
+        # genuine attestation.  If the attestation raises the specific reason,
+        # a bad attestation is itself a hard reject.
+        _genuine = False
+        _reject_reason = 'unverified build — unknown code hash, no valid attestation'
 
-        # Origin attestation — reject forks and rebranded builds
-        peer_attestation = delta.get('origin_attestation')
-        if peer_attestation:
+        _peer_code_hash = delta.get('code_hash', '')
+        if _peer_code_hash:
+            try:
+                from security.release_hash_registry import get_release_hash_registry
+                if get_release_hash_registry().is_known_release_hash(_peer_code_hash):
+                    _genuine = True
+            except ImportError:
+                pass
+
+        _peer_attestation = delta.get('origin_attestation')
+        if not _genuine and _peer_attestation:
             try:
                 from security.origin_attestation import verify_peer_attestation
-                att_ok, att_msg = verify_peer_attestation(peer_attestation)
-                if not att_ok:
-                    return False, f'origin attestation failed: {att_msg}'
+                att_ok, att_msg = verify_peer_attestation(_peer_attestation)
+                if att_ok:
+                    _genuine = True
+                else:
+                    # A PRESENT-but-INVALID attestation is a fork/impersonator
+                    # signal, not just "unknown" — name it.
+                    _reject_reason = f'origin attestation failed: {att_msg}'
             except ImportError:
-                pass  # Origin module not available — accept
+                pass  # attestation module absent — fall back to hash result
+
+        if not _genuine and _enforcement == 'hard':
+            return False, _reject_reason
+
+        # HMAC-SHA256 — verified when present, but NEVER required.
+        #
+        # It used to be mandatory in hard mode, which silently partitioned the
+        # whole hive: HMAC is symmetric, so it needs a per-node secret handed
+        # to the receiver in a separate signed handshake, and that handshake
+        # was not happening — so every real delta from every real machine was
+        # rejected with 'missing/invalid HMAC signature' and the census showed
+        # only the central node itself (measured live 2026-08-24 from MSI,
+        # .69, .83).  Ed25519 already proves identity+integrity and the gate
+        # above proves a genuine unmodified build, so the HMAC layer is
+        # redundant AND the un-seamless part.  Kept as a non-fatal check for
+        # nodes that still exchange it, so nothing that worked before breaks.
+        if delta.get('hmac_signature') and not _verify_delta_signature(delta):
+            logger.debug('federation delta: HMAC present but unverified '
+                         '(non-fatal; Ed25519 + genuine-build gate already applied)')
 
         # Revocation check — master-key-signed network halt via federation
         revocation = delta.get('revocation')
@@ -1263,3 +1455,89 @@ def get_federated_aggregator() -> FederatedAggregator:
             if _aggregator is None:
                 _aggregator = FederatedAggregator()
     return _aggregator
+
+
+# ── PeerLink inbound transport for learning deltas ─────────────────────────
+# A learning delta reaches this node's aggregator by exactly ONE of two
+# AUTHENTICATED transports, both landing on the SAME receiver
+# (receive_peer_delta, which runs the full genuine-build join gate):
+#
+#   * HTTP   — POST /api/social/peers/federation-delta (discovery.py:425).
+#              The only transport central needs (it has a public URL); the
+#              only one a peer behind NAT can offer to a public seed.
+#   * PeerLink — the 'learning' channel (0x0A) over the persistent, Ed25519-
+#              authenticated, encrypted link.  This is what lets a delta cross
+#              between two NAT'd peers, where neither can HTTP-POST the other.
+#
+# This is NOT a parallel path: it is a second transport into the one existing
+# receiver, mirroring how 'events' (message_bus.bootstrap_peerlink_ingress) and
+# 'federation' (social posts) already ride PeerLink alongside HTTP.  The link
+# is authenticated at the transport layer AND the delta re-verifies its own
+# Ed25519 signature + attestation in receive_peer_delta — defence in depth, and
+# never weaker than the HTTP path.
+
+_learning_ingress_wired = False
+_learning_ingress_lock = threading.Lock()
+
+
+def handle_learning_delta(channel, data, sender_peer_id):
+    """PeerLink 'learning' (0x0A) receiver — hand the delta to the aggregator.
+
+    Signature is the ON-LINK handler contract that ``PeerLink._receive_loop``
+    invokes: ``handler(channel, data, sender_peer_id)`` (link.py:754) — three
+    positional args, NOT the two-arg ChannelDispatcher shape.  (The dispatcher
+    is not on the inbound link path; only ``register_channel_handler`` →
+    ``link.on_message`` → ``_message_handlers`` is.)
+
+    ``receive_peer_delta`` already performs the entire join gate (freshness,
+    Ed25519 signature over code_hash, known-release-hash OR origin attestation,
+    guardrail hash), so this wrapper only guards the payload type and delegates.
+    The return value is informational: ``_receive_loop`` ignores it, and this
+    protocol constructs no response frame, so delivery is fire-and-forget.
+    """
+    if not isinstance(data, dict):
+        logger.debug(
+            "learning delta from %s not a dict: %s",
+            (sender_peer_id or '?')[:8], type(data).__name__)
+        return None
+    try:
+        accepted, reason = get_federated_aggregator().receive_peer_delta(data)
+        if not accepted:
+            logger.debug("learning delta from %s rejected: %s",
+                         (sender_peer_id or '?')[:8], reason)
+        return {'accepted': accepted, 'reason': reason}
+    except Exception as e:
+        logger.debug("learning delta handler error from %s: %s",
+                     (sender_peer_id or '?')[:8], e)
+        return None
+
+
+def bootstrap_learning_delta_ingress() -> bool:
+    """Register the 'learning' channel handler on every PeerLink.
+
+    Idempotent — returns ``True`` on the first successful wiring, ``False`` on
+    any later call or when PeerLink is unavailable.  Called once per process
+    from ``local_subscribers.bootstrap_local_subscribers`` (the single boot that
+    runs on BOTH the central/regional server, hart_intelligence_entry.py:12463,
+    and the flat/Nunba node, embedded_main.py:392), so one wiring covers every
+    tier.  ``register_channel_handler`` applies the handler to all present and
+    future links, so a delta pushed over any link reaches receive_peer_delta.
+    """
+    global _learning_ingress_wired
+    with _learning_ingress_lock:
+        if _learning_ingress_wired:
+            return False
+        try:
+            from core.peer_link.link_manager import get_link_manager
+        except ImportError:
+            logger.debug("learning ingress: peer_link not importable")
+            return False
+        try:
+            get_link_manager().register_channel_handler(
+                'learning', handle_learning_delta)
+        except Exception as e:
+            logger.debug("learning ingress registration skipped: %s", e)
+            return False
+        _learning_ingress_wired = True
+        logger.info("Federation learning-delta (0x0A) PeerLink ingress registered")
+        return True

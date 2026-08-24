@@ -136,3 +136,42 @@ class TestStatSweepTier:
         monkeypatch.setenv('HEVOLVE_TAMPER_FULL_EVERY', '4')
         mon = RuntimeIntegrityMonitor(None, code_root=str(tree))
         assert mon._full_every == 4
+
+
+class TestDevnullSurvivesUnicode:
+    """io_guard's discard streams must accept ALL of Unicode.
+
+    Regression for the 2026-08-23 production failure: a bare
+    open(os.devnull, 'w') is cp1252 on Windows and encodes BEFORE
+    discarding, so printing '\u2192' through the silenced stdout raised
+    UnicodeEncodeError and killed the whole agent turn (the final action
+    of a six-action creation flow failed on every retry).
+    """
+
+    def test_silenced_stdout_swallows_arrows(self, monkeypatch):
+        import io as _io
+        import sys as _sys
+        from core.io_guard import silence_stdio
+        closed = _io.StringIO()
+        closed.close()
+        monkeypatch.setattr(_sys, 'stdout', closed)
+        monkeypatch.setattr(_sys, 'stderr', closed)
+        silence_stdio()
+        try:
+            print('recipe_received \u2192 terminated')
+            print('unicode: \u2713 \u00e9 \U0001f41d')
+        finally:
+            pass  # monkeypatch restores the real streams
+
+    def test_safe_iostream_rearm_is_unicode_safe(self, monkeypatch):
+        import os as _os
+        import sys as _sys
+        from core.io_guard import _SafeIOStream
+        # stdout closed underneath — print() raises, stream re-arms
+        broken = open(_os.devnull, 'w', encoding='utf-8')
+        broken.close()
+        monkeypatch.setattr(_sys, 'stdout', broken)
+        s = _SafeIOStream()
+        s.print('first \u2192 drops and re-arms')
+        # the re-armed stream must then take arrows without raising
+        s.print('second \u2192 must not raise')

@@ -273,7 +273,25 @@ except ImportError as _lc_err:
     import logging as _logging
     _logging.getLogger(__name__).error(
         "langchain_classic unavailable (%s) — backend boots WITHOUT the langchain "
-        "chat path; social/sync/status/daemon still serve (#99).", _lc_err)
+        "chat path; social/sync/status/daemon still serve (#99).", _lc_err,
+        exc_info=True)
+    # 2026-08-24: the message alone cannot be root-caused — the frozen
+    # install failed with "No module named 'yaml.error'" while every yaml
+    # copy on every path (frozen lib/, python-embed site-packages, user
+    # site, ~/.nunba) had a complete package incl. error.py, and the same
+    # import block passed on bare python-embed.  Whatever yaml object the
+    # app actually resolved is the evidence; capture it.
+    try:
+        import sys as _lc_sys
+        _lc_y = _lc_sys.modules.get('yaml')
+        _logging.getLogger(__name__).error(
+            "langchain import-failure context: yaml=%r file=%s path=%s "
+            "spec=%s | sys.path[:6]=%s",
+            _lc_y, getattr(_lc_y, '__file__', None),
+            getattr(_lc_y, '__path__', None),
+            getattr(_lc_y, '__spec__', None), _lc_sys.path[:6])
+    except Exception:
+        pass
     _LANGCHAIN_OK = False
 
     class _LangchainUnavailable:
@@ -817,14 +835,14 @@ handler.setLevel(logging.INFO)
 # In cx_Freeze frozen builds, stdout/stderr may be closed — redirect to devnull.
 try:
     if sys.stdout is None or sys.stdout.closed:
-        sys.stdout = open(os.devnull, 'w')
+        sys.stdout = open(os.devnull, 'w', encoding='utf-8', errors='replace')
     else:
         sys.stdout.reconfigure(errors='replace')
 except Exception:
-    sys.stdout = open(os.devnull, 'w')
+    sys.stdout = open(os.devnull, 'w', encoding='utf-8', errors='replace')
 try:
     if sys.stderr is None or sys.stderr.closed:
-        sys.stderr = open(os.devnull, 'w')
+        sys.stderr = open(os.devnull, 'w', encoding='utf-8', errors='replace')
 except Exception:
     logging.getLogger(__name__).exception("<module>: swallowed Exception")
 stream_handler = logging.StreamHandler(sys.stdout)
@@ -4977,6 +4995,12 @@ def get_tools(req_tool, is_first: bool = False):
                 ui_label='Looking up user details…',
             ),
             labeled_tool(
+                name="List_Agents",
+                func=_parse_list_agents,
+                description=_LIST_AGENTS_TOOL_DESCRIPTION,
+                ui_label='Listing your agents…',
+            ),
+            labeled_tool(
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
                 description="To see user or if there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input. Only if last 16 seconds Visual Context information is present & is enough, then use that to craft a better creative, better, cohesive, correlated , summarised natural response, format this tool response togather with Previous 15 minutes Visual Context information if you are seeing the scene via videocall from the other end. If there are more than 1 person try to give an identity to each across frames to track the subjects through time by framing the tool input accordingly.",
@@ -5456,6 +5480,11 @@ def get_tools(req_tool, is_first: bool = False):
                 description="Utilize this functionality to retrieve information about students or users, requiring the current user_id as the only acceptable input; access to other user details is not allowed."
             ),
             Tool(
+                name="List_Agents",
+                func=_parse_list_agents,
+                description=_LIST_AGENTS_TOOL_DESCRIPTION,
+            ),
+            Tool(
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
                 description="This tool captures the user's visual context during a video call, providing real-time captions. Use it for visual question answering, scene understanding, recognizing objects, activities, & monitoring the user. Input will be the user's input/query. If the last 16 seconds of visual context are available and sufficient, it crafts a creative, cohesive response. If not, inform the user of the glitch accessing the current camera feed and guess using the Last_5_Minutes_Visual_Context. Ensure responses are natural, avoiding lists of captions, and format them as if you are seeing the user scene via video call. Analyze the current tool response and previous visual context captions to recognize user activities and infer actions from multiple frames. If the user requests continuous narration without active input, adapt the response to include past, present, and future tenses for dynamic and contextually aware commentary."
@@ -5537,9 +5566,18 @@ def get_tools(req_tool, is_first: bool = False):
             elif hasattr(t, '_run') and callable(t._run):
                 t._run = _with_tool_logging(t._run, t.name)
 
-        tool_strings = "\n".join(
-            f"\n> {tool.name}: {tool.description}" for tool in tools)
-        return tool_strings
+        # Return the Tool objects, symmetric with the is_first=True branch.
+        # This branch used to return a rendered "> name: description" STRING
+        # (shaped for the CustomGPT <TOOLS_START> splice, which now renders
+        # at its own call site).  get_ans passes this value to
+        # ConversationalChatAgent.create_prompt + CustomAgentExecutor, and
+        # the string crashed both: live 2026-08-24 08:23:44, hie:7608
+        # "AttributeError: 'str' object has no attribute 'name'" — every
+        # casual_conv=False turn died there and the tool-less '_tier':
+        # 'direct' fallback answered.  Unreachable dead code until the
+        # classifier override (15ed5874) made this branch live; all 3
+        # logged crashes are the 3 override-fired turns.
+        return tools
 
 # custom GPT
 
@@ -5828,9 +5866,13 @@ class CustomGPT(LLM):
 
         if self.count > 1 and thread_local_data.get_global_intent() != self.previous_intent:
             tools = get_tools(thread_local_data.get_global_intent())
+            # get_tools returns Tool objects; this splice needs text, so
+            # render here (the only consumer that wants the string form).
+            tool_strings = "\n".join(
+                f"\n> {t.name}: {t.description}" for t in tools)
             start_index = prompt.find("<TOOLS_START>")
             end_index = prompt.find("<TOOLS_END>") + len("<TOOLS_END>")
-            prompt = prompt[:start_index] + tools + prompt[end_index:]
+            prompt = prompt[:start_index] + tool_strings + prompt[end_index:]
             app.logger.info(f"second time calling {len(prompt)}")
 
             # prompt = create_prompt(tools)
@@ -6988,6 +7030,36 @@ def parse_visual_context(inp: str):
     return "No visual context available — camera not active."
 
 
+# Shared by BOTH get_tools branches (is_first=True labeled_tool and the
+# is_first=False exhaustive list) — same single-source shape as
+# _CREATE_AGENT_TOOL_DESCRIPTION.  Live 2026-08-24 07:01: the tool was
+# registered only in the is_first=True branch, so every casual_conv=False
+# turn (the branch enumeration questions actually reach since 15ed5874)
+# got a registry WITHOUT it and the model truthfully denied having it.
+_LIST_AGENTS_TOOL_DESCRIPTION = (
+    "List every agent available here: built-in expert agents, the user's "
+    "own created agents, and hive agents shared from peer nodes or pulled "
+    "from central (marked origin='hive'), with name, category, and "
+    "description. Use whenever the user asks what agents exist, what "
+    "agents they have, or which agent could handle a task — never say "
+    "there are no separate agents without calling this. Input: an optional "
+    "search term to filter by name or skill, or an empty string for the "
+    "full list.")
+
+
+def _parse_list_agents(inp: str = ''):
+    """Chat-tool wrapper over the canonical agent enumeration.
+
+    Delegates to integrations.mcp._tool_impls.list_agents — the same
+    implementation the MCP bridge serves — so there is ONE enumeration.
+    Before this wrapper the chat model answered "I do not have separate
+    agents" while 4 expert + 2,633 dynamic recipes sat in the registry
+    (live 2026-08-23 15:02, #688 P3)."""
+    from integrations.mcp._tool_impls import list_agents
+    q = (inp or '').strip()
+    return list_agents(query=q or None)
+
+
 def parse_user_id(inp: str):
     url = 'https://azurekong.hertzai.com:8443/db/getstudent_by_user_id'
 
@@ -7451,11 +7523,15 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     start_time = time.time()
     _stage_req_id = str(thread_local_data.get_request_id() or '')
     publish_chat_stage('loading_context', user_id=str(user_id), request_id=_stage_req_id)
-    # casual_conv is the draft classifier's `is_casual` flag propagated
-    # from the /chat handler — when True we skip the action+profile
-    # fetch entirely because a casual acknowledgement doesn't consult
-    # either. No Python-side classification of `query` happens anywhere
-    # in the user_context module; the draft 0.8B is the only classifier.
+    # casual_conv is the SESSION-SHAPE flag from the route (chatbot_routes:486
+    # `not bool(prompt_id or create_agent)`): no prompt_id = casual companion
+    # session (light path), prompt_id = agent-bound session (full tool path).
+    # It is NOT the draft classifier's per-turn `is_casual` verdict — a
+    # 2026-08-24 change treated it as such and overrode it in the /chat
+    # handler; the owner reverted that same day. When True we skip the
+    # action+profile fetch entirely because a casual acknowledgement doesn't
+    # consult either. No Python-side classification of `query` happens
+    # anywhere in the user_context module.
     if casual_conv:
         user_details = "Casual conversation mode."
         actions = ""
@@ -9271,7 +9347,7 @@ def chat():
                         app.logger.info(f'GOT LEN OF FLOW AS {no_of_flow}')
                     if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_{no_of_flow}_recipe.json')):
                         # All flows complete → REUSE
-                        create_agent = set_flags_to_enter_review_mode(no_of_flow, user_id, prompt_id) #returns false
+                        create_agent = set_flags_to_enter_reuse_mode(no_of_flow, user_id, prompt_id) #returns false
                     else:
                         # Some flows complete, some not.
                         # Enter CREATE — recipe() has resume logic (initialize_with_resume)
@@ -9449,6 +9525,16 @@ def chat():
                         f"recall/Q&A directly or escalates a genuine task via "
                         f"its own tools."
                     )
+                    # casual_conv is DELIBERATELY left as the route sent it
+                    # (chatbot_routes:486 `not bool(prompt_id or
+                    # create_agent)`): it is a SESSION-SHAPE flag — no
+                    # prompt_id = casual companion session (draft-first,
+                    # light get_ans), prompt_id = agent-bound session — NOT
+                    # the classifier's per-turn is_casual verdict.  A
+                    # 2026-08-24 change overrode it to False here whenever
+                    # the classifier said not-casual; the owner reverted it
+                    # the same day: default-agent turns must keep the casual
+                    # shape, and only prompt_id sessions run agent-bound.
                     # #118 FIX: do NOT force create_agent/autonomous here.
                     # Forcing CREATE on EVERY non-casual turn hijacked recall/
                     # Q&A ("what did we discuss 15 days back") into an 8-action
@@ -9829,7 +9915,8 @@ def chat():
                     _mce()
                 except ImportError:
                     logging.getLogger(__name__).debug("chat: swallowed ImportError")
-            if response =='Agent Created Successfully':
+            if response in ('Agent Created Successfully',
+                            'Agent Already Created Successfully'):
                 with _user_lock:
                     conversation_agent[_ak] = True
                 _touch_agent_timestamp(_ak)
@@ -10217,25 +10304,30 @@ def evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_
     )
 
 
-def set_flags_to_enter_review_mode(no_of_flow, user_id, prompt_id=''):
-    """Despite the name, this only ever runs from the "all flows complete
-    -> REUSE" branch (its one call site) -- it has never actually meant
-    "enter review mode". It used to set review_agents[_ak] = True
-    unconditionally, which poisoned the SAME request's own outcome: the
-    "resuming in-progress creation" check a few lines later in chat()
-    reads that same key and stomps this function's correct
-    create_agent=False return value back to True, permanently trapping
-    every later message for this (user, prompt) in the creation flow even
-    though the agent was already fully built. Found 2026-08-24 testing a
-    brand-new Slack binding against prompt_id=8888 -- every single
-    message, including the very first one from a user who had never
-    touched this agent before, got stuck this way.
+def set_flags_to_enter_reuse_mode(no_of_flow, user_id, prompt_id=''):
+    """This only ever runs from the "all flows complete -> REUSE" branch
+    (its one call site) -- it has never meant "enter review mode", hence
+    the rename. It used to set review_agents[_ak] = True unconditionally,
+    which poisoned the SAME request's own outcome: the "resuming
+    in-progress creation" check a few lines later in chat() reads that
+    same key and stomps this function's correct create_agent=False
+    return value back to True, permanently trapping every later message
+    for this (user, prompt) in the creation flow even though the agent
+    was already fully built. Confirmed independently two ways: live
+    2026-08-23 09:42 (#684) as "Agent Already Created Successfully" raw
+    stub replies with the message never executed, and again 2026-08-24
+    testing a brand-new Slack binding against prompt_id=8888, where every
+    single message -- including the very first one from a user who had
+    never touched the agent before -- got stuck the same way.
+
+    All flow recipes exist -> the agent is BUILT; this turn is a
+    conversation, not a fresh creation.
     """
     app.logger.info(f'{no_of_flow} Recipe Json exist Going to reuse')
     create_agent = False
     _ak = f'{user_id}_{prompt_id}'
     review_agents[_ak] = False
-    conversation_agent[_ak] = False
+    conversation_agent[_ak] = True
     _touch_agent_timestamp(_ak)
     return create_agent
 

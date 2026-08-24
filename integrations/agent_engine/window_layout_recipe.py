@@ -39,8 +39,10 @@ from typing import Any, Dict, List, Optional
 try:
     from helper import PROMPTS_DIR
 except ImportError:  # pragma: no cover - standalone
-    PROMPTS_DIR = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), '..', '..', 'prompts'))
+    # Same resolved canonical dir, without helper's weight.  The old
+    # module-relative fallback pointed at site-packages/prompts in the
+    # frozen layout — a folder that does not exist (#692).
+    from core.cache_loaders import PROMPTS_DIR
 
 logger = logging.getLogger('hevolve.window_layout_recipe')
 
