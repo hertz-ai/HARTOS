@@ -753,6 +753,42 @@ class TestFederationDeltaSigning(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn('Ed25519', msg)
 
+    def test_origin_attestation_added_after_signing_still_verifies(self):
+        """A delta carrying origin_attestation must still pass the Ed25519 check.
+
+        broadcast_delta attaches BOTH hmac_signature (via _sign_delta) AND
+        origin_attestation AFTER extract_local_delta() signs the content. If
+        receive_peer_delta hashes either into the verify payload it fails
+        'invalid signature'. This is the live census-of-1 cause for attested
+        nodes, reproduced 2026-08-25 against real central. Stripping
+        hmac_signature alone (7c430eb8) is NOT enough — origin_attestation is on
+        every real broadcast, so it must be stripped too.
+        """
+        from integrations.agent_engine.federated_aggregator import (
+            FederatedAggregator, _sign_delta)
+        from security.node_integrity import sign_json_payload, get_public_key_hex
+
+        agg = FederatedAggregator()
+        delta = {
+            'version': 1, 'node_id': 'attest-peer',
+            'public_key': get_public_key_hex(), 'guardrail_hash': '',
+            'timestamp': time.time(),
+            'experience_stats': {'total_recorded': 10, 'total_flushed': 8,
+                                 'flush_rate': 0.8},
+        }
+        delta['signature'] = sign_json_payload(delta)   # sign the CONTENT
+        _sign_delta(delta)                              # + hmac (post-signing)
+        delta['origin_attestation'] = {'blob': 'x' * 40}  # + attestation (post-signing)
+
+        # Soft isolates the signature layer from the genuine-build gate: the
+        # ONLY thing that can say 'invalid signature' is the Ed25519 check.
+        with patch('security.master_key.get_enforcement_mode',
+                   return_value='soft'):
+            ok, msg = agg.receive_peer_delta(delta)
+        self.assertNotIn('invalid signature', (msg or '').lower(),
+                         f'attestation added post-signing broke the sig check: {msg}')
+        self.assertTrue(ok, f'attested delta should verify + accept, got: {msg}')
+
 
 # ═══════════════════════════════════════════════════════════════
 # 7. Recipe Consent Check

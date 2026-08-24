@@ -649,32 +649,37 @@ class FederatedAggregator:
         if sig:
             try:
                 from security.node_integrity import verify_json_signature
-                # Verify against the delta WITHOUT hmac_signature, because
-                # that field did not exist when the sender signed.
+                # Verify against the delta WITHOUT the fields added AFTER the
+                # sender signed. extract_local_delta() computes the Ed25519
+                # signature over the content delta; broadcast_delta() then adds
+                # TWO more fields before posting: _sign_delta() adds
+                # hmac_signature, and the attestation block adds
+                # origin_attestation. verify_json_signature strips only
+                # 'signature', so any field added post-signing that we do NOT
+                # strip here gets hashed into a payload the signature never
+                # covered — and verification fails with 'invalid signature'.
                 #
-                # Order of operations on the send side: extract_local_delta()
-                # computes the Ed25519 signature, then broadcast_delta() calls
-                # _sign_delta() which ADDS hmac_signature before posting
-                # (line ~422). verify_json_signature strips only 'signature',
-                # so the payload it hashes on this side contains a field the
-                # signed payload did not, and every delta on the wire failed
-                # with 'invalid signature'.
+                # Reproduced live 2026-08-25: a genuine attested delta POSTed
+                # from a real build to central was rejected 'invalid signature'.
+                # Stripping hmac_signature alone (the original 7c430eb8 fix) is
+                # NOT enough once origin_attestation is present — which it is on
+                # every REAL broadcast_delta (the two-node harness passed only
+                # because its dev send-delta attaches no attestation). This was
+                # THE live census-of-1 cause for attested nodes, independent of
+                # the split-identity bug.
                 #
-                # Measured on a real delta from extract_local_delta():
-                #   before _sign_delta                       verifies True
-                #   after  _sign_delta (the wire form)       verifies False
-                #   wire form minus hmac_signature only      verifies True
+                # Measured on a real attested delta:
+                #   wire form                                 verifies False
+                #   minus hmac_signature only                 verifies False
+                #   minus hmac_signature + origin_attestation verifies True
                 #
-                # Since hard is the default enforcement mode, this rejected
-                # every peer delta regardless of networking, which is a second
-                # and independent reason hive-census reported one node.
-                #
-                # Fixed here rather than in verify_json_signature because that
-                # helper is generic and also verifies peer announcements, which
-                # carry no HMAC. The two-signature layering is specific to
-                # federation deltas.
+                # Fixed here, not in verify_json_signature: that helper is
+                # generic and also verifies peer announcements, which carry
+                # neither field. This post-signing layering is federation-delta
+                # specific.
+                _POST_SIGN_FIELDS = ('hmac_signature', 'origin_attestation')
                 _ed_payload = {k: v for k, v in delta.items()
-                               if k != 'hmac_signature'}
+                               if k not in _POST_SIGN_FIELDS}
                 if not verify_json_signature(delta.get('public_key', ''),
                                              _ed_payload, sig):
                     return False, 'invalid signature'
