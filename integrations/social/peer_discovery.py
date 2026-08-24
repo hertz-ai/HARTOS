@@ -16,6 +16,70 @@ from core.http_pool import pooled_get, pooled_post
 from core.session_cache import TTLCache  # bounded + TTL dedup (peer churn safe)
 from core.ttl_cache import ttl_cached  # hard-TTL discovery cache (gossip counts)
 
+import ipaddress as _ipaddress
+from urllib.parse import urlparse as _urlparse
+
+# Docker's default bridge network. A container that advertises its in-bridge
+# address (172.17.x) instead of its host's address is unreachable from any
+# other node — a config bug, never a routable inter-node peer address.
+_DOCKER_BRIDGE = _ipaddress.ip_network('172.17.0.0/16')
+# The historical port typo: the real backend port is 6777; drifted configs
+# advertised :677, where nothing binds.
+_DEAD_PEER_PORT = 677
+
+
+def is_unroutable_peer_url(url):
+    """Is this URL structurally unusable as a DISTINCT peer address — for anyone?
+
+    Returns (True, reason) for addresses that can never be a real distinct peer
+    on ANY host: the docker default bridge (172.17.x — a per-host internal
+    address, unreachable between nodes), the dead :677 port (the 6777 typo,
+    nothing binds it), the unspecified/link-local ranges, and hostless/
+    unparseable URLs. A local ping to a docker-bridge row succeeds (the node
+    reaches its own bridge), so the age-based health check keeps it 'active'
+    forever — hence they must be excluded by CLASS, not aged out. Measured live
+    2026-08-25: central's 673-row table held 134 docker-172.17 + 8 dead-:677 of
+    exactly this kind, all cert_verified=0.
+
+    Loopback (localhost / 127.x / ::1) is deliberately NOT rejected here: two
+    co-located nodes — dev, test (tests/standalone/two_node_collaboration.py),
+    single-box multi-process — legitimately reach each other over loopback on
+    distinct ports. The production loopback pollution (a REMOTE node that
+    advertised its own localhost) is prevented at the SOURCE by
+    get_advertisable_base_url (nodes now advertise a routable address); any
+    legacy localhost rows on central are a one-time ops cleanup, not worth
+    breaking co-located collaboration for. Also does NOT reject ordinary
+    private LAN addresses (192.168.x, 10.x, the rest of 172.16/12).
+
+    The one canonical definition of "structurally not a peer"; reuse it, do not
+    re-implement per call site.
+    """
+    if not url:
+        return True, 'empty url'
+    try:
+        parsed = _urlparse(url if '://' in url else 'http://' + url)
+    except Exception:
+        return True, 'unparseable url'
+    host = (parsed.hostname or '').lower()
+    if not host:
+        return True, 'no host'
+    try:
+        if parsed.port == _DEAD_PEER_PORT:
+            return True, 'dead :677 port'
+    except ValueError:
+        return True, 'malformed port'
+    try:
+        ip = _ipaddress.ip_address(host)
+    except ValueError:
+        # A DNS hostname (incl. 'localhost') — resolution + reachability
+        # decide, not this structural gate.
+        return False, ''
+    if ip.is_unspecified or ip.is_link_local:
+        return True, 'unspecified/link-local ip'
+    if ip.version == 4 and ip in _DOCKER_BRIDGE:
+        return True, 'docker bridge 172.17.x'
+    return False, ''
+
 logger = logging.getLogger('hevolve_social')
 
 
@@ -624,11 +688,25 @@ class GossipProtocol:
         try:
             peers = db.query(PeerNode).filter(PeerNode.status != 'dead').all()
             now = datetime.utcnow()
+            purged = 0
+            live_peers = []
             for peer in peers:
                 if not self._running:
                     break
                 if peer.node_id == self.node_id:
                     continue
+                # #38: a structurally-unroutable row (loopback / docker-bridge /
+                # dead :677) can never be a real remote peer, and a local ping
+                # to it SUCCEEDS — so the age logic below would keep it 'active'
+                # forever and inflate every count. Delete it outright rather
+                # than age it out; ingest (_merge_peer) now rejects new ones, so
+                # it will not come back.
+                _bad_url, _ = is_unroutable_peer_url(peer.url)
+                if _bad_url:
+                    db.delete(peer)
+                    purged += 1
+                    continue
+                live_peers.append(peer)
                 reachable = self._ping_peer(peer.url)
                 self._heartbeat()
                 if reachable:
@@ -641,10 +719,15 @@ class GossipProtocol:
                     elif age > self.stale_threshold:
                         peer.status = 'stale'
             db.commit()
-            # Update contribution scores for active/stale peers
+            if purged:
+                logger.info(
+                    "Peer purge (#38): removed %d unroutable rows "
+                    "(loopback / docker-172.17 / dead :677)", purged)
+            # Update contribution scores for active/stale peers (live rows only;
+            # purged rows are gone from the session).
             try:
                 from .hosting_reward_service import HostingRewardService
-                for peer in peers:
+                for peer in live_peers:
                     if peer.status in ('active', 'stale') and peer.node_id != self.node_id:
                         HostingRewardService.compute_contribution_score(db, peer.node_id)
                 db.commit()
@@ -1263,6 +1346,16 @@ class GossipProtocol:
             return _reject('node_id and url are both required')
         if node_id == self.node_id:
             return _reject('announcement is from this node itself')
+
+        # Structural gate: a peer whose URL is loopback / docker-bridge / :677
+        # can never be dialed as a REMOTE node (it points at self or nowhere).
+        # This is the source of the localhost:6777 flood — the Sybil check
+        # below deliberately EXEMPTS loopback, so without this gate those rows
+        # accumulate without limit and then fool the age-based health check
+        # (a local ping to them succeeds). Reject at ingest; #38.
+        _bad_url, _bad_why = is_unroutable_peer_url(url)
+        if _bad_url:
+            return _reject('unroutable peer url (%s)' % _bad_why)
 
         # Sybil protection: max 5 nodes per IP/hostname.
         # Loopback addresses are exempt - single-user dev installs
