@@ -1487,11 +1487,17 @@ class FederatedAggregator:
         except Exception:
             package['recipe_index'] = {}
 
-        # Quality heuristics — community-validated metrics
+        # Quality heuristics — community-validated metrics.
+        # Reads self._peer_deltas (where receive_peer_delta stores accepted
+        # peer learning). The earlier self.peer_deltas had no underscore and no
+        # such attribute exists, so the AttributeError was swallowed by the
+        # except below and a joiner NEVER received the hive's pooled heuristics —
+        # the network-value mechanism was silently a no-op (found + fixed
+        # 2026-08-25 via network_beats_solo_proof.py).
         try:
-            if self.peer_deltas:
+            if self._peer_deltas:
                 quality = {}
-                for d in self.peer_deltas.values():
+                for d in self._peer_deltas.values():
                     qm = d.get('quality_metrics', {})
                     for k, v in qm.items():
                         if isinstance(v, (int, float)):

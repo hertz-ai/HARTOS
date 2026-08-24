@@ -162,6 +162,32 @@ class TestNodeBootstrap:
         assert 'quality_baselines' in pkg
         assert 'resonance_norms' in pkg
 
+    def test_bootstrap_shares_pooled_quality_baselines(self):
+        """A joiner must inherit the hive's pooled quality heuristics.
+
+        Regression: bootstrap_new_node read self.peer_deltas (no underscore, no
+        such attribute), the AttributeError was swallowed, and every joiner got
+        quality_baselines={} — the network-value mechanism was silently a no-op.
+        It must average quality_metrics from _peer_deltas (where accepted peer
+        learning is stored). Proven end to end by
+        tests/standalone/network_beats_solo_proof.py.
+        """
+        agg = self._make_aggregator()
+        agg._peer_deltas = {
+            'peer-a': {'quality_metrics': {'success_rate': 0.9,
+                                           'avg_latency_ms': 100}},
+            'peer-b': {'quality_metrics': {'success_rate': 0.8,
+                                           'avg_latency_ms': 140}},
+        }
+        pkg = agg.bootstrap_new_node('joiner')
+        qb = pkg.get('quality_baselines') or {}
+        assert qb.get('success_rate') == pytest.approx(0.85)
+        assert qb.get('avg_latency_ms') == pytest.approx(120.0)
+        # A solo node (no peer deltas) has nothing to share.
+        solo = self._make_aggregator()
+        solo._peer_deltas = {}
+        assert (solo.bootstrap_new_node('joiner').get('quality_baselines') or {}) == {}
+
     def test_bootstrap_no_raw_user_data(self):
         agg = self._make_aggregator()
         pkg = agg.bootstrap_new_node('node-456')
