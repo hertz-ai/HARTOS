@@ -178,6 +178,16 @@ class FederatedAggregator:
         # EventBus counters (fed by real-time events)
         self._event_counters_lock = threading.Lock()
         self._event_counters: Dict[str, int] = {}
+        # Cumulative genuine-install ledger: distinct node_ids that have EVER
+        # passed the join gate (version/freshness/Ed25519/genuine-build). Unlike
+        # _peer_deltas (active only within the freshness window, decays after
+        # ~1h), this is the MONOTONIC "installs that joined the hive" count —
+        # the number /hive reports toward the fleet target. Persisted in the
+        # durable agent_data mount so it survives restarts and the window.
+        # Only gate-passed nodes are recorded, so it cannot be inflated by
+        # unverified traffic — the anti-cheat carries into the headline figure.
+        self._installs_lock = threading.Lock()
+        self._genuine_installs = self._load_installs_ledger()
 
         # Subscribe to EventBus (if platform is bootstrapped)
         self._subscribe_to_eventbus()
@@ -617,6 +627,68 @@ class FederatedAggregator:
         except Exception as e:
             logger.debug(f"Federation broadcast error: {e}")
 
+    def _installs_ledger_path(self):
+        """Durable cumulative-install ledger path — one canonical agent_data
+        resolution, matching core.node_secret."""
+        base = os.environ.get(
+            'HEVOLVE_AGENT_DATA',
+            os.path.join(os.path.expanduser('~'), '.nunba', 'agent_data'))
+        return os.path.join(base, 'federation_installs.json')
+
+    def _load_installs_ledger(self):
+        """Load the set of genuine node_ids seen so far. Empty on first boot or
+        any read error — this is best-effort telemetry, never fatal."""
+        try:
+            p = self._installs_ledger_path()
+            if os.path.isfile(p):
+                with open(p, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return set(data.get('node_ids') or [])
+                if isinstance(data, list):
+                    return set(data)
+        except Exception as e:
+            logger.debug('installs ledger load skipped: %s', e)
+        return set()
+
+    def _record_genuine_install(self, node_id):
+        """Record a gate-passed node_id in the cumulative ledger. Persists ONLY
+        when the node is new (first join), so repeat deltas do no disk I/O.
+        Atomic write (tmp + replace). Never raises — accounting must not break
+        the receive path."""
+        if not node_id:
+            return
+        try:
+            with self._installs_lock:
+                if node_id in self._genuine_installs:
+                    return
+                self._genuine_installs.add(node_id)
+                snapshot = sorted(self._genuine_installs)
+            import tempfile
+            p = self._installs_ledger_path()
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            payload = {'node_ids': snapshot, 'count': len(snapshot)}
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), suffix='.tmp')
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(payload, f)
+                os.replace(tmp, p)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+                raise
+            logger.info('Cumulative genuine installs: %d (new node %s)',
+                        len(snapshot), (node_id or '')[:12])
+        except Exception as e:
+            logger.debug('installs ledger persist skipped: %s', e)
+
+    def total_genuine_installs(self) -> int:
+        """Cumulative distinct genuine node_ids that ever joined the hive."""
+        with self._installs_lock:
+            return len(self._genuine_installs)
+
     def receive_peer_delta(self, delta: dict) -> Tuple[bool, str]:
         """Validate and store incoming peer delta.
 
@@ -792,6 +864,11 @@ class FederatedAggregator:
         with self._lock:
             self._peer_deltas[node_id] = delta
 
+        # Cumulative install ledger: this node passed the full join gate, so it
+        # is a genuine install that joined the hive. Monotonic + persistent,
+        # unlike _peer_deltas which decays after the freshness window.
+        self._record_genuine_install(node_id)
+
         return True, 'accepted'
 
     def hive_census(self) -> dict:
@@ -873,6 +950,12 @@ class FederatedAggregator:
             # The denominator, first, because everything under it is meaningless
             # without it.
             'nodes_reporting': len(per_node),
+            # Cumulative distinct genuine installs that have EVER joined the hive
+            # (monotonic, persistent), vs nodes_reporting which is only those
+            # active in this window. This is the honest "installs" figure the
+            # fleet target is measured against; it counts gate-passed nodes
+            # only, so it cannot be inflated by unverified traffic.
+            'total_installs': self.total_genuine_installs(),
             'nodes_with_intelligence': with_intelligence,
             'nodes_stale': stale,
             'window_seconds': DELTA_MAX_AGE_SECONDS,
