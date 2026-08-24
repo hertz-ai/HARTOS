@@ -47,14 +47,19 @@ sudo docker build -t langchain_gpt:latest .
 # `docker run langchain_gpt` (foreground, unnamed, no ports) and the real
 # invocation lived only in operators' shell history — every box drifted.
 #
-# Networking: deploy/deployment-manifest.json declares
-# hart-discovery {port 6780, udp, always_enabled}.  Docker bridge NAT
-# cannot deliver subnet-broadcast beacons (DNAT matches the host IP, not
-# 192.168.0.255), so bridge mode silently disables LAN peer discovery —
-# --network host is the only mode where it works.  Default host; set
-# HART_DOCKER_NETWORK=bridge on shared multi-service VMs to keep today's
-# published-port behavior instead.
-NETWORK_MODE="${HART_DOCKER_NETWORK:-host}"
+# The CANONICAL deploy is .github/workflows/deploy-hartos-deepbox.yml
+# (sha-tagged build + signed release manifest + /status-gated rollback);
+# this script only provisions a box the workflow has not adopted yet, and
+# its run invocation mirrors the workflow's so the two cannot drift.
+#
+# Networking: bridge + published 6777, same as the workflow.  A central-
+# tier node is found by URL over HTTP and needs no UDP beacon.  Set
+# HART_DOCKER_NETWORK=host ONLY for a flat/regional node on a LAN that
+# must do zero-config discovery: deployment-manifest.json declares
+# hart-discovery {6780, udp, always_enabled}, and bridge NAT cannot
+# deliver subnet-broadcast beacons (DNAT matches the host IP, not
+# 192.168.0.255) — host networking is the only mode where they arrive.
+NETWORK_MODE="${HART_DOCKER_NETWORK:-bridge}"
 if [ "$NETWORK_MODE" = "host" ]; then
     NET_ARGS="--network host"
 else
