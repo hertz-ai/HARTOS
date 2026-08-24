@@ -22,11 +22,20 @@ let
   # instruction (SIGILL, status 4/ILL) and core-dumped at startup, before binding
   # cfg.ports.llm. Under Restart=on-failure that was a crash loop: 6762 restarts
   # over ~19h (2026-08-24), the node had no local inference, and every goal agent
-  # stalled. Note the "Ivy Bridge Vulkan incomplete" journal lines above each dump
-  # are a RED HERRING -- every one of those crashes also loaded the avx2
-  # libggml-cpu.so, and `llama-server --version` alone dies, so the SIGILL
-  # explains them all. Do not blame Vulkan without testing a Vulkan build that
-  # HAS the ISA fix.
+  # stalled.
+  #
+  # The "Ivy Bridge Vulkan incomplete" journal lines sitting above each dump are
+  # only a PARTIAL red herring, and the difference is worth stating because it
+  # was measured rather than assumed. Building the Vulkan variant WITH this ISA
+  # fix and running it on the box (2026-08-24) separates the two:
+  #   * `llama-server --version`, which used to core-dump, now prints normally
+  #     -- so the STARTUP crash was the avx2 libggml-cpu.so, not Vulkan;
+  #   * but that same binary still cannot SERVE here: it fails model load and
+  #     dies with "vkDestroyFence: Invalid device", because the HD 4000's Mesa
+  #     ANV driver is incomplete on Ivy Bridge.
+  # So there are TWO independent faults on this hardware and neither explanation
+  # covers the other. Fixing the ISA alone would still leave this node unable to
+  # serve; dropping Vulkan alone would still leave it SIGILLing.
   #
   # llama.cpp b4154 has no runtime CPU dispatch (GGML_CPU_ALL_VARIANTS and
   # GGML_BACKEND_DL do not exist in this source tree -- checked), so ONE binary
@@ -37,10 +46,11 @@ let
   llamaFast = pkgs.llama-cpp.override { vulkanSupport = true; };
 
   # The floor: exactly the configuration PROVEN to run on the box (avx/f16c only,
-  # no Vulkan). Vulkan is dropped HERE ONLY -- the sole GPU on this class of
-  # hardware is the Intel HD 4000, whose Mesa ANV driver announces itself as
-  # "incomplete" on Ivy Bridge, so a GPU backend buys that node nothing. Capable
-  # nodes keep Vulkan via llamaFast above.
+  # no Vulkan). Vulkan is dropped HERE ONLY, and by experiment rather than by
+  # assumption -- see above: with the ISA fix applied, a Vulkan build STILL fails
+  # model load on this hardware ("vkDestroyFence: Invalid device"). Capable nodes
+  # keep Vulkan via llamaFast above; this variant is the one that has to boot on
+  # a machine whose GPU driver cannot be trusted.
   llamaPortable = (pkgs.llama-cpp.override { vulkanSupport = false; }).overrideAttrs (o: {
     cmakeFlags = (o.cmakeFlags or [ ]) ++ [
       "-DGGML_NATIVE=OFF"

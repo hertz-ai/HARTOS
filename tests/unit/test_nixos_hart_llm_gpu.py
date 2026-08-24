@@ -11,8 +11,11 @@ History (two real-HW boots on the same Lenovo/Ivy Bridge box):
     fallback, so llama-server hit an illegal instruction (SIGILL) and core-dumped
     at startup -- a 6760+ restart crash loop over ~19h, and the local LLM was
     never reachable, so every goal agent stalled. Only libggml-cpu.so carried the
-    bad insns (1028); Vulkan was a red herring, and the Intel HD 4000's Mesa ANV
-    Vulkan is "incomplete" on Ivy Bridge anyway (a second crash vector).
+    bad insns (1028). Rebuilding the Vulkan variant WITH the ISA fix separates
+    two independent faults: `llama-server --version` stops core-dumping (so the
+    STARTUP crash was the CPU backend, not Vulkan), yet it still cannot serve on
+    this box, failing model load with "vkDestroyFence: Invalid device" because
+    the HD 4000's Mesa ANV driver is incomplete on Ivy Bridge.
 
 The fix must not trade one regression for a bigger one. nixpkgs' avx2 baseline is
 DELIBERATE (-DGGML_NATIVE:BOOL=FALSE sets INS_ENB=ON, enabling GGML_AVX2/FMA), so
