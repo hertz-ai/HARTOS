@@ -8,43 +8,65 @@
 let
   cfg = config.hart;
 
-  # GPU-accelerated llama.cpp. Vulkan is the UNIVERSAL GPU backend -- Intel iGPU (mesa
-  # ANV), AMD (RADV), NVIDIA (its Vulkan ICD) -- so ONE build offloads on any GPU and
-  # cleanly falls back to CPU. The old flake `.default` was CPU-only, so EVERY layer ran
-  # on the CPU = the "assistant keeps thinking" slowness. The Vulkan RUNTIME is already
-  # present (desktop.nix `hardware.graphics.enable` -> mesa ICDs in /run/opengl-driver).
-  # This is the NixOS analogue of the Nunba companion's "CPU prebundled, GPU when present"
-  # bootstrap: one universal binary, GPU-or-CPU decided at launch, no runtime download.
-  llama-server = pkgs.llama-cpp.override { vulkanSupport = true; };
+  # ── llama.cpp built for the fleet's REAL cpu floor ────────────────────────────
+  # The Samsung/Lenovo HART box is an Intel i7-3630QM (Ivy Bridge, 2012): it has
+  # avx + f16c + sse4.2 but NO avx2, NO fma, NO bmi2. Stock nixpkgs `llama-cpp`
+  # ships a SINGLE libggml-cpu.so compiled WITH avx2/fma and no runtime fallback,
+  # so on this CPU llama-server hits an illegal instruction (SIGILL, status 4/ILL)
+  # and core-dumps at startup -- before it can bind cfg.ports.llm. Under
+  # Restart=on-failure that became a crash loop (measured: 6760+ restarts / ~19h,
+  # 2026-08-24), which is why the local LLM was never reachable and every goal
+  # agent stalled with no inference engine. The "Ivy Bridge Vulkan incomplete"
+  # journal lines were a red herring -- only libggml-cpu.so carried the bad insns
+  # (1028 of them); the Vulkan/base libs had zero.
+  #
+  # Fix: build llama.cpp for THIS ISA -- disable avx2/fma/bmi2/avx512 (keep avx +
+  # f16c, which Ivy Bridge has) and turn NATIVE off for reproducibility. Proven on
+  # the box: the resulting libggml-cpu.so has ZERO avx2/fma insns and serves a real
+  # completion on :808 (objdump + a live /v1/chat/completions round trip,
+  # 2026-08-24). Guarded by tests/unit/test_nixos_hart_llm_gpu.py.
+  #
+  # Vulkan is REMOVED (vulkanSupport = false). The only GPU on the real fleet
+  # hardware is the Intel HD 4000, whose Mesa ANV driver is "incomplete" on Ivy
+  # Bridge (Mesa's own warning) and makes ggml's Vulkan backend abort at device
+  # init regardless of --n-gpu-layers -- a second crash vector, not a speed-up. A
+  # CPU-only binary cannot take that path at all. The earlier Vulkan build "fixed"
+  # a June slowness but never actually ran on real hardware; CPU-that-runs beats
+  # GPU-that-crashes, and HART's speed story is network-distributed inference (the
+  # frontier/EXPERT tier), not this local floor.
+  #   FUTURE: -DGGML_CPU_ALL_VARIANTS=ON + -DGGML_BACKEND_DL=ON gives one binary
+  #   that runtime-selects avx2 kernels on capable nodes AND avx-only on the potato;
+  #   deferred until a healthy-GPU / newer-CPU node actually joins the fleet.
+  llama-server = (pkgs.llama-cpp.override { vulkanSupport = false; }).overrideAttrs (o: {
+    cmakeFlags = (o.cmakeFlags or [ ]) ++ [
+      "-DGGML_NATIVE=OFF"
+      "-DGGML_AVX2=OFF"
+      "-DGGML_FMA=OFF"
+      "-DGGML_BMI2=OFF"
+      "-DGGML_AVX512=OFF"
+      "-DGGML_AVX=ON"
+      "-DGGML_F16C=ON"
+    ];
+  });
 
-  # GPU-aware launcher. A Vulkan-built llama-server with --n-gpu-layers>0 but NO Vulkan
-  # device ERRORS out at load (and would crash-loop under Restart=on-failure), so gate
-  # -ngl on a real render node + a Vulkan ICD actually being present; otherwise pure-CPU.
+  # CPU-only launcher. The binary above has NO GPU backend, so there is no
+  # --n-gpu-layers here (a CPU-only llama-server would reject it). THREADS = nproc
+  # - 1 by default (0 = AUTO) so inference leaves one core for the OS; paired with
+  # the systemd CPUWeight/Nice below it stays a background citizen and never starves
+  # the interactive desktop.
   llamaLauncher = pkgs.writeShellScriptBin "hart-llm-server" ''
     set -eu
-    # CPU-thread budget. 0 = AUTO = leave one core for the rest of the OS (nproc - 1, min
-    # 1) so CPU-FALLBACK inference never saturates every core and starves the interactive
-    # desktop/shell. (The systemd CPUWeight + Nice below keep it a background citizen on the
-    # SHARED cores too -- the desktop always wins under contention, spare CPU is still used
-    # when it is idle.)
     THREADS="${toString config.hart.llm.threads}"
     if [ "$THREADS" -le 0 ]; then
       THREADS=$(( $(${pkgs.coreutils}/bin/nproc) - 1 ))
       [ "$THREADS" -lt 1 ] && THREADS=1
     fi
-    NGL=""
-    if [ -e /dev/dri/renderD128 ] && ls /run/opengl-driver/share/vulkan/icd.d/*.json >/dev/null 2>&1; then
-      NGL="--n-gpu-layers ${toString config.hart.llm.gpuLayers}"
-      echo "hart-llm: Vulkan GPU present -> offloading ${toString config.hart.llm.gpuLayers} layers ($THREADS CPU threads)" >&2
-    else
-      echo "hart-llm: no Vulkan GPU -> CPU inference ($THREADS threads, one core left for the OS)" >&2
-    fi
+    echo "hart-llm: CPU inference ($THREADS threads, one core left for the OS)" >&2
     exec ${llama-server}/bin/llama-server \
       --model "${config.hart.llm.modelPath}" \
       --port "${toString cfg.ports.llm}" \
       --ctx-size "${toString config.hart.llm.contextSize}" \
-      --threads "$THREADS" \
-      $NGL
+      --threads "$THREADS"
   '';
 in
 {
@@ -100,15 +122,6 @@ in
         "CPU threads for inference. 0 = AUTO: leave one core for the rest of the OS "
         + "(nproc - 1, min 1) so CPU-fallback inference never starves the interactive "
         + "desktop/shell. Set a positive value to pin it.";
-    };
-
-    gpuLayers = lib.mkOption {
-      type = lib.types.int;
-      default = 999;
-      description =
-        "Layers to offload to the (Vulkan) GPU when one is present. 999 = offload ALL "
-        + "(llama.cpp clamps to the model's real layer count). The launcher only passes "
-        + "this when a Vulkan device actually exists, else it runs pure-CPU.";
     };
 
     autoProvision = lib.mkOption {
