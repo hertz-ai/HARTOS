@@ -10,7 +10,11 @@ from typing import Optional
 
 logger = logging.getLogger('hevolve_social')
 
-PROMPTS_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'prompts')
+# Canonical recipe dir (bundled desktop → user data dir; Docker/dev →
+# code-relative prompts/).  The old module-relative '../../prompts' is
+# site-packages/prompts in the frozen layout — nonexistent, so shared
+# recipes could never load on installed builds (#692).
+from core.cache_loaders import PROMPTS_DIR  # noqa: E402
 
 
 def load_recipe(recipe_file: str) -> Optional[dict]:

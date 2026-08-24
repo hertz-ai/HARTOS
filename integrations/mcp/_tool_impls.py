@@ -28,6 +28,13 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+# Recipes are SAVED to the deployment-aware dir (bundled desktop → user data
+# dir; Docker/dev → code-relative prompts/).  The old module-relative
+# '../../prompts' resolved to site-packages/prompts in the frozen layout —
+# a folder that does not exist — so installed builds listed 0 of 2,633
+# recipes (task #692).
+from core.platform_paths import get_recipe_prompts_dir
+
 logger = logging.getLogger('hartos_mcp.tools')
 
 # ─── Lazy resources (deferred to avoid import-time side effects) ───
@@ -98,7 +105,7 @@ def list_agents(category: Optional[str] = None, query: Optional[str] = None) -> 
         })
 
     # Also include dynamically discovered agents (trained recipes)
-    prompts_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'prompts')
+    prompts_dir = get_recipe_prompts_dir()
     dynamic = []
     if os.path.isdir(prompts_dir):
         for f in _glob.glob(os.path.join(prompts_dir, '*.json')):
@@ -448,7 +455,7 @@ def recall(query: str, top_k: int = 5) -> str:
 
 def list_recipes() -> str:
     """List trained agent recipes (prompts/*.json files)."""
-    prompts_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'prompts')
+    prompts_dir = get_recipe_prompts_dir()
     recipes = []
     if os.path.isdir(prompts_dir):
         for f in sorted(_glob.glob(os.path.join(prompts_dir, '*.json'))):
