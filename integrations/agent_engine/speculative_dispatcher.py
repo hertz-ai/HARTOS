@@ -1253,11 +1253,22 @@ class SpeculativeDispatcher:
         - expert_model.model_id == origin_model_id → pointless, skip
         - budget denied → skip
         """
+        # Every refusal below leaves the user on the draft's reply (often the
+        # "Let me check that for you…" standby) with NOTHING coming — logged
+        # at INFO because live 2026-08-26 01:15-01:27 three delegate='local'
+        # turns produced zero expert activity and zero lines naming why.
         if expert_model is None:
+            logger.info("expert not scheduled for %s: no expert model "
+                        "registered (draft reply is final)", speculation_id)
             return False
         if expert_model.model_id == origin_model_id:
+            logger.info("expert not scheduled for %s: pick equals origin %s "
+                        "(draft reply is final)", speculation_id,
+                        origin_model_id)
             return False
         if not self._check_and_reserve_budget(user_id, goal_id, expert_model):
+            logger.info("expert not scheduled for %s: budget denied for %s",
+                        speculation_id, expert_model.model_id)
             return False
 
         with self._lock:
@@ -1574,14 +1585,21 @@ class SpeculativeDispatcher:
             # GUARDRAIL: circuit breaker (check again — may have been halted)
             from security.hive_guardrails import HiveCircuitBreaker
             if HiveCircuitBreaker.is_halted():
+                logger.info("expert task %s skipped: hive halted "
+                            "(draft reply is final)", speculation_id)
                 return
 
             self._run_collapsed_expert_path(
                 speculation_id, original_prompt, fast_response,
                 expert_model, user_id, prompt_id, goal_id, goal_type)
 
-        except Exception as e:
-            logger.debug(f"Expert background task failed for {speculation_id}: {e}")
+        except Exception:
+            # warning + traceback, not debug: this swallow is the only place
+            # the whole expert leg can die, and at debug it dies invisibly —
+            # the user keeps waiting on the standby bubble forever.
+            logger.warning("Expert background task failed for %s (user turn "
+                           "stays on the draft standby)", speculation_id,
+                           exc_info=True)
         finally:
             with self._lock:
                 self._active.pop(speculation_id, None)
