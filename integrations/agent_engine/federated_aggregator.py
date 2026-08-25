@@ -343,6 +343,40 @@ class FederatedAggregator:
             hivemind_stats = learning_stats.get('hivemind', {})
             bridge_stats = learning_stats.get('bridge', {})
 
+            # hivemind_state carries this node's live learning-core telemetry.
+            # BootstrappedIntelligence.get_stats() (learning core) exposes a real
+            # intelligence_index and a growth rate over joins (OPEN_PROBLEMS.md
+            # problem 1).  Surface them here so hive_census can report a real
+            # collective figure with an honest denominator, reading whichever
+            # sub-dict the bridge populated.  Omitted (never zeroed) when the
+            # learning core did not run, so a presence-only node is absent from
+            # the mean rather than counted as zero, keeping the census
+            # "absent is not zero" contract.  Previously these were dropped here
+            # and the census read a `hivemind` key nothing produced, so
+            # nodes_with_intelligence was structurally 0.
+            _learning_core = learning_stats.get('learning', {}) or {}
+
+            def _real_metric(*keys):
+                for _src in (hivemind_stats, _learning_core):
+                    for _k in keys:
+                        _v = _src.get(_k)
+                        if isinstance(_v, (int, float)) and not isinstance(_v, bool):
+                            return _v
+                return None
+
+            hivemind_state = {
+                'agent_count': hivemind_stats.get('agent_count', 0),
+                'total_queries': bridge_stats.get('total_hivemind_queries', 0),
+                'avg_fusion_latency_ms': hivemind_stats.get(
+                    'avg_fusion_latency_ms', 0),
+            }
+            _ii = _real_metric('intelligence_index')
+            if _ii is not None:
+                hivemind_state['intelligence_index'] = _ii
+                _gr = _real_metric('growth_rate', 'growth')
+                if _gr is not None:
+                    hivemind_state['growth_rate'] = _gr
+
             delta = {
                 'version': DELTA_VERSION,
                 'node_id': node_id,
@@ -368,13 +402,7 @@ class FederatedAggregator:
                             bridge_stats.get('total_skills_blocked', 0))
                     ),
                 },
-                'hivemind_state': {
-                    'agent_count': hivemind_stats.get('agent_count', 0),
-                    'total_queries': bridge_stats.get(
-                        'total_hivemind_queries', 0),
-                    'avg_fusion_latency_ms': hivemind_stats.get(
-                        'avg_fusion_latency_ms', 0),
-                },
+                'hivemind_state': hivemind_state,
                 'quality_metrics': {
                     'correction_density': bridge_stats.get(
                         'total_corrections', 0),
@@ -923,10 +951,14 @@ class FederatedAggregator:
 
         def _read(node_id, d, is_local):
             nonlocal index_sum, growth_sum, agents_sum, with_intelligence, stale
-            hive = (d.get('hivemind') or {})
-            # Absent is not zero. A node that reported no hivemind block is not
-            # a node with an intelligence index of 0.0, and averaging it in as
-            # zero would drag the hive figure down for a reason that is an
+            # Read the `hivemind_state` block the node actually sends (built in
+            # extract_local_delta and averaged by aggregate()).  This used to
+            # read `hivemind`, a key no producer emits, so has_idx was always
+            # False and mean_intelligence_index was permanently null.
+            hive = (d.get('hivemind_state') or {})
+            # Absent is not zero. A node that reported no intelligence_index is
+            # not a node with an intelligence index of 0.0, and averaging it in
+            # as zero would drag the hive figure down for a reason that is an
             # artefact of reporting rather than a fact about the network.
             has_idx = 'intelligence_index' in hive
             age = now - float(d.get('timestamp', 0) or 0)
@@ -939,7 +971,7 @@ class FederatedAggregator:
                 'local': is_local,
                 'intelligence_index': hive.get('intelligence_index'),
                 'growth_rate': hive.get('growth_rate'),
-                'num_agents': hive.get('num_agents'),
+                'num_agents': hive.get('num_agents', hive.get('agent_count')),
                 'exponential': hive.get('exponential'),
             }
             per_node[node_id] = entry

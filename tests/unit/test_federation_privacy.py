@@ -324,3 +324,61 @@ class TestEdgePrivacyDefaults:
     def test_user_devices_blocked_from_federation(self):
         from security.edge_privacy import scope_allows, PrivacyScope
         assert not scope_allows(PrivacyScope.USER_DEVICES, PrivacyScope.FEDERATED)
+
+
+# ── Collective intelligence metric flows end to end ──
+
+class TestCollectiveIntelligenceMetric:
+    """The real intelligence_index the learning core computes must reach the
+    census.  Regression guard for the drop+miskey bug: extract_local_delta kept
+    only agent_count/latency in hivemind_state and hive_census read a `hivemind`
+    key nothing produced, so mean_intelligence_index was permanently null.
+    """
+
+    @patch('integrations.agent_engine.world_model_bridge.get_world_model_bridge')
+    def test_intelligence_index_reaches_census(self, mock_bridge):
+        from integrations.agent_engine.federated_aggregator import FederatedAggregator
+        bridge = MagicMock()
+        bridge.get_stats.return_value = {}
+        bridge.get_learning_stats.return_value = {
+            'hivemind': {
+                'agent_count': 4, 'avg_fusion_latency_ms': 12.5,
+                'intelligence_index': 7.5, 'growth_rate': 1.3,
+            },
+            'bridge': {'total_hivemind_queries': 20},
+        }
+        mock_bridge.return_value = bridge
+
+        agg = FederatedAggregator()
+        delta = agg.extract_local_delta()
+        assert delta is not None
+        # Carried in the existing (privacy-allowlisted) hivemind_state block,
+        # not a new top-level key.
+        assert delta['hivemind_state']['intelligence_index'] == 7.5
+        assert delta['hivemind_state']['growth_rate'] == 1.3
+        assert 'hivemind' not in delta  # no phantom parallel key
+
+        agg._local_delta = delta
+        census = agg.hive_census()
+        assert census['nodes_with_intelligence'] == 1
+        assert census['mean_intelligence_index'] == 7.5
+
+    @patch('integrations.agent_engine.world_model_bridge.get_world_model_bridge')
+    def test_presence_node_absent_not_zero(self, mock_bridge):
+        """A node whose learning core did not run carries no intelligence_index
+        and must be absent from the mean, never counted as 0.0."""
+        from integrations.agent_engine.federated_aggregator import FederatedAggregator
+        bridge = MagicMock()
+        bridge.get_stats.return_value = {}
+        bridge.get_learning_stats.return_value = {
+            'hivemind': {'agent_count': 0}, 'bridge': {},
+        }
+        mock_bridge.return_value = bridge
+
+        agg = FederatedAggregator()
+        delta = agg.extract_local_delta()
+        assert 'intelligence_index' not in delta['hivemind_state']
+        agg._local_delta = delta
+        census = agg.hive_census()
+        assert census['nodes_with_intelligence'] == 0
+        assert census['mean_intelligence_index'] is None
