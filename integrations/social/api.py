@@ -2679,7 +2679,16 @@ def track_marketing_event():
     """
     import re as _re
     data = _get_json()
-    code = (data.get('code') or '').strip()
+    # Canonicalise hyphens before validating so a marketing link written with a
+    # hyphen ('product-hunt', 'hacker-news') lands in the same bucket as its
+    # underscore form instead of 400ing and silently losing the attribution
+    # (PENDING.md #10 — a launch channel is exactly where hyphens get used).
+    # Case is left strict on purpose (test_track_rejects_uppercase_code), and
+    # only the endpoint normalises: the signup/referral callers of
+    # _record_marketing_event keep the STRICT check, so a user referral code that
+    # is not a channel tag is still separated into the Referral table, not
+    # misfiled as a channel event.
+    code = (data.get('code') or '').strip().replace('-', '_')
     event = (data.get('event') or 'click').strip().lower()
     # Distinct 400s preserve the public contract (callers distinguish the two).
     if not _re.match(r'^[a-z][a-z0-9_]{0,31}$', code):
