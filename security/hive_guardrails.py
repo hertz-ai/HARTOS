@@ -1246,7 +1246,8 @@ class GuardrailEnforcer:
 
     @staticmethod
     def before_dispatch(prompt: str, goal_dict: dict = None,
-                        node_id: str = None) -> Tuple[bool, str, str]:
+                        node_id: str = None,
+                        user_id: str = None) -> Tuple[bool, str, str]:
         """Pre-dispatch guardrail gate."""
         # 1. Circuit breaker
         if HiveCircuitBreaker.is_halted():
@@ -1265,6 +1266,41 @@ class GuardrailEnforcer:
             passed, reason = HiveEthos.check_goal_ethos(goal_dict)
             if not passed:
                 return False, reason, prompt
+
+            # Consent: goals flagged require_consent never dispatch without
+            # a granted UserConsent (#698, owner 2026-08-25).  goal_seeding
+            # carried the flag with zero enforcement sites.  The pending
+            # record filed here is what the UserConsent UI surfaces; one
+            # blanket grant per consent_type unlocks that class of work.
+            # Lazy integrations imports mirror after_response's
+            # model_registry pattern.
+            try:
+                from integrations.agent_engine.goal_manager import _goal_config
+                cfg = _goal_config(goal_dict)
+            except ImportError:
+                cfg = (goal_dict.get('config')
+                       or goal_dict.get('config_json') or {})
+            if cfg.get('require_consent'):
+                if not user_id:
+                    return False, ('consent-flagged goal dispatched without '
+                                   'user context'), prompt
+                consent_type = cfg.get('consent_type', 'data_access')
+                try:
+                    from integrations.social.consent_service import ConsentService
+                    from integrations.social.models import db_session
+                    with db_session(commit=True) as db:
+                        if not ConsentService.check_consent(
+                                db, str(user_id), consent_type, scope='*'):
+                            ConsentService.request_consent(
+                                db, str(user_id), consent_type, scope='*')
+                            return False, (
+                                f"consent '{consent_type}' not granted — "
+                                "pending request filed for the user"), prompt
+                except ImportError:
+                    pass  # social models unavailable on this topology
+                except Exception as e:
+                    # Flagged goal + broken consent machinery: fail-closed.
+                    return False, f'consent check failed: {e}', prompt
 
         # 4. Rewrite for togetherness
         rewritten = HiveEthos.rewrite_prompt_for_togetherness(prompt)
