@@ -7818,7 +7818,57 @@ function renderAgentOverlay(ev) {{
         # ── Shell APIs: Display ──
         @app.route('/api/shell/display', methods=['GET'])
         def shell_display():
+            """Connected outputs + their modes. WAYLAND FIRST.
+
+            This endpoint asked `xrandr --current` and nothing else -- an X11
+            tool -- on an OS whose every tier is Wayland (hart-comp, sway, cage).
+            It could therefore never return anything here, and it is the endpoint
+            the shell UI actually fetches (the Display panel), so the panel read
+            "no displays" on a box driving a 1600x900 LVDS-1 panel. Measured on
+            the box 2026-08-26: this returned {"displays":[]} while swaymsg
+            reported the real output and `wlr-randr` printed
+            LVDS-1 "Seiko Epson Corporation 0x314B".
+
+            swaymsg is the source the rest of the codebase already treats as
+            primary for outputs (shell_desktop_apis._wlr_randr_outputs documents
+            itself as the fallback "when swaymsg is unavailable"), so this reuses
+            that same probe rather than adding a third way to ask. The xrandr path
+            is kept underneath, unchanged, for a genuinely X11 node. Response
+            SHAPE is identical either way -- the UI parses {name, resolution,
+            modes:[{resolution, rates, active}]} and must not have to care.
+            """
             displays = []
+            try:
+                from integrations.agent_engine.shell_desktop_apis import (
+                    _is_wayland as _wl, _run as _probe)
+            except Exception:
+                _wl = _probe = None
+            if _wl is not None and _probe is not None and _wl():
+                r = _probe(['swaymsg', '-t', 'get_outputs', '--raw'], timeout=5)
+                if r is not None and getattr(r, 'returncode', 1) == 0:
+                    try:
+                        for out in json.loads(r.stdout or '[]'):
+                            cur = out.get('current_mode') or {}
+                            rect = out.get('rect') or {}
+                            cur_res = ('%sx%s' % (cur.get('width'), cur.get('height'))
+                                       if cur.get('width') else
+                                       '%sx%s' % (rect.get('width', 0), rect.get('height', 0)))
+                            modes = []
+                            for m in (out.get('modes') or []):
+                                res = '%sx%s' % (m.get('width', 0), m.get('height', 0))
+                                # sway reports refresh in mHz.
+                                hz = round((m.get('refresh') or 0) / 1000.0, 2)
+                                modes.append({'resolution': res,
+                                              'rates': [hz] if hz else [],
+                                              'active': res == cur_res})
+                            displays.append({'name': out.get('name', ''),
+                                             'resolution': cur_res,
+                                             'modes': modes})
+                    except (ValueError, TypeError, KeyError):
+                        displays = []
+            if displays:
+                return jsonify({'displays': displays})
+            # X11 fallback, byte-identical to the previous implementation.
             try:
                 r = subprocess.run(
                     ['xrandr', '--current'],

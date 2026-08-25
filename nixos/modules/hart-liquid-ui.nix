@@ -663,13 +663,19 @@ in
           PULSE_SERVER = "unix:/run/user/1000/pulse/native";
           # swaymsg resolves its socket from SWAYSOCK and nothing else, and sway's
           # real socket name embeds its PID (sway-ipc.1000.<PID>.sock), so it cannot
-          # be named statically. hart-layer-shell-host.nix publishes a stable symlink
-          # from a sway `exec` and grants this user connect access to the IPC socket;
-          # this points at that symlink. Without it swaymsg exits "Unable to retrieve
-          # socket path" and BOTH the display APIs (which use swaymsg as their primary
-          # source, wlr-randr being the documented fallback) and the brain's window
-          # client returned empty on a desktop that had a working display all along.
-          SWAYSOCK = "/run/hart/session/sway-ipc.sock";
+          # be named statically. Three things had to be true for this to work, and
+          # only the third is visible from here: the name must be stable, the
+          # backend must be allowed to connect, and the socket must EXIST inside
+          # this unit's mount namespace -- which it does not, because ProtectHome
+          # ="tmpfs" masks /run/user and BindPaths punches through only pulse.
+          # hart-layer-shell-host.nix therefore relays sway IPC to /run/hart, which
+          # is outside the masked tree; this points at that relay.
+          # Without it swaymsg exits "Unable to retrieve socket path", the display
+          # APIs (which use swaymsg as their primary source, wlr-randr being the
+          # documented fallback) return empty, and /api/shell/workspaces silently
+          # serves its synthetic "Main" placeholder -- a desktop reporting no
+          # display while driving a 1600x900 panel.
+          SWAYSOCK = "/run/hart/sway-ipc.sock";
           # NEVER let pactl autospawn a PulseAudio daemon. PipeWire owns the
           # devices, so an autospawned pulseaudio dies instantly with "Daemon
           # startup without any loaded modules" -- and because the UI polls audio
@@ -679,6 +685,17 @@ in
             ; PipeWire owns audio on HART OS. Autospawn would fork a doomed daemon.
             autospawn = no
           '';
+          # The App Store's offline catalog. hart-apps.nix publishes this path as
+          # environment.sessionVariables, which only reaches LOGIN SHELLS -- a
+          # systemd service never sees it. app_catalog.py's second candidate is a
+          # repo-relative nixos/modules/hart-app-catalog.json, and the deployed
+          # app package (hart-app-1.0.0) ships Python only, with no nixos/ dir. So
+          # BOTH candidates missed and the store served {"apps":[],"count":0} on a
+          # box whose catalog was sitting in the store the whole time.
+          # Verified 2026-08-26: pointing this at the store copy took the catalog
+          # from 0 to 34 entries, with Firefox correctly flagged installed:true.
+          # Same file hart-apps.nix reads, so there is one source of truth.
+          HART_APP_CATALOG = "${./hart-app-catalog.json}";
           MODEL_BUS_HTTP_PORT = toString (config.hart.modelBus.ports.http or 6790);
           HARTOS_BACKEND_PORT = toString cfg.ports.backend;
           HART_THEME_DIR = "/run/current-system/sw/share/hart/conky-themes";

@@ -951,25 +951,75 @@ app.run(None)
   # the AI the screen. Re-verified after the grant: wayland-1 still not writable.
   # Destructive window verbs stay gated brain-side in HartWmClient.DESTRUCTIVE_VERBS.
   #
-  # Runs as a sway `exec` so SWAYSOCK is already in the environment and the IPC
-  # socket is bound. Every step is best-effort: this must never be able to stop a
-  # session from coming up (a desktop that boots beats a queryable one that does not).
-  swayIpcPublish = pkgs.writeShellScript "hart-sway-ipc-publish" ''
-    # Absolute store paths, not bare names: a sway `exec` inherits whatever PATH
-    # the session had, and assuming a tool is on PATH is the exact defect this
-    # commit is fixing elsewhere. Do not reintroduce it here.
-    [ -n "''${SWAYSOCK:-}" ] || exit 0
-    i=0
-    while [ "$i" -lt 25 ]; do
-      [ -S "$SWAYSOCK" ] && break
-      ${pkgs.coreutils}/bin/sleep 0.2
-      i=$((i + 1))
-    done
-    [ -S "$SWAYSOCK" ] || exit 0
-    ${pkgs.acl}/bin/setfacl -m u:hart:rwx "$SWAYSOCK" 2>/dev/null || true
-    ${pkgs.coreutils}/bin/mkdir -p /run/hart/session 2>/dev/null || true
-    ${pkgs.coreutils}/bin/ln -sfn "$SWAYSOCK" /run/hart/session/sway-ipc.sock 2>/dev/null || true
-    exit 0
+  #  3. NAMESPACE (the one that makes a symlink useless). hart-liquid-ui runs with
+  #     ProtectHome="tmpfs", which masks /run/user ENTIRELY inside its mount
+  #     namespace, and punches exactly one hole: BindPaths=/run/user/1000/pulse.
+  #     Verified from inside the running service's namespace 2026-08-26:
+  #         nsenter -t <pid> -m -- ls -A /run/user/1000   ->   pulse
+  #     so the sway socket is not merely unreadable there, it does not exist. A
+  #     symlink or an ACL cannot help: both resolve to a masked path. Widening
+  #     BindPaths to the whole runtime dir would expose the wayland socket to the
+  #     service and is the opposite of what the screen gate wants.
+  #
+  # So the session's socket is RELAYED to a path the service can already see.
+  # /run/hart is outside the masked tree, so a socket there needs no sandbox
+  # change at all. Socket-activated with Accept=yes: the relay re-resolves the
+  # sway socket on EVERY connection, so a session restart (which changes the PID
+  # in the socket name) heals itself with no stale target and no ordering race
+  # against the compositor. Proven end to end on the box: with the relay in place
+  # /api/shell/displays returned the real panel (LVDS-1, Seiko Epson 0x314B,
+  # 1600x900) and /api/shell/workspaces returned sway's real workspace "1"
+  # instead of the synthetic "Main" fallback it had been serving.
+  #
+  # SCOPE stays narrow and is unchanged by the relay: sway IPC carries the window
+  # tree and window commands. SCREEN CAPTURE rides wlr-screencopy on the WAYLAND
+  # socket, which is not relayed and stays masked, so the human's fail-closed
+  # AI-sensing screen gate keeps its meaning. Destructive window verbs remain
+  # gated brain-side in HartWmClient.DESTRUCTIVE_VERBS.
+  swayIpcRelay = pkgs.writeScript "hart-sway-ipc-relay" ''
+    #!${pkgs.python3}/bin/python3
+    # systemd hands us the accepted connection on stdin/stdout (Accept=yes).
+    # Pick the NEWEST sway socket by mtime rather than by name: the name embeds a
+    # PID, which does not order by recency across a session restart.
+    import glob, os, socket, sys, threading
+
+    cands = [p for p in glob.glob('/run/user/*/sway-ipc.*.sock')]
+    if not cands:
+        sys.exit(1)
+    try:
+        cands.sort(key=lambda p: os.stat(p).st_mtime)
+    except OSError:
+        pass
+    up = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        up.connect(cands[-1])
+    except OSError:
+        sys.exit(1)
+
+    def to_sway():
+        try:
+            while True:
+                d = os.read(0, 65536)
+                if not d:
+                    break
+                up.sendall(d)
+        except OSError:
+            pass
+        finally:
+            try:
+                up.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    threading.Thread(target=to_sway, daemon=True).start()
+    try:
+        while True:
+            d = up.recv(65536)
+            if not d:
+                break
+            os.write(1, d)
+    except OSError:
+        pass
   '';
 
   swayHostConfig = pkgs.writeText "hart-gtk4-layer-host.conf" ''
@@ -1018,11 +1068,10 @@ app.run(None)
     bindsym --locked XF86AudioRaiseVolume  exec ${pkgs.pulseaudio}/bin/pactl set-sink-volume @DEFAULT_SINK@ +5%
     bindsym --locked XF86AudioLowerVolume  exec ${pkgs.pulseaudio}/bin/pactl set-sink-volume @DEFAULT_SINK@ -5%
     bindsym --locked XF86AudioMute         exec ${pkgs.pulseaudio}/bin/pactl set-sink-mute @DEFAULT_SINK@ toggle
-    # Publish sway's IPC socket to a stable path and grant the brain connect access
-    # (see swayIpcPublish above for the measurement and the deliberately narrow
-    # scope). Ordered BEFORE the shell exec so the desktop's first display/window
-    # queries already resolve instead of returning empty on every fresh session.
-    exec ${swayIpcPublish}
+    # NOTE: sway's IPC socket is reached by the brain through the socket-activated
+    # relay (swayIpcRelay above), NOT from here. Nothing to exec: the relay
+    # re-resolves this session's socket on every connection, so it needs no hook
+    # in the session and cannot race the compositor's bind.
     # Launch the GTK4 layer-shell host as sway's startup client. It anchors itself
     # as the BACKGROUND layer (exclusive zone 0) via gtk4-layer-shell so it is the
     # desktop, not a fullscreen app. Native toplevels (Phase 5) map above it.
@@ -1098,6 +1147,47 @@ in
           + "disable layerShellHost.";
       }
     ];
+
+    # ── sway IPC relay: the brain's only route to the window manager ───────────
+    # See swayIpcRelay above for the full measurement. /run/hart is OUTSIDE the
+    # tmpfs that ProtectHome drops over /run/user, so a socket here is reachable
+    # from inside hart-liquid-ui's mount namespace with no sandbox widening and
+    # no ACL on the compositor's own socket.
+    systemd.tmpfiles.rules = [ "d /run/hart 0755 root root -" ];
+
+    systemd.sockets.hart-sway-ipc = {
+      description = "HART OS sway IPC relay socket (brain -> window manager)";
+      wantedBy = [ "sockets.target" ];
+      socketConfig = {
+        ListenStream = "/run/hart/sway-ipc.sock";
+        # 0660 root:hart — the backend runs as `hart` and needs connect(2), which
+        # requires WRITE on the socket inode. Not world-accessible: this is a
+        # window-manager control channel, not public data.
+        SocketMode = "0660";
+        SocketGroup = "hart";
+        # One relay process per connection, so the target socket is re-resolved
+        # every time and a session restart cannot leave a stale upstream pinned.
+        Accept = true;
+        RemoveOnStop = true;
+      };
+    };
+
+    systemd.services."hart-sway-ipc@" = {
+      description = "HART OS sway IPC relay (connection %i)";
+      serviceConfig = {
+        # Runs as root so it can connect to the session user's socket. That keeps
+        # the grant in ONE auditable place (this unit) instead of loosening the
+        # permissions on sway's own socket for everyone on the box.
+        ExecStart = swayIpcRelay;
+        StandardInput = "socket";
+        StandardOutput = "socket";
+        StandardError = "journal";
+        # A query that cannot resolve a compositor must fail fast and quietly:
+        # the caller degrades to an empty list exactly as it does today.
+        TimeoutStartSec = "10s";
+        RuntimeMaxSec = "60s";
+      };
+    };
 
     # The GTK4 host binary + its software-GL session launcher + sway (the layer-
     # shell-capable compositor that hosts it). gtk4-layer-shell + webkitgtk_6_0 +
