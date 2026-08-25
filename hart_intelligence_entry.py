@@ -1831,6 +1831,23 @@ def _init_learning_pipeline():
     """
     global _learning_provider, _hive_mind, _trace_recorder
 
+    # RFC-B (2026-08-25): one learning home in bundled mode. The docstring's
+    # "instead of starting a separate server on port 8000" predates
+    # hevolveai_supervisor, which now always spawns (or adopts) that server
+    # in bundled Nunba and exports HEVOLVEAI_API_URL before this delayed
+    # init runs (measured: export 19:15:49 vs this init 19:19:13; export
+    # ~18:23 vs init 18:27:15). Running BOTH stacks grew commit ~23GB/h
+    # (snapshots 21:40→22:17) and OOM-killed the app at 22:2x. When bundled
+    # and a server is designated, the child is the sole learning home; the
+    # WorldModelBridge already carries stats/experiences/skills over HTTP
+    # (the http_disabled heal + the Direction-B poller, both live-proven).
+    if _is_bundled() and os.environ.get('HEVOLVEAI_API_URL'):
+        logging.getLogger(__name__).info(
+            "learning pipeline: skipping in-process init — supervisor-managed "
+            "hevolveai at %s is the learning home (RFC-B)",
+            os.environ['HEVOLVEAI_API_URL'])
+        return
+
     try:
         # G2: Ensure HevolveArmor's import hook is installed before the first
         # `import hevolveai.*` statement runs below.  `try_import_hevolveai`
