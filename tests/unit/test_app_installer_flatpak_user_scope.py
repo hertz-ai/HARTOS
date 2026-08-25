@@ -112,3 +112,37 @@ def test_nixos_makes_the_hart_flatpak_root_usable_by_the_desktop():
     assert "extraInit" in code, (
         "use extraInit to APPEND: sessionVariables would clobber XDG_DATA_DIRS "
         "and PATH wholesale")
+
+
+def test_availability_probe_and_execution_share_one_path():
+    """The App Store must not advertise a platform as unavailable while
+    installing through it works.
+
+    Measured on the fleet box 2026-08-25, both endpoints live at the same
+    moment: ``/api/shell/apps/platforms`` reported ``flatpak available=false``
+    and ``nix available=false``, while ``/api/shell/apps/installed`` listed
+    ``org.mozilla.firefox 154.0 (flatpak)`` -- an app flatpak had just
+    installed. Cause: execution routed through ``_flatpak_env()``'s augmented
+    PATH (which appends /run/current-system/sw/bin), while the availability
+    probe called a bare ``shutil.which()`` against the systemd unit's short
+    PATH. Same class of bug the installer's own comment documents from
+    2026-08-12; the execution path was fixed then and the probe was left behind.
+    """
+    import inspect
+    from integrations.agent_engine import app_installer as ai
+
+    # One resolver, shared.
+    assert hasattr(ai.AppInstaller, 'tool_path'), (
+        "AppInstaller must expose the tool PATH used for execution so the "
+        "availability probe can ask the same question")
+    src = inspect.getsource(ai)
+    # _flatpak_env must consume it rather than rebuilding its own list.
+    env_src = inspect.getsource(ai.AppInstaller._flatpak_env)
+    assert 'tool_path()' in env_src, (
+        "_flatpak_env must build PATH from tool_path(), not a private copy")
+    # The platforms route must probe WITH that path, never bare.
+    routes = src[src.find("def shell_apps_platforms"):][:2000]
+    assert 'tool_path()' in routes and 'path=' in routes, (
+        "the /platforms availability probe must pass the installer's tool_path "
+        "to shutil.which; a bare which() uses the unit's short PATH and "
+        "misreports working tools as unavailable")
