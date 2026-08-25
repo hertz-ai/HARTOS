@@ -718,6 +718,33 @@ class GossipProtocol:
                         peer.status = 'dead'
                     elif age > self.stale_threshold:
                         peer.status = 'stale'
+            # Dead is not deleted. The main query above excludes 'dead' rows,
+            # so a peer that aged out during an outage was never re-pinged and
+            # could only come back via an INBOUND announce — two nodes that
+            # age each other out stay partitioned forever on a LAN with no
+            # central to reintroduce them (measured 2026-08-25: box9 alive and
+            # serving while this node's broadcast skipped it; a manual
+            # gossip._announce_to_peer was what healed it). Re-probe a bounded
+            # random batch per round: bounded because central's table held 673
+            # rows; random so unrevivable rows cannot starve the rotation.
+            dead_ids = [r[0] for r in db.query(PeerNode.id)
+                        .filter(PeerNode.status == 'dead').all()]
+            for _id in random.sample(dead_ids, min(5, len(dead_ids))):
+                if not self._running:
+                    break
+                peer = db.query(PeerNode).filter(PeerNode.id == _id).first()
+                if peer is None or peer.node_id == self.node_id:
+                    continue
+                _bad_url, _ = is_unroutable_peer_url(peer.url)
+                if _bad_url:
+                    db.delete(peer)
+                    purged += 1
+                    continue
+                if self._ping_peer(peer.url):
+                    peer.last_seen = now
+                    peer.status = 'active'
+                    logger.info("Dead peer revived by re-probe: %s", peer.url)
+                self._heartbeat()
             db.commit()
             if purged:
                 logger.info(
