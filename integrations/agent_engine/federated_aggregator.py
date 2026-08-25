@@ -355,9 +355,14 @@ class FederatedAggregator:
             # and the census read a `hivemind` key nothing produced, so
             # nodes_with_intelligence was structurally 0.
             _learning_core = learning_stats.get('learning', {}) or {}
+            # HiveMind.get_stats() nests the BootstrappedIntelligence stats
+            # under 'intelligence' (hevolveai hive_mind.py:3588) — reading
+            # only top-level keys left intelligence_index structurally
+            # unreachable on every live node (census null, 2026-08-25).
+            _hm_intelligence = hivemind_stats.get('intelligence') or {}
 
             def _real_metric(*keys):
-                for _src in (hivemind_stats, _learning_core):
+                for _src in (hivemind_stats, _hm_intelligence, _learning_core):
                     for _k in keys:
                         _v = _src.get(_k)
                         if isinstance(_v, (int, float)) and not isinstance(_v, bool):
