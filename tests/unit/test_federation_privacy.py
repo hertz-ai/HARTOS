@@ -43,6 +43,10 @@ class TestDeltaStructure:
         # These are the ONLY keys that should contain data
         allowed_keys = {
             'version', 'node_id', 'public_key', 'guardrail_hash',
+            # advertise_url: the node's OWN routable base URL (public address,
+            # like code_hash), added so a receiver can broadcast the aggregate
+            # back to it — fixes the one-way relay. Not user data.
+            'advertise_url',
             'timestamp', 'experience_stats', 'ralt_stats', 'hivemind_state',
             'quality_metrics', 'benchmark_results', 'capability_tier',
             'contribution_score', 'event_counters', 'signature',

@@ -377,10 +377,25 @@ class FederatedAggregator:
                 if _gr is not None:
                     hivemind_state['growth_rate'] = _gr
 
+            # Own routable address so a receiving node can learn to broadcast the
+            # aggregate BACK to us. Receivers stored our delta + counted the
+            # install but never learned a reply address, so central only ever held
+            # stale/dead rows for a newly-joined node and the relay ran one-way.
+            # Canonical resolver; empty on failure -> receiver skips the upsert.
+            # Signed with the rest of the delta (added before signing), so the
+            # receiver upserts a VERIFIED address, not an unauthenticated hint.
+            advertise_url = ''
+            try:
+                from core.port_registry import get_advertisable_base_url
+                advertise_url = (get_advertisable_base_url() or '')
+            except Exception:
+                pass
+
             delta = {
                 'version': DELTA_VERSION,
                 'node_id': node_id,
                 'public_key': public_key,
+                'advertise_url': advertise_url,
                 'guardrail_hash': guardrail_hash,
                 'timestamp': time.time(),
                 'experience_stats': {
@@ -910,6 +925,30 @@ class FederatedAggregator:
         # is a genuine install that joined the hive. Monotonic + persistent,
         # unlike _peer_deltas which decays after the freshness window.
         self._record_genuine_install(node_id)
+
+        # Register the genuine sender as a REACHABLE peer so the hive can
+        # broadcast the aggregate BACK to it. Root cause of the one-way relay:
+        # receive stored the delta + counted the install but never learned a
+        # reply address, so central only had stale/dead PeerNode rows for a
+        # newly-joined node and never broadcast to its live address. The delta's
+        # advertise_url is covered by the Ed25519 signature verified above, so
+        # this is a trusted upsert: _merge_peer(relayed=True) records it without
+        # re-demanding an announce signature, and its is_unroutable_peer_url gate
+        # drops dead :677/docker-bridge rows (#38) at ingest. Reuses the one
+        # canonical peer-upsert path — no parallel registration.
+        _adv = (delta.get('advertise_url') or '').rstrip('/')
+        if _adv:
+            try:
+                from integrations.social.peer_discovery import gossip
+                from integrations.social.models import get_db
+                _pdb = get_db()
+                try:
+                    gossip._merge_peer(_pdb, {'node_id': node_id, 'url': _adv},
+                                       relayed=True)
+                finally:
+                    _pdb.close()
+            except Exception as _pe:
+                logger.debug('peer upsert on accepted delta skipped: %s', _pe)
 
         return True, 'accepted'
 
