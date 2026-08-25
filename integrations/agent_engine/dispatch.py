@@ -667,6 +667,44 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     Returns:
         Response text or None on failure
     """
+    # CONSENT GATE (before budget — consent outranks spend): goals flagged
+    # require_consent in their config never dispatch without a granted
+    # UserConsent.  goal_seeding has carried the flag since inception with
+    # ZERO enforcement sites (#698, owner directive 2026-08-25); the pending
+    # record filed here is what the shipped UserConsent UI surfaces for the
+    # human to grant, after which the daemon's next tick dispatches normally.
+    _cg_flagged = False
+    _cg_type = 'data_access'
+    try:
+        from integrations.social.models import db_session, AgentGoal
+        with db_session(commit=True) as db:
+            _cg_goal = db.query(AgentGoal).filter_by(id=goal_id).first()
+            _cg_cfg = (_cg_goal.config_json or {}) if _cg_goal else {}
+            _cg_flagged = bool(_cg_cfg.get('require_consent'))
+            if _cg_flagged:
+                _cg_type = _cg_cfg.get('consent_type', 'data_access')
+                from integrations.social.consent_service import ConsentService
+                if not ConsentService.check_consent(
+                        db, user_id, _cg_type, scope='*', agent_id=None):
+                    ConsentService.request_consent(
+                        db, user_id, _cg_type, scope='*', agent_id=None)
+                    logger.warning(
+                        f"Dispatch blocked pending consent for {goal_type} "
+                        f"goal {goal_id}: '{_cg_type}' not granted — pending "
+                        "request filed for the user")
+                    return None
+    except ImportError:
+        pass  # social models unavailable on this topology
+    except Exception as _cg_err:
+        if _cg_flagged:
+            # Known consent-required goal + broken consent machinery:
+            # fail-closed (safety outranks progress for flagged goals).
+            logger.error(
+                f"Consent gate error for flagged goal {goal_id} — "
+                f"blocking dispatch: {_cg_err}")
+            return None
+        logger.debug(f"Consent gate read skipped for {goal_id}: {_cg_err}")
+
     # BUDGET GATE: check goal budget + platform affordability before dispatch
     try:
         from integrations.agent_engine.budget_gate import pre_dispatch_budget_gate
