@@ -212,5 +212,38 @@ class TestPreconditions(unittest.TestCase):
         self.assertIn('Not connected', r.error)
 
 
+class TestReel(unittest.TestCase):
+    """Video reels — the daemon video-editor's output. Feed publishing existed
+    only for images (photo/carousel); a reel is media_type=REELS + a video_url,
+    same create->poll->publish container flow."""
+
+    def test_publishes_a_reel_with_video_url_and_media_type(self):
+        g = _FakeGraph()
+        r = _run(_adapter(g).publish_reel('https://x/v.mp4', 'my reel'))
+        self.assertTrue(r.success)
+        self.assertEqual(r.message_id, 'PUBLISHED_1')
+        media = next(d for u, d in g.posts if u.endswith('/media'))
+        self.assertEqual(media.get('media_type'), 'REELS')
+        self.assertEqual(media.get('video_url'), 'https://x/v.mp4')
+        self.assertEqual(media.get('caption'), 'my reel')
+        self.assertEqual([u.split('/')[-1] for u, _ in g.posts],
+                         ['media', 'media_publish'])
+
+    def test_truncates_caption_to_the_limit(self):
+        g = _FakeGraph()
+        _run(_adapter(g).publish_reel('https://x/v.mp4', 'A' * 5000))
+        media = next(d for u, d in g.posts if u.endswith('/media'))
+        self.assertEqual(len(media['caption']),
+                         InstagramAdapter.CAPTION_MAX_CHARS)
+
+    def test_a_failed_container_never_publishes(self):
+        g = _FakeGraph(status_sequence=['ERROR'])
+        r = _run(_adapter(g).publish_reel('https://x/v.mp4', 'x'))
+        self.assertFalse(r.success)
+        self.assertIn('ERROR', r.error)
+        self.assertFalse(
+            any(u.endswith('/media_publish') for u, _ in g.posts))
+
+
 if __name__ == '__main__':
     unittest.main()
