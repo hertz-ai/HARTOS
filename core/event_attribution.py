@@ -110,6 +110,12 @@ def owner_user_id(user_prompt=None, goal_id=None, metadata=None) -> Optional[str
     return None
 
 
+# User rows that are NOT tenants: the platform stores agents and bootstrap
+# identities in the SAME `users` table as people (UserService.ensure_system_user
+# writes user_type='system'; owned agents carry user_type='agent'). Only human
+# rows can be leaked BETWEEN, so only human rows decide single-vs-multi tenancy.
+_NON_TENANT_USER_TYPES = ('system', 'agent')
+
 _SOLE_USER_CACHE = []          # [] unknown, [None] known-not-single, [uid] known
 
 # Zero-user results are re-checked rather than cached (see _sole_local_user_id):
@@ -146,7 +152,37 @@ def _sole_local_user_id() -> Optional[str]:
     try:
         from integrations.social.models import db_session, User
         with db_session() as db:
-            rows = db.query(User).limit(2).all()
+            # Count HUMAN tenants only.  `users` is NOT a table of people: the
+            # platform mints a real User row for every agent (user_type='agent',
+            # see UserService.get_owned_agents) and for each bootstrap identity
+            # (user_type='system', see UserService.ensure_system_user).  A plain
+            # count therefore reads a single-human appliance as multi-tenant the
+            # moment its first agent is created, and this function then caches
+            # None FOREVER (the >1 branch below is the deliberately permanent
+            # one), silently disabling per-user routing for the life of the
+            # process.
+            #
+            # Measured on the fleet box 2026-08-26: users=173, of which 172 are
+            # user_type='agent' and 1 is user_type='system' -- and 363 SSE
+            # broadcasts were refused in three hours
+            # (194 agent.action.completed, 95 learning.federation_update,
+            # 74 agent.ui.update), i.e. the entire live agent feed dropped.
+            #
+            # The P3a invariant is unchanged: it exists to stop one HUMAN's agent
+            # activity leaking to another HUMAN, and agent/system rows are not
+            # tenants anyone can leak to.  A node with two real people still
+            # resolves >1 and still falls through to None.  NULL user_type counts
+            # as human: legacy rows predate the column and a human is the safe
+            # reading (worst case it resolves >1 and we refuse, as today).
+            q = db.query(User)
+            try:
+                q = q.filter((User.user_type.is_(None))
+                             | (~User.user_type.in_(_NON_TENANT_USER_TYPES)))
+            except Exception:
+                # A schema without user_type degrades to the old count rather
+                # than failing the emit path.
+                pass
+            rows = q.limit(2).all()
             if len(rows) == 1:
                 uid = getattr(rows[0], 'id', None)
                 if uid:

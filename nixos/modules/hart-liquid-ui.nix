@@ -605,7 +605,36 @@ in
           ++ lib.optional (pkgs ? upower)       pkgs.upower        # upower  - battery/power
           ++ lib.optional (pkgs ? wireplumber)  pkgs.wireplumber   # wpctl   - audio (sibling of pactl)
           ++ lib.optional (pkgs ? alsa-utils)   pkgs.alsa-utils    # amixer  - the layer BELOW PipeWire
-          ++ lib.optional (pkgs ? xorg && pkgs.xorg ? xrandr) pkgs.xorg.xrandr;  # xrandr - display
+          ++ lib.optional (pkgs ? xorg && pkgs.xorg ? xrandr) pkgs.xorg.xrandr   # xrandr - display (X11 only; see wlr-randr note below)
+          # Second wave of the SAME defect, found by sweeping all 143 GET routes on
+          # the box 2026-08-26: six more capabilities were installed and working,
+          # but invisible to this unit. Each missing binary silently emptied a
+          # feature the UI then rendered as "nothing here":
+          #   lsblk        -> /api/shell/storage/devices {"devices":[]},
+          #                   /api/shell/flash/disks "No such file or directory: 'lsblk'",
+          #                   /api/shell/encryption/status HTTP 503 "lsblk not available"
+          #   fc-list      -> /api/shell/fonts {"fonts":[],"count":0} on a box with Noto installed
+          #   bluetoothctl -> /api/shell/bluetooth{,/status,/discovered} all empty, while the
+          #                   adapter C8:F7:33:88:6B:E2 was present and powered
+          #   lpstat/lp    -> /api/shell/printers, /api/shell/printers/jobs empty
+          #   smartctl     -> /api/shell/storage/smart could never report disk health
+          #   scanimage    -> /api/shell/scanner/list empty
+          # Every one of these was verified to WORK when run as the service user
+          # (`sudo -u hart`) with only PATH widened, so PATH was the whole defect.
+          #
+          # NOT fixed here (deliberately, it is a different bug): swaymsg and
+          # wlr-randr also fail, but not for want of PATH. Their sockets are
+          # srwxr-xr-x hart-admin:users and connect(2) needs WRITE, so uid 992
+          # `hart` is refused even with the existing user:hart:--x ACL on
+          # /run/user/1000. Adding them to PATH would only convert "command not
+          # found" into "failed to connect to display" -- the same empty payload
+          # with a nicer log line. That needs socket access, tracked separately.
+          ++ lib.optional (pkgs ? util-linux)    pkgs.util-linux    # lsblk        - storage / flash / encryption
+          ++ lib.optional (pkgs ? fontconfig)    pkgs.fontconfig    # fc-list      - fonts + preview
+          ++ lib.optional (pkgs ? bluez)         pkgs.bluez         # bluetoothctl - bluetooth
+          ++ lib.optional (pkgs ? cups)          pkgs.cups          # lpstat/lpadmin/lp - printers
+          ++ lib.optional (pkgs ? smartmontools) pkgs.smartmontools # smartctl     - SMART disk health
+          ++ lib.optional (pkgs ? sane-backends) pkgs.sane-backends; # scanimage   - scanners
 
         environment = {
           HEVOLVE_DATA_DIR = cfg.dataDir;
@@ -632,6 +661,15 @@ in
           # to traverse in (see ProtectHome/BindPaths + the tmpfiles ACL below).
           XDG_RUNTIME_DIR = "/run/user/1000";
           PULSE_SERVER = "unix:/run/user/1000/pulse/native";
+          # swaymsg resolves its socket from SWAYSOCK and nothing else, and sway's
+          # real socket name embeds its PID (sway-ipc.1000.<PID>.sock), so it cannot
+          # be named statically. hart-layer-shell-host.nix publishes a stable symlink
+          # from a sway `exec` and grants this user connect access to the IPC socket;
+          # this points at that symlink. Without it swaymsg exits "Unable to retrieve
+          # socket path" and BOTH the display APIs (which use swaymsg as their primary
+          # source, wlr-randr being the documented fallback) and the brain's window
+          # client returned empty on a desktop that had a working display all along.
+          SWAYSOCK = "/run/hart/session/sway-ipc.sock";
           # NEVER let pactl autospawn a PulseAudio daemon. PipeWire owns the
           # devices, so an autospawned pulseaudio dies instantly with "Daemon
           # startup without any loaded modules" -- and because the UI polls audio

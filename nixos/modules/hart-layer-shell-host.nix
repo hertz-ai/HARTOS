@@ -921,6 +921,57 @@ app.run(None)
   # bars / launchers — sway exists to give the layer-shell surface a compositor
   # that implements zwlr_layer_shell_v1 (cage does not). Mirrors the sway-Tier-1
   # kiosk config shape; software-GL is forced in the launcher env above.
+  # ── Publish the sway IPC socket so the BRAIN can actually use it ───────────────
+  # hart_wm_client.py calls itself "the AI-native MOAT: agents arrange REAL native
+  # windows", and shell_desktop_apis treats `swaymsg` as the PRIMARY source for
+  # outputs (wlr-randr is only its documented fallback). Both were dead on real HW.
+  # Measured on the box 2026-08-26, sweeping all 143 GET routes:
+  #     /api/shell/display            -> {"displays":[]}
+  #     /api/shell/workspaces/windows -> {"windows":[],"count":0}
+  # while the session itself answered `wlr-randr` with
+  #     LVDS-1 "Seiko Epson Corporation 0x314B (LVDS-1)"
+  # so the data existed and only the brain could not reach it. TWO causes, both here:
+  #
+  #  1. NAME. sway's socket is sway-ipc.<uid>.<PID>.sock, so the PID changes every
+  #     boot and no static env var can name it. swaymsg with no SWAYSOCK exits
+  #     "Unable to retrieve socket path". Hence the stable symlink below, which
+  #     hart-liquid-ui.nix points SWAYSOCK at.
+  #  2. PERMISSION. The socket is srwxr-xr-x hart-admin:users and connect(2)
+  #     requires WRITE, so uid 992 `hart` was refused even though the existing
+  #     user:hart:--x ACL on /run/user/1000 let it traverse in. Verified on the box:
+  #     before the ACL `swaymsg -t get_outputs` as hart failed at ipc-client.c:66
+  #     "Unable to connect"; immediately after `setfacl -m u:hart:rwx` the same
+  #     command returned the real output JSON, and get_tree worked.
+  #
+  # SCOPE, deliberately narrow: this grants the sway IPC socket ONLY, never the
+  # wayland socket. sway IPC carries the window tree and window commands; SCREEN
+  # CAPTURE rides wlr-screencopy on the WAYLAND socket, which stays srwxr-xr-x and
+  # unreachable by `hart`. So the human's fail-closed AI-sensing screen gate
+  # (core/ai_sensing.py) keeps its meaning: widening the moat must not quietly hand
+  # the AI the screen. Re-verified after the grant: wayland-1 still not writable.
+  # Destructive window verbs stay gated brain-side in HartWmClient.DESTRUCTIVE_VERBS.
+  #
+  # Runs as a sway `exec` so SWAYSOCK is already in the environment and the IPC
+  # socket is bound. Every step is best-effort: this must never be able to stop a
+  # session from coming up (a desktop that boots beats a queryable one that does not).
+  swayIpcPublish = pkgs.writeShellScript "hart-sway-ipc-publish" ''
+    # Absolute store paths, not bare names: a sway `exec` inherits whatever PATH
+    # the session had, and assuming a tool is on PATH is the exact defect this
+    # commit is fixing elsewhere. Do not reintroduce it here.
+    [ -n "''${SWAYSOCK:-}" ] || exit 0
+    i=0
+    while [ "$i" -lt 25 ]; do
+      [ -S "$SWAYSOCK" ] && break
+      ${pkgs.coreutils}/bin/sleep 0.2
+      i=$((i + 1))
+    done
+    [ -S "$SWAYSOCK" ] || exit 0
+    ${pkgs.acl}/bin/setfacl -m u:hart:rwx "$SWAYSOCK" 2>/dev/null || true
+    ${pkgs.coreutils}/bin/mkdir -p /run/hart/session 2>/dev/null || true
+    ${pkgs.coreutils}/bin/ln -sfn "$SWAYSOCK" /run/hart/session/sway-ipc.sock 2>/dev/null || true
+    exit 0
+  '';
+
   swayHostConfig = pkgs.writeText "hart-gtk4-layer-host.conf" ''
     # HART OS GTK4 layer-shell host — single client (the GTK4 glass shell).
     # Generated; do not edit on the live ISO. See hart-layer-shell-host.nix.
@@ -967,6 +1018,11 @@ app.run(None)
     bindsym --locked XF86AudioRaiseVolume  exec ${pkgs.pulseaudio}/bin/pactl set-sink-volume @DEFAULT_SINK@ +5%
     bindsym --locked XF86AudioLowerVolume  exec ${pkgs.pulseaudio}/bin/pactl set-sink-volume @DEFAULT_SINK@ -5%
     bindsym --locked XF86AudioMute         exec ${pkgs.pulseaudio}/bin/pactl set-sink-mute @DEFAULT_SINK@ toggle
+    # Publish sway's IPC socket to a stable path and grant the brain connect access
+    # (see swayIpcPublish above for the measurement and the deliberately narrow
+    # scope). Ordered BEFORE the shell exec so the desktop's first display/window
+    # queries already resolve instead of returning empty on every fresh session.
+    exec ${swayIpcPublish}
     # Launch the GTK4 layer-shell host as sway's startup client. It anchors itself
     # as the BACKGROUND layer (exclusive zone 0) via gtk4-layer-shell so it is the
     # desktop, not a fullscreen app. Native toplevels (Phase 5) map above it.
