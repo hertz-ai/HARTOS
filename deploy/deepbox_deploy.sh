@@ -300,6 +300,7 @@ sudo docker run -d --name langchain --restart unless-stopped \
   -v ${DEPLOY_IMAGES_PATH}:/app/output_images \
   -v "$AD":/app/agent_data \
   -e HEVOLVE_KEY_DIR=/app/agent_data \
+  -e HEVOLVE_AGENT_DATA=/app/agent_data \
   langchain_gpt:"$DEPLOY_COMMIT_SHORT"
 
 echo "=== Wait for service ==="
@@ -420,6 +421,7 @@ if [ -z "$STATUS_JSON" ]; then
        -v ${DEPLOY_IMAGES_PATH}:/app/output_images \
        -v "$AD":/app/agent_data \
        -e HEVOLVE_KEY_DIR=/app/agent_data \
+       -e HEVOLVE_AGENT_DATA=/app/agent_data \
        "$ROLLBACK_IMAGE"; then
     echo "rolled back to $ROLLBACK_IMAGE"
   else
