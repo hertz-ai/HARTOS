@@ -148,6 +148,19 @@ class ConsentService:
         )
         db.add(consent)
         db.flush()
+        # Delivery, sibling-parity: grant_consent / auto_grant_with_notice
+        # / announce_revocation all _emit, and _emit's own comment always
+        # listed consent.request as a topic -- but this filing site never
+        # called it, so pending asks were invisible until the user opened
+        # the UserConsent page (the hie L6891 bypass rationale).  NEW rows
+        # only: the dedup return above stays silent, so a denied gate
+        # polling every tick pushes exactly ONE ask per combination.
+        _emit('consent.request', {
+            'user_id': user_id,
+            'consent_type': consent_type,
+            'scope': scope,
+            'agent_id': agent_id,
+        })
         return consent
 
     @staticmethod

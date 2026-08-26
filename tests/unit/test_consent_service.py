@@ -54,6 +54,31 @@ def test_request_consent_invalid_type():
             ConsentService.request_consent(db, 'u1', 'unknown_type')
 
 
+def test_request_consent_emits_ask_on_new_row():
+    """Sibling parity: a freshly filed ask must reach the user's frontends
+    via _emit (grant/auto-grant/revoke always did; the ask never did, so
+    pending consents were invisible until the UserConsent page was opened)."""
+    with patch('integrations.social.consent_service._emit') as emit:
+        with db_session() as db:
+            ConsentService.request_consent(db, 'u1', 'data_access')
+    emit.assert_called_once()
+    topic, payload = emit.call_args[0]
+    assert topic == 'consent.request'
+    assert payload['user_id'] == 'u1'
+    assert payload['consent_type'] == 'data_access'
+
+
+def test_request_consent_dedup_stays_silent():
+    """A denied gate re-asks every tick (daemon 30s, screen capture 10s);
+    only the FIRST filing may notify or the tray floods."""
+    with patch('integrations.social.consent_service._emit') as emit:
+        with db_session() as db:
+            ConsentService.request_consent(db, 'u1', 'data_access')
+        with db_session() as db:
+            ConsentService.request_consent(db, 'u1', 'data_access')
+    assert emit.call_count == 1
+
+
 # ──────────────────────────────────────────────────────────────────────
 # grant_consent
 # ──────────────────────────────────────────────────────────────────────

@@ -6887,14 +6887,14 @@ def parse_visual_context(inp: str):
         #       used and can revoke in one tap.  A prior explicit
         #       revoke returns False and we refuse rather than
         #       silently re-grant.  Never silently uploads.
-        # There is NO request-then-wait branch here.  ConsentService.
-        # request_consent() has zero production callers tree-wide and
-        # emits nothing (its siblings grant_consent /
-        # auto_grant_with_notice / announce_revocation all call _emit;
-        # request_consent does not), so routing through it would
-        # neither prompt the user nor notify any device.  The only live
-        # producer of the consent.request topic is
-        # security/ai_governance.py:695.
+        # There is NO request-then-wait branch here BY DESIGN: this hot
+        # path must answer the turn, so it auto-grants-with-notice
+        # rather than ask-and-block.  (The old rationale -- that
+        # request_consent had zero callers and emitted nothing -- is
+        # obsolete as of 2026-08-26: the daemon-goal gate and the
+        # screen producer both file asks through it, and it now _emits
+        # consent.request like its siblings.  The design choice above
+        # is what keeps this branch auto-grant, not that gap.)
         from core.config_cache import get_vision_api
         _user_vision_url = (get_vision_api() or '').strip()
         _allow_cloud = (
