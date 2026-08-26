@@ -53,6 +53,11 @@ CONSENT_TYPES = frozenset({
                          # room_presence_service — MUST be registered here or
                          # check_consent's _validate_consent_type rejects it and
                          # the whole T2 read/post subsystem is denied (#review).
+    'screen_capture',    # The desktop's own screen is captured and described
+                         # for the visual agent (VisionService screen channel,
+                         # #701).  The capture loop's first denied tick files
+                         # the pending ask; granting in the UserConsent UI
+                         # starts capture on the next tick.
 })
 
 
