@@ -152,8 +152,10 @@ def _budget_for(spec, budget_name):
     return b.get(budget_name, b["default"])
 
 
-def profile(spec, port):
-    results = []
+def _items(spec):
+    """The work list: every agent task + every surface, each with its probe and
+    budget class. ONE builder, so the planned duration below and the run itself
+    can never disagree about what this baseline actually does."""
     cats = spec["categories"]
     surfaces = spec["surfaces"]
     items = []
@@ -164,8 +166,45 @@ def profile(spec, port):
         if sname.startswith("_"):
             continue
         items.append(("surface:" + sname, "surface", s["probe"], s["budget"]))
+    return items
+
+
+def plan_seconds(spec, items=None):
+    """How long this baseline can legitimately need, derived from the SAME
+    per-item budgets the PASS/FAIL verdicts are judged against.
+
+    The unit used to allow a flat TimeoutStartSec=300 for this. That number was
+    never related to the work: measured on the fleet box 2026-08-26 the run is
+    72 agent tasks + 3 surfaces = 75 probes whose own declared budgets are
+    25-45s each, i.e. 37-56 minutes. So systemd killed it with SIGTERM after
+    roughly seven probes, every time, and because the kill lands mid-run the
+    node recorded a FAILED unit and wrote NO baseline at all -- the one artifact
+    the whole exercise exists to produce.
+
+    A timeout for this job has to be a function of the number of actions, not a
+    constant, which is what this returns.
+    """
+    if items is None:
+        items = _items(spec)
+    total_ms = sum(_budget_for(spec, b)["total_ms"] for (_n, _c, _p, b) in items)
+    return total_ms / 1000.0
+
+
+def profile(spec, port, deadline=None):
+    results = []
+    items = _items(spec)
 
     for name, cat, probe, budget_name in items:
+        # Past our own budget: record the remainder honestly and return what we
+        # measured. A partial baseline is data; a SIGTERM is not.
+        if deadline is not None and time.monotonic() >= deadline:
+            results.append({
+                "name": name, "category": cat, "budget": budget_name,
+                "first_token_ms": None, "total_ms": None, "chars": 0,
+                "error": "skipped: run exceeded its budget-derived deadline",
+                "verdict": "SKIPPED",
+            })
+            continue
         first_ms, total_ms, chars, err = _run_probe(port, spec, probe, budget_name)
         bud = _budget_for(spec, budget_name)
         ok = (err is None and first_ms is not None
@@ -184,13 +223,26 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true", help="env only, no model calls")
     ap.add_argument("--json", action="store_true", help="print the result JSON")
+    ap.add_argument("--plan", action="store_true",
+                    help="print the budget-derived duration in seconds and exit "
+                         "(what a unit timeout should be sized from)")
     args = ap.parse_args(argv)
 
     spec = _load_spectrum()
     port = _llm_port()
     tasks = _agent_tasks()
+    items = _items(spec)
+    planned = plan_seconds(spec, items)
     print("profile_local_2b: %d agent tasks + %d surfaces, llm port %d"
           % (len(tasks), len([k for k in spec["surfaces"] if not k.startswith("_")]), port))
+    # Print the derived budget BEFORE doing any work, so an operator (and any
+    # unit timeout) can see what this run actually needs rather than guessing.
+    print("profile_local_2b: %d probes, budget-derived plan %.0fs (%.1f min)"
+          % (len(items), planned, planned / 60.0))
+
+    if args.plan:
+        print("%d" % int(planned))
+        return 0
 
     if args.check:
         print("profile_local_2b: --check OK (no calls made)")
@@ -202,8 +254,14 @@ def main(argv=None):
               "failure; the dev box has no 2B)." % port)
         return 0
 
-    results = profile(spec, port)
+    # Self-bound to the plan. The unit's timeout is a backstop; THIS is the
+    # deadline that keeps a slow node's partial results instead of losing them.
+    results = profile(spec, port, deadline=time.monotonic() + planned)
     passed = sum(1 for r in results if r["verdict"] == "PASS")
+    skipped = sum(1 for r in results if r["verdict"] == "SKIPPED")
+    if skipped:
+        print("profile_local_2b: %d/%d probes SKIPPED (ran out of the %.0fs "
+              "budget). Partial baseline written." % (skipped, len(results), planned))
     ts = int(time.time())
     out_dir = os.path.join(REPO, "agent_data", "baselines", "local_2b")
     try:
