@@ -481,8 +481,37 @@ in
 
           echo "[HART OTA] Checking for updates (channel: ${ota.channel})"
 
-          # ── Query current version ──
-          CURRENT=$(nixos-version 2>/dev/null || echo "unknown")
+          # ── The node's own revision (ONE resolver, used by the banner AND
+          #    the staleness decision below) ──
+          # This called `nixos-version`, which is not on this unit's curated
+          # PATH (it runs as `hart`), so it fell through to the literal string
+          # "unknown" on every single check. Measured on the fleet box
+          # 2026-08-26: the log reads "[HART OTA] Current: unknown" while
+          # /etc/hart/image-rev plainly contains 579ce33.
+          #
+          # And even resolvable it was the wrong question: nixos-version reports
+          # the NixOS release (24.11.20250630.50ab793), not the HART revision
+          # this OTA actually compares against. So the line an operator reads
+          # could never agree with the decision the code makes underneath it --
+          # the worst kind of log, one that looks like information.
+          #
+          # The correct resolution already existed a few lines down as
+          # LOCAL_REV, buried inside the idle branch. Hoisted into one function
+          # so there is a single notion of "this node's revision": a dd'd node
+          # has no /etc/nixos at all (which is exactly the node OTA exists for),
+          # so /etc/hart/image-rev is primary and the flake checkout is the
+          # fallback for installer-written systems.
+          hart_local_rev() {
+            local rev
+            rev=$(cat /etc/hart/image-rev 2>/dev/null | tr -d '[:space:]')
+            if [[ -z "$rev" ]]; then
+              rev=$(${pkgs.nix}/bin/nix flake metadata /etc/nixos --json 2>/dev/null \
+                | ${pkgs.jq}/bin/jq -r '.revision // ""') || rev=""
+            fi
+            [[ -n "$rev" ]] || rev="unknown"
+            printf '%s' "$rev"
+          }
+          CURRENT=$(hart_local_rev)
           echo "[HART OTA] Current: $CURRENT"
 
           # ── Check upstream via Python orchestrator ──
@@ -547,19 +576,12 @@ in
                 | ${pkgs.jq}/bin/jq -r '.revision // "unknown"') || REMOTE_REV="check_failed"
             fi
 
-            # The node's own revision. /etc/hart/image-rev is the raw image's
-            # identity file (written at build from hartRev, hart-repart-image
-            # module) -- a dd'd node has no /etc/nixos at all, which left
-            # LOCAL_REV "unknown" forever on exactly the nodes OTA exists for
-            # (first real check on flashed HW, 2026-08-23). /etc/nixos stays
-            # as the fallback for installer-written systems, where it is a
-            # real flake checkout with a readable revision.
-            LOCAL_REV=$(cat /etc/hart/image-rev 2>/dev/null | tr -d '[:space:]')
-            if [[ -z "$LOCAL_REV" ]]; then
-              LOCAL_REV=$(${pkgs.nix}/bin/nix flake metadata /etc/nixos --json 2>/dev/null \
-                | ${pkgs.jq}/bin/jq -r '.revision // "unknown"') || LOCAL_REV="unknown"
-            fi
-            [[ -z "$LOCAL_REV" ]] && LOCAL_REV="unknown"
+            # The node's own revision, resolved ONCE at the top of this script
+            # (hart_local_rev). It used to be resolved a second time right here,
+            # which is how the banner and the decision drifted apart: the banner
+            # said "unknown" while this block read the correct value from
+            # /etc/hart/image-rev. One value, one meaning, no second reader.
+            LOCAL_REV="$CURRENT"
 
             echo "[HART OTA] Local: $LOCAL_REV"
             echo "[HART OTA] Approved: $REMOTE_REV"
