@@ -689,18 +689,26 @@ def _score_human_consent(context: dict) -> ConstitutionalSignal:
             pass  # DB not available — fall through to context-based check
 
     if not given:
-        # Emit consent.request event so frontends show a consent dialog
-        try:
-            from core.platform.events import emit_event
-            emit_event('consent.request', {
-                'user_id': user_id,
-                'consent_type': consent_type,
-                'agent_id': agent_id,
-                'scope': context.get('scope', '*'),
-                'reason': context.get('consent_reason', 'Agent needs your permission'),
-            })
-        except Exception:
-            pass
+        # Ask through the ONE filing site.  request_consent files the
+        # UserConsent row the UI lists AND _emits consent.request over
+        # the canonical fan-out (EventBus + per-user WAMP + scoped SSE)
+        # — the raw emit_event that used to sit here reached only
+        # in-process subscribers, so its "frontends show a consent
+        # dialog" comment was never true.  Dedup lives in
+        # request_consent: repeated guardian scoring files ONE ask.
+        if user_id:
+            try:
+                from integrations.social.consent_service import (
+                    ConsentService,
+                )
+                from integrations.social.models import db_session
+                with db_session(commit=True) as db:
+                    ConsentService.request_consent(
+                        db, user_id, consent_type,
+                        scope=context.get('scope', '*'),
+                        agent_id=agent_id)
+            except Exception:
+                pass
 
         return ConstitutionalSignal(
             name='consent', score=0.15, confidence=0.95,
