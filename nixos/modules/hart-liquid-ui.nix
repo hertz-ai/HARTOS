@@ -622,13 +622,21 @@ in
           # Every one of these was verified to WORK when run as the service user
           # (`sudo -u hart`) with only PATH widened, so PATH was the whole defect.
           #
-          # NOT fixed here (deliberately, it is a different bug): swaymsg and
-          # wlr-randr also fail, but not for want of PATH. Their sockets are
-          # srwxr-xr-x hart-admin:users and connect(2) needs WRITE, so uid 992
-          # `hart` is refused even with the existing user:hart:--x ACL on
-          # /run/user/1000. Adding them to PATH would only convert "command not
-          # found" into "failed to connect to display" -- the same empty payload
-          # with a nicer log line. That needs socket access, tracked separately.
+          # swaymsg: the note that used to live here said adding it to PATH
+          # would only convert "command not found" into "failed to connect to
+          # display", because the compositor socket was unreachable from this
+          # unit. That was true WHEN IT WAS WRITTEN and stopped being true the
+          # moment hart-layer-shell-host.nix started relaying sway IPC to
+          # /run/hart, which is outside the tmpfs ProtectHome drops over
+          # /run/user. I did not revisit it, so generation 7 shipped with
+          # SWAYSOCK pointing at a working relay and no swaymsg to use it:
+          # verified on the box 2026-08-26, the unit had
+          # SWAYSOCK=/run/hart/sway-ipc.sock and `command -v swaymsg` came back
+          # empty, so /api/shell/displays returned {"compositor":"wayland",
+          # "displays":[]} and /api/shell/workspaces served its synthetic
+          # "Main" placeholder while the compositor was right there.
+          # A socket without a client is not a transport.
+          ++ lib.optional (pkgs ? sway)          pkgs.sway          # swaymsg      - outputs, workspaces, window tree
           ++ lib.optional (pkgs ? util-linux)    pkgs.util-linux    # lsblk        - storage / flash / encryption
           ++ lib.optional (pkgs ? fontconfig)    pkgs.fontconfig    # fc-list      - fonts + preview
           ++ lib.optional (pkgs ? bluez)         pkgs.bluez         # bluetoothctl - bluetooth
