@@ -95,12 +95,48 @@ def test_flagged_goal_without_user_context_blocks(monkeypatch):
     from security.hive_guardrails import GuardrailEnforcer
     _quiet_other_policies(monkeypatch)
     _patch_consent(monkeypatch, granted=True)
+    monkeypatch.delenv('HEVOLVE_OWNER_USER_ID', raising=False)
 
     allowed, reason, _ = GuardrailEnforcer.before_dispatch(
         'p', goal_dict=FLAGGED, user_id=None)
 
     assert allowed is False
     assert 'user context' in reason
+
+
+def test_daemon_goal_falls_back_to_boot_owner_and_asks(monkeypatch):
+    """A user-less goal on an owned desktop asks the OWNER, not a wall.
+
+    Before this fallback the daemon's require_consent goals looped
+    blocked forever because request_consent needs a user to file the
+    pending record against; HEVOLVE_OWNER_USER_ID (boot-set, same trust
+    as crossbar publish auth) names that user.
+    """
+    from security.hive_guardrails import GuardrailEnforcer
+    _quiet_other_policies(monkeypatch)
+    req_spy = _patch_consent(monkeypatch, granted=False)
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', 'owner-9')
+
+    allowed, reason, _ = GuardrailEnforcer.before_dispatch(
+        'p', goal_dict=FLAGGED, user_id=None)
+
+    assert allowed is False
+    assert 'pending request filed' in reason
+    assert req_spy.call_count == 1
+    assert req_spy.call_args[0][1] == 'owner-9'
+
+
+def test_daemon_goal_with_boot_owner_and_granted_consent_dispatches(monkeypatch):
+    from security.hive_guardrails import GuardrailEnforcer
+    _quiet_other_policies(monkeypatch)
+    req_spy = _patch_consent(monkeypatch, granted=True)
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', 'owner-9')
+
+    allowed, _, _ = GuardrailEnforcer.before_dispatch(
+        'p', goal_dict=FLAGGED, user_id=None)
+
+    assert allowed is True
+    assert req_spy.call_count == 0
 
 
 def test_dispatch_goal_feeds_goal_dict_and_user_to_the_one_gate(monkeypatch):

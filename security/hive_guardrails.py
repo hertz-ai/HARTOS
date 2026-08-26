@@ -1282,6 +1282,16 @@ class GuardrailEnforcer:
                        or goal_dict.get('config_json') or {})
             if cfg.get('require_consent'):
                 if not user_id:
+                    # Daemon goals carry no requester, which left every
+                    # consent-flagged goal in a blocked loop with nobody
+                    # ever ASKED (18 blocks on 2026-08-26 alone).  On an
+                    # owned desktop the human to ask IS the boot-declared
+                    # owner — the same boot-set trust source
+                    # crossbar_server.py uses for publish auth.  Env unset
+                    # (cloud/regional, pre-login desktop) keeps the gate
+                    # fail-closed exactly as before.
+                    user_id = os.environ.get('HEVOLVE_OWNER_USER_ID') or None
+                if not user_id:
                     return False, ('consent-flagged goal dispatched without '
                                    'user context'), prompt
                 consent_type = cfg.get('consent_type', 'data_access')
