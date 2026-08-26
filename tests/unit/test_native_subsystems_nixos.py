@@ -155,6 +155,30 @@ class TestSourceGuardAndroidWaydroid:
             "the init script must clear /var/lib/waydroid/cache_http so aborted "
             "downloads cannot accumulate across boots")
 
+    def test_source_guard_no_quadruple_quote_escape(self):
+        """A Nix escaping trap that silently broke EVERY image build.
+
+        In a Nix indented string the escape for a literal '' is ''' (THREE
+        quotes). The disk guard above was written with FOUR, which emits three,
+        leaving its `case` statement unbalanced. The module still evaluated --
+        the damage only appeared when the unit was BUILT:
+
+            hart-waydroid-init: line 21: unexpected EOF while looking for
+            matching quote
+            error: Cannot build '...-unit-hart-waydroid-init.service.drv'
+
+        which failed the Nix Build Matrix on every ISO and raw image (CI
+        2026-08-25), so nothing reached any node until it was fixed. Eval-only
+        gates cannot catch this class, which is exactly why it is guarded here.
+        Use "" for an empty shell pattern: it needs no Nix escaping at all.
+        """
+        src = _subsystems()
+        assert "''''" not in src, (
+            "four consecutive single quotes in a Nix indented string emit THREE "
+            "quotes, not two -- the escape for a literal '' is ''' . This broke "
+            "the waydroid unit build and with it every image. Use \"\" for an "
+            "empty shell pattern instead of escaping ''.")
+
     def test_source_guard_waydroid_init_tolerates_no_network(self):
         src = _subsystems()
         # Must not fail the boot transaction when the image download is impossible

@@ -450,7 +450,21 @@ in
             # image later. A node that filled its disk gets a working OS instead.
             NEED_MB=${toString sub.android.minFreeMB}
             FREE_MB=$(${pkgs.coreutils}/bin/df -Pm /var/lib | ${pkgs.gnugrep}/bin/grep -v Filesystem | ${pkgs.gawk}/bin/awk '{print $4}' | head -1)
-            case "$FREE_MB" in ''''|*[!0-9]*) FREE_MB=0 ;; esac
+            # Empty or non-numeric df output means "could not measure"; treat it
+            # as 0 free so the floor below refuses, rather than letting an
+            # unparsed value through as though it were headroom.
+            #
+            # The empty pattern is "" and NOT the shell's '' on purpose. In a Nix
+            # indented string the escape for a literal '' is ''' (THREE quotes);
+            # writing four emits three, which left this case statement unbalanced
+            # and the unit failed to build with
+            #     hart-waydroid-init: line 21: unexpected EOF while looking for
+            #     matching quote
+            # taking every ISO and raw image build down with it (CI 2026-08-25,
+            # so nothing shipped until it was fixed). "" needs no Nix escaping at
+            # all and means the same thing to the shell, so the trap cannot
+            # return. Guarded in tests/unit/test_native_subsystems_nixos.py.
+            case "$FREE_MB" in ""|*[!0-9]*) FREE_MB=0 ;; esac
             if [ "$FREE_MB" -lt "$NEED_MB" ]; then
               echo "[HART OS] waydroid init SKIPPED — ''${FREE_MB}MB free, need ''${NEED_MB}MB." \
                    "Not filling the disk for an optional subsystem; retries next boot."
