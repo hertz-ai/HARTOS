@@ -22,6 +22,9 @@ Run:
 """
 
 import os
+import re
+
+import pytest as _pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MODULES_DIR = os.path.join(REPO_ROOT, "nixos", "modules")
@@ -155,29 +158,95 @@ class TestSourceGuardAndroidWaydroid:
             "the init script must clear /var/lib/waydroid/cache_http so aborted "
             "downloads cannot accumulate across boots")
 
-    def test_source_guard_no_quadruple_quote_escape(self):
-        """A Nix escaping trap that silently broke EVERY image build.
+    def test_source_guard_waydroid_script_string_is_well_formed(self):
+        """Two REAL build breakages, both invisible to an eval-only gate.
 
-        In a Nix indented string the escape for a literal '' is ''' (THREE
-        quotes). The disk guard above was written with FOUR, which emits three,
-        leaving its `case` statement unbalanced. The module still evaluated --
-        the damage only appeared when the unit was BUILT:
+        The waydroid ExecStart is a Nix indented string. Two ways that bit:
 
-            hart-waydroid-init: line 21: unexpected EOF while looking for
-            matching quote
-            error: Cannot build '...-unit-hart-waydroid-init.service.drv'
+        1. The disk guard used FOUR single quotes where the escape for an
+           emitted pair is THREE. It emitted three, leaving the case statement
+           unbalanced. The module still EVALUATED; the unit failed to BUILD:
+               hart-waydroid-init: line 21: unexpected EOF while looking for
+               matching quote
+               error: Cannot build ...-unit-hart-waydroid-init.service.drv
+           That failed the Nix Build Matrix on every ISO and raw image
+           (CI 2026-08-25), so nothing reached any node.
 
-        which failed the Nix Build Matrix on every ISO and raw image (CI
-        2026-08-25), so nothing reached any node until it was fixed. Eval-only
-        gates cannot catch this class, which is exactly why it is guarded here.
-        Use "" for an empty shell pattern: it needs no Nix escaping at all.
+        2. The follow-up commit explaining rule 1 put quote characters in a
+           COMMENT inside that same string. Comments are inside the string too,
+           so Nix parsed them and the string ended early:
+               error: syntax error, unexpected 'in', expecting ';'
+           i.e. documenting the trap re-triggered it (CI 2026-08-26).
+
+        A substring check cannot catch both. This lexes the string the way Nix
+        does and asserts it ends exactly where it should, which catches any
+        stray or miscounted quote anywhere inside, comments included.
         """
         src = _subsystems()
-        assert "''''" not in src, (
-            "four consecutive single quotes in a Nix indented string emit THREE "
-            "quotes, not two -- the escape for a literal '' is ''' . This broke "
-            "the waydroid unit build and with it every image. Use \"\" for an "
-            "empty shell pattern instead of escaping ''.")
+        key = 'writeShellScript "hart-waydroid-init" \'\''
+        assert key in src, "waydroid ExecStart script not found"
+        i = src.index(key) + len(key)
+        out = []
+        end = -1
+        while i < len(src):
+            if src.startswith("'''", i):        # escape -> literal pair
+                out.append("''"); i += 3
+            elif src.startswith("''$", i):      # escape -> literal $
+                out.append("$"); i += 3
+            elif src.startswith("''\\", i):     # escaped backslash sequence
+                out.append(src[i + 2:i + 4]); i += 4
+            elif src.startswith("''", i):       # end of string
+                end = i
+                break
+            else:
+                out.append(src[i]); i += 1
+
+        assert end != -1, "the waydroid script string never terminates"
+        tail = src[end + 2:end + 4].lstrip()
+        assert tail.startswith(";"), (
+            "the waydroid script string ends early (next chars %r). A stray or "
+            "miscounted single quote INSIDE the script -- including inside a "
+            "comment, which Nix also parses -- closes the string and breaks the "
+            "whole module." % src[end:end + 12])
+
+        body = "".join(out)
+        assert "waydroid init" in body and body.rstrip().endswith("exit 0"), (
+            "the rendered script is truncated, so the string closed somewhere "
+            "in the middle of it")
+
+        # Termination alone does NOT catch bug 1: four quotes still terminate
+        # correctly, they just render broken SHELL. So render the way Nix does
+        # and let bash judge it. This is the check that reproduces the CI
+        # failure locally.
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+
+        bash = shutil.which("bash")
+        if not bash:
+            _pytest.skip("bash unavailable; the VM/CI gate covers this")
+
+        raw = src[src.index(key) + len(key):end]
+        # Order matters: protect the escaped shell $ FIRST, then resolve real
+        # Nix interpolations, then unescape the quote pairs.
+        raw = raw.replace("''${", "\x00")
+        raw = re.sub(r"\$\{[^{}]*\}", "/nix/store/x-tool", raw)
+        rendered = raw.replace("\x00", "${").replace("'''", "''")
+
+        fd, path = tempfile.mkstemp(suffix=".sh")
+        try:
+            with os.fdopen(fd, "w", newline="\n") as fh:
+                fh.write(rendered)
+            proc = subprocess.run([bash, "-n", path],
+                                  capture_output=True, text=True)
+        finally:
+            os.unlink(path)
+
+        assert proc.returncode == 0, (
+            "the rendered waydroid script is not valid shell, so the unit will "
+            "fail to BUILD even though the module evaluates fine:\n%s"
+            % (proc.stderr or "").strip())
 
     def test_source_guard_waydroid_init_tolerates_no_network(self):
         src = _subsystems()

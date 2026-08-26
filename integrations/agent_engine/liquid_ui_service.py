@@ -7910,34 +7910,37 @@ function renderAgentOverlay(ev) {{
             modes:[{resolution, rates, active}]} and must not have to care.
             """
             displays = []
+            # ONE reader for compositor outputs (shell_desktop_apis.sway_outputs).
+            # This endpoint must not carry its own probe: that is how it drifted
+            # to `xrandr --current` and kept answering "no displays" on a
+            # Wayland-only OS while the sibling endpoint answered correctly.
+            # Only the SHAPING below is local, because this endpoint's response
+            # contract (modes + rates) differs from the sibling's.
             try:
-                from integrations.agent_engine.shell_desktop_apis import (
-                    _is_wayland as _wl, _run as _probe)
+                from integrations.agent_engine.shell_desktop_apis import sway_outputs
             except Exception:
-                _wl = _probe = None
-            if _wl is not None and _probe is not None and _wl():
-                r = _probe(['swaymsg', '-t', 'get_outputs', '--raw'], timeout=5)
-                if r is not None and getattr(r, 'returncode', 1) == 0:
-                    try:
-                        for out in json.loads(r.stdout or '[]'):
-                            cur = out.get('current_mode') or {}
-                            rect = out.get('rect') or {}
-                            cur_res = ('%sx%s' % (cur.get('width'), cur.get('height'))
-                                       if cur.get('width') else
-                                       '%sx%s' % (rect.get('width', 0), rect.get('height', 0)))
-                            modes = []
-                            for m in (out.get('modes') or []):
-                                res = '%sx%s' % (m.get('width', 0), m.get('height', 0))
-                                # sway reports refresh in mHz.
-                                hz = round((m.get('refresh') or 0) / 1000.0, 2)
-                                modes.append({'resolution': res,
-                                              'rates': [hz] if hz else [],
-                                              'active': res == cur_res})
-                            displays.append({'name': out.get('name', ''),
-                                             'resolution': cur_res,
-                                             'modes': modes})
-                    except (ValueError, TypeError, KeyError):
-                        displays = []
+                sway_outputs = None
+            if sway_outputs is not None:
+                try:
+                    for out in sway_outputs():
+                        cur = out.get('current_mode') or {}
+                        rect = out.get('rect') or {}
+                        cur_res = ('%sx%s' % (cur.get('width'), cur.get('height'))
+                                   if cur.get('width') else
+                                   '%sx%s' % (rect.get('width', 0), rect.get('height', 0)))
+                        modes = []
+                        for m in (out.get('modes') or []):
+                            res = '%sx%s' % (m.get('width', 0), m.get('height', 0))
+                            # sway reports refresh in mHz.
+                            hz = round((m.get('refresh') or 0) / 1000.0, 2)
+                            modes.append({'resolution': res,
+                                          'rates': [hz] if hz else [],
+                                          'active': res == cur_res})
+                        displays.append({'name': out.get('name', ''),
+                                         'resolution': cur_res,
+                                         'modes': modes})
+                except (ValueError, TypeError, KeyError):
+                    displays = []
             if displays:
                 return jsonify({'displays': displays})
             # X11 fallback, byte-identical to the previous implementation.

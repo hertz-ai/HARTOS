@@ -454,16 +454,22 @@ in
             # as 0 free so the floor below refuses, rather than letting an
             # unparsed value through as though it were headroom.
             #
-            # The empty pattern is "" and NOT the shell's '' on purpose. In a Nix
-            # indented string the escape for a literal '' is ''' (THREE quotes);
-            # writing four emits three, which left this case statement unbalanced
-            # and the unit failed to build with
-            #     hart-waydroid-init: line 21: unexpected EOF while looking for
-            #     matching quote
-            # taking every ISO and raw image build down with it (CI 2026-08-25,
-            # so nothing shipped until it was fixed). "" needs no Nix escaping at
-            # all and means the same thing to the shell, so the trap cannot
-            # return. Guarded in tests/unit/test_native_subsystems_nixos.py.
+            # The empty pattern below is written with DOUBLE quotes on purpose.
+            # An empty single-quoted pattern cannot be written here: this whole
+            # script lives inside a Nix indented string, where a pair of single
+            # quotes ENDS the string and the escape for an emitted pair is three
+            # of them. Getting that count wrong shipped an unbalanced case
+            # statement and the unit failed to build with "unexpected EOF while
+            # looking for matching quote", taking every ISO and raw image with
+            # it (CI 2026-08-25). Double quotes mean the same thing to the shell
+            # and need no Nix escaping at all, so the trap cannot return.
+            #
+            # NOTE TO A FUTURE EDITOR: do not put single-quote characters in
+            # this comment either. The comment is INSIDE the string, so Nix
+            # parses those quotes too, and a well-meaning explanation of the
+            # escape rule is itself enough to break the parse -- which is
+            # exactly how the follow-up commit failed. Say it in words.
+            # Guarded in tests/unit/test_native_subsystems_nixos.py.
             case "$FREE_MB" in ""|*[!0-9]*) FREE_MB=0 ;; esac
             if [ "$FREE_MB" -lt "$NEED_MB" ]; then
               echo "[HART OS] waydroid init SKIPPED — ''${FREE_MB}MB free, need ''${NEED_MB}MB." \
