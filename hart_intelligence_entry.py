@@ -5788,12 +5788,12 @@ class CustomGPT(LLM):
         thread_local_data.update_req_token_count(num_tokens)
         app.logger.info(f"len---->{num_tokens}")
 
-        app.logger.info(f"first time calling {len(prompt)}")
         # Recall-drop discriminator: prep_inputs logs "Memory loaded: N" on the
-        # load side; this counts the history actually rendered into the prompt.
-        # N>0 with Human==1 here = history dropped between merge and format.
+        # load side; Human/AI counts show the history actually rendered here.
+        # N>0 with Human==1 = history dropped between memory merge and format.
         app.logger.info(
-            f"prompt history blocks: Human={prompt.count('Human:')} AI={prompt.count('AI:')}")
+            f"first time calling {len(prompt)} "
+            f"(history blocks: Human={prompt.count('Human:')} AI={prompt.count('AI:')})")
         publish_chat_stage('generating', user_id=str(thread_local_data.get_user_id() or ''), request_id=str(thread_local_data.get_request_id() or ''))
 
         if self.count > 1 and thread_local_data.get_global_intent() != self.previous_intent:
