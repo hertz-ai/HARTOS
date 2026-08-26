@@ -1006,8 +1006,22 @@ app.run(None)
         except OSError:
             pass
         finally:
+            # The client is gone, so tear the upstream down HARD rather than
+            # half-closing it. sway keeps its side of an IPC connection open
+            # indefinitely, so SHUT_WR alone left the reader below blocked in
+            # recv() until RuntimeMaxSec killed the unit -- and systemd then
+            # recorded a FAILED service for a query that had already answered
+            # correctly. Measured on the box 2026-08-26: 12 failed
+            # hart-sway-ipc@ instances, all "reached runtime time limit", while
+            # every display and workspace endpoint was returning real data.
+            # Closing the socket makes recv() raise, the loop ends, and the
+            # instance exits cleanly the moment the query is done.
             try:
-                up.shutdown(socket.SHUT_WR)
+                up.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                up.close()
             except OSError:
                 pass
 
