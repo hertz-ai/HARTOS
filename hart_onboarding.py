@@ -740,6 +740,7 @@ def generate_hart_name(
     locale: str = 'en_US',
     voice_transcript: str = '',
     existing_names: set = None,
+    use_llm: bool = True,
 ) -> Dict:
     """Generate a HART name — the gift from the PA to the human.
 
@@ -750,6 +751,17 @@ def generate_hart_name(
     - Globally unique
 
     Returns dict with 'name', 'emoji_combo', 'dimensions', 'candidates'.
+
+    use_llm=False is the INSTANT path: curated names only, no model call and no
+    cloud uniqueness round trips. It exists because this function is on the
+    single most emotionally loaded request in the product, and when the model is
+    slow it was making THREE blocking LLM calls (generate, validate candidates,
+    validate the fallbacks) plus up to 5 cloud checks at 5s each. Measured on the
+    fleet box 2026-08-26: the reveal took 60.45s and the journal recorded
+    "LLM name gen: local endpoint unreachable (timed out) - using curated
+    fallback", i.e. the human waited a full minute to be handed the name this
+    path produces immediately. Local DB uniqueness and the suffix forge still
+    apply, so a fast name is still a unique name.
     """
     # Pre-fetch all sealed names from DB for collision prevention
     if existing_names is None:
@@ -832,7 +844,7 @@ Example format: ["zanmizu", "hivaan", "kazeran", "uyiren", "tsukiron"]"""
     # not yet published), fall through to _fallback_names below — we NEVER import
     # hart_intelligence here: in bundled Nunba mode that pulls langchain_classic
     # + transformers into the onboarding hot path.
-    text = _llm_generate_direct(generation_prompt)
+    text = _llm_generate_direct(generation_prompt) if use_llm else None
 
     if text:
         # Parse JSON array from response
@@ -850,13 +862,20 @@ Example format: ["zanmizu", "hivaan", "kazeran", "uyiren", "tsukiron"]"""
                 pass
 
     # Validate candidates — LLM checks for negative meanings across all languages
-    if candidates:
+    if candidates and use_llm:
         candidates = _validate_names_cross_language(candidates, language)
 
-    # Fallback: curated legendary names if LLM fails or all filtered out
+    # Fallback: curated legendary names if LLM fails or all filtered out.
+    # NOTE the second LLM call here: when generation already timed out, this ran
+    # the SAME unreachable endpoint again on the curated list, doubling the
+    # stall. The curated names are hand-picked and already safe, so on the
+    # instant path they are used as-is.
     if len(candidates) < 1:
         fallbacks = _fallback_names(dimensions, existing_names)
-        candidates = _validate_names_cross_language(fallbacks, language) or fallbacks[:1]
+        if use_llm:
+            candidates = _validate_names_cross_language(fallbacks, language) or fallbacks[:1]
+        else:
+            candidates = fallbacks[:3] or fallbacks[:1]
 
     # GUARANTEE uniqueness: live DB check + suffix forge if all taken
     # Refresh existing names from DB right before final pick (race window minimized)
@@ -872,7 +891,10 @@ Example format: ["zanmizu", "hivaan", "kazeran", "uyiren", "tsukiron"]"""
     # Global uniqueness: check each candidate against cloud (when online)
     # Cap at 5 cloud calls total to avoid stalling the ceremony (5s timeout each = 25s max)
     _cloud_checks = 0
-    _MAX_CLOUD_CHECKS = 5
+    # 0 on the instant path: five 5s network round trips is another 25s of
+    # ceremony stall. Local DB uniqueness (above) and the suffix forge (below)
+    # still guarantee the name is unused on this node.
+    _MAX_CLOUD_CHECKS = 5 if use_llm else 0
     globally_unique = []
     for c in unique_candidates:
         if _cloud_checks < _MAX_CLOUD_CHECKS:
@@ -1630,6 +1652,21 @@ class HARTOnboardingSession:
         self.escape_key = None
         self.voice_transcript = ''
         self.generated_name = None
+        # Name PREWARM. Both answers are known one phase before the reveal, and
+        # the script then plays ~8.5s of deliberate pause ("I like that about
+        # you already." 2000ms + 3500ms auto-advance, then "I think I know you."
+        # 3000ms + 5000ms). That pause is dramatic cover we were not using: the
+        # model call only started when the client finally asked to reveal, so
+        # its full latency landed ON the reveal. Start it as soon as we can and
+        # let it cook behind the ceremony instead.
+        # Imported locally, matching this module's existing convention (it uses
+        # __import__('threading') for its module-level locks and a function-local
+        # import elsewhere rather than a top-level one).
+        import threading
+        self._prewarm_thread = None
+        self._prewarm_result = None
+        self._prewarm_token = 0
+        self._prewarm_lock = threading.Lock()
         self.started_at = time.time()
 
     def advance(self, action: str = None, data: dict = None) -> Dict:
@@ -1691,6 +1728,9 @@ class HARTOnboardingSession:
                 self.escape_key = data.get('key', '')
                 if data.get('voice_transcript') and not self.voice_transcript:
                     self.voice_transcript = data['voice_transcript']
+                # Both answers are in: start generating behind the two scripted
+                # acknowledgement beats instead of waiting for the reveal call.
+                self._start_prewarm()
                 self.phase = 'ack_escape'
                 ack_text = ACKNOWLEDGMENT_ESCAPE.get(self.language,
                                                       ACKNOWLEDGMENT_ESCAPE['en'])
@@ -1789,18 +1829,90 @@ class HARTOnboardingSession:
         # Default: return current state
         return self._response()
 
-    def _do_reveal(self, alternative: bool = False) -> Dict:
-        """Generate and reveal the HART name."""
-        existing = HARTNameRegistry.get_all_names()
+    # How long the reveal will wait for a prewarm that has not landed yet. The
+    # script already gave it ~8.5s of cover, so this is only the tail: a warm
+    # model (measured 3.7s) is long done, a cold one (19.8s) is not, and the
+    # human gets a curated name instantly instead of watching a spinner.
+    REVEAL_WAIT_S = 2.5
 
-        result = generate_hart_name(
-            language=self.language,
-            passion_key=self.passion_key or 'reading_learning',
-            escape_key=self.escape_key or 'quiet_alone',
-            locale=self.locale,
-            voice_transcript=self.voice_transcript,
-            existing_names=existing,
-        )
+    def _start_prewarm(self) -> None:
+        """Generate the name on a background thread, behind the scripted pause.
+
+        Never raises and never blocks the caller: a failure here just leaves the
+        reveal to the instant curated path.
+        """
+        import threading
+        with self._prewarm_lock:
+            if self._prewarm_thread is not None:
+                return                      # already cooking
+            self._prewarm_token = getattr(self, '_prewarm_token', 0) + 1
+            token = self._prewarm_token
+            lang, loc = self.language, self.locale
+            passion = self.passion_key or 'reading_learning'
+            escape = self.escape_key or 'quiet_alone'
+            transcript = self.voice_transcript
+
+        def _work():
+            try:
+                r = generate_hart_name(
+                    language=lang, passion_key=passion, escape_key=escape,
+                    locale=loc, voice_transcript=transcript,
+                    existing_names=HARTNameRegistry.get_all_names(),
+                    use_llm=True,
+                )
+            except Exception:
+                logger.debug("HART name prewarm failed", exc_info=True)
+                r = None
+            with self._prewarm_lock:
+                # A 'try another' restarts the prewarm; a straggler from the
+                # previous round must not overwrite the current answer.
+                if token == getattr(self, '_prewarm_token', 0):
+                    self._prewarm_result = r
+
+        t = threading.Thread(target=_work, daemon=True, name='hart-name-prewarm')
+        with self._prewarm_lock:
+            self._prewarm_thread = t
+        t.start()
+
+    def _collect_prewarm(self) -> Optional[Dict]:
+        """The prewarmed name if it lands within the grace period, else None."""
+        t = self._prewarm_thread
+        if t is None:
+            return None
+        t.join(self.REVEAL_WAIT_S)
+        with self._prewarm_lock:
+            return self._prewarm_result
+
+    def _do_reveal(self, alternative: bool = False) -> Dict:
+        """Reveal the HART name. NEVER holds the ceremony open on a slow model.
+
+        Measured on the fleet box 2026-08-26 before this change: 60.45s, with
+        the journal recording "LLM name gen: local endpoint unreachable
+        (timed out) - using curated fallback". The human waited a full minute
+        for a name the curated path produces instantly, on the single most
+        emotionally loaded screen in the product.
+        """
+        if alternative:
+            # A fresh ask for a different name: restart the prewarm so this one
+            # also gets a chance at a model-generated answer, bounded the same.
+            with self._prewarm_lock:
+                self._prewarm_thread = None
+                self._prewarm_result = None
+            self._start_prewarm()
+
+        result = self._collect_prewarm()
+
+        if result is None:
+            # Nothing landed in time. Hand over a curated name NOW.
+            result = generate_hart_name(
+                language=self.language,
+                passion_key=self.passion_key or 'reading_learning',
+                escape_key=self.escape_key or 'quiet_alone',
+                locale=self.locale,
+                voice_transcript=self.voice_transcript,
+                existing_names=HARTNameRegistry.get_all_names(),
+                use_llm=False,
+            )
 
         if alternative and self.generated_name:
             # Pick a different candidate
