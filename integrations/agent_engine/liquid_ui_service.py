@@ -897,19 +897,87 @@ class LiquidUIService:
         self._custom_component_types: Dict[str, dict] = \
             self._load_custom_component_types()
 
+        # AI-UI cache. Inference NEVER runs on the request thread (see
+        # generate_ui). Mirrors _ConnectivityCache's contract: one refresher at a
+        # time, request handlers read the snapshot instantly, a failed refresh
+        # keeps the last good answer.
+        self._ai_ui_lock = threading.Lock()
+        self._ai_ui = None          # last good AI-generated ui dict
+        self._ai_ui_at = 0.0        # monotonic stamp of that answer
+        self._ai_ui_busy = False    # a refresh is already in flight
+
         logger.info(
             "LiquidUIService initialized: port=%d, renderer=%s, "
             "voice=%s, haptic=%s", port, renderer, voice_enabled, haptic_enabled)
 
     # ─── UI Generation (preserved) ────────────────────────────
 
+    # How long an AI-generated layout stays fresh before a refresh is worth
+    # spending inference on, and how long that refresh may take. Both are sized
+    # from the real box rather than guessed: a 1024-token /v1/chat measured 50.7s
+    # on the fleet node (llama.cpp on two pinned cores), and a 16-token prompt
+    # measured 19.8s cold / 3.7s warm. The old 15s call timeout could therefore
+    # NEVER succeed for a UI generation here, which is why every /api/ui request
+    # spent 15s failing and then returned the static layout anyway.
+    AI_UI_TTL_S = 300.0
+    AI_UI_TIMEOUT_S = 120.0
+
     def generate_ui(self, context: Optional[dict] = None) -> Dict[str, Any]:
-        """Generate adaptive UI layout based on current context."""
+        """Adaptive UI for the current context. NEVER blocks on inference.
+
+        This used to call the model bus synchronously on the waitress request
+        thread, which is the same defect _ConnectivityCache was written to fix,
+        only worse: measured on the box 2026-08-26, /api/ui took >10s and the
+        journal showed "AI UI generation failed: ... Read timed out (read
+        timeout=15)" on every single call. With generation measured at 50.7s the
+        15s budget was unreachable by construction, so the endpoint was a
+        guaranteed 15s stall that returned the static layout regardless -- and on
+        a box whose shell polls it, that stall sits on the same small thread pool
+        every other shell fetch needs.
+
+        Now: serve the freshest thing we already have (last good AI layout, else
+        the static one, both instant) and let a single background thread earn the
+        upgrade. The AI layout appears on a later poll instead of never.
+        """
         if context is None:
             context = self.context_engine.get_context()
-        if self._model_available:
-            return self._generate_ai_ui(context)
-        return self._generate_static_ui(context)
+        if not self._model_available:
+            return self._generate_static_ui(context)
+        with self._ai_ui_lock:
+            cached = self._ai_ui
+            fresh = cached is not None and (
+                time.monotonic() - self._ai_ui_at) < self.AI_UI_TTL_S
+        if not fresh:
+            self._ai_ui_refresh_async(context)
+        return cached if cached is not None else self._generate_static_ui(context)
+
+    def _ai_ui_refresh_async(self, context: dict) -> None:
+        """Kick ONE background AI-UI generation. Demand-driven: nothing runs
+        unless something actually asked for the UI, so an idle desktop spends no
+        inference at all (this box would otherwise burn ~50s of CPU per refresh
+        on two cores). A refresh already in flight is never duplicated."""
+        with self._ai_ui_lock:
+            if self._ai_ui_busy:
+                return
+            self._ai_ui_busy = True
+
+        def _work():
+            try:
+                ui = self._generate_ai_ui(context)
+                # Only cache a real AI answer; a static fallback must not pin the
+                # cache and suppress the next attempt.
+                if ui and str(ui.get('source', '')).startswith('ai'):
+                    with self._ai_ui_lock:
+                        self._ai_ui = ui
+                        self._ai_ui_at = time.monotonic()
+            except Exception:
+                logger.warning("AI UI refresh failed", exc_info=True)
+            finally:
+                with self._ai_ui_lock:
+                    self._ai_ui_busy = False
+
+        threading.Thread(target=_work, daemon=True,
+                         name='ai-ui-refresh').start()
 
     def _generate_ai_ui(self, context: dict) -> dict:
         """Generate UI via LLM (when model is available)."""
@@ -918,7 +986,11 @@ class LiquidUIService:
         try:
             resp = pooled_post(
                 f'http://localhost:{self.model_bus_port}/v1/chat',
-                json={'prompt': prompt, 'max_tokens': 1024}, timeout=15)
+                json={'prompt': prompt, 'max_tokens': 1024},
+                # Runs on the background refresher only (see generate_ui), so a
+                # long budget costs a daemon thread, not a request. 15s was
+                # unreachable: real generation measured 50.7s on the fleet box.
+                timeout=self.AI_UI_TIMEOUT_S)
             if resp.status_code == 200:
                 response = resp.json().get('response', '')
                 try:
