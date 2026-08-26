@@ -47,6 +47,19 @@ def _save_json(path, data):
 
 def _is_wayland():
     """Detect Wayland compositor — env var check + GNOME session fallback."""
+    # SWAYSOCK is proof of a live wlroots session, and it is the ONE signal a
+    # sandboxed backend actually has. _detect_compositor already trusts it to
+    # answer 'sway'; this function did not, so the two disagreed about the same
+    # box. Measured after the OTA landed on the fleet node 2026-08-26: the
+    # service had SWAYSOCK=/run/hart/sway-ipc.sock and could drive swaymsg
+    # through it successfully, yet /api/shell/displays still reported
+    # {"compositor":"x11","displays":[]} because none of the three checks below
+    # can see anything from inside the unit: WAYLAND_DISPLAY and
+    # XDG_SESSION_TYPE are unset for a system service, and the pgrep fallback
+    # needs procps, which is not on the unit's curated PATH. So the display
+    # endpoints bailed before ever using a transport that was working.
+    if os.environ.get('SWAYSOCK'):
+        return True
     if os.environ.get('WAYLAND_DISPLAY'):
         return True
     # Fallback: some GNOME sessions don't set WAYLAND_DISPLAY
