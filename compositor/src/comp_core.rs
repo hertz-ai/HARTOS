@@ -230,18 +230,13 @@ pub struct BloomCache {
 }
 
 impl BloomCache {
-    /// Drop the composed field AND the resolved palette, so the next frame
-    /// re-reads the theme from disk and recomposes.
-    ///
-    /// This is the seam a theme/mood change calls. Nothing calls it yet: the
-    /// theme is fixed for the session today, and wiring the change signal is a
-    /// later milestone. It exists so that wiring does not have to reach inside
-    /// this type's private fields.
-    pub fn invalidate(&mut self) {
-        self.palette = None;
-        self.key = None;
-        self.buffer = None;
-    }
+    // KNOWN GAP, deliberately not papered over with an unused method: the
+    // palette is resolved once and never re-read, so a theme change at runtime
+    // ("switch theme" through the agent) will not restyle this backdrop until
+    // the compositor restarts. An `invalidate()` was written here and removed
+    // again because nothing calls it, and a dead pub method is worse than an
+    // absent one: it warns on every build and reads as though the wiring exists.
+    // Whoever lands the theme-change signal adds it back with a caller.
 
     /// The backdrop for this size, composing only on a genuine miss.
     ///

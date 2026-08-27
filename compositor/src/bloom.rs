@@ -76,7 +76,7 @@ pub fn palette_from_theme_file(path: &Path) -> BloomPalette {
         Ok(t) => t,
         Err(_) => return p,
     };
-    let mut find = |key: &str| -> Option<[u8; 3]> {
+    let find = |key: &str| -> Option<[u8; 3]> {
         let k = format!("\"{}\"", key);
         let i = text.find(&k)?;
         let rest = &text[i + k.len()..];
