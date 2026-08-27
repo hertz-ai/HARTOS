@@ -58,8 +58,13 @@ class TestShouldDelegateRouteToHelper:
     def test_does_not_bounce_immediately_back_to_helper(self):
         # Helper just spoke -- don't re-select Helper before Assistant gets a
         # turn to synthesize, or the graph could stall bouncing on itself.
+        # "Helper" (capitalized) matches the agent's real registered name
+        # (reuse_recipe.py's AssistantAgent(name="Helper", ...)) -- a
+        # lowercase "helper" here would silently pin the case-mismatch bug
+        # that let this guard never fire (found live 2026-08-27: an
+        # infinite Helper<->Helper bounce on every delegate='local' turn).
         last_json = {"delegate": "local"}
-        assert should_delegate_route_to_helper(last_json, "helper") is False
+        assert should_delegate_route_to_helper(last_json, "Helper") is False
 
     def test_does_not_override_executor_or_chatinstructor_turns(self):
         last_json = {"delegate": "local"}

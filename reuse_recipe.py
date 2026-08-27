@@ -3032,7 +3032,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
             if (last_speaker.name == f"user_proxy_{user_id}" or
                     last_speaker.name == "multi_role_agent" or
-                    last_speaker.name == "helper" or
+                    last_speaker.name == "Helper" or
                     last_speaker.name == "Executor" or
                     last_speaker.name == "ChatInstructor"):
                 return assistant
@@ -3585,7 +3585,7 @@ def should_delegate_route_to_helper(last_json, last_speaker_name: str) -> bool:
     delegate = str(last_json.get('delegate') or '').strip().lower()
     if delegate not in ('local', 'hive'):
         return False
-    return last_speaker_name not in ('helper', 'Executor', 'ChatInstructor')
+    return last_speaker_name not in ('Helper', 'Executor', 'ChatInstructor')
 
 
 def _extract_conversational_reply(messages) -> Optional[str]:
