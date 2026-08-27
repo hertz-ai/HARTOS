@@ -202,3 +202,67 @@ class TestNoMeasurementIsNotAZeroPassRate:
         assert "pass_rate < 0.95" in body, (
             "the quality gate itself must survive; only the UNMEASURED case is "
             "reclassified, never a measured failure")
+
+
+class TestRegressionAdapterReportsWhyItFoundNothing:
+    """Zero tests collected must not be reported as a 0% pass rate.
+
+    RegressionAdapter shells out to `venv310/bin/python -m pytest tests/`. A dev
+    checkout has that interpreter. A NixOS node does not: hart-app runs from the
+    store and there is no venv anywhere. So on the real box the subprocess raised
+    FileNotFoundError, the adapter returned {'metrics': {}, 'error': ...}, and
+    the pipeline scored the absence as 0%.
+
+    There were TWO routes to the same bad verdict:
+      1. the interpreter is missing      -> exception -> empty metrics
+      2. pytest runs but collects nothing -> total == 0 -> passed/max(1,total)
+         == 0.0, a REAL-looking metric meaning "nothing passed"
+
+    Route 2 is the nastier one, because it produces a number rather than an
+    absence, so a caller checking `is None` would never catch it.
+
+    And the adapter's 'error' was never read by _stage_test, so the diagnosis was
+    discarded every time: the box logged three days of "pass_rate=0.00%, fail=0"
+    while the adapter had been saying, on each run, exactly what was wrong.
+    """
+
+    def _adapter_src(self, code_only=False):
+        p = os.path.join(REPO, "integrations", "agent_engine",
+                         "benchmark_registry.py")
+        src = _read(p)
+        i = src.index("class RegressionAdapter")
+        body = src[i: src.index("class GuardrailAdapter")]
+        if code_only:
+            # Drop comments: the comment explaining this very bug necessarily
+            # quotes the expression the guard asserts is gone.
+            body = "\n".join(
+                l for l in body.splitlines() if not l.lstrip().startswith("#"))
+        return body
+
+    def test_zero_tests_does_not_become_a_zero_pass_rate(self):
+        body = self._adapter_src(code_only=True)
+        assert "max(1, total)" not in body, (
+            "passed/max(1, total) turns zero collected tests into a 0.0 pass "
+            "rate, which reads as a catastrophic build instead of a missing "
+            "measurement")
+        assert "if total == 0:" in body, (
+            "the adapter must detect that no tests ran and report no metric")
+
+    def test_the_adapter_falls_back_to_a_real_interpreter(self):
+        body = self._adapter_src()
+        assert "sys.executable" in body, (
+            "with no venv310 on a NixOS node the adapter must fall back to the "
+            "interpreter already running it, or it can never run the suite")
+
+    def test_the_failure_carries_evidence(self):
+        body = self._adapter_src()
+        assert "'error'" in body and "output_tail" in body, (
+            "the adapter must return why it failed and what pytest last said")
+
+    def test_stage_test_actually_reads_that_error(self):
+        """The half that made this invisible for three days."""
+        src = _read(ORCH)
+        body = src[src.index("def _stage_test"): src.index("def _stage_audit")]
+        assert "result.get('error')" in body, (
+            "_stage_test must surface the adapter's own error; discarding it is "
+            "why the box reported a fake 0% instead of 'no interpreter found'")

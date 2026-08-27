@@ -237,9 +237,18 @@ class UpgradeOrchestrator:
                 # Fail, because passing an unverified build is the silent-success
                 # lie this codebase keeps having to delete. But say WHY, so the
                 # operator sees an infrastructure problem and not a code verdict.
-                return False, ('regression produced NO pass_rate metric; refusing '
-                               'to score an unmeasured run as 0%. Adapter returned '
-                               f'keys: {sorted(metrics) or "none"}')
+                #
+                # The adapter's own 'error' is the whole diagnosis and was being
+                # thrown away: the box recorded three days of "pass_rate=0.00%,
+                # fail=0" while the adapter had been saying, every time, that it
+                # could not find an interpreter to run pytest with.
+                why = result.get('error') or 'adapter reported no error'
+                tail = result.get('output_tail')
+                msg = ('regression produced NO pass_rate metric; refusing to '
+                       f'score an unmeasured run as 0%. Adapter: {why}')
+                if tail:
+                    msg += f' | last output: {tail!r}'
+                return False, msg
             if fail_count is None:
                 fail_count = 0
             if pass_rate < 0.95:
