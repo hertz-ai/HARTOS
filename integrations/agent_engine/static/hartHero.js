@@ -514,7 +514,21 @@
       var op = 1;
       if (B.merged && !B.compact && !B.panelOpen && !B.chatOpen) op = 0.34;
       s.opacity = String(op);
-      s.pointerEvents = 'auto';
+      // Do NOT force pointer-events on the CONTAINER. The shell CSS states the
+      // contract deliberately:
+      //     .hart-hero   { pointer-events: none }   /* the box is not a target */
+      //     .hart-hero>* { pointer-events: auto }   /* the orb/input/chips are  */
+      // so the hero's 660px-wide bounding box lets clicks through to whatever it
+      // is floating over, while its actual controls stay clickable. Setting
+      // pointerEvents='auto' here is an INLINE style, so it outranked that rule
+      // and turned the whole box into a click target parked over the Home
+      // content -- the "orb swallows clicks meant for other components" report
+      // (#32). Visible on the box 2026-08-27: the hero sits fixed at top:46%
+      // with z-index 1450 (below), i.e. directly across the Continue row.
+      // Clearing the inline value hands the decision back to the stylesheet;
+      // the children keep their own pointer-events:auto, so nothing the user
+      // can SEE stops being clickable.
+      s.pointerEvents = '';
       // FLOAT OVER WINDOWS: the orb is the always-on-top brand centerpiece, so it
       // rides ABOVE app windows. The shell CSS rests #hart-hero at z-index:40, which
       // buries it BEHIND panels (they start at z 100 and a focused .panel reaches
