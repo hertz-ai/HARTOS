@@ -44,8 +44,18 @@ let
   # that need not resolve. No other module does it, and this reads the SAME
   # spectrum.json the profiler loads at runtime, so the bound and the work are
   # derived from one file.
+  #
+  # CONCATENATE the path, do NOT interpolate it. `hartSrc + "/..."` keeps a PATH
+  # value; `"${hartSrc}/..."` coerces the repo root to a STRING, which forces the
+  # whole source tree to be a realised store path at EVALUATION time. That is what
+  # the interpolated form did here between 52a8a34 and this commit, and it broke
+  # the flake evaluation gate with
+  #     error: path '/nix/store/<hash>-<hash>-source' is not valid
+  # on every run, naming a different path each time. Nothing built for a day, so
+  # no image could carry any commit to any node. hart-comp.nix:59
+  # (`compositorSrc = hartSrc + "/compositor"`) is the established form; match it.
   spectrum = builtins.fromJSON
-    (builtins.readFile "${hartSrc}/scripts/agent_baseline/spectrum.json");
+    (builtins.readFile (hartSrc + "/scripts/agent_baseline/spectrum.json"));
   worstBudgetMs = lib.foldl'
     (acc: b: let ms = b.total_ms or 0; in if ms > acc then ms else acc)
     0

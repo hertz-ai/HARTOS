@@ -4263,3 +4263,68 @@ class TestOtaBootableOnRawNodes:
             "self-build and OTA must target the SAME config; divergence means "
             "a manual rebuild and an OTA apply can produce different systems")
         assert "#hart-$VARIANT" not in src, "inline attr construction must be gone"
+
+
+class TestNoEvalTimeReadOfAnInterpolatedSource:
+    """A source tree read at EVAL time must be concatenated, never interpolated.
+
+    `hartSrc` is the repo root handed to every module through the flake's
+    specialArgs. There are two ways to reach a file inside it and they are not
+    equivalent:
+
+        hartSrc + "/scripts/x.json"     -> stays a PATH. Lazy. Fine.
+        "${hartSrc}/scripts/x.json"     -> coerces the tree to a STRING, which
+                                           forces the whole source to be a
+                                           REALISED store path right then.
+
+    Interpolating is harmless inside a derivation's build script, where Nix
+    copies the source in as a build input, and several modules legitimately do
+    that (hart-installer, hart-onboarding, hart-app). It is NOT harmless when the
+    result is handed to builtins.readFile/readDir at evaluation time, outside any
+    derivation: evaluation then depends on a store object that the flake
+    evaluation gate does not have.
+
+    52a8a34 did exactly that to derive a systemd timeout from spectrum.json. The
+    gate went red on every run with
+
+        error: path '/nix/store/<hash>-<hash>-source' is not valid
+
+    naming a DIFFERENT path each time, which made it read like flaky
+    infrastructure rather than a code defect. Nothing built for a day, so none of
+    that day's commits could reach any node, and the OTA path was silently dead
+    the whole time. The build being green is what carries work to the fleet, so a
+    break here is not a CI inconvenience, it is a delivery outage.
+    """
+
+    EVAL_READERS = ("readFile", "readDir", "fromJSON", "fromTOML", "pathExists")
+
+    def _nix_files(self):
+        return glob.glob(os.path.join(NIXOS_DIR, "**", "*.nix"), recursive=True)
+
+    def test_no_builtin_reads_an_interpolated_source_tree(self):
+        offenders = []
+        for path in self._nix_files():
+            src = read_nix(path)
+            for line in src.splitlines():
+                code = line.split("#", 1)[0]          # prose may discuss the form
+                if '"${hartSrc}' not in code and '"${self}' not in code:
+                    continue
+                if any(("builtins." + fn) in code or (fn + " ") in code
+                       for fn in self.EVAL_READERS):
+                    offenders.append("%s: %s" % (os.path.basename(path), code.strip()))
+        assert not offenders, (
+            "eval-time read of a string-interpolated source tree:\n  "
+            + "\n  ".join(offenders)
+            + "\nUse path concatenation instead: (hartSrc + \"/dir/file.json\"). "
+              "The interpolated form makes evaluation depend on a realised store "
+              "path and takes the whole flake evaluation gate down with it.")
+
+    def test_the_baseline_timeout_still_derives_from_spectrum(self):
+        """Guard the fix without re-freezing the bug: the derivation must stay,
+        in the safe form. Deleting the read would silently restore the flat 300s
+        timeout that killed every baseline run."""
+        src = read_nix(os.path.join(MODULES_DIR, "hart-agent-baseline.nix"))
+        assert 'hartSrc + "/scripts/agent_baseline/spectrum.json"' in src, (
+            "the timeout must still be derived from spectrum.json, via path "
+            "concatenation")
+        assert 'readFile "${hartSrc}' not in src
