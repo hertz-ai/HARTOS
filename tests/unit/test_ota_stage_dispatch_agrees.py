@@ -146,3 +146,59 @@ def test_start_upgrade_still_accepts_the_terminal_states():
         assert "UpgradeStage.%s.value" % name in body, (
             "start_upgrade no longer treats %s as startable; the dispatch routes "
             "it to a fresh check and would now be rejected there" % name)
+
+
+class TestNoMeasurementIsNotAZeroPassRate:
+    """The test gate must not score an unmeasured run as a total failure.
+
+    _stage_test read its metrics with `.get('value', 0)`, so an adapter that
+    returned no metrics produced pass_rate=0.0, tripped the `< 0.95` gate, and
+    failed the pipeline with:
+
+        pass_rate=0.00%, fail=0
+
+    Zero percent passing alongside zero failures is not a quality result, it is
+    the shape of a run that never happened. That exact string is what the real
+    box recorded on 2026-08-24, and combined with the dispatch bug above it left
+    the node unable to update for three days.
+
+    It was inconsistent too: a MISSING adapter returns True and skips, while an
+    adapter returning nothing failed hard. Both are the same condition, no
+    evidence, and must not read as opposite verdicts.
+
+    The gate still FAILS on no measurement, because passing an unverified build
+    is the silent-success lie this codebase keeps deleting. What changes is that
+    it says so, instead of inventing a 0% score.
+    """
+
+    def _stage_test_src(self):
+        src = _read(ORCH)
+        i = src.index("def _stage_test")
+        return src[i: src.index("def _stage_audit")]
+
+    def test_metrics_are_not_defaulted_to_zero(self):
+        body = self._stage_test_src()
+        assert ".get('value', 0)" not in body, (
+            "_stage_test defaults a missing metric to 0, which makes an "
+            "unmeasured run indistinguishable from a 0% pass rate")
+
+    def test_absent_pass_rate_is_detected_explicitly(self):
+        body = self._stage_test_src()
+        assert "pass_rate is None" in body, (
+            "_stage_test must distinguish an absent pass_rate from a real 0.0")
+
+    def test_the_failure_message_names_the_real_cause(self):
+        """An operator reading the journal must see an infrastructure problem,
+        not a code-quality verdict."""
+        body = self._stage_test_src()
+        assert "NO pass_rate metric" in body, (
+            "the no-measurement failure must say that nothing was measured; "
+            "'pass_rate=0.00%, fail=0' reads as though every test failed")
+
+    def test_a_real_zero_pass_rate_still_fails(self):
+        """Guard the other direction: this must not become a way to pass a build
+        where the tests genuinely all failed."""
+        body = self._stage_test_src()
+        assert "pass_rate < 0.95" in body, (
+            "the quality gate itself must survive; only the UNMEASURED case is "
+            "reclassified, never a measured failure")

@@ -217,8 +217,31 @@ class UpgradeOrchestrator:
                 return True, 'regression adapter not available, skipping'
             result = adapter.run()
             metrics = result.get('metrics', {})
-            pass_rate = metrics.get('pass_rate', {}).get('value', 0)
-            fail_count = metrics.get('fail_count', {}).get('value', 0)
+            # NO MEASUREMENT IS NOT A 0% PASS RATE.
+            #
+            # These used to default to 0, so an adapter that produced no metrics
+            # at all scored pass_rate=0.0 and tripped the `< 0.95` gate. The
+            # verdict was indistinguishable from a build where every test failed:
+            #     pass_rate=0.00%, fail=0
+            # Zero percent passing with zero failures is not a quality result, it
+            # is the shape of a run that never happened. The real box wedged on
+            # exactly this string (2026-08-24) and sat unable to update until
+            # 2026-08-27.
+            #
+            # It was also inconsistent: a MISSING adapter returns True and skips
+            # (above), while an adapter returning nothing failed hard. Both are
+            # the same condition, no evidence, and must read the same way.
+            pass_rate = metrics.get('pass_rate', {}).get('value')
+            fail_count = metrics.get('fail_count', {}).get('value')
+            if pass_rate is None:
+                # Fail, because passing an unverified build is the silent-success
+                # lie this codebase keeps having to delete. But say WHY, so the
+                # operator sees an infrastructure problem and not a code verdict.
+                return False, ('regression produced NO pass_rate metric; refusing '
+                               'to score an unmeasured run as 0%. Adapter returned '
+                               f'keys: {sorted(metrics) or "none"}')
+            if fail_count is None:
+                fail_count = 0
             if pass_rate < 0.95:
                 return False, f'pass_rate={pass_rate:.2%}, fail={fail_count}'
             return True, f'pass_rate={pass_rate:.2%}, fail={fail_count}'
