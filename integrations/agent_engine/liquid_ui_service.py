@@ -6072,8 +6072,27 @@ document.addEventListener('keydown', function(e) {{
 document.addEventListener('contextmenu', e => {{
   e.preventDefault();
   const menu = document.getElementById('ctx-menu');
-  // Desktop right-click
-  if(e.target.classList.contains('wallpaper')||e.target===document.body) {{
+  // Desktop right-click = anything NOT inside real chrome.
+  //
+  // This used to test the opposite way: `e.target` had to BE `.wallpaper` or
+  // `document.body`. That enumerated the backdrop, and the backdrop kept
+  // growing. `.hart-ambient`, `.hart-bloom-canvas`, `.hart-grain`,
+  // `.hart-vignette` and `.hart-hero` all paint OVER `.wallpaper` and cover the
+  // screen, so in practice a right-click on the desktop landed on one of THEM,
+  // failed the test, and produced the two-item "Open in New Panel / Properties"
+  // menu, whose items do nothing.
+  //
+  // Personalize is reachable ONLY from this menu, and Personalize is where the
+  // orb-style picker lives (hartPersonalize.js -> HartSession.orb_style). So the
+  // orb chooser was built, loaded and completely unreachable: "orb selection was
+  // there but not able to see that". Same for wallpaper and auto-arrange.
+  //
+  // Inverting it makes the test stable: new backdrop or decoration layers are
+  // desktop by default, and only real chrome has to be named.
+  const _chrome = e.target.closest && e.target.closest(
+    '.panel-container,.taskbar,#taskbar,#ctx-menu,.hart-topbar,.start-menu,'
+    + 'input,textarea,button,a,select,[contenteditable]');
+  if(!_chrome) {{
     menu.innerHTML = [
       ctxItem('add_to_home_screen','Add app to desktop','window.hartAddAppPicker&&hartAddAppPicker()'),
       ctxItem('grid_view','Auto-arrange icons','window.hartAutoArrange&&hartAutoArrange()'),
