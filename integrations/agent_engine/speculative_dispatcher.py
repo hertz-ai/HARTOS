@@ -49,8 +49,11 @@ When a turn escalates, ``_expert_background_task`` dispatches via
 
 When the expert returns, ``_deliver_expert_response`` bubble-replaces
 the standby via the existing ``speculation_id`` channel: SSE for the
-chat UI + TTS pupit topic for voice. The fast_response stays only when
-the expert returned empty or got guardrail-blocked.
+chat UI, TTS pupit topic for voice, and — since 2026-08-26 — a second
+message back through the originating messaging channel (Discord/Slack/
+etc.), via ``channel_context`` captured at schedule time. The
+fast_response stays only when the expert returned empty or got
+guardrail-blocked.
 
 Guardrails at every layer
 -------------------------
@@ -1308,6 +1311,21 @@ class SpeculativeDispatcher:
         if not self._check_and_reserve_budget(user_id, goal_id, expert_model):
             return False
 
+        # Capture the originating channel (Discord/Slack/etc.) the same way
+        # #162 captures request_id below — thread-locals don't cross the
+        # pool boundary, so this must happen on the request thread, before
+        # submit. Stashed in self._active (not threaded through 3 layers of
+        # background-task submission, same rationale as #224's user_pref)
+        # so _deliver_expert_response can add channels as a third delivery
+        # leg alongside the existing Crossbar/TTS legs — closes the gap
+        # documented since 2026-08-14 where an escalated expert answer
+        # never reached the channel that asked the question.
+        try:
+            from threadlocal import thread_local_data as _tl_cc
+            _channel_context = _tl_cc.get_channel_context()
+        except Exception:
+            _channel_context = None
+
         with self._lock:
             entry = {
                 origin_model_role: origin_model_id,
@@ -1320,6 +1338,7 @@ class SpeculativeDispatcher:
                 # record_interaction on local_only without re-plumbing the
                 # parameter through 3 layers of background-task submission.
                 'user_pref': user_pref,
+                'channel_context': _channel_context,
             }
             if delegate is not None:
                 entry['delegate'] = delegate
@@ -1995,7 +2014,9 @@ class SpeculativeDispatcher:
 
     def _deliver_expert_response(self, user_id: str, prompt_id: str,
                                   speculation_id: str, response: str):
-        """Dual-channel async delivery: Crossbar chat topic + TTS pupit topic.
+        """Async delivery, three legs: Crossbar chat topic (SSE), TTS pupit
+        topic, and — if this turn originated on a messaging channel — the
+        originating channel itself via ``ChannelRegistry.send_to_channel``.
 
         Worker-thread safe — uses ``core.safe_hartos_attr`` to read
         hart_intelligence symbols without triggering Python's per-module
@@ -2051,6 +2072,62 @@ class SpeculativeDispatcher:
                 )
         except Exception as e:
             logger.debug(f"Expert TTS publish failed: spec={speculation_id} err={e}")
+
+        # 3. Deliver to the originating messaging channel (Discord/Slack/
+        #    Telegram/etc.), if this turn came from one. Legs 1+2 above are
+        #    UI-only (SSE chat topic + TTS) — integrations/channels/ never
+        #    subscribed to either, so before this a channel user only ever
+        #    saw the draft standby ("Let me check that for you…") and the
+        #    real expert answer vanished. channel_context was captured on
+        #    the request thread at schedule time (see
+        #    _schedule_expert_background) since thread-locals don't cross
+        #    the background-pool boundary.
+        try:
+            with self._lock:
+                _channel_context = self._active.get(speculation_id, {}).get(
+                    'channel_context')
+            if _channel_context and _channel_context.get('channel') and \
+                    _channel_context.get('chat_id'):
+                from integrations.channels.registry import get_registry
+                from integrations.channels.flask_integration import (
+                    get_channel_integration)
+                import asyncio as _asyncio
+
+                _registry = get_registry()
+                # The running asyncio loop lives on FlaskChannelIntegration
+                # (_run_async_loop's own event loop, in its background
+                # thread) — NOT on ChannelRegistry, which has no _loop
+                # attribute at all. This worker thread (spec_expert_N) has
+                # no loop of its own, so asyncio.get_event_loop() would
+                # always raise here; the integration singleton is the only
+                # correct source.
+                _loop = getattr(get_channel_integration(), '_loop', None)
+                if _loop and _loop.is_running():
+                    _asyncio.run_coroutine_threadsafe(
+                        _registry.send_to_channel(
+                            _channel_context['channel'],
+                            _channel_context['chat_id'],
+                            response,
+                        ),
+                        _loop,
+                    )
+                    logger.info(
+                        "Expert channel delivery scheduled: spec=%s "
+                        "channel=%s chat_id=%s",
+                        speculation_id, _channel_context['channel'],
+                        _channel_context['chat_id'],
+                    )
+                else:
+                    logger.info(
+                        "Expert channel delivery skipped: spec=%s "
+                        "channel=%s — no running event loop",
+                        speculation_id, _channel_context.get('channel'),
+                    )
+        except Exception as e:
+            logger.warning(
+                "Expert channel delivery failed: spec=%s user=%s err=%s",
+                speculation_id, user_id, e,
+            )
 
         logger.info(f"Expert enhancement delivered: spec={speculation_id}, "
                      f"user={user_id}")
