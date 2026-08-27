@@ -524,7 +524,30 @@ in
           STAGE=$(echo "$RESULT" | ${pkgs.jq}/bin/jq -r '.stage // "idle"')
           echo "[HART OTA] Pipeline stage: $STAGE"
 
-          if [[ "$STAGE" == "idle" ]]; then
+          # TERMINAL, NOT-YET-APPLIED stages all mean the same thing here: no
+          # pipeline is running, so go look for work. `failed` and `rolled_back`
+          # used to fall through to the catch-all "advancing" branch below, which
+          # called advance_pipeline on a stage that has no handler (advance only
+          # knows the 7 ACTIVE stages). Every tick then printed
+          #     Pipeline in progress (failed), advancing...
+          #     Advanced: {'success': False, 'error': 'No handler for stage: failed'}
+          # and exited 0. The node was wedged permanently: ONE failed upgrade
+          # meant it could never accept another, and it reported success while
+          # doing nothing. Observed on the real box 2026-08-27, sitting on
+          # b229551 with four newer commits waiting and no way to take them.
+          #
+          # This is not a new policy, it is the orchestrator's EXISTING one:
+          # start_upgrade already accepts IDLE, COMPLETED, ROLLED_BACK and FAILED
+          # as startable (upgrade_orchestrator.py start_upgrade). The dispatch
+          # here had drifted from it, so a state start_upgrade would have gladly
+          # taken could never reach start_upgrade at all.
+          if [[ "$STAGE" == "idle" || "$STAGE" == "failed" || "$STAGE" == "rolled_back" ]]; then
+            if [[ "$STAGE" != "idle" ]]; then
+              # Say it out loud. A pipeline that fails every attempt must look
+              # different from one that simply has nothing to do, or a node that
+              # CANNOT upgrade reads exactly like a node with nothing to take.
+              echo "[HART OTA] Previous pipeline ended in '$STAGE'; starting a fresh check." >&2
+            fi
             # ── Resolve the approved {flake_ref, commit} for this channel ──
             # PRIMARY source = CENTRAL authority (the queen-bee account decides
             # which revision each channel is cleared to run). We poll CENTRAL,
@@ -656,10 +679,27 @@ in
             else
               echo "[HART OTA] Update staged. Run 'hart-ota apply' to switch."
             fi
-          else
+          elif [[ "$STAGE" == "building" || "$STAGE" == "testing" \
+               || "$STAGE" == "auditing" || "$STAGE" == "benchmarking" \
+               || "$STAGE" == "signing" || "$STAGE" == "canary" \
+               || "$STAGE" == "deploying" ]]; then
+            # ONLY the seven stages advance_pipeline actually has handlers for.
+            # This was a catch-all `else`, which is how `failed` ended up being
+            # "advanced" every tick forever. Naming the active stages means a
+            # stage that cannot be advanced can never again be silently handed to
+            # the advancer.
             echo "[HART OTA] Pipeline in progress ($STAGE), advancing..."
             ${hartApp.python}/bin/python ${otaOrchestratorDrive} advance \
               || echo "[HART OTA] Advance failed"
+          else
+            # A stage this script does not know. Do NOT advance it and do NOT
+            # call it success: an unrecognised state is exactly the condition
+            # that wedged this node, and it must be loud rather than routed into
+            # whichever branch happens to be last.
+            echo "[HART OTA] UNKNOWN pipeline stage '$STAGE' - not advancing." >&2
+            echo "[HART OTA] The orchestrator and this dispatch disagree about the" >&2
+            echo "[HART OTA] stage set; reconcile them before this node can update." >&2
+            exit 1
           fi
         '';
 
