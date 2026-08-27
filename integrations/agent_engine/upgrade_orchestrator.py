@@ -216,6 +216,15 @@ class UpgradeOrchestrator:
             if not adapter:
                 return True, 'regression adapter not available, skipping'
             result = adapter.run()
+            # A node that carries no test suite cannot run a regression, and
+            # never could. That is a SKIP, exactly like the missing-adapter
+            # branch above, not a verdict on the build: CI ran the full suite
+            # before this revision was signed and cached, and the local safety
+            # gates are SIGN and CANARY (see hart-ota.nix). Treating an
+            # impossible measurement as a failure is what wedged the fleet.
+            skipped = result.get('skipped')
+            if skipped:
+                return True, 'regression skipped: %s' % skipped
             metrics = result.get('metrics', {})
             # NO MEASUREMENT IS NOT A 0% PASS RATE.
             #

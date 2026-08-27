@@ -134,6 +134,21 @@ class RegressionAdapter(BenchmarkAdapter):
             # running us, which by definition exists and has our dependencies.
             if not os.path.isabs(python) and not os.path.exists(python):
                 python = sys.executable
+            root = os.environ.get(
+                'HEVOLVE_PROJECT_ROOT',
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+            # A DEPLOYED NODE CARRIES NO TEST SUITE. hart-app ships the runtime
+            # only, so `pytest tests/` there collects nothing and there is no
+            # interpreter or flag that changes it: the files are simply absent.
+            # Report that as a distinct SKIP rather than a failure. The build
+            # being gated already ran the full suite in CI before it was signed
+            # and cached, and this module's own safety model names SIGN and
+            # CANARY as the local gates, not regression. Calling an impossible
+            # measurement a failure is what left the real box unable to update.
+            if not os.path.isdir(os.path.join(root, 'tests')):
+                return {'metrics': {},
+                        'skipped': 'no test suite at %s (deployed node: '
+                                   'regression is gated in CI, not here)' % root}
             result = subprocess.run(
                 [python, '-m', 'pytest', 'tests/', '-s',
                  '--ignore=tests/runtime_tests', '-q',

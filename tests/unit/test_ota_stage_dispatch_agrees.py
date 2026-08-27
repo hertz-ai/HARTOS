@@ -266,3 +266,60 @@ class TestRegressionAdapterReportsWhyItFoundNothing:
         assert "result.get('error')" in body, (
             "_stage_test must surface the adapter's own error; discarding it is "
             "why the box reported a fake 0% instead of 'no interpreter found'")
+
+
+class TestDeployedNodeSkipsRegressionRatherThanFailing:
+    """A node with no test suite must SKIP the regression gate, not fail it.
+
+    hart-app ships the runtime only. There is no tests/ directory on a deployed
+    node, so `pytest tests/` collects nothing and no interpreter or flag can
+    change that: the files are absent. The gate was therefore impossible to
+    satisfy on the exact hardware it was meant to gate, and it failed every
+    upgrade attempt on every node, permanently.
+
+    This is not a safety hole. hart-ota.nix states the local safety model
+    plainly: central chooses WHICH commit, and the node still runs sign-verify
+    and canary. Regression belongs to CI, which ran the full suite before the
+    revision was signed and pushed to the cache. Running it again on a potato
+    node was always redundant; the bug is that its impossibility was scored as a
+    failure.
+
+    The precedent was already there three lines up: a MISSING adapter returns
+    True and skips. A node with no tests is the same condition.
+    """
+
+    def _adapter_src(self):
+        p = os.path.join(REPO, "integrations", "agent_engine",
+                         "benchmark_registry.py")
+        src = _read(p)
+        i = src.index("class RegressionAdapter")
+        return src[i: src.index("class GuardrailAdapter")]
+
+    def test_adapter_detects_a_missing_test_suite(self):
+        body = self._adapter_src()
+        assert "isdir(os.path.join(root, 'tests'))" in body, (
+            "the adapter must notice that the node has no test suite before it "
+            "tries to run one")
+        assert "'skipped'" in body, (
+            "a missing suite must be reported as a skip, distinct from both a "
+            "measured failure and an adapter error")
+
+    def test_stage_test_treats_a_skip_as_a_pass(self):
+        src = _read(ORCH)
+        body = src[src.index("def _stage_test"): src.index("def _stage_audit")]
+        assert "result.get('skipped')" in body, (
+            "_stage_test must honour the adapter's skip; otherwise a deployed "
+            "node can never complete an upgrade")
+        i = body.index("result.get('skipped')")
+        assert "return True" in body[i:i + 240], (
+            "a skip must pass the stage, matching the missing-adapter branch")
+
+    def test_a_skip_is_not_confused_with_a_measured_result(self):
+        """The skip path must not also invent a pass_rate, or it would report a
+        fake 100% just as the old code reported a fake 0%."""
+        body = self._adapter_src()
+        i = body.index("'skipped'")
+        window = body[max(0, i - 400): i + 200]
+        assert "'pass_rate'" not in window, (
+            "the skip branch must return NO pass_rate; fabricating one is the "
+            "same class of lie as the 0.00% it replaces")
