@@ -62,6 +62,28 @@ in
         default = false;
         description = "Include Google Play Services and Play Store";
       };
+
+      minFreeMB = lib.mkOption {
+        type = lib.types.int;
+        default = 4096;
+        description = ''
+          Free megabytes required under /var/lib before hart-waydroid-init will
+          fetch the Android system image. Below this it SKIPS and retries on a
+          later boot.
+
+          Android is an optional subsystem; the OS is not. The image is ~700MB
+          compressed and is staged in /var/lib/waydroid/cache_http before being
+          unpacked, so an attempt needs several GB of headroom. Without a floor
+          it will fill the disk and take the node with it, which is measured
+          rather than theoretical: on the 28G fleet stick (2026-08-24) repeated
+          attempts left 0.8-1.7GB of partials behind and drove the filesystem to
+          100%, which broke the OTA request writer with "No space left on
+          device" and made a user's app install fail.
+
+          4096 leaves room for the download, the unpack, and an OTA generation
+          on top. Lower it only on a node with a disk to spare.
+        '';
+      };
     };
 
     # ─── Subsystem 3: Windows Native ───
@@ -411,10 +433,64 @@ in
           ExecStart = pkgs.writeShellScript "hart-waydroid-init" ''
             set -uo pipefail
             echo "[HART OS] Waydroid first-boot init (best-effort, non-blocking)..."
+
+            # DISK GUARD. The image is ~700MB compressed and waydroid stages it in
+            # /var/lib/waydroid/cache_http before unpacking, so a run needs multiple
+            # GB of headroom. Without this it will happily fill the disk and take the
+            # whole node down with it, which is not hypothetical: on the 28G fleet
+            # stick (2026-08-24) repeated attempts left an 800MB-1.7GB partial behind
+            # and drove the filesystem to 100%, which broke an OTA request writer
+            # ("No space left on device") and made a user's app install fail. Making
+            # this unit non-blocking (Type=simple, above) actually made the disk risk
+            # WORSE, because the download now gets the full RuntimeMaxSec window
+            # instead of dying at a 600s start timeout.
+            #
+            # Skipping is the correct outcome, not a failure: ConditionPathExists
+            # re-arms this unit on the next boot, so a node that frees space gets its
+            # image later. A node that filled its disk gets a working OS instead.
+            NEED_MB=${toString sub.android.minFreeMB}
+            FREE_MB=$(${pkgs.coreutils}/bin/df -Pm /var/lib | ${pkgs.gnugrep}/bin/grep -v Filesystem | ${pkgs.gawk}/bin/awk '{print $4}' | head -1)
+            # Empty or non-numeric df output means "could not measure"; treat it
+            # as 0 free so the floor below refuses, rather than letting an
+            # unparsed value through as though it were headroom.
+            #
+            # The empty pattern below is written with DOUBLE quotes on purpose.
+            # An empty single-quoted pattern cannot be written here: this whole
+            # script lives inside a Nix indented string, where a pair of single
+            # quotes ENDS the string and the escape for an emitted pair is three
+            # of them. Getting that count wrong shipped an unbalanced case
+            # statement and the unit failed to build with "unexpected EOF while
+            # looking for matching quote", taking every ISO and raw image with
+            # it (CI 2026-08-25). Double quotes mean the same thing to the shell
+            # and need no Nix escaping at all, so the trap cannot return.
+            #
+            # NOTE TO A FUTURE EDITOR: do not put single-quote characters in
+            # this comment either. The comment is INSIDE the string, so Nix
+            # parses those quotes too, and a well-meaning explanation of the
+            # escape rule is itself enough to break the parse -- which is
+            # exactly how the follow-up commit failed. Say it in words.
+            # Guarded in tests/unit/test_native_subsystems_nixos.py.
+            case "$FREE_MB" in ""|*[!0-9]*) FREE_MB=0 ;; esac
+            if [ "$FREE_MB" -lt "$NEED_MB" ]; then
+              echo "[HART OS] waydroid init SKIPPED — ''${FREE_MB}MB free, need ''${NEED_MB}MB." \
+                   "Not filling the disk for an optional subsystem; retries next boot."
+              exit 0
+            fi
+
+            # Clean any partial from a previous interrupted run before starting, so
+            # aborted attempts cannot accumulate across boots.
+            ${pkgs.coreutils}/bin/rm -rf /var/lib/waydroid/cache_http 2>/dev/null || true
+
             # ${if sub.android.playStore then "GApps" else "vanilla"} system image.
-            ${pkgs.waydroid}/bin/waydroid init \
-              ${lib.optionalString sub.android.playStore "-s GAPPS"} || \
+            if ${pkgs.waydroid}/bin/waydroid init \
+                 ${lib.optionalString sub.android.playStore "-s GAPPS"}; then
+              echo "[HART OS] waydroid init complete"
+            else
               echo "[HART OS] waydroid init deferred (no network / mirror down) — will retry next boot"
+              # Drop the partial: keeping it buys nothing (waydroid re-fetches) and it
+              # is exactly what accumulated to 1.7GB on the fleet stick.
+              ${pkgs.coreutils}/bin/rm -rf /var/lib/waydroid/cache_http 2>/dev/null || true
+            fi
             exit 0
           '';
         };

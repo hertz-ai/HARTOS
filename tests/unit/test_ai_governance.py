@@ -275,6 +275,38 @@ class TestConsentScoring:
         assert sig.score < 0.3
         assert 'ask' in sig.reasoning.lower()
 
+    def test_consent_missing_files_ask_through_canonical_site(self):
+        """The guardian's denied path must route through
+        ConsentService.request_consent — the one filing site whose _emit
+        rides the canonical fan-out — not a raw emit_event that reached
+        only in-process subscribers (the pre-2026-08-26 behavior)."""
+        import contextlib
+        from unittest.mock import MagicMock, patch
+        from integrations.social import models as social_models
+        from integrations.social.consent_service import ConsentService
+
+        db = MagicMock()
+
+        @contextlib.contextmanager
+        def db_session(commit=False):
+            yield db
+
+        with patch.object(social_models, 'db_session', db_session), \
+             patch.object(ConsentService, 'check_consent',
+                          staticmethod(lambda *a, **k: False)), \
+             patch.object(ConsentService, 'request_consent') as req:
+            sig = _score_human_consent({
+                'requires_consent': True,
+                'consent_given': False,
+                'user_id': 'u-guardian',
+                'consent_type': 'data_access',
+            })
+
+        assert sig.score < 0.3
+        req.assert_called_once()
+        assert req.call_args[0][1] == 'u-guardian'
+        assert req.call_args[0][2] == 'data_access'
+
     def test_expired_consent_degrades_gently(self):
         """Expired consent should degrade, not binary block."""
         sig = _score_human_consent({

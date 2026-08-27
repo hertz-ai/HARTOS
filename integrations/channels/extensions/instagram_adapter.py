@@ -751,6 +751,31 @@ class InstagramAdapter(ChannelAdapter):
             return parent
         return await self._publish_container(parent.message_id)
 
+    async def publish_reel(
+        self,
+        video_url: str,
+        caption: str = "",
+    ) -> SendResult:
+        """Publish ONE video as a Reel to the feed. Returns the media id.
+
+        Reels are the daemon video-editor's output format, and the reason feed
+        publishing existed only for images until now.  Same 3-step container
+        flow as publish_photo (create -> poll -> publish), but media_type=REELS
+        with a ``video_url`` instead of an image.  Video containers take longer
+        to reach FINISHED than images, so this is the tier most likely to
+        exhaust the poll window; _wait_for_container reports "not ready after N
+        polls" rather than publishing a half-processed reel — a caller can
+        retry the publish on the same creation_id once Meta finishes it.
+        """
+        container = await self._create_media_container({
+            "media_type": "REELS",
+            "video_url": video_url,
+            "caption": caption[:self.CAPTION_MAX_CHARS],
+        })
+        if not container.success:
+            return container
+        return await self._publish_container(container.message_id)
+
     async def _create_media_container(
         self,
         params: Dict[str, Any],

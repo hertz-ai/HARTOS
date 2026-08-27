@@ -1859,6 +1859,23 @@ def _init_learning_pipeline():
     """
     global _learning_provider, _hive_mind, _trace_recorder
 
+    # RFC-B (2026-08-25): one learning home in bundled mode. The docstring's
+    # "instead of starting a separate server on port 8000" predates
+    # hevolveai_supervisor, which now always spawns (or adopts) that server
+    # in bundled Nunba and exports HEVOLVEAI_API_URL before this delayed
+    # init runs (measured: export 19:15:49 vs this init 19:19:13; export
+    # ~18:23 vs init 18:27:15). Running BOTH stacks grew commit ~23GB/h
+    # (snapshots 21:40→22:17) and OOM-killed the app at 22:2x. When bundled
+    # and a server is designated, the child is the sole learning home; the
+    # WorldModelBridge already carries stats/experiences/skills over HTTP
+    # (the http_disabled heal + the Direction-B poller, both live-proven).
+    if _is_bundled() and os.environ.get('HEVOLVEAI_API_URL'):
+        logging.getLogger(__name__).info(
+            "learning pipeline: skipping in-process init — supervisor-managed "
+            "hevolveai at %s is the learning home (RFC-B)",
+            os.environ['HEVOLVEAI_API_URL'])
+        return
+
     try:
         # G2: Ensure HevolveArmor's import hook is installed before the first
         # `import hevolveai.*` statement runs below.  `try_import_hevolveai`
@@ -5861,7 +5878,12 @@ class CustomGPT(LLM):
         thread_local_data.update_req_token_count(num_tokens)
         app.logger.info(f"len---->{num_tokens}")
 
-        app.logger.info(f"first time calling {len(prompt)}")
+        # Recall-drop discriminator: prep_inputs logs "Memory loaded: N" on the
+        # load side; Human/AI counts show the history actually rendered here.
+        # N>0 with Human==1 = history dropped between memory merge and format.
+        app.logger.info(
+            f"first time calling {len(prompt)} "
+            f"(history blocks: Human={prompt.count('Human:')} AI={prompt.count('AI:')})")
         publish_chat_stage('generating', user_id=str(thread_local_data.get_user_id() or ''), request_id=str(thread_local_data.get_request_id() or ''))
 
         if self.count > 1 and thread_local_data.get_global_intent() != self.previous_intent:
@@ -6955,14 +6977,14 @@ def parse_visual_context(inp: str):
         #       used and can revoke in one tap.  A prior explicit
         #       revoke returns False and we refuse rather than
         #       silently re-grant.  Never silently uploads.
-        # There is NO request-then-wait branch here.  ConsentService.
-        # request_consent() has zero production callers tree-wide and
-        # emits nothing (its siblings grant_consent /
-        # auto_grant_with_notice / announce_revocation all call _emit;
-        # request_consent does not), so routing through it would
-        # neither prompt the user nor notify any device.  The only live
-        # producer of the consent.request topic is
-        # security/ai_governance.py:695.
+        # There is NO request-then-wait branch here BY DESIGN: this hot
+        # path must answer the turn, so it auto-grants-with-notice
+        # rather than ask-and-block.  (The old rationale -- that
+        # request_consent had zero callers and emitted nothing -- is
+        # obsolete as of 2026-08-26: the daemon-goal gate and the
+        # screen producer both file asks through it, and it now _emits
+        # consent.request like its siblings.  The design choice above
+        # is what keeps this branch auto-grant, not that gap.)
         from core.config_cache import get_vision_api
         _user_vision_url = (get_vision_api() or '').strip()
         _allow_cloud = (

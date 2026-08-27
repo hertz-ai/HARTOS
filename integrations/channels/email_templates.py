@@ -3,9 +3,18 @@
 Kept as data rather than buried in a script so the wording can be reviewed and
 argued with, which is the part that actually decides whether anyone replies.
 
+Provenance, because it governs what we may honestly say: these addresses are
+NOT hevolve.ai registrants. There is no hevolve.ai signup list (see the iOS
+note in ~/.hevolve/PENDING.md: "it collects no email, because there is no
+list"). They are the owner's own contacts migrated from earlier HertzAI
+systems. So the copy says exactly that and no more. Do not reintroduce a "you
+signed up / registered at hevolve.ai" claim; it is false and it is the kind of
+fabricated-relationship line we have standing instructions never to write.
+
 The first version read like a product announcement: "You created a Hevolve
-account a while back. Nunba is our desktop AI companion." Accurate, and nobody
-would ever act on it. No reason to care today, no voice, sent from a system
+account a while back. Nunba is our desktop AI companion." It read as accurate
+at the time but was not (see provenance above), and nobody would ever act on
+it. No reason to care today, no voice, sent from a system
 address.
 
 What this version does:
@@ -44,8 +53,8 @@ SUBJECT = "Your own AI, free forever, running on your laptop"
 
 TEXT = """Hi,
 
-I am Sathish. I run Hevolve in Chennai. You signed up with us a while ago, so
-I wanted to write to you myself.
+I am Sathish. I run Hevolve in Chennai, which is part of HertzAI. You are on
+an early HertzAI contact list of ours, so I wanted to write to you myself.
 
 We spent the last two years building something called Nunba, and I would like
 to give it to you. Not a free trial. Not a limited tier with the useful parts
@@ -96,8 +105,9 @@ max-width:520px;margin:0 auto;padding:8px">
 
   <p style="margin:0 0 18px">Hi,</p>
 
-  <p style="margin:0 0 18px">I am Sathish. I run Hevolve in Chennai. You
-  signed up with us a while ago, so I wanted to write to you myself.</p>
+  <p style="margin:0 0 18px">I am Sathish. I run Hevolve in Chennai, which is
+  part of HertzAI. You are on an early HertzAI contact list of ours, so I
+  wanted to write to you myself.</p>
 
   <p style="margin:0 0 18px">We spent the last two years building something
   called <b>Nunba</b>, and I would like to give it to you. Not a free trial.
@@ -147,8 +157,8 @@ max-width:520px;margin:0 auto;padding:8px">
 
   <p style="margin:28px 0 0;padding-top:14px;border-top:1px solid #e8e8e8;\
 font-size:13px;color:#888">
-    You are getting this because you registered at hevolve.ai. Reply with the
-    word <b>unsubscribe</b> and I will take you off this list today.
+    You are getting this because you are on an early HertzAI contact list.
+    Reply with the word <b>unsubscribe</b> and I will take you off today.
   </p>
 </div>
 """

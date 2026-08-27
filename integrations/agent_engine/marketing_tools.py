@@ -68,6 +68,64 @@ def _consent_required_result(channel: str) -> str:
     })
 
 
+def _publish_instagram_feed(user_id, media_url, caption='', *,
+                            _adapter=None, _consent=None):
+    """Publish media to the Instagram FEED (Content Publishing API).
+
+    DISTINCT from post_to_channel, which is messaging (send_message = a DM).  A
+    feed post is a different Meta product: a video URL becomes a Reel
+    (``publish_reel``), an image becomes a feed photo (``publish_photo``) — the
+    daemon video-editor's whole output is reels, which had no code path before.
+    Gated on the same standing ``public_exposure`` consent as every external
+    post.  The adapter methods are async; this drives them from sync agent-tool
+    code through the canonical ``core.event_loop.run_async`` bridge (the same
+    one search_long_term_memory uses), so no new async plumbing and no touch of
+    the shared wamp_bridge dispatcher.
+
+    ``_adapter`` / ``_consent`` are injection seams for tests; production
+    resolves the live Instagram adapter from get_available_adapters and reads
+    real operator consent.
+    """
+    consent = _consent or _external_post_allowed
+    if not consent(user_id):
+        return _consent_required_result('instagram')
+    if not media_url:
+        return json.dumps({'success': False,
+                           'error': 'media_url is required for a feed post'})
+    try:
+        adapter = _adapter
+        if adapter is None:
+            from integrations.channels.extensions import get_available_adapters
+            factories = get_available_adapters()
+            factory = next((f for n, f in factories.items()
+                            if 'instagram' in n.lower()), None)
+            if factory is None:
+                return json.dumps({
+                    'success': False,
+                    'error': ('no instagram adapter available; connect an '
+                              'Instagram business account first'),
+                    'available_channels': list(factories.keys()),
+                })
+            adapter = factory()
+
+        from core.event_loop import run_async
+        base = str(media_url).split('?', 1)[0].lower()
+        is_video = base.endswith(('.mp4', '.mov', '.m4v', '.webm'))
+        coro = (adapter.publish_reel(media_url, caption or '')
+                if is_video else
+                adapter.publish_photo(media_url, caption or ''))
+        res = run_async(coro)
+        return json.dumps({
+            'success': bool(getattr(res, 'success', False)),
+            'channel': 'instagram',
+            'kind': 'reel' if is_video else 'photo',
+            'media_id': getattr(res, 'message_id', None),
+            'error': getattr(res, 'error', None),
+        })
+    except Exception as e:
+        return json.dumps({'success': False, 'error': str(e)})
+
+
 def register_marketing_tools(helper, assistant, user_id: str):
     """Register marketing-specific tools with the agent (Tier 2).
 
@@ -214,6 +272,19 @@ def register_marketing_tools(helper, assistant, user_id: str):
                 })
         except Exception as e:
             return json.dumps({'success': False, 'error': str(e)})
+
+    def publish_to_instagram_feed(
+        media_url: Annotated[str, "URL of the video (.mp4/.mov -> Reel) or image (-> feed photo) to publish"],
+        caption: Annotated[str, "Caption (trimmed to Instagram's 2200-char limit)"] = "",
+    ) -> str:
+        """Publish a video Reel or a photo to the Instagram FEED (not a DM).
+
+        The daemon video-editor's publish step: hand it the finished reel's URL.
+        Feed publishing is Meta's Content Publishing API, distinct from
+        post_to_channel (which is messaging). Gated on standing operator
+        public_exposure consent; needs a connected Instagram business account.
+        """
+        return _publish_instagram_feed(user_id, media_url, caption)
 
     def create_referral_campaign(
         name: Annotated[str, "Campaign name"],
@@ -408,6 +479,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
         ('create_campaign', 'Create a marketing campaign with strategy, targeting, and budget', create_campaign),
         ('create_ad', 'Create a targeted ad unit with budget and audience targeting', create_ad),
         ('post_to_channel', 'Post content to external channels (Twitter, Instagram, Email, Discord, etc.)', post_to_channel),
+        ('publish_to_instagram_feed', 'Publish a video Reel or photo to the Instagram FEED (Content Publishing API) — the daemon video-editor publish step; consent-gated, needs a connected IG business account', publish_to_instagram_feed),
         ('create_referral_campaign', 'Create a referral-driven growth campaign with auto-generated referral code', create_referral_campaign),
         ('get_growth_metrics', 'Get platform growth metrics including viral coefficient (K factor)', get_growth_metrics),
         ('record_demo_video', 'Record a short screen demo video of the app running; returns a file path to attach via post_to_channel/create_social_post media_url', record_demo_video),

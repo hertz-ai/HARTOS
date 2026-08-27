@@ -178,6 +178,16 @@ class FederatedAggregator:
         # EventBus counters (fed by real-time events)
         self._event_counters_lock = threading.Lock()
         self._event_counters: Dict[str, int] = {}
+        # Cumulative genuine-install ledger: distinct node_ids that have EVER
+        # passed the join gate (version/freshness/Ed25519/genuine-build). Unlike
+        # _peer_deltas (active only within the freshness window, decays after
+        # ~1h), this is the MONOTONIC "installs that joined the hive" count —
+        # the number /hive reports toward the fleet target. Persisted in the
+        # durable agent_data mount so it survives restarts and the window.
+        # Only gate-passed nodes are recorded, so it cannot be inflated by
+        # unverified traffic — the anti-cheat carries into the headline figure.
+        self._installs_lock = threading.Lock()
+        self._genuine_installs = self._load_installs_ledger()
 
         # Subscribe to EventBus (if platform is bootstrapped)
         self._subscribe_to_eventbus()
@@ -267,10 +277,24 @@ class FederatedAggregator:
     def extract_local_delta(self) -> Optional[dict]:
         """Pull learning metrics from WorldModelBridge + HiveMind."""
         try:
-            from .world_model_bridge import get_world_model_bridge
-            bridge = get_world_model_bridge()
-            stats = bridge.get_stats()
-            learning_stats = bridge.get_learning_stats()
+            # Learning metrics — degrade to empty on failure so the node still
+            # federates a signed PRESENCE delta. A genuine INSTALL must reach the
+            # census even before its learning bridge has data, and on a frozen
+            # build with no hevolveai where the bridge import raises. Previously
+            # a bridge error returned None (tick() at ~line 220 broadcasts only
+            # on a truthy delta), so a fresh install NEVER reached the census
+            # (#694 "installed but not federating"). The delta below is built
+            # entirely from .get(default) calls, so empty stats yield a valid
+            # zeroed presence delta rather than a KeyError.
+            stats, learning_stats = {}, {}
+            try:
+                from .world_model_bridge import get_world_model_bridge
+                _b = get_world_model_bridge()
+                stats = _b.get_stats() or {}
+                learning_stats = _b.get_learning_stats() or {}
+            except Exception as _be:
+                logger.debug("Federation extract: bridge unavailable, "
+                             "sending presence delta (%s)", _be)
 
             # Get node identity for signing
             node_id = ''
@@ -319,6 +343,45 @@ class FederatedAggregator:
             hivemind_stats = learning_stats.get('hivemind', {})
             bridge_stats = learning_stats.get('bridge', {})
 
+            # hivemind_state carries this node's live learning-core telemetry.
+            # BootstrappedIntelligence.get_stats() (learning core) exposes a real
+            # intelligence_index and a growth rate over joins (OPEN_PROBLEMS.md
+            # problem 1).  Surface them here so hive_census can report a real
+            # collective figure with an honest denominator, reading whichever
+            # sub-dict the bridge populated.  Omitted (never zeroed) when the
+            # learning core did not run, so a presence-only node is absent from
+            # the mean rather than counted as zero, keeping the census
+            # "absent is not zero" contract.  Previously these were dropped here
+            # and the census read a `hivemind` key nothing produced, so
+            # nodes_with_intelligence was structurally 0.
+            _learning_core = learning_stats.get('learning', {}) or {}
+            # HiveMind.get_stats() nests the BootstrappedIntelligence stats
+            # under 'intelligence' (hevolveai hive_mind.py:3588) — reading
+            # only top-level keys left intelligence_index structurally
+            # unreachable on every live node (census null, 2026-08-25).
+            _hm_intelligence = hivemind_stats.get('intelligence') or {}
+
+            def _real_metric(*keys):
+                for _src in (hivemind_stats, _hm_intelligence, _learning_core):
+                    for _k in keys:
+                        _v = _src.get(_k)
+                        if isinstance(_v, (int, float)) and not isinstance(_v, bool):
+                            return _v
+                return None
+
+            hivemind_state = {
+                'agent_count': hivemind_stats.get('agent_count', 0),
+                'total_queries': bridge_stats.get('total_hivemind_queries', 0),
+                'avg_fusion_latency_ms': hivemind_stats.get(
+                    'avg_fusion_latency_ms', 0),
+            }
+            _ii = _real_metric('intelligence_index')
+            if _ii is not None:
+                hivemind_state['intelligence_index'] = _ii
+                _gr = _real_metric('growth_rate', 'growth')
+                if _gr is not None:
+                    hivemind_state['growth_rate'] = _gr
+
             delta = {
                 'version': DELTA_VERSION,
                 'node_id': node_id,
@@ -344,13 +407,7 @@ class FederatedAggregator:
                             bridge_stats.get('total_skills_blocked', 0))
                     ),
                 },
-                'hivemind_state': {
-                    'agent_count': hivemind_stats.get('agent_count', 0),
-                    'total_queries': bridge_stats.get(
-                        'total_hivemind_queries', 0),
-                    'avg_fusion_latency_ms': hivemind_stats.get(
-                        'avg_fusion_latency_ms', 0),
-                },
+                'hivemind_state': hivemind_state,
                 'quality_metrics': {
                     'correction_density': bridge_stats.get(
                         'total_corrections', 0),
@@ -617,6 +674,68 @@ class FederatedAggregator:
         except Exception as e:
             logger.debug(f"Federation broadcast error: {e}")
 
+    def _installs_ledger_path(self):
+        """Durable cumulative-install ledger path — one canonical agent_data
+        resolution, matching core.node_secret."""
+        base = os.environ.get(
+            'HEVOLVE_AGENT_DATA',
+            os.path.join(os.path.expanduser('~'), '.nunba', 'agent_data'))
+        return os.path.join(base, 'federation_installs.json')
+
+    def _load_installs_ledger(self):
+        """Load the set of genuine node_ids seen so far. Empty on first boot or
+        any read error — this is best-effort telemetry, never fatal."""
+        try:
+            p = self._installs_ledger_path()
+            if os.path.isfile(p):
+                with open(p, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return set(data.get('node_ids') or [])
+                if isinstance(data, list):
+                    return set(data)
+        except Exception as e:
+            logger.debug('installs ledger load skipped: %s', e)
+        return set()
+
+    def _record_genuine_install(self, node_id):
+        """Record a gate-passed node_id in the cumulative ledger. Persists ONLY
+        when the node is new (first join), so repeat deltas do no disk I/O.
+        Atomic write (tmp + replace). Never raises — accounting must not break
+        the receive path."""
+        if not node_id:
+            return
+        try:
+            with self._installs_lock:
+                if node_id in self._genuine_installs:
+                    return
+                self._genuine_installs.add(node_id)
+                snapshot = sorted(self._genuine_installs)
+            import tempfile
+            p = self._installs_ledger_path()
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            payload = {'node_ids': snapshot, 'count': len(snapshot)}
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), suffix='.tmp')
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(payload, f)
+                os.replace(tmp, p)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+                raise
+            logger.info('Cumulative genuine installs: %d (new node %s)',
+                        len(snapshot), (node_id or '')[:12])
+        except Exception as e:
+            logger.debug('installs ledger persist skipped: %s', e)
+
+    def total_genuine_installs(self) -> int:
+        """Cumulative distinct genuine node_ids that ever joined the hive."""
+        with self._installs_lock:
+            return len(self._genuine_installs)
+
     def receive_peer_delta(self, delta: dict) -> Tuple[bool, str]:
         """Validate and store incoming peer delta.
 
@@ -649,32 +768,37 @@ class FederatedAggregator:
         if sig:
             try:
                 from security.node_integrity import verify_json_signature
-                # Verify against the delta WITHOUT hmac_signature, because
-                # that field did not exist when the sender signed.
+                # Verify against the delta WITHOUT the fields added AFTER the
+                # sender signed. extract_local_delta() computes the Ed25519
+                # signature over the content delta; broadcast_delta() then adds
+                # TWO more fields before posting: _sign_delta() adds
+                # hmac_signature, and the attestation block adds
+                # origin_attestation. verify_json_signature strips only
+                # 'signature', so any field added post-signing that we do NOT
+                # strip here gets hashed into a payload the signature never
+                # covered — and verification fails with 'invalid signature'.
                 #
-                # Order of operations on the send side: extract_local_delta()
-                # computes the Ed25519 signature, then broadcast_delta() calls
-                # _sign_delta() which ADDS hmac_signature before posting
-                # (line ~422). verify_json_signature strips only 'signature',
-                # so the payload it hashes on this side contains a field the
-                # signed payload did not, and every delta on the wire failed
-                # with 'invalid signature'.
+                # Reproduced live 2026-08-25: a genuine attested delta POSTed
+                # from a real build to central was rejected 'invalid signature'.
+                # Stripping hmac_signature alone (the original 7c430eb8 fix) is
+                # NOT enough once origin_attestation is present — which it is on
+                # every REAL broadcast_delta (the two-node harness passed only
+                # because its dev send-delta attaches no attestation). This was
+                # THE live census-of-1 cause for attested nodes, independent of
+                # the split-identity bug.
                 #
-                # Measured on a real delta from extract_local_delta():
-                #   before _sign_delta                       verifies True
-                #   after  _sign_delta (the wire form)       verifies False
-                #   wire form minus hmac_signature only      verifies True
+                # Measured on a real attested delta:
+                #   wire form                                 verifies False
+                #   minus hmac_signature only                 verifies False
+                #   minus hmac_signature + origin_attestation verifies True
                 #
-                # Since hard is the default enforcement mode, this rejected
-                # every peer delta regardless of networking, which is a second
-                # and independent reason hive-census reported one node.
-                #
-                # Fixed here rather than in verify_json_signature because that
-                # helper is generic and also verifies peer announcements, which
-                # carry no HMAC. The two-signature layering is specific to
-                # federation deltas.
+                # Fixed here, not in verify_json_signature: that helper is
+                # generic and also verifies peer announcements, which carry
+                # neither field. This post-signing layering is federation-delta
+                # specific.
+                _POST_SIGN_FIELDS = ('hmac_signature', 'origin_attestation')
                 _ed_payload = {k: v for k, v in delta.items()
-                               if k != 'hmac_signature'}
+                               if k not in _POST_SIGN_FIELDS}
                 if not verify_json_signature(delta.get('public_key', ''),
                                              _ed_payload, sig):
                     return False, 'invalid signature'
@@ -787,6 +911,11 @@ class FederatedAggregator:
         with self._lock:
             self._peer_deltas[node_id] = delta
 
+        # Cumulative install ledger: this node passed the full join gate, so it
+        # is a genuine install that joined the hive. Monotonic + persistent,
+        # unlike _peer_deltas which decays after the freshness window.
+        self._record_genuine_install(node_id)
+
         return True, 'accepted'
 
     def hive_census(self) -> dict:
@@ -827,10 +956,14 @@ class FederatedAggregator:
 
         def _read(node_id, d, is_local):
             nonlocal index_sum, growth_sum, agents_sum, with_intelligence, stale
-            hive = (d.get('hivemind') or {})
-            # Absent is not zero. A node that reported no hivemind block is not
-            # a node with an intelligence index of 0.0, and averaging it in as
-            # zero would drag the hive figure down for a reason that is an
+            # Read the `hivemind_state` block the node actually sends (built in
+            # extract_local_delta and averaged by aggregate()).  This used to
+            # read `hivemind`, a key no producer emits, so has_idx was always
+            # False and mean_intelligence_index was permanently null.
+            hive = (d.get('hivemind_state') or {})
+            # Absent is not zero. A node that reported no intelligence_index is
+            # not a node with an intelligence index of 0.0, and averaging it in
+            # as zero would drag the hive figure down for a reason that is an
             # artefact of reporting rather than a fact about the network.
             has_idx = 'intelligence_index' in hive
             age = now - float(d.get('timestamp', 0) or 0)
@@ -843,7 +976,7 @@ class FederatedAggregator:
                 'local': is_local,
                 'intelligence_index': hive.get('intelligence_index'),
                 'growth_rate': hive.get('growth_rate'),
-                'num_agents': hive.get('num_agents'),
+                'num_agents': hive.get('num_agents', hive.get('agent_count')),
                 'exponential': hive.get('exponential'),
             }
             per_node[node_id] = entry
@@ -868,6 +1001,12 @@ class FederatedAggregator:
             # The denominator, first, because everything under it is meaningless
             # without it.
             'nodes_reporting': len(per_node),
+            # Cumulative distinct genuine installs that have EVER joined the hive
+            # (monotonic, persistent), vs nodes_reporting which is only those
+            # active in this window. This is the honest "installs" figure the
+            # fleet target is measured against; it counts gate-passed nodes
+            # only, so it cannot be inflated by unverified traffic.
+            'total_installs': self.total_genuine_installs(),
             'nodes_with_intelligence': with_intelligence,
             'nodes_stale': stale,
             'window_seconds': DELTA_MAX_AGE_SECONDS,
@@ -1399,11 +1538,17 @@ class FederatedAggregator:
         except Exception:
             package['recipe_index'] = {}
 
-        # Quality heuristics — community-validated metrics
+        # Quality heuristics — community-validated metrics.
+        # Reads self._peer_deltas (where receive_peer_delta stores accepted
+        # peer learning). The earlier self.peer_deltas had no underscore and no
+        # such attribute exists, so the AttributeError was swallowed by the
+        # except below and a joiner NEVER received the hive's pooled heuristics —
+        # the network-value mechanism was silently a no-op (found + fixed
+        # 2026-08-25 via network_beats_solo_proof.py).
         try:
-            if self.peer_deltas:
+            if self._peer_deltas:
                 quality = {}
-                for d in self.peer_deltas.values():
+                for d in self._peer_deltas.values():
                     qm = d.get('quality_metrics', {})
                     for k, v in qm.items():
                         if isinstance(v, (int, float)):

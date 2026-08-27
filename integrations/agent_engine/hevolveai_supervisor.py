@@ -620,6 +620,59 @@ def run_learning_yield_loop(gate, post, sleep, stop):
         sleep()
 
 
+def run_commit_ceiling_loop(get_commit, recycle, ceiling_bytes, sleep, stop):
+    """Recycle the child before its commit leak starves the DISK (#696).
+
+    Measured 2026-08-26, three consecutive child generations: commit grows
+    ~31-33GB/h (34.6GB at 66min, 26.9GB at 69min) until Windows expands the
+    pagefile into the last free gigabytes (51GB allocation, 0.7GB disk free
+    at the worst) — then the child dies anyway and the cycle repeats.  Until
+    the accumulator leak is fixed at source, terminate the child once its
+    commit charge crosses the ceiling; the existing ProcessSupervisor spawn
+    loop respawns it fresh in minutes.  This automates the controlled-kill
+    playbook run by hand at 04:19 and 05:26 that night.
+
+    Failure semantics: a raising get_commit is skipped (child mid-restart);
+    recycle errors are swallowed so the loop survives to the next tick.
+    """
+    while not stop():
+        try:
+            commit = get_commit()
+            if commit is not None and commit > ceiling_bytes:
+                recycle(commit)
+        except Exception:
+            pass
+        sleep()
+
+
+def run_goal_seed_loop(get_goals, post_goal, sleep, stop):
+    """Re-POST the durable goal set to the child's drain-on-restart queue.
+
+    C166 (hevolveai qwen_distillation_engine.seed_goal) makes the child's
+    goal queue deliberately non-persistent: "every producer re-seeds --
+    daemons re-POST /v1/goals/seed on their own cadence."  No producer
+    existed in any repo -- the 2026-08-26 sawtooth kills wiped the queue
+    every ~45min and the child fell back to synthetic self-queries (#687)
+    until a human re-seeded by hand.  This loop is that producer: each
+    tick posts the active AgentGoal rows; the child's exact-text dedup
+    makes re-posting idempotent, and a consumed goal is re-fed at this
+    cadence for as long as its row stays active.
+
+    Failure semantics: the first raising call (child down/booting, DB
+    busy) abandons the tick -- no per-goal retries -- and the next tick
+    starts over.  POST success is the only child-health signal used; the
+    supervisor never probes (a probe would kill slow-booting children,
+    see the ALIVE-is-healthy note in _on_child_exit).
+    """
+    while not stop():
+        try:
+            for text, priority in get_goals():
+                post_goal(text, priority)
+        except Exception:
+            pass
+        sleep()
+
+
 class _Supervisor(ProcessSupervisor):
     """Owns the HevolveAI uvicorn subprocess for the lifetime of HARTOS.
 
@@ -674,6 +727,8 @@ class _Supervisor(ProcessSupervisor):
             # An operator-managed child grinds the shared llama just the
             # same — arm the learning-yield bridge for it too (#687).
             self._start_learning_yield_poller()
+            self._start_commit_ceiling_poller()
+            self._start_goal_seed_poller()
             return self.info()
 
         # Surface the URL to the parent env BEFORE the bridge constructs
@@ -701,6 +756,8 @@ class _Supervisor(ProcessSupervisor):
         # (the governor itself starts later in some boot orders).
         self._subscribe_governor_modes()
         self._start_learning_yield_poller()
+        self._start_commit_ceiling_poller()
+        self._start_goal_seed_poller()
         return self.info()
 
     def _start_learning_yield_poller(self, poll_seconds: float = 5.0) -> None:
@@ -733,6 +790,91 @@ class _Supervisor(ProcessSupervisor):
         t = threading.Thread(target=_run, name='hevolveai-learning-yield',
                              daemon=True)
         self._yield_poller_thread = t
+        t.start()
+
+    def _start_commit_ceiling_poller(self, poll_seconds: float = 30.0) -> None:
+        """#696 stopgap: recycle the child when its commit charge crosses
+        HEVOLVE_CHILD_COMMIT_CEILING_GB (default 20 — the pagefile balloon
+        started at child commit ~19-25GB in all three measured generations).
+        Idempotent like the yield poller; stops with stop_event."""
+        existing = getattr(self, '_ceiling_poller_thread', None)
+        if existing is not None and existing.is_alive():
+            return
+        ceiling_bytes = float(os.environ.get(
+            'HEVOLVE_CHILD_COMMIT_CEILING_GB', '20')) * (1024 ** 3)
+
+        def _get_commit():
+            import psutil
+            proc = self.proc
+            if proc is None or proc.poll() is not None:
+                return None
+            return psutil.Process(proc.pid).memory_info().pagefile
+
+        def _recycle(commit: float) -> None:
+            logger.warning(
+                'hevolveai_supervisor: child commit %.1fGB > ceiling %.1fGB '
+                '— recycling before the pagefile balloons (#696 stopgap)',
+                commit / (1024 ** 3), ceiling_bytes / (1024 ** 3))
+            self.proc.terminate()
+
+        def _run() -> None:
+            run_commit_ceiling_loop(
+                _get_commit, _recycle, ceiling_bytes,
+                sleep=lambda: self.stop_event.wait(poll_seconds),
+                stop=self.stop_event.is_set)
+
+        t = threading.Thread(target=_run, name='hevolveai-commit-ceiling',
+                             daemon=True)
+        self._ceiling_poller_thread = t
+        t.start()
+
+    def _start_goal_seed_poller(self, poll_seconds: float = 300.0) -> None:
+        """C166 producer leg: re-seed the child's goal queue (see
+        run_goal_seed_loop).  Source of truth mirrors the daemon's own
+        dispatch query (agent_daemon L1024): active AgentGoal rows minus
+        CODING_GOAL_TYPES -- coding goals are decomposed source files
+        (#662), junk as learning queries.  Idempotent like its two
+        sibling pollers; stops with stop_event."""
+        existing = getattr(self, '_seed_poller_thread', None)
+        if existing is not None and existing.is_alive():
+            return
+
+        def _get_goals():
+            from integrations.social.models import get_db, AgentGoal
+            from .goal_manager import CODING_GOAL_TYPES
+            db = get_db()
+            try:
+                rows = (db.query(AgentGoal)
+                          .filter(AgentGoal.status == 'active',
+                                  ~AgentGoal.goal_type.in_(
+                                      CODING_GOAL_TYPES))
+                          .all())
+                # Floor priority at the GoalSeedRequest default (1) so a
+                # DB row (default 0) never ranks below an ad-hoc seed in
+                # the engine's drop-lowest-first eviction.
+                return [((f'{g.title}: {g.description}' if g.description
+                          else g.title or '')[:2000],
+                         max(1, int(g.priority or 0))) for g in rows]
+            finally:
+                db.close()
+
+        def _post_goal(text: str, priority: int) -> None:
+            import requests
+            requests.post(
+                f'{self.api_url}/v1/goals/seed',
+                json={'text': text, 'source': 'hartos_agent_goals',
+                      'priority': priority},
+                timeout=5.0).raise_for_status()
+
+        def _run() -> None:
+            run_goal_seed_loop(
+                _get_goals, _post_goal,
+                sleep=lambda: self.stop_event.wait(poll_seconds),
+                stop=self.stop_event.is_set)
+
+        t = threading.Thread(target=_run, name='hevolveai-goal-seed',
+                             daemon=True)
+        self._seed_poller_thread = t
         t.start()
 
     def stop(self) -> None:

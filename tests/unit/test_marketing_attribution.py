@@ -91,6 +91,26 @@ def test_track_rejects_empty_code(tmp_path):
         patcher.stop()
 
 
+def test_track_normalizes_hyphenated_channel_code(tmp_path):
+    """A launch channel written with a hyphen ('product-hunt') must be captured,
+    normalized to its underscore bucket, not 400ed and silently lost
+    (PENDING.md #10 — launch channels are exactly where hyphens get used)."""
+    client, patcher = _make_client(str(tmp_path))
+    try:
+        resp = client.post(
+            '/api/social/marketing/track',
+            json={'code': 'product-hunt', 'event': 'click'},
+        )
+        assert resp.status_code == 200
+        assert resp.get_json()['data']['code'] == 'product_hunt'
+        path = os.path.join(str(tmp_path), 'marketing_clicks.jsonl')
+        with open(path, 'r', encoding='utf-8') as f:
+            row = json.loads(f.readline())
+        assert row['code'] == 'product_hunt'
+    finally:
+        patcher.stop()
+
+
 # ─── /marketing/track — invalid event ───
 
 def test_track_rejects_unknown_event(tmp_path):

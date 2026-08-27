@@ -150,7 +150,29 @@ def start_authority_server(path: str = None) -> bool:
             pass
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(sock_path)
-        os.chmod(sock_path, 0o600)
+        # 0660, not 0600. The whole point of this socket is that a SEPARATE
+        # process asks the gate — and on HART OS that process runs as a
+        # DIFFERENT user. The state holder runs as `hart`; the screencast gate
+        # is exec'd by grim/wf-recorder inside the DESKTOP session, which runs
+        # as the login user. At 0600 that user cannot connect at all, so
+        # query_authority() hit its fail-closed branch and returned False no
+        # matter what the human had chosen.
+        #
+        # Measured on the fleet box 2026-08-25, same gate binary, same moment:
+        #     as hart        -> exit 0   (allowed)
+        #     as hart-admin  -> exit 77  (refused)
+        #     query_authority('screen'): True as hart, False as hart-admin
+        # and the refusal printed "the human cut the AI's 'screen' sense" while
+        # the sense was ON. So the control reported a permission bug as a human
+        # decision, and there was no consent anywhere to grant that would fix it
+        # — the operator went looking for a switch that did not exist.
+        #
+        # 0660 is the correct audience, not a loosening: the socket stays owned
+        # by `hart`, the desktop user is already in the `hart` group, and the
+        # protocol is a READ-ONLY authority query (send a sensor name, get
+        # allow/deny) with no mutation. A human's cut still applies to everyone
+        # — the difference is that now everyone can actually ASK.
+        os.chmod(sock_path, 0o660)
         srv.listen(8)
     except Exception:
         return False

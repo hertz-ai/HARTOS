@@ -722,9 +722,24 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             pass  # Model registry unavailable — no tier restriction
 
     # GUARDRAIL: full pre-dispatch gate (fail-closed: block if guardrails unavailable)
+    # Pass the goal dict + user_id so before_dispatch's goal-specific checks
+    # (constitutional, ethos, require_consent — #698) actually run on this
+    # path; agent_daemon.py:1268 passes goal.to_dict() the same way, and
+    # prompt-only here left those checks dormant for dispatch_goal.
+    _guard_goal_dict = None
+    try:
+        from integrations.social.models import db_session, AgentGoal
+        with db_session(commit=False) as _gdb:
+            _grow = _gdb.query(AgentGoal).filter_by(id=goal_id).first()
+            if _grow is not None:
+                _guard_goal_dict = _grow.to_dict()
+    except Exception as _gerr:
+        logger.debug(f"Goal row unavailable for guardrail checks "
+                     f"({goal_id}): {_gerr}")
     try:
         from security.hive_guardrails import GuardrailEnforcer
-        allowed, reason, prompt = GuardrailEnforcer.before_dispatch(prompt)
+        allowed, reason, prompt = GuardrailEnforcer.before_dispatch(
+            prompt, goal_dict=_guard_goal_dict, user_id=user_id)
         if not allowed:
             logger.warning(f"Dispatch blocked for {goal_type} goal {goal_id}: {reason}")
             return None

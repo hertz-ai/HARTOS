@@ -31,6 +31,39 @@ from .lightweight_backend import get_vision_backend, VisionBackend
 logger = logging.getLogger('hevolve_vision')
 
 
+def run_screen_capture_loop(consent_ok, grab, put, yielding, sleep, stop):
+    """Feed the local desktop's screen into the frame store (#701).
+
+    The screen channel's server side has always been complete -- WS
+    ingest, _description_loop (both channels), triggers, world-model
+    record -- but NO producer ever existed: useCameraFrameStream.js
+    carries the 'screen_start' handshake yet only captures getUserMedia
+    (camera), and nothing mounts channel='screen'.  This loop is the
+    missing producer, running where the screen actually lives.
+
+    Ordering is consent -> yield -> grab: consent_ok() is the canonical
+    ConsentService gate (a denied tick files the pending ask the
+    UserConsent UI surfaces -- daemons ask, #698); yielding() skips the
+    tick while the user is mid-chat so fresh frames never pull the
+    describe backend onto the shared GPU during a turn (#687 lesson --
+    an unchanged stored frame fails _should_describe's change check, so
+    pausing capture pauses VLM load).  Injected callbacks, the same
+    testable shape as the supervisor's poller loops.
+
+    Failure semantics: any raising callback abandons the tick; the
+    next tick starts clean.
+    """
+    while not stop():
+        try:
+            if consent_ok() and not yielding():
+                frame = grab()
+                if frame:
+                    put(frame)
+        except Exception:
+            pass
+        sleep()
+
+
 class VisionService:
     """Orchestrates the vision pipeline: sidecar + frames + descriptions.
 
@@ -166,6 +199,10 @@ class VisionService:
         )
         self._desc_thread.start()
 
+        # #701: only modes with a describe backend reach here, so the
+        # consent ask is never filed for frames nothing could describe.
+        self._start_screen_capture()
+
         backend_name = self._vision_backend.name if self._vision_backend else 'none'
         logger.info(f"VisionService started (backend={backend_name}, adaptive sampling)")
 
@@ -189,6 +226,62 @@ class VisionService:
             )
         except Exception:
             pass
+
+    def _start_screen_capture(self, interval: Optional[float] = None):
+        """#701: the desktop's own screen is the missing producer for
+        the screen channel (see run_screen_capture_loop).  Idempotent,
+        one thread per service lifetime; exits with self._running like
+        the description loop."""
+        existing = getattr(self, '_screen_capture_thread', None)
+        if existing is not None and existing.is_alive():
+            return
+        owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+        if not owner:
+            logger.info("Screen capture idle: no HEVOLVE_OWNER_USER_ID "
+                        "identity to consent-ask or file frames under")
+            return
+        if interval is None:
+            interval = float(os.environ.get(
+                'HEVOLVE_SCREEN_CAPTURE_SECONDS', '10'))
+        state = {'capture': None}
+
+        def _consent_ok() -> bool:
+            from integrations.social.models import db_session
+            from integrations.social.consent_service import ConsentService
+            with db_session(commit=True) as db:
+                if ConsentService.check_consent(db, owner, 'screen_capture'):
+                    return True
+                # request_consent dedupes: re-asking returns the existing
+                # pending row, so exactly one ask reaches the UI.
+                ConsentService.request_consent(db, owner, 'screen_capture')
+                return False
+
+        def _grab():
+            if state['capture'] is None:
+                from integrations.remote_desktop.frame_capture import (
+                    FrameCapture,
+                )
+                state['capture'] = FrameCapture()
+            return state['capture'].capture_frame()
+
+        def _yielding() -> bool:
+            from integrations.agent_engine.dispatch import (
+                should_yield_to_user,
+            )
+            return should_yield_to_user()
+
+        def _run():
+            run_screen_capture_loop(
+                _consent_ok, _grab,
+                lambda jpeg: self.store.put_screen_frame(owner, jpeg),
+                _yielding,
+                sleep=lambda: time.sleep(interval),
+                stop=lambda: not self._running)
+
+        t = threading.Thread(target=_run, daemon=True,
+                             name='vision-screen-capture')
+        self._screen_capture_thread = t
+        t.start()
 
     def _detect_mode(self) -> str:
         """Detect vision mode from hardware tier."""

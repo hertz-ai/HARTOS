@@ -897,19 +897,87 @@ class LiquidUIService:
         self._custom_component_types: Dict[str, dict] = \
             self._load_custom_component_types()
 
+        # AI-UI cache. Inference NEVER runs on the request thread (see
+        # generate_ui). Mirrors _ConnectivityCache's contract: one refresher at a
+        # time, request handlers read the snapshot instantly, a failed refresh
+        # keeps the last good answer.
+        self._ai_ui_lock = threading.Lock()
+        self._ai_ui = None          # last good AI-generated ui dict
+        self._ai_ui_at = 0.0        # monotonic stamp of that answer
+        self._ai_ui_busy = False    # a refresh is already in flight
+
         logger.info(
             "LiquidUIService initialized: port=%d, renderer=%s, "
             "voice=%s, haptic=%s", port, renderer, voice_enabled, haptic_enabled)
 
     # ─── UI Generation (preserved) ────────────────────────────
 
+    # How long an AI-generated layout stays fresh before a refresh is worth
+    # spending inference on, and how long that refresh may take. Both are sized
+    # from the real box rather than guessed: a 1024-token /v1/chat measured 50.7s
+    # on the fleet node (llama.cpp on two pinned cores), and a 16-token prompt
+    # measured 19.8s cold / 3.7s warm. The old 15s call timeout could therefore
+    # NEVER succeed for a UI generation here, which is why every /api/ui request
+    # spent 15s failing and then returned the static layout anyway.
+    AI_UI_TTL_S = 300.0
+    AI_UI_TIMEOUT_S = 120.0
+
     def generate_ui(self, context: Optional[dict] = None) -> Dict[str, Any]:
-        """Generate adaptive UI layout based on current context."""
+        """Adaptive UI for the current context. NEVER blocks on inference.
+
+        This used to call the model bus synchronously on the waitress request
+        thread, which is the same defect _ConnectivityCache was written to fix,
+        only worse: measured on the box 2026-08-26, /api/ui took >10s and the
+        journal showed "AI UI generation failed: ... Read timed out (read
+        timeout=15)" on every single call. With generation measured at 50.7s the
+        15s budget was unreachable by construction, so the endpoint was a
+        guaranteed 15s stall that returned the static layout regardless -- and on
+        a box whose shell polls it, that stall sits on the same small thread pool
+        every other shell fetch needs.
+
+        Now: serve the freshest thing we already have (last good AI layout, else
+        the static one, both instant) and let a single background thread earn the
+        upgrade. The AI layout appears on a later poll instead of never.
+        """
         if context is None:
             context = self.context_engine.get_context()
-        if self._model_available:
-            return self._generate_ai_ui(context)
-        return self._generate_static_ui(context)
+        if not self._model_available:
+            return self._generate_static_ui(context)
+        with self._ai_ui_lock:
+            cached = self._ai_ui
+            fresh = cached is not None and (
+                time.monotonic() - self._ai_ui_at) < self.AI_UI_TTL_S
+        if not fresh:
+            self._ai_ui_refresh_async(context)
+        return cached if cached is not None else self._generate_static_ui(context)
+
+    def _ai_ui_refresh_async(self, context: dict) -> None:
+        """Kick ONE background AI-UI generation. Demand-driven: nothing runs
+        unless something actually asked for the UI, so an idle desktop spends no
+        inference at all (this box would otherwise burn ~50s of CPU per refresh
+        on two cores). A refresh already in flight is never duplicated."""
+        with self._ai_ui_lock:
+            if self._ai_ui_busy:
+                return
+            self._ai_ui_busy = True
+
+        def _work():
+            try:
+                ui = self._generate_ai_ui(context)
+                # Only cache a real AI answer; a static fallback must not pin the
+                # cache and suppress the next attempt.
+                if ui and str(ui.get('source', '')).startswith('ai'):
+                    with self._ai_ui_lock:
+                        self._ai_ui = ui
+                        self._ai_ui_at = time.monotonic()
+            except Exception:
+                logger.warning("AI UI refresh failed", exc_info=True)
+            finally:
+                with self._ai_ui_lock:
+                    self._ai_ui_busy = False
+
+        threading.Thread(target=_work, daemon=True,
+                         name='ai-ui-refresh').start()
 
     def _generate_ai_ui(self, context: dict) -> dict:
         """Generate UI via LLM (when model is available)."""
@@ -918,7 +986,11 @@ class LiquidUIService:
         try:
             resp = pooled_post(
                 f'http://localhost:{self.model_bus_port}/v1/chat',
-                json={'prompt': prompt, 'max_tokens': 1024}, timeout=15)
+                json={'prompt': prompt, 'max_tokens': 1024},
+                # Runs on the background refresher only (see generate_ui), so a
+                # long budget costs a daemon thread, not a request. 15s was
+                # unreachable: real generation measured 50.7s on the fleet box.
+                timeout=self.AI_UI_TIMEOUT_S)
             if resp.status_code == 200:
                 response = resp.json().get('response', '')
                 try:
@@ -7818,7 +7890,60 @@ function renderAgentOverlay(ev) {{
         # ── Shell APIs: Display ──
         @app.route('/api/shell/display', methods=['GET'])
         def shell_display():
+            """Connected outputs + their modes. WAYLAND FIRST.
+
+            This endpoint asked `xrandr --current` and nothing else -- an X11
+            tool -- on an OS whose every tier is Wayland (hart-comp, sway, cage).
+            It could therefore never return anything here, and it is the endpoint
+            the shell UI actually fetches (the Display panel), so the panel read
+            "no displays" on a box driving a 1600x900 LVDS-1 panel. Measured on
+            the box 2026-08-26: this returned {"displays":[]} while swaymsg
+            reported the real output and `wlr-randr` printed
+            LVDS-1 "Seiko Epson Corporation 0x314B".
+
+            swaymsg is the source the rest of the codebase already treats as
+            primary for outputs (shell_desktop_apis._wlr_randr_outputs documents
+            itself as the fallback "when swaymsg is unavailable"), so this reuses
+            that same probe rather than adding a third way to ask. The xrandr path
+            is kept underneath, unchanged, for a genuinely X11 node. Response
+            SHAPE is identical either way -- the UI parses {name, resolution,
+            modes:[{resolution, rates, active}]} and must not have to care.
+            """
             displays = []
+            # ONE reader for compositor outputs (shell_desktop_apis.sway_outputs).
+            # This endpoint must not carry its own probe: that is how it drifted
+            # to `xrandr --current` and kept answering "no displays" on a
+            # Wayland-only OS while the sibling endpoint answered correctly.
+            # Only the SHAPING below is local, because this endpoint's response
+            # contract (modes + rates) differs from the sibling's.
+            try:
+                from integrations.agent_engine.shell_desktop_apis import sway_outputs
+            except Exception:
+                sway_outputs = None
+            if sway_outputs is not None:
+                try:
+                    for out in sway_outputs():
+                        cur = out.get('current_mode') or {}
+                        rect = out.get('rect') or {}
+                        cur_res = ('%sx%s' % (cur.get('width'), cur.get('height'))
+                                   if cur.get('width') else
+                                   '%sx%s' % (rect.get('width', 0), rect.get('height', 0)))
+                        modes = []
+                        for m in (out.get('modes') or []):
+                            res = '%sx%s' % (m.get('width', 0), m.get('height', 0))
+                            # sway reports refresh in mHz.
+                            hz = round((m.get('refresh') or 0) / 1000.0, 2)
+                            modes.append({'resolution': res,
+                                          'rates': [hz] if hz else [],
+                                          'active': res == cur_res})
+                        displays.append({'name': out.get('name', ''),
+                                         'resolution': cur_res,
+                                         'modes': modes})
+                except (ValueError, TypeError, KeyError):
+                    displays = []
+            if displays:
+                return jsonify({'displays': displays})
+            # X11 fallback, byte-identical to the previous implementation.
             try:
                 r = subprocess.run(
                     ['xrandr', '--current'],

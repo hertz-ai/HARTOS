@@ -64,6 +64,27 @@ class TestDeltaStructure:
         assert 'prompt' not in delta_str.lower() or 'prompt_id' in delta_str.lower()
 
     @patch('integrations.agent_engine.world_model_bridge.get_world_model_bridge')
+    def test_presence_delta_when_bridge_unavailable(self, mock_bridge):
+        """A fresh/frozen node whose learning bridge raises must STILL produce a
+        signed presence delta, not None.
+
+        tick() broadcasts only on a truthy delta, so returning None here means a
+        genuine INSTALL never federates and never reaches the census (#694
+        "installed but not federating"). On a frozen build with no hevolveai the
+        bridge import raises; the extract must degrade to zeroed stats + a signed
+        presence delta rather than swallowing the whole node.
+        """
+        mock_bridge.side_effect = RuntimeError('no hevolveai in frozen build')
+        agg = self._make_aggregator()
+        delta = agg.extract_local_delta()
+        assert delta is not None, 'bridge failure must degrade to a presence delta'
+        assert delta.get('node_id') is not None
+        assert 'signature' in delta
+        # Stats degrade to zeros, not missing keys (no KeyError building the delta).
+        assert delta['experience_stats']['total_recorded'] == 0
+        assert delta['experience_stats']['flush_rate'] == 0.0
+
+    @patch('integrations.agent_engine.world_model_bridge.get_world_model_bridge')
     def test_no_user_text_in_delta(self, mock_bridge):
         """Ensure no raw user text ends up in federation delta."""
         bridge = MagicMock()
@@ -161,6 +182,32 @@ class TestNodeBootstrap:
         assert 'recipe_index' in pkg
         assert 'quality_baselines' in pkg
         assert 'resonance_norms' in pkg
+
+    def test_bootstrap_shares_pooled_quality_baselines(self):
+        """A joiner must inherit the hive's pooled quality heuristics.
+
+        Regression: bootstrap_new_node read self.peer_deltas (no underscore, no
+        such attribute), the AttributeError was swallowed, and every joiner got
+        quality_baselines={} — the network-value mechanism was silently a no-op.
+        It must average quality_metrics from _peer_deltas (where accepted peer
+        learning is stored). Proven end to end by
+        tests/standalone/network_beats_solo_proof.py.
+        """
+        agg = self._make_aggregator()
+        agg._peer_deltas = {
+            'peer-a': {'quality_metrics': {'success_rate': 0.9,
+                                           'avg_latency_ms': 100}},
+            'peer-b': {'quality_metrics': {'success_rate': 0.8,
+                                           'avg_latency_ms': 140}},
+        }
+        pkg = agg.bootstrap_new_node('joiner')
+        qb = pkg.get('quality_baselines') or {}
+        assert qb.get('success_rate') == pytest.approx(0.85)
+        assert qb.get('avg_latency_ms') == pytest.approx(120.0)
+        # A solo node (no peer deltas) has nothing to share.
+        solo = self._make_aggregator()
+        solo._peer_deltas = {}
+        assert (solo.bootstrap_new_node('joiner').get('quality_baselines') or {}) == {}
 
     def test_bootstrap_no_raw_user_data(self):
         agg = self._make_aggregator()
@@ -277,3 +324,61 @@ class TestEdgePrivacyDefaults:
     def test_user_devices_blocked_from_federation(self):
         from security.edge_privacy import scope_allows, PrivacyScope
         assert not scope_allows(PrivacyScope.USER_DEVICES, PrivacyScope.FEDERATED)
+
+
+# ── Collective intelligence metric flows end to end ──
+
+class TestCollectiveIntelligenceMetric:
+    """The real intelligence_index the learning core computes must reach the
+    census.  Regression guard for the drop+miskey bug: extract_local_delta kept
+    only agent_count/latency in hivemind_state and hive_census read a `hivemind`
+    key nothing produced, so mean_intelligence_index was permanently null.
+    """
+
+    @patch('integrations.agent_engine.world_model_bridge.get_world_model_bridge')
+    def test_intelligence_index_reaches_census(self, mock_bridge):
+        from integrations.agent_engine.federated_aggregator import FederatedAggregator
+        bridge = MagicMock()
+        bridge.get_stats.return_value = {}
+        bridge.get_learning_stats.return_value = {
+            'hivemind': {
+                'agent_count': 4, 'avg_fusion_latency_ms': 12.5,
+                'intelligence_index': 7.5, 'growth_rate': 1.3,
+            },
+            'bridge': {'total_hivemind_queries': 20},
+        }
+        mock_bridge.return_value = bridge
+
+        agg = FederatedAggregator()
+        delta = agg.extract_local_delta()
+        assert delta is not None
+        # Carried in the existing (privacy-allowlisted) hivemind_state block,
+        # not a new top-level key.
+        assert delta['hivemind_state']['intelligence_index'] == 7.5
+        assert delta['hivemind_state']['growth_rate'] == 1.3
+        assert 'hivemind' not in delta  # no phantom parallel key
+
+        agg._local_delta = delta
+        census = agg.hive_census()
+        assert census['nodes_with_intelligence'] == 1
+        assert census['mean_intelligence_index'] == 7.5
+
+    @patch('integrations.agent_engine.world_model_bridge.get_world_model_bridge')
+    def test_presence_node_absent_not_zero(self, mock_bridge):
+        """A node whose learning core did not run carries no intelligence_index
+        and must be absent from the mean, never counted as 0.0."""
+        from integrations.agent_engine.federated_aggregator import FederatedAggregator
+        bridge = MagicMock()
+        bridge.get_stats.return_value = {}
+        bridge.get_learning_stats.return_value = {
+            'hivemind': {'agent_count': 0}, 'bridge': {},
+        }
+        mock_bridge.return_value = bridge
+
+        agg = FederatedAggregator()
+        delta = agg.extract_local_delta()
+        assert 'intelligence_index' not in delta['hivemind_state']
+        agg._local_delta = delta
+        census = agg.hive_census()
+        assert census['nodes_with_intelligence'] == 0
+        assert census['mean_intelligence_index'] is None

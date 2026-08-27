@@ -196,6 +196,33 @@ class WorldModelBridge:
             self._provider = None
             self._hive_mind = None
 
+    def _maybe_reenable_http(self) -> None:
+        """Clear the http_disabled latch once the supervisor's promise exists.
+
+        __init__ latches ``_http_disabled=True`` when ``HEVOLVEAI_API_URL``
+        is absent.  hevolveai_supervisor exports that env var when it spawns
+        the child, but a first caller (init_social, measured 2026-08-25:
+        bridge constructed 19:15:46, supervisor export 19:15:49) can build
+        this singleton seconds earlier, so the latch outlives the promise
+        and every exported delta carries no intelligence_index while the
+        node's own :8000 child answers /v1/hivemind/intelligence.  Called
+        from get_learning_stats — the federation tick reaches it every
+        ~60s, so the bridge heals within one tick of the env appearing,
+        after which all _http_disabled readers see the healed value.
+        Self-extinguishing: once cleared this is a single boolean read.
+        """
+        if self._in_process or not self._http_disabled:
+            return
+        url = os.environ.get('HEVOLVEAI_API_URL')
+        if not url:
+            return
+        self._api_url = url
+        self._http_disabled = False
+        logger.info(
+            "[WorldModelBridge] HTTP re-enabled: HEVOLVEAI_API_URL "
+            "appeared after construction (%s)", url)
+        self._start_inbound_skill_poller()
+
     def _cb_is_open(self) -> bool:
         """Check if circuit breaker is open (blocking requests)."""
         return self._circuit_breaker.is_open()
@@ -1371,6 +1398,7 @@ class WorldModelBridge:
             return result
 
         # HTTP fallback — guarded by circuit breaker to avoid retry storms
+        self._maybe_reenable_http()
         if self._http_disabled or self._circuit_breaker.is_open():
             return result
         try:

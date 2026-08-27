@@ -605,7 +605,44 @@ in
           ++ lib.optional (pkgs ? upower)       pkgs.upower        # upower  - battery/power
           ++ lib.optional (pkgs ? wireplumber)  pkgs.wireplumber   # wpctl   - audio (sibling of pactl)
           ++ lib.optional (pkgs ? alsa-utils)   pkgs.alsa-utils    # amixer  - the layer BELOW PipeWire
-          ++ lib.optional (pkgs ? xorg && pkgs.xorg ? xrandr) pkgs.xorg.xrandr;  # xrandr - display
+          ++ lib.optional (pkgs ? xorg && pkgs.xorg ? xrandr) pkgs.xorg.xrandr   # xrandr - display (X11 only; see wlr-randr note below)
+          # Second wave of the SAME defect, found by sweeping all 143 GET routes on
+          # the box 2026-08-26: six more capabilities were installed and working,
+          # but invisible to this unit. Each missing binary silently emptied a
+          # feature the UI then rendered as "nothing here":
+          #   lsblk        -> /api/shell/storage/devices {"devices":[]},
+          #                   /api/shell/flash/disks "No such file or directory: 'lsblk'",
+          #                   /api/shell/encryption/status HTTP 503 "lsblk not available"
+          #   fc-list      -> /api/shell/fonts {"fonts":[],"count":0} on a box with Noto installed
+          #   bluetoothctl -> /api/shell/bluetooth{,/status,/discovered} all empty, while the
+          #                   adapter C8:F7:33:88:6B:E2 was present and powered
+          #   lpstat/lp    -> /api/shell/printers, /api/shell/printers/jobs empty
+          #   smartctl     -> /api/shell/storage/smart could never report disk health
+          #   scanimage    -> /api/shell/scanner/list empty
+          # Every one of these was verified to WORK when run as the service user
+          # (`sudo -u hart`) with only PATH widened, so PATH was the whole defect.
+          #
+          # swaymsg: the note that used to live here said adding it to PATH
+          # would only convert "command not found" into "failed to connect to
+          # display", because the compositor socket was unreachable from this
+          # unit. That was true WHEN IT WAS WRITTEN and stopped being true the
+          # moment hart-layer-shell-host.nix started relaying sway IPC to
+          # /run/hart, which is outside the tmpfs ProtectHome drops over
+          # /run/user. I did not revisit it, so generation 7 shipped with
+          # SWAYSOCK pointing at a working relay and no swaymsg to use it:
+          # verified on the box 2026-08-26, the unit had
+          # SWAYSOCK=/run/hart/sway-ipc.sock and `command -v swaymsg` came back
+          # empty, so /api/shell/displays returned {"compositor":"wayland",
+          # "displays":[]} and /api/shell/workspaces served its synthetic
+          # "Main" placeholder while the compositor was right there.
+          # A socket without a client is not a transport.
+          ++ lib.optional (pkgs ? sway)          pkgs.sway          # swaymsg      - outputs, workspaces, window tree
+          ++ lib.optional (pkgs ? util-linux)    pkgs.util-linux    # lsblk        - storage / flash / encryption
+          ++ lib.optional (pkgs ? fontconfig)    pkgs.fontconfig    # fc-list      - fonts + preview
+          ++ lib.optional (pkgs ? bluez)         pkgs.bluez         # bluetoothctl - bluetooth
+          ++ lib.optional (pkgs ? cups)          pkgs.cups          # lpstat/lpadmin/lp - printers
+          ++ lib.optional (pkgs ? smartmontools) pkgs.smartmontools # smartctl     - SMART disk health
+          ++ lib.optional (pkgs ? sane-backends) pkgs.sane-backends; # scanimage   - scanners
 
         environment = {
           HEVOLVE_DATA_DIR = cfg.dataDir;
@@ -632,6 +669,21 @@ in
           # to traverse in (see ProtectHome/BindPaths + the tmpfiles ACL below).
           XDG_RUNTIME_DIR = "/run/user/1000";
           PULSE_SERVER = "unix:/run/user/1000/pulse/native";
+          # swaymsg resolves its socket from SWAYSOCK and nothing else, and sway's
+          # real socket name embeds its PID (sway-ipc.1000.<PID>.sock), so it cannot
+          # be named statically. Three things had to be true for this to work, and
+          # only the third is visible from here: the name must be stable, the
+          # backend must be allowed to connect, and the socket must EXIST inside
+          # this unit's mount namespace -- which it does not, because ProtectHome
+          # ="tmpfs" masks /run/user and BindPaths punches through only pulse.
+          # hart-layer-shell-host.nix therefore relays sway IPC to /run/hart, which
+          # is outside the masked tree; this points at that relay.
+          # Without it swaymsg exits "Unable to retrieve socket path", the display
+          # APIs (which use swaymsg as their primary source, wlr-randr being the
+          # documented fallback) return empty, and /api/shell/workspaces silently
+          # serves its synthetic "Main" placeholder -- a desktop reporting no
+          # display while driving a 1600x900 panel.
+          SWAYSOCK = "/run/hart/sway-ipc.sock";
           # NEVER let pactl autospawn a PulseAudio daemon. PipeWire owns the
           # devices, so an autospawned pulseaudio dies instantly with "Daemon
           # startup without any loaded modules" -- and because the UI polls audio
@@ -641,6 +693,17 @@ in
             ; PipeWire owns audio on HART OS. Autospawn would fork a doomed daemon.
             autospawn = no
           '';
+          # The App Store's offline catalog. hart-apps.nix publishes this path as
+          # environment.sessionVariables, which only reaches LOGIN SHELLS -- a
+          # systemd service never sees it. app_catalog.py's second candidate is a
+          # repo-relative nixos/modules/hart-app-catalog.json, and the deployed
+          # app package (hart-app-1.0.0) ships Python only, with no nixos/ dir. So
+          # BOTH candidates missed and the store served {"apps":[],"count":0} on a
+          # box whose catalog was sitting in the store the whole time.
+          # Verified 2026-08-26: pointing this at the store copy took the catalog
+          # from 0 to 34 entries, with Firefox correctly flagged installed:true.
+          # Same file hart-apps.nix reads, so there is one source of truth.
+          HART_APP_CATALOG = "${./hart-app-catalog.json}";
           MODEL_BUS_HTTP_PORT = toString (config.hart.modelBus.ports.http or 6790);
           HARTOS_BACKEND_PORT = toString cfg.ports.backend;
           HART_THEME_DIR = "/run/current-system/sw/share/hart/conky-themes";

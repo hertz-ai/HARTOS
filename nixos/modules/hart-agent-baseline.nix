@@ -1,4 +1,4 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, hartSrc, ... }:
 
 # ════════════════════════════════════════════════════════════════════════════
 # HART OS -- LOCAL-2B AGENT BASELINE runner (potato-machine baseline capture)
@@ -20,6 +20,42 @@
 let
   cfg = config.hart;
   app = cfg.package;
+
+  # ── The unit bound, DERIVED from the work rather than guessed ──────────────
+  # This unit shipped TimeoutStartSec=300, a constant with no relationship to
+  # what the profiler does. Measured on the fleet box 2026-08-26: the run is 72
+  # agent tasks + 3 surfaces = 75 probes, and the profiler's own per-probe
+  # budgets (spectrum.json) are 25-45s each, so a complete pass needs ~2630s
+  # (43.8 min). systemd was therefore killing it with SIGTERM after roughly
+  # seven probes, EVERY time, and because the kill lands mid-run the node
+  # recorded a failed unit and wrote no baseline at all -- losing the one
+  # artifact the exercise exists to produce. It only started showing up once
+  # llama actually answered on :808; before that the profiler self-deferred in
+  # under a second and the timeout was never approached.
+  #
+  # A timeout for this job has to be a function of the number of actions. The
+  # profiler now computes and enforces its own budget-derived deadline (see
+  # plan_seconds / --plan), so THIS value is only the outer backstop; it is
+  # sized from the same spectrum.json budgets times a probe ceiling, so it can
+  # never end up tighter than the work it is bounding.
+  # hartSrc (the repo root, supplied to every module via the flake's
+  # specialArgs) rather than a ../../ escape: the flake lives in nixos/, so a
+  # relative climb out of it is both a second way of reaching the repo and one
+  # that need not resolve. No other module does it, and this reads the SAME
+  # spectrum.json the profiler loads at runtime, so the bound and the work are
+  # derived from one file.
+  spectrum = builtins.fromJSON
+    (builtins.readFile "${hartSrc}/scripts/agent_baseline/spectrum.json");
+  worstBudgetMs = lib.foldl'
+    (acc: b: let ms = b.total_ms or 0; in if ms > acc then ms else acc)
+    0
+    (lib.filter lib.isAttrs (lib.attrValues spectrum.budgets));
+  # Ceiling, not a count: nix cannot enumerate the Python task list, so this
+  # bounds how far the list may grow before someone must revisit it. 128 is
+  # comfortably above the measured 75.
+  probeCeiling = 128;
+  # + 300s of startup/teardown margin on top of the worst-case probe time.
+  baselineTimeoutSec = (worstBudgetMs / 1000) * probeCeiling + 300;
 in
 {
   options.hart.agentBaseline = {
@@ -56,7 +92,12 @@ in
         # failure: SuccessExitStatus keeps the unit green so the timer keeps
         # sampling and the journal is the record of the verdict.
         SuccessExitStatus = "0 1";
-        TimeoutStartSec = "300";
+        # Derived from spectrum.json's worst per-probe budget x the probe
+        # ceiling (see baselineTimeoutSec above), NOT a constant. The profiler
+        # bounds itself to its own exact plan and writes a partial baseline if
+        # it runs long, so reaching this outer limit means something is truly
+        # wedged rather than merely slow.
+        TimeoutStartSec = toString baselineTimeoutSec;
       };
     };
 

@@ -47,6 +47,19 @@ def _save_json(path, data):
 
 def _is_wayland():
     """Detect Wayland compositor — env var check + GNOME session fallback."""
+    # SWAYSOCK is proof of a live wlroots session, and it is the ONE signal a
+    # sandboxed backend actually has. _detect_compositor already trusts it to
+    # answer 'sway'; this function did not, so the two disagreed about the same
+    # box. Measured after the OTA landed on the fleet node 2026-08-26: the
+    # service had SWAYSOCK=/run/hart/sway-ipc.sock and could drive swaymsg
+    # through it successfully, yet /api/shell/displays still reported
+    # {"compositor":"x11","displays":[]} because none of the three checks below
+    # can see anything from inside the unit: WAYLAND_DISPLAY and
+    # XDG_SESSION_TYPE are unset for a system service, and the pgrep fallback
+    # needs procps, which is not on the unit's curated PATH. So the display
+    # endpoints bailed before ever using a transport that was working.
+    if os.environ.get('SWAYSOCK'):
+        return True
     if os.environ.get('WAYLAND_DISPLAY'):
         return True
     # Fallback: some GNOME sessions don't set WAYLAND_DISPLAY
@@ -241,6 +254,32 @@ def _save_display_profile(outputs):
     # Tell a running kanshi to reload its config (best-effort; absent on a tier
     # without wlr-output-management — never an error here).
     _run(['pkill', '-HUP', 'kanshi'], timeout=3)
+
+
+def sway_outputs():
+    """The compositor's outputs, probed and parsed ONCE. The canonical source.
+
+    swaymsg is the primary outputs source across this codebase (the wlr-randr
+    reader below documents itself as the fallback "when swaymsg is
+    unavailable"), but the probe+parse had been copy-pasted per endpoint. When
+    the transport was fixed on real HW 2026-08-26, each copy had to be found
+    separately, and /api/shell/display had drifted to `xrandr --current` on a
+    Wayland-only OS, which can never return anything. One reader means one place
+    to fix and no drift.
+
+    Returns [] when there is no reachable compositor, which is what every caller
+    already treats as "no displays".
+    """
+    if not _is_wayland():
+        return []
+    r = _run(['swaymsg', '-t', 'get_outputs', '-r'], timeout=5)
+    if not (r and getattr(r, 'returncode', 1) == 0):
+        return []
+    try:
+        data = json.loads(r.stdout or '[]')
+    except (ValueError, TypeError):
+        return []
+    return data if isinstance(data, list) else []
 
 
 def _wlr_randr_outputs():
@@ -1438,22 +1477,16 @@ def register_shell_desktop_routes(app):
         """List connected displays with resolution and position."""
         displays = []
         if _is_wayland():
-            r = _run(['swaymsg', '-t', 'get_outputs', '-r'], timeout=5)
-            if r and r.returncode == 0:
-                try:
-                    outputs = json.loads(r.stdout)
-                    for out in outputs:
-                        displays.append({
-                            'name': out.get('name', ''),
-                            'make': out.get('make', ''),
-                            'model': out.get('model', ''),
-                            'resolution': f"{out.get('rect', {}).get('width', 0)}x{out.get('rect', {}).get('height', 0)}",
-                            'position': f"{out.get('rect', {}).get('x', 0)},{out.get('rect', {}).get('y', 0)}",
-                            'scale': out.get('scale', 1.0),
-                            'active': out.get('active', False),
-                        })
-                except (json.JSONDecodeError, KeyError):
-                    pass
+            for out in sway_outputs():          # the ONE canonical reader
+                displays.append({
+                    'name': out.get('name', ''),
+                    'make': out.get('make', ''),
+                    'model': out.get('model', ''),
+                    'resolution': f"{out.get('rect', {}).get('width', 0)}x{out.get('rect', {}).get('height', 0)}",
+                    'position': f"{out.get('rect', {}).get('x', 0)},{out.get('rect', {}).get('y', 0)}",
+                    'scale': out.get('scale', 1.0),
+                    'active': out.get('active', False),
+                })
         else:
             r = _run(['xrandr', '--query'], timeout=5)
             if r and r.returncode == 0:

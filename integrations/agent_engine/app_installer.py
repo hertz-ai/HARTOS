@@ -783,14 +783,33 @@ class AppInstaller:
         # Append (never replace) the standard NixOS command dirs so an inherited PATH
         # still wins, and every flatpak call site gets this because they all route
         # through this one env builder.
+        env['PATH'] = self.tool_path()
+        return env
+
+    @staticmethod
+    def tool_path() -> str:
+        """The PATH this service must use to FIND packaging tools.
+
+        Split out of ``_flatpak_env`` so that "can I run X?" and "run X" answer
+        from the SAME list. They used to disagree: execution went through the
+        augmented PATH here, while the /platforms availability probe called a
+        bare ``shutil.which()`` against the unit's short PATH — so the App Store
+        advertised flatpak and nix as UNAVAILABLE on a box where installing
+        through them worked. Measured on the fleet box 2026-08-25: /platforms
+        reported ``flatpak available=false`` while /installed simultaneously
+        listed a Firefox that had just been installed BY flatpak.
+
+        That is the same class of bug the comment above documents (a short unit
+        PATH misreported as a missing system tool); the installer was fixed for
+        execution in 2026-08-12 and the availability probe was left behind.
+        """
         _extra = ['/run/current-system/sw/bin', '/run/wrappers/bin',
                   os.path.expanduser('~/.nix-profile/bin')]
-        _path = [p for p in env.get('PATH', '').split(os.pathsep) if p]
+        _path = [p for p in os.environ.get('PATH', '').split(os.pathsep) if p]
         for _d in _extra:
             if _d not in _path and os.path.isdir(_d):
                 _path.append(_d)
-        env['PATH'] = os.pathsep.join(_path)
-        return env
+        return os.pathsep.join(_path)
 
     def _ensure_flathub(self) -> None:
         """Idempotently add the Flathub remote at --user scope. `remote-add` needs NO
@@ -2068,6 +2087,17 @@ def register_app_install_routes(app):
     @_route('/platforms', methods=['GET'])
     def shell_apps_platforms():
         """List supported platforms and their availability."""
+        # Probe with the SAME PATH the installer executes with. A bare
+        # shutil.which() here uses the systemd unit's short PATH and answered
+        # "unavailable" for tools that install successfully seconds later —
+        # measured on the fleet box 2026-08-25, where /platforms said
+        # `flatpak available=false` while /installed listed a Firefox that
+        # flatpak had just installed. One list, one answer.
+        _tp = get_installer().tool_path()
+
+        def _has(*names):
+            return any(shutil.which(n, path=_tp) is not None for n in names)
+
         platforms = []
         for p in InstallerPlatform:
             if p == InstallerPlatform.UNKNOWN:
@@ -2076,22 +2106,21 @@ def register_app_install_routes(app):
             tool = ''
             if p == InstallerPlatform.NIX:
                 tool = 'nix-env'
-                available = shutil.which('nix-env') is not None
+                available = _has('nix-env')
             elif p == InstallerPlatform.FLATPAK:
                 tool = 'flatpak'
-                available = shutil.which('flatpak') is not None
+                available = _has('flatpak')
             elif p == InstallerPlatform.APPIMAGE:
                 available = True  # Always available (just needs chmod +x)
             elif p == InstallerPlatform.WINDOWS:
                 tool = 'wine64'
-                available = shutil.which('wine64') is not None or \
-                           shutil.which('wine') is not None
+                available = _has('wine64', 'wine')
             elif p == InstallerPlatform.ANDROID:
                 tool = 'waydroid'
-                available = shutil.which('waydroid') is not None
+                available = _has('waydroid')
             elif p == InstallerPlatform.MACOS:
                 tool = 'darling'
-                available = shutil.which('darling') is not None
+                available = _has('darling')
             elif p == InstallerPlatform.SNAP:
                 # Honestly unsupported — shown so the UI can grey it out.
                 tool = 'snapd'
