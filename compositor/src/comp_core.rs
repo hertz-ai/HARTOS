@@ -81,6 +81,7 @@ use smithay::input::{
     keyboard::{FilterResult, Keysym, ModifiersState, keysyms as xkb},
     pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, RelativeMotionEvent},
 };
+use smithay::backend::allocator::Fourcc;
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{
@@ -205,6 +206,80 @@ impl MapAnim {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// NATIVE SHELL PARITY PROGRAM, M1 — the composed aura backdrop.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The composed bloom field, held as a texture-ready buffer across frames.
+///
+/// This is the "COMPOSE ONCE, REUSE FOREVER" half of `bloom.rs`'s performance
+/// contract. `bloom::compose` walks every pixel, which is a few milliseconds at
+/// panel size — perfectly fine ONCE, and catastrophic at 60Hz. So the result is
+/// cached against `(width, height, palette)` and recomposed ONLY when the output
+/// mode or the theme actually changes. A steady desktop does zero bloom work per
+/// frame, which is what keeps the #137 idle-skip meaningful.
+///
+/// Held on each backend's `State` (reached via `CompState::bloom_mut`) rather
+/// than in a static, mirroring how `black_buffer` is already owned.
+#[derive(Default)]
+pub struct BloomCache {
+    /// Resolved ONCE, not per frame. `bloom::theme_palette` reads a JSON file off
+    /// disk; doing that at 60Hz would be a syscall storm behind a static image.
+    palette: Option<crate::bloom::BloomPalette>,
+    key: Option<(i32, i32, crate::bloom::BloomPalette)>,
+    buffer: Option<MemoryRenderBuffer>,
+}
+
+impl BloomCache {
+    /// Drop the composed field AND the resolved palette, so the next frame
+    /// re-reads the theme from disk and recomposes.
+    ///
+    /// This is the seam a theme/mood change calls. Nothing calls it yet: the
+    /// theme is fixed for the session today, and wiring the change signal is a
+    /// later milestone. It exists so that wiring does not have to reach inside
+    /// this type's private fields.
+    pub fn invalidate(&mut self) {
+        self.palette = None;
+        self.key = None;
+        self.buffer = None;
+    }
+
+    /// The backdrop for this size, composing only on a genuine miss.
+    ///
+    /// Returns `None` for a degenerate output size (a disconnected or
+    /// not-yet-moded connector reports 0x0). The caller simply paints no
+    /// backdrop then and the clear colour still covers the frame, so a bad mode
+    /// can never panic the render loop.
+    pub fn get(&mut self, w: i32, h: i32) -> Option<&MemoryRenderBuffer> {
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        // `BloomPalette` is `Copy`, so this reads the cached value and does NOT
+        // hold the borrow across the compose below.
+        let pal = *self.palette.get_or_insert_with(crate::bloom::theme_palette);
+        if self.key != Some((w, h, pal)) {
+            let started = Instant::now();
+            let rgba = crate::bloom::compose(w, h, &pal);
+            self.buffer = Some(MemoryRenderBuffer::from_slice(
+                &rgba,
+                Fourcc::Argb8888,
+                (w, h),
+                1,
+                Transform::Normal,
+                None,
+            ));
+            self.key = Some((w, h, pal));
+            info!(
+                width = w,
+                height = h,
+                took_ms = started.elapsed().as_millis() as u64,
+                "bloom.composed (native aura backdrop; cached until the mode or theme changes)"
+            );
+        }
+        self.buffer.as_ref()
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // THE `CompState` trait — the backend-agnostic accessor surface the shared WM brain
 // drives. Each backend's concrete `State` impls it by handing back references to the
 // fields it already holds. The supertrait `SeatHandler<KeyboardFocus = WlSurface,
@@ -261,6 +336,9 @@ pub trait CompState:
     fn capture_blocked(&self) -> bool;
     fn set_capture_blocked_flag(&mut self, on: bool);
     fn black_buffer_mut(&mut self) -> &mut SolidColorBuffer;
+
+    // ── NATIVE SHELL M1: the composed aura backdrop (see BloomCache). ──
+    fn bloom_mut(&mut self) -> &mut BloomCache;
 
     /// Toggle the screen kill-switch (the `screen.kill` IPC verb's executor). Default
     /// = the shared flag-flip + log. The winit backend OVERRIDES it to ALSO fail any
@@ -1628,6 +1706,43 @@ where
         let prev = LAYERS_PAINTED.swap(layers_painted, std::sync::atomic::Ordering::Relaxed);
         if prev != layers_painted {
             info!(layers_painted, "layer.composited (wlr-layer surfaces now in the rendered frame)");
+        }
+    }
+
+    // ── 4. BLOOM BACKDROP (last in the list = drawn UNDER everything). ──
+    // NATIVE SHELL M1. Before this, the bottom of the frame was the flat
+    // HART_SPLASH_RGBA clear and the aurora was painted by a browser in a
+    // WebView above it. Now the compositor owns its own backdrop.
+    //
+    // Deliberately built LAST and pushed LAST: it must sit beneath the layer
+    // surfaces (the glass shell) so a shell that paints transparency reveals the
+    // native field rather than flat slate. The clear colour still runs, so if
+    // this element is skipped the frame is exactly what it was before.
+    //
+    // Cheap by construction: `BloomCache::get` is a key comparison on every
+    // frame but the first at a given size/theme.
+    if !state.capture_blocked() {
+        // Split the borrow: `bloom_mut` holds `state` mutably, and
+        // `MemoryRenderBufferRenderElement::from_buffer` needs the buffer while
+        // `renderer` is also borrowed. They are disjoint (`renderer` is a separate
+        // parameter, not a `state` field), so this type-checks and stays short.
+        if let Some(buffer) = state.bloom_mut().get(size.w, size.h) {
+            let origin: Point<f64, Physical> = Point::from((0.0, 0.0));
+            match MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                origin,
+                buffer,
+                None,
+                None,
+                None,
+                Kind::Unspecified,
+            ) {
+                Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                // Never fatal: without the backdrop the clear colour shows, which
+                // is precisely the pre-M1 desktop. A failed import must not cost
+                // the user their session.
+                Err(err) => warn!(?err, "bloom: failed to import the backdrop; falling back to the clear colour"),
+            }
         }
     }
 

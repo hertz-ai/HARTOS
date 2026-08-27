@@ -498,6 +498,10 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         ws_switch_at: None,
         capture_blocked: false,
         black_buffer,
+        // NATIVE SHELL M1 — empty until the first frame composes the backdrop at
+        // the output's real mode (the 1920x1080 guess above is only the killswitch
+        // solid's initial size, and the bloom must match the ACTUAL scanout).
+        bloom: Default::default(),
         ipc: crate::ipc::IpcState::default(),
         // F1 (#166) — no flips in flight at boot; the VBlank source populates this.
         vblank_completed: std::collections::HashSet::new(),

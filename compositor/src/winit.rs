@@ -270,6 +270,9 @@ pub struct State {
     // â”€â”€ M6 â€” the killswitch black surface buffer (full-output opaque black). Cached +
     // resized on output change so the kill draw is one cheap solid element. â”€â”€
     pub black_buffer: SolidColorBuffer,
+    /// NATIVE SHELL M1 — the composed aura backdrop, cached across frames so the
+    /// per-pixel compose runs once per (size, theme) rather than every frame.
+    pub bloom: crate::comp_core::BloomCache,
 }
 
 impl State {
@@ -366,6 +369,9 @@ impl CompState for State {
     }
     fn black_buffer_mut(&mut self) -> &mut SolidColorBuffer {
         &mut self.black_buffer
+    }
+    fn bloom_mut(&mut self) -> &mut crate::comp_core::BloomCache {
+        &mut self.bloom
     }
     /// winit OVERRIDE: the shared flag-flip/log PLUS fail any in-flight screencopy
     /// frames so no capture queued just-as-the-kill-engaged leaks a frame painted before
@@ -1109,6 +1115,8 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         cursor_hotspot: cur_hotspot,
         ws_switch_at: None,
         black_buffer,
+        // NATIVE SHELL M1 — composed lazily on the first frame at the real size.
+        bloom: Default::default(),
     };
 
     // 6. (No calloop Generic source for the Display â€” see step 1. The Display is

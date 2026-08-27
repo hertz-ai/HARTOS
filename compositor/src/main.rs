@@ -93,6 +93,21 @@ mod shared;
 #[cfg(any(feature = "winit", feature = "smithay"))]
 mod comp_core;
 
+// ── NATIVE SHELL PARITY PROGRAM, M1: the aura bloom drawn by the COMPOSITOR ──
+// The desktop backdrop used to be a flat HART_SPLASH_RGBA clear with the real
+// aurora painted by a browser inside a WebView. `bloom.rs` composes that same
+// field natively (parity source: the ONE conky-themes palette the HTML shell
+// reads, so there is no second theme table). It is pure CPU math with no smithay
+// types, and `comp_core` owns the caching + element assembly — so this is gated
+// exactly like `comp_core`, the only thing that consumes it. See src/bloom.rs
+// for the compose-once performance contract.
+//
+// NOTE this module existed since 2026-07-20 with NO `mod` declaration, so it was
+// never compiled and the desktop kept clearing to flat black. Declaring it here
+// is what makes M1 real; do not drop this line.
+#[cfg(any(feature = "winit", feature = "smithay"))]
+mod bloom;
+
 // ── Phase-5 Smithay handler BODIES (CI-COMPILE only) ──
 // The real xdg-shell / XWayland / xdg-decoration / wlr-foreign-toplevel-management
 // handler bodies live in `wayland.rs`, gated behind the `smithay` cargo feature
