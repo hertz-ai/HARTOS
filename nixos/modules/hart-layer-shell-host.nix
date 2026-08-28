@@ -591,6 +591,17 @@ class GlassShellLayer:
         # what makes this landable ahead of the compositor half.
         _claimed = _native_chrome_claimed()
         if _claimed:
+            # `import sys as _sys` LOCALLY, the idiom this program already uses
+            # everywhere else (see the shutdown and crash handlers below). The
+            # top of this program is only `import gi, os` -- there is no global
+            # sys. An earlier version of this block used a bare `sys.stderr` in
+            # BOTH the success print and the except handler, which would have
+            # raised NameError on the success path, then raised NameError AGAIN
+            # inside the handler where nothing catches it, killing the GTK4 host
+            # and leaving no shell -- and it would have fired only once the
+            # compositor first claimed chrome, i.e. the moment the bridge began
+            # working. py_compile cannot see this; only reading the imports can.
+            import sys as _sys
             try:
                 from gi.repository import Gdk
                 clear = Gdk.RGBA()
@@ -607,14 +618,14 @@ class GlassShellLayer:
                     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
                 print('[hart-glass-shell-gtk4] NATIVE CHROME: surface transparent '
                       '(compositor owns %s)' % ','.join(sorted(_claimed)),
-                      file=sys.stderr, flush=True)
+                      file=_sys.stderr, flush=True)
             except Exception as exc:
                 # NEVER take the session down over a cosmetic handoff. An opaque
                 # shell that paints is strictly better than a transparent one
                 # that crashed, and the served shell independently falls back to
                 # drawing its own backdrop when it sees no claim.
                 print('[hart-glass-shell-gtk4] NATIVE CHROME: transparency failed '
-                      '(%s); staying opaque' % exc, file=sys.stderr, flush=True)
+                      '(%s); staying opaque' % exc, file=_sys.stderr, flush=True)
         # Honest-paint state: shell-ready must mean the surface is MAPPED and the
         # page load FINISHED, not merely load-finished. On 2026-07-19 the host
         # crashed before present(), the WINDOWLESS WebView still finished loading,

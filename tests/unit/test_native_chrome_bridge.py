@@ -286,3 +286,91 @@ def test_the_claim_is_cleared_at_session_start():
     assert "rm -f /run/hart/session/native-chrome" in head, (
         "every session must start claiming nothing; hart-comp re-earns the "
         "claim by presenting a frame")
+
+
+def test_the_embedded_python_uses_no_undefined_module_name():
+    """A NameError in that program kills the GTK4 host, and py_compile CANNOT see it.
+
+    The host program's only top-level imports are `import gi, os` and the
+    gi.repository line; everything else (sys, subprocess, ...) is imported
+    LOCALLY inside the function that needs it. So a bare `sys.stderr` written at
+    a scope with no local import compiles fine and raises NameError at runtime.
+
+    That is not hypothetical. The native-chrome transparency block was written
+    with `file=sys.stderr` in BOTH its success print and its except handler.
+    The success path would have raised NameError, been caught, and then the
+    handler would have raised NameError AGAIN where nothing catches it —
+    killing the host and leaving no shell. And it would have fired only once the
+    compositor first CLAIMED chrome, i.e. exactly when the bridge began working.
+
+    test_gtk4_host_python_py_compiles passes on that code, because it is a
+    runtime error. This checks name resolution instead.
+    """
+    import ast
+    body = _host_python()
+    tree = ast.parse(body)
+    builtins_ns = set(dir(__builtins__)) | set(dir(__import__("builtins")))
+
+    def bound_by(node, nodes=None):
+        """Names bound in this scope: imports, assignments, defs, args, except.
+
+        `nodes` lets the caller pass ONLY the statements of a scope. That matters:
+        ast.walk descends INTO nested functions, so walking the module would
+        absorb every local `import sys` from every method and make this check
+        vacuous — which is precisely how the first version of this test passed
+        against the very bug it was written to catch.
+        """
+        out = set()
+        for n in (nodes if nodes is not None else ast.walk(node)):
+            if isinstance(n, (ast.Import, ast.ImportFrom)):
+                for a in n.names:
+                    out.add((a.asname or a.name).split(".")[0])
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                out.add(n.id)
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                out.add(n.name)
+            elif isinstance(n, ast.arg):
+                out.add(n.arg)
+            elif isinstance(n, ast.ExceptHandler) and n.name:
+                out.add(n.name)
+            elif isinstance(n, ast.alias):
+                out.add((n.asname or n.name).split(".")[0])
+        return out
+
+    # MODULE scope: fully walk each top-level statement (so `FOO = ...` and
+    # `import x` register their targets), but for a def/class bind only its NAME
+    # and never descend into a function body — that descent is what made the
+    # first version of this check vacuous.
+    def module_bindings(mod):
+        out = set()
+        def take(stmt):
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.add(stmt.name)
+            elif isinstance(stmt, ast.ClassDef):
+                out.add(stmt.name)
+                for s in stmt.body:          # class-level names methods can see
+                    take(s)
+            else:
+                out.update(bound_by(stmt))   # safe: no nested function scope here
+        for stmt in mod.body:
+            take(stmt)
+        return out
+
+    module_ns = module_bindings(tree) | builtins_ns
+
+    bad = []
+    for fn in [n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        # The function's OWN bindings (walk is fine here: an inner def's imports
+        # are genuinely unavailable to the outer body, but treating them as
+        # available only makes this check more permissive, never falsely red).
+        local = bound_by(fn) | module_ns
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                if n.id not in local:
+                    bad.append("%s() line %d: %r" % (fn.name, n.lineno, n.id))
+    assert not bad, (
+        "undefined name(s) in the `python -c` host program — these raise "
+        "NameError at runtime and py_compile cannot see them. If it is a stdlib "
+        "module, import it LOCALLY the way the rest of this program does "
+        "(`import sys as _sys`): %s" % bad[:6])
