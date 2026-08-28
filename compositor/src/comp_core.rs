@@ -133,6 +133,25 @@ pub const WS_FADE_MS: u128 = 120;
 pub static LAYERS_PAINTED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Which native chrome the LAST built frame actually contained, as a bitmask
+/// (NATIVE_CHROME_BLOOM | NATIVE_CHROME_ORB).
+///
+/// The shell only stands down for chrome we can prove we are drawing, so the
+/// claim must be published from the RENDER PATH rather than from configuration:
+/// "the flag is set" is a promise, "this element was in the frame that reached
+/// the screen" is evidence. Getting that backwards yields a desktop with no
+/// background, which the paint watchdog does NOT catch — it watches for hangs,
+/// not for wrong-looking desktops.
+///
+/// A static for the same reason LAYERS_PAINTED is one: the value is produced
+/// deep in the generic frame builder and consumed by the backend's flip
+/// handler, and threading it through the CompState trait would put a render
+/// detail into the backend-agnostic accessor surface for no gain.
+pub static NATIVE_CHROME_EMITTED: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+pub const NATIVE_CHROME_BLOOM: u8 = 1 << 0;
+pub const NATIVE_CHROME_ORB: u8 = 1 << 1;
+
 /// The action a compositor keyboard shortcut resolves to (anvil's `KeyAction`
 /// analogue). `process_keyboard_shortcut` maps a `(ModifiersState, Keysym)` to one of
 /// these; the chord is INTERCEPTED (never forwarded to the focused client) iff the map
@@ -1722,6 +1741,10 @@ where
     R::TextureId: Send + Clone + 'static,
 {
     let mut elements: Vec<HartRenderElement<R>> = Vec::new();
+    // What native chrome THIS frame ends up containing. Accumulated as elements
+    // are actually pushed (never on a failed import), and published at the end
+    // for the backend's flip handler to turn into the shell's verdict file.
+    let mut native_mask: u8 = 0;
 
     // ── 0. KILLSWITCH (top): a full-output opaque black solid ABOVE all windows. ──
     if state.capture_blocked() {
@@ -1804,10 +1827,16 @@ where
     // difference between this and the ~5.4s/6s of userspace rasterisation
     // measured in WebKit while it breathed the same orb.
     if !state.capture_blocked() {
-        // Provisional geometry: centred horizontally, at the hero's 46% line
-        // (`.hart-hero{top:46%}`), sized as a fraction of the short edge. The
-        // scene will own this once A2UI drives the native tree (M4); hard-coding
-        // it here keeps M2 to ONE new idea instead of two.
+        // Placement per checklist rule c7: "Home mode: orb floats to the RIGHT
+        // of the hero copy". An earlier draft centred it, which contradicts a
+        // binding rule — the checklist is the instruction record, not a
+        // suggestion. Vertically it sits on the hero's own line
+        // (`.hart-hero{top:46%}`), sized as a fraction of the short edge.
+        //
+        // Still PROVISIONAL: the scene owns this once A2UI drives the native
+        // tree (M4), and c7's compact orb-sm docked in the top bar is not
+        // modelled here at all. Hard-coding a c7-shaped default keeps M2 to one
+        // new idea while not shipping a placement the checklist forbids.
         let short = size.w.min(size.h);
         let side = (short as f32 * 0.30) as i32;
         let energy = state.orb_energy();
@@ -1816,7 +1845,8 @@ where
             // the growth. Computed from the motion rather than stored, so there
             // is no second source of truth for where the orb is.
             let drawn = (side as f32 * motion.scale) as i32;
-            let cx = size.w / 2;
+            // 0.72 of the width = right of the hero copy (c7), not centred.
+            let cx = (size.w as f32 * 0.72) as i32;
             let cy = (size.h as f32 * 0.46) as i32;
             let origin: Point<f64, Physical> =
                 Point::from(((cx - drawn / 2) as f64, (cy - drawn / 2) as f64));
@@ -1829,9 +1859,14 @@ where
                 Some((drawn, drawn).into()),
                 Kind::Unspecified,
             ) {
-                Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                Ok(e) => {
+                    elements.push(HartRenderElement::Memory(e));
+                    native_mask |= NATIVE_CHROME_ORB;
+                }
                 // Never fatal: a missing orb is a desktop without an orb, not a
-                // dead session. Same posture as the backdrop below.
+                // dead session. Same posture as the backdrop below. Note the
+                // mask is NOT set here — a failed import must never let the
+                // shell hide its own orb.
                 Err(err) => warn!(?err, "orb: failed to import the composed orb"),
             }
         }
@@ -1865,14 +1900,23 @@ where
                 None,
                 Kind::Unspecified,
             ) {
-                Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                Ok(e) => {
+                    elements.push(HartRenderElement::Memory(e));
+                    native_mask |= NATIVE_CHROME_BLOOM;
+                }
                 // Never fatal: without the backdrop the clear colour shows, which
                 // is precisely the pre-M1 desktop. A failed import must not cost
-                // the user their session.
+                // the user their session, and must NOT set the mask — the shell
+                // would then go transparent over a backdrop we never drew.
                 Err(err) => warn!(?err, "bloom: failed to import the backdrop; falling back to the clear colour"),
             }
         }
     }
+
+    // Publish what this frame contains. The backend turns it into the shell's
+    // verdict ONLY after the frame is actually presented, so a composed-but-
+    // never-flipped frame can never make the shell go transparent.
+    NATIVE_CHROME_EMITTED.store(native_mask, std::sync::atomic::Ordering::Relaxed);
 
     elements
 }

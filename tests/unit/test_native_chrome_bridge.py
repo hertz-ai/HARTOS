@@ -209,3 +209,80 @@ def test_transparency_failure_never_kills_the_session():
     assert "except Exception" in window, (
         "a cosmetic handoff must not be able to take the session down; an "
         "opaque shell that paints beats a transparent one that crashed")
+
+
+# ── the compositor half (bridge part 4): the claim must be EARNED ────────────
+
+COMP_SRC = os.path.join(REPO, "compositor", "src")
+
+
+def _rust(name):
+    with open(os.path.join(COMP_SRC, name), encoding="utf-8") as fh:
+        src = fh.read()
+    import re as _re
+    src = _re.sub(r"/\*.*?\*/", "", src, flags=_re.S)
+    return "\n".join(l for l in src.splitlines()
+                     if not l.lstrip().startswith("//"))
+
+
+def test_the_claim_is_published_from_the_flip_path_not_config():
+    """THE contract. 'A flag is set' is a promise; 'this element was in the frame
+    that reached the screen' is evidence. Only the second is safe to act on,
+    because acting wrongly yields a desktop with no background and the paint
+    watchdog does not catch wrong-looking desktops."""
+    udev = _rust("udev.rs")
+    import re as _re
+    # The CALL site, not the `fn publish_native_chrome()` definition.
+    calls = [m.start() for m in _re.finditer(r"(?<!fn )publish_native_chrome\(\)", udev)]
+    assert calls, "publish_native_chrome is never called"
+    i = calls[0]
+    window = udev[max(0, i - 500): i]
+    assert "last_flip_at = Some(now)" in window, (
+        "the claim must be published where the frame is recorded as presented, "
+        "not from configuration or at startup")
+
+
+def test_a_failed_element_import_does_not_claim_it():
+    """A buffer that failed to import was never drawn. Claiming it anyway would
+    make the shell hide its own copy of something nobody is painting."""
+    core = _rust("comp_core.rs")
+    for elem, mask in (("orb", "NATIVE_CHROME_ORB"),
+                       ("bloom", "NATIVE_CHROME_BLOOM")):
+        i = core.index("%s: failed to import" % elem)
+        # The mask must be set in the Ok arm ABOVE, never in/after the Err arm.
+        after_err = core[i: i + 300]
+        assert mask not in after_err, (
+            "%s sets its claim mask on the failure path" % elem)
+
+
+def test_the_claim_only_grows_within_a_session():
+    """The shell re-reads this on every render. Retracting a claim mid-session
+    would flicker the desktop between native and HTML chrome."""
+    udev = _rust("udev.rs")
+    i = udev.index("fn publish_native_chrome")
+    body = udev[i: i + 2200]
+    assert "prev | mask" in body, "the published claim must only ever grow"
+    assert "if next == prev" in body, "an unchanged claim must not be rewritten"
+
+
+def test_the_write_is_atomic():
+    """The shell polls this file on every render; a torn read would flicker."""
+    udev = _rust("udev.rs")
+    i = udev.index("fn publish_native_chrome")
+    body = udev[i: i + 2200]
+    assert "rename" in body, (
+        "write-then-rename, or a reader can observe a half-written claim")
+
+
+def test_the_claim_is_cleared_at_session_start():
+    """The dangerous case: hart-comp claims, then the ladder drops to sway/cage
+    where NOTHING draws the native backdrop. A stale claim would leave the shell
+    transparent over nothing."""
+    with open(os.path.join(REPO, "nixos", "modules", "hart-comp.nix"),
+              encoding="utf-8") as fh:
+        nix = fh.read()
+    i = nix.index('writeShellScriptBin "hart-comp-session"')
+    head = nix[i: i + 1600]
+    assert "rm -f /run/hart/session/native-chrome" in head, (
+        "every session must start claiming nothing; hart-comp re-earns the "
+        "claim by presenting a frame")

@@ -421,6 +421,18 @@ let
   # exec wrapper; it inherits the constitution gate from the session boot path.
   compSessionLauncher = pkgs.writeShellScriptBin "hart-comp-session" ''
     set -u
+    # ── NATIVE CHROME BRIDGE: start every session claiming NOTHING ───────────
+    # hart-comp writes /run/hart/session/native-chrome after a frame containing
+    # its own bloom/orb is presented, and the shell then stops painting those.
+    # A claim left over from a PREVIOUS session is dangerous in one specific
+    # way: if the ladder drops to sway/cage (no hart-comp, so nothing draws the
+    # native backdrop) a stale file would still tell the shell to go transparent,
+    # and the user gets a desktop with no background. The paint watchdog does not
+    # catch that -- it watches for hangs, not for wrong-looking desktops.
+    # So clear it here, before anything can read it. hart-comp re-earns the claim
+    # each session by actually presenting a frame; a tier that never runs
+    # hart-comp simply never writes it.
+    rm -f /run/hart/session/native-chrome /run/hart/session/.native-chrome.tmp 2>/dev/null || true
     # coreutils provides the launcher's own ls/seq/sleep/basename/id; xwayland puts
     # the `Xwayland` BINARY on PATH so Smithay's `XWayland::spawn` (which is hardcoded
     # to `Command::new("Xwayland")` and resolves it from $PATH — it only forwards PATH
