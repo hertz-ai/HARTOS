@@ -274,6 +274,80 @@ impl BloomCache {
     }
 }
 
+/// The breathing orb: ONE texture, animated by two scalars (NATIVE SHELL M2).
+///
+/// The bloom is composed once because it never moves. The orb breathes, and the
+/// tempting shortcut is to recompose it every frame — which would simply move
+/// the browser's cost into Rust — or to cache a ring of animation phases, which
+/// quantises a smooth breath into steps and pays memory linear in the step
+/// count for an approximation of what the GPU does exactly.
+///
+/// Neither is what a real compositor does. Core Animation and DWM both
+/// rasterise once and then vary cheap per-frame parameters on the GPU. smithay
+/// exposes exactly that: `MemoryRenderBufferRenderElement::from_buffer` takes
+/// `alpha` and `size`, so one buffer plus two floats per frame gives continuous
+/// motion at the display's own rate. Per-frame CPU cost is arithmetic on two
+/// scalars. Memory is O(1) rather than O(steps).
+#[derive(Default)]
+pub struct OrbCache {
+    key: Option<(i32, crate::orb::OrbPalette)>,
+    buffer: Option<MemoryRenderBuffer>,
+    /// When this orb started breathing. Owned HERE rather than passed in, so the
+    /// phase is COMPUTED from a clock at the point of use and there is nowhere
+    /// to store a "target" value to ease toward — the program's binding rule for
+    /// `animated`, which exists because CSS-style easing is what made the orb
+    /// drag rubber-band on 2026-07-20.
+    epoch: Option<Instant>,
+}
+
+impl OrbCache {
+    /// The composed orb plus its motion RIGHT NOW.
+    ///
+    /// Returns the buffer to draw and the (scale, alpha) to draw it with. The
+    /// caller hands those straight to the render element, so the CPU never
+    /// touches a pixel after the first compose.
+    ///
+    /// `energy` is the live signal (mic RMS, 0..=1) P2 calls for. It is threaded
+    /// through rather than sampled here so this stays a pure cache: the source
+    /// of the signal can change without this type changing.
+    ///
+    /// `None` for a degenerate size, matching BloomCache: the caller then emits
+    /// no orb and the frame is the desktop without it, never a panic.
+    pub fn current(
+        &mut self,
+        side: i32,
+        energy: f32,
+    ) -> Option<(&MemoryRenderBuffer, crate::orb::OrbMotion)> {
+        if side <= 0 {
+            return None;
+        }
+        let now = Instant::now();
+        let epoch = *self.epoch.get_or_insert(now);
+        let motion = crate::orb::motion_at(now.saturating_duration_since(epoch), energy);
+
+        let pal = crate::orb::OrbPalette::default();
+        if self.key != Some((side, pal)) {
+            let started = Instant::now();
+            let rgba = crate::orb::compose(side, &pal);
+            self.buffer = Some(MemoryRenderBuffer::from_slice(
+                &rgba,
+                Fourcc::Argb8888,
+                (side, side),
+                1,
+                Transform::Normal,
+                None,
+            ));
+            self.key = Some((side, pal));
+            info!(
+                side,
+                took_ms = started.elapsed().as_millis() as u64,
+                "orb.composed (once; breathing is per-frame scale+alpha on the GPU)"
+            );
+        }
+        self.buffer.as_ref().map(|b| (b, motion))
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // THE `CompState` trait — the backend-agnostic accessor surface the shared WM brain
 // drives. Each backend's concrete `State` impls it by handing back references to the
@@ -334,6 +408,19 @@ pub trait CompState:
 
     // ── NATIVE SHELL M1: the composed aura backdrop (see BloomCache). ──
     fn bloom_mut(&mut self) -> &mut BloomCache;
+
+    // ── NATIVE SHELL M2: the breathing voice orb (see OrbCache). ──
+    fn orb_mut(&mut self) -> &mut OrbCache;
+
+    /// The orb's live energy signal, 0..=1 (mic RMS while listening/speaking).
+    ///
+    /// Default 0.0 = resting breath, so a backend that has not wired voice yet
+    /// still gets a correct, calm orb rather than no orb. The DRM backend
+    /// overrides this once the voice IPC lands (M5); until then the orb breathes
+    /// on the clock alone, which is exactly P2's resting behaviour.
+    fn orb_energy(&self) -> f32 {
+        0.0
+    }
 
     /// Toggle the screen kill-switch (the `screen.kill` IPC verb's executor). Default
     /// = the shared flag-flip + log. The winit backend OVERRIDES it to ALSO fail any
@@ -1701,6 +1788,52 @@ where
         let prev = LAYERS_PAINTED.swap(layers_painted, std::sync::atomic::Ordering::Relaxed);
         if prev != layers_painted {
             info!(layers_painted, "layer.composited (wlr-layer surfaces now in the rendered frame)");
+        }
+    }
+
+    // ── 3b. NATIVE ORB (NATIVE SHELL M2), above the backdrop, below the shell. ──
+    // Placed here in the z-order so it composites over the bloom but under the
+    // layer surfaces, matching M1's staging: while the HTML shell still paints an
+    // opaque background this is OCCLUDED, exactly as the bloom is. It is wired
+    // now rather than later so the module cannot rot unreferenced — which is
+    // precisely how bloom.rs sat dormant from 2026-07-20 to 2026-08-27.
+    //
+    // The whole point of M2 is here: `motion` is two floats from a clock, handed
+    // to the element as `alpha` and `size`. The GPU scales and blends a texture
+    // composed once. No pixel is touched by the CPU per frame, which is the
+    // difference between this and the ~5.4s/6s of userspace rasterisation
+    // measured in WebKit while it breathed the same orb.
+    if !state.capture_blocked() {
+        // Provisional geometry: centred horizontally, at the hero's 46% line
+        // (`.hart-hero{top:46%}`), sized as a fraction of the short edge. The
+        // scene will own this once A2UI drives the native tree (M4); hard-coding
+        // it here keeps M2 to ONE new idea instead of two.
+        let short = size.w.min(size.h);
+        let side = (short as f32 * 0.30) as i32;
+        let energy = state.orb_energy();
+        if let Some((buffer, motion)) = state.orb_mut().current(side, energy) {
+            // Breathing scales about the CENTRE, so the top-left moves by half
+            // the growth. Computed from the motion rather than stored, so there
+            // is no second source of truth for where the orb is.
+            let drawn = (side as f32 * motion.scale) as i32;
+            let cx = size.w / 2;
+            let cy = (size.h as f32 * 0.46) as i32;
+            let origin: Point<f64, Physical> =
+                Point::from(((cx - drawn / 2) as f64, (cy - drawn / 2) as f64));
+            match MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                origin,
+                buffer,
+                Some(motion.alpha),
+                None,
+                Some((drawn, drawn).into()),
+                Kind::Unspecified,
+            ) {
+                Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                // Never fatal: a missing orb is a desktop without an orb, not a
+                // dead session. Same posture as the backdrop below.
+                Err(err) => warn!(?err, "orb: failed to import the composed orb"),
+            }
         }
     }
 

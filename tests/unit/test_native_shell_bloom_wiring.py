@@ -132,3 +132,92 @@ def test_the_compose_is_cached_against_size_and_palette():
     assert re.search(r"self\.key\s*!=\s*Some\(\(w,\s*h,\s*pal\)\)", code), (
         "BloomCache must skip the compose when (size, palette) is unchanged"
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# M2 — the native orb. Same guards (a module must not rot unreferenced), plus
+# the ones that protect the DESIGN, because the tempting shortcuts here are
+# subtle and would silently reintroduce the cost M2 exists to remove.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_orb_module_is_declared():
+    """The bloom lesson, applied. An undeclared module is not an error in Rust,
+    it is simply absent from the program, and that is how M1 sat dormant for
+    five weeks."""
+    code = _strip_rust_comments(_read("main.rs"))
+    assert re.search(r"^\s*mod orb;", code, re.M), (
+        "compositor/src/orb.rs is not declared with `mod orb;` in main.rs, so "
+        "rustc never compiles it and the native orb silently does not exist")
+
+
+def test_the_orb_reaches_the_frame():
+    code = _strip_rust_comments(_read("comp_core.rs"))
+    assert "orb_mut()" in code, "nothing reads the orb cache while building a frame"
+    assert "OrbCache" in code, "the orb cache type is gone"
+
+
+def test_both_backends_implement_the_orb_accessor():
+    for backend in ("wayland.rs", "winit.rs"):
+        code = _strip_rust_comments(_read(backend))
+        assert "fn orb_mut(&mut self)" in code, (
+            "%s does not implement CompState::orb_mut" % backend)
+        assert re.search(r"pub orb:\s*crate::comp_core::OrbCache", code), (
+            "%s has no orb field to hand back" % backend)
+
+
+def test_breathing_is_per_frame_scalars_not_a_phase_cache():
+    """THE design guard.
+
+    The shortcut is to cache one composed buffer per animation phase. It looks
+    efficient and is not: it quantises a smooth breath into steps, costs memory
+    linear in the step count, and is an approximation of what the GPU does
+    exactly. Real compositors (Core Animation, DWM) rasterise ONCE and vary
+    per-frame parameters. smithay exposes exactly that -- from_buffer takes
+    `alpha` and `size` -- so one texture plus two floats gives continuous motion
+    at the display's rate with O(1) memory.
+
+    This was written the wrong way first and corrected; the guard exists so it
+    does not drift back.
+    """
+    code = _strip_rust_comments(_read("comp_core.rs"))
+    orb = code[code.index("pub struct OrbCache"):]
+    orb = orb[: orb.index("\n}\n", orb.index("impl OrbCache"))]
+    assert "steps" not in orb, (
+        "OrbCache is caching per-phase buffers again; breathing must be "
+        "per-frame scale+alpha on ONE composed texture")
+    assert "motion_at" in orb, "the orb's motion must come from orb::motion_at"
+
+
+def test_the_element_actually_varies_alpha_and_size():
+    """A one-texture design only pays off if the per-frame parameters are
+    ACTUALLY passed. Handing None/None here would render a static orb and
+    quietly discard the whole point of M2."""
+    code = _strip_rust_comments(_read("comp_core.rs"))
+    i = code.index("orb_mut()")
+    window = code[i: i + 1400]
+    assert "Some(motion.alpha)" in window, (
+        "the orb element must pass its per-frame alpha, or it cannot breathe")
+    assert "motion.scale" in window, (
+        "the orb element must apply its per-frame scale")
+
+
+def test_motion_is_a_pure_function_of_clock_and_signal():
+    """The program's SEMANTICS TRAP: `animated` must be COMPUTED from (clock,
+    energy) every frame and must never store a target to ease toward. That is
+    what makes the CSS-transition drag bug structurally impossible."""
+    src = _read("orb.rs")
+    code = _strip_rust_comments(src)
+    assert re.search(r"pub fn motion_at\(\s*elapsed: Duration,\s*energy: f32\s*\)", code), (
+        "motion_at must take the clock and the live signal as ARGUMENTS; making "
+        "either internal state reintroduces the eased-toward-a-target model")
+    assert "target" not in code.lower().replace("saturating", ""), (
+        "orb.rs mentions a motion target; motion is computed, never eased toward")
+
+
+def test_the_orb_is_premultiplied():
+    """The orb is translucent over the desktop, unlike the opaque bloom. Without
+    premultiplication its halo composites as a bright fringe."""
+    code = _strip_rust_comments(_read("orb.rs"))
+    assert "* a)" in code, (
+        "orb::compose must premultiply every colour channel by alpha")

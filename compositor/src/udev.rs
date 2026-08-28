@@ -502,6 +502,8 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         // the output's real mode (the 1920x1080 guess above is only the killswitch
         // solid's initial size, and the bloom must match the ACTUAL scanout).
         bloom: Default::default(),
+        // NATIVE SHELL M2 — composed on the first frame at the real output size.
+        orb: Default::default(),
         ipc: crate::ipc::IpcState::default(),
         // F1 (#166) — no flips in flight at boot; the VBlank source populates this.
         vblank_completed: std::collections::HashSet::new(),
