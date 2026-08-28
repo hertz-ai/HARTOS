@@ -15,10 +15,14 @@ beside the copilot's — the parallel-path trap. One backend, two consumers, the
 same pattern as one _tool_impls behind several MCP transports.
 
 Pure stdlib (subprocess/os) so both a bare daemon script and the backend can
-import it without dragging in heavy deps.
+import it without dragging in heavy deps.  core.subprocess_safe is the one
+exception and costs nothing: it imports only logging/subprocess/sys/typing, and
+both consumers already reach `integrations.*`, so `core.*` resolves for free.
 """
 import os
 import subprocess
+
+from core.subprocess_safe import no_window_kwargs
 
 CLAUDE_BIN = os.environ.get('HART_CLAUDE_BIN', 'claude')
 
@@ -65,8 +69,12 @@ def invoke_claude(prompt, *, mode='agentic', cwd=None, timeout_s=None,
         cmd += list(extra_args)
 
     try:
+        # claude is a console-subsystem binary. Nunba.exe is GUI-subsystem and
+        # owns no console, so spawning it bare makes Windows allocate a fresh
+        # VISIBLE console for the run's lifetime — a cmd window flashing on the
+        # user's desktop. no_window_kwargs() returns {} off win32.
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                              timeout=timeout_s)
+                              timeout=timeout_s, **no_window_kwargs())
         return {'ok': proc.returncode == 0, 'returncode': proc.returncode,
                 'stdout': (proc.stdout or ''), 'stderr': (proc.stderr or '')}
     except FileNotFoundError:
