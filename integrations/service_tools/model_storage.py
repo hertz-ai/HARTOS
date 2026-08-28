@@ -10,7 +10,6 @@ Pattern from: integrations/vision/minicpm_installer.py
 
 import json
 import logging
-import os
 import shutil
 import subprocess
 import sys
@@ -58,12 +57,23 @@ class ModelStorageManager:
     # ── Download state ───────────────────────────────────────────
 
     def is_downloaded(self, tool_name: str) -> bool:
-        """Check if a tool's models are already downloaded."""
-        manifest = self._read_manifest()
-        entry = manifest.get("tools", {}).get(tool_name)
-        if not entry:
-            return False
-        # Also verify the directory actually exists
+        """Check if a tool's models are already downloaded.
+
+        The DIRECTORY is the source of truth, not the manifest.  Models can
+        arrive by paths that never call mark_downloaded(): measured on a live
+        box 2026-08-29, ~/.hevolve/models held 12.3 GB across minicpm (6600MB),
+        stt (5347MB), luxtts (342MB) and tts (59MB) with no manifest row, so
+        this returned False for all four.  Callers act on that -- runtime_manager
+        :126 and :160 gate tool use on it, :209 and :302 report it to the UI,
+        and download_hf_model:163 would re-fetch every one of those gigabytes.
+        manifest.json stays what its own module docstring calls it, a ledger of
+        where disk space went; presence on disk answers "is it downloaded".
+
+        An empty directory is NOT a download: `tool_dir.mkdir()` runs BEFORE
+        each fetch, so a failure leaves a 0-file directory behind (that is why
+        chatterbox/cosyvoice/diffrhythm/kokoro each had one -- diffrhythm's HF
+        call took a 401).  The non-empty test below is what excludes them.
+        """
         tool_dir = self.get_tool_dir(tool_name)
         return tool_dir.exists() and any(tool_dir.iterdir())
 
