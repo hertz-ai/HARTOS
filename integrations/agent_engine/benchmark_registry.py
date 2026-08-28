@@ -125,6 +125,30 @@ class RegressionAdapter(BenchmarkAdapter):
                 os.path.join('venv310', 'Scripts', 'python.exe')
                 if sys.platform == 'win32' else
                 os.path.join('venv310', 'bin', 'python'))
+            # A dev checkout has venv310. A NixOS node does not: hart-app runs
+            # from the store and there is no venv anywhere, so this resolved to a
+            # path that does not exist, subprocess raised FileNotFoundError, and
+            # the whole adapter returned empty metrics. The upgrade pipeline then
+            # read that absence as a 0% pass rate and failed every attempt
+            # (real box, 2026-08-24). Fall back to the interpreter already
+            # running us, which by definition exists and has our dependencies.
+            if not os.path.isabs(python) and not os.path.exists(python):
+                python = sys.executable
+            root = os.environ.get(
+                'HEVOLVE_PROJECT_ROOT',
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+            # A DEPLOYED NODE CARRIES NO TEST SUITE. hart-app ships the runtime
+            # only, so `pytest tests/` there collects nothing and there is no
+            # interpreter or flag that changes it: the files are simply absent.
+            # Report that as a distinct SKIP rather than a failure. The build
+            # being gated already ran the full suite in CI before it was signed
+            # and cached, and this module's own safety model names SIGN and
+            # CANARY as the local gates, not regression. Calling an impossible
+            # measurement a failure is what left the real box unable to update.
+            if not os.path.isdir(os.path.join(root, 'tests')):
+                return {'metrics': {},
+                        'skipped': 'no test suite at %s (deployed node: '
+                                   'regression is gated in CI, not here)' % root}
             result = subprocess.run(
                 [python, '-m', 'pytest', 'tests/', '-s',
                  '--ignore=tests/runtime_tests', '-q',
@@ -153,16 +177,31 @@ class RegressionAdapter(BenchmarkAdapter):
                             except ValueError:
                                 pass
             total = passed + failed
+            if total == 0:
+                # NO TESTS RAN. `passed / max(1, total)` used to turn that into
+                # 0/1 = 0.0, a real-looking metric meaning "nothing passed",
+                # which the upgrade gate then treated as a catastrophically bad
+                # build. Zero collected tests is a missing measurement, not a
+                # result, and reporting no metric lets the caller say so.
+                # Carry the evidence: without it the failure read only as
+                # "pass_rate=0.00%, fail=0" and the actual cause (wrong
+                # interpreter, missing tests/ directory, collection error) was
+                # thrown away.
+                tail = '\n'.join(output.strip().splitlines()[-5:])
+                return {'metrics': {},
+                        'error': ('pytest collected no tests (exit %s) using %s'
+                                  % (result.returncode, python)),
+                        'output_tail': tail}
             return {'metrics': {
                 'pass_rate': {
-                    'value': passed / max(1, total),
+                    'value': passed / total,
                     'direction': 'higher', 'unit': 'ratio'},
                 'fail_count': {
                     'value': failed,
                     'direction': 'lower', 'unit': 'count'},
             }}
         except Exception as e:
-            return {'metrics': {}, 'error': str(e)}
+            return {'metrics': {}, 'error': '%s: %s' % (type(e).__name__, e)}
 
 
 class GuardrailAdapter(BenchmarkAdapter):

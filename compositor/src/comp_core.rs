@@ -81,6 +81,7 @@ use smithay::input::{
     keyboard::{FilterResult, Keysym, ModifiersState, keysyms as xkb},
     pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, RelativeMotionEvent},
 };
+use smithay::backend::allocator::Fourcc;
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{
@@ -131,6 +132,25 @@ pub const WS_FADE_MS: u128 = 120;
 /// transition (0→N / N→0) instead of spamming every frame. Pure observability.
 pub static LAYERS_PAINTED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Which native chrome the LAST built frame actually contained, as a bitmask
+/// (NATIVE_CHROME_BLOOM | NATIVE_CHROME_ORB).
+///
+/// The shell only stands down for chrome we can prove we are drawing, so the
+/// claim must be published from the RENDER PATH rather than from configuration:
+/// "the flag is set" is a promise, "this element was in the frame that reached
+/// the screen" is evidence. Getting that backwards yields a desktop with no
+/// background, which the paint watchdog does NOT catch — it watches for hangs,
+/// not for wrong-looking desktops.
+///
+/// A static for the same reason LAYERS_PAINTED is one: the value is produced
+/// deep in the generic frame builder and consumed by the backend's flip
+/// handler, and threading it through the CompState trait would put a render
+/// detail into the backend-agnostic accessor surface for no gain.
+pub static NATIVE_CHROME_EMITTED: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+pub const NATIVE_CHROME_BLOOM: u8 = 1 << 0;
+pub const NATIVE_CHROME_ORB: u8 = 1 << 1;
 
 /// The action a compositor keyboard shortcut resolves to (anvil's `KeyAction`
 /// analogue). `process_keyboard_shortcut` maps a `(ModifiersState, Keysym)` to one of
@@ -205,6 +225,149 @@ impl MapAnim {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// NATIVE SHELL PARITY PROGRAM, M1 — the composed aura backdrop.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The composed bloom field, held as a texture-ready buffer across frames.
+///
+/// This is the "COMPOSE ONCE, REUSE FOREVER" half of `bloom.rs`'s performance
+/// contract. `bloom::compose` walks every pixel, which is a few milliseconds at
+/// panel size — perfectly fine ONCE, and catastrophic at 60Hz. So the result is
+/// cached against `(width, height, palette)` and recomposed ONLY when the output
+/// mode or the theme actually changes. A steady desktop does zero bloom work per
+/// frame, which is what keeps the #137 idle-skip meaningful.
+///
+/// Held on each backend's `State` (reached via `CompState::bloom_mut`) rather
+/// than in a static, mirroring how `black_buffer` is already owned.
+#[derive(Default)]
+pub struct BloomCache {
+    /// Resolved ONCE, not per frame. `bloom::theme_palette` reads a JSON file off
+    /// disk; doing that at 60Hz would be a syscall storm behind a static image.
+    palette: Option<crate::bloom::BloomPalette>,
+    key: Option<(i32, i32, crate::bloom::BloomPalette)>,
+    buffer: Option<MemoryRenderBuffer>,
+}
+
+impl BloomCache {
+    // KNOWN GAP, deliberately not papered over with an unused method: the
+    // palette is resolved once and never re-read, so a theme change at runtime
+    // ("switch theme" through the agent) will not restyle this backdrop until
+    // the compositor restarts. An `invalidate()` was written here and removed
+    // again because nothing calls it, and a dead pub method is worse than an
+    // absent one: it warns on every build and reads as though the wiring exists.
+    // Whoever lands the theme-change signal adds it back with a caller.
+
+    /// The backdrop for this size, composing only on a genuine miss.
+    ///
+    /// Returns `None` for a degenerate output size (a disconnected or
+    /// not-yet-moded connector reports 0x0). The caller simply paints no
+    /// backdrop then and the clear colour still covers the frame, so a bad mode
+    /// can never panic the render loop.
+    pub fn get(&mut self, w: i32, h: i32) -> Option<&MemoryRenderBuffer> {
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        // `BloomPalette` is `Copy`, so this reads the cached value and does NOT
+        // hold the borrow across the compose below.
+        let pal = *self.palette.get_or_insert_with(crate::bloom::theme_palette);
+        if self.key != Some((w, h, pal)) {
+            let started = Instant::now();
+            let rgba = crate::bloom::compose(w, h, &pal);
+            self.buffer = Some(MemoryRenderBuffer::from_slice(
+                &rgba,
+                Fourcc::Argb8888,
+                (w, h),
+                1,
+                Transform::Normal,
+                None,
+            ));
+            self.key = Some((w, h, pal));
+            info!(
+                width = w,
+                height = h,
+                took_ms = started.elapsed().as_millis() as u64,
+                "bloom.composed (native aura backdrop; cached until the mode or theme changes)"
+            );
+        }
+        self.buffer.as_ref()
+    }
+}
+
+/// The breathing orb: ONE texture, animated by two scalars (NATIVE SHELL M2).
+///
+/// The bloom is composed once because it never moves. The orb breathes, and the
+/// tempting shortcut is to recompose it every frame — which would simply move
+/// the browser's cost into Rust — or to cache a ring of animation phases, which
+/// quantises a smooth breath into steps and pays memory linear in the step
+/// count for an approximation of what the GPU does exactly.
+///
+/// Neither is what a real compositor does. Core Animation and DWM both
+/// rasterise once and then vary cheap per-frame parameters on the GPU. smithay
+/// exposes exactly that: `MemoryRenderBufferRenderElement::from_buffer` takes
+/// `alpha` and `size`, so one buffer plus two floats per frame gives continuous
+/// motion at the display's own rate. Per-frame CPU cost is arithmetic on two
+/// scalars. Memory is O(1) rather than O(steps).
+#[derive(Default)]
+pub struct OrbCache {
+    key: Option<(i32, crate::orb::OrbPalette)>,
+    buffer: Option<MemoryRenderBuffer>,
+    /// When this orb started breathing. Owned HERE rather than passed in, so the
+    /// phase is COMPUTED from a clock at the point of use and there is nowhere
+    /// to store a "target" value to ease toward — the program's binding rule for
+    /// `animated`, which exists because CSS-style easing is what made the orb
+    /// drag rubber-band on 2026-07-20.
+    epoch: Option<Instant>,
+}
+
+impl OrbCache {
+    /// The composed orb plus its motion RIGHT NOW.
+    ///
+    /// Returns the buffer to draw and the (scale, alpha) to draw it with. The
+    /// caller hands those straight to the render element, so the CPU never
+    /// touches a pixel after the first compose.
+    ///
+    /// `energy` is the live signal (mic RMS, 0..=1) P2 calls for. It is threaded
+    /// through rather than sampled here so this stays a pure cache: the source
+    /// of the signal can change without this type changing.
+    ///
+    /// `None` for a degenerate size, matching BloomCache: the caller then emits
+    /// no orb and the frame is the desktop without it, never a panic.
+    pub fn current(
+        &mut self,
+        side: i32,
+        energy: f32,
+    ) -> Option<(&MemoryRenderBuffer, crate::orb::OrbMotion)> {
+        if side <= 0 {
+            return None;
+        }
+        let now = Instant::now();
+        let epoch = *self.epoch.get_or_insert(now);
+        let motion = crate::orb::motion_at(now.saturating_duration_since(epoch), energy);
+
+        let pal = crate::orb::OrbPalette::default();
+        if self.key != Some((side, pal)) {
+            let started = Instant::now();
+            let rgba = crate::orb::compose(side, &pal);
+            self.buffer = Some(MemoryRenderBuffer::from_slice(
+                &rgba,
+                Fourcc::Argb8888,
+                (side, side),
+                1,
+                Transform::Normal,
+                None,
+            ));
+            self.key = Some((side, pal));
+            info!(
+                side,
+                took_ms = started.elapsed().as_millis() as u64,
+                "orb.composed (once; breathing is per-frame scale+alpha on the GPU)"
+            );
+        }
+        self.buffer.as_ref().map(|b| (b, motion))
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // THE `CompState` trait — the backend-agnostic accessor surface the shared WM brain
 // drives. Each backend's concrete `State` impls it by handing back references to the
 // fields it already holds. The supertrait `SeatHandler<KeyboardFocus = WlSurface,
@@ -261,6 +424,22 @@ pub trait CompState:
     fn capture_blocked(&self) -> bool;
     fn set_capture_blocked_flag(&mut self, on: bool);
     fn black_buffer_mut(&mut self) -> &mut SolidColorBuffer;
+
+    // ── NATIVE SHELL M1: the composed aura backdrop (see BloomCache). ──
+    fn bloom_mut(&mut self) -> &mut BloomCache;
+
+    // ── NATIVE SHELL M2: the breathing voice orb (see OrbCache). ──
+    fn orb_mut(&mut self) -> &mut OrbCache;
+
+    /// The orb's live energy signal, 0..=1 (mic RMS while listening/speaking).
+    ///
+    /// Default 0.0 = resting breath, so a backend that has not wired voice yet
+    /// still gets a correct, calm orb rather than no orb. The DRM backend
+    /// overrides this once the voice IPC lands (M5); until then the orb breathes
+    /// on the clock alone, which is exactly P2's resting behaviour.
+    fn orb_energy(&self) -> f32 {
+        0.0
+    }
 
     /// Toggle the screen kill-switch (the `screen.kill` IPC verb's executor). Default
     /// = the shared flag-flip + log. The winit backend OVERRIDES it to ALSO fail any
@@ -1562,6 +1741,10 @@ where
     R::TextureId: Send + Clone + 'static,
 {
     let mut elements: Vec<HartRenderElement<R>> = Vec::new();
+    // What native chrome THIS frame ends up containing. Accumulated as elements
+    // are actually pushed (never on a failed import), and published at the end
+    // for the backend's flip handler to turn into the shell's verdict file.
+    let mut native_mask: u8 = 0;
 
     // ── 0. KILLSWITCH (top): a full-output opaque black solid ABOVE all windows. ──
     if state.capture_blocked() {
@@ -1630,6 +1813,110 @@ where
             info!(layers_painted, "layer.composited (wlr-layer surfaces now in the rendered frame)");
         }
     }
+
+    // ── 3b. NATIVE ORB (NATIVE SHELL M2), above the backdrop, below the shell. ──
+    // Placed here in the z-order so it composites over the bloom but under the
+    // layer surfaces, matching M1's staging: while the HTML shell still paints an
+    // opaque background this is OCCLUDED, exactly as the bloom is. It is wired
+    // now rather than later so the module cannot rot unreferenced — which is
+    // precisely how bloom.rs sat dormant from 2026-07-20 to 2026-08-27.
+    //
+    // The whole point of M2 is here: `motion` is two floats from a clock, handed
+    // to the element as `alpha` and `size`. The GPU scales and blends a texture
+    // composed once. No pixel is touched by the CPU per frame, which is the
+    // difference between this and the ~5.4s/6s of userspace rasterisation
+    // measured in WebKit while it breathed the same orb.
+    if !state.capture_blocked() {
+        // Placement per checklist rule c7: "Home mode: orb floats to the RIGHT
+        // of the hero copy". An earlier draft centred it, which contradicts a
+        // binding rule — the checklist is the instruction record, not a
+        // suggestion. Vertically it sits on the hero's own line
+        // (`.hart-hero{top:46%}`), sized as a fraction of the short edge.
+        //
+        // Still PROVISIONAL: the scene owns this once A2UI drives the native
+        // tree (M4), and c7's compact orb-sm docked in the top bar is not
+        // modelled here at all. Hard-coding a c7-shaped default keeps M2 to one
+        // new idea while not shipping a placement the checklist forbids.
+        let short = size.w.min(size.h);
+        let side = (short as f32 * 0.30) as i32;
+        let energy = state.orb_energy();
+        if let Some((buffer, motion)) = state.orb_mut().current(side, energy) {
+            // Breathing scales about the CENTRE, so the top-left moves by half
+            // the growth. Computed from the motion rather than stored, so there
+            // is no second source of truth for where the orb is.
+            let drawn = (side as f32 * motion.scale) as i32;
+            // 0.72 of the width = right of the hero copy (c7), not centred.
+            let cx = (size.w as f32 * 0.72) as i32;
+            let cy = (size.h as f32 * 0.46) as i32;
+            let origin: Point<f64, Physical> =
+                Point::from(((cx - drawn / 2) as f64, (cy - drawn / 2) as f64));
+            match MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                origin,
+                buffer,
+                Some(motion.alpha),
+                None,
+                Some((drawn, drawn).into()),
+                Kind::Unspecified,
+            ) {
+                Ok(e) => {
+                    elements.push(HartRenderElement::Memory(e));
+                    native_mask |= NATIVE_CHROME_ORB;
+                }
+                // Never fatal: a missing orb is a desktop without an orb, not a
+                // dead session. Same posture as the backdrop below. Note the
+                // mask is NOT set here — a failed import must never let the
+                // shell hide its own orb.
+                Err(err) => warn!(?err, "orb: failed to import the composed orb"),
+            }
+        }
+    }
+
+    // ── 4. BLOOM BACKDROP (last in the list = drawn UNDER everything). ──
+    // NATIVE SHELL M1. Before this, the bottom of the frame was the flat
+    // HART_SPLASH_RGBA clear and the aurora was painted by a browser in a
+    // WebView above it. Now the compositor owns its own backdrop.
+    //
+    // Deliberately built LAST and pushed LAST: it must sit beneath the layer
+    // surfaces (the glass shell) so a shell that paints transparency reveals the
+    // native field rather than flat slate. The clear colour still runs, so if
+    // this element is skipped the frame is exactly what it was before.
+    //
+    // Cheap by construction: `BloomCache::get` is a key comparison on every
+    // frame but the first at a given size/theme.
+    if !state.capture_blocked() {
+        // Split the borrow: `bloom_mut` holds `state` mutably, and
+        // `MemoryRenderBufferRenderElement::from_buffer` needs the buffer while
+        // `renderer` is also borrowed. They are disjoint (`renderer` is a separate
+        // parameter, not a `state` field), so this type-checks and stays short.
+        if let Some(buffer) = state.bloom_mut().get(size.w, size.h) {
+            let origin: Point<f64, Physical> = Point::from((0.0, 0.0));
+            match MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                origin,
+                buffer,
+                None,
+                None,
+                None,
+                Kind::Unspecified,
+            ) {
+                Ok(e) => {
+                    elements.push(HartRenderElement::Memory(e));
+                    native_mask |= NATIVE_CHROME_BLOOM;
+                }
+                // Never fatal: without the backdrop the clear colour shows, which
+                // is precisely the pre-M1 desktop. A failed import must not cost
+                // the user their session, and must NOT set the mask — the shell
+                // would then go transparent over a backdrop we never drew.
+                Err(err) => warn!(?err, "bloom: failed to import the backdrop; falling back to the clear colour"),
+            }
+        }
+    }
+
+    // Publish what this frame contains. The backend turns it into the shell's
+    // verdict ONLY after the frame is actually presented, so a composed-but-
+    // never-flipped frame can never make the shell go transparent.
+    NATIVE_CHROME_EMITTED.store(native_mask, std::sync::atomic::Ordering::Relaxed);
 
     elements
 }

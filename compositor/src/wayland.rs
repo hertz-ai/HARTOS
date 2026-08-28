@@ -243,6 +243,12 @@ pub struct State {
     /// M6 killswitch — the constitutional screen cut (black surface + input/capture gate).
     pub capture_blocked: bool,
     pub black_buffer: smithay::backend::renderer::element::solid::SolidColorBuffer,
+    /// NATIVE SHELL M1 — the composed aura backdrop, cached across frames so the
+    /// per-pixel compose runs once per (mode, theme) rather than every frame.
+    pub bloom: crate::comp_core::BloomCache,
+    /// NATIVE SHELL M2 — the voice orb, composed once and animated per frame by
+    /// scale+alpha on the GPU.
+    pub orb: crate::comp_core::OrbCache,
     /// M8 — the com.hart.Compositor IPC server's per-compositor state (the event
     /// fan-out subscribers). The DRM backend serves the SAME framed-JSON socket the
     /// winit backend does, so an agent arranges real windows on real hardware too.
@@ -376,6 +382,12 @@ impl CompState for State {
     }
     fn black_buffer_mut(&mut self) -> &mut smithay::backend::renderer::element::solid::SolidColorBuffer {
         &mut self.black_buffer
+    }
+    fn bloom_mut(&mut self) -> &mut crate::comp_core::BloomCache {
+        &mut self.bloom
+    }
+    fn orb_mut(&mut self) -> &mut crate::comp_core::OrbCache {
+        &mut self.orb
     }
     fn emit_window_event(&mut self, event: &str, window: &Window, handle: &str) {
         // Fan the edge out over the SHARED framed-JSON IPC (the same socket the winit

@@ -143,6 +143,51 @@ def read_gpu_render_mode() -> str:
         return 'software'
 
 
+# ── NATIVE CHROME (the NATIVE SHELL PARITY PROGRAM bridge) ───────────────────
+# hart-comp composites parts of the desktop chrome ITSELF now (M1 the aura
+# backdrop, M2 the breathing orb). Those are painted UNDER this shell's layer
+# surface, so while the shell also draws them the native ones are invisible and
+# the browser keeps paying for animation it does not need to run: measured
+# 2026-08-28, WebKitWebProcess burning a full core with ZERO ioctls, ~5.4s of
+# every 6s in userspace pixel work.
+#
+# So the compositor PUBLISHES what it owns and the shell stands down for exactly
+# those pieces. One verdict file, many consumers — the same contract
+# /run/hart/gpu-render already uses, and the reason its comment says "REUSE the
+# probe's verdict; do NOT invent a second probe".
+#
+# A LIST rather than a boolean on purpose: M3 adds the top bar and taskbar, and
+# they must extend this file rather than add a second signal.
+#
+# Lives under /run/hart/session (0770, group-writable) NOT /run/hart (0750,
+# owner-only) for the same reason shell-ready and current-tier do — see the note
+# below on the perms bug that silently defeats the whole ladder.
+_NATIVE_CHROME_FILE = '/run/hart/session/native-chrome'
+
+# What this shell knows how to stand down for. A name the shell does not
+# recognise is IGNORED rather than trusted: a newer compositor claiming
+# `taskbar` must not make an older shell hide a taskbar it still owns.
+_NATIVE_CHROME_KNOWN = frozenset({'bloom', 'orb'})
+
+
+def read_native_chrome() -> frozenset:
+    """Which chrome elements the compositor is currently painting itself.
+
+    Best-effort + fail-EMPTY: a missing, unreadable or unrecognised file yields
+    the empty set, which means "the shell draws everything", i.e. byte-for-byte
+    today's behaviour. That direction matters — the failure mode of guessing
+    wrong is a desktop with NO background or NO orb, and the paint watchdog does
+    not catch a wrong-looking desktop, only a hung one. Never raises.
+    """
+    try:
+        with open(_NATIVE_CHROME_FILE, 'r') as f:
+            raw = (f.read() or '').strip().lower()
+    except (FileNotFoundError, PermissionError, OSError):
+        return frozenset()
+    names = {p.strip() for p in raw.replace('\n', ',').split(',') if p.strip()}
+    return frozenset(names & _NATIVE_CHROME_KNOWN)
+
+
 # /run/hart/session (0770, group-writable) NOT /run/hart (0750, owner-only): the
 # session HOST runs as hart-admin (in the `hart` group, not the `hart` OWNER), so it
 # can only write the group-writable session dir -- the SAME dir + reason shell-ready /
@@ -1750,6 +1795,37 @@ class LiquidUIService:
         if wallpaper.get('type') == 'solid':
             wp_css = wallpaper['value']
 
+        # ── NATIVE CHROME BRIDGE ──
+        # When hart-comp reports it is painting the aura backdrop itself, this
+        # shell must get OUT OF THE WAY: the default wallpaper bottoms out in an
+        # opaque linear-gradient, which is precisely what has been hiding the
+        # native bloom since M1 landed. Standing down is what lets the
+        # compositor's field be seen at all.
+        #
+        # Empty set when the compositor has not claimed it (missing file, older
+        # compositor, degraded tier), so this whole block is INERT until the
+        # native side proves itself — and the shell keeps its own opaque
+        # backdrop, which is the safe direction.
+        native_chrome = read_native_chrome()
+        if 'bloom' in native_chrome:
+            wp_css = 'transparent'
+        # The orb half. Without this there would be TWO orbs, the native one
+        # breathing under an HTML one breathing on top of it — and the browser
+        # would still be paying the per-frame cost M2 exists to remove, so the
+        # win would be exactly zero while looking twice as busy.
+        #
+        # visibility+animation:none rather than display:none: the wrapper keeps
+        # its layout box and its hit target, so click-to-talk and the drag
+        # handler keep working against the same geometry while the compositor
+        # draws the pixels. Ripping the element out would break input as well as
+        # painting, which is a much bigger change than M2 is scoped for.
+        native_orb_css = ''
+        if 'orb' in native_chrome:
+            native_orb_css = (
+                '.hart-hero-orbwrap>canvas,#hart-voice-orb,'
+                '.hart-orb-orbit,.hart-orb-orbit2{visibility:hidden;animation:none}'
+            )
+
         # Living-Glass: emit the active accent as a comma-triple so every glow /
         # ring / selection re-tints when the theme accent changes. Parsed from the
         # SAME accent ThemeService resolves (#308-310). Emitted right after
@@ -2866,6 +2942,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 
 /* ── Wallpaper ── */
 .wallpaper{{position:fixed;inset:0;z-index:0;background:{wp_css}}}
+{native_orb_css}
 
 /* ── Glass mixin (perf-aware) ── */
 .glass{{background:var(--hart-glass-bg);
@@ -6072,8 +6149,27 @@ document.addEventListener('keydown', function(e) {{
 document.addEventListener('contextmenu', e => {{
   e.preventDefault();
   const menu = document.getElementById('ctx-menu');
-  // Desktop right-click
-  if(e.target.classList.contains('wallpaper')||e.target===document.body) {{
+  // Desktop right-click = anything NOT inside real chrome.
+  //
+  // This used to test the opposite way: `e.target` had to BE `.wallpaper` or
+  // `document.body`. That enumerated the backdrop, and the backdrop kept
+  // growing. `.hart-ambient`, `.hart-bloom-canvas`, `.hart-grain`,
+  // `.hart-vignette` and `.hart-hero` all paint OVER `.wallpaper` and cover the
+  // screen, so in practice a right-click on the desktop landed on one of THEM,
+  // failed the test, and produced the two-item "Open in New Panel / Properties"
+  // menu, whose items do nothing.
+  //
+  // Personalize is reachable ONLY from this menu, and Personalize is where the
+  // orb-style picker lives (hartPersonalize.js -> HartSession.orb_style). So the
+  // orb chooser was built, loaded and completely unreachable: "orb selection was
+  // there but not able to see that". Same for wallpaper and auto-arrange.
+  //
+  // Inverting it makes the test stable: new backdrop or decoration layers are
+  // desktop by default, and only real chrome has to be named.
+  const _chrome = e.target.closest && e.target.closest(
+    '.panel-container,.taskbar,#taskbar,#ctx-menu,.hart-topbar,.start-menu,'
+    + 'input,textarea,button,a,select,[contenteditable]');
+  if(!_chrome) {{
     menu.innerHTML = [
       ctxItem('add_to_home_screen','Add app to desktop','window.hartAddAppPicker&&hartAddAppPicker()'),
       ctxItem('grid_view','Auto-arrange icons','window.hartAutoArrange&&hartAutoArrange()'),

@@ -1354,16 +1354,48 @@ class SmartLedger:
         self.session_id = session_id
         self.ledger_key = f"ledger_{agent_id}_{session_id}"
         self.ledger_dir = Path(ledger_dir)
+        # WRITABILITY IS NOT IMPLIED BY mkdir SUCCEEDING.
+        #
+        # This used to fall back only when mkdir RAISED. But `exist_ok=True`
+        # succeeds happily on a directory that already exists and is read-only,
+        # which is exactly the deployed case: the relative "agent_data" resolves
+        # under the nix store, the directory is present, mkdir returns cleanly,
+        # the fallback never fires, and the failure surfaces later at write time
+        # where nothing catches it. Observed on the real box 2026-08-27, the
+        # agent daemon logging on every dispatch:
+        #     [JSONBackend] Save error: [Errno 30] Read-only file system:
+        #     'agent_data/ledger_<agent>_<session>.json'
+        # Note the path is still the RELATIVE one, which is the tell that the
+        # fallback below was never reached. Every ledger write was lost.
+        #
+        # So probe the directory for real rather than inferring it.
+        writable = False
         try:
             self.ledger_dir.mkdir(parents=True, exist_ok=True)
+            probe = self.ledger_dir / '.hart-write-probe'
+            probe.touch()
+            probe.unlink()
+            writable = True
         except OSError:
-            # Bundled/installed mode: relative path resolves to read-only dir
+            writable = False
+        if not writable:
+            # Bundled/installed mode: the configured path is not writable here.
+            # Catch OSError as well as ImportError: get_agent_data_dir() creates
+            # the directory itself, so on a fully read-only filesystem it raises
+            # from inside the resolver rather than from the mkdir below.
             try:
                 from core.platform_paths import get_agent_data_dir
                 self.ledger_dir = Path(get_agent_data_dir())
-            except ImportError:
+            except (ImportError, OSError):
                 self.ledger_dir = Path.home() / 'Documents' / 'Nunba' / 'data' / 'agent_data'
-            self.ledger_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                self.ledger_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                # Last resort only. Losing the ledger is bad; taking the agent
+                # daemon down with an unhandled error at construction is worse:
+                # the daemon keeps dispatching goals either way, and a crash
+                # here would take the goal engine with it.
+                pass
         self.ledger_file = self.ledger_dir / f"ledger_{agent_id}_{session_id}.json"
         self.tasks: Dict[str, Task] = {}
         self.task_order: List[str] = []  # Track order of task creation
