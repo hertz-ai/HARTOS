@@ -787,6 +787,41 @@ class TestEdgeCases(unittest.TestCase):
         result = ledger.add_task(_make_task(task_id="t1"))
         self.assertFalse(result)
 
+    def test_add_task_over_terminal_existing_replaces_it(self):
+        """2026-08-28: a deterministic ledger key (agent_id, session_id) is
+        reused across a process restart -- add_task's collision guard used to
+        block ANY re-add unconditionally, so a long-dead terminal task (e.g.
+        one abandoned via ActionState.GAVE_UP, see test_gave_up_state.py)
+        silently kept its stale description forever and the caller's real,
+        brand-new task for that id was discarded. This is the mechanism
+        behind weeks of "agent 8888 has weird pre-existing state" reports --
+        a genuinely NEW message must win over a dead old task, while a
+        still-active (non-terminal) one must still be protected."""
+        ledger = _make_ledger()
+        old = _make_task(task_id="t1", description="stale goal from a dead session",
+                          status=TaskStatus.IN_PROGRESS)
+        ledger.add_task(old)
+        old.transition_to(TaskStatus.FAILED, "GAVE_UP: abandoned")
+
+        new = _make_task(task_id="t1", description="brand new message")
+        result = ledger.add_task(new)
+
+        self.assertTrue(result)
+        self.assertEqual(ledger.tasks["t1"].description, "brand new message")
+
+    def test_add_task_over_non_terminal_existing_still_rejected(self):
+        """The protective half of the same change: a genuinely in-flight
+        task (e.g. mid-way through a real multi-action recipe) must still
+        block a collision -- only a TERMINAL existing task is safe to
+        replace."""
+        ledger = _make_ledger()
+        ledger.add_task(_make_task(task_id="t1", status=TaskStatus.IN_PROGRESS))
+
+        result = ledger.add_task(_make_task(task_id="t1", description="different"))
+
+        self.assertFalse(result)
+        self.assertEqual(ledger.tasks["t1"].description, "Test task")
+
     def test_update_nonexistent_task(self):
         ledger = _make_ledger()
         result = ledger.update_task_status("ghost", TaskStatus.IN_PROGRESS)

@@ -1464,9 +1464,24 @@ class SmartLedger:
         the always-persist contract for every other caller.
         """
         with self._lock:
-            if task.task_id in self.tasks:
+            existing = self.tasks.get(task.task_id)
+            if existing is not None and not existing.is_terminal():
                 logger.warning(f"Task {task.task_id} already exists")
                 return False
+            if existing is not None:
+                # The existing task under this id already reached a terminal
+                # state (completed/failed/terminated/cancelled/...) in an
+                # earlier session -- most commonly a process restart
+                # reloading an old on-disk ledger before a brand new
+                # caller's actions get added under the same deterministic
+                # key. Replace it instead of silently keeping the dead task
+                # and discarding the new one, which is what let a truly
+                # abandoned action (once it started being marked terminal
+                # via ActionState.GAVE_UP) go on blocking every later
+                # message for that (agent, session) pair forever.
+                logger.info(
+                    f"Task {task.task_id} already exists but is terminal "
+                    f"({existing.status.value}); replacing with the new task")
 
             self.tasks[task.task_id] = task
             if task.task_id not in self.task_order:

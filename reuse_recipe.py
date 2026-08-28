@@ -3681,6 +3681,38 @@ def _extract_conversational_reply(messages) -> Optional[str]:
     return None
 
 
+def _giveup_current_reuse_action(user_prompt: str, reason: str) -> None:
+    """Mark the in-flight ledger action GAVE_UP (-> ledger FAILED, #139) when
+    the reuse loop abandons a turn without ever reaching TERMINATE.
+
+    Without this, the action's ledger task stays PENDING/IN_PROGRESS forever
+    -- create_ledger_from_actions' _find_resumable_session() has no age/TTL
+    check, so it treats ANY non-terminal task as "in-flight" no matter how
+    stale, and silently reattaches the next unrelated message for this
+    (user, prompt) pair to the abandoned session's stale goal/description
+    instead of starting fresh. This is the mechanism behind the
+    weeks-long "agent 8888 has weird pre-existing state" pattern -- create_
+    recipe.py's flow-complete path already force-abandons stalled actions
+    via ActionState.GAVE_UP, but the reuse loop's own give-up paths
+    (turn/loop-deadline abort, budget exhaustion, empty groupchat) never
+    called it. GAVE_UP is deliberately re-openable (-> ASSIGNED) so a later
+    real retry is not blocked by this.
+
+    Best-effort: must never raise into a give-up path that is already
+    trying to return an honest reply to the user.
+    """
+    try:
+        if user_prompt not in user_tasks:
+            return
+        action_id = user_tasks[user_prompt].current_action
+        safe_set_state(user_prompt, action_id, ActionState.GAVE_UP, reason)
+    except Exception as e:
+        try:
+            current_app.logger.error(f"[GAVE-UP] failed to mark {user_prompt} action GAVE_UP: {e}")
+        except Exception:
+            pass
+
+
 def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autogen.UserProxyAgent,
                        helper: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent,
                        manager: autogen.GroupChatManager, group_chat: autogen.GroupChat, message: str, role: str,
@@ -3775,6 +3807,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                 # group_chat.messages.  Sending the apology on top of a real
                 # reply is the worst of both -- the user waits the full bound
                 # AND is told nothing could be done.
+                _giveup_current_reuse_action(user_prompt, f'[REUSE-LOOP-ABORT] bound hit: {_which}')
                 _salvaged = _salvage_assistant_reply(group_chat.messages)
                 if _salvaged:
                     current_app.logger.warning(
@@ -3796,6 +3829,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                     _reuse_task.heartbeat()
                     if _reuse_task.is_budget_exhausted():
                         current_app.logger.warning(f"[BUDGET] Task {_reuse_task_id} budget exhausted in reuse loop")
+                        _giveup_current_reuse_action(user_prompt, f'[BUDGET] {_reuse_task_id} budget exhausted')
                         break
                     if _reuse_task.is_sla_breached() and not _reuse_task.sla_breached:
                         _reuse_task.mark_sla_breached()
@@ -3953,6 +3987,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
             current_app.logger.error(
                 f'[EMPTY-GROUPCHAT] group_chat.messages empty after reuse loop '
                 f'(user_prompt={user_prompt}) — returning fallback reply')
+            _giveup_current_reuse_action(user_prompt, '[EMPTY-GROUPCHAT] no messages after reuse loop')
             return "I wasn't able to put a response together just then. Could you try asking again?"
 
         last_message = group_chat.messages[-1]
