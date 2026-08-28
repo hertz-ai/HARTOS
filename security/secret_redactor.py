@@ -401,8 +401,19 @@ def _model_detect_pii(text: str) -> str:
             os.environ.get('HEVOLVEAI_API_URL', 'http://localhost:8080')
         )
 
+        # Do NOT double the /v1. The deployed unit sets this variable WITH the
+        # suffix already on it (hart-backend.nix:62,
+        # HEVOLVE_LOCAL_LLM_URL = "http://127.0.0.1:<llm port>/v1"), so blindly
+        # appending built http://127.0.0.1:808/v1/v1/chat/completions and every
+        # call 404'd. Silently: the except below swallows it and PII detection
+        # just returned nothing, so the redactor looked like it was working.
+        # Same shape as the guard at hart_intelligence_entry.py's forwarder --
+        # a bare host keeps its /v1, a /v1 base does not get a second one.
+        _base = llm_url.rstrip('/')
+        _target = _base + ('/chat/completions' if _base.endswith('/v1')
+                           else '/v1/chat/completions')
         resp = _req.post(
-            f'{llm_url.rstrip("/")}/v1/chat/completions',
+            _target,
             json={
                 'model': 'local',
                 'messages': [{

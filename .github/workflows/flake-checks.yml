@@ -354,7 +354,10 @@ jobs:
 
   # ─── Compositor: default-feature pure-logic floor (the dev-box build path) ──
   cargo-test:
-    name: Compositor cargo test (default / pure-logic floor)
+    # Job ID stays `cargo-test` — release.yml's gate and this file's header refer
+    # to it by ID; renaming that would be the parallel path. Only the display
+    # name changes, because it no longer covers default features alone.
+    name: Compositor cargo (default test + winit type-check)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -372,10 +375,43 @@ jobs:
       # feature is off). This is the floor the Windows dev box also runs; the
       # SMITHAY feature set is gated by the compositor-nix job below (which runs
       # `cargo test --features smithay` via the nix doCheck on the pinned
-      # toolchain). Together they gate BOTH compositor feature sets that ship.
+      # toolchain), and the WINIT set by the check step immediately below.
+      # Together those three gate every compositor feature set that ships —
+      # before the winit step there were three sets and only two gates.
       - name: cargo test (default features)
         working-directory: compositor
         run: cargo test --verbose
+
+      # ── The WINIT backend: TYPE-CHECKED here, and nowhere else before this ──
+      # src/winit.rs is a whole backend (and the ONLY one implementing
+      # screencopy), but `default = []` in Cargo.toml and
+      # `buildFeatures = [ "smithay" ]` in hart-comp.nix meant NOTHING compiled
+      # it: the step above builds default features, the compositor-nix job below
+      # builds smithay. So every change to the shared `CompState` trait in
+      # comp_core.rs had to be mirrored into winit.rs by hand with no compiler to
+      # catch a miss — which is exactly what happened while wiring the native
+      # shell caches (bloom/orb) into both backends.
+      #
+      # `check`, deliberately NOT `build`/`test`: check never LINKS, and linking
+      # is the only stage that would need a system library here (-lxkbcommon,
+      # via smithay's non-optional xkbcommon dep). Everything before the link
+      # already works on a stock runner with no apt step:
+      #   * smithay's build.rs only runs gl_generator unless `backend_gbm` is on,
+      #     and the winit feature does not enable it (no cc / pkg-config);
+      #   * smithay pins winit with `wayland-dlopen`, so wayland-sys's build.rs
+      #     takes its CARGO_FEATURE_DLOPEN early-out and never probes
+      #     wayland-client / wayland-egl;
+      #   * x11-dl tolerates a missing .pc.
+      # Building instead would need libxkbcommon-dev on the runner to produce a
+      # binary nothing in this job can run anyway (the nested-Wayland smoke E2E
+      # is #[ignore]d and needs a live host).
+      #
+      # `--all-targets` so the winit-only `#[cfg(test)]` floors are type-checked
+      # too, which is what hart-comp.nix's comment already claims happens "under
+      # the --features winit check".
+      - name: cargo check (winit backend / type-check only)
+        working-directory: compositor
+        run: cargo check --features winit --all-targets --verbose
 
   # ─── Compositor: the SMITHAY (DRM) feature set, built + tested in Nix ───────
   compositor-nix:
