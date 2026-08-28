@@ -69,13 +69,20 @@ class ModelStorageManager:
         manifest.json stays what its own module docstring calls it, a ledger of
         where disk space went; presence on disk answers "is it downloaded".
 
-        An empty directory is NOT a download: `tool_dir.mkdir()` runs BEFORE
-        each fetch, so a failure leaves a 0-file directory behind (that is why
-        chatterbox/cosyvoice/diffrhythm/kokoro each had one -- diffrhythm's HF
-        call took a 401).  The non-empty test below is what excludes them.
+        A directory without FILES is not a download.  `tool_dir.mkdir()` runs
+        BEFORE each fetch, so a failure leaves an empty directory behind
+        (diffrhythm's HF call took a 401 and left one).  Several tools also
+        pre-create an `output/` subdirectory, so kokoro/chatterbox/cosyvoice
+        each held one empty child dir and nothing else -- a plain
+        `any(iterdir())` counts that as content and answers True.  Requiring a
+        real file is what separates "downloaded" from "directory exists".
+        any() short-circuits on the first hit, so this does not walk a 6 GB
+        tree.
         """
         tool_dir = self.get_tool_dir(tool_name)
-        return tool_dir.exists() and any(tool_dir.iterdir())
+        if not tool_dir.exists():
+            return False
+        return any(p.is_file() for p in tool_dir.rglob("*"))
 
     def mark_downloaded(self, tool_name: str, source_url: str,
                         size_bytes: int = 0) -> None:

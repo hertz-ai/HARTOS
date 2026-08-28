@@ -43,6 +43,18 @@ def test_empty_dir_without_manifest_entry_is_not_downloaded(store):
     assert store.is_downloaded("diffrhythm") is False
 
 
+def test_dir_holding_only_an_empty_subdir_is_not_downloaded(store):
+    """Self-caught regression 2026-08-29.
+
+    kokoro / chatterbox / cosyvoice each held ONLY an empty `output/`
+    subdirectory -- 0 files recursively.  `any(tool_dir.iterdir())` counts that
+    directory entry as content, so a first pass at this fix flipped all three
+    from correct-False to wrong-True.  The predicate must require a FILE.
+    """
+    (store.get_tool_dir("kokoro") / "output").mkdir(parents=True, exist_ok=True)
+    assert store.is_downloaded("kokoro") is False
+
+
 def test_absent_dir_is_not_downloaded(store):
     assert store.is_downloaded("never_fetched") is False
 
