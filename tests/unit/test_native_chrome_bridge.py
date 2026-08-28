@@ -131,3 +131,81 @@ def test_the_orb_keeps_its_hit_target():
     assert "display:none" not in window, (
         "display:none would remove the orb's hit target and break input, which "
         "is a far bigger change than swapping who paints it")
+
+
+# ── the GTK4 host half (bridge part 2) ───────────────────────────────────────
+
+HOST_NIX = os.path.join(REPO, "nixos", "modules", "hart-layer-shell-host.nix")
+
+
+def _host_python():
+    """The program passed to `python -c` in the GTK4 host wrapper."""
+    with open(HOST_NIX, encoding="utf-8") as fh:
+        src = fh.read()
+    lines = src.split("\n")
+    start = next(i for i, l in enumerate(lines) if l.startswith("import gi, os"))
+    end = next(i for i, l in enumerate(lines[start:], start)
+               if l.strip() == "app.run(None)")
+    return "\n".join(lines[start:end + 1])
+
+
+def test_the_embedded_python_has_no_double_quote_or_backslash():
+    """THE build-breaker, stated as its own rule.
+
+    That program is passed to `python -c "<body>"` — a Nix DOUBLE-quoted string.
+    A single `"` anywhere in it, INCLUDING inside a Python comment, ends the Nix
+    string early and no image builds at all. A backslash is consumed as a Nix
+    escape before Python ever sees it, so `\n` silently becomes a real newline.
+
+    test_gtk4_host_python_py_compiles already fails when this happens, but it
+    reports "extraction failed — body did not contain the host class", which
+    reads like a broken test rather than broken source. This says what the rule
+    actually is.
+    """
+    body = _host_python()
+    bad_q = [l for l in body.split("\n") if '"' in l]
+    assert not bad_q, (
+        "double quote inside the `python -c` program (ends the Nix string "
+        "early; use single quotes, even in comments): %r" % bad_q[:3])
+    bad_b = [l for l in body.split("\n") if "\\" in l]
+    assert not bad_b, (
+        "backslash inside the `python -c` program (Nix eats it as an escape "
+        "before Python sees it; use chr(10) etc.): %r" % bad_b[:3])
+
+
+def test_the_host_reads_the_same_verdict_as_the_shell():
+    """One publisher, several consumers. A second path here would let the host
+    and the served shell disagree about who is painting the backdrop, which
+    shows up as either a double orb or no background at all."""
+    body = _host_python()
+    assert "/run/hart/session/native-chrome" in body, (
+        "the GTK4 host must read the SAME verdict file as the served shell")
+    assert "_native_chrome_claimed" in body
+
+
+def test_the_host_makes_both_layers_transparent():
+    """The WebView paints an opaque page background AND the GTK4 window paints
+    its own themed background behind it. Clearing only one leaves the other
+    covering the compositor, which is the whole point of the bridge."""
+    body = _host_python()
+    assert "set_background_color" in body, "the WebView background must be cleared"
+    assert "background: transparent" in body, (
+        "the GTK4 window background must be cleared too")
+
+
+def test_the_host_stays_opaque_when_nothing_is_claimed():
+    body = _host_python()
+    i = body.index("_claimed = _native_chrome_claimed()")
+    window = body[i: i + 400]
+    assert "if _claimed:" in window, (
+        "transparency must be gated on the compositor's claim; unconditional "
+        "transparency with no native backdrop is a black desktop")
+
+
+def test_transparency_failure_never_kills_the_session():
+    body = _host_python()
+    i = body.index("set_background_color")
+    window = body[max(0, i - 400): i + 900]
+    assert "except Exception" in window, (
+        "a cosmetic handoff must not be able to take the session down; an "
+        "opaque shell that paints beats a transparent one that crashed")
