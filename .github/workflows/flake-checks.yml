@@ -428,12 +428,27 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libudev-dev libseat-dev libinput-dev libxkbcommon-dev libwayland-dev
 
-      # `--all-targets` so the winit-only `#[cfg(test)]` floors are type-checked
-      # too, which is what hart-comp.nix's comment already claims happens "under
-      # the --features winit check".
-      - name: cargo check (winit backend / type-check only)
+      # `test`, not `check`, and that is a deliberate upgrade from what this step
+      # was. `check` never links, which is why it was chosen — but it also never
+      # RUNS anything, and comp_core.rs's #[cfg(test)] module is where the pure
+      # policy floors live (layer stacking, the panel work-area clamps, the
+      # reservation parser, clamp_region, the chord map). Those are compiled out
+      # of the default build, because comp_core needs smithay types, so the ONLY
+      # place they executed was the compositor-nix job's `cargo test --features
+      # smithay` doCheck — and that job has been failing on crates.io 403s while
+      # vendoring hart-claw-precedent, i.e. they were not running at all.
+      #
+      # Linking is affordable now that the step installs its own system deps
+      # (libxkbcommon is the one the old comment named). The tests themselves are
+      # pure arithmetic and need no display; tests/smoke_e2e.rs is #[ignore]d and
+      # needs a live Wayland host, so it stays skipped.
+      #
+      # `--all-targets` so the winit-only test targets are built too, which is
+      # what hart-comp.nix's comment already claims happens "under the
+      # --features winit check".
+      - name: cargo test (winit backend — compiles AND runs the pure floors)
         working-directory: compositor
-        run: cargo check --features winit --all-targets --verbose
+        run: cargo test --features winit --all-targets --verbose
 
   # ─── Compositor: the SMITHAY (DRM) feature set, built + tested in Nix ───────
   compositor-nix:
