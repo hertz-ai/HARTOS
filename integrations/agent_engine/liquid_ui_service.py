@@ -6109,11 +6109,35 @@ function acSend() {{
     window._hartThinking = false;  // terminal: handled locally, no brain wait
     return;
   }}
-  // Fallback fast-path: launch a NAMED app directly (no brain round-trip).
-  if(lower.startsWith('open ')) {{
-    const target = lower.replace('open ','').trim();
-    const match = Object.entries(MANIFEST).find(([k,v])=>
-      v.title.toLowerCase().includes(target)||k.includes(target));
+  // Fast-path: launch a NAMED app directly (no brain round-trip).
+  //
+  // MANIFEST now carries the machine's OWN applications as well as the shell's
+  // panels: AppRegistry discovers .desktop entries at bootstrap, and
+  // installed_app_manifest() merges them into this same object. So this reaches
+  // Firefox and the other 161 installed apps, which it never could before.
+  //
+  // The bare-name half is the 2026-08-29 fix. Typing 'firefox' used to need the
+  // word 'open' in front of it; without the prefix the text went to the brain and
+  // came back "Agent creation requires the 'pyautogen' package". An implicit open
+  // only applies to text that LOOKS like a name -- a few words, no sentence
+  // punctuation -- so 'run the numbers on my budget' still reaches the brain
+  // rather than launching whatever happens to share a word with it.
+  const OPEN_VERB = /^(?:open|launch|start|run) +/;
+  const explicit = OPEN_VERB.test(lower);
+  const target = (explicit ? lower.replace(OPEN_VERB,'') : lower).trim();
+  const nameLike = target.length >= 2 && target.split(/ +/).length <= 3
+                   && !/[?.!]/.test(target);
+  if(target && (explicit || nameLike)) {{
+    const entries = Object.entries(MANIFEST);
+    const title = function(v){{ return (v.title||'').toLowerCase(); }};
+    // Exact, then prefix, then -- only when the user actually said 'open' --
+    // a loose substring. With 162 apps in here a bare substring match is far too
+    // easy to hit by accident, and launching the wrong program is worse than
+    // handing the text to the brain.
+    const match = entries.find(([k,v])=> title(v)===target || k.toLowerCase()===target)
+      || entries.find(([k,v])=> title(v).startsWith(target) || k.toLowerCase().startsWith(target))
+      || (explicit ? entries.find(([k,v])=>
+            title(v).includes(target) || k.toLowerCase().includes(target)) : null);
     if(match) {{
       openPanel(match[0]);
       typing.textContent = 'Opened ' + match[1].title;
@@ -7414,25 +7438,26 @@ function renderAgentOverlay(ev) {{
         # ── Shell APIs: Apps ──
         @app.route('/api/shell/apps', methods=['GET'])
         def shell_apps():
-            apps = []
-            # Linux .desktop files
-            app_dirs = ['/usr/share/applications',
-                        os.path.expanduser('~/.local/share/applications')]
-            for d in app_dirs:
-                if not os.path.isdir(d):
-                    continue
-                try:
-                    for fname in os.listdir(d):
-                        if not fname.endswith('.desktop'):
-                            continue
-                        apps.append({
-                            'id': fname.replace('.desktop', ''),
-                            'name': fname.replace('.desktop', '').replace('-', ' ').title(),
-                            'subsystem': 'linux',
-                        })
-                except OSError:
-                    logger.warning("shell_apps: swallowed OSError", exc_info=True)
-            return jsonify({'apps': apps[:100]})
+            """The machine's launchable applications, from its .desktop entries.
+
+            Delegates to core.platform.desktop_entries, the ONE place that knows
+            how to find and read them (AppRegistry's bootstrap discovery uses the
+            same function). This used to carry its own scan of two hardcoded
+            directories, /usr/share/applications and ~/.local/share/applications,
+            and on HART OS neither exists -- so it returned four Wine file-type
+            stubs out of the service user's home while 162 real entries sat in the
+            NixOS profile. It also never opened the files, inventing names by
+            title-casing the filename, which is why NoDisplay stubs showed up at
+            all.
+
+            Still filesystem-only: no package manager is consulted here.
+            """
+            from core.platform.desktop_entries import discover
+            apps = [{'id': app_id,
+                     'name': entry.get('Name', app_id),
+                     'subsystem': 'linux'}
+                    for app_id, entry in sorted(discover().items())]
+            return jsonify({'apps': apps})
 
         # ── Shell APIs: Launch ──
         from integrations.agent_engine.shell_os_apis import _require_shell_auth
