@@ -8,12 +8,39 @@ if sys.platform == 'win32' and 'pytest' not in sys.modules:
     # and replacing them here closes pytest's file handles.
     # Skip in cx_Freeze windowed builds — sys.stdout.buffer is closed (no console),
     # and TextIOWrapper on a closed buffer raises ValueError at import time.
-    if sys.stdout is not None and hasattr(sys.stdout, 'buffer'):
+    # Only re-wrap a stream that is NOT already UTF-8.  The hasattr('buffer')
+    # test above is NOT sufficient to skip frozen builds: app.py installs a
+    # _CappedStream as sys.stdout/stderr, and its __getattr__ delegates every
+    # unknown attribute to the inner file handle -- so `hasattr(.., 'buffer')`
+    # is True and `.buffer` hands back the INNER handle.  Wrapping that inner
+    # handle escapes the wrapper: when _CappedStream._rotate() later closes and
+    # reopens the inner handle at the 20MB cap, this TextIOWrapper is left
+    # holding the CLOSED one, and every write after that raises
+    # "ValueError: I/O operation on closed file" for the rest of the process.
+    # The try/except below cannot catch it either -- at import time the buffer
+    # is still open, so the wrap succeeds and the failure lands hours later.
+    #
+    # Measured 2026-08-29 on the installed build: frozen_debug.log rotated at
+    # 08:37:09, and both langchain tool turns after it (08:58:17, 09:04:27)
+    # died in warnings.warn -> sys.stderr.write during LLMChain's deprecation
+    # warning, so /chat 500'd and fell back to a tool-less '_tier: direct'.
+    # This is the consumer that task #621 predicted but never located.
+    #
+    # _CappedStream and the devnull fallbacks are all opened encoding='utf-8',
+    # so skipping them loses nothing; a real cp1252 Windows console still gets
+    # wrapped, which is the only case this code was written for.
+    def _needs_utf8_wrap(stream):
+        if stream is None or not hasattr(stream, 'buffer'):
+            return False
+        enc = (getattr(stream, 'encoding', '') or '').lower().replace('-', '')
+        return enc != 'utf8'
+
+    if _needs_utf8_wrap(sys.stdout):
         try:
             sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
         except (ValueError, OSError):
             pass
-    if sys.stderr is not None and hasattr(sys.stderr, 'buffer'):
+    if _needs_utf8_wrap(sys.stderr):
         try:
             sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
         except (ValueError, OSError):
