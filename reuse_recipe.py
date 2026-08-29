@@ -5,7 +5,6 @@
 # proxy: without this, those variable annotations would touch
 # autogen.AssistantAgent at module load and force the heavy import we are
 # trying to defer.  MUST be the first statement after the docstring.
-from __future__ import annotations
 # Guard: cx_Freeze frozen builds close stdout/stderr.
 import sys, os
 from core.io_guard import silence_stdio, install_autogen_iostream; silence_stdio()
@@ -266,8 +265,8 @@ _atexit.register(_shutdown_reuse_scheduler)
 # logging_session_id = runtime_logging.start(config={"dbname": "logs.db"})
 # Store user-specific agents & their chat history
 # Performance: TTL caches replace unbounded global dicts (auto-expire after 2 hours)
-user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_agents')
-role_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_role_agents')
+user_agents: "Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]]" = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_agents')
+role_agents: "Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]]" = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_role_agents')
 recipes = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_recipes', loader=load_recipe)
 user_journey = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_journey')
 temp_users = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_temp_users')
@@ -892,7 +891,7 @@ def create_agents_for_role(user_id: str, prompt_id):
         return 'TERMINATE', 'TERMINATE', 'TERMINATE', 'TERMINATE', 'TERMINATE', True
 
 
-def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
+def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]":
     """Create new assistant & user proxy agents for a user with basic configuration."""
     user_prompt = f'{user_id}_{prompt_id}'
     # Create a basic function calling config
@@ -3184,9 +3183,9 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     return assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group
 
 
-def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autogen.UserProxyAgent,
-                       helper: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent,
-                       manager: autogen.GroupChatManager, group_chat: autogen.GroupChat, message: str, role: str,
+def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "autogen.UserProxyAgent",
+                       helper: "autogen.AssistantAgent", user_proxy: "autogen.UserProxyAgent",
+                       manager: "autogen.GroupChatManager", group_chat: "autogen.GroupChat", message: str, role: str,
                        user_id: int, prompt_id: int, request_id: str) -> str:
     """Get a single response from the agent for the given message."""
     user_prompt = f'{user_id}_{prompt_id}'
