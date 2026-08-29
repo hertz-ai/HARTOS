@@ -374,3 +374,29 @@ def test_the_embedded_python_uses_no_undefined_module_name():
         "NameError at runtime and py_compile cannot see them. If it is a stdlib "
         "module, import it LOCALLY the way the rest of this program does "
         "(`import sys as _sys`): %s" % bad[:6])
+
+def test_the_embedded_python_has_no_doubled_single_quote():
+    """A doubled single quote in this program is read by NIX, not Python.
+
+    The program is passed to python -c, and that whole thing sits inside an
+    OUTER Nix INDENTED string where a doubled single quote is the escape
+    sequence. So an ordinary Python empty-string literal in
+
+        raw = (fh.read() or <empty literal>).strip().lower()
+
+    was consumed by Nix, ended the string early, and failed the flake
+    evaluation gate with a syntax error. That gate SKIPS every build target,
+    so nothing shipped at all until it was found.
+
+    This is the third build break of this family (the quad-quote incident,
+    then double quotes, then this). The sibling guards check for a double
+    quote and for backslash and did NOT catch it: a doubled single quote is
+    legal in Python AND in a Nix double-quoted string, and is fatal only
+    because of the enclosing indented string. Hence its own check.
+    """
+    body = _host_python()
+    bad = [(i + 1, l) for i, l in enumerate(body.split(chr(10))) if "''" in l]
+    assert not bad, (
+        'doubled single quote inside the python -c program: Nix reads it as an '
+        'escape in the enclosing indented string and the evaluation gate dies, '
+        'skipping every build: %r' % bad[:3])

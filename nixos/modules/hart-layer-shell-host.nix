@@ -483,7 +483,16 @@ from gi.repository import Gtk, WebKit, Gtk4LayerShell as LayerShell
 def _native_chrome_claimed():
     try:
         with open('/run/hart/session/native-chrome') as fh:
-            raw = (fh.read() or '').strip().lower()
+            # NO empty-string literal here, and note this comment carries
+            # neither a double quote nor a doubled single quote for the same
+            # reason. This program is passed to python -c and that whole thing
+            # sits inside an outer Nix INDENTED string, where a doubled single
+            # quote is an escape sequence. So an ordinary Python empty literal
+            # was read by Nix rather than Python and failed the flake evaluation
+            # gate, which SKIPS every build target, so nothing shipped at all.
+            # read() already returns an empty string at EOF, so the guard it was
+            # part of was dead weight as well as fatal.
+            raw = fh.read().strip().lower()
     except OSError:
         return frozenset()
     known = frozenset(('bloom', 'orb'))
