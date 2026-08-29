@@ -493,18 +493,120 @@ pub fn next_cascade_loc<S: CompState>(state: &mut S) -> Point<i32, Logical> {
     const STEP_X: i32 = 230;
     const STEP_Y: i32 = 150;
     const MARGIN: i32 = 16;
-    let loc = state.next_window_loc();
-    let out_size = state
-        .space()
-        .output_geometry(state.output())
-        .map(|g| g.size)
-        .unwrap_or((1280, 800).into());
+    // Cascade inside the WORK AREA, never the raw output: the origin the cascade
+    // resets to has to sit below whatever chrome the shell reserved, or every
+    // fresh window opens underneath the taskbar.
+    let (ax, ay, aw, ah) = work_area_for(state).unwrap_or((0, 0, 1280, 800));
+    // Clamp the location we hand OUT too, so even the first window -- whose
+    // stored location predates any reservation -- lands below the chrome.
+    let stored = state.next_window_loc();
+    let loc = Point::from((stored.x.max(ax), stored.y.max(ay)));
     let mut next = Point::from((loc.x + STEP_X, loc.y + STEP_Y));
-    if next.x + 200 > out_size.w || next.y + 150 > out_size.h {
-        next = Point::from((MARGIN, MARGIN));
+    if next.x + 200 > ax + aw || next.y + 150 > ay + ah {
+        next = Point::from((ax + MARGIN, ay + MARGIN));
     }
     state.set_next_window_loc(next);
     loc
+}
+
+// ── PANEL RESERVATION ────────────────────────────────────────────────────────
+// The HART shell is a SINGLE fullscreen layer surface on the Background layer,
+// with its taskbar painted inside it (Z-ORDER MODEL 1 in hart-layer-shell-host.nix
+// -- one WebView, so the shell JS keeps its window.* globals). The consequence the
+// user hit on 2026-08-29: a window maximizes over the whole output and the bar it
+// covers is unreachable, because the bar is not a surface of its own that could
+// claim an exclusive zone.
+//
+// So the compositor reserves the strip on the shell's behalf. Every window-placement
+// path resolves its rect through `work_area_for` instead of the output geometry,
+// which means maximize, all nine snap zones, all five tiling layouts and the
+// new-window cascade honour the bar from ONE definition rather than four.
+
+/// Where the shell publishes how much chrome it owns, in logical pixels per edge.
+///
+/// The CSS that draws the bars is the only thing that knows their size, so the
+/// compositor ASKS rather than hardcoding numbers that would silently drift the
+/// first time either bar is restyled. Same runtime-file contract as the
+/// native-chrome bridge next door, for the same reason: it is the channel that
+/// already crosses from the shell to the compositor.
+///
+/// Format is one `key=pixels` per line, unknown keys ignored, so left/right docks
+/// can be added later without a flag day:
+///     top=40
+///     bottom=44
+pub const PANEL_RESERVATION_PATH: &str = "/run/hart/session/panel-reservation";
+
+/// Logical pixels of chrome the shell reserves on each edge. The HART shell has
+/// TWO: a 40px top bar (Home / Agents / Apps / Hive / Earn) and a 44px bottom
+/// taskbar, both painted inside the one Background layer surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PanelReservation {
+    pub top: i32,
+    pub bottom: i32,
+}
+
+/// Parse a published reservation. PURE, so every fail-safe path below is testable.
+///
+/// FAIL-SAFE TO ZERO, per field. A junk line, a negative number, an unknown key --
+/// each is skipped and leaves that edge unreserved. Zero everywhere reproduces the
+/// pre-existing layout exactly, which is what lets the compositor half of this ship
+/// inert before the shell half exists.
+pub fn parse_panel_reservation(text: &str) -> PanelReservation {
+    let mut r = PanelReservation::default();
+    for line in text.lines() {
+        let (key, value) = match line.split_once('=') {
+            Some(kv) => kv,
+            None => continue,
+        };
+        let v = match value.trim().parse::<i32>() {
+            Ok(v) if v > 0 => v,
+            _ => continue,
+        };
+        match key.trim() {
+            "top" => r.top = v,
+            "bottom" => r.bottom = v,
+            _ => {} // forward-compatible: an older compositor ignores newer edges
+        }
+    }
+    r
+}
+
+/// The reservation the shell has published, or none at all.
+pub fn panel_reservation() -> PanelReservation {
+    std::fs::read_to_string(PANEL_RESERVATION_PATH)
+        .map(|s| parse_panel_reservation(&s))
+        .unwrap_or_default()
+}
+
+/// The output rect MINUS the reserved chrome: the region windows may occupy.
+/// PURE, so the clamping below is unit-testable without a mapped output.
+///
+/// The reservation is CAPPED AT HALF the output height, and when both edges
+/// together exceed that they are scaled down in proportion rather than one edge
+/// winning. These numbers cross a process boundary as a text file, and a corrupt or
+/// absurd value must not be able to squeeze the usable area to nothing: a desktop
+/// with no room for windows is a far worse failure than a bar that overlaps one.
+pub fn work_area(
+    ox: i32, oy: i32, ow: i32, oh: i32, reserved: PanelReservation,
+) -> (i32, i32, i32, i32) {
+    let cap = (oh / 2).max(0);
+    let top = reserved.top.clamp(0, cap);
+    let bottom = reserved.bottom.clamp(0, cap);
+    let total = top + bottom;
+    let (top, bottom) = if total > cap && total > 0 {
+        let t = top * cap / total;
+        (t, cap - t)
+    } else {
+        (top, bottom)
+    };
+    (ox, oy + top, ow, oh - top - bottom)
+}
+
+/// The live work area. THE single place window placement learns where it may lay
+/// things out; `output_geometry` must not be read directly for that purpose again.
+pub fn work_area_for<S: CompState>(state: &S) -> Option<(i32, i32, i32, i32)> {
+    let g = state.space().output_geometry(state.output())?;
+    Some(work_area(g.loc.x, g.loc.y, g.size.w, g.size.h, panel_reservation()))
 }
 
 /// The current output size in PHYSICAL (framebuffer) pixels. Screencopy reports this
@@ -972,11 +1074,13 @@ pub fn restore_focused_window<S: CompState>(state: &mut S) {
         .and_then(|s| s.0.take());
     let (x, y, w, h) = match stashed {
         Some(g) => (g.loc.x, g.loc.y, g.size.w, g.size.h),
-        None => match state.space().output_geometry(state.output()) {
-            Some(o) => {
-                let w = o.size.w * 3 / 5;
-                let h = o.size.h * 3 / 5;
-                (o.loc.x + (o.size.w - w) / 2, o.loc.y + (o.size.h - h) / 2, w, h)
+        // Centred 60% of the WORK AREA, so an un-snapped restore also lands clear
+        // of the reserved chrome.
+        None => match work_area_for(state) {
+            Some((ax, ay, aw, ah)) => {
+                let w = aw * 3 / 5;
+                let h = ah * 3 / 5;
+                (ax + (aw - w) / 2, ay + (ah - h) / 2, w, h)
             }
             None => return,
         },
@@ -1504,11 +1608,15 @@ pub fn zone_rect(ox: i32, oy: i32, ow: i32, oh: i32, zone: &str) -> Option<(i32,
     Some(r)
 }
 
-/// Compute a named-zone rect over the output (§4.4 zones). Logical pixels. Thin wrapper:
-/// reads the live output geometry then defers to the pure `zone_rect`.
+/// Compute a named-zone rect over the WORK AREA (§4.4 zones). Logical pixels. Thin
+/// wrapper: reads the live work area then defers to the pure `zone_rect`.
+///
+/// The work area rather than the output geometry is what makes "maximize" stop at
+/// the taskbar instead of burying it, and it lands the same fix on all nine zones
+/// at once -- a top-half snap now means the top half of the usable desktop.
 pub fn ipc_zone_rect<S: CompState>(state: &S, zone: &str) -> Option<(i32, i32, i32, i32)> {
-    let geo = state.space().output_geometry(state.output())?;
-    zone_rect(geo.loc.x, geo.loc.y, geo.size.w, geo.size.h, zone)
+    let (ax, ay, aw, ah) = work_area_for(state)?;
+    zone_rect(ax, ay, aw, ah, zone)
 }
 
 /// PURE tile geometry: lay `n` windows over an output rect `(ox, oy, ow, oh)` per the
@@ -1582,11 +1690,13 @@ pub fn ipc_tile<S: CompState>(state: &mut S, layout: &str) -> Vec<String> {
     if n == 0 {
         return Vec::new();
     }
-    let geo = match state.space().output_geometry(state.output()) {
-        Some(g) => g,
+    // Tile over the WORK AREA: a tiling layout that paved over the taskbar would
+    // hide it on every single window, which is the worst case of all.
+    let (ax, ay, aw, ah) = match work_area_for(state) {
+        Some(a) => a,
         None => return Vec::new(),
     };
-    let rects = tile_rects(geo.loc.x, geo.loc.y, geo.size.w, geo.size.h, n, layout);
+    let rects = tile_rects(ax, ay, aw, ah, n, layout);
 
     for (handle, (x, y, w, h)) in handles.iter().zip(rects.iter()) {
         ipc_place_window(state, handle, *x, *y, *w, *h);
@@ -2189,6 +2299,147 @@ mod tests {
             assert!(!layer_is_above_windows(layer),
                     "{layer:?} is hit-tested after windows, so it must paint below them");
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // work_area — the panel reservation. The HART taskbar lives INSIDE the single
+    // Background layer surface, so it cannot claim an exclusive zone of its own;
+    // the compositor reserves the strip for it instead. Every window-placement
+    // path resolves through here, so these cases cover maximize, all nine snap
+    // zones, all five tiling layouts and the new-window cascade at once.
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// The HART shell's real chrome: a 40px top bar and a 44px bottom taskbar,
+    /// both read off the served CSS (--hart-topbar-height and .taskbar height).
+    fn hart_chrome() -> PanelReservation {
+        PanelReservation { top: 40, bottom: 44 }
+    }
+
+    #[test]
+    fn no_reservation_leaves_the_output_untouched() {
+        // The pre-existing behaviour, and what every node without a published
+        // reservation keeps getting.
+        let none = PanelReservation::default();
+        assert_eq!(work_area(0, 0, 1600, 900, none), (0, 0, 1600, 900));
+    }
+
+    #[test]
+    fn both_edges_are_taken_off_the_usable_area() {
+        let (x, y, w, h) = work_area(0, 0, 1600, 900, hart_chrome());
+        assert_eq!((x, y, w, h), (0, 40, 1600, 816));
+        assert_eq!(y + h, 900 - 44, "the bottom taskbar must stay clear too");
+    }
+
+    #[test]
+    fn a_reservation_respects_a_non_zero_output_origin() {
+        // Multi-output layouts put the origin somewhere other than 0,0.
+        assert_eq!(work_area(1600, 100, 1280, 800, hart_chrome()),
+                   (1600, 140, 1280, 716));
+    }
+
+    #[test]
+    fn an_absurd_reservation_cannot_squeeze_the_desktop_to_nothing() {
+        // These numbers cross a process boundary as a text file. A desktop with no
+        // room for windows is a worse failure than a bar that overlaps one.
+        let absurd = PanelReservation { top: 100_000, bottom: 100_000 };
+        let (_, y, _, h) = work_area(0, 0, 1600, 900, absurd);
+        assert!(h >= 450, "at least half the output must stay usable, got {h}");
+        assert!(y <= 450);
+    }
+
+    #[test]
+    fn two_oversized_edges_shrink_in_proportion_rather_than_one_winning() {
+        // Each edge is capped at half the output (450) first, so 600/200 becomes
+        // 450/200, then the pair is scaled to fit 450 total: 311 top, 139 bottom.
+        // Both edges survive; neither is zeroed out to let the other have its way.
+        let greedy = PanelReservation { top: 600, bottom: 200 };
+        let (_, y, _, h) = work_area(0, 0, 1600, 900, greedy);
+        assert_eq!(h, 450);
+        assert!(y > 300 && y < 380, "top edge kept its share, got {y}");
+    }
+
+    #[test]
+    fn a_negative_reservation_is_ignored_rather_than_growing_the_area() {
+        let bad = PanelReservation { top: -40, bottom: -44 };
+        assert_eq!(work_area(0, 0, 1600, 900, bad), (0, 0, 1600, 900));
+    }
+
+    #[test]
+    fn maximize_over_the_work_area_stops_at_the_chrome() {
+        // The user-visible bug: a maximized window covered the bar and there was no
+        // way back to Home/Agents/Apps without minimizing it.
+        let (ax, ay, aw, ah) = work_area(0, 0, 1600, 900, hart_chrome());
+        let (x, y, w, h) = zone_rect(ax, ay, aw, ah, "maximize").unwrap();
+        assert_eq!((x, y, w, h), (0, 40, 1600, 816));
+        assert!(y >= 40, "a maximized window must start below the top bar");
+        assert!(y + h <= 900 - 44, "and stop above the taskbar");
+    }
+
+    #[test]
+    fn no_snap_zone_reaches_into_either_bar() {
+        let c = hart_chrome();
+        let (ax, ay, aw, ah) = work_area(0, 0, 1600, 900, c);
+        for zone in ["left-half", "right-half", "top-half", "bottom-half", "top-left",
+                     "top-right", "bottom-left", "bottom-right", "center",
+                     "maximize", "fullscreen"] {
+            let (_, y, _, h) = zone_rect(ax, ay, aw, ah, zone).unwrap();
+            assert!(y >= c.top, "zone {zone} starts at y={y}, inside the top bar");
+            assert!(y + h <= 900 - c.bottom,
+                    "zone {zone} ends at y={}, inside the taskbar", y + h);
+        }
+    }
+
+    #[test]
+    fn no_tiling_layout_paves_over_either_bar() {
+        // A tiler that ignored the chrome would hide the bars behind EVERY window,
+        // which is the worst case of the lot.
+        let c = hart_chrome();
+        let (ax, ay, aw, ah) = work_area(0, 0, 1600, 900, c);
+        for layout in ["grid", "cols", "columns", "rows", "master-stack", "fullscreen"] {
+            for n in 1..=6 {
+                for (_, y, _, h) in tile_rects(ax, ay, aw, ah, n, layout) {
+                    assert!(y >= c.top,
+                            "layout {layout} n={n} placed a tile at y={y}");
+                    assert!(y + h <= 900 - c.bottom,
+                            "layout {layout} n={n} tile ends at y={}", y + h);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_published_format_parses_both_edges() {
+        let r = parse_panel_reservation("top=40\nbottom=44\n");
+        assert_eq!(r, PanelReservation { top: 40, bottom: 44 });
+    }
+
+    #[test]
+    fn junk_in_the_published_file_reserves_nothing_rather_than_guessing() {
+        // Every one of these is a way the file could be wrong in the field.
+        for junk in ["", "garbage", "top=", "top=abc", "top=-5", "=40", "top:40",
+                     "\n\n\n", "top=40px"] {
+            assert_eq!(parse_panel_reservation(junk), PanelReservation::default(),
+                       "{junk:?} should have reserved nothing");
+        }
+    }
+
+    #[test]
+    fn a_partial_or_extended_file_still_works() {
+        // One edge only, and an edge this build has never heard of. Neither may
+        // break the ones it does understand -- that is what lets an older
+        // compositor keep running against a newer shell.
+        assert_eq!(parse_panel_reservation("top=40"),
+                   PanelReservation { top: 40, bottom: 0 });
+        assert_eq!(parse_panel_reservation("top=40\nleft=64\nbottom=44"),
+                   PanelReservation { top: 40, bottom: 44 });
+    }
+
+    #[test]
+    fn a_missing_file_reserves_nothing() {
+        // Fail-safe: this runs on a dev box with no /run/hart, and on a node that
+        // has not published anything yet. Either way the answer is "no
+        // reservation", so the compositor half ships inert ahead of the shell half.
+        assert_eq!(panel_reservation(), PanelReservation::default());
     }
 
     // ════════════════════════════════════════════════════════════════════════

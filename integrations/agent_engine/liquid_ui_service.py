@@ -188,6 +188,64 @@ def read_native_chrome() -> frozenset:
     return frozenset(names & _NATIVE_CHROME_KNOWN)
 
 
+# ── Panel reservation: shell -> compositor ──────────────────────────────────
+# read_native_chrome above runs compositor -> shell. This is the same bridge in the
+# other direction, and it exists because of Z-ORDER MODEL 1: the HART shell is ONE
+# fullscreen Background layer surface with the top bar AND the taskbar painted
+# inside it, so neither bar is a surface of its own that could claim a wlr-layer-
+# shell exclusive zone. Without this the compositor cannot know they are there, and
+# a maximized window covers both -- the 2026-08-29 report "the taskbar should always
+# stay on top", where the bar sat unreachable behind a full-screen Firefox with no
+# way back to Home/Agents/Apps.
+#
+# comp_core.rs `work_area` subtracts what we publish here, and EVERY placement path
+# (maximize, all nine snap zones, all five tiling layouts, the new-window cascade)
+# resolves through it.
+_PANEL_RESERVATION_FILE = '/run/hart/session/panel-reservation'
+
+#: Height of the bottom taskbar in CSS pixels. This MUST equal the `height:` in the
+#: `.taskbar` rule of the served stylesheet. tests/unit/test_panel_reservation.py
+#: greps the CSS and fails if the two drift, which is the only thing stopping a
+#: restyle from silently leaving a band of desktop covered again.
+TASKBAR_HEIGHT_PX = 44
+
+#: Used only if the served CSS somehow carries no --hart-topbar-height. Matches the
+#: theme-load fallback in render_desktop_shell.
+TOPBAR_HEIGHT_FALLBACK_PX = 40
+
+
+def publish_panel_reservation(css_vars: str) -> dict:
+    """Tell the compositor how much of the screen the shell's chrome owns.
+
+    The top value is parsed out of the SAME `--hart-topbar-height` the browser is
+    about to apply, so a theme that restyles the bar moves the reservation with it
+    and the two cannot disagree. The bottom is a constant pinned to the CSS by test.
+
+    Best-effort and NEVER raises. This runs on the desktop render path, and a
+    desktop that failed to draw because it could not write a hint file would be a
+    far worse bug than a window overlapping a bar. On any failure the compositor
+    finds no file and reserves nothing, which is exactly the behaviour that shipped
+    before this existed.
+
+    Returns the reservation it published, for tests and logging.
+    """
+    m = re.search(r'--hart-topbar-height:\s*(\d+)px', css_vars or '')
+    reservation = {'top': int(m.group(1)) if m else TOPBAR_HEIGHT_FALLBACK_PX,
+                   'bottom': TASKBAR_HEIGHT_PX}
+    body = ''.join('%s=%d\n' % kv for kv in reservation.items())
+    try:
+        # Write-then-rename so the compositor can never read a half-written file,
+        # the same way the compositor publishes its own native-chrome verdict.
+        tmp = _PANEL_RESERVATION_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            f.write(body)
+        os.replace(tmp, _PANEL_RESERVATION_FILE)
+    except (PermissionError, FileNotFoundError, OSError) as exc:
+        logger.debug('[shell] panel reservation not published (%s); the '
+                     'compositor will reserve nothing', exc)
+    return reservation
+
+
 # /run/hart/session (0770, group-writable) NOT /run/hart (0750, owner-only): the
 # session HOST runs as hart-admin (in the `hart` group, not the `hart` OWNER), so it
 # can only write the group-writable session dir -- the SAME dir + reason shell-ready /
@@ -1654,6 +1712,14 @@ class LiquidUIService:
                 "theme; this is a fault, not a style.")
             css_vars = ':root { --hart-background: #0F0E17; --hart-accent: #00E6C3; --hart-on-accent: #0F0E17; --hart-active: #00e676; --hart-text: #e0e0e0; --hart-glass-bg: rgba(15,14,23,0.65); --hart-glass-border: rgba(0,230,195,0.18); --hart-muted: #78909c; --hart-surface: #1a1a2e; --hart-blur: 20px; --hart-saturation: 180%; --hart-radius: 16px; --hart-panel-opacity: 0.65; --hart-topbar-height: 40px; --hart-icon-size: 20px; --hart-titlebar-height: 32px; --hart-font-family: "JetBrains Mono"; --hart-font-size: 13px; --hart-heading-size: 18px; --hart-font-weight: 400; --hart-heading-weight: 600; --hart-anim-speed: 200ms; --hart-error: #FF6B6B; --hart-caution: #ffab40; --hart-heading: #00E6C3; --hart-surface-hover: #252540; }'
             theme = {}
+
+        # Tell the compositor how much of the screen the chrome owns, derived from
+        # the SAME css_vars this page is about to be served -- so a theme that
+        # restyles the top bar moves the window work-area with it. Placed after
+        # BOTH the theme path and the fallback path above, so the reservation is
+        # published even on a failed theme load (where the bars still render at the
+        # fallback sizes). Never raises; see publish_panel_reservation.
+        publish_panel_reservation(css_vars)
 
         # Performance tier detection
         perf = theme.get('performance', {})
