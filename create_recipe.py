@@ -632,7 +632,7 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
     restart = False
     while True:
         current_app.logger.info('inside Timer while')
-        if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
+        if group_chat.messages[-1]['name'] == 'ChatInstructor' and _is_terminate(group_chat.messages[-1]['content']):
             current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
             json_obj = retrieve_json(group_chat.messages[-2]["content"])
             if json_obj and type(json_obj)==dict and 'status' in json_obj.keys() and json_obj['status'].lower() == 'completed':
@@ -663,7 +663,7 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
         break
 
     last_message = group_chat.messages[-1]
-    if last_message['content'] == 'TERMINATE':
+    if _is_terminate(last_message['content']):
         last_message = group_chat.messages[-2]
     #sending response to receiver agent
     if f'message2user'.lower() in last_message['content'].lower():
@@ -760,7 +760,7 @@ def visual_execution(task_description: str, user_id: int, prompt_id: int):
         # Use the existing agent structure
         result = author.initiate_chat(manager, message=text, clear_history=False)
         last_message = group_chat.messages[-1]
-        if last_message['content'] == 'TERMINATE':
+        if _is_terminate(last_message['content']):
             if len(group_chat.messages) > 1:
                 last_message = group_chat.messages[-2]
             if 'message2user' in last_message['content'].lower():
@@ -2899,7 +2899,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         if isinstance(msg, dict) and msg.get('_from_shared'):
             return  # seeded message, already in buffer
         content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-        if not content or len(content.strip()) <= 5 or content == 'TERMINATE':
+        if not content or len(content.strip()) <= 5 or _is_terminate(content):
             return
         speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
         # SimpleMem ingest
@@ -4382,7 +4382,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     f"breaking clean instead of draining max_iterations")
                 break
 
-            if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
+            if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and _is_terminate(group_chat.messages[-1]['content']):
                 current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                 json_obj = retrieve_json(group_chat.messages[-2]["content"])
 
