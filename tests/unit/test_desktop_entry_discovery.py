@@ -48,6 +48,20 @@ APP = ("[Desktop Entry]\n"
        "Icon=%s\n")
 
 
+def iso(tmp_path):
+    """An environment that scans ONLY the fixture tree.
+
+    entry_dirs falls back to the XDG spec defaults (/usr/local/share:/usr/share)
+    when XDG_DATA_DIRS is unset. On a Windows dev box neither exists, so `env={}`
+    looked like isolation; on a Linux CI runner both exist and are full of real
+    applications, and these tests failed with 170 discovered apps where the
+    fixture had written 162, and with google-chrome and htop in a list that was
+    supposed to hold two entries. Pointing XDG_DATA_DIRS at a directory that does
+    not exist is what actually isolates them.
+    """
+    return {"XDG_DATA_DIRS": str(tmp_path / "no-system-dirs-here")}
+
+
 # ── where we look ───────────────────────────────────────────────────────────
 
 def test_xdg_precedence_is_followed():
@@ -153,7 +167,7 @@ def test_the_box_scenario_end_to_end(tmp_path, monkeypatch):
     write_entry(str(nix), "audacity.desktop", APP % ("Audacity", "audacity", "aud"))
     monkeypatch.setattr(DE, "_EXTRA_DIRS", (str(nix),))
 
-    found = DE.discover(env={}, home=str(home))
+    found = DE.discover(env=iso(tmp_path), home=str(home))
     assert sorted(found) == ["audacity", "firefox"], sorted(found)
     assert not any("wine" in k for k in found), "NoDisplay stubs leaked in"
 
@@ -166,7 +180,7 @@ def test_every_entry_is_returned(tmp_path, monkeypatch):
         write_entry(str(nix), "app%03d.desktop" % i,
                     APP % ("App %03d" % i, "app%03d" % i, "icon"))
     monkeypatch.setattr(DE, "_EXTRA_DIRS", (str(nix),))
-    assert len(DE.discover(env={}, home=str(tmp_path / "nohome"))) == 162
+    assert len(DE.discover(env=iso(tmp_path), home=str(tmp_path / "nohome"))) == 162
 
 
 def test_a_user_entry_shadows_the_system_one(tmp_path, monkeypatch):
@@ -177,12 +191,12 @@ def test_a_user_entry_shadows_the_system_one(tmp_path, monkeypatch):
     nix = tmp_path / "applications"
     write_entry(str(nix), "firefox.desktop", APP % ("Firefox", "firefox", "ff"))
     monkeypatch.setattr(DE, "_EXTRA_DIRS", (str(nix),))
-    assert DE.discover(env={}, home=str(home))["firefox"]["Name"] == "Firefox Nightly"
+    assert DE.discover(env=iso(tmp_path), home=str(home))["firefox"]["Name"] == "Firefox Nightly"
 
 
 def test_a_missing_directory_is_not_fatal(tmp_path, monkeypatch):
     monkeypatch.setattr(DE, "_EXTRA_DIRS", ("/definitely/not/here",))
-    assert DE.discover(env={}, home=str(tmp_path)) == {}
+    assert DE.discover(env=iso(tmp_path), home=str(tmp_path)) == {}
 
 
 def test_non_desktop_files_are_ignored(tmp_path, monkeypatch):
@@ -191,7 +205,7 @@ def test_non_desktop_files_are_ignored(tmp_path, monkeypatch):
     write_entry(str(nix), "mimeinfo.cache", "junk")
     write_entry(str(nix), "README", "junk")
     monkeypatch.setattr(DE, "_EXTRA_DIRS", (str(nix),))
-    assert list(DE.discover(env={}, home=str(tmp_path))) == ["firefox"]
+    assert list(DE.discover(env=iso(tmp_path), home=str(tmp_path))) == ["firefox"]
 
 
 # ── into the registry the rest of the OS already uses ───────────────────────
