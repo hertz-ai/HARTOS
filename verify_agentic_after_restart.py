@@ -138,6 +138,7 @@ def check_create():
 def _check_create():
     print("\n== CREATE: a 'completed' config must carry actions (ec7af78a) ==")
     rid = "verify-create-%d" % int(time.time())
+    before = log_offsets()
     r = post("/chat", {"text": "Build me an agent that reads a text file and "
                                "writes a one-line summary.",
                        "user_id": "verify", "create_agent": True,
@@ -154,10 +155,26 @@ def _check_create():
                            "prompt_id": pid, "media_mode": "text", "request_id": rid})
         print("  turn   ->", str(r.get("text"))[:90])
 
+    new = log_since(before)
+    n_exc = new.count("Exception on /chat")
+    last = str(r.get("text") or "")
+
     cfg_path = os.path.join(PROMPTS, "%s.json" % pid)
     if not os.path.exists(cfg_path):
-        print("  (no config written yet - gate may have asked for more detail, "
-              "which is the FIXED behaviour, not a failure)")
+        # "No config" is the FIXED behaviour only when the gate actually asked
+        # for more detail.  It is ALSO what a crash, a timeout or a dead LLM
+        # produces, so absence alone cannot be read as a pass - that is the
+        # same mistake the reuse check made (see 0b274da9).
+        if n_exc:
+            print("  FAIL: no config and /chat raised %d time(s) - the turn "
+                  "died, it did not decline to build" % n_exc)
+            return False
+        if _is_standby(last) or len(last.strip()) < 15:
+            print("  FAIL: no config and no real ask either; last reply was "
+                  "%r" % last[:80])
+            return False
+        print("  PASS: no config, and the gate asked for more detail instead "
+              "of saving an empty agent - that is ec7af78a working")
         return True
     with open(cfg_path, encoding="utf-8") as f:
         cfg = json.load(f)
@@ -184,8 +201,12 @@ def _check_reuse():
     reusable = [n[:-len("_0_recipe.json")] for n in os.listdir(PROMPTS)
                 if re.match(r"^\d+_0_recipe\.json$", n)]
     if not reusable:
-        print("  SKIP: no agent with a flow-0 recipe on this box")
-        return True
+        # Not a benign skip.  #718 IS "agents get saved without a flow recipe",
+        # so zero reusable agents is the defect's own signature, and reporting
+        # PASS here would certify a path that was never exercised.
+        print("  FAIL: no agent has a _0_recipe.json, so reuse cannot be "
+              "tested at all - that is #718's signature, not a clean box")
+        return False
     pid = reusable[0]
     before = log_offsets()
     rid = "verify-reuse-%d" % int(time.time())
