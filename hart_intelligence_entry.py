@@ -8805,6 +8805,35 @@ def _optional_capability_missing(exc):
     }), 503
 
 
+_EMPTY_BUILD_REPLY = (
+    "I have the name and goal, but not the steps yet. Tell me the actions "
+    "this agent should take, in order, and I will build it from those."
+)
+
+
+def _config_is_buildable(cfg) -> bool:
+    """True iff a 'completed' agent config actually contains actions to build.
+
+    LIVE-PROVEN 2026-08-29 20:00 (prompt_id 88013682884, driven through the
+    real /chat API): the model answered gather_info with status='completed'
+    but every STRUCTURAL field empty -- personas '', tools '', flows
+    [{'flow_name': '', 'persona': '', 'actions': [], 'sub_goal': ''}] -- while
+    filling in name, goal and a full personality block.  Log evidence: zero
+    'gather_info parse error', zero 'salvaging partial', one 'COMPLETED
+    STATUS'.  So the parse was faithful and this was the NORMAL path; the
+    model simply returned an empty shell and nothing checked that
+    "completed" meant buildable.  It was saved with is_active=true and can
+    never produce a flow recipe, because there are no actions to execute.
+    That shape is 485 of the 624-config corpus (#718).
+    """
+    try:
+        flows = (cfg or {}).get('flows') or []
+        return any((f or {}).get('actions') for f in flows
+                   if isinstance(f, dict))
+    except (AttributeError, TypeError):
+        return False
+
+
 @app.route('/chat', methods=['POST'])
 @_mark_foreground
 def chat():
@@ -9737,6 +9766,19 @@ def chat():
                     )
                 else:
                     # Completed (or forced completion after max turns)
+                    if turn_num < MAX_GATHER_TURNS and not _config_is_buildable(new_res):
+                        app.logger.warning(
+                            "[EMPTY-BUILD] status='completed' with no actions for %s "
+                            "- asking for the steps instead of saving a config that "
+                            "can never build (#718)", prompt_id)
+                        _record_lifecycle('Creation Mode', user_id, prompt_id,
+                                          'Completed with no actions - re-asking')
+                        return _chat_reply(
+                            user_id, request_id, _EMPTY_BUILD_REPLY,
+                            intent=['FINAL_ANSWER'],
+                            req_token_count=0, res_token_count=0, history_request_id=[],
+                            Agent_status='Creation Mode', prompt_id=prompt_id,
+                        )
                     app.logger.info('COMPLETED STATUS')
                     _save_and_enter_review(new_res)
                     _push_workflow_flowchart(user_id, prompt_id, request_id)
