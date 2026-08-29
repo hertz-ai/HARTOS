@@ -9393,8 +9393,23 @@ def chat():
                     # Persist so next requests also use the new language
                     _persist_language(_lang_change)
 
-                if (result.get('is_create_agent')
-                        and _draft_conf >= _DRAFT_INTENT_CONFIDENCE):
+                # ONE predicate for "the draft's create-intent is real
+                # enough to route on".  Both the CREATE branch below and
+                # the delegate branch further down must read THIS, not the
+                # raw flag: a turn whose is_create_agent is set but NOT
+                # trusted used to be refused by both (too uncertain to
+                # create, yet the flag still suppressed delegation) and
+                # fell to the `else`, which returns the draft's raw text
+                # as the answer.  Measured live 2026-08-29 21:30: "What is
+                # 17 multiplied by 4?" -> conf 0.5, delegate 'local',
+                # is_create_agent True -> a memory-recall ramble.  Same
+                # shape as the 2026-05-07 regression branch 3 was added to
+                # fix.  Untrusted intent is treated as absent, everywhere.
+                _create_intent_actionable = (
+                    bool(result.get('is_create_agent'))
+                    and _draft_conf >= _DRAFT_INTENT_CONFIDENCE)
+
+                if _create_intent_actionable:
                     app.logger.info(
                         'draft classifier: is_create_agent=true '
                         f'(conf={_draft_conf:.2f}) — routing to autogen CREATE'
@@ -9422,7 +9437,7 @@ def chat():
                     # VLM tool will produce a grounded answer.
                 elif (result.get('delegate') in ('local', 'hive')
                       and not result.get('is_casual')
-                      and not result.get('is_create_agent')):
+                      and not _create_intent_actionable):
                     # Draft self-assessed: this is a non-casual TASK
                     # that needs more capability than the 0.8B has
                     # (delegate='local' = bigger local model + tools;
