@@ -466,6 +466,38 @@ def _get_budget_per_slot() -> int:
         return LLAMA_CTX_SIZE_DEFAULT
 
 
+def _schema_tokens(body: dict, model=None) -> int:
+    """Prompt-token cost of EVERY schema block on the request.
+
+    llama-server bills the serialised schema exactly like message content.
+    autogen sends BOTH ``functions`` (legacy OpenAI) and ``tools``; only
+    ``tools`` was ever charged, so ``functions`` was free budget that did not
+    exist.  Measured on the 2026-08-29 400: functions = 5 entries / 2,918
+    chars (~729 tok) alongside tools = 70 entries (~10,181 tok).
+
+    ONE canonical accessor so the budget maths and the post-trim acceptance
+    test cannot drift apart — they are the same number by construction.
+    """
+    from core.token_utils import count_tokens_for_text
+    total = 0
+    for key in ('tools', 'functions'):
+        block = body.get(key)
+        if not block:
+            continue
+        try:
+            total += count_tokens_for_text(
+                json.dumps(block, ensure_ascii=False), model)
+        except (TypeError, ValueError):
+            # A non-serialisable block is not ours to fix, but pretending it
+            # costs zero is how this bug shipped. Charge from its repr.
+            logger.warning(
+                "wire-trim: %s block is not JSON-serialisable; charging an "
+                "approximate cost so the budget is not silently overstated",
+                key)
+            total += count_tokens_for_text(repr(block), model)
+    return total
+
+
 def _trim_to_budget(body: dict) -> tuple:
     """Return ``(trimmed_body, n_dropped, n_truncated_chars, est_before,
     est_after, budget)``.
@@ -513,19 +545,7 @@ def _trim_to_budget(body: dict) -> tuple:
     # "FULL INPUT MESSAGES DEBUG" dump is a messages-only view. The wire layer is the
     # ONLY place the tools block is observable before it hits the socket, which makes
     # counting it here not an optimisation but the whole point of the layer.
-    tools_tokens = 0
-    if body.get('tools'):
-        try:
-            tools_tokens = count_tokens_for_text(
-                json.dumps(body['tools'], ensure_ascii=False), model)
-        except (TypeError, ValueError):
-            # A non-serialisable tools block is not ours to fix, but pretending it
-            # costs zero is how this bug shipped. Charge a conservative estimate
-            # from its repr rather than silently under-counting.
-            logger.warning(
-                "wire-trim: tools block is not JSON-serialisable; charging an "
-                "approximate cost so the budget is not silently overstated")
-            tools_tokens = count_tokens_for_text(repr(body['tools']), model)
+    tools_tokens = _schema_tokens(body, model)
 
     budget = (_get_budget_per_slot() - max_tokens
               - WIRE_TRIM_SAFETY_MARGIN_TOKENS - tools_tokens)
@@ -601,10 +621,33 @@ def _trim_to_budget(body: dict) -> tuple:
                 last['content'] = new_text
             messages[-1] = last
 
+    # ─── Post-trim acceptance test — the trim is best-effort, so CHECK it ───
+    # Trimming can be structurally unable to reach the budget: it drops and
+    # truncates the LAST message, which cannot shrink the SYSTEM message.  On
+    # 2026-08-29 that produced est 795 against a budget of 351 — over by 2.3x —
+    # and the request was sent anyway because `we truncated something` was
+    # treated as success.  llama-server then rejected it (11,236 > n_ctx 8192).
+    # Say so here: a silent doomed request costs a full round trip and surfaces
+    # to the user as an unexplained failure (see #591 for the caller side).
+    _est_after = count_tokens_for_messages(messages, model)
+    _wire_total = _est_after + tools_tokens
+    _per_slot = _get_budget_per_slot()
+    if _est_after > budget or _wire_total > _per_slot:
+        logger.error(
+            "[TRIM] trim could not reach budget — request is STILL over and "
+            "will very likely be rejected: messages %d tok + schema %d tok = "
+            "%d tok against n_ctx %d (budget was %d, %d msg(s) dropped, %d "
+            "char(s) truncated). Trimming cannot shrink the system message; "
+            "the oversized component is %s.",
+            _est_after, tools_tokens, _wire_total, _per_slot, budget,
+            n_dropped, n_truncated_chars,
+            'the tool/function schema' if tools_tokens > _est_after
+            else 'the message content')
+
     new_body = dict(body)
     new_body['messages'] = messages
     return (new_body, n_dropped, n_truncated_chars,
-            est_before, count_tokens_for_messages(messages, model), budget)
+            est_before, _est_after, budget)
 
 
 def _apply_trim_to_request(httpx_module, request, body: dict) -> tuple:
