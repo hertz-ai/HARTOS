@@ -46,6 +46,17 @@ coloredlogs==15.0.1
 config==0.5.1
 crossbarhttp3==1.1
 dataclasses-json==0.6.7
+# Keyless web search. helper.py:348 `from ddgs import DDGS` is tier A of
+# _keyless_serp and sits FIRST in the ladder, but the package was never declared
+# anywhere, so that tier has never executed. Measured 2026-08-29 from a
+# residential desktop, every other keyless tier is dead: Mojeek returns HTTP 200
+# WITH A CAPTCHA (raises nothing, logs nothing, yields []), DDG html returns 202,
+# and tier D needs SEARXNG_URL which is set nowhere. So google_search returns []
+# on every install. ddgs survives because its transport (primp) does browser TLS
+# impersonation rather than being fingerprinted as a bot; verified against the
+# exact tier-A path, 5 rows with titles/urls/snippets. primp + lxml resolve
+# transitively and are deliberately not pinned here.
+ddgs==9.16.0
 dill==0.3.7
 distro==1.8.0
 duckdb==0.8.1

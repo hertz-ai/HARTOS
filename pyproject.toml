@@ -94,6 +94,13 @@ dependencies = [
     "numpy>=1.25.0,<2.0.0",
     "pandas>=2.0.0,<4.0.0",
     "beautifulsoup4>=4.12.0,<5.0.0",
+    # Keyless web search — tier A of helper.py:_keyless_serp (`from ddgs import
+    # DDGS` at :348), first in the ladder. Undeclared until 2026-08-29, so it had
+    # never run once and google_search returned [] on every install; the other
+    # keyless tiers are blocked (Mojeek serves a captcha behind HTTP 200, DDG html
+    # 202) and tier D needs SEARXNG_URL, set nowhere. Pulls primp (browser TLS
+    # impersonation, the reason this tier survives) and lxml transitively.
+    "ddgs>=9.16.0",
     "PyPDF2>=3.0.0,<4.0.0",
 
     # Tokenization
