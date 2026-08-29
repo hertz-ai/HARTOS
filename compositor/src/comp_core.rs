@@ -1726,8 +1726,62 @@ pub fn build_cursor_elements<S, R>(
     }
 }
 
+/// Does a wlr-layer-shell layer sit ABOVE mapped toplevels?
+///
+/// The protocol stacks background < bottom < WINDOWS < top < overlay. This states
+/// it in ONE place because the renderer and the input hit-test have to agree, and
+/// they did not: `surface_under` has routed Overlay/Top above windows since it was
+/// written (its own docstring says so), while `build_frame_elements` painted EVERY
+/// layer below EVERY window. A Top-layer panel therefore swallowed clicks in a
+/// strip where nothing of it was drawn -- pixels saying one thing and input
+/// another, in exactly the surfaces the Top layer exists for.
+pub fn layer_is_above_windows(layer: WlrLayer) -> bool {
+    matches!(layer, WlrLayer::Top | WlrLayer::Overlay)
+}
+
+/// Push the layer surfaces on ONE side of the toplevels, returning how many were
+/// painted. Called twice per frame, before and after the window loop.
+///
+/// `elements` is TOP→bottom (index 0 paints first, on top), and `LayerMap::layers`
+/// yields bottom-to-top, so the `.rev()` is what keeps two surfaces on the same
+/// layer from stacking upside down. This mirrors anvil, which partitions
+/// `layers().rev()` on `Background | Bottom` for the same reason.
+fn push_layer_elements<R>(
+    renderer: &mut R,
+    elements: &mut Vec<HartRenderElement<R>>,
+    output: &Output,
+    ws_alpha: f32,
+    above_windows: bool,
+) -> usize
+where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Send + Clone + 'static,
+{
+    let map = layer_map_for_output(output);
+    let mut painted = 0usize;
+    for layer in map.layers().rev() {
+        if layer_is_above_windows(layer.layer()) != above_windows {
+            continue;
+        }
+        painted += 1;
+        let loc = map.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
+        let layer_elems: Vec<WaylandSurfaceRenderElement<R>> =
+            render_elements_from_surface_tree(
+                renderer,
+                layer.wl_surface(),
+                (loc.x, loc.y),
+                1.0,
+                ws_alpha,
+                Kind::Unspecified,
+            );
+        elements.extend(layer_elems.into_iter().map(HartRenderElement::Surface));
+    }
+    painted
+}
+
 /// Build the FULL frame element list in z-order (TOP→bottom; `draw_render_elements`
-/// paints index 0 first = top-most): killswitch → cursor → windows (faded) → layers.
+/// paints index 0 first = top-most): killswitch → cursor → Top/Overlay layers →
+/// windows (faded) → Bottom/Background layers.
 /// Generic over R so BOTH backends build the identical frame; the backend then binds its
 /// framebuffer + draws this slice. This is the single source of the desktop's z-order.
 pub fn build_frame_elements<S, R>(
@@ -1762,8 +1816,23 @@ where
         build_cursor_elements(state, renderer, &mut elements);
     }
 
-    // ── 2. WINDOW TOPLEVELS (above layers, below cursor), top-most first. ──
     let ws_alpha = workspace_fade_alpha(state);
+    let output = state.output().clone();
+    let mut layers_painted = 0usize;
+
+    // ── 2. TOP / OVERLAY layer surfaces — ABOVE the toplevels. ──
+    // wlr-layer-shell stacks background < bottom < WINDOWS < top < overlay, and
+    // `surface_under` has always routed clicks that way (its own docstring says
+    // so). The renderer did not: every layer, whatever its layer, was painted
+    // below every window. So a Top-layer panel took clicks in a strip where it
+    // was nowhere to be seen -- pixels said one thing and input another, which
+    // is unusable for exactly the panels and notification surfaces the Top layer
+    // exists for. `layer_is_above_windows` is now the single statement of that
+    // order, shared by both.
+    layers_painted += push_layer_elements(
+        renderer, &mut elements, &output, ws_alpha, /* above_windows = */ true);
+
+    // ── 3. WINDOW TOPLEVELS (below Top/Overlay layers and the cursor). ──
     let windows: Vec<Window> = state.space().elements().rev().cloned().collect();
     for window in &windows {
         let loc = state.space().element_location(window).unwrap_or_default();
@@ -1787,26 +1856,11 @@ where
         elements.extend(win_elems.into_iter().map(HartRenderElement::Surface));
     }
 
-    // ── 3. LAYER surfaces (below the toplevels in this list = drawn under them). ──
-    let output = state.output().clone();
-    let mut layers_painted = 0usize;
-    {
-        let map = layer_map_for_output(&output);
-        for layer in map.layers() {
-            layers_painted += 1;
-            let loc = map.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
-            let layer_elems: Vec<WaylandSurfaceRenderElement<R>> =
-                render_elements_from_surface_tree(
-                    renderer,
-                    layer.wl_surface(),
-                    (loc.x, loc.y),
-                    1.0,
-                    ws_alpha,
-                    Kind::Unspecified,
-                );
-            elements.extend(layer_elems.into_iter().map(HartRenderElement::Surface));
-        }
-    }
+    // ── 4. BOTTOM / BACKGROUND layer surfaces — BELOW the toplevels. ──
+    // This is the desktop plane: the HART glass shell anchors here, which is what
+    // makes it the desktop rather than an app.
+    layers_painted += push_layer_elements(
+        renderer, &mut elements, &output, ws_alpha, /* above_windows = */ false);
     {
         let prev = LAYERS_PAINTED.swap(layers_painted, std::sync::atomic::Ordering::Relaxed);
         if prev != layers_painted {
@@ -2086,6 +2140,55 @@ mod tests {
     }
     fn digit_chord(m: ModifiersState, modified: Keysym, level0: Keysym) -> Option<WmAction> {
         process_keyboard_shortcut(m, modified, Some(level0))
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // layer_is_above_windows — the ONE statement of wlr-layer-shell stacking,
+    // shared by the renderer and the pointer hit-test. They disagreed: the
+    // hit-test routed Overlay/Top above windows from the start while the frame
+    // builder painted every layer below every window, so a Top-layer panel took
+    // clicks in a strip where nothing of it was visible.
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn top_and_overlay_are_above_the_toplevels() {
+        assert!(layer_is_above_windows(WlrLayer::Top));
+        assert!(layer_is_above_windows(WlrLayer::Overlay));
+    }
+
+    #[test]
+    fn background_and_bottom_are_below_the_toplevels() {
+        // The HART glass shell anchors to Background. That is what makes it the
+        // desktop rather than an app, and it must keep sitting under windows.
+        assert!(!layer_is_above_windows(WlrLayer::Background));
+        assert!(!layer_is_above_windows(WlrLayer::Bottom));
+    }
+
+    #[test]
+    fn every_layer_falls_on_exactly_one_side() {
+        // A partition, not a filter: each of the four layers is either above or
+        // below, so the two push_layer_elements passes paint each surface once.
+        // If a layer were ever missed by both, it would silently vanish.
+        let all = [WlrLayer::Background, WlrLayer::Bottom, WlrLayer::Top, WlrLayer::Overlay];
+        let above = all.iter().filter(|l| layer_is_above_windows(**l)).count();
+        assert_eq!(above, 2);
+        assert_eq!(all.len() - above, 2);
+    }
+
+    #[test]
+    fn the_renderer_and_the_hit_test_use_the_same_rule() {
+        // surface_under tries Overlay then Top BEFORE space().element_under, and
+        // Bottom then Background after it. Those are the two groups this function
+        // returns, so the pixels and the pointer cannot drift apart again without
+        // this assertion failing.
+        for layer in [WlrLayer::Overlay, WlrLayer::Top] {
+            assert!(layer_is_above_windows(layer),
+                    "{layer:?} is hit-tested before windows, so it must paint above them");
+        }
+        for layer in [WlrLayer::Bottom, WlrLayer::Background] {
+            assert!(!layer_is_above_windows(layer),
+                    "{layer:?} is hit-tested after windows, so it must paint below them");
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════════
