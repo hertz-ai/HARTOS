@@ -8287,7 +8287,7 @@ def _autonomous_gather_info(user_id, description, prompt_id):
     # Fallback: save partial config so the pipeline can recover
     app.logger.warning(f'Autonomous gather_info did not complete in {max_iterations} iterations, saving partial config')
     partial = {
-        'status': 'completed',
+        'status': 'pending',  # NOT completed: creation FAILED (#718)
         'name': f'Agent {prompt_id}',
         'agent_name': f'auto.agent{str(prompt_id)[-4:]}',
         'goal': description or 'General assistant',
@@ -9770,7 +9770,7 @@ def chat():
                         f'Too many gather_info failures (turn {turn_num}, '
                         f'autonomous={is_autonomous}), salvaging partial config')
                     partial = {
-                        'status': 'completed',
+                        'status': 'pending',  # NOT completed: creation FAILED (#718)
                         'name': f'Agent {prompt_id}',
                         'agent_name': f'auto.agent{str(prompt_id)[-4:]}',
                         'goal': prompt or 'General assistant',
