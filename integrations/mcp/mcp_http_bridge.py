@@ -485,7 +485,11 @@ def _tool_watchdog_status() -> str:
         wd = get_watchdog()
         if wd is None:
             return json.dumps({"status": "not_started", "threads": {}})
-        return json.dumps(wd.get_status(), indent=2, default=str)
+        # NodeWatchdog exposes get_health() (node_watchdog.py:246), never
+        # get_status().  The old name raised AttributeError on every call, and
+        # the except below turned it into a 200 carrying {"error": ...} -- so
+        # the tool looked alive to anything that only checked for bytes.
+        return json.dumps(wd.get_health(), indent=2, default=str)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
