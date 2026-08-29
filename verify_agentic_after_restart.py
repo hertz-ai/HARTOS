@@ -11,6 +11,15 @@ Covers the two things that are code-verified but not yet user-visible-verified:
 
 Exit 0 = both user-visible behaviours confirmed. Exit 1 = something still broken,
 and it prints which.
+
+WHICH COPY THIS ACTUALLY TESTS. Measured 2026-08-29 from the live process's own
+tracebacks: all 68 `reuse_recipe.py` frames in gui_app.log are the REPO copy
+(C:/Users/sathi/PycharmProjects/HARTOS/), zero are the bundle. So on a dev box a
+RESTART is enough to pick up a repo commit. The bundled copy under
+python-embed/Lib/site-packages is a SEPARATE artifact and was still stale when
+this was written (AST-confirmed: it carries the real `from __future__ import
+annotations` that a4208301 removed). A FAIL here on an INSTALLED build therefore
+means the bundle needs rebuilding, not that the fix is wrong.
 """
 import json
 import os
