@@ -44,6 +44,7 @@ import inspect
 import json
 import logging
 from functools import partial, wraps
+from typing import get_type_hints
 
 # Module-level tool_logger named "agent_logger" — matches the legacy
 # logger create_recipe.py:284 configured with a RotatingFileHandler.
@@ -134,6 +135,36 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
 
     tool_name = name or func.__name__
 
+    # PEP 563 repair, done here because this decorator is the INNERMOST one on
+    # every registered tool -- autogen's register_for_llm sits above it and so
+    # only ever sees what we hand back.
+    #
+    # reuse_recipe.py carries `from __future__ import annotations` (load-bearing
+    # there: it stops the module-level
+    # `user_agents: Dict[str, Tuple[autogen.AssistantAgent, ...]]` at :269-270
+    # and the defs at :895/:3187 from evaluating `autogen.*` at import time and
+    # dragging the lazy autogen proxy -- ~7.6s + torch -- onto the boot path).
+    # But PEP 563 stringizes EVERY annotation in that module, including the
+    # `Annotated[str, "..."]` params of its 48 tools.  @wraps copies those
+    # strings onto the wrapper, autogen hands them to pydantic, and pydantic
+    # raises:
+    #   PydanticUserError: TypeAdapter[ForwardRef("Annotated[str, 'Target
+    #   persona/role name to deliver the message to']")] is not fully defined
+    # Measured live 2026-08-29 09:31:18: that killed create_agents_for_user(),
+    # i.e. every agent REUSE and the whole multi-persona path.  create_recipe.py
+    # has no __future__ import, which is exactly why CREATE worked and REUSE did
+    # not.
+    #
+    # include_extras=True is required: without it Annotated[str, "desc"]
+    # collapses to plain str and every per-argument description autogen shows
+    # the model is silently lost.
+    try:
+        _resolved_hints = get_type_hints(func, include_extras=True)
+    except Exception as _e:  # unresolvable forward ref -> leave the original
+        tool_logger.debug(
+            f"annotation resolve skipped for {tool_name}: {_e}")
+        _resolved_hints = None
+
     def _on_error(e, _t0=None):
         _took = '' if _t0 is None else f" latency_ms={round((time.perf_counter() - _t0) * 1000, 1)}"
         tool_logger.error(f"TOOL EXECUTION ERROR: {tool_name} - {e}{_took}")
@@ -171,6 +202,8 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
             except Exception as e:
                 return _on_error(e, _t0)
 
+        if _resolved_hints:
+            async_wrapper.__annotations__ = _resolved_hints
         return async_wrapper
 
     @wraps(func)
@@ -207,6 +240,8 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
         except Exception as e:
             return _on_error(e, _t0)
 
+    if _resolved_hints:
+        sync_wrapper.__annotations__ = _resolved_hints
     return sync_wrapper
 
 
