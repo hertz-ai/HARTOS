@@ -418,15 +418,21 @@ jobs:
       # still uncompiled, and comp_core.rs changes shipped unverified on the
       # strength of it.
       #
-      # These are the -sys crates in smithay's tree whose build scripts probe
-      # pkg-config; the packages are apt-cached on ubuntu-latest and cost seconds.
-      # Still `check`, never `build`/`test`, so nothing is linked and no binary is
-      # produced that this job could not run anyway.
-      - name: System deps for the winit type-check build scripts
+      # WHAT THIS LIST IS. At the pinned smithay rev, udev / pixman / gbm are NOT
+      # gated behind backend_udev / renderer_pixman / backend_gbm — they are in the
+      # dependency graph of ANY smithay build, winit included. That single fact
+      # produced both surprises here: libudev-sys's build script (pkg-config, runs
+      # even under `check`) and then, once the step started linking,
+      #     rust-lld: error: unable to find library -lpixman-1
+      #     rust-lld: error: unable to find library -lgbm
+      # The linker reports every missing library at once, so this list is complete
+      # rather than a guess. All are apt-cached on ubuntu-latest and cost seconds.
+      - name: System deps for the winit build (smithay pulls udev/pixman/gbm)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev libseat-dev libinput-dev libxkbcommon-dev libwayland-dev
+            libudev-dev libseat-dev libinput-dev libxkbcommon-dev libwayland-dev \
+            libpixman-1-dev libgbm-dev
 
       # `test`, not `check`, and that is a deliberate upgrade from what this step
       # was. `check` never links, which is why it was chosen — but it also never
