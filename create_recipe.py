@@ -5766,6 +5766,34 @@ def set_states_from_progress(user_prompt, prompt_id, current_flow, flow_progress
 
 # FIX: Enhanced boundary check before while loop - Add this in get_response_group()
 
+_BUILD_INCOMPLETE_REPLY = (
+    "I couldn't finish building that agent — its steps didn't complete, so it "
+    "wouldn't be usable yet. Tell me a bit more about what it should do and "
+    "I'll pick up where it stopped."
+)
+
+
+def _agent_build_is_complete(prompt_id) -> bool:
+    """True iff the agent is actually reusable.
+
+    The reuse gate (hart_intelligence_entry.py:9250) asks exactly one question:
+    does ``{prompt_id}_0_recipe.json`` exist?  Completion must answer the SAME
+    question or the two disagree forever — which is precisely what happened:
+    measured 2026-08-29, 531 of 612 status='completed' agents (86.8%) have no
+    flow-0 recipe, so every turn against them re-enters creation.
+
+    Deliberately mirrors the gate's own predicate rather than inventing a
+    second notion of "done".
+    """
+    if not prompt_id:
+        return False
+    try:
+        return os.path.exists(
+            os.path.join(PROMPTS_DIR, f'{prompt_id}_0_recipe.json'))
+    except (TypeError, ValueError, OSError):
+        return False
+
+
 def safe_action_boundary_check(user_prompt, prompt_id, text, user_id):
     """
     Enhanced boundary check with proper flow transition logic
@@ -5779,6 +5807,17 @@ def safe_action_boundary_check(user_prompt, prompt_id, text, user_id):
     # Check if current flow exists
     if current_flow >= total_flows:
         current_app.logger.info(f"All flows ({total_flows}) completed")
+        # This is a BOUNDARY CHECK, not the completion path — it reached this
+        # branch on a bare index comparison, having verified nothing.  Only the
+        # flow-recipe writer makes an agent reusable, so ask for its artifact
+        # before telling the user the agent exists.
+        if not _agent_build_is_complete(prompt_id):
+            current_app.logger.error(
+                "[BUILD-INCOMPLETE] flow index %s >= total %s but no "
+                "%s_0_recipe.json — the agent is NOT reusable; refusing to "
+                "report it as created (see #718)",
+                current_flow, total_flows, prompt_id)
+            return False, _BUILD_INCOMPLETE_REPLY
         return False, 'Agent Created Successfully'
 
     current_flow_actions = get_total_actions_length_for_flow(config, current_flow)
@@ -5829,6 +5868,16 @@ def safe_action_boundary_check(user_prompt, prompt_id, text, user_id):
         else:
             # All flows completed
             current_app.logger.info("All flows completed - agent creation ready")
+            # Same rule as the branch above: "ready" is not "built".  Verified
+            # live 2026-08-29 — this exact marker fired twice, in the same two
+            # rotated logs that carry the success string, while every
+            # recipe-writing marker fired zero times.
+            if not _agent_build_is_complete(prompt_id):
+                current_app.logger.error(
+                    "[BUILD-INCOMPLETE] all flows reported complete but no "
+                    "%s_0_recipe.json was written — the agent is NOT reusable; "
+                    "refusing to report it as created (see #718)", prompt_id)
+                return False, _BUILD_INCOMPLETE_REPLY
             return False, 'Agent Created Successfully'
 
     # Action is within bounds, continue normal execution
