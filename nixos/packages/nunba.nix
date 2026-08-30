@@ -173,6 +173,19 @@ let
     cryptography pyjwt cachetools apscheduler
     psutil python-dateutil pyyaml jinja2 aiohttp websockets pillow numpy regex tqdm
     packaging
+    # NOT boot-critical, but a HART OS install has no API key and web search is
+    # the capability people notice missing first. Verified against the PINNED
+    # rev (flake.nix:11, github:NixOS/nixpkgs/50ab793), not against a branch,
+    # because a wrong attr fails eval:
+    #   ddgs               ABSENT at this pin (renamed upstream; master only)
+    #   duckduckgo-search  present, 6.3.4
+    # The pre-rename name is the correct one here and needs NO code change:
+    # hartos/helper.py:391-393 already does `from ddgs import DDGS` with an
+    # ImportError fallback to `from duckduckgo_search import DDGS`, and 6.3.4's
+    # DDGS has __enter__/__exit__ and text(..., max_results=), which is exactly
+    # what tier A calls. click, primp and lxml arrive transitively: the nixpkgs
+    # expression declares `dependencies = [ click primp ] ++ optional-dependencies.lxml`.
+    duckduckgo-search
     # ── systemd Type=notify (if the service ever notifies) + gi (NOT needed headless) ──
     systemd
     # NOTE (CI dominoes to resolve on first build): pydantic in the 24.11 pin is the
