@@ -78,6 +78,44 @@ class WireTrimTruncatesOversizedAnchor(unittest.TestCase):
         self.assertIn('newest question', user_texts,
                       'the newest user message is the anchor and must be intact')
 
+    def test_giant_system_message_is_truncated_as_last_resort(self):
+        """The dominant live failure (86 of 100 STILL-over, 2026-08-30
+        20:06-20:20): autogen.reuse builds a system message carrying the
+        persona boilerplate PLUS the whole serialized recipe (~28k chars,
+        sample [system 28154c, assistant 247c]) — over the per-slot budget
+        on its own.  Dropping and truncating other messages can never fix
+        that, so every such turn was sent doomed and rejected.  As a LAST
+        resort (everything else already trimmed), the system content gets
+        the same left-truncation: the boilerplate head is cut, the
+        actionable recipe tail survives."""
+        messages = [
+            {'role': 'system',
+             'content': 'CULTURAL BOILERPLATE. ' + ('wisdom ' * 4000)
+                        + ' <recipeEnd> ACTIONABLE TAIL.'},
+            {'role': 'assistant', 'content': 'Short reply.'},
+        ]
+        trimmed, n_dropped, n_chars, est_before, est_after, budget = \
+            self._trim(messages)
+        self.assertLessEqual(
+            est_after, budget,
+            f'trim left the request over budget ({est_after} > {budget}) - '
+            'the oversized system message was never truncated, so the '
+            'request goes out doomed (measured 86x live)')
+        sys_text = trimmed['messages'][0]['content']
+        self.assertTrue(sys_text.startswith(WIRE_TRIM_MARKER))
+        self.assertIn('ACTIONABLE TAIL.', sys_text,
+                      'left-truncation must keep the system tail')
+
+    def test_small_system_is_never_touched(self):
+        """System stays intact whenever anything else can absorb the cut."""
+        messages = [
+            {'role': 'system', 'content': 'small system prompt'},
+            {'role': 'user', 'content': 'HEAD. ' + ('data ' * 4000) + ' TAIL.'},
+        ]
+        trimmed, *_ = self._trim(messages)
+        self.assertEqual(trimmed['messages'][0]['content'],
+                         'small system prompt')
+
     def test_anchor_as_last_message_is_not_double_truncated(self):
         """When the anchor IS messages[-1], the existing last-message step
         already handles it - the anchor pass must not cut it twice."""

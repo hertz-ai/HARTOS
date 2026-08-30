@@ -674,6 +674,28 @@ def _trim_to_budget(body: dict) -> tuple:
             n_truncated_chars += n_cut
             messages[a_idx] = new_anchor
 
+    # LAST resort: the SYSTEM message itself.  autogen.reuse builds its
+    # system prompt as persona boilerplate + the whole serialized recipe —
+    # measured 2026-08-30 20:06-20:20 on the installed build: 86 of 100
+    # STILL-over failures were this shape (sample: [system 28,154 chars,
+    # assistant 247]), each sent doomed and rejected by llama-server.  When
+    # drops + last + anchor have all run and the set is STILL over, the
+    # system message is the only mass left; left-truncating it cuts the
+    # boilerplate head and keeps the actionable recipe tail.  Only reached
+    # when the alternative is a guaranteed reject.
+    if (count_tokens_for_messages(messages, model) > budget
+            and has_system and len(messages) >= 1):
+        others = messages[1:]
+        overhead_tokens = (count_tokens_for_messages(others, model)
+                           + _TOKENS_PER_MSG + marker_tokens)
+        room_for_system = max(64, budget - overhead_tokens)
+        target_chars = int(room_for_system * 3.5)
+        new_sys, n_cut = _truncate_msg_content(
+            messages[0], target_chars, WIRE_TRIM_MARKER, _content_to_text)
+        if n_cut:
+            n_truncated_chars += n_cut
+            messages[0] = new_sys
+
     # ─── Post-trim acceptance test — the trim is best-effort, so CHECK it ───
     # Trimming can be structurally unable to reach the budget: it drops and
     # truncates the LAST message, which cannot shrink the SYSTEM message.  On
