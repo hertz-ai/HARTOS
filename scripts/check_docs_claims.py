@@ -35,7 +35,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # nobody arrives through it.
 PUBLIC_DOCS = [
     'README.md',
-    'CAPABILITIES.md',
+    os.path.join('docs', 'CAPABILITIES.md'),
     'OPEN_PROBLEMS.md',
     'CONTRIBUTING.md',
     'SECURITY.md',

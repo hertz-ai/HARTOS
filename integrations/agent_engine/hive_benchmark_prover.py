@@ -265,7 +265,7 @@ KNOWN_BASELINES = {
 #
 # Stage 2 is the one that matters and the cheapest to settle: three nodes beating
 # one node is the threshold where the whole approach either works or does not.
-# Three laptops can answer it. VERIFICATION.md row 16 tracks it.
+# Three laptops can answer it. docs/VERIFICATION.md row 16 tracks it.
 #
 # The target: Mythos Preview scores 93.9% SWE-bench, 92.7% MMLU, 97.6% USAMO.
 # But Mythos is ONE model, proprietary, not public.

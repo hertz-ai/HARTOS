@@ -28,7 +28,7 @@
 #
 # LIMIT: `main` has no branch protection, so a failure reports rather than
 # blocks. Making this a required check is a repository setting and the owner's
-# call. See VERIFICATION.md.
+# call. See docs/VERIFICATION.md.
 name: Agent PR review
 
 on:
