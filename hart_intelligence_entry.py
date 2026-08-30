@@ -6185,6 +6185,15 @@ class CustomAgentExecutor(AgentExecutor):
                         except Exception:
                             logging.getLogger(__name__).exception("_bg_register: swallowed Exception")
                     threading.Thread(target=_bg_register, daemon=True).start()
+                    # Stamp the request so _chat_reply's gap-filler (which
+                    # indexes early-return turns, #729) does not register
+                    # this same turn a second time.
+                    try:
+                        from flask import g as _flask_g, has_request_context as _hrc
+                        if _hrc():
+                            _flask_g._hie_graph_indexed = True
+                    except Exception:
+                        pass
             except Exception:
                 logging.getLogger(__name__).exception("prep_outputs: swallowed Exception")  # Non-blocking
         else:
@@ -8494,6 +8503,36 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
                     )
         except Exception as _mem_err:
             app.logger.debug(f"_chat_reply: memory save skipped: {_mem_err}")
+
+        # Index the turn into the MemoryGraph too — the OTHER half of
+        # prep_outputs' job (hie:6173).  This block saved early-return
+        # turns to SimpleMem only, so a fact stated on a draft-first /
+        # casual turn was buffered but invisible to recall_memory's
+        # store search (measured 2026-08-30: "my favorite color is teal"
+        # in buffer.json, absent from the recall results, #729).  Same
+        # canonical primitives as prep_outputs; the flask.g flag —
+        # stamped there — stops executor turns being indexed twice.
+        try:
+            if _prompt and response_text:
+                from flask import g as _g, has_request_context as _hrc
+                _already = _hrc() and getattr(_g, '_hie_graph_indexed', False)
+                if not _already:
+                    _prom_id = payload.get('prompt_id')
+                    _graph = _get_or_create_graph(user_id, _prom_id)
+                    if _graph:
+                        _sk = (f"{user_id}_{_prom_id}" if _prom_id
+                               else str(user_id))
+                        def _bg_reg(g=_graph, ui=_prompt,
+                                    ao=response_text, sk=_sk):
+                            try:
+                                g.register_conversation('user', ui, sk)
+                                g.register_conversation('langchain', ao, sk)
+                            except Exception:
+                                logging.getLogger(__name__).exception(
+                                    '_chat_reply graph register: swallowed')
+                        threading.Thread(target=_bg_reg, daemon=True).start()
+        except Exception as _gr_err:
+            app.logger.debug(f"_chat_reply: graph register skipped: {_gr_err}")
 
         # U1-U8 cross-device mirroring (task #389): submit persist + WAMP
         # publish for both sides of the turn to the chat_messages
