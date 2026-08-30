@@ -573,9 +573,23 @@ def _trim_to_budget(body: dict) -> tuple:
 
     has_system = bool(messages and isinstance(messages[0], dict)
                       and messages[0].get('role') == 'system')
+    # The newest user message is load-bearing: llama.cpp's Qwen3.5 chat
+    # template raises "No user query found in messages." whenever a
+    # role='tool' message survives with no user message anywhere, and the
+    # server turns that into HTTP 500 (measured 3x on 2026-08-30, source
+    # autogen.reuse — post-trim roles were [system, assistant, assistant,
+    # tool, assistant]).  Left-dropping by position deleted it first,
+    # because the user's task instruction is the OLDEST non-system message.
+    anchor = next((m for m in reversed(messages)
+                   if isinstance(m, dict) and m.get('role') == 'user'), None)
     n_dropped = 0
-    while len(messages) > (2 if has_system else 1):
+    floor = 2 if has_system else 1
+    while len(messages) > floor:
         drop_idx = 1 if has_system else 0
+        if messages[drop_idx] is anchor:
+            if len(messages) <= floor + 1:
+                break  # only system + anchor + newest remain
+            drop_idx += 1
         messages.pop(drop_idx)
         n_dropped += 1
         if count_tokens_for_messages(messages, model) <= budget:
