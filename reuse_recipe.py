@@ -3294,6 +3294,11 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 error_message = traceback.format_exc()  # Capture full traceback
                 current_app.logger.error(f"Error in get_agent_response indexx:\n{error_message}")
 
+            if not group_chat.messages:
+                current_app.logger.warning(
+                    'reuse: group chat emptied mid-loop (transform_messages trimmed '
+                    'to zero) - ending the turn instead of raising IndexError')
+                break
             last_message = group_chat.messages[-1]
             content_lower = last_message['content'].lower()
             # Check if this message has already been sent to the user by state_transition
@@ -3334,8 +3339,13 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
 
         # if individual_recipe[currentaction_id-1]['can_perform_without_user_input'] == 'yes':
         #     return assistant
+        if not group_chat.messages:
+            current_app.logger.warning(
+                'reuse: no messages to extract a reply from after trimming')
+            return ''
         last_message = group_chat.messages[-1]
-        if last_message['content'] == 'TERMINATE':
+        # len>1 matters: a lone TERMINATE would send [-2] off the front.
+        if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
             last_message = group_chat.messages[-2]
 
         content_lower = last_message['content'].lower()
