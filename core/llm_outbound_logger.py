@@ -498,6 +498,37 @@ def _schema_tokens(body: dict, model=None) -> int:
     return total
 
 
+def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
+                          content_to_text) -> tuple:
+    """Left-truncate one message's content to ``target_chars``, marker-prefixed.
+
+    Returns ``(new_msg, n_cut_chars)`` — ``(msg, 0)`` when it already fits.
+    Multimodal-aware: rebuilds list-shaped content preserving image parts.
+    The ONE truncation implementation; both the last-message step and the
+    anchor step in ``_trim_to_budget`` call it.
+    """
+    text = content_to_text(msg.get('content'))
+    if len(text) <= target_chars:
+        return msg, 0
+    new_msg = dict(msg)
+    new_text = marker + text[-target_chars:]
+    if isinstance(new_msg.get('content'), list):
+        new_parts = []
+        replaced = False
+        for p in new_msg['content']:
+            if isinstance(p, dict) and p.get('type') == 'text' and not replaced:
+                new_parts.append({**p, 'text': new_text})
+                replaced = True
+            else:
+                new_parts.append(p)
+        if not replaced:
+            new_parts.insert(0, {'type': 'text', 'text': new_text})
+        new_msg['content'] = new_parts
+    else:
+        new_msg['content'] = new_text
+    return new_msg, len(text) - target_chars
+
+
 def _trim_to_budget(body: dict) -> tuple:
     """Return ``(trimmed_body, n_dropped, n_truncated_chars, est_before,
     est_after, budget)``.
@@ -595,18 +626,15 @@ def _trim_to_budget(body: dict) -> tuple:
         if count_tokens_for_messages(messages, model) <= budget:
             break
 
+    # (b)+(c) reserves below: the message-frame overhead of the message being
+    # truncated, and the truncation marker we'll prepend.  Previous bug:
+    # didn't subtract (c), so the post-truncation message exceeded budget by
+    # the marker length (~7 tokens) and the wire request still tickled n_ctx.
+    _TOKENS_PER_MSG = 4  # OpenAI envelope overhead per message
+    marker_tokens = count_tokens_for_text(WIRE_TRIM_MARKER, model)
+
     n_truncated_chars = 0
     if count_tokens_for_messages(messages, model) > budget and messages:
-        last = dict(messages[-1])
-        last_text = _content_to_text(last.get('content'))
-        # Reserve room for: (a) overhead of remaining non-last messages,
-        # (b) the message-frame overhead of the last message itself,
-        # (c) the truncation marker we'll prepend.  Previous bug: didn't
-        # subtract (c), so the post-truncation message exceeded budget
-        # by the marker length (~7 tokens) and the wire request still
-        # tickled n_ctx.
-        _TOKENS_PER_MSG = 4  # OpenAI envelope overhead per message
-        marker_tokens = count_tokens_for_text(WIRE_TRIM_MARKER, model)
         overhead_tokens = (count_tokens_for_messages(messages[:-1], model)
                            + _TOKENS_PER_MSG
                            + marker_tokens)
@@ -616,24 +644,35 @@ def _trim_to_budget(body: dict) -> tuple:
         # active path, it's exact.  Either way we're cutting from the
         # left so over-cutting just means a slightly smaller payload.
         target_chars = int(room_for_last * 3.5)
-        if len(last_text) > target_chars:
-            n_truncated_chars = len(last_text) - target_chars
-            new_text = WIRE_TRIM_MARKER + last_text[-target_chars:]
-            if isinstance(last.get('content'), list):
-                new_parts = []
-                replaced = False
-                for p in last['content']:
-                    if isinstance(p, dict) and p.get('type') == 'text' and not replaced:
-                        new_parts.append({**p, 'text': new_text})
-                        replaced = True
-                    else:
-                        new_parts.append(p)
-                if not replaced:
-                    new_parts.insert(0, {'type': 'text', 'text': new_text})
-                last['content'] = new_parts
-            else:
-                last['content'] = new_text
-            messages[-1] = last
+        new_last, n_cut = _truncate_msg_content(
+            messages[-1], target_chars, WIRE_TRIM_MARKER, _content_to_text)
+        if n_cut:
+            n_truncated_chars += n_cut
+            messages[-1] = new_last
+
+    # The anchor (newest user message) is drop-protected, so when IT is the
+    # oversized component the step above never touches it: it only truncates
+    # messages[-1], and in the autogen.reuse conversations the anchor sits
+    # mid-list behind assistant/tool replies.  Measured 2026-08-30 19:35-19:46
+    # on the installed build: system+anchor ~5597 tok against budget 3840 —
+    # every trim ended in the STILL-over error below and llama-server rejected
+    # the turn, 95x in 11 minutes.  Same policy, same helper, applied to the
+    # anchor.
+    if (count_tokens_for_messages(messages, model) > budget
+            and anchor is not None and anchor in messages
+            and messages[-1] is not anchor):
+        a_idx = messages.index(anchor)
+        others = messages[:a_idx] + messages[a_idx + 1:]
+        overhead_tokens = (count_tokens_for_messages(others, model)
+                           + _TOKENS_PER_MSG
+                           + marker_tokens)
+        room_for_anchor = max(64, budget - overhead_tokens)
+        target_chars = int(room_for_anchor * 3.5)
+        new_anchor, n_cut = _truncate_msg_content(
+            anchor, target_chars, WIRE_TRIM_MARKER, _content_to_text)
+        if n_cut:
+            n_truncated_chars += n_cut
+            messages[a_idx] = new_anchor
 
     # ─── Post-trim acceptance test — the trim is best-effort, so CHECK it ───
     # Trimming can be structurally unable to reach the budget: it drops and
