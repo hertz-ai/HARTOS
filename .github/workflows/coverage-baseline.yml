@@ -37,6 +37,14 @@ name: Coverage Baseline
 # measured at all.
 on:
   workflow_dispatch:
+  schedule:
+    # Weekly repo-wide coverage baseline (Sundays 06:00 UTC). This workflow was
+    # built (4-way sharded, fail-fast:false, fail-closed combine) but had ONLY
+    # workflow_dispatch, so it ran once and was never re-triggered — which is
+    # literally why repo-wide coverage went unmeasured for months (#27). A
+    # schedule turns "measured when someone remembers" into "measured
+    # continuously". First green baseline: 55.63% (run 33305986527).
+    - cron: '0 6 * * 0'
 
 concurrency:
   # A workflow_dispatch gets its OWN group (keyed by run id) so a manual,
