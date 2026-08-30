@@ -61,3 +61,72 @@ def test_server_getter_raising_is_swallowed():
     # Even get_a2a_server() itself blowing up must not propagate.
     with patch.object(reg, 'get_a2a_server', side_effect=RuntimeError("boom")):
         reg.register_all_agents()  # must not raise
+
+
+# ── the four A2A executors: response-contract + error fallback ───────────────
+# Each lazy-imports a heavy pipeline module inside a try; inject a fake so no
+# reuse_recipe/create_recipe (autogen/full pipeline) import happens. asyncio_mode
+# is auto (pyproject), so `async def test_*` runs without an explicit marker.
+import sys as _sys
+import types as _types
+
+
+def _fake_reuse(monkeypatch, fn):
+    m = _types.ModuleType('reuse_recipe')
+    m.chat_agent = fn
+    monkeypatch.setitem(_sys.modules, 'reuse_recipe', m)
+
+
+def _fake_create(monkeypatch, fn):
+    m = _types.ModuleType('create_recipe')
+    m.recipe = fn
+    monkeypatch.setitem(_sys.modules, 'create_recipe', m)
+
+
+def _is_a2a_shape(r):
+    return (r.get('role') == 'model'
+            and isinstance(r.get('parts'), list)
+            and r['parts'] and 'text' in r['parts'][0])
+
+
+async def test_assistant_executor_formats_response(monkeypatch):
+    _fake_reuse(monkeypatch, lambda msg: 'hello back')
+    r = await reg.assistant_executor('hi', 'ctx1')
+    assert _is_a2a_shape(r) and r['parts'][0]['text'] == 'hello back'
+
+
+async def test_assistant_executor_error_is_formatted_not_raised(monkeypatch):
+    def boom(msg):
+        raise RuntimeError('pipeline down')
+    _fake_reuse(monkeypatch, boom)
+    r = await reg.assistant_executor('hi', 'ctx1')
+    assert _is_a2a_shape(r) and 'Error executing task' in r['parts'][0]['text']
+
+
+async def test_helper_executor_calls_recipe_with_helper_role(monkeypatch):
+    seen = []
+    _fake_create(monkeypatch, lambda msg, agent_name=None: seen.append(agent_name) or 'helped')
+    r = await reg.helper_executor('do', 'ctx')
+    assert r['parts'][0]['text'] == 'helped' and seen == ['helper']
+
+
+async def test_executor_executor_calls_recipe_with_executor_role(monkeypatch):
+    seen = []
+    _fake_create(monkeypatch, lambda msg, agent_name=None: seen.append(agent_name) or 'ran')
+    r = await reg.executor_executor('do', 'ctx')
+    assert r['parts'][0]['text'] == 'ran' and seen == ['executor']
+
+
+async def test_verify_executor_calls_recipe_with_verify_role(monkeypatch):
+    seen = []
+    _fake_create(monkeypatch, lambda msg, agent_name=None: seen.append(agent_name) or 'ok')
+    r = await reg.verify_executor('do', 'ctx')
+    assert r['parts'][0]['text'] == 'ok' and seen == ['verify']
+
+
+async def test_recipe_error_path_is_formatted(monkeypatch):
+    def boom(msg, agent_name=None):
+        raise ValueError('recipe blew up')
+    _fake_create(monkeypatch, boom)
+    r = await reg.verify_executor('do', 'ctx')
+    assert _is_a2a_shape(r) and 'Error executing task' in r['parts'][0]['text']
