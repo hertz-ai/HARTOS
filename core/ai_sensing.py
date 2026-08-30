@@ -202,13 +202,34 @@ def start_authority_server(path: str = None) -> bool:
     return True
 
 
-def query_authority(sensor: str, path: str = None, timeout: float = 1.0) -> bool:
-    """Cross-process query of the sense gate. FAIL-CLOSED: returns False
-    (denied) if the authority is unreachable or errors — a portal that cannot
-    reach the gate must NOT capture. The portal consults THIS, never its own
-    flag, so the human's cut applies in the portal process too."""
+#: The three answers the gate can give. A caller that must treat a HUMAN'S CUT
+#: differently from a DEAD AUTHORITY needs all three; `query_authority` collapses
+#: them to a bool for the callers that only ever refuse.
+SENSE_ALLOW = 'allow'
+SENSE_CUT = 'cut'
+SENSE_UNREACHABLE = 'unreachable'
+
+
+def query_authority_state(sensor: str, path: str = None,
+                          timeout: float = 1.0) -> str:
+    """Cross-process query of the sense gate, TRI-STATE.
+
+    Returns SENSE_ALLOW, SENSE_CUT or SENSE_UNREACHABLE.
+
+    WHY THIS EXISTS. The boolean form below cannot tell "the human said no"
+    apart from "the socket did not answer" — both are False. That is correct
+    for anything that simply refuses, and WRONG for anything with an escape
+    hatch: hart_drm_capture's `--allow-ungated` is meant for a bare node with
+    no authority running, and its own docstring promises it is "NOT a way
+    around a human's cut". It could not honour that promise, because the answer
+    it received could not express the difference. Nothing downstream could.
+
+    Still fail-closed at every boundary: an unreachable authority is never
+    SENSE_ALLOW, so a caller that treats anything-but-allow as a refusal keeps
+    exactly today's behaviour.
+    """
     if not hasattr(socket, 'AF_UNIX'):
-        return False
+        return SENSE_UNREACHABLE
     try:
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         c.settimeout(timeout)
@@ -216,6 +237,18 @@ def query_authority(sensor: str, path: str = None, timeout: float = 1.0) -> bool
         c.sendall(sensor.encode('ascii'))
         reply = c.recv(8).strip()
         c.close()
-        return reply == b'1'
     except Exception:
-        return False
+        return SENSE_UNREACHABLE
+    return SENSE_ALLOW if reply == b'1' else SENSE_CUT
+
+
+def query_authority(sensor: str, path: str = None, timeout: float = 1.0) -> bool:
+    """Cross-process query of the sense gate. FAIL-CLOSED: returns False
+    (denied) if the authority is unreachable or errors — a portal that cannot
+    reach the gate must NOT capture. The portal consults THIS, never its own
+    flag, so the human's cut applies in the portal process too.
+
+    Thin wrapper over `query_authority_state` so there is ONE socket protocol,
+    not two. Every existing caller keeps its exact behaviour.
+    """
+    return query_authority_state(sensor, path, timeout) == SENSE_ALLOW

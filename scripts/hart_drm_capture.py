@@ -84,22 +84,56 @@ DRM_IOCTL_MODE_GETFB = _iowr(0xAD, 28)          # drm_mode_fb_cmd: 7 x u32
 DRM_IOCTL_PRIME_HANDLE_TO_FD = _iowr(0x2D, 12)  # drm_prime_handle: u32,u32,s32
 
 
+#: The refusal reason that means a REACHABLE authority reported the human cut
+#: the sense. `main` matches on it, so it must be one constant, not a literal
+#: repeated in two places that can drift apart.
+CUT_BY_HUMAN = "the human has CUT the 'screen' sense"
+
+
 def screen_capture_allowed():
     """Ask the human's sense gate. FAIL-CLOSED on any doubt.
 
-    Mirrors the portal's use of core.ai_sensing.query_authority('screen'): a
-    definitive allow is the ONLY thing that lets a capture proceed.
+    Returns ``(allowed, why)``. When ``allowed`` is False and ``why`` is
+    exactly ``CUT_BY_HUMAN``, a reachable authority said NO and no flag may
+    override it; every other False is "we could not ask".
+
+    That distinction is why this uses `query_authority_state` rather than the
+    boolean `query_authority`. The boolean returns False for BOTH a human's cut
+    and an unreachable socket, so this function used to report a dead authority
+    as "the human has CUT the 'screen' sense" — and `--allow-ungated`, which
+    exists for a node with no authority, then sailed past a real human cut
+    because it could not tell the two apart. The docstring at the top of this
+    file promised it could. It could not, at any layer.
     """
     try:
-        from core.ai_sensing import query_authority
+        import core.ai_sensing as _sensing
     except Exception:
         return False, "ai_sensing unavailable (cannot confirm the human's consent)"
+
+    tri = getattr(_sensing, 'query_authority_state', None)
+    if tri is None:
+        # An OLDER ai_sensing that only has the boolean. It cannot tell a cut
+        # from a dead socket, so neither can we — report the SAFE reading:
+        # refuse, and do NOT claim it was a human's cut, because claiming that
+        # wrongly would block --allow-ungated on the bring-up node the flag
+        # exists for. Fail-closed either way; only the reason differs.
+        try:
+            if _sensing.query_authority('screen'):
+                return True, "screen sense allowed by the human's gate"
+            return False, ("sense denied and this ai_sensing cannot say whether "
+                           "that is the human's cut or an unreachable gate")
+        except Exception as exc:
+            return False, "sense authority unreachable (%s)" % exc
+
     try:
-        if query_authority('screen'):
-            return True, "screen sense allowed by the human's gate"
-        return False, "the human has CUT the 'screen' sense"
+        state = tri('screen')
     except Exception as exc:
         return False, "sense authority unreachable (%s)" % exc
+    if state == getattr(_sensing, 'SENSE_ALLOW', 'allow'):
+        return True, "screen sense allowed by the human's gate"
+    if state == getattr(_sensing, 'SENSE_CUT', 'cut'):
+        return False, CUT_BY_HUMAN
+    return False, "sense authority unreachable (no answer from the gate)"
 
 
 # ── Pixel format: ASK the kernel, never assume ───────────────────────────────
@@ -350,7 +384,13 @@ def main(argv=None):
 
     ok, why = screen_capture_allowed()
     if not ok:
-        if not allow_ungated:
+        # A HUMAN'S CUT IS NOT OVERRIDABLE. --allow-ungated exists for a bare
+        # bring-up node with no authority running; it was written to be "NOT a
+        # way around a human's cut" (see the module docstring) but it bypassed
+        # every refusal, because the gate could not distinguish a cut from an
+        # unreachable socket. Both halves are fixed: the gate is tri-state now,
+        # and the cut is checked BEFORE the flag.
+        if why == CUT_BY_HUMAN or not allow_ungated:
             raise SystemExit("REFUSED: %s. Capture is fail-closed; pass "
                              "--allow-ungated only on a node with no authority." % why)
         sys.stderr.write("[hart-drm-capture] proceeding UNGATED (%s)\n" % why)
