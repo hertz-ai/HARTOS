@@ -533,8 +533,13 @@ class TestDispatch:
         patch('integrations.agent_engine.dispatch.is_user_recently_active', return_value=False),
         patch('integrations.agent_engine.budget_gate.pre_dispatch_budget_gate',
               return_value=(True, 'OK')),
+        # **kw so the mock matches the REAL before_dispatch signature, which
+        # grew a goal_dict kwarg — dispatch_goal now passes it, and a
+        # positional-only lambda raised "unexpected keyword argument
+        # 'goal_dict'" (reddened Python shard 5, #29). Mocks are callers too:
+        # a stand-in must accept every arg the real callee does.
         patch('security.hive_guardrails.GuardrailEnforcer.before_dispatch',
-              side_effect=lambda prompt, *a: (True, '', prompt)),
+              side_effect=lambda prompt, *a, **kw: (True, '', prompt)),
         patch('security.hive_guardrails.GuardrailEnforcer.after_response',
               return_value=(True, 'ok')),
     ]
