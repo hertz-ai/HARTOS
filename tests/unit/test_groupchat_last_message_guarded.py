@@ -80,11 +80,11 @@ def test_terminate_checks_guard_against_an_empty_group_chat():
             bad.append('  %s:%d  %s' % (name, lineno, cond))
     assert not bad, (
         'these TERMINATE checks index .messages[-1] without first testing that '
-        '.messages is non-empty. autogen\'s transform_messages capability trims '
-        'history between turns and may trim to zero, so each of these raises '
-        'IndexError and the user gets "Error getting response: list index out '
-        'of range" instead of an answer (live-reproduced 2026-08-30 at '
-        'reuse_recipe.py:3216). Use the idiom already in create_recipe.py:4385 '
+        '.messages is non-empty. An empty group chat is reachable here '
+        '(live-reproduced 2026-08-30 at reuse_recipe.py:3216; what empties it '
+        'is still open, see #725), and each of these then raises IndexError so '
+        'the user gets "Error getting response: list index out of range" '
+        'instead of an answer. Use the idiom already in create_recipe.py:4385 '
         '-- `if group_chat.messages and group_chat.messages[-1][...]`:\n'
         + '\n'.join(bad))
 
