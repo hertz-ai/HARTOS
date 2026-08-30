@@ -54,38 +54,39 @@ jobs:
           sudo apt-get autoremove -y && sudo apt-get clean
           df -h /
 
-      - name: Bump nixpkgs-rust + re-lock
+      # Q1 (the VM-critical one): does hart-comp build? The nixosTest closure
+      # needs hart-comp, which vendors via CRANE (claimed to fetch from
+      # static.crates.io post-0.16.3). If crane 403s too, crate-403 genuinely
+      # blocks the VM suite; if crane builds GREEN, the VM suite is NOT
+      # crane-blocked and the real gate is #29 (unit-tests red -> needs: skip).
+      - name: PROBE hart-comp (crane vendoring) on the CURRENT tree
         working-directory: nixos
         run: |
           set -o pipefail
-          REF='${{ github.event.inputs.nixpkgs_rust_ref }}'
-          echo "=== BEFORE ==="
-          grep -n 'nixpkgs-rust.url' flake.nix || true
-          # Repoint nixpkgs-rust at the probed ref (branch or rev).
-          sed -i -E "s|nixpkgs-rust\.url = \"github:NixOS/nixpkgs/[^\"]*\"|nixpkgs-rust.url = \"github:NixOS/nixpkgs/${REF}\"|" flake.nix
-          echo "=== AFTER ==="
-          grep -n 'nixpkgs-rust.url' flake.nix
-          nix flake lock --update-input nixpkgs-rust
-          echo "=== locked nixpkgs-rust rev ==="
-          nix flake metadata --json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['locks']['nodes']['nixpkgs-rust']['locked'])" || true
+          echo "=== nix build .#hart-comp (crane) ==="
+          if time nix build ".#hart-comp" \
+              --no-link --print-out-paths --print-build-logs \
+              --cores 0 --max-jobs 2 \
+              --option narinfo-cache-negative-ttl 0; then
+            echo "PROBE_HART_COMP=GREEN"
+          else
+            echo "PROBE_HART_COMP=RED"
+          fi
 
-      - name: Build hart-rust-precedent (the importCargoLock path that 403s today)
-        working-directory: nixos
-        run: |
-          set -o pipefail
-          echo "=== nix build .#hart-rust-precedent ==="
-          time nix build ".#hart-rust-precedent" \
-            --no-link --print-out-paths --print-build-logs \
-            --cores 0 --max-jobs 2 \
-            --option narinfo-cache-negative-ttl 0
-          echo "PROBE RESULT: hart-rust-precedent BUILT GREEN with nixpkgs-rust bump."
-
-      - name: Upload the verified flake.nix + flake.lock
+      # Q2: does the importCargoLock precedent still 403? (Bump probing deferred —
+      # the earlier --update-input was a no-op; the correct form is
+      # --override-input, tried only if hart-comp itself is crane-blocked.)
+      - name: PROBE hart-rust-precedent (importCargoLock) on the CURRENT tree
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: crate403-probe-flake
-          path: |
-            nixos/flake.nix
-            nixos/flake.lock
-          if-no-files-found: warn
+        working-directory: nixos
+        run: |
+          set -o pipefail
+          echo "=== nix build .#hart-rust-precedent (importCargoLock) ==="
+          if time nix build ".#hart-rust-precedent" \
+              --no-link --print-out-paths --print-build-logs \
+              --cores 0 --max-jobs 2 \
+              --option narinfo-cache-negative-ttl 0; then
+            echo "PROBE_HART_RUST_PRECEDENT=GREEN"
+          else
+            echo "PROBE_HART_RUST_PRECEDENT=RED"
+          fi
