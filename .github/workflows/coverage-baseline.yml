@@ -84,7 +84,10 @@ jobs:
       - name: Install pytest + coverage + project deps
         run: |
           pip install -r requirements.txt
-          pip install pytest coverage
+          # pytest-timeout bounds any single hanging test so one stuck test
+          # (e.g. a live/network test that slipped into the selection) cannot
+          # stall a whole shard up to the 150-min job cap.
+          pip install pytest coverage pytest-timeout
 
       - name: Run this shard under coverage
         # -p writes a separate data file per process, which is what lets the
@@ -105,7 +108,15 @@ jobs:
           # Deterministic file sharding: sorted, then round-robin, so shard
           # membership is stable across runs and a missing quarter is
           # identifiable rather than arbitrary.
-          mapfile -t ALL < <(find tests/unit -name 'test_*.py' | sort)
+          # tests/unit + tests/ ROOT-LEVEL unit-style files. The root-level
+          # files (test_user_lang.py, test_core_diag.py, ...) were UNMEASURED:
+          # the old `find tests/unit` missed 70 unit-style files, so modules
+          # tested only from the root (e.g. core/user_lang.py — 14 tests in
+          # tests/test_user_lang.py) reported artificially low coverage (22.9%).
+          # tests/{integration,e2e,standalone,functional} stay EXCLUDED on
+          # purpose: slow / env- or service-dependent, and non-gating (#46).
+          mapfile -t ALL < <( { find tests/unit -name 'test_*.py'; \
+                                find tests -maxdepth 1 -name 'test_*.py'; } | sort)
           TOTAL=${#ALL[@]}
           echo "discovered $TOTAL test files"
           if [[ "$TOTAL" -eq 0 ]]; then
@@ -140,6 +151,7 @@ jobs:
           coverage run -p -m pytest "${SEL[@]}" -q \
             --noconftest -p no:cacheprovider \
             --continue-on-collection-errors \
+            --timeout=120 \
             2>&1 | tail -30 || true
           # THE `|| true` ABOVE IS WHY THIS CHECK EXISTS. It is there so a
           # FAILING TEST cannot abort the MEASUREMENT — but it equally swallows
