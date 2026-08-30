@@ -84,6 +84,29 @@ sandboxed) — recorded + guarded.
 
 (`#19` edge cgroup caps moved to Verified above — fixed + VM-guarded.)
 
+### 🖥️ VM suite — FIRST full run since #29 cleared (run `33315100170` @ `44affaf4`, 2026-08-30)
+
+nixosTests finally EXECUTED (the gate had SKIPped them for weeks). Shard 1 GREEN;
+shards 0/2/3 red with **5 deterministic** `failed with error` tests — a mix of
+known-hard and regressions that accumulated *unvalidated* while the suite was
+gated off. **None trace to this session** (test-only + two `except:pass`→log
+source edits; VM boot/paint/mount failures cannot come from that). The many
+`hart-backend … sqlalche.me` journal lines are **benign idempotent-migration
+skips** (`duplicate column`), not failures.
+
+| VM test | Failure | Class | Action |
+|---|---|---|---|
+| `hart-desktop-shell-boot` | WebView first-frame PAINT (OCR) timed out 120s on llvmpipe | **#12** GPU/GSK software-paint | known-hard; root-cause the GSK-GL path |
+| `display-tiers-…-paint-ladder` | `/run/hart/session/shell-ready` EXISTS when all tiers fell to the cage floor with no paint | **#3/#6 false-healthy** | shell-boot design; consult HOME_DESKTOP_DESIGN_CHECKLIST — one of 5 shell-ready writers touches it without a real paint |
+| `hart-native-subsystems` | "waydroid init must bound a hung mirror with RuntimeMaxSec" | **stale test** | ✅ FIXED `b6f7717d` — test queried `RuntimeMaxSec`; the systemd show-property is `RuntimeMaxUSec` (unit correctly sets `RuntimeMaxSec=3600`) |
+| `hart-ota-central` | "realtime push leg wired into backend" timed out 120s | triage | needs CI-iteration to see the backend push-leg state |
+| `hart-boot-log` | `mount /dev/vdb` exit 32 after finding HARTLOG on another device | test-infra (device-name) | the label lookup found HARTLOG elsewhere; the mount hardcodes `/dev/vdb` — CI-iteration to confirm the actual device |
+
+Verification of the waydroid fix + flaky-vs-deterministic on the other four rides
+the next flake-checks dispatch. CI-iteration only from the Windows box (no local
+nix/VM); the shell paint items (#12, false-healthy shell-ready) are the #3
+workstream and design-gated.
+
 ## 🧭 Steward decisions (yours — not mine to default)
 
 | # | Decision |
