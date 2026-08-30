@@ -24,7 +24,7 @@ import pytest
 
 from core.file_cache import atomic_json_write
 
-_SRC_PATH = Path(__file__).resolve().parents[2] / 'create_recipe.py'
+_SRC_PATH = Path(__file__).resolve().parents[2] / 'hartos/create_recipe.py'
 
 
 # ── 1. Behavioural: the atomicity this file is named for ─────────────────────

@@ -343,7 +343,7 @@ class TestHeraldNewsAgent:
         """create_recipe.py and reuse_recipe.py must both call
         register_news_tools under a 'news' branch — parity, so a Herald
         recipe authored in create replays with its tools in reuse."""
-        for filename in ('create_recipe.py', 'reuse_recipe.py'):
+        for filename in ('hartos/create_recipe.py', 'hartos/reuse_recipe.py'):
             path = os.path.join(os.path.dirname(__file__), '..', '..', filename)
             with open(path, encoding='utf-8') as fh:
                 src = fh.read()

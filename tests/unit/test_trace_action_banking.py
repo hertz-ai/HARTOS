@@ -32,7 +32,7 @@ class _FakeTask:
 
 
 def _load_bank_fn(tmp_path):
-    src = open(os.path.join(_ROOT, 'create_recipe.py'), encoding='utf-8').read()
+    src = open(os.path.join(_ROOT, 'hartos/create_recipe.py'), encoding='utf-8').read()
     block = re.search(
         r'def _bank_action_recipe_from_trace.*?\n        return False\n',
         src, re.DOTALL).group(0)

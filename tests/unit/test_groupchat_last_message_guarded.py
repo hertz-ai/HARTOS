@@ -51,7 +51,7 @@ import os
 import re
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-FILES = ('reuse_recipe.py', 'create_recipe.py')
+FILES = ('hartos/reuse_recipe.py', 'hartos/create_recipe.py')
 
 # The TERMINATE dispatch condition: reads the last message to decide whether a
 # whole action-advance body runs.  This is the shape that went bang.
@@ -96,7 +96,7 @@ def test_the_canonical_guarded_site_still_exists():
     rewritten the next reader still learns where the idiom came from -- and so
     a regex that silently stops matching anything is caught.
     """
-    with io.open(os.path.join(ROOT, 'create_recipe.py'), encoding='utf-8') as fh:
+    with io.open(os.path.join(ROOT, 'hartos/create_recipe.py'), encoding='utf-8') as fh:
         src = fh.read()
     assert _LAST_MSG_READ.search(src), (
         'no .messages[-1][\'name\'] read found in create_recipe.py at all -- '

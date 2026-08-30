@@ -28,10 +28,10 @@ def test_prompt_files_exist():
         'hart_intelligence_entry.py',
         'scripts/run_flywheel_dev.py',
         'nixos/modules/hart-agent.nix',
-        'hartos_bootstrap.py',
+        'hartos/hartos_bootstrap.py',
         'integrations/agent_engine/goal_manager.py',
-        'create_recipe.py',
-        'lifecycle_hooks.py',
+        'hartos/create_recipe.py',
+        'hartos/lifecycle_hooks.py',
         'docs/design/HOME_DESKTOP_DESIGN_CHECKLIST.md',
     ):
         assert os.path.exists(os.path.join(ROOT, rel)), 'prompt names missing file: ' + rel

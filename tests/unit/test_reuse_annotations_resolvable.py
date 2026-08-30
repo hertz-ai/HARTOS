@@ -45,7 +45,7 @@ import io
 import os
 
 _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__)))), 'reuse_recipe.py')
+    os.path.abspath(__file__)))), 'hartos/reuse_recipe.py')
 
 
 def _read(path=_SRC):
