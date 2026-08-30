@@ -44,6 +44,7 @@ place and concluding about the whole.
 | Task Manager (processes) | psutil + systemd | ✅ | `/api/shell/tasks/{processes,kill,priority,resources}` — per-process CPU/mem/threads, kill behind a protected-name guard, renice, live resource totals |
 | Process isolation / containment | systemd cgroups (`CPUQuota`, `MemoryMax`/`MemoryHigh`, `TasksMax`) + `systemd.oomd` via `hart.memory.oomProtect` | n/a | Android's model, not just a lower priority: background agents are HARD-bounded on cpu, memory and task count, so a wedged agent degrades itself rather than the node. `Nice`/`CPUWeight` alone were the trap — they only bite under contention |
 | App install / store | flatpak, appimage, `hart.apps` | ✅ | offline catalog |
+| System search / indexing | `hart-smart-index` (semantic index service) | ✅ | Spotlight / Windows-Search parity, both channels: `/api/shell/files/search` (recursive filename) + `/api/shell/files/search-by-tag`, AND a semantic filesystem index (`hart-smart-index` — metadata + content summaries). Arguably AHEAD via the semantic layer |
 | Updates + rollback | `hart.ota` → `nixos-rebuild` generations | ✅ | atomic; rollback is a generation switch |
 | Accessibility | `at-spi2`, `hart.accessibility` | ✅ | |
 | Input methods (IME) | `i18n.inputMethod` (`hart.ime`) | ✅ | CJK + Indic |
@@ -81,6 +82,21 @@ tier-drop compositor ladder (`hart.sessionSupervisor`) with a cage floor.
    runtime enable cannot exist.
 2. **`hart.devtools` does not fit the desktop image** — measured +3 GiB against
    ~2 GiB of slack (audits 30570492265 / 30573861911).
-3. **Runtime verification** of the current tree is still owed: CI runner
+3. **No whole-filesystem user-file backup (Time Machine / File History).** Two
+   backup-shaped things exist and are NOT this: OS *config* rollback via
+   `hart.ota` generations (the "Updates + rollback" row), and encrypted
+   *account-data* backup (`/api/shell/backup/{list,restore}` →
+   `integrations.social.backup_service`: profile/posts/comments/votes). Neither
+   backs up the user's documents/photos/settings the way a closed OS's
+   file-history does. This is a real parity gap, not an overclaimed row — the
+   honest place for it is here rather than a ✅ that conflates account backup
+   with filesystem backup. Candidate declarative half when built: a
+   `hart.backup` module wrapping restic/borg on a systemd timer (union, not a
+   reimplementation), with an `/api/shell/backup/*`-style agent surface.
+4. **Runtime verification** of the current tree is still owed: CI runner
    starvation (fixed in `c42f446a`) meant no nixosTest suite completed on main
-   between 07-28 and 07-31.
+   between 07-28 and 07-31. As of 2026-08-30 the VM suite is additionally
+   cascade-skipped by the crate-403 compositor-build failure (nixpkgs-rust
+   `importCargoLock` hitting the deprecated crates.io API — see
+   OS_PARITY_CLOSURE_PLAN.md); driver/BIOS/Hyper-V rows stay declaratively
+   guarded but their BOOTED assertions do not currently execute.
