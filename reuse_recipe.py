@@ -3213,7 +3213,13 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         _reuse_task.mark_sla_breached()
                         current_app.logger.warning(f"[SLA] Task {_reuse_task_id} SLA breached in reuse loop")
 
-            if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
+            # transform_messages trims history between turns and may trim to
+            # zero (live 2026-08-30: "Message count changed: 8 -> 1", then an
+            # empty list).  This subscript SELECTS the body, so the
+            # `except IndexError` below -- which opens on the next line -- can
+            # never cover it; the turn died with "Error getting response: list
+            # index out of range".  Guard as create_recipe.py:4385 does.
+            if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                 current_app.logger.info(
                     f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                 try:
@@ -3787,7 +3793,8 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                             if _w2_task.is_sla_breached() and not _w2_task.sla_breached:
                                 _w2_task.mark_sla_breached()
 
-                    if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
+                    # Same empty-history hazard as the while1 loop above.
+                    if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                         current_app.logger.info(
                             f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                         try:

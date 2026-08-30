@@ -632,7 +632,10 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
     restart = False
     while True:
         current_app.logger.info('inside Timer while')
-        if group_chat.messages[-1]['name'] == 'ChatInstructor' and _is_terminate(group_chat.messages[-1]['content']):
+        # Same empty-history hazard the reuse loops hit live on 2026-08-30:
+        # transform_messages can trim to zero between turns.  :4385 already
+        # guards this way.
+        if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and _is_terminate(group_chat.messages[-1]['content']):
             current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
             json_obj = retrieve_json(group_chat.messages[-2]["content"])
             if json_obj and type(json_obj)==dict and 'status' in json_obj.keys() and json_obj['status'].lower() == 'completed':
