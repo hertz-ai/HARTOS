@@ -168,7 +168,7 @@ class TestFrozenDetection:
         wd = NodeWatchdog(frozen_multiplier=2.0)
         restarted = []
         wd.register("f", expected_interval=0.01, restart_fn=lambda: restarted.append(True))
-        wd._threads["f"].last_heartbeat = time.time() - 100
+        wd._threads["f"].last_heartbeat_mono = time.monotonic() - 100
         wd._check_all()
         assert len(restarted) == 1
         assert wd._threads["f"].restart_count == 1
@@ -187,11 +187,11 @@ class TestFrozenDetection:
         restarted = []
         wd.register("n", expected_interval=10, restart_fn=lambda: restarted.append(True))
         # Age = 40s, threshold = 10*5 = 50s -> NOT frozen
-        wd._threads["n"].last_heartbeat = time.time() - 40
+        wd._threads["n"].last_heartbeat_mono = time.monotonic() - 40
         wd._check_all()
         assert len(restarted) == 0
         # Age = 60s, threshold = 50s -> frozen
-        wd._threads["n"].last_heartbeat = time.time() - 60
+        wd._threads["n"].last_heartbeat_mono = time.monotonic() - 60
         wd._check_all()
         assert len(restarted) == 1
 
@@ -203,7 +203,7 @@ class TestFrozenDetection:
         info = wd._threads["llm"]
         info.in_llm_call = True
         # 500s into an LLM call — under 900s threshold, should NOT restart
-        info.last_heartbeat = time.time() - 500
+        info.last_heartbeat_mono = time.monotonic() - 500
         wd._check_all()
         assert len(restarted) == 0
         assert info.status == "healthy"
@@ -215,7 +215,7 @@ class TestFrozenDetection:
         wd.register("llm_stuck", expected_interval=10, restart_fn=lambda: restarted.append(True))
         info = wd._threads["llm_stuck"]
         info.in_llm_call = True
-        info.last_heartbeat = time.time() - 1000  # > 900s
+        info.last_heartbeat_mono = time.monotonic() - 1000  # > 900s
         wd._check_all()
         assert len(restarted) == 1
 
@@ -233,11 +233,54 @@ class TestFrozenDetection:
         ra, rb = [], []
         wd.register("a", expected_interval=0.01, restart_fn=lambda: ra.append(True))
         wd.register("b", expected_interval=60, restart_fn=lambda: rb.append(True))
-        wd._threads["a"].last_heartbeat = time.time() - 100
+        wd._threads["a"].last_heartbeat_mono = time.monotonic() - 100
         wd.heartbeat("b")
         wd._check_all()
         assert len(ra) == 1
         assert len(rb) == 0
+
+
+# ---------------------------------------------------------------------------
+# Clock-jump immunity (#24 / #6) — freeze detection uses time.monotonic()
+# ---------------------------------------------------------------------------
+class TestClockJumpImmunity:
+    """A wall-clock jump (RTC localtime<->UTC at WiFi connect, or an NTP step —
+    task #24) must NOT blind freeze detection. Liveness is measured with
+    time.monotonic(), so a wall jump — even one that makes the wall heartbeat
+    timestamp look FUTURE-dated (which the old `age < 0: continue` grace-skip
+    treated as healthy) — cannot hide a genuinely frozen thread (#6)."""
+
+    def test_frozen_detected_despite_backward_wall_jump(self):
+        wd = NodeWatchdog(frozen_multiplier=2.0)
+        restarted = []
+        wd.register("j", expected_interval=0.01,
+                    restart_fn=lambda: restarted.append(True))
+        info = wd._threads["j"]
+        # Post-backward-jump state: the WALL heartbeat looks far in the FUTURE
+        # (now < last_heartbeat -> wall age NEGATIVE, which the OLD code skipped
+        # as "grace"), but the thread is GENUINELY frozen in monotonic terms.
+        info.last_heartbeat = time.time() + 20000          # wall: future (age<0)
+        info.last_heartbeat_mono = time.monotonic() - 100  # mono: 100s stale
+        wd._check_all()
+        assert len(restarted) == 1, (
+            "a frozen thread must be detected via monotonic age even when the "
+            "wall-clock heartbeat is future-dated by a backward RTC jump")
+
+    def test_forward_wall_jump_does_not_falsely_freeze(self):
+        wd = NodeWatchdog(frozen_multiplier=2.0)
+        restarted = []
+        wd.register("k", expected_interval=60,
+                    restart_fn=lambda: restarted.append(True))
+        info = wd._threads["k"]
+        # Forward wall jump: wall heartbeat looks ancient (wall age huge), but
+        # monotonically the thread heartbeated moments ago -> NOT frozen.
+        info.last_heartbeat = time.time() - 100000     # wall: ancient
+        info.last_heartbeat_mono = time.monotonic()    # mono: just now
+        wd._check_all()
+        assert len(restarted) == 0, (
+            "a forward wall-clock jump must not trigger a spurious restart — "
+            "liveness is monotonic")
+        assert info.status == "healthy"
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +293,7 @@ class TestRestartThread:
         wd.register("t", expected_interval=0.01,
                      restart_fn=lambda: order.append("start"),
                      stop_fn=lambda: order.append("stop"))
-        wd._threads["t"].last_heartbeat = time.time() - 100
+        wd._threads["t"].last_heartbeat_mono = time.monotonic() - 100
         wd._check_all()
         assert order == ["stop", "start"]
 
@@ -258,7 +301,7 @@ class TestRestartThread:
         restarted = []
         wd = NodeWatchdog()
         wd.register("t", expected_interval=0.01, restart_fn=lambda: restarted.append(True))
-        wd._threads["t"].last_heartbeat = time.time() - 100
+        wd._threads["t"].last_heartbeat_mono = time.monotonic() - 100
         wd._check_all()
         assert len(restarted) == 1
 
@@ -266,7 +309,7 @@ class TestRestartThread:
         wd = NodeWatchdog()
         wd.register("fail", expected_interval=0.01,
                      restart_fn=MagicMock(side_effect=RuntimeError("boom")))
-        wd._threads["fail"].last_heartbeat = time.time() - 100
+        wd._threads["fail"].last_heartbeat_mono = time.monotonic() - 100
         wd._check_all()
         assert wd._threads["fail"].consecutive_failures == 1
         assert wd._threads["fail"].status == "frozen"
@@ -277,7 +320,7 @@ class TestRestartThread:
                      restart_fn=MagicMock(side_effect=RuntimeError("boom")))
         info = wd._threads["dying"]
         info.consecutive_failures = MAX_CONSECUTIVE_FAILURES - 1  # 4
-        info.last_heartbeat = time.time() - 100
+        info.last_heartbeat_mono = time.monotonic() - 100
         wd._check_all()
         assert info.status == "dead"
         assert info.consecutive_failures == MAX_CONSECUTIVE_FAILURES
@@ -287,7 +330,7 @@ class TestRestartThread:
         wd.register("rec", expected_interval=0.01, restart_fn=lambda: None)
         info = wd._threads["rec"]
         info.consecutive_failures = 3
-        info.last_heartbeat = time.time() - 100
+        info.last_heartbeat_mono = time.monotonic() - 100
         wd._check_all()
         assert info.consecutive_failures == 0
         assert info.restart_count == 1
@@ -296,15 +339,17 @@ class TestRestartThread:
         """After restart, last_heartbeat is pushed into the future for grace."""
         wd = NodeWatchdog()
         wd.register("gp", expected_interval=0.01, restart_fn=lambda: None)
-        wd._threads["gp"].last_heartbeat = time.time() - 100
+        wd._threads["gp"].last_heartbeat_mono = time.monotonic() - 100
         wd._check_all()
-        # Grace period: last_heartbeat should be in the future
+        # Grace period: last_heartbeat (wall, for display) should be in the future
         assert wd._threads["gp"].last_heartbeat > time.time()
+        # ...and the monotonic mirror that drives detection is also future-dated
+        assert wd._threads["gp"].last_heartbeat_mono > time.monotonic()
 
     def test_restart_log_appended(self):
         wd = NodeWatchdog()
         wd.register("logged", expected_interval=0.01, restart_fn=lambda: None)
-        wd._threads["logged"].last_heartbeat = time.time() - 100
+        wd._threads["logged"].last_heartbeat_mono = time.monotonic() - 100
         wd._check_all()
         assert len(wd._restart_log) == 1
         assert wd._restart_log[0]["name"] == "logged"
@@ -317,7 +362,7 @@ class TestRestartThread:
         wd.register("t", expected_interval=0.01,
                      restart_fn=lambda: restarted.append(True),
                      stop_fn=MagicMock(side_effect=Exception("stop failed")))
-        wd._threads["t"].last_heartbeat = time.time() - 100
+        wd._threads["t"].last_heartbeat_mono = time.monotonic() - 100
         wd._check_all()
         assert len(restarted) == 1
 
@@ -335,9 +380,9 @@ class TestRapidRestartLoop:
         wd = NodeWatchdog()
         wd.register("looper", expected_interval=0.01, restart_fn=lambda: None)
         info = wd._threads["looper"]
-        now = time.time()
+        now = time.monotonic()
         info.recent_restart_times = [now - 60, now - 30, now - 10]
-        info.last_heartbeat = now - 100
+        info.last_heartbeat_mono = now - 100
         wd._check_all()
         assert info.status == "dead"
 
@@ -347,10 +392,10 @@ class TestRapidRestartLoop:
         wd.register("old", expected_interval=0.01,
                      restart_fn=lambda: restarted.append(True))
         info = wd._threads["old"]
-        now = time.time()
+        now = time.monotonic()
         # All restarts > 5 min ago
         info.recent_restart_times = [now - 600, now - 500, now - 400]
-        info.last_heartbeat = now - 100
+        info.last_heartbeat_mono = now - 100
         wd._check_all()
         assert info.status == "healthy"
         assert len(restarted) == 1
@@ -361,9 +406,9 @@ class TestRapidRestartLoop:
         wd.register("two", expected_interval=0.01,
                      restart_fn=lambda: restarted.append(True))
         info = wd._threads["two"]
-        now = time.time()
+        now = time.monotonic()
         info.recent_restart_times = [now - 60, now - 30]
-        info.last_heartbeat = now - 100
+        info.last_heartbeat_mono = now - 100
         wd._check_all()
         assert info.status == "healthy"
         assert len(restarted) == 1
@@ -373,10 +418,10 @@ class TestRapidRestartLoop:
         wd = NodeWatchdog()
         wd.register("prune", expected_interval=0.01, restart_fn=lambda: None)
         info = wd._threads["prune"]
-        now = time.time()
+        now = time.monotonic()
         # 1 old + 1 recent
         info.recent_restart_times = [now - 600, now - 10]
-        info.last_heartbeat = now - 100
+        info.last_heartbeat_mono = now - 100
         wd._check_all()
         # After restart, old entry should be pruned; recent + new one remain
         assert all(t > now - 300 for t in info.recent_restart_times)
@@ -399,7 +444,7 @@ class TestGracePeriod:
         restarted = []
         wd.register("aged", expected_interval=0.01,
                      restart_fn=lambda: restarted.append(True))
-        wd._threads["aged"].last_heartbeat = time.time() - 100
+        wd._threads["aged"].last_heartbeat_mono = time.monotonic() - 100
         wd._check_all()
         assert len(restarted) == 1
 
@@ -448,7 +493,7 @@ class TestGetHealth:
         wd._started_at = time.time()
         wd._running = True
         wd.register("r", expected_interval=0.01, restart_fn=lambda: None)
-        wd._threads["r"].last_heartbeat = time.time() - 100
+        wd._threads["r"].last_heartbeat_mono = time.monotonic() - 100
         wd._check_all()
         h = wd.get_health()
         assert "last_restart_iso" in h["threads"]["r"]

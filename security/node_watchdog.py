@@ -52,6 +52,12 @@ class ThreadInfo:
     restart_fn: Callable
     stop_fn: Optional[Callable] = None
     last_heartbeat: float = field(default_factory=time.time)
+    # Monotonic mirror of last_heartbeat used for ALL liveness/age math. A
+    # wall-clock jump (RTC localtime<->UTC at WiFi connect, or an NTP step —
+    # task #24) must NOT make `age = now - last_heartbeat` go negative and
+    # silently skip freeze detection (the false-healthy / undetected-hang bug,
+    # #6). `last_heartbeat` above stays wall-clock, for the human ISO display ONLY.
+    last_heartbeat_mono: float = field(default_factory=time.monotonic)
     status: str = 'healthy'  # healthy | frozen | restarting | dead | in_llm_call
     restart_count: int = 0
     last_restart_at: Optional[float] = None
@@ -115,6 +121,7 @@ class NodeWatchdog:
                 # Pretend the last heartbeat is in the future so the grace
                 # period must elapse before we consider the thread frozen.
                 last_heartbeat=time.time() + STARTUP_GRACE_SECONDS,
+                last_heartbeat_mono=time.monotonic() + STARTUP_GRACE_SECONDS,
             )
         logger.info(f"Watchdog: registered thread '{name}' "
                     f"(interval={expected_interval}s)")
@@ -130,6 +137,7 @@ class NodeWatchdog:
             info = self._threads.get(name)
             if info:
                 info.last_heartbeat = time.time()
+                info.last_heartbeat_mono = time.monotonic()
 
     def is_registered(self, name: str) -> bool:
         """Check if a thread name is registered."""
@@ -154,6 +162,7 @@ class NodeWatchdog:
                 info.in_llm_call = True
                 info.llm_call_started_at = time.time()
                 info.last_heartbeat = time.time()  # refresh heartbeat
+                info.last_heartbeat_mono = time.monotonic()
 
     def clear_llm_call(self, name: str) -> None:
         """Clear the LLM call marker after inference completes."""
@@ -230,7 +239,7 @@ class NodeWatchdog:
             if self._running:
                 return
             self._running = True
-            self._started_at = time.time()
+            self._started_at = time.monotonic()  # elapsed/liveness — clock-jump-proof
         self._thread = threading.Thread(target=self._check_loop, daemon=True)
         self._thread.start()
         logger.info(f"NodeWatchdog started (interval={self._check_interval}s, "
@@ -245,11 +254,12 @@ class NodeWatchdog:
 
     def get_health(self) -> Dict:
         """Return health status of all monitored threads."""
-        now = time.time()
+        now = time.time()            # wall — for the human ISO displays only
+        now_mono = time.monotonic()  # for ALL age/elapsed math (clock-jump-proof)
         threads = {}
         with self._lock:
             for name, info in self._threads.items():
-                age = now - info.last_heartbeat
+                age = now_mono - info.last_heartbeat_mono
                 threads[name] = {
                     'status': info.status,
                     'last_heartbeat_age_s': round(age, 1),
@@ -263,13 +273,13 @@ class NodeWatchdog:
                     threads[name]['last_restart_iso'] = datetime.fromtimestamp(
                         info.last_restart_at, tz=timezone.utc).isoformat()
 
-        uptime = round(now - self._started_at, 1) if self._started_at else 0
+        uptime = round(now_mono - self._started_at, 1) if self._started_at else 0
         with self._lock:
             fleet_recent = len(self._fleet_restart_times)
             fleet_halted = self._fleet_halted
         return {
-            'watchdog': self._watchdog_liveness(now),
-            'last_check_age_seconds': (round(now - self._last_check_at, 1)
+            'watchdog': self._watchdog_liveness(now_mono),
+            'last_check_age_seconds': (round(now_mono - self._last_check_at, 1)
                                        if self._last_check_at is not None else None),
             'uptime_seconds': uptime,
             'threads': threads,
@@ -333,20 +343,20 @@ class NodeWatchdog:
                 break
             try:
                 self._check_all()
-                self._last_check_at = time.time()
+                self._last_check_at = time.monotonic()
             except Exception:
                 logger.exception(
                     "NodeWatchdog: check pass failed; loop continues (not fatal)")
 
     def _check_all(self) -> None:
         """Single check pass over all threads."""
-        now = time.time()
+        now = time.monotonic()  # clock-jump-proof: compare monotonic-to-monotonic
         to_restart = []
         with self._lock:
             for name, info in self._threads.items():
                 if info.status == 'dead':
                     continue
-                age = now - info.last_heartbeat
+                age = now - info.last_heartbeat_mono
                 # Negative age means we're still in the grace period
                 if age < 0:
                     continue
@@ -481,12 +491,16 @@ class NodeWatchdog:
                     # Give the restarted thread a grace period before
                     # monitoring resumes (same as initial registration)
                     info.last_heartbeat = time.time() + STARTUP_GRACE_SECONDS
+                    info.last_heartbeat_mono = (
+                        time.monotonic() + STARTUP_GRACE_SECONDS)
                     info.restart_count += 1
-                    info.last_restart_at = time.time()
+                    info.last_restart_at = time.time()  # wall — ISO display only
                     info.consecutive_failures = 0
-                    info.recent_restart_times.append(time.time())
-                    # Prune entries older than 5 minutes
-                    cutoff = time.time() - 300
+                    # Monotonic: the rapid-restart window (_check_all) compares
+                    # against time.monotonic(), so a clock jump can't corrupt it.
+                    info.recent_restart_times.append(time.monotonic())
+                    # Prune entries older than 5 minutes (monotonic window)
+                    cutoff = time.monotonic() - 300
                     info.recent_restart_times = [
                         t for t in info.recent_restart_times if t > cutoff]
                     self._restart_log.append({
