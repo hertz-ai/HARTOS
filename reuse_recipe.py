@@ -3272,7 +3272,16 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
                         actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
                         message = 'Hey @StatusVerifier Agent, Please verify the status of the action ' + f'{user_tasks[user_prompt].current_action}: {actions_prompt}' + '\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": ' + f'{user_tasks[user_prompt].current_action}' + ',"message": "message here"}'
-                        assistant.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
+                        # chat_instructor (UserProxyAgent), not assistant: a
+                        # message initiated by an AssistantAgent lands as
+                        # role='assistant' in every other agent's view, and a
+                        # view with no user-role message anywhere trips the
+                        # Qwen3.5 template raise ("No user query found",
+                        # jinja line 79) — captured live 2026-08-30 20:15,
+                        # body [system, assistant], 3x llama 500.  This loop's
+                        # canonical steering initiator is chat_instructor
+                        # (see the two sites above).
+                        chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
                         continue
             try:
                 # Safely access recipes
@@ -3289,7 +3298,10 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action - 1]['can_perform_without_user_input'] == 'yes':
                     current_app.logger.info('GOT can_perform_without_user_input as true')
                     message = 'You should complete this task independently. Feel free to make reasonable assumptions where necessary'
-                    helper.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
+                    # chat_instructor, not helper — same reason as the
+                    # StatusVerifier injection above: instructions must enter
+                    # the group as user-role turns.
+                    chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
 
             except Exception as e:
                 current_app.logger.error(f'WE have some indexx error here: {e}')
@@ -3863,8 +3875,13 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 actions_prompt = user_tasks[user_prompt].get_action(
                                     user_tasks[user_prompt].current_action - 1)
                                 message = 'Hey @StatusVerifier Agent, Please verify the status of the action ' + f'{user_tasks[user_prompt].current_action}: {actions_prompt}' + '\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": ' + f'{user_tasks[user_prompt].current_action}' + ',"message": "message here"}'
-                                assistant.initiate_chat(recipient=manager, message=message, clear_history=False,
-                                                        silent=False)
+                                # chat_instructor, not assistant — see the
+                                # matching recovery site in the first loop:
+                                # steering must enter the group as a
+                                # user-role turn or the Qwen3.5 template can
+                                # see a no-user view and raise.
+                                chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,
+                                                              silent=False)
                                 continue
                     count += 1
                     if count == 4:
