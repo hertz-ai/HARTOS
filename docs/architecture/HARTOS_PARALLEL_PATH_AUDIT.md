@@ -67,6 +67,27 @@ palette is *shadowed* by an OLDER dup). The SEVERE findings are **long-standing 
 CLEAN.
 
 ---
+## NEW HIGH (2026-08-28, **SUBSTANTIALLY CORRECTED 2026-08-30**) — PeerLink vs gossip
+
+> **⚠ READ `PEER_TRANSPORT_IMPACT_ASSESSMENT.md` INSTEAD OF THIS SECTION.**
+> The steward pushed back with *"understand how each shd ideally be wired, something
+> might be intentional"* and commissioned a full source read. That read **refuted the
+> core claim below**: PeerLink is NOT a duplicate of gossip. It is a session
+> transport layered ABOVE discovery (`link.py:8-9` says it is discovered *by* gossip),
+> and its eleven channels are ROUTING SLOTS designed to delegate to the same handlers
+> HTTP already uses (`channels.py:138-140`), not eleven reimplementations.
+>
+> Also intentional, and wrongly flagged here: `compute_mesh`'s separate detector
+> (it reports *dynamic* availability, not static hardware), and the refusal to
+> persist capacity from relayed gossip records (a security property — relayed
+> records are unverifiable hearsay, and capacity feeds the ≤5% influence cap).
+>
+> What survives as genuine drift: one duplicated static-hardware detector, a
+> read-before-write bug in the handshake, and a dispatcher the receive loop never
+> consults. Six findings, five drift mechanisms, and an ordered canonicalisation
+> plan are in the impact assessment. The text below is kept only so the correction
+> is legible.
+
 ## NEW HIGH (2026-08-28) — PeerLink and gossip are ONE set of concerns implemented twice, and the duplicate is the dead one
 
 Raised by the steward: *"we created peer link and peer exchange as parallel paths
