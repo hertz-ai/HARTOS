@@ -77,7 +77,7 @@ def test_inject_resolves_flywheel_goal_with_null_prompt_id():
     def _resolver(k):
         return gc if k == key else None
 
-    with patch('lifecycle_hooks.get_registered_groupchat', side_effect=_resolver), \
+    with patch('hartos.lifecycle_hooks.get_registered_groupchat', side_effect=_resolver), \
          patch('security.immutable_audit_log.get_audit_log'):
         out = ds.inject_instruction(_db_returning(goal), goal_id,
                                     'Emit the recipe JSON now.', actor_id='claude-copilot')
@@ -96,7 +96,7 @@ def test_inject_resolves_flywheel_goal_under_system_user():
                            user_id=None)
     gc = _GC()
     key = f'system_{prompt_id_for_goal(goal_id)}'
-    with patch('lifecycle_hooks.get_registered_groupchat',
+    with patch('hartos.lifecycle_hooks.get_registered_groupchat',
                side_effect=lambda k: gc if k == key else None), \
          patch('security.immutable_audit_log.get_audit_log'):
         out = ds.inject_instruction(_db_returning(goal), goal_id, 'steer', actor_id='cp')
@@ -109,7 +109,7 @@ def test_inject_still_resolves_human_goal_via_row_prompt_id():
     goal = SimpleNamespace(prompt_id='12345', owner_id='u1',
                            created_by='u1', user_id=None)
     gc = _GC()
-    with patch('lifecycle_hooks.get_registered_groupchat',
+    with patch('hartos.lifecycle_hooks.get_registered_groupchat',
                side_effect=lambda k: gc if k == 'u1_12345' else None), \
          patch('security.immutable_audit_log.get_audit_log'):
         out = ds.inject_instruction(_db_returning(goal), 'agent-x', 'hello', actor_id='admin')
@@ -121,7 +121,7 @@ def test_inject_no_live_groupchat_returns_clear_error():
     """No registered GroupChat (goal not currently executing) → ok=False with
     a clear, non-crashing message."""
     goal = SimpleNamespace(prompt_id=None, owner_id='o', created_by='o', user_id=None)
-    with patch('lifecycle_hooks.get_registered_groupchat', return_value=None), \
+    with patch('hartos.lifecycle_hooks.get_registered_groupchat', return_value=None), \
          patch('security.immutable_audit_log.get_audit_log'):
         out = ds.inject_instruction(_db_returning(goal), 'gid', 'x', actor_id='cp')
     assert out['ok'] is False

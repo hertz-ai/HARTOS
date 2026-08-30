@@ -681,7 +681,7 @@ def _execute_tier_promote(params: dict) -> Dict:
 
     # Regenerate HART node identity for new tier
     try:
-        from hart_onboarding import generate_node_identity
+        from hartos.hart_onboarding import generate_node_identity
         central_element = os.environ.get('HART_CENTRAL_ELEMENT', '')
         generate_node_identity(
             tier=new_tier,
@@ -724,7 +724,7 @@ def _execute_tier_demote(params: dict) -> Dict:
 
     # Remove HART node identity file (will regenerate as flat on restart)
     try:
-        from hart_onboarding import _identity_path
+        from hartos.hart_onboarding import _identity_path
         path = _identity_path()
         if os.path.isfile(path):
             os.remove(path)

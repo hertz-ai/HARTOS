@@ -103,7 +103,7 @@ def test_wrapped_function_emits_tool_call_when_user_context_set():
     user_id, invoking the wrapped function MUST call
     publish_chat_stage('tool_call', user_id=…, request_id=…, text=…)."""
     from core.labeled_autogen_function import register_labeled_function
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
 
     def _stub_fn(arg):
         return f'echo:{arg}'
@@ -142,7 +142,7 @@ def test_wrapped_function_skips_emit_when_no_user_context(caplog):
     context), the wrapped function logs a debug line + invokes the
     real func — no exception, no emit."""
     from core.labeled_autogen_function import register_labeled_function
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
 
     def _stub_fn():
         return 'noctx'
@@ -225,7 +225,7 @@ def test_emit_failure_does_not_block_tool_and_is_logged(caplog):
     """If publish_chat_stage itself raises, the tool MUST still run AND
     the failure MUST appear in logs at warning level."""
     from core.labeled_autogen_function import register_labeled_function
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
 
     def _good_fn():
         return 'still_runs'
@@ -375,8 +375,8 @@ def test_log_tool_execution_canonical_home():
     autogen registration chokepoint.  Drift-guard: ensure all four files
     resolve the same callable."""
     from core.tool_logging import log_tool_execution as canonical
-    from create_recipe import log_tool_execution as via_create
-    from reuse_recipe import log_tool_execution as via_reuse
+    from hartos.create_recipe import log_tool_execution as via_create
+    from hartos.reuse_recipe import log_tool_execution as via_reuse
 
     assert via_create is canonical, (
         "create_recipe.log_tool_execution must re-export the canonical "
@@ -395,7 +395,7 @@ def test_reuse_recipe_inner_tools_have_log_tool_execution():
     in reuse_recipe.py must ALSO have `@log_tool_execution` in its
     decorator stack so autogen-side tools get the same logging + UI
     emit contract as the LangChain side."""
-    path = os.path.join(REPO_ROOT, 'reuse_recipe.py')
+    path = os.path.join(REPO_ROOT, 'hartos', 'reuse_recipe.py')
     src = io.open(path, encoding='utf-8').read()
     tree = ast.parse(src)
 

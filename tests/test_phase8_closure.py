@@ -440,7 +440,7 @@ def test_crossbar_server_invokes_authorize_subscribe():
     Until crossbar_server.py wires the dynamic-authorizer HTTP
     callback to this function, the WAMP subscribe-side gate exists
     in code but never fires for real subscribers."""
-    import crossbar_server
+    from hartos import crossbar_server
     src = open(crossbar_server.__file__).read()
     assert 'authorize_subscribe' in src or 'tenant_acl' in src, (
         "crossbar_server.py must reference authorize_subscribe / "

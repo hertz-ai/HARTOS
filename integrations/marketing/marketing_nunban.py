@@ -14,7 +14,7 @@ The marketing agent uses:
   - claims that can be checked, rather than dark patterns or urgency tricks
 """
 
-from cultural_wisdom import CULTURAL_TRAITS, get_trait_by_name
+from hartos.cultural_wisdom import CULTURAL_TRAITS, get_trait_by_name
 
 
 # ═══════════════════════════════════════════════════════════════════════

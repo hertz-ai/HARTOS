@@ -224,7 +224,7 @@ def is_current_request_autonomous() -> bool:
     Degrades safe — any error / missing request_id returns False (interactive).
     """
     try:
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
         rid = thread_local_data.get_request_id() or ''
         # A MISSING request_id must mean INTERACTIVE (the docstring's "degrades
         # safe" contract, and what the test suite pins). The previous bare
@@ -455,7 +455,7 @@ def _notify_watchdog_llm_start():
         # different thread (e.g. Flask worker). Mark the calling daemon
         # via threadlocal source hint if available.
         try:
-            from threadlocal import get_task_source
+            from hartos.threadlocal import get_task_source
             source = get_task_source()
             if source and wd.is_registered(source):
                 wd.mark_in_llm_call(source)

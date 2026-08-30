@@ -30,9 +30,9 @@ _fake_current_app.logger = MagicMock()
 class RoleOrderGuardTests(unittest.TestCase):
     def setUp(self):
         # Patch current_app for the duration of each test.
-        self._patcher = patch('helper.current_app', _fake_current_app)
+        self._patcher = patch('hartos.helper.current_app', _fake_current_app)
         self._patcher.start()
-        from helper import ToolMessageHandler
+        from hartos.helper import ToolMessageHandler
         self.handler = ToolMessageHandler(user_tasks=None, user_prompt=None)
 
     def tearDown(self):
@@ -173,9 +173,9 @@ class RoleOrderGuardLogCardinalityTests(unittest.TestCase):
         self._logger = MagicMock()
         fake_app = MagicMock()
         fake_app.logger = self._logger
-        self._patcher = patch('helper.current_app', fake_app)
+        self._patcher = patch('hartos.helper.current_app', fake_app)
         self._patcher.start()
-        from helper import ToolMessageHandler
+        from hartos.helper import ToolMessageHandler
         self.handler = ToolMessageHandler(user_tasks=None, user_prompt=None)
 
     def tearDown(self):

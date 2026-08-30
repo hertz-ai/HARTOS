@@ -161,7 +161,7 @@ def test_chat_tail_unregistered_returns_empty(monkeypatch):
     _install_fake_models(monkeypatch, goal=goal)
 
     # Stub lifecycle_hooks so the import succeeds but returns None.
-    monkeypatch.setitem(sys.modules, 'lifecycle_hooks',
+    monkeypatch.setitem(sys.modules, 'hartos.lifecycle_hooks',
                         SimpleNamespace(get_registered_groupchat=lambda key: None))
 
     out = ds.DashboardService.get_agent_chat_tail('agent-1', since_index=0, limit=10)
@@ -181,7 +181,7 @@ def test_chat_tail_returns_messages_after_cursor(monkeypatch):
         {'role': 'assistant', 'name': 'Verify', 'content': 'looks good'},
     ]
     fake_gc = SimpleNamespace(messages=fake_messages)
-    monkeypatch.setitem(sys.modules, 'lifecycle_hooks',
+    monkeypatch.setitem(sys.modules, 'hartos.lifecycle_hooks',
                         SimpleNamespace(get_registered_groupchat=lambda key: fake_gc))
 
     out = ds.DashboardService.get_agent_chat_tail('agent-1', since_index=1, limit=10)
@@ -202,7 +202,7 @@ def test_chat_tail_cold_fetch_caps_at_limit(monkeypatch):
         for i in range(100)
     ]
     fake_gc = SimpleNamespace(messages=fake_messages)
-    monkeypatch.setitem(sys.modules, 'lifecycle_hooks',
+    monkeypatch.setitem(sys.modules, 'hartos.lifecycle_hooks',
                         SimpleNamespace(get_registered_groupchat=lambda key: fake_gc))
 
     # Cold fetch with since=0 — should give us the LAST `limit` turns,

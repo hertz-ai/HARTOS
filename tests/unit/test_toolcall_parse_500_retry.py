@@ -95,7 +95,7 @@ def test_exhausted_retries_returns_fallback_and_reports_self_heal():
     wrapped = _wrap(agent)
 
     pushes = []
-    import exception_collector as ec
+    from hartos import exception_collector as ec
     with patch.object(ec, 'report_subsystem_failure',
                       side_effect=lambda **kw: pushes.append(kw)):
         result = wrapped('hi')
@@ -132,7 +132,7 @@ def test_different_error_on_retry_stops_and_reports():
 
     agent = _MixedAgent()
     wrapped = _wrap(agent)
-    import exception_collector as ec
+    from hartos import exception_collector as ec
     with patch.object(ec, 'report_subsystem_failure', side_effect=lambda **kw: None):
         result = wrapped('hi')
     # call 1 (parse-500) + call 2 (different 500) → break, no call 3.

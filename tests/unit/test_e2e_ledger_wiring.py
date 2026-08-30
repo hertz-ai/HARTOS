@@ -32,7 +32,7 @@ from agent_ledger import (
     InMemoryBackend, TaskLocality, TaskSensitivity,
 )
 from agent_ledger.core import create_ledger_from_actions
-from lifecycle_hooks import (
+from hartos.lifecycle_hooks import (
     ActionState,
     _auto_sync_to_ledger,
     register_ledger_for_session,
@@ -667,7 +667,7 @@ class TestBlockedStateWiring:
 
     def test_block_for_user_input_helper(self):
         """block_for_user_input() transitions IN_PROGRESS → BLOCKED(input_required)"""
-        from lifecycle_hooks import block_for_user_input
+        from hartos.lifecycle_hooks import block_for_user_input
         up = "test_blocked_5"
         ledger = self._make_ledger(up, [{"action_id": 1, "description": "Need consent"}])
         _auto_sync_to_ledger(up, 1, ActionState.IN_PROGRESS)
@@ -680,7 +680,7 @@ class TestBlockedStateWiring:
 
     def test_resume_from_user_input_helper(self):
         """resume_from_user_input() transitions BLOCKED → RESUMING → IN_PROGRESS"""
-        from lifecycle_hooks import block_for_user_input, resume_from_user_input
+        from hartos.lifecycle_hooks import block_for_user_input, resume_from_user_input
         up = "test_blocked_6"
         ledger = self._make_ledger(up, [{"action_id": 1, "description": "Need consent"}])
         _auto_sync_to_ledger(up, 1, ActionState.IN_PROGRESS)
@@ -693,7 +693,7 @@ class TestBlockedStateWiring:
 
     def test_block_no_op_when_not_in_progress(self):
         """block_for_user_input() does nothing if task is not IN_PROGRESS"""
-        from lifecycle_hooks import block_for_user_input
+        from hartos.lifecycle_hooks import block_for_user_input
         up = "test_blocked_7"
         ledger = self._make_ledger(up, [{"action_id": 1, "description": "Pending task"}])
         # Task is in PENDING state, not IN_PROGRESS
@@ -705,7 +705,7 @@ class TestBlockedStateWiring:
 
     def test_resume_no_op_when_not_blocked(self):
         """resume_from_user_input() does nothing if task is not BLOCKED"""
-        from lifecycle_hooks import resume_from_user_input
+        from hartos.lifecycle_hooks import resume_from_user_input
         up = "test_blocked_8"
         ledger = self._make_ledger(up, [{"action_id": 1, "description": "Active task"}])
         _auto_sync_to_ledger(up, 1, ActionState.IN_PROGRESS)

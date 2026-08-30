@@ -25,8 +25,8 @@ from core.optional_import import lazy_module
 # llmlingua -> torch) off the backend boot path.
 autogen = lazy_module("autogen")
 
-from helper import retrieve_json, retrieve_json, _is_terminate_msg
-from cultural_wisdom import get_cultural_prompt
+from hartos.helper import retrieve_json, retrieve_json, _is_terminate_msg
+from hartos.cultural_wisdom import get_cultural_prompt
 from core.platform_paths import get_coding_workspace_dir
 
 # Feature flag — when set, append a self-explanatory tool-name catalog to the
@@ -353,7 +353,7 @@ def gather_info(user_id, user_message, prompt_id, autonomous=False):
     current_app.logger.info('--'*100)
     # Push thinking to UI
     try:
-        from create_recipe import _push_thinking
+        from hartos.create_recipe import _push_thinking
         _push_thinking(user_id, 'Designing agent personas and planning actions...')
     except Exception:
         pass
@@ -377,7 +377,7 @@ def gather_info(user_id, user_message, prompt_id, autonomous=False):
         # history_length = len(user_proxy.chat_messages.get(assistant.name, []))
         current_app.logger.info('INSIDE GATHER INFo Respponse')
         try:
-            from create_recipe import _push_thinking
+            from hartos.create_recipe import _push_thinking
             _push_thinking(user_id, 'Agent blueprint ready. Starting execution...')
         except Exception:
             pass

@@ -112,25 +112,25 @@ class TestCulturalTraitsIntegrity:
     """CULTURAL_TRAITS shape every agent's personality — must be comprehensive."""
 
     def test_at_least_25_traits(self):
-        from cultural_wisdom import CULTURAL_TRAITS
+        from hartos.cultural_wisdom import CULTURAL_TRAITS
         assert len(CULTURAL_TRAITS) >= 25
 
     def test_all_have_required_keys(self):
-        from cultural_wisdom import CULTURAL_TRAITS
+        from hartos.cultural_wisdom import CULTURAL_TRAITS
         required = {'name', 'origin', 'meaning', 'trait', 'behavior'}
         for t in CULTURAL_TRAITS:
             missing = required - set(t.keys())
             assert not missing, f"Trait '{t.get('name', '?')}' missing: {missing}"
 
     def test_no_duplicate_names(self):
-        from cultural_wisdom import CULTURAL_TRAITS
+        from hartos.cultural_wisdom import CULTURAL_TRAITS
         names = [t['name'] for t in CULTURAL_TRAITS]
         dupes = [n for n in names if names.count(n) > 1]
         assert not dupes, f"Duplicate traits: {set(dupes)}"
 
     def test_multiple_cultural_regions(self):
         """Must represent at least 5 cultural regions — prevents monoculture bias."""
-        from cultural_wisdom import CULTURAL_TRAITS
+        from hartos.cultural_wisdom import CULTURAL_TRAITS
         regions = set()
         for t in CULTURAL_TRAITS:
             region = t['origin'].split('(')[0].strip().split(',')[0].strip()

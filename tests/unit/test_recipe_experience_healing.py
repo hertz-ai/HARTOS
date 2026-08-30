@@ -31,16 +31,16 @@ os.environ.setdefault('HEVOLVE_DB_PATH', ':memory:')
 class TestExceptionCollector:
 
     def setup_method(self):
-        from exception_collector import ExceptionCollector
+        from hartos.exception_collector import ExceptionCollector
         ExceptionCollector.reset_instance()
         self.collector = ExceptionCollector.get_instance()
 
     def teardown_method(self):
-        from exception_collector import ExceptionCollector
+        from hartos.exception_collector import ExceptionCollector
         ExceptionCollector.reset_instance()
 
     def test_singleton(self):
-        from exception_collector import ExceptionCollector
+        from hartos.exception_collector import ExceptionCollector
         c1 = ExceptionCollector.get_instance()
         c2 = ExceptionCollector.get_instance()
         assert c1 is c2
@@ -144,7 +144,7 @@ class TestExceptionCollector:
         assert top_types['KeyError'] == 3
 
     def test_record_exception_convenience(self):
-        from exception_collector import record_exception
+        from hartos.exception_collector import record_exception
         record_exception(ValueError("conv test"), module='m', function='f')
 
         stats = self.collector.get_stats()
@@ -184,12 +184,12 @@ class TestExceptionCollector:
 class TestRecipeExperienceRecorder:
 
     def setup_method(self):
-        from recipe_experience import _telemetry, _timers
+        from hartos.recipe_experience import _telemetry, _timers
         _telemetry.clear()
         _timers.clear()
 
     def test_timer_start_stop(self):
-        from recipe_experience import RecipeExperienceRecorder as RER
+        from hartos.recipe_experience import RecipeExperienceRecorder as RER
         RER.start_action_timer('test_session', 1)
         time.sleep(0.05)
         RER.stop_action_timer('test_session', 1, 'completed')
@@ -201,7 +201,7 @@ class TestRecipeExperienceRecorder:
         assert tel[1]['outcomes'] == ['completed']
 
     def test_record_dead_end(self):
-        from recipe_experience import RecipeExperienceRecorder as RER
+        from hartos.recipe_experience import RecipeExperienceRecorder as RER
         RER.record_dead_end('s1', 1, 'tried path A, got timeout')
         RER.record_dead_end('s1', 1, 'tried path B, permission denied')
         RER.record_dead_end('s1', 1, 'tried path A, got timeout')  # duplicate
@@ -210,7 +210,7 @@ class TestRecipeExperienceRecorder:
         assert len(tel[1]['dead_ends']) == 2  # deduped
 
     def test_record_fallback(self):
-        from recipe_experience import RecipeExperienceRecorder as RER
+        from hartos.recipe_experience import RecipeExperienceRecorder as RER
         RER.record_fallback_used('s1', 1, 'retry with different params', True)
         RER.record_fallback_used('s1', 1, 'skip action', False)
 
@@ -219,7 +219,7 @@ class TestRecipeExperienceRecorder:
         assert tel[1]['fallbacks_used'][0]['success'] is True
 
     def test_record_tool_call(self):
-        from recipe_experience import RecipeExperienceRecorder as RER
+        from hartos.recipe_experience import RecipeExperienceRecorder as RER
         RER.record_tool_call('s1', 1, 'google_search', True, 2.5)
         RER.record_tool_call('s1', 1, 'google_search', False, 1.0)
 
@@ -229,7 +229,7 @@ class TestRecipeExperienceRecorder:
         assert stats['successes'] == 1
 
     def test_merge_experience_into_recipe(self):
-        from recipe_experience import RecipeExperienceRecorder as RER
+        from hartos.recipe_experience import RecipeExperienceRecorder as RER
 
         # Create a temp recipe file
         recipe = {
@@ -260,7 +260,7 @@ class TestRecipeExperienceRecorder:
 
             # Merge — patch PROMPTS_DIR to point to temp directory
             from unittest.mock import patch
-            with patch('recipe_experience.PROMPTS_DIR', prompts_dir):
+            with patch('hartos.recipe_experience.PROMPTS_DIR', prompts_dir):
                 RER.merge_experience_into_recipe('999', 0, 'test_merge')
 
             # Verify merged recipe
@@ -279,7 +279,7 @@ class TestRecipeExperienceRecorder:
             assert 'retry' in action1['experience']['effective_fallbacks']
 
     def test_build_experience_hints(self):
-        from recipe_experience import build_experience_hints
+        from hartos.recipe_experience import build_experience_hints
 
         recipes = [
             {
@@ -304,12 +304,12 @@ class TestRecipeExperienceRecorder:
         assert '5.2s' in hints
 
     def test_build_experience_hints_empty(self):
-        from recipe_experience import build_experience_hints
+        from hartos.recipe_experience import build_experience_hints
         hints = build_experience_hints([{'action': 'test'}])
         assert hints == 'No prior experience recorded.'
 
     def test_cleanup_session(self):
-        from recipe_experience import RecipeExperienceRecorder as RER, _telemetry, _timers
+        from hartos.recipe_experience import RecipeExperienceRecorder as RER, _telemetry, _timers
         RER.start_action_timer('cleanup_test', 1)
         RER.record_dead_end('cleanup_test', 1, 'path X')
 
@@ -328,13 +328,13 @@ class TestRecipeExperienceRecorder:
 class TestSelfHealingDispatcher:
 
     def setup_method(self):
-        from exception_collector import ExceptionCollector
+        from hartos.exception_collector import ExceptionCollector
         from integrations.agent_engine.self_healing_dispatcher import SelfHealingDispatcher
         ExceptionCollector.reset_instance()
         SelfHealingDispatcher.reset_instance()
 
     def teardown_method(self):
-        from exception_collector import ExceptionCollector
+        from hartos.exception_collector import ExceptionCollector
         from integrations.agent_engine.self_healing_dispatcher import SelfHealingDispatcher
         ExceptionCollector.reset_instance()
         SelfHealingDispatcher.reset_instance()
@@ -346,7 +346,7 @@ class TestSelfHealingDispatcher:
         assert d1 is d2
 
     def test_no_dispatch_below_threshold(self):
-        from exception_collector import ExceptionCollector
+        from hartos.exception_collector import ExceptionCollector
         from integrations.agent_engine.self_healing_dispatcher import SelfHealingDispatcher
 
         collector = ExceptionCollector.get_instance()
@@ -362,7 +362,7 @@ class TestSelfHealingDispatcher:
         assert count == 0
 
     def test_dispatch_above_threshold(self):
-        from exception_collector import ExceptionCollector
+        from hartos.exception_collector import ExceptionCollector
         from integrations.agent_engine.self_healing_dispatcher import SelfHealingDispatcher
 
         collector = ExceptionCollector.get_instance()
@@ -390,7 +390,7 @@ class TestSelfHealingDispatcher:
         assert 'mymod' in call_kwargs[1]['title']
 
     def test_no_duplicate_goals(self):
-        from exception_collector import ExceptionCollector
+        from hartos.exception_collector import ExceptionCollector
         from integrations.agent_engine.self_healing_dispatcher import SelfHealingDispatcher
 
         collector = ExceptionCollector.get_instance()
@@ -422,13 +422,13 @@ class TestExceptionWatcher:
 
     def setup_method(self):
         from integrations.agent_engine.exception_watcher import ExceptionWatcher
-        from exception_collector import ExceptionCollector
+        from hartos.exception_collector import ExceptionCollector
         ExceptionWatcher.reset_instance()
         ExceptionCollector.reset_instance()
 
     def teardown_method(self):
         from integrations.agent_engine.exception_watcher import ExceptionWatcher
-        from exception_collector import ExceptionCollector
+        from hartos.exception_collector import ExceptionCollector
         ExceptionWatcher.reset_instance()
         ExceptionCollector.reset_instance()
 
@@ -460,7 +460,7 @@ class TestExceptionWatcher:
 
     def test_severity_classification(self):
         from integrations.agent_engine.exception_watcher import ExceptionWatcher
-        from exception_collector import ExceptionRecord
+        from hartos.exception_collector import ExceptionRecord
 
         watcher = ExceptionWatcher.get_instance()
 
@@ -475,7 +475,7 @@ class TestExceptionWatcher:
 
     def test_severity_from_message(self):
         from integrations.agent_engine.exception_watcher import ExceptionWatcher
-        from exception_collector import ExceptionRecord
+        from hartos.exception_collector import ExceptionRecord
 
         watcher = ExceptionWatcher.get_instance()
 

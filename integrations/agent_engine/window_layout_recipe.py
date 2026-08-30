@@ -37,7 +37,7 @@ import threading
 from typing import Any, Dict, List, Optional
 
 try:
-    from helper import PROMPTS_DIR
+    from hartos.helper import PROMPTS_DIR
 except ImportError:  # pragma: no cover - standalone
     # Same resolved canonical dir, without helper's weight.  The old
     # module-relative fallback pointed at site-packages/prompts in the

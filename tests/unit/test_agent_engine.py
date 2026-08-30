@@ -1962,38 +1962,38 @@ class TestGoalManagerGuardrails:
 
 class TestModelConfigOverride:
     def test_set_and_get_override(self):
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
         thread_local_data.set_model_config_override([{'model': 'test'}])
         assert thread_local_data.get_model_config_override() == [{'model': 'test'}]
         thread_local_data.clear_model_config_override()
 
     def test_clear_override(self):
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
         thread_local_data.set_model_config_override([{'model': 'test'}])
         thread_local_data.clear_model_config_override()
         assert thread_local_data.get_model_config_override() is None
 
     def test_default_is_none(self):
         import threading
-        from threadlocal import ThreadLocalData
+        from hartos.threadlocal import ThreadLocalData
         tld = ThreadLocalData()
         assert tld.get_model_config_override() is None
 
     def test_get_llm_config_uses_override(self):
         pytest.importorskip('autogen', reason='autogen not installed')
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
         override = [{'model': 'override-model', 'api_key': 'test'}]
         thread_local_data.set_model_config_override(override)
-        from create_recipe import get_llm_config
+        from hartos.create_recipe import get_llm_config
         cfg = get_llm_config()
         assert cfg['config_list'] == override
         thread_local_data.clear_model_config_override()
 
     def test_get_llm_config_falls_back_to_global(self):
         pytest.importorskip('autogen', reason='autogen not installed')
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
         thread_local_data.clear_model_config_override()
-        from create_recipe import get_llm_config, config_list
+        from hartos.create_recipe import get_llm_config, config_list
         cfg = get_llm_config()
         # Should fall back to global config_list (model name depends on env)
         assert cfg['config_list'] == config_list

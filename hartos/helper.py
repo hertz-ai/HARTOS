@@ -153,7 +153,7 @@ except Exception:
         PROMPTS_DIR = os.path.abspath(os.path.join(
             os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
     else:
-        PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+        PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'))
 os.makedirs(PROMPTS_DIR, exist_ok=True)
 
 
@@ -2413,7 +2413,7 @@ def get_llm_config(fallback_config_list=None):
         fallback_config_list: config_list to use when no thread-local override is set.
                               Defaults to this module's config_list.
     """
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
     override = thread_local_data.get_model_config_override()
     return {"cache_seed": None, "config_list": override or (fallback_config_list if fallback_config_list is not None else config_list), "max_tokens": 1500}
 
@@ -2634,7 +2634,7 @@ def _resolve_agent_data_dir():
             return get_agent_data_dir()
         except ImportError:
             return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_data')
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'agent_data')
 
 AGENT_DATA_DIR = _resolve_agent_data_dir()
 try:

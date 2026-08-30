@@ -709,7 +709,7 @@ class MessageBus:
 
         # Try native WAMP session first (crossbar_server is optional)
         try:
-            from crossbar_server import wamp_session
+            from hartos.crossbar_server import wamp_session
             if wamp_session:
                 import asyncio
                 asyncio.ensure_future(wamp_session.publish(legacy_topic, payload))

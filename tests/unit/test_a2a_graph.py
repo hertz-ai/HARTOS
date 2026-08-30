@@ -277,7 +277,7 @@ def test_inject_rejects_empty_instruction(monkeypatch):
 def test_inject_no_groupchat_registered(monkeypatch):
     ds = pytest.importorskip('integrations.social.dashboard_service')
     fake_db = _install_fake_models(monkeypatch, goal=_make_goal())
-    monkeypatch.setitem(sys.modules, 'lifecycle_hooks',
+    monkeypatch.setitem(sys.modules, 'hartos.lifecycle_hooks',
                         SimpleNamespace(get_registered_groupchat=lambda key: None))
 
     out = ds.inject_instruction(fake_db, 'agent-1', 'retry now')
@@ -293,7 +293,7 @@ def test_inject_appends_to_groupchat_and_audits(monkeypatch):
     fake_gc = SimpleNamespace(messages=[
         {'role': 'assistant', 'content': 'first turn'},
     ])
-    monkeypatch.setitem(sys.modules, 'lifecycle_hooks',
+    monkeypatch.setitem(sys.modules, 'hartos.lifecycle_hooks',
                         SimpleNamespace(get_registered_groupchat=lambda key: fake_gc))
     captured = _install_fake_audit(monkeypatch)
 

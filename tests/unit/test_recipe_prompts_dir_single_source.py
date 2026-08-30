@@ -75,7 +75,7 @@ def test_save_reuse_check_resolvers_all_agree():
     (cache_loaders.PROMPTS_DIR), and the daemon CHECK's resolver
     (get_recipe_prompts_dir) must resolve identically — so a recipe written by
     CREATE is found by REUSE and routed correctly by the daemon."""
-    import helper
+    from hartos import helper
     import core.cache_loaders as cl
     from core.platform_paths import get_recipe_prompts_dir
     assert _norm(helper.PROMPTS_DIR) == _norm(cl.PROMPTS_DIR) == _norm(get_recipe_prompts_dir())

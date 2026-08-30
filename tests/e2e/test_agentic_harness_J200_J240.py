@@ -63,8 +63,8 @@ class TestJ200MultiPersonaReviewer:
         sequence, lifecycle_hooks emits events for each transition,
         recipe JSON ends up on disk."""
         skip_if_missing(
-            'lifecycle_hooks',
-            'create_recipe',
+            'hartos.lifecycle_hooks',
+            'hartos.create_recipe',
             'core.agent_personality:generate_personality',
         )
         with harness() as h:
@@ -74,7 +74,7 @@ class TestJ200MultiPersonaReviewer:
             # three-persona decomposition; the ASSERTIONS below are
             # on the state machine + events, not the text.
             try:
-                from lifecycle_hooks import ActionState
+                from hartos.lifecycle_hooks import ActionState
             except ImportError:
                 pytest.skip('lifecycle_hooks.ActionState not importable')
 
@@ -108,7 +108,7 @@ class TestJ200MultiPersonaReviewer:
         """J201: Reviewer returns ERROR → autonomous fallback → retry
         → eventual COMPLETED.  Asserts retry counter increments and
         recipe still saves."""
-        skip_if_missing('create_recipe', 'helper_ledger:SmartLedger')
+        skip_if_missing('hartos.create_recipe', 'hartos.helper_ledger:SmartLedger')
         pytest.skip(
             'J201 driver not wired — StatusVerifier fallback path '
             'exercised only via unit test today; E2E gap.'
@@ -120,7 +120,7 @@ class TestJ200MultiPersonaReviewer:
         Asserts no ACTION executes until /api/agent/approval fires."""
         skip_if_missing(
             'security.action_classifier:PREVIEW_PENDING',
-            'lifecycle_hooks',
+            'hartos.lifecycle_hooks',
         )
         # Contract: when we build this, the assertion shape is:
         #   h.events.assert_emitted('action_state.changed',

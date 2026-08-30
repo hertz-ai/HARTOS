@@ -1094,8 +1094,7 @@ jobs:
             -v --tb=short \
             --junitxml=_site/test-reports/junit/results.xml \
             --cov=integrations --cov=security --cov=core \
-            --cov=hart_intelligence_entry --cov=create_recipe --cov=reuse_recipe \
-            --cov=lifecycle_hooks --cov=helper --cov=helper_ledger \
+            --cov=hart_intelligence_entry --cov=hartos \
             --cov-report=html:_site/test-reports/coverage \
             --cov-report=term-missing || true
 

@@ -36,7 +36,7 @@ import autogen
 from autogen import ConversableAgent, AssistantAgent, UserProxyAgent
 
 # Agent Ledger imports
-from helper_ledger import create_ledger_for_user_prompt
+from hartos.helper_ledger import create_ledger_for_user_prompt
 from agent_ledger import Task, TaskType, TaskStatus
 
 # AP2 imports

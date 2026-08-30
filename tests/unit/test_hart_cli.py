@@ -8,7 +8,7 @@ from unittest.mock import patch, MagicMock
 from click.testing import CliRunner
 
 # Import the CLI
-from hart_cli import hart
+from hartos.hart_cli import hart
 
 
 @pytest.fixture
@@ -212,7 +212,7 @@ def test_headless_mode(runner):
     mock_response = MagicMock()
     mock_response.json.return_value = {'response': 'Hello from HART'}
 
-    with patch('hart_cli.pooled_post', return_value=mock_response):
+    with patch('hartos.hart_cli.pooled_post', return_value=mock_response):
         result = runner.invoke(hart, ['-p', 'say hello'])
         assert result.exit_code == 0
         assert 'Hello from HART' in result.output
@@ -223,7 +223,7 @@ def test_headless_mode_json(runner):
     mock_response = MagicMock()
     mock_response.json.return_value = {'response': 'Hello'}
 
-    with patch('hart_cli.pooled_post', return_value=mock_response):
+    with patch('hartos.hart_cli.pooled_post', return_value=mock_response):
         result = runner.invoke(hart, ['-p', 'say hello', '--json'])
         assert result.exit_code == 0
         data = json.loads(result.output)
@@ -234,7 +234,7 @@ def test_headless_connection_error(runner):
     """hart -p handles connection error gracefully."""
     import requests as real_requests
 
-    with patch('hart_cli.pooled_post', side_effect=real_requests.ConnectionError):
+    with patch('hartos.hart_cli.pooled_post', side_effect=real_requests.ConnectionError):
         result = runner.invoke(hart, ['-p', 'say hello'])
         assert result.exit_code != 0
 
@@ -428,7 +428,7 @@ def test_code_help(runner):
 
 # ── Status (with mock) ──
 
-@patch('hart_cli._api_get')
+@patch('hartos.hart_cli._api_get')
 def test_status_offline(mock_get, runner):
     """hart status handles offline server."""
     mock_get.return_value = None
@@ -440,7 +440,7 @@ def test_status_offline(mock_get, runner):
 
 # ── Social commands (with mock) ──
 
-@patch('hart_cli._api_post')
+@patch('hartos.hart_cli._api_post')
 def test_social_post(mock_post, runner):
     """hart social post creates a post."""
     mock_post.return_value = {'id': '123'}
@@ -449,7 +449,7 @@ def test_social_post(mock_post, runner):
     assert result.exit_code == 0
 
 
-@patch('hart_cli._api_get')
+@patch('hartos.hart_cli._api_get')
 def test_social_feed(mock_get, runner):
     """hart social feed shows posts."""
     mock_get.return_value = {'posts': [
@@ -460,7 +460,7 @@ def test_social_feed(mock_get, runner):
     assert result.exit_code == 0
 
 
-@patch('hart_cli._api_get')
+@patch('hartos.hart_cli._api_get')
 def test_social_communities(mock_get, runner):
     """hart social communities lists communities."""
     mock_get.return_value = {'communities': [

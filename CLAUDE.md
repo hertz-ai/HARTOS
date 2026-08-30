@@ -225,11 +225,11 @@ REUSE Mode:  User Input → Load Recipe → LLM-GUIDED replay of proven steps (a
 | File | Purpose |
 |------|---------|
 | `hart_intelligence_entry.py` | Flask entry point (port 6777, Hypercorn ASGI primary; Waitress WSGI fallback on ImportError) |
-| `create_recipe.py` | Agent creation, action execution, recipe generation |
-| `reuse_recipe.py` | Recipe reuse, trained agent execution |
-| `helper.py` | Action class, JSON utilities, tool handlers |
-| `lifecycle_hooks.py` | ActionState machine, ledger sync |
-| `helper_ledger.py` | SmartLedger integration |
+| `hartos/create_recipe.py` | Agent creation, action execution, recipe generation |
+| `hartos/reuse_recipe.py` | Recipe reuse, trained agent execution |
+| `hartos/helper.py` | Action class, JSON utilities, tool handlers |
+| `hartos/lifecycle_hooks.py` | ActionState machine, ledger sync |
+| `hartos/helper_ledger.py` | SmartLedger integration |
 
 ### State Machine (ActionState)
 ```

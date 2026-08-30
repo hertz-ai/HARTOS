@@ -82,24 +82,24 @@ class TestCulturalWisdomScenario:
     """Every agent created gets cultural wisdom injected into system prompt."""
 
     def test_prompt_is_non_trivial(self):
-        from cultural_wisdom import get_cultural_prompt
+        from hartos.cultural_wisdom import get_cultural_prompt
         prompt = get_cultural_prompt()
         assert len(prompt) > 200  # Must be substantial, not a placeholder
 
     def test_compact_prompt_exists(self):
         """Compact mode for context-limited models."""
-        from cultural_wisdom import get_cultural_prompt_compact
+        from hartos.cultural_wisdom import get_cultural_prompt_compact
         compact = get_cultural_prompt_compact()
         assert len(compact) > 50
 
     def test_guardian_values_immutable(self):
-        from cultural_wisdom import get_guardian_cultural_values
+        from hartos.cultural_wisdom import get_guardian_cultural_values
         values = get_guardian_cultural_values()
         assert isinstance(values, tuple)  # Immutable
         assert len(values) >= 3
 
     def test_proactive_behavior_prompt(self):
-        from cultural_wisdom import get_proactive_behavior_prompt
+        from hartos.cultural_wisdom import get_proactive_behavior_prompt
         prompt = get_proactive_behavior_prompt()
         assert isinstance(prompt, str)
         assert len(prompt) > 50
@@ -142,25 +142,25 @@ class TestActionLifecycleScenario:
     """Action tracks progress through recipe execution: action 1 → 2 → ... → done."""
 
     def test_action_starts_at_1(self):
-        from helper import Action
+        from hartos.helper import Action
         action = Action(['step1', 'step2', 'step3'])
         assert action.current_action == 1
 
     def test_action_get_first(self):
-        from helper import Action
+        from hartos.helper import Action
         action = Action([{'action': 'first'}, {'action': 'second'}])
         assert action.get_action(0)['action'] == 'first'
 
     def test_action_advance(self):
         """Advancing current_action moves to next step."""
-        from helper import Action
+        from hartos.helper import Action
         action = Action(['s1', 's2', 's3'])
         action.current_action = 2
         assert action.current_action == 2
 
     def test_action_out_of_range_raises(self):
         """Accessing beyond available actions raises IndexError — signals completion."""
-        from helper import Action
+        from hartos.helper import Action
         action = Action(['s1', 's2'])
         with pytest.raises(IndexError):
             action.get_action(5)

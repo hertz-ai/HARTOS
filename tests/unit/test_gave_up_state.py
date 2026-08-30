@@ -27,7 +27,7 @@ if _LEDGER_SRC not in sys.path:
 
 def _L():
     try:
-        import lifecycle_hooks as L
+        from hartos import lifecycle_hooks as L
         return L
     except Exception as e:  # pragma: no cover
         pytest.skip(f"lifecycle_hooks unavailable: {e}")

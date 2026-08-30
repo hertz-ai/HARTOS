@@ -211,26 +211,15 @@ Repository = "https://github.com/hertz-ai/HARTOS"
 Issues = "https://github.com/hertz-ai/HARTOS/issues"
 
 [tool.setuptools]
+# Entry/facade modules only; the implementation lives in the hartos/
+# package (moved from the repo root 2026-08-30). Nunba's freeze scripts
+# auto-discover this list, so it must stay in lockstep with the repo root.
 py-modules = [
     "hart_version",
     "hart_intelligence",
     "hart_intelligence_entry",
-    "helper",
-    "helper_ledger",
-    "threadlocal",
-    "crossbar_server",
-    "create_recipe",
-    "reuse_recipe",
-    "gather_agentdetails",
-    "lifecycle_hooks",
-    "cultural_wisdom",
-    "exception_collector",
-    "recipe_experience",
     "embedded_main",
-    "agent_identity",
-    "hart_onboarding",
-    "hart_cli",
-    "hartos_bootstrap",
+    "asgi",
 ]
 
 # packages.find walks BOTH the repo root (for core/integrations/security/
@@ -244,7 +233,7 @@ py-modules = [
 # `agent-ledger>=1.2.0` to [project.dependencies] above instead.
 [tool.setuptools.packages.find]
 where = [".", "agent-ledger-opensource"]
-include = ["core*", "integrations*", "security*", "hart_sdk*", "agent_ledger*"]
+include = ["core*", "hartos", "desktop", "integrations*", "security*", "hart_sdk*", "agent_ledger*"]
 exclude = ["venv*", "tests*", "docs*", "examples*"]
 
 [tool.setuptools.package-dir]

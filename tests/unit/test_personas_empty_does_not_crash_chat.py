@@ -82,7 +82,7 @@ def _import_reuse_recipe():
             sys.modules[name] = m
             added.append(name)
     try:
-        import reuse_recipe
+        from hartos import reuse_recipe
     finally:
         for name in added:            # remove ONLY what we added
             sys.modules.pop(name, None)

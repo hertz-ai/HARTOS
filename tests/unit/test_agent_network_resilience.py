@@ -38,7 +38,7 @@ from integrations.social.peer_discovery import GossipProtocol
 from integrations.social.agent_naming import (
     validate_agent_name, validate_local_name, compose_global_name,
 )
-from lifecycle_hooks import (
+from hartos.lifecycle_hooks import (
     ActionState, ActionRetryTracker, action_states,
     set_action_state, get_action_state,
 )
@@ -481,8 +481,8 @@ class TestNetworkConnectivityScenarios:
         mock_ledger.tasks = {'action_1': {}}
         mock_ledger.update_task_status.side_effect = ConnectionError("Network down")
 
-        with patch('lifecycle_hooks._ledger_registry', {'test_prompt': mock_ledger}):
-            with patch('lifecycle_hooks._get_ledger_task_status') as mock_ts:
+        with patch('hartos.lifecycle_hooks._ledger_registry', {'test_prompt': mock_ledger}):
+            with patch('hartos.lifecycle_hooks._get_ledger_task_status') as mock_ts:
                 mock_ts.return_value = MagicMock()
                 # State transition should succeed even if ledger sync fails
                 try:
@@ -998,7 +998,7 @@ class TestEdgeCases:
 
     def test_ledger_cache_isolation(self):
         """Same params → same object; after clear → original object gone."""
-        from lifecycle_hooks import _ledger_registry
+        from hartos.lifecycle_hooks import _ledger_registry
 
         mock_ledger_a = MagicMock()
         mock_ledger_b = MagicMock()

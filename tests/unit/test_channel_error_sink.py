@@ -125,7 +125,7 @@ def sinks(monkeypatch):
     # Self-heal pipeline stub — capture the canonical helper invocation
     # so we can assert the (subsystem, identifier, exc_type) shape that
     # SelfHealingDispatcher's pattern_key grouping depends on.
-    import exception_collector as ec_mod
+    from hartos import exception_collector as ec_mod
     def _fake_report(subsystem, identifier, exc, function, **ctx):
         captured['self_heal'].append({
             'subsystem': subsystem,

@@ -26,7 +26,7 @@ from unittest.mock import patch, MagicMock
 _mock_lgapi = MagicMock()
 _mock_lgapi.get_llm.side_effect = Exception("mocked — no LLM in tests")
 
-from hart_onboarding import (
+from hartos.hart_onboarding import (
     ELEMENTS, SPIRITS,
     assign_element_spirit, build_hart_tag,
     generate_emoji_combo, generate_hart_name,

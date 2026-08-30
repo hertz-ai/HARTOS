@@ -728,7 +728,7 @@ class DashboardService:
         user_prompt = f'{goal.owner_id or goal.created_by}_{goal.prompt_id}'
 
         try:
-            from lifecycle_hooks import get_registered_groupchat
+            from hartos.lifecycle_hooks import get_registered_groupchat
         except ImportError:
             return out
         gc = get_registered_groupchat(user_prompt)
@@ -1092,7 +1092,7 @@ def inject_instruction(db, agent_id: str, instruction: str,
         return out
 
     try:
-        from lifecycle_hooks import get_registered_groupchat
+        from hartos.lifecycle_hooks import get_registered_groupchat
     except ImportError:
         out['error'] = 'groupchat registry unavailable'
         return out

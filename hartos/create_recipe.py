@@ -57,12 +57,12 @@ import re
 import json
 from flask import current_app
 try:
-    from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, PROMPTS_DIR, _is_terminate_msg
+    from hartos.helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, PROMPTS_DIR, _is_terminate_msg
 except Exception:
-    from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, _is_terminate_msg
-    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+    from hartos.helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, _is_terminate_msg
+    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'))
 os.makedirs(PROMPTS_DIR, exist_ok=True)
-import helper as helper_fun
+from hartos import helper as helper_fun
 import threading
 from concurrent.futures import ThreadPoolExecutor
 # transform_messages / transforms are autogen.agentchat.contrib.capabilities
@@ -208,7 +208,7 @@ def publish_agent_thought(last_speaker, messages, user_id):
         #   - the Android consumer at AbstractChatActivity.java:2127
         #     groups it under "123456" → orphan bucket, never displayed.
         # Fix breaks all three failure modes for both transports.
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
         from core.peer_link.crossbar_publish import publish_thinking_trace
         publish_thinking_trace(
             text=content, user_id=user_id,
@@ -244,7 +244,7 @@ from agent_ledger import (
 )
 from agent_ledger.factory import create_production_ledger, get_or_create_ledger
 # Add to your create_recipe.py after imports
-from lifecycle_hooks import (
+from hartos.lifecycle_hooks import (
     initialize_deterministic_actions,
     lifecycle_hook_track_action_assignment,
     lifecycle_hook_track_user_fallback,
@@ -268,7 +268,7 @@ from lifecycle_hooks import (
 )
 
 # Import helper_ledger functions for subtask management and ledger awareness
-from helper_ledger import (
+from hartos.helper_ledger import (
     add_subtasks_to_ledger,
     check_and_unblock_parent,
     get_pending_subtasks,
@@ -290,9 +290,9 @@ import pytz
 from PIL import Image
 
 from datetime import timedelta
-from lifecycle_hooks import initialize_minimal_lifecycle_hooks
+from hartos.lifecycle_hooks import initialize_minimal_lifecycle_hooks
 initialize_minimal_lifecycle_hooks()  # Prints integration guide
-from cultural_wisdom import get_cultural_prompt
+from hartos.cultural_wisdom import get_cultural_prompt
 
 # MCP Integration
 from integrations.mcp import load_user_mcp_servers, get_mcp_tools_for_autogen, mcp_registry
@@ -394,7 +394,7 @@ tool_logger.addHandler(console_handler)
 def _record_exception(exc, module, function, user_prompt='', action_id=0, **ctx):
     """Fire-and-forget exception recording to centralized collector. Never raises."""
     try:
-        from exception_collector import ExceptionCollector
+        from hartos.exception_collector import ExceptionCollector
         ExceptionCollector.get_instance().record(
             exc, module=module, function=function,
             user_prompt=user_prompt, action_id=action_id, context=ctx)
@@ -2272,7 +2272,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # Only preempt if THIS request is from the daemon (not user/CREATE).
         try:
             from integrations.agent_engine.dispatch import is_user_recently_active
-            from threadlocal import get_task_source
+            from hartos.threadlocal import get_task_source
             _source = get_task_source()
             if _source in ('daemon', 'idle') and is_user_recently_active():
                 current_app.logger.info("[PREEMPT] User active — aborting daemon recipe to free LLM")
@@ -2798,7 +2798,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
         # Merge accumulated experience data into the saved recipe
         try:
-            from recipe_experience import RecipeExperienceRecorder
+            from hartos.recipe_experience import RecipeExperienceRecorder
             RecipeExperienceRecorder.merge_experience_into_recipe(prompt_id, flow, user_prompt)
         except Exception:
             pass
@@ -2896,7 +2896,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # user_prompt key the rest of the lifecycle uses (user_agents dict,
     # _ledger_registry, etc.).  Idempotent + no-op safe.
     try:
-        from lifecycle_hooks import register_groupchat_for_session as _reg_gc
+        from hartos.lifecycle_hooks import register_groupchat_for_session as _reg_gc
         _reg_gc(user_prompt, group_chat)
     except Exception:
         current_app.logger.debug("groupchat registry hook skipped", exc_info=True)
@@ -2996,7 +2996,7 @@ def instantiate_executor_agent():
     # Inject cultural wisdom — even code execution should embody care
     _executor_cultural = ""
     try:
-        from cultural_wisdom import get_cultural_prompt_compact
+        from hartos.cultural_wisdom import get_cultural_prompt_compact
         _executor_cultural = get_cultural_prompt_compact()
     except Exception:
         pass
@@ -3082,7 +3082,7 @@ def instantiate_helper_agent():
     # Inject cultural wisdom into Helper for warm, caring assistance
     _helper_cultural = ""
     try:
-        from cultural_wisdom import get_cultural_prompt_compact
+        from hartos.cultural_wisdom import get_cultural_prompt_compact
         _helper_cultural = get_cultural_prompt_compact()
     except Exception:
         pass
@@ -3152,7 +3152,7 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
 
     if not _personality_block:
         try:
-            from cultural_wisdom import get_cultural_prompt_compact
+            from hartos.cultural_wisdom import get_cultural_prompt_compact
             from core.agent_personality import get_regional_tone_prompt
             _personality_block = get_cultural_prompt_compact()
             _regional = get_regional_tone_prompt()  # resolves language internally
@@ -3586,7 +3586,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     # cache uses (caller does `time_agents[user_prompt] = create_time_
     # agents(...)`); we derive it here from user_id+prompt_id.
     try:
-        from lifecycle_hooks import register_groupchat_for_session as _reg_gc
+        from hartos.lifecycle_hooks import register_groupchat_for_session as _reg_gc
         _reg_gc(f'{user_id}_{prompt_id}', time_group_chat)
     except Exception:
         logging.getLogger(__name__).debug(
@@ -5280,7 +5280,7 @@ def publish_to_crossbar_new_action_start(message, user_id):
     # Pull real request_id from threadlocal — see publish_agent_thought
     # for the full failure-mode analysis (drain key miss, React daemon
     # filter, Android orphan bucket).  Single source via thread_local_data.
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
     from core.peer_link.crossbar_publish import publish_thinking_trace
     publish_thinking_trace(
         text=text, user_id=user_id,

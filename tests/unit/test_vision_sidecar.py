@@ -805,7 +805,7 @@ class TestVisualTriggers:
 class TestSearchVisualHistory:
     """helper.search_visual_history - thin wrapper over DB endpoint."""
 
-    @patch('helper.pooled_request')
+    @patch('hartos.helper.pooled_request')
     def test_search_returns_matching_camera_results(self, mock_req):
         from datetime import datetime, timedelta
         now = datetime.now()
@@ -826,14 +826,14 @@ class TestSearchVisualHistory:
                 },
             ])
         )
-        from helper import search_visual_history
+        from hartos.helper import search_visual_history
         results = search_visual_history('u1', 'photoshop', mins=30, channel='camera')
         assert results is not None
         assert len(results) == 1
         assert 'Photoshop' in results[0]
         assert '[camera]' in results[0]
 
-    @patch('helper.pooled_request')
+    @patch('hartos.helper.pooled_request')
     def test_search_returns_screen_results(self, mock_req):
         from datetime import datetime
         now = datetime.now()
@@ -848,12 +848,12 @@ class TestSearchVisualHistory:
                 },
             ])
         )
-        from helper import search_visual_history
+        from hartos.helper import search_visual_history
         results = search_visual_history('u1', 'VS Code', mins=30, channel='screen')
         assert results is not None
         assert '[screen]' in results[0]
 
-    @patch('helper.pooled_request')
+    @patch('hartos.helper.pooled_request')
     def test_search_both_channels(self, mock_req):
         from datetime import datetime
         now = datetime.now()
@@ -874,12 +874,12 @@ class TestSearchVisualHistory:
                 },
             ])
         )
-        from helper import search_visual_history
+        from hartos.helper import search_visual_history
         results = search_visual_history('u1', 'typing', mins=30, channel='both')
         assert results is not None
         assert len(results) == 2
 
-    @patch('helper.pooled_request')
+    @patch('hartos.helper.pooled_request')
     def test_search_no_matches_returns_none(self, mock_req):
         from datetime import datetime
         now = datetime.now()
@@ -894,19 +894,19 @@ class TestSearchVisualHistory:
                 },
             ])
         )
-        from helper import search_visual_history
+        from hartos.helper import search_visual_history
         results = search_visual_history('u1', 'photoshop', mins=30)
         assert results is None
 
-    @patch('helper.pooled_request')
+    @patch('hartos.helper.pooled_request')
     def test_search_api_failure_returns_none(self, mock_req):
         mock_req.return_value = MagicMock(status_code=500)
-        from helper import search_visual_history
+        from hartos.helper import search_visual_history
         results = search_visual_history('u1', 'test', mins=30)
         assert results is None
 
-    @patch('helper.pooled_request', side_effect=Exception('network error'))
+    @patch('hartos.helper.pooled_request', side_effect=Exception('network error'))
     def test_search_network_error_returns_none(self, mock_req):
-        from helper import search_visual_history
+        from hartos.helper import search_visual_history
         results = search_visual_history('u1', 'test', mins=30)
         assert results is None

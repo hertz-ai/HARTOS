@@ -37,7 +37,7 @@ from core.llm_outbound_logger import (
 def _clean_threadlocal_request_id():
     """``_get_request_id`` checks the thread-local FIRST; clear it around every
     test so a stale value from another test can't shadow the contextvar path."""
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
     thread_local_data.set_request_id(None)
     yield
     thread_local_data.set_request_id(None)
@@ -109,7 +109,7 @@ def test_threadlocal_request_id_does_not_cross_context():
     """Regression guard documenting WHY the contextvar is required: the
     thread-local set by the /chat handler does NOT reach a copied worker
     context — the exact gap that lost the daemon tag."""
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
     thread_local_data.set_request_id('daemon_should_not_leak')
     # No contextvar bound -> the worker context falls through to ''.
     assert (_read_request_id_in_copied_worker_context() or '') == ''
@@ -125,7 +125,7 @@ def test_request_id_context_resets_on_exit():
 def test_threadlocal_still_takes_precedence_for_genuine_chat_turn():
     """The thread-local stays authoritative on the request thread, so a real
     /chat turn's id is never shadowed by a stale contextvar fallback."""
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
     thread_local_data.set_request_id('live-user-turn')
     with request_id_context('daemon_stale'):
         # On THIS (request) thread the thread-local wins.

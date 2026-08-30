@@ -21,7 +21,7 @@ if ROOT not in sys.path:
 # when autogen is absent (CI). Skip cleanly, matching the suite-wide pattern.
 pytest.importorskip('autogen', reason='autogen not installed')
 
-import gather_agentdetails as ga  # noqa: E402
+from hartos import gather_agentdetails as ga  # noqa: E402
 
 _ENV = 'HEVOLVE_AUTONOMOUS_GATHER_TOOL_MAP'
 

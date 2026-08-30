@@ -11,8 +11,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 pytest.importorskip('autogen', reason='autogen not installed')
 
-from create_recipe import create_agents, create_time_agents
-from helper import Action
+from hartos.create_recipe import create_agents, create_time_agents
+from hartos.helper import Action
 
 
 def _agent_mocks():
@@ -31,7 +31,7 @@ def _agent_mocks():
     stack = ExitStack()
     mocks = {}
     for name in ('AssistantAgent', 'UserProxyAgent', 'GroupChat', 'GroupChatManager'):
-        m = stack.enter_context(patch(f'create_recipe.autogen.{name}'))
+        m = stack.enter_context(patch(f'hartos.create_recipe.autogen.{name}'))
         m.return_value = MagicMock()
         mocks[name] = m
     return stack, mocks
@@ -50,12 +50,12 @@ class TestAgentCreation:
                 self[key] = a
                 return a
 
-        with patch('create_recipe.user_tasks', _AutoActionDict()):
+        with patch('hartos.create_recipe.user_tasks', _AutoActionDict()):
             yield
 
     def test_create_agents_basic_success(self, test_user_id, test_prompt_id, mock_flask_app, sample_config_json):
         """Test basic agent creation succeeds"""
-        with patch('create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
+        with patch('hartos.create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
             stack, mocks = _agent_mocks()
             with stack:
                 try:
@@ -67,7 +67,7 @@ class TestAgentCreation:
 
     def test_create_agents_with_empty_task(self, test_user_id, test_prompt_id, mock_flask_app, sample_config_json):
         """Test agent creation with empty task doesn't crash"""
-        with patch('create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
+        with patch('hartos.create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
             stack, mocks = _agent_mocks()
             with stack:
                 try:
@@ -78,7 +78,7 @@ class TestAgentCreation:
 
     def test_create_agents_with_invalid_user_id(self, test_prompt_id, mock_flask_app):
         """Test agent creation handles invalid user IDs gracefully"""
-        with patch('create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
+        with patch('hartos.create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
             stack, mocks = _agent_mocks()
             with stack:
                 try:
@@ -93,9 +93,9 @@ class TestAgentCreation:
         user_prompt = f'{test_user_id}_{test_prompt_id}'
         mock_tasks = {user_prompt: Action(sample_actions)}
         mock_recipe = {test_prompt_id: {"actions": sample_actions}}
-        with patch('create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
-            with patch('create_recipe.user_tasks', mock_tasks):
-                with patch('create_recipe.final_recipe', mock_recipe):
+        with patch('hartos.create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
+            with patch('hartos.create_recipe.user_tasks', mock_tasks):
+                with patch('hartos.create_recipe.final_recipe', mock_recipe):
                     stack, mocks = _agent_mocks()
                     with stack:
                         try:
@@ -113,8 +113,8 @@ class TestAgentCreation:
 
     def test_create_time_agents_with_empty_actions(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test time agent creation handles empty actions"""
-        with patch('create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
-            with patch('create_recipe.Action') as mock_action_class:
+        with patch('hartos.create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
+            with patch('hartos.create_recipe.Action') as mock_action_class:
                 mock_action_class.return_value = Action([])
                 stack, mocks = _agent_mocks()
                 with stack:
@@ -133,7 +133,7 @@ class TestAgentCreation:
 
     def test_agent_creation_with_api_key_missing(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test agent creation handles missing API keys gracefully"""
-        with patch('create_recipe.config_list', [{"model": "test"}]):  # No api_key
+        with patch('hartos.create_recipe.config_list', [{"model": "test"}]):  # No api_key
             stack, mocks = _agent_mocks()
             with stack:
                 try:
@@ -144,12 +144,12 @@ class TestAgentCreation:
 
     def test_agent_creation_recovery_from_network_error(self, test_user_id, test_prompt_id, mock_flask_app, sample_config_json):
         """Test agent creation can recover from network errors"""
-        with patch('create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
-            with patch('create_recipe.autogen.AssistantAgent') as mock_assistant:
+        with patch('hartos.create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
+            with patch('hartos.create_recipe.autogen.AssistantAgent') as mock_assistant:
                 mock_assistant.side_effect = [ConnectionError("Network error"), Mock()]
-                with patch('create_recipe.autogen.UserProxyAgent', return_value=Mock()):
-                    with patch('create_recipe.autogen.GroupChat', return_value=Mock()):
-                        with patch('create_recipe.autogen.GroupChatManager', return_value=Mock()):
+                with patch('hartos.create_recipe.autogen.UserProxyAgent', return_value=Mock()):
+                    with patch('hartos.create_recipe.autogen.GroupChat', return_value=Mock()):
+                        with patch('hartos.create_recipe.autogen.GroupChatManager', return_value=Mock()):
                             try:
                                 result = create_agents(test_user_id, "Test", test_prompt_id)
                             except ConnectionError:
@@ -157,7 +157,7 @@ class TestAgentCreation:
 
     def test_multiple_concurrent_agent_creations(self, test_user_id, test_prompt_id, mock_flask_app, sample_config_json):
         """Test multiple agents can be created concurrently without conflicts"""
-        with patch('create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
+        with patch('hartos.create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
             stack, mocks = _agent_mocks()
             with stack:
                 try:
@@ -177,7 +177,7 @@ class TestAgentCreation:
 
     def test_agent_creation_memory_cleanup(self, test_user_id, test_prompt_id, mock_flask_app, sample_config_json):
         """Test agent creation cleans up memory properly"""
-        with patch('create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
+        with patch('hartos.create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
             stack, mocks = _agent_mocks()
             with stack:
                 try:
@@ -197,7 +197,7 @@ class TestAgentCreation:
             "Test with {json: 'like'} syntax"
         ]
 
-        with patch('create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
+        with patch('hartos.create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
             stack, mocks = _agent_mocks()
             with stack:
                 for task in special_tasks:
@@ -220,12 +220,12 @@ class TestAgentCreationRobustness:
                 self[key] = a
                 return a
 
-        with patch('create_recipe.user_tasks', _AutoActionDict()):
+        with patch('hartos.create_recipe.user_tasks', _AutoActionDict()):
             yield
 
     def test_agent_creation_never_fails_guarantee(self, test_user_id, test_prompt_id, mock_flask_app, sample_config_json):
         """Guarantee that agent creation returns a valid result or safe fallback"""
-        with patch('create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
+        with patch('hartos.create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
             stack, mocks = _agent_mocks()
             with stack:
                 result = create_agents(test_user_id, "Test", test_prompt_id)
@@ -241,7 +241,7 @@ class TestAgentCreationRobustness:
             (0, "", 0),
         ]
 
-        with patch('create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
+        with patch('hartos.create_recipe.config_list', [{"model": "test", "api_key": "test"}]):
             stack, mocks = _agent_mocks()
             with stack:
                 for user_id, task, prompt_id in test_cases:

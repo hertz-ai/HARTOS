@@ -20,7 +20,7 @@ class TestEndToEndCreationFlow:
     def test_complete_creation_flow(self, test_user_id, test_prompt_id, tmp_path, mock_flask_app):
         """Test complete flow from task to recipe generation"""
         # 1. Create agents
-        with patch('create_recipe.create_agents') as mock_create_agents:
+        with patch('hartos.create_recipe.create_agents') as mock_create_agents:
             mock_create_agents.return_value = (
                 Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
             )
@@ -29,10 +29,10 @@ class TestEndToEndCreationFlow:
             assert agents is not None
 
         # 2. Execute actions
-        with patch('create_recipe.user_tasks', {
+        with patch('hartos.create_recipe.user_tasks', {
             f"{test_user_id}_{test_prompt_id}": Mock(current_action=1)
         }):
-            from lifecycle_hooks import lifecycle_hook_track_action_assignment
+            from hartos.lifecycle_hooks import lifecycle_hook_track_action_assignment
             lifecycle_hook_track_action_assignment(
                 f"{test_user_id}_{test_prompt_id}",
                 1
@@ -57,7 +57,7 @@ class TestEndToEndCreationFlow:
         assert recipe_file.exists()
 
         # 4. Verify all actions completed
-        from lifecycle_hooks import lifecycle_hook_check_all_actions_terminated
+        from hartos.lifecycle_hooks import lifecycle_hook_check_all_actions_terminated
         try:
             all_terminated = lifecycle_hook_check_all_actions_terminated(
                 f"{test_user_id}_{test_prompt_id}"
@@ -152,14 +152,14 @@ class TestEndToEndReuseFlow:
         assert loaded_recipe["actions"][0]["action_id"] == 1
 
         # 3. Execute from recipe
-        with patch('reuse_recipe.user_agents', {
+        with patch('hartos.reuse_recipe.user_agents', {
             f"{test_user_id}_{test_prompt_id}": (
                 Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), Mock(),
                 Mock(), Mock(), Mock(), Mock(), Mock()
             )
         }):
-            with patch('reuse_recipe.send_message_to_user1'):
-                from reuse_recipe import time_based_execution
+            with patch('hartos.reuse_recipe.send_message_to_user1'):
+                from hartos.reuse_recipe import time_based_execution
                 try:
                     result = time_based_execution(
                         loaded_recipe["actions"][0]["action"],
@@ -191,14 +191,14 @@ class TestEndToEndReuseFlow:
             json.dump(recipe, f)
 
         # Schedule the task
-        with patch('reuse_recipe.scheduler') as mock_scheduler:
-            with patch('reuse_recipe.os.path.exists', return_value=True):
+        with patch('hartos.reuse_recipe.scheduler') as mock_scheduler:
+            with patch('hartos.reuse_recipe.os.path.exists', return_value=True):
                 with patch('builtins.open', create=True) as mock_open:
                     mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(recipe)
 
                     mock_scheduler.add_job.return_value = Mock()
 
-                    from reuse_recipe import create_schedule
+                    from hartos.reuse_recipe import create_schedule
                     try:
                         create_schedule(test_prompt_id, test_user_id)
                     except Exception:
@@ -211,7 +211,7 @@ class TestCreationToReuseTransition:
     def test_mode_transition_validation(self, test_user_id, test_prompt_id, tmp_path, mock_flask_app):
         """Test validating all requirements before mode transition"""
         # 1. Ensure all actions completed
-        from lifecycle_hooks import lifecycle_hook_check_all_actions_terminated
+        from hartos.lifecycle_hooks import lifecycle_hook_check_all_actions_terminated
         try:
             all_done = lifecycle_hook_check_all_actions_terminated(
                 f"{test_user_id}_{test_prompt_id}"
@@ -229,10 +229,10 @@ class TestCreationToReuseTransition:
         assert recipe_file.exists()
 
         # 3. Update database
-        with patch('create_recipe.requests.patch') as mock_patch:
+        with patch('hartos.create_recipe.requests.patch') as mock_patch:
             mock_patch.return_value.status_code = 200
 
-            from create_recipe import update_agent_creation_to_db
+            from hartos.create_recipe import update_agent_creation_to_db
             try:
                 update_agent_creation_to_db(test_prompt_id)
             except Exception:
@@ -274,12 +274,12 @@ def process_image(image):
 '''
 
         # VLM agent analyzes visual context
-        with patch('create_recipe.get_frame') as mock_frame:
-            with patch('create_recipe.helper_fun.get_visual_context') as mock_context:
+        with patch('hartos.create_recipe.get_frame') as mock_frame:
+            with patch('hartos.create_recipe.helper_fun.get_visual_context') as mock_context:
                 mock_frame.return_value = np.zeros((480, 640, 3))
                 mock_context.return_value = "User is working on image processing"
 
-                from create_recipe import get_visual_context
+                from hartos.create_recipe import get_visual_context
                 context = get_visual_context(test_user_id, minutes=1)
 
                 assert context is not None
@@ -396,7 +396,7 @@ class TestPerformanceAndScalability:
         results = []
 
         def user_workflow(user_id):
-            with patch('create_recipe.user_agents', {}):
+            with patch('hartos.create_recipe.user_agents', {}):
                 results.append(f"User {user_id} completed")
 
         threads = []

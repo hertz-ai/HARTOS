@@ -31,7 +31,7 @@ SRC = REPO / "create_recipe.py"
 def _helper():
     """Import lazily — create_recipe pulls in autogen/langchain at import."""
     sys.path.insert(0, str(REPO))
-    import create_recipe
+    from hartos import create_recipe
     return create_recipe
 
 

@@ -251,17 +251,17 @@ class TestEmbeddedMainRobot:
 
 class TestPhysicalActionStates:
     def test_executing_motion_state_exists(self):
-        from lifecycle_hooks import ActionState
+        from hartos.lifecycle_hooks import ActionState
         assert hasattr(ActionState, 'EXECUTING_MOTION')
         assert ActionState.EXECUTING_MOTION.value == 'executing_motion'
 
     def test_sensor_confirm_state_exists(self):
-        from lifecycle_hooks import ActionState
+        from hartos.lifecycle_hooks import ActionState
         assert hasattr(ActionState, 'SENSOR_CONFIRM')
         assert ActionState.SENSOR_CONFIRM.value == 'sensor_confirm'
 
     def test_all_original_states_preserved(self):
-        from lifecycle_hooks import ActionState
+        from hartos.lifecycle_hooks import ActionState
         # Verify original states still exist
         expected = [
             'ASSIGNED', 'IN_PROGRESS', 'STATUS_VERIFICATION_REQUESTED',

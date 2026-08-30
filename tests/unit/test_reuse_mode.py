@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 pytest.importorskip('autogen', reason='autogen not installed')
 
-from reuse_recipe import (
+from hartos.reuse_recipe import (
     chat_agent,
     time_based_execution,
     visual_based_execution,
@@ -54,18 +54,18 @@ class TestReuseModExecutionExecution:
 
     def test_execute_action_from_recipe(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test executing action from loaded recipe"""
-        with patch('reuse_recipe.user_agents', {
+        with patch('hartos.reuse_recipe.user_agents', {
             f"{test_user_id}_{test_prompt_id}": (
                 Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), Mock(),
                 Mock(), Mock(), Mock(), Mock(), Mock()
             )
         }):
-            with patch('reuse_recipe.recipes', {
+            with patch('hartos.reuse_recipe.recipes', {
                 f"{test_user_id}_{test_prompt_id}": {
                     "actions": [{"action_id": 1, "recipe": []}]
                 }
             }):
-                with patch('reuse_recipe.send_message_to_user1'):
+                with patch('hartos.reuse_recipe.send_message_to_user1'):
                     try:
                         result = time_based_execution(
                             "Execute action 1",
@@ -80,9 +80,9 @@ class TestReuseModExecutionExecution:
 
     def test_reuse_mode_chat_agent(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test chat agent in reuse mode"""
-        with patch('reuse_recipe.recipes', {f"{test_user_id}_{test_prompt_id}": {}}):
-            with patch('reuse_recipe.user_agents', {}):
-                with patch('reuse_recipe.os.path.exists', return_value=True):
+        with patch('hartos.reuse_recipe.recipes', {f"{test_user_id}_{test_prompt_id}": {}}):
+            with patch('hartos.reuse_recipe.user_agents', {}):
+                with patch('hartos.reuse_recipe.os.path.exists', return_value=True):
                     with patch('builtins.open', create=True) as mock_open_func:
                         mock_open_func.return_value.__enter__.return_value.read.return_value = json.dumps({
                             "actions": [],
@@ -119,8 +119,8 @@ class TestReuseModExecutionExecution:
         with open(recipe_file, 'w') as f:
             json.dump(recipe, f)
 
-        with patch('reuse_recipe.scheduler') as mock_scheduler:
-            with patch('reuse_recipe.os.path.exists', return_value=True):
+        with patch('hartos.reuse_recipe.scheduler') as mock_scheduler:
+            with patch('hartos.reuse_recipe.os.path.exists', return_value=True):
                 with patch('builtins.open', create=True) as mock_open_func:
                     mock_open_func.return_value.__enter__.return_value.read.return_value = json.dumps(recipe)
 
@@ -140,13 +140,13 @@ class TestReuseModExecutionExecution:
             {"action_id": 3, "action": "Action 3"}
         ]
 
-        with patch('reuse_recipe.user_agents', {
+        with patch('hartos.reuse_recipe.user_agents', {
             f"{test_user_id}_{test_prompt_id}": (
                 Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), Mock(),
                 Mock(), Mock(), Mock(), Mock(), Mock()
             )
         }):
-            with patch('reuse_recipe.send_message_to_user1'):
+            with patch('hartos.reuse_recipe.send_message_to_user1'):
                 for action in actions:
                     try:
                         result = time_based_execution(
@@ -184,10 +184,10 @@ class TestOutputValidation:
 
     def test_validate_reuse_mode_message_format(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test reuse mode messages have correct format"""
-        with patch('reuse_recipe.send_message_to_user1') as mock_send:
+        with patch('hartos.reuse_recipe.send_message_to_user1') as mock_send:
             mock_send.return_value = "Message sent successfully"
 
-            from reuse_recipe import send_message_to_user1
+            from hartos.reuse_recipe import send_message_to_user1
             result = send_message_to_user1(
                 test_user_id,
                 "Test message",
@@ -201,7 +201,7 @@ class TestOutputValidation:
         """Test reuse mode correctly handles message2user format"""
         message_content = '{"message2user": "Hello, task completed!"}'
 
-        from helper import retrieve_json
+        from hartos.helper import retrieve_json
         json_obj = retrieve_json(message_content)
 
         assert json_obj is not None
@@ -224,13 +224,13 @@ class TestOutputValidation:
         """Test outputs are consistent across multiple runs"""
         outputs = []
 
-        with patch('reuse_recipe.user_agents', {
+        with patch('hartos.reuse_recipe.user_agents', {
             f"{test_user_id}_{test_prompt_id}": (
                 Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), Mock(),
                 Mock(), Mock(), Mock(), Mock(), Mock()
             )
         }):
-            with patch('reuse_recipe.send_message_to_user1', return_value="sent"):
+            with patch('hartos.reuse_recipe.send_message_to_user1', return_value="sent"):
                 for _ in range(3):
                     try:
                         result = time_based_execution(
@@ -329,7 +329,7 @@ class TestReuseModeRobustness:
 
     def test_reuse_mode_handles_agent_not_found(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test reuse mode handles missing agent gracefully"""
-        with patch('reuse_recipe.user_agents', {}):
+        with patch('hartos.reuse_recipe.user_agents', {}):
             try:
                 result = time_based_execution(
                     "Test task",
@@ -346,7 +346,7 @@ class TestReuseModeRobustness:
         error_count = 0
         max_errors = 3
 
-        with patch('reuse_recipe.user_agents', {
+        with patch('hartos.reuse_recipe.user_agents', {
             f"{test_user_id}_{test_prompt_id}": (
                 Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), Mock(),
                 Mock(), Mock(), Mock(), Mock(), Mock()
@@ -373,7 +373,7 @@ class TestReuseModeRobustness:
         results = []
 
         def execute_for_user(user_id):
-            with patch('reuse_recipe.user_agents', {
+            with patch('hartos.reuse_recipe.user_agents', {
                 f"{user_id}_{test_prompt_id}": (
                     Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), Mock(),
                     Mock(), Mock(), Mock(), Mock(), Mock()
@@ -404,13 +404,13 @@ class TestReuseModeRobustness:
 
     def test_reuse_mode_memory_efficient(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test reuse mode is memory efficient for repeated executions"""
-        with patch('reuse_recipe.user_agents', {
+        with patch('hartos.reuse_recipe.user_agents', {
             f"{test_user_id}_{test_prompt_id}": (
                 Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), Mock(),
                 Mock(), Mock(), Mock(), Mock(), Mock()
             )
         }):
-            with patch('reuse_recipe.send_message_to_user1'):
+            with patch('hartos.reuse_recipe.send_message_to_user1'):
                 # Execute many times
                 for i in range(100):
                     try:
@@ -452,13 +452,13 @@ class TestReuseModeIntegration:
             loaded_recipe = json.load(f)
 
         # Execute action from recipe
-        with patch('reuse_recipe.user_agents', {
+        with patch('hartos.reuse_recipe.user_agents', {
             f"{test_user_id}_{test_prompt_id}": (
                 Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), Mock(),
                 Mock(), Mock(), Mock(), Mock(), Mock()
             )
         }):
-            with patch('reuse_recipe.send_message_to_user1'):
+            with patch('hartos.reuse_recipe.send_message_to_user1'):
                 try:
                     result = time_based_execution(
                         loaded_recipe["actions"][0]["action"],
@@ -474,14 +474,14 @@ class TestReuseModeIntegration:
         """Test visual task execution in reuse mode"""
         import numpy as np
 
-        with patch('reuse_recipe.user_agents', {
+        with patch('hartos.reuse_recipe.user_agents', {
             f"{test_user_id}_{test_prompt_id}": (
                 Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), Mock(),
                 Mock(), Mock(), Mock(), Mock(), Mock()
             )
         }):
-            with patch('reuse_recipe.get_frame', return_value=np.zeros((480, 640, 3))):
-                with patch('reuse_recipe.helper_fun.get_visual_context', return_value="context"):
+            with patch('hartos.reuse_recipe.get_frame', return_value=np.zeros((480, 640, 3))):
+                with patch('hartos.reuse_recipe.helper_fun.get_visual_context', return_value="context"):
                     try:
                         result = visual_based_execution(
                             "Visual task",

@@ -74,13 +74,13 @@ import types as _types
 def _fake_reuse(monkeypatch, fn):
     m = _types.ModuleType('reuse_recipe')
     m.chat_agent = fn
-    monkeypatch.setitem(_sys.modules, 'reuse_recipe', m)
+    monkeypatch.setitem(_sys.modules, 'hartos.reuse_recipe', m)
 
 
 def _fake_create(monkeypatch, fn):
     m = _types.ModuleType('create_recipe')
     m.recipe = fn
-    monkeypatch.setitem(_sys.modules, 'create_recipe', m)
+    monkeypatch.setitem(_sys.modules, 'hartos.create_recipe', m)
 
 
 def _is_a2a_shape(r):

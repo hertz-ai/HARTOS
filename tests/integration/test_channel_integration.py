@@ -348,7 +348,7 @@ class TestRegressionExistingFunctionality:
     def test_helper_module_available(self):
         """Test helper module is still available."""
         try:
-            from helper import retrieve_json, topological_sort
+            from hartos.helper import retrieve_json, topological_sort
             assert retrieve_json is not None
             assert topological_sort is not None
         except ImportError:
@@ -357,7 +357,7 @@ class TestRegressionExistingFunctionality:
     def test_lifecycle_hooks_available(self):
         """Test lifecycle hooks are available."""
         try:
-            from lifecycle_hooks import ActionState
+            from hartos.lifecycle_hooks import ActionState
             assert hasattr(ActionState, 'ASSIGNED')
             assert hasattr(ActionState, 'IN_PROGRESS')
             assert hasattr(ActionState, 'COMPLETED')

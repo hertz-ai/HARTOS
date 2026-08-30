@@ -82,7 +82,7 @@ _PROBE = textwrap.dedent(
 )
 
 
-@pytest.mark.parametrize("mod", ["create_recipe", "reuse_recipe"])
+@pytest.mark.parametrize("mod", ["hartos.create_recipe", "hartos.reuse_recipe"])
 def test_module_import_does_not_pull_autogen(mod):
     proc = subprocess.run(
         [sys.executable, "-c", _PROBE.format(mod=mod, mark=_MARK)],

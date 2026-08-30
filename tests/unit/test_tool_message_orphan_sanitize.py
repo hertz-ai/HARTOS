@@ -18,7 +18,7 @@ _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import helper  # noqa: E402
+from hartos import helper  # noqa: E402
 
 
 def _no_orphaned_tool(messages):

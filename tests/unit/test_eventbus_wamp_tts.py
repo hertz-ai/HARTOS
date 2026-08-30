@@ -441,7 +441,7 @@ class TestLifecycleEventEmission(unittest.TestCase):
 
     @patch('core.platform.events.emit_event')
     def test_auto_sync_emits_event(self, mock_emit):
-        from lifecycle_hooks import _auto_sync_to_ledger, _ledger_registry, ActionState
+        from hartos.lifecycle_hooks import _auto_sync_to_ledger, _ledger_registry, ActionState
 
         # Register a mock ledger
         mock_ledger = MagicMock()
@@ -449,7 +449,7 @@ class TestLifecycleEventEmission(unittest.TestCase):
         _ledger_registry['test_prompt'] = mock_ledger
 
         try:
-            with patch('lifecycle_hooks._get_ledger_task_status') as mock_status:
+            with patch('hartos.lifecycle_hooks._get_ledger_task_status') as mock_status:
                 MockStatus = MagicMock()
                 MockStatus.IN_PROGRESS = 'IN_PROGRESS'
                 mock_status.return_value = MockStatus

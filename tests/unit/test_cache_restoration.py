@@ -240,7 +240,7 @@ class TestLoadRecipe:
             json.dump(recipe_data, f)
 
         with patch.object(cache_loaders, 'PROMPTS_DIR', self.tmpdir):
-            with patch('helper.retrieve_json', return_value=recipe_data):
+            with patch('hartos.helper.retrieve_json', return_value=recipe_data):
                 result = cache_loaders.load_recipe('123_456')
 
         assert result is not None
@@ -271,8 +271,8 @@ class TestLoadUserLedger:
         mock_ledger = MagicMock()
         mock_ledger.tasks = {'action_1': MagicMock(), 'action_2': MagicMock()}
 
-        with patch('helper_ledger.create_ledger_with_auto_backend', return_value=mock_ledger) as mock_create:
-            with patch('lifecycle_hooks.restore_action_states_from_ledger', return_value=2):
+        with patch('hartos.helper_ledger.create_ledger_with_auto_backend', return_value=mock_ledger) as mock_create:
+            with patch('hartos.lifecycle_hooks.restore_action_states_from_ledger', return_value=2):
                 result = cache_loaders.load_user_ledger('123_456')
 
         mock_create.assert_called_once_with(123, 456)
@@ -285,7 +285,7 @@ class TestLoadUserLedger:
         mock_ledger = MagicMock()
         mock_ledger.tasks = {}
 
-        with patch('helper_ledger.create_ledger_with_auto_backend', return_value=mock_ledger):
+        with patch('hartos.helper_ledger.create_ledger_with_auto_backend', return_value=mock_ledger):
             result = cache_loaders.load_user_ledger('123_456')
 
         assert result is None
@@ -305,7 +305,7 @@ class TestRestoreActionStates:
     """Test restore_action_states_from_ledger."""
 
     def setup_method(self):
-        from lifecycle_hooks import action_states, _state_lock
+        from hartos.lifecycle_hooks import action_states, _state_lock
         import threading
         with _state_lock:
             action_states.clear()
@@ -313,7 +313,7 @@ class TestRestoreActionStates:
     def test_restore_from_ledger(self):
         """Should restore action_states from ledger task statuses."""
         pytest.importorskip('agent_ledger', reason='agent_ledger not installed')
-        from lifecycle_hooks import restore_action_states_from_ledger, action_states, ActionState
+        from hartos.lifecycle_hooks import restore_action_states_from_ledger, action_states, ActionState
         from agent_ledger import TaskStatus as LedgerTaskStatus
 
         # Create mock ledger with tasks
@@ -341,7 +341,7 @@ class TestRestoreActionStates:
     def test_restore_skips_non_action_tasks(self):
         """Should skip tasks that don't start with 'action_'."""
         pytest.importorskip('agent_ledger', reason='agent_ledger not installed')
-        from lifecycle_hooks import restore_action_states_from_ledger, action_states
+        from hartos.lifecycle_hooks import restore_action_states_from_ledger, action_states
         from agent_ledger import TaskStatus as LedgerTaskStatus
 
         mock_task = MagicMock()
@@ -359,7 +359,7 @@ class TestRestoreActionStates:
 
     def test_restore_empty_ledger(self):
         """Should handle empty ledger gracefully."""
-        from lifecycle_hooks import restore_action_states_from_ledger
+        from hartos.lifecycle_hooks import restore_action_states_from_ledger
 
         mock_ledger = MagicMock()
         mock_ledger.tasks = {}

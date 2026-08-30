@@ -89,7 +89,7 @@ class SignalingChannel:
     def start(self) -> bool:
         """Start listening for signals on WAMP topic."""
         try:
-            from crossbar_server import wamp_session
+            from hartos.crossbar_server import wamp_session
             self._wamp_session = wamp_session
             if self._wamp_session:
                 topic = f"{self.TOPIC_PREFIX}.{self._device_id}"

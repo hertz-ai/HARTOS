@@ -1303,7 +1303,7 @@ class SpeculativeDispatcher:
         # background and the foreground preempt starves it (witnessed:
         # source=autogen.create, thread=spec_expert_0, thread_local_rid=None).
         try:
-            from threadlocal import thread_local_data as _tl
+            from hartos.threadlocal import thread_local_data as _tl
             _req_rid = _tl.get_request_id() or ''
         except Exception:
             _req_rid = ''
@@ -1577,7 +1577,7 @@ class SpeculativeDispatcher:
         # is classified foreground, not background-and-preemptible.
         if request_id:
             try:
-                from threadlocal import thread_local_data as _tl
+                from hartos.threadlocal import thread_local_data as _tl
                 _tl.set_request_id(request_id=request_id)
             except Exception:
                 pass

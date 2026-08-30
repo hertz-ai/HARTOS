@@ -73,20 +73,20 @@ class TestCulturalWisdomResilience:
     """Cultural functions must always return valid data — never crash the agent."""
 
     def test_get_cultural_prompt_never_empty(self):
-        from cultural_wisdom import get_cultural_prompt
+        from hartos.cultural_wisdom import get_cultural_prompt
         prompt = get_cultural_prompt()
         assert isinstance(prompt, str)
         assert len(prompt) > 0
 
     def test_get_traits_for_role_unknown(self):
         """Unknown role must still return traits — fallback to general set."""
-        from cultural_wisdom import get_traits_for_role
+        from hartos.cultural_wisdom import get_traits_for_role
         traits = get_traits_for_role('completely_unknown_role_xyz')
         assert isinstance(traits, list)
         assert len(traits) > 0
 
     def test_guardian_values_never_empty(self):
-        from cultural_wisdom import get_guardian_cultural_values
+        from hartos.cultural_wisdom import get_guardian_cultural_values
         values = get_guardian_cultural_values()
         assert len(values) > 0
 
@@ -131,14 +131,14 @@ class TestThreadlocalResilience:
     """ThreadLocalData must never crash — even with unexpected patterns."""
 
     def test_get_before_set_returns_default(self):
-        from threadlocal import ThreadLocalData
+        from hartos.threadlocal import ThreadLocalData
         tld = ThreadLocalData()
         assert tld.get_request_id() is None
         assert tld.get_user_id() is None
         assert tld.get_task_source() == 'own'
 
     def test_clear_before_set_no_crash(self):
-        from threadlocal import ThreadLocalData
+        from hartos.threadlocal import ThreadLocalData
         tld = ThreadLocalData()
         tld.clear_creation_flags()  # Must not crash
         tld.clear_agentic_flags()
@@ -147,7 +147,7 @@ class TestThreadlocalResilience:
 
     def test_update_token_count_without_set(self):
         """update_req_token_count without prior set_req_token_count should handle gracefully."""
-        from threadlocal import ThreadLocalData
+        from hartos.threadlocal import ThreadLocalData
         tld = ThreadLocalData()
         tld.set_req_token_count(0)
         tld.update_req_token_count(100)

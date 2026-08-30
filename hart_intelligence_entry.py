@@ -247,8 +247,8 @@ except Exception:
 
 from bs4 import BeautifulSoup
 from enum import Enum
-from cultural_wisdom import get_cultural_prompt_compact
-from agent_identity import build_identity_prompt, SECRETS_GUARDRAIL, extract_owner_name
+from hartos.cultural_wisdom import get_cultural_prompt_compact
+from hartos.agent_identity import build_identity_prompt, SECRETS_GUARDRAIL, extract_owner_name
 
 # langchain_classic — pydantic v2-compatible fork of langchain 0.0.230.
 # Fail-safe (#99): in a frozen env where langchain_classic is absent (the HART OS
@@ -457,7 +457,7 @@ try:
     from pydantic import BaseModel, Field, field_validator as root_validator
 except ImportError:
     from pydantic import BaseModel, Field, root_validator
-from threadlocal import thread_local_data
+from hartos.threadlocal import thread_local_data
 # Crossbar HTTP publisher — canonical path is `crossbarhttp3.CrossbarHttpPublisher`
 # (the same publisher used by integrations/social/realtime.py:25).  We fall
 # back to the legacy `crossbarhttp.Client` API only if the canonical
@@ -504,8 +504,8 @@ load_dotenv()
 #autogen requirements
 
 try:
-    from create_recipe import recipe, time_based_execution as time_execution, visual_execution
-    from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution, visual_based_execution
+    from hartos.create_recipe import recipe, time_based_execution as time_execution, visual_execution
+    from hartos.reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution, visual_based_execution
 except ImportError as e:
     # print() went nowhere: frozen windowed builds have no real stdout, so the
     # ONE line explaining why agent creation is dead was invisible.  MEASURED
@@ -534,7 +534,7 @@ except ImportError:
 import threading
 
 try:
-    from helper import retrieve_json, PROMPTS_DIR, safe_prompt_path, _is_terminate_msg
+    from hartos.helper import retrieve_json, PROMPTS_DIR, safe_prompt_path, _is_terminate_msg
 except Exception:
     retrieve_json = None
     safe_prompt_path = None
@@ -6298,7 +6298,7 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
     fork (this working copy vs helper's dead-Zep twin). helper does not import
     this module, so the delegate is a one-way dependency (no import cycle).
     '''
-    import helper
+    from hartos import helper
     return helper.get_time_based_history(prompt, session_id, start_date, end_date)
 
 def parsing_string(string):
@@ -7231,7 +7231,7 @@ if autogen is not None:
     def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
         """Create new assistant and user proxy agents for a user with basic configuration."""
         # Use the dynamic module-level config_list (cloud or local, set by wizard)
-        from threadlocal import thread_local_data as _tld
+        from hartos.threadlocal import thread_local_data as _tld
         _override = _tld.get_model_config_override() if hasattr(_tld, 'get_model_config_override') else None
         _clist = _override or config_list
 
@@ -7311,7 +7311,7 @@ if autogen is not None:
 
     def create_agents(user_id: str,recipe:str) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
         """Create new assistant and user agents for a given user_id"""
-        from threadlocal import thread_local_data as _tld
+        from hartos.threadlocal import thread_local_data as _tld
         _override = _tld.get_model_config_override() if hasattr(_tld, 'get_model_config_override') else None
         _clist = _override or config_list
 
@@ -7784,7 +7784,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
                     'silent_drops': get_ans._g10_silent_drops,
                 })
             try:
-                from exception_collector import record_exception
+                from hartos.exception_collector import record_exception
                 record_exception(
                     _cb_te, module=__name__, function='get_ans',
                     component='AgentInteractionIngestor',
@@ -8053,7 +8053,7 @@ def _autonomous_gather_info(user_id, description, prompt_id):
     (helper.py:2025) and the same Qwen3-VL endpoint that gather_info
     uses handles the review verdict at zero marginal cost.
     """
-    from gather_agentdetails import gather_info
+    from hartos.gather_agentdetails import gather_info
     response = gather_info(user_id, description, prompt_id, autonomous=True)
 
     # Auto-review + refinement loop (no human in path)
@@ -9736,7 +9736,7 @@ def chat():
                     Agent_status='Review Mode',
                     autonomous_creation=True, prompt_id=prompt_id,
                 )
-            from gather_agentdetails import gather_info
+            from hartos.gather_agentdetails import gather_info
 
             # --- Turn counter: force-complete after MAX_GATHER_TURNS ---
             turn_key = f'{user_id}_{prompt_id}'
@@ -10062,7 +10062,7 @@ def chat():
         user_prompt = f'{user_id}_{prompt_id}'
         if not review_agents.get(_ak) and not create_agent:
             # Check autogen tool signal first (intelligent detection)
-            from reuse_recipe import creation_signals
+            from hartos.reuse_recipe import creation_signals
             if user_prompt in creation_signals:
                 signal = creation_signals.pop(user_prompt)
                 agent_desc = signal.get('description', '')
@@ -10228,7 +10228,7 @@ def chat():
             )
         else:
             # Interactive: start gather_info, return first question
-            from gather_agentdetails import gather_info
+            from hartos.gather_agentdetails import gather_info
             response = gather_info(user_id, agent_description, new_prompt_id)
             new_response = response.replace('true', 'True').replace("false", "False")
             try:
@@ -10855,7 +10855,7 @@ def admin_agent_data_info(prompt_id):
     — the info-gathering stays in helper where the file-layout logic
     lives; this route is a thin JSON facade."""
     try:
-        from helper import get_agent_data_info as _info
+        from hartos.helper import get_agent_data_info as _info
     except ImportError:
         return jsonify({'error': 'helper.get_agent_data_info unavailable'}), 500
     return jsonify(_info(int(prompt_id)))

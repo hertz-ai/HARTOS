@@ -54,7 +54,7 @@ from PIL import Image
 
 
 from flask import current_app
-from helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files, _is_terminate_msg
+from hartos.helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files, _is_terminate_msg
 
 
 def _normalize_flow_recipe(config):
@@ -90,11 +90,11 @@ def _normalize_flow_recipe(config):
     out['actions'] = []
     return out
 try:
-    from helper import PROMPTS_DIR
+    from hartos.helper import PROMPTS_DIR
 except Exception:
-    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'))
 os.makedirs(PROMPTS_DIR, exist_ok=True)
-import helper as helper_fun
+from hartos import helper as helper_fun
 # Lazy — same heavy-chain rationale as the `autogen` proxy above; used
 # only inside the agent-building functions.
 transform_messages = lazy_module(
@@ -110,7 +110,7 @@ import traceback
 # and hard-failed `import reuse_recipe` wherever autobahn isn't installed (CI base
 # install); tests/unit/test_lazy_autogen_import.py guards that import.
 
-from threadlocal import thread_local_data
+from hartos.threadlocal import thread_local_data
 # #509: canonical tool-logging decorator — wraps each autogen tool with
 # entry/exit/error logs, structured JSON error envelope, str-coercion,
 # coroutine-accidental-return guard, AND per-tool publish_chat_stage UI
@@ -175,7 +175,7 @@ except ImportError:
     get_production_backend = None
 
 # Import helper_ledger functions for subtask management and ledger awareness
-from helper_ledger import (
+from hartos.helper_ledger import (
     add_subtasks_to_ledger,
     check_and_unblock_parent,
     get_pending_subtasks,
@@ -183,11 +183,11 @@ from helper_ledger import (
 )
 
 # Import sync function from lifecycle_hooks
-from lifecycle_hooks import (
+from hartos.lifecycle_hooks import (
     sync_action_state_to_ledger, register_ledger_for_session,
     ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
 )
-from cultural_wisdom import get_cultural_prompt
+from hartos.cultural_wisdom import get_cultural_prompt
 
 
 class ActionExecutionStatus(Enum):
@@ -1073,7 +1073,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     # Build experience hints from accumulated recipe experience data
     experience_hints = ''
     try:
-        from recipe_experience import build_experience_hints
+        from hartos.recipe_experience import build_experience_hints
         experience_hints = build_experience_hints(individual_recipe)
     except Exception:
         experience_hints = 'No prior experience recorded.'
@@ -2988,7 +2988,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                 return
         except Exception:
             pass
-        from create_recipe import publish_agent_thought
+        from hartos.create_recipe import publish_agent_thought
         publish_agent_thought(last_speaker, messages, user_id)
 
     select_speaker_transforms = transform_messages.TransformMessages(

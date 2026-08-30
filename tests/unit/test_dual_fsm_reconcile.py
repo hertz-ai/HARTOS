@@ -25,7 +25,7 @@ if _LEDGER_SRC not in sys.path:
 
 def test_terminated_recipe_capture_edge():
     try:
-        import lifecycle_hooks as L
+        from hartos import lifecycle_hooks as L
     except Exception as e:
         pytest.skip(f"lifecycle_hooks unavailable: {e}")
 
@@ -49,7 +49,7 @@ def test_recipe_capture_cycle_from_terminated_is_complete():
     """The capture flow a terminated action can now follow must be a closed,
     terminating cycle (no path back into open execution that could re-loop)."""
     try:
-        import lifecycle_hooks as L
+        from hartos import lifecycle_hooks as L
     except Exception as e:
         pytest.skip(f"lifecycle_hooks unavailable: {e}")
     up, aid = 'u56_778', 2
@@ -89,7 +89,7 @@ def test_recipe_requested_has_recovery_edges():
     already have; the fix stays targeted (no jump back into open execution).
     """
     try:
-        import lifecycle_hooks as L
+        from hartos import lifecycle_hooks as L
     except Exception as e:
         pytest.skip(f"lifecycle_hooks unavailable: {e}")
 
@@ -132,7 +132,7 @@ def test_force_path_recipe_requested_to_terminated_completes():
     shortcuts.  The action must actually END in TERMINATED (→ ledger COMPLETED).
     """
     try:
-        import lifecycle_hooks as L
+        from hartos import lifecycle_hooks as L
     except Exception as e:
         pytest.skip(f"lifecycle_hooks unavailable: {e}")
 
@@ -198,7 +198,7 @@ def test_auto_sync_reconciles_failed_ledger_on_recovery():
     #56 advisory-skip (which left the recovered goal reading FAILED and capped
     the completed count)."""
     try:
-        import lifecycle_hooks as L
+        from hartos import lifecycle_hooks as L
         from agent_ledger.core import Task, TaskType, TaskStatus, SmartLedger
         from agent_ledger.backends import InMemoryBackend
     except Exception as e:
@@ -238,7 +238,7 @@ def test_refusal_is_not_logged_as_error(caplog):
     """
     import logging
     try:
-        import lifecycle_hooks as L
+        from hartos import lifecycle_hooks as L
     except Exception as e:
         pytest.skip(f"lifecycle_hooks unavailable: {e}")
 

@@ -46,7 +46,7 @@ class TestTTLCacheDuckTyping:
 
     def test_action_has_current_action(self):
         """Action class must have .current_action — duck-typing distinguishes it from TTLCache."""
-        from helper import Action
+        from hartos.helper import Action
         action = Action(['step1'])
         assert hasattr(action, 'current_action')
 
@@ -105,11 +105,11 @@ class TestPathResolution:
 
     def test_prompts_dir_is_absolute(self):
         """PROMPTS_DIR must be absolute — relative paths fail in installed builds."""
-        from helper import PROMPTS_DIR
+        from hartos.helper import PROMPTS_DIR
         assert os.path.isabs(PROMPTS_DIR)
 
     def test_prompts_dir_exists(self):
-        from helper import PROMPTS_DIR
+        from hartos.helper import PROMPTS_DIR
         # On CI, ensure the directory exists (it may not if this is a fresh checkout)
         os.makedirs(PROMPTS_DIR, exist_ok=True)
         assert os.path.isdir(PROMPTS_DIR)
@@ -169,7 +169,7 @@ class TestLedgerTransitionSkip:
     def test_no_op_transitions_concept(self):
         """Multiple ActionStates map to IN_PROGRESS — the skip guard prevents
         noisy warnings from update_task_status(IN_PROGRESS→IN_PROGRESS)."""
-        from lifecycle_hooks import ActionState
+        from hartos.lifecycle_hooks import ActionState
         # These states all represent "work in progress" at different sub-phases
         in_progress_states = [
             ActionState.IN_PROGRESS,

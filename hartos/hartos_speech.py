@@ -219,7 +219,7 @@ SPEECH = {
     ),
 }
 
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), 'hartos_speech_audio')
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'hartos_speech_audio')
 
 
 async def generate_audio(text: str, voice: str, filename: str):

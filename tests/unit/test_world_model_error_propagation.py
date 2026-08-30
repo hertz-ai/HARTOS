@@ -40,7 +40,7 @@ def test_send_action_non200_records_into_exception_collector():
     b = _make_bridge()
     resp = MagicMock(); resp.status_code = 500
     with patch.object(wmb, 'pooled_post', return_value=resp), \
-            patch('exception_collector.ExceptionCollector') as MockEC:
+            patch('hartos.exception_collector.ExceptionCollector') as MockEC:
         ok = b.send_action(_ok_action())
     assert ok is False
     inst = MockEC.get_instance.return_value
@@ -55,7 +55,7 @@ def test_send_action_exception_records_into_exception_collector():
     b = _make_bridge()
     with patch.object(wmb, 'pooled_post',
                       side_effect=requests.exceptions.ConnectionError('boom')), \
-            patch('exception_collector.ExceptionCollector') as MockEC:
+            patch('hartos.exception_collector.ExceptionCollector') as MockEC:
         ok = b.send_action(_ok_action())
     assert ok is False
     assert MockEC.get_instance.return_value.record.called
@@ -68,7 +68,7 @@ def test_breaker_records_every_failure_to_collector_until_open():
     b = _make_bridge()
     resp = MagicMock(); resp.status_code = 500
     with patch.object(wmb, 'pooled_post', return_value=resp), \
-            patch('exception_collector.ExceptionCollector') as MockEC:
+            patch('hartos.exception_collector.ExceptionCollector') as MockEC:
         for _ in range(8):
             b.send_action(_ok_action())
     # default threshold=5 → 5 records, then send_action short-circuits on cb_open
@@ -87,7 +87,7 @@ def test_sensor_ingest_failure_also_propagates():
     b = _make_bridge()
     resp = MagicMock(); resp.status_code = 503
     with patch.object(wmb, 'pooled_post', return_value=resp), \
-            patch('exception_collector.ExceptionCollector') as MockEC:
+            patch('hartos.exception_collector.ExceptionCollector') as MockEC:
         n = b.ingest_sensor_batch([{
             'sensor_id': 'cam0', 'sensor_type': 'camera',
             'data': {'frame_base64': 'aGk=', 'encoding': 'jpeg'},
@@ -106,7 +106,7 @@ def test_sensor_types_without_a_modality_are_skipped_not_posted():
     error propagation, because nothing failed."""
     b = _make_bridge()
     with patch.object(wmb, 'pooled_post') as post, \
-            patch('exception_collector.ExceptionCollector') as MockEC:
+            patch('hartos.exception_collector.ExceptionCollector') as MockEC:
         n = b.ingest_sensor_batch([{'sensor_id': 's0', 'sensor_type': 'imu'}])
     assert n == 0
     post.assert_not_called()
@@ -117,7 +117,7 @@ def test_success_does_not_propagate_or_gossip():
     b = _make_bridge()
     resp = MagicMock(); resp.status_code = 200
     with patch.object(wmb, 'pooled_post', return_value=resp), \
-            patch('exception_collector.ExceptionCollector') as MockEC:
+            patch('hartos.exception_collector.ExceptionCollector') as MockEC:
         ok = b.send_action(_ok_action())
     assert ok is True
     assert not MockEC.get_instance.return_value.record.called

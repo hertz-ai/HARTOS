@@ -34,7 +34,7 @@ question, or the two disagree forever.
 """
 import os
 
-import create_recipe
+from hartos import create_recipe
 
 
 def test_helper_exists_and_is_the_gate_predicate():

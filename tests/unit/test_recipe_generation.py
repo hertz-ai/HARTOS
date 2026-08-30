@@ -16,8 +16,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 pytest.importorskip('autogen', reason='autogen not installed')
 
-from helper import topological_sort, fix_json
-from lifecycle_hooks import lifecycle_hook_track_recipe_request, lifecycle_hook_track_recipe_completion
+from hartos.helper import topological_sort, fix_json
+from hartos.lifecycle_hooks import lifecycle_hook_track_recipe_request, lifecycle_hook_track_recipe_completion
 
 
 class TestRecipeJSONCreation:
@@ -367,7 +367,7 @@ class TestRecipeCompletion:
 
     def test_all_recipes_completed_check(self, test_user_prompt):
         """Test checking if all recipes are completed"""
-        from lifecycle_hooks import lifecycle_hook_check_all_actions_terminated
+        from hartos.lifecycle_hooks import lifecycle_hook_check_all_actions_terminated
 
         try:
             # Should check if all actions have recipes
@@ -404,7 +404,7 @@ class TestModeSwitching:
 
     def test_verify_all_actions_completed_before_switch(self, test_user_prompt):
         """Test verifying all actions completed before mode switch"""
-        from lifecycle_hooks import lifecycle_hook_check_all_actions_terminated
+        from hartos.lifecycle_hooks import lifecycle_hook_check_all_actions_terminated
 
         try:
             all_terminated = lifecycle_hook_check_all_actions_terminated(test_user_prompt)
@@ -429,7 +429,7 @@ class TestModeSwitching:
 
     def test_verify_final_agent_creation(self, test_user_prompt):
         """Test final agent creation validation"""
-        from lifecycle_hooks import lifecycle_hook_validate_final_agent_creation
+        from hartos.lifecycle_hooks import lifecycle_hook_validate_final_agent_creation
 
         try:
             lifecycle_hook_validate_final_agent_creation(test_user_prompt)
@@ -442,7 +442,7 @@ class TestModeSwitching:
         # Mock incomplete state
         incomplete = False
 
-        from lifecycle_hooks import lifecycle_hook_check_all_actions_terminated
+        from hartos.lifecycle_hooks import lifecycle_hook_check_all_actions_terminated
 
         try:
             all_done = lifecycle_hook_check_all_actions_terminated(test_user_prompt)
@@ -463,12 +463,12 @@ class TestModeSwitching:
         # HTTP client (core.http_pool.pooled_patch), so patching
         # create_recipe.requests.patch died with AttributeError instead of
         # intercepting the call. Patch the function the code actually calls.
-        with patch('create_recipe.pooled_patch') as mock_patch:
+        with patch('hartos.create_recipe.pooled_patch') as mock_patch:
             mock_patch.return_value.status_code = 200
 
             try:
                 # Should update database to mark agent as created
-                from create_recipe import update_agent_creation_to_db
+                from hartos.create_recipe import update_agent_creation_to_db
                 update_agent_creation_to_db(test_prompt_id)
                 mock_patch.assert_called()
             except Exception:

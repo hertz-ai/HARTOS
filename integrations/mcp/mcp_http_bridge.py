@@ -497,7 +497,7 @@ def _tool_watchdog_status() -> str:
 def _tool_exception_report() -> str:
     """Get recent exception patterns — grouped by type, count, and recency. Use this to find bugs to fix."""
     try:
-        from exception_collector import ExceptionCollector
+        from hartos.exception_collector import ExceptionCollector
         collector = ExceptionCollector.instance()
         if collector is None:
             return json.dumps({"error": "ExceptionCollector not initialized"})

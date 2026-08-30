@@ -18,8 +18,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 pytest.importorskip('autogen', reason='autogen not installed')
 
-from create_recipe import visual_execution, get_frame, get_visual_context, call_visual_task
-from reuse_recipe import visual_based_execution, get_frame as reuse_get_frame
+from hartos.create_recipe import visual_execution, get_frame, get_visual_context, call_visual_task
+from hartos.reuse_recipe import visual_based_execution, get_frame as reuse_get_frame
 
 
 class TestVLMAgentInterruption:
@@ -27,13 +27,13 @@ class TestVLMAgentInterruption:
 
     def test_vlm_agent_user_interrupt_during_execution(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test VLM agent can be interrupted by user during execution"""
-        with patch('create_recipe.user_agents', {
+        with patch('hartos.create_recipe.user_agents', {
             f"{test_user_id}_{test_prompt_id}": (
                 Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
             )
         }):
-            with patch('create_recipe.get_frame') as mock_frame:
-                with patch('create_recipe.helper_fun.get_visual_context') as mock_context:
+            with patch('hartos.create_recipe.get_frame') as mock_frame:
+                with patch('hartos.create_recipe.helper_fun.get_visual_context') as mock_context:
                     # Setup mocks
                     mock_frame.return_value = np.zeros((480, 640, 3), dtype=np.uint8)
                     mock_context.return_value = "Visual context"
@@ -46,7 +46,7 @@ class TestVLMAgentInterruption:
                     ]
                     mock_group_chat.messages = mock_messages
 
-                    with patch('create_recipe.user_agents', {
+                    with patch('hartos.create_recipe.user_agents', {
                         f"{test_user_id}_{test_prompt_id}": (
                             Mock(), Mock(), Mock(), mock_group_chat, Mock(), Mock(), Mock()
                         )
@@ -72,13 +72,13 @@ class TestVLMAgentInterruption:
             {'name': 'ChatInstructor', 'content': 'TERMINATE'}
         ]
 
-        with patch('create_recipe.user_agents', {
+        with patch('hartos.create_recipe.user_agents', {
             f"{test_user_id}_{test_prompt_id}": (
                 mock_author, Mock(), Mock(), mock_group_chat, mock_manager, Mock(), Mock()
             )
         }):
-            with patch('create_recipe.get_frame', return_value=np.zeros((480, 640, 3))):
-                with patch('create_recipe.helper_fun.get_visual_context', return_value="context"):
+            with patch('hartos.create_recipe.get_frame', return_value=np.zeros((480, 640, 3))):
+                with patch('hartos.create_recipe.helper_fun.get_visual_context', return_value="context"):
                     mock_author.initiate_chat.return_value = Mock()
 
                     result = visual_execution("Test task", test_user_id, test_prompt_id)
@@ -94,18 +94,18 @@ class TestVLMAgentInterruption:
             {'name': 'ChatInstructor', 'content': 'TERMINATE'}
         ]
 
-        with patch('create_recipe.user_agents', {
+        with patch('hartos.create_recipe.user_agents', {
             f"{test_user_id}_{test_prompt_id}": (
                 Mock(), Mock(), Mock(), mock_group_chat, Mock(), Mock(), Mock()
             )
         }):
-            with patch('create_recipe.get_frame', return_value=np.zeros((480, 640, 3))):
-                with patch('create_recipe.helper_fun.get_visual_context', return_value="context"):
-                    with patch('create_recipe.send_message_to_user1') as mock_send:
+            with patch('hartos.create_recipe.get_frame', return_value=np.zeros((480, 640, 3))):
+                with patch('hartos.create_recipe.helper_fun.get_visual_context', return_value="context"):
+                    with patch('hartos.create_recipe.send_message_to_user1') as mock_send:
                         mock_author = Mock()
                         mock_author.initiate_chat.return_value = Mock()
 
-                        with patch('create_recipe.user_agents', {
+                        with patch('hartos.create_recipe.user_agents', {
                             f"{test_user_id}_{test_prompt_id}": (
                                 mock_author, Mock(), Mock(), mock_group_chat, Mock(), Mock(), Mock()
                             )
@@ -216,7 +216,7 @@ class TestVLMVisualContextQA:
 
     def test_vlm_get_visual_context(self, test_user_id, mock_flask_app):
         """Test getting visual context from past minutes"""
-        with patch('create_recipe.helper_fun.get_visual_context') as mock_context:
+        with patch('hartos.create_recipe.helper_fun.get_visual_context') as mock_context:
             mock_context.return_value = "User is looking at a code editor with Python file open"
 
             context = get_visual_context(test_user_id, minutes=2)
@@ -226,10 +226,10 @@ class TestVLMVisualContextQA:
 
     def test_vlm_visual_context_with_no_camera(self, test_user_id, mock_flask_app):
         """Test visual context when camera is off"""
-        with patch('create_recipe.helper_fun.get_visual_context') as mock_context:
+        with patch('hartos.create_recipe.helper_fun.get_visual_context') as mock_context:
             mock_context.return_value = None
 
-            with patch('create_recipe.get_visual_context') as mock_get_context:
+            with patch('hartos.create_recipe.get_visual_context') as mock_get_context:
                 mock_get_context.return_value = "User's camera is not on. no visual data"
 
                 context = get_visual_context(test_user_id, minutes=2)
@@ -240,13 +240,13 @@ class TestVLMVisualContextQA:
         question = "What am I looking at?"
         visual_context = "User is viewing a web browser with a recipe website"
 
-        with patch('create_recipe.user_agents', {
+        with patch('hartos.create_recipe.user_agents', {
             f"{test_user_id}_{test_prompt_id}": (
                 Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
             )
         }):
-            with patch('create_recipe.get_frame') as mock_frame:
-                with patch('create_recipe.helper_fun.get_visual_context') as mock_context:
+            with patch('hartos.create_recipe.get_frame') as mock_frame:
+                with patch('hartos.create_recipe.helper_fun.get_visual_context') as mock_context:
                     mock_frame.return_value = np.zeros((480, 640, 3))
                     mock_context.return_value = visual_context
 
@@ -259,18 +259,18 @@ class TestVLMVisualContextQA:
                     mock_author = Mock()
                     mock_author.initiate_chat.return_value = Mock()
 
-                    with patch('create_recipe.user_agents', {
+                    with patch('hartos.create_recipe.user_agents', {
                         f"{test_user_id}_{test_prompt_id}": (
                             mock_author, Mock(), Mock(), mock_group_chat, Mock(), Mock(), Mock()
                         )
                     }):
-                        with patch('create_recipe.send_message_to_user1') as mock_send:
+                        with patch('hartos.create_recipe.send_message_to_user1') as mock_send:
                             result = visual_execution(question, test_user_id, test_prompt_id)
                             assert result == 'done'
 
     def test_vlm_object_detection(self, test_user_id, mock_flask_app):
         """Test VLM can detect objects in visual context"""
-        with patch('create_recipe.helper_fun.get_visual_context') as mock_context:
+        with patch('hartos.create_recipe.helper_fun.get_visual_context') as mock_context:
             mock_context.return_value = "Detected objects: laptop, coffee mug, notebook, pen"
 
             context = get_visual_context(test_user_id, minutes=1)
@@ -279,7 +279,7 @@ class TestVLMVisualContextQA:
 
     def test_vlm_scene_understanding(self, test_user_id, mock_flask_app):
         """Test VLM understanding of scene context"""
-        with patch('create_recipe.helper_fun.get_visual_context') as mock_context:
+        with patch('hartos.create_recipe.helper_fun.get_visual_context') as mock_context:
             mock_context.return_value = "User is in a home office setting, sitting at a desk"
 
             context = get_visual_context(test_user_id, minutes=5)
@@ -287,7 +287,7 @@ class TestVLMVisualContextQA:
 
     def test_vlm_text_recognition_ocr(self, test_user_id, mock_flask_app):
         """Test VLM can recognize text from visual context"""
-        with patch('create_recipe.helper_fun.get_visual_context') as mock_context:
+        with patch('hartos.create_recipe.helper_fun.get_visual_context') as mock_context:
             mock_context.return_value = "Text visible on screen: 'def hello_world():'"
 
             context = get_visual_context(test_user_id, minutes=1)
@@ -295,7 +295,7 @@ class TestVLMVisualContextQA:
 
     def test_vlm_activity_recognition(self, test_user_id, mock_flask_app):
         """Test VLM recognizes user activity"""
-        with patch('create_recipe.helper_fun.get_visual_context') as mock_context:
+        with patch('hartos.create_recipe.helper_fun.get_visual_context') as mock_context:
             mock_context.return_value = "User is coding, typing on keyboard"
 
             context = get_visual_context(test_user_id, minutes=3)
@@ -307,8 +307,8 @@ class TestVLMAgentIntegration:
 
     def test_vlm_visual_task_call(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test calling visual task via API"""
-        with patch('create_recipe.pooled_request') as mock_request:
-            with patch('create_recipe.pooled_post') as mock_post:
+        with patch('hartos.create_recipe.pooled_request') as mock_request:
+            with patch('hartos.create_recipe.pooled_post') as mock_post:
                 # Mock API response
                 mock_response = Mock()
                 mock_response.status_code = 200
@@ -323,7 +323,7 @@ class TestVLMAgentIntegration:
 
     def test_vlm_visual_task_no_video_reasoning(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test visual task when no Video Reasoning entries found"""
-        with patch('create_recipe.pooled_request') as mock_request:
+        with patch('hartos.create_recipe.pooled_request') as mock_request:
             # Mock API response without Video Reasoning
             mock_response = Mock()
             mock_response.status_code = 200
@@ -333,20 +333,20 @@ class TestVLMAgentIntegration:
             mock_request.return_value = mock_response
 
             # Should not call visual agent
-            with patch('create_recipe.pooled_post') as mock_post:
+            with patch('hartos.create_recipe.pooled_post') as mock_post:
                 result = call_visual_task("Visual task", test_user_id, test_prompt_id)
                 # Should handle gracefully
 
     def test_vlm_reuse_mode_visual_execution(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test VLM visual execution in reuse mode"""
-        with patch('reuse_recipe.user_agents', {
+        with patch('hartos.reuse_recipe.user_agents', {
             f"{test_user_id}_{test_prompt_id}": (
                 Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), Mock(),
                 Mock(), Mock(), Mock(), Mock(), Mock()
             )
         }):
-            with patch('reuse_recipe.get_frame') as mock_frame:
-                with patch('reuse_recipe.helper_fun.get_visual_context') as mock_context:
+            with patch('hartos.reuse_recipe.get_frame') as mock_frame:
+                with patch('hartos.reuse_recipe.helper_fun.get_visual_context') as mock_context:
                     mock_frame.return_value = np.zeros((480, 640, 3))
                     mock_context.return_value = "Visual context"
 
@@ -356,7 +356,7 @@ class TestVLMAgentIntegration:
                         {'name': 'ChatInstructor', 'content': 'TERMINATE'}
                     ]
 
-                    with patch('reuse_recipe.user_agents', {
+                    with patch('hartos.reuse_recipe.user_agents', {
                         f"{test_user_id}_{test_prompt_id}": (
                             Mock(), Mock(), mock_group_chat, Mock(), Mock(), Mock(), Mock(),
                             Mock(), Mock(), Mock(), Mock(), Mock()
@@ -377,7 +377,7 @@ class TestVLMAgentIntegration:
         """Test retrieving video frame from Redis (FrameStore miss → Redis fallback)"""
         import pickle
 
-        with patch('helper.redis_client') as mock_redis, \
+        with patch('hartos.helper.redis_client') as mock_redis, \
              patch('hart_intelligence_entry.get_vision_service', return_value=None):
             # Mock serialized frame
             fake_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
@@ -390,7 +390,7 @@ class TestVLMAgentIntegration:
 
     def test_vlm_frame_retrieval_no_frame(self, test_user_id, mock_flask_app):
         """Test frame retrieval when no frame is available"""
-        with patch('helper.redis_client') as mock_redis, \
+        with patch('hartos.helper.redis_client') as mock_redis, \
              patch('hart_intelligence_entry.get_vision_service', return_value=None):
             mock_redis.get.return_value = None
 
@@ -399,7 +399,7 @@ class TestVLMAgentIntegration:
 
     def test_vlm_multi_minute_context_retrieval(self, test_user_id, mock_flask_app):
         """Test retrieving visual context for different time windows"""
-        with patch('create_recipe.helper_fun.get_visual_context') as mock_context:
+        with patch('hartos.create_recipe.helper_fun.get_visual_context') as mock_context:
             # Test different time windows
             for minutes in [1, 2, 5, 10]:
                 mock_context.return_value = f"Context for {minutes} minutes"

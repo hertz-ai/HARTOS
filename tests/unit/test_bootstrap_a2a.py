@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import pytest
 from flask import Flask
 
-import hartos_bootstrap as hb
+from hartos import hartos_bootstrap as hb
 
 
 def _consumer_style_app():

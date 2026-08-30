@@ -18,10 +18,10 @@ class TestCoreModulesImportable(unittest.TestCase):
     """Every core module must import without errors."""
 
     CORE_MODULES = [
-        'threadlocal',
-        'helper',
-        'helper_ledger',
-        'lifecycle_hooks',
+        'hartos.threadlocal',
+        'hartos.helper',
+        'hartos.helper_ledger',
+        'hartos.lifecycle_hooks',
     ]
 
     def test_all_core_modules_import(self):

@@ -369,8 +369,8 @@ class DynamicAgentExecutor:
 
         try:
             # Import execution functions
-            from create_recipe import recipe
-            from reuse_recipe import chat_agent
+            from hartos.create_recipe import recipe
+            from hartos.reuse_recipe import chat_agent
 
             logger.info(f"Executing task for agent {agent_id} (persona: {agent.persona})")
 

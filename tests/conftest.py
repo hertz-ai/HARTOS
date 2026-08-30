@@ -132,7 +132,7 @@ def reset_state_machine():
     requires Flask app context, which not all test files set up.
     """
     try:
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             action_states, flow_lifecycle, initialize_deterministic_actions)
         action_states.clear()
         flow_lifecycle.flows.clear()
@@ -141,7 +141,7 @@ def reset_state_machine():
         pass  # No Flask app context / deps absent - test doesn't use lifecycle
     yield
     try:
-        from lifecycle_hooks import action_states, flow_lifecycle
+        from hartos.lifecycle_hooks import action_states, flow_lifecycle
         action_states.clear()
         flow_lifecycle.flows.clear()
     except (RuntimeError, Exception):
@@ -180,7 +180,7 @@ def sample_actions():
 def mock_user_tasks(sample_actions):
     """Mock user tasks object"""
     try:
-        from helper import Action
+        from hartos.helper import Action
     except ImportError:
         pytest.skip("helper.Action unavailable (autogen not installed)")
     tasks = Action(sample_actions)
@@ -223,7 +223,7 @@ def temp_prompts_dir(tmp_path):
 
     # Patch PROMPTS_DIR in all modules that reference it
     patches = []
-    for mod_name in ('create_recipe', 'reuse_recipe', 'helper', 'recipe_experience'):
+    for mod_name in ('hartos.create_recipe', 'hartos.reuse_recipe', 'hartos.helper', 'hartos.recipe_experience'):
         mod = sys.modules.get(mod_name)
         if mod and hasattr(mod, 'PROMPTS_DIR'):
             p = patch.object(mod, 'PROMPTS_DIR', prompts_str)
@@ -334,7 +334,7 @@ def mock_database_requests():
 @pytest.fixture
 def mock_crossbar_client():
     """Mock Crossbar HTTP client"""
-    with patch('create_recipe.client') as mock_client:
+    with patch('hartos.create_recipe.client') as mock_client:
         mock_client.publish = Mock()
         yield mock_client
 
@@ -368,7 +368,7 @@ def create_mock_message():
 @pytest.fixture
 def action_flow_scenarios():
     """Predefined action flow scenarios for testing"""
-    from lifecycle_hooks import ActionState
+    from hartos.lifecycle_hooks import ActionState
     return {
         'success_flow': [
             ActionState.ASSIGNED,

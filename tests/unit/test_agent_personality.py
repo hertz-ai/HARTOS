@@ -30,7 +30,7 @@ from core.agent_personality import (
     load_personality,
     adapt_personality,
 )
-from cultural_wisdom import (
+from hartos.cultural_wisdom import (
     CULTURAL_TRAITS,
     PROACTIVE_BEHAVIORS,
     get_traits_for_role,
@@ -177,7 +177,7 @@ class TestLovingNature:
         """StatusVerifier system_message should reference caring error framing."""
         # The Kintsugi principle was injected into instantiate_status_verifier_agent
         # Verify the constant string contains the caring framing
-        from cultural_wisdom import get_trait_by_name
+        from hartos.cultural_wisdom import get_trait_by_name
         kintsugi = get_trait_by_name('Kintsugi')
         assert kintsugi is not None
         assert 'imperfection' in kintsugi['trait'].lower() or 'beautiful' in kintsugi['trait'].lower()
@@ -341,14 +341,14 @@ class TestPersonalityIntegration:
 
     def test_helper_cultural_prompt_exists(self):
         """Helper agent template should reference cultural wisdom."""
-        from cultural_wisdom import get_cultural_prompt_compact
+        from hartos.cultural_wisdom import get_cultural_prompt_compact
         compact = get_cultural_prompt_compact()
         assert 'Ubuntu' in compact
         assert 'Sawubona' in compact
 
     def test_executor_cultural_prompt_compact(self):
         """Cultural compact prompt is concise enough for Executor context."""
-        from cultural_wisdom import get_cultural_prompt_compact
+        from hartos.cultural_wisdom import get_cultural_prompt_compact
         compact = get_cultural_prompt_compact()
         # Compact should be under 500 chars (~100 tokens)
         assert len(compact) < 1000, "Compact prompt should be concise"

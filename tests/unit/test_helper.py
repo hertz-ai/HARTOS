@@ -30,28 +30,28 @@ class TestIsTerminateMsg:
     """_is_terminate_msg guards against None content crashes in autogen."""
 
     def test_terminate_in_content(self):
-        from helper import _is_terminate_msg
+        from hartos.helper import _is_terminate_msg
         assert _is_terminate_msg({'content': 'TERMINATE'}) is True
 
     def test_terminate_substring(self):
-        from helper import _is_terminate_msg
+        from hartos.helper import _is_terminate_msg
         assert _is_terminate_msg({'content': 'Action done. TERMINATE'}) is True
 
     def test_no_terminate(self):
-        from helper import _is_terminate_msg
+        from hartos.helper import _is_terminate_msg
         assert _is_terminate_msg({'content': 'Hello world'}) is False
 
     def test_none_content_safe(self):
         """Tool-call messages have content=None — must not crash."""
-        from helper import _is_terminate_msg
+        from hartos.helper import _is_terminate_msg
         assert _is_terminate_msg({'content': None}) is False
 
     def test_missing_content_key(self):
-        from helper import _is_terminate_msg
+        from hartos.helper import _is_terminate_msg
         assert _is_terminate_msg({}) is False
 
     def test_non_dict_input(self):
-        from helper import _is_terminate_msg
+        from hartos.helper import _is_terminate_msg
         assert _is_terminate_msg("not a dict") is False
         assert _is_terminate_msg(None) is False
 
@@ -64,22 +64,22 @@ class TestPathSanitization:
     """sanitize_path_component prevents path traversal in prompt file access."""
 
     def test_rejects_path_separators(self):
-        from helper import sanitize_path_component
+        from hartos.helper import sanitize_path_component
         with pytest.raises(ValueError):
             sanitize_path_component("../../etc/passwd")
 
     def test_rejects_backslash(self):
-        from helper import sanitize_path_component
+        from hartos.helper import sanitize_path_component
         with pytest.raises(ValueError):
             sanitize_path_component("..\\windows\\system32")
 
     def test_allows_normal_id(self):
-        from helper import sanitize_path_component
+        from hartos.helper import sanitize_path_component
         result = sanitize_path_component("prompt_12345")
         assert result == "prompt_12345"
 
     def test_allows_numeric_string(self):
-        from helper import sanitize_path_component
+        from hartos.helper import sanitize_path_component
         result = sanitize_path_component("42")
         assert result == "42"
 
@@ -89,7 +89,7 @@ class TestPathSanitization:
         a 'safe' path component and reached the filesystem. re.fullmatch rejects
         it. A value that is valid EXCEPT for a trailing newline is exactly the
         edge case a path-traversal guard must not wave through."""
-        from helper import sanitize_path_component
+        from hartos.helper import sanitize_path_component
         with pytest.raises(ValueError):
             sanitize_path_component("prompt_1\n")
         with pytest.raises(ValueError):
@@ -100,12 +100,12 @@ class TestSafePromptPath:
     """safe_prompt_path builds paths that stay within PROMPTS_DIR."""
 
     def test_returns_path_within_prompts_dir(self):
-        from helper import safe_prompt_path, PROMPTS_DIR
+        from hartos.helper import safe_prompt_path, PROMPTS_DIR
         path = safe_prompt_path("123", ext='.json')
         assert path.startswith(PROMPTS_DIR)
 
     def test_rejects_traversal_in_parts(self):
-        from helper import safe_prompt_path
+        from hartos.helper import safe_prompt_path
         with pytest.raises(ValueError):
             safe_prompt_path("../../../etc/passwd")
 
@@ -120,7 +120,7 @@ class TestTopologicalSort:
 
     def test_simple_chain(self):
         """A→B→C should produce [A, B, C]."""
-        from helper import topological_sort
+        from hartos.helper import topological_sort
         actions = [
             {'action_id': 1, 'actions_this_action_depends_on': None},
             {'action_id': 2, 'actions_this_action_depends_on': [1]},
@@ -132,7 +132,7 @@ class TestTopologicalSort:
 
     def test_parallel_actions(self):
         """Independent actions can be in any order but all appear."""
-        from helper import topological_sort
+        from hartos.helper import topological_sort
         actions = [
             {'action_id': 1, 'actions_this_action_depends_on': None},
             {'action_id': 2, 'actions_this_action_depends_on': None},
@@ -144,7 +144,7 @@ class TestTopologicalSort:
 
     def test_diamond_dependency(self):
         """A→B, A→C, B→D, C→D — D must come after both B and C."""
-        from helper import topological_sort
+        from hartos.helper import topological_sort
         actions = [
             {'action_id': 1, 'actions_this_action_depends_on': None},
             {'action_id': 2, 'actions_this_action_depends_on': [1]},
@@ -161,7 +161,7 @@ class TestTopologicalSort:
 
     def test_cycle_detected(self):
         """Circular deps (A→B→A) must be detected and reported."""
-        from helper import topological_sort
+        from hartos.helper import topological_sort
         actions = [
             {'action_id': 1, 'actions_this_action_depends_on': [2]},
             {'action_id': 2, 'actions_this_action_depends_on': [1]},
@@ -173,7 +173,7 @@ class TestTopologicalSort:
 
     def test_self_dependency_ignored(self):
         """Action depending on itself must not cause a cycle."""
-        from helper import topological_sort
+        from hartos.helper import topological_sort
         actions = [
             {'action_id': 1, 'actions_this_action_depends_on': [1]},
         ]
@@ -190,40 +190,40 @@ class TestRetrieveJson:
     """retrieve_json is called on every LLM response — handles messy output."""
 
     def test_valid_json(self):
-        from helper import retrieve_json
+        from hartos.helper import retrieve_json
         result = retrieve_json('{"status": "completed", "action_id": 1}')
         assert result is not None
         assert result['status'] == 'completed'
 
     def test_json_with_prefix_text(self):
         """LLM often prefixes JSON with explanation text."""
-        from helper import retrieve_json
+        from hartos.helper import retrieve_json
         result = retrieve_json('Here is the result: {"status": "done"}')
         assert result is not None
         assert result['status'] == 'done'
 
     def test_json_with_at_user_prefix(self):
         """@user prefix from group chat must be stripped."""
-        from helper import retrieve_json
+        from hartos.helper import retrieve_json
         result = retrieve_json('@user {"status": "completed", "action_id": 1}')
         assert result is not None
         assert result['status'] == 'completed'
 
     def test_unicode_curly_quotes_normalized(self):
         """Local LLMs emit Unicode curly quotes — must normalize to ASCII."""
-        from helper import retrieve_json
+        from hartos.helper import retrieve_json
         # \u201c and \u201d are left/right double curly quotes
         result = retrieve_json('\u201c{"status": "done"}\u201d')
         # May or may not parse depending on exact format — key: no crash
         assert result is None or isinstance(result, dict)
 
     def test_returns_none_for_non_json(self):
-        from helper import retrieve_json
+        from hartos.helper import retrieve_json
         result = retrieve_json("This is just plain text with no JSON")
         assert result is None
 
     def test_returns_none_for_empty_string(self):
-        from helper import retrieve_json
+        from hartos.helper import retrieve_json
         result = retrieve_json("")
         assert result is None
 
@@ -236,30 +236,30 @@ class TestStripJsonValues:
     """strip_json_values redacts values but preserves structure — used for safe logging."""
 
     def test_preserves_dict_keys(self):
-        from helper import strip_json_values
+        from hartos.helper import strip_json_values
         result = strip_json_values({'name': 'secret', 'age': 42})
         assert 'name' in result
         assert 'age' in result
 
     def test_redacts_leaf_values(self):
-        from helper import strip_json_values
+        from hartos.helper import strip_json_values
         result = strip_json_values({'password': 'hunter2'})
         assert result['password'] != 'hunter2'
 
     def test_preserves_nested_structure(self):
-        from helper import strip_json_values
+        from hartos.helper import strip_json_values
         result = strip_json_values({'outer': {'inner': 'value'}})
         assert isinstance(result['outer'], dict)
         assert 'inner' in result['outer']
 
     def test_preserves_list_structure(self):
-        from helper import strip_json_values
+        from hartos.helper import strip_json_values
         result = strip_json_values([1, 2, 3])
         assert isinstance(result, list)
         assert len(result) == 3
 
     def test_tuple_preserved_as_tuple(self):
-        from helper import strip_json_values
+        from hartos.helper import strip_json_values
         result = strip_json_values((1, 2))
         assert isinstance(result, tuple)
 
@@ -272,12 +272,12 @@ class TestActionClass:
     """Action is the state object for recipe execution — wrong state = wrong action executed."""
 
     def test_initial_current_action_is_1(self):
-        from helper import Action
+        from hartos.helper import Action
         action = Action(['action1', 'action2', 'action3'])
         assert action.current_action == 1
 
     def test_get_action_returns_correct_item(self):
-        from helper import Action
+        from hartos.helper import Action
         actions = [
             {'action': 'step1', 'action_id': 1},
             {'action': 'step2', 'action_id': 2},
@@ -287,26 +287,26 @@ class TestActionClass:
         assert action.get_action(1)['action'] == 'step2'
 
     def test_get_action_raises_on_out_of_range(self):
-        from helper import Action
+        from hartos.helper import Action
         action = Action(['a', 'b'])
         with pytest.raises(IndexError):
             action.get_action(5)
 
     def test_get_action_raises_on_negative(self):
-        from helper import Action
+        from hartos.helper import Action
         action = Action(['a'])
         with pytest.raises(IndexError):
             action.get_action(-1)
 
     def test_initial_flags(self):
-        from helper import Action
+        from hartos.helper import Action
         action = Action([])
         assert action.fallback is False
         assert action.recipe is False
         assert action.ledger is None
 
     def test_set_ledger(self):
-        from helper import Action
+        from hartos.helper import Action
         from flask import Flask
         app = Flask(__name__)
         action = Action([])
@@ -317,7 +317,7 @@ class TestActionClass:
         assert action.ledger is mock_ledger
 
     def test_get_action_byaction_id_found(self):
-        from helper import Action
+        from hartos.helper import Action
         actions = [
             {'action_id': 1, 'action': 'first'},
             {'action_id': 2, 'action': 'second'},
@@ -328,7 +328,7 @@ class TestActionClass:
         assert result['action'] == 'second'
 
     def test_get_action_byaction_id_not_found(self):
-        from helper import Action
+        from hartos.helper import Action
         action = Action([{'action_id': 1, 'action': 'only'}])
         result = action.get_action_byaction_id(99)
         assert result is None
@@ -342,20 +342,20 @@ class TestParseDate:
     """parse_date converts ISO strings to datetime — used by visual context."""
 
     def test_valid_iso_format(self):
-        from helper import parse_date
+        from hartos.helper import parse_date
         result = parse_date("2026-03-24T10:30:00")
         assert result.year == 2026
         assert result.month == 3
         assert result.hour == 10
 
     def test_midnight(self):
-        from helper import parse_date
+        from hartos.helper import parse_date
         result = parse_date("2026-01-01T00:00:00")
         assert result.hour == 0
         assert result.minute == 0
 
     def test_invalid_format_raises(self):
-        from helper import parse_date
+        from hartos.helper import parse_date
         with pytest.raises(ValueError):
             parse_date("not-a-date")
 
@@ -368,33 +368,33 @@ class TestSafePromptPath:
     """safe_prompt_path prevents path traversal when building prompt file paths."""
 
     def test_single_part(self):
-        from helper import safe_prompt_path, PROMPTS_DIR
+        from hartos.helper import safe_prompt_path, PROMPTS_DIR
         path = safe_prompt_path("12345")
         assert path.endswith("12345.json")
         assert PROMPTS_DIR in path
 
     def test_multi_part(self):
-        from helper import safe_prompt_path
+        from hartos.helper import safe_prompt_path
         path = safe_prompt_path("12345", "0", "recipe")
         assert "12345_0_recipe.json" in path
 
     def test_custom_extension(self):
-        from helper import safe_prompt_path
+        from hartos.helper import safe_prompt_path
         path = safe_prompt_path("12345", ext='.txt')
         assert path.endswith("12345.txt")
 
     def test_rejects_traversal(self):
-        from helper import safe_prompt_path
+        from hartos.helper import safe_prompt_path
         with pytest.raises(ValueError):
             safe_prompt_path("../../etc/passwd")
 
     def test_rejects_slashes(self):
-        from helper import safe_prompt_path
+        from hartos.helper import safe_prompt_path
         with pytest.raises(ValueError):
             safe_prompt_path("path/to/file")
 
     def test_accepts_numeric(self):
-        from helper import safe_prompt_path
+        from hartos.helper import safe_prompt_path
         path = safe_prompt_path("42", "0", "1")
         assert "42_0_1.json" in path
 
@@ -404,7 +404,7 @@ class TestSafePromptPath:
         # f'...') string the bypassing sites build — so routing them through it
         # is provably transparent (only malicious ids diverge, by raising).
         import os
-        from helper import safe_prompt_path, PROMPTS_DIR
+        from hartos.helper import safe_prompt_path, PROMPTS_DIR
         for pid in ('71', '12345', 'a1b2c3d4-5e6f-7890-abcd-ef1234567890'):
             assert safe_prompt_path(pid) == os.path.join(PROMPTS_DIR, f'{pid}.json')
             assert safe_prompt_path(pid, '0', 'recipe') == \
@@ -416,7 +416,7 @@ class TestSafePromptPath:
                 os.path.join(PROMPTS_DIR, f'{pid}_0')
 
     def test_accepts_hyphens_and_underscores(self):
-        from helper import safe_prompt_path
+        from hartos.helper import safe_prompt_path
         path = safe_prompt_path("my-agent_v2")
         assert "my-agent_v2.json" in path
 
@@ -429,17 +429,17 @@ class TestToolMessageHandler:
     """ToolMessageHandler fixes tool_call_id errors in autogen conversations."""
 
     def test_class_exists(self):
-        from helper import ToolMessageHandler
+        from hartos.helper import ToolMessageHandler
         assert ToolMessageHandler is not None
 
     def test_instantiation(self):
-        from helper import ToolMessageHandler
+        from hartos.helper import ToolMessageHandler
         handler = ToolMessageHandler(user_tasks={}, user_prompt='test_user_123')
         assert handler is not None
 
     def test_apply_transform_returns_list(self):
         """apply_transform must return a list of messages — autogen requires it."""
-        from helper import ToolMessageHandler
+        from hartos.helper import ToolMessageHandler
         from flask import Flask
         app = Flask(__name__)
         handler = ToolMessageHandler(user_tasks={}, user_prompt='test')
@@ -450,7 +450,7 @@ class TestToolMessageHandler:
 
     def test_preserves_user_messages(self):
         """User messages must pass through unchanged."""
-        from helper import ToolMessageHandler
+        from hartos.helper import ToolMessageHandler
         from flask import Flask
         app = Flask(__name__)
         handler = ToolMessageHandler(user_tasks={}, user_prompt='test')
@@ -468,18 +468,18 @@ class TestGetLlmConfig:
     """get_llm_config builds the autogen config_list for LLM calls."""
 
     def test_returns_dict(self):
-        from helper import get_llm_config
+        from hartos.helper import get_llm_config
         result = get_llm_config()
         assert isinstance(result, dict)
 
     def test_has_config_list(self):
-        from helper import get_llm_config
+        from hartos.helper import get_llm_config
         result = get_llm_config()
         assert 'config_list' in result
 
     def test_fallback_config_used(self):
         """When no local LLM, fallback config is used."""
-        from helper import get_llm_config
+        from hartos.helper import get_llm_config
         fallback = [{'model': 'test-model', 'base_url': 'http://test:8080/v1'}]
         result = get_llm_config(fallback_config_list=fallback)
         assert isinstance(result, dict)
@@ -493,12 +493,12 @@ class TestPromptsDir:
     """PROMPTS_DIR must be an absolute path to prevent relative-path bugs."""
 
     def test_is_absolute(self):
-        from helper import PROMPTS_DIR
+        from hartos.helper import PROMPTS_DIR
         assert os.path.isabs(PROMPTS_DIR)
 
     def test_exists(self):
         """PROMPTS_DIR is created on import — must exist."""
-        from helper import PROMPTS_DIR
+        from hartos.helper import PROMPTS_DIR
         # On CI, ensure the directory exists (it may not in a fresh checkout)
         os.makedirs(PROMPTS_DIR, exist_ok=True)
         assert os.path.isdir(PROMPTS_DIR)
@@ -518,7 +518,7 @@ class TestSafeFunctionCall:
 
     # ── happy-path dispatch branches ──────────────────────────────────────
     def test_dict_dispatched_as_kwargs(self):
-        from helper import safe_function_call
+        from hartos.helper import safe_function_call
 
         def f(a, b):
             return (a, b)
@@ -526,28 +526,28 @@ class TestSafeFunctionCall:
 
     def test_list_of_single_dict_dispatched_as_kwargs(self):
         """retrieve_json commonly wraps the arg dict in a 1-element list."""
-        from helper import safe_function_call
+        from hartos.helper import safe_function_call
 
         def f(a, b):
             return {'a': a, 'b': b}
         assert safe_function_call(f, [{'a': 10, 'b': 20}]) == {'a': 10, 'b': 20}
 
     def test_list_dispatched_as_positional_args(self):
-        from helper import safe_function_call
+        from hartos.helper import safe_function_call
 
         def f(a, b):
             return (a, b)
         assert safe_function_call(f, [1, 2]) == (1, 2)
 
     def test_scalar_dispatched_as_single_positional(self):
-        from helper import safe_function_call
+        from hartos.helper import safe_function_call
 
         def f(x):
             return x * 2
         assert safe_function_call(f, 5) == 10
 
     def test_string_dispatched_as_single_positional(self):
-        from helper import safe_function_call
+        from hartos.helper import safe_function_call
 
         def f(x):
             return x.upper()
@@ -555,7 +555,7 @@ class TestSafeFunctionCall:
 
     def test_none_dispatched_as_single_positional(self):
         """None is neither dict nor list — passed through as the sole arg."""
-        from helper import safe_function_call
+        from hartos.helper import safe_function_call
 
         def f(x):
             return x is None
@@ -563,7 +563,7 @@ class TestSafeFunctionCall:
 
     def test_empty_list_dispatched_as_no_args(self):
         """[] takes the positional branch → func() with no arguments."""
-        from helper import safe_function_call
+        from hartos.helper import safe_function_call
 
         def f():
             return "ok"
@@ -571,7 +571,7 @@ class TestSafeFunctionCall:
 
     def test_tuple_is_single_arg_not_unpacked(self):
         """Only list is special-cased for unpacking; a tuple is one argument."""
-        from helper import safe_function_call
+        from hartos.helper import safe_function_call
 
         def f(x):
             return x
@@ -579,7 +579,7 @@ class TestSafeFunctionCall:
 
     def test_falsy_return_value_preserved(self):
         """A falsy return (0) must be returned verbatim, not coerced/dropped."""
-        from helper import safe_function_call
+        from hartos.helper import safe_function_call
 
         def f(a):
             return 0
@@ -591,7 +591,7 @@ class TestSafeFunctionCall:
         *args call (too many positionals) → recovery filters the sentinel and
         maps the remaining args onto the signature by name. This whole recovery
         path is the reason the function exists; it must yield the clean call."""
-        from helper import safe_function_call
+        from hartos.helper import safe_function_call
 
         def f(a, b):
             return (a, b)
@@ -600,7 +600,7 @@ class TestSafeFunctionCall:
     def test_extra_positional_no_remap_reraises_typeerror(self):
         """More real args than the function accepts (no sentinel to strip) is
         unrecoverable — the original TypeError must surface, not be swallowed."""
-        from helper import safe_function_call
+        from hartos.helper import safe_function_call
 
         def f(a):
             return a
@@ -610,7 +610,7 @@ class TestSafeFunctionCall:
     def test_dict_wrong_keys_reraises_typeerror(self):
         """A dict with keys the function doesn't accept is not a list, so the
         recovery path doesn't apply — the TypeError propagates."""
-        from helper import safe_function_call
+        from hartos.helper import safe_function_call
 
         def f(a, b):
             return (a, b)
@@ -620,7 +620,7 @@ class TestSafeFunctionCall:
     def test_non_typeerror_from_func_propagates(self):
         """Errors raised *inside* the target function (not dispatch mismatches)
         must propagate unchanged — safe_function_call is not a swallow-all."""
-        from helper import safe_function_call
+        from hartos.helper import safe_function_call
 
         def f(**kwargs):
             raise ValueError("boom")
@@ -641,7 +641,7 @@ class TestLoadAgentDataFromFile:
     def env(self, tmp_path, monkeypatch):
         """Point AGENT_DATA_DIR at an isolated tmp dir and give a Flask app
         context (the function logs via current_app.logger)."""
-        import helper
+        from hartos import helper
         from flask import Flask
         monkeypatch.setattr(helper, 'AGENT_DATA_DIR', str(tmp_path))
         app = Flask(__name__)

@@ -190,7 +190,7 @@ def test_target_request_stamps_headers_does_not_mutate_body(
     # get_request_id() accessor (stored in _local), not a bare instance attr.
     fake_tl.thread_local_data = types.SimpleNamespace(
         get_request_id=lambda: 'req-abc-1234')
-    monkeypatch.setitem(sys.modules, 'threadlocal', fake_tl)
+    monkeypatch.setitem(sys.modules, 'hartos.threadlocal', fake_tl)
     import core.llm_outbound_logger as mod
     mod.install()
 
@@ -237,7 +237,7 @@ def test_source_context_stamps_headers_and_tags_log(
     fake_tl = types.ModuleType('threadlocal')
     fake_tl.thread_local_data = types.SimpleNamespace(
         get_request_id=lambda: 'req-x')
-    monkeypatch.setitem(sys.modules, 'threadlocal', fake_tl)
+    monkeypatch.setitem(sys.modules, 'hartos.threadlocal', fake_tl)
     import core.llm_outbound_logger as mod
     mod.install()
 

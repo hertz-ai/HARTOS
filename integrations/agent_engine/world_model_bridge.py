@@ -1857,7 +1857,7 @@ class WorldModelBridge:
         Fire-and-forget: never raises into the embodied control path."""
         self._cb_record_failure()
         try:
-            from exception_collector import ExceptionCollector
+            from hartos.exception_collector import ExceptionCollector
             _e = exc if exc is not None else RuntimeError(
                 f"embodied {where} failed (status={status}) at {self._api_url}")
             ExceptionCollector.get_instance().record(

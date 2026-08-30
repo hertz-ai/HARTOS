@@ -70,7 +70,7 @@ def _emit_tool_call_stage(tool_name: str) -> None:
     try:
         from core.constants import TOOL_LABELS, generic_tool_label
         from core.peer_link.crossbar_publish import publish_chat_stage
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
 
         user_id = thread_local_data.get_user_id() or ''
         request_id = thread_local_data.get_request_id() or ''
