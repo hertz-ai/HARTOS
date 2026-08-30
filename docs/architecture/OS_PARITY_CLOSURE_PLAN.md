@@ -107,6 +107,19 @@ the next flake-checks dispatch. CI-iteration only from the Windows box (no local
 nix/VM); the shell paint items (#12, false-healthy shell-ready) are the #3
 workstream and design-gated.
 
+**RE-VERIFIED run `33322172168` @ `ae538fc8` (2026-08-30):** all 8 unit shards
+GREEN again (after two concurrent-session gate-breaks I fixed: `ddgs`→`click`
+dep conflict `8313ac90`, and a `/chat` diagnostic moved to `scripts/` `5892f5a6`).
+nixosTests shards 1+2 GREEN — **shard 2 flipped green = the waydroid
+`RuntimeMaxUSec` fix CONFIRMED.** Shards 0+3 red, and the reds are stable across
+both VM runs (deterministic, not flaky), collapsing to THREE classes: (A) **#12**
+software-GL paint hang (`hart-desktop-shell-boot` OCR timeout, `hart-layer-shell-
+host-paint` pkill 137); (B) **#3/#6** false-healthy `shell-ready`
+(`hart-session-supervisor-paint-watchdog`); (C) `hart-ota-central` realtime-push
+wiring timeout. A/B are the design-gated shell-boot workstream; C needs VM
+runtime state (CI-iteration). `hart-boot-log` mount did NOT recur — passed after
+the shard reshuffle.
+
 ## 🧭 Steward decisions (yours — not mine to default)
 
 | # | Decision |
