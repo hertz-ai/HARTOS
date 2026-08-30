@@ -21,8 +21,10 @@
  *  C. hartHero.js FLOAT OVER WINDOWS — run the real hero module on a tiny DOM shim
  *     and assert place() (the single style writer) stamps a high z-index on #hart-hero
  *     so the orb floats ABOVE app windows (focused .panel reaches z 999) yet stays
- *     BELOW the persistent system chrome (ctx-menu z 3000, taskbar z 8000), keeps
- *     pointer-events reachable, and NEVER calls focus() during init (never traps focus).
+ *     BELOW the persistent system chrome (ctx-menu z 3000, taskbar z 8000), CLEARS
+ *     the box's inline pointer-events so the stylesheet's pass-through contract
+ *     governs (never the #32 inline "auto" that swallowed clicks meant for the
+ *     content behind the box), and NEVER calls focus() during init (never traps focus).
  *
  * Run:  node tests/unit/test_stream_orb_brand_breathing.mjs
  * (A Python wrapper, test_stream_orb_brand_breathing.py, shells out so pytest/CI
@@ -260,7 +262,19 @@ if (runs('C')) (function testFloatOverWindows() {
   ok(!isNaN(z), 'place() stamped a z-index on #hart-hero  (got ' + JSON.stringify(H.hero.style.zIndex) + ')');
   ok(z > 999, 'the orb floats ABOVE app windows (z ' + z + ' > focused .panel z 999)');
   ok(z < 3000 && z < 8000, 'the orb stays BELOW system chrome (ctx-menu z 3000 / taskbar z 8000) so chrome stays reachable');
-  ok(H.hero.style.pointerEvents === 'auto', 'the floating orb stays pointer-reachable (never inert wallpaper)');
+  // #32 anti-swallow regression guard. place() must CLEAR the container's inline
+  // pointer-events (to '') so the shell stylesheet governs the box:
+  //     .hart-hero   { pointer-events: none }   /* the 660px box passes clicks through */
+  //     .hart-hero>* { pointer-events: auto }   /* the orb/input/chips stay clickable  */
+  // Forcing an inline 'auto' here (the pre-2026-08-27 bug, hartHero.js:517-531)
+  // outranked that rule and turned the whole bounding box into a click target
+  // parked over the Home content -- "the orb swallows clicks meant for other
+  // components". The shim tracks inline styles only (no stylesheet), so the
+  // verifiable invariant is: the container never carries inline 'auto'; it is
+  // cleared to '' (or an explicit non-target 'none') so children stay reachable.
+  const hpe = H.hero.style.pointerEvents;
+  ok(hpe === '' || hpe === 'none',
+     'place() clears the hero box inline pointer-events so the stylesheet governs -- never the #32 inline "auto" that swallowed clicks (got ' + JSON.stringify(hpe) + ')');
   ok(H.hero.style.opacity !== undefined && H.hero.style.opacity !== '', 'place() set an opacity (merge/demerge state)');
   ok(/translate\(-50%,-50%\)/.test(H.hero.style.transform || ''), 'place() keeps the CSS centring contract in the transform');
 
