@@ -108,7 +108,7 @@ def _get_request_id() -> str:
          routed to the closable background client and never released the single
          llama slot to a live user turn."""
     try:
-        from threadlocal import thread_local_data as _tl
+        from hartos.threadlocal import thread_local_data as _tl
         rid = _tl.get_request_id()
         if rid:
             return str(rid)
@@ -260,7 +260,7 @@ def with_llm_context(source_name: str, request_id_arg: str = 'request_id'):
                 _tl_rid = ''
                 try:
                     import threading as _t
-                    from threadlocal import thread_local_data as _tl
+                    from hartos.threadlocal import thread_local_data as _tl
                     _tl_rid = _tl.get_request_id() or ''
                     logger.info(
                         "LLM-CONTEXT empty request_id at %s (source=%s, thread=%s, "
@@ -750,7 +750,13 @@ def _apply_trim_to_request(httpx_module, request, body: dict) -> tuple:
     """
     trimmed, n_dropped, n_truncated, est_before, est_after, budget = \
         _trim_to_budget(body)
-    if n_dropped == 0 and n_truncated == 0:
+    # `trimmed is body` iff NOTHING changed — _trim_to_budget returns the
+    # original object untouched only when the body already fit AND already
+    # carried max_tokens.  Gating on the drop/truncate counts alone threw
+    # away the max_tokens pin on the under-budget path (small prompts — the
+    # exact runaway case): measured live 21:23-21:53, 96 reuse bodies went
+    # out pinned at 2048 while 87 same-source bodies went out unpinned.
+    if n_dropped == 0 and n_truncated == 0 and trimmed is body:
         return body, False
 
     try:
@@ -767,13 +773,14 @@ def _apply_trim_to_request(httpx_module, request, body: dict) -> tuple:
             request.headers['content-length'] = str(len(new_bytes))
         except Exception:
             pass
-        logger.warning(
-            "[TRIM] left-trimmed %d msg(s) + %d char(s) — est tokens "
-            "%d→%d, budget %d (n_ctx/%s slots, max_tokens=%s)",
-            n_dropped, n_truncated, est_before, est_after, budget,
-            os.environ.get('HEVOLVE_LLAMA_SLOTS', '1'),
-            body.get('max_tokens') or body.get('max_completion_tokens') or 2048,
-        )
+        if n_dropped or n_truncated:
+            logger.warning(
+                "[TRIM] left-trimmed %d msg(s) + %d char(s) — est tokens "
+                "%d→%d, budget %d (n_ctx/%s slots, max_tokens=%s)",
+                n_dropped, n_truncated, est_before, est_after, budget,
+                os.environ.get('HEVOLVE_LLAMA_SLOTS', '1'),
+                body.get('max_tokens') or body.get('max_completion_tokens') or 2048,
+            )
         return trimmed, True
     except Exception as e:
         logger.warning("[TRIM] failed to apply trim, sending original: %s", e)

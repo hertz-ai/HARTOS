@@ -73,6 +73,64 @@ class WireTrimTruncatesOversizedAnchor(unittest.TestCase):
                                  max_tokens=64)
         self.assertEqual(trimmed.get('max_tokens'), 64)
 
+    def test_pin_reaches_the_wire_on_the_under_budget_path(self):
+        """181e7415 pinned max_tokens inside _trim_to_budget, but
+        _apply_trim_to_request discarded the returned body whenever
+        n_dropped == n_truncated == 0 — so under-budget calls (small
+        prompts, the exact runaway case) still went out unpinned.
+        Measured live 21:23-21:53: 96 reuse bodies pinned at 2048, 87
+        SAME-source bodies unpinned in the same window.  The applicator
+        must write the pinned body to the request even when nothing was
+        dropped or truncated."""
+        import json as _json
+
+        class _Req:
+            def __init__(self, body):
+                self._content = _json.dumps(body).encode()
+                self.stream = None
+                self.headers = {}
+
+        class _HttpxStub:
+            class ByteStream:
+                def __init__(self, data):
+                    self.data = data
+
+        body = {'messages': [{'role': 'user', 'content': 'hi'}]}
+        req = _Req(body)
+        with patch.object(lol, '_get_budget_per_slot', lambda: 900):
+            new_body, applied = lol._apply_trim_to_request(
+                _HttpxStub, req, dict(body))
+        wire = _json.loads(req._content.decode())
+        self.assertEqual(wire.get('max_tokens'), 2048,
+                         'the pin must reach the wire bytes, not just the '
+                         'function return')
+        self.assertEqual(new_body.get('max_tokens'), 2048)
+
+    def test_untouched_body_is_not_rewritten(self):
+        """A body that needs neither trim nor pin passes through with the
+        request bytes untouched (no needless rewrite of auth-bearing
+        request state)."""
+        import json as _json
+
+        class _Req:
+            def __init__(self, body):
+                self._content = _json.dumps(body).encode()
+                self.stream = 'ORIGINAL'
+                self.headers = {}
+
+        class _HttpxStub:
+            class ByteStream:
+                def __init__(self, data):
+                    self.data = data
+
+        body = {'messages': [{'role': 'user', 'content': 'hi'}],
+                'max_tokens': 64}
+        req = _Req(body)
+        with patch.object(lol, '_get_budget_per_slot', lambda: 900):
+            _, applied = lol._apply_trim_to_request(_HttpxStub, req, dict(body))
+        self.assertFalse(applied)
+        self.assertEqual(req.stream, 'ORIGINAL')
+
     def test_giant_anchor_is_truncated_to_fit_the_budget(self):
         trimmed, n_dropped, n_chars, est_before, est_after, budget = \
             self._trim(_msgs_with_giant_anchor())
