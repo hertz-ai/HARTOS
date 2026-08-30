@@ -3295,9 +3295,13 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 current_app.logger.error(f"Error in get_agent_response indexx:\n{error_message}")
 
             if not group_chat.messages:
+                # States the OBSERVATION only.  An earlier version of this line
+                # blamed transform_messages; that was never established -- the
+                # transform logs "N -> 1", never "-> 0", and it rewrites the
+                # per-reply view, not group_chat.messages.  Cause still open.
                 current_app.logger.warning(
-                    'reuse: group chat emptied mid-loop (transform_messages trimmed '
-                    'to zero) - ending the turn instead of raising IndexError')
+                    'reuse: group chat history is empty mid-loop - ending the '
+                    'turn instead of raising IndexError (cause not established)')
                 break
             last_message = group_chat.messages[-1]
             content_lower = last_message['content'].lower()
