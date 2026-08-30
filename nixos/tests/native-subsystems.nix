@@ -146,7 +146,15 @@ in
           assert unit_prop("RemainAfterExit") == "yes", "waydroid init must RemainAfterExit (idempotent)"
           # A start timeout is exactly what broke the OTA, and it is meaningless for
           # a simple unit anyway; a hung mirror is bounded by RuntimeMaxSec instead.
-          assert unit_prop("RuntimeMaxSec") not in ("", "infinity"), \
+          # Query RuntimeMaxUSec, NOT RuntimeMaxSec: systemd normalizes every
+          # `*Sec=` DIRECTIVE to a `*USec` show-property (RuntimeMaxSec ->
+          # RuntimeMaxUSec, like TimeoutStartSec -> TimeoutStartUSec). `systemctl
+          # show -p RuntimeMaxSec` returns EMPTY, so the directive name read as
+          # "unset" against a unit that correctly sets RuntimeMaxSec=3600
+          # (hart-subsystems.nix). Set -> a finite duration (e.g. "1h"), unset ->
+          # "infinity"; the exclusion catches both. (Dormant until #29 unblocked
+          # the VM suite; the unit itself was never wrong.)
+          assert unit_prop("RuntimeMaxUSec") not in ("", "infinity"), \
               "waydroid init must bound a hung mirror with RuntimeMaxSec"
           # Pulled in by hart.target (a plain HART child) — NOT multi-user ->
           # graphical, which formed the ordering cycle the old runtime hit.
