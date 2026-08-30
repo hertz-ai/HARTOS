@@ -17,6 +17,8 @@ These pins keep the design from silently flipping again in either repo.
 import os
 import re
 
+import pytest
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 _SRC = open(os.path.join(ROOT, 'hart_intelligence_entry.py'),
             encoding='utf-8').read()
@@ -50,9 +52,16 @@ def test_route_hint_is_the_authority_in_nunba():
     (iq_* recipes): those sessions route through the autogen reuse path
     before get_ans matters, but the divergence is an owner design
     question, tracked separately — this pin documents what IS."""
-    nunba = open(os.path.join(
+    nunba_path = os.path.join(
         os.path.dirname(ROOT), 'Nunba-HART-Companion', 'routes',
-        'chatbot_routes.py'), encoding='utf-8').read()
+        'chatbot_routes.py')
+    if not os.path.isfile(nunba_path):
+        pytest.skip(
+            "Nunba-HART-Companion sibling repo not checked out — CI runs HARTOS "
+            "alone, so this cross-repo invariant is verified only when both "
+            "repos are present (local / full-checkout). This made the harness "
+            "non-hermetic: green locally, FileNotFoundError in CI (#29).")
+    nunba = open(nunba_path, encoding='utf-8').read()
     assert '"casual_conv": not bool(prompt_id or create_agent)' in nunba
     assert '_needs_tools = bool(langchain_prompt_id or create_agent' in nunba, (
         'live session-shape producer (chat_route _needs_tools) changed — '

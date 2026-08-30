@@ -31,7 +31,12 @@ SKIP = {'.git', '__pycache__', 'venv', '.venv', 'node_modules', 'claw_native',
 # ── BUDGETS — measured 2026-08-17. RATCHET DOWN ONLY. ────────────────────────
 # Raising a number here to make CI pass is the failure mode this guard exists to
 # prevent: it converts a regression into a silently accepted new normal.
-MAX_BARE_SWALLOWS = 1528        # `except ...: pass` (was 1533)
+MAX_BARE_SWALLOWS = 1521        # `except ...: pass` (was 1533 -> 1528 -> 1521;
+                                # 2026-08-30: world_model_bridge.py's 24 silent
+                                # swallows converted to logged debug/warning
+                                # excepts — security-control absences now WARN
+                                # (task #6, no-silent-gulping), best-effort paths
+                                # log debug. Net tree count 1545 -> 1521.)
 
 #: security/ gets its OWN, TIGHTER budget. A swallow here is worst: a control that
 #: fails without saying so still reports green, so the system cannot tell a working

@@ -48,7 +48,10 @@ def test_reachable_but_never_flushed_is_not_learning():
 
 def test_learning_active_true_after_a_recent_flush():
     b = _bridge()
-    b._last_flush_at = time.time()
+    # _last_flush_at is a MONOTONIC stamp (world_model_bridge.py:837/894), so a
+    # wall-clock jump can't flip stalled->active (#24/#6). Inject the same clock
+    # the code reads, exactly as test_world_model_bridge.py:511-521 does.
+    b._last_flush_at = time.monotonic()
     h = b.check_health()
     assert h['learning_active'] is True
 
@@ -56,7 +59,7 @@ def test_learning_active_true_after_a_recent_flush():
 def test_learning_active_false_when_flush_is_stale():
     b = _bridge()
     b._active_window_s = 60
-    b._last_flush_at = time.time() - 600   # 10 min ago, well past the window
+    b._last_flush_at = time.monotonic() - 600   # 10 min ago (monotonic), past the window
     h = b.check_health()
     assert h['learning_active'] is False
     assert h['last_flush_age_seconds'] >= 590

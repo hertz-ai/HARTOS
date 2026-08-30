@@ -301,21 +301,32 @@ class TestFleetIssuerVerification:
 # ═══════════════════════════════════════════════════════════════
 
 class TestRuntimeMonitorPurge:
-    """Verify RuntimeIntegrityMonitor calls purge_pycache at init."""
+    """Verify RuntimeIntegrityMonitor purges pycache + snapshots the manifest
+    during BASELINE PREP.
+
+    The purge + manifest snapshot used to run in __init__, but that wedged the
+    hartos-bootstrap thread for minutes (hashing ~10,900 .py under the AV
+    scanner). They were deliberately moved to _prepare_baseline(), which runs
+    ONCE on the monitor's own daemon thread so arming costs the caller nothing
+    (runtime_monitor.py:_prepare_baseline docstring). These tests were left
+    asserting the old __init__ behaviour and reddened Python shard 4 (#29);
+    they now drive _prepare_baseline(), matching the intended design."""
 
     @patch('security.node_integrity.purge_pycache')
     @patch('security.node_integrity.compute_file_manifest', return_value={})
-    def test_monitor_init_calls_purge(self, mock_manifest, mock_purge):
+    def test_baseline_prep_calls_purge(self, mock_manifest, mock_purge):
         from security.runtime_monitor import RuntimeIntegrityMonitor
+        # code_hash present => manifest-mode (not baseline-mode), so purge runs.
         manifest = {'code_hash': 'abc123'}
         with tempfile.TemporaryDirectory() as tmp:
             monitor = RuntimeIntegrityMonitor(manifest, code_root=tmp)
+            monitor._prepare_baseline()
         mock_purge.assert_called_once_with(tmp)
 
     @patch('security.node_integrity.purge_pycache')
     @patch('security.node_integrity.compute_file_manifest')
-    def test_monitor_boot_manifest_after_purge(self, mock_manifest, mock_purge):
-        """Boot manifest should be computed AFTER pycache purge."""
+    def test_boot_manifest_after_purge(self, mock_manifest, mock_purge):
+        """Boot manifest must be computed AFTER the pycache purge."""
         call_order = []
         mock_purge.side_effect = lambda *a, **kw: call_order.append('purge')
         mock_manifest.side_effect = lambda *a, **kw: (
@@ -326,6 +337,7 @@ class TestRuntimeMonitorPurge:
         manifest = {'code_hash': 'abc123'}
         with tempfile.TemporaryDirectory() as tmp:
             monitor = RuntimeIntegrityMonitor(manifest, code_root=tmp)
+            monitor._prepare_baseline()
 
         assert call_order == ['purge', 'manifest']
 

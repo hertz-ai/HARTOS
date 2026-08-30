@@ -173,6 +173,10 @@ def test_source_guard_open_app_fallback_fastpath_preserved():
     # acSend() is the ONE live intent dispatcher and keeps the launch-a-named-app
     # fast-path.  The old askAgent() was a DEAD parallel copy of the same M1 block
     # (no handler invoked it) and was removed, so the fast-path now appears once.
-    assert src.count("Fallback fast-path: launch a NAMED app directly") == 1
+    # The comment was reworded 2026-08 ("Fallback fast-path…" -> "Fast-path:
+    # launch a NAMED app directly (no brain round-trip)"); the FASTPATH itself is
+    # preserved (liquid_ui_service.py:6204), so this source-guard tracks the
+    # current wording. (#29: the old exact string reddened Python shard 6.)
+    assert src.count("Fast-path: launch a NAMED app directly") == 1
     # And the default still posts to the brain compose route.
     assert "/api/agent/ask" in src
