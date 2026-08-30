@@ -216,9 +216,13 @@ class PeerLink:
 
     @property
     def idle_seconds(self) -> float:
+        # Monotonic: a backward wall-clock jump (RTC/NTP, #24) must never make an
+        # idle (dead) link read as fresh — that keeps the idle-prune gate
+        # (link_manager) from ever firing and skews the eviction score. The
+        # 0.0 sentinel ("never active") still holds under monotonic.
         if self._last_activity == 0:
             return 0
-        return time.time() - self._last_activity
+        return time.monotonic() - self._last_activity
 
     def connect(self) -> bool:
         """Initiate outgoing connection to peer."""
@@ -250,8 +254,8 @@ class PeerLink:
                 return False
 
             self._state = LinkState.CONNECTED
-            self._connected_at = time.time()
-            self._last_activity = time.time()
+            self._connected_at = time.monotonic()
+            self._last_activity = time.monotonic()
 
             # Start receive loop
             self._recv_thread = threading.Thread(
@@ -279,8 +283,8 @@ class PeerLink:
                 return False
 
             self._state = LinkState.CONNECTED
-            self._connected_at = time.time()
-            self._last_activity = time.time()
+            self._connected_at = time.monotonic()
+            self._last_activity = time.monotonic()
 
             self._recv_thread = threading.Thread(
                 target=self._receive_loop, daemon=True,
@@ -333,7 +337,7 @@ class PeerLink:
             self._ws_send(frame_bytes)
             self._messages_sent += 1
             self._bytes_sent += len(frame_bytes)
-            self._last_activity = time.time()
+            self._last_activity = time.monotonic()
         except Exception as e:
             logger.debug(f"PeerLink send failed: {e}")
             self._pending_responses.pop(msg_id, None)
@@ -363,7 +367,7 @@ class PeerLink:
             self._ws_send_binary(frame)
             self._messages_sent += 1
             self._bytes_sent += len(frame)
-            self._last_activity = time.time()
+            self._last_activity = time.monotonic()
             return True
         except Exception:
             self._handle_disconnect()
@@ -425,7 +429,7 @@ class PeerLink:
             'state': self._state.value,
             'trust': self.trust.value,
             'encrypted': self.is_encrypted,
-            'connected_seconds': (time.time() - self._connected_at) if self._connected_at else 0,
+            'connected_seconds': (time.monotonic() - self._connected_at) if self._connected_at else 0,
             'idle_seconds': self.idle_seconds,
             'messages_sent': self._messages_sent,
             'messages_received': self._messages_received,
@@ -659,7 +663,7 @@ class PeerLink:
                 info=b'hart-peerlink-v1',
             ).derive(shared_secret)
 
-            self._key_established_at = time.time()
+            self._key_established_at = time.monotonic()
             self._session_nonce_counter = 0
             logger.debug(f"Session key derived for {self.peer_id[:8]}")
         except Exception as e:
@@ -675,8 +679,10 @@ class PeerLink:
 
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-        # Check key rotation
-        if (time.time() - self._key_established_at) > KEY_ROTATION_INTERVAL:
+        # Check key rotation. Monotonic: a backward wall-clock jump must never
+        # DELAY rotation (negative elapsed would read as "not yet due"), which
+        # would keep a session key alive past its intended lifetime.
+        if (time.monotonic() - self._key_established_at) > KEY_ROTATION_INTERVAL:
             self._derive_session_key()
 
         nonce = os.urandom(12)
@@ -805,7 +811,7 @@ class PeerLink:
 
                 self._messages_received += 1
                 self._bytes_received += len(raw)
-                self._last_activity = time.time()
+                self._last_activity = time.monotonic()
 
                 # Try JSON (text message)
                 try:

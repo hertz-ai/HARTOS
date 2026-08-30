@@ -99,7 +99,7 @@ def make_link(ws):
     link._session_key = None
     link._messages_received = 0
     link._bytes_received = 0
-    link._last_activity = time.time()
+    link._last_activity = time.monotonic()
     link._message_handlers = {}
     link._pending_responses = {}
     link._response_data = {}
