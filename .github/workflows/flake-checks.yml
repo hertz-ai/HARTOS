@@ -491,11 +491,23 @@ jobs:
           # pipefail is MANDATORY: `nix build … | tee` otherwise reports tee's
           # exit (0) and the job goes green even when nix FAILED.
           set -o pipefail
-          # precedent FIRST (claw-cli) so a toolchain-resolution failure is
-          # isolated before hart-comp depends on it. --cores 0 = ALL runner cores
-          # per derivation (the CPU-bound rustc/LLVM compile; the iso-desktop
-          # 4h-hang lesson: NEVER throttle this Rust build to 2 cores).
-          for tgt in hart-rust-precedent hart-comp; do
+          # hart-rust-precedent DROPPED from this loop 2026-08-30 (crate-403).
+          # It builds via nixpkgs importCargoLock, which fetches from the
+          # deprecated https://crates.io/api/v1/.../download endpoint that
+          # crates.io now 403s (rust-lang/crates.io#13482) — an EXTERNAL change,
+          # not a HART regression. Because it built FIRST under `set -e`, its 403
+          # aborted the loop and hart-comp (the REAL compositor) was never even
+          # attempted, so this gate had been chronically red while the shipped
+          # artifact was fine. hart-comp vendors via CRANE (static.crates.io) and
+          # was PROVEN to build green in isolation (probe run 33308820048:
+          # PROBE_HART_COMP=GREEN, 161 tests pass). hart-comp is a STRICTLY
+          # STRONGER toolchain proof than the claw-cli precedent (same rust_1_88,
+          # 245 crates vs one), and the precedent ships in no closure
+          # (installBinary defaults false). Restore it here once importCargoLock
+          # is on static.crates.io (nixpkgs-rust bump — OS_PARITY_CLOSURE_PLAN.md).
+          # --cores 0 = ALL runner cores per derivation (CPU-bound rustc/LLVM
+          # compile; the iso-desktop 4h-hang lesson: NEVER throttle to 2 cores).
+          for tgt in hart-comp; do
             echo "=== nix build .#$tgt ==="
             time nix build ".#$tgt" \
               --no-link --print-out-paths --print-build-logs \
