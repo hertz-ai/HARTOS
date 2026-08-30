@@ -217,18 +217,28 @@ jobs:
           echo "=== TOTAL ==="
           coverage report | tail -3 || true
           # Machine-readable, so the baseline can be checked in from the run
-          # rather than transcribed by hand.
-          coverage json -o coverage.json || true
+          # rather than transcribed by hand. NOT `|| true`: producing the
+          # baseline is this job's entire purpose. --ignore-errors matches
+          # .coveragerc so a vanished run-time temp (config-3.py) skips instead
+          # of aborting. Run 33305338230 was GREEN yet produced NO coverage.json
+          # because this line swallowed the failure — a false-green baseline.
+          coverage json -o coverage.json --ignore-errors
+          # FAIL-CLOSED: no baseline is a failed run, not a silent pass.
+          if [ ! -s coverage.json ]; then
+            echo "::error::coverage.json was not produced — no baseline was measured"
+            exit 1
+          fi
           python - <<'PY'
-          import json
+          import json, sys
           try:
               d = json.load(open('coverage.json'))
               t = d['totals']
-              print(f"COVERAGE_PERCENT={t['percent_covered']:.2f}")
-              print(f"COVERAGE_STATEMENTS={t['num_statements']}")
-              print(f"COVERAGE_MISSING={t['missing_lines']}")
           except Exception as e:
-              print("could not read coverage.json:", e)
+              print(f"::error::coverage.json unreadable — no baseline: {e}")
+              sys.exit(1)
+          print(f"COVERAGE_PERCENT={t['percent_covered']:.2f}")
+          print(f"COVERAGE_STATEMENTS={t['num_statements']}")
+          print(f"COVERAGE_MISSING={t['missing_lines']}")
           PY
 
       - name: Upload the combined baseline
