@@ -834,7 +834,7 @@ class WorldModelBridge:
                     )
                     with self._lock:
                         self._stats['total_flushed'] += 1
-                        self._last_flush_at = time.time()
+                        self._last_flush_at = time.monotonic()
                 except Exception as e:
                     logger.debug(f"In-process flush error: {e}")
             return
@@ -891,7 +891,7 @@ class WorldModelBridge:
                 self._cb_record_success()
                 with self._lock:
                     self._stats['total_flushed'] += 1
-                    self._last_flush_at = time.time()
+                    self._last_flush_at = time.monotonic()
                     _first_flush = self._stats['total_flushed'] == 1
                 # One-time log on first successful HTTP flush so operators
                 # see Direction A go live without grepping for tensorboard
@@ -1754,7 +1754,7 @@ class WorldModelBridge:
         if self._last_flush_at is None:
             return False
         if now is None:
-            now = time.time()
+            now = time.monotonic()  # monotonic: a wall jump can't flip stalled->active (#24/#6)
         return (now - self._last_flush_at) < self._active_window_s
 
     def _throughput_fields(self) -> dict:
@@ -1762,7 +1762,7 @@ class WorldModelBridge:
         whether experiences are actually FLOWING to the world model, plus the raw
         counters + buffer depth so 'buffering into the void' (buffered > 0 while
         flushed is stalled and learning_active is False) is visible, not hidden."""
-        now = time.time()
+        now = time.monotonic()  # monotonic: last_flush_at is monotonic (#24/#6)
         return {
             'learning_active': self._learning_active(now),
             'total_recorded': self._stats.get('total_recorded', 0),
