@@ -29,6 +29,64 @@ from core.peer_link.link_manager import get_link_manager, reset_link_manager
 from core.peer_link.server import (
     ASGIWebSocketAdapter, PEER_LINK_PATH, peer_link_asgi, peer_link_enabled,
 )
+import json as _json
+
+import core.peer_link.server as _server
+from core.peer_link.server import _read_hello
+
+
+class TestReadHello(unittest.TestCase):
+    """_read_hello parses the peer's opening frame or returns None (never raises).
+
+    This is the first thing an inbound peer connection hits, so a malformed or
+    absent hello must be a clean None (reject), not an exception that crashes the
+    ASGI handler. async fn driven via asyncio.run to fit this unittest file."""
+
+    def _run(self, messages):
+        q = list(messages)
+
+        async def receive():
+            return q.pop(0)
+
+        return asyncio.run(_read_hello(receive))
+
+    def test_valid_bytes_hello(self):
+        frame = _json.dumps({'type': 'hello', 'peer_id': 'abc'}).encode()
+        result = self._run([{'type': 'websocket.receive', 'bytes': frame}])
+        self.assertEqual(result['type'], 'hello')
+        self.assertEqual(result['peer_id'], 'abc')
+
+    def test_valid_text_hello(self):
+        frame = _json.dumps({'type': 'hello', 'peer_id': 'xyz'})
+        result = self._run([{'type': 'websocket.receive', 'text': frame}])
+        self.assertEqual(result['peer_id'], 'xyz')
+
+    def test_wrong_message_type_returns_none(self):
+        self.assertIsNone(self._run([{'type': 'websocket.connect'}]))
+
+    def test_no_payload_returns_none(self):
+        self.assertIsNone(self._run([{'type': 'websocket.receive'}]))
+
+    def test_non_json_returns_none(self):
+        result = self._run([{'type': 'websocket.receive', 'bytes': b'\xff\xfenot-json'}])
+        self.assertIsNone(result)
+
+    def test_json_but_not_a_hello_returns_none(self):
+        frame = _json.dumps({'type': 'goodbye'}).encode()
+        self.assertIsNone(self._run([{'type': 'websocket.receive', 'bytes': frame}]))
+
+    def test_json_scalar_not_dict_returns_none(self):
+        frame = _json.dumps("just a string").encode()
+        self.assertIsNone(self._run([{'type': 'websocket.receive', 'bytes': frame}]))
+
+    def test_timeout_returns_none(self):
+        # No hello within the window -> None (not a hang, not a raise).
+        async def slow_receive():
+            await asyncio.sleep(0.2)
+            return {'type': 'websocket.receive', 'bytes': b'{}'}
+
+        with patch.object(_server, '_HELLO_TIMEOUT', 0.01):
+            self.assertIsNone(asyncio.run(_read_hello(slow_receive)))
 
 
 class TestWrapperIsTransparent(unittest.TestCase):

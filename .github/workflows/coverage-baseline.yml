@@ -37,6 +37,14 @@ name: Coverage Baseline
 # measured at all.
 on:
   workflow_dispatch:
+  schedule:
+    # Weekly repo-wide coverage baseline (Sundays 06:00 UTC). This workflow was
+    # built (4-way sharded, fail-fast:false, fail-closed combine) but had ONLY
+    # workflow_dispatch, so it ran once and was never re-triggered — which is
+    # literally why repo-wide coverage went unmeasured for months (#27). A
+    # schedule turns "measured when someone remembers" into "measured
+    # continuously". First green baseline: 55.63% (run 33305986527).
+    - cron: '0 6 * * 0'
 
 concurrency:
   # A workflow_dispatch gets its OWN group (keyed by run id) so a manual,
@@ -76,7 +84,10 @@ jobs:
       - name: Install pytest + coverage + project deps
         run: |
           pip install -r requirements.txt
-          pip install pytest coverage
+          # pytest-timeout bounds any single hanging test so one stuck test
+          # (e.g. a live/network test that slipped into the selection) cannot
+          # stall a whole shard up to the 150-min job cap.
+          pip install pytest coverage pytest-timeout
 
       - name: Run this shard under coverage
         # -p writes a separate data file per process, which is what lets the
@@ -97,7 +108,15 @@ jobs:
           # Deterministic file sharding: sorted, then round-robin, so shard
           # membership is stable across runs and a missing quarter is
           # identifiable rather than arbitrary.
-          mapfile -t ALL < <(find tests/unit -name 'test_*.py' | sort)
+          # tests/unit + tests/ ROOT-LEVEL unit-style files. The root-level
+          # files (test_user_lang.py, test_core_diag.py, ...) were UNMEASURED:
+          # the old `find tests/unit` missed 70 unit-style files, so modules
+          # tested only from the root (e.g. core/user_lang.py — 14 tests in
+          # tests/test_user_lang.py) reported artificially low coverage (22.9%).
+          # tests/{integration,e2e,standalone,functional} stay EXCLUDED on
+          # purpose: slow / env- or service-dependent, and non-gating (#46).
+          mapfile -t ALL < <( { find tests/unit -name 'test_*.py'; \
+                                find tests -maxdepth 1 -name 'test_*.py'; } | sort)
           TOTAL=${#ALL[@]}
           echo "discovered $TOTAL test files"
           if [[ "$TOTAL" -eq 0 ]]; then
@@ -132,6 +151,7 @@ jobs:
           coverage run -p -m pytest "${SEL[@]}" -q \
             --noconftest -p no:cacheprovider \
             --continue-on-collection-errors \
+            --timeout=120 \
             2>&1 | tail -30 || true
           # THE `|| true` ABOVE IS WHY THIS CHECK EXISTS. It is there so a
           # FAILING TEST cannot abort the MEASUREMENT — but it equally swallows
@@ -217,18 +237,28 @@ jobs:
           echo "=== TOTAL ==="
           coverage report | tail -3 || true
           # Machine-readable, so the baseline can be checked in from the run
-          # rather than transcribed by hand.
-          coverage json -o coverage.json || true
+          # rather than transcribed by hand. NOT `|| true`: producing the
+          # baseline is this job's entire purpose. --ignore-errors matches
+          # .coveragerc so a vanished run-time temp (config-3.py) skips instead
+          # of aborting. Run 33305338230 was GREEN yet produced NO coverage.json
+          # because this line swallowed the failure — a false-green baseline.
+          coverage json -o coverage.json --ignore-errors
+          # FAIL-CLOSED: no baseline is a failed run, not a silent pass.
+          if [ ! -s coverage.json ]; then
+            echo "::error::coverage.json was not produced — no baseline was measured"
+            exit 1
+          fi
           python - <<'PY'
-          import json
+          import json, sys
           try:
               d = json.load(open('coverage.json'))
               t = d['totals']
-              print(f"COVERAGE_PERCENT={t['percent_covered']:.2f}")
-              print(f"COVERAGE_STATEMENTS={t['num_statements']}")
-              print(f"COVERAGE_MISSING={t['missing_lines']}")
           except Exception as e:
-              print("could not read coverage.json:", e)
+              print(f"::error::coverage.json unreadable — no baseline: {e}")
+              sys.exit(1)
+          print(f"COVERAGE_PERCENT={t['percent_covered']:.2f}")
+          print(f"COVERAGE_STATEMENTS={t['num_statements']}")
+          print(f"COVERAGE_MISSING={t['missing_lines']}")
           PY
 
       - name: Upload the combined baseline
