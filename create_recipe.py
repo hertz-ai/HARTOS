@@ -2549,7 +2549,17 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 user_tasks[user_prompt].recipe = False
                                 metadata = strip_json_values(agent_data[prompt_id])
                                 json_obj['metadata'] = metadata
-                                json_obj['time_took_to_complete'] = task_time[prompt_id]['times'][-1]
+                                # 'times' is [] at init (:4211) and appended only
+                                # inside a branch (:2438), so it can legitimately
+                                # be empty here.  Unguarded, this raised
+                                # IndexError 22 times in the installed build's
+                                # logs -- always one line before the recipe was
+                                # written, so the save was lost and the turn only
+                                # logged "GOT SOME ERROR WHILE JSON".  Timing is
+                                # metadata; never let it cost us the recipe.
+                                # Same guard as :2599 below.
+                                if prompt_id in task_time and task_time[prompt_id].get('times'):
+                                    json_obj['time_took_to_complete'] = task_time[prompt_id]['times'][-1]
                                 for i in json_obj['recipe']:
                                     if 'tool_name' in i and i['tool_name'] != "":
                                         i['agent_to_perform_this_action'] = 'Helper'
