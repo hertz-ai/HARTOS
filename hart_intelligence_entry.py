@@ -8436,21 +8436,46 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         ``return jsonify({'response': response_text, **payload})``.
     """
     if response_text:
+        # media_mode honor: the Nunba adapter has forwarded the user's
+        # chosen mode ('audio'|'video'|'text') in the /chat body all
+        # along (hartos_backend_adapter.py carried a TODO naming this
+        # exact read), but nothing here consumed it — every reply was
+        # synthesized, so text-mode users were spoken at (measured
+        # 2026-08-30 17:48, #731).  Only an EXPLICIT 'text' suppresses;
+        # absent means the caller predates the flag and keeps today's
+        # behavior.  Callers with no request context (the speculative
+        # expert publish calls _tts_synthesize_and_publish directly,
+        # below this gate) are untouched.
+        _tts_wanted = True
         try:
-            # preferred_lang resolution must match the chat entry path:
-            # body/kwarg → canonical persisted reader → 'en'.  Bare
-            # 'en' default forced English Piper on Tamil replies.
-            _lang = payload.get('preferred_lang') or payload.get('language')
-            if not _lang:
-                try:
-                    from core.user_lang import get_preferred_lang
-                    _lang = get_preferred_lang() or 'en'
-                except Exception:
-                    _lang = 'en'
-            _tts_synthesize_and_publish(response_text, user_id, request_id, language=_lang)
-        except Exception as e:
-            # Never let a TTS failure block delivery of the text reply.
-            app.logger.debug(f"_chat_reply: TTS dispatch skipped: {e}")
+            # Local import: _chat_reply's source is exec'd in an isolated
+            # namespace by test_consent_fanout_p2, where module globals
+            # (including the flask request proxy) do not exist.
+            from flask import request as _req
+            _mm = (_req.get_json(silent=True) or {}).get('media_mode')
+            if _mm == 'text':
+                _tts_wanted = False
+                app.logger.info(
+                    '_chat_reply: TTS suppressed (media_mode=text) for '
+                    f'request_id={request_id}')
+        except RuntimeError:
+            pass  # outside a request — keep speaking, as before
+        if _tts_wanted:
+            try:
+                # preferred_lang resolution must match the chat entry path:
+                # body/kwarg → canonical persisted reader → 'en'.  Bare
+                # 'en' default forced English Piper on Tamil replies.
+                _lang = payload.get('preferred_lang') or payload.get('language')
+                if not _lang:
+                    try:
+                        from core.user_lang import get_preferred_lang
+                        _lang = get_preferred_lang() or 'en'
+                    except Exception:
+                        _lang = 'en'
+                _tts_synthesize_and_publish(response_text, user_id, request_id, language=_lang)
+            except Exception as e:
+                # Never let a TTS failure block delivery of the text reply.
+                app.logger.debug(f"_chat_reply: TTS dispatch skipped: {e}")
 
         # Persist conversation turn to SimpleMem so multi-turn context works.
         # prep_outputs (the normal LangChain path) never fires for casual_conv
