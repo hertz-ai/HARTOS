@@ -39,9 +39,39 @@ def _msgs_with_giant_anchor():
 class WireTrimTruncatesOversizedAnchor(unittest.TestCase):
 
     def _trim(self, messages, max_tokens=64):
-        body = {'messages': messages, 'max_tokens': max_tokens}
+        """max_tokens=None omits the field entirely (the autogen.reuse shape)."""
+        body = {'messages': messages}
+        if max_tokens is not None:
+            body['max_tokens'] = max_tokens
         with patch.object(lol, '_get_budget_per_slot', lambda: 900):
             return lol._trim_to_budget(body)
+
+    def test_missing_max_tokens_is_pinned_to_the_budgeted_default(self):
+        """The budget math reserves max_tokens (default 2048) out of every
+        slot — but autogen.reuse bodies carry NO max_tokens field, so
+        llama-server generated unbounded.  Measured 2026-08-30 (llama rel
+        11.36-11.40, installed build): task 7256 reached n_decoded=3,975,
+        hit its 6,144 slot ceiling ('Context size has been exceeded') AND
+        exhausted the shared batch memory ('failed to find a memory slot
+        for batch of size 467'), collateral-failing a concurrent request
+        whose 3,039 real tokens fit comfortably (#734).  The wire must
+        enforce the same default it budgets with — on BOTH the untrimmed
+        and trimmed paths."""
+        trimmed, *_ = self._trim([{'role': 'user', 'content': 'hi'}],
+                                 max_tokens=None)
+        self.assertEqual(trimmed.get('max_tokens'), 2048,
+                         'under-budget path must pin the budgeted default')
+        trimmed2, *_ = self._trim([
+            {'role': 'system', 'content': 'sys'},
+            {'role': 'user', 'content': 'x ' * 8000},
+        ], max_tokens=None)
+        self.assertEqual(trimmed2.get('max_tokens'), 2048,
+                         'trimmed path must pin the budgeted default')
+
+    def test_explicit_max_tokens_is_preserved(self):
+        trimmed, *_ = self._trim([{'role': 'user', 'content': 'hi'}],
+                                 max_tokens=64)
+        self.assertEqual(trimmed.get('max_tokens'), 64)
 
     def test_giant_anchor_is_truncated_to_fit_the_budget(self):
         trimmed, n_dropped, n_chars, est_before, est_after, budget = \

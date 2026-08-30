@@ -562,6 +562,17 @@ def _trim_to_budget(body: dict) -> tuple:
 
     model = body.get('model') or None
     max_tokens = int(body.get('max_tokens') or body.get('max_completion_tokens') or 2048)
+    if 'max_tokens' not in body and 'max_completion_tokens' not in body:
+        # The budget below RESERVES max_tokens out of the slot, but when the
+        # producer omits the field llama-server generates unbounded and the
+        # reservation is a lie.  Measured 2026-08-30 (llama rel 11.36-11.40,
+        # installed build): an autogen.reuse call with no max_tokens reached
+        # n_decoded=3,975, hit its 6,144-token slot ceiling AND exhausted the
+        # shared batch memory, collateral-failing a concurrent request whose
+        # 3,039 real tokens fit comfortably (#734).  Pin the SAME default the
+        # budget math just used, so the wire enforces what it accounts for.
+        body = dict(body)
+        body['max_tokens'] = max_tokens
 
     # ─── The tool schema occupies n_ctx too — count it or the budget is a lie ───
     # llama-server bills prompt tokens for the SERIALISED TOOL SCHEMA exactly like
