@@ -13,10 +13,19 @@ process against a real llama-server (agent 11470436451, user reuselive1):
     IndexError: list index out of range
     -> user-visible reply: "Error getting response: list index out of range"
 
-WHY IT EMPTIES.  autogen's transform_messages capability trims history between
-turns (that is the "Message count changed" line).  It is allowed to trim to
-nothing, and the loops here re-test the condition on every iteration, so the
-list can be empty at the top of any pass.
+WHY IT EMPTIES — NOT ESTABLISHED.  My first answer here blamed autogen's
+transform_messages ("that is the Message count changed line").  That was an
+inference stated as fact and it is now ruled out: the transform logs "10 -> 1",
+never "-> 0", and helper.py:1786 merely COMPARES pre/post counts rather than
+mutating anything.  Also ruled out: explicit clear_history (all 17 sites pass
+False), autogen _prepare_chat (groupchat.py:1079, gated on clear_history),
+clear_agents_history (:1648/1653, gated on enable_clear_history which defaults
+False), resume/a_resume (:1317/1420, not this path), and a mismatched
+groupchat/manager pair (manager IS built with groupchat=group_chat, and both
+are rebound from the same tuple at chat_agent:3905).  Tracked as #725.
+
+What IS established, and all this test needs: the list can be empty at the top
+of any pass, and these loops re-test the condition every iteration.
 
 WHY THE EXISTING except DID NOT CATCH IT.  reuse_recipe.py:3216 puts the
 subscript in the `if` CONDITION, and the `try:` -- whose `except IndexError:`

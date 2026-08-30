@@ -3213,12 +3213,14 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         _reuse_task.mark_sla_breached()
                         current_app.logger.warning(f"[SLA] Task {_reuse_task_id} SLA breached in reuse loop")
 
-            # transform_messages trims history between turns and may trim to
-            # zero (live 2026-08-30: "Message count changed: 8 -> 1", then an
-            # empty list).  This subscript SELECTS the body, so the
-            # `except IndexError` below -- which opens on the next line -- can
-            # never cover it; the turn died with "Error getting response: list
-            # index out of range".  Guard as create_recipe.py:4385 does.
+            # group_chat.messages can be empty here (live 2026-08-30).  CAUSE
+            # NOT ESTABLISHED -- see #725; transform_messages was my first
+            # guess and is ruled out (it logs "10 -> 1", never "-> 0", and
+            # helper.py:1786 only COMPARES pre/post, it does not mutate).
+            # What matters for this line: the subscript SELECTS the body, so
+            # the `except IndexError` below -- which opens on the next line --
+            # can never cover it; the turn died with "Error getting response:
+            # list index out of range".  Guard as create_recipe.py:4385 does.
             if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                 current_app.logger.info(
                     f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
