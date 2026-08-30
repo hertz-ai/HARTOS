@@ -139,11 +139,13 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
     # every registered tool -- autogen's register_for_llm sits above it and so
     # only ever sees what we hand back.
     #
-    # reuse_recipe.py carries `from __future__ import annotations` (load-bearing
-    # there: it stops the module-level
+    # HISTORY, and why this repair still earns its place:
+    #
+    # reuse_recipe.py USED TO carry `from __future__ import annotations`.  It was
+    # load-bearing: it stopped the module-level
     # `user_agents: Dict[str, Tuple[autogen.AssistantAgent, ...]]` at :269-270
     # and the defs at :895/:3187 from evaluating `autogen.*` at import time and
-    # dragging the lazy autogen proxy -- ~7.6s + torch -- onto the boot path).
+    # dragging the lazy autogen proxy -- ~7.6s + torch -- onto the boot path.
     # But PEP 563 stringizes EVERY annotation in that module, including the
     # `Annotated[str, "..."]` params of its 48 tools.  @wraps copies those
     # strings onto the wrapper, autogen hands them to pydantic, and pydantic
@@ -154,6 +156,23 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
     # i.e. every agent REUSE and the whole multi-persona path.  create_recipe.py
     # has no __future__ import, which is exactly why CREATE worked and REUSE did
     # not.
+    #
+    # 2026-08-30 UPDATE — reuse_recipe.py NO LONGER HAS THE FUTURE IMPORT.
+    # a4208301 removed it and instead QUOTED the 9 annotation positions that
+    # actually touch `autogen.*` (the two module-level globals, the
+    # create_agents_for_user return, and get_agent_response's 6 params), so the
+    # boot-path property above is preserved -- guarded by
+    # tests/unit/test_lazy_autogen_import.py::test_module_import_does_not_pull_autogen
+    # and tests/unit/test_reuse_annotations_resolvable.py.
+    #
+    # DO NOT DELETE THIS REPAIR AS "now redundant".  It is NOT.  Measured by A/B
+    # on the real function: arm A = a4208301^ (which ALREADY CONTAINED this
+    # repair, confirmed via `git merge-base --is-ancestor e6f7d6ce a4208301^`)
+    # still raised PydanticUserError; arm B = a4208301 returned the agent tuple.
+    # So neither fix is sufficient alone -- they are LAYERED, not duplicated:
+    # this one resolves stringized hints for decorated tools generally, that one
+    # stops reuse_recipe stringizing them in the first place.  Two fixes for one
+    # defect family is worth knowing about; removing either re-breaks REUSE.
     #
     # include_extras=True is required: without it Annotated[str, "desc"]
     # collapses to plain str and every per-argument description autogen shows
