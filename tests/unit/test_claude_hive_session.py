@@ -58,7 +58,7 @@ def _make_valid_task(task_id='task_001', trust_level='same_user',
         'description': 'Fix the bug in helper.py',
         'trust_level': trust_level,
         'scope_level': scope_level,
-        'target_files': ['helper.py'],
+        'target_files': ['hartos/helper.py'],
         'origin_signature': '',
         'priority': 5,
     }

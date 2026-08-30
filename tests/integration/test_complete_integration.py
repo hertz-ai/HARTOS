@@ -325,7 +325,7 @@ def test_vlm_agent_tool_availability():
     try:
         # Check if tool is defined in create_recipe.py source
         from pathlib import Path
-        create_recipe_path = Path(__file__).parent / "create_recipe.py"
+        create_recipe_path = Path(__file__).parent / "hartos/create_recipe.py"
 
         with open(create_recipe_path, 'r', encoding='utf-8') as f:
             source = f.read()

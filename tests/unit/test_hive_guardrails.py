@@ -320,7 +320,7 @@ class TestConstitutionalFilter:
     def test_code_change_to_normal_file_allowed(self):
         """Coding agents can modify non-protected files."""
         passed, reason = ConstitutionalFilter.check_code_change(
-            'diff --git a/helper.py', ['helper.py']
+            'diff --git a/helper.py', ['hartos/helper.py']
         )
         assert passed is True
 

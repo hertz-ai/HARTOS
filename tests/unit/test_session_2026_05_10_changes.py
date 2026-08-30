@@ -149,10 +149,10 @@ class TestCodingWorkspaceDir:
         repo_root = os.path.dirname(os.path.dirname(
             os.path.dirname(os.path.abspath(__file__))))
         for relpath in [
-            'create_recipe.py',
-            'gather_agentdetails.py',
-            'reuse_recipe.py',
-            'helper.py',
+            'hartos/create_recipe.py',
+            'hartos/gather_agentdetails.py',
+            'hartos/reuse_recipe.py',
+            'hartos/helper.py',
             'hart_intelligence_entry.py',
         ]:
             p = os.path.join(repo_root, relpath)
