@@ -1,0 +1,92 @@
+# crate-403 fix PROBE — ephemeral, workflow_dispatch ONLY.
+#
+# Purpose: produce EVIDENCE for the crate-403 blocker without mutating main's
+# build. crate-403 = the Rust vendor fetch hitting the deprecated crates.io API
+# endpoint (`.../api/v1/crates/<n>/<v>/download` -> HTTP 403), which fails the
+# `Compositor nix build` job and cascade-skips the whole nixosTest suite
+# (driver/BIOS/Hyper-V/boot-latency). Root cause (OS_PARITY_CLOSURE_PLAN.md):
+# nixpkgs-rust's `importCargoLock` at the pinned ac62194c (2026-01-02) still
+# builds the old URL; the .crate on static.crates.io is byte-identical, so a
+# nixpkgs-rust bump that switches importCargoLock to the CDN fixes it with every
+# Cargo.lock sha256 unchanged.
+#
+# This job bumps nixpkgs-rust to the nixos-25.05 branch head (SAME stable
+# release -> same rust toolchain, picks up backported fixes), re-locks, and
+# BUILDS the actual failing target (hart-rust-precedent, the importCargoLock
+# path). It commits NOTHING to main — it only reports green/red and uploads the
+# generated flake.nix + flake.lock so a verified fix can be committed by hand.
+# Delete this workflow once crate-403 is resolved.
+name: crate-403 fix probe (ephemeral)
+
+on:
+  workflow_dispatch:
+    inputs:
+      nixpkgs_rust_ref:
+        description: "nixpkgs-rust ref to probe (branch or rev)"
+        required: false
+        default: "nixos-25.05"
+
+concurrency:
+  group: crate403-probe-${{ github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: Probe nixpkgs-rust bump -> hart-rust-precedent build
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            substituters = https://cache.nixos.org
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+            narinfo-cache-negative-ttl = 0
+            fallback = true
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get autoremove -y && sudo apt-get clean
+          df -h /
+
+      # Q1 (the VM-critical one): does hart-comp build? The nixosTest closure
+      # needs hart-comp, which vendors via CRANE (claimed to fetch from
+      # static.crates.io post-0.16.3). If crane 403s too, crate-403 genuinely
+      # blocks the VM suite; if crane builds GREEN, the VM suite is NOT
+      # crane-blocked and the real gate is #29 (unit-tests red -> needs: skip).
+      - name: PROBE hart-comp (crane vendoring) on the CURRENT tree
+        working-directory: nixos
+        run: |
+          set -o pipefail
+          echo "=== nix build .#hart-comp (crane) ==="
+          if time nix build ".#hart-comp" \
+              --no-link --print-out-paths --print-build-logs \
+              --cores 0 --max-jobs 2 \
+              --option narinfo-cache-negative-ttl 0; then
+            echo "PROBE_HART_COMP=GREEN"
+          else
+            echo "PROBE_HART_COMP=RED"
+          fi
+
+      # Q2: does the importCargoLock precedent still 403? (Bump probing deferred —
+      # the earlier --update-input was a no-op; the correct form is
+      # --override-input, tried only if hart-comp itself is crane-blocked.)
+      - name: PROBE hart-rust-precedent (importCargoLock) on the CURRENT tree
+        if: always()
+        working-directory: nixos
+        run: |
+          set -o pipefail
+          echo "=== nix build .#hart-rust-precedent (importCargoLock) ==="
+          if time nix build ".#hart-rust-precedent" \
+              --no-link --print-out-paths --print-build-logs \
+              --cores 0 --max-jobs 2 \
+              --option narinfo-cache-negative-ttl 0; then
+            echo "PROBE_HART_RUST_PRECEDENT=GREEN"
+          else
+            echo "PROBE_HART_RUST_PRECEDENT=RED"
+          fi
