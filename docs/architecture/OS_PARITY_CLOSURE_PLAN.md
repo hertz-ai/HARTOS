@@ -120,22 +120,24 @@ wiring timeout. A/B are the design-gated shell-boot workstream; C needs VM
 runtime state (CI-iteration). `hart-boot-log` mount did NOT recur — passed after
 the shard reshuffle.
 
-**`hart-ota-central` ROOT-CAUSED (run `33322172168` shard 0 journal):** the
-subtest `wait_until_succeeds`-es 120s for hart-backend to log `"Local subscribers
-bootstrapped … ota-push"`, but the backend journal shows a **~91s SILENT stall**
-between `[92.5s]` (WorldModelBridge `Direction B subscribed`) and `[183.9s]`
-(`hive_benchmark_prover` loop). The stall is the backend's SYNCHRONOUS module-load
-startup serialising blocking waits on the main thread BEFORE
-`bootstrap_local_subscribers`: `_wait_for_llm_server(timeout=30)` + `(timeout=15)`
-+ `(timeout=5)` (hart_intelligence_entry.py:1920/1928/… — waiting out an LLM
-server the *server* node never starts) plus torch-stagger `time.sleep(5)`+`sleep(6)`
-(:2022/:2140). So the OTA leg wires ~183s in — WITHIN `boot_userspace_s`=600 but
-past the test's 120s window. The OTA subscriber has no LLM dependency, so the
-correct fix is to wire `bootstrap_local_subscribers` BEFORE the LLM waits (or make
-those waits non-blocking / skip them when no local model is configured) — a
-backend boot-ORDERING change, CI-iteration + regression-risk, not a blind edit; a
-timeout bump would paper over a possible real slow-boot regression. Deferred as a
-scoped backend-boot task, not left-to-guess.
+**`hart-ota-central` — PARTIAL diagnosis (one hypothesis DISPROVEN by reading the
+code):** the subtest `wait_until_succeeds`-es 120s for hart-backend to log
+`"Local subscribers bootstrapped … ota-push"`, and the journal shows a **~91s
+SILENT main-thread stall** between `[92.5s]` (WorldModelBridge `Direction B
+subscribed`) and `[183.9s]` (`hive_benchmark_prover` loop), with
+`bootstrap_local_subscribers` (hart_intelligence_entry.py:12632) reached only
+after it. **DISPROVEN hypothesis:** the `_wait_for_llm_server` waits are NOT the
+blocker — they live inside `_delayed_learning_init`, which runs in a **daemon
+thread** (:2025), and on the VM (`bundled=False`, `cloud=False`, :1912-1928) that
+path takes only the **5s** `else`-branch wait, off the main thread entirely. So
+the real ~91s main-thread blocker between WorldModelBridge init and
+`bootstrap_local_subscribers` is **not yet identified** — it needs thread-aware
+tracing (which of the 92s→183s work is main-thread vs background) via an
+instrumented CI run, not a blind edit. Recording the corrected state honestly:
+the *symptom* (OTA leg wires ~183s in, past the 120s test window, within
+`boot_userspace_s`=600) is pinned; the *cause* is still open. Do NOT bump the
+test timeout until the stall is understood — that could mask a real slow-boot
+regression.
 
 ## 🧭 Steward decisions (yours — not mine to default)
 
