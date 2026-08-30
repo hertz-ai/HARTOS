@@ -62,10 +62,12 @@ let any node inflate a peer's apparent capacity — and since
 compute-democracy weighting, that is a direct attack on the ≤5% influence cap.
 **Only the signed, direct self-announce may set capacity.**
 
-**(c) Two handler registries.** `PeerLink._message_handlers` (per-link, for
-request/response correlation on *that* socket) and `ChannelDispatcher._handlers`
-(module singleton, for subsystem routing) answer different questions. Both are
-legitimate.
+**(c) The per-link handler copy.** `link_manager._channel_handlers` is the
+subsystem registry; `_apply_channel_handlers` fans it out to each link's
+`_message_handlers` BEFORE `accept()` starts the receive thread (the ordering is
+commented — a handler attached later would miss whatever arrived first). The per-link
+copy is a deliberate fan-out of one registry, not a second one. **`ChannelDispatcher`
+is a different matter — see D3 as corrected in §5b.**
 
 **(d) `provable_user_id()` diverging from `link_manager`'s identity lookup.**
 `link.py:83-103` explains it at length: one asks *"is this peer mine?"* (local
@@ -108,14 +110,19 @@ demoted and "multi-device sync (and the skill broadcast riding it) had no recipi
 on any node." Fixed 2026-08-13 (`ce8be281`, `6098a66f`). The capabilities field is
 the same defect, still open.
 
-**(D3) `_receive_loop` bypasses the ChannelDispatcher.** `:751` dispatches to
-`self._message_handlers` only. The module-singleton dispatcher that `channels.py`
-documents as *the* routing mechanism is never consulted — which is why
-`dispatcher.dispatch()` has **zero call sites** and only 1 of 11 channels
-(`hivemind_handler.py:204`) ever registers.
+**(D3) `ChannelDispatcher` is an ORPHAN registry.** *(Restated after the §5b
+trace — the first version of this finding blamed the receive loop and was WRONG.)*
+`link_manager._channel_handlers` is the live registry with FOUR real registrants, and
+`_receive_loop → _message_handlers` is fed from it correctly. `ChannelDispatcher`
+(`channels.py:135`) is a SECOND module-level registry that only `hivemind_handler`
+writes to — and it writes to the real one too (`:204` + `:208`) — and from which
+`dispatch()` is **never called**. It is a duplicate of a working mechanism, not the
+broken half of it.
 
 **(D4) The registrations in `channels.py:139-140` are inside a DOCSTRING**, not code.
-They read as wiring; nothing executes them.
+Harmless in itself, but it is what makes D3 hard to see: a reader greps
+`register('gossip'`, gets a hit, and concludes the dispatcher is wired. The real
+registrations live on `link_manager.register_channel_handler` in four other files.
 
 **(D5) `_resolve_ws_url` (`:674-682`) has two identical branches.** Both return
 `ws://`; the `wss://` for WAN promised in the header docstring (`:23`) is
@@ -171,6 +178,93 @@ security/system_requirements          ← the ONE static hardware truth
 Guard for every consumer: `get_capabilities()` returns `None` until
 `run_system_check()` has run. Gossip already guards correctly (`:1117 if caps:`);
 any new consumer must do the same rather than assume a profile exists.
+
+---
+
+## 5b. THE COMPLETE CALL FLOW — what fires, when, driven by what
+
+Traced end to end 2026-08-30. This is the part that makes the change plan surgical
+rather than speculative, and it **corrects two claims made earlier in this document**.
+
+### BOOT
+```
+integrations/social/__init__.py:481   run_system_check()  → _capabilities (cached global)
+                                        └─ detect_hardware(): cpu_count, RAM ladder
+                                           (psutil→sysconf→Win32→/proc), disk, GPU via
+                                           vram_manager, and a NETWORK reachability probe
+security/system_requirements.py:722   get_capabilities()  → O(1) read; None before the check
+```
+
+### GOSSIP ROUND — 60s, fanout 3, HTTP `:6777` (THE LIVE RAIL)
+```
+_exchange_with_peer(peer_url)                            peer_discovery.py:839
+  ├─ _self_info()                                        :1135   ← the ANNOUNCE payload
+  │    ├─ node_id, url, name, version, tier, hart_tag
+  │    ├─ public_key, code_hash, guardrail_hash, x25519_public, certificate
+  │    ├─ capability_tier + hardware_summary             :~1190
+  │    │     {cpu_cores, ram_gb, gpu_vram_gb, disk_free_gb}   ← from caps.hardware
+  │    ├─ idle_compute {available, idle_agents, opted_in}:~1205
+  │    └─ signature = sign_json_payload(info)            :1267   ← signed LAST, covering
+  │                                                              every field (fix 477d61b7)
+  ├─ POST /api/social/peers/exchange
+  ├─ handle_exchange(their_peers)                        :1049
+  │    └─ _merge_peer_list(peer_list)                    :1303   ALL entries relayed=True
+  │         └─ _merge_peer(db, p, relayed=True)          :1371
+  │              ├─ banned check · Sybil cap (HEVOLVE_MAX_PEERS_PER_IP, default 5)
+  │              ├─ guardrail-hash agreement
+  │              ├─ signature_valid = verify_json_signature(...)  ← COMPUTED REGARDLESS
+  │              │                                                  of `relayed`
+  │              └─ writes node_id/url/public_key/tier/... but **NEVER compute_***
+  └─ get_link_manager().record_http_exchange(peer_id)    :856, :889
+       └─ at _UPGRADE_THRESHOLD → _try_auto_upgrade()    link_manager.py:472
+            ├─ gossip.get_peer_list() → resolve peer_info
+            ├─ core/peer_link/nat.py ladder (LAN direct via beacon → STUN → relay)
+            └─ upgrade_peer() → PeerLink.connect() → dial ws://<addr>/peer_link
+                                                          ↑ NOTHING SERVES THIS ROUTE
+```
+
+### PEERLINK — fully wired, blocked on one route
+```
+subsystem → link_manager.register_channel_handler(ch, h)  link_manager.py:337
+     FOUR real registrants, not one:
+       core/peer_link/hivemind_handler.py:208        'hivemind'
+       core/peer_link/message_bus.py:485             'events'
+       embedded_main.py:279                          'dispatch'
+       integrations/agent_engine/federated_aggregator.py:1681  'learning' (FedAvg deltas)
+  └─ _apply_channel_handlers(link)                        :290
+        (called BEFORE accept() on purpose — a handler attached after the receive
+         thread starts would miss whatever arrived first)
+       └─ link.on_message(ch, h) → PeerLink._message_handlers
+            └─ _receive_loop dispatches to them            link.py:751   ✓ CORRECT PATH
+inbound:  link_manager.accept_inbound(peer_id, addr, ws, hello)  :230  ✓ IMPLEMENTED
+          (same budget check, same handler registration, same side effects as outbound;
+           trust constructed at PEER and ratcheted up only on a valid user_id_proof)
+```
+
+### TWO CORRECTIONS TO THIS DOCUMENT
+
+**(i) D3 was WRONG — the receive loop does NOT bypass the intended registry.**
+`link_manager._channel_handlers` is the live mechanism, it has FOUR real registrants,
+and `_apply_channel_handlers → link.on_message → _message_handlers → _receive_loop`
+is a complete, correct chain. What is orphaned is `ChannelDispatcher`
+(`channels.py:135`): a SECOND module-level registry that only `hivemind_handler`
+writes to (and it also writes to the real one, belt-and-braces at `:204` + `:208`),
+and which nothing ever dispatches from. **The orphan is the dispatcher, not the loop.**
+
+**(ii) PeerLink is far more complete than "dead" suggests.** Handlers registered,
+`accept_inbound` implemented, budgets, trust ratchet, key rotation, and the NAT
+traversal ladder all present, and the gossip→PeerLink upgrade trigger genuinely fires
+(`record_http_exchange` is called from two live gossip sites). **The entire stack is
+blocked on ONE missing thing: nothing serves `ws://…/peer_link`.** That is hook #5,
+and it is much closer to done than the bootstrap doc's "DIAL-ONLY" implies.
+
+### ONE NEW FINDING FROM THE TRACE
+
+**(D7) The `hardware_summary` block is built TWICE** — `get_health()` (`:1105`, around
+`:1119`) and `_self_info()` (`:1135`, around `:1190`) each construct
+`{cpu_cores, ram_gb, gpu_vram_gb, disk_free_gb}` from `caps.hardware` independently.
+Add a field to one and the other silently lacks it. Small, but it is the same class
+as everything else here and it is one extract-method away.
 
 ---
 
