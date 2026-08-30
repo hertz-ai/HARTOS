@@ -43,8 +43,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 #: one. Do not quote this list's length as a count of broken callers.
 KNOWN_UNMIGRATED = {
     # --- omit request_id entirely: a real person is classified as background ---
-    'hartos/hartos_bootstrap.py',
-    'hartos/hart_cli.py',
+    'hartos_bootstrap.py',
+    'hart_cli.py',
     'worker_loop.py',              # legitimately background, but by OMISSION not
                                    # declaration — should send an explicit daemon tag
     'hart_dbus_service.py',
@@ -55,7 +55,7 @@ KNOWN_UNMIGRATED = {
     'morphable_agent.py',
 
     # --- already reference request_id; migrating is DRY, not a bug fix ---
-    'hartos/crossbar_server.py',
+    'crossbar_server.py',
     'api_tracker.py',
     'commercial_api.py',           # the paid API surface — user turns
     'dispatch.py',                 # already sends daemon_<goal_id> correctly

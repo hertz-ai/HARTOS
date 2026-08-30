@@ -395,7 +395,7 @@ def test_reuse_recipe_inner_tools_have_log_tool_execution():
     in reuse_recipe.py must ALSO have `@log_tool_execution` in its
     decorator stack so autogen-side tools get the same logging + UI
     emit contract as the LangChain side."""
-    path = os.path.join(REPO_ROOT, 'hartos', 'hartos/reuse_recipe.py')
+    path = os.path.join(REPO_ROOT, 'hartos', 'reuse_recipe.py')
     src = io.open(path, encoding='utf-8').read()
     tree = ast.parse(src)
 

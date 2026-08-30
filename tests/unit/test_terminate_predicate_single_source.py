@@ -52,7 +52,7 @@ import re
 from hartos import create_recipe
 
 _SRC_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__)))), 'hartos', 'hartos/create_recipe.py')
+    os.path.abspath(__file__)))), 'hartos', 'create_recipe.py')
 
 
 def _src():
