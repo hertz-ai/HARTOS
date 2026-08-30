@@ -126,18 +126,21 @@ code):** the subtest `wait_until_succeeds`-es 120s for hart-backend to log
 SILENT main-thread stall** between `[92.5s]` (WorldModelBridge `Direction B
 subscribed`) and `[183.9s]` (`hive_benchmark_prover` loop), with
 `bootstrap_local_subscribers` (hart_intelligence_entry.py:12632) reached only
-after it. **DISPROVEN hypothesis:** the `_wait_for_llm_server` waits are NOT the
-blocker — they live inside `_delayed_learning_init`, which runs in a **daemon
-thread** (:2025), and on the VM (`bundled=False`, `cloud=False`, :1912-1928) that
-path takes only the **5s** `else`-branch wait, off the main thread entirely. So
-the real ~91s main-thread blocker between WorldModelBridge init and
-`bootstrap_local_subscribers` is **not yet identified** — it needs thread-aware
-tracing (which of the 92s→183s work is main-thread vs background) via an
-instrumented CI run, not a blind edit. Recording the corrected state honestly:
-the *symptom* (OTA leg wires ~183s in, past the 120s test window, within
-`boot_userspace_s`=600) is pinned; the *cause* is still open. Do NOT bump the
-test timeout until the stall is understood — that could mask a real slow-boot
-regression.
+after it. **DISPROVEN hypothesis (first pass):** the `_wait_for_llm_server` waits are NOT the
+blocker — they live inside `_delayed_learning_init`, a **daemon thread** (:2025),
+and on the VM take only the 5s branch, off the main thread. **REAL ROOT CAUSE
+(traced through `main()`):** `main()` runs `hevolve_verify_boot()` FIRST (:12592),
+whose `compute_code_hash()` + `compute_file_manifest()` (:397/:404) hash EVERY
+file in the tree against the signed `release_manifest.json` — a MANDATORY
+release-integrity step (the same whole-repo hash that flaked the tamper unit
+test) that legitimately costs ~90s on a loaded CI VM, on the main thread, BEFORE
+`bootstrap_local_subscribers()` (:12632). So the OTA subscriber log lands ~180s
+in — well within `boot_userspace_s`=600 (the OS's own enforced boot budget,
+VM-verified by hart-boot-latency), but past the test's old 120s window. This is a
+slow-but-correct SECURE boot, NOT a regression, and reordering subscribers ahead
+of the integrity check would wire them on a not-yet-verified (possibly tampered)
+node. **✅ FIXED (`ota-central.nix` wait 120s→240s):** the test now matches the
+legitimate secure-boot time instead of racing it. Verifies on the next VM run.
 
 ## 🧭 Steward decisions (yours — not mine to default)
 
