@@ -147,6 +147,38 @@ class AppManifest:
             tags=panel.get('tags', []),
         )
 
+    @classmethod
+    def from_desktop_entry(cls, app_id: str,
+                           entry: Dict[str, Any]) -> 'AppManifest':
+        """Convert an XDG .desktop entry to AppManifest.
+
+        The third source alongside from_panel_manifest and from_system_panel, and
+        the one that gives the OS its own applications: everything the image ships
+        lives in .desktop files, and nothing was reading them into the registry.
+
+        DESKTOP_APP is deliberate — that is the type installed_app_manifest()
+        surfaces into window.MANIFEST, and manifest_entry_for() emits ``exec``
+        (defaulting to the manifest id, which for a desktop entry IS the id
+        gtk-launch and /api/shell/launch expect) so openPanel routes it to
+        launchApp instead of trying to iframe a native binary.
+
+        Keywords and Categories both become tags so matches_search finds an app by
+        what it DOES ("browser", "editor") and not only by its name.
+        """
+        keywords = [k for k in entry.get('Keywords', '').split(';') if k]
+        categories = [c for c in entry.get('Categories', '').split(';') if c]
+        return cls(
+            id=app_id,
+            name=entry.get('Name', app_id),
+            version=entry.get('Version', '1.0.0'),
+            type=AppType.DESKTOP_APP.value,
+            icon=entry.get('Icon', 'apps'),
+            entry={'exec': app_id},
+            group='Applications',
+            tags=keywords + categories,
+            description=entry.get('Comment', ''),
+        )
+
     def matches_search(self, query: str) -> bool:
         """Check if this manifest matches a search query (case-insensitive)."""
         q = query.lower()

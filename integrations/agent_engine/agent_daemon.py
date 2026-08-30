@@ -227,7 +227,7 @@ class AgentDaemon:
         # the operator sees the bypass.  Bounded blast radius — single
         # tick of relief, then back to honoring the gate.  Matches the
         # watchdog's ``mark_in_llm_call`` escalation pattern.
-        self._last_tick_completed_at = time.time()
+        self._last_tick_completed_at = time.monotonic()
         # 120s default — under sustained pressure the flywheel forces a
         # tick every 2 min instead of every 10.  Combined with the
         # override raising max_concurrent past the throttled floor, this
@@ -975,7 +975,9 @@ class AgentDaemon:
         if should_yield_to_user():
             from .dispatch import get_last_yield_reason
             _yreason = get_last_yield_reason()
-            _starved_for = time.time() - self._last_tick_completed_at
+            # monotonic: a wall-clock jump (#24) must not make _starved_for go
+            # negative and perpetually yield -> flywheel stall (false-healthy #6)
+            _starved_for = time.monotonic() - self._last_tick_completed_at
             if _starved_for < self._starvation_s:
                 logger.debug(
                     "Agent daemon: yielding (reason=%s)", _yreason)
@@ -1450,7 +1452,7 @@ class AgentDaemon:
             # dispatches is a different signal (no idle agents, no
             # active goals, all goals in cooldown) and is unrelated to
             # the user-pressure stall the override is guarding against.
-            self._last_tick_completed_at = time.time()
+            self._last_tick_completed_at = time.monotonic()
 
             # Content gen monitor: check stuck games every 5 ticks (~2.5 min)
             if self._tick_count % 5 == 0:

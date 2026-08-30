@@ -464,6 +464,41 @@ gi.require_version('WebKit', '6.0')
 gi.require_version('Gtk4LayerShell', '1.0')
 from gi.repository import Gtk, WebKit, Gtk4LayerShell as LayerShell
 
+
+# Which desktop chrome hart-comp is painting ITSELF (M1 bloom, M2 orb).
+# The compositor composites those under this layer surface; while the surface is
+# opaque they are invisible and the browser keeps paying to animate what the GPU
+# already draws (measured 2026-08-28: a full core, ZERO ioctls).
+# Same verdict file the served shell reads, NOT a second signal -- one publisher,
+# several consumers, the contract /run/hart/gpu-render already established.
+# Fail-EMPTY: missing/unreadable/unrecognised means the shell draws everything,
+# i.e. today's opaque surface. Guessing wrong here yields a desktop with NO
+# background, and the paint watchdog catches hangs rather than wrong-looking
+# desktops, so the safe direction is to stay opaque.
+# NOTE this whole program is passed to python -c inside a Nix DOUBLE-quoted
+# string, so it must contain no double-quote character and no backslash escape
+# anywhere -- including in comments. Use chr(10) rather than a newline escape and
+# single quotes throughout. That is not style: a stray double quote ends the Nix
+# string early and no image builds at all.
+def _native_chrome_claimed():
+    try:
+        with open('/run/hart/session/native-chrome') as fh:
+            # NO empty-string literal here, and note this comment carries
+            # neither a double quote nor a doubled single quote for the same
+            # reason. This program is passed to python -c and that whole thing
+            # sits inside an outer Nix INDENTED string, where a doubled single
+            # quote is an escape sequence. So an ordinary Python empty literal
+            # was read by Nix rather than Python and failed the flake evaluation
+            # gate, which SKIPS every build target, so nothing shipped at all.
+            # read() already returns an empty string at EOF, so the guard it was
+            # part of was dead weight as well as fatal.
+            raw = fh.read().strip().lower()
+    except OSError:
+        return frozenset()
+    known = frozenset(('bloom', 'orb'))
+    parts = [p.strip() for p in raw.replace(chr(10), ',').split(',') if p.strip()]
+    return frozenset(parts) & known
+
 SHELL_URL = os.environ.get('HART_SHELL_URL', 'http://localhost:${liquidPort}')
 READY_FLAG = os.environ.get('HART_SHELL_READY_FLAG', '/run/hart/session/shell-ready')
 
@@ -552,6 +587,54 @@ class GlassShellLayer:
         # a later __init__ crash left the object half-built -- the headless WebView
         # kept loading, FINISHED fired, and the handler died on the missing attribute.
         self._webview = webview
+
+        # ── NATIVE CHROME BRIDGE (part 2 of 4) ────────────────────────────────
+        # Hand the backdrop to the compositor. Two things must BOTH be
+        # transparent or the native bloom/orb stay hidden: the WebView paints an
+        # opaque white page background by default, and the GTK4 window paints
+        # its own themed background behind that. Setting only one leaves the
+        # other covering the compositor.
+        #
+        # Gated on the compositor's claim, so with no verdict file this whole
+        # block never runs and the surface is opaque exactly as today. That is
+        # what makes this landable ahead of the compositor half.
+        _claimed = _native_chrome_claimed()
+        if _claimed:
+            # `import sys as _sys` LOCALLY, the idiom this program already uses
+            # everywhere else (see the shutdown and crash handlers below). The
+            # top of this program is only `import gi, os` -- there is no global
+            # sys. An earlier version of this block used a bare `sys.stderr` in
+            # BOTH the success print and the except handler, which would have
+            # raised NameError on the success path, then raised NameError AGAIN
+            # inside the handler where nothing catches it, killing the GTK4 host
+            # and leaving no shell -- and it would have fired only once the
+            # compositor first claimed chrome, i.e. the moment the bridge began
+            # working. py_compile cannot see this; only reading the imports can.
+            import sys as _sys
+            try:
+                from gi.repository import Gdk
+                clear = Gdk.RGBA()
+                clear.red = 0.0
+                clear.green = 0.0
+                clear.blue = 0.0
+                clear.alpha = 0.0
+                webview.set_background_color(clear)
+                css = Gtk.CssProvider()
+                css.load_from_data(
+                    b'window, webview { background: transparent; }')
+                Gtk.StyleContext.add_provider_for_display(
+                    self._win.get_display(), css,
+                    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+                print('[hart-glass-shell-gtk4] NATIVE CHROME: surface transparent '
+                      '(compositor owns %s)' % ','.join(sorted(_claimed)),
+                      file=_sys.stderr, flush=True)
+            except Exception as exc:
+                # NEVER take the session down over a cosmetic handoff. An opaque
+                # shell that paints is strictly better than a transparent one
+                # that crashed, and the served shell independently falls back to
+                # drawing its own backdrop when it sees no claim.
+                print('[hart-glass-shell-gtk4] NATIVE CHROME: transparency failed '
+                      '(%s); staying opaque' % exc, file=_sys.stderr, flush=True)
         # Honest-paint state: shell-ready must mean the surface is MAPPED and the
         # page load FINISHED, not merely load-finished. On 2026-07-19 the host
         # crashed before present(), the WINDOWLESS WebView still finished loading,
@@ -1006,8 +1089,22 @@ app.run(None)
         except OSError:
             pass
         finally:
+            # The client is gone, so tear the upstream down HARD rather than
+            # half-closing it. sway keeps its side of an IPC connection open
+            # indefinitely, so SHUT_WR alone left the reader below blocked in
+            # recv() until RuntimeMaxSec killed the unit -- and systemd then
+            # recorded a FAILED service for a query that had already answered
+            # correctly. Measured on the box 2026-08-26: 12 failed
+            # hart-sway-ipc@ instances, all "reached runtime time limit", while
+            # every display and workspace endpoint was returning real data.
+            # Closing the socket makes recv() raise, the loop ends, and the
+            # instance exits cleanly the moment the query is done.
             try:
-                up.shutdown(socket.SHUT_WR)
+                up.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                up.close()
             except OSError:
                 pass
 

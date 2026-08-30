@@ -498,6 +498,12 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         ws_switch_at: None,
         capture_blocked: false,
         black_buffer,
+        // NATIVE SHELL M1 — empty until the first frame composes the backdrop at
+        // the output's real mode (the 1920x1080 guess above is only the killswitch
+        // solid's initial size, and the bloom must match the ACTUAL scanout).
+        bloom: Default::default(),
+        // NATIVE SHELL M2 — composed on the first frame at the real output size.
+        orb: Default::default(),
         ipc: crate::ipc::IpcState::default(),
         // F1 (#166) — no flips in flight at boot; the VBlank source populates this.
         vblank_completed: std::collections::HashSet::new(),
@@ -1280,6 +1286,73 @@ fn build_gles_renderer(gbm: &GbmDevice<DrmDeviceFd>) -> Result<GlesRenderer, Box
     Ok(renderer)
 }
 
+/// Tell the shell which desktop chrome hart-comp is painting itself, so it can
+/// stop painting the same thing on top (NATIVE CHROME BRIDGE, part 4 of 4).
+///
+/// Called after a page-flip is accepted, i.e. only once we have EVIDENCE the
+/// native elements reached the screen, never from configuration. The bitmask
+/// comes from the frame builder and is set only where an element was actually
+/// pushed, so a failed buffer import cannot make the shell hide its own copy.
+///
+/// Writes at most once per (re)start and only when the claim GROWS, because the
+/// shell re-reads this on every render: rewriting the same value 60 times a
+/// second would be pointless churn on a tmpfs, and shrinking it mid-session
+/// would make the desktop flicker between native and HTML chrome.
+///
+/// Best-effort throughout. If this file cannot be written the shell simply keeps
+/// drawing everything, which is exactly today's behaviour — the failure mode is
+/// "no speedup", never "no desktop".
+fn publish_native_chrome() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    /// What we have already told the shell. Starts at 0 = "we claim nothing".
+    static PUBLISHED: AtomicU8 = AtomicU8::new(0);
+
+    let mask = crate::comp_core::NATIVE_CHROME_EMITTED.load(Ordering::Relaxed);
+    if mask == 0 {
+        return;
+    }
+    let prev = PUBLISHED.load(Ordering::Relaxed);
+    // Only ever grow. A frame that happens to omit the orb (capture blocked, a
+    // degenerate mode) must not retract a claim the shell has already acted on.
+    let next = prev | mask;
+    if next == prev {
+        return;
+    }
+
+    let mut names: Vec<&str> = Vec::new();
+    if next & crate::comp_core::NATIVE_CHROME_BLOOM != 0 {
+        names.push("bloom");
+    }
+    if next & crate::comp_core::NATIVE_CHROME_ORB != 0 {
+        names.push("orb");
+    }
+
+    // /run/hart/session is the group-writable (0770) dir the session may write;
+    // /run/hart itself is 0750 owner-only. Writing the wrong one fails silently
+    // and defeats the whole bridge — the same perms trap already documented in
+    // liquid_ui_service.py for shell-render.
+    let path = "/run/hart/session/native-chrome";
+    let tmp = "/run/hart/session/.native-chrome.tmp";
+    // Write-then-rename so a reader never sees a half-written claim: the shell
+    // polls this on every render and a torn read would flicker the desktop.
+    let body = names.join(",");
+    let wrote = std::fs::write(tmp, &body)
+        .and_then(|()| std::fs::rename(tmp, path))
+        .is_ok();
+    if wrote {
+        PUBLISHED.store(next, Ordering::Relaxed);
+        info!(
+            chrome = %body,
+            "native-chrome published (the shell may stop painting these; \
+             claimed only after a presented frame contained them)"
+        );
+    } else {
+        // Do NOT retry-storm: a missing dir or a perms problem will not fix
+        // itself mid-session, and this runs on the flip path.
+        let _ = std::fs::remove_file(tmp);
+    }
+}
+
 /// PURE policy (no Smithay types): given whether a `render_frame` error was the
 /// `RenderFrame` variant (a renderer fault — a lost GL context / a failed import) versus
 /// the `PrepareFrame` variant (a DRM/swapchain/master hiccup that would hit pixman too),
@@ -1425,6 +1498,14 @@ where
                         // This CRTC just presented. Sole input to the silent-freeze
                         // beacon's "how long since anything reached the screen".
                         surface.last_flip_at = Some(now);
+                        // NATIVE CHROME BRIDGE (part 4 of 4). The frame just
+                        // accepted by the kernel is the FIRST evidence that the
+                        // native bloom/orb actually reached the screen, so this
+                        // is where the shell is told it may stand down. Claiming
+                        // from configuration instead would let a compositor that
+                        // composed but never flipped turn the shell transparent
+                        // over nothing.
+                        publish_native_chrome();
                     }
                     Err(err) => {
                         // A flip/commit ioctl error (the real-HW EACCES/EBUSY/ENODEV/

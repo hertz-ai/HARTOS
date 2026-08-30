@@ -263,6 +263,35 @@ class AppRegistry:
                 count += 1
         return count
 
+    def load_desktop_entries(self, entries: Dict[str, dict]) -> int:
+        """Bulk-import XDG .desktop entries discovered on this machine.
+
+        The third bulk importer alongside load_panel_manifest and
+        load_system_panels, and the one that lets the OS see its own applications:
+        until this existed only apps installed THROUGH HART's installer were ever
+        registered, so on the box the registry knew about one flatpak while 162
+        .desktop files sat unread.
+
+        Args:
+            entries: {desktop_id: fields} from
+                     core.platform.desktop_entries.discover().
+
+        Returns:
+            Number of entries imported.
+
+        An id already in the registry is SKIPPED, same as the panel importers, so
+        a desktop entry can never displace a panel that owns the same name. Panels
+        load first in bootstrap, so they keep winning.
+        """
+        count = 0
+        for app_id, entry in entries.items():
+            if app_id not in self._apps:
+                manifest = AppManifest.from_desktop_entry(app_id, entry)
+                with self._lock:
+                    self._apps[manifest.id] = manifest
+                count += 1
+        return count
+
     # ── Native-window handle map (Phase 5, ADDITIVE) ──────────
     # Mirrors compositor/src/main.rs WindowRegistry on the brain side. These are
     # fed by the HART-comp `window.opened`/`window.closed` events (Phase 6 IPC);

@@ -147,6 +147,13 @@ def bootstrap_platform(extensions_dir: Optional[str] = None) -> ServiceRegistry:
 
     _register_native_apps(apps)
 
+    # ── Discover the machine's own applications ───────────────
+    # LAST of the three sources on purpose. Panels and the hand-curated native
+    # apps above own their ids; load_desktop_entries skips an id already present,
+    # so a generic .desktop file can never displace them.
+
+    _discover_desktop_apps(apps)
+
     # ── Load Extensions ───────────────────────────────────────
 
     if extensions_dir is None:
@@ -380,6 +387,26 @@ def _migrate_shell_manifest(apps: AppRegistry) -> None:
         logger.debug("shell_manifest.py not available — skipping migration")
     except Exception as e:
         logger.warning("Shell manifest migration failed: %s", e)
+
+
+def _discover_desktop_apps(apps: AppRegistry) -> None:
+    """Register every launchable application the machine already has.
+
+    The gap this closes: only apps installed THROUGH HART's own installer were
+    ever registered, so on the box the registry knew about ONE flatpak while 162
+    .desktop files sat unread in the NixOS profile. Nothing could list, search or
+    open the applications the image itself ships — which is why typing an app's
+    name at the assistant could not open it. There was no list to match against.
+
+    Best-effort: a machine with no desktop entries (a headless node, a container)
+    simply registers none, exactly as before.
+    """
+    try:
+        from core.platform.desktop_entries import discover
+        count = apps.load_desktop_entries(discover())
+        logger.debug("Discovered %d desktop applications", count)
+    except Exception as e:
+        logger.warning("Desktop application discovery failed: %s", e)
 
 
 def _register_native_apps(apps: AppRegistry) -> None:

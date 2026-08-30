@@ -101,7 +101,18 @@ class JSONBackend(StorageBackend):
     def __init__(self, storage_dir: str = ".agent_ledger"):
         from pathlib import Path
         self.storage_dir = Path(storage_dir)
-        self.storage_dir.mkdir(exist_ok=True)
+        try:
+            # parents=True so a nested storage dir works; the old exist_ok-only
+            # call needed the parent to exist already.
+            self.storage_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # A read-only or otherwise unusable location must not raise HERE.
+            # This runs during SmartLedger construction, which runs inside the
+            # agent daemon's goal dispatch: raising takes the goal engine down
+            # over a storage problem. save() already reports its own failures
+            # ("[JSONBackend] Save error: ..."), so the honest degradation is to
+            # construct, let writes fail loudly, and keep the daemon alive.
+            pass
 
     def _get_path(self, key: str):
         # Sanitize key to prevent path traversal

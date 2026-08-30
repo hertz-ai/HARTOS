@@ -81,6 +81,7 @@ use smithay::input::{
     keyboard::{FilterResult, Keysym, ModifiersState, keysyms as xkb},
     pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, RelativeMotionEvent},
 };
+use smithay::backend::allocator::Fourcc;
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{
@@ -131,6 +132,25 @@ pub const WS_FADE_MS: u128 = 120;
 /// transition (0→N / N→0) instead of spamming every frame. Pure observability.
 pub static LAYERS_PAINTED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Which native chrome the LAST built frame actually contained, as a bitmask
+/// (NATIVE_CHROME_BLOOM | NATIVE_CHROME_ORB).
+///
+/// The shell only stands down for chrome we can prove we are drawing, so the
+/// claim must be published from the RENDER PATH rather than from configuration:
+/// "the flag is set" is a promise, "this element was in the frame that reached
+/// the screen" is evidence. Getting that backwards yields a desktop with no
+/// background, which the paint watchdog does NOT catch — it watches for hangs,
+/// not for wrong-looking desktops.
+///
+/// A static for the same reason LAYERS_PAINTED is one: the value is produced
+/// deep in the generic frame builder and consumed by the backend's flip
+/// handler, and threading it through the CompState trait would put a render
+/// detail into the backend-agnostic accessor surface for no gain.
+pub static NATIVE_CHROME_EMITTED: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+pub const NATIVE_CHROME_BLOOM: u8 = 1 << 0;
+pub const NATIVE_CHROME_ORB: u8 = 1 << 1;
 
 /// The action a compositor keyboard shortcut resolves to (anvil's `KeyAction`
 /// analogue). `process_keyboard_shortcut` maps a `(ModifiersState, Keysym)` to one of
@@ -205,6 +225,149 @@ impl MapAnim {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// NATIVE SHELL PARITY PROGRAM, M1 — the composed aura backdrop.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The composed bloom field, held as a texture-ready buffer across frames.
+///
+/// This is the "COMPOSE ONCE, REUSE FOREVER" half of `bloom.rs`'s performance
+/// contract. `bloom::compose` walks every pixel, which is a few milliseconds at
+/// panel size — perfectly fine ONCE, and catastrophic at 60Hz. So the result is
+/// cached against `(width, height, palette)` and recomposed ONLY when the output
+/// mode or the theme actually changes. A steady desktop does zero bloom work per
+/// frame, which is what keeps the #137 idle-skip meaningful.
+///
+/// Held on each backend's `State` (reached via `CompState::bloom_mut`) rather
+/// than in a static, mirroring how `black_buffer` is already owned.
+#[derive(Default)]
+pub struct BloomCache {
+    /// Resolved ONCE, not per frame. `bloom::theme_palette` reads a JSON file off
+    /// disk; doing that at 60Hz would be a syscall storm behind a static image.
+    palette: Option<crate::bloom::BloomPalette>,
+    key: Option<(i32, i32, crate::bloom::BloomPalette)>,
+    buffer: Option<MemoryRenderBuffer>,
+}
+
+impl BloomCache {
+    // KNOWN GAP, deliberately not papered over with an unused method: the
+    // palette is resolved once and never re-read, so a theme change at runtime
+    // ("switch theme" through the agent) will not restyle this backdrop until
+    // the compositor restarts. An `invalidate()` was written here and removed
+    // again because nothing calls it, and a dead pub method is worse than an
+    // absent one: it warns on every build and reads as though the wiring exists.
+    // Whoever lands the theme-change signal adds it back with a caller.
+
+    /// The backdrop for this size, composing only on a genuine miss.
+    ///
+    /// Returns `None` for a degenerate output size (a disconnected or
+    /// not-yet-moded connector reports 0x0). The caller simply paints no
+    /// backdrop then and the clear colour still covers the frame, so a bad mode
+    /// can never panic the render loop.
+    pub fn get(&mut self, w: i32, h: i32) -> Option<&MemoryRenderBuffer> {
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        // `BloomPalette` is `Copy`, so this reads the cached value and does NOT
+        // hold the borrow across the compose below.
+        let pal = *self.palette.get_or_insert_with(crate::bloom::theme_palette);
+        if self.key != Some((w, h, pal)) {
+            let started = Instant::now();
+            let rgba = crate::bloom::compose(w, h, &pal);
+            self.buffer = Some(MemoryRenderBuffer::from_slice(
+                &rgba,
+                Fourcc::Argb8888,
+                (w, h),
+                1,
+                Transform::Normal,
+                None,
+            ));
+            self.key = Some((w, h, pal));
+            info!(
+                width = w,
+                height = h,
+                took_ms = started.elapsed().as_millis() as u64,
+                "bloom.composed (native aura backdrop; cached until the mode or theme changes)"
+            );
+        }
+        self.buffer.as_ref()
+    }
+}
+
+/// The breathing orb: ONE texture, animated by two scalars (NATIVE SHELL M2).
+///
+/// The bloom is composed once because it never moves. The orb breathes, and the
+/// tempting shortcut is to recompose it every frame — which would simply move
+/// the browser's cost into Rust — or to cache a ring of animation phases, which
+/// quantises a smooth breath into steps and pays memory linear in the step
+/// count for an approximation of what the GPU does exactly.
+///
+/// Neither is what a real compositor does. Core Animation and DWM both
+/// rasterise once and then vary cheap per-frame parameters on the GPU. smithay
+/// exposes exactly that: `MemoryRenderBufferRenderElement::from_buffer` takes
+/// `alpha` and `size`, so one buffer plus two floats per frame gives continuous
+/// motion at the display's own rate. Per-frame CPU cost is arithmetic on two
+/// scalars. Memory is O(1) rather than O(steps).
+#[derive(Default)]
+pub struct OrbCache {
+    key: Option<(i32, crate::orb::OrbPalette)>,
+    buffer: Option<MemoryRenderBuffer>,
+    /// When this orb started breathing. Owned HERE rather than passed in, so the
+    /// phase is COMPUTED from a clock at the point of use and there is nowhere
+    /// to store a "target" value to ease toward — the program's binding rule for
+    /// `animated`, which exists because CSS-style easing is what made the orb
+    /// drag rubber-band on 2026-07-20.
+    epoch: Option<Instant>,
+}
+
+impl OrbCache {
+    /// The composed orb plus its motion RIGHT NOW.
+    ///
+    /// Returns the buffer to draw and the (scale, alpha) to draw it with. The
+    /// caller hands those straight to the render element, so the CPU never
+    /// touches a pixel after the first compose.
+    ///
+    /// `energy` is the live signal (mic RMS, 0..=1) P2 calls for. It is threaded
+    /// through rather than sampled here so this stays a pure cache: the source
+    /// of the signal can change without this type changing.
+    ///
+    /// `None` for a degenerate size, matching BloomCache: the caller then emits
+    /// no orb and the frame is the desktop without it, never a panic.
+    pub fn current(
+        &mut self,
+        side: i32,
+        energy: f32,
+    ) -> Option<(&MemoryRenderBuffer, crate::orb::OrbMotion)> {
+        if side <= 0 {
+            return None;
+        }
+        let now = Instant::now();
+        let epoch = *self.epoch.get_or_insert(now);
+        let motion = crate::orb::motion_at(now.saturating_duration_since(epoch), energy);
+
+        let pal = crate::orb::OrbPalette::default();
+        if self.key != Some((side, pal)) {
+            let started = Instant::now();
+            let rgba = crate::orb::compose(side, &pal);
+            self.buffer = Some(MemoryRenderBuffer::from_slice(
+                &rgba,
+                Fourcc::Argb8888,
+                (side, side),
+                1,
+                Transform::Normal,
+                None,
+            ));
+            self.key = Some((side, pal));
+            info!(
+                side,
+                took_ms = started.elapsed().as_millis() as u64,
+                "orb.composed (once; breathing is per-frame scale+alpha on the GPU)"
+            );
+        }
+        self.buffer.as_ref().map(|b| (b, motion))
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // THE `CompState` trait — the backend-agnostic accessor surface the shared WM brain
 // drives. Each backend's concrete `State` impls it by handing back references to the
 // fields it already holds. The supertrait `SeatHandler<KeyboardFocus = WlSurface,
@@ -262,6 +425,22 @@ pub trait CompState:
     fn set_capture_blocked_flag(&mut self, on: bool);
     fn black_buffer_mut(&mut self) -> &mut SolidColorBuffer;
 
+    // ── NATIVE SHELL M1: the composed aura backdrop (see BloomCache). ──
+    fn bloom_mut(&mut self) -> &mut BloomCache;
+
+    // ── NATIVE SHELL M2: the breathing voice orb (see OrbCache). ──
+    fn orb_mut(&mut self) -> &mut OrbCache;
+
+    /// The orb's live energy signal, 0..=1 (mic RMS while listening/speaking).
+    ///
+    /// Default 0.0 = resting breath, so a backend that has not wired voice yet
+    /// still gets a correct, calm orb rather than no orb. The DRM backend
+    /// overrides this once the voice IPC lands (M5); until then the orb breathes
+    /// on the clock alone, which is exactly P2's resting behaviour.
+    fn orb_energy(&self) -> f32 {
+        0.0
+    }
+
     /// Toggle the screen kill-switch (the `screen.kill` IPC verb's executor). Default
     /// = the shared flag-flip + log. The winit backend OVERRIDES it to ALSO fail any
     /// in-flight screencopy frames (it owns the read-back queue); the DRM backend has no
@@ -314,18 +493,120 @@ pub fn next_cascade_loc<S: CompState>(state: &mut S) -> Point<i32, Logical> {
     const STEP_X: i32 = 230;
     const STEP_Y: i32 = 150;
     const MARGIN: i32 = 16;
-    let loc = state.next_window_loc();
-    let out_size = state
-        .space()
-        .output_geometry(state.output())
-        .map(|g| g.size)
-        .unwrap_or((1280, 800).into());
+    // Cascade inside the WORK AREA, never the raw output: the origin the cascade
+    // resets to has to sit below whatever chrome the shell reserved, or every
+    // fresh window opens underneath the taskbar.
+    let (ax, ay, aw, ah) = work_area_for(state).unwrap_or((0, 0, 1280, 800));
+    // Clamp the location we hand OUT too, so even the first window -- whose
+    // stored location predates any reservation -- lands below the chrome.
+    let stored = state.next_window_loc();
+    let loc = Point::from((stored.x.max(ax), stored.y.max(ay)));
     let mut next = Point::from((loc.x + STEP_X, loc.y + STEP_Y));
-    if next.x + 200 > out_size.w || next.y + 150 > out_size.h {
-        next = Point::from((MARGIN, MARGIN));
+    if next.x + 200 > ax + aw || next.y + 150 > ay + ah {
+        next = Point::from((ax + MARGIN, ay + MARGIN));
     }
     state.set_next_window_loc(next);
     loc
+}
+
+// ── PANEL RESERVATION ────────────────────────────────────────────────────────
+// The HART shell is a SINGLE fullscreen layer surface on the Background layer,
+// with its taskbar painted inside it (Z-ORDER MODEL 1 in hart-layer-shell-host.nix
+// -- one WebView, so the shell JS keeps its window.* globals). The consequence the
+// user hit on 2026-08-29: a window maximizes over the whole output and the bar it
+// covers is unreachable, because the bar is not a surface of its own that could
+// claim an exclusive zone.
+//
+// So the compositor reserves the strip on the shell's behalf. Every window-placement
+// path resolves its rect through `work_area_for` instead of the output geometry,
+// which means maximize, all nine snap zones, all five tiling layouts and the
+// new-window cascade honour the bar from ONE definition rather than four.
+
+/// Where the shell publishes how much chrome it owns, in logical pixels per edge.
+///
+/// The CSS that draws the bars is the only thing that knows their size, so the
+/// compositor ASKS rather than hardcoding numbers that would silently drift the
+/// first time either bar is restyled. Same runtime-file contract as the
+/// native-chrome bridge next door, for the same reason: it is the channel that
+/// already crosses from the shell to the compositor.
+///
+/// Format is one `key=pixels` per line, unknown keys ignored, so left/right docks
+/// can be added later without a flag day:
+///     top=40
+///     bottom=44
+pub const PANEL_RESERVATION_PATH: &str = "/run/hart/session/panel-reservation";
+
+/// Logical pixels of chrome the shell reserves on each edge. The HART shell has
+/// TWO: a 40px top bar (Home / Agents / Apps / Hive / Earn) and a 44px bottom
+/// taskbar, both painted inside the one Background layer surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PanelReservation {
+    pub top: i32,
+    pub bottom: i32,
+}
+
+/// Parse a published reservation. PURE, so every fail-safe path below is testable.
+///
+/// FAIL-SAFE TO ZERO, per field. A junk line, a negative number, an unknown key --
+/// each is skipped and leaves that edge unreserved. Zero everywhere reproduces the
+/// pre-existing layout exactly, which is what lets the compositor half of this ship
+/// inert before the shell half exists.
+pub fn parse_panel_reservation(text: &str) -> PanelReservation {
+    let mut r = PanelReservation::default();
+    for line in text.lines() {
+        let (key, value) = match line.split_once('=') {
+            Some(kv) => kv,
+            None => continue,
+        };
+        let v = match value.trim().parse::<i32>() {
+            Ok(v) if v > 0 => v,
+            _ => continue,
+        };
+        match key.trim() {
+            "top" => r.top = v,
+            "bottom" => r.bottom = v,
+            _ => {} // forward-compatible: an older compositor ignores newer edges
+        }
+    }
+    r
+}
+
+/// The reservation the shell has published, or none at all.
+pub fn panel_reservation() -> PanelReservation {
+    std::fs::read_to_string(PANEL_RESERVATION_PATH)
+        .map(|s| parse_panel_reservation(&s))
+        .unwrap_or_default()
+}
+
+/// The output rect MINUS the reserved chrome: the region windows may occupy.
+/// PURE, so the clamping below is unit-testable without a mapped output.
+///
+/// The reservation is CAPPED AT HALF the output height, and when both edges
+/// together exceed that they are scaled down in proportion rather than one edge
+/// winning. These numbers cross a process boundary as a text file, and a corrupt or
+/// absurd value must not be able to squeeze the usable area to nothing: a desktop
+/// with no room for windows is a far worse failure than a bar that overlaps one.
+pub fn work_area(
+    ox: i32, oy: i32, ow: i32, oh: i32, reserved: PanelReservation,
+) -> (i32, i32, i32, i32) {
+    let cap = (oh / 2).max(0);
+    let top = reserved.top.clamp(0, cap);
+    let bottom = reserved.bottom.clamp(0, cap);
+    let total = top + bottom;
+    let (top, bottom) = if total > cap && total > 0 {
+        let t = top * cap / total;
+        (t, cap - t)
+    } else {
+        (top, bottom)
+    };
+    (ox, oy + top, ow, oh - top - bottom)
+}
+
+/// The live work area. THE single place window placement learns where it may lay
+/// things out; `output_geometry` must not be read directly for that purpose again.
+pub fn work_area_for<S: CompState>(state: &S) -> Option<(i32, i32, i32, i32)> {
+    let g = state.space().output_geometry(state.output())?;
+    Some(work_area(g.loc.x, g.loc.y, g.size.w, g.size.h, panel_reservation()))
 }
 
 /// The current output size in PHYSICAL (framebuffer) pixels. Screencopy reports this
@@ -793,11 +1074,13 @@ pub fn restore_focused_window<S: CompState>(state: &mut S) {
         .and_then(|s| s.0.take());
     let (x, y, w, h) = match stashed {
         Some(g) => (g.loc.x, g.loc.y, g.size.w, g.size.h),
-        None => match state.space().output_geometry(state.output()) {
-            Some(o) => {
-                let w = o.size.w * 3 / 5;
-                let h = o.size.h * 3 / 5;
-                (o.loc.x + (o.size.w - w) / 2, o.loc.y + (o.size.h - h) / 2, w, h)
+        // Centred 60% of the WORK AREA, so an un-snapped restore also lands clear
+        // of the reserved chrome.
+        None => match work_area_for(state) {
+            Some((ax, ay, aw, ah)) => {
+                let w = aw * 3 / 5;
+                let h = ah * 3 / 5;
+                (ax + (aw - w) / 2, ay + (ah - h) / 2, w, h)
             }
             None => return,
         },
@@ -1325,11 +1608,15 @@ pub fn zone_rect(ox: i32, oy: i32, ow: i32, oh: i32, zone: &str) -> Option<(i32,
     Some(r)
 }
 
-/// Compute a named-zone rect over the output (§4.4 zones). Logical pixels. Thin wrapper:
-/// reads the live output geometry then defers to the pure `zone_rect`.
+/// Compute a named-zone rect over the WORK AREA (§4.4 zones). Logical pixels. Thin
+/// wrapper: reads the live work area then defers to the pure `zone_rect`.
+///
+/// The work area rather than the output geometry is what makes "maximize" stop at
+/// the taskbar instead of burying it, and it lands the same fix on all nine zones
+/// at once -- a top-half snap now means the top half of the usable desktop.
 pub fn ipc_zone_rect<S: CompState>(state: &S, zone: &str) -> Option<(i32, i32, i32, i32)> {
-    let geo = state.space().output_geometry(state.output())?;
-    zone_rect(geo.loc.x, geo.loc.y, geo.size.w, geo.size.h, zone)
+    let (ax, ay, aw, ah) = work_area_for(state)?;
+    zone_rect(ax, ay, aw, ah, zone)
 }
 
 /// PURE tile geometry: lay `n` windows over an output rect `(ox, oy, ow, oh)` per the
@@ -1403,11 +1690,13 @@ pub fn ipc_tile<S: CompState>(state: &mut S, layout: &str) -> Vec<String> {
     if n == 0 {
         return Vec::new();
     }
-    let geo = match state.space().output_geometry(state.output()) {
-        Some(g) => g,
+    // Tile over the WORK AREA: a tiling layout that paved over the taskbar would
+    // hide it on every single window, which is the worst case of all.
+    let (ax, ay, aw, ah) = match work_area_for(state) {
+        Some(a) => a,
         None => return Vec::new(),
     };
-    let rects = tile_rects(geo.loc.x, geo.loc.y, geo.size.w, geo.size.h, n, layout);
+    let rects = tile_rects(ax, ay, aw, ah, n, layout);
 
     for (handle, (x, y, w, h)) in handles.iter().zip(rects.iter()) {
         ipc_place_window(state, handle, *x, *y, *w, *h);
@@ -1547,8 +1836,62 @@ pub fn build_cursor_elements<S, R>(
     }
 }
 
+/// Does a wlr-layer-shell layer sit ABOVE mapped toplevels?
+///
+/// The protocol stacks background < bottom < WINDOWS < top < overlay. This states
+/// it in ONE place because the renderer and the input hit-test have to agree, and
+/// they did not: `surface_under` has routed Overlay/Top above windows since it was
+/// written (its own docstring says so), while `build_frame_elements` painted EVERY
+/// layer below EVERY window. A Top-layer panel therefore swallowed clicks in a
+/// strip where nothing of it was drawn -- pixels saying one thing and input
+/// another, in exactly the surfaces the Top layer exists for.
+pub fn layer_is_above_windows(layer: WlrLayer) -> bool {
+    matches!(layer, WlrLayer::Top | WlrLayer::Overlay)
+}
+
+/// Push the layer surfaces on ONE side of the toplevels, returning how many were
+/// painted. Called twice per frame, before and after the window loop.
+///
+/// `elements` is TOP→bottom (index 0 paints first, on top), and `LayerMap::layers`
+/// yields bottom-to-top, so the `.rev()` is what keeps two surfaces on the same
+/// layer from stacking upside down. This mirrors anvil, which partitions
+/// `layers().rev()` on `Background | Bottom` for the same reason.
+fn push_layer_elements<R>(
+    renderer: &mut R,
+    elements: &mut Vec<HartRenderElement<R>>,
+    output: &Output,
+    ws_alpha: f32,
+    above_windows: bool,
+) -> usize
+where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Send + Clone + 'static,
+{
+    let map = layer_map_for_output(output);
+    let mut painted = 0usize;
+    for layer in map.layers().rev() {
+        if layer_is_above_windows(layer.layer()) != above_windows {
+            continue;
+        }
+        painted += 1;
+        let loc = map.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
+        let layer_elems: Vec<WaylandSurfaceRenderElement<R>> =
+            render_elements_from_surface_tree(
+                renderer,
+                layer.wl_surface(),
+                (loc.x, loc.y),
+                1.0,
+                ws_alpha,
+                Kind::Unspecified,
+            );
+        elements.extend(layer_elems.into_iter().map(HartRenderElement::Surface));
+    }
+    painted
+}
+
 /// Build the FULL frame element list in z-order (TOP→bottom; `draw_render_elements`
-/// paints index 0 first = top-most): killswitch → cursor → windows (faded) → layers.
+/// paints index 0 first = top-most): killswitch → cursor → Top/Overlay layers →
+/// windows (faded) → Bottom/Background layers.
 /// Generic over R so BOTH backends build the identical frame; the backend then binds its
 /// framebuffer + draws this slice. This is the single source of the desktop's z-order.
 pub fn build_frame_elements<S, R>(
@@ -1562,6 +1905,10 @@ where
     R::TextureId: Send + Clone + 'static,
 {
     let mut elements: Vec<HartRenderElement<R>> = Vec::new();
+    // What native chrome THIS frame ends up containing. Accumulated as elements
+    // are actually pushed (never on a failed import), and published at the end
+    // for the backend's flip handler to turn into the shell's verdict file.
+    let mut native_mask: u8 = 0;
 
     // ── 0. KILLSWITCH (top): a full-output opaque black solid ABOVE all windows. ──
     if state.capture_blocked() {
@@ -1579,8 +1926,23 @@ where
         build_cursor_elements(state, renderer, &mut elements);
     }
 
-    // ── 2. WINDOW TOPLEVELS (above layers, below cursor), top-most first. ──
     let ws_alpha = workspace_fade_alpha(state);
+    let output = state.output().clone();
+    let mut layers_painted = 0usize;
+
+    // ── 2. TOP / OVERLAY layer surfaces — ABOVE the toplevels. ──
+    // wlr-layer-shell stacks background < bottom < WINDOWS < top < overlay, and
+    // `surface_under` has always routed clicks that way (its own docstring says
+    // so). The renderer did not: every layer, whatever its layer, was painted
+    // below every window. So a Top-layer panel took clicks in a strip where it
+    // was nowhere to be seen -- pixels said one thing and input another, which
+    // is unusable for exactly the panels and notification surfaces the Top layer
+    // exists for. `layer_is_above_windows` is now the single statement of that
+    // order, shared by both.
+    layers_painted += push_layer_elements(
+        renderer, &mut elements, &output, ws_alpha, /* above_windows = */ true);
+
+    // ── 3. WINDOW TOPLEVELS (below Top/Overlay layers and the cursor). ──
     let windows: Vec<Window> = state.space().elements().rev().cloned().collect();
     for window in &windows {
         let loc = state.space().element_location(window).unwrap_or_default();
@@ -1604,32 +1966,121 @@ where
         elements.extend(win_elems.into_iter().map(HartRenderElement::Surface));
     }
 
-    // ── 3. LAYER surfaces (below the toplevels in this list = drawn under them). ──
-    let output = state.output().clone();
-    let mut layers_painted = 0usize;
-    {
-        let map = layer_map_for_output(&output);
-        for layer in map.layers() {
-            layers_painted += 1;
-            let loc = map.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
-            let layer_elems: Vec<WaylandSurfaceRenderElement<R>> =
-                render_elements_from_surface_tree(
-                    renderer,
-                    layer.wl_surface(),
-                    (loc.x, loc.y),
-                    1.0,
-                    ws_alpha,
-                    Kind::Unspecified,
-                );
-            elements.extend(layer_elems.into_iter().map(HartRenderElement::Surface));
-        }
-    }
+    // ── 4. BOTTOM / BACKGROUND layer surfaces — BELOW the toplevels. ──
+    // This is the desktop plane: the HART glass shell anchors here, which is what
+    // makes it the desktop rather than an app.
+    layers_painted += push_layer_elements(
+        renderer, &mut elements, &output, ws_alpha, /* above_windows = */ false);
     {
         let prev = LAYERS_PAINTED.swap(layers_painted, std::sync::atomic::Ordering::Relaxed);
         if prev != layers_painted {
             info!(layers_painted, "layer.composited (wlr-layer surfaces now in the rendered frame)");
         }
     }
+
+    // ── 3b. NATIVE ORB (NATIVE SHELL M2), above the backdrop, below the shell. ──
+    // Placed here in the z-order so it composites over the bloom but under the
+    // layer surfaces, matching M1's staging: while the HTML shell still paints an
+    // opaque background this is OCCLUDED, exactly as the bloom is. It is wired
+    // now rather than later so the module cannot rot unreferenced — which is
+    // precisely how bloom.rs sat dormant from 2026-07-20 to 2026-08-27.
+    //
+    // The whole point of M2 is here: `motion` is two floats from a clock, handed
+    // to the element as `alpha` and `size`. The GPU scales and blends a texture
+    // composed once. No pixel is touched by the CPU per frame, which is the
+    // difference between this and the ~5.4s/6s of userspace rasterisation
+    // measured in WebKit while it breathed the same orb.
+    if !state.capture_blocked() {
+        // Placement per checklist rule c7: "Home mode: orb floats to the RIGHT
+        // of the hero copy". An earlier draft centred it, which contradicts a
+        // binding rule — the checklist is the instruction record, not a
+        // suggestion. Vertically it sits on the hero's own line
+        // (`.hart-hero{top:46%}`), sized as a fraction of the short edge.
+        //
+        // Still PROVISIONAL: the scene owns this once A2UI drives the native
+        // tree (M4), and c7's compact orb-sm docked in the top bar is not
+        // modelled here at all. Hard-coding a c7-shaped default keeps M2 to one
+        // new idea while not shipping a placement the checklist forbids.
+        let short = size.w.min(size.h);
+        let side = (short as f32 * 0.30) as i32;
+        let energy = state.orb_energy();
+        if let Some((buffer, motion)) = state.orb_mut().current(side, energy) {
+            // Breathing scales about the CENTRE, so the top-left moves by half
+            // the growth. Computed from the motion rather than stored, so there
+            // is no second source of truth for where the orb is.
+            let drawn = (side as f32 * motion.scale) as i32;
+            // 0.72 of the width = right of the hero copy (c7), not centred.
+            let cx = (size.w as f32 * 0.72) as i32;
+            let cy = (size.h as f32 * 0.46) as i32;
+            let origin: Point<f64, Physical> =
+                Point::from(((cx - drawn / 2) as f64, (cy - drawn / 2) as f64));
+            match MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                origin,
+                buffer,
+                Some(motion.alpha),
+                None,
+                Some((drawn, drawn).into()),
+                Kind::Unspecified,
+            ) {
+                Ok(e) => {
+                    elements.push(HartRenderElement::Memory(e));
+                    native_mask |= NATIVE_CHROME_ORB;
+                }
+                // Never fatal: a missing orb is a desktop without an orb, not a
+                // dead session. Same posture as the backdrop below. Note the
+                // mask is NOT set here — a failed import must never let the
+                // shell hide its own orb.
+                Err(err) => warn!(?err, "orb: failed to import the composed orb"),
+            }
+        }
+    }
+
+    // ── 4. BLOOM BACKDROP (last in the list = drawn UNDER everything). ──
+    // NATIVE SHELL M1. Before this, the bottom of the frame was the flat
+    // HART_SPLASH_RGBA clear and the aurora was painted by a browser in a
+    // WebView above it. Now the compositor owns its own backdrop.
+    //
+    // Deliberately built LAST and pushed LAST: it must sit beneath the layer
+    // surfaces (the glass shell) so a shell that paints transparency reveals the
+    // native field rather than flat slate. The clear colour still runs, so if
+    // this element is skipped the frame is exactly what it was before.
+    //
+    // Cheap by construction: `BloomCache::get` is a key comparison on every
+    // frame but the first at a given size/theme.
+    if !state.capture_blocked() {
+        // Split the borrow: `bloom_mut` holds `state` mutably, and
+        // `MemoryRenderBufferRenderElement::from_buffer` needs the buffer while
+        // `renderer` is also borrowed. They are disjoint (`renderer` is a separate
+        // parameter, not a `state` field), so this type-checks and stays short.
+        if let Some(buffer) = state.bloom_mut().get(size.w, size.h) {
+            let origin: Point<f64, Physical> = Point::from((0.0, 0.0));
+            match MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                origin,
+                buffer,
+                None,
+                None,
+                None,
+                Kind::Unspecified,
+            ) {
+                Ok(e) => {
+                    elements.push(HartRenderElement::Memory(e));
+                    native_mask |= NATIVE_CHROME_BLOOM;
+                }
+                // Never fatal: without the backdrop the clear colour shows, which
+                // is precisely the pre-M1 desktop. A failed import must not cost
+                // the user their session, and must NOT set the mask — the shell
+                // would then go transparent over a backdrop we never drew.
+                Err(err) => warn!(?err, "bloom: failed to import the backdrop; falling back to the clear colour"),
+            }
+        }
+    }
+
+    // Publish what this frame contains. The backend turns it into the shell's
+    // verdict ONLY after the frame is actually presented, so a composed-but-
+    // never-flipped frame can never make the shell go transparent.
+    NATIVE_CHROME_EMITTED.store(native_mask, std::sync::atomic::Ordering::Relaxed);
 
     elements
 }
@@ -1799,6 +2250,196 @@ mod tests {
     }
     fn digit_chord(m: ModifiersState, modified: Keysym, level0: Keysym) -> Option<WmAction> {
         process_keyboard_shortcut(m, modified, Some(level0))
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // layer_is_above_windows — the ONE statement of wlr-layer-shell stacking,
+    // shared by the renderer and the pointer hit-test. They disagreed: the
+    // hit-test routed Overlay/Top above windows from the start while the frame
+    // builder painted every layer below every window, so a Top-layer panel took
+    // clicks in a strip where nothing of it was visible.
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn top_and_overlay_are_above_the_toplevels() {
+        assert!(layer_is_above_windows(WlrLayer::Top));
+        assert!(layer_is_above_windows(WlrLayer::Overlay));
+    }
+
+    #[test]
+    fn background_and_bottom_are_below_the_toplevels() {
+        // The HART glass shell anchors to Background. That is what makes it the
+        // desktop rather than an app, and it must keep sitting under windows.
+        assert!(!layer_is_above_windows(WlrLayer::Background));
+        assert!(!layer_is_above_windows(WlrLayer::Bottom));
+    }
+
+    #[test]
+    fn every_layer_falls_on_exactly_one_side() {
+        // A partition, not a filter: each of the four layers is either above or
+        // below, so the two push_layer_elements passes paint each surface once.
+        // If a layer were ever missed by both, it would silently vanish.
+        let all = [WlrLayer::Background, WlrLayer::Bottom, WlrLayer::Top, WlrLayer::Overlay];
+        let above = all.iter().filter(|l| layer_is_above_windows(**l)).count();
+        assert_eq!(above, 2);
+        assert_eq!(all.len() - above, 2);
+    }
+
+    #[test]
+    fn the_renderer_and_the_hit_test_use_the_same_rule() {
+        // surface_under tries Overlay then Top BEFORE space().element_under, and
+        // Bottom then Background after it. Those are the two groups this function
+        // returns, so the pixels and the pointer cannot drift apart again without
+        // this assertion failing.
+        for layer in [WlrLayer::Overlay, WlrLayer::Top] {
+            assert!(layer_is_above_windows(layer),
+                    "{layer:?} is hit-tested before windows, so it must paint above them");
+        }
+        for layer in [WlrLayer::Bottom, WlrLayer::Background] {
+            assert!(!layer_is_above_windows(layer),
+                    "{layer:?} is hit-tested after windows, so it must paint below them");
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // work_area — the panel reservation. The HART taskbar lives INSIDE the single
+    // Background layer surface, so it cannot claim an exclusive zone of its own;
+    // the compositor reserves the strip for it instead. Every window-placement
+    // path resolves through here, so these cases cover maximize, all nine snap
+    // zones, all five tiling layouts and the new-window cascade at once.
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// The HART shell's real chrome: a 40px top bar and a 44px bottom taskbar,
+    /// both read off the served CSS (--hart-topbar-height and .taskbar height).
+    fn hart_chrome() -> PanelReservation {
+        PanelReservation { top: 40, bottom: 44 }
+    }
+
+    #[test]
+    fn no_reservation_leaves_the_output_untouched() {
+        // The pre-existing behaviour, and what every node without a published
+        // reservation keeps getting.
+        let none = PanelReservation::default();
+        assert_eq!(work_area(0, 0, 1600, 900, none), (0, 0, 1600, 900));
+    }
+
+    #[test]
+    fn both_edges_are_taken_off_the_usable_area() {
+        let (x, y, w, h) = work_area(0, 0, 1600, 900, hart_chrome());
+        assert_eq!((x, y, w, h), (0, 40, 1600, 816));
+        assert_eq!(y + h, 900 - 44, "the bottom taskbar must stay clear too");
+    }
+
+    #[test]
+    fn a_reservation_respects_a_non_zero_output_origin() {
+        // Multi-output layouts put the origin somewhere other than 0,0.
+        assert_eq!(work_area(1600, 100, 1280, 800, hart_chrome()),
+                   (1600, 140, 1280, 716));
+    }
+
+    #[test]
+    fn an_absurd_reservation_cannot_squeeze_the_desktop_to_nothing() {
+        // These numbers cross a process boundary as a text file. A desktop with no
+        // room for windows is a worse failure than a bar that overlaps one.
+        let absurd = PanelReservation { top: 100_000, bottom: 100_000 };
+        let (_, y, _, h) = work_area(0, 0, 1600, 900, absurd);
+        assert!(h >= 450, "at least half the output must stay usable, got {h}");
+        assert!(y <= 450);
+    }
+
+    #[test]
+    fn two_oversized_edges_shrink_in_proportion_rather_than_one_winning() {
+        // Each edge is capped at half the output (450) first, so 600/200 becomes
+        // 450/200, then the pair is scaled to fit 450 total: 311 top, 139 bottom.
+        // Both edges survive; neither is zeroed out to let the other have its way.
+        let greedy = PanelReservation { top: 600, bottom: 200 };
+        let (_, y, _, h) = work_area(0, 0, 1600, 900, greedy);
+        assert_eq!(h, 450);
+        assert!(y > 300 && y < 380, "top edge kept its share, got {y}");
+    }
+
+    #[test]
+    fn a_negative_reservation_is_ignored_rather_than_growing_the_area() {
+        let bad = PanelReservation { top: -40, bottom: -44 };
+        assert_eq!(work_area(0, 0, 1600, 900, bad), (0, 0, 1600, 900));
+    }
+
+    #[test]
+    fn maximize_over_the_work_area_stops_at_the_chrome() {
+        // The user-visible bug: a maximized window covered the bar and there was no
+        // way back to Home/Agents/Apps without minimizing it.
+        let (ax, ay, aw, ah) = work_area(0, 0, 1600, 900, hart_chrome());
+        let (x, y, w, h) = zone_rect(ax, ay, aw, ah, "maximize").unwrap();
+        assert_eq!((x, y, w, h), (0, 40, 1600, 816));
+        assert!(y >= 40, "a maximized window must start below the top bar");
+        assert!(y + h <= 900 - 44, "and stop above the taskbar");
+    }
+
+    #[test]
+    fn no_snap_zone_reaches_into_either_bar() {
+        let c = hart_chrome();
+        let (ax, ay, aw, ah) = work_area(0, 0, 1600, 900, c);
+        for zone in ["left-half", "right-half", "top-half", "bottom-half", "top-left",
+                     "top-right", "bottom-left", "bottom-right", "center",
+                     "maximize", "fullscreen"] {
+            let (_, y, _, h) = zone_rect(ax, ay, aw, ah, zone).unwrap();
+            assert!(y >= c.top, "zone {zone} starts at y={y}, inside the top bar");
+            assert!(y + h <= 900 - c.bottom,
+                    "zone {zone} ends at y={}, inside the taskbar", y + h);
+        }
+    }
+
+    #[test]
+    fn no_tiling_layout_paves_over_either_bar() {
+        // A tiler that ignored the chrome would hide the bars behind EVERY window,
+        // which is the worst case of the lot.
+        let c = hart_chrome();
+        let (ax, ay, aw, ah) = work_area(0, 0, 1600, 900, c);
+        for layout in ["grid", "cols", "columns", "rows", "master-stack", "fullscreen"] {
+            for n in 1..=6 {
+                for (_, y, _, h) in tile_rects(ax, ay, aw, ah, n, layout) {
+                    assert!(y >= c.top,
+                            "layout {layout} n={n} placed a tile at y={y}");
+                    assert!(y + h <= 900 - c.bottom,
+                            "layout {layout} n={n} tile ends at y={}", y + h);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_published_format_parses_both_edges() {
+        let r = parse_panel_reservation("top=40\nbottom=44\n");
+        assert_eq!(r, PanelReservation { top: 40, bottom: 44 });
+    }
+
+    #[test]
+    fn junk_in_the_published_file_reserves_nothing_rather_than_guessing() {
+        // Every one of these is a way the file could be wrong in the field.
+        for junk in ["", "garbage", "top=", "top=abc", "top=-5", "=40", "top:40",
+                     "\n\n\n", "top=40px"] {
+            assert_eq!(parse_panel_reservation(junk), PanelReservation::default(),
+                       "{junk:?} should have reserved nothing");
+        }
+    }
+
+    #[test]
+    fn a_partial_or_extended_file_still_works() {
+        // One edge only, and an edge this build has never heard of. Neither may
+        // break the ones it does understand -- that is what lets an older
+        // compositor keep running against a newer shell.
+        assert_eq!(parse_panel_reservation("top=40"),
+                   PanelReservation { top: 40, bottom: 0 });
+        assert_eq!(parse_panel_reservation("top=40\nleft=64\nbottom=44"),
+                   PanelReservation { top: 40, bottom: 44 });
+    }
+
+    #[test]
+    fn a_missing_file_reserves_nothing() {
+        // Fail-safe: this runs on a dev box with no /run/hart, and on a node that
+        // has not published anything yet. Either way the answer is "no
+        // reservation", so the compositor half ships inert ahead of the shell half.
+        assert_eq!(panel_reservation(), PanelReservation::default());
     }
 
     // ════════════════════════════════════════════════════════════════════════

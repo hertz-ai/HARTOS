@@ -76,7 +76,7 @@ pub fn palette_from_theme_file(path: &Path) -> BloomPalette {
         Ok(t) => t,
         Err(_) => return p,
     };
-    let mut find = |key: &str| -> Option<[u8; 3]> {
+    let find = |key: &str| -> Option<[u8; 3]> {
         let k = format!("\"{}\"", key);
         let i = text.find(&k)?;
         let rest = &text[i + k.len()..];
@@ -96,6 +96,38 @@ pub fn palette_from_theme_file(path: &Path) -> BloomPalette {
         }
     }
     p
+}
+
+/// Where the shipped theme JSONs land at runtime. This is the SAME directory
+/// `hart-liquid-ui.nix` hands the HTML shell as `HART_THEME_DIR`, so both
+/// renderers read one palette source (Gate 4: no parallel theme table).
+const THEME_DIR_DEFAULT: &str = "/run/current-system/sw/share/hart/conky-themes";
+
+/// Resolve the active palette from the environment, degrading at every step.
+///
+/// `HART_THEME_DIR` / `HART_THEME` follow the convention the conky + liquid-ui
+/// modules already export. Every failure path lands on aura's shipped values
+/// rather than a void, because this is the DESKTOP BACKDROP: an unreadable theme
+/// file must never produce a black screen the user cannot explain.
+pub fn theme_palette() -> BloomPalette {
+    let dir = std::env::var("HART_THEME_DIR").unwrap_or_else(|_| THEME_DIR_DEFAULT.to_string());
+    let id = std::env::var("HART_THEME").unwrap_or_else(|_| "aura".to_string());
+    theme_palette_from(&dir, &id)
+}
+
+/// The resolution rule itself, with the environment read out of the way.
+///
+/// Split from `theme_palette` so it is testable WITHOUT mutating process-global
+/// environment: cargo runs tests as parallel threads in one process, so an
+/// env-mutating test would race every other test in this module.
+pub fn theme_palette_from(dir: &str, id: &str) -> BloomPalette {
+    // Reject a theme id that could escape the theme directory. The id reaches us
+    // from the environment, and a path separator would let it name any file on
+    // disk; a bad id falls back to the shipped look rather than reading around.
+    if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+        return BloomPalette::default();
+    }
+    palette_from_theme_file(&Path::new(dir).join(format!("{}.json", id)))
 }
 
 /// One additive radial blob: centre as a fraction of the output, radius as a
@@ -243,6 +275,46 @@ mod tests {
         assert_eq!(p.base, [0x04, 0x05, 0x0B]);
         assert_eq!(p.amb[1], [0x00, 0xDD, 0xF9]);
         assert_eq!(p.amb[3], [0xFF, 0xB3, 0x30]);
+    }
+
+    #[test]
+    fn theme_id_that_escapes_the_theme_dir_is_rejected() {
+        // The id arrives from the environment. A separator would let it name any
+        // file on disk, so a hostile or fat-fingered value must land on the
+        // shipped look rather than reading around the theme directory.
+        for bad in ["../../etc/shadow", "a/b", "a\\b", "..", ""] {
+            assert_eq!(
+                theme_palette_from("/share/hart/conky-themes", bad),
+                BloomPalette::default(),
+                "id {:?} was not rejected",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn theme_is_read_from_the_named_dir_and_missing_keys_keep_aura() {
+        let dir = std::env::temp_dir().join("hart_bloom_resolve_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("moss.json"),
+            r#"{"colors":{"background":"010203","ambient_1":"0A0B0C"}}"#,
+        )
+        .unwrap();
+        let p = theme_palette_from(dir.to_str().unwrap(), "moss");
+        assert_eq!(p.base, [0x01, 0x02, 0x03]);
+        assert_eq!(p.amb[0], [0x0A, 0x0B, 0x0C]);
+        // Ambients the file does not mention keep aura's values, never black:
+        // a partial theme must not punch holes in the backdrop.
+        assert_eq!(p.amb[3], BloomPalette::default().amb[3]);
+    }
+
+    #[test]
+    fn a_theme_that_is_not_installed_still_paints_the_shipped_look() {
+        assert_eq!(
+            theme_palette_from("/nonexistent/theme/dir", "whatever"),
+            BloomPalette::default()
+        );
     }
 
     #[test]

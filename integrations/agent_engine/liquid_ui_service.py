@@ -143,6 +143,109 @@ def read_gpu_render_mode() -> str:
         return 'software'
 
 
+# ── NATIVE CHROME (the NATIVE SHELL PARITY PROGRAM bridge) ───────────────────
+# hart-comp composites parts of the desktop chrome ITSELF now (M1 the aura
+# backdrop, M2 the breathing orb). Those are painted UNDER this shell's layer
+# surface, so while the shell also draws them the native ones are invisible and
+# the browser keeps paying for animation it does not need to run: measured
+# 2026-08-28, WebKitWebProcess burning a full core with ZERO ioctls, ~5.4s of
+# every 6s in userspace pixel work.
+#
+# So the compositor PUBLISHES what it owns and the shell stands down for exactly
+# those pieces. One verdict file, many consumers — the same contract
+# /run/hart/gpu-render already uses, and the reason its comment says "REUSE the
+# probe's verdict; do NOT invent a second probe".
+#
+# A LIST rather than a boolean on purpose: M3 adds the top bar and taskbar, and
+# they must extend this file rather than add a second signal.
+#
+# Lives under /run/hart/session (0770, group-writable) NOT /run/hart (0750,
+# owner-only) for the same reason shell-ready and current-tier do — see the note
+# below on the perms bug that silently defeats the whole ladder.
+_NATIVE_CHROME_FILE = '/run/hart/session/native-chrome'
+
+# What this shell knows how to stand down for. A name the shell does not
+# recognise is IGNORED rather than trusted: a newer compositor claiming
+# `taskbar` must not make an older shell hide a taskbar it still owns.
+_NATIVE_CHROME_KNOWN = frozenset({'bloom', 'orb'})
+
+
+def read_native_chrome() -> frozenset:
+    """Which chrome elements the compositor is currently painting itself.
+
+    Best-effort + fail-EMPTY: a missing, unreadable or unrecognised file yields
+    the empty set, which means "the shell draws everything", i.e. byte-for-byte
+    today's behaviour. That direction matters — the failure mode of guessing
+    wrong is a desktop with NO background or NO orb, and the paint watchdog does
+    not catch a wrong-looking desktop, only a hung one. Never raises.
+    """
+    try:
+        with open(_NATIVE_CHROME_FILE, 'r') as f:
+            raw = (f.read() or '').strip().lower()
+    except (FileNotFoundError, PermissionError, OSError):
+        return frozenset()
+    names = {p.strip() for p in raw.replace('\n', ',').split(',') if p.strip()}
+    return frozenset(names & _NATIVE_CHROME_KNOWN)
+
+
+# ── Panel reservation: shell -> compositor ──────────────────────────────────
+# read_native_chrome above runs compositor -> shell. This is the same bridge in the
+# other direction, and it exists because of Z-ORDER MODEL 1: the HART shell is ONE
+# fullscreen Background layer surface with the top bar AND the taskbar painted
+# inside it, so neither bar is a surface of its own that could claim a wlr-layer-
+# shell exclusive zone. Without this the compositor cannot know they are there, and
+# a maximized window covers both -- the 2026-08-29 report "the taskbar should always
+# stay on top", where the bar sat unreachable behind a full-screen Firefox with no
+# way back to Home/Agents/Apps.
+#
+# comp_core.rs `work_area` subtracts what we publish here, and EVERY placement path
+# (maximize, all nine snap zones, all five tiling layouts, the new-window cascade)
+# resolves through it.
+_PANEL_RESERVATION_FILE = '/run/hart/session/panel-reservation'
+
+#: Height of the bottom taskbar in CSS pixels. This MUST equal the `height:` in the
+#: `.taskbar` rule of the served stylesheet. tests/unit/test_panel_reservation.py
+#: greps the CSS and fails if the two drift, which is the only thing stopping a
+#: restyle from silently leaving a band of desktop covered again.
+TASKBAR_HEIGHT_PX = 44
+
+#: Used only if the served CSS somehow carries no --hart-topbar-height. Matches the
+#: theme-load fallback in render_desktop_shell.
+TOPBAR_HEIGHT_FALLBACK_PX = 40
+
+
+def publish_panel_reservation(css_vars: str) -> dict:
+    """Tell the compositor how much of the screen the shell's chrome owns.
+
+    The top value is parsed out of the SAME `--hart-topbar-height` the browser is
+    about to apply, so a theme that restyles the bar moves the reservation with it
+    and the two cannot disagree. The bottom is a constant pinned to the CSS by test.
+
+    Best-effort and NEVER raises. This runs on the desktop render path, and a
+    desktop that failed to draw because it could not write a hint file would be a
+    far worse bug than a window overlapping a bar. On any failure the compositor
+    finds no file and reserves nothing, which is exactly the behaviour that shipped
+    before this existed.
+
+    Returns the reservation it published, for tests and logging.
+    """
+    m = re.search(r'--hart-topbar-height:\s*(\d+)px', css_vars or '')
+    reservation = {'top': int(m.group(1)) if m else TOPBAR_HEIGHT_FALLBACK_PX,
+                   'bottom': TASKBAR_HEIGHT_PX}
+    body = ''.join('%s=%d\n' % kv for kv in reservation.items())
+    try:
+        # Write-then-rename so the compositor can never read a half-written file,
+        # the same way the compositor publishes its own native-chrome verdict.
+        tmp = _PANEL_RESERVATION_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            f.write(body)
+        os.replace(tmp, _PANEL_RESERVATION_FILE)
+    except (PermissionError, FileNotFoundError, OSError) as exc:
+        logger.debug('[shell] panel reservation not published (%s); the '
+                     'compositor will reserve nothing', exc)
+    return reservation
+
+
 # /run/hart/session (0770, group-writable) NOT /run/hart (0750, owner-only): the
 # session HOST runs as hart-admin (in the `hart` group, not the `hart` OWNER), so it
 # can only write the group-writable session dir -- the SAME dir + reason shell-ready /
@@ -805,6 +908,57 @@ class ContextEngine:
         except Exception:
             logger.exception("_get_system_context: swallowed Exception")
         return context
+
+
+#: Most A2UI events carried in ONE SSE message. The browser applies a message's
+#: events on its main thread (every branch of the EventSource handler is DOM
+#: work), so this is the bound on how much one message can ask of it. The
+#: remainder is not dropped — the producer keeps its cursor at the last event it
+#: actually sent and emits the rest immediately afterwards, so a burst arrives as
+#: several small frames instead of one unresponsive one.
+#:
+#: 8 is a floor-of-evidence number, not a tuning knob: the measured freeze came
+#: from federation backfill pushing dozens of events inside one second on a
+#: fresh install. Small enough that one message is a few DOM writes; large
+#: enough that ordinary single-event traffic still arrives in one round trip.
+_SSE_MAX_EVENTS_PER_MESSAGE = 8
+
+
+def sse_next_batch(events, cursor, now, limit=_SSE_MAX_EVENTS_PER_MESSAGE):
+    """Decide ONE SSE message: what to send, and where the cursor moves.
+
+    PURE — no locks, no clock, no service state — so the rule that actually
+    matters (bound the batch, never drop an event) is testable directly instead
+    of through a live stream. The caller owns the concurrency; this owns the
+    arithmetic.
+
+    Args:
+        events: pending events, each a dict with a numeric ``_ts``. Need not be
+            sorted; this sorts, because "the first N" is only meaningful in
+            timestamp order and the cursor is a timestamp.
+        cursor: the caller's current position. Returned unchanged when a batch
+            carries no usable ``_ts``, so a malformed event can never rewind or
+            silently skip the stream.
+        now: the caller's clock reading, used only when there is nothing to send.
+        limit: max events in this message.
+
+    Returns:
+        ``(batch, next_cursor)``. ``batch`` is empty when there is nothing to
+        send, and ``next_cursor`` is then ``now`` — the only case where jumping
+        the cursor forward is safe, because nothing is pending to jump over.
+
+    The invariant: ``next_cursor`` never advances past the last event ACTUALLY
+    included, so anything left over is still ``> cursor`` on the next call and
+    gets sent then. Bounding the batch is a DEFERRAL, never a discard.
+    """
+    if not events:
+        return [], now
+    ordered = sorted(events, key=lambda e: e.get('_ts', 0))
+    batch = ordered[:max(1, limit)]
+    last_ts = batch[-1].get('_ts')
+    # A missing/None _ts must not become the cursor: it would rewind the stream
+    # (re-sending everything forever) or skip ahead (dropping events).
+    return batch, last_ts if isinstance(last_ts, (int, float)) else cursor
 
 
 def _resolve_shell_pool_threads(tier):
@@ -1610,6 +1764,21 @@ class LiquidUIService:
             css_vars = ':root { --hart-background: #0F0E17; --hart-accent: #00E6C3; --hart-on-accent: #0F0E17; --hart-active: #00e676; --hart-text: #e0e0e0; --hart-glass-bg: rgba(15,14,23,0.65); --hart-glass-border: rgba(0,230,195,0.18); --hart-muted: #78909c; --hart-surface: #1a1a2e; --hart-blur: 20px; --hart-saturation: 180%; --hart-radius: 16px; --hart-panel-opacity: 0.65; --hart-topbar-height: 40px; --hart-icon-size: 20px; --hart-titlebar-height: 32px; --hart-font-family: "JetBrains Mono"; --hart-font-size: 13px; --hart-heading-size: 18px; --hart-font-weight: 400; --hart-heading-weight: 600; --hart-anim-speed: 200ms; --hart-error: #FF6B6B; --hart-caution: #ffab40; --hart-heading: #00E6C3; --hart-surface-hover: #252540; }'
             theme = {}
 
+        # Tell the compositor how much of the screen the chrome owns, derived from
+        # The bar heights the page will lay itself out with, taken from the SAME
+        # constants publish_panel_reservation hands the compositor. Interpolated
+        # into the CSS var + the two JS clamp sites so the paint and the
+        # reservation cannot drift; see the --hart-taskbar-height definition.
+        taskbar_height_px = TASKBAR_HEIGHT_PX
+        topbar_fallback_px = TOPBAR_HEIGHT_FALLBACK_PX
+
+        # the SAME css_vars this page is about to be served -- so a theme that
+        # restyles the top bar moves the window work-area with it. Placed after
+        # BOTH the theme path and the fallback path above, so the reservation is
+        # published even on a failed theme load (where the bars still render at the
+        # fallback sizes). Never raises; see publish_panel_reservation.
+        publish_panel_reservation(css_vars)
+
         # Performance tier detection
         perf = theme.get('performance', {})
 
@@ -1749,6 +1918,37 @@ class LiquidUIService:
         wp_css = wallpaper.get('value', 'radial-gradient(120% 120% at 18% 0%,rgba(0,212,170,0.07),transparent 50%),radial-gradient(100% 100% at 100% 100%,rgba(22,33,62,0.55),transparent 60%),linear-gradient(135deg,#0F0E17 0%,#1a1a2e 50%,#16213e 100%)')
         if wallpaper.get('type') == 'solid':
             wp_css = wallpaper['value']
+
+        # ── NATIVE CHROME BRIDGE ──
+        # When hart-comp reports it is painting the aura backdrop itself, this
+        # shell must get OUT OF THE WAY: the default wallpaper bottoms out in an
+        # opaque linear-gradient, which is precisely what has been hiding the
+        # native bloom since M1 landed. Standing down is what lets the
+        # compositor's field be seen at all.
+        #
+        # Empty set when the compositor has not claimed it (missing file, older
+        # compositor, degraded tier), so this whole block is INERT until the
+        # native side proves itself — and the shell keeps its own opaque
+        # backdrop, which is the safe direction.
+        native_chrome = read_native_chrome()
+        if 'bloom' in native_chrome:
+            wp_css = 'transparent'
+        # The orb half. Without this there would be TWO orbs, the native one
+        # breathing under an HTML one breathing on top of it — and the browser
+        # would still be paying the per-frame cost M2 exists to remove, so the
+        # win would be exactly zero while looking twice as busy.
+        #
+        # visibility+animation:none rather than display:none: the wrapper keeps
+        # its layout box and its hit target, so click-to-talk and the drag
+        # handler keep working against the same geometry while the compositor
+        # draws the pixels. Ripping the element out would break input as well as
+        # painting, which is a much bigger change than M2 is scoped for.
+        native_orb_css = ''
+        if 'orb' in native_chrome:
+            native_orb_css = (
+                '.hart-hero-orbwrap>canvas,#hart-voice-orb,'
+                '.hart-orb-orbit,.hart-orb-orbit2{visibility:hidden;animation:none}'
+            )
 
         # Living-Glass: emit the active accent as a comma-triple so every glow /
         # ring / selection re-tints when the theme accent changes. Parsed from the
@@ -2327,7 +2527,7 @@ html.a11y-rmotion .hart-ambient,html.a11y-rmotion .hart-hero-hevolve .dot,html.a
         # pointer-events:none (so empty-desktop right-click still reaches the
         # wallpaper menu); only the icons capture pointer events.
         _CSS_DESKTOP = '''
-.hart-desktop{position:fixed;left:0;right:0;top:var(--hart-topbar-height);bottom:44px;z-index:20;pointer-events:none}
+.hart-desktop{position:fixed;left:0;right:0;top:var(--hart-topbar-height);bottom:var(--hart-taskbar-height);z-index:20;pointer-events:none}
 .desktop-icon{position:absolute;width:84px;display:flex;flex-direction:column;align-items:center;gap:6px;
   padding:8px 4px;border-radius:12px;cursor:default;pointer-events:auto;user-select:none;
   transition:background .15s,transform .12s cubic-bezier(.175,.885,.32,1.275);will-change:transform}
@@ -2857,6 +3057,14 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
 <style>/* Icons: the BUNDLED /shell/static/MaterialSymbolsRounded.woff2 @font-face below is authoritative (every glyph, fully offline). This CDN <link> is progressive-enhancement ONLY (online round variant). */</style>
 <style>
 {css_vars}
+/* The taskbar height, DERIVED from the Python constant the compositor is told
+   to reserve (TASKBAR_HEIGHT_PX -> publish_panel_reservation -> comp_core's
+   work_area). It was hardcoded as 44px at three CSS sites and two JS sites, so
+   nothing stopped the reservation and the paint from drifting apart -- and a
+   drift means a maximized window sits under the bar, which is the defect
+   #52 was filed for. Emitted AFTER css_vars so a stale theme cannot override
+   the value the compositor is actually reserving. */
+:root {{ --hart-taskbar-height: {taskbar_height_px}px; }}
 {accent_rgb_css}
 {a11y_fontscale}
 *{{margin:0;padding:0;box-sizing:border-box}}
@@ -2866,6 +3074,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 
 /* ── Wallpaper ── */
 .wallpaper{{position:fixed;inset:0;z-index:0;background:{wp_css}}}
+{native_orb_css}
 
 /* ── Glass mixin (perf-aware) ── */
 .glass{{background:var(--hart-glass-bg);
@@ -2898,7 +3107,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 
 /* ── Panel Container ── */
 .panel-container{{position:fixed;top:var(--hart-topbar-height);left:0;right:0;
-  bottom:44px;z-index:100;pointer-events:none}}
+  bottom:var(--hart-taskbar-height);z-index:100;pointer-events:none}}
 .panel-container>*{{pointer-events:auto}}
 
 /* ── Glass Panel (floating window) ── */
@@ -3081,7 +3290,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 ::-webkit-scrollbar-thumb:hover{{background:var(--hart-accent)}}
 
 /* ── Taskbar ── */
-.taskbar{{position:fixed;bottom:0;left:0;right:0;height:44px;z-index:8000;
+.taskbar{{position:fixed;bottom:0;left:0;right:0;height:var(--hart-taskbar-height);z-index:8000;
   display:flex;gap:2px;padding:0 8px;align-items:center;border-radius:0;
   border-top:1px solid var(--hart-glass-border)}}
 .taskbar-chip{{height:34px;padding:0 12px;display:flex;align-items:center;gap:4px;
@@ -3871,11 +4080,32 @@ function updateTaskbar() {{
 }}
 
 // ═══ Panel Snap ═══
+// The live pixel height of a chrome bar, read from its CSS custom property.
+// ONE reader for every layout calculation, so a theme that restyles a bar moves
+// the windows with it. Before this, snapPanel and the drag-commit clamp both
+// hardcoded 40/44 while the CSS read var(--hart-topbar-height) from the theme:
+// under a taller bar, snapped panels were the wrong height and a dragged window
+// could be dropped underneath the bar and become unreachable.
+// `fallback` is the shipped default, used only if the var is missing entirely.
+function hartBarPx(varName, fallback) {{
+  try {{
+    var v = getComputedStyle(document.documentElement)
+              .getPropertyValue(varName);
+    var n = parseFloat(v);
+    return (isFinite(n) && n > 0) ? n : fallback;
+  }} catch(e) {{ return fallback; }}
+}}
+
 function snapPanel(id, side) {{
   const p = panels[id];
   if(!p) return;
-  const topH = 40;
-  const taskH = 44;
+  // Read the LIVE bar heights rather than assuming 40/44. Both were hardcoded
+  // here while the CSS read var(--hart-topbar-height) from the theme, so any
+  // theme with a taller top bar snapped every panel to the wrong height. The
+  // vars are the one source; hartBarPx falls back to the shipped defaults only
+  // if a var is missing entirely.
+  const topH = hartBarPx('--hart-topbar-height', {topbar_fallback_px});
+  const taskH = hartBarPx('--hart-taskbar-height', {taskbar_height_px});
   if(!PERF.potato) p.el.style.transition = 'all 0.2s ease-out';
   if(side==='left') {{
     p.el.style.left='0';p.el.style.top=topH+'px';
@@ -4220,7 +4450,8 @@ function applyMax(id) {{
   const p = panels[id];
   if(!p || p.max) return;
   p.el.style.left = '0'; p.el.style.top = '0';
-  p.el.style.width = '100vw'; p.el.style.height = 'calc(100vh - var(--hart-topbar-height) - 44px)';
+  p.el.style.width = '100vw';
+  p.el.style.height = 'calc(100vh - var(--hart-topbar-height) - var(--hart-taskbar-height))';
   p.el.style.borderRadius = '0';
   p.el.classList.add('maximized');
   p.max = true;
@@ -4339,7 +4570,11 @@ document.addEventListener('mouseup', e=>{{
       // innerWidth/innerHeight cached at dragstart (no forced reflow). Keep the
       // titlebar >=80px reachable so a window can't be lost under the bars.
       p.el.style.transform = '';
-      const KEEP=80, TOP=40, TASK=44;
+      // Live bar heights, not hardcoded: a theme with a taller top bar used to
+      // let a dragged window be dropped underneath it and become unreachable.
+      const KEEP=80;
+      const TOP=hartBarPx('--hart-topbar-height', {topbar_fallback_px});
+      const TASK=hartBarPx('--hart-taskbar-height', {taskbar_height_px});
       let nx = d.ox+d.dx, ny = d.oy+d.dy;
       nx = Math.min(Math.max(nx, KEEP - p.el.offsetWidth), d.vw - KEEP);
       ny = Math.min(Math.max(ny, TOP), d.vh - TASK - 28);
@@ -5966,11 +6201,35 @@ function acSend() {{
     window._hartThinking = false;  // terminal: handled locally, no brain wait
     return;
   }}
-  // Fallback fast-path: launch a NAMED app directly (no brain round-trip).
-  if(lower.startsWith('open ')) {{
-    const target = lower.replace('open ','').trim();
-    const match = Object.entries(MANIFEST).find(([k,v])=>
-      v.title.toLowerCase().includes(target)||k.includes(target));
+  // Fast-path: launch a NAMED app directly (no brain round-trip).
+  //
+  // MANIFEST now carries the machine's OWN applications as well as the shell's
+  // panels: AppRegistry discovers .desktop entries at bootstrap, and
+  // installed_app_manifest() merges them into this same object. So this reaches
+  // Firefox and the other 161 installed apps, which it never could before.
+  //
+  // The bare-name half is the 2026-08-29 fix. Typing 'firefox' used to need the
+  // word 'open' in front of it; without the prefix the text went to the brain and
+  // came back "Agent creation requires the 'pyautogen' package". An implicit open
+  // only applies to text that LOOKS like a name -- a few words, no sentence
+  // punctuation -- so 'run the numbers on my budget' still reaches the brain
+  // rather than launching whatever happens to share a word with it.
+  const OPEN_VERB = /^(?:open|launch|start|run) +/;
+  const explicit = OPEN_VERB.test(lower);
+  const target = (explicit ? lower.replace(OPEN_VERB,'') : lower).trim();
+  const nameLike = target.length >= 2 && target.split(/ +/).length <= 3
+                   && !/[?.!]/.test(target);
+  if(target && (explicit || nameLike)) {{
+    const entries = Object.entries(MANIFEST);
+    const title = function(v){{ return (v.title||'').toLowerCase(); }};
+    // Exact, then prefix, then -- only when the user actually said 'open' --
+    // a loose substring. With 162 apps in here a bare substring match is far too
+    // easy to hit by accident, and launching the wrong program is worse than
+    // handing the text to the brain.
+    const match = entries.find(([k,v])=> title(v)===target || k.toLowerCase()===target)
+      || entries.find(([k,v])=> title(v).startsWith(target) || k.toLowerCase().startsWith(target))
+      || (explicit ? entries.find(([k,v])=>
+            title(v).includes(target) || k.toLowerCase().includes(target)) : null);
     if(match) {{
       openPanel(match[0]);
       typing.textContent = 'Opened ' + match[1].title;
@@ -6072,8 +6331,27 @@ document.addEventListener('keydown', function(e) {{
 document.addEventListener('contextmenu', e => {{
   e.preventDefault();
   const menu = document.getElementById('ctx-menu');
-  // Desktop right-click
-  if(e.target.classList.contains('wallpaper')||e.target===document.body) {{
+  // Desktop right-click = anything NOT inside real chrome.
+  //
+  // This used to test the opposite way: `e.target` had to BE `.wallpaper` or
+  // `document.body`. That enumerated the backdrop, and the backdrop kept
+  // growing. `.hart-ambient`, `.hart-bloom-canvas`, `.hart-grain`,
+  // `.hart-vignette` and `.hart-hero` all paint OVER `.wallpaper` and cover the
+  // screen, so in practice a right-click on the desktop landed on one of THEM,
+  // failed the test, and produced the two-item "Open in New Panel / Properties"
+  // menu, whose items do nothing.
+  //
+  // Personalize is reachable ONLY from this menu, and Personalize is where the
+  // orb-style picker lives (hartPersonalize.js -> HartSession.orb_style). So the
+  // orb chooser was built, loaded and completely unreachable: "orb selection was
+  // there but not able to see that". Same for wallpaper and auto-arrange.
+  //
+  // Inverting it makes the test stable: new backdrop or decoration layers are
+  // desktop by default, and only real chrome has to be named.
+  const _chrome = e.target.closest && e.target.closest(
+    '.panel-container,.taskbar,#taskbar,#ctx-menu,.hart-topbar,.start-menu,'
+    + 'input,textarea,button,a,select,[contenteditable]');
+  if(!_chrome) {{
     menu.innerHTML = [
       ctxItem('add_to_home_screen','Add app to desktop','window.hartAddAppPicker&&hartAddAppPicker()'),
       ctxItem('grid_view','Auto-arrange icons','window.hartAutoArrange&&hartAutoArrange()'),
@@ -6361,10 +6639,40 @@ function speakText(text, source) {{
 if(!PERF.potato) {{
   try {{
     const evtSrc = new EventSource(SHELL+'/api/notifications/stream');
-    evtSrc.onmessage = function(e) {{
-      try {{
-        const events = JSON.parse(e.data);
-        events.forEach(function(ev) {{
+    // ── Apply events across FRAMES, never in one synchronous run ──
+    // Every branch of _applyEvent below is DOM work (toasts, icon pins, a full
+    // home recompose, palette repaint, overlay render). Applying a whole message
+    // in one forEach blocks the main thread for its duration, and on 2026-08-30
+    // that froze the desktop hard enough that clicking the wifi icon did nothing:
+    // measured DURING the hang, hart-comp was idle in do_epoll_wait, the shell's
+    // 127 threads were all sleeping and only 8 sockets were open — nothing was
+    // stuck anywhere except this loop.
+    //
+    // The queue drains a few events per animation frame, so input and paint get
+    // a turn between chunks. requestAnimationFrame is deliberate: it is already
+    // the paint clock, so work lands between frames rather than fighting them,
+    // and it self-throttles when the tab is not visible.
+    var _evQueue = [];
+    var _evDraining = false;
+    // Per frame. A frame is ~16.7ms; these handlers are milliseconds each, so a
+    // few keeps the chunk well inside one frame while still draining a backlog
+    // in well under a second.
+    var EV_PER_FRAME = 3;
+    function _drainEvents() {{
+      var budget = EV_PER_FRAME;
+      while(budget-- > 0 && _evQueue.length) {{
+        var ev = _evQueue.shift();
+        // One bad event must never abandon the rest of the queue.
+        try {{ _applyEvent(ev); }} catch(err) {{}}
+      }}
+      if(_evQueue.length) {{
+        requestAnimationFrame(_drainEvents);
+      }} else {{
+        _evDraining = false;
+      }}
+    }}
+    function _applyEvent(ev) {{
+      {{
           const type = ev.type || 'notification';
           if(type === 'notification') {{
             showToast(ev.title||ev.agent||'Notification', ev.message||'', ev.severity||'info');
@@ -6392,7 +6700,17 @@ if(!PERF.potato) {{
             // Render as floating overlay fragment
             renderAgentOverlay(ev);
           }}
-        }});
+      }}
+    }}
+    evtSrc.onmessage = function(e) {{
+      try {{
+        const events = JSON.parse(e.data);
+        // ENQUEUE, never apply inline. The parse is cheap; the DOM work is not.
+        for(var i=0;i<events.length;i++) _evQueue.push(events[i]);
+        if(!_evDraining && _evQueue.length) {{
+          _evDraining = true;
+          requestAnimationFrame(_drainEvents);
+        }}
       }} catch(err) {{}}
     }};
     evtSrc.onerror = function() {{ /* SSE reconnects automatically */ }};
@@ -7252,25 +7570,26 @@ function renderAgentOverlay(ev) {{
         # ── Shell APIs: Apps ──
         @app.route('/api/shell/apps', methods=['GET'])
         def shell_apps():
-            apps = []
-            # Linux .desktop files
-            app_dirs = ['/usr/share/applications',
-                        os.path.expanduser('~/.local/share/applications')]
-            for d in app_dirs:
-                if not os.path.isdir(d):
-                    continue
-                try:
-                    for fname in os.listdir(d):
-                        if not fname.endswith('.desktop'):
-                            continue
-                        apps.append({
-                            'id': fname.replace('.desktop', ''),
-                            'name': fname.replace('.desktop', '').replace('-', ' ').title(),
-                            'subsystem': 'linux',
-                        })
-                except OSError:
-                    logger.warning("shell_apps: swallowed OSError", exc_info=True)
-            return jsonify({'apps': apps[:100]})
+            """The machine's launchable applications, from its .desktop entries.
+
+            Delegates to core.platform.desktop_entries, the ONE place that knows
+            how to find and read them (AppRegistry's bootstrap discovery uses the
+            same function). This used to carry its own scan of two hardcoded
+            directories, /usr/share/applications and ~/.local/share/applications,
+            and on HART OS neither exists -- so it returned four Wine file-type
+            stubs out of the service user's home while 162 real entries sat in the
+            NixOS profile. It also never opened the files, inventing names by
+            title-casing the filename, which is why NoDisplay stubs showed up at
+            all.
+
+            Still filesystem-only: no package manager is consulted here.
+            """
+            from core.platform.desktop_entries import discover
+            apps = [{'id': app_id,
+                     'name': entry.get('Name', app_id),
+                     'subsystem': 'linux'}
+                    for app_id, entry in sorted(discover().items())]
+            return jsonify({'apps': apps})
 
         # ── Shell APIs: Launch ──
         from integrations.agent_engine.shell_os_apis import _require_shell_auth
@@ -8235,6 +8554,7 @@ function renderAgentOverlay(ev) {{
             def _collect(since):
                 # Lock-free snapshot (unchanged from the old poll): ALL component
                 # types newer than the caller's cursor, stamped with their agent.
+                # Ordering + bounding belong to sse_next_batch, not here.
                 out = []
                 for agent_id, comps in list(self._agent_components.items()):
                     for c in comps:
@@ -8254,15 +8574,29 @@ function renderAgentOverlay(ev) {{
                 # is atomic under the CV so a push between them can't be lost. The
                 # producer holds ONLY the CV (never self._lock) -> no deadlock with
                 # the writer's lock order.
+                # THE BOUNDED BATCH (the 2026-08-30 desktop freeze). This loop
+                # used to emit every pending event as ONE array and set the cursor
+                # to now; the browser applied that whole array on its main thread
+                # and the desktop froze for the duration. Federation backfill on a
+                # fresh install produced dozens inside one second — measured on
+                # .69 with every OS-level process idle while the UI was dead.
+                #
+                # collect + decide + advance all happen UNDER THE CV, and only the
+                # yield is outside it. That split is load-bearing in both
+                # directions: a push landing between the release and the cursor
+                # assignment would get a _ts below the new cursor and be skipped
+                # forever (a silent drop), while holding the CV across the socket
+                # write would block every pusher behind a slow client.
                 while True:
                     with self._ui_event_cv:
                         events = _collect(last_check)
                         if not events:
                             self._ui_event_cv.wait(timeout=15.0)
                             events = _collect(last_check)
-                        last_check = _time.time()
-                    if events:
-                        yield f"data: {json.dumps(events)}\n\n"
+                        batch, last_check = sse_next_batch(
+                            events, last_check, _time.time())
+                    if batch:
+                        yield f"data: {json.dumps(batch)}\n\n"
                     else:
                         # SSE comment: keeps the stream warm through proxies,
                         # ignored by the browser EventSource.

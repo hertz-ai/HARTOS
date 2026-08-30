@@ -481,8 +481,37 @@ in
 
           echo "[HART OTA] Checking for updates (channel: ${ota.channel})"
 
-          # ── Query current version ──
-          CURRENT=$(nixos-version 2>/dev/null || echo "unknown")
+          # ── The node's own revision (ONE resolver, used by the banner AND
+          #    the staleness decision below) ──
+          # This called `nixos-version`, which is not on this unit's curated
+          # PATH (it runs as `hart`), so it fell through to the literal string
+          # "unknown" on every single check. Measured on the fleet box
+          # 2026-08-26: the log reads "[HART OTA] Current: unknown" while
+          # /etc/hart/image-rev plainly contains 579ce33.
+          #
+          # And even resolvable it was the wrong question: nixos-version reports
+          # the NixOS release (24.11.20250630.50ab793), not the HART revision
+          # this OTA actually compares against. So the line an operator reads
+          # could never agree with the decision the code makes underneath it --
+          # the worst kind of log, one that looks like information.
+          #
+          # The correct resolution already existed a few lines down as
+          # LOCAL_REV, buried inside the idle branch. Hoisted into one function
+          # so there is a single notion of "this node's revision": a dd'd node
+          # has no /etc/nixos at all (which is exactly the node OTA exists for),
+          # so /etc/hart/image-rev is primary and the flake checkout is the
+          # fallback for installer-written systems.
+          hart_local_rev() {
+            local rev
+            rev=$(cat /etc/hart/image-rev 2>/dev/null | tr -d '[:space:]')
+            if [[ -z "$rev" ]]; then
+              rev=$(${pkgs.nix}/bin/nix flake metadata /etc/nixos --json 2>/dev/null \
+                | ${pkgs.jq}/bin/jq -r '.revision // ""') || rev=""
+            fi
+            [[ -n "$rev" ]] || rev="unknown"
+            printf '%s' "$rev"
+          }
+          CURRENT=$(hart_local_rev)
           echo "[HART OTA] Current: $CURRENT"
 
           # ── Check upstream via Python orchestrator ──
@@ -495,7 +524,30 @@ in
           STAGE=$(echo "$RESULT" | ${pkgs.jq}/bin/jq -r '.stage // "idle"')
           echo "[HART OTA] Pipeline stage: $STAGE"
 
-          if [[ "$STAGE" == "idle" ]]; then
+          # TERMINAL, NOT-YET-APPLIED stages all mean the same thing here: no
+          # pipeline is running, so go look for work. `failed` and `rolled_back`
+          # used to fall through to the catch-all "advancing" branch below, which
+          # called advance_pipeline on a stage that has no handler (advance only
+          # knows the 7 ACTIVE stages). Every tick then printed
+          #     Pipeline in progress (failed), advancing...
+          #     Advanced: {'success': False, 'error': 'No handler for stage: failed'}
+          # and exited 0. The node was wedged permanently: ONE failed upgrade
+          # meant it could never accept another, and it reported success while
+          # doing nothing. Observed on the real box 2026-08-27, sitting on
+          # b229551 with four newer commits waiting and no way to take them.
+          #
+          # This is not a new policy, it is the orchestrator's EXISTING one:
+          # start_upgrade already accepts IDLE, COMPLETED, ROLLED_BACK and FAILED
+          # as startable (upgrade_orchestrator.py start_upgrade). The dispatch
+          # here had drifted from it, so a state start_upgrade would have gladly
+          # taken could never reach start_upgrade at all.
+          if [[ "$STAGE" == "idle" || "$STAGE" == "failed" || "$STAGE" == "rolled_back" ]]; then
+            if [[ "$STAGE" != "idle" ]]; then
+              # Say it out loud. A pipeline that fails every attempt must look
+              # different from one that simply has nothing to do, or a node that
+              # CANNOT upgrade reads exactly like a node with nothing to take.
+              echo "[HART OTA] Previous pipeline ended in '$STAGE'; starting a fresh check." >&2
+            fi
             # ── Resolve the approved {flake_ref, commit} for this channel ──
             # PRIMARY source = CENTRAL authority (the queen-bee account decides
             # which revision each channel is cleared to run). We poll CENTRAL,
@@ -547,19 +599,12 @@ in
                 | ${pkgs.jq}/bin/jq -r '.revision // "unknown"') || REMOTE_REV="check_failed"
             fi
 
-            # The node's own revision. /etc/hart/image-rev is the raw image's
-            # identity file (written at build from hartRev, hart-repart-image
-            # module) -- a dd'd node has no /etc/nixos at all, which left
-            # LOCAL_REV "unknown" forever on exactly the nodes OTA exists for
-            # (first real check on flashed HW, 2026-08-23). /etc/nixos stays
-            # as the fallback for installer-written systems, where it is a
-            # real flake checkout with a readable revision.
-            LOCAL_REV=$(cat /etc/hart/image-rev 2>/dev/null | tr -d '[:space:]')
-            if [[ -z "$LOCAL_REV" ]]; then
-              LOCAL_REV=$(${pkgs.nix}/bin/nix flake metadata /etc/nixos --json 2>/dev/null \
-                | ${pkgs.jq}/bin/jq -r '.revision // "unknown"') || LOCAL_REV="unknown"
-            fi
-            [[ -z "$LOCAL_REV" ]] && LOCAL_REV="unknown"
+            # The node's own revision, resolved ONCE at the top of this script
+            # (hart_local_rev). It used to be resolved a second time right here,
+            # which is how the banner and the decision drifted apart: the banner
+            # said "unknown" while this block read the correct value from
+            # /etc/hart/image-rev. One value, one meaning, no second reader.
+            LOCAL_REV="$CURRENT"
 
             echo "[HART OTA] Local: $LOCAL_REV"
             echo "[HART OTA] Approved: $REMOTE_REV"
@@ -634,10 +679,27 @@ in
             else
               echo "[HART OTA] Update staged. Run 'hart-ota apply' to switch."
             fi
-          else
+          elif [[ "$STAGE" == "building" || "$STAGE" == "testing" \
+               || "$STAGE" == "auditing" || "$STAGE" == "benchmarking" \
+               || "$STAGE" == "signing" || "$STAGE" == "canary" \
+               || "$STAGE" == "deploying" ]]; then
+            # ONLY the seven stages advance_pipeline actually has handlers for.
+            # This was a catch-all `else`, which is how `failed` ended up being
+            # "advanced" every tick forever. Naming the active stages means a
+            # stage that cannot be advanced can never again be silently handed to
+            # the advancer.
             echo "[HART OTA] Pipeline in progress ($STAGE), advancing..."
             ${hartApp.python}/bin/python ${otaOrchestratorDrive} advance \
               || echo "[HART OTA] Advance failed"
+          else
+            # A stage this script does not know. Do NOT advance it and do NOT
+            # call it success: an unrecognised state is exactly the condition
+            # that wedged this node, and it must be loud rather than routed into
+            # whichever branch happens to be last.
+            echo "[HART OTA] UNKNOWN pipeline stage '$STAGE' - not advancing." >&2
+            echo "[HART OTA] The orchestrator and this dispatch disagree about the" >&2
+            echo "[HART OTA] stage set; reconcile them before this node can update." >&2
+            exit 1
           fi
         '';
 

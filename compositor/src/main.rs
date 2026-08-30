@@ -93,6 +93,32 @@ mod shared;
 #[cfg(any(feature = "winit", feature = "smithay"))]
 mod comp_core;
 
+// ── NATIVE SHELL PARITY PROGRAM, M1: the aura bloom drawn by the COMPOSITOR ──
+// The desktop backdrop used to be a flat HART_SPLASH_RGBA clear with the real
+// aurora painted by a browser inside a WebView. `bloom.rs` composes that same
+// field natively (parity source: the ONE conky-themes palette the HTML shell
+// reads, so there is no second theme table). It is pure CPU math with no smithay
+// types, and `comp_core` owns the caching + element assembly — so this is gated
+// exactly like `comp_core`, the only thing that consumes it. See src/bloom.rs
+// for the compose-once performance contract.
+//
+// NOTE this module existed since 2026-07-20 with NO `mod` declaration, so it was
+// never compiled and the desktop kept clearing to flat black. Declaring it here
+// is what makes M1 real; do not drop this line.
+#[cfg(any(feature = "winit", feature = "smithay"))]
+mod bloom;
+
+// ── NATIVE SHELL PARITY PROGRAM, M2: the voice orb, drawn by the COMPOSITOR ──
+// The orb breathes continuously, so in the HTML shell it forces the browser to
+// rasterise forever: measured 2026-08-28, WebKitWebProcess burning a full core
+// with ZERO ioctls and only 0.64s of 6s in syscalls, i.e. ~5.4s of pure
+// userspace pixel work that never reached the GPU. hart-comp DOES hold a live
+// GLES context on this hardware, so the orb belongs here. Same gate and same
+// shape as `bloom` above: pure CPU compose, cached, assembled by comp_core.
+// See src/orb.rs for the compose-once-per-phase-step contract.
+#[cfg(any(feature = "winit", feature = "smithay"))]
+mod orb;
+
 // ── Phase-5 Smithay handler BODIES (CI-COMPILE only) ──
 // The real xdg-shell / XWayland / xdg-decoration / wlr-foreign-toplevel-management
 // handler bodies live in `wayland.rs`, gated behind the `smithay` cargo feature

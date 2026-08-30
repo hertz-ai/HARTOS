@@ -219,14 +219,32 @@ in
       # The boot now tries Tier-1 first; the shell-paint watchdog still drops to
       # sway then the cage floor if Tier-1 fails on real HW (safe to re-arm).
       startTier = "hart-comp";
-      # The glass-shell host blocks on the :6800 LiquidUI server's /health for up to
-      # 30s before it can paint its first frame. The default 20s watchdog therefore
-      # killed a tier that was legitimately WAITING for the backend (real-HW boot
-      # 2026-06-24: Tier-1/2 dropped to cage mid-wait). 45s > the host's 30s wait +
-      # load + paint, so a backend that comes up within 30s is NOT killed; a truly
-      # hung tier still drops (just 25s later). Paired with the :6800-starts-fast fix
-      # (hart-liquid-ui no longer orders after the model bus), this should rarely bind.
-      shellPaintTimeoutSeconds = 45;
+      # NO paint-budget override here. The module owns it.
+      #
+      # This profile used to pin shellPaintTimeoutSeconds = 45. That was written
+      # 2026-06-24 to beat the glass-host's 30s wait on :6800 /health, and it was
+      # right at the time. Two months later the MODULE raised its own default
+      # 20 -> 120 (hart-session-supervisor.nix) on a much harder measurement:
+      # first paint landed 16 MILLISECONDS after a 45s watchdog fired and killed a
+      # completely healthy Tier-1, because "WebKit + GTK4 simply take ~45s to load
+      # off a 22 MB/s stick".
+      #
+      # This plain assignment silently outranked that default, so the August fix
+      # was dead on the desktop profile and Tier-1 kept dying at exactly 45s.
+      # Measured on the fleet box 2026-08-27, cold boot from the USB stick:
+      #   04:36:51  hart-comp: first real scanout — the display is LIVE
+      #   04:36:51  [glass-shell] render rung = webkit-cairo   (shell starts)
+      #   04:37:12  [glass-shell] GSK = CAIRO / portal OWNED   (+21s, still warming)
+      #   04:37:30  supervisor: "HUNG (compositor up, no first paint in 45s)"
+      # hart-comp had DRM master and had page-flipped; the same probes that took
+      # 21s cold measure ~300ms once the page cache is warm. That is I/O speed
+      # deciding whether the desktop comes up, which is precisely what the module
+      # comment says a watchdog must not do.
+      #
+      # Tier-1 is the tier we want to PAINT, so it gets the module's budget. Two
+      # declarations of one number is what let a fixed default rot behind a stale
+      # override; there is now one. Guarded by
+      # tests/unit/test_paint_budget_single_source.py.
     };
 
     # Tier-1: HART-comp, the AI-native Smithay/Rust compositor (--backend drm).
