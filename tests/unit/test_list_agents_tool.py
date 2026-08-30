@@ -13,8 +13,40 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 _HIE_SRC = (Path(__file__).resolve().parents[2] /
             'hart_intelligence_entry.py').read_text(encoding='utf-8')
+
+
+@pytest.fixture
+def _seeded_trained_agent():
+    """Hermetic seed for the trained-agent count.
+
+    list_agents' trained/hive buckets read the social DB via _get_db(). CI
+    starts from an EMPTY DB, so the old `trained_agents >= 1` assertion — which
+    silently assumed the ambient dev DB's 100+ agent rows — failed in CI for
+    lack of data, not a real bug (#29: a test must carry its own state, never
+    inherit the host's). Ensure the schema exists and seed ONE trained agent
+    through the canonical UserService.register_agent (user_type='agent' +
+    api_token = the trained/local marker), so the REAL DB query runs against
+    REAL data on any machine. Idempotent: a re-run against the same DB hits the
+    global-name-uniqueness guard, which means the row is already present.
+    """
+    from integrations.social.models import Base, get_engine, get_db
+    from integrations.social.services import UserService
+    Base.metadata.create_all(get_engine())
+    db = get_db()
+    try:
+        try:
+            UserService.register_agent(
+                db, 'ci seed agent', skip_name_validation=True)
+            db.commit()
+        except ValueError:
+            db.rollback()  # already seeded (name taken) — still >= 1 trained
+    finally:
+        db.close()
+    yield
 
 
 def test_impl_enumerates_real_agents():
@@ -25,7 +57,7 @@ def test_impl_enumerates_real_agents():
     assert isinstance(data.get('agents'), list) and data['agents']
 
 
-def test_impl_reports_hive_and_trained_buckets():
+def test_impl_reports_hive_and_trained_buckets(_seeded_trained_agent):
     """Owner design 2026-08-24: 'list agents shd give local agents and
     hive agents that are peerlink exchanged or pulled from central'.
     The sync engine lands those as user_type='agent' User rows with
