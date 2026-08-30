@@ -910,6 +910,57 @@ class ContextEngine:
         return context
 
 
+#: Most A2UI events carried in ONE SSE message. The browser applies a message's
+#: events on its main thread (every branch of the EventSource handler is DOM
+#: work), so this is the bound on how much one message can ask of it. The
+#: remainder is not dropped — the producer keeps its cursor at the last event it
+#: actually sent and emits the rest immediately afterwards, so a burst arrives as
+#: several small frames instead of one unresponsive one.
+#:
+#: 8 is a floor-of-evidence number, not a tuning knob: the measured freeze came
+#: from federation backfill pushing dozens of events inside one second on a
+#: fresh install. Small enough that one message is a few DOM writes; large
+#: enough that ordinary single-event traffic still arrives in one round trip.
+_SSE_MAX_EVENTS_PER_MESSAGE = 8
+
+
+def sse_next_batch(events, cursor, now, limit=_SSE_MAX_EVENTS_PER_MESSAGE):
+    """Decide ONE SSE message: what to send, and where the cursor moves.
+
+    PURE — no locks, no clock, no service state — so the rule that actually
+    matters (bound the batch, never drop an event) is testable directly instead
+    of through a live stream. The caller owns the concurrency; this owns the
+    arithmetic.
+
+    Args:
+        events: pending events, each a dict with a numeric ``_ts``. Need not be
+            sorted; this sorts, because "the first N" is only meaningful in
+            timestamp order and the cursor is a timestamp.
+        cursor: the caller's current position. Returned unchanged when a batch
+            carries no usable ``_ts``, so a malformed event can never rewind or
+            silently skip the stream.
+        now: the caller's clock reading, used only when there is nothing to send.
+        limit: max events in this message.
+
+    Returns:
+        ``(batch, next_cursor)``. ``batch`` is empty when there is nothing to
+        send, and ``next_cursor`` is then ``now`` — the only case where jumping
+        the cursor forward is safe, because nothing is pending to jump over.
+
+    The invariant: ``next_cursor`` never advances past the last event ACTUALLY
+    included, so anything left over is still ``> cursor`` on the next call and
+    gets sent then. Bounding the batch is a DEFERRAL, never a discard.
+    """
+    if not events:
+        return [], now
+    ordered = sorted(events, key=lambda e: e.get('_ts', 0))
+    batch = ordered[:max(1, limit)]
+    last_ts = batch[-1].get('_ts')
+    # A missing/None _ts must not become the cursor: it would rewind the stream
+    # (re-sending everything forever) or skip ahead (dropping events).
+    return batch, last_ts if isinstance(last_ts, (int, float)) else cursor
+
+
 def _resolve_shell_pool_threads(tier):
     """How many waitress worker threads the glass shell serves on, by HW tier.
 
@@ -1714,6 +1765,13 @@ class LiquidUIService:
             theme = {}
 
         # Tell the compositor how much of the screen the chrome owns, derived from
+        # The bar heights the page will lay itself out with, taken from the SAME
+        # constants publish_panel_reservation hands the compositor. Interpolated
+        # into the CSS var + the two JS clamp sites so the paint and the
+        # reservation cannot drift; see the --hart-taskbar-height definition.
+        taskbar_height_px = TASKBAR_HEIGHT_PX
+        topbar_fallback_px = TOPBAR_HEIGHT_FALLBACK_PX
+
         # the SAME css_vars this page is about to be served -- so a theme that
         # restyles the top bar moves the window work-area with it. Placed after
         # BOTH the theme path and the fallback path above, so the reservation is
@@ -2469,7 +2527,7 @@ html.a11y-rmotion .hart-ambient,html.a11y-rmotion .hart-hero-hevolve .dot,html.a
         # pointer-events:none (so empty-desktop right-click still reaches the
         # wallpaper menu); only the icons capture pointer events.
         _CSS_DESKTOP = '''
-.hart-desktop{position:fixed;left:0;right:0;top:var(--hart-topbar-height);bottom:44px;z-index:20;pointer-events:none}
+.hart-desktop{position:fixed;left:0;right:0;top:var(--hart-topbar-height);bottom:var(--hart-taskbar-height);z-index:20;pointer-events:none}
 .desktop-icon{position:absolute;width:84px;display:flex;flex-direction:column;align-items:center;gap:6px;
   padding:8px 4px;border-radius:12px;cursor:default;pointer-events:auto;user-select:none;
   transition:background .15s,transform .12s cubic-bezier(.175,.885,.32,1.275);will-change:transform}
@@ -2999,6 +3057,14 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
 <style>/* Icons: the BUNDLED /shell/static/MaterialSymbolsRounded.woff2 @font-face below is authoritative (every glyph, fully offline). This CDN <link> is progressive-enhancement ONLY (online round variant). */</style>
 <style>
 {css_vars}
+/* The taskbar height, DERIVED from the Python constant the compositor is told
+   to reserve (TASKBAR_HEIGHT_PX -> publish_panel_reservation -> comp_core's
+   work_area). It was hardcoded as 44px at three CSS sites and two JS sites, so
+   nothing stopped the reservation and the paint from drifting apart -- and a
+   drift means a maximized window sits under the bar, which is the defect
+   #52 was filed for. Emitted AFTER css_vars so a stale theme cannot override
+   the value the compositor is actually reserving. */
+:root {{ --hart-taskbar-height: {taskbar_height_px}px; }}
 {accent_rgb_css}
 {a11y_fontscale}
 *{{margin:0;padding:0;box-sizing:border-box}}
@@ -3041,7 +3107,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 
 /* ── Panel Container ── */
 .panel-container{{position:fixed;top:var(--hart-topbar-height);left:0;right:0;
-  bottom:44px;z-index:100;pointer-events:none}}
+  bottom:var(--hart-taskbar-height);z-index:100;pointer-events:none}}
 .panel-container>*{{pointer-events:auto}}
 
 /* ── Glass Panel (floating window) ── */
@@ -3224,7 +3290,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 ::-webkit-scrollbar-thumb:hover{{background:var(--hart-accent)}}
 
 /* ── Taskbar ── */
-.taskbar{{position:fixed;bottom:0;left:0;right:0;height:44px;z-index:8000;
+.taskbar{{position:fixed;bottom:0;left:0;right:0;height:var(--hart-taskbar-height);z-index:8000;
   display:flex;gap:2px;padding:0 8px;align-items:center;border-radius:0;
   border-top:1px solid var(--hart-glass-border)}}
 .taskbar-chip{{height:34px;padding:0 12px;display:flex;align-items:center;gap:4px;
@@ -4014,11 +4080,32 @@ function updateTaskbar() {{
 }}
 
 // ═══ Panel Snap ═══
+// The live pixel height of a chrome bar, read from its CSS custom property.
+// ONE reader for every layout calculation, so a theme that restyles a bar moves
+// the windows with it. Before this, snapPanel and the drag-commit clamp both
+// hardcoded 40/44 while the CSS read var(--hart-topbar-height) from the theme:
+// under a taller bar, snapped panels were the wrong height and a dragged window
+// could be dropped underneath the bar and become unreachable.
+// `fallback` is the shipped default, used only if the var is missing entirely.
+function hartBarPx(varName, fallback) {{
+  try {{
+    var v = getComputedStyle(document.documentElement)
+              .getPropertyValue(varName);
+    var n = parseFloat(v);
+    return (isFinite(n) && n > 0) ? n : fallback;
+  }} catch(e) {{ return fallback; }}
+}}
+
 function snapPanel(id, side) {{
   const p = panels[id];
   if(!p) return;
-  const topH = 40;
-  const taskH = 44;
+  // Read the LIVE bar heights rather than assuming 40/44. Both were hardcoded
+  // here while the CSS read var(--hart-topbar-height) from the theme, so any
+  // theme with a taller top bar snapped every panel to the wrong height. The
+  // vars are the one source; hartBarPx falls back to the shipped defaults only
+  // if a var is missing entirely.
+  const topH = hartBarPx('--hart-topbar-height', {topbar_fallback_px});
+  const taskH = hartBarPx('--hart-taskbar-height', {taskbar_height_px});
   if(!PERF.potato) p.el.style.transition = 'all 0.2s ease-out';
   if(side==='left') {{
     p.el.style.left='0';p.el.style.top=topH+'px';
@@ -4363,7 +4450,8 @@ function applyMax(id) {{
   const p = panels[id];
   if(!p || p.max) return;
   p.el.style.left = '0'; p.el.style.top = '0';
-  p.el.style.width = '100vw'; p.el.style.height = 'calc(100vh - var(--hart-topbar-height) - 44px)';
+  p.el.style.width = '100vw';
+  p.el.style.height = 'calc(100vh - var(--hart-topbar-height) - var(--hart-taskbar-height))';
   p.el.style.borderRadius = '0';
   p.el.classList.add('maximized');
   p.max = true;
@@ -4482,7 +4570,11 @@ document.addEventListener('mouseup', e=>{{
       // innerWidth/innerHeight cached at dragstart (no forced reflow). Keep the
       // titlebar >=80px reachable so a window can't be lost under the bars.
       p.el.style.transform = '';
-      const KEEP=80, TOP=40, TASK=44;
+      // Live bar heights, not hardcoded: a theme with a taller top bar used to
+      // let a dragged window be dropped underneath it and become unreachable.
+      const KEEP=80;
+      const TOP=hartBarPx('--hart-topbar-height', {topbar_fallback_px});
+      const TASK=hartBarPx('--hart-taskbar-height', {taskbar_height_px});
       let nx = d.ox+d.dx, ny = d.oy+d.dy;
       nx = Math.min(Math.max(nx, KEEP - p.el.offsetWidth), d.vw - KEEP);
       ny = Math.min(Math.max(ny, TOP), d.vh - TASK - 28);
@@ -6547,10 +6639,40 @@ function speakText(text, source) {{
 if(!PERF.potato) {{
   try {{
     const evtSrc = new EventSource(SHELL+'/api/notifications/stream');
-    evtSrc.onmessage = function(e) {{
-      try {{
-        const events = JSON.parse(e.data);
-        events.forEach(function(ev) {{
+    // ── Apply events across FRAMES, never in one synchronous run ──
+    // Every branch of _applyEvent below is DOM work (toasts, icon pins, a full
+    // home recompose, palette repaint, overlay render). Applying a whole message
+    // in one forEach blocks the main thread for its duration, and on 2026-08-30
+    // that froze the desktop hard enough that clicking the wifi icon did nothing:
+    // measured DURING the hang, hart-comp was idle in do_epoll_wait, the shell's
+    // 127 threads were all sleeping and only 8 sockets were open — nothing was
+    // stuck anywhere except this loop.
+    //
+    // The queue drains a few events per animation frame, so input and paint get
+    // a turn between chunks. requestAnimationFrame is deliberate: it is already
+    // the paint clock, so work lands between frames rather than fighting them,
+    // and it self-throttles when the tab is not visible.
+    var _evQueue = [];
+    var _evDraining = false;
+    // Per frame. A frame is ~16.7ms; these handlers are milliseconds each, so a
+    // few keeps the chunk well inside one frame while still draining a backlog
+    // in well under a second.
+    var EV_PER_FRAME = 3;
+    function _drainEvents() {{
+      var budget = EV_PER_FRAME;
+      while(budget-- > 0 && _evQueue.length) {{
+        var ev = _evQueue.shift();
+        // One bad event must never abandon the rest of the queue.
+        try {{ _applyEvent(ev); }} catch(err) {{}}
+      }}
+      if(_evQueue.length) {{
+        requestAnimationFrame(_drainEvents);
+      }} else {{
+        _evDraining = false;
+      }}
+    }}
+    function _applyEvent(ev) {{
+      {{
           const type = ev.type || 'notification';
           if(type === 'notification') {{
             showToast(ev.title||ev.agent||'Notification', ev.message||'', ev.severity||'info');
@@ -6578,7 +6700,17 @@ if(!PERF.potato) {{
             // Render as floating overlay fragment
             renderAgentOverlay(ev);
           }}
-        }});
+      }}
+    }}
+    evtSrc.onmessage = function(e) {{
+      try {{
+        const events = JSON.parse(e.data);
+        // ENQUEUE, never apply inline. The parse is cheap; the DOM work is not.
+        for(var i=0;i<events.length;i++) _evQueue.push(events[i]);
+        if(!_evDraining && _evQueue.length) {{
+          _evDraining = true;
+          requestAnimationFrame(_drainEvents);
+        }}
       }} catch(err) {{}}
     }};
     evtSrc.onerror = function() {{ /* SSE reconnects automatically */ }};
@@ -8422,6 +8554,7 @@ function renderAgentOverlay(ev) {{
             def _collect(since):
                 # Lock-free snapshot (unchanged from the old poll): ALL component
                 # types newer than the caller's cursor, stamped with their agent.
+                # Ordering + bounding belong to sse_next_batch, not here.
                 out = []
                 for agent_id, comps in list(self._agent_components.items()):
                     for c in comps:
@@ -8441,15 +8574,29 @@ function renderAgentOverlay(ev) {{
                 # is atomic under the CV so a push between them can't be lost. The
                 # producer holds ONLY the CV (never self._lock) -> no deadlock with
                 # the writer's lock order.
+                # THE BOUNDED BATCH (the 2026-08-30 desktop freeze). This loop
+                # used to emit every pending event as ONE array and set the cursor
+                # to now; the browser applied that whole array on its main thread
+                # and the desktop froze for the duration. Federation backfill on a
+                # fresh install produced dozens inside one second — measured on
+                # .69 with every OS-level process idle while the UI was dead.
+                #
+                # collect + decide + advance all happen UNDER THE CV, and only the
+                # yield is outside it. That split is load-bearing in both
+                # directions: a push landing between the release and the cursor
+                # assignment would get a _ts below the new cursor and be skipped
+                # forever (a silent drop), while holding the CV across the socket
+                # write would block every pusher behind a slow client.
                 while True:
                     with self._ui_event_cv:
                         events = _collect(last_check)
                         if not events:
                             self._ui_event_cv.wait(timeout=15.0)
                             events = _collect(last_check)
-                        last_check = _time.time()
-                    if events:
-                        yield f"data: {json.dumps(events)}\n\n"
+                        batch, last_check = sse_next_batch(
+                            events, last_check, _time.time())
+                    if batch:
+                        yield f"data: {json.dumps(batch)}\n\n"
                     else:
                         # SSE comment: keeps the stream warm through proxies,
                         # ignored by the browser EventSource.

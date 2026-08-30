@@ -48,31 +48,76 @@ def published(tmp_path, monkeypatch):
 
 # ── the drift guard ─────────────────────────────────────────────────────────
 
-def test_taskbar_constant_matches_the_served_css():
-    """TASKBAR_HEIGHT_PX must equal the height in the .taskbar CSS rule.
+@pytest.fixture(scope="module")
+def shell_html():
+    """The REAL served document, not the source file."""
+    return L.LiquidUIService().render_desktop_shell()
 
-    Nothing else couples them. If someone restyles the taskbar to 52px and this
-    constant stays 44, the compositor reserves 8px too little and the bottom of
-    every maximized window sits on top of the bar again -- the exact bug, back,
-    silently. This test is the coupling.
+
+def _css_px(html, pattern):
+    m = re.search(pattern, html)
+    assert m, "pattern not found in the SERVED shell CSS: %s" % pattern
+    return int(m.group(1))
+
+
+def test_the_page_lays_itself_out_with_the_height_the_compositor_reserves(
+        shell_html, published):
+    """The reservation the compositor is given must equal the height the browser
+    actually paints, or a maximized window sits on top of the bar (#52).
+
+    Parsed from the RENDERED page rather than the source file: the taskbar
+    height is now DERIVED from TASKBAR_HEIGHT_PX via --hart-taskbar-height, so
+    this proves the derivation reaches the browser, and it keeps working if the
+    rule moves out of the f-string entirely.
     """
-    src = open(SERVICE_SRC, encoding="utf-8").read()
-    # The rule is inside an f-string, so its braces are doubled in the source.
-    m = re.search(r"\.taskbar\{\{[^}]*?height:\s*(\d+)px", src)
-    assert m, "could not find the .taskbar height rule in the served CSS"
-    assert int(m.group(1)) == L.TASKBAR_HEIGHT_PX, (
-        "the .taskbar CSS rule says %spx but TASKBAR_HEIGHT_PX is %s; the "
-        "compositor would reserve the wrong amount"
-        % (m.group(1), L.TASKBAR_HEIGHT_PX))
+    served = _css_px(shell_html, r"--hart-taskbar-height:\s*(\d+)px")
+    reservation = L.publish_panel_reservation(":root{--hart-topbar-height:40px}")
+    assert reservation["bottom"] == served == L.TASKBAR_HEIGHT_PX
+    assert "bottom=%d" % served in published.read_text()
 
 
-def test_the_topbar_fallback_matches_the_theme_load_fallback():
-    """If the theme fails to load, render_desktop_shell substitutes a hardcoded
-    css_vars block. Our fallback has to be the height in THAT block, or a failed
-    theme load also mis-reserves."""
-    src = open(SERVICE_SRC, encoding="utf-8").read()
-    m = re.search(r"--hart-topbar-height:\s*(\d+)px", src)
-    assert m and int(m.group(1)) == L.TOPBAR_HEIGHT_FALLBACK_PX
+def test_no_layout_rule_hardcodes_the_bar_heights(shell_html):
+    """THE DRIFT CLASS. The taskbar height was written as a literal 44 at five
+    sites (three CSS rules and two JS clamps) while the CSS read the top bar
+    from the theme -- so a theme with a taller bar mis-snapped every panel and
+    could drop a dragged window under the bar where it could not be grabbed.
+    Every layout site must now read the vars.
+    """
+    for pattern, what in (
+        (r"\.hart-desktop\s*\{[^}]*?bottom:\s*44px", ".hart-desktop"),
+        (r"\.panel-container\s*\{[^}]*?bottom:\s*44px", ".panel-container"),
+        (r"\.taskbar\s*\{[^}]*?height:\s*44px", ".taskbar"),
+        (r"const\s+topH\s*=\s*40", "snapPanel topH"),
+        (r"const\s+taskH\s*=\s*44", "snapPanel taskH"),
+        (r"TOP\s*=\s*40\s*,", "drag-clamp TOP"),
+    ):
+        assert not re.search(pattern, shell_html), (
+            "%s still hardcodes a bar height instead of reading the CSS var"
+            % what)
+    assert shell_html.count("hartBarPx(") >= 5, (
+        "the JS layout sites should read the live bar heights via hartBarPx")
+
+
+def test_a_failed_theme_load_still_reserves_the_bar_it_actually_paints(
+        published, monkeypatch):
+    """Replaces the fallback-constant grep AND the source index-ordering check.
+    Force the real theme-load failure, render the real fallback page, and assert
+    the published reservation matches the CSS THAT page carries. If the publish
+    moved above the fallback, top would be the theme's value and this fails.
+    """
+    from integrations.agent_engine.theme_service import ThemeService
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("theme store unreadable")
+
+    monkeypatch.setattr(ThemeService, "get_css_variables", staticmethod(boom))
+    html = L.LiquidUIService().render_desktop_shell()
+
+    served_top = _css_px(html, r"--hart-topbar-height:\s*(\d+)px")
+    served_bottom = _css_px(html, r"--hart-taskbar-height:\s*(\d+)px")
+    assert served_top == L.TOPBAR_HEIGHT_FALLBACK_PX
+    assert sorted(l for l in published.read_text().splitlines() if l.strip()) \
+        == ["bottom=%d" % served_bottom, "top=%d" % served_top]
 
 
 # ── parsing the top value out of the live css_vars ──────────────────────────
@@ -155,16 +200,19 @@ def test_a_permission_error_does_not_raise(published, monkeypatch):
     L.publish_panel_reservation(":root { --hart-topbar-height: 40px; }")
 
 
-def test_the_render_path_publishes(monkeypatch):
-    """The call has to be wired into render_desktop_shell, not just defined. It
-    sits after BOTH the theme branch and the theme-load fallback, so a failed
-    theme load still reserves."""
-    src = open(SERVICE_SRC, encoding="utf-8").read()
-    assert "publish_panel_reservation(css_vars)" in src, (
-        "publish_panel_reservation is never called from the render path")
-    body = src.split("def render_desktop_shell", 1)[1]
-    call = body.index("publish_panel_reservation(css_vars)")
-    fallback = body.index("--hart-topbar-height: 40px")
-    assert call > fallback, (
-        "the publish must come after the theme-load fallback sets css_vars, "
-        "or a failed theme load publishes a stale or unset value")
+def test_rendering_the_shell_publishes_the_reservation_it_served(published):
+    """The honest form of "the render path publishes": render with the target
+    redirected into tmp and assert the file LANDED, carrying the same numbers
+    the page carries. The old version asserted that a call expression appeared
+    in the source text and that its byte offset was greater than another
+    string's -- which a refactor breaks and a broken value passes."""
+    assert not published.exists()
+    html = L.LiquidUIService().render_desktop_shell()
+    assert published.exists(), (
+        "render_desktop_shell() produced a page but published no reservation")
+    got = dict(
+        (k, int(v)) for k, _, v in
+        (l.partition("=") for l in published.read_text().splitlines()
+         if l.strip()))
+    assert got["top"] == _css_px(html, r"--hart-topbar-height:\s*(\d+)px")
+    assert got["bottom"] == _css_px(html, r"--hart-taskbar-height:\s*(\d+)px")
