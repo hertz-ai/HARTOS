@@ -164,6 +164,7 @@ setup(
         find_packages(
             include=[
                 "core", "core.*",
+                "hartos",
                 "integrations", "integrations.*",
                 "security", "security.*",
                 "hart_sdk", "hart_sdk.*",
@@ -187,25 +188,15 @@ setup(
     },
 
     # Include main modules at root level
+    # Only the entry/facade surface stays flat at the repo root. The
+    # implementation modules live in the hartos/ package (moved 2026-08-30);
+    # they ship via find_packages() below, not py_modules.
     py_modules=[
         "hart_version",
         "hart_intelligence",
         "hart_intelligence_entry",
-        "helper",
-        "helper_ledger",
-        "threadlocal",
-        "crossbar_server",
-        "create_recipe",
-        "reuse_recipe",
-        "gather_agentdetails",
-        "lifecycle_hooks",
-        "cultural_wisdom",
-        "exception_collector",
-        "recipe_experience",
         "embedded_main",
-        "agent_identity",
-        "hart_onboarding",
-        "hart_cli",
+        "asgi",
     ],
 
     # Include non-Python files
@@ -227,9 +218,9 @@ setup(
     # Entry points for console scripts
     entry_points={
         "console_scripts": [
-            "hart=hart_cli:hart",
+            "hart=hartos.hart_cli:hart",
             "hart-server=hart_intelligence:main",
-            "hart-crossbar=crossbar_server:main",
+            "hart-crossbar=hartos.crossbar_server:main",
         ],
     },
 

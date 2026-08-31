@@ -16,11 +16,34 @@ import os
 import json
 import logging
 import glob
-from typing import Dict, List, Any, Optional
+import threading
+import time
+from typing import Dict, List, Any, Optional, Set
 from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# ── What we have already REPORTED, per prompts directory ────────────────────
+# discover_all_agents used to log the whole roster on every call. Measured on the
+# box 2026-08-29: 6,498 identical "Discovered agent" lines in two minutes, 55
+# lines/second from this one module, because build_agent_directory() rescans on
+# every GET /a2a/agents and something polls it ~19 times a minute. That was the
+# machine's dominant IO load — journald wrote 6.3 GB, systemd 71.8 GB in 48h — on
+# a USB stick root that subsequently started returning read errors.
+#
+# MODULE-level, not per-instance, and that is load-bearing: build_agent_directory
+# constructs a FRESH DynamicAgentDiscovery for every request, so an instance
+# attribute would be empty each time and would re-log the entire roster forever,
+# i.e. it would look like a fix and change nothing.
+_reported_lock = threading.Lock()
+_reported_agents: Dict[str, Set[str]] = {}
+_reported_at: Dict[str, float] = {}
+
+#: Even when nothing changes, say so occasionally. Silence must never be
+#: ambiguous between "no changes" and "the scanner died" — that ambiguity would
+#: be a REAL loss of diagnostic information, which cutting the repetition is not.
+UNCHANGED_HEARTBEAT_SECONDS = 600
 
 
 @dataclass
@@ -75,7 +98,20 @@ class DynamicAgentDiscovery:
         Returns:
             Number of agents discovered
         """
-        logger.info(f"Scanning {self.prompts_dir} for trained agents...")
+        # Report the DELTA, not the roster. Every fact the old logging carried is
+        # still emitted -- each agent is named with its persona the first time it
+        # is seen, the count is stated whenever it changes -- and two facts it
+        # never carried are added: agents that DISAPPEAR, and an explicit
+        # unchanged heartbeat. In a wall of 171 identical lines every 3 seconds, a
+        # recipe vanishing was invisible; now it is one line. See the note on
+        # _reported_agents for the measurements that forced this.
+        with _reported_lock:
+            previous = _reported_agents.get(self.prompts_dir)
+            last_said = _reported_at.get(self.prompts_dir, 0.0)
+        first_scan = previous is None
+
+        if first_scan:
+            logger.info(f"Scanning {self.prompts_dir} for trained agents...")
 
         # First, load all main prompt definitions (e.g., 71.json, 8888.json)
         self._load_prompt_definitions()
@@ -89,11 +125,34 @@ class DynamicAgentDiscovery:
                 agent = self._load_agent_from_recipe(recipe_file)
                 if agent:
                     self.discovered_agents[agent.agent_id] = agent
-                    logger.info(f"Discovered agent: {agent.agent_id} (persona: {agent.persona})")
+                    if first_scan or agent.agent_id not in previous:
+                        logger.info(f"Discovered agent: {agent.agent_id} (persona: {agent.persona})")
             except Exception as e:
+                # UNTOUCHED, deliberately: a recipe that fails to load is exactly
+                # the kind of thing this log exists to tell us, and it is rare.
                 logger.warning(f"Failed to load agent from {recipe_file}: {e}")
 
-        logger.info(f"Discovered {len(self.discovered_agents)} trained agents")
+        current = set(self.discovered_agents)
+        now = time.time()
+        if first_scan:
+            logger.info(f"Discovered {len(current)} trained agents")
+            last_said = now
+        else:
+            gone = previous - current
+            added = current - previous
+            for agent_id in sorted(gone):
+                logger.info(f"Agent no longer present: {agent_id}")
+            if added or gone:
+                logger.info(f"Discovered {len(current)} trained agents "
+                            f"(+{len(added)} -{len(gone)})")
+                last_said = now
+            elif now - last_said >= UNCHANGED_HEARTBEAT_SECONDS:
+                logger.info(f"Discovered {len(current)} trained agents (unchanged)")
+                last_said = now
+
+        with _reported_lock:
+            _reported_agents[self.prompts_dir] = current
+            _reported_at[self.prompts_dir] = last_said
         return len(self.discovered_agents)
 
     def _load_prompt_definitions(self):
@@ -310,8 +369,8 @@ class DynamicAgentExecutor:
 
         try:
             # Import execution functions
-            from create_recipe import recipe
-            from reuse_recipe import chat_agent
+            from hartos.create_recipe import recipe
+            from hartos.reuse_recipe import chat_agent
 
             logger.info(f"Executing task for agent {agent_id} (persona: {agent.persona})")
 

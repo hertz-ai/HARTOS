@@ -56,7 +56,11 @@ class MeshPeer:
         self.address = address
         self.public_key = public_key
         self.capabilities = capabilities or {}
-        self.last_seen = time.time()
+        self.last_seen = time.time()  # wall — for the to_dict export/display
+        # Monotonic mirror for liveness/age math: a wall-clock jump (#24) must not
+        # make a dead peer read as alive (is_stale false-negative -> mesh routes
+        # work to a gone peer; false-healthy #6).
+        self.last_seen_mono = time.monotonic()
         self.latency_ms: Optional[int] = None
         self.available_compute: float = 0.0  # 0.0 to 1.0
         self.loaded_models: List[str] = []
@@ -71,12 +75,13 @@ class MeshPeer:
             'latency_ms': self.latency_ms,
             'available_compute': self.available_compute,
             'loaded_models': self.loaded_models,
-            'age_seconds': int(time.time() - self.last_seen),
+            'age_seconds': int(time.monotonic() - self.last_seen_mono),
         }
 
     def is_stale(self, max_age: int = 300) -> bool:
-        """Peer is stale if not seen for max_age seconds."""
-        return (time.time() - self.last_seen) > max_age
+        """Peer is stale if not seen for max_age seconds (monotonic — a wall-clock
+        jump must not make a dead peer read as alive)."""
+        return (time.monotonic() - self.last_seen_mono) > max_age
 
 
 class ComputeMeshService:
@@ -194,6 +199,7 @@ class ComputeMeshService:
                                         )
                                     else:
                                         self._peers[peer_id].last_seen = time.time()
+                                        self._peers[peer_id].last_seen_mono = time.monotonic()
                                         self._peers[peer_id].capabilities = mesh_data.get('capabilities', {})
                                         self._peers[peer_id].available_compute = mesh_data.get('available_compute', 0)
                                         self._peers[peer_id].loaded_models = mesh_data.get('loaded_models', [])
@@ -225,7 +231,7 @@ class ComputeMeshService:
             return {'error': f'Unknown peer: {peer_id}'}
 
         if peer.is_stale():
-            age = int(time.time() - peer.last_seen)
+            age = int(time.monotonic() - peer.last_seen_mono)
             return {'error': f'Peer {peer_id} is stale (last seen {age}s ago)'}
 
         payload = {

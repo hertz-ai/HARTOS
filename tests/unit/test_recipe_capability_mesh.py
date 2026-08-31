@@ -203,7 +203,7 @@ def test_private_recipe_is_not_advertised_on_bank(tmp_path, clean_state):
     """The REAL bank gate (create_recipe._announce_flow_recipe) checks
     export_allowed before announcing. A private recipe (not goal-linked,
     no broadcast_agent opt-in) -> export_allowed False -> NO broadcast."""
-    import create_recipe
+    from hartos import create_recipe
 
     broadcasts = []
 

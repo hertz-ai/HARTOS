@@ -1721,7 +1721,7 @@ def hierarchy_verify_upgrade():
 
     # Generate HART central identity
     try:
-        from hart_onboarding import generate_node_identity
+        from hartos.hart_onboarding import generate_node_identity
         generate_node_identity(tier='central')
     except Exception:
         pass

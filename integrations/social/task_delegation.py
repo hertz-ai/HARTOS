@@ -30,7 +30,7 @@ def delegate_to_best_agent(task_description: str, required_skill: str = None) ->
 def create_ledger_task(user_id: str, prompt_id: int, task_description: str) -> Optional[str]:
     """Create a SmartLedger task for tracking. Returns ledger key."""
     try:
-        from helper_ledger import create_ledger_for_user_prompt
+        from hartos.helper_ledger import create_ledger_for_user_prompt
         ledger = create_ledger_for_user_prompt(user_id, prompt_id)
         if ledger:
             task_key = f"social_task_{user_id}"

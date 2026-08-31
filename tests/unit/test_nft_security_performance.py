@@ -112,17 +112,17 @@ class TestImportSpeed:
 
     def test_helper_imports_under_2s(self):
         start = time.time()
-        import helper
+        from hartos import helper
         assert time.time() - start < 3.0
 
     def test_cultural_wisdom_imports_under_1s(self):
         start = time.time()
-        import cultural_wisdom
+        from hartos import cultural_wisdom
         assert time.time() - start < 1.0
 
     def test_threadlocal_imports_under_100ms(self):
         start = time.time()
-        import threadlocal
+        from hartos import threadlocal
         assert time.time() - start < 0.5
 
 
@@ -213,18 +213,18 @@ class TestCulturalWisdomImmutability:
 
     def test_guardian_values_are_tuple(self):
         """Tuples are immutable — prevents accidental modification."""
-        from cultural_wisdom import get_guardian_cultural_values
+        from hartos.cultural_wisdom import get_guardian_cultural_values
         values = get_guardian_cultural_values()
         assert isinstance(values, tuple)
 
     def test_trait_count_is_stable(self):
         """Trait count must not change between calls — no dynamic modification."""
-        from cultural_wisdom import get_trait_count
+        from hartos.cultural_wisdom import get_trait_count
         count1 = get_trait_count()
         count2 = get_trait_count()
         assert count1 == count2
 
     def test_traits_are_tuple(self):
         """CULTURAL_TRAITS must be a tuple (immutable), not a list."""
-        from cultural_wisdom import CULTURAL_TRAITS
+        from hartos.cultural_wisdom import CULTURAL_TRAITS
         assert isinstance(CULTURAL_TRAITS, tuple)

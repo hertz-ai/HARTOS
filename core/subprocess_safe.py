@@ -47,42 +47,21 @@ from __future__ import annotations
 import logging
 import subprocess
 import sys
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
 
 def hidden_popen_kwargs() -> dict:
-    """Return Popen kwargs that hide the cmd console window on Windows.
+    """Deprecated alias for `no_window_kwargs()`.  Kept for its 34 callers.
 
-    Use this for any subprocess.run / subprocess.Popen / subprocess.call
-    site that:
-      - runs a console binary (where, ping, nvidia-smi, git, npm, etc.); AND
-      - is invoked from the cx_Freeze Windows GUI (no parent console);
-    otherwise a brief cmd.exe window flickers per call.
-
-    Usage:
-        from core.subprocess_safe import hidden_popen_kwargs
-        kw = hidden_popen_kwargs()
-        proc = subprocess.run(cmd, capture_output=True, text=True, **kw)
-        # OR
-        proc = subprocess.Popen(cmd, stdout=..., stderr=..., **kw)
-
-    On macOS/Linux this returns {} so the call is a no-op cross-platform.
-
-    Mirrors Nunba's tts/_subprocess.py::hidden_startupinfo() but exposes
-    a kwargs dict (more ergonomic for **kw merging).  run_bounded() and
-    run_with_timeout() in this module already inline the same flags.
+    Until 2026-08-29 this carried its own copy of the flag-building body.  The
+    two returned identical values -- same keys, creationflags 134217728,
+    startupinfo dwFlags=1 wShowWindow=0 -- so this is a name, not a second
+    behaviour.  It now delegates, leaving one implementation of the concept.
+    New callers should use no_window_kwargs(), which run_bounded() also uses.
     """
-    if sys.platform != "win32":
-        return {}
-    si = subprocess.STARTUPINFO()
-    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    si.wShowWindow = 0
-    return {
-        "startupinfo": si,
-        "creationflags": subprocess.CREATE_NO_WINDOW,
-    }
+    return no_window_kwargs()
 
 
 class BoundedResult:
@@ -289,4 +268,5 @@ def _safe_kill_and_close(
         pass
 
 
-__all__ = ["BoundedResult", "run_bounded", "run_probe", "hidden_popen_kwargs"]
+__all__ = ["BoundedResult", "run_bounded", "run_probe",
+           "no_window_kwargs", "hidden_popen_kwargs"]

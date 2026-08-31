@@ -38,7 +38,7 @@ _URL = 'http://127.0.0.1:8082/v1/chat/completions'
 def _clean():
     """Reset all process-global state this feature touches, before and after."""
     from core import foreground, http_pool
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
 
     def _reset():
         while foreground.in_flight() > 0:
@@ -80,7 +80,7 @@ def test_is_background_call_treats_empty_id_as_background():
     — classifying it foreground (the old bespoke `if not rid: return False`) is
     what left empty-rid daemon 4B calls un-preemptible (#162)."""
     from core.llm_outbound_logger import _is_background_call
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
     thread_local_data.set_request_id('')  # deterministic: no leftover from another test
     assert _is_background_call(httpx.Request('POST', _URL)) is True
 
@@ -89,7 +89,7 @@ def test_thread_local_request_id_is_the_fallback():
     """When the header is absent, the thread-local request_id still classifies
     the call (covers callers that don't reach _annotate_request)."""
     from core.llm_outbound_logger import _is_background_call
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
     thread_local_data.set_request_id('daemon_goal_99')
     assert _is_background_call(httpx.Request('POST', _URL)) is True
     thread_local_data.set_request_id('user_turn_1')

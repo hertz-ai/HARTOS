@@ -167,10 +167,15 @@ def list_agents(category: Optional[str] = None, query: Optional[str] = None) -> 
                     hive.append(entry)
         finally:
             db.close()
-    except Exception:
+    except Exception as e:
         # DB-less contexts (bare MCP unit runs) — counts stay 0, the
-        # local registry + recipes above still enumerate.
-        pass
+        # local registry + recipes above still enumerate. LOG (not silent
+        # pass): a swallowed DB error here read as "0 trained agents on a DB
+        # that has them" and reddened test_list_agents_tool in CI with no clue
+        # why (#29, no-silent-gulping house rule). debug level so a genuinely
+        # DB-less unit run stays quiet while a real failure is now visible.
+        logger.debug("list_agents trained/hive DB leg skipped or failed "
+                     "(DB-less context, or a real error to investigate): %r", e)
 
     return json.dumps({
         "expert_agents": len(result),

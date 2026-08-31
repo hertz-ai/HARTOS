@@ -447,10 +447,21 @@ in
           # the last hart-backend line in the failing run's journal was still the
           # vision init. Every other timing-sensitive assertion in this file already
           # uses wait_until_succeeds; this one was the outlier.
+          #
+          # 240s, not 120s (2026-08-31): main() runs hevolve_verify_boot() FIRST,
+          # whose compute_code_hash() + compute_file_manifest() hash EVERY file in
+          # the tree against the signed release_manifest.json — a mandatory
+          # release-integrity step that legitimately costs ~90s on a loaded CI VM
+          # (the same whole-repo hash that flaked the tamper unit test) BEFORE
+          # bootstrap_local_subscribers() runs. So the OTA subscriber log lands
+          # ~180s in — well within boot_userspace_s=600 (the OS's own enforced boot
+          # budget, VM-verified by hart-boot-latency), but past the old 120s window.
+          # This is a slow-but-correct SECURE boot, not a regression; the wait now
+          # matches the legitimate secure-boot time instead of racing it.
           jb = node.wait_until_succeeds(
               "journalctl -u hart-backend --no-pager | "
               "grep -i 'Local subscribers bootstrapped' | tail -1",
-              timeout=120)
+              timeout=240)
           assert "ota-push" in jb, \
               f"OTA realtime push leg not wired into backend bootstrap:\n{jb}"
 

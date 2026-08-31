@@ -261,7 +261,11 @@ class Probe:
                f'{self.user_id}&limit=10')
         status, body = _http('GET', url, timeout=10.0)
         if status == 0:
-            return Result('G3 transcript persist', 'SKIP', [str(body)],
+            # FAIL, not SKIP: status==0 is a dead socket, not "this build has
+            # no such endpoint" (that is the 404 branch below).  Five sibling
+            # gates already FAIL on unreachable; SKIP here made `--gates g3`
+            # against a down server exit 0 with nothing verified.
+            return Result('G3 transcript persist', 'FAIL', [str(body)],
                           '/api/chat-sync/pull unreachable')
         signals.append(f'GET /api/chat-sync/pull → HTTP {status}')
         if status == 404:
@@ -338,7 +342,9 @@ class Probe:
         url = f'{self.base_url}/api/agent/liquid-ui/component-types'
         status, body = _http('GET', url, timeout=10.0)
         if status == 0:
-            return Result('G5 meet_copilot', 'SKIP', [str(body)],
+            # FAIL, not SKIP — see the G3 note: a dead socket is not the same
+            # as the 404 "catalog endpoint isn't exposed" case handled below.
+            return Result('G5 meet_copilot', 'FAIL', [str(body)],
                           'liquid-ui catalog endpoint unreachable')
         if status == 404:
             # Catalog endpoint isn't always exposed.  Fall back to
@@ -396,6 +402,16 @@ class Probe:
 
 
 def main() -> int:
+    # Windows consoles default to cp1252; force UTF-8 (replace on failure) so a
+    # status glyph can never crash the run with a UnicodeEncodeError.  This file
+    # carries 206 non-ASCII chars (box-drawing, em-dash, arrow), and printing a
+    # result row killed the run at probe.run() before any summary was reached.
+    # Same guard, same reason as scripts/hart_usb_flasher.py:2270.
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
     p = argparse.ArgumentParser(description=__doc__.split('\n')[1])
     p.add_argument('--base-url', default='http://127.0.0.1:5001',
                    help='HARTOS / Nunba dev endpoint')

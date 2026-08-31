@@ -14,9 +14,9 @@ from typing import Dict, Optional, Any
 from core.session_cache import TTLCache
 
 try:
-    from helper import PROMPTS_DIR
+    from hartos.helper import PROMPTS_DIR
 except ImportError:
-    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'))
 
 logger = logging.getLogger(__name__)
 
@@ -480,7 +480,7 @@ def _banked_artifact_exists(task):
         a = getattr(task, 'recipe_action_id', None)
         if p is None or f is None or a is None:
             return None
-        from helper import safe_prompt_path
+        from hartos.helper import safe_prompt_path
         return os.path.exists(safe_prompt_path(str(p), str(f), str(a)))
     except Exception:
         return None
@@ -773,7 +773,7 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState, reaso
 
     # Telemetry recording for recipe experience
     try:
-        from recipe_experience import RecipeExperienceRecorder as RER
+        from hartos.recipe_experience import RecipeExperienceRecorder as RER
         if state == ActionState.IN_PROGRESS:
             RER.start_action_timer(user_prompt, action_id)
         elif state in (ActionState.COMPLETED, ActionState.ERROR, ActionState.TERMINATED, ActionState.GAVE_UP):

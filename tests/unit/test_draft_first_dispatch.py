@@ -792,8 +792,17 @@ class TestAgentBindingGuard:
             "the agent's expert path runs, not short-circuit on the "
             "0.8B draft's generic voice"
         )
-        # Standby reply still surfaces for latency comfort.
-        assert result['response'] == 'Hello!'
+        # A standby still surfaces for latency comfort — but on an
+        # agent-bound turn it is the GENERIC holding reply, NOT the draft's
+        # own words. The 0.8B has no tools, so its in-band reply can only
+        # DESCRIBE work it cannot do (the live "saved and confirmed while
+        # nothing ran" incident; speculative_dispatcher.py:647-654 replaces
+        # draft_reply with _REFUSAL_STANDBY_REPLY here). The expert's real
+        # answer then replaces it via the speculation_id bubble.
+        from integrations.agent_engine.speculative_dispatcher import (
+            _REFUSAL_STANDBY_REPLY,
+        )
+        assert result['response'] == _REFUSAL_STANDBY_REPLY
 
     def test_no_agent_binding_keeps_none(
             self, dispatcher, monkeypatch):

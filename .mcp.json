@@ -4,7 +4,8 @@
       "command": "python",
       "args": ["-m", "integrations.mcp.mcp_stdio_bridge"],
       "env": {
-        "PYTHONPATH": "."
+        "PYTHONPATH": ".",
+        "NUNBA_BUNDLED": "1"
       }
     },
     "trueflow": {

@@ -10,7 +10,6 @@ Pattern from: integrations/vision/minicpm_installer.py
 
 import json
 import logging
-import os
 import shutil
 import subprocess
 import sys
@@ -58,14 +57,32 @@ class ModelStorageManager:
     # ── Download state ───────────────────────────────────────────
 
     def is_downloaded(self, tool_name: str) -> bool:
-        """Check if a tool's models are already downloaded."""
-        manifest = self._read_manifest()
-        entry = manifest.get("tools", {}).get(tool_name)
-        if not entry:
-            return False
-        # Also verify the directory actually exists
+        """Check if a tool's models are already downloaded.
+
+        The DIRECTORY is the source of truth, not the manifest.  Models can
+        arrive by paths that never call mark_downloaded(): measured on a live
+        box 2026-08-29, ~/.hevolve/models held 12.3 GB across minicpm (6600MB),
+        stt (5347MB), luxtts (342MB) and tts (59MB) with no manifest row, so
+        this returned False for all four.  Callers act on that -- runtime_manager
+        :126 and :160 gate tool use on it, :209 and :302 report it to the UI,
+        and download_hf_model:163 would re-fetch every one of those gigabytes.
+        manifest.json stays what its own module docstring calls it, a ledger of
+        where disk space went; presence on disk answers "is it downloaded".
+
+        A directory without FILES is not a download.  `tool_dir.mkdir()` runs
+        BEFORE each fetch, so a failure leaves an empty directory behind
+        (diffrhythm's HF call took a 401 and left one).  Several tools also
+        pre-create an `output/` subdirectory, so kokoro/chatterbox/cosyvoice
+        each held one empty child dir and nothing else -- a plain
+        `any(iterdir())` counts that as content and answers True.  Requiring a
+        real file is what separates "downloaded" from "directory exists".
+        any() short-circuits on the first hit, so this does not walk a 6 GB
+        tree.
+        """
         tool_dir = self.get_tool_dir(tool_name)
-        return tool_dir.exists() and any(tool_dir.iterdir())
+        if not tool_dir.exists():
+            return False
+        return any(p.is_file() for p in tool_dir.rglob("*"))
 
     def mark_downloaded(self, tool_name: str, source_url: str,
                         size_bytes: int = 0) -> None:

@@ -211,25 +211,31 @@ def test_03_first_paint_asset_closure_no_dead_husk(client, monkeypatch,
 def test_04_boot_data_apps_listing(client):
     # ENTRY  the booted page's start menu asks which OS apps exist:
     #        GET /api/shell/apps -> shell_apps()  [liquid_ui_service.py]
-    #        -> os.listdir over /usr/share/applications and
-    #           ~/.local/share/applications, collecting *.desktop entries as
-    #           {'id': fname-minus-.desktop, 'name': titlecased, 'subsystem':
-    #           'linux'}, capped at 100
-    # BRANCH on this dev box neither .desktop dir exists -> the loop skips
-    #        both -> the CONTROLLED empty listing (the start menu falls back
-    #        to the inlined MANIFEST panels, which is why the desktop is
-    #        never empty even with zero native apps)
-    # DATA   {'apps': [...]} -- every entry, when present, is a linux
-    #        .desktop id; never more than 100
+    #        -> core.platform.desktop_entries.discover(): the XDG lookup
+    #           (XDG_DATA_HOME + XDG_DATA_DIRS, plus the NixOS profile and
+    #           flatpak export trees), reading each entry's own Name and
+    #           dropping NoDisplay/Hidden/non-Application files
+    # BRANCH on this dev box no application directory exists -> the
+    #        CONTROLLED empty listing (the start menu falls back to the
+    #        inlined MANIFEST panels, which is why the desktop is never
+    #        empty even with zero native apps)
+    # DATA   {'apps': [...]} -- every entry is a linux .desktop id
     # SINK   200 application/json to the start-menu JS
+    #
+    # NOT capped. This asserted `<= 100` when the route did `apps[:100]`, which
+    # was an echo of the implementation rather than a contract: on the box, with
+    # 162 applications installed, that cap silently hid a third of the machine
+    # from a route whose entire job is to say what is installed. Nothing in the
+    # shell consumes this route, so no caller depended on the bound.
     resp = client.get('/api/shell/apps')
     assert resp.status_code == 200
     body = resp.get_json()
     assert isinstance(body['apps'], list)
-    assert len(body['apps']) <= 100
     for entry in body['apps']:
         assert entry['subsystem'] == 'linux'
         assert entry['id'] and entry['name']
+    ids = [e['id'] for e in body['apps']]
+    assert len(ids) == len(set(ids)), "the same desktop id was listed twice"
 
 
 def test_05_boot_data_context_snapshot_degrades_offline(client):

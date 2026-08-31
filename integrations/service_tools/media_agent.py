@@ -258,7 +258,7 @@ def _generate_image(context: str, input_text: str, style: str) -> dict:
     if style:
         prompt = f"{prompt}, {style} style"
     try:
-        from helper import txt2img
+        from hartos.helper import txt2img
         img_url = txt2img(prompt)
         return {
             'status': 'completed',

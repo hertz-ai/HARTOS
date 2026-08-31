@@ -17,8 +17,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 pytest.importorskip('autogen', reason='autogen not installed')
 
-from helper import Action, retrieve_json
-from lifecycle_hooks import (
+from hartos.helper import Action, retrieve_json
+from hartos.lifecycle_hooks import (
     ActionState,
     lifecycle_hook_track_action_assignment,
     lifecycle_hook_track_status_verification_request,
@@ -60,7 +60,7 @@ class TestActionExecutionValidation:
             'StatusVerifier'
         )
 
-        from lifecycle_hooks import lifecycle_hook_process_verifier_response
+        from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response
         try:
             lifecycle_hook_process_verifier_response(
                 test_user_prompt,
@@ -85,7 +85,7 @@ class TestActionExecutionValidation:
             'StatusVerifier'
         )
 
-        from lifecycle_hooks import lifecycle_hook_process_verifier_response
+        from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response
         try:
             lifecycle_hook_process_verifier_response(
                 test_user_prompt,
@@ -109,7 +109,7 @@ class TestActionExecutionValidation:
             'StatusVerifier'
         )
 
-        from lifecycle_hooks import lifecycle_hook_process_verifier_response
+        from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response
         try:
             lifecycle_hook_process_verifier_response(
                 test_user_prompt,
@@ -268,7 +268,7 @@ class TestFlowExecutionTracking:
 
     def test_track_single_flow_execution(self, test_user_prompt):
         """Test tracking single flow execution"""
-        from lifecycle_hooks import FlowState, flow_lifecycle
+        from hartos.lifecycle_hooks import FlowState, flow_lifecycle
 
         # Initialize flow
         try:
@@ -280,7 +280,7 @@ class TestFlowExecutionTracking:
 
     def test_track_multiple_flows(self, test_user_prompt):
         """Test tracking multiple flows"""
-        from lifecycle_hooks import flow_lifecycle, FlowState
+        from hartos.lifecycle_hooks import flow_lifecycle, FlowState
 
         try:
             # Initialize multiple flows
@@ -296,7 +296,7 @@ class TestFlowExecutionTracking:
 
     def test_flow_completion_tracking(self, test_user_prompt):
         """Test tracking flow completion"""
-        from lifecycle_hooks import flow_lifecycle, FlowState
+        from hartos.lifecycle_hooks import flow_lifecycle, FlowState
 
         try:
             flow_lifecycle.initialize_flow(0, total_actions=2)
@@ -306,7 +306,7 @@ class TestFlowExecutionTracking:
             lifecycle_hook_track_status_verification_request(test_user_prompt, 1)
 
             # Check if flow completes when all actions done
-            from lifecycle_hooks import lifecycle_hook_check_all_actions_terminated
+            from hartos.lifecycle_hooks import lifecycle_hook_check_all_actions_terminated
             all_terminated = lifecycle_hook_check_all_actions_terminated(test_user_prompt)
         except Exception:
             pass
@@ -413,7 +413,7 @@ class TestActionOutputValidation:
         }
 
         # Should sanitize potentially dangerous content
-        from helper import strip_json_values
+        from hartos.helper import strip_json_values
         try:
             sanitized = strip_json_values(output_with_special_chars)
             # Verify sanitization occurred

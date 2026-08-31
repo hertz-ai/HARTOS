@@ -83,7 +83,7 @@ class TestPreviewStatesExist(unittest.TestCase):
     """Verify lifecycle_hooks has preview states."""
 
     def test_preview_states_in_action_state(self):
-        from lifecycle_hooks import ActionState
+        from hartos.lifecycle_hooks import ActionState
         self.assertTrue(hasattr(ActionState, 'PREVIEW_PENDING'))
         self.assertTrue(hasattr(ActionState, 'PREVIEW_APPROVED'))
 

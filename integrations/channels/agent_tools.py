@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 def _get_channel_context():
     """Read the current channel context from thread-local storage."""
     try:
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
         return thread_local_data.get_channel_context()
     except Exception:
         return None
@@ -42,7 +42,7 @@ def _get_channel_context():
 def _get_user_id_from_threadlocal():
     """Get current user_id from thread-local."""
     try:
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
         return thread_local_data.get_user_id()
     except Exception:
         return None

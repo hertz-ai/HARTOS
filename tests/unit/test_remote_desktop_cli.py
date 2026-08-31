@@ -17,7 +17,7 @@ class TestRemoteDesktopCLI(unittest.TestCase):
 
     def setUp(self):
         from click.testing import CliRunner
-        from hart_cli import hart
+        from hartos.hart_cli import hart
         self.runner = CliRunner()
         self.hart = hart
 

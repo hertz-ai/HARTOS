@@ -25,8 +25,8 @@ _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import lifecycle_hooks as lh  # noqa: E402
-from lifecycle_hooks import (  # noqa: E402
+from hartos import lifecycle_hooks as lh  # noqa: E402
+from hartos.lifecycle_hooks import (  # noqa: E402
     ActionState as S, force_state_through_valid_path, set_action_state,
     get_action_state)
 

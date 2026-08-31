@@ -98,7 +98,7 @@ def _load_from_node_identity() -> Optional[str]:
     Best-effort — returns None on any import/file failure rather than
     exploding a chat request."""
     try:
-        from hart_onboarding import get_onboarding_identity
+        from hartos.hart_onboarding import get_onboarding_identity
         v = (get_onboarding_identity() or {}).get('language', '')
         if v and v[:2] in SUPPORTED_LANG_DICT:
             return v

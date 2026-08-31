@@ -67,6 +67,102 @@ palette is *shadowed* by an OLDER dup). The SEVERE findings are **long-standing 
 CLEAN.
 
 ---
+## NEW HIGH (2026-08-28, **SUBSTANTIALLY CORRECTED 2026-08-30**) — PeerLink vs gossip
+
+> **⚠ READ `PEER_TRANSPORT_IMPACT_ASSESSMENT.md` INSTEAD OF THIS SECTION.**
+> The steward pushed back with *"understand how each shd ideally be wired, something
+> might be intentional"* and commissioned a full source read. That read **refuted the
+> core claim below**: PeerLink is NOT a duplicate of gossip. It is a session
+> transport layered ABOVE discovery (`link.py:8-9` says it is discovered *by* gossip),
+> and its eleven channels are ROUTING SLOTS designed to delegate to the same handlers
+> HTTP already uses (`channels.py:138-140`), not eleven reimplementations.
+>
+> Also intentional, and wrongly flagged here: `compute_mesh`'s separate detector
+> (it reports *dynamic* availability, not static hardware), and the refusal to
+> persist capacity from relayed gossip records (a security property — relayed
+> records are unverifiable hearsay, and capacity feeds the ≤5% influence cap).
+>
+> What survives as genuine drift: one duplicated static-hardware detector, a
+> read-before-write bug in the handshake, and a dispatcher the receive loop never
+> consults. Six findings, five drift mechanisms, and an ordered canonicalisation
+> plan are in the impact assessment. The text below is kept only so the correction
+> is legible.
+
+## NEW HIGH (2026-08-28) — PeerLink and gossip are ONE set of concerns implemented twice, and the duplicate is the dead one
+
+Raised by the steward: *"we created peer link and peer exchange as parallel paths
+for different concerns which might end up get conflated later? one is not live is
+concerning."* Checked, and the concern understates it.
+
+**They are not two concerns.** `core/peer_link/channels.py` declares ELEVEN
+channels. Eight duplicate something that already works over a live rail:
+
+| PeerLink channel | its description | already live as |
+|---|---|---|
+| **`gossip`** | *"Peer list exchange, announce, health check"* | **gossip HTTP `:6777` `/api/social/peers/exchange` — same name, same job** |
+| `learning` | *"Federation learning deltas — FedAvg metric sync"* | federated metric deltas over gossip |
+| `ralt` | *"RALT skill distribution"* | skill packets announce over gossip/WAMP |
+| `control` | *"capability updates"* | gossip's `hardware_summary` |
+| `compute` | *"Inference offload"* | mesh `:6796` `/mesh/infer` |
+| `dispatch` | *"Agent task dispatch"* | A2A + `dispatch.py` |
+| `federation` | *"Federated post delivery"* | `federated_posts` over gossip |
+| `events` | *"EventBus cross-device"* | WAMP / EventBus |
+
+Only `sensor` (camera/screen/audio frames), `messages` (DMs) and arguably
+`hivemind` need what PeerLink uniquely provides — a persistent, encrypted, binary,
+bidirectional session. Gossip physically cannot stream frames; that residue is
+real. Everything above it is a second implementation of a solved problem.
+
+**AND THE DUPLICATE IS THE DEAD ONE.** Per `HIVE_COLLAB_BOOTSTRAP.md` (code-verified):
+*"PeerLink is DIAL-ONLY: no `/peer_link` listener and no `/api/peer-link/message`
+route exists anywhere, so the encrypted-link layer never connects (budgets
+10/50/200 are therefore moot)."*
+
+**IT WAS NEVER A DECISION.** `core/peer_link/__init__.py` is one line — *"HART Agent
+Protocol — Peer-to-peer communication layer."* No rationale, no relationship to
+gossip, no migration plan, no "supersedes" or "complements" anywhere in the package.
+The bootstrap doc's warning is something a later reader had to reverse-engineer
+after being misled, not a design statement.
+
+**The conflation has ALREADY started** — this is not a future risk:
+- THREE `_get_local_capabilities`-shaped detectors: `peer_link/link.py:789`,
+  `compute_mesh_service.py:570`, and the gossip sender's `hardware_summary`
+  (`peer_discovery.py:1119`). Only the gossip one measures system RAM
+  cross-platform; only compute_mesh's has the psutil→sysconf→Win32→/proc ladder.
+- THREE peer registries: `PeerNode` (DB), `link_manager._links` (memory),
+  `compute_mesh._peers` (memory).
+- An inert layer that READS as working: trust levels, AES-256-GCM, a channel
+  registry, per-tier link budgets — none of it reachable.
+
+**WHY THIS IS A DECISION, NOT A CLEANUP.** Hook #5 of the bootstrap's conversion
+list is *"add the inbound PeerLink listener on `:6777` feeding the existing
+ChannelDispatcher"* — i.e. the plan of record is to MAKE PeerLink live. If that
+lands as-is, the fleet gets two live implementations of gossip, federation-learning
+and skill-distribution, and the drift becomes bidirectional and permanent. The
+steward's "might end up get conflated later" is precisely that.
+
+**DECIDE, then make the tree say so:**
+1. Scope PeerLink to its genuine residue — the streaming/session channels (`sensor`,
+   `messages`, `hivemind`) — and DELETE or explicitly demote the eight duplicates,
+   with a reason and a date. An inert channel that reads as working is worse than
+   an absent one (this is the same failure class as `openclaw.enable = true`
+   installing nothing, and `copilot.enable` doing nothing without `daemon.enable`).
+2. Write the relationship into `core/peer_link/__init__.py` so the next reader does
+   not have to reverse-engineer it: gossip = periodic, stateless, epidemic METADATA;
+   PeerLink = persistent, encrypted, bidirectional STREAMS. One sentence prevents
+   the next duplicate.
+3. Only then land hook #5.
+
+**CONSEQUENCE FOR THE COMPUTE-CAPACITY WORK (task: elastic compute joins):** do NOT
+wire capability persistence through PeerLink — it is the dead path. The live rail
+already ships the data (`hardware_summary` + `idle_compute` in the gossip payload,
+`peer_discovery.py:1119`); the gap is that the RECEIVER never persists it, so
+`PeerNode.compute_*` stays NULL and compute-democracy weighting falls back to a
+uniform 1-GPU/8-core fiction for all 107 active peers. That fix belongs on the
+gossip receive path, through the existing `HierarchyService.report_node_capacity`.
+
+---
+
 ## NEW HIGH (2026-08-18) — the relay/federation endpoint has THREE names, 15 hardcodes, and ignores the router we ship
 
 WAMP is the **central relay AND federation transport** here (steward, 2026-08-18).

@@ -359,7 +359,7 @@ class WAMPRelayTransport(TransportChannel):
     def start(self) -> bool:
         """Connect to existing WAMP session and subscribe to topics."""
         try:
-            from crossbar_server import wamp_session
+            from hartos.crossbar_server import wamp_session
             self._wamp_session = wamp_session
             if not self._wamp_session:
                 logger.warning("WAMP session not available")

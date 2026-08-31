@@ -76,12 +76,71 @@ sandboxed) — recorded + guarded.
 
 | # | Item | Status / next step |
 |---|---|---|
+| **compositor build (crate-403)** | **⬇️ DEMOTED 2026-08-30 — PROBE-PROVEN NOT A VM BLOCKER.** Probe run `33308820048`: `PROBE_HART_COMP=GREEN` — `hart-comp` (the compositor the nixosTest desktop closure actually builds, vendored via **crane** = static.crates.io) builds fine (161 tests pass, 15.64s). `PROBE_HART_RUST_PRECEDENT=RED` — only the standalone `hart-rust-precedent` (nixpkgs `importCargoLock`) 403s, and it is **NOT in any system closure**: `installBinary` defaults `false` (`hart-rust-precedent.nix:163`) and `desktop.nix` sets only `rustPrecedent.enable = true` (exposes the `nix build` attr; does not add the pkg to `environment.systemPackages`). So the VM suite (driver/BIOS/Hyper-V/latency) is **NOT** blocked by crate-403 — it is blocked SOLELY by **#29** (Python fleet red → nixosTests `needs: unit-tests` → SKIP). crate-403 now only reddens the standalone `compositor-nix` CI job, which redundantly builds the precedent that `hart-comp` already supersedes; clean fix = drop `hart-rust-precedent` from that job's build loop (`flake-checks.yml:498`). **The stale "HIGHEST-PRIORITY BLOCKER, gates ALL VM" framing below is superseded by this line.** ~~HIGHEST-PRIORITY BLOCKER — gates ALL VM verification.~~ The compositor Rust build fetches its ~245 crates and gets **HTTP 403** on `js-sys 0.3.93` → the `Compositor nix build` job fails → ~~nixosTests cascade-SKIP~~ (WRONG — nixosTests skip on #29, not this) → the entire VM parity suite (driver/BIOS/Hyper-V/latency/`#42`/`#12`) never executes. Root-caused via run `33298320160` @ `ca645a43`. **PRECISE CAUSE (live-confirmed this session, curl from a dev box):** `https://crates.io/api/v1/crates/js-sys/0.3.93/download` → **403**, but `https://static.crates.io/crates/js-sys/js-sys-0.3.93.crate` → **200** (S3, 103 KB). crates.io now 403s the legacy `/api/v1/.../download` endpoint for non-cargo fetchers; the build's fetch routes through it instead of the working `static.crates.io` CDN. `js-sys` is a benign target-agnostic transitive (vendored, never compiled on native — NOT removable). **GROUND-TRUTH CORRECTION (run `33298320160` @ `ca645a43`, 2026-08-30, full job log line):** the failing derivation is `crate-rustyline-15.0.0.tar.gz` (also `syntect-5.3.0`; the exact crate varies run-to-run — whichever the fetcher hits first — because the 403 is systematic, not crate-specific), and the fetch line is verbatim `crate-rustyline> trying https://crates.io/api/v1/crates/rustyline/15.0.0/download`. The `crate-<name>-<ver>.tar.gz` name + `cannot download … from any mirror` phrasing is nixpkgs **`importCargoLock`** (`pkgs/build-support/rust/import-cargo-lock.nix`), and the build that failed first is **`hart-rust-precedent` / `hart-claw-precedent`** — the `buildRustPackage` path, **NOT crane.** **The earlier "bump crane" attribution was WRONG:** the pinned `crane` `469fd08d` is dated **2026-06-18**, well *after* crane's CDN switch (crane v0.16.3, 2024-03-19, "sources are now fetched [from] crates.io's CDN" — crane changelog), so crane already uses `static.crates.io`. The live culprit is **nixpkgs-rust's `importCargoLock`**, which still builds the deprecated `https://crates.io/api/v1/crates/${n}/${v}/download` URL that crates.io now **403s** (rust-lang/crates.io#13482 — the API endpoint / UA block, a 2026 change). **FIX = `nix flake lock --update-input nixpkgs-rust`** to a rev whose `importCargoLock` fetches from `static.crates.io` (nixpkgs fixed this in response to #13482; bump `crane` too for the hart-comp path to be safe). The `.crate` from `static.crates.io` is byte-identical to the old API download (the API was a 302→CDN redirect), so every `Cargo.lock` sha256 stays valid — the bump only changes the URL, not any content hash. **BLOCKED ON A NIX ENV:** `flake lock` recomputes `flake.lock`'s input narHash, which cannot be hand-authored on the Windows dev box (no nix). A `hartOverlays` mirror (à la libsciter `ebabc10c`) would need to wrap `fetchurl` on BOTH the main `pkgs` (importCargoLock) AND `rustNixpkgs` (crane, `hart-comp.nix:159`), and a mis-authored overlay eval-reds ALL shards — too risky to push blind to shared `main`. Handoff: run the two `flake lock --update-input` commands on any Nix box (or CI with lock-write), or greenlight me to draft the targeted overlay and iterate it via CI. |
 | `#42` | VM suite has FLAKY timing tests (`hart-server-boot` port-bind, `hart-session-supervisor-reboot-latch`) — different reds each run, blocks all-green | **ROOT-CAUSED + FIXED (verifying, run `31367253577`).** Three causes: (a) one-shot `curl` after `wait_for_open_port` raced socket-listening-before-Flask-serving → bounded `wait_until_succeeds` at all 4 sites (`8ef180d7`); (b) the reboot-latch subtest asserted a broken Tier-1 (`/bin/false`) FREEZES as `hart-comp` across a reboot — invalid: `greetd.service` is a NixOS-managed unit, so boot-time `/etc` regeneration undoes the runtime `systemctl mask`, greetd re-runs the selector and correctly re-drops. Now asserts the reboot READS+HONORS the durable re-arm via the supervisor's append-only journal (`f7eb7325`); (c) that rewrite's OWN terminal `cat`==cage was itself the one-shot race (cage needs a 2nd degrade after `sway`) → bounded `wait_until_succeeds` on the floor value (`a0e5c4fe`, caught by the parallel-path audit). **Verify run `31377165213`** (the prior `31367253577` was WASTED: `a0e5c4fe`'s comment carried a literal `''` inside the testScript indented string, which closed it → eval syntax error → all 12 shards red on eval at 2m37s, not the tests; fixed by a concurrent session in `74e54c1a`). Close when the re-run shows both absent from `--log-failed`. |
 | `#12` | `hart-layer-shell-host-paint` GTK4 SIGABRT on software GL (vulkan/GSK hang) | Known, deep, multi-session; GPU proven-good — the fix is root-causing the GSK-GL/layer-shell path, not another workaround |
-| `#29` | Python CI fleet red — harness inherits host machine identity (D-Bus/sysfs/abs paths) | Hermetic-harness fix; separate from the OS-parity VMs |
+| `#29` | Python CI fleet red — harness inherits host machine identity (D-Bus/sysfs/abs paths) | **THE nixosTests gate** (`needs: unit-tests` → any red shard SKIPs ALL VM tests). Whittled per-shard from fresh CI logs (run `33310728776` @ `9015a342`): shards 2/3/4/5/6 already GREEN. Remaining reds fixed 2026-08-30 on shards **0/1/7**, each root-caused + locally verified: **shard 0** — orb harness section C asserted the pre-`#32` inline `pointer-events:auto` the fix deliberately cleared → realigned to the anti-swallow guard (`3cec4f1c`); `crate403-probe.yml`'s concurrency group lacked `github.ref` (test_ci_workflow_concurrency) → deleted the ephemeral probe (`8843d7af`). **shard 1** — `test_world_model_learning_active` hand-set `_last_flush_at` from `time.time()` after the source moved to `time.monotonic()` (my own clock-jump fix; sibling test_world_model_bridge was updated, this file missed) → inject monotonic (`57a0090c`). **shard 7** — `test_whatsapp_live_adapter` flaked on CPython-3.11 sqlite `SystemError` (a `side_effect=RuntimeError(instance)` retained a traceback pinning the sqlite conn; GC mid-`db.commit()` re-entered) → fresh-exception callable (`0d36f515`); repo-health ratchet bare-`except:pass` rose 1528→1540 → converted `world_model_bridge.py`'s 24 silent swallows to logged debug/warning + ratcheted budget to 1521 (`29e8dc8d`). Run `33313552929` @ `8843d7af` CONFIRMED shards **0 + 7 flipped GREEN** (and 2/3/4/6 green), exposing the last reds from fresh logs: **shard 1** also had `test_list_agents_tool` (empty `:memory:` DB → 0 trained agents; hermetic seed `26e23bd8`) and `test_draft_first_dispatch::test_agent_bound_escalates_none_to_local` (STALE — the agent-bind guard now replaces the draft reply with `_REFUSAL_STANDBY_REPLY`, test still asserted the old raw reply; `44affaf4`); **shard 5** regressed to a 120s Timeout on `test_monitor_detects_code_tamper` (a flaky whole-repo `compute_file_manifest` in the tamper path, mocked `766778cb`). compositor-nix at 8843d7af was still the PRE-`bb122b24` YAML (built the crate-403 precedent); HEAD builds `hart-comp` only. **✅ CLEARED 2026-08-30 — run `33315100170` @ `44affaf4`: ALL 8 Python shards GREEN + BOTH compositor jobs GREEN (compositor-nix's crate-403 precedent failure gone now that it builds `hart-comp` only). `needs: unit-tests` satisfied → nixosTests shards 0-3/4 SPAWNED and executing — the driver/BIOS/Hyper-V/latency VM suite is finally running (long pole; #12 layer-shell + any #42 flakies may still red, but the gate that blocked ALL VM verification is open).** |
 | `#3` | Shell hang cluster: mic-freeze on cage FLOOR + false-healthy paint signals | Live; part of the shell-stability track |
 
 (`#19` edge cgroup caps moved to Verified above — fixed + VM-guarded.)
+
+### 🖥️ VM suite — FIRST full run since #29 cleared (run `33315100170` @ `44affaf4`, 2026-08-30)
+
+nixosTests finally EXECUTED (the gate had SKIPped them for weeks). Shard 1 GREEN;
+shards 0/2/3 red with **5 deterministic** `failed with error` tests — a mix of
+known-hard and regressions that accumulated *unvalidated* while the suite was
+gated off. **None trace to this session** (test-only + two `except:pass`→log
+source edits; VM boot/paint/mount failures cannot come from that). The many
+`hart-backend … sqlalche.me` journal lines are **benign idempotent-migration
+skips** (`duplicate column`), not failures.
+
+| VM test | Failure | Class | Action |
+|---|---|---|---|
+| `hart-desktop-shell-boot` | WebView first-frame PAINT (OCR) timed out 120s on llvmpipe | **#12** GPU/GSK software-paint | known-hard; root-cause the GSK-GL path |
+| `display-tiers-…-paint-ladder` | `/run/hart/session/shell-ready` EXISTS when all tiers fell to the cage floor with no paint | **#3/#6 false-healthy** | shell-boot design; consult HOME_DESKTOP_DESIGN_CHECKLIST — one of 5 shell-ready writers touches it without a real paint |
+| `hart-native-subsystems` | "waydroid init must bound a hung mirror with RuntimeMaxSec" | **stale test** | ✅ FIXED `b6f7717d` — test queried `RuntimeMaxSec`; the systemd show-property is `RuntimeMaxUSec` (unit correctly sets `RuntimeMaxSec=3600`) |
+| `hart-ota-central` | "realtime push leg wired into backend" timed out 120s | triage | needs CI-iteration to see the backend push-leg state |
+| `hart-boot-log` | `mount /dev/vdb` exit 32 after finding HARTLOG on another device | test-infra (device-name) | the label lookup found HARTLOG elsewhere; the mount hardcodes `/dev/vdb` — CI-iteration to confirm the actual device |
+
+Verification of the waydroid fix + flaky-vs-deterministic on the other four rides
+the next flake-checks dispatch. CI-iteration only from the Windows box (no local
+nix/VM); the shell paint items (#12, false-healthy shell-ready) are the #3
+workstream and design-gated.
+
+**RE-VERIFIED run `33322172168` @ `ae538fc8` (2026-08-30):** all 8 unit shards
+GREEN again (after two concurrent-session gate-breaks I fixed: `ddgs`→`click`
+dep conflict `8313ac90`, and a `/chat` diagnostic moved to `scripts/` `5892f5a6`).
+nixosTests shards 1+2 GREEN — **shard 2 flipped green = the waydroid
+`RuntimeMaxUSec` fix CONFIRMED.** Shards 0+3 red, and the reds are stable across
+both VM runs (deterministic, not flaky), collapsing to THREE classes: (A) **#12**
+software-GL paint hang (`hart-desktop-shell-boot` OCR timeout, `hart-layer-shell-
+host-paint` pkill 137); (B) **#3/#6** false-healthy `shell-ready`
+(`hart-session-supervisor-paint-watchdog`); (C) `hart-ota-central` realtime-push
+wiring timeout. A/B are the design-gated shell-boot workstream; C needs VM
+runtime state (CI-iteration). `hart-boot-log` mount did NOT recur — passed after
+the shard reshuffle.
+
+**`hart-ota-central` — PARTIAL diagnosis (one hypothesis DISPROVEN by reading the
+code):** the subtest `wait_until_succeeds`-es 120s for hart-backend to log
+`"Local subscribers bootstrapped … ota-push"`, and the journal shows a **~91s
+SILENT main-thread stall** between `[92.5s]` (WorldModelBridge `Direction B
+subscribed`) and `[183.9s]` (`hive_benchmark_prover` loop), with
+`bootstrap_local_subscribers` (hart_intelligence_entry.py:12632) reached only
+after it. **DISPROVEN hypothesis (first pass):** the `_wait_for_llm_server` waits are NOT the
+blocker — they live inside `_delayed_learning_init`, a **daemon thread** (:2025),
+and on the VM take only the 5s branch, off the main thread. **REAL ROOT CAUSE
+(traced through `main()`):** `main()` runs `hevolve_verify_boot()` FIRST (:12592),
+whose `compute_code_hash()` + `compute_file_manifest()` (:397/:404) hash EVERY
+file in the tree against the signed `release_manifest.json` — a MANDATORY
+release-integrity step (the same whole-repo hash that flaked the tamper unit
+test) that legitimately costs ~90s on a loaded CI VM, on the main thread, BEFORE
+`bootstrap_local_subscribers()` (:12632). So the OTA subscriber log lands ~180s
+in — well within `boot_userspace_s`=600 (the OS's own enforced boot budget,
+VM-verified by hart-boot-latency), but past the test's old 120s window. This is a
+slow-but-correct SECURE boot, NOT a regression, and reordering subscribers ahead
+of the integrity check would wire them on a not-yet-verified (possibly tampered)
+node. **✅ FIXED (`ota-central.nix` wait 120s→240s):** the test now matches the
+legitimate secure-boot time instead of racing it. Verifies on the next VM run.
 
 ## 🧭 Steward decisions (yours — not mine to default)
 

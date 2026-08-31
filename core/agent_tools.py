@@ -1011,7 +1011,7 @@ def build_core_tool_closures(ctx):
     ) -> str:
         """Extract content from a URL (PDF or website). Uses Crawl4AI or direct parsing."""
         try:
-            from threadlocal import thread_local_data as _tld
+            from hartos.threadlocal import thread_local_data as _tld
             _uid = _tld.get_user_id() if hasattr(_tld, 'get_user_id') else user_id
             _rid = _tld.get_request_id() if hasattr(_tld, 'get_request_id') else None
 

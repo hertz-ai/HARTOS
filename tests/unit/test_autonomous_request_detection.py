@@ -16,7 +16,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from threadlocal import thread_local_data
+from hartos.threadlocal import thread_local_data
 from integrations.agent_engine.dispatch import is_current_request_autonomous
 
 

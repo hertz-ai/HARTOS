@@ -78,7 +78,7 @@ MOUNT_ARGS=""
 sudo mkdir -p /opt/hzai-LLM-Langchain-Chatbot-Agent/logs /opt/hzai-LLM-Langchain-Chatbot-Agent/mount/images
 # Flywheel state (goals DB, outreach prospects, node keys) lives in
 # /app/agent_data.  Unmounted, a rebuild wiped it — the 2026-04-28 wipe
-# in FLYWHEEL_RECOVERY_BRIEF.md.  Same mount as the workflow.
+# in docs/internal/FLYWHEEL_RECOVERY_BRIEF.md.  Same mount as the workflow.
 sudo mkdir -p /opt/hzai-LLM-Langchain-Chatbot-Agent/agent_data
 ENV_FILE_ARGS=""
 [ -f "$(pwd)/.env" ] && ENV_FILE_ARGS="--env-file $(pwd)/.env"

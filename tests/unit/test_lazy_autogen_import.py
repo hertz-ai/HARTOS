@@ -82,7 +82,7 @@ _PROBE = textwrap.dedent(
 )
 
 
-@pytest.mark.parametrize("mod", ["create_recipe", "reuse_recipe"])
+@pytest.mark.parametrize("mod", ["hartos.create_recipe", "hartos.reuse_recipe"])
 def test_module_import_does_not_pull_autogen(mod):
     proc = subprocess.run(
         [sys.executable, "-c", _PROBE.format(mod=mod, mark=_MARK)],
@@ -120,7 +120,7 @@ _NO_AUTOGEN_PROBE = textwrap.dedent(
             return None
     sys.meta_path.insert(0, _Block())
 
-    import gather_agentdetails          # must NOT raise
+    import hartos.gather_agentdetails as gather_agentdetails          # must NOT raise
     print("IMPORT_OK")
 
     # the module's own guard must still be reachable and still explain itself

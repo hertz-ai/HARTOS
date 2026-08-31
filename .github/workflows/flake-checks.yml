@@ -354,7 +354,10 @@ jobs:
 
   # ─── Compositor: default-feature pure-logic floor (the dev-box build path) ──
   cargo-test:
-    name: Compositor cargo test (default / pure-logic floor)
+    # Job ID stays `cargo-test` — release.yml's gate and this file's header refer
+    # to it by ID; renaming that would be the parallel path. Only the display
+    # name changes, because it no longer covers default features alone.
+    name: Compositor cargo (default test + winit type-check)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -372,10 +375,86 @@ jobs:
       # feature is off). This is the floor the Windows dev box also runs; the
       # SMITHAY feature set is gated by the compositor-nix job below (which runs
       # `cargo test --features smithay` via the nix doCheck on the pinned
-      # toolchain). Together they gate BOTH compositor feature sets that ship.
+      # toolchain), and the WINIT set by the check step immediately below.
+      # Together those three gate every compositor feature set that ships —
+      # before the winit step there were three sets and only two gates.
       - name: cargo test (default features)
         working-directory: compositor
         run: cargo test --verbose
+
+      # ── The WINIT backend: TYPE-CHECKED here, and nowhere else before this ──
+      # src/winit.rs is a whole backend (and the ONLY one implementing
+      # screencopy), but `default = []` in Cargo.toml and
+      # `buildFeatures = [ "smithay" ]` in hart-comp.nix meant NOTHING compiled
+      # it: the step above builds default features, the compositor-nix job below
+      # builds smithay. So every change to the shared `CompState` trait in
+      # comp_core.rs had to be mirrored into winit.rs by hand with no compiler to
+      # catch a miss — which is exactly what happened while wiring the native
+      # shell caches (bloom/orb) into both backends.
+      #
+      # `check`, deliberately NOT `build`/`test`: check never LINKS, and linking
+      # is the only stage that would need a system library here (-lxkbcommon,
+      # via smithay's non-optional xkbcommon dep). Everything before the link
+      # already works on a stock runner with no apt step:
+      #   * smithay's build.rs only runs gl_generator unless `backend_gbm` is on,
+      #     and the winit feature does not enable it (no cc / pkg-config);
+      #   * smithay pins winit with `wayland-dlopen`, so wayland-sys's build.rs
+      #     takes its CARGO_FEATURE_DLOPEN early-out and never probes
+      #     wayland-client / wayland-egl;
+      #   * x11-dl tolerates a missing .pc.
+      # Building instead would need libxkbcommon-dev on the runner to produce a
+      # binary nothing in this job can run anyway (the nested-Wayland smoke E2E
+      # is #[ignore]d and needs a live host).
+      #
+      # ⚠️ THE NO-APT REASONING ABOVE DID NOT SURVIVE CONTACT. It is kept because
+      # every clause of it is still true about LINKING, but it missed that `check`
+      # still RUNS BUILD SCRIPTS. libudev-sys's build.rs calls pkg-config
+      # unconditionally, so the job died at
+      #     error: failed to run custom build command for `libudev-sys v0.1.4`
+      # before hart-comp was compiled at all — measured on runs 33231155954
+      # (c018bfe) and 33234426375 (ff8b5f7), i.e. this gate has been red since the
+      # step was added and has therefore NEVER type-checked winit. That is worse
+      # than not having the gate: task #48 read as closed while src/winit.rs was
+      # still uncompiled, and comp_core.rs changes shipped unverified on the
+      # strength of it.
+      #
+      # WHAT THIS LIST IS. At the pinned smithay rev, udev / pixman / gbm are NOT
+      # gated behind backend_udev / renderer_pixman / backend_gbm — they are in the
+      # dependency graph of ANY smithay build, winit included. That single fact
+      # produced both surprises here: libudev-sys's build script (pkg-config, runs
+      # even under `check`) and then, once the step started linking,
+      #     rust-lld: error: unable to find library -lpixman-1
+      #     rust-lld: error: unable to find library -lgbm
+      # The linker reports every missing library at once, so this list is complete
+      # rather than a guess. All are apt-cached on ubuntu-latest and cost seconds.
+      - name: System deps for the winit build (smithay pulls udev/pixman/gbm)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libudev-dev libseat-dev libinput-dev libxkbcommon-dev libwayland-dev \
+            libpixman-1-dev libgbm-dev
+
+      # `test`, not `check`, and that is a deliberate upgrade from what this step
+      # was. `check` never links, which is why it was chosen — but it also never
+      # RUNS anything, and comp_core.rs's #[cfg(test)] module is where the pure
+      # policy floors live (layer stacking, the panel work-area clamps, the
+      # reservation parser, clamp_region, the chord map). Those are compiled out
+      # of the default build, because comp_core needs smithay types, so the ONLY
+      # place they executed was the compositor-nix job's `cargo test --features
+      # smithay` doCheck — and that job has been failing on crates.io 403s while
+      # vendoring hart-claw-precedent, i.e. they were not running at all.
+      #
+      # Linking is affordable now that the step installs its own system deps
+      # (libxkbcommon is the one the old comment named). The tests themselves are
+      # pure arithmetic and need no display; tests/smoke_e2e.rs is #[ignore]d and
+      # needs a live Wayland host, so it stays skipped.
+      #
+      # `--all-targets` so the winit-only test targets are built too, which is
+      # what hart-comp.nix's comment already claims happens "under the
+      # --features winit check".
+      - name: cargo test (winit backend — compiles AND runs the pure floors)
+        working-directory: compositor
+        run: cargo test --features winit --all-targets --verbose
 
   # ─── Compositor: the SMITHAY (DRM) feature set, built + tested in Nix ───────
   compositor-nix:
@@ -412,11 +491,23 @@ jobs:
           # pipefail is MANDATORY: `nix build … | tee` otherwise reports tee's
           # exit (0) and the job goes green even when nix FAILED.
           set -o pipefail
-          # precedent FIRST (claw-cli) so a toolchain-resolution failure is
-          # isolated before hart-comp depends on it. --cores 0 = ALL runner cores
-          # per derivation (the CPU-bound rustc/LLVM compile; the iso-desktop
-          # 4h-hang lesson: NEVER throttle this Rust build to 2 cores).
-          for tgt in hart-rust-precedent hart-comp; do
+          # hart-rust-precedent DROPPED from this loop 2026-08-30 (crate-403).
+          # It builds via nixpkgs importCargoLock, which fetches from the
+          # deprecated https://crates.io/api/v1/.../download endpoint that
+          # crates.io now 403s (rust-lang/crates.io#13482) — an EXTERNAL change,
+          # not a HART regression. Because it built FIRST under `set -e`, its 403
+          # aborted the loop and hart-comp (the REAL compositor) was never even
+          # attempted, so this gate had been chronically red while the shipped
+          # artifact was fine. hart-comp vendors via CRANE (static.crates.io) and
+          # was PROVEN to build green in isolation (probe run 33308820048:
+          # PROBE_HART_COMP=GREEN, 161 tests pass). hart-comp is a STRICTLY
+          # STRONGER toolchain proof than the claw-cli precedent (same rust_1_88,
+          # 245 crates vs one), and the precedent ships in no closure
+          # (installBinary defaults false). Restore it here once importCargoLock
+          # is on static.crates.io (nixpkgs-rust bump — OS_PARITY_CLOSURE_PLAN.md).
+          # --cores 0 = ALL runner cores per derivation (CPU-bound rustc/LLVM
+          # compile; the iso-desktop 4h-hang lesson: NEVER throttle to 2 cores).
+          for tgt in hart-comp; do
             echo "=== nix build .#$tgt ==="
             time nix build ".#$tgt" \
               --no-link --print-out-paths --print-build-logs \

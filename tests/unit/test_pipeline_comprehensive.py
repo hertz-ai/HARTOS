@@ -125,7 +125,7 @@ def _terminate_action(user_prompt, action_id):
     force_state_through_valid_path only knows 1-2 step jumps, so we must
     walk the entire ASSIGNED->...->TERMINATED chain explicitly.
     """
-    from lifecycle_hooks import safe_set_state, force_state_through_valid_path, ActionState
+    from hartos.lifecycle_hooks import safe_set_state, force_state_through_valid_path, ActionState
     force_state_through_valid_path(user_prompt, action_id, ActionState.COMPLETED, "done")
     safe_set_state(user_prompt, action_id, ActionState.FALLBACK_REQUESTED, "fb")
     safe_set_state(user_prompt, action_id, ActionState.FALLBACK_RECEIVED, "fb recv")
@@ -146,7 +146,7 @@ def flask_app():
 @pytest.fixture
 def mock_user_tasks():
     """Create a mock user_tasks dict with an Action instance."""
-    from helper import Action
+    from hartos.helper import Action
     actions = [
         {"action_id": 1, "action": "Do thing A", "can_perform_without_user_input": "yes"},
         {"action_id": 2, "action": "Do thing B", "can_perform_without_user_input": "yes"},
@@ -209,7 +209,7 @@ class TestGatherInfo:
 
     def test_gather_info_raises_without_autogen(self):
         """gather_info raises ImportError when autogen is not installed."""
-        from gather_agentdetails import gather_info
+        from hartos.gather_agentdetails import gather_info
 
         # `autogen` is a LAZY MODULE that never yields None (the module says so
         # where it guards: the old `if autogen is None` check would silently
@@ -221,13 +221,13 @@ class TestGatherInfo:
             def __getattr__(self, name):
                 raise ImportError("No module named 'autogen'")
 
-        with patch('gather_agentdetails.autogen', _MissingAutogen()):
+        with patch('hartos.gather_agentdetails.autogen', _MissingAutogen()):
             with pytest.raises(ImportError, match="pyautogen"):
                 gather_info("user1", "Build a weather bot", "prompt1")
 
     def test_agent_creator_system_message_has_required_fields(self):
         """System message must mention all required config fields."""
-        from gather_agentdetails import AGENT_CREATOR_SYSTEM_MESSAGE
+        from hartos.gather_agentdetails import AGENT_CREATOR_SYSTEM_MESSAGE
         required_fields = ["name", "agent_name", "goal", "broadcast_agent",
                            "personas", "flows", "flow_name", "actions", "sub_goal"]
         for field in required_fields:
@@ -235,13 +235,13 @@ class TestGatherInfo:
 
     def test_agent_creator_system_message_has_personality(self):
         """System message must include personality fields for completed agents."""
-        from gather_agentdetails import AGENT_CREATOR_SYSTEM_MESSAGE
+        from hartos.gather_agentdetails import AGENT_CREATOR_SYSTEM_MESSAGE
         for field in ["primary_traits", "tone", "greeting_style", "identity"]:
             assert field in AGENT_CREATOR_SYSTEM_MESSAGE, f"Missing personality field: {field}"
 
     def test_agent_name_format_three_part(self):
         """System message requires skill.region.name format."""
-        from gather_agentdetails import AGENT_CREATOR_SYSTEM_MESSAGE
+        from hartos.gather_agentdetails import AGENT_CREATOR_SYSTEM_MESSAGE
         assert "skill.region.name" in AGENT_CREATOR_SYSTEM_MESSAGE
 
     def test_create_agents_autonomous_mode(self):
@@ -252,10 +252,10 @@ class TestGatherInfo:
         mock_autogen.AssistantAgent.return_value = mock_assistant
         mock_autogen.UserProxyAgent.return_value = mock_proxy
 
-        with patch('gather_agentdetails.autogen', mock_autogen), \
+        with patch('hartos.gather_agentdetails.autogen', mock_autogen), \
              patch.dict(os.environ, {'HEVOLVE_NODE_TIER': 'flat'}), \
              patch('core.port_registry.get_local_llm_url', return_value='http://localhost:8080'):
-            from gather_agentdetails import create_agents_for_user
+            from hartos.gather_agentdetails import create_agents_for_user
             assistant, proxy = create_agents_for_user(
                 "user1", autonomous=True, initial_description="A weather bot")
 
@@ -274,10 +274,10 @@ class TestGatherInfo:
         mock_autogen.AssistantAgent.return_value = MagicMock()
         mock_autogen.UserProxyAgent.return_value = MagicMock()
 
-        with patch('gather_agentdetails.autogen', mock_autogen), \
+        with patch('hartos.gather_agentdetails.autogen', mock_autogen), \
              patch.dict(os.environ, {'HEVOLVE_NODE_TIER': 'flat'}), \
              patch('core.port_registry.get_local_llm_url', return_value='http://localhost:8080'):
-            from gather_agentdetails import create_agents_for_user
+            from hartos.gather_agentdetails import create_agents_for_user
             create_agents_for_user("user1", autonomous=False)
 
             proxy_kwargs = mock_autogen.UserProxyAgent.call_args[1]
@@ -285,7 +285,7 @@ class TestGatherInfo:
 
     def test_get_agent_response_returns_string(self):
         """get_agent_response always returns a string."""
-        from gather_agentdetails import get_agent_response
+        from hartos.gather_agentdetails import get_agent_response
         mock_assistant = MagicMock()
         mock_proxy = MagicMock()
         mock_proxy.chat_messages = {
@@ -298,7 +298,7 @@ class TestGatherInfo:
 
     def test_get_agent_response_retries_on_missing_flows(self):
         """If LLM returns completed without flows, it retries."""
-        from gather_agentdetails import get_agent_response
+        from hartos.gather_agentdetails import get_agent_response
         mock_assistant = MagicMock()
         mock_proxy = MagicMock()
         # First response: completed but no flows key
@@ -330,7 +330,7 @@ class TestGatherInfo:
 
     def test_user_agents_cache_reuse(self):
         """Same user_prompt should reuse cached agents."""
-        from gather_agentdetails import user_agents
+        from hartos.gather_agentdetails import user_agents
         key = "test_cache_99999"
         mock_agents = (MagicMock(), MagicMock())
         user_agents[key] = mock_agents
@@ -361,7 +361,7 @@ class TestCreateRecipeExecution:
 
     def test_action_class_initialization(self):
         """Action class correctly stores actions list."""
-        from helper import Action
+        from hartos.helper import Action
         actions = [{"action_id": 1, "action": "Do thing"}]
         a = Action(actions)
         assert a.actions == actions
@@ -371,7 +371,7 @@ class TestCreateRecipeExecution:
 
     def test_action_class_set_ledger(self):
         """Action.set_ledger attaches ledger instance."""
-        from helper import Action
+        from hartos.helper import Action
         from flask import Flask
         app = Flask(__name__)
         a = Action([{"action_id": 1}])
@@ -383,7 +383,7 @@ class TestCreateRecipeExecution:
 
     def test_action_get_action(self):
         """Action.get_action returns correct action by index."""
-        from helper import Action
+        from hartos.helper import Action
         actions = [
             {"action_id": 1, "action": "First"},
             {"action_id": 2, "action": "Second"}
@@ -402,7 +402,7 @@ class TestCreateRecipeExecution:
 
     def test_action_execution_sets_in_progress_state(self):
         """Starting an action transitions it from ASSIGNED to IN_PROGRESS."""
-        from lifecycle_hooks import safe_set_state, get_action_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, get_action_state, ActionState
         user_prompt = "test_exec_ip"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         safe_set_state(user_prompt, 1, ActionState.IN_PROGRESS, "first action start")
@@ -426,8 +426,8 @@ class TestStatusVerifierReview:
 
     def test_lifecycle_hook_process_verifier_valid_completion(self):
         """Verifier accepts valid completion JSON."""
-        from lifecycle_hooks import lifecycle_hook_process_verifier_response, safe_set_state, ActionState
-        from helper import Action
+        from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response, safe_set_state, ActionState
+        from hartos.helper import Action
 
         user_prompt = "test_verifier_valid"
         actions = [{"action_id": 1, "action": "Do thing"}]
@@ -441,8 +441,8 @@ class TestStatusVerifierReview:
 
     def test_lifecycle_hook_process_verifier_passes_none_through(self):
         """Verifier allows None JSON through (defensive design)."""
-        from lifecycle_hooks import lifecycle_hook_process_verifier_response, safe_set_state, ActionState
-        from helper import Action
+        from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response, safe_set_state, ActionState
+        from hartos.helper import Action
 
         user_prompt = "test_verifier_none"
         actions = [{"action_id": 1, "action": "Do thing"}]
@@ -455,8 +455,8 @@ class TestStatusVerifierReview:
 
     def test_lifecycle_hook_process_verifier_passes_missing_status(self):
         """Verifier allows JSON without status field (defensive design)."""
-        from lifecycle_hooks import lifecycle_hook_process_verifier_response, safe_set_state, ActionState
-        from helper import Action
+        from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response, safe_set_state, ActionState
+        from hartos.helper import Action
 
         user_prompt = "test_verifier_no_status"
         actions = [{"action_id": 1, "action": "Do thing"}]
@@ -469,7 +469,7 @@ class TestStatusVerifierReview:
 
     def test_verifier_completion_with_fallback_action(self):
         """StatusVerifier completion with auto-generated fallback proceeds to recipe."""
-        from helper import Action
+        from hartos.helper import Action
         user_prompt = "test_verifier_fallback"
         actions = [{"action_id": 1, "action": "Do thing"}]
         task = Action(actions)
@@ -492,7 +492,7 @@ class TestStatusVerifierReview:
 
     def test_verifier_completion_without_fallback_requests_from_user(self):
         """StatusVerifier completion without fallback requests from user."""
-        from helper import Action
+        from hartos.helper import Action
         user_prompt = "test_verifier_no_fb"
         actions = [{"action_id": 1, "action": "Do thing"}]
         task = Action(actions)
@@ -512,7 +512,7 @@ class TestStatusVerifierReview:
 
     def test_verifier_error_status_sets_error_state(self):
         """Error status from verifier triggers ERROR action state."""
-        from lifecycle_hooks import safe_set_state, get_action_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, get_action_state, ActionState
         user_prompt = "test_verifier_error"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         safe_set_state(user_prompt, 1, ActionState.IN_PROGRESS, "start")
@@ -572,7 +572,7 @@ class TestActionRecipeCreation:
 
     def test_action_recipe_includes_metadata(self, tmp_prompts_dir):
         """Action recipe file includes stripped metadata."""
-        from helper import strip_json_values
+        from hartos.helper import strip_json_values
         metadata = {"key1": "value1", "nested": {"key2": "value2"}}
         stripped = strip_json_values(metadata)
         json_obj = {
@@ -600,7 +600,7 @@ class TestActionRecipeCreation:
 
     def test_recipe_state_transition_to_terminated(self):
         """After recipe is saved, action transitions to TERMINATED."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             safe_set_state, get_action_state, ActionState,
             force_state_through_valid_path
         )
@@ -624,7 +624,7 @@ class TestTopologicalSort:
 
     def test_topological_sort_basic(self):
         """Topological sort orders actions by dependencies."""
-        from helper import topological_sort
+        from hartos.helper import topological_sort
         actions = [
             {"action_id": 3, "actions_this_action_depends_on": [1, 2]},
             {"action_id": 1, "actions_this_action_depends_on": []},
@@ -638,7 +638,7 @@ class TestTopologicalSort:
 
     def test_topological_sort_no_dependencies(self):
         """Actions without dependencies maintain order."""
-        from helper import topological_sort
+        from hartos.helper import topological_sort
         actions = [
             {"action_id": 1, "actions_this_action_depends_on": []},
             {"action_id": 2, "actions_this_action_depends_on": []},
@@ -650,7 +650,7 @@ class TestTopologicalSort:
 
     def test_topological_sort_cyclic_detection(self):
         """Cyclic dependencies should be detected."""
-        from helper import topological_sort
+        from hartos.helper import topological_sort
         actions = [
             {"action_id": 1, "actions_this_action_depends_on": [2]},
             {"action_id": 2, "actions_this_action_depends_on": [1]}
@@ -661,7 +661,7 @@ class TestTopologicalSort:
 
     def test_topological_sort_diamond_dependency(self):
         """Diamond dependency pattern resolves correctly (1->2,3->4)."""
-        from helper import topological_sort
+        from hartos.helper import topological_sort
         actions = [
             {"action_id": 4, "actions_this_action_depends_on": [2, 3]},
             {"action_id": 2, "actions_this_action_depends_on": [1]},
@@ -678,13 +678,13 @@ class TestTopologicalSort:
 
     def test_fix_actions_with_cyclic_ids(self):
         """fix_actions handles cyclic dependency resolution."""
-        from helper import fix_actions
+        from hartos.helper import fix_actions
         actions = [
             {"action": "Do A", "action_id": 1},
             {"action": "Do B", "action_id": 2},
         ]
         cyclic_ids = [1, 2]
-        with patch('helper.pooled_post') as mock_post:
+        with patch('hartos.helper.pooled_post') as mock_post:
             mock_post.return_value = MagicMock(
                 status_code=200,
                 json=lambda: {"choices": [{"message": {"content": str(actions)}}]}
@@ -694,7 +694,7 @@ class TestTopologicalSort:
 
     def test_retrieve_json_valid(self):
         """retrieve_json extracts JSON from text."""
-        from helper import retrieve_json
+        from hartos.helper import retrieve_json
         text = 'Here is the result: {"status": "completed", "action_id": 1}'
         result = retrieve_json(text)
         assert result is not None
@@ -702,13 +702,13 @@ class TestTopologicalSort:
 
     def test_retrieve_json_invalid(self):
         """retrieve_json returns None for non-JSON text."""
-        from helper import retrieve_json
+        from hartos.helper import retrieve_json
         result = retrieve_json("This is plain text with no JSON")
         assert result is None
 
     def test_retrieve_json_nested(self):
         """retrieve_json handles nested JSON."""
-        from helper import retrieve_json
+        from hartos.helper import retrieve_json
         text = '{"status": "completed", "data": {"key": "value", "list": [1,2,3]}}'
         result = retrieve_json(text)
         assert result is not None
@@ -716,7 +716,7 @@ class TestTopologicalSort:
 
     def test_strip_json_values_redacts(self):
         """strip_json_values redacts all leaf values for privacy."""
-        from helper import strip_json_values
+        from hartos.helper import strip_json_values
         data = {"key": "sensitive", "nested": {"inner": "secret"}}
         result = strip_json_values(data)
         assert isinstance(result, dict)
@@ -758,14 +758,14 @@ class TestFlowRecipeCreation:
 
     def test_flow_lifecycle_state_tracking(self):
         """FlowLifecycleState tracks flow-level states."""
-        from lifecycle_hooks import FlowState, flow_lifecycle
+        from hartos.lifecycle_hooks import FlowState, flow_lifecycle
         user_prompt = "test_flow_state"
         flow_lifecycle.set_flow_state(user_prompt, 0, FlowState.DEPENDENCY_ANALYSIS)
         assert flow_lifecycle.flows[user_prompt][0] == FlowState.DEPENDENCY_ANALYSIS
 
     def test_flow_lifecycle_multiple_flows(self):
         """FlowLifecycleState handles multiple flows independently."""
-        from lifecycle_hooks import FlowState, flow_lifecycle
+        from hartos.lifecycle_hooks import FlowState, flow_lifecycle
         user_prompt = "test_multi_flow"
         flow_lifecycle.set_flow_state(user_prompt, 0, FlowState.FLOW_RECIPE_CREATION)
         flow_lifecycle.set_flow_state(user_prompt, 1, FlowState.TOPOLOGICAL_SORT)
@@ -774,11 +774,11 @@ class TestFlowRecipeCreation:
 
     def test_all_actions_terminated_check(self):
         """lifecycle_hook_check_all_actions_terminated verifies all actions terminated."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             safe_set_state, ActionState,
             lifecycle_hook_check_all_actions_terminated
         )
-        from helper import Action
+        from hartos.helper import Action
 
         user_prompt = "test_all_term"
         actions = [
@@ -805,7 +805,7 @@ class TestAgentLedger:
     def test_create_ledger_for_user_prompt(self):
         """create_ledger_for_user_prompt creates properly configured ledger."""
         try:
-            from helper_ledger import create_ledger_for_user_prompt
+            from hartos.helper_ledger import create_ledger_for_user_prompt
         except ImportError:
             pytest.skip("agent_ledger not installed")
         ledger = create_ledger_for_user_prompt(123, 456)
@@ -816,7 +816,7 @@ class TestAgentLedger:
     def test_create_ledger_with_auto_backend(self):
         """create_ledger_with_auto_backend selects best backend."""
         try:
-            from helper_ledger import create_ledger_with_auto_backend
+            from hartos.helper_ledger import create_ledger_with_auto_backend
         except ImportError:
             pytest.skip("agent_ledger not installed")
         ledger = create_ledger_with_auto_backend(123, 456, prefer_redis=False)
@@ -826,7 +826,7 @@ class TestAgentLedger:
         """add_subtasks_to_ledger delegates to ledger.add_subtasks."""
         try:
             from agent_ledger import SmartLedger, Task, TaskType, TaskStatus, ExecutionMode
-            from helper_ledger import add_subtasks_to_ledger
+            from hartos.helper_ledger import add_subtasks_to_ledger
         except ImportError:
             pytest.skip("agent_ledger not installed")
 
@@ -900,7 +900,7 @@ class TestAgentLedger:
         business owning. Assert the removal contract AND that the message
         still points at the fix.
         """
-        from helper_ledger import get_default_llm_client
+        from hartos.helper_ledger import get_default_llm_client
         with pytest.raises(NotImplementedError, match="llm_client"):
             get_default_llm_client()
 
@@ -914,7 +914,7 @@ class TestLifecycleHooks:
 
     def setup_method(self):
         """Reset action_states for test isolation."""
-        from lifecycle_hooks import action_states, initialize_deterministic_actions
+        from hartos.lifecycle_hooks import action_states, initialize_deterministic_actions
         action_states.clear()
         initialize_deterministic_actions()
 
@@ -926,7 +926,7 @@ class TestLifecycleHooks:
         verified success like TERMINATED -- and re-openable so a hive peer can
         retry. Pinning 15 made that honesty a red test.
         """
-        from lifecycle_hooks import ActionState
+        from hartos.lifecycle_hooks import ActionState
         assert len(ActionState) == 16
         expected = {"assigned", "in_progress", "status_verification_requested",
                     "completed", "pending", "error", "fallback_requested",
@@ -938,7 +938,7 @@ class TestLifecycleHooks:
 
     def test_initial_state_is_assigned(self):
         """New actions start in ASSIGNED state."""
-        from lifecycle_hooks import get_action_state, ActionState, safe_set_state
+        from hartos.lifecycle_hooks import get_action_state, ActionState, safe_set_state
         user_prompt = "test_init_1"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "test init")
         state = get_action_state(user_prompt, 1)
@@ -946,21 +946,21 @@ class TestLifecycleHooks:
 
     def test_valid_transition_assigned_to_in_progress(self):
         """ASSIGNED -> IN_PROGRESS is valid."""
-        from lifecycle_hooks import validate_state_transition, ActionState, safe_set_state
+        from hartos.lifecycle_hooks import validate_state_transition, ActionState, safe_set_state
         user_prompt = "test_trans_1"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         assert validate_state_transition(user_prompt, 1, ActionState.IN_PROGRESS)
 
     def test_invalid_transition_assigned_to_completed(self):
         """ASSIGNED -> COMPLETED is invalid (must go through IN_PROGRESS first)."""
-        from lifecycle_hooks import validate_state_transition, ActionState, safe_set_state
+        from hartos.lifecycle_hooks import validate_state_transition, ActionState, safe_set_state
         user_prompt = "test_trans_2"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         assert not validate_state_transition(user_prompt, 1, ActionState.COMPLETED)
 
     def test_full_happy_path_transitions(self):
         """ASSIGNED -> IN_PROGRESS -> STATUS_VERIFICATION -> COMPLETED -> TERMINATED."""
-        from lifecycle_hooks import safe_set_state, get_action_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, get_action_state, ActionState
         user_prompt = "test_happy_path"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         safe_set_state(user_prompt, 1, ActionState.IN_PROGRESS, "start")
@@ -971,7 +971,7 @@ class TestLifecycleHooks:
 
     def test_error_recovery_path(self):
         """ERROR -> IN_PROGRESS (retry) is valid."""
-        from lifecycle_hooks import safe_set_state, get_action_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, get_action_state, ActionState
         user_prompt = "test_error_retry"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         safe_set_state(user_prompt, 1, ActionState.IN_PROGRESS, "start")
@@ -982,7 +982,7 @@ class TestLifecycleHooks:
 
     def test_fallback_path(self):
         """COMPLETED -> FALLBACK_REQUESTED -> FALLBACK_RECEIVED -> RECIPE_REQUESTED."""
-        from lifecycle_hooks import safe_set_state, get_action_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, get_action_state, ActionState
         user_prompt = "test_fallback"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         safe_set_state(user_prompt, 1, ActionState.IN_PROGRESS, "start")
@@ -995,7 +995,7 @@ class TestLifecycleHooks:
 
     def test_recipe_path(self):
         """RECIPE_REQUESTED -> RECIPE_RECEIVED -> TERMINATED."""
-        from lifecycle_hooks import safe_set_state, get_action_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, get_action_state, ActionState
         user_prompt = "test_recipe_path"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         safe_set_state(user_prompt, 1, ActionState.IN_PROGRESS, "start")
@@ -1010,7 +1010,7 @@ class TestLifecycleHooks:
 
     def test_preview_pending_path(self):
         """ASSIGNED -> PREVIEW_PENDING -> PREVIEW_APPROVED -> IN_PROGRESS."""
-        from lifecycle_hooks import safe_set_state, get_action_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, get_action_state, ActionState
         user_prompt = "test_preview"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         safe_set_state(user_prompt, 1, ActionState.PREVIEW_PENDING, "destructive action")
@@ -1020,7 +1020,7 @@ class TestLifecycleHooks:
 
     def test_state_transition_error_raised(self):
         """Invalid transitions raise StateTransitionError."""
-        from lifecycle_hooks import set_action_state, ActionState, StateTransitionError, safe_set_state
+        from hartos.lifecycle_hooks import set_action_state, ActionState, StateTransitionError, safe_set_state
         user_prompt = "test_invalid"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         with pytest.raises(StateTransitionError):
@@ -1028,7 +1028,7 @@ class TestLifecycleHooks:
 
     def test_idempotent_state_set(self):
         """Setting same state is idempotent (no error)."""
-        from lifecycle_hooks import safe_set_state, get_action_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, get_action_state, ActionState
         user_prompt = "test_idempotent"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "again")
@@ -1036,7 +1036,7 @@ class TestLifecycleHooks:
 
     def test_multiple_actions_independent(self):
         """Multiple actions have independent state."""
-        from lifecycle_hooks import safe_set_state, get_action_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, get_action_state, ActionState
         user_prompt = "test_multi"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         safe_set_state(user_prompt, 2, ActionState.ASSIGNED, "init")
@@ -1046,7 +1046,7 @@ class TestLifecycleHooks:
 
     def test_thread_safety_of_state_transitions(self):
         """State transitions are thread-safe."""
-        from lifecycle_hooks import safe_set_state, get_action_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, get_action_state, ActionState
         user_prompt = "test_thread"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         errors = []
@@ -1074,13 +1074,13 @@ class TestForceStateTransitions:
     """Tests for force_state_through_valid_path() which validates multi-step transitions."""
 
     def setup_method(self):
-        from lifecycle_hooks import action_states, initialize_deterministic_actions
+        from hartos.lifecycle_hooks import action_states, initialize_deterministic_actions
         action_states.clear()
         initialize_deterministic_actions()
 
     def test_force_state_assigned_to_completed(self):
         """Force from ASSIGNED directly to COMPLETED goes through intermediate states."""
-        from lifecycle_hooks import force_state_through_valid_path, get_action_state, ActionState, safe_set_state
+        from hartos.lifecycle_hooks import force_state_through_valid_path, get_action_state, ActionState, safe_set_state
         user_prompt = "test_force_1"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         force_state_through_valid_path(user_prompt, 1, ActionState.COMPLETED, "force complete")
@@ -1088,7 +1088,7 @@ class TestForceStateTransitions:
 
     def test_force_state_from_in_progress_to_completed(self):
         """Force IN_PROGRESS -> COMPLETED goes through STATUS_VERIFICATION."""
-        from lifecycle_hooks import force_state_through_valid_path, get_action_state, ActionState, safe_set_state
+        from hartos.lifecycle_hooks import force_state_through_valid_path, get_action_state, ActionState, safe_set_state
         user_prompt = "test_force_ip"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         safe_set_state(user_prompt, 1, ActionState.IN_PROGRESS, "start")
@@ -1097,7 +1097,7 @@ class TestForceStateTransitions:
 
     def test_force_state_assigned_to_terminated(self):
         """ASSIGNED -> ... -> TERMINATED requires walking through the full path."""
-        from lifecycle_hooks import force_state_through_valid_path, get_action_state, ActionState, safe_set_state
+        from hartos.lifecycle_hooks import force_state_through_valid_path, get_action_state, ActionState, safe_set_state
         user_prompt = "test_force_term"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         # force_state only has 1-2 step paths, so walk the full path explicitly
@@ -1111,7 +1111,7 @@ class TestForceStateTransitions:
 
     def test_force_state_error_to_in_progress(self):
         """Force ERROR -> IN_PROGRESS for retry."""
-        from lifecycle_hooks import force_state_through_valid_path, get_action_state, ActionState, safe_set_state
+        from hartos.lifecycle_hooks import force_state_through_valid_path, get_action_state, ActionState, safe_set_state
         user_prompt = "test_force_err_ip"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         safe_set_state(user_prompt, 1, ActionState.IN_PROGRESS, "start")
@@ -1122,7 +1122,7 @@ class TestForceStateTransitions:
 
     def test_terminated_allows_reassignment(self):
         """TERMINATED -> ASSIGNED is valid (for flow restart)."""
-        from lifecycle_hooks import validate_state_transition, ActionState, safe_set_state
+        from hartos.lifecycle_hooks import validate_state_transition, ActionState, safe_set_state
         user_prompt = "test_reassign"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         _terminate_action(user_prompt, 1)
@@ -1138,7 +1138,7 @@ class TestHandoverToUser:
 
     def test_exec_retries_tracking(self):
         """_exec_retries dict tracks per-action retry counts."""
-        from helper import Action
+        from hartos.helper import Action
         actions = [{"action_id": 1, "action": "Need user input"}]
         task = Action(actions)
         task._exec_retries = {}
@@ -1149,7 +1149,7 @@ class TestHandoverToUser:
 
     def test_needs_input_breaks_after_3_retries(self):
         """After 3+ attempts, pipeline should break out for user input."""
-        from helper import Action
+        from hartos.helper import Action
         actions = [{"action_id": 1, "action": "Need user input"}]
         task = Action(actions)
         task._exec_retries = {1: 4}
@@ -1160,7 +1160,7 @@ class TestHandoverToUser:
 
     def test_under_retry_limit_continues(self):
         """Under 3 retries, the pipeline keeps trying."""
-        from helper import Action
+        from hartos.helper import Action
         actions = [{"action_id": 1, "action": "Autonomous action"}]
         task = Action(actions)
         task._exec_retries = {1: 2}
@@ -1176,7 +1176,7 @@ class TestHandoverToUser:
 
     def test_handover_via_fallback_state(self):
         """Handover to user goes through FALLBACK_REQUESTED state."""
-        from lifecycle_hooks import safe_set_state, get_action_state, ActionState, force_state_through_valid_path
+        from hartos.lifecycle_hooks import safe_set_state, get_action_state, ActionState, force_state_through_valid_path
         user_prompt = "test_handover"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         force_state_through_valid_path(user_prompt, 1, ActionState.COMPLETED, "needs input")
@@ -1195,7 +1195,7 @@ class TestAutonomousFallback:
 
     def test_autonomous_action_skips_user_fallback(self):
         """When LLM provides fallback_action, user is not asked."""
-        from helper import Action
+        from hartos.helper import Action
         task = Action([{"action_id": 1, "action": "Do thing"}])
         json_obj = {
             "status": "completed",
@@ -1211,7 +1211,7 @@ class TestAutonomousFallback:
 
     def test_missing_fallback_requests_from_user(self):
         """Empty fallback_action triggers user fallback request."""
-        from helper import Action
+        from hartos.helper import Action
         task = Action([{"action_id": 1, "action": "Do thing"}])
         json_obj = {
             "status": "completed",
@@ -1231,8 +1231,8 @@ class TestAutonomousFallback:
 
     def test_lifecycle_hook_track_recipe_completion(self):
         """lifecycle_hook_track_recipe_completion detects recipe in response."""
-        from lifecycle_hooks import lifecycle_hook_track_recipe_completion, safe_set_state, ActionState
-        from helper import Action
+        from hartos.lifecycle_hooks import lifecycle_hook_track_recipe_completion, safe_set_state, ActionState
+        from hartos.helper import Action
         user_prompt = "test_recipe_comp"
         actions = [{"action_id": 1, "action": "Do thing"}]
         user_tasks = {user_prompt: Action(actions)}
@@ -1500,7 +1500,7 @@ class TestAutoAdvance:
 
     def test_auto_advance_increments_current_action(self):
         """When action is COMPLETED/TERMINATED and recipe exists, advance to next."""
-        from helper import Action
+        from hartos.helper import Action
         actions = [
             {"action_id": 1, "action": "A"},
             {"action_id": 2, "action": "B"},
@@ -1519,7 +1519,7 @@ class TestAutoAdvance:
 
     def test_auto_advance_last_action_sets_fallback(self):
         """When last action is already done, set fallback=True."""
-        from helper import Action
+        from hartos.helper import Action
         actions = [{"action_id": 1, "action": "Only action"}]
         task = Action(actions)
         task.current_action = 1
@@ -1532,7 +1532,7 @@ class TestAutoAdvance:
 
     def test_auto_advance_requests_recipe_when_missing(self, tmp_prompts_dir):
         """When action is done but recipe file missing, request recipe instead of advancing."""
-        from helper import Action
+        from hartos.helper import Action
         actions = [{"action_id": 1, "action": "A"}, {"action_id": 2, "action": "B"}]
         task = Action(actions)
         task.current_action = 1
@@ -1555,7 +1555,7 @@ class TestExecutePending:
 
     def test_pending_action_gets_started(self):
         """ASSIGNED/PENDING actions get transitioned to IN_PROGRESS and executed."""
-        from lifecycle_hooks import safe_set_state, get_action_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, get_action_state, ActionState
         user_prompt = "test_exec_pending"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         # Simulates the EXECUTE-PENDING check at line 3792
@@ -1567,7 +1567,7 @@ class TestExecutePending:
 
     def test_execute_pending_message_format(self):
         """Execute-pending message includes action number and description."""
-        from helper import Action
+        from hartos.helper import Action
         actions = [{"action_id": 1, "action": "Search for data"}]
         task = Action(actions)
         _ca_pending = 1
@@ -1577,7 +1577,7 @@ class TestExecutePending:
 
     def test_execute_pending_tracks_attempt_count(self):
         """Each execution attempt increments the retry counter."""
-        from helper import Action
+        from hartos.helper import Action
         actions = [{"action_id": 1, "action": "Do thing"}]
         task = Action(actions)
         task._exec_retries = {}
@@ -1619,7 +1619,7 @@ class TestRecipeNeededDetection:
 
     def test_already_done_with_recipe_advances(self, tmp_prompts_dir):
         """ALREADY DONE handler: completed + recipe saved -> advance to next action."""
-        from helper import Action
+        from hartos.helper import Action
         prompt_id = "already_done"
         flow = 0
         actions = [{"action_id": 1, "action": "A"}, {"action_id": 2, "action": "B"}]
@@ -1691,7 +1691,7 @@ class TestLateRecipeSave:
 
     def test_late_recipe_transitions_terminated_properly(self):
         """After late recipe save, action transitions through RECIPE_RECEIVED to TERMINATED."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             safe_set_state, get_action_state, ActionState, force_state_through_valid_path
         )
         user_prompt = "test_late_term"
@@ -1804,13 +1804,13 @@ class TestGroupChatSync:
 
     def test_is_terminate_msg_helper(self):
         """_is_terminate_msg returns True for TERMINATE messages."""
-        from helper import _is_terminate_msg
+        from hartos.helper import _is_terminate_msg
         assert _is_terminate_msg({"content": "TERMINATE"}) is True
         assert _is_terminate_msg({"content": "Hello"}) is False
 
     def test_is_terminate_msg_handles_none(self):
         """_is_terminate_msg handles None content gracefully."""
-        from helper import _is_terminate_msg
+        from hartos.helper import _is_terminate_msg
         result = _is_terminate_msg({"content": None})
         assert isinstance(result, bool)
 
@@ -1830,7 +1830,7 @@ class TestLedgerSync:
         except ImportError:
             pytest.skip("agent_ledger not installed")
 
-        from lifecycle_hooks import register_ledger_for_session, action_states
+        from hartos.lifecycle_hooks import register_ledger_for_session, action_states
 
         user_prompt = f"ledger_test_{id(self)}"
         ledger = SmartLedger(agent_id="test", session_id=user_prompt)
@@ -1855,14 +1855,14 @@ class TestLedgerSync:
     def test_assigned_maps_to_pending(self, ledger_setup):
         """ActionState.ASSIGNED -> LedgerTaskStatus.PENDING."""
         user_prompt, ledger, TaskStatus = ledger_setup
-        from lifecycle_hooks import safe_set_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, ActionState
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "test")
         assert ledger.tasks["action_1"].status == TaskStatus.PENDING
 
     def test_in_progress_maps_and_claims(self, ledger_setup):
         """ActionState.IN_PROGRESS -> LedgerTaskStatus.IN_PROGRESS + ownership claimed."""
         user_prompt, ledger, TaskStatus = ledger_setup
-        from lifecycle_hooks import safe_set_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, ActionState
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         safe_set_state(user_prompt, 1, ActionState.IN_PROGRESS, "start")
         assert ledger.tasks["action_1"].status == TaskStatus.IN_PROGRESS
@@ -1871,7 +1871,7 @@ class TestLedgerSync:
     def test_completed_maps_and_releases(self, ledger_setup):
         """ActionState.COMPLETED -> LedgerTaskStatus.COMPLETED + ownership released."""
         user_prompt, ledger, TaskStatus = ledger_setup
-        from lifecycle_hooks import safe_set_state, ActionState, force_state_through_valid_path
+        from hartos.lifecycle_hooks import safe_set_state, ActionState, force_state_through_valid_path
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         force_state_through_valid_path(user_prompt, 1, ActionState.COMPLETED, "done")
         assert ledger.tasks["action_1"].status == TaskStatus.COMPLETED
@@ -1879,7 +1879,7 @@ class TestLedgerSync:
     def test_error_maps_to_failed(self, ledger_setup):
         """ActionState.ERROR -> LedgerTaskStatus.FAILED."""
         user_prompt, ledger, TaskStatus = ledger_setup
-        from lifecycle_hooks import safe_set_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, ActionState
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         safe_set_state(user_prompt, 1, ActionState.IN_PROGRESS, "start")
         safe_set_state(user_prompt, 1, ActionState.STATUS_VERIFICATION_REQUESTED, "verify")
@@ -1889,7 +1889,7 @@ class TestLedgerSync:
     def test_fallback_requested_maps_to_blocked(self, ledger_setup):
         """ActionState.FALLBACK_REQUESTED sets blocked_reason on ledger task."""
         user_prompt, ledger, TaskStatus = ledger_setup
-        from lifecycle_hooks import safe_set_state, ActionState, force_state_through_valid_path
+        from hartos.lifecycle_hooks import safe_set_state, ActionState, force_state_through_valid_path
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         force_state_through_valid_path(user_prompt, 1, ActionState.COMPLETED, "done")
         safe_set_state(user_prompt, 1, ActionState.FALLBACK_REQUESTED, "need input")
@@ -1899,7 +1899,7 @@ class TestLedgerSync:
     def test_heartbeat_recorded_on_state_change(self, ledger_setup):
         """Every state change records a heartbeat."""
         user_prompt, ledger, TaskStatus = ledger_setup
-        from lifecycle_hooks import safe_set_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, ActionState
         task = ledger.tasks["action_1"]
         old_heartbeat = getattr(task, 'last_heartbeat', None)
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
@@ -1911,7 +1911,7 @@ class TestLedgerSync:
     def test_preview_pending_sets_blocked_reason(self, ledger_setup):
         """PREVIEW_PENDING -> blocked_reason = 'approval_required'."""
         user_prompt, ledger, TaskStatus = ledger_setup
-        from lifecycle_hooks import safe_set_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, ActionState
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         safe_set_state(user_prompt, 1, ActionState.PREVIEW_PENDING, "destructive")
         task = ledger.tasks["action_1"]
@@ -1920,7 +1920,7 @@ class TestLedgerSync:
     def test_block_and_resume_for_user_input(self, ledger_setup):
         """block_for_user_input + resume_from_user_input cycle."""
         user_prompt, ledger, TaskStatus = ledger_setup
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             safe_set_state, ActionState,
             block_for_user_input, resume_from_user_input
         )
@@ -1941,13 +1941,13 @@ class TestActionRetryTracker:
 
     def test_retry_tracker_exists(self):
         """ActionRetryTracker class exists."""
-        from lifecycle_hooks import ActionRetryTracker
+        from hartos.lifecycle_hooks import ActionRetryTracker
         tracker = ActionRetryTracker()
         assert hasattr(tracker, 'pending_counts')
 
     def test_retry_count_increments(self):
         """Retry count increments via increment_pending."""
-        from lifecycle_hooks import ActionRetryTracker
+        from hartos.lifecycle_hooks import ActionRetryTracker
         tracker = ActionRetryTracker()
         exceeded = tracker.increment_pending("test_user", 1)
         assert exceeded is False
@@ -1955,7 +1955,7 @@ class TestActionRetryTracker:
 
     def test_retry_threshold_triggers_error(self):
         """After MAX_PENDING_RETRIES, increment_pending returns True."""
-        from lifecycle_hooks import ActionRetryTracker
+        from hartos.lifecycle_hooks import ActionRetryTracker
         tracker = ActionRetryTracker()
         # Exhaust retries
         for _ in range(tracker.MAX_PENDING_RETRIES):
@@ -1966,7 +1966,7 @@ class TestActionRetryTracker:
 
     def test_retry_reset_clears_count(self):
         """reset_count clears the pending count for an action."""
-        from lifecycle_hooks import ActionRetryTracker
+        from hartos.lifecycle_hooks import ActionRetryTracker
         tracker = ActionRetryTracker()
         tracker.increment_pending("test_user", 1)
         tracker.increment_pending("test_user", 1)
@@ -1983,7 +1983,7 @@ class TestAuditAndEventBus:
 
     def test_state_change_emits_audit_event(self):
         """State transitions emit audit log events."""
-        from lifecycle_hooks import safe_set_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, ActionState
         mock_log = MagicMock()
         with patch('security.immutable_audit_log.get_audit_log', return_value=mock_log):
             user_prompt = "audit_test"
@@ -1994,7 +1994,7 @@ class TestAuditAndEventBus:
 
     def test_state_change_emits_eventbus_event(self):
         """State transitions emit EventBus events."""
-        from lifecycle_hooks import safe_set_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, ActionState
         with patch('core.platform.events.emit_event') as mock_emit:
             user_prompt = "eventbus_test"
             safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
@@ -2050,7 +2050,7 @@ class TestResumeFromProgress:
         except ImportError:
             pytest.skip("agent_ledger not installed")
 
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             safe_set_state, get_action_state, ActionState,
             force_state_through_valid_path, register_ledger_for_session, action_states
         )
@@ -2099,15 +2099,15 @@ class TestCreateActionWithLedger:
 
         mock_ledger = SmartLedger(agent_id="test", session_id="test_1")
 
-        with patch('create_recipe.current_app', mock_app), \
-             patch('helper.current_app', mock_app), \
-             patch('create_recipe.get_production_backend', return_value=None), \
-             patch('create_recipe.create_ledger_from_actions', return_value=mock_ledger), \
-             patch('create_recipe.register_ledger_for_session'), \
-             patch('create_recipe.TaskDelegationBridge', return_value=MagicMock()), \
-             patch('create_recipe.a2a_context', MagicMock()):
+        with patch('hartos.create_recipe.current_app', mock_app), \
+             patch('hartos.helper.current_app', mock_app), \
+             patch('hartos.create_recipe.get_production_backend', return_value=None), \
+             patch('hartos.create_recipe.create_ledger_from_actions', return_value=mock_ledger), \
+             patch('hartos.create_recipe.register_ledger_for_session'), \
+             patch('hartos.create_recipe.TaskDelegationBridge', return_value=MagicMock()), \
+             patch('hartos.create_recipe.a2a_context', MagicMock()):
 
-            from create_recipe import create_action_with_ledger, user_ledgers, user_delegation_bridges
+            from hartos.create_recipe import create_action_with_ledger, user_ledgers, user_delegation_bridges
             user_prompt = f"test_cal_{id(self)}"
 
             try:
@@ -2129,7 +2129,7 @@ class TestCreateActionWithLedger:
         mock_app.logger = MagicMock()
         mock_ledger = SmartLedger(agent_id="test", session_id="reuse_test")
 
-        from create_recipe import user_ledgers, user_delegation_bridges
+        from hartos.create_recipe import user_ledgers, user_delegation_bridges
 
         user_prompt = f"test_reuse_{id(self)}"
         user_ledgers[user_prompt] = mock_ledger
@@ -2137,12 +2137,12 @@ class TestCreateActionWithLedger:
 
         actions = [{"action_id": 1, "action": "Do thing"}]
 
-        with patch('create_recipe.current_app', mock_app), \
-             patch('helper.current_app', mock_app), \
-             patch('create_recipe.TaskDelegationBridge', return_value=MagicMock()), \
-             patch('create_recipe.a2a_context', MagicMock()):
+        with patch('hartos.create_recipe.current_app', mock_app), \
+             patch('hartos.helper.current_app', mock_app), \
+             patch('hartos.create_recipe.TaskDelegationBridge', return_value=MagicMock()), \
+             patch('hartos.create_recipe.a2a_context', MagicMock()):
             try:
-                from create_recipe import create_action_with_ledger
+                from hartos.create_recipe import create_action_with_ledger
                 result = create_action_with_ledger(actions, "test", "1", user_prompt)
                 assert result.ledger is mock_ledger
             finally:
@@ -2218,7 +2218,7 @@ class TestFullCreatePipeline:
         assert len(config["flows"]) == 2
 
         # Step 3: Initialize states for flow 0
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             safe_set_state, get_action_state, ActionState,
             force_state_through_valid_path
         )
@@ -2315,7 +2315,7 @@ class TestAutonomousAgentWithScheduledTasks:
             json.dump(config, f)
 
         # Execute flow 0 (simulate) and save recipe with scheduled_tasks
-        from lifecycle_hooks import safe_set_state, ActionState, force_state_through_valid_path
+        from hartos.lifecycle_hooks import safe_set_state, ActionState, force_state_through_valid_path
         user_prompt = "auto_sched_user"
 
         for action in config["flows"][0]["actions"]:
@@ -2368,7 +2368,7 @@ class TestMultiFlowAgent:
 
     def test_multi_flow_progression(self):
         """After flow 0 completes, flow 1 starts with fresh action states."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             safe_set_state, get_action_state, ActionState, force_state_through_valid_path
         )
 
@@ -2394,7 +2394,7 @@ class TestMultiFlowAgent:
 
     def test_multi_flow_full_lifecycle(self, tmp_prompts_dir):
         """Both flows complete full lifecycle with recipe files."""
-        from lifecycle_hooks import safe_set_state, ActionState, force_state_through_valid_path
+        from hartos.lifecycle_hooks import safe_set_state, ActionState, force_state_through_valid_path
         prompt_id = "multi_flow_full"
         user_prompt = "multi_flow_user"
 
@@ -2427,7 +2427,7 @@ class TestErrorRecoveryChain:
 
     def test_error_then_helper_then_retry_then_complete(self):
         """Full error recovery: ERROR -> IN_PROGRESS (retry) -> COMPLETED."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             safe_set_state, get_action_state, ActionState, force_state_through_valid_path
         )
 
@@ -2445,7 +2445,7 @@ class TestErrorRecoveryChain:
 
     def test_multiple_error_retries_then_complete(self):
         """Action can error and retry multiple times before completing."""
-        from lifecycle_hooks import safe_set_state, get_action_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, get_action_state, ActionState
 
         user_prompt = "multi_retry"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
@@ -2472,7 +2472,7 @@ class TestErrorRecoveryChain:
         except ImportError:
             pytest.skip("agent_ledger not installed")
 
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             safe_set_state, get_action_state, ActionState, register_ledger_for_session,
             force_state_through_valid_path, action_states
         )
@@ -2501,7 +2501,7 @@ class TestErrorRecoveryChain:
 
     def test_destructive_action_preview_then_execute(self):
         """Destructive actions go through preview approval before execution."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             safe_set_state, get_action_state, ActionState, force_state_through_valid_path
         )
 
@@ -2523,10 +2523,10 @@ class TestResumeFromProgressCombination:
 
     def test_resume_from_partial_completion(self, tmp_prompts_dir):
         """Pipeline resumes from action 3 after actions 1 and 2 completed."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             safe_set_state, get_action_state, ActionState, force_state_through_valid_path
         )
-        from helper import Action
+        from hartos.helper import Action
 
         prompt_id = "resume_combo"
         user_prompt = "resume_combo_user"
@@ -2565,7 +2565,7 @@ class TestResumeFromProgressCombination:
         except ImportError:
             pytest.skip("agent_ledger not installed")
 
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             safe_set_state, ActionState, register_ledger_for_session,
             force_state_through_valid_path, action_states
         )
@@ -2611,7 +2611,7 @@ class TestDaemonAgentPipeline:
         """Daemon's CREATE goal should call the recipe() function."""
         # The daemon dispatches to recipe() for CREATE goals
         # Verify the function signature exists
-        from create_recipe import recipe as create_recipe_fn
+        from hartos.create_recipe import recipe as create_recipe_fn
         import inspect
         sig = inspect.signature(create_recipe_fn)
         params = list(sig.parameters.keys())
@@ -2621,7 +2621,7 @@ class TestDaemonAgentPipeline:
 
     def test_daemon_pipeline_state_transitions(self):
         """Daemon-created agent follows same state machine."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             safe_set_state, get_action_state, ActionState
         )
 
@@ -2639,7 +2639,7 @@ class TestDaemonAgentPipeline:
 
     def test_daemon_agent_full_lifecycle(self, tmp_prompts_dir):
         """Daemon agent goes through full CREATE lifecycle and produces recipe files."""
-        from lifecycle_hooks import safe_set_state, ActionState, force_state_through_valid_path
+        from hartos.lifecycle_hooks import safe_set_state, ActionState, force_state_through_valid_path
 
         prompt_id = "daemon_full"
         user_prompt = "daemon_full_user"
@@ -2679,7 +2679,7 @@ class TestChannelRouting:
 
     def test_crossbar_publish_async_delegates(self):
         """publish_async delegates to hart_intelligence module."""
-        with patch('create_recipe.publish_async') as mock_pub:
+        with patch('hartos.create_recipe.publish_async') as mock_pub:
             mock_pub("test.topic", {"data": "hello"})
             mock_pub.assert_called_once_with("test.topic", {"data": "hello"})
 
@@ -2708,7 +2708,7 @@ class TestMultiDeviceCoordination:
 
     def test_device_session_independence(self):
         """Each device maintains independent action state."""
-        from lifecycle_hooks import safe_set_state, get_action_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, get_action_state, ActionState
 
         safe_set_state("phone_user_1", 1, ActionState.ASSIGNED, "init")
         safe_set_state("desktop_user_1", 1, ActionState.ASSIGNED, "init")
@@ -2723,7 +2723,7 @@ class TestFlowManagement:
 
     def test_safe_increment_rejects_non_terminated(self):
         """safe_increment_flow raises if actions are not terminated."""
-        from lifecycle_hooks import safe_set_state, ActionState
+        from hartos.lifecycle_hooks import safe_set_state, ActionState
         user_prompt = "test_safe_inc"
         safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
         state = ActionState.ASSIGNED

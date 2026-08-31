@@ -27,7 +27,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from lifecycle_hooks import (
+from hartos.lifecycle_hooks import (
     stall_guard_step, STALL_GUARD_MAX_ITERS, STALL_GUARD_INPROGRESS_ITERS,
     cycle_guard_step, CYCLE_GUARD_MAX_REVISITS,
     ActionState, recipe_correction_directive,

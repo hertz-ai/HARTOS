@@ -57,12 +57,12 @@ import re
 import json
 from flask import current_app
 try:
-    from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, PROMPTS_DIR, _is_terminate_msg
+    from hartos.helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, PROMPTS_DIR, _is_terminate_msg
 except Exception:
-    from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, _is_terminate_msg
-    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+    from hartos.helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, _is_terminate_msg
+    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'))
 os.makedirs(PROMPTS_DIR, exist_ok=True)
-import helper as helper_fun
+from hartos import helper as helper_fun
 import threading
 from concurrent.futures import ThreadPoolExecutor
 # transform_messages / transforms are autogen.agentchat.contrib.capabilities
@@ -208,7 +208,7 @@ def publish_agent_thought(last_speaker, messages, user_id):
         #   - the Android consumer at AbstractChatActivity.java:2127
         #     groups it under "123456" → orphan bucket, never displayed.
         # Fix breaks all three failure modes for both transports.
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
         from core.peer_link.crossbar_publish import publish_thinking_trace
         publish_thinking_trace(
             text=content, user_id=user_id,
@@ -244,7 +244,7 @@ from agent_ledger import (
 )
 from agent_ledger.factory import create_production_ledger, get_or_create_ledger
 # Add to your create_recipe.py after imports
-from lifecycle_hooks import (
+from hartos.lifecycle_hooks import (
     initialize_deterministic_actions,
     lifecycle_hook_track_action_assignment,
     lifecycle_hook_track_user_fallback,
@@ -268,7 +268,7 @@ from lifecycle_hooks import (
 )
 
 # Import helper_ledger functions for subtask management and ledger awareness
-from helper_ledger import (
+from hartos.helper_ledger import (
     add_subtasks_to_ledger,
     check_and_unblock_parent,
     get_pending_subtasks,
@@ -290,9 +290,9 @@ import pytz
 from PIL import Image
 
 from datetime import timedelta
-from lifecycle_hooks import initialize_minimal_lifecycle_hooks
+from hartos.lifecycle_hooks import initialize_minimal_lifecycle_hooks
 initialize_minimal_lifecycle_hooks()  # Prints integration guide
-from cultural_wisdom import get_cultural_prompt
+from hartos.cultural_wisdom import get_cultural_prompt
 
 # MCP Integration
 from integrations.mcp import load_user_mcp_servers, get_mcp_tools_for_autogen, mcp_registry
@@ -394,7 +394,7 @@ tool_logger.addHandler(console_handler)
 def _record_exception(exc, module, function, user_prompt='', action_id=0, **ctx):
     """Fire-and-forget exception recording to centralized collector. Never raises."""
     try:
-        from exception_collector import ExceptionCollector
+        from hartos.exception_collector import ExceptionCollector
         ExceptionCollector.get_instance().record(
             exc, module=module, function=function,
             user_prompt=user_prompt, action_id=action_id, context=ctx)
@@ -632,7 +632,10 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
     restart = False
     while True:
         current_app.logger.info('inside Timer while')
-        if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
+        # Same empty-history hazard the reuse loops hit live on 2026-08-30.
+        # (What empties it is NOT established -- see #725; transform_messages
+        # is ruled out.)  :4385 already guards this way.
+        if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and _is_terminate(group_chat.messages[-1]['content']):
             current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
             json_obj = retrieve_json(group_chat.messages[-2]["content"])
             if json_obj and type(json_obj)==dict and 'status' in json_obj.keys() and json_obj['status'].lower() == 'completed':
@@ -663,7 +666,7 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
         break
 
     last_message = group_chat.messages[-1]
-    if last_message['content'] == 'TERMINATE':
+    if _is_terminate(last_message['content']):
         last_message = group_chat.messages[-2]
     #sending response to receiver agent
     if f'message2user'.lower() in last_message['content'].lower():
@@ -760,7 +763,7 @@ def visual_execution(task_description: str, user_id: int, prompt_id: int):
         # Use the existing agent structure
         result = author.initiate_chat(manager, message=text, clear_history=False)
         last_message = group_chat.messages[-1]
-        if last_message['content'] == 'TERMINATE':
+        if _is_terminate(last_message['content']):
             if len(group_chat.messages) > 1:
                 last_message = group_chat.messages[-2]
             if 'message2user' in last_message['content'].lower():
@@ -2271,7 +2274,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # Only preempt if THIS request is from the daemon (not user/CREATE).
         try:
             from integrations.agent_engine.dispatch import is_user_recently_active
-            from threadlocal import get_task_source
+            from hartos.threadlocal import get_task_source
             _source = get_task_source()
             if _source in ('daemon', 'idle') and is_user_recently_active():
                 current_app.logger.info("[PREEMPT] User active — aborting daemon recipe to free LLM")
@@ -2548,7 +2551,17 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 user_tasks[user_prompt].recipe = False
                                 metadata = strip_json_values(agent_data[prompt_id])
                                 json_obj['metadata'] = metadata
-                                json_obj['time_took_to_complete'] = task_time[prompt_id]['times'][-1]
+                                # 'times' is [] at init (:4211) and appended only
+                                # inside a branch (:2438), so it can legitimately
+                                # be empty here.  Unguarded, this raised
+                                # IndexError 22 times in the installed build's
+                                # logs -- always one line before the recipe was
+                                # written, so the save was lost and the turn only
+                                # logged "GOT SOME ERROR WHILE JSON".  Timing is
+                                # metadata; never let it cost us the recipe.
+                                # Same guard as :2599 below.
+                                if prompt_id in task_time and task_time[prompt_id].get('times'):
+                                    json_obj['time_took_to_complete'] = task_time[prompt_id]['times'][-1]
                                 for i in json_obj['recipe']:
                                     if 'tool_name' in i and i['tool_name'] != "":
                                         i['agent_to_perform_this_action'] = 'Helper'
@@ -2787,7 +2800,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
         # Merge accumulated experience data into the saved recipe
         try:
-            from recipe_experience import RecipeExperienceRecorder
+            from hartos.recipe_experience import RecipeExperienceRecorder
             RecipeExperienceRecorder.merge_experience_into_recipe(prompt_id, flow, user_prompt)
         except Exception:
             pass
@@ -2885,7 +2898,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # user_prompt key the rest of the lifecycle uses (user_agents dict,
     # _ledger_registry, etc.).  Idempotent + no-op safe.
     try:
-        from lifecycle_hooks import register_groupchat_for_session as _reg_gc
+        from hartos.lifecycle_hooks import register_groupchat_for_session as _reg_gc
         _reg_gc(user_prompt, group_chat)
     except Exception:
         current_app.logger.debug("groupchat registry hook skipped", exc_info=True)
@@ -2901,7 +2914,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         if isinstance(msg, dict) and msg.get('_from_shared'):
             return  # seeded message, already in buffer
         content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-        if not content or len(content.strip()) <= 5 or content == 'TERMINATE':
+        if not content or len(content.strip()) <= 5 or _is_terminate(content):
             return
         speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
         # SimpleMem ingest
@@ -2985,7 +2998,7 @@ def instantiate_executor_agent():
     # Inject cultural wisdom — even code execution should embody care
     _executor_cultural = ""
     try:
-        from cultural_wisdom import get_cultural_prompt_compact
+        from hartos.cultural_wisdom import get_cultural_prompt_compact
         _executor_cultural = get_cultural_prompt_compact()
     except Exception:
         pass
@@ -3071,7 +3084,7 @@ def instantiate_helper_agent():
     # Inject cultural wisdom into Helper for warm, caring assistance
     _helper_cultural = ""
     try:
-        from cultural_wisdom import get_cultural_prompt_compact
+        from hartos.cultural_wisdom import get_cultural_prompt_compact
         _helper_cultural = get_cultural_prompt_compact()
     except Exception:
         pass
@@ -3141,7 +3154,7 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
 
     if not _personality_block:
         try:
-            from cultural_wisdom import get_cultural_prompt_compact
+            from hartos.cultural_wisdom import get_cultural_prompt_compact
             from core.agent_personality import get_regional_tone_prompt
             _personality_block = get_cultural_prompt_compact()
             _regional = get_regional_tone_prompt()  # resolves language internally
@@ -3575,7 +3588,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     # cache uses (caller does `time_agents[user_prompt] = create_time_
     # agents(...)`); we derive it here from user_id+prompt_id.
     try:
-        from lifecycle_hooks import register_groupchat_for_session as _reg_gc
+        from hartos.lifecycle_hooks import register_groupchat_for_session as _reg_gc
         _reg_gc(f'{user_id}_{prompt_id}', time_group_chat)
     except Exception:
         logging.getLogger(__name__).debug(
@@ -4384,7 +4397,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     f"breaking clean instead of draining max_iterations")
                 break
 
-            if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
+            if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and _is_terminate(group_chat.messages[-1]['content']):
                 current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                 json_obj = retrieve_json(group_chat.messages[-2]["content"])
 
@@ -5269,7 +5282,7 @@ def publish_to_crossbar_new_action_start(message, user_id):
     # Pull real request_id from threadlocal — see publish_agent_thought
     # for the full failure-mode analysis (drain key miss, React daemon
     # filter, Android orphan bucket).  Single source via thread_local_data.
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
     from core.peer_link.crossbar_publish import publish_thinking_trace
     publish_thinking_trace(
         text=text, user_id=user_id,
@@ -5768,6 +5781,34 @@ def set_states_from_progress(user_prompt, prompt_id, current_flow, flow_progress
 
 # FIX: Enhanced boundary check before while loop - Add this in get_response_group()
 
+_BUILD_INCOMPLETE_REPLY = (
+    "I couldn't finish building that agent — its steps didn't complete, so it "
+    "wouldn't be usable yet. Tell me a bit more about what it should do and "
+    "I'll pick up where it stopped."
+)
+
+
+def _agent_build_is_complete(prompt_id) -> bool:
+    """True iff the agent is actually reusable.
+
+    The reuse gate (hart_intelligence_entry.py:9250) asks exactly one question:
+    does ``{prompt_id}_0_recipe.json`` exist?  Completion must answer the SAME
+    question or the two disagree forever — which is precisely what happened:
+    measured 2026-08-29, 531 of 612 status='completed' agents (86.8%) have no
+    flow-0 recipe, so every turn against them re-enters creation.
+
+    Deliberately mirrors the gate's own predicate rather than inventing a
+    second notion of "done".
+    """
+    if not prompt_id:
+        return False
+    try:
+        return os.path.exists(
+            os.path.join(PROMPTS_DIR, f'{prompt_id}_0_recipe.json'))
+    except (TypeError, ValueError, OSError):
+        return False
+
+
 def safe_action_boundary_check(user_prompt, prompt_id, text, user_id):
     """
     Enhanced boundary check with proper flow transition logic
@@ -5781,6 +5822,17 @@ def safe_action_boundary_check(user_prompt, prompt_id, text, user_id):
     # Check if current flow exists
     if current_flow >= total_flows:
         current_app.logger.info(f"All flows ({total_flows}) completed")
+        # This is a BOUNDARY CHECK, not the completion path — it reached this
+        # branch on a bare index comparison, having verified nothing.  Only the
+        # flow-recipe writer makes an agent reusable, so ask for its artifact
+        # before telling the user the agent exists.
+        if not _agent_build_is_complete(prompt_id):
+            current_app.logger.error(
+                "[BUILD-INCOMPLETE] flow index %s >= total %s but no "
+                "%s_0_recipe.json — the agent is NOT reusable; refusing to "
+                "report it as created (see #718)",
+                current_flow, total_flows, prompt_id)
+            return False, _BUILD_INCOMPLETE_REPLY
         return False, 'Agent Created Successfully'
 
     current_flow_actions = get_total_actions_length_for_flow(config, current_flow)
@@ -5831,6 +5883,16 @@ def safe_action_boundary_check(user_prompt, prompt_id, text, user_id):
         else:
             # All flows completed
             current_app.logger.info("All flows completed - agent creation ready")
+            # Same rule as the branch above: "ready" is not "built".  Verified
+            # live 2026-08-29 — this exact marker fired twice, in the same two
+            # rotated logs that carry the success string, while every
+            # recipe-writing marker fired zero times.
+            if not _agent_build_is_complete(prompt_id):
+                current_app.logger.error(
+                    "[BUILD-INCOMPLETE] all flows reported complete but no "
+                    "%s_0_recipe.json was written — the agent is NOT reusable; "
+                    "refusing to report it as created (see #718)", prompt_id)
+                return False, _BUILD_INCOMPLETE_REPLY
             return False, 'Agent Created Successfully'
 
     # Action is within bounds, continue normal execution

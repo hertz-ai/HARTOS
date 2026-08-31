@@ -146,6 +146,10 @@ HART_IDENTITY_DESIGN.md
 # leading-underscore convention marks throwaway investigation
 # tooling from interactive sessions. They shouldn't pollute the
 # repo but kept locally so a session can resume work.
+# NOTE: ignoring these does NOT keep them out of the installer. The Nunba
+# build syncs root modules with os.listdir() + endswith('.py'), reading the
+# filesystem rather than git, so every _*.py here still ships. See
+# scripts/build.py, "Sync top-level HARTOS .py modules".
 /_*.py
 /_*.txt
 /_*.md
@@ -161,3 +165,6 @@ integrations/channels/*/node_modules/
 
 # Runtime trading + capture logs
 integrations/trading/paper_trades.jsonl
+
+# Runtime PID file written by the agent daemon on first start
+agent.pid

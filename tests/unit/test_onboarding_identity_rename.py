@@ -5,7 +5,7 @@ Both returned a dict carrying ``tier``, a name-collision footgun where importing
 the wrong module silently returned the wrong dict. The onboarding one is renamed
 to ``get_onboarding_identity``.
 """
-import hart_onboarding
+from hartos import hart_onboarding
 
 
 def test_onboarding_identity_renamed_and_collision_gone():

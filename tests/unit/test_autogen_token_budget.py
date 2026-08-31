@@ -78,7 +78,7 @@ class AutogenBudgetTests(unittest.TestCase):
         not carry its own 3500 literal in the MessageTokenLimiter
         construction.  A regression here means someone re-introduced
         the magic number."""
-        with open('create_recipe.py', 'rb') as fp:
+        with open('hartos/create_recipe.py', 'rb') as fp:
             content = fp.read().decode('utf-8', errors='replace')
         code_only = self._strip_comments(content)
         self.assertNotIn(
@@ -94,7 +94,7 @@ class AutogenBudgetTests(unittest.TestCase):
         )
 
     def test_reuse_recipe_uses_the_constant_not_hardcoded(self):
-        with open('reuse_recipe.py', 'rb') as fp:
+        with open('hartos/reuse_recipe.py', 'rb') as fp:
             content = fp.read().decode('utf-8', errors='replace')
         code_only = self._strip_comments(content)
         # NOTE: reuse_recipe.py:818 intentionally uses max_tokens=3000

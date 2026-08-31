@@ -3,7 +3,7 @@ import asyncio
 import os
 import sys
 
-AUDIO_DIR = os.path.join(os.path.dirname(__file__), 'hartos_speech_audio')
+AUDIO_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'hartos_speech_audio')
 
 # Closing line in each language — "I'm your privacy-first local Nanban (friend in Tamil)"
 CLOSING = {

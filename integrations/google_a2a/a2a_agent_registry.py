@@ -29,7 +29,7 @@ async def assistant_executor(message: str, context_id: str) -> Dict[str, Any]:
     """
     try:
         # Import here to avoid circular dependencies
-        from reuse_recipe import chat_agent
+        from hartos.reuse_recipe import chat_agent
 
         logger.info(f"Assistant A2A executing: {message[:100]}... (context: {context_id})")
 
@@ -63,7 +63,7 @@ async def helper_executor(message: str, context_id: str) -> Dict[str, Any]:
     """
     try:
         # Import here to avoid circular dependencies
-        from create_recipe import recipe
+        from hartos.create_recipe import recipe
 
         logger.info(f"Helper A2A executing: {message[:100]}... (context: {context_id})")
 
@@ -97,7 +97,7 @@ async def executor_executor(message: str, context_id: str) -> Dict[str, Any]:
     """
     try:
         # Import here to avoid circular dependencies
-        from create_recipe import recipe
+        from hartos.create_recipe import recipe
 
         logger.info(f"Executor A2A executing: {message[:100]}... (context: {context_id})")
 
@@ -131,7 +131,7 @@ async def verify_executor(message: str, context_id: str) -> Dict[str, Any]:
     """
     try:
         # Import here to avoid circular dependencies
-        from create_recipe import recipe
+        from hartos.create_recipe import recipe
 
         logger.info(f"Verify A2A executing: {message[:100]}... (context: {context_id})")
 

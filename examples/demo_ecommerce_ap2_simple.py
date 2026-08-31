@@ -25,7 +25,7 @@ import time
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 # Agent Ledger imports
-from helper_ledger import create_ledger_for_user_prompt
+from hartos.helper_ledger import create_ledger_for_user_prompt
 from agent_ledger import Task, TaskType, TaskStatus
 
 # AP2 imports

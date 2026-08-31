@@ -60,6 +60,24 @@ def client(app):
     return app.test_client()
 
 
+def _raise_boom(*_args, **_kwargs):
+    """Raise a FRESH RuntimeError on every call.
+
+    Using ``side_effect=RuntimeError('boom')`` (a single exception INSTANCE)
+    is flaky under CPython 3.11's sqlite3: once raised, that instance's
+    ``__traceback__`` pins the view frame — and thus the request's sqlite
+    Connection — alive, and the mock keeps the instance until ``patch`` tears
+    down. When the cyclic GC later reclaims that traceback DURING require_auth's
+    ``db.commit()`` (auth.py:396), sqlite3 re-enters and raises
+    ``SystemError: commit returned NULL without setting an exception``
+    (intermittent: seen on run 33310728776, absent on 33302654141). A callable
+    side_effect raises a new exception each call that is refcount-freed the
+    instant the view's ``except`` block deletes its name — nothing lingers for
+    GC to collect mid-commit.
+    """
+    raise RuntimeError('boom')
+
+
 def _register(client, username='wa_live_tester'):
     resp = client.post('/api/social/auth/register', json={
         'username': username,
@@ -240,7 +258,7 @@ class TestWhatsappGetQrWiresLiveAdapter:
             return_value=(fake_gateway_body, 200),
         ), patch(
             'hart_intelligence_entry._ensure_whatsapp_live_adapter',
-            side_effect=RuntimeError('boom'),
+            side_effect=_raise_boom,   # fresh exception per call — see _raise_boom
         ):
             resp = client.get('/api/social/channels/whatsapp/qr', headers=headers)
 

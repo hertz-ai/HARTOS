@@ -212,7 +212,7 @@ class CentralConnection:
 
         # Check WAMP session
         try:
-            from crossbar_server import wamp_session
+            from hartos.crossbar_server import wamp_session
             if wamp_session is not None:
                 self._connected = True
                 self._disconnected_since = None

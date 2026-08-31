@@ -563,7 +563,7 @@ def get_regional_tone_prompt(language: str = '') -> str:
         language = os.environ.get('HART_USER_LANGUAGE', '')
     if not language:
         try:
-            from hart_onboarding import get_onboarding_identity
+            from hartos.hart_onboarding import get_onboarding_identity
             language = get_onboarding_identity().get('language', '')
         except Exception:
             pass
@@ -595,7 +595,7 @@ def generate_personality(role: str, goal: str, agent_name: str = "") -> AgentPer
     Same (role, goal) always produces the same personality — reproducible
     across sessions without LLM calls.
     """
-    from cultural_wisdom import get_traits_for_role
+    from hartos.cultural_wisdom import get_traits_for_role
 
     role_category = _get_role_category(role)
 
@@ -646,7 +646,7 @@ def build_personality_prompt(personality: AgentPersonality,
         resonance_profile: Optional UserResonanceProfile for continuous tuning.
         user_language: User's preferred language for regional tone code-mixing.
     """
-    from cultural_wisdom import get_trait_by_name, PROACTIVE_BEHAVIORS
+    from hartos.cultural_wisdom import get_trait_by_name, PROACTIVE_BEHAVIORS
 
     # Build trait descriptions
     trait_lines = []
@@ -718,7 +718,7 @@ Remember: You are not just executing tasks — you are a caring partner in the u
 
     # Append living principles (the heartbeat)
     try:
-        from agent_identity import LIVING_PRINCIPLES
+        from hartos.agent_identity import LIVING_PRINCIPLES
         if LIVING_PRINCIPLES:
             base_prompt += "\n\nLIVING PRINCIPLES (your heartbeat):\n"
             for principle in LIVING_PRINCIPLES:

@@ -7,12 +7,12 @@ set -euo pipefail
 #
 # Usage (from Git Bash on Windows):
 #   MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu-22.04 -u root -- \
-#     /bin/bash /mnt/c/Users/sathi/PycharmProjects/HARTOS/boot_vm.sh
+#     /bin/bash /mnt/c/Users/sathi/PycharmProjects/HARTOS/scripts/boot_vm.sh
 #
 # Must run as root (for /dev/kvm chmod). The VM runs as sathish.
 #
 # Prerequisites:
-#   - nix_build.sh completed successfully (ISO at nixos/result/iso/)
+#   - scripts/nix_build.sh completed successfully (ISO at nixos/result/iso/)
 #   - QEMU installed in WSL2 (qemu-system-x86_64)
 #   - /dev/kvm available (WSL2 with nested virtualization)
 #
@@ -36,7 +36,7 @@ OVMF_VARS="/home/sathish/hart-ovmf-vars.fd"
 # ─── Verify ISO ───
 if [ ! -f "$ISO" ]; then
     echo "ERROR: ISO not found at $ISO"
-    echo "Run nix_build.sh first."
+    echo "Run scripts/nix_build.sh first."
     exit 1
 fi
 echo "ISO: $(ls -lh "$ISO" | awk '{print $5}')"

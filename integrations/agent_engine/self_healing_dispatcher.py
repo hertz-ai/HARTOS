@@ -56,7 +56,7 @@ class SelfHealingDispatcher:
             self._last_check = now
 
         try:
-            from exception_collector import ExceptionCollector
+            from hartos.exception_collector import ExceptionCollector
             collector = ExceptionCollector.get_instance()
         except ImportError:
             return 0

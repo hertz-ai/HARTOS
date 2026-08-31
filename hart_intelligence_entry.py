@@ -21,12 +21,39 @@ if sys.platform == 'win32' and 'pytest' not in sys.modules:
     # and replacing them here closes pytest's file handles.
     # Skip in cx_Freeze windowed builds — sys.stdout.buffer is closed (no console),
     # and TextIOWrapper on a closed buffer raises ValueError at import time.
-    if sys.stdout is not None and hasattr(sys.stdout, 'buffer'):
+    # Only re-wrap a stream that is NOT already UTF-8.  The hasattr('buffer')
+    # test above is NOT sufficient to skip frozen builds: app.py installs a
+    # _CappedStream as sys.stdout/stderr, and its __getattr__ delegates every
+    # unknown attribute to the inner file handle -- so `hasattr(.., 'buffer')`
+    # is True and `.buffer` hands back the INNER handle.  Wrapping that inner
+    # handle escapes the wrapper: when _CappedStream._rotate() later closes and
+    # reopens the inner handle at the 20MB cap, this TextIOWrapper is left
+    # holding the CLOSED one, and every write after that raises
+    # "ValueError: I/O operation on closed file" for the rest of the process.
+    # The try/except below cannot catch it either -- at import time the buffer
+    # is still open, so the wrap succeeds and the failure lands hours later.
+    #
+    # Measured 2026-08-29 on the installed build: frozen_debug.log rotated at
+    # 08:37:09, and both langchain tool turns after it (08:58:17, 09:04:27)
+    # died in warnings.warn -> sys.stderr.write during LLMChain's deprecation
+    # warning, so /chat 500'd and fell back to a tool-less '_tier: direct'.
+    # This is the consumer that task #621 predicted but never located.
+    #
+    # _CappedStream and the devnull fallbacks are all opened encoding='utf-8',
+    # so skipping them loses nothing; a real cp1252 Windows console still gets
+    # wrapped, which is the only case this code was written for.
+    def _needs_utf8_wrap(stream):
+        if stream is None or not hasattr(stream, 'buffer'):
+            return False
+        enc = (getattr(stream, 'encoding', '') or '').lower().replace('-', '')
+        return enc != 'utf8'
+
+    if _needs_utf8_wrap(sys.stdout):
         try:
             sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
         except (ValueError, OSError):
             pass
-    if sys.stderr is not None and hasattr(sys.stderr, 'buffer'):
+    if _needs_utf8_wrap(sys.stderr):
         try:
             sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
         except (ValueError, OSError):
@@ -233,8 +260,8 @@ except Exception:
 
 from bs4 import BeautifulSoup
 from enum import Enum
-from cultural_wisdom import get_cultural_prompt_compact
-from agent_identity import build_identity_prompt, SECRETS_GUARDRAIL, extract_owner_name
+from hartos.cultural_wisdom import get_cultural_prompt_compact
+from hartos.agent_identity import build_identity_prompt, SECRETS_GUARDRAIL, extract_owner_name
 
 # langchain_classic — pydantic v2-compatible fork of langchain 0.0.230.
 # Fail-safe (#99): in a frozen env where langchain_classic is absent (the HART OS
@@ -443,7 +470,7 @@ try:
     from pydantic import BaseModel, Field, field_validator as root_validator
 except ImportError:
     from pydantic import BaseModel, Field, root_validator
-from threadlocal import thread_local_data
+from hartos.threadlocal import thread_local_data
 # Crossbar HTTP publisher — canonical path is `crossbarhttp3.CrossbarHttpPublisher`
 # (the same publisher used by integrations/social/realtime.py:25).  We fall
 # back to the legacy `crossbarhttp.Client` API only if the canonical
@@ -490,8 +517,8 @@ load_dotenv()
 #autogen requirements
 
 try:
-    from create_recipe import recipe, time_based_execution as time_execution, visual_execution
-    from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution, visual_based_execution
+    from hartos.create_recipe import recipe, time_based_execution as time_execution, visual_execution
+    from hartos.reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution, visual_based_execution
 except ImportError as e:
     # print() went nowhere: frozen windowed builds have no real stdout, so the
     # ONE line explaining why agent creation is dead was invisible.  MEASURED
@@ -520,7 +547,7 @@ except ImportError:
 import threading
 
 try:
-    from helper import retrieve_json, PROMPTS_DIR, safe_prompt_path, _is_terminate_msg
+    from hartos.helper import retrieve_json, PROMPTS_DIR, safe_prompt_path, _is_terminate_msg
 except Exception:
     retrieve_json = None
     safe_prompt_path = None
@@ -6248,6 +6275,15 @@ class CustomAgentExecutor(AgentExecutor):
                         except Exception:
                             logging.getLogger(__name__).exception("_bg_register: swallowed Exception")
                     threading.Thread(target=_bg_register, daemon=True).start()
+                    # Stamp the request so _chat_reply's gap-filler (which
+                    # indexes early-return turns, #729) does not register
+                    # this same turn a second time.
+                    try:
+                        from flask import g as _flask_g, has_request_context as _hrc
+                        if _hrc():
+                            _flask_g._hie_graph_indexed = True
+                    except Exception:
+                        pass
             except Exception:
                 logging.getLogger(__name__).exception("prep_outputs: swallowed Exception")  # Non-blocking
         else:
@@ -6352,7 +6388,7 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
     fork (this working copy vs helper's dead-Zep twin). helper does not import
     this module, so the delegate is a one-way dependency (no import cycle).
     '''
-    import helper
+    from hartos import helper
     return helper.get_time_based_history(prompt, session_id, start_date, end_date)
 
 def parsing_string(string):
@@ -7285,7 +7321,7 @@ if autogen is not None:
     def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
         """Create new assistant and user proxy agents for a user with basic configuration."""
         # Use the dynamic module-level config_list (cloud or local, set by wizard)
-        from threadlocal import thread_local_data as _tld
+        from hartos.threadlocal import thread_local_data as _tld
         _override = _tld.get_model_config_override() if hasattr(_tld, 'get_model_config_override') else None
         _clist = _override or config_list
 
@@ -7365,7 +7401,7 @@ if autogen is not None:
 
     def create_agents(user_id: str,recipe:str) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
         """Create new assistant and user agents for a given user_id"""
-        from threadlocal import thread_local_data as _tld
+        from hartos.threadlocal import thread_local_data as _tld
         _override = _tld.get_model_config_override() if hasattr(_tld, 'get_model_config_override') else None
         _clist = _override or config_list
 
@@ -7838,7 +7874,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
                     'silent_drops': get_ans._g10_silent_drops,
                 })
             try:
-                from exception_collector import record_exception
+                from hartos.exception_collector import record_exception
                 record_exception(
                     _cb_te, module=__name__, function='get_ans',
                     component='AgentInteractionIngestor',
@@ -8107,7 +8143,7 @@ def _autonomous_gather_info(user_id, description, prompt_id):
     (helper.py:2025) and the same Qwen3-VL endpoint that gather_info
     uses handles the review verdict at zero marginal cost.
     """
-    from gather_agentdetails import gather_info
+    from hartos.gather_agentdetails import gather_info
     response = gather_info(user_id, description, prompt_id, autonomous=True)
 
     # Auto-review + refinement loop (no human in path)
@@ -8350,7 +8386,7 @@ def _autonomous_gather_info(user_id, description, prompt_id):
     # Fallback: save partial config so the pipeline can recover
     app.logger.warning(f'Autonomous gather_info did not complete in {max_iterations} iterations, saving partial config')
     partial = {
-        'status': 'completed',
+        'status': 'pending',  # NOT completed: creation FAILED (#718)
         'name': f'Agent {prompt_id}',
         'agent_name': f'auto.agent{str(prompt_id)[-4:]}',
         'goal': description or 'General assistant',
@@ -8499,21 +8535,46 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         ``return jsonify({'response': response_text, **payload})``.
     """
     if response_text:
+        # media_mode honor: the Nunba adapter has forwarded the user's
+        # chosen mode ('audio'|'video'|'text') in the /chat body all
+        # along (hartos_backend_adapter.py carried a TODO naming this
+        # exact read), but nothing here consumed it — every reply was
+        # synthesized, so text-mode users were spoken at (measured
+        # 2026-08-30 17:48, #731).  Only an EXPLICIT 'text' suppresses;
+        # absent means the caller predates the flag and keeps today's
+        # behavior.  Callers with no request context (the speculative
+        # expert publish calls _tts_synthesize_and_publish directly,
+        # below this gate) are untouched.
+        _tts_wanted = True
         try:
-            # preferred_lang resolution must match the chat entry path:
-            # body/kwarg → canonical persisted reader → 'en'.  Bare
-            # 'en' default forced English Piper on Tamil replies.
-            _lang = payload.get('preferred_lang') or payload.get('language')
-            if not _lang:
-                try:
-                    from core.user_lang import get_preferred_lang
-                    _lang = get_preferred_lang() or 'en'
-                except Exception:
-                    _lang = 'en'
-            _tts_synthesize_and_publish(response_text, user_id, request_id, language=_lang)
-        except Exception as e:
-            # Never let a TTS failure block delivery of the text reply.
-            app.logger.debug(f"_chat_reply: TTS dispatch skipped: {e}")
+            # Local import: _chat_reply's source is exec'd in an isolated
+            # namespace by test_consent_fanout_p2, where module globals
+            # (including the flask request proxy) do not exist.
+            from flask import request as _req
+            _mm = (_req.get_json(silent=True) or {}).get('media_mode')
+            if _mm == 'text':
+                _tts_wanted = False
+                app.logger.info(
+                    '_chat_reply: TTS suppressed (media_mode=text) for '
+                    f'request_id={request_id}')
+        except RuntimeError:
+            pass  # outside a request — keep speaking, as before
+        if _tts_wanted:
+            try:
+                # preferred_lang resolution must match the chat entry path:
+                # body/kwarg → canonical persisted reader → 'en'.  Bare
+                # 'en' default forced English Piper on Tamil replies.
+                _lang = payload.get('preferred_lang') or payload.get('language')
+                if not _lang:
+                    try:
+                        from core.user_lang import get_preferred_lang
+                        _lang = get_preferred_lang() or 'en'
+                    except Exception:
+                        _lang = 'en'
+                _tts_synthesize_and_publish(response_text, user_id, request_id, language=_lang)
+            except Exception as e:
+                # Never let a TTS failure block delivery of the text reply.
+                app.logger.debug(f"_chat_reply: TTS dispatch skipped: {e}")
 
         # Persist conversation turn to SimpleMem so multi-turn context works.
         # prep_outputs (the normal LangChain path) never fires for casual_conv
@@ -8532,6 +8593,36 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
                     )
         except Exception as _mem_err:
             app.logger.debug(f"_chat_reply: memory save skipped: {_mem_err}")
+
+        # Index the turn into the MemoryGraph too — the OTHER half of
+        # prep_outputs' job (hie:6173).  This block saved early-return
+        # turns to SimpleMem only, so a fact stated on a draft-first /
+        # casual turn was buffered but invisible to recall_memory's
+        # store search (measured 2026-08-30: "my favorite color is teal"
+        # in buffer.json, absent from the recall results, #729).  Same
+        # canonical primitives as prep_outputs; the flask.g flag —
+        # stamped there — stops executor turns being indexed twice.
+        try:
+            if _prompt and response_text:
+                from flask import g as _g, has_request_context as _hrc
+                _already = _hrc() and getattr(_g, '_hie_graph_indexed', False)
+                if not _already:
+                    _prom_id = payload.get('prompt_id')
+                    _graph = _get_or_create_graph(user_id, _prom_id)
+                    if _graph:
+                        _sk = (f"{user_id}_{_prom_id}" if _prom_id
+                               else str(user_id))
+                        def _bg_reg(g=_graph, ui=_prompt,
+                                    ao=response_text, sk=_sk):
+                            try:
+                                g.register_conversation('user', ui, sk)
+                                g.register_conversation('langchain', ao, sk)
+                            except Exception:
+                                logging.getLogger(__name__).exception(
+                                    '_chat_reply graph register: swallowed')
+                        threading.Thread(target=_bg_reg, daemon=True).start()
+        except Exception as _gr_err:
+            app.logger.debug(f"_chat_reply: graph register skipped: {_gr_err}")
 
         # U1-U8 cross-device mirroring (task #389): submit persist + WAMP
         # publish for both sides of the turn to the chat_messages
@@ -8883,6 +8974,35 @@ def _optional_capability_missing(exc):
         'retryable': False,
         'response': None,
     }), 503
+
+
+_EMPTY_BUILD_REPLY = (
+    "I have the name and goal, but not the steps yet. Tell me the actions "
+    "this agent should take, in order, and I will build it from those."
+)
+
+
+def _config_is_buildable(cfg) -> bool:
+    """True iff a 'completed' agent config actually contains actions to build.
+
+    LIVE-PROVEN 2026-08-29 20:00 (prompt_id 88013682884, driven through the
+    real /chat API): the model answered gather_info with status='completed'
+    but every STRUCTURAL field empty -- personas '', tools '', flows
+    [{'flow_name': '', 'persona': '', 'actions': [], 'sub_goal': ''}] -- while
+    filling in name, goal and a full personality block.  Log evidence: zero
+    'gather_info parse error', zero 'salvaging partial', one 'COMPLETED
+    STATUS'.  So the parse was faithful and this was the NORMAL path; the
+    model simply returned an empty shell and nothing checked that
+    "completed" meant buildable.  It was saved with is_active=true and can
+    never produce a flow recipe, because there are no actions to execute.
+    That shape is 485 of the 624-config corpus (#718).
+    """
+    try:
+        flows = (cfg or {}).get('flows') or []
+        return any((f or {}).get('actions') for f in flows
+                   if isinstance(f, dict))
+    except (AttributeError, TypeError):
+        return False
 
 
 @app.route('/chat', methods=['POST'])
@@ -9477,8 +9597,23 @@ def chat():
                     # Persist so next requests also use the new language
                     _persist_language(_lang_change)
 
-                if (result.get('is_create_agent')
-                        and _draft_conf >= _DRAFT_INTENT_CONFIDENCE):
+                # ONE predicate for "the draft's create-intent is real
+                # enough to route on".  Both the CREATE branch below and
+                # the delegate branch further down must read THIS, not the
+                # raw flag: a turn whose is_create_agent is set but NOT
+                # trusted used to be refused by both (too uncertain to
+                # create, yet the flag still suppressed delegation) and
+                # fell to the `else`, which returns the draft's raw text
+                # as the answer.  Measured live 2026-08-29 21:30: "What is
+                # 17 multiplied by 4?" -> conf 0.5, delegate 'local',
+                # is_create_agent True -> a memory-recall ramble.  Same
+                # shape as the 2026-05-07 regression branch 3 was added to
+                # fix.  Untrusted intent is treated as absent, everywhere.
+                _create_intent_actionable = (
+                    bool(result.get('is_create_agent'))
+                    and _draft_conf >= _DRAFT_INTENT_CONFIDENCE)
+
+                if _create_intent_actionable:
                     app.logger.info(
                         'draft classifier: is_create_agent=true '
                         f'(conf={_draft_conf:.2f}) — routing to autogen CREATE'
@@ -9506,7 +9641,7 @@ def chat():
                     # VLM tool will produce a grounded answer.
                 elif (result.get('delegate') in ('local', 'hive')
                       and not result.get('is_casual')
-                      and not result.get('is_create_agent')):
+                      and not _create_intent_actionable):
                     # Draft self-assessed: this is a non-casual TASK
                     # that needs more capability than the 0.8B has
                     # (delegate='local' = bigger local model + tools;
@@ -9752,7 +9887,7 @@ def chat():
                     Agent_status='Review Mode',
                     autonomous_creation=True, prompt_id=prompt_id,
                 )
-            from gather_agentdetails import gather_info
+            from hartos.gather_agentdetails import gather_info
 
             # --- Turn counter: force-complete after MAX_GATHER_TURNS ---
             turn_key = f'{user_id}_{prompt_id}'
@@ -9861,6 +9996,19 @@ def chat():
                     )
                 else:
                     # Completed (or forced completion after max turns)
+                    if turn_num < MAX_GATHER_TURNS and not _config_is_buildable(new_res):
+                        app.logger.warning(
+                            "[EMPTY-BUILD] status='completed' with no actions for %s "
+                            "- asking for the steps instead of saving a config that "
+                            "can never build (#718)", prompt_id)
+                        _record_lifecycle('Creation Mode', user_id, prompt_id,
+                                          'Completed with no actions - re-asking')
+                        return _chat_reply(
+                            user_id, request_id, _EMPTY_BUILD_REPLY,
+                            intent=['FINAL_ANSWER'],
+                            req_token_count=0, res_token_count=0, history_request_id=[],
+                            Agent_status='Creation Mode', prompt_id=prompt_id,
+                        )
                     app.logger.info('COMPLETED STATUS')
                     _save_and_enter_review(new_res)
                     _push_workflow_flowchart(user_id, prompt_id, request_id)
@@ -9894,7 +10042,7 @@ def chat():
                         f'Too many gather_info failures (turn {turn_num}, '
                         f'autonomous={is_autonomous}), salvaging partial config')
                     partial = {
-                        'status': 'completed',
+                        'status': 'pending',  # NOT completed: creation FAILED (#718)
                         'name': f'Agent {prompt_id}',
                         'agent_name': f'auto.agent{str(prompt_id)[-4:]}',
                         'goal': prompt or 'General assistant',
@@ -10065,7 +10213,7 @@ def chat():
         user_prompt = f'{user_id}_{prompt_id}'
         if not review_agents.get(_ak) and not create_agent:
             # Check autogen tool signal first (intelligent detection)
-            from reuse_recipe import creation_signals
+            from hartos.reuse_recipe import creation_signals
             if user_prompt in creation_signals:
                 signal = creation_signals.pop(user_prompt)
                 agent_desc = signal.get('description', '')
@@ -10231,7 +10379,7 @@ def chat():
             )
         else:
             # Interactive: start gather_info, return first question
-            from gather_agentdetails import gather_info
+            from hartos.gather_agentdetails import gather_info
             response = gather_info(user_id, agent_description, new_prompt_id)
             new_response = response.replace('true', 'True').replace("false", "False")
             try:
@@ -10870,7 +11018,7 @@ def admin_agent_data_info(prompt_id):
     — the info-gathering stays in helper where the file-layout logic
     lives; this route is a thin JSON facade."""
     try:
-        from helper import get_agent_data_info as _info
+        from hartos.helper import get_agent_data_info as _info
     except ImportError:
         return jsonify({'error': 'helper.get_agent_data_info unavailable'}), 500
     return jsonify(_info(int(prompt_id)))

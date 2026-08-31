@@ -53,9 +53,9 @@ jobs:
           python -c "
           import ast, sys
           files = [
-              'hart_intelligence_entry.py', 'helper.py', 'agent_identity.py',
-              'cultural_wisdom.py', 'hart_onboarding.py', 'create_recipe.py',
-              'reuse_recipe.py', 'lifecycle_hooks.py',
+              'hart_intelligence_entry.py', 'hartos/helper.py', 'hartos/agent_identity.py',
+              'hartos/cultural_wisdom.py', 'hartos/hart_onboarding.py', 'hartos/create_recipe.py',
+              'hartos/reuse_recipe.py', 'hartos/lifecycle_hooks.py',
           ]
           failed = []
           for f in files:
@@ -119,7 +119,7 @@ jobs:
           docker pull ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
           docker run --rm ${{ fromJSON(steps.meta.outputs.json).tags[0] }} python -c "
           from hart_intelligence_entry import app
-          from agent_identity import build_identity_prompt
+          from hartos.agent_identity import build_identity_prompt
           from integrations.social import init_social
           print('All critical imports OK')
           "

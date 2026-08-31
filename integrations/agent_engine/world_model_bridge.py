@@ -177,7 +177,7 @@ class WorldModelBridge:
             self._crawl_watcher = watcher
             logger.info("[WorldModelBridge] CrawlIntegrityWatcher started")
         except ImportError:
-            pass  # source_protection not available
+            logger.debug("[WorldModelBridge] source_protection unavailable; CrawlIntegrityWatcher not started")
         except Exception as e:
             logger.warning(
                 f"[WorldModelBridge] CrawlIntegrityWatcher failed: {e}")
@@ -271,7 +271,7 @@ class WorldModelBridge:
             finally:
                 db.close()
         except Exception:
-            pass
+            logger.debug("[WorldModelBridge] cloud-data consent lookup failed; defaulting to no consent", exc_info=True)
 
         self._consent_cache[user_id] = (consent, now)
         return consent
@@ -304,7 +304,7 @@ class WorldModelBridge:
             finally:
                 db.close()
         except Exception:
-            pass
+            logger.debug("[WorldModelBridge] hive_participation lookup failed; using default", exc_info=True)
 
         self._consent_cache[cache_key] = (participate, now)
         return participate
@@ -403,7 +403,7 @@ class WorldModelBridge:
                         f"[WorldModelBridge] HTTP mode: {self._api_url}")
                     return
         except ImportError:
-            pass  # source_protection not available — skip check
+            logger.debug("[WorldModelBridge] source_protection unavailable; skipping HevolveAI integrity check")
         except Exception as e:
             logger.debug(f"[WorldModelBridge] Integrity check skipped: {e}")
         if mod is not None:
@@ -605,7 +605,7 @@ class WorldModelBridge:
                     self._stats['total_inbound_skills_filtered'] += 1
                 return
         except ImportError:
-            pass  # constructive_filter unavailable — skip check
+            logger.warning("[WorldModelBridge] constructive_filter unavailable; inbound skill NOT filtered")
 
         try:
             from security.hive_guardrails import WorldModelSafetyBounds
@@ -622,7 +622,7 @@ class WorldModelBridge:
                     self._stats['total_inbound_skills_filtered'] += 1
                 return
         except ImportError:
-            pass
+            logger.warning("[WorldModelBridge] constructive_filter unavailable; inbound skill NOT filtered")
 
         # Fan out to HARTOS gossip so HARTOS-only peers learn.
         try:
@@ -686,7 +686,7 @@ class WorldModelBridge:
             if not passed:
                 return
         except ImportError:
-            pass
+            logger.warning("[WorldModelBridge] ConstitutionalFilter unavailable; inbound response NOT constitution-checked")
 
         experience = {
             'prompt': prompt[:2000],
@@ -718,7 +718,7 @@ class WorldModelBridge:
             from security.secret_redactor import redact_experience
             experience = redact_experience(experience)
         except ImportError:
-            pass
+            logger.warning("[WorldModelBridge] secret_redactor unavailable; experience NOT redacted before ingestion")
 
         self._experience_queue.append(experience)
         with self._lock:
@@ -791,14 +791,14 @@ class WorldModelBridge:
                 try:
                     db.rollback()
                 except Exception:
-                    pass
+                    logger.debug("[WorldModelBridge] rollback in flush error-path failed (non-fatal)", exc_info=True)
             raise
         finally:
             if db is not None:
                 try:
                     db.close()
                 except Exception:
-                    pass
+                    logger.debug("[WorldModelBridge] db.close() in finally failed (non-fatal)", exc_info=True)
 
     def _flush_to_world_model(self, batch: list):
         """Flush experience batch to HevolveAI's learning provider.
@@ -834,7 +834,7 @@ class WorldModelBridge:
                     )
                     with self._lock:
                         self._stats['total_flushed'] += 1
-                        self._last_flush_at = time.time()
+                        self._last_flush_at = time.monotonic()
                 except Exception as e:
                     logger.debug(f"In-process flush error: {e}")
             return
@@ -891,7 +891,7 @@ class WorldModelBridge:
                 self._cb_record_success()
                 with self._lock:
                     self._stats['total_flushed'] += 1
-                    self._last_flush_at = time.time()
+                    self._last_flush_at = time.monotonic()
                     _first_flush = self._stats['total_flushed'] == 1
                 # One-time log on first successful HTTP flush so operators
                 # see Direction A go live without grepping for tensorboard
@@ -933,7 +933,7 @@ class WorldModelBridge:
             if not passed:
                 return {'success': False, 'reason': reason}
         except ImportError:
-            pass
+            logger.warning("[WorldModelBridge] ConstitutionalFilter unavailable; correction NOT constitution-checked")
 
         # PRIVACY: Redact secrets from corrections before shared learning
         try:
@@ -943,7 +943,7 @@ class WorldModelBridge:
             if explanation:
                 explanation, _ = redact_secrets(explanation)
         except ImportError:
-            pass
+            logger.warning("[WorldModelBridge] secret_redactor unavailable; correction NOT redacted")
 
         # In-process direct call
         if self._in_process and self._provider:
@@ -1227,7 +1227,7 @@ class WorldModelBridge:
             if not passed:
                 return None
         except ImportError:
-            pass
+            logger.warning("[WorldModelBridge] ConstitutionalFilter unavailable; query NOT constitution-checked")
 
         # In-process direct call
         if self._in_process and self._hive_mind:
@@ -1297,7 +1297,7 @@ class WorldModelBridge:
             from security.secret_redactor import redact_secrets
             query_text, _ = redact_secrets(query_text)
         except ImportError:
-            pass
+            logger.warning("[WorldModelBridge] secret_redactor unavailable; query NOT redacted before hivemind send")
 
         # CONSENT GATE: external HTTP requires consent
         if self._is_external_target() and user_id:
@@ -1351,7 +1351,7 @@ class WorldModelBridge:
                     'peer_count': len(responses),
                 }
         except Exception:
-            pass
+            logger.debug("[WorldModelBridge] peerlink thought query failed; falling through", exc_info=True)
 
         # HTTP fallback
         if self._http_disabled or self._cb_is_open():
@@ -1389,12 +1389,12 @@ class WorldModelBridge:
                 try:
                     result['learning'] = self._provider.get_stats()
                 except Exception:
-                    pass
+                    logger.debug("[WorldModelBridge] provider.get_stats() failed; 'learning' stat omitted", exc_info=True)
             if self._hive_mind:
                 try:
                     result['hivemind'] = self._hive_mind.get_stats()
                 except Exception:
-                    pass
+                    logger.debug("[WorldModelBridge] hive_mind.get_stats() failed; 'hivemind' stat omitted", exc_info=True)
             return result
 
         # HTTP fallback — guarded by circuit breaker to avoid retry storms
@@ -1436,7 +1436,7 @@ class WorldModelBridge:
             try:
                 return self._hive_mind.get_all_agents()
             except Exception:
-                pass
+                logger.debug("[WorldModelBridge] hive_mind.get_all_agents() failed; returning fallback", exc_info=True)
 
         # HTTP fallback — guarded by circuit breaker
         if self._http_disabled or self._circuit_breaker.is_open():
@@ -1486,7 +1486,7 @@ class WorldModelBridge:
                     self._stats['total_skills_blocked'] += 1
                 return {'success': False, 'reason': reason}
         except ImportError:
-            pass
+            logger.warning("[WorldModelBridge] guardrail filter unavailable; skill NOT checked before accept")
 
         try:
             from security.hive_guardrails import ConstructiveFilter
@@ -1497,7 +1497,7 @@ class WorldModelBridge:
                     self._stats['total_skills_blocked'] += 1
                 return {'success': False, 'reason': reason}
         except ImportError:
-            pass
+            logger.warning("[WorldModelBridge] ConstructiveFilter unavailable; skill output NOT checked")
 
         # Notify peers via gossip that a skill is available
         # Each peer ingests via their local HevolveAI RALT receiver
@@ -1678,7 +1678,7 @@ class WorldModelBridge:
                         self._stats['total_skills_blocked'] += 1
                     return {'success': False, 'reason': reason}
         except ImportError:
-            pass
+            logger.warning("[WorldModelBridge] guardrail filter unavailable; packet NOT checked")
         except Exception as e:
             logger.debug(f"gate_ralt_ingest skipped: {e}")
 
@@ -1754,7 +1754,7 @@ class WorldModelBridge:
         if self._last_flush_at is None:
             return False
         if now is None:
-            now = time.time()
+            now = time.monotonic()  # monotonic: a wall jump can't flip stalled->active (#24/#6)
         return (now - self._last_flush_at) < self._active_window_s
 
     def _throughput_fields(self) -> dict:
@@ -1762,7 +1762,7 @@ class WorldModelBridge:
         whether experiences are actually FLOWING to the world model, plus the raw
         counters + buffer depth so 'buffering into the void' (buffered > 0 while
         flushed is stalled and learning_active is False) is visible, not hidden."""
-        now = time.time()
+        now = time.monotonic()  # monotonic: last_flush_at is monotonic (#24/#6)
         return {
             'learning_active': self._learning_active(now),
             'total_recorded': self._stats.get('total_recorded', 0),
@@ -1857,7 +1857,7 @@ class WorldModelBridge:
         Fire-and-forget: never raises into the embodied control path."""
         self._cb_record_failure()
         try:
-            from exception_collector import ExceptionCollector
+            from hartos.exception_collector import ExceptionCollector
             _e = exc if exc is not None else RuntimeError(
                 f"embodied {where} failed (status={status}) at {self._api_url}")
             ExceptionCollector.get_instance().record(
@@ -1866,7 +1866,7 @@ class WorldModelBridge:
                          'action_type': (action or {}).get('type'),
                          'node_tier': self._node_tier})
         except Exception:
-            pass
+            logger.debug("[WorldModelBridge] ExceptionCollector.record() failed (meta-error, non-fatal)", exc_info=True)
 
     def send_action(self, action: dict) -> bool:
         """Send a motor/actuator command to HevolveAI's world model.
@@ -1897,7 +1897,7 @@ class WorldModelBridge:
                     logger.warning("[WorldModelBridge] Action blocked: outside workspace")
                     return False
         except ImportError:
-            pass
+            logger.warning("[WorldModelBridge] workspace safety monitor unavailable; action NOT position-checked")
 
         # In-process: actions route through submit_correction() for error
         # propagation when outcomes differ from predictions.  No separate
@@ -2069,7 +2069,7 @@ class WorldModelBridge:
                 stats = self._provider.get_stats()
                 return stats.get('last_feedback') or stats
             except Exception:
-                pass
+                logger.debug("[WorldModelBridge] provider.get_stats() for last_feedback failed", exc_info=True)
 
         # HTTP fallback. There is NO /v1/feedback/latest route -- learning
         # feedback is exposed by the SAME /v1/stats surface the in-process

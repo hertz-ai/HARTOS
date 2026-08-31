@@ -48,7 +48,7 @@ class TestSignalingChannel(unittest.TestCase):
     def test_start_without_wamp(self):
         """Should start in HTTP fallback mode when WAMP unavailable."""
         from integrations.remote_desktop.signaling import SignalingChannel
-        with patch.dict('sys.modules', {'crossbar_server': None}):
+        with patch.dict('sys.modules', {'hartos.crossbar_server': None}):
             channel = SignalingChannel('dev-1')
             result = channel.start()
             self.assertTrue(result)

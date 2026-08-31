@@ -109,7 +109,7 @@ class HARTToolHandler:
 
     def _handle_hart_recipe_run(self, args: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            from reuse_recipe import reuse_recipe
+            from hartos.reuse_recipe import reuse_recipe
             result = reuse_recipe(
                 prompt_id=args['prompt_id'],
                 flow_id=args.get('flow_id', '0'),

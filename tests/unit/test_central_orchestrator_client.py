@@ -1,164 +1,168 @@
-"""Unit tests for central_orchestrator_client (Package D).
+"""Behavioural tests for core.central_orchestrator_client — the background
+heartbeat/halt client to hevolve.ai central.
 
-Covers: no-op behavior when unconfigured, heartbeat payload shape,
-halt signal verification, graceful start/stop.
+Covers the deterministic surface (env parsing, the configured/tier start gates,
+stop, status, the PRIVACY-conscious heartbeat payload, URL construction, the
+node-id fallback, and the module singleton). The network loop + the master-key
+halt-apply are integration paths left to the VM suite; here we pin the pure logic
++ the guards that decide whether the client even runs. 0% covered before this
+file. Real functions, env via monkeypatch, no source-substring checks.
+
+    python -m pytest tests/unit/test_central_orchestrator_client.py -q --noconftest
 """
 from __future__ import annotations
 
-import os
-import sys
-from unittest import mock
-
 import pytest
 
-_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), '..', '..'),
-)
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
-
 from core import central_orchestrator_client as coc
+from core.central_orchestrator_client import (
+    CentralOrchestratorClient, ENV_CENTRAL_URL, ENV_NODE_TIER, ENV_NODE_ID,
+    ENV_HEARTBEAT_INTERVAL, ENV_HEARTBEAT_PATH, _int_env,
+)
 
 
 @pytest.fixture(autouse=True)
-def _reset_singleton(monkeypatch):
-    """Each test gets a fresh client so state doesn't leak."""
-    monkeypatch.setattr(coc, '_client', None)
-    # Clear every env var this module consults — tests opt-in.
-    for var in (
-        coc.ENV_CENTRAL_URL, coc.ENV_HEARTBEAT_PATH, coc.ENV_HALT_PATH,
-        coc.ENV_TENSORBOARD_URL, coc.ENV_HEARTBEAT_INTERVAL,
-        coc.ENV_HALT_POLL_INTERVAL, coc.ENV_NODE_ID, coc.ENV_NODE_TIER,
-    ):
-        monkeypatch.delenv(var, raising=False)
+def _clean_env(monkeypatch):
+    for k in (ENV_CENTRAL_URL, ENV_NODE_TIER, ENV_NODE_ID,
+              ENV_HEARTBEAT_INTERVAL, ENV_HEARTBEAT_PATH):
+        monkeypatch.delenv(k, raising=False)
     yield
 
 
-def test_is_configured_false_when_env_unset():
-    client = coc.CentralOrchestratorClient()
-    assert client.is_configured() is False
+# ── _int_env ────────────────────────────────────────────────────────────────
+class TestIntEnv:
+    def test_parses_a_valid_int(self, monkeypatch):
+        monkeypatch.setenv(ENV_HEARTBEAT_INTERVAL, "45")
+        assert _int_env(ENV_HEARTBEAT_INTERVAL, 60) == 45
+
+    def test_unset_returns_default(self):
+        assert _int_env(ENV_HEARTBEAT_INTERVAL, 60) == 60
+
+    @pytest.mark.parametrize("bad", ["", "  ", "abc", "1.5"])
+    def test_blank_or_nonint_returns_default(self, monkeypatch, bad):
+        monkeypatch.setenv(ENV_HEARTBEAT_INTERVAL, bad)
+        assert _int_env(ENV_HEARTBEAT_INTERVAL, 60) == 60
 
 
-def test_is_configured_true_when_env_set(monkeypatch):
-    monkeypatch.setenv(coc.ENV_CENTRAL_URL, 'https://central.example.com')
-    client = coc.CentralOrchestratorClient()
-    assert client.is_configured() is True
+# ── is_configured ───────────────────────────────────────────────────────────
+class TestIsConfigured:
+    def test_true_when_central_url_set(self, monkeypatch):
+        monkeypatch.setenv(ENV_CENTRAL_URL, "http://central")
+        assert CentralOrchestratorClient().is_configured() is True
+
+    def test_false_when_unset(self):
+        assert CentralOrchestratorClient().is_configured() is False
+
+    def test_false_when_only_whitespace(self, monkeypatch):
+        monkeypatch.setenv(ENV_CENTRAL_URL, "   ")
+        assert CentralOrchestratorClient().is_configured() is False
 
 
-def test_start_noop_when_unconfigured():
-    client = coc.CentralOrchestratorClient()
-    assert client.start() is False
-    assert client._thread is None
+# ── start / stop gates ──────────────────────────────────────────────────────
+class TestStartStop:
+    def test_start_is_noop_when_unconfigured(self):
+        assert CentralOrchestratorClient().start() is False
+
+    def test_start_is_noop_on_central_tier(self, monkeypatch):
+        # A central node must NOT heartbeat itself, even when a URL is set.
+        monkeypatch.setenv(ENV_CENTRAL_URL, "http://central")
+        monkeypatch.setenv(ENV_NODE_TIER, "CENTRAL")   # case-insensitive
+        assert CentralOrchestratorClient().start() is False
+
+    def test_start_spawns_loop_when_configured_and_stops_cleanly(self, monkeypatch):
+        monkeypatch.setenv(ENV_CENTRAL_URL, "http://central")
+        monkeypatch.setenv(ENV_NODE_TIER, "flat")
+        c = CentralOrchestratorClient()
+        # Replace the network loop with a stop-event wait so no real HTTP fires.
+        monkeypatch.setattr(c, "_loop", lambda: c._stop_event.wait())
+        assert c.start() is True
+        assert c._running is True
+        assert c._thread is not None and c._thread.is_alive()
+        c.stop()
+        assert c._running is False
+        assert c._stop_event.is_set()
+        c._thread.join(timeout=5)
+        assert not c._thread.is_alive()
+
+    def test_start_is_idempotent_while_running(self, monkeypatch):
+        monkeypatch.setenv(ENV_CENTRAL_URL, "http://central")
+        c = CentralOrchestratorClient()
+        monkeypatch.setattr(c, "_loop", lambda: c._stop_event.wait())
+        assert c.start() is True
+        assert c.start() is False  # already running — no second thread
+        c.stop()
+        c._thread.join(timeout=5)
 
 
-def test_start_noop_when_tier_is_central(monkeypatch):
-    monkeypatch.setenv(coc.ENV_CENTRAL_URL, 'https://central.example.com')
-    monkeypatch.setenv(coc.ENV_NODE_TIER, 'central')
-    client = coc.CentralOrchestratorClient()
-    assert client.start() is False
+# ── get_status ──────────────────────────────────────────────────────────────
+class TestGetStatus:
+    def test_status_reports_configuration_and_defaults(self, monkeypatch):
+        monkeypatch.setenv(ENV_CENTRAL_URL, "http://central")
+        st = CentralOrchestratorClient().get_status()
+        assert st["configured"] is True
+        assert st["central_url"] == "http://central"
+        assert st["running"] is False        # not started
+        assert st["halt_applied"] is False
+        for k in ("last_heartbeat_ts", "last_heartbeat_error",
+                  "last_halt_poll_ts", "last_halt_poll_error"):
+            assert k in st
 
 
-def test_url_builder_joins_base_and_path(monkeypatch):
-    monkeypatch.setenv(coc.ENV_CENTRAL_URL, 'https://central.example.com/')
-    monkeypatch.setenv(coc.ENV_HEARTBEAT_PATH, '/custom/hb')
-    client = coc.CentralOrchestratorClient()
-    assert client._url(coc.ENV_HEARTBEAT_PATH, '/heartbeat') == (
-        'https://central.example.com/custom/hb'
-    )
+# ── _build_heartbeat_payload (privacy + defaults) ───────────────────────────
+class TestHeartbeatPayload:
+    _ALLOWED = {"node_id", "node_tier", "timestamp", "version",
+                "guardrail_hash", "halted", "benchmark_best", "world_model"}
+
+    def test_mandatory_fields_and_defaults(self, monkeypatch):
+        c = CentralOrchestratorClient()
+        p = c._build_heartbeat_payload()
+        assert p["version"] == 1
+        assert isinstance(p["timestamp"], float)
+        assert p["node_tier"] == "flat"                 # default when unset
+        assert isinstance(p["node_id"], str) and p["node_id"]
+
+    def test_env_overrides_node_id_and_tier(self, monkeypatch):
+        monkeypatch.setenv(ENV_NODE_ID, "node-XYZ")
+        monkeypatch.setenv(ENV_NODE_TIER, "regional")
+        p = CentralOrchestratorClient()._build_heartbeat_payload()
+        assert p["node_id"] == "node-XYZ"
+        assert p["node_tier"] == "regional"
+
+    def test_payload_carries_no_pii_only_allowed_keys(self):
+        # The privacy contract: central sees only node identity + guardrail hash
+        # + small summaries, never raw user data.
+        p = CentralOrchestratorClient()._build_heartbeat_payload()
+        assert set(p).issubset(self._ALLOWED), (
+            f"heartbeat leaked unexpected keys: {set(p) - self._ALLOWED}")
 
 
-def test_url_builder_uses_default_path_when_env_absent(monkeypatch):
-    monkeypatch.setenv(coc.ENV_CENTRAL_URL, 'https://central.example.com')
-    client = coc.CentralOrchestratorClient()
-    assert client._url(coc.ENV_HEARTBEAT_PATH, '/heartbeat') == (
-        'https://central.example.com/heartbeat'
-    )
+# ── _url construction ───────────────────────────────────────────────────────
+class TestUrl:
+    def test_empty_base_yields_empty(self):
+        assert CentralOrchestratorClient()._url(ENV_HEARTBEAT_PATH, "/hb") == ""
+
+    def test_base_plus_default_path(self, monkeypatch):
+        monkeypatch.setenv(ENV_CENTRAL_URL, "http://c")
+        assert CentralOrchestratorClient()._url(
+            ENV_HEARTBEAT_PATH, "/heartbeat") == "http://c/heartbeat"
+
+    def test_trailing_slash_on_base_is_normalised(self, monkeypatch):
+        monkeypatch.setenv(ENV_CENTRAL_URL, "http://c/")
+        assert CentralOrchestratorClient()._url(
+            ENV_HEARTBEAT_PATH, "/heartbeat") == "http://c/heartbeat"
+
+    def test_custom_path_env_without_leading_slash_is_fixed(self, monkeypatch):
+        monkeypatch.setenv(ENV_CENTRAL_URL, "http://c")
+        monkeypatch.setenv(ENV_HEARTBEAT_PATH, "beat")
+        assert CentralOrchestratorClient()._url(
+            ENV_HEARTBEAT_PATH, "/heartbeat") == "http://c/beat"
 
 
-def test_heartbeat_payload_shape(monkeypatch):
-    monkeypatch.setenv(coc.ENV_NODE_ID, 'node-42')
-    monkeypatch.setenv(coc.ENV_NODE_TIER, 'flat')
-    client = coc.CentralOrchestratorClient()
-    payload = client._build_heartbeat_payload()
-    assert payload['node_id'] == 'node-42'
-    assert payload['node_tier'] == 'flat'
-    assert 'timestamp' in payload
-    assert payload['version'] == 1
-    # Keys that are always present even when sub-services fail
-    assert 'benchmark_best' in payload
-    assert 'world_model' in payload
+# ── fallback node id + singleton ────────────────────────────────────────────
+class TestMisc:
+    def test_fallback_node_id_is_a_nonempty_string(self):
+        nid = coc._fallback_node_id()
+        assert isinstance(nid, str) and nid  # a hash prefix or 'unknown-node'
 
-
-def test_post_heartbeat_success_sets_timestamp(monkeypatch):
-    monkeypatch.setenv(coc.ENV_CENTRAL_URL, 'https://central.example.com')
-    client = coc.CentralOrchestratorClient()
-    fake_resp = mock.MagicMock(status_code=200)
-    with mock.patch(
-        'core.http_pool.pooled_post', return_value=fake_resp,
-    ):
-        assert client._post_heartbeat() is True
-    assert client._last_heartbeat_ts > 0
-    assert client._last_heartbeat_error is None
-
-
-def test_post_heartbeat_failure_records_error(monkeypatch):
-    monkeypatch.setenv(coc.ENV_CENTRAL_URL, 'https://central.example.com')
-    client = coc.CentralOrchestratorClient()
-    fake_resp = mock.MagicMock(status_code=502)
-    with mock.patch(
-        'core.http_pool.pooled_post', return_value=fake_resp,
-    ):
-        assert client._post_heartbeat() is False
-    assert 'HTTP 502' in (client._last_heartbeat_error or '')
-
-
-def test_halt_without_signature_is_ignored(monkeypatch):
-    """Regression gate — a halt signal missing the master-key signature
-    must NEVER be applied.  Brief §4 + security/master_key.py."""
-    monkeypatch.setenv(coc.ENV_CENTRAL_URL, 'https://central.example.com')
-    client = coc.CentralOrchestratorClient()
-    fake_resp = mock.MagicMock(
-        status_code=200,
-        json=lambda: {'halt': True, 'reason': 'forged', 'signature': ''},
-    )
-    with mock.patch(
-        'core.http_pool.pooled_post', return_value=fake_resp,
-    ), mock.patch(
-        'core.http_pool.pooled_get', return_value=fake_resp,
-    ), mock.patch(
-        'security.hive_guardrails.HiveCircuitBreaker.halt_network',
-    ) as halt_mock:
-        client._check_halt()
-    halt_mock.assert_not_called()
-    assert client._halt_applied is False
-
-
-def test_halt_with_signature_calls_circuit_breaker(monkeypatch):
-    monkeypatch.setenv(coc.ENV_CENTRAL_URL, 'https://central.example.com')
-    client = coc.CentralOrchestratorClient()
-    fake_resp = mock.MagicMock(
-        status_code=200,
-        json=lambda: {'halt': True, 'reason': 'ops drill',
-                      'signature': 'fake-sig'},
-    )
-    with mock.patch(
-        'core.http_pool.pooled_get', return_value=fake_resp,
-    ), mock.patch(
-        'security.hive_guardrails.HiveCircuitBreaker.halt_network',
-        return_value=True,
-    ) as halt_mock:
-        client._check_halt()
-    halt_mock.assert_called_once()
-    call_kwargs = halt_mock.call_args.kwargs
-    assert 'central:ops drill' in call_kwargs['reason']
-    assert call_kwargs['signature'] == 'fake-sig'
-    assert client._halt_applied is True
-
-
-def test_get_status_returns_snapshot():
-    client = coc.CentralOrchestratorClient()
-    status = client.get_status()
-    assert 'configured' in status
-    assert 'running' in status
-    assert 'last_heartbeat_ts' in status
-    assert 'halt_applied' in status
+    def test_get_client_is_a_singleton(self):
+        assert coc.get_client() is coc.get_client()

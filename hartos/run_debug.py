@@ -4,7 +4,7 @@ import sys
 import os
 
 # Force all logging to file
-log_file = os.path.join(os.path.dirname(__file__), 'debug_output.log')
+log_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'debug_output.log')
 handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
 handler.setLevel(logging.DEBUG)
 handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s] %(levelname)s: %(message)s'))

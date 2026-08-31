@@ -84,7 +84,7 @@ def test_load_agent_config_drops_cache_when_file_removed(tmp_path, monkeypatch):
 # ── build_identity_prompt: persona injection + non-dict hardening ────────
 
 def test_identity_includes_persona_and_owner_from_dict_config():
-    from agent_identity import build_identity_prompt
+    from hartos.agent_identity import build_identity_prompt
     out = build_identity_prompt(
         {'name': 'Vijai', 'goal': 'help you ship',
          'personality': {'primary_traits': ['kind', 'precise'], 'tone': 'warm'}},
@@ -97,14 +97,14 @@ def test_identity_tolerates_string_personality_no_crash():
     """Regression guard: some configs store `personality` as a plain string;
     this branch now runs for real (fed by load_agent_config) and must not raise
     on the chat hot path. Falls back to name-only."""
-    from agent_identity import build_identity_prompt
+    from hartos.agent_identity import build_identity_prompt
     out = build_identity_prompt({'name': 'Vijai', 'personality': 'vijai'},
                                 owner_name='', user_details='')
     assert 'Vijai' in out  # no AttributeError; name still surfaces
 
 
 def test_identity_generic_when_no_config():
-    from agent_identity import build_identity_prompt
+    from hartos.agent_identity import build_identity_prompt
     out = build_identity_prompt(None, owner_name='', user_details='')
     assert 'Hevolve' in out  # generic platform identity, no persona layer
 
@@ -112,7 +112,7 @@ def test_identity_generic_when_no_config():
 # ── extract_owner_name: single regex source (chat path + channel announce) ──
 
 def test_extract_owner_name():
-    from agent_identity import extract_owner_name
+    from hartos.agent_identity import extract_owner_name
     assert extract_owner_name('name: Alice\nrole: admin') == 'Alice'
     assert extract_owner_name('Name: Bob, age 30') == 'Bob'
     assert extract_owner_name('') == ''

@@ -94,6 +94,13 @@ dependencies = [
     "numpy>=1.25.0,<2.0.0",
     "pandas>=2.0.0,<4.0.0",
     "beautifulsoup4>=4.12.0,<5.0.0",
+    # Keyless web search — tier A of helper.py:_keyless_serp (`from ddgs import
+    # DDGS` at :348), first in the ladder. Undeclared until 2026-08-29, so it had
+    # never run once and google_search returned [] on every install; the other
+    # keyless tiers are blocked (Mojeek serves a captcha behind HTTP 200, DDG html
+    # 202) and tier D needs SEARXNG_URL, set nowhere. Pulls primp (browser TLS
+    # impersonation, the reason this tier survives) and lxml transitively.
+    "ddgs>=9.16.0",
     "PyPDF2>=3.0.0,<4.0.0",
 
     # Tokenization
@@ -204,26 +211,15 @@ Repository = "https://github.com/hertz-ai/HARTOS"
 Issues = "https://github.com/hertz-ai/HARTOS/issues"
 
 [tool.setuptools]
+# Entry/facade modules only; the implementation lives in the hartos/
+# package (moved from the repo root 2026-08-30). Nunba's freeze scripts
+# auto-discover this list, so it must stay in lockstep with the repo root.
 py-modules = [
     "hart_version",
     "hart_intelligence",
     "hart_intelligence_entry",
-    "helper",
-    "helper_ledger",
-    "threadlocal",
-    "crossbar_server",
-    "create_recipe",
-    "reuse_recipe",
-    "gather_agentdetails",
-    "lifecycle_hooks",
-    "cultural_wisdom",
-    "exception_collector",
-    "recipe_experience",
     "embedded_main",
-    "agent_identity",
-    "hart_onboarding",
-    "hart_cli",
-    "hartos_bootstrap",
+    "asgi",
 ]
 
 # packages.find walks BOTH the repo root (for core/integrations/security/
@@ -237,7 +233,7 @@ py-modules = [
 # `agent-ledger>=1.2.0` to [project.dependencies] above instead.
 [tool.setuptools.packages.find]
 where = [".", "agent-ledger-opensource"]
-include = ["core*", "integrations*", "security*", "hart_sdk*", "agent_ledger*"]
+include = ["core*", "hartos", "desktop", "integrations*", "security*", "hart_sdk*", "agent_ledger*"]
 exclude = ["venv*", "tests*", "docs*", "examples*"]
 
 [tool.setuptools.package-dir]

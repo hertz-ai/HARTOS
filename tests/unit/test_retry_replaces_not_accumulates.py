@@ -62,7 +62,7 @@ class _FakeSender:
 
 def _mod():
     try:
-        import create_recipe
+        from hartos import create_recipe
         return create_recipe
     except Exception as e:                                   # pragma: no cover
         pytest.skip(f"create_recipe unavailable: {e}")

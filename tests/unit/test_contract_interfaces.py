@@ -31,29 +31,29 @@ class TestImportPaths:
         assert hasattr(hart_intelligence, 'publish_async') or hasattr(hart_intelligence, 'app')
 
     def test_helper_action_class_importable(self):
-        from helper import Action
+        from hartos.helper import Action
         assert Action is not None
 
     def test_helper_retrieve_json_importable(self):
-        from helper import retrieve_json
+        from hartos.helper import retrieve_json
         assert callable(retrieve_json)
 
     def test_helper_prompts_dir_importable(self):
-        from helper import PROMPTS_DIR
+        from hartos.helper import PROMPTS_DIR
         assert isinstance(PROMPTS_DIR, str)
         assert os.path.isabs(PROMPTS_DIR)
 
     def test_cultural_wisdom_importable(self):
-        from cultural_wisdom import get_cultural_prompt, CULTURAL_TRAITS
+        from hartos.cultural_wisdom import get_cultural_prompt, CULTURAL_TRAITS
         assert callable(get_cultural_prompt)
         assert len(CULTURAL_TRAITS) >= 25
 
     def test_threadlocal_importable(self):
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
         assert thread_local_data is not None
 
     def test_lifecycle_hooks_importable(self):
-        from lifecycle_hooks import set_action_state, get_action_state
+        from hartos.lifecycle_hooks import set_action_state, get_action_state
         assert callable(set_action_state)
         assert callable(get_action_state)
 

@@ -178,7 +178,15 @@ def init_social(app):
     try:
         from .api_hive_census import hive_census_bp
         app.register_blueprint(hive_census_bp)
-        logger.info("HevolveSocial hive census registered at /api/hive/census/")
+        # Must match hive_census_bp's own url_prefix (api_hive_census.py:35).
+        # This line used to say "/api/hive/census/", which does not exist and
+        # 404s at the GATEWAY (no Kong route for /api/hive/*), while the real
+        # route is /api/social/hive-census. The wrong string is plausible
+        # because the contest blueprint above genuinely is under
+        # /api/hive/contest/. It cost real time: anyone reading the boot log,
+        # including me, kept probing a dead URL and concluded the census was
+        # unreachable when it has been public and healthy all along.
+        logger.info("HevolveSocial hive census registered at /api/social/hive-census")
     except Exception as e:
         logger.warning(f"HevolveSocial hive census blueprint skipped: {e}")
 

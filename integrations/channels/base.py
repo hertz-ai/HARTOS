@@ -497,7 +497,7 @@ class ChannelAdapter(ABC):
         # naming convention; this helper enforces it.
         if exc is not None:
             try:
-                from exception_collector import report_subsystem_failure
+                from hartos.exception_collector import report_subsystem_failure
                 method_name = (context or {}).get('method', 'unknown')
                 report_subsystem_failure(
                     subsystem='channels',

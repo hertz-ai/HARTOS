@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import unittest
 
-from lifecycle_hooks import (
+from hartos.lifecycle_hooks import (
     is_recipe_creation_request,
     RECIPE_CREATE_PROMPT_PREFIX,
 )

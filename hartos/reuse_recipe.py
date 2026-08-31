@@ -5,7 +5,6 @@
 # proxy: without this, those variable annotations would touch
 # autogen.AssistantAgent at module load and force the heavy import we are
 # trying to defer.  MUST be the first statement after the docstring.
-from __future__ import annotations
 # Guard: cx_Freeze frozen builds close stdout/stderr.
 import sys, os
 from core.io_guard import silence_stdio, install_autogen_iostream; silence_stdio()
@@ -55,7 +54,7 @@ from PIL import Image
 
 
 from flask import current_app
-from helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files, _is_terminate_msg
+from hartos.helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files, _is_terminate_msg
 
 
 def _normalize_flow_recipe(config):
@@ -91,11 +90,11 @@ def _normalize_flow_recipe(config):
     out['actions'] = []
     return out
 try:
-    from helper import PROMPTS_DIR
+    from hartos.helper import PROMPTS_DIR
 except Exception:
-    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'))
 os.makedirs(PROMPTS_DIR, exist_ok=True)
-import helper as helper_fun
+from hartos import helper as helper_fun
 # Lazy — same heavy-chain rationale as the `autogen` proxy above; used
 # only inside the agent-building functions.
 transform_messages = lazy_module(
@@ -111,7 +110,7 @@ import traceback
 # and hard-failed `import reuse_recipe` wherever autobahn isn't installed (CI base
 # install); tests/unit/test_lazy_autogen_import.py guards that import.
 
-from threadlocal import thread_local_data
+from hartos.threadlocal import thread_local_data
 # #509: canonical tool-logging decorator — wraps each autogen tool with
 # entry/exit/error logs, structured JSON error envelope, str-coercion,
 # coroutine-accidental-return guard, AND per-tool publish_chat_stage UI
@@ -176,7 +175,7 @@ except ImportError:
     get_production_backend = None
 
 # Import helper_ledger functions for subtask management and ledger awareness
-from helper_ledger import (
+from hartos.helper_ledger import (
     add_subtasks_to_ledger,
     check_and_unblock_parent,
     get_pending_subtasks,
@@ -184,11 +183,11 @@ from helper_ledger import (
 )
 
 # Import sync function from lifecycle_hooks
-from lifecycle_hooks import (
+from hartos.lifecycle_hooks import (
     sync_action_state_to_ledger, register_ledger_for_session,
     ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
 )
-from cultural_wisdom import get_cultural_prompt
+from hartos.cultural_wisdom import get_cultural_prompt
 
 
 class ActionExecutionStatus(Enum):
@@ -266,8 +265,8 @@ _atexit.register(_shutdown_reuse_scheduler)
 # logging_session_id = runtime_logging.start(config={"dbname": "logs.db"})
 # Store user-specific agents & their chat history
 # Performance: TTL caches replace unbounded global dicts (auto-expire after 2 hours)
-user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_agents')
-role_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_role_agents')
+user_agents: "Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]]" = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_agents')
+role_agents: "Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]]" = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_role_agents')
 recipes = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_recipes', loader=load_recipe)
 user_journey = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_journey')
 temp_users = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_temp_users')
@@ -1071,7 +1070,7 @@ def create_agents_for_role(user_id: str, prompt_id):
         return 'TERMINATE', 'TERMINATE', 'TERMINATE', 'TERMINATE', 'TERMINATE', True
 
 
-def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
+def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]":
     """Create new assistant & user proxy agents for a user with basic configuration."""
     user_prompt = f'{user_id}_{prompt_id}'
     # Create a basic function calling config
@@ -1253,7 +1252,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     # Build experience hints from accumulated recipe experience data
     experience_hints = ''
     try:
-        from recipe_experience import build_experience_hints
+        from hartos.recipe_experience import build_experience_hints
         experience_hints = build_experience_hints(individual_recipe)
     except Exception:
         experience_hints = 'No prior experience recorded.'
@@ -3210,7 +3209,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 return
         except Exception:
             pass
-        from create_recipe import publish_agent_thought
+        from hartos.create_recipe import publish_agent_thought
         publish_agent_thought(last_speaker, messages, user_id)
 
     select_speaker_transforms = transform_messages.TransformMessages(
@@ -3713,9 +3712,9 @@ def _giveup_current_reuse_action(user_prompt: str, reason: str) -> None:
             pass
 
 
-def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autogen.UserProxyAgent,
-                       helper: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent,
-                       manager: autogen.GroupChatManager, group_chat: autogen.GroupChat, message: str, role: str,
+def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "autogen.UserProxyAgent",
+                       helper: "autogen.AssistantAgent", user_proxy: "autogen.UserProxyAgent",
+                       manager: "autogen.GroupChatManager", group_chat: "autogen.GroupChat", message: str, role: str,
                        user_id: int, prompt_id: int, request_id: str) -> str:
     """Get a single response from the agent for the given message."""
     user_prompt = f'{user_id}_{prompt_id}'
@@ -3842,6 +3841,10 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
             # The diagnostic is deliberately loud: it records whether the
             # manager is even holding the same GroupChat object we were handed,
             # which is the one thing the traceback alone could never tell us.
+            # (main independently added an `and group_chat.messages` guard on
+            # the line below this block for the same symptom, #725 "cause not
+            # established" — moot here since this break already prevents that
+            # line from ever running on an empty groupchat.)
             if not group_chat.messages:
                 try:
                     _mgr_chat = getattr(manager, 'groupchat', None)
@@ -3916,7 +3919,16 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                         current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
                         actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
                         message = 'Hey @StatusVerifier Agent, Please verify the status of the action ' + f'{user_tasks[user_prompt].current_action}: {actions_prompt}' + '\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": ' + f'{user_tasks[user_prompt].current_action}' + ',"message": "message here"}'
-                        assistant.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
+                        # chat_instructor (UserProxyAgent), not assistant: a
+                        # message initiated by an AssistantAgent lands as
+                        # role='assistant' in every other agent's view, and a
+                        # view with no user-role message anywhere trips the
+                        # Qwen3.5 template raise ("No user query found",
+                        # jinja line 79) — captured live 2026-08-30 20:15,
+                        # body [system, assistant], 3x llama 500.  This loop's
+                        # canonical steering initiator is chat_instructor
+                        # (see the two sites above).
+                        chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
                         continue
             try:
                 # Safely access recipes
@@ -3933,13 +3945,25 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                 if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action - 1]['can_perform_without_user_input'] == 'yes':
                     current_app.logger.info('GOT can_perform_without_user_input as true')
                     message = 'You should complete this task independently. Feel free to make reasonable assumptions where necessary'
-                    helper.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
+                    # chat_instructor, not helper — same reason as the
+                    # StatusVerifier injection above: instructions must enter
+                    # the group as user-role turns.
+                    chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
 
             except Exception as e:
                 current_app.logger.error(f'WE have some indexx error here: {e}')
                 error_message = traceback.format_exc()  # Capture full traceback
                 current_app.logger.error(f"Error in get_agent_response indexx:\n{error_message}")
 
+            if not group_chat.messages:
+                # States the OBSERVATION only.  An earlier version of this line
+                # blamed transform_messages; that was never established -- the
+                # transform logs "N -> 1", never "-> 0", and it rewrites the
+                # per-reply view, not group_chat.messages.  Cause still open.
+                current_app.logger.warning(
+                    'reuse: group chat history is empty mid-loop - ending the '
+                    'turn instead of raising IndexError (cause not established)')
+                break
             last_message = group_chat.messages[-1]
             content_lower = last_message['content'].lower()
             # Check if this message has already been sent to the user by state_transition
@@ -3981,8 +4005,11 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
         # if individual_recipe[currentaction_id-1]['can_perform_without_user_input'] == 'yes':
         #     return assistant
         # Same emptiness hazard as the loop head — reached when the group chat
-        # produced nothing at all.  Return a plain sentence rather than letting
-        # IndexError escape into the channel reply.
+        # produced nothing at all.  Return a plain sentence (and mark the
+        # ledger action given-up, see _giveup_current_reuse_action) rather
+        # than the '' silent-failure main independently used here — an
+        # empty response looks identical to "handler declined intentionally"
+        # downstream and delivers total silence to the channel.
         if not group_chat.messages:
             current_app.logger.error(
                 f'[EMPTY-GROUPCHAT] group_chat.messages empty after reuse loop '
@@ -3991,6 +4018,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
             return "I wasn't able to put a response together just then. Could you try asking again?"
 
         last_message = group_chat.messages[-1]
+        # len>1 matters: a lone TERMINATE would send [-2] off the front.
         if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
             last_message = group_chat.messages[-2]
 
@@ -4541,7 +4569,8 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                             if _w2_task.is_sla_breached() and not _w2_task.sla_breached:
                                 _w2_task.mark_sla_breached()
 
-                    if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
+                    # Same empty-history hazard as the while1 loop above.
+                    if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                         current_app.logger.info(
                             f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                         try:
@@ -4594,8 +4623,13 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 actions_prompt = user_tasks[user_prompt].get_action(
                                     user_tasks[user_prompt].current_action - 1)
                                 message = 'Hey @StatusVerifier Agent, Please verify the status of the action ' + f'{user_tasks[user_prompt].current_action}: {actions_prompt}' + '\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": ' + f'{user_tasks[user_prompt].current_action}' + ',"message": "message here"}'
-                                assistant.initiate_chat(recipient=manager, message=message, clear_history=False,
-                                                        silent=False)
+                                # chat_instructor, not assistant — see the
+                                # matching recovery site in the first loop:
+                                # steering must enter the group as a
+                                # user-role turn or the Qwen3.5 template can
+                                # see a no-user view and raise.
+                                chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,
+                                                              silent=False)
                                 continue
                     count += 1
                     if count == 4:

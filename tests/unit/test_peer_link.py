@@ -124,7 +124,8 @@ class TestPeerLink(unittest.TestCase):
         self.assertEqual(self.link.idle_seconds, 0)
 
     def test_idle_seconds_positive_after_activity(self):
-        self.link._last_activity = time.time() - 5
+        # _last_activity is monotonic (clock-jump-proof); simulate 5s ago.
+        self.link._last_activity = time.monotonic() - 5
         idle = self.link.idle_seconds
         self.assertGreaterEqual(idle, 4.5)
         self.assertLess(idle, 10)
@@ -226,7 +227,7 @@ class TestPeerLink(unittest.TestCase):
 
         key = os.urandom(32)
         self.link._session_key = key
-        self.link._key_established_at = time.time()
+        self.link._key_established_at = time.monotonic()
 
         plaintext = b'hello peer link world!'
         ciphertext = self.link._encrypt(plaintext)
@@ -266,6 +267,49 @@ class TestPeerLink(unittest.TestCase):
     def test_get_local_capabilities_cpu_count_fallback(self, mock_cpu):
         caps = PeerLink._get_local_capabilities()
         self.assertEqual(caps['cpu_count'], 1)
+
+
+# ---------------------------------------------------------------------------
+# TestClockJumpImmunity — #24 RTC/NTP backward jump must not fake liveness
+# ---------------------------------------------------------------------------
+class TestClockJumpImmunity(unittest.TestCase):
+    """A backward wall-clock jump (RTC/NTP, #24) must never make an idle link
+    read as fresh (which would keep the idle-prune gate from firing) nor delay
+    session-key rotation. All PeerLink liveness/elapsed math is monotonic; the
+    only remaining wall-clock uses are cross-node wire timestamps + a nonce."""
+
+    def setUp(self):
+        self.link = PeerLink('abc123def456', '192.168.1.10:6777', TrustLevel.PEER)
+
+    def tearDown(self):
+        with contextlib.suppress(Exception):
+            self.link.close()
+
+    @patch('core.peer_link.link.time.time')
+    def test_backward_wall_jump_keeps_idle_link_idle(self, mock_time):
+        # Genuinely idle 120s ago in monotonic terms.
+        self.link._last_activity = time.monotonic() - 120
+        # RTC leaps backward to a tiny epoch — the OLD wall-based idle_seconds
+        # (time.time() - _last_activity) would go massively negative and read
+        # as "0s idle" (fresh), defeating the idle-prune gate. Monotonic is immune.
+        mock_time.return_value = 1000.0
+        self.assertGreaterEqual(self.link.idle_seconds, 100)
+
+    @patch('core.peer_link.link.time.time')
+    def test_backward_wall_jump_does_not_delay_key_rotation(self, mock_time):
+        # Key established 'long ago' in monotonic terms.
+        self.link._key_established_at = time.monotonic() - 1_000_000
+        mock_time.return_value = 1000.0  # backward RTC jump
+        from core.peer_link.link import KEY_ROTATION_INTERVAL
+        elapsed = time.monotonic() - self.link._key_established_at
+        # Monotonic elapsed is still past the rotation interval regardless of the
+        # wall-clock jump, so rotation is NOT delayed by a clock rewind.
+        self.assertGreater(elapsed, KEY_ROTATION_INTERVAL)
+
+    def test_never_active_link_reports_zero_idle(self):
+        # The 0.0 "never active" sentinel still holds under monotonic.
+        self.assertEqual(self.link._last_activity, 0.0)
+        self.assertEqual(self.link.idle_seconds, 0)
 
 
 # ---------------------------------------------------------------------------

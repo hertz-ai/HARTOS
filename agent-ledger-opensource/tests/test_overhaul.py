@@ -824,7 +824,7 @@ class TestLifecycleOwnershipSync:
 
     def test_ownership_claimed_on_in_progress(self):
         """When ActionState → IN_PROGRESS, task ownership should be claimed."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             _auto_sync_to_ledger, register_ledger_for_session,
             ActionState, _ledger_registry
         )
@@ -843,7 +843,7 @@ class TestLifecycleOwnershipSync:
 
     def test_ownership_released_on_terminal(self):
         """When ActionState → COMPLETED/TERMINATED, ownership released."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             _auto_sync_to_ledger, register_ledger_for_session,
             ActionState, _ledger_registry
         )
@@ -863,7 +863,7 @@ class TestLifecycleOwnershipSync:
 
     def test_heartbeat_updated_on_every_transition(self):
         """Every state change should update heartbeat timestamp."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             _auto_sync_to_ledger, register_ledger_for_session,
             ActionState, _ledger_registry
         )
@@ -881,7 +881,7 @@ class TestLifecycleOwnershipSync:
 
     def test_time_spent_recorded_on_completion(self):
         """Time spent should be recorded when task completes."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             _auto_sync_to_ledger, register_ledger_for_session,
             ActionState, _ledger_registry
         )
@@ -899,7 +899,7 @@ class TestLifecycleOwnershipSync:
 
     def test_sla_breach_flagged(self):
         """SLA breach should be flagged during state transition."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             _auto_sync_to_ledger, register_ledger_for_session,
             ActionState, _ledger_registry
         )
@@ -919,7 +919,7 @@ class TestLifecycleOwnershipSync:
 
     def test_no_crash_on_missing_task(self):
         """If task doesn't exist in ledger, sync should silently skip."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             _auto_sync_to_ledger, register_ledger_for_session,
             ActionState, _ledger_registry
         )
@@ -933,7 +933,7 @@ class TestLifecycleOwnershipSync:
 
     def test_no_crash_on_missing_ledger(self):
         """If no ledger registered, sync should silently skip."""
-        from lifecycle_hooks import _auto_sync_to_ledger, ActionState
+        from hartos.lifecycle_hooks import _auto_sync_to_ledger, ActionState
         # No ledger registered for this prompt — should not crash
         _auto_sync_to_ledger("nonexistent_prompt", 1, ActionState.IN_PROGRESS)
 

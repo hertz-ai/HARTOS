@@ -16,7 +16,7 @@ _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from helper import retrieve_json  # noqa: E402
+from hartos.helper import retrieve_json  # noqa: E402
 
 
 def _as_dict(x):

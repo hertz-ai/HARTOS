@@ -77,7 +77,7 @@ def test_log_tool_execution_is_innermost_in_reuse_recipe():
     register_for_llm decorator MUST have @log_tool_execution as the
     INNERMOST decorator (closest to `def`).  Otherwise the registered
     function is unwrapped at runtime and the wrapper is dead code."""
-    path = os.path.join(REPO_ROOT, 'reuse_recipe.py')
+    path = os.path.join(REPO_ROOT, 'hartos', 'reuse_recipe.py')
     tree = ast.parse(_read(path))
     broken = []
     for node in ast.walk(tree):
@@ -118,7 +118,7 @@ def test_persona_caches_assigned_only_in_core_persona_registry():
     redeclaration in reuse_recipe.py or create_recipe.py — would
     break the single-source-of-truth invariant."""
     cache_names = ('agents_session', 'agents_roles', 'chat_joinees')
-    files_to_check = ('reuse_recipe.py', 'create_recipe.py')
+    files_to_check = (os.path.join('hartos', 'reuse_recipe.py'), os.path.join('hartos', 'create_recipe.py'))
     for filename in files_to_check:
         path = os.path.join(REPO_ROOT, filename)
         src = _read(path)
@@ -164,7 +164,7 @@ def test_persona_caches_are_identical_objects_across_imports():
         agents_roles as canon_roles,
         chat_joinees as canon_joinees,
     )
-    from reuse_recipe import (
+    from hartos.reuse_recipe import (
         agents_session as reuse_session,
         agents_roles as reuse_roles,
         chat_joinees as reuse_joinees,
@@ -205,7 +205,7 @@ def test_connect_time_main_register_dual_name_matches_func():
     LLM prompt at create_recipe.py:2823).  Pre-fix it was
     `'Connect_to_main_agent'` — LLM 404'd because the prompt advertised
     the wrong name."""
-    path = os.path.join(REPO_ROOT, 'reuse_recipe.py')
+    path = os.path.join(REPO_ROOT, 'hartos', 'reuse_recipe.py')
     src = _read(path)
     tree = ast.parse(src)
     found = False
@@ -358,8 +358,8 @@ def test_send_message_to_roles_registered_in_both_flows():
     registry by the time create-mode autogen runs).  Same canonical impl
     from core.persona_registry behind both registrations — capability
     parity is the invariant."""
-    reuse_src = _read(os.path.join(REPO_ROOT, 'reuse_recipe.py'))
-    create_src = _read(os.path.join(REPO_ROOT, 'create_recipe.py'))
+    reuse_src = _read(os.path.join(REPO_ROOT, 'hartos', 'reuse_recipe.py'))
+    create_src = _read(os.path.join(REPO_ROOT, 'hartos', 'create_recipe.py'))
 
     # Both files reference the tool name
     assert 'def send_message_to_roles' in reuse_src, (
@@ -398,7 +398,7 @@ def test_tier2_goal_detection_parity():
         # these wired in BOTH flows or a news recipe replays toolless.
         'news': 'register_news_tools',
     }
-    for filename in ('create_recipe.py', 'reuse_recipe.py'):
+    for filename in (os.path.join('hartos', 'create_recipe.py'), os.path.join('hartos', 'reuse_recipe.py')):
         src = _read(os.path.join(REPO_ROOT, filename))
 
         # Must use detect_goal_tags() — semantic method, not prefix string

@@ -4,7 +4,7 @@ import asyncio
 from autobahn.asyncio.component import Component, run
 from autobahn.wamp.exception import ApplicationError
 from autobahn.wamp.types import SubscribeOptions
-from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution
+from hartos.reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution
 
 print('Inside crossbar_server')
 

@@ -23,12 +23,12 @@ if ROOT not in sys.path:
 
 
 def _clear():
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
     thread_local_data.clear_channel_context()
 
 
 def test_set_then_get_on_same_thread():
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
     _clear()
     ctx = {'channel': 'discord', 'sender_id': 'u1', 'chat_id': 'c1'}
     thread_local_data.set_channel_context(ctx)
@@ -41,7 +41,7 @@ def test_channel_context_is_isolated_across_concurrent_threads():
     """THE regression test: two threads set different channel contexts at the
     same time; each must read back its OWN.  A shared-singleton attribute fails
     this — the second setter's value would be seen by both."""
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
     results = {}
     errors = []
     # Barrier(2): guarantee BOTH threads have set before EITHER reads, so a
@@ -70,7 +70,7 @@ def test_channel_context_is_isolated_across_concurrent_threads():
 def test_fresh_thread_sees_none_not_a_leaked_value():
     """A pooled worker thread that never set a channel must read None, not a
     prior request's context."""
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
     # Pollute the MAIN thread's value; the child thread must not inherit it.
     thread_local_data.set_channel_context({'channel': 'slack'})
     out = {}
@@ -88,7 +88,7 @@ def test_agent_tools_reader_uses_the_accessor():
     """The channels tool helper reads via the thread-local accessor (the same
     value the /chat handler set), so the agent's send/get_channel_context tools
     see the live per-request origin."""
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
     from integrations.channels.agent_tools import _get_channel_context
     _clear()
     assert _get_channel_context() is None

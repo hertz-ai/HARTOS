@@ -80,7 +80,7 @@ runner.section("TEST 1: Module Imports and Basic Structure")
 
 def test_import_helper():
     """Test importing helper module"""
-    from helper import Action, retrieve_json, topological_sort
+    from hartos.helper import Action, retrieve_json, topological_sort
     assert Action is not None
     assert retrieve_json is not None
     assert topological_sort is not None
@@ -89,7 +89,7 @@ runner.test("Import helper module", test_import_helper)
 
 def test_import_lifecycle_hooks():
     """Test importing lifecycle_hooks module"""
-    from lifecycle_hooks import (
+    from hartos.lifecycle_hooks import (
         ActionState,
         initialize_deterministic_actions,
         lifecycle_hook_track_action_assignment,
@@ -103,7 +103,7 @@ def test_import_create_recipe():
     """Test importing create_recipe module"""
     try:
         # This will fail if Flask context is needed, but we're just testing imports
-        import create_recipe
+        from hartos import create_recipe
         assert create_recipe is not None
     except Exception as e:
         # Expected if Flask context is missing
@@ -115,7 +115,7 @@ runner.test("Import create_recipe module", test_import_create_recipe)
 def test_import_reuse_recipe():
     """Test importing reuse_recipe module"""
     try:
-        import reuse_recipe
+        from hartos import reuse_recipe
         assert reuse_recipe is not None
     except Exception as e:
         # Expected if Flask context is missing
@@ -131,7 +131,7 @@ runner.section("TEST 2: Action Class Functionality")
 
 def test_action_class_initialization():
     """Test Action class can be initialized"""
-    from helper import Action
+    from hartos.helper import Action
 
     actions = [
         {"action_id": 1, "action": "Create file"},
@@ -149,7 +149,7 @@ runner.test("Action class initialization", test_action_class_initialization)
 
 def test_action_get_by_index():
     """Test getting action by array index"""
-    from helper import Action
+    from hartos.helper import Action
 
     actions = [
         {"action_id": 1, "action": "Test 1"},
@@ -167,7 +167,7 @@ runner.test("Action get by index", test_action_get_by_index)
 
 def test_action_get_by_id():
     """Test getting action by action_id"""
-    from helper import Action
+    from hartos.helper import Action
 
     actions = [
         {"action_id": 5, "action": "Test 5"},
@@ -193,7 +193,7 @@ runner.section("TEST 3: Lifecycle Hooks and State Management")
 
 def test_lifecycle_action_assignment():
     """Test tracking action assignment"""
-    from lifecycle_hooks import (
+    from hartos.lifecycle_hooks import (
         initialize_deterministic_actions,
         lifecycle_hook_track_action_assignment,
         get_action_state,
@@ -217,7 +217,7 @@ runner.test("Lifecycle action assignment tracking", test_lifecycle_action_assign
 
 def test_lifecycle_status_verification():
     """Test tracking status verification request"""
-    from lifecycle_hooks import (
+    from hartos.lifecycle_hooks import (
         initialize_deterministic_actions,
         lifecycle_hook_track_action_assignment,
         lifecycle_hook_track_status_verification_request,
@@ -245,7 +245,7 @@ runner.test("Lifecycle status verification tracking", test_lifecycle_status_veri
 
 def test_lifecycle_recipe_request():
     """Test tracking recipe request"""
-    from lifecycle_hooks import (
+    from hartos.lifecycle_hooks import (
         initialize_deterministic_actions,
         lifecycle_hook_track_action_assignment,
         lifecycle_hook_track_status_verification_request,
@@ -271,7 +271,7 @@ def test_lifecycle_recipe_request():
     }
 
     # Process verifier response to get to COMPLETED state
-    from lifecycle_hooks import lifecycle_hook_process_verifier_response
+    from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response
     try:
         lifecycle_hook_process_verifier_response(user_prompt, action_id, mock_message)
     except:
@@ -292,7 +292,7 @@ runner.section("TEST 4: JSON Processing and Validation")
 
 def test_retrieve_json_from_text():
     """Test extracting JSON from text"""
-    from helper import retrieve_json
+    from hartos.helper import retrieve_json
 
     text_with_json = """
     Here is the result:
@@ -309,7 +309,7 @@ runner.test("Retrieve JSON from text", test_retrieve_json_from_text)
 
 def test_retrieve_json_with_code_blocks():
     """Test retrieving JSON from code blocks"""
-    from helper import retrieve_json
+    from hartos.helper import retrieve_json
 
     text_with_code_block = """
     ```json
@@ -355,7 +355,7 @@ runner.section("TEST 5: Dependency Management and Topological Sort")
 
 def test_topological_sort_linear():
     """Test topological sort with linear dependencies"""
-    from helper import topological_sort
+    from hartos.helper import topological_sort
 
     individual_recipe = {
         1: {"dependencies": []},
@@ -373,7 +373,7 @@ runner.test("Topological sort linear dependencies", test_topological_sort_linear
 
 def test_topological_sort_parallel():
     """Test topological sort with parallel dependencies"""
-    from helper import topological_sort
+    from hartos.helper import topological_sort
 
     individual_recipe = {
         1: {"dependencies": []},
@@ -392,7 +392,7 @@ runner.test("Topological sort parallel dependencies", test_topological_sort_para
 
 def test_topological_sort_cyclic():
     """Test topological sort detects cyclic dependencies"""
-    from helper import topological_sort
+    from hartos.helper import topological_sort
 
     individual_recipe = {
         1: {"dependencies": [2]},

@@ -30,7 +30,7 @@ if ROOT not in sys.path:
 # (CI). Skip cleanly, matching the suite-wide pattern.
 pytest.importorskip('autogen', reason='autogen not installed')
 
-import reuse_recipe  # noqa: E402
+from hartos import reuse_recipe  # noqa: E402
 
 
 def test_empty_action_api_skips_http_entirely():

@@ -495,6 +495,37 @@ class TestCheckHealth(unittest.TestCase):
             self.assertIn('node_tier', result, f"Missing node_tier in {scenario}")
 
 
+class TestLearningActiveClockJump(unittest.TestCase):
+    """A wall-clock jump (RTC localtime<->UTC at WiFi connect / NTP step — #24)
+    must NOT flip learning_active. Liveness is measured with time.monotonic()
+    (last_flush_at is stamped monotonic), so a backward wall jump cannot make a
+    stalled pipeline (buffering into the void) falsely report active (#6)."""
+
+    def setUp(self):
+        self.bridge = _make_bridge()
+        self.bridge._in_process = True
+        self.bridge._provider = MagicMock()
+        self.bridge._active_window_s = 60
+
+    def test_stale_flush_reports_inactive(self):
+        self.bridge._last_flush_at = time.monotonic() - 120  # 2min > 60s window
+        self.assertFalse(self.bridge.check_health()['learning_active'])
+
+    def test_recent_flush_reports_active(self):
+        self.bridge._last_flush_at = time.monotonic()
+        self.assertTrue(self.bridge.check_health()['learning_active'])
+
+    @patch('integrations.agent_engine.world_model_bridge.time.time')
+    def test_backward_wall_jump_does_not_falsely_activate(self, mock_time):
+        # Genuinely stalled in monotonic terms (last flush 2min ago, 60s window).
+        self.bridge._last_flush_at = time.monotonic() - 120
+        # Simulate the RTC backward jump: wall clock leaps to a tiny value that
+        # would flip the OLD wall-based check (now - last_flush < window) to True.
+        mock_time.return_value = 1000.0
+        # The monotonic-based check is immune -> still honestly inactive.
+        self.assertFalse(self.bridge.check_health()['learning_active'])
+
+
 class TestGetStats(unittest.TestCase):
     """CTR: get_stats return shape."""
 

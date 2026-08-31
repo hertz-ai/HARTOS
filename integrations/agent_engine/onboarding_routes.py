@@ -21,7 +21,7 @@ def register_onboarding_routes(app):
     @app.route('/api/onboarding/start', methods=['POST'])
     def _onboarding_start():
         from flask import request, jsonify
-        from hart_onboarding import (
+        from hartos.hart_onboarding import (
             get_or_create_session, has_hart_name, get_hart_profile,
             CONVERSATION_SCRIPT,
         )
@@ -51,7 +51,7 @@ def register_onboarding_routes(app):
     @app.route('/api/onboarding/advance', methods=['POST'])
     def _onboarding_advance():
         from flask import request, jsonify
-        from hart_onboarding import (
+        from hartos.hart_onboarding import (
             get_or_create_session, remove_session,
             has_hart_name, get_hart_profile,
         )
@@ -105,7 +105,7 @@ def register_onboarding_routes(app):
     @app.route('/api/onboarding/status', methods=['GET'])
     def _onboarding_status():
         from flask import request, jsonify
-        from hart_onboarding import has_hart_name, get_hart_profile
+        from hartos.hart_onboarding import has_hart_name, get_hart_profile
 
         user_id = request.args.get('user_id', '1')
 
@@ -124,7 +124,7 @@ def register_onboarding_routes(app):
     @app.route('/api/onboarding/profile', methods=['GET'])
     def _onboarding_profile():
         from flask import request, jsonify
-        from hart_onboarding import get_hart_profile
+        from hartos.hart_onboarding import get_hart_profile
 
         user_id = request.args.get('user_id', '1')
         profile = get_hart_profile(user_id)

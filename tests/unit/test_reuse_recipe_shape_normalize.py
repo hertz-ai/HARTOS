@@ -32,7 +32,7 @@ if ROOT not in sys.path:
 # (CI). Skip cleanly, matching the suite-wide pattern.
 pytest.importorskip('autogen', reason='autogen not installed')
 
-from reuse_recipe import _normalize_flow_recipe  # noqa: E402
+from hartos.reuse_recipe import _normalize_flow_recipe  # noqa: E402
 
 
 def test_per_action_recipe_in_flow_slot_gets_wrapped():

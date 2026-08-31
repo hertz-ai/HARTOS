@@ -40,7 +40,7 @@ class TestActionClassRoundtrip:
     def test_action_class_roundtrip(self):
         """Create Action with 3 actions, verify get_action(), current_action
         increment, and action count via len(actions)."""
-        from helper import Action
+        from hartos.helper import Action
 
         raw = self._make_actions(3)
         action = Action(raw)
@@ -75,7 +75,7 @@ class TestActionClassRoundtrip:
 
     def test_action_new_json_accumulation(self):
         """Verify new_json list accumulates entries."""
-        from helper import Action
+        from hartos.helper import Action
 
         action = Action(self._make_actions(2))
         assert action.new_json == []
@@ -94,13 +94,13 @@ class TestLifecycleStateMachine:
 
     def setup_method(self):
         """Clear global state before each test."""
-        from lifecycle_hooks import action_states
+        from hartos.lifecycle_hooks import action_states
         action_states.clear()
 
     def test_lifecycle_state_machine(self):
         """ASSIGNED -> IN_PROGRESS -> STATUS_VERIFICATION_REQUESTED ->
         COMPLETED -> TERMINATED.  Each transition must be accepted."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             ActionState,
             set_action_state,
             get_action_state,
@@ -128,7 +128,7 @@ class TestLifecycleStateMachine:
     def test_full_recipe_path(self):
         """ASSIGNED -> ... -> COMPLETED -> RECIPE_REQUESTED -> RECIPE_RECEIVED
         -> TERMINATED (the CREATE-mode recipe path)."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             ActionState,
             set_action_state,
             get_action_state,
@@ -152,7 +152,7 @@ class TestLifecycleStateMachine:
 
     def test_error_retry_path(self):
         """ASSIGNED -> IN_PROGRESS -> SVR -> ERROR -> IN_PROGRESS (retry)."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             ActionState,
             set_action_state,
             get_action_state,
@@ -181,12 +181,12 @@ class TestInvalidStateTransition:
     """Verify the state machine rejects illegal jumps."""
 
     def setup_method(self):
-        from lifecycle_hooks import action_states
+        from hartos.lifecycle_hooks import action_states
         action_states.clear()
 
     def test_invalid_state_transition(self):
         """ASSIGNED -> COMPLETED directly must raise StateTransitionError."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             ActionState,
             StateTransitionError,
             set_action_state,
@@ -206,7 +206,7 @@ class TestInvalidStateTransition:
 
     def test_assigned_to_terminated_rejected(self):
         """ASSIGNED -> TERMINATED must be rejected (no shortcut)."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             ActionState,
             StateTransitionError,
             set_action_state,
@@ -220,7 +220,7 @@ class TestInvalidStateTransition:
 
     def test_in_progress_to_completed_rejected(self):
         """IN_PROGRESS -> COMPLETED is invalid (must go through SVR)."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             ActionState,
             StateTransitionError,
             set_action_state,
@@ -393,7 +393,7 @@ class TestSafePromptPathTraversal:
 
     def test_safe_prompt_path_traversal(self):
         """Path traversal attempts must be rejected."""
-        from helper import safe_prompt_path
+        from hartos.helper import safe_prompt_path
 
         traversal_payloads = [
             '../etc/passwd',
@@ -414,7 +414,7 @@ class TestSafePromptPathTraversal:
 
     def test_safe_prompt_path_traversal_in_later_parts(self):
         """Traversal in flow_id or action_id parts must also be rejected."""
-        from helper import safe_prompt_path
+        from hartos.helper import safe_prompt_path
 
         with pytest.raises(ValueError):
             safe_prompt_path('12345', '../escape')
@@ -432,7 +432,7 @@ class TestSafePromptPathValid:
 
     def test_safe_prompt_path_valid(self):
         """Normal alphanumeric prompt_ids produce correct paths."""
-        from helper import safe_prompt_path, PROMPTS_DIR
+        from hartos.helper import safe_prompt_path, PROMPTS_DIR
 
         # Single part
         path = safe_prompt_path('12345')
@@ -452,14 +452,14 @@ class TestSafePromptPathValid:
 
     def test_safe_prompt_path_hyphen_and_underscore(self):
         """Hyphens and underscores are accepted in path components."""
-        from helper import safe_prompt_path, PROMPTS_DIR
+        from hartos.helper import safe_prompt_path, PROMPTS_DIR
 
         path = safe_prompt_path('my-prompt', 'flow_1')
         assert path == os.path.join(PROMPTS_DIR, 'my-prompt_flow_1.json')
 
     def test_safe_prompt_path_custom_extension(self):
         """Custom extension via ext= kwarg."""
-        from helper import safe_prompt_path, PROMPTS_DIR
+        from hartos.helper import safe_prompt_path, PROMPTS_DIR
 
         path = safe_prompt_path('12345', ext='.txt')
         assert path == os.path.join(PROMPTS_DIR, '12345.txt')
@@ -479,7 +479,7 @@ class TestActionToDict:
 
     def test_action_to_dict(self):
         """Serialize Action attributes to dict and verify JSON round-trip."""
-        from helper import Action
+        from hartos.helper import Action
 
         raw_actions = [
             {'action_id': 1, 'action': 'Search web', 'tool': 'google_search'},
@@ -514,7 +514,7 @@ class TestActionToDict:
 
     def test_action_empty_state_serializable(self):
         """An Action with default state serializes cleanly."""
-        from helper import Action
+        from hartos.helper import Action
 
         action = Action([])
         d = {
@@ -541,12 +541,12 @@ class TestValidateStateTransition:
     """Direct tests for validate_state_transition()."""
 
     def setup_method(self):
-        from lifecycle_hooks import action_states
+        from hartos.lifecycle_hooks import action_states
         action_states.clear()
 
     def test_idempotent_same_state(self):
         """Setting the same state twice is a no-op (idempotent)."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             ActionState,
             set_action_state,
             get_action_state,
@@ -563,7 +563,7 @@ class TestValidateStateTransition:
 
     def test_terminated_to_assigned_allowed(self):
         """TERMINATED -> ASSIGNED is allowed (action can be re-run)."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             ActionState,
             set_action_state,
             get_action_state,
@@ -579,7 +579,7 @@ class TestValidateStateTransition:
         # Verify we are TERMINATED (force_state walks through intermediates)
         # Depending on path availability, manually walk if needed
         # Let's just walk manually for certainty
-        from lifecycle_hooks import action_states
+        from hartos.lifecycle_hooks import action_states
         action_states.clear()
 
         for state in [
@@ -598,7 +598,7 @@ class TestValidateStateTransition:
 
     def test_preview_path(self):
         """ASSIGNED -> PREVIEW_PENDING -> PREVIEW_APPROVED -> IN_PROGRESS."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             ActionState,
             set_action_state,
             get_action_state,
@@ -625,12 +625,12 @@ class TestStateMachineThreadSafety:
     """Verify concurrent state transitions don't corrupt global state."""
 
     def setup_method(self):
-        from lifecycle_hooks import action_states
+        from hartos.lifecycle_hooks import action_states
         action_states.clear()
 
     def test_concurrent_transitions(self):
         """Multiple threads transitioning different actions concurrently."""
-        from lifecycle_hooks import (
+        from hartos.lifecycle_hooks import (
             ActionState,
             set_action_state,
             get_action_state,

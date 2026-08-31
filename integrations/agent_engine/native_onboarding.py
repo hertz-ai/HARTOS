@@ -35,7 +35,7 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib, Gdk  # noqa: E402
 
-from hart_onboarding import (  # noqa: E402
+from hartos.hart_onboarding import (  # noqa: E402
     HARTOnboardingSession, CONVERSATION_SCRIPT,
     PASSION_OPTIONS, ESCAPE_OPTIONS,
     ACKNOWLEDGMENTS_PASSION, ACKNOWLEDGMENT_ESCAPE,

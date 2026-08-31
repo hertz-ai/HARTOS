@@ -132,18 +132,18 @@ class TestThreadLocalTaskSource(unittest.TestCase):
     """Test task_source thread-local propagation."""
 
     def test_default_task_source_is_own(self):
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
         self.assertEqual(thread_local_data.get_task_source(), 'own')
 
     def test_set_and_get_task_source(self):
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
         thread_local_data.set_task_source('hive')
         self.assertEqual(thread_local_data.get_task_source(), 'hive')
         thread_local_data.clear_task_source()
         self.assertEqual(thread_local_data.get_task_source(), 'own')
 
     def test_idle_task_source(self):
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
         thread_local_data.set_task_source('idle')
         self.assertEqual(thread_local_data.get_task_source(), 'idle')
         thread_local_data.clear_task_source()

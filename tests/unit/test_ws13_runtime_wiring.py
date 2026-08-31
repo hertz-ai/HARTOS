@@ -207,7 +207,7 @@ class TestRetryTrackerEventBus(unittest.TestCase):
 
     def test_retry_exhaustion_emits_event(self):
         """When retry count exceeds MAX, EventBus should emit action.retry_exhausted."""
-        from lifecycle_hooks import ActionRetryTracker
+        from hartos.lifecycle_hooks import ActionRetryTracker
 
         tracker = ActionRetryTracker()
         events = []
@@ -234,7 +234,7 @@ class TestRetryTrackerEventBus(unittest.TestCase):
 
     def test_no_event_before_threshold(self):
         """No event should be emitted before retry threshold is exceeded."""
-        from lifecycle_hooks import ActionRetryTracker
+        from hartos.lifecycle_hooks import ActionRetryTracker
 
         tracker = ActionRetryTracker()
         events = []
@@ -247,7 +247,7 @@ class TestRetryTrackerEventBus(unittest.TestCase):
 
     def test_reset_clears_count(self):
         """Reset should clear the retry count."""
-        from lifecycle_hooks import ActionRetryTracker
+        from hartos.lifecycle_hooks import ActionRetryTracker
 
         tracker = ActionRetryTracker()
         tracker.increment_pending('p', 1)
@@ -257,7 +257,7 @@ class TestRetryTrackerEventBus(unittest.TestCase):
 
     def test_event_graceful_without_eventbus(self):
         """Retry exhaustion should not crash if EventBus unavailable."""
-        from lifecycle_hooks import ActionRetryTracker
+        from hartos.lifecycle_hooks import ActionRetryTracker
 
         tracker = ActionRetryTracker()
         with patch('core.platform.events.emit_event',
@@ -269,7 +269,7 @@ class TestRetryTrackerEventBus(unittest.TestCase):
     def test_increment_source_has_emit_event(self):
         """increment_pending source should call emit_event."""
         import inspect
-        from lifecycle_hooks import ActionRetryTracker
+        from hartos.lifecycle_hooks import ActionRetryTracker
         src = inspect.getsource(ActionRetryTracker.increment_pending)
         self.assertIn('emit_event', src)
         self.assertIn('action.retry_exhausted', src)

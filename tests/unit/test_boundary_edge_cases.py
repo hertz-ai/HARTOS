@@ -27,32 +27,32 @@ class TestCulturalWisdomEdges:
     """Cultural functions must handle any input without crash."""
 
     def test_get_trait_by_name_empty(self):
-        from cultural_wisdom import get_trait_by_name
+        from hartos.cultural_wisdom import get_trait_by_name
         assert get_trait_by_name('') is None
 
     def test_get_trait_by_name_none_safe(self):
-        from cultural_wisdom import get_trait_by_name
+        from hartos.cultural_wisdom import get_trait_by_name
         # Should handle None-like input
         assert get_trait_by_name('nonexistent_trait_xyz') is None
 
     def test_get_traits_by_origin_empty(self):
-        from cultural_wisdom import get_traits_by_origin
+        from hartos.cultural_wisdom import get_traits_by_origin
         result = get_traits_by_origin('')
         assert isinstance(result, list)
 
     def test_get_traits_for_role_empty(self):
-        from cultural_wisdom import get_traits_for_role
+        from hartos.cultural_wisdom import get_traits_for_role
         result = get_traits_for_role('')
         assert isinstance(result, list)
 
     def test_get_traits_for_role_zero_count(self):
-        from cultural_wisdom import get_traits_for_role
+        from hartos.cultural_wisdom import get_traits_for_role
         result = get_traits_for_role('assistant', count=0)
         assert isinstance(result, list)
 
     def test_cultural_prompt_is_non_empty(self):
         """Prompt must always return something — empty prompt = agent has no personality."""
-        from cultural_wisdom import get_cultural_prompt
+        from hartos.cultural_wisdom import get_cultural_prompt
         prompt = get_cultural_prompt()
         assert len(prompt) > 50
 
@@ -66,7 +66,7 @@ class TestThreadLocalEdges:
 
     def test_100_threads_isolated(self):
         """100 concurrent threads must each see their own data."""
-        from threadlocal import ThreadLocalData
+        from hartos.threadlocal import ThreadLocalData
         tld = ThreadLocalData()
         errors = []
 
@@ -91,7 +91,7 @@ class TestThreadLocalEdges:
 
     def test_set_get_round_trip_all_fields(self):
         """Every field must survive set→get without corruption."""
-        from threadlocal import ThreadLocalData
+        from hartos.threadlocal import ThreadLocalData
         tld = ThreadLocalData()
         tld.set_request_id('r1')
         tld.set_user_id('u1')
@@ -172,11 +172,11 @@ class TestRetrieveJsonEdges:
     """retrieve_json is called on every LLM response — must handle garbage."""
 
     def test_empty_string(self):
-        from helper import retrieve_json
+        from hartos.helper import retrieve_json
         assert retrieve_json('') is None
 
     def test_none_input(self):
-        from helper import retrieve_json
+        from hartos.helper import retrieve_json
         # May raise or return None — must not crash the caller
         try:
             result = retrieve_json(None)
@@ -185,17 +185,17 @@ class TestRetrieveJsonEdges:
         assert result is None
 
     def test_only_whitespace(self):
-        from helper import retrieve_json
+        from hartos.helper import retrieve_json
         assert retrieve_json('   \n\t  ') is None
 
     def test_nested_json(self):
-        from helper import retrieve_json
+        from hartos.helper import retrieve_json
         result = retrieve_json('{"outer": {"inner": "value"}}')
         assert result is not None
         assert result['outer']['inner'] == 'value'
 
     def test_json_with_unicode(self):
-        from helper import retrieve_json
+        from hartos.helper import retrieve_json
         result = retrieve_json('{"name": "தமிழ்", "lang": "ta"}')
         assert result is not None
         assert result['lang'] == 'ta'

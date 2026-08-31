@@ -68,13 +68,13 @@ class TestLifecycleTransitionsRelaxed:
     def setup_method(self):
         # Stub heavy transitive imports the same way test_lifecycle_hooks
         # does.  Importing here keeps the stub scoped to this class.
-        sys.modules.pop('lifecycle_hooks', None)
+        sys.modules.pop('hartos.lifecycle_hooks', None)
         # Ensure core.session_cache is importable (real or stub).
         try:
             import core.session_cache  # noqa: F401
         except Exception:
             pass
-        from lifecycle_hooks import (validate_state_transition, ActionState,
+        from hartos.lifecycle_hooks import (validate_state_transition, ActionState,
                                      action_states, _state_lock)
         self.validate = validate_state_transition
         self.AS = ActionState
@@ -85,7 +85,7 @@ class TestLifecycleTransitionsRelaxed:
     def _set_state(self, user_prompt, action_id, state):
         """Force the action into a state without going through
         set_action_state (which itself validates)."""
-        from lifecycle_hooks import action_states, _state_lock
+        from hartos.lifecycle_hooks import action_states, _state_lock
         with _state_lock:
             action_states.setdefault(user_prompt, {})[action_id] = state
 
@@ -149,10 +149,10 @@ class TestCodingWorkspaceDir:
         repo_root = os.path.dirname(os.path.dirname(
             os.path.dirname(os.path.abspath(__file__))))
         for relpath in [
-            'create_recipe.py',
-            'gather_agentdetails.py',
-            'reuse_recipe.py',
-            'helper.py',
+            'hartos/create_recipe.py',
+            'hartos/gather_agentdetails.py',
+            'hartos/reuse_recipe.py',
+            'hartos/helper.py',
             'hart_intelligence_entry.py',
         ]:
             p = os.path.join(repo_root, relpath)

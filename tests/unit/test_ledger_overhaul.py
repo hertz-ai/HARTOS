@@ -618,7 +618,7 @@ class TestLLMClientRemoved(unittest.TestCase):
     """Verify get_default_llm_client raises NotImplementedError."""
 
     def test_helper_ledger_llm_client_raises(self):
-        from helper_ledger import get_default_llm_client
+        from hartos.helper_ledger import get_default_llm_client
         with self.assertRaises(NotImplementedError):
             get_default_llm_client()
 

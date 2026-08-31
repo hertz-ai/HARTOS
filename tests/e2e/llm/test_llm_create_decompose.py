@@ -36,7 +36,7 @@ def test_model_emits_plan_json_retrieve_json_can_parse(live_llm):
     — not the wording — so it tolerates the model's natural variance while
     still proving the capability the pipeline depends on.
     """
-    from helper import retrieve_json
+    from hartos.helper import retrieve_json
     from core.autogen_config import get_autogen_config_list
 
     base = get_autogen_config_list()[0]["base_url"]

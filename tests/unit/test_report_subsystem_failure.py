@@ -35,7 +35,7 @@ if ROOT not in sys.path:
 @pytest.fixture
 def fresh_collector():
     """Reset the singleton so each test sees an empty buffer."""
-    from exception_collector import ExceptionCollector
+    from hartos.exception_collector import ExceptionCollector
     ExceptionCollector.reset_instance()
     collector = ExceptionCollector.get_instance()
     try:
@@ -50,7 +50,7 @@ def test_module_key_is_subsystem_dot_identifier(fresh_collector):
     """``report_subsystem_failure('tts', 'indic_parler', exc, fn)``
     must produce ``module='tts.indic_parler'`` — the convention
     SelfHealingDispatcher's pattern_key splits on."""
-    from exception_collector import report_subsystem_failure
+    from hartos.exception_collector import report_subsystem_failure
 
     try:
         raise RuntimeError('parler version conflict')
@@ -73,7 +73,7 @@ def test_module_key_omits_dot_when_identifier_missing(fresh_collector):
     """A subsystem-wide failure with no specific identifier (e.g.
     the agent_daemon supervisor itself died) should produce
     ``module='daemon'`` not ``module='daemon.'``."""
-    from exception_collector import report_subsystem_failure
+    from hartos.exception_collector import report_subsystem_failure
 
     try:
         raise SystemExit('supervisor thread died')
@@ -93,7 +93,7 @@ def test_context_includes_subsystem_identity_for_repair_tool_routing(
     ``record.context['subsystem']`` — without this, an agent
     receiving a self_heal goal can't tell if it's a TTS install
     fix or a channel reconnect fix."""
-    from exception_collector import report_subsystem_failure
+    from hartos.exception_collector import report_subsystem_failure
 
     try:
         raise ImportError('No module named discord.py')
@@ -120,7 +120,7 @@ def test_three_failures_on_same_backend_share_one_pattern_key(
     instances on the same adapter MUST land under one pattern_key
     so the dispatcher counts them together and creates ONE
     self_heal goal — not three."""
-    from exception_collector import report_subsystem_failure
+    from hartos.exception_collector import report_subsystem_failure
 
     class TelegramError(Exception):
         pass
@@ -146,7 +146,7 @@ def test_different_subsystems_split_pattern_keys(fresh_collector):
     """A timeout on TTS and a timeout on Discord must NOT cluster
     into one pattern_key — different subsystems require different
     repair tools."""
-    from exception_collector import report_subsystem_failure
+    from hartos.exception_collector import report_subsystem_failure
 
     try:
         raise TimeoutError('tts synth took 60s')
@@ -171,7 +171,7 @@ def test_different_subsystems_split_pattern_keys(fresh_collector):
 def test_helper_never_raises(monkeypatch):
     """Helper must swallow ALL internal errors — observability must
     not become a failure surface for the caller."""
-    from exception_collector import report_subsystem_failure, ExceptionCollector
+    from hartos.exception_collector import report_subsystem_failure, ExceptionCollector
 
     # Break the collector so the inner .record() raises.
     def _boom(*a, **kw):
@@ -206,7 +206,7 @@ def test_subsystem_taxonomy_uniform(fresh_collector, subsystem,
     subsystem that will use this helper.  If a future subsystem
     invents 'channels::discord' or 'tts-indic_parler' instead, the
     pattern_key grouping breaks and the dispatcher can't dedup."""
-    from exception_collector import report_subsystem_failure
+    from hartos.exception_collector import report_subsystem_failure
 
     try:
         raise RuntimeError('test')
@@ -225,7 +225,7 @@ def test_mixin_auto_wraps_listed_methods(fresh_collector):
     class-load time.  Exceptions escaping wrapped methods feed the
     self-heal pipeline with the right (subsystem, identifier)
     shape — zero per-method except-block edits required."""
-    from exception_collector import AutoReportSubsystemFailures
+    from hartos.exception_collector import AutoReportSubsystemFailures
 
     class FakeBackend(AutoReportSubsystemFailures):
         SUBSYSTEM = 'vlm'
@@ -260,7 +260,7 @@ def test_mixin_auto_wraps_listed_methods(fresh_collector):
 async def test_mixin_handles_async_methods(fresh_collector):
     """Async methods are detected via inspect.iscoroutinefunction and
     get an async wrapper.  Same self-heal push behavior, awaitable."""
-    from exception_collector import AutoReportSubsystemFailures
+    from hartos.exception_collector import AutoReportSubsystemFailures
 
     class FakeAsyncBackend(AutoReportSubsystemFailures):
         SUBSYSTEM = 'llm'
@@ -283,7 +283,7 @@ def test_mixin_wrap_is_idempotent(fresh_collector):
     """Re-running __init_subclass__ (e.g. module reload in dev) MUST
     NOT stack wrappers — the sentinel attribute on the wrapper
     short-circuits double-wraps."""
-    from exception_collector import (
+    from hartos.exception_collector import (
         AutoReportSubsystemFailures, _AUTO_REPORT_WRAPPED_ATTR,
     )
 
@@ -306,7 +306,7 @@ def test_mixin_wrap_is_idempotent(fresh_collector):
 def test_mixin_success_path_no_record(fresh_collector):
     """When wrapped method returns normally, the collector sees
     NOTHING — wrap is transparent on the happy path."""
-    from exception_collector import AutoReportSubsystemFailures
+    from hartos.exception_collector import AutoReportSubsystemFailures
 
     class FakeOK(AutoReportSubsystemFailures):
         SUBSYSTEM = 'daemon'
@@ -328,7 +328,7 @@ def test_mixin_intermediate_base_without_subsystem_passes_through(
     must NOT trigger wrap until a concrete subclass sets it.
     Prevents the mixin from accidentally wrapping abstract methods
     on the intermediate."""
-    from exception_collector import AutoReportSubsystemFailures
+    from hartos.exception_collector import AutoReportSubsystemFailures
 
     class IntermediateAbstract(AutoReportSubsystemFailures):
         # SUBSYSTEM intentionally left empty — this is an abstract layer
@@ -357,7 +357,7 @@ def test_mixin_identifier_fallback_to_class_name(fresh_collector):
     """A class without ``name`` attribute falls back to the class
     name as identifier — keeps the helper safe even when subclasses
     forget the convention."""
-    from exception_collector import AutoReportSubsystemFailures
+    from hartos.exception_collector import AutoReportSubsystemFailures
 
     class FakeNoName(AutoReportSubsystemFailures):
         SUBSYSTEM = 'daemon'

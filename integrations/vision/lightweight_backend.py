@@ -24,7 +24,7 @@ logger = logging.getLogger('hevolve_vision')
 
 
 try:
-    from exception_collector import AutoReportSubsystemFailures
+    from hartos.exception_collector import AutoReportSubsystemFailures
 except Exception:  # pragma: no cover — collector unavailable in minimal envs
     class AutoReportSubsystemFailures:  # type: ignore[no-redef]
         """No-op fallback when the self-heal pipeline isn't importable

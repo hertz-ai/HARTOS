@@ -13,8 +13,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 pytest.importorskip('autogen', reason='autogen not installed')
 
-from create_recipe import scheduler, time_based_execution, visual_execution
-from reuse_recipe import create_schedule, time_based_execution as reuse_time_based_execution
+from hartos.create_recipe import scheduler, time_based_execution, visual_execution
+from hartos.reuse_recipe import create_schedule, time_based_execution as reuse_time_based_execution
 
 
 class TestSchedulerCreationReviewMode:
@@ -22,15 +22,15 @@ class TestSchedulerCreationReviewMode:
 
     def test_scheduler_initialization(self):
         """Test that scheduler is properly initialized"""
-        from create_recipe import scheduler
+        from hartos.create_recipe import scheduler
         assert scheduler is not None
         assert scheduler.running
 
     def test_time_based_job_scheduling_creation_mode(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test scheduling time-based jobs in creation mode"""
-        with patch('create_recipe.scheduler') as mock_scheduler:
-            with patch('create_recipe.time_agents', {}):
-                with patch('create_recipe.user_tasks', {}):
+        with patch('hartos.create_recipe.scheduler') as mock_scheduler:
+            with patch('hartos.create_recipe.time_agents', {}):
+                with patch('hartos.create_recipe.user_tasks', {}):
                     mock_job = Mock()
                     mock_scheduler.add_job.return_value = mock_job
 
@@ -50,7 +50,7 @@ class TestSchedulerCreationReviewMode:
 
     def test_visual_execution_job_scheduling_creation_mode(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test scheduling visual execution jobs in creation mode"""
-        with patch('create_recipe.scheduler') as mock_scheduler:
+        with patch('hartos.create_recipe.scheduler') as mock_scheduler:
             mock_job = Mock()
             mock_scheduler.add_job.return_value = mock_job
 
@@ -70,7 +70,7 @@ class TestSchedulerCreationReviewMode:
 
     def test_cron_trigger_scheduling(self, test_user_id, test_prompt_id):
         """Test scheduling with cron triggers"""
-        with patch('create_recipe.scheduler') as mock_scheduler:
+        with patch('hartos.create_recipe.scheduler') as mock_scheduler:
             from apscheduler.triggers.cron import CronTrigger
 
             trigger = CronTrigger(hour=9, minute=0)  # Daily at 9 AM
@@ -89,7 +89,7 @@ class TestSchedulerCreationReviewMode:
 
     def test_interval_trigger_scheduling(self, test_user_id, test_prompt_id):
         """Test scheduling with interval triggers"""
-        with patch('create_recipe.scheduler') as mock_scheduler:
+        with patch('hartos.create_recipe.scheduler') as mock_scheduler:
             from apscheduler.triggers.interval import IntervalTrigger
 
             trigger = IntervalTrigger(minutes=30)  # Every 30 minutes
@@ -108,7 +108,7 @@ class TestSchedulerCreationReviewMode:
 
     def test_multiple_scheduled_jobs_creation_mode(self, test_user_id, test_prompt_id):
         """Test scheduling multiple jobs without conflicts"""
-        with patch('create_recipe.scheduler') as mock_scheduler:
+        with patch('hartos.create_recipe.scheduler') as mock_scheduler:
             mock_scheduler.add_job.return_value = Mock()
             jobs = []
 
@@ -131,7 +131,7 @@ class TestSchedulerCreationReviewMode:
 
     def test_job_removal_and_replacement(self, test_user_id, test_prompt_id):
         """Test removing and replacing scheduled jobs"""
-        with patch('create_recipe.scheduler') as mock_scheduler:
+        with patch('hartos.create_recipe.scheduler') as mock_scheduler:
             mock_job = Mock()
             mock_scheduler.add_job.return_value = mock_job
             mock_scheduler.remove_job.return_value = True
@@ -171,7 +171,7 @@ class TestSchedulerCreationReuseMode:
 
     def test_scheduler_initialization_reuse_mode(self):
         """Test that scheduler is initialized in reuse mode"""
-        from reuse_recipe import scheduler
+        from hartos.reuse_recipe import scheduler
         assert scheduler is not None
         assert scheduler.running
 
@@ -194,8 +194,8 @@ class TestSchedulerCreationReuseMode:
         with open(recipe_file, 'w') as f:
             json.dump(recipe, f)
 
-        with patch('reuse_recipe.scheduler') as mock_scheduler:
-            with patch('reuse_recipe.get_flow_number', return_value=(0, 'Test Assistant')):
+        with patch('hartos.reuse_recipe.scheduler') as mock_scheduler:
+            with patch('hartos.reuse_recipe.get_flow_number', return_value=(0, 'Test Assistant')):
                 mock_scheduler.add_job.return_value = Mock()
 
                 try:
@@ -206,11 +206,11 @@ class TestSchedulerCreationReuseMode:
 
     def test_time_based_execution_reuse_mode(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test time-based execution in reuse mode"""
-        with patch('reuse_recipe.user_agents', {f"{test_user_id}_{test_prompt_id}": (
+        with patch('hartos.reuse_recipe.user_agents', {f"{test_user_id}_{test_prompt_id}": (
             Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), Mock(),
             Mock(), Mock(), Mock(), Mock(), Mock()
         )}):
-            with patch('reuse_recipe.send_message_to_user1'):
+            with patch('hartos.reuse_recipe.send_message_to_user1'):
                 try:
                     result = reuse_time_based_execution(
                         "Test task",
@@ -240,8 +240,8 @@ class TestSchedulerCreationReuseMode:
         with open(recipe_file, 'w') as f:
             json.dump(recipe, f)
 
-        with patch('reuse_recipe.scheduler') as mock_scheduler:
-            with patch('reuse_recipe.get_flow_number', return_value=(0, 'Test Assistant')):
+        with patch('hartos.reuse_recipe.scheduler') as mock_scheduler:
+            with patch('hartos.reuse_recipe.get_flow_number', return_value=(0, 'Test Assistant')):
                 mock_scheduler.add_job.return_value = Mock()
 
                 try:
@@ -266,8 +266,8 @@ class TestSchedulerCreationReuseMode:
         with open(recipe_file, 'w') as f:
             json.dump(recipe, f)
 
-        with patch('reuse_recipe.scheduler') as mock_scheduler:
-            with patch('reuse_recipe.get_flow_number', return_value=(0, 'Test Assistant')):
+        with patch('hartos.reuse_recipe.scheduler') as mock_scheduler:
+            with patch('hartos.reuse_recipe.get_flow_number', return_value=(0, 'Test Assistant')):
                 mock_scheduler.add_job.return_value = Mock()
 
                 try:
@@ -304,8 +304,8 @@ class TestSchedulerCreationReuseMode:
         with open(recipe_file, 'w') as f:
             json.dump(recipe, f)
 
-        with patch('reuse_recipe.scheduler') as mock_scheduler:
-            with patch('reuse_recipe.get_flow_number', return_value=(0, 'Test Assistant')):
+        with patch('hartos.reuse_recipe.scheduler') as mock_scheduler:
+            with patch('hartos.reuse_recipe.get_flow_number', return_value=(0, 'Test Assistant')):
                 mock_scheduler.add_job.return_value = Mock()
 
                 try:
@@ -319,7 +319,7 @@ class TestSchedulerRobustness:
 
     def test_scheduler_handles_past_run_dates(self, test_user_id, test_prompt_id):
         """Test scheduler handles past run dates gracefully"""
-        with patch('create_recipe.scheduler') as mock_scheduler:
+        with patch('hartos.create_recipe.scheduler') as mock_scheduler:
             past_time = datetime.now() - timedelta(hours=1)
 
             try:
@@ -336,7 +336,7 @@ class TestSchedulerRobustness:
 
     def test_scheduler_handles_invalid_cron_expression(self, test_user_id, test_prompt_id):
         """Test scheduler handles invalid cron expressions"""
-        with patch('create_recipe.scheduler') as mock_scheduler:
+        with patch('hartos.create_recipe.scheduler') as mock_scheduler:
             from apscheduler.triggers.cron import CronTrigger
 
             try:
@@ -349,7 +349,7 @@ class TestSchedulerRobustness:
 
     def test_scheduler_concurrent_job_execution(self, test_user_id, test_prompt_id):
         """Test scheduler handles concurrent job execution"""
-        with patch('create_recipe.scheduler') as mock_scheduler:
+        with patch('hartos.create_recipe.scheduler') as mock_scheduler:
             mock_scheduler.add_job.return_value = Mock()
 
             try:
@@ -369,7 +369,7 @@ class TestSchedulerRobustness:
     def test_scheduler_persistence_across_restarts(self, test_user_id, test_prompt_id):
         """Test scheduler jobs can be persisted and restored"""
         # This would typically use a JobStore like SQLAlchemyJobStore
-        with patch('create_recipe.scheduler') as mock_scheduler:
+        with patch('hartos.create_recipe.scheduler') as mock_scheduler:
             mock_scheduler.add_job.return_value = Mock()
 
             try:
@@ -394,7 +394,7 @@ class TestSchedulerRobustness:
         import pytz
         from apscheduler.triggers.cron import CronTrigger
 
-        with patch('create_recipe.scheduler') as mock_scheduler:
+        with patch('hartos.create_recipe.scheduler') as mock_scheduler:
             mock_scheduler.add_job.return_value = Mock()
 
             try:
@@ -416,7 +416,7 @@ class TestSchedulerRobustness:
         def failing_job(*args, **kwargs):
             raise Exception("Job execution failed")
 
-        with patch('create_recipe.scheduler') as mock_scheduler:
+        with patch('hartos.create_recipe.scheduler') as mock_scheduler:
             mock_scheduler.add_job.return_value = Mock()
 
             try:

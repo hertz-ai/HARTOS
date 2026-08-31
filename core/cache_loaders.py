@@ -96,12 +96,12 @@ def load_user_ledger(user_prompt):
         return None
 
     try:
-        from helper_ledger import create_ledger_with_auto_backend
+        from hartos.helper_ledger import create_ledger_with_auto_backend
         ledger = create_ledger_with_auto_backend(user_id_int, prompt_id_int)
         if ledger and hasattr(ledger, 'tasks') and len(ledger.tasks) > 0:
             # Also restore action_states from this ledger
             try:
-                from lifecycle_hooks import restore_action_states_from_ledger
+                from hartos.lifecycle_hooks import restore_action_states_from_ledger
                 restored = restore_action_states_from_ledger(user_prompt, ledger)
                 if restored > 0:
                     logger.info(f"Restored {restored} action states for {user_prompt}")
@@ -130,7 +130,7 @@ def load_recipe(user_prompt):
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
-                from helper import retrieve_json
+                from hartos.helper import retrieve_json
                 recipe = retrieve_json(content)
                 if recipe:
                     logger.info(f"Restored recipe for {user_prompt} from {file_path}")

@@ -52,7 +52,7 @@ def test_dead_when_loop_thread_is_not_alive():
     # thread is not alive. Old code said 'healthy'; the fix says 'dead'.
     wd = _fresh()
     wd._running = True
-    wd._started_at = time.time()
+    wd._started_at = time.monotonic()
     wd._thread = threading.Thread(target=lambda: None)  # never started -> not alive
     assert wd.get_health()['watchdog'] == 'dead'
 
@@ -60,9 +60,9 @@ def test_dead_when_loop_thread_is_not_alive():
 def test_healthy_when_running_thread_alive_and_recent_check():
     wd = _fresh()
     wd._running = True
-    wd._started_at = time.time()
+    wd._started_at = time.monotonic()
     wd._thread, gate = _alive_thread()
-    wd._last_check_at = time.time()
+    wd._last_check_at = time.monotonic()
     try:
         assert wd.get_health()['watchdog'] == 'healthy'
     finally:
@@ -73,9 +73,9 @@ def test_stalled_when_last_check_is_stale():
     # Alive but no pass completed within 2x the interval -> livelocked, report it.
     wd = _fresh(interval=0.1)
     wd._running = True
-    wd._started_at = time.time() - 100
+    wd._started_at = time.monotonic() - 100
     wd._thread, gate = _alive_thread()
-    wd._last_check_at = time.time() - 100
+    wd._last_check_at = time.monotonic() - 100
     try:
         assert wd.get_health()['watchdog'] == 'stalled'
     finally:
@@ -109,6 +109,6 @@ def test_last_check_age_exposed_for_staleness_alerts():
     wd = _fresh()
     # Never checked -> None (honest "unknown"), not a fabricated 0.
     assert wd.get_health()['last_check_age_seconds'] is None
-    wd._last_check_at = time.time() - 5
+    wd._last_check_at = time.monotonic() - 5
     age = wd.get_health()['last_check_age_seconds']
     assert age is not None and age >= 4.5

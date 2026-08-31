@@ -42,7 +42,7 @@ class IdleDetectionService:
         # loaded by the main-thread bootstrap.  No module loaded yet ⇒
         # treat as idle (same fall-through as the original ImportError
         # branch — caller already handles missing user_tasks gracefully).
-        cr_mod = sys.modules.get('create_recipe')
+        cr_mod = sys.modules.get('hartos.create_recipe')
         if cr_mod is None:
             return False
         user_agents = getattr(cr_mod, 'user_agents', None)
@@ -61,7 +61,7 @@ class IdleDetectionService:
 
         # Check lifecycle state.  Same sys.modules guard — lifecycle_hooks
         # is part of the same heavy import chain.
-        lh_mod = sys.modules.get('lifecycle_hooks')
+        lh_mod = sys.modules.get('hartos.lifecycle_hooks')
         if lh_mod is None:
             return user_agents is None or user_prompt not in user_agents
         action_states = getattr(lh_mod, 'action_states', None)
@@ -102,7 +102,7 @@ class IdleDetectionService:
         # thread loads create_recipe lazily; once that finishes,
         # subsequent ticks see a populated ``user_tasks`` and the
         # all_idle gate runs as designed.
-        cr_mod = sys.modules.get('create_recipe')
+        cr_mod = sys.modules.get('hartos.create_recipe')
         user_tasks = getattr(cr_mod, 'user_tasks', None) if cr_mod else None
         if user_tasks is None:
             return True

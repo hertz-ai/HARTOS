@@ -43,6 +43,37 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 logger = logging.getLogger('hevolve.peer_link')
 
 
+#: Consecutive immediate empty receives before `_receive_loop` calls the link
+#: dead. With a 60s recv timeout, a healthy idle link produces one per minute,
+#: so reaching this many in quick succession means the socket is not blocking at
+#: all. Sized well above any plausible burst of genuine timeouts.
+_MAX_EMPTY_RECVS = 100
+
+
+def _is_recv_timeout(exc: BaseException) -> bool:
+    """Is this exception "no message arrived in time", as opposed to a real fault?
+
+    THE DISTINCTION IS LOAD-BEARING, so it is one function with one caller
+    (`_ws_recv`) rather than an inline guess. A timeout is the normal idle case
+    and must keep the receive loop running; ANY other error means the link is
+    finished and must reach `_receive_loop`'s handler so the link is retired.
+    Getting this backwards is what burned a CPU core for hours on the live node.
+
+    Matched by TYPE NAME, not by isinstance, deliberately: the two supported
+    WebSocket libraries raise different types, either may be absent (the
+    connect() path falls back between them), and importing them here to build an
+    isinstance tuple would create an import that the rest of this module does
+    not need and that would fail on a node carrying only the other one.
+
+      websockets      -> TimeoutError (builtin; socket.timeout is an alias of it
+                         since 3.10, so the builtin covers both)
+      websocket-client -> WebSocketTimeoutException
+    """
+    if isinstance(exc, TimeoutError):          # covers socket.timeout on 3.10+
+        return True
+    return type(exc).__name__ in ('WebSocketTimeoutException', 'TimeoutError')
+
+
 class TrustLevel(Enum):
     SAME_USER = 'same_user'   # Own devices on ANY network (LAN + WAN + regional) — no encryption
     PEER = 'peer'             # Other user's device — E2E mandatory
@@ -185,9 +216,13 @@ class PeerLink:
 
     @property
     def idle_seconds(self) -> float:
+        # Monotonic: a backward wall-clock jump (RTC/NTP, #24) must never make an
+        # idle (dead) link read as fresh — that keeps the idle-prune gate
+        # (link_manager) from ever firing and skews the eviction score. The
+        # 0.0 sentinel ("never active") still holds under monotonic.
         if self._last_activity == 0:
             return 0
-        return time.time() - self._last_activity
+        return time.monotonic() - self._last_activity
 
     def connect(self) -> bool:
         """Initiate outgoing connection to peer."""
@@ -219,8 +254,8 @@ class PeerLink:
                 return False
 
             self._state = LinkState.CONNECTED
-            self._connected_at = time.time()
-            self._last_activity = time.time()
+            self._connected_at = time.monotonic()
+            self._last_activity = time.monotonic()
 
             # Start receive loop
             self._recv_thread = threading.Thread(
@@ -248,8 +283,8 @@ class PeerLink:
                 return False
 
             self._state = LinkState.CONNECTED
-            self._connected_at = time.time()
-            self._last_activity = time.time()
+            self._connected_at = time.monotonic()
+            self._last_activity = time.monotonic()
 
             self._recv_thread = threading.Thread(
                 target=self._receive_loop, daemon=True,
@@ -302,7 +337,7 @@ class PeerLink:
             self._ws_send(frame_bytes)
             self._messages_sent += 1
             self._bytes_sent += len(frame_bytes)
-            self._last_activity = time.time()
+            self._last_activity = time.monotonic()
         except Exception as e:
             logger.debug(f"PeerLink send failed: {e}")
             self._pending_responses.pop(msg_id, None)
@@ -332,7 +367,7 @@ class PeerLink:
             self._ws_send_binary(frame)
             self._messages_sent += 1
             self._bytes_sent += len(frame)
-            self._last_activity = time.time()
+            self._last_activity = time.monotonic()
             return True
         except Exception:
             self._handle_disconnect()
@@ -394,7 +429,7 @@ class PeerLink:
             'state': self._state.value,
             'trust': self.trust.value,
             'encrypted': self.is_encrypted,
-            'connected_seconds': (time.time() - self._connected_at) if self._connected_at else 0,
+            'connected_seconds': (time.monotonic() - self._connected_at) if self._connected_at else 0,
             'idle_seconds': self.idle_seconds,
             'messages_sent': self._messages_sent,
             'messages_received': self._messages_received,
@@ -628,7 +663,7 @@ class PeerLink:
                 info=b'hart-peerlink-v1',
             ).derive(shared_secret)
 
-            self._key_established_at = time.time()
+            self._key_established_at = time.monotonic()
             self._session_nonce_counter = 0
             logger.debug(f"Session key derived for {self.peer_id[:8]}")
         except Exception as e:
@@ -644,8 +679,10 @@ class PeerLink:
 
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-        # Check key rotation
-        if (time.time() - self._key_established_at) > KEY_ROTATION_INTERVAL:
+        # Check key rotation. Monotonic: a backward wall-clock jump must never
+        # DELAY rotation (negative elapsed would read as "not yet due"), which
+        # would keep a session key alive past its intended lifetime.
+        if (time.monotonic() - self._key_established_at) > KEY_ROTATION_INTERVAL:
             self._derive_session_key()
 
         nonce = os.urandom(12)
@@ -697,28 +734,70 @@ class PeerLink:
             self._ws.send(data)
 
     def _ws_recv(self, timeout: float = 30.0) -> Optional[bytes]:
-        """Receive from WebSocket with timeout."""
+        """Receive from WebSocket with timeout. `None` means "nothing this time".
+
+        A TIMEOUT is the only thing that may return None -- it is the normal
+        idle case and the caller loops on it. Anything else PROPAGATES, so
+        `_receive_loop`'s handler can retire the link.
+
+        This used to be a bare `except Exception: return None`, and it burned a
+        whole CPU core on the live node (measured 2026-08-29: one thread at
+        98.8%, 400/400 syscall samples in userspace, silent). Once the peer's
+        socket closed, `recv` raised ConnectionClosed on EVERY call; this
+        swallowed it into None; `_receive_loop` did `continue` with no sleep;
+        and the `while self._state == CONNECTED` condition stayed true forever
+        because the only thing that clears it is `_handle_disconnect()`, which
+        lives in the outer handler this swallow was stealing from.
+
+        Syscall-free is not incidental: on a closed connection the websockets
+        sync client answers from its own already-drained buffer, so the loop
+        never entered the kernel -- no socket read to see, no sleep to see, and
+        nothing logged on either line. That is why it was invisible.
+        """
         if self._ws is None:
             return None
-        try:
-            if hasattr(self._ws, 'recv'):
-                # websockets sync client has recv(timeout)
-                try:
-                    return self._ws.recv(timeout=timeout)
-                except TypeError:
-                    # websocket-client doesn't have timeout param on recv
-                    self._ws.settimeout(timeout)
-                    return self._ws.recv()
-        except Exception:
+        if not hasattr(self._ws, 'recv'):
             return None
+        try:
+            # websockets sync client takes recv(timeout); websocket-client does
+            # not, and raises TypeError -- fall back to its settimeout() form.
+            try:
+                return self._ws.recv(timeout=timeout)
+            except TypeError:
+                self._ws.settimeout(timeout)
+                return self._ws.recv()
+        except Exception as exc:
+            if _is_recv_timeout(exc):
+                return None
+            raise
 
     def _receive_loop(self):
         """Background thread: receive and dispatch messages."""
+        # Second line of defence behind _ws_recv's timeout/error split. That
+        # split is the fix; this is the guard that makes the WHOLE CLASS of bug
+        # impossible, because the failure mode was not "one wrong except" but
+        # "a `continue` with nothing bounding it". A recv that returns
+        # instantly, forever, must never again become a free-running core.
+        #
+        # A real 60s timeout makes this counter irrelevant (one empty return per
+        # minute, and any message resets it). It only trips when returns are
+        # arriving far faster than the timeout allows, which means the socket is
+        # not actually waiting -- i.e. it is dead.
+        empty_returns = 0
         while self._state == LinkState.CONNECTED and self._ws is not None:
             try:
                 raw = self._ws_recv(timeout=60)
                 if raw is None:
+                    empty_returns += 1
+                    if empty_returns >= _MAX_EMPTY_RECVS:
+                        logger.warning(
+                            "PeerLink %s: %d immediate empty receives -- the "
+                            "socket is not blocking, treating the link as dead",
+                            self.peer_id[:8], empty_returns)
+                        self._handle_disconnect()
+                        break
                     continue
+                empty_returns = 0
 
                 if isinstance(raw, str):
                     raw = raw.encode('utf-8')
@@ -732,7 +811,7 @@ class PeerLink:
 
                 self._messages_received += 1
                 self._bytes_received += len(raw)
-                self._last_activity = time.time()
+                self._last_activity = time.monotonic()
 
                 # Try JSON (text message)
                 try:

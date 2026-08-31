@@ -26,14 +26,14 @@ _real_ttl_cache_store = {}
 # ---------------------------------------------------------------------------
 _ALL_STUB_NAMES = [
     "core", "core.session_cache",
-    "helper",
+    "hartos.helper",
     "agent_ledger",
     "agent_ledger.factory",
     "core.platform",
     "core.platform.events",
     "security",
     "security.immutable_audit_log",
-    "recipe_experience",
+    "hartos.recipe_experience",
     "integrations",
     "integrations.social",
     "integrations.social.consent_service",
@@ -65,14 +65,14 @@ sys.modules["core.session_cache"] = _session_cache_mod
 
 # Stub other imports that lifecycle_hooks touches at import time or runtime
 for _mod_name in [
-    "helper",
+    "hartos.helper",
     "agent_ledger",
     "agent_ledger.factory",
     "core.platform",
     "core.platform.events",
     "security",
     "security.immutable_audit_log",
-    "recipe_experience",
+    "hartos.recipe_experience",
     "integrations",
     "integrations.social",
     "integrations.social.consent_service",
@@ -82,7 +82,7 @@ for _mod_name in [
         sys.modules[_mod_name] = types.ModuleType(_mod_name)
 
 # Provide PROMPTS_DIR so the import doesn't fail
-sys.modules["helper"].PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "_prompts_test")
+sys.modules["hartos.helper"].PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "_prompts_test")
 
 # Provide a fake TaskStatus enum for ledger sync tests
 from enum import Enum as _Enum
@@ -110,7 +110,7 @@ sys.modules["agent_ledger"].TaskStatus = _FakeLedgerTaskStatus
 # ---------------------------------------------------------------------------
 # NOW import the module under test
 # ---------------------------------------------------------------------------
-from lifecycle_hooks import (
+from hartos.lifecycle_hooks import (
     ActionState,
     FlowState,
     FlowLifecycleState,
@@ -656,7 +656,7 @@ class TestCheckAllActionsTerminated:
 
 class TestValidateFinalAgentCreation:
     def test_all_terminated_and_files_exist(self):
-        import lifecycle_hooks as _lh_mod
+        from hartos import lifecycle_hooks as _lh_mod
         _walk_to_state(UP, 1, ActionState.TERMINATED)
         action = _make_action_obj(current_action=1, actions=[1])
         # Use the actual PROMPTS_DIR the module resolved at import time
@@ -996,7 +996,7 @@ class TestRestoreFromLedger:
 
 class TestProcessVerifierResponse:
     def test_completed_status(self):
-        from lifecycle_hooks import lifecycle_hook_process_verifier_response
+        from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response
         set_action_state(UP, 1, ActionState.IN_PROGRESS)
         set_action_state(UP, 1, ActionState.STATUS_VERIFICATION_REQUESTED)
         action = _make_action_obj(current_action=1)
@@ -1004,7 +1004,7 @@ class TestProcessVerifierResponse:
         assert result["action"] == "force_fallback"
 
     def test_pending_status(self):
-        from lifecycle_hooks import lifecycle_hook_process_verifier_response
+        from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response
         set_action_state(UP, 1, ActionState.IN_PROGRESS)
         set_action_state(UP, 1, ActionState.STATUS_VERIFICATION_REQUESTED)
         action = _make_action_obj(current_action=1)
@@ -1012,7 +1012,7 @@ class TestProcessVerifierResponse:
         assert result["action"] == "force_completion"
 
     def test_error_status(self):
-        from lifecycle_hooks import lifecycle_hook_process_verifier_response
+        from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response
         set_action_state(UP, 1, ActionState.IN_PROGRESS)
         set_action_state(UP, 1, ActionState.STATUS_VERIFICATION_REQUESTED)
         action = _make_action_obj(current_action=1)
@@ -1020,13 +1020,13 @@ class TestProcessVerifierResponse:
         assert result["action"] == "force_fallback"
 
     def test_no_status_key(self):
-        from lifecycle_hooks import lifecycle_hook_process_verifier_response
+        from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response
         action = _make_action_obj(current_action=1)
         result = lifecycle_hook_process_verifier_response(UP, {"foo": "bar"}, action)
         assert result["action"] == "allow"
 
     def test_none_json(self):
-        from lifecycle_hooks import lifecycle_hook_process_verifier_response
+        from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response
         action = _make_action_obj(current_action=1)
         result = lifecycle_hook_process_verifier_response(UP, None, action)
         assert result["action"] == "allow"
@@ -1047,7 +1047,7 @@ class TestPublishNarrationRemoved:
     sneak back into lifecycle_hooks."""
 
     def test_hook_symbol_is_gone(self):
-        import lifecycle_hooks as lh
+        from hartos import lifecycle_hooks as lh
         assert not hasattr(lh, 'lifecycle_hook_publish_narration'), (
             'Deleted: the narration hook was a parallel publisher on the '
             'same Crossbar topic as publish_intermediate_thoughts_to_user. '
@@ -1055,6 +1055,6 @@ class TestPublishNarrationRemoved:
         )
 
     def test_dedupe_cache_is_gone(self):
-        import lifecycle_hooks as lh
+        from hartos import lifecycle_hooks as lh
         assert not hasattr(lh, '_last_narrations')
         assert not hasattr(lh, '_json_dump')

@@ -69,11 +69,25 @@ omit =
     nixos/*
     scripts/*
     .github/*
+    # Runtime-generated temp modules some tests write at CWD (e.g. config-3.py):
+    # never real source, and they break combine on a fresh checkout (see the
+    # [report] ignore_errors note). Omit so they never enter the data.
+    config-*.py
 
 [report]
 show_missing = true
 precision = 1
 fail_under = 0
+# A combined data set can reference a file that existed only at run time — e.g.
+# a test writes a temp `config-3.py` at CWD, coverage records it, then the
+# combine job runs on a FRESH checkout where that file is gone. Without this,
+# `coverage report`/`coverage json` raise "No source for code: config-3.py"
+# and abort → the Coverage Baseline combine step produced NO coverage.json and,
+# because every command there was `|| true`, the job still went GREEN with no
+# baseline (run 33305338230). ignore_errors skips the vanished source instead
+# of aborting the whole report; the phantom is also omitted below so it never
+# enters the data in the first place.
+ignore_errors = true
 exclude_lines =
     pragma: no cover
     def __repr__

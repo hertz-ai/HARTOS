@@ -31,7 +31,7 @@ import time
 
 import pytest
 
-import hart_onboarding as ho
+from hartos import hart_onboarding as ho
 
 
 @pytest.fixture(autouse=True)

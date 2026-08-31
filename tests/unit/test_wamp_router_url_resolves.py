@@ -116,7 +116,7 @@ class ItReconcilesTheTwoDialects(unittest.TestCase):
 class TheRpcHelperUsesTheResolver(unittest.TestCase):
 
     def _src(self):
-        return open(os.path.join(REPO, 'helper.py'),
+        return open(os.path.join(REPO, 'hartos/helper.py'),
                     encoding='utf-8', errors='replace').read()
 
     def test_helper_resolves_instead_of_hardcoding(self):

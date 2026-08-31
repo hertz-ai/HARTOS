@@ -533,8 +533,13 @@ class TestDispatch:
         patch('integrations.agent_engine.dispatch.is_user_recently_active', return_value=False),
         patch('integrations.agent_engine.budget_gate.pre_dispatch_budget_gate',
               return_value=(True, 'OK')),
+        # **kw so the mock matches the REAL before_dispatch signature, which
+        # grew a goal_dict kwarg — dispatch_goal now passes it, and a
+        # positional-only lambda raised "unexpected keyword argument
+        # 'goal_dict'" (reddened Python shard 5, #29). Mocks are callers too:
+        # a stand-in must accept every arg the real callee does.
         patch('security.hive_guardrails.GuardrailEnforcer.before_dispatch',
-              side_effect=lambda prompt, *a: (True, '', prompt)),
+              side_effect=lambda prompt, *a, **kw: (True, '', prompt)),
         patch('security.hive_guardrails.GuardrailEnforcer.after_response',
               return_value=(True, 'ok')),
     ]
@@ -1957,38 +1962,38 @@ class TestGoalManagerGuardrails:
 
 class TestModelConfigOverride:
     def test_set_and_get_override(self):
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
         thread_local_data.set_model_config_override([{'model': 'test'}])
         assert thread_local_data.get_model_config_override() == [{'model': 'test'}]
         thread_local_data.clear_model_config_override()
 
     def test_clear_override(self):
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
         thread_local_data.set_model_config_override([{'model': 'test'}])
         thread_local_data.clear_model_config_override()
         assert thread_local_data.get_model_config_override() is None
 
     def test_default_is_none(self):
         import threading
-        from threadlocal import ThreadLocalData
+        from hartos.threadlocal import ThreadLocalData
         tld = ThreadLocalData()
         assert tld.get_model_config_override() is None
 
     def test_get_llm_config_uses_override(self):
         pytest.importorskip('autogen', reason='autogen not installed')
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
         override = [{'model': 'override-model', 'api_key': 'test'}]
         thread_local_data.set_model_config_override(override)
-        from create_recipe import get_llm_config
+        from hartos.create_recipe import get_llm_config
         cfg = get_llm_config()
         assert cfg['config_list'] == override
         thread_local_data.clear_model_config_override()
 
     def test_get_llm_config_falls_back_to_global(self):
         pytest.importorskip('autogen', reason='autogen not installed')
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
         thread_local_data.clear_model_config_override()
-        from create_recipe import get_llm_config, config_list
+        from hartos.create_recipe import get_llm_config, config_list
         cfg = get_llm_config()
         # Should fall back to global config_list (model name depends on env)
         assert cfg['config_list'] == config_list
@@ -2207,7 +2212,18 @@ class TestRuntimeMonitorGuardrailCheck:
         # DETECTED", not the sweep cadence — force the full verify on the
         # first cycle so detection is exercised in one pass.
         monitor._full_every = 1
-        with patch('security.node_integrity.compute_code_hash', return_value='tampered_hash'):
+        # De-flake (shard 5, run 33313552929 Timeout >120s; green on 33310728776
+        # with IDENTICAL code). compute_code_hash is mocked, but the tamper path
+        # runs the REAL whole-repo compute_file_manifest TWICE — once in
+        # _prepare_baseline and again in _on_tamper_detected — and on a loaded CI
+        # checkout that occasionally blows the 120s budget. This test's contract
+        # is "a hash mismatch is DETECTED" (monitor._tampered, set BEFORE the
+        # response runs), not the manifest file-diff the response logs. Mock the
+        # manifest so detection is exercised deterministically without hashing
+        # thousands of files.
+        with patch('security.node_integrity.compute_code_hash', return_value='tampered_hash'), \
+                patch('security.node_integrity.compute_file_manifest',
+                      return_value={'sentinel': 'h'}):
             monitor._running = True
             monitor._check_interval = 0
             with patch('time.sleep', side_effect=lambda s: None):

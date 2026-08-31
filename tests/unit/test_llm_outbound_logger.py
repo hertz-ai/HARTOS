@@ -94,6 +94,16 @@ def _build_fake_httpx_module():
             resp.status_code = 200
             return resp
 
+    # Real httpx exposes ByteStream at the top level; the wire-trim uses it to
+    # rebuild the request body stream after a rewrite (llm_outbound_logger.py:766)
+    # and only falls back to httpx._content when it is absent. Provide it so the
+    # test exercises the SAME code path production takes (rewrite -> ByteStream ->
+    # Content-Length update), not the fake-only import-fallback branch.
+    class ByteStream:
+        def __init__(self, data=b''):
+            self._data = bytes(data)
+
+    mod.ByteStream = ByteStream
     mod.Client = Client
     mod.AsyncClient = AsyncClient
     mod._captured = captured
@@ -178,10 +188,11 @@ def test_non_target_request_passes_through_untouched(
 def test_target_request_stamps_headers_does_not_mutate_body(
         tmp_path, monkeypatch):
     """The target endpoint sees: (1) ``X-HARTOS-Request-ID`` header
-    stamped on the outgoing request, (2) request body BYTES UNCHANGED
-    (no Content-Length drift, no LocalProtocolError — see 2026-05-12
-    16:48 live regression that motivated dropping body-rewrite), and
-    (3) JSONL record appended with all the same info."""
+    stamped on the outgoing request, (2) Content-Length ALWAYS matches the body
+    on the wire (the wire-trim may pin max_tokens / trim to budget, but the
+    header can never drift from the bytes — that drift was the 2026-05-12 16:48
+    LocalProtocolError storm), and (3) JSONL record appended with the same
+    info."""
     _reset_module(monkeypatch, tmp_path)
     fake_httpx = _build_fake_httpx_module()
     monkeypatch.setitem(sys.modules, 'httpx', fake_httpx)
@@ -190,7 +201,7 @@ def test_target_request_stamps_headers_does_not_mutate_body(
     # get_request_id() accessor (stored in _local), not a bare instance attr.
     fake_tl.thread_local_data = types.SimpleNamespace(
         get_request_id=lambda: 'req-abc-1234')
-    monkeypatch.setitem(sys.modules, 'threadlocal', fake_tl)
+    monkeypatch.setitem(sys.modules, 'hartos.threadlocal', fake_tl)
     import core.llm_outbound_logger as mod
     mod.install()
 
@@ -202,13 +213,23 @@ def test_target_request_stamps_headers_does_not_mutate_body(
     fake_httpx.Client.send(_FakeClient(), request)
 
     sent = fake_httpx._captured['send_calls'][0]
-    # CRITICAL invariant: the body bytes that went on the wire MUST
-    # equal what the caller (autogen/openai-python) produced.  If we
-    # ever rewrite the body again, this assertion catches the regression.
-    assert sent['content'] == original_body, (
-        f'body bytes were mutated! Caused LocalProtocolError storm '
-        f'in 2026-05-12 16:48 live evidence.  Bytes: {sent["content"]!r}'
-    )
+    # CRITICAL invariant (updated 2026-08-31): the wire-trim feature
+    # (181e7415 "pin max_tokens when the producer omits it", 26819d22 "the pin
+    # now reaches the wire on the under-budget path") DELIBERATELY re-enabled
+    # body rewrite — reversing the 2026-05-12 "drop body-rewrite" decision, but
+    # SAFELY: it re-sets Content-Length whenever it re-encodes the body
+    # (llm_outbound_logger.py:773 / "Trim BEFORE annotating headers so
+    # content-length matches"). So the property that actually prevents the
+    # LocalProtocolError storm is Content-Length CONSISTENCY, not byte
+    # immutability. Assert THAT — a rewrite that forgets Content-Length is the
+    # real regression this guards, and it stays well-formed + keeps the user msg.
+    assert sent['content_length'] == str(len(sent['content'])), (
+        f"Content-Length header {sent['content_length']!r} != body bytes "
+        f"({len(sent['content'])}) on the wire — the exact 2026-05-12 drift "
+        f"that caused the LocalProtocolError storm.")
+    parsed = json.loads(sent['content'])
+    assert parsed['model'] == 'qwen3.5-4b'
+    assert parsed['messages'][-1]['content'] == 'IPL scores?'
     # Header stamped (this part stays — headers are cheap and llama.cpp ignores unknown ones)
     assert request.headers.get('X-HARTOS-Request-ID') == 'req-abc-1234'
     assert 'X-HARTOS-Source' not in request.headers
@@ -237,7 +258,7 @@ def test_source_context_stamps_headers_and_tags_log(
     fake_tl = types.ModuleType('threadlocal')
     fake_tl.thread_local_data = types.SimpleNamespace(
         get_request_id=lambda: 'req-x')
-    monkeypatch.setitem(sys.modules, 'threadlocal', fake_tl)
+    monkeypatch.setitem(sys.modules, 'hartos.threadlocal', fake_tl)
     import core.llm_outbound_logger as mod
     mod.install()
 

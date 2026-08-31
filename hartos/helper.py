@@ -153,7 +153,7 @@ except Exception:
         PROMPTS_DIR = os.path.abspath(os.path.join(
             os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
     else:
-        PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+        PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'))
 os.makedirs(PROMPTS_DIR, exist_ok=True)
 
 
@@ -273,6 +273,39 @@ def _unwrap_ddg_link(href: str) -> str:
         return href
 
 
+_CHALLENGE_MARKERS = ('captcha', 'javascript is required', 'unusual traffic',
+                      'are you a robot', 'anomaly', 'enable javascript')
+
+
+def _log_serp_outcome(tier: str, resp, rows) -> None:
+    """Say WHY a tier returned nothing, so a block is distinguishable from a
+    genuinely empty query.
+
+    Every keyless tier used to fail silently: a scrape that fetched a perfectly
+    good page and parsed zero rows returned [] exactly like a real no-results
+    query, and the `except` never fired because nothing raised.  Mojeek is the
+    worst case: it serves an anti-bot challenge with **HTTP 200**, so status
+    alone says success (measured 2026-08-29: 200, 5,519 bytes, 0 rows, body
+    containing 'captcha').  That ambiguity is why the search outage read as a
+    code bug for weeks and was filed as "all four keyless tiers are down" when
+    two were blocked and two had never been installed.
+
+    Logging only.  Callers and return values are untouched.
+    """
+    if rows:
+        return
+    try:
+        body = getattr(resp, 'text', '') or ''
+        hit = next((m for m in _CHALLENGE_MARKERS if m in body.lower()), None)
+        detail = (f"looks BLOCKED (page contains {hit!r})" if hit
+                  else "no challenge markers, treat as a genuine empty result")
+        current_app.logger.warning(
+            "keyless SERP tier %s: HTTP %s, fetched %d bytes, parsed 0 rows: %s",
+            tier, getattr(resp, 'status_code', '?'), len(body), detail)
+    except Exception:
+        pass
+
+
 def _ddg_html_serp(query: str, max_results: int = 5) -> List[dict]:
     """Keyless DuckDuckGo SERP via the html/ endpoint — no key, no account.
     Returns [{'title','url','snippet'}]; best-effort [] on any failure."""
@@ -296,6 +329,7 @@ def _ddg_html_serp(query: str, max_results: int = 5) -> List[dict]:
                 rows.append({'title': title, 'url': url, 'snippet': snippet})
             if len(rows) >= max_results:
                 break
+        _log_serp_outcome('C/ddg-html', resp, rows)
         return rows
     except Exception as e:
         try:
@@ -306,8 +340,16 @@ def _ddg_html_serp(query: str, max_results: int = 5) -> List[dict]:
 
 
 def _mojeek_serp(query: str, max_results: int = 5) -> List[dict]:
-    """Keyless Mojeek SERP — independent index, scrape-tolerant (plain GET returns
-    HTTP 200, no key, no account, no anti-bot token).  Primary keyless backend.
+    """Keyless Mojeek SERP — independent index, no key, no account.
+
+    WAS documented as "scrape-tolerant, plain GET returns HTTP 200, no anti-bot
+    token" and described as the primary keyless backend.  That is NO LONGER TRUE
+    and the stale wording actively misled a debugging session on 2026-08-29.
+    Measured that day from a residential desktop: HTTP **200**, 5,519 bytes,
+    `ul.results-standard > li` -> **0 rows**, body containing 'captcha' and
+    'javascript is required'.  The 200 is the trap — nothing raises, so the
+    handler below never fires; see _log_serp_outcome.  Treat this tier as
+    BLOCKED until re-measured; tier A (ddgs) is the working keyless path.
     Returns [{'title','url','snippet'}]; best-effort [] on any failure."""
     try:
         from urllib.parse import quote
@@ -328,6 +370,7 @@ def _mojeek_serp(query: str, max_results: int = 5) -> List[dict]:
                          'snippet': snip_el.get_text(' ', strip=True) if snip_el else ''})
             if len(rows) >= max_results:
                 break
+        _log_serp_outcome('B/mojeek', resp, rows)
         return rows
     except Exception as e:
         try:
@@ -2377,7 +2420,7 @@ def get_llm_config(fallback_config_list=None):
         fallback_config_list: config_list to use when no thread-local override is set.
                               Defaults to this module's config_list.
     """
-    from threadlocal import thread_local_data
+    from hartos.threadlocal import thread_local_data
     override = thread_local_data.get_model_config_override()
     return {"cache_seed": None, "config_list": override or (fallback_config_list if fallback_config_list is not None else config_list), "max_tokens": 1500}
 
@@ -2598,7 +2641,7 @@ def _resolve_agent_data_dir():
             return get_agent_data_dir()
         except ImportError:
             return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_data')
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'agent_data')
 
 AGENT_DATA_DIR = _resolve_agent_data_dir()
 try:

@@ -243,7 +243,7 @@ class AgentLightningWrapper:
                     # 'RuntimeError::llm.<agent_id>::generate_reply' lets
                     # SelfHealingDispatcher cluster repeated occurrences.
                     try:
-                        from exception_collector import report_subsystem_failure
+                        from hartos.exception_collector import report_subsystem_failure
                         report_subsystem_failure(
                             subsystem='llm',
                             identifier=str(self.agent_id),

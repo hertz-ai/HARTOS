@@ -207,7 +207,7 @@ class TestBundledModePathRedirection:
 
     def test_agent_data_derives_from_db_path(self):
         """When HEVOLVE_DB_PATH is set to absolute path, agent_data is sibling dir."""
-        from helper import _resolve_agent_data_dir
+        from hartos.helper import _resolve_agent_data_dir
 
         test_db_path = os.path.join('C:', os.sep, 'Users', 'test', 'Documents',
                                      'Nunba', 'data', 'hevolve.db')
@@ -220,7 +220,7 @@ class TestBundledModePathRedirection:
 
     def test_agent_data_default_when_no_db_path(self):
         """Without HEVOLVE_DB_PATH, agent_data is relative to project root."""
-        from helper import _resolve_agent_data_dir
+        from hartos.helper import _resolve_agent_data_dir
 
         with patch.dict(os.environ, {}, clear=False):
             env = os.environ.copy()

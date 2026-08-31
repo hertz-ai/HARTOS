@@ -48,13 +48,33 @@ def test_fails_closed_when_the_authority_is_unreachable(monkeypatch):
 
 
 def test_refuses_when_the_human_cut_the_screen_sense(monkeypatch):
-    fake = type(sys)("core.ai_sensing")
-    fake.query_authority = lambda sensor: False
-    monkeypatch.setitem(sys.modules, "core.ai_sensing", fake)
+    """A definitive cut refuses, and is NAMED as a cut so nothing downstream
+    can treat it as "we could not ask" and wave it through."""
+    _authority(monkeypatch, 'cut')
     mod = _tool()
     ok, why = mod.screen_capture_allowed()
     assert ok is False
-    assert "CUT" in why
+    assert why == mod.CUT_BY_HUMAN
+
+
+def test_an_older_ai_sensing_still_refuses_but_does_not_claim_a_cut(monkeypatch):
+    """BACKWARD COMPATIBILITY, and an honesty rule.
+
+    An ai_sensing carrying only the boolean `query_authority` cannot tell a
+    human's cut from a dead socket — that ambiguity is the whole defect. Against
+    such a module the capture must still REFUSE (fail-closed is unchanged), but
+    it must NOT report the refusal as a human's cut: doing so would block
+    --allow-ungated on exactly the bare bring-up node that flag exists for.
+    """
+    fake = type(sys)("core.ai_sensing")
+    fake.query_authority = lambda sensor: False      # no query_authority_state
+    monkeypatch.setitem(sys.modules, "core.ai_sensing", fake)
+    mod = _tool()
+    ok, why = mod.screen_capture_allowed()
+    assert ok is False, "fail-closed must survive an older ai_sensing"
+    assert why != mod.CUT_BY_HUMAN, (
+        "a boolean-only gate cannot know it was a cut; claiming so would "
+        "wrongly block the no-authority bring-up path")
 
 
 def test_allows_only_on_a_definitive_yes(monkeypatch):
@@ -94,20 +114,102 @@ def test_main_refuses_and_captures_nothing_when_gated(monkeypatch, tmp_path):
     assert not out.exists()
 
 
-def test_allow_ungated_does_not_override_a_reachable_cut(monkeypatch, tmp_path):
-    """--allow-ungated is for a node with NO authority. It must still be usable
-    there, but it is documented as not being a way around a human's decision --
-    so it stays loud on stderr rather than silent."""
+def _authority(monkeypatch, state):
+    """Install a fake ai_sensing whose gate answers exactly `state`."""
+    fake = type(sys)("core.ai_sensing")
+    fake.SENSE_ALLOW = 'allow'
+    fake.SENSE_CUT = 'cut'
+    fake.SENSE_UNREACHABLE = 'unreachable'
+    fake.query_authority_state = lambda sensor, *a, **kw: state
+    fake.query_authority = lambda sensor, *a, **kw: state == 'allow'
+    monkeypatch.setitem(sys.modules, "core.ai_sensing", fake)
+
+
+def _record_capture(mod, monkeypatch, seen):
+    """Stand in for the DRM read so main() can be driven off Linux, and so a
+    capture that should NOT have happened is observable rather than inferred."""
+    def fake_capture(path):
+        seen.append(path)
+        return (8, 8, mod.Scanout(1, '1', 'hart-comp', 'XR24', 'little', 0,
+                                  'test'), 99, 0.5)
+    monkeypatch.setattr(mod, "capture", fake_capture)
+
+
+def test_a_reachable_cut_is_distinguishable_from_a_dead_authority(monkeypatch):
+    """The root defect. `query_authority` returns False for BOTH, so the caller
+    could not tell a human's NO from a socket that never answered -- and the
+    escape hatch below therefore could not honour its own promise."""
     mod = _tool()
-    src = open(TOOL, encoding="utf-8").read()
-    assert "--allow-ungated" in src
-    assert "not a way around" in src.lower() or "NOT a way around" in src
+    _authority(monkeypatch, 'cut')
+    ok, why = mod.screen_capture_allowed()
+    assert ok is False and why == mod.CUT_BY_HUMAN
+
+    _authority(monkeypatch, 'unreachable')
+    ok, why = mod.screen_capture_allowed()
+    assert ok is False and why != mod.CUT_BY_HUMAN, (
+        "an unreachable authority must not be reported as a human's cut")
 
 
-def test_only_numeric_debugfs_nodes_are_used():
-    """Newer kernels expose the same GPU twice, as /dri/1 and as
-    /dri/0000:00:02.0. Only the numeric name is a valid /dev/dri/card suffix;
-    using the PCI alias built '/dev/dri/card0000:00:02.0' and failed."""
-    src = open(TOOL, encoding="utf-8").read()
-    assert "isdigit()" in src, (
-        "find_scanout_fb must skip PCI-address debugfs aliases")
+def test_allow_ungated_cannot_override_a_reachable_cut(monkeypatch, tmp_path):
+    """THE BUG THIS FILE USED TO HIDE.
+
+    The module docstring promises "--allow-ungated is NOT a way around a
+    human's cut: a REACHABLE authority reporting 'screen' cut still refuses".
+    The old test asserted that SENTENCE was present in the source file. The
+    code did the opposite: `if not allow_ungated:` bypassed every refusal.
+
+    This is the promise as behaviour -- no pixels read, no file written, flag
+    or no flag. It FAILS against the code as it was written.
+    """
+    mod = _tool()
+    _authority(monkeypatch, 'cut')
+    seen = []
+    _record_capture(mod, monkeypatch, seen)
+    out = tmp_path / "shot.png"
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main([str(out), "--allow-ungated"])
+
+    assert "REFUSED" in str(exc.value)
+    assert not seen, "--allow-ungated ran a capture the human had CUT"
+    assert not out.exists()
+
+
+def test_allow_ungated_still_works_on_a_node_with_no_authority(
+        monkeypatch, tmp_path, capsys):
+    """The case the flag exists for must keep working, or the fix above would
+    have broken bring-up on a bare node. It must also SAY SO on stderr."""
+    mod = _tool()
+    _authority(monkeypatch, 'unreachable')
+    seen = []
+    _record_capture(mod, monkeypatch, seen)
+    out = tmp_path / "shot.png"
+
+    assert mod.main([str(out), "--allow-ungated"]) == 0
+    assert seen == [str(out)], "the ungated capture did not run"
+    assert "UNGATED" in capsys.readouterr().err, (
+        "an ungated capture must announce itself, never proceed silently")
+
+
+def test_no_flag_and_no_authority_still_refuses(monkeypatch, tmp_path):
+    """Fail-closed stays the default: no flag, no answer, no capture."""
+    mod = _tool()
+    _authority(monkeypatch, 'unreachable')
+    seen = []
+    _record_capture(mod, monkeypatch, seen)
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main([str(tmp_path / "shot.png")])
+
+    assert "REFUSED" in str(exc.value)
+    assert not seen
+
+
+def test_an_allowed_sense_captures(monkeypatch, tmp_path):
+    """The positive path, so the gate cannot be 'fixed' by refusing always."""
+    mod = _tool()
+    _authority(monkeypatch, 'allow')
+    seen = []
+    _record_capture(mod, monkeypatch, seen)
+    assert mod.main([str(tmp_path / "shot.png")]) == 0
+    assert seen == [str(tmp_path / "shot.png")]

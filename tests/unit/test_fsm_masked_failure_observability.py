@@ -11,7 +11,7 @@ reconcile behaviour is unchanged; PREVENTING the masking is a policy call (#139)
 
     python -m pytest tests/unit/test_fsm_masked_failure_observability.py --noconftest -q
 """
-from lifecycle_hooks import _is_possible_masked_failure, ActionState
+from hartos.lifecycle_hooks import _is_possible_masked_failure, ActionState
 
 
 def test_terminated_recovery_is_flagged():
@@ -48,7 +48,7 @@ def test_non_completed_mapping_states_not_flagged():
 import os
 from unittest.mock import MagicMock
 
-import lifecycle_hooks as LH
+from hartos import lifecycle_hooks as LH
 
 
 class _FakeStatus:
@@ -93,7 +93,7 @@ def _run_sync(recipe_coords, monkeypatch):
 
 def test_terminated_without_artifact_stays_failed(tmp_path, monkeypatch):
     """No banked recipe -> the reconcile REFUSES the FAILED->COMPLETED flip."""
-    import helper
+    from hartos import helper
     monkeypatch.setattr(helper, 'PROMPTS_DIR', str(tmp_path))
     before = LH._MASKED_FAILURE_STATE['prevented']
     ledger = _run_sync(('9001', '0', '7'), monkeypatch)
@@ -103,7 +103,7 @@ def test_terminated_without_artifact_stays_failed(tmp_path, monkeypatch):
 
 def test_terminated_with_banked_artifact_recovers(tmp_path, monkeypatch):
     """Banked recipe present -> genuine recovery, the flip proceeds."""
-    import helper
+    from hartos import helper
     monkeypatch.setattr(helper, 'PROMPTS_DIR', str(tmp_path))
     (tmp_path / '9001_0_7.json').write_text('{"recipe": true}')
     ledger = _run_sync(('9001', '0', '7'), monkeypatch)
@@ -112,14 +112,14 @@ def test_terminated_with_banked_artifact_recovers(tmp_path, monkeypatch):
 
 def test_unknown_coordinates_fail_open(tmp_path, monkeypatch):
     """Task lacks recipe coordinates -> historical reconcile behaviour."""
-    import helper
+    from hartos import helper
     monkeypatch.setattr(helper, 'PROMPTS_DIR', str(tmp_path))
     ledger = _run_sync((None, None, None), monkeypatch)
     assert ledger.update_task_status.call_count == 1
 
 
 def test_banked_artifact_exists_tristate(tmp_path, monkeypatch):
-    import helper
+    from hartos import helper
     monkeypatch.setattr(helper, 'PROMPTS_DIR', str(tmp_path))
     t = MagicMock()
     t.recipe_prompt_id, t.recipe_flow_id, t.recipe_action_id = '5', '1', '2'

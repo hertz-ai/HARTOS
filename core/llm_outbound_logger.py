@@ -108,7 +108,7 @@ def _get_request_id() -> str:
          routed to the closable background client and never released the single
          llama slot to a live user turn."""
     try:
-        from threadlocal import thread_local_data as _tl
+        from hartos.threadlocal import thread_local_data as _tl
         rid = _tl.get_request_id()
         if rid:
             return str(rid)
@@ -260,7 +260,7 @@ def with_llm_context(source_name: str, request_id_arg: str = 'request_id'):
                 _tl_rid = ''
                 try:
                     import threading as _t
-                    from threadlocal import thread_local_data as _tl
+                    from hartos.threadlocal import thread_local_data as _tl
                     _tl_rid = _tl.get_request_id() or ''
                     logger.info(
                         "LLM-CONTEXT empty request_id at %s (source=%s, thread=%s, "
@@ -466,6 +466,69 @@ def _get_budget_per_slot() -> int:
         return LLAMA_CTX_SIZE_DEFAULT
 
 
+def _schema_tokens(body: dict, model=None) -> int:
+    """Prompt-token cost of EVERY schema block on the request.
+
+    llama-server bills the serialised schema exactly like message content.
+    autogen sends BOTH ``functions`` (legacy OpenAI) and ``tools``; only
+    ``tools`` was ever charged, so ``functions`` was free budget that did not
+    exist.  Measured on the 2026-08-29 400: functions = 5 entries / 2,918
+    chars (~729 tok) alongside tools = 70 entries (~10,181 tok).
+
+    ONE canonical accessor so the budget maths and the post-trim acceptance
+    test cannot drift apart — they are the same number by construction.
+    """
+    from core.token_utils import count_tokens_for_text
+    total = 0
+    for key in ('tools', 'functions'):
+        block = body.get(key)
+        if not block:
+            continue
+        try:
+            total += count_tokens_for_text(
+                json.dumps(block, ensure_ascii=False), model)
+        except (TypeError, ValueError):
+            # A non-serialisable block is not ours to fix, but pretending it
+            # costs zero is how this bug shipped. Charge from its repr.
+            logger.warning(
+                "wire-trim: %s block is not JSON-serialisable; charging an "
+                "approximate cost so the budget is not silently overstated",
+                key)
+            total += count_tokens_for_text(repr(block), model)
+    return total
+
+
+def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
+                          content_to_text) -> tuple:
+    """Left-truncate one message's content to ``target_chars``, marker-prefixed.
+
+    Returns ``(new_msg, n_cut_chars)`` — ``(msg, 0)`` when it already fits.
+    Multimodal-aware: rebuilds list-shaped content preserving image parts.
+    The ONE truncation implementation; both the last-message step and the
+    anchor step in ``_trim_to_budget`` call it.
+    """
+    text = content_to_text(msg.get('content'))
+    if len(text) <= target_chars:
+        return msg, 0
+    new_msg = dict(msg)
+    new_text = marker + text[-target_chars:]
+    if isinstance(new_msg.get('content'), list):
+        new_parts = []
+        replaced = False
+        for p in new_msg['content']:
+            if isinstance(p, dict) and p.get('type') == 'text' and not replaced:
+                new_parts.append({**p, 'text': new_text})
+                replaced = True
+            else:
+                new_parts.append(p)
+        if not replaced:
+            new_parts.insert(0, {'type': 'text', 'text': new_text})
+        new_msg['content'] = new_parts
+    else:
+        new_msg['content'] = new_text
+    return new_msg, len(text) - target_chars
+
+
 def _trim_to_budget(body: dict) -> tuple:
     """Return ``(trimmed_body, n_dropped, n_truncated_chars, est_before,
     est_after, budget)``.
@@ -499,6 +562,17 @@ def _trim_to_budget(body: dict) -> tuple:
 
     model = body.get('model') or None
     max_tokens = int(body.get('max_tokens') or body.get('max_completion_tokens') or 2048)
+    if 'max_tokens' not in body and 'max_completion_tokens' not in body:
+        # The budget below RESERVES max_tokens out of the slot, but when the
+        # producer omits the field llama-server generates unbounded and the
+        # reservation is a lie.  Measured 2026-08-30 (llama rel 11.36-11.40,
+        # installed build): an autogen.reuse call with no max_tokens reached
+        # n_decoded=3,975, hit its 6,144-token slot ceiling AND exhausted the
+        # shared batch memory, collateral-failing a concurrent request whose
+        # 3,039 real tokens fit comfortably (#734).  Pin the SAME default the
+        # budget math just used, so the wire enforces what it accounts for.
+        body = dict(body)
+        body['max_tokens'] = max_tokens
 
     # ─── The tool schema occupies n_ctx too — count it or the budget is a lie ───
     # llama-server bills prompt tokens for the SERIALISED TOOL SCHEMA exactly like
@@ -513,19 +587,7 @@ def _trim_to_budget(body: dict) -> tuple:
     # "FULL INPUT MESSAGES DEBUG" dump is a messages-only view. The wire layer is the
     # ONLY place the tools block is observable before it hits the socket, which makes
     # counting it here not an optimisation but the whole point of the layer.
-    tools_tokens = 0
-    if body.get('tools'):
-        try:
-            tools_tokens = count_tokens_for_text(
-                json.dumps(body['tools'], ensure_ascii=False), model)
-        except (TypeError, ValueError):
-            # A non-serialisable tools block is not ours to fix, but pretending it
-            # costs zero is how this bug shipped. Charge a conservative estimate
-            # from its repr rather than silently under-counting.
-            logger.warning(
-                "wire-trim: tools block is not JSON-serialisable; charging an "
-                "approximate cost so the budget is not silently overstated")
-            tools_tokens = count_tokens_for_text(repr(body['tools']), model)
+    tools_tokens = _schema_tokens(body, model)
 
     budget = (_get_budget_per_slot() - max_tokens
               - WIRE_TRIM_SAFETY_MARGIN_TOKENS - tools_tokens)
@@ -553,26 +615,37 @@ def _trim_to_budget(body: dict) -> tuple:
 
     has_system = bool(messages and isinstance(messages[0], dict)
                       and messages[0].get('role') == 'system')
+    # The newest user message is load-bearing: llama.cpp's Qwen3.5 chat
+    # template raises "No user query found in messages." whenever a
+    # role='tool' message survives with no user message anywhere, and the
+    # server turns that into HTTP 500 (measured 3x on 2026-08-30, source
+    # autogen.reuse — post-trim roles were [system, assistant, assistant,
+    # tool, assistant]).  Left-dropping by position deleted it first,
+    # because the user's task instruction is the OLDEST non-system message.
+    anchor = next((m for m in reversed(messages)
+                   if isinstance(m, dict) and m.get('role') == 'user'), None)
     n_dropped = 0
-    while len(messages) > (2 if has_system else 1):
+    floor = 2 if has_system else 1
+    while len(messages) > floor:
         drop_idx = 1 if has_system else 0
+        if messages[drop_idx] is anchor:
+            if len(messages) <= floor + 1:
+                break  # only system + anchor + newest remain
+            drop_idx += 1
         messages.pop(drop_idx)
         n_dropped += 1
         if count_tokens_for_messages(messages, model) <= budget:
             break
 
+    # (b)+(c) reserves below: the message-frame overhead of the message being
+    # truncated, and the truncation marker we'll prepend.  Previous bug:
+    # didn't subtract (c), so the post-truncation message exceeded budget by
+    # the marker length (~7 tokens) and the wire request still tickled n_ctx.
+    _TOKENS_PER_MSG = 4  # OpenAI envelope overhead per message
+    marker_tokens = count_tokens_for_text(WIRE_TRIM_MARKER, model)
+
     n_truncated_chars = 0
     if count_tokens_for_messages(messages, model) > budget and messages:
-        last = dict(messages[-1])
-        last_text = _content_to_text(last.get('content'))
-        # Reserve room for: (a) overhead of remaining non-last messages,
-        # (b) the message-frame overhead of the last message itself,
-        # (c) the truncation marker we'll prepend.  Previous bug: didn't
-        # subtract (c), so the post-truncation message exceeded budget
-        # by the marker length (~7 tokens) and the wire request still
-        # tickled n_ctx.
-        _TOKENS_PER_MSG = 4  # OpenAI envelope overhead per message
-        marker_tokens = count_tokens_for_text(WIRE_TRIM_MARKER, model)
         overhead_tokens = (count_tokens_for_messages(messages[:-1], model)
                            + _TOKENS_PER_MSG
                            + marker_tokens)
@@ -582,29 +655,85 @@ def _trim_to_budget(body: dict) -> tuple:
         # active path, it's exact.  Either way we're cutting from the
         # left so over-cutting just means a slightly smaller payload.
         target_chars = int(room_for_last * 3.5)
-        if len(last_text) > target_chars:
-            n_truncated_chars = len(last_text) - target_chars
-            new_text = WIRE_TRIM_MARKER + last_text[-target_chars:]
-            if isinstance(last.get('content'), list):
-                new_parts = []
-                replaced = False
-                for p in last['content']:
-                    if isinstance(p, dict) and p.get('type') == 'text' and not replaced:
-                        new_parts.append({**p, 'text': new_text})
-                        replaced = True
-                    else:
-                        new_parts.append(p)
-                if not replaced:
-                    new_parts.insert(0, {'type': 'text', 'text': new_text})
-                last['content'] = new_parts
-            else:
-                last['content'] = new_text
-            messages[-1] = last
+        new_last, n_cut = _truncate_msg_content(
+            messages[-1], target_chars, WIRE_TRIM_MARKER, _content_to_text)
+        if n_cut:
+            n_truncated_chars += n_cut
+            messages[-1] = new_last
+
+    # The anchor (newest user message) is drop-protected, so when IT is the
+    # oversized component the step above never touches it: it only truncates
+    # messages[-1], and in the autogen.reuse conversations the anchor sits
+    # mid-list behind assistant/tool replies.  Measured 2026-08-30 19:35-19:46
+    # on the installed build: system+anchor ~5597 tok against budget 3840 —
+    # every trim ended in the STILL-over error below and llama-server rejected
+    # the turn, 95x in 11 minutes.  Same policy, same helper, applied to the
+    # anchor.
+    if (count_tokens_for_messages(messages, model) > budget
+            and anchor is not None and anchor in messages
+            and messages[-1] is not anchor):
+        a_idx = messages.index(anchor)
+        others = messages[:a_idx] + messages[a_idx + 1:]
+        overhead_tokens = (count_tokens_for_messages(others, model)
+                           + _TOKENS_PER_MSG
+                           + marker_tokens)
+        room_for_anchor = max(64, budget - overhead_tokens)
+        target_chars = int(room_for_anchor * 3.5)
+        new_anchor, n_cut = _truncate_msg_content(
+            anchor, target_chars, WIRE_TRIM_MARKER, _content_to_text)
+        if n_cut:
+            n_truncated_chars += n_cut
+            messages[a_idx] = new_anchor
+
+    # LAST resort: the SYSTEM message itself.  autogen.reuse builds its
+    # system prompt as persona boilerplate + the whole serialized recipe —
+    # measured 2026-08-30 20:06-20:20 on the installed build: 86 of 100
+    # STILL-over failures were this shape (sample: [system 28,154 chars,
+    # assistant 247]), each sent doomed and rejected by llama-server.  When
+    # drops + last + anchor have all run and the set is STILL over, the
+    # system message is the only mass left; left-truncating it cuts the
+    # boilerplate head and keeps the actionable recipe tail.  Only reached
+    # when the alternative is a guaranteed reject.
+    if (count_tokens_for_messages(messages, model) > budget
+            and has_system and len(messages) >= 1):
+        others = messages[1:]
+        overhead_tokens = (count_tokens_for_messages(others, model)
+                           + _TOKENS_PER_MSG + marker_tokens)
+        room_for_system = max(64, budget - overhead_tokens)
+        target_chars = int(room_for_system * 3.5)
+        new_sys, n_cut = _truncate_msg_content(
+            messages[0], target_chars, WIRE_TRIM_MARKER, _content_to_text)
+        if n_cut:
+            n_truncated_chars += n_cut
+            messages[0] = new_sys
+
+    # ─── Post-trim acceptance test — the trim is best-effort, so CHECK it ───
+    # Trimming can be structurally unable to reach the budget: it drops and
+    # truncates the LAST message, which cannot shrink the SYSTEM message.  On
+    # 2026-08-29 that produced est 795 against a budget of 351 — over by 2.3x —
+    # and the request was sent anyway because `we truncated something` was
+    # treated as success.  llama-server then rejected it (11,236 > n_ctx 8192).
+    # Say so here: a silent doomed request costs a full round trip and surfaces
+    # to the user as an unexplained failure (see #591 for the caller side).
+    _est_after = count_tokens_for_messages(messages, model)
+    _wire_total = _est_after + tools_tokens
+    _per_slot = _get_budget_per_slot()
+    if _est_after > budget or _wire_total > _per_slot:
+        logger.error(
+            "[TRIM] trim could not reach budget — request is STILL over and "
+            "will very likely be rejected: messages %d tok + schema %d tok = "
+            "%d tok against n_ctx %d (budget was %d, %d msg(s) dropped, %d "
+            "char(s) truncated). Trimming cannot shrink the system message; "
+            "the oversized component is %s.",
+            _est_after, tools_tokens, _wire_total, _per_slot, budget,
+            n_dropped, n_truncated_chars,
+            'the tool/function schema' if tools_tokens > _est_after
+            else 'the message content')
 
     new_body = dict(body)
     new_body['messages'] = messages
     return (new_body, n_dropped, n_truncated_chars,
-            est_before, count_tokens_for_messages(messages, model), budget)
+            est_before, _est_after, budget)
 
 
 def _apply_trim_to_request(httpx_module, request, body: dict) -> tuple:
@@ -621,7 +750,13 @@ def _apply_trim_to_request(httpx_module, request, body: dict) -> tuple:
     """
     trimmed, n_dropped, n_truncated, est_before, est_after, budget = \
         _trim_to_budget(body)
-    if n_dropped == 0 and n_truncated == 0:
+    # `trimmed is body` iff NOTHING changed — _trim_to_budget returns the
+    # original object untouched only when the body already fit AND already
+    # carried max_tokens.  Gating on the drop/truncate counts alone threw
+    # away the max_tokens pin on the under-budget path (small prompts — the
+    # exact runaway case): measured live 21:23-21:53, 96 reuse bodies went
+    # out pinned at 2048 while 87 same-source bodies went out unpinned.
+    if n_dropped == 0 and n_truncated == 0 and trimmed is body:
         return body, False
 
     try:
@@ -638,13 +773,14 @@ def _apply_trim_to_request(httpx_module, request, body: dict) -> tuple:
             request.headers['content-length'] = str(len(new_bytes))
         except Exception:
             pass
-        logger.warning(
-            "[TRIM] left-trimmed %d msg(s) + %d char(s) — est tokens "
-            "%d→%d, budget %d (n_ctx/%s slots, max_tokens=%s)",
-            n_dropped, n_truncated, est_before, est_after, budget,
-            os.environ.get('HEVOLVE_LLAMA_SLOTS', '1'),
-            body.get('max_tokens') or body.get('max_completion_tokens') or 2048,
-        )
+        if n_dropped or n_truncated:
+            logger.warning(
+                "[TRIM] left-trimmed %d msg(s) + %d char(s) — est tokens "
+                "%d→%d, budget %d (n_ctx/%s slots, max_tokens=%s)",
+                n_dropped, n_truncated, est_before, est_after, budget,
+                os.environ.get('HEVOLVE_LLAMA_SLOTS', '1'),
+                body.get('max_tokens') or body.get('max_completion_tokens') or 2048,
+            )
         return trimmed, True
     except Exception as e:
         logger.warning("[TRIM] failed to apply trim, sending original: %s", e)

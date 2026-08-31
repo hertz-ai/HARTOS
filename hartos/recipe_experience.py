@@ -23,9 +23,9 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Any
 
 try:
-    from helper import PROMPTS_DIR
+    from hartos.helper import PROMPTS_DIR
 except ImportError:
-    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'))
 
 logger = logging.getLogger(__name__)
 

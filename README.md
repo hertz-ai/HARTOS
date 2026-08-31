@@ -219,7 +219,7 @@ question that needs frontier capability still wants a frontier model. And a
 recipe is learned from a real run, which means a wrong recipe replays wrongly
 until a person corrects it, and nothing else in the loop will catch it.
 
-**[Full capability map →](CAPABILITIES.md)** covers every subsystem with the
+**[Full capability map →](docs/CAPABILITIES.md)** covers every subsystem with the
 file that implements it: agent runtime, auto-evolve, federation, 31 channel
 adapters, 16 providers, security, economics, the API surface, and how it
 compares to the agent frameworks rather than to operating systems.
@@ -288,7 +288,7 @@ out so nobody spends a Saturday re-testing it. Setup is in
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 The gap we cannot close ourselves is hardware. Twelve claims in
-[VERIFICATION.md](VERIFICATION.md) are written and never run on the metal:
+[VERIFICATION.md](docs/VERIFICATION.md) are written and never run on the metal:
 whether the Pi image boots, whether GPIO toggles from the agent, what
 tokens/sec the 2B actually manages on a Pi 4, whether two machines owned by two
 people can borrow compute from each other and settle what they owe. CI has no
@@ -333,7 +333,7 @@ anything"). The split is constants, the borrowing path is written, and nobody
 has been paid through any of it.
 
 So anyone lending compute today is helping prove the mechanism, not collecting
-on it. That is [row 8](VERIFICATION.md), and it wants two machines owned by two
+on it. That is [row 8](docs/VERIFICATION.md), and it wants two machines owned by two
 people.
 
 Details at [provider join](https://docs.hevolve.ai/provider/joining/).
@@ -344,9 +344,9 @@ Details at [provider join](https://docs.hevolve.ai/provider/joining/).
 
 | Section | What's in it |
 |---|---|
-| [Capabilities](CAPABILITIES.md) | Every subsystem, with the file that implements it |
+| [Capabilities](docs/CAPABILITIES.md) | Every subsystem, with the file that implements it |
 | [Open problems](OPEN_PROBLEMS.md) | Ten things we have not solved |
-| [Verification](VERIFICATION.md) | What is proven, what is not, and how to settle a row |
+| [Verification](docs/VERIFICATION.md) | What is proven, what is not, and how to settle a row |
 | [Contributing](CONTRIBUTING.md) | Setup, where help is wanted, what we will not merge |
 | [Quickstart](https://docs.hevolve.ai/getting-started/quickstart/) | Install to first agent |
 | [Architecture](https://docs.hevolve.ai/architecture/overview/) | Topology, PeerLink, draft-first dispatch, federation |

@@ -70,7 +70,7 @@ def _emit_tool_call_stage(tool_name: str) -> None:
     try:
         from core.constants import TOOL_LABELS, generic_tool_label
         from core.peer_link.crossbar_publish import publish_chat_stage
-        from threadlocal import thread_local_data
+        from hartos.threadlocal import thread_local_data
 
         user_id = thread_local_data.get_user_id() or ''
         request_id = thread_local_data.get_request_id() or ''
@@ -194,6 +194,55 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
 
     tool_name = name or func.__name__
 
+    # PEP 563 repair, done here because this decorator is the INNERMOST one on
+    # every registered tool -- autogen's register_for_llm sits above it and so
+    # only ever sees what we hand back.
+    #
+    # HISTORY, and why this repair still earns its place:
+    #
+    # reuse_recipe.py USED TO carry `from __future__ import annotations`.  It was
+    # load-bearing: it stopped the module-level
+    # `user_agents: Dict[str, Tuple[autogen.AssistantAgent, ...]]` at :269-270
+    # and the defs at :895/:3187 from evaluating `autogen.*` at import time and
+    # dragging the lazy autogen proxy -- ~7.6s + torch -- onto the boot path.
+    # But PEP 563 stringizes EVERY annotation in that module, including the
+    # `Annotated[str, "..."]` params of its 48 tools.  @wraps copies those
+    # strings onto the wrapper, autogen hands them to pydantic, and pydantic
+    # raises:
+    #   PydanticUserError: TypeAdapter[ForwardRef("Annotated[str, 'Target
+    #   persona/role name to deliver the message to']")] is not fully defined
+    # Measured live 2026-08-29 09:31:18: that killed create_agents_for_user(),
+    # i.e. every agent REUSE and the whole multi-persona path.  create_recipe.py
+    # has no __future__ import, which is exactly why CREATE worked and REUSE did
+    # not.
+    #
+    # 2026-08-30 UPDATE — reuse_recipe.py NO LONGER HAS THE FUTURE IMPORT.
+    # a4208301 removed it and instead QUOTED the 9 annotation positions that
+    # actually touch `autogen.*` (the two module-level globals, the
+    # create_agents_for_user return, and get_agent_response's 6 params), so the
+    # boot-path property above is preserved -- guarded by
+    # tests/unit/test_lazy_autogen_import.py::test_module_import_does_not_pull_autogen
+    # and tests/unit/test_reuse_annotations_resolvable.py.
+    #
+    # DO NOT DELETE THIS REPAIR AS "now redundant".  It is NOT.  Measured by A/B
+    # on the real function: arm A = a4208301^ (which ALREADY CONTAINED this
+    # repair, confirmed via `git merge-base --is-ancestor e6f7d6ce a4208301^`)
+    # still raised PydanticUserError; arm B = a4208301 returned the agent tuple.
+    # So neither fix is sufficient alone -- they are LAYERED, not duplicated:
+    # this one resolves stringized hints for decorated tools generally, that one
+    # stops reuse_recipe stringizing them in the first place.  Two fixes for one
+    # defect family is worth knowing about; removing either re-breaks REUSE.
+    #
+    # include_extras=True is required: without it Annotated[str, "desc"]
+    # collapses to plain str and every per-argument description autogen shows
+    # the model is silently lost.
+    try:
+        _resolved_hints = get_type_hints(func, include_extras=True)
+    except Exception as _e:  # unresolvable forward ref -> leave the original
+        tool_logger.debug(
+            f"annotation resolve skipped for {tool_name}: {_e}")
+        _resolved_hints = None
+
     def _on_error(e, _t0=None):
         _took = '' if _t0 is None else f" latency_ms={round((time.perf_counter() - _t0) * 1000, 1)}"
         tool_logger.error(f"TOOL EXECUTION ERROR: {tool_name} - {e}{_took}")
@@ -231,6 +280,15 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
             except Exception as e:
                 return _on_error(e, _t0)
 
+        if _resolved_hints:
+            async_wrapper.__annotations__ = _resolved_hints
+        # _rebind_annotations additionally pins __signature__, which
+        # inspect.signature() (what autogen's register_for_llm actually
+        # calls) follows via __wrapped__ regardless of __annotations__ —
+        # see its own docstring. Layered with the _resolved_hints repair
+        # above for the same reason reuse_recipe.py keeps its own
+        # annotation-quoting fix alongside this one (comment above):
+        # two fixes for one defect family, neither sufficient alone.
         _rebind_annotations(async_wrapper, func)
         return async_wrapper
 
@@ -268,6 +326,8 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
         except Exception as e:
             return _on_error(e, _t0)
 
+    if _resolved_hints:
+        sync_wrapper.__annotations__ = _resolved_hints
     _rebind_annotations(sync_wrapper, func)
     return sync_wrapper
 

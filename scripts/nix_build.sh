@@ -6,7 +6,7 @@ set -euo pipefail
 # ═══════════════════════════════════════════════════════════════
 #
 # Usage (from Git Bash on Windows):
-#   MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu-22.04 -- /bin/bash /mnt/c/Users/sathi/PycharmProjects/HARTOS/nix_build.sh
+#   MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu-22.04 -- /bin/bash /mnt/c/Users/sathi/PycharmProjects/HARTOS/scripts/nix_build.sh
 #
 # Prerequisites:
 #   - WSL2 with Ubuntu-22.04
@@ -59,4 +59,4 @@ echo ""
 echo "=== Build complete ==="
 ls -lh result/iso/*.iso 2>/dev/null || ls -lh result/ 2>/dev/null || echo "No result directory"
 echo ""
-echo "To boot in QEMU, run: bash $REPO/boot_vm.sh"
+echo "To boot in QEMU, run: bash $REPO/scripts/boot_vm.sh"
