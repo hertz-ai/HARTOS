@@ -54,6 +54,15 @@ class TestEstimateLLMCostSpark:
         assert isinstance(cost, int)
         assert cost >= 1
 
+    def test_free_tier_model_costs_zero_spark(self):
+        # The financial invariant: a free-tier model name (llama/qwen/phi/groq/
+        # mistral) costs 0 Spark from its _MODEL_COST_MAP entry alone — even with
+        # _is_local_model() forced False (no local-URL env). Guards the "local /
+        # free models never charge Spark" guarantee independent of the env probe.
+        from integrations.agent_engine.budget_gate import estimate_llm_cost_spark
+        assert estimate_llm_cost_spark("Test prompt " * 100, "llama") == 0
+        assert estimate_llm_cost_spark("Test prompt " * 100, "qwen-2.5-7b") == 0
+
 
 # ── WS1: check_goal_budget ───────────────────────────────────────────
 
@@ -256,6 +265,48 @@ class TestRevenueSplitConstants:
         assert 'infra_pool_share' in result
         assert 'central_share' in result
         assert 'platform_share' in result
+
+
+# ── _resolve_model_name: correct pricing when the caller passes the default ──
+
+class TestResolveModelName:
+    def test_explicit_non_default_name_is_trusted(self):
+        from integrations.agent_engine.budget_gate import _resolve_model_name
+        assert _resolve_model_name('claude-3-opus') == 'claude-3-opus'
+
+    def test_default_gpt4o_uses_env_local_model_when_set(self, monkeypatch):
+        # caller passed the default 'gpt-4o' but an explicit local model is
+        # configured -> price against the local model (0 Spark), not gpt-4o
+        monkeypatch.setenv('HEVOLVE_LOCAL_LLM_MODEL', 'my-local-7b')
+        from integrations.agent_engine.budget_gate import _resolve_model_name
+        assert _resolve_model_name('gpt-4o') == 'my-local-7b'
+
+    def test_default_gpt4o_resolves_to_llama_when_local_backend_active(self, monkeypatch):
+        monkeypatch.delenv('HEVOLVE_LOCAL_LLM_MODEL', raising=False)
+        monkeypatch.setattr(
+            'integrations.agent_engine.budget_gate._is_local_model', lambda: True)
+        from integrations.agent_engine.budget_gate import _resolve_model_name
+        assert _resolve_model_name('gpt-4o') == 'llama'
+
+    def test_default_gpt4o_stays_gpt4o_when_no_local(self, monkeypatch):
+        monkeypatch.delenv('HEVOLVE_LOCAL_LLM_MODEL', raising=False)
+        monkeypatch.setattr(
+            'integrations.agent_engine.budget_gate._is_local_model', lambda: False)
+        from integrations.agent_engine.budget_gate import _resolve_model_name
+        assert _resolve_model_name('gpt-4o') == 'gpt-4o'
+
+
+# ── check_platform_affordability: fresh-cache fast path ──────────────────────
+
+class TestAffordabilityCache:
+    def test_fresh_cache_is_returned_without_recompute(self, monkeypatch):
+        import time
+        import integrations.agent_engine.budget_gate as bg
+        sentinel = (True, {'sentinel': True})
+        monkeypatch.setitem(bg._affordability_cache, 'result', sentinel)
+        monkeypatch.setitem(bg._affordability_cache, 'ts', time.time())
+        # a fresh cache short-circuits the DB round-trip and returns as-is
+        assert bg.check_platform_affordability() == sentinel
 
 
 if __name__ == '__main__':
