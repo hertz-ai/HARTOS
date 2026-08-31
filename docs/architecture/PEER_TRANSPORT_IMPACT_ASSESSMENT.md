@@ -258,13 +258,19 @@ traversal ladder all present, and the gossip→PeerLink upgrade trigger genuinel
 blocked on ONE missing thing: nothing serves `ws://…/peer_link`.** That is hook #5,
 and it is much closer to done than the bootstrap doc's "DIAL-ONLY" implies.
 
-### ONE NEW FINDING FROM THE TRACE
+### ONE FINDING FROM THE TRACE — RETRACTED 2026-08-31
 
-**(D7) The `hardware_summary` block is built TWICE** — `get_health()` (`:1105`, around
-`:1119`) and `_self_info()` (`:1135`, around `:1190`) each construct
-`{cpu_cores, ram_gb, gpu_vram_gb, disk_free_gb}` from `caps.hardware` independently.
-Add a field to one and the other silently lacks it. Small, but it is the same class
-as everything else here and it is one extract-method away.
+**(D7) WITHDRAWN. `hardware_summary` is built ONCE, not twice.** I claimed
+`get_health()` (`:1105`) and `_self_info()` (`:1135`) each construct the block
+independently. Verified by AST — there is exactly ONE
+`info['hardware_summary'] = {...}` in the file and it belongs to `_self_info()`.
+
+The error is worth recording because it is a re-read hazard, not a typo: I read
+`:1110-1140` as one span, saw the construction, and attributed it to `get_health()`
+because that function *starts* at `:1105`. A later read of `:1175-1270` found the
+same construction inside `_self_info()` and I counted it as a second site. **One
+site, read twice, reported as two.** Attribute a line to its enclosing function by
+parsing, not by "which def did I last see above it".
 
 ---
 

@@ -456,6 +456,24 @@ class PeerLink:
             'x25519_public': get_x25519_public_hex(),
             'trust_requested': self.trust.value,
             'protocol_version': 1,
+            # SYMMETRY: _complete_handshake on the far side does
+            # `self.capabilities = hello_data.get('capabilities', {})`, but nothing
+            # ever WROTE this field, so every peer that ACCEPTED a link recorded {}
+            # — only the ack direction (hello_ack below) ever carried capabilities.
+            # A one-way exchange is not an exchange: the dialer learned the
+            # acceptor's GPU/cpu/tier and the acceptor learned nothing, so
+            # link_manager's GPU-aware eviction scoring and any capability routing
+            # saw an empty dict for exactly half the fleet.
+            #
+            # This is the SAME read-before-write class this file already fixed once
+            # for `user_id_proof` (see the comment in the SAME_USER block below):
+            # a receiver read a field no sender wrote, it failed silently, and it
+            # looked like "the peer just didn't send it". That one cost every node
+            # its multi-device sync recipients. Fixing this BEFORE the inbound
+            # listener lands (bootstrap hook #5) matters — with no listener today
+            # the blast radius is nil, but the day the accept path goes live this
+            # would ship as silent data loss on every inbound link.
+            'capabilities': self._get_local_capabilities(),
             'timestamp': time.time(),
         }
 
