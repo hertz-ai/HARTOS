@@ -128,6 +128,17 @@ class VerifyLLMFailureTests(unittest.TestCase):
             self.assertEqual(out["http_status"], 500)
             self.assertEqual(out["reason"], "http_500")
 
+    def test_non_200_status_returned_without_httperror(self):
+        """urlopen can RETURN a non-200 (e.g. 204 No Content, 201) WITHOUT
+        raising HTTPError — urllib only raises for status >= 400. That branch
+        must report http_<status> and short-circuit BEFORE reading/parsing a
+        body that isn't there, not fall through to malformed_json."""
+        with patch("urllib.request.urlopen", return_value=_fake_resp(204, {})):
+            out = verify_llm()
+            self.assertFalse(out["ok"])
+            self.assertEqual(out["http_status"], 204)
+            self.assertEqual(out["reason"], "http_204")
+
     def test_bool_wrapper_returns_false_on_unreachable(self):
         import urllib.error
         with patch("urllib.request.urlopen",
