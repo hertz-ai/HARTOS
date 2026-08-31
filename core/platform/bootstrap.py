@@ -559,25 +559,53 @@ def _verify_extension_signatures(extensions_dir: str) -> None:
                 logger.debug("Extension '%s' is unsigned (advisory)", entry)
             continue
 
-        # Verify signature using master public key
+        # Verify the signature using the ONE extension-signature verifier in
+        # the repo: ExtensionSandbox.verify_signature (Ed25519 over the
+        # SHA-256 of the file bytes, checked against the hardcoded master
+        # public key).
+        #
+        # This block previously called ``security.master_key.verify_release``,
+        # WHICH HAS NEVER EXISTED -- no definition anywhere in the tree. The
+        # import raised ImportError on every extension, every boot, and the
+        # handler below logged it at DEBUG and moved on. So this gate has never
+        # once verified a signature.
+        #
+        # The failure was worse than "no checking", because it was asymmetric.
+        # The missing-signature branch above runs BEFORE this import and still
+        # works, so an extension with NO manifest.sig gets quarantined -- while
+        # an extension carrying any manifest.sig at all sailed through, even
+        # under HART_REQUIRE_SIGNED_EXTENSIONS=1. Supplying a garbage signature
+        # was strictly safer for an attacker than supplying none.
         try:
-            from security.master_key import verify_release
-            import json
-            with open(manifest_path, 'rb') as f:
-                manifest_bytes = f.read()
-            with open(sig_path, 'rb') as f:
-                sig_bytes = f.read()
+            from core.platform.extension_sandbox import ExtensionSandbox
+            with open(sig_path, 'r', encoding='utf-8') as f:
+                sig_hex = f.read().strip()
 
-            if not verify_release(manifest_bytes, sig_bytes):
+            if not ExtensionSandbox.verify_signature(manifest_path, sig_hex):
                 logger.warning(
-                    "Extension '%s' has INVALID signature — %s",
+                    "Extension '%s' has INVALID signature - %s",
                     entry, "skipping" if require_signed else "loading anyway (advisory)")
                 if require_signed:
                     try:
                         os.rename(ext_path, ext_path + '.badsig')
                     except OSError:
                         pass
-        except ImportError:
-            logger.debug("master_key not available — skipping signature verification")
         except Exception as e:
-            logger.warning("Extension '%s' signature check error: %s", entry, e)
+            # EVERY failure to verify is fail-closed under require_signed, not
+            # just a False verdict. Absence of a verifier is not evidence of a
+            # good signature, and neither is an unreadable signature file.
+            #
+            # ImportError lands here (the verifier is missing) and so does
+            # UnicodeDecodeError (manifest.sig holds raw bytes rather than
+            # hex). Splitting these into a warn-only arm would rebuild the
+            # exact asymmetry this commit removes: an attacker shipping a
+            # BINARY manifest.sig would skip the check that a hex one fails.
+            logger.warning(
+                "Extension '%s' signature check failed (%s: %s) - %s",
+                entry, type(e).__name__, e,
+                "skipping" if require_signed else "loading anyway (advisory)")
+            if require_signed:
+                try:
+                    os.rename(ext_path, ext_path + '.badsig')
+                except OSError:
+                    pass
