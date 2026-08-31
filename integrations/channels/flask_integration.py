@@ -109,7 +109,21 @@ class FlaskChannelIntegration:
             # fan-out). Gated per-adapter via extra.enable_self_chat_agent.
             if self._self_chat.is_self_message(message):
                 logger.debug("self-chat from %s", message.sender_id)
-                return self._self_chat.handle(message, session)
+                # SelfChatHandler.handle() ALREADY sends its own reply
+                # (see its docstring) and returns that same text for
+                # callers of handle() directly (e.g. its own unit tests).
+                # But THIS caller is registry._route_to_agent, which
+                # unconditionally re-sends whatever non-empty string it
+                # gets back — so returning the text here made every
+                # escalated self-chat turn deliver its reply TWICE
+                # (found live 2026-08-31: two independent send_message
+                # calls, ~1ms apart, one via self_chat's own
+                # _send_reply_in_thread and one via _route_to_agent).
+                # Returning None tells _route_to_agent "already handled,
+                # nothing to send" — the same contract a mention-gated
+                # group message already relies on.
+                self._self_chat.handle(message, session)
+                return None
 
             # ── Resolve user_id ───────────────────────────────────
             # 1. UserChannelBinding (durable DB row written by

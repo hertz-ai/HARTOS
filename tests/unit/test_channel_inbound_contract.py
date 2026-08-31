@@ -120,6 +120,32 @@ def test_chat_contract_reply_reads_either_key():
     assert chat_reply(None, 'fallback') == 'fallback'     # non-dict safe
 
 
+def test_self_chat_reply_not_returned_to_avoid_double_send():
+    """SelfChatHandler.handle() already sends its own reply (private
+    reply-in-thread) AND returns that same text. _handle_message must NOT
+    hand that text back up to registry._route_to_agent, which
+    unconditionally re-sends any non-empty string it receives — found
+    live 2026-08-31: every escalated self-chat turn delivered "Let me
+    check that for you…" TWICE, ~1ms apart, one send from
+    SelfChatHandler._send_reply_in_thread and one from _route_to_agent
+    re-sending _handle_message's return value."""
+    try:
+        fi = _bare_integration()
+    except Exception as e:
+        pytest.skip(f"flask_integration unavailable: {e}")
+
+    fi._self_chat.is_self_message.return_value = True
+    fi._self_chat.handle.return_value = "Let me check that for you…"
+
+    reply = fi._handle_message(_msg())
+
+    fi._self_chat.handle.assert_called_once()
+    assert reply is None, (
+        "a non-None return here gets re-sent verbatim by "
+        "registry._route_to_agent, duplicating self-chat's own send"
+    )
+
+
 def test_self_chat_uses_shared_dual_contract():
     """SelfChatHandler (the 2nd inbound path) must send 'text' too + read
     'text' — it used to be prompt-only/response-only (parallel-path bug)."""
