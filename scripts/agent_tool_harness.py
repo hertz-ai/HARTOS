@@ -90,6 +90,7 @@ def analyze_window(w):
         "calls": 0, "visible": set(), "invisible": set(),
         "emitted": [], "unresolved": 0, "results_ok": 0, "results_err": 0,
         "exec_start": [], "exec_err": [], "log_text": "", "sources": {},
+        "tool_results": [],
     }
     for line in _since(w["jsonl"]).splitlines():
         try:
@@ -110,6 +111,12 @@ def analyze_window(w):
             if msg.get("role") in ("function", "tool"):
                 c = msg.get("content")
                 c = c if isinstance(c, str) else str(c)
+                # #741: response_text truncates BEFORE the tool_calls field,
+                # so emissions undercount; a tool-role result in a SUBSEQUENT
+                # body is the reliable executed-call signal (register_dual
+                # tools also carry no TOOL EXECUTION marker).
+                if msg.get("name"):
+                    res["tool_results"].append(msg["name"])
                 if c.startswith("Error: Function"):
                     res["unresolved"] += 1
                 elif c.startswith("Error") or '"error"' in c[:60]:
@@ -193,13 +200,14 @@ def probe_static(tool, prompt, pid, misses):
     emitted = tool in a["emitted"]
     # framework-injected function-role results in CONCURRENT background
     # traffic land in the same window, so results_ok cannot prove OUR tool
-    # ran - only the TOOL EXECUTION marker with the right name can.
-    executed = tool in a["exec_start"]
+    # ran - only a NAMED signal can: the TOOL EXECUTION marker, or (#741)
+    # a tool-role result carrying our tool's name in a subsequent body.
+    executed = tool in a["exec_start"] or tool in a["tool_results"]
     print(f"  advertised via: {advertised}   emitted: {emitted}   "
           f"executed: {executed}   reply: {reply[:70]!r}")
     print(f"  window: {a['calls']} llm calls by source {a['sources']}, "
           f"emissions={a['emitted']}, exec_start={a['exec_start']}, "
-          f"exec_err={a['exec_err']}")
+          f"tool_results={a['tool_results']}, exec_err={a['exec_err']}")
     if advertised == "functions":
         misses["structural_invisible"].append(tool)
     if not emitted:
