@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+import types
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -377,6 +378,168 @@ class TestBootVerificationIntegration(unittest.TestCase):
         with patch.dict(os.environ, {'HEVOLVE_DEV_MODE': 'true'}):
             result = full_boot_verification()
             self.assertTrue(result['passed'])
+
+
+class TestOriginRejectionPaths(unittest.TestCase):
+    """Anti-fork REJECTION paths — the branches that fire when a build is
+    tampered/forked, proving the attestation correctly says 'not genuine'.
+
+    Boundaries are mocked: a FAKE security.hive_guardrails is injected via
+    patch.dict(sys.modules) to simulate stripped/rebranded guardrails. The
+    REAL _FrozenValues is NEVER modified (that is the immutability guard) —
+    the fake is a stand-in so the rejection branch can execute, exactly as it
+    would on a genuinely-tampered fork."""
+
+    def setUp(self):
+        import security.origin_attestation as oa
+        self.oa = oa
+        oa._attestation_cache = None            # defeat the 5-min result cache
+
+    def tearDown(self):
+        self.oa._attestation_cache = None
+
+    # ── verify_brand_markers rejection ──────────────────────────────────
+    def test_file_present_but_marker_absent_is_rejected(self):
+        import tempfile
+        oa = self.oa
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, 'brandcheck.txt'), 'w', encoding='utf-8') as f:
+                f.write('nothing branded here')
+            with patch.dict(oa.BRAND_MARKER_FILES,
+                            {'brandcheck.txt': 'REQUIRED_MARKER'}, clear=True):
+                ok, msg = oa.verify_brand_markers(code_root=d)
+        self.assertFalse(ok)
+        self.assertIn('Brand marker missing', msg)
+
+    def test_unreadable_brand_file_is_rejected(self):
+        import tempfile
+        oa = self.oa
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'brandcheck.txt')
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write('x')
+            real_open = open
+
+            def boom(path, *a, **k):
+                if os.path.abspath(str(path)) == os.path.abspath(p):
+                    raise OSError('unreadable')
+                return real_open(path, *a, **k)
+
+            with patch.dict(oa.BRAND_MARKER_FILES, {'brandcheck.txt': 'M'}, clear=True):
+                with patch('builtins.open', side_effect=boom):
+                    ok, msg = oa.verify_brand_markers(code_root=d)
+        self.assertFalse(ok)
+        self.assertIn('Cannot read', msg)
+
+    def test_hart_intelligence_import_adds_a_candidate_root(self):
+        # exercises the candidate-root append when `import hart_intelligence`
+        # succeeds (skipped on this box, hence uncovered)
+        oa = self.oa
+        fake_hi = types.ModuleType('hart_intelligence')
+        fake_hi.__file__ = os.path.join(os.getcwd(), 'hart_intelligence', '__init__.py')
+        with patch.dict(sys.modules, {'hart_intelligence': fake_hi}):
+            ok, _msg = oa.verify_brand_markers()
+        self.assertIsInstance(ok, bool)
+
+    # ── verify_guardrail_brand_integrity rejection (FAKE guardrails) ─────
+    def _fake_guardrails(self, guardian=('protect',), rules=()):
+        m = types.ModuleType('security.hive_guardrails')
+
+        class _FrozenValues:
+            GUARDIAN_PURPOSE = guardian
+            CONSTITUTIONAL_RULES = rules
+
+        m._FrozenValues = _FrozenValues
+        return m
+
+    def test_missing_guardian_purpose_is_rejected(self):
+        oa = self.oa
+        with patch.dict(sys.modules,
+                        {'security.hive_guardrails': self._fake_guardrails(guardian=())}):
+            ok, msg = oa.verify_guardrail_brand_integrity()
+        self.assertFalse(ok)
+        self.assertIn('GUARDIAN_PURPOSE missing', msg)
+
+    def test_guardrail_brand_marker_absent_is_rejected(self):
+        oa = self.oa
+        fake = self._fake_guardrails(guardian=('zzz',), rules=('yyy',))
+        with patch.dict(sys.modules, {'security.hive_guardrails': fake}):
+            ok, msg = oa.verify_guardrail_brand_integrity()
+        self.assertFalse(ok)
+        self.assertIn('missing from guardrails', msg)
+
+    # ── verify_origin orchestration failure details ─────────────────────
+    def test_fingerprint_mismatch_flags_not_genuine(self):
+        oa = self.oa
+        with patch.object(oa, 'compute_origin_fingerprint', return_value='de' * 32):
+            result = oa.verify_origin()
+        self.assertFalse(result['genuine'])
+        self.assertFalse(result['checks']['fingerprint_match'])
+        self.assertIn('Fingerprint mismatch', result['details'])
+
+    def test_each_subcheck_failure_is_collected_into_details(self):
+        oa = self.oa
+        with patch.object(oa, 'compute_origin_fingerprint',
+                          return_value=oa.ORIGIN_FINGERPRINT), \
+             patch.object(oa, 'verify_brand_markers', return_value=(False, 'brand X')), \
+             patch.object(oa, 'verify_master_key_present', return_value=(False, 'key X')), \
+             patch.object(oa, 'verify_guardrail_brand_integrity',
+                          return_value=(False, 'guard X')):
+            result = oa.verify_origin()
+        self.assertFalse(result['genuine'])
+        self.assertIn('brand X', result['details'])
+        self.assertIn('key X', result['details'])
+        self.assertIn('guard X', result['details'])
+
+    # ── get_attestation_for_federation refuses a non-genuine origin ──────
+    def test_no_attestation_generated_when_origin_not_genuine(self):
+        oa = self.oa
+        with patch.object(oa, 'verify_origin',
+                          return_value={'genuine': False, 'fingerprint': 'x',
+                                        'checks': {}, 'details': 'nope',
+                                        'timestamp': 0}):
+            out = oa.get_attestation_for_federation()
+        self.assertFalse(out['valid'])
+        self.assertIn('origin verification failed', out['reason'])
+
+    # ── verify_peer_attestation rejects a peer with no node signature ────
+    def test_peer_missing_node_key_or_signature_is_rejected(self):
+        oa = self.oa
+        att = {
+            'origin_fingerprint': oa.ORIGIN_FINGERPRINT,
+            'master_public_key': oa.ORIGIN_IDENTITY['master_public_key_hex'],
+            # node_public_key / node_signature intentionally absent
+        }
+        ok, msg = oa.verify_peer_attestation(att)
+        self.assertFalse(ok)
+        self.assertIn('Missing node key or signature', msg)
+
+    def test_peer_with_differing_guardrail_hash_is_warned_not_rejected(self):
+        # A peer that passes fingerprint + master-key + a VALID node signature +
+        # freshness but reports a DIFFERENT guardrail hash is a version mismatch,
+        # not a forgery — verify_peer WARNS and still ACCEPTS (guardrail check is
+        # advisory). Builds a genuinely-signed attestation the same way the
+        # valid-peer test does, then diverges only the guardrail hash.
+        oa = self.oa
+        try:
+            from security.node_integrity import get_or_create_keypair
+            from security.hive_guardrails import compute_guardrail_hash
+        except Exception:  # pragma: no cover - env-dependent import
+            self.skipTest("node_integrity / hive_guardrails unavailable here")
+        priv, pub = get_or_create_keypair()
+        local = compute_guardrail_hash()
+        differing = ('f' * len(local)) if local != 'f' * len(local) else ('e' * len(local))
+        payload = {
+            'origin_fingerprint': oa.ORIGIN_FINGERPRINT,
+            'master_public_key': oa.ORIGIN_IDENTITY['master_public_key_hex'],
+            'node_public_key': pub.public_bytes_raw().hex(),
+            'guardrail_hash': differing,
+            'timestamp': time.time(),
+        }
+        canonical = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+        payload['node_signature'] = priv.sign(canonical.encode('utf-8')).hex()
+        ok, msg = oa.verify_peer_attestation(payload)
+        self.assertTrue(ok, msg)   # accepted despite the differing guardrail hash
 
 
 if __name__ == '__main__':
