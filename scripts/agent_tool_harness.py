@@ -89,7 +89,7 @@ def analyze_window(w):
     res = {
         "calls": 0, "visible": set(), "invisible": set(),
         "emitted": [], "unresolved": 0, "results_ok": 0, "results_err": 0,
-        "exec_start": [], "exec_err": [], "log_text": "",
+        "exec_start": [], "exec_err": [], "log_text": "", "sources": {},
     }
     for line in _since(w["jsonl"]).splitlines():
         try:
@@ -97,6 +97,8 @@ def analyze_window(w):
         except Exception:
             continue
         res["calls"] += 1
+        src = r.get("source", "?")
+        res["sources"][src] = res["sources"].get(src, 0) + 1
         body = r.get("body") or {}
         res["invisible"] |= {f.get("name") for f in body.get("functions") or []}
         res["visible"] |= {t.get("function", {}).get("name")
@@ -189,11 +191,15 @@ def probe_static(tool, prompt, pid, misses):
     advertised = ("tools" if tool in a["visible"] else
                   "functions" if tool in a["invisible"] else "ABSENT")
     emitted = tool in a["emitted"]
-    executed = tool in a["exec_start"] or a["results_ok"] > 0
+    # framework-injected function-role results in CONCURRENT background
+    # traffic land in the same window, so results_ok cannot prove OUR tool
+    # ran - only the TOOL EXECUTION marker with the right name can.
+    executed = tool in a["exec_start"]
     print(f"  advertised via: {advertised}   emitted: {emitted}   "
           f"executed: {executed}   reply: {reply[:70]!r}")
-    print(f"  window: {a['calls']} llm calls, emissions={a['emitted']}, "
-          f"exec_start={a['exec_start']}, exec_err={a['exec_err']}")
+    print(f"  window: {a['calls']} llm calls by source {a['sources']}, "
+          f"emissions={a['emitted']}, exec_start={a['exec_start']}, "
+          f"exec_err={a['exec_err']}")
     if advertised == "functions":
         misses["structural_invisible"].append(tool)
     if not emitted:
@@ -249,10 +255,19 @@ def probe_dynamic(misses):
         misses["dynamic"] = "reuse timeout"
         return
     reply = str(r.get("text") or "")
-    a = analyze_window(w)
-    engaged = "inside reuse while1" in a["log_text"]
+    # /chat acks fast ('Let me check that for you') while the reuse pipeline
+    # continues ASYNC - baseline showed 1 llm call at HTTP return.  Grace-poll
+    # the same window so the async continuation is judged, not the ack.
+    engaged = False
+    for _ in range(9):
+        a = analyze_window(w)
+        engaged = "inside reuse while1" in a["log_text"]
+        if engaged:
+            break
+        time.sleep(10)
     print(f"  reuse reply: {reply[:70]!r}")
-    print(f"  action loop engaged: {engaged}   window calls: {a['calls']}")
+    print(f"  action loop engaged: {engaged}   window calls: {a['calls']} "
+          f"by source {a['sources']}")
     if base._is_standby(reply) or not engaged:
         misses["dynamic"] = "reuse did not engage the created actions"
     else:
