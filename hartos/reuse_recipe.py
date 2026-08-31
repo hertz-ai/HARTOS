@@ -2494,6 +2494,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
 
     # Service Tools: Register HTTP microservice tools (Crawl4AI, AceStep, etc.)
     # Follows same pattern as MCP block above — register tools, get functions, wire to agents
+    goal_tags = []  # bound before the gated blocks; detected inside the try
     try:
         from integrations.service_tools import (
             service_tool_registry, Crawl4AITool, AceStepTool,
@@ -2507,6 +2508,19 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
 
         svc_tools = service_tool_registry.get_all_tool_functions()
         svc_defs = service_tool_registry.get_tool_definitions()
+
+        # Tier-1 hierarchical gate: ONE detection per constructor, consumed
+        # here and by the Tier-2 family loaders below.  Ungated, all 50
+        # rendered defs cost 5,820 of the 6,144-token slot (2026-08-31).
+        from integrations.agent_engine.marketing_tools import detect_goal_tags
+        from core.agent_tools import filter_service_tools
+        goal_tags = detect_goal_tags(goal or '')
+        _n_all_svc = len(svc_tools)
+        svc_tools = filter_service_tools(goal_tags, svc_tools, svc_defs,
+                                         service_tool_registry)
+        current_app.logger.info(
+            f"Tier-1 tool gate: goal_tags={goal_tags} kept "
+            f"{len(svc_tools)}/{_n_all_svc} service tools")
 
         for tool_name, tool_func in svc_tools.items():
             tool_def = next((d for d in svc_defs if d['name'] == tool_name), None)
@@ -2681,8 +2695,9 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     # in create) would replay in reuse without the outreach + journey tools
     # → tool calls 404 → recipe step fails.
     try:
-        from integrations.agent_engine.marketing_tools import detect_goal_tags, register_marketing_tools
-        goal_tags = detect_goal_tags(goal or '')
+        # goal_tags comes from the single Tier-1 detection above — the
+        # second detect_goal_tags call this block used to make is gone.
+        from integrations.agent_engine.marketing_tools import register_marketing_tools
         if 'marketing' in goal_tags:
             register_marketing_tools(helper, assistant, user_id)
             current_app.logger.info("Marketing tools loaded (Tier 2) for reuse agent")

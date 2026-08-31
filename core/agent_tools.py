@@ -62,6 +62,44 @@ def register_core_tools(tools, helper, executor):
         register_dual(helper, executor, func, name, desc)
 
 
+def filter_service_tools(goal_tags, svc_tools, svc_defs, registry):
+    """Tier-1 hierarchical gate: keep only registry tools the goal unlocks.
+
+    Completes the 'progressive/hierarchical tool injection' design that
+    Tier 2 (goal-gated family loaders in create/reuse_recipe) already
+    follows: goal_manager.register_goal_type rows map goal tags to
+    ServiceToolRegistry capability tags, get_tool_tags reads them, and
+    this filter applies the intersection at the attach site.  Until now
+    the service loop registered EVERY tool unconditionally — measured
+    2026-08-31: 50 rendered defs cost 5,820 of the 6,144-token slot,
+    so a one-message conversation overflowed (12 'Context size has been
+    exceeded' rejections in one boot).
+
+    A goal with no unlocked tags gets NO service tools (need-to-know);
+    the always-on core closures and Tier-2 families are unaffected.
+
+    Args:
+        goal_tags: tags from marketing_tools.detect_goal_tags(goal)
+        svc_tools: {func_name: callable} from get_all_tool_functions()
+        svc_defs:  defs from get_tool_definitions() — each carries
+                   'name' (func name) and 'service_tool' (parent tool)
+        registry:  the ServiceToolRegistry (parent tools carry .tags)
+    """
+    from integrations.agent_engine.goal_manager import get_tool_tags
+    unlocked = set()
+    for t in goal_tags or []:
+        unlocked.update(get_tool_tags(t))
+    if not unlocked:
+        return {}
+    parent_of = {d.get('name'): d.get('service_tool') for d in svc_defs}
+    kept = {}
+    for func_name, func in svc_tools.items():
+        parent = registry._tools.get(parent_of.get(func_name))
+        if parent is not None and set(parent.tags or []) & unlocked:
+            kept[func_name] = func
+    return kept
+
+
 # ---------------------------------------------------------------------------
 # Core tool closure factory
 # ---------------------------------------------------------------------------

@@ -1,0 +1,95 @@
+"""Tier-1 hierarchical tool gate: need-to-know service-tool loading.
+
+Owner decision 2026-08-31: option 1, hierarchically selected.  The design
+already existed half-wired — detect_goal_tags ("category-based tool
+loading"), register_goal_type(tool_tags=[ServiceToolRegistry tags]) and
+get_tool_tags (tested-but-dead, #666) — while the attach loops in
+create/reuse_recipe registered EVERY registry tool unconditionally.
+Measured cost of the ungated loop: 50 rendered defs = 5,820 of the
+6,144-token slot, so a one-message conversation overflowed (12 context-
+exceeded rejections in one boot).
+
+    python -m pytest tests/unit/test_hierarchical_tool_gate.py --noconftest -q
+"""
+from pathlib import Path
+from types import SimpleNamespace
+import unittest
+
+from core.agent_tools import filter_service_tools
+from integrations.agent_engine.goal_manager import get_tool_tags
+from integrations.agent_engine.marketing_tools import detect_goal_tags
+
+_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _fake_registry():
+    tools = {
+        'crawl4ai': SimpleNamespace(tags=['web', 'scraping']),
+        'pocket_tts': SimpleNamespace(tags=['tts', 'speech']),
+    }
+    return SimpleNamespace(_tools=tools)
+
+
+_SVC_TOOLS = {'crawl4ai_crawl': lambda: None, 'pocket_tts_synthesize': lambda: None}
+_SVC_DEFS = [
+    {'name': 'crawl4ai_crawl', 'service_tool': 'crawl4ai'},
+    {'name': 'pocket_tts_synthesize', 'service_tool': 'pocket_tts'},
+]
+
+
+class HierarchicalToolGate(unittest.TestCase):
+
+    def test_goal_unlocks_only_matching_capability_tags(self):
+        kept = filter_service_tools(['marketing'], _SVC_TOOLS, _SVC_DEFS,
+                                    _fake_registry())
+        self.assertIn('crawl4ai_crawl', kept, "'marketing' unlocks web/scraping")
+        self.assertNotIn('pocket_tts_synthesize', kept,
+                         "'marketing' must not drag TTS defs into the prompt")
+
+    def test_no_goal_tags_means_no_service_tools(self):
+        """Need-to-know default: a general conversation carries only the
+        always-on core closures, zero registry defs."""
+        self.assertEqual(filter_service_tools([], _SVC_TOOLS, _SVC_DEFS,
+                                              _fake_registry()), {})
+        self.assertEqual(filter_service_tools(['no_such_tag'], _SVC_TOOLS,
+                                              _SVC_DEFS, _fake_registry()), {})
+
+    def test_media_goal_unlocks_tts(self):
+        kept = filter_service_tools(['media'], _SVC_TOOLS, _SVC_DEFS,
+                                    _fake_registry())
+        self.assertIn('pocket_tts_synthesize', kept)
+
+    def test_capability_rows_seeded(self):
+        """get_tool_tags is no longer dead — the detectable vocabulary maps
+        to registry capability tags (goal_manager._CAPABILITY_TAGS)."""
+        self.assertIn('web', get_tool_tags('marketing'))
+        self.assertIn('tts', get_tool_tags('media'))
+        self.assertEqual(get_tool_tags('never_registered'), [])
+
+    def test_detect_media_vocabulary(self):
+        self.assertIn('media', detect_goal_tags('compose a song about rain'))
+        self.assertNotIn('media', detect_goal_tags('summarize this text file'))
+
+    def test_single_detection_and_gate_in_both_constructors(self):
+        """Parity + no-parallel-path: each constructor detects ONCE and
+        filters ONCE.  A second detect_goal_tags call means the Tier-2
+        block regrew its own detection (the pre-fix shape)."""
+        for fname in ('create_recipe.py', 'reuse_recipe.py'):
+            src = (_ROOT / 'hartos' / fname).read_text(encoding='utf-8',
+                                                       errors='replace')
+            # count CODE lines only — reuse_recipe:2691 names the function
+            # inside a #510 history comment
+            code = [ln for ln in src.splitlines()
+                    if not ln.lstrip().startswith('#')]
+            n_detect = sum('detect_goal_tags(' in ln for ln in code)
+            n_filter = sum('filter_service_tools(' in ln for ln in code)
+            self.assertEqual(
+                n_detect, 1,
+                f'{fname}: expected exactly one detect_goal_tags call')
+            self.assertEqual(
+                n_filter, 1,
+                f'{fname}: expected exactly one Tier-1 gate call')
+
+
+if __name__ == '__main__':
+    unittest.main()
