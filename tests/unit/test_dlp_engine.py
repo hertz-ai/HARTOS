@@ -60,6 +60,23 @@ class TestDLPScan(unittest.TestCase):
         self.assertIn('ssn', types)
         self.assertIn('phone', types)
 
+    def test_unknown_scan_type_degrades_gracefully(self):
+        """A misconfigured scan_types (unknown/typo'd type with no registered
+        pattern) must NOT crash the engine and must NOT stop the VALID types in
+        the same list from being scanned — the DLP gate fails safe by still
+        catching every type it CAN, rather than aborting the whole scan."""
+        dlp = DLPEngine(scan_types=['email', 'not_a_real_pii_type'])
+        findings = dlp.scan("reach me at john@example.com")
+        types = [f[0] for f in findings]
+        self.assertIn('email', types)                    # valid type still scanned
+        self.assertNotIn('not_a_real_pii_type', types)   # unknown type skipped
+
+    def test_only_unknown_scan_type_yields_no_findings_no_crash(self):
+        """If EVERY requested scan type is unknown, scan returns [] cleanly
+        rather than raising — a bad config degrades to a no-op, never a fault."""
+        dlp = DLPEngine(scan_types=['bogus'])
+        self.assertEqual(dlp.scan("john@example.com and 123-45-6789"), [])
+
 
 class TestDLPRedact(unittest.TestCase):
     """PII redaction tests."""
