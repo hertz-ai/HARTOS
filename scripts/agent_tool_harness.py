@@ -223,7 +223,11 @@ def probe_dynamic(misses):
             print("  FAIL: no prompt_id from create")
             misses["dynamic"] = "no prompt_id"
             return
-        for msg in ("Role: File Summarizer. Actions: 1) read the file, "
+        # the create gate asks for the agent's NAME first (#690 HITL flow) -
+        # rounds 2-3 stalled at that question because the script never
+        # answered it, so creation registered 0 actions
+        for msg in ("Name it FileSummarizerHT.",
+                    "Role: File Summarizer. Actions: 1) read the file, "
                     "2) write a one-line summary, 3) save it.",
                     "Yes, that is correct, proceed."):
             r = _chat(msg, pid, rid, create=True)
