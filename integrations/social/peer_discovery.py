@@ -1368,6 +1368,63 @@ class GossipProtocol:
         host = f'[{ip}]' if ':' in ip else ip
         return f'http://{host}:{port}'
 
+    @staticmethod
+    def _capacity_from_announce(peer_data):
+        """Map a signed announce's ``hardware_summary`` onto PeerNode.compute_*.
+
+        WHY THIS EXISTS: ``_self_info`` has always shipped ``hardware_summary``
+        (cpu_cores / ram_gb / gpu_vram_gb / disk_free_gb) inside the SIGNED
+        payload, and its siblings from the same block — ``capability_tier`` and
+        ``enabled_features`` — were persisted. The hardware sub-dict alone was
+        never mapped, so ``PeerNode.compute_*`` stayed NULL fleet-wide (0 of 107
+        active peers reporting, measured 2026-08-22).
+
+        The consequence is not "no data", it is WRONG data:
+        ``ComputeDemocracy.compute_effective_weight`` defaults a missing value to
+        1 GPU / 8 GB, so ``raw = 1 * (8/8) = 1`` and EVERY node scores exactly
+        1.0. Compute democracy has been a uniform no-op, and ``adjusted_reward``
+        scales every payout identically — the 90/9/1 split cannot discriminate
+        between a contributor and a freeloader.
+
+        SELF-REPORTED IS ACCEPTABLE HERE, and that is a decision this function
+        inherits rather than invents. The code-hash gate three screens up records
+        exactly the same reasoning: an unrecognised hash is "recorded, not fatal"
+        because rejecting "partitioned the entire network: 69 registered nodes,
+        none federating", and because "code_hash is self-reported — the signature
+        authenticates that the sender's key asserted the value, not that it
+        matches the code actually running". Capacity is the same shape of claim,
+        so it gets the same treatment: record it, let provenance carry the doubt.
+
+        The lie is bounded BY DESIGN. ``compute_effective_weight`` is
+        ``log2(gpus * ram/8) + 1`` clamped to ``MAX_INFLUENCE_WEIGHT``: a node
+        claiming 100x hardware earns ~3x, then hits the cap. And the standing
+        rule is that a gate may refuse on evidence of badness, never on absence
+        of evidence — refusing every claim because none can be proven is the
+        partition failure, not the safe default. Delivered work
+        (``gpu_hours_served``, ``total_inferences``) accrues separately and is
+        the ground truth that outlives any claim.
+
+        Returns ``{}`` when the announce carries no hardware block, so callers
+        can apply it unconditionally without clobbering a known value with None.
+        """
+        hw = (peer_data or {}).get('hardware_summary') or {}
+        if not isinstance(hw, dict) or not hw:
+            return {}
+        out = {}
+        if hw.get('cpu_cores') is not None:
+            out['compute_cpu_cores'] = hw['cpu_cores']
+        if hw.get('ram_gb') is not None:
+            out['compute_ram_gb'] = hw['ram_gb']
+        # gpu_vram_gb is VRAM, NOT a device count, and PeerNode has no VRAM
+        # column. Mapping one onto the other would be the '#91 wrong-keys' error
+        # this codebase already memorialises, so derive PRESENCE only: >0 VRAM
+        # means at least one usable GPU. Under-reporting a multi-GPU node is
+        # honest; inventing a count from a capacity number is not.
+        vram = hw.get('gpu_vram_gb')
+        if vram is not None:
+            out['compute_gpu_count'] = 1 if (vram or 0) > 0 else 0
+        return out
+
     def _merge_peer(self, db, peer_data, reasons=None, relayed=False,
                     observed_ip=''):
         """Upsert a single peer into PeerNode table. Returns True if new.
@@ -1683,6 +1740,13 @@ class GossipProtocol:
                 if certificate:
                     existing.certificate_json = certificate
                     existing.certificate_verified = certificate_verified
+                # Capacity, from the node speaking for ITSELF only. Same gate as
+                # the fields above and for the same reason: a relayed hint is a
+                # third party republishing a row, so letting it set compute_*
+                # would let any node inflate (or zero out) a peer's standing in
+                # ComputeDemocracy just by gossiping about it.
+                for _k, _v in self._capacity_from_announce(peer_data).items():
+                    setattr(existing, _k, _v)
             if peer_data.get('release_version'):
                 existing.release_version = peer_data['release_version']
             # Update capability tier from HART OS equilibrium
@@ -1732,6 +1796,11 @@ class GossipProtocol:
             capability_tier=peer_data.get('capability_tier'),
             enabled_features_json=peer_data.get('enabled_features'),
             x25519_public=peer_data.get('x25519_public', ''),
+            # Capacity only from a DIRECT announce — see _capacity_from_announce
+            # and the `if not relayed` gate in the update branch above. A first
+            # sighting via someone else's peer list is an address hint; it must
+            # not seed ComputeDemocracy weighting with hearsay.
+            **({} if relayed else self._capacity_from_announce(peer_data)),
         )
         db.add(new_peer)
 
