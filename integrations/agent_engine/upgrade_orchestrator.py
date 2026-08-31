@@ -446,8 +446,34 @@ class UpgradeOrchestrator:
                            'advancing', details)
             return True, 'no release manifest - signature NOT verified'
 
-        # bad_signature / code_mismatch / origin_failed: real tampering
-        # evidence. This is the gate doing its job.
+        if reason == 'code_mismatch':
+            # WARN, DO NOT BLOCK. A mismatch here is not tamper evidence today,
+            # it is the expected result of comparing two different things: CI
+            # computes the manifest's code_hash over a REPO CHECKOUT, while a
+            # node computes it over a nix store path with a different file set.
+            # They cannot match. Blocking would stop OTA fleet-wide the moment a
+            # release manifest is first shipped, on a signal that is wrong by
+            # construction -- friction in the name of security, protecting
+            # nothing, and the failure would look like a security incident.
+            #
+            # The real fix is HEVOLVE_CODE_HASH_PRECOMPUTED (see
+            # security/node_integrity.py:277 tier 1 -- "set at build time from a
+            # known-good hash", exactly the read-only-image case). Once the build
+            # bakes the hash the manifest was signed against, this comparison
+            # becomes meaningful and can be promoted to a block.
+            #
+            # The CRYPTOGRAPHIC check is untouched: a manifest that does not
+            # verify against the master public key still fails below. That is the
+            # signal that actually means tampering, and it costs nobody anything
+            # when it passes.
+            logger.warning('[OTA] signing gate: %s - advancing (the local/CI '
+                           'code-hash comparison is not yet meaningful on a '
+                           'read-only image; master signature DID verify)',
+                           details)
+            return True, f'code hash not comparable, signature OK: {details}'
+
+        # bad_signature / origin_failed: the manifest does not verify against the
+        # master public key, or this is not genuine HART OS. Block.
         return False, f'release signature verification FAILED: {details}'
 
     def _stage_canary(self) -> tuple:

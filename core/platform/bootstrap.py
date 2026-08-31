@@ -531,6 +531,26 @@ def _verify_extension_signatures(extensions_dir: str) -> None:
     Does NOT block loading — verification is advisory for now.
     Production environments should set HART_REQUIRE_SIGNED_EXTENSIONS=1
     to enforce signatures.
+
+    READ THIS BEFORE HARDENING ANYTHING HERE. This gate cannot currently stop
+    any code from running, and tightening it does not change that:
+
+      * It iterates DIRECTORIES and quarantines by renaming `<dir>` to
+        `<dir>.badsig`. ExtensionRegistry.load_from_directory
+        (core/platform/extensions.py:239) loads top-level `.py` FILES and skips
+        anything that is not one. It never looks at directories, so a renamed
+        directory was never going to be loaded either way. The quarantine is
+        inert by construction.
+      * NOTHING in this repo writes a `manifest.sig`. There is no extension
+        signing pipeline, so in practice every extension takes the unsigned
+        branch above.
+
+    So the useful work here is honest REPORTING, not enforcement: say clearly
+    what was and was not verified. Making it fail closed adds real friction --
+    a rename is sticky and needs a human to undo -- in exchange for protection
+    that does not exist. If extension signing is ever wanted for real, wire the
+    verdict into load_from_directory and add a signer; until then, do not
+    mistake this for a control.
     """
     require_signed = os.environ.get('HART_REQUIRE_SIGNED_EXTENSIONS', '') == '1'
 
@@ -591,21 +611,20 @@ def _verify_extension_signatures(extensions_dir: str) -> None:
                     except OSError:
                         pass
         except Exception as e:
-            # EVERY failure to verify is fail-closed under require_signed, not
-            # just a False verdict. Absence of a verifier is not evidence of a
-            # good signature, and neither is an unreadable signature file.
+            # CANNOT-VERIFY IS NOT A GUILTY VERDICT, and it must not be punished
+            # like one. A missing verifier, an unreadable manifest.sig, a
+            # transient OSError -- none of these are evidence that an extension
+            # was tampered with, and the quarantine here is a RENAME: a sticky
+            # change to the user's install that survives reboots and needs a
+            # human to undo. Renaming on a transient read error would disable a
+            # legitimate extension permanently.
             #
-            # ImportError lands here (the verifier is missing) and so does
-            # UnicodeDecodeError (manifest.sig holds raw bytes rather than
-            # hex). Splitting these into a warn-only arm would rebuild the
-            # exact asymmetry this commit removes: an attacker shipping a
-            # BINARY manifest.sig would skip the check that a hex one fails.
+            # I briefly made this arm fail closed (rename on any exception).
+            # That was wrong twice over: it contradicts this function's own
+            # contract ("Does NOT block loading -- verification is advisory for
+            # now"), and it bought nothing, for the reason in the note above
+            # _verify_extension_signatures. Reverted to log-and-continue.
             logger.warning(
-                "Extension '%s' signature check failed (%s: %s) - %s",
-                entry, type(e).__name__, e,
-                "skipping" if require_signed else "loading anyway (advisory)")
-            if require_signed:
-                try:
-                    os.rename(ext_path, ext_path + '.badsig')
-                except OSError:
-                    pass
+                "Extension '%s' signature could not be verified (%s: %s) - "
+                "loading anyway; this gate is advisory",
+                entry, type(e).__name__, e)

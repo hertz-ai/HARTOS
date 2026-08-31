@@ -169,10 +169,18 @@ def test_a_forged_signature_is_no_safer_than_no_signature(tmp_path, test_key,
         'carrying a forged signature must not be safer than carrying none')
 
 
-def test_a_missing_verifier_fails_closed_when_signatures_are_required(
-        tmp_path, monkeypatch):
-    """Absence of a verifier is not evidence of a good signature. This is the
-    precise handler that swallowed the bug for its whole life."""
+def test_a_missing_verifier_does_not_quarantine(tmp_path, monkeypatch):
+    """CANNOT-VERIFY IS NOT A GUILTY VERDICT.
+
+    I briefly made this arm fail closed. That was wrong: quarantine here is a
+    RENAME, a sticky change to the user's install that a human must undo, and
+    a missing verifier is not evidence anyone tampered with anything. It also
+    bought nothing -- see the note in _verify_extension_signatures: the rename
+    cannot stop a load, because the loader reads top-level .py FILES and never
+    looks at these directories.
+
+    Security that disables working software on an inconclusive result is
+    friction, not protection."""
     monkeypatch.setenv('HART_REQUIRE_SIGNED_EXTENSIONS', '1')
     make_ext(tmp_path, 'unverifiable', sig_hex='ab' * 64)
 
@@ -187,15 +195,18 @@ def test_a_missing_verifier_fails_closed_when_signatures_are_required(
     monkeypatch.setattr(builtins, '__import__', blocked)
     _verify_extension_signatures(str(tmp_path))
 
-    assert names(tmp_path) == ['unverifiable.badsig']
+    assert names(tmp_path) == ['unverifiable'], (
+        'an extension was disabled because the gate could not reach a verdict')
 
 
-def test_a_binary_signature_file_fails_closed(tmp_path, test_key, monkeypatch):
-    """The hole I nearly shipped in the FIX. manifest.sig is read as UTF-8
-    text (hex). Raw bytes raise UnicodeDecodeError, which is not a False
-    verdict -- it is a failure to verify. If that landed in a warn-only arm,
-    an attacker shipping a BINARY signature would skip the check that a hex
-    one fails, rebuilding the exact asymmetry this gate exists to remove."""
+def test_an_unreadable_signature_file_does_not_quarantine(tmp_path, test_key,
+                                                          monkeypatch):
+    """manifest.sig is read as UTF-8 hex, so raw bytes raise UnicodeDecodeError.
+
+    That is a failure to verify, not a failed verification, and it is treated
+    the same as any other inconclusive result: log it, load anyway. Quarantining
+    on an unreadable file would let one corrupt byte permanently disable an
+    extension while protecting nothing (the rename cannot stop a load)."""
     monkeypatch.setenv('HART_REQUIRE_SIGNED_EXTENSIONS', '1')
     d = make_ext(tmp_path, 'binarysig')
     with open(os.path.join(d, 'manifest.sig'), 'wb') as f:
@@ -203,7 +214,8 @@ def test_a_binary_signature_file_fails_closed(tmp_path, test_key, monkeypatch):
 
     _verify_extension_signatures(str(tmp_path))
 
-    assert names(tmp_path) == ['binarysig.badsig']
+    assert names(tmp_path) == ['binarysig'], (
+        'an unreadable signature file permanently disabled an extension')
 
 
 def test_an_empty_signature_file_fails_closed(tmp_path, test_key, monkeypatch):
