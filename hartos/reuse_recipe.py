@@ -731,7 +731,7 @@ def create_agents_for_role(user_id: str, prompt_id):
         )
 
         @helper.register_for_execution()
-        @assistant.register_for_llm(api_style="function", description="update the role/persona in db")
+        @assistant.register_for_llm(api_style="tool", description="update the role/persona in db")
         @log_tool_execution
         def update_persona(name: Annotated[str, "The persona name user selected"],
                            description: Annotated[str, "The persona description user selected"],
@@ -1319,7 +1319,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     # flows.  Uses the canonical publish_async from this module.
     @assistant.register_for_execution()
     @helper.register_for_llm(
-        api_style="function",
+        api_style="tool",
         description="Send a message to a specific persona/role within this multi-persona agent (e.g. student/parent/teacher).")
     @log_tool_execution
     def send_message_to_roles(
@@ -1333,7 +1333,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     # sovereignty-violating + parallel-path with core_AT.  helper_fun
     # routes local-first.
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function", description="Text to image Creator")
+    @helper.register_for_llm(api_style="tool", description="Text to image Creator")
     @log_tool_execution
     def txt2img(text: Annotated[str, "Text to create image"]) -> str:
         return helper_fun.txt2img(text)
@@ -1344,7 +1344,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     # The canonical closure is built later in this function (register_core_tools
     # at L2262); we reach into core_tools at call time to dispatch.
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function", description="Image to Text/Question Answering from image")
+    @helper.register_for_llm(api_style="tool", description="Image to Text/Question Answering from image")
     @log_tool_execution
     def img2txt(
         image_url: Annotated[str, "image url of which you want text"],
@@ -1379,7 +1379,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         return response.text if response.status_code == 200 else 'Not able to get this page details try later'
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",
+    @helper.register_for_llm(api_style="tool",
                              description="Use this to Store and retrieve data using key-value storage system")
     @log_tool_execution
     def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
@@ -1455,7 +1455,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             return f"Error: {error_msg} - Data not saved"
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",
+    @helper.register_for_llm(api_style="tool",
                              description="Returns the schema of the json from internal memory with all keys but without actual values.")
     @log_tool_execution
     def get_saved_metadata() -> str:
@@ -1463,7 +1463,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         return f'{stripped_json}'
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function", description="Returns all data from the internal Memory using key")
+    @helper.register_for_llm(api_style="tool", description="Returns all data from the internal Memory using key")
     @log_tool_execution
     def get_data_by_key(key: Annotated[
         str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."]) -> str:
@@ -1486,7 +1486,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             return "Key not found in stored data."
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",
+    @helper.register_for_llm(api_style="tool",
                              description="Returns the unique identifier (user_id) of the current user.")
     @log_tool_execution
     def get_user_id() -> str:
@@ -1494,7 +1494,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         return f'{user_id}'
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",
+    @helper.register_for_llm(api_style="tool",
                              description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")
     @log_tool_execution
     def get_prompt_id() -> str:
@@ -1504,7 +1504,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     database_url = get_db_url() or 'https://mailer.hertzai.com'
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function", description="Generate video with text and save it in database")
+    @helper.register_for_llm(api_style="tool", description="Generate video with text and save it in database")
     @log_tool_execution
     def Generate_video(text: Annotated[str, "Text to be used for video generation"],
                        avatar_id: Annotated[str, "Unique identifier for the avatar"],
@@ -1584,7 +1584,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             return f"Video Generation completed with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function", description="get user's recent uploaded files")
+    @helper.register_for_llm(api_style="tool", description="get user's recent uploaded files")
     @log_tool_execution
     def get_user_uploaded_file() -> str:
         current_app.logger.info('INSIDE get_user_uploaded_file')
@@ -1594,7 +1594,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         return 'No file uploaded from user'
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function", description="Get user's visual information to process somethings")
+    @helper.register_for_llm(api_style="tool", description="Get user's visual information to process somethings")
     @log_tool_execution
     def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual context"]) -> str:
         request_id = 'Autogent_1234'
@@ -1630,7 +1630,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                 return 'failed to get visual context ask user to check if the camera is turned on'
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function", description="Get Chat history based on text & start & end date")
+    @helper.register_for_llm(api_style="tool", description="Get Chat history based on text & start & end date")
     @log_tool_execution
     def get_chat_history(text: Annotated[str, "Text related to which you want history"],
                          start: Annotated[str, "start date in format %Y-%m-%dT%H:%M:%S.%fZ"],
@@ -1639,7 +1639,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         return get_time_based_history(text, f'user_{user_id}', start, end)
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function", description="Search past camera and screen descriptions by keyword and time range. Use for visual history queries.")
+    @helper.register_for_llm(api_style="tool", description="Search past camera and screen descriptions by keyword and time range. Use for visual history queries.")
     @log_tool_execution
     def search_visual_history(
         query: Annotated[str, "What to search for in visual/screen descriptions"],
@@ -1655,7 +1655,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     # --- Visual/audio trigger watcher (continuous monitoring) ---
     @assistant.register_for_execution()
     @helper.register_for_llm(
-        api_style="function",
+        api_style="tool",
         description=(
             "Register a visual or audio trigger: continuously watch what the user is "
             "doing via camera or listen to what they say, and perform an action when a "
@@ -1676,7 +1676,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     # --- SimpleMem long-term memory tools ---
     if simplemem_store is not None:
         @assistant.register_for_execution()
-        @helper.register_for_llm(api_style="function",
+        @helper.register_for_llm(api_style="tool",
                                  description="Search long-term memory for past conversations, facts, and context using natural language query. More powerful than get_chat_history for finding relevant information.")
         @log_tool_execution
         def search_long_term_memory(
@@ -1694,7 +1694,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                 return "Memory search unavailable."
 
         @assistant.register_for_execution()
-        @helper.register_for_llm(api_style="function",
+        @helper.register_for_llm(api_style="tool",
                                  description="Save important facts or information to long-term memory for future retrieval across sessions.")
         @log_tool_execution
         def save_to_long_term_memory(
@@ -1734,7 +1734,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             current_app.logger.warning(f"MemoryGraph tools registration failed: {e}")
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",
+    @helper.register_for_llm(api_style="tool",
                              description="Creates time-based jobs using APScheduler to schedule jobs")
     @log_tool_execution
     def create_scheduled_jobs(cron_expression: Annotated[
@@ -1756,7 +1756,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             return f"Error creating scheduled job: {str(e)}"
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",
+    @helper.register_for_llm(api_style="tool",
                              description="Sends a message/information to user. You can use this if you want to ask a question")
     @log_tool_execution
     def send_message_to_user(text: Annotated[str, "Text to send to the user"],
@@ -1790,7 +1790,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
 
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",
+    @helper.register_for_llm(api_style="tool",
                              description="Sends a presynthesized message/video/dialogue to user using conv_id from memory.")
     @log_tool_execution
     def send_presynthesized_video_to_user(
@@ -1800,7 +1800,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         return 'Message sent successfully to user'
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",
+    @helper.register_for_llm(api_style="tool",
                              description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")
     @log_tool_execution
     def send_message_in_seconds(text: Annotated[str, "text to send to user"],
@@ -1815,7 +1815,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
 
     # Expert agent consultation tool — domain-specific guidance on demand
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",
+    @helper.register_for_llm(api_style="tool",
                              description="Consult a specialized domain expert for the current task")
     @log_tool_execution
     def consult_expert(task_description: Annotated[str, "Describe what expertise you need"]) -> str:
@@ -1833,7 +1833,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             return f"Expert consultation unavailable: {str(e)}"
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",
+    @helper.register_for_llm(api_style="tool",
                              description="Retrieve the user's visual camera input from the past specified minutes.")
     @log_tool_execution
     def get_user_camera_inp_by_mins(minutes: Annotated[
@@ -1847,7 +1847,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         return visual_context
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",
+    @helper.register_for_llm(api_style="tool",
                              description="Processes user-defined commands on a personal Windows or Android system.")
     @log_tool_execution
     async def execute_windows_or_android_command(
@@ -2190,14 +2190,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
 
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function", description="Get google search response")
+    @helper.register_for_llm(api_style="tool", description="Get google search response")
     @log_tool_execution
     def google_search(text: Annotated[str, "Text which you want to search"]) -> str:
         current_app.logger.info('INSIDE google search')
         return helper_fun.top5_results(text)
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",
+    @helper.register_for_llm(api_style="tool",
                              description="Signal that the user's request requires creating a new specialized AI agent. "
                                          "Use this when the user asks to create, build, set up, or deploy a new agent, "
                                          "or when the current agent's capabilities are insufficient for the task. "
