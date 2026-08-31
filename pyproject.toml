@@ -233,7 +233,12 @@ py-modules = [
 # `agent-ledger>=1.2.0` to [project.dependencies] above instead.
 [tool.setuptools.packages.find]
 where = [".", "agent-ledger-opensource"]
-include = ["core*", "hartos", "desktop", "integrations*", "security*", "hart_sdk*", "agent_ledger*"]
+# NOTE desktop/ is deliberately NOT shipped: Nunba owns the top-level
+# `desktop` package (14 app modules). HARTOS's desktop/ is a 2-file
+# standalone fallback; shipping it shadows Nunba's package in the frozen
+# app (12 ModuleNotFoundError, build 2026-08-31). In the co-located app
+# `import desktop.ai_key_vault` resolves Nunba's copy at runtime.
+include = ["core*", "hartos", "integrations*", "security*", "hart_sdk*", "agent_ledger*"]
 exclude = ["venv*", "tests*", "docs*", "examples*"]
 
 [tool.setuptools.package-dir]

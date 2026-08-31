@@ -124,7 +124,7 @@ class PolymarketAdapter:
             # _client is already configured for this session
             return ''
         try:
-            from desktop.ai_key_vault import AIKeyVault
+            from hartos.ai_key_vault import AIKeyVault
             vault = AIKeyVault.get_instance()
             key = vault.get_tool_key('POLYMARKET_PRIVATE_KEY')
         except Exception as e:

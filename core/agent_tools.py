@@ -1115,7 +1115,7 @@ def build_core_tool_closures(ctx):
 
             # Check vault
             try:
-                from desktop.ai_key_vault import AIKeyVault
+                from hartos.ai_key_vault import AIKeyVault
                 vault = AIKeyVault.get_instance()
                 val = vault.get_tool_key(key_name) if resource_type != 'channel_secret' else vault.get_channel_secret(req.get('channel_type', ''), key_name)
                 if val:
@@ -1126,7 +1126,7 @@ def build_core_tool_closures(ctx):
 
             # Track as pending and request from user
             try:
-                from desktop.ai_key_vault import AIKeyVault
+                from hartos.ai_key_vault import AIKeyVault
                 AIKeyVault.get_instance().add_pending_request(
                     key_name=key_name, resource_type=resource_type,
                     channel_type=req.get('channel_type', ''),

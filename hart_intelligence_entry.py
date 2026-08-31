@@ -1467,7 +1467,7 @@ except Exception as e:
 
 # ── Credential Vault API — frontend submits missing credentials ──────
 try:
-    from desktop.ai_key_vault import AIKeyVault as _VaultCls, is_local_request
+    from hartos.ai_key_vault import AIKeyVault as _VaultCls, is_local_request
 
     @app.route('/api/credentials/submit', methods=['POST'])
     @_json_endpoint
@@ -4439,7 +4439,7 @@ def _handle_request_resource(input_text: str) -> str:
         return f"Resource '{key_name}' is already configured and available."
 
     try:
-        from desktop.ai_key_vault import AIKeyVault
+        from hartos.ai_key_vault import AIKeyVault
         vault = AIKeyVault.get_instance()
         if resource_type == 'channel_secret':
             val = vault.get_channel_secret(
@@ -4456,7 +4456,7 @@ def _handle_request_resource(input_text: str) -> str:
     # The backend will detect __SECRET_REQUEST__ and inject it into the response
     # Track as pending so /api/credentials/pending can list it
     try:
-        from desktop.ai_key_vault import AIKeyVault
+        from hartos.ai_key_vault import AIKeyVault
         AIKeyVault.get_instance().add_pending_request(
             key_name=key_name,
             resource_type=resource_type,

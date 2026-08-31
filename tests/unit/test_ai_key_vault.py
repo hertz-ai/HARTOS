@@ -1,5 +1,5 @@
 """
-Tests for desktop.ai_key_vault.AIKeyVault.
+Tests for hartos.ai_key_vault.AIKeyVault.
 
 Verifies singleton, channel key resolution, delegation to SecretsManager,
 credential storage, env preloading, pending request tracking, and endpoints.
@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from desktop.ai_key_vault import AIKeyVault, get_ai_key_vault, is_local_request
+from hartos.ai_key_vault import AIKeyVault, get_ai_key_vault, is_local_request
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -26,7 +26,7 @@ from desktop.ai_key_vault import AIKeyVault, get_ai_key_vault, is_local_request
 def reset_singleton():
     """Reset vault singleton before/after each test."""
     AIKeyVault.reset()
-    import desktop.ai_key_vault as mod
+    import hartos.ai_key_vault as mod
     mod._instance = None
     yield
     AIKeyVault.reset()
@@ -40,7 +40,7 @@ def mock_sm():
     sm.get_secret.return_value = ''
     sm._cache = {}
 
-    with patch('desktop.ai_key_vault.AIKeyVault._secrets_manager',
+    with patch('hartos.ai_key_vault.AIKeyVault._secrets_manager',
                return_value=sm):
         yield sm
 

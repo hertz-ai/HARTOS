@@ -110,7 +110,7 @@ def test_get_balance_raises_without_key():
     fake_ai_key_vault.get_instance.return_value = fake_vault
 
     with patch.dict('sys.modules',
-                    {'desktop.ai_key_vault': MagicMock(
+                    {'hartos.ai_key_vault': MagicMock(
                         AIKeyVault=fake_ai_key_vault)}):
         with pytest.raises(PolymarketKeyMissingError,
                            match='POLYMARKET_PRIVATE_KEY'):
@@ -129,7 +129,7 @@ def test_place_order_raises_without_key():
     fake_ai_key_vault.get_instance.return_value = fake_vault
 
     with patch.dict('sys.modules',
-                    {'desktop.ai_key_vault': MagicMock(
+                    {'hartos.ai_key_vault': MagicMock(
                         AIKeyVault=fake_ai_key_vault)}):
         with pytest.raises(PolymarketKeyMissingError):
             adapter.place_order(
@@ -147,7 +147,7 @@ def test_get_open_positions_raises_without_key():
     fake_ai_key_vault = MagicMock()
     fake_ai_key_vault.get_instance.return_value = fake_vault
     with patch.dict('sys.modules',
-                    {'desktop.ai_key_vault': MagicMock(
+                    {'hartos.ai_key_vault': MagicMock(
                         AIKeyVault=fake_ai_key_vault)}):
         with pytest.raises(PolymarketKeyMissingError):
             adapter.get_open_positions()
