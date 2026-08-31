@@ -2522,6 +2522,21 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             f"Tier-1 tool gate: goal_tags={goal_tags} kept "
             f"{len(svc_tools)}/{_n_all_svc} service tools")
 
+        # Never-say-unavailable: always-on discovery that attaches gated-out
+        # or newly-needed tools mid-conversation (owner req 2026-08-31).
+        _attached_names = set(svc_tools)
+
+        def request_tools(need: str) -> str:
+            from core.agent_tools import discover_and_attach
+            return discover_and_attach(need, helper, assistant,
+                                       service_tool_registry, _attached_names)
+        register_dual(helper, assistant, request_tools, 'request_tools',
+                      "Discover and attach additional tools by describing the "
+                      "capability you need, e.g. 'text to speech' or 'crawl a "
+                      "webpage'. Call this FIRST whenever your current tools "
+                      "lack a capability - never tell the user something is "
+                      "unavailable without trying this.")
+
         for tool_name, tool_func in svc_tools.items():
             tool_def = next((d for d in svc_defs if d['name'] == tool_name), None)
             if tool_def:

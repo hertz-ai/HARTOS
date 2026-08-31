@@ -15,7 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
-from core.agent_tools import filter_service_tools
+from core.agent_tools import discover_and_attach, filter_service_tools
 from integrations.agent_engine.goal_manager import get_tool_tags
 from integrations.agent_engine.marketing_tools import detect_goal_tags
 
@@ -69,6 +69,46 @@ class HierarchicalToolGate(unittest.TestCase):
     def test_detect_media_vocabulary(self):
         self.assertIn('media', detect_goal_tags('compose a song about rain'))
         self.assertNotIn('media', detect_goal_tags('summarize this text file'))
+
+    def test_discover_attaches_gated_out_tool(self):
+        """Never-say-unavailable: a need matching a registry tool attaches
+        it onto the live agents mid-conversation."""
+        calls = []
+
+        class _Agent:
+            def register_for_llm(self, name=None, description=None):
+                calls.append(('llm', name))
+                return lambda f: f
+
+            def register_for_execution(self, name=None):
+                calls.append(('exec', name))
+                return lambda f: f
+
+        reg = _fake_registry()
+        reg._tools['pocket_tts'].endpoints = {
+            'synthesize': {'description': 'Text to speech synthesis'}}
+        reg._tools['crawl4ai'].endpoints = {
+            'crawl': {'description': 'Crawl a webpage to markdown'}}
+        reg._tools['pocket_tts'].description = 'offline speech synthesis'
+        reg._tools['crawl4ai'].description = 'web crawler'
+        reg.create_endpoint_function = lambda t, e: (lambda **kw: 'ok')
+        attached = set()
+        out = discover_and_attach('text to speech please', _Agent(), _Agent(),
+                                  reg, attached)
+        self.assertIn('pocket_tts_synthesize', attached)
+        self.assertIn('Attached', out)
+        self.assertNotIn('crawl4ai_crawl', attached,
+                         'unrelated tools must not attach')
+
+    def test_discover_no_match_offers_routes_not_denial(self):
+        reg = _fake_registry()
+        for t in reg._tools.values():
+            t.endpoints = {}
+        out = discover_and_attach('quantum teleportation', object(), object(),
+                                  reg, set())
+        self.assertNotIn('impossible', out.split('Do not tell')[0])
+        for route in ('install', 'peer', 'consent'):
+            self.assertIn(route, out)
 
     def test_single_detection_and_gate_in_both_constructors(self):
         """Parity + no-parallel-path: each constructor detects ONCE and

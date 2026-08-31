@@ -100,6 +100,69 @@ def filter_service_tools(goal_tags, svc_tools, svc_defs, registry):
     return kept
 
 
+def discover_and_attach(need, helper, executor, registry, attached_names):
+    """On-demand tool discovery: the never-say-unavailable half of the gate.
+
+    Owner requirement 2026-08-31: the hierarchy must be LAZY, not
+    exclusionary — an agent whose current set lacks a capability calls
+    this (via its always-on `request_tools` wrapper) instead of denying.
+    Searches the FULL service registry by name/description/tags, attaches
+    every match onto the live helper/executor pair right now (autogen
+    updates llm_config immediately, so the NEXT model call carries the
+    defs), and reports what else exists beyond this box: registry tools
+    whose backing service is not running can be self-hosted via the
+    existing install scaffolding, and hive peers may offer the
+    capability (earning mode — requires the user's payment consent;
+    discovery only REPORTS that, it never executes remotely).
+
+    Args:
+        need: free-text capability description from the model
+        helper/executor: the live agent pair to attach onto
+        registry: ServiceToolRegistry
+        attached_names: set of func names already on the agents —
+            updated in place with everything newly attached
+    Returns a human/model-readable summary string.
+    """
+    words = {w for w in str(need).lower().replace(',', ' ').split() if len(w) > 2}
+    if not words:
+        return "Tell me what capability you need, e.g. 'text to speech'."
+    attached, startable = [], []
+    for tool_name, tool in registry._tools.items():
+        hay = ' '.join([tool_name, ' '.join(tool.tags or []),
+                        getattr(tool, 'description', '') or '']).lower()
+        for ep_name, ep in tool.endpoints.items():
+            fn = (tool_name if ep_name == tool_name
+                  else f"{tool_name}_{ep_name}")
+            hay_ep = hay + ' ' + str(ep.get('description', '')).lower()
+            if not any(w in hay_ep for w in words):
+                continue
+            if fn in attached_names:
+                continue
+            func = registry.create_endpoint_function(tool_name, ep_name)
+            if func is None:
+                startable.append(fn)
+                continue
+            register_dual(helper, executor, func, fn,
+                          ep.get('description', f'{tool_name} {ep_name}'))
+            attached_names.add(fn)
+            attached.append(fn)
+    parts = []
+    if attached:
+        parts.append("Attached and ready to call NOW: " + ', '.join(attached))
+    if startable:
+        parts.append("Exists locally but the backing service is down — it "
+                     "can be self-hosted/started via the install flow: "
+                     + ', '.join(startable))
+    if not parts:
+        parts.append(
+            "No local registry tool matches. Options that DO exist: ask the "
+            "user to install it (hub install flow), or a hive peer may offer "
+            "this capability — peer execution needs the user's consent and, "
+            "in earning mode, payment approval. Do not tell the user this is "
+            "impossible; offer these routes.")
+    return '  '.join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Core tool closure factory
 # ---------------------------------------------------------------------------
