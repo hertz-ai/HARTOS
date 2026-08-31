@@ -78,11 +78,27 @@ VERIFY_UNIT = 'hart-copilot-verify.service'
 
 
 def backend():
-    """The node's own backend, from the ONE canonical port source rather than a
-    hardcoded port or an env override that can drift from what is listening."""
+    """The node's own backend: the port actually LISTENING, not the configured one.
+
+    This called get_port("backend"), which answers "which port is backend
+    assigned" (6777), not "where is HARTOS actually serving". On a bundled
+    Nunba desktop HARTOS runs in-process on the Flask port (5000) and nothing
+    listens on 6777, so next_task() dialled a dead port on EVERY tick and the
+    daemon logged {"action": "idle", "reason": "no task assigned by the hive"}
+    forever. That is indistinguishable from a genuinely idle hive, which is
+    why the co-pilot looked wired and did nothing.
+
+    Measured on this desktop 2026-09-01: 127.0.0.1:6777 refuses the connection
+    while 127.0.0.1:5000 answers /health with 200.
+
+    get_local_backend_url is the resolver written for exactly this, and its own
+    docstring names the incident: "ONE resolver, so neither hardcodes a dead
+    :6777 in bundled mode (#71 + omni-channel bridge inbound)". It probes the
+    serve ports and honours HEVOLVE_BASE_URL for remote deploys.
+    """
     try:
-        from core.port_registry import get_port
-        return f'http://127.0.0.1:{get_port("backend")}'
+        from core.port_registry import get_local_backend_url
+        return get_local_backend_url()
     except Exception:
         return 'http://127.0.0.1:6777'
 
