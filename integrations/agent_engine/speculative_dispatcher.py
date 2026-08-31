@@ -1930,7 +1930,17 @@ class SpeculativeDispatcher:
                 'HEVOLVE_BASE_URL',
                 f'http://localhost:{get_port("backend")}',
             )
-            resp = _req.post(f'{base}/chat', json=payload, timeout=60)
+            # Same budget flask_integration._handle_message and self_chat.py
+            # use for a channel's own /chat call — this re-entrant call runs
+            # the SAME full multi-agent turn (chat_agent/reuse), which
+            # routinely takes well over 60s locally. Found live 2026-08-31:
+            # this hardcoded 60 fired ~60.0s after the expert task started,
+            # silently discarding a real answer that was still generating —
+            # _run_collapsed_expert_path treats the resulting '' exactly
+            # like "expert produced nothing" and the standby stays final,
+            # with no error surfaced anywhere.
+            _timeout = int(os.environ.get('HEVOLVE_CHANNEL_AGENT_TIMEOUT', '120'))
+            resp = _req.post(f'{base}/chat', json=payload, timeout=_timeout)
             if resp.status_code == 200:
                 return (resp.json() or {}).get('response') or ''
             logger.debug(
@@ -2044,6 +2054,27 @@ class SpeculativeDispatcher:
         """
         from core.safe_hartos_attr import safe_hartos_attr
         from core.peer_link.message_bus import chat_topic_for
+
+        # A failed expert turn (reuse_recipe.py's get_agent_response, and
+        # its hart_intelligence_entry.py / gather_agentdetails.py siblings)
+        # returns its exception as the literal string "Error getting
+        # response: {e}" instead of raising -- so on an inference-server
+        # failure (e.g. a 500 from a malformed tool-call parse) that raw
+        # internal error text was delivered to the user verbatim as if it
+        # were the real answer, landing right after the standby and
+        # reading as a second, broken reply. Caught here since all three
+        # delivery legs (SSE, TTS, channel) share this one entry point.
+        if isinstance(response, str) and response.startswith(
+                "Error getting response:"):
+            logger.warning(
+                "Expert turn failed, not delivering raw error to user: "
+                "spec=%s user=%s err=%r",
+                speculation_id, user_id, response,
+            )
+            response = (
+                "I ran into a problem working on that — could you try "
+                "again?"
+            )
 
         # 1. Publish text via canonical publish_async (MessageBus → Crossbar)
         try:
