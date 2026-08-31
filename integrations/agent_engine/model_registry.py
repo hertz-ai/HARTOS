@@ -541,6 +541,19 @@ def _register_defaults():
     _qwen_is_free = _dt.date.today().isoformat() <= _qwen_free_until
     _qwen_rate = 0.0 if _qwen_is_free else float(
         os.environ.get('QWEN_RATE_PER_1K', '0.5'))
+    # DO NOT health-check this endpoint with urllib. The vendor's edge rejects
+    # Python-urllib by User-Agent. Measured from inside the live central
+    # container, same key, same body, same second:
+    #   requests -> 200 | httpx -> 200 | urllib default UA -> 403 Forbidden
+    #   urllib with User-Agent 'curl/8.5.0' -> 200
+    # The openai SDK rides httpx, so dispatch is fine. A urllib-based prober
+    # (core/verified_llm.py uses urllib.request, though it defaults to the LOCAL
+    # llama endpoint) would report this model dead while it is perfectly healthy.
+    # If you ever point a urllib prober at a hosted provider, set a UA first.
+    #
+    # This also disproves the first read of that 403: it is NOT an IP block on
+    # central. curl from the host AND from inside the container both returned
+    # 200 in the same minute.
     _qwen_key = os.environ.get('QWEN_API_KEY') or os.environ.get('BITDEER_API_KEY')
     if _qwen_key:
         model_registry.register(ModelBackend(
