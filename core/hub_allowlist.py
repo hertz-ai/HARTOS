@@ -200,7 +200,10 @@ class HubAllowlist:
         if not org or not isinstance(org, str):
             raise ValueError("org must be a non-empty string")
         org_clean = org.strip()
-        if '/' in org_clean or ' ' in org_clean:
+        # Reject ANY interior whitespace (tab / newline / space), not just the
+        # ASCII space — the message and docstring both say "whitespace", and an
+        # HF org id is [A-Za-z0-9-] so a tab/newline is always malformed input.
+        if '/' in org_clean or any(c.isspace() for c in org_clean):
             raise ValueError("org must not contain '/' or whitespace")
         # ASCII-only — same homoglyph defense as _normalize_hf_id.
         if any(ord(c) > 0x7F for c in org_clean):

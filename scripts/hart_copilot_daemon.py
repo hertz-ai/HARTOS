@@ -78,28 +78,35 @@ VERIFY_UNIT = 'hart-copilot-verify.service'
 
 
 def backend():
-    """The node's own backend: the port actually LISTENING, not the configured one.
+    """Where HARTOS is actually SERVING — not merely which port it is assigned.
 
-    This called get_port("backend"), which answers "which port is backend
-    assigned" (6777), not "where is HARTOS actually serving". On a bundled
-    Nunba desktop HARTOS runs in-process on the Flask port (5000) and nothing
-    listens on 6777, so next_task() dialled a dead port on EVERY tick and the
-    daemon logged {"action": "idle", "reason": "no task assigned by the hive"}
-    forever. That is indistinguishable from a genuinely idle hive, which is
-    why the co-pilot looked wired and did nothing.
+    get_port("backend") answers "which port is the backend ASSIGNED" (6777).
+    That is right on a standalone appliance, where 6777 really is listening, and
+    WRONG on a bundled desktop, where HARTOS runs in-process on the Flask port
+    (5000) and nothing binds 6777 at all. Dialling the assigned port there hits a
+    dead socket on every tick, and because next_task() treats any failure as "no
+    work", the daemon logs
 
-    Measured on this desktop 2026-09-01: 127.0.0.1:6777 refuses the connection
-    while 127.0.0.1:5000 answers /health with 200.
+        {"action": "idle", "reason": "no task assigned by the hive"}
 
-    get_local_backend_url is the resolver written for exactly this, and its own
-    docstring names the incident: "ONE resolver, so neither hardcodes a dead
-    :6777 in bundled mode (#71 + omni-channel bridge inbound)". It probes the
-    serve ports and honours HEVOLVE_BASE_URL for remote deploys.
+    forever -- which reads as an idle hive rather than a broken dial. Diagnosed
+    on the desktop by @agent-4 (#71) and fixed there in Nunba a34b6244; this is
+    the same fix on the HARTOS side, which still carried the assigned-port
+    resolver.
+
+    get_local_backend_url() is the existing single resolver for exactly this: it
+    probes 'backend' then 'flask' and returns the first ACTUALLY LISTENING, so
+    the appliance still resolves 6777 and the desktop resolves 5000 without
+    either hardcoding the other's port. Verified on the Samsung appliance
+    2026-09-01: 6777 is bound and /api/hive/session/tasks answers
+    {"completed":[],"pending":[]}, so this change is a no-op there and a repair
+    on the desktop.
     """
     try:
         from core.port_registry import get_local_backend_url
         return get_local_backend_url()
     except Exception:
+        # Same last-ditch default as before: the appliance's assigned port.
         return 'http://127.0.0.1:6777'
 
 
