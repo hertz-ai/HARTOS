@@ -196,9 +196,23 @@ def bootstrap_platform(extensions_dir: Optional[str] = None) -> ServiceRegistry:
 
     # ── Connect EventBus to Crossbar WAMP (if configured) ────
 
-    cburl = os.environ.get('CBURL')
-    if cburl:
-        bus.connect_wamp(cburl, os.environ.get('CBREALM', 'realm1'))
+    # Reads BOTH names. This gate asked only for CBURL, so setting WAMP_URL,
+    # the name core/wamp_url.py documents and scripts/run.sh:49 actually
+    # exports, left the bridge dark and gave no hint why. WAMP is the relay AND
+    # federation transport, so that silence is what kept the mesh dark while
+    # the router sat up and publicly reachable.
+    #
+    # A configured router URL IS consent to bridge (owner, 2026-08-31): HYBRID
+    # is the default posture, so a node that knows where the router is, is a
+    # node that means to reach it. resolve_router_url then decides WHERE, so a
+    # regional host or the router Nunba ships locally works the same way and
+    # central is not the only option.
+    _router = os.environ.get('CBURL', '').strip()
+    if not _router and os.environ.get('WAMP_URL', '').strip():
+        from core.wamp_url import resolve_router_url
+        _router = resolve_router_url()
+    if _router:
+        bus.connect_wamp(_router, os.environ.get('CBREALM', 'realm1'))
 
     # ── Wire EventBus subscribers for orphaned events ────────
 
