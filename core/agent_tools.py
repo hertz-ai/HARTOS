@@ -163,6 +163,40 @@ def discover_and_attach(need, helper, executor, registry, attached_names):
     return '  '.join(parts)
 
 
+def attach_for_tags(cap_tags, helper, executor, registry, attached_names):
+    """Attach every registry tool whose capability tags intersect cap_tags.
+
+    The deterministic sibling of discover_and_attach: same attach
+    primitives (create_endpoint_function + register_dual) but matched by
+    registry capability tags, exactly like filter_service_tools.  The
+    per-turn hook in reuse uses this so a conversation that drifts into
+    a capability the construction-time goal never mentioned gets its
+    family attached BEFORE the model sees the turn — zero extra LLM
+    calls, no reliance on the model choosing to call request_tools.
+    Names already in attached_names are skipped (idempotent across
+    turns); the set is updated in place.  Returns the count attached.
+    """
+    cap = set(cap_tags or [])
+    if not cap:
+        return 0
+    n = 0
+    for tool_name, tool in registry._tools.items():
+        if not (set(tool.tags or []) & cap):
+            continue
+        for ep_name, ep in tool.endpoints.items():
+            fn = tool_name if ep_name == tool_name else f"{tool_name}_{ep_name}"
+            if fn in attached_names:
+                continue
+            func = registry.create_endpoint_function(tool_name, ep_name)
+            if func is None:
+                continue
+            register_dual(helper, executor, func, fn,
+                          ep.get('description', f'{tool_name} {ep_name}'))
+            attached_names.add(fn)
+            n += 1
+    return n
+
+
 # ---------------------------------------------------------------------------
 # Core tool closure factory
 # ---------------------------------------------------------------------------

@@ -2525,6 +2525,11 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         # Never-say-unavailable: always-on discovery that attaches gated-out
         # or newly-needed tools mid-conversation (owner req 2026-08-31).
         _attached_names = set(svc_tools)
+        # Shared per-conversation state for the per-turn attach hook in
+        # get_agent_response — same set object request_tools mutates, so
+        # both layers see one attach ledger.
+        assistant._hart_attached_tools = _attached_names
+        assistant._hart_unlocked_tags = set(goal_tags)
 
         def request_tools(need: str) -> str:
             from core.agent_tools import discover_and_attach
@@ -3220,6 +3225,31 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
     """Get a single response from the agent for the given message."""
     user_prompt = f'{user_id}_{prompt_id}'
     try:
+        # Tier-1 per-turn attach: deterministic keyword scan of THIS message
+        # unlocks families the construction-time goal never mentioned — zero
+        # extra LLM calls, and no reliance on the model choosing to call
+        # request_tools.  Attach happens before the model sees the turn.
+        try:
+            _unlocked = getattr(assistant, '_hart_unlocked_tags', None)
+            if _unlocked is not None:
+                from integrations.agent_engine.marketing_tools import detect_goal_tags
+                _new = [t for t in detect_goal_tags(message or '')
+                        if t not in _unlocked]
+                if _new:
+                    from core.agent_tools import attach_for_tags
+                    from integrations.agent_engine.goal_manager import get_tool_tags
+                    from integrations.service_tools import service_tool_registry
+                    _cap = set()
+                    for _t in _new:
+                        _cap.update(get_tool_tags(_t))
+                    _n = attach_for_tags(_cap, helper, assistant,
+                                         service_tool_registry,
+                                         assistant._hart_attached_tools)
+                    _unlocked.update(_new)
+                    current_app.logger.info(
+                        f"Tier-1 turn attach: +{_new} -> {_n} tools")
+        except Exception as _e:
+            current_app.logger.debug(f"turn attach skipped: {_e}")
 
         result = user_proxy.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
                                           clear_history=False)

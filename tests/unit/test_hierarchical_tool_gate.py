@@ -15,7 +15,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
-from core.agent_tools import discover_and_attach, filter_service_tools
+from core.agent_tools import (attach_for_tags, discover_and_attach,
+                              filter_service_tools)
 from integrations.agent_engine.goal_manager import get_tool_tags
 from integrations.agent_engine.marketing_tools import detect_goal_tags
 
@@ -111,10 +112,13 @@ class HierarchicalToolGate(unittest.TestCase):
             self.assertIn(route, out)
 
     def test_single_detection_and_gate_in_both_constructors(self):
-        """Parity + no-parallel-path: each constructor detects ONCE and
-        filters ONCE.  A second detect_goal_tags call means the Tier-2
-        block regrew its own detection (the pre-fix shape)."""
-        for fname in ('create_recipe.py', 'reuse_recipe.py'):
+        """Parity + no-parallel-path: sanctioned detection sites only.
+        create: 1 (construction).  reuse: 2 (construction + the per-turn
+        hook in get_agent_response that attaches families when the
+        conversation drifts — deterministic, zero extra LLM calls).
+        Any count above these means a detection regrew somewhere."""
+        expected_detect = {'create_recipe.py': 1, 'reuse_recipe.py': 2}
+        for fname, n_expected in expected_detect.items():
             src = (_ROOT / 'hartos' / fname).read_text(encoding='utf-8',
                                                        errors='replace')
             # count CODE lines only — reuse_recipe:2691 names the function
@@ -124,11 +128,48 @@ class HierarchicalToolGate(unittest.TestCase):
             n_detect = sum('detect_goal_tags(' in ln for ln in code)
             n_filter = sum('filter_service_tools(' in ln for ln in code)
             self.assertEqual(
-                n_detect, 1,
-                f'{fname}: expected exactly one detect_goal_tags call')
+                n_detect, n_expected,
+                f'{fname}: expected exactly {n_expected} detect_goal_tags '
+                f'call(s) (construction gate; reuse also has the per-turn '
+                f'attach hook)')
             self.assertEqual(
                 n_filter, 1,
                 f'{fname}: expected exactly one Tier-1 gate call')
+
+    def test_attach_for_tags_attaches_matching_family(self):
+        """Per-turn drift: capability tags attach the matching family via
+        the same primitives, skip non-matching and already-attached."""
+        calls = []
+
+        class _Agent:
+            def register_for_llm(self, name=None, description=None):
+                calls.append(('llm', name))
+                return lambda f: f
+
+            def register_for_execution(self, name=None):
+                calls.append(('exec', name))
+                return lambda f: f
+
+        reg = _fake_registry()
+        reg._tools['pocket_tts'].endpoints = {
+            'synthesize': {'description': 'Text to speech synthesis'}}
+        reg._tools['crawl4ai'].endpoints = {
+            'crawl': {'description': 'Crawl a webpage to markdown'}}
+        reg.create_endpoint_function = lambda t, e: (lambda **kw: 'ok')
+        attached = set()
+        n = attach_for_tags({'tts', 'speech'}, _Agent(), _Agent(), reg,
+                            attached)
+        self.assertEqual(n, 1)
+        self.assertIn('pocket_tts_synthesize', attached)
+        self.assertNotIn('crawl4ai_crawl', attached)
+        # idempotent across turns: second call attaches nothing
+        self.assertEqual(
+            attach_for_tags({'tts'}, _Agent(), _Agent(), reg, attached), 0)
+
+    def test_attach_for_tags_empty_tags_noop(self):
+        self.assertEqual(
+            attach_for_tags(set(), object(), object(), _fake_registry(),
+                            set()), 0)
 
 
 if __name__ == '__main__':
