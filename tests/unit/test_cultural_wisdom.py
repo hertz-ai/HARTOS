@@ -192,3 +192,25 @@ class TestRoleTraits:
         result = get_traits_for_role('unknown_role_xyz', count=3)
         assert isinstance(result, list)
         assert len(result) > 0
+
+
+class TestBranchCoverage:
+    """The env-gated compact path + the fill-from-defaults fallback — both
+    documented behaviours the rest of the suite doesn't exercise directly."""
+
+    def test_compact_mode_env_returns_the_compact_prompt(self, monkeypatch):
+        # CULTURAL_COMPACT_MODE=true routes get_cultural_prompt() to the
+        # ~100-token compact variant instead of the full ~500-token one.
+        import hartos.cultural_wisdom as cw
+        monkeypatch.setattr(cw, 'CULTURAL_COMPACT_MODE', True)
+        assert cw.get_cultural_prompt() == cw.get_cultural_prompt_compact()
+
+    def test_role_with_unresolvable_affinities_fills_from_defaults(self, monkeypatch):
+        # a role whose affinity names resolve to NO real traits must still yield
+        # `count` traits, back-filled from the default set (never short/empty)
+        import hartos.cultural_wisdom as cw
+        monkeypatch.setitem(cw._ROLE_TRAIT_AFFINITIES, 'brokenrole',
+                            ['DefinitelyNotARealTrait', 'AlsoFake'])
+        result = cw.get_traits_for_role('brokenrole', count=3)
+        assert len(result) == 3
+        assert all(isinstance(t, dict) for t in result)

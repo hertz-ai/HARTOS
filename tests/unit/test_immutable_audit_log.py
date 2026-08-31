@@ -5,8 +5,10 @@ Run: pytest tests/unit/test_immutable_audit_log.py -v --noconftest
 """
 import os
 import sys
+import types
 import unittest
 import threading
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
@@ -230,6 +232,79 @@ class TestSingleton(unittest.TestCase):
         a = get_audit_log()
         b = get_audit_log()
         self.assertIs(a, b)
+
+
+class TestGetEntriesDBPath(unittest.TestCase):
+    """The DB-backed read path (_use_db=True). The in-memory path and the
+    DB-EXCEPT fallback are covered elsewhere; this pins the happy DB query ->
+    dict mapping, which for an AUDIT LOG must be faithful (a mapping bug
+    silently corrupts the trail an auditor reads) and must not leak the
+    connection (the `finally: db.close()`)."""
+
+    @staticmethod
+    def _row(**kw):
+        r = MagicMock()
+        for k, v in kw.items():
+            setattr(r, k, v)
+        return r
+
+    def _run_with_fake_db(self, db, limit=10):
+        log = ImmutableAuditLog()
+        log._use_db = True
+        fake_models = types.ModuleType('integrations.social.models')
+        fake_models.get_db = lambda: db
+        fake_models.AuditLogEntry = MagicMock(name='AuditLogEntry')
+        # Inject the whole dotted path so the real (heavy / non-importable here)
+        # integrations.social.models is never touched.
+        with patch.dict(sys.modules, {
+            'integrations': types.ModuleType('integrations'),
+            'integrations.social': types.ModuleType('integrations.social'),
+            'integrations.social.models': fake_models,
+        }):
+            return log._get_entries(limit=limit)
+
+    def test_db_rows_are_mapped_and_connection_closed(self):
+        created = MagicMock()
+        created.isoformat.return_value = '2026-09-01T00:00:00'
+        row = self._row(
+            id=1, event_type='auth', actor_id='user_1', target_id='t',
+            action='login', detail_json='{}', prev_hash='GENESIS',
+            entry_hash='abc123', created_at=created,
+        )
+        db = MagicMock()
+        db.query.return_value.order_by.return_value.limit.return_value.all.return_value = [row]
+
+        entries = self._run_with_fake_db(db)
+
+        self.assertEqual(len(entries), 1)
+        e = entries[0]
+        self.assertEqual(e['id'], 1)
+        self.assertEqual(e['event_type'], 'auth')
+        self.assertEqual(e['actor_id'], 'user_1')
+        self.assertEqual(e['target_id'], 't')
+        self.assertEqual(e['action'], 'login')
+        self.assertEqual(e['detail_json'], '{}')
+        self.assertEqual(e['prev_hash'], 'GENESIS')
+        self.assertEqual(e['entry_hash'], 'abc123')
+        # datetime-like created_at is serialized via isoformat()
+        self.assertEqual(e['created_at'], '2026-09-01T00:00:00')
+        # the connection was returned in the finally block (no leak)
+        db.close.assert_called_once()
+
+    def test_created_at_without_isoformat_is_passed_through(self):
+        # A plain-string created_at (no .isoformat) must pass through verbatim,
+        # exercising the else side of the serialization ternary.
+        row = self._row(
+            id=2, event_type='state_change', actor_id='u2', target_id=None,
+            action='x', detail_json=None, prev_hash='abc123',
+            entry_hash='def456', created_at='2026-09-01 raw',
+        )
+        db = MagicMock()
+        db.query.return_value.order_by.return_value.limit.return_value.all.return_value = [row]
+
+        entries = self._run_with_fake_db(db)
+        self.assertEqual(entries[0]['created_at'], '2026-09-01 raw')
+        db.close.assert_called_once()
 
 
 if __name__ == '__main__':

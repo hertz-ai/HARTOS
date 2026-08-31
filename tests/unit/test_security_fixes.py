@@ -329,6 +329,43 @@ class TestG8FederationHMAC(unittest.TestCase):
             handshake_secret = fa.get_hmac_secret_for_handshake()
             self.assertEqual(handshake_secret, secret)
 
+    def test_sign_delta_without_secret_leaves_it_unsigned(self):
+        """No HMAC secret available -> the delta is returned UNSIGNED (logged
+        loud). It carries no signature, so a downstream verify rejects it —
+        the fail-safe is 'unverifiable', never 'silently trusted'."""
+        from integrations.agent_engine import federated_aggregator as fa
+        with patch.object(fa, '_get_hmac_secret', return_value=None):
+            out = fa._sign_delta({'version': 1, 'node_id': 'test'})
+            self.assertNotIn('hmac_signature', out)
+            self.assertFalse(fa._verify_delta_signature(out))
+
+    def test_verify_delta_via_registered_peer_secret(self):
+        """The cross-node anti-forgery path: a delta signed with a PEER's
+        handshake-exchanged secret verifies against that registered secret
+        (own-secret path skipped)."""
+        from integrations.agent_engine import federated_aggregator as fa
+        with patch.object(fa, '_get_hmac_secret', return_value=None), \
+                patch.object(fa, '_peer_hmac_secrets', {}):
+            fa.register_peer_hmac_secret('peer-1', 'peer-secret')
+            delta = {'version': 1, 'node_id': 'peer-1', 'metric': 42}
+            payload = json.dumps(delta, sort_keys=True).encode()
+            delta['hmac_signature'] = hmac.new(
+                b'peer-secret', payload, hashlib.sha256).hexdigest()
+            self.assertTrue(fa._verify_delta_signature(delta))
+
+    def test_verify_delta_via_legacy_pubkey_fallback(self):
+        """Legacy fallback: a sender that used its Ed25519 public key as the
+        HMAC key still verifies (backward compat with pre-handshake peers),
+        after both the own-secret and peer-secret paths miss."""
+        from integrations.agent_engine import federated_aggregator as fa
+        with patch.object(fa, '_get_hmac_secret', return_value=None), \
+                patch.object(fa, '_peer_hmac_secrets', {}):
+            delta = {'version': 1, 'node_id': 'legacy', 'public_key': 'ed25519pub'}
+            payload = json.dumps(delta, sort_keys=True).encode()
+            delta['hmac_signature'] = hmac.new(
+                b'ed25519pub', payload, hashlib.sha256).hexdigest()
+            self.assertTrue(fa._verify_delta_signature(delta))
+
 
 # ═══════════════════════════════════════════════════════════════
 # G9: Trust downgrade prevention in PeerLink

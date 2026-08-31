@@ -9,8 +9,18 @@
 #
 # Pipeline: BUILD → TEST → AUDIT → BENCHMARK → SIGN → CANARY → DEPLOY
 #
-# NixOS advantage: every update is a new system generation, so
-# rollback is always one `nixos-rebuild switch --rollback` away.
+# NixOS advantage: every update is a new system generation, so the
+# previous one stays on disk and stays bootable.
+#
+# HOW AN UPDATE IS APPLIED (changed 2026-09-01, after a real failed apply):
+# the engine below stages with `nixos-rebuild boot`, NOT `switch`. It
+# registers the generation as the boot default and touches nothing in the
+# running system; activation happens at the next boot, with no build
+# competing for CPU. Rollback is therefore the BOOTLOADER's job (systemd-boot
+# with boot counting), not a second activation of a system that just failed
+# to activate. The long note at the apply site records the incident that
+# forced this: a good generation was torn down because one Type=notify
+# service missed its readiness window on a box the build had saturated.
 # The canary stage leverages this — if health degrades, the OS
 # atomically reverts to the previous generation.
 #
@@ -196,18 +206,62 @@ let
             # ota.flakeAttr, NOT hart-${cfg.variant}: the config names itself.
             # The inline construction sent a raw-flashed node to the ISO-kind
             # closure, which cannot mount a raw root (real HW 2026-08-22).
-            echo "[HART OTA apply] switching to $FLAKE#${ota.flakeAttr} ..."
-            # if-form on purpose: the source sync runs on SUCCESS alone — a
-            # rolled-back switch must not advance /etc/hart/src (task #20).
-            if nixos-rebuild switch --flake "$FLAKE#${ota.flakeAttr}"; then
-              STATUS="applied"
+            # -- boot, NOT switch. This is the load-bearing decision. --
+            #
+            # `switch` = build + register + ACTIVATE THE RUNNING SYSTEM in one
+            # command. That coupling is what broke the real apply on .69
+            # (2026-08-31, generation 2):
+            #
+            #   the build peaked at 4.3 GB / 9m52s CPU, then activation
+            #   restarted services INTO that load; hart-model-bus (Type=notify)
+            #   printed its whole startup banner and then missed its readiness
+            #   window at loadavg 7+; switch-to-configuration exited 4;
+            #   nixos-rebuild reported "error(s) occurred"; we read that as a
+            #   failed update and rolled back.
+            #
+            # NOTHING WAS WRONG WITH THE NEW GENERATION. It built and registered
+            # correctly. A good update was torn down because one service was
+            # slow on a box we had just saturated ourselves.
+            #
+            # `boot` registers the generation and makes it the boot default
+            # while touching NOTHING in the running system. Three consequences,
+            # each of them the point:
+            #
+            #   1. There is nothing to roll back on failure. A failed `boot`
+            #      leaves the running system byte-identical, so the recovery
+            #      path DISAPPEARS instead of being made more clever.
+            #   2. Activation happens at the next boot, with no build competing
+            #      for CPU -- the conditions activation is designed for.
+            #   3. Rollback becomes the BOOTLOADER's job. systemd-boot is
+            #      installed here with boot counting (confirmed in bootctl
+            #      status) and configurationLimit keeps a spare generation, so
+            #      recovery shares NO code with the forward path. That is what
+            #      makes it a rollback rather than a second run at the thing
+            #      that just failed.
+            #
+            # The cost is stated honestly: an update touching the kernel, units,
+            # the compositor and the shell takes effect on reboot. It always
+            # did -- `switch` only made it LOOK immediate while leaving the
+            # booted kernel and half the units on the old generation.
+            echo "[HART OTA apply] staging $FLAKE#${ota.flakeAttr} for next boot ..."
+            # if-form on purpose: the source sync runs on SUCCESS alone -- a
+            # failed stage must not advance /etc/hart/src (task #20).
+            if nixos-rebuild boot --flake "$FLAKE#${ota.flakeAttr}"; then
+              STATUS="staged"
+              mkdir -p /run/hart 2>/dev/null || true
+              touch /run/hart/ota-reboot-required 2>/dev/null || true
+              echo "[HART OTA apply] generation registered as boot default; reboot to activate"
               ${otaSyncSrc}/bin/hart-ota-sync-src "$FLAKE" \
-                || echo "[HART OTA apply] source sync failed unexpectedly — /etc/hart/src may be stale"
+                || echo "[HART OTA apply] source sync failed unexpectedly -- /etc/hart/src may be stale"
             else
-              echo "[HART OTA apply] switch FAILED — rolling back..."
-              STATUS="rolled_back"
-              nixos-rebuild switch --rollback \
-                || { STATUS="rollback_failed"; echo "[HART OTA apply] ROLLBACK FAILED — manual intervention needed"; }
+              # The running system was never touched, so there is nothing to
+              # undo. Deliberately NO rollback call: the old code ran
+              # `switch --rollback`, which re-entered the very activation that
+              # had just failed and duly reported ROLLBACK FAILED for the same
+              # reason -- a recovery path inheriting the failure mode of what
+              # it recovers from.
+              STATUS="stage_failed"
+              echo "[HART OTA apply] staging FAILED -- running system untouched, nothing to roll back"
             fi
             ${lib.optionalString (ota.postUpdateHook != "") ''
               echo "[HART OTA apply] running post-update hook..."
@@ -216,12 +270,32 @@ let
           fi
           ;;
         rollback)
-          echo "[HART OTA apply] rollback requested — switching to previous generation..."
-          if nixos-rebuild switch --rollback; then
+          # NOT `nixos-rebuild switch --rollback`. Two reasons, both observed on
+          # real hardware 2026-08-31:
+          #
+          #   a. Without --flake, nixos-rebuild evaluates
+          #      `with import <nixpkgs/nixos> {}; config.system.build.nixos-rebuild`
+          #      to locate its own helper. This node is flake-only with NO
+          #      channels, so that is an error BY CONSTRUCTION:
+          #        error: file 'nixpkgs/nixos' was not found in the Nix search path
+          #      The recovery path depended on machinery this system does not have.
+          #   b. It ACTIVATES, so it can fail exactly the way the forward switch
+          #      failed. It did, and reported ROLLBACK FAILED.
+          #
+          # Every generation ships its own bin/switch-to-configuration, so the
+          # profile pointer and the boot entry move with NO nixpkgs evaluation
+          # and NO activation of the running system.
+          echo "[HART OTA apply] rollback requested -- pointing next boot at the previous generation..."
+          SYSPROFILE=/nix/var/nix/profiles/system
+          if nix-env --rollback -p "$SYSPROFILE" \
+             && "$SYSPROFILE"/bin/switch-to-configuration boot; then
             STATUS="rolled_back"
+            mkdir -p /run/hart 2>/dev/null || true
+            touch /run/hart/ota-reboot-required 2>/dev/null || true
+            echo "[HART OTA apply] previous generation is the boot default; reboot to complete"
           else
             STATUS="rollback_failed"
-            echo "[HART OTA apply] ROLLBACK FAILED — manual intervention needed"
+            echo "[HART OTA apply] ROLLBACK FAILED -- manual intervention needed"
           fi
           ;;
         *)
