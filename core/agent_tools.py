@@ -13,6 +13,7 @@ Pattern mirrors:
 import json
 import logging
 import os
+import re as _re
 import threading
 import time
 import uuid
@@ -123,7 +124,13 @@ def discover_and_attach(need, helper, executor, registry, attached_names):
             updated in place with everything newly attached
     Returns a human/model-readable summary string.
     """
-    words = {w for w in str(need).lower().replace(',', ' ').split() if len(w) > 2}
+    # Stopwords would over-attach: 'the' passes len>2 AND is a substring of
+    # 'synthesis', so "summarize the page" would match nearly every tool.
+    stop = {'the', 'and', 'for', 'you', 'your', 'with', 'that', 'this',
+            'please', 'need', 'want', 'tool', 'tools', 'use', 'able',
+            'can', 'get', 'have', 'from', 'into', 'about', 'some', 'any'}
+    words = {w for w in str(need).lower().replace(',', ' ').split()
+             if len(w) > 2 and w not in stop}
     if not words:
         return "Tell me what capability you need, e.g. 'text to speech'."
     attached, startable = [], []
@@ -134,7 +141,14 @@ def discover_and_attach(need, helper, executor, registry, attached_names):
             fn = (tool_name if ep_name == tool_name
                   else f"{tool_name}_{ep_name}")
             hay_ep = hay + ' ' + str(ep.get('description', '')).lower()
-            if not any(w in hay_ep for w in words):
+            # Substring alone misses morphological variants ('scrape' is not
+            # a substring of 'scraping') — also match on shared 4-char stems.
+            # Deterministic, no fuzz; a rare extra attach is bounded cost.
+            hay_words = {hw for hw in _re.split(r'[^a-z0-9]+', hay_ep)
+                         if len(hw) >= 4}
+            stems = {hw[:4] for hw in hay_words}
+            if not any(w in hay_ep or (len(w) >= 4 and w[:4] in stems)
+                       for w in words):
                 continue
             if fn in attached_names:
                 continue

@@ -1135,7 +1135,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the pre synthesized generated video if it is successful.
             7. If you receive a request to perform a task or action on the user's computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_or_android_command` tool.
             8. If you want the user's ID then ask the @Helper to use 'get_user_id' tool and do not prompt the user for their user_id, never mention the user_id to the user. Important: Get the user Id yourself always, Do not ask the user_id from User ever.
-            9. If you want to do a google search then you should ask the @Helper to use the 'google_search' tool.        
+            9. If you want to do a google search then you should ask the @Helper to use the 'google_search' tool.
+            10. If a capability you need is NOT covered by any tool listed above, ask @Helper to call the 'request_tools' tool with a short description of the capability (for example: request_tools with need='crawl a webpage'). When it replies "Attached and ready to call NOW: <tool names>", those tools are live IMMEDIATELY in this same conversation - ask @Helper to call them to finish the task. Never tell the user a capability is unavailable before trying request_tools.
         10. **Never reveal actions, internal processes, or tools to the user**. Do not ask for user confirmation unless absolutely necessary(You can assume normal things like user's interests).
         11. Calling Other Agents (Important):
             i. When you need to direct a question or route the conversation to a specific agent, use the @ tag followed by the agent's name. Examples include: @Executor or @Helper or @User
@@ -1207,6 +1208,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
             4. Tools you have [txt2img, img2txt, save_data_in_memory, get_data_from_memory, search_long_term_memory, save_to_long_term_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs, send_message_to_user,send_presynthesized_video_to_user] If a task cannot be completed using the available tools, first check the recipe. If no solution is found, create Python code to accomplish the task.
+            4a. If the task needs a capability none of your tools cover, FIRST call the 'request_tools' tool with a short description (for example need='crawl a webpage'); the tools it attaches are callable immediately in this same conversation - call them to complete the task. If it reports no match, retry once with different wording, then offer the routes it names. Never claim a capability is unavailable without trying request_tools.
             5. Keep track of action and only ask for next action when the current action is completed successfully.
             6. Always use code from recipe given below.
             7. If there is any action which is like to perform a task continuously you should not do it.
@@ -2540,7 +2542,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                       "capability you need, e.g. 'text to speech' or 'crawl a "
                       "webpage'. Call this FIRST whenever your current tools "
                       "lack a capability - never tell the user something is "
-                      "unavailable without trying this.")
+                      "unavailable without trying this. If it finds no "
+                      "match, call it once more with different wording.")
 
         for tool_name, tool_func in svc_tools.items():
             tool_def = next((d for d in svc_defs if d['name'] == tool_name), None)

@@ -171,6 +171,73 @@ class HierarchicalToolGate(unittest.TestCase):
             attach_for_tags(set(), object(), object(), _fake_registry(),
                             set()), 0)
 
+    def test_discover_matches_morphological_variant(self):
+        """'scrape' is NOT a substring of 'scraping' — the 4-char stem rule
+        must catch inflected forms (was a proven miss pre-fix)."""
+
+        class _Agent:
+            def register_for_llm(self, name=None, description=None):
+                return lambda f: f
+
+            def register_for_execution(self, name=None):
+                return lambda f: f
+
+        reg = _fake_registry()
+        reg._tools['crawl4ai'].endpoints = {
+            'crawl': {'description': 'Crawl a URL to markdown'}}
+        reg._tools['pocket_tts'].endpoints = {
+            'synthesize': {'description': 'Text to speech synthesis'}}
+        reg.create_endpoint_function = lambda t, e: (lambda **kw: 'ok')
+        attached = set()
+        discover_and_attach('scrape the site', _Agent(), _Agent(), reg,
+                            attached)
+        self.assertIn('crawl4ai_crawl', attached)
+        self.assertNotIn('pocket_tts_synthesize', attached)
+
+    def test_discover_stopwords_do_not_overattach(self):
+        """'the' is a substring of 'synthesis' — stopwords must not match."""
+        reg = _fake_registry()
+        reg._tools['pocket_tts'].endpoints = {
+            'synthesize': {'description': 'Text to speech synthesis'}}
+        reg._tools['crawl4ai'].endpoints = {}
+        attached = set()
+        out = discover_and_attach('please get the thing for me', object(),
+                                  object(), reg, attached)
+        self.assertEqual(attached, set())
+        self.assertIn('No local registry tool matches', out)
+
+    def test_registry_umbrella_has_no_orphans(self):
+        """Exhaustiveness where it is enumerable: every statically seeded
+        registry tool must be reachable through >=1 goal tag's capability
+        set — a tool added with out-of-umbrella tags goes red here instead
+        of being silently unreachable by the gate."""
+        from integrations.service_tools import (
+            service_tool_registry, Crawl4AITool, AceStepTool,
+            SeoAuditTool, GhPrTool)
+        from integrations.agent_engine.goal_manager import _tool_tags
+        Crawl4AITool.register()
+        AceStepTool.register()
+        SeoAuditTool.register()
+        GhPrTool.register()
+        cap_by_goal = {g: set(get_tool_tags(g)) for g in _tool_tags}
+        for name, tool in service_tool_registry._tools.items():
+            tags = set(tool.tags or [])
+            reachable = [g for g, caps in cap_by_goal.items() if tags & caps]
+            self.assertTrue(
+                reachable,
+                f"registry tool '{name}' (tags={sorted(tags)}) is an ORPHAN: "
+                f"no goal tag unlocks it — add a capability tag to a "
+                f"goal_manager row or fix the tool's tags")
+
+    def test_intent_prompts_mention_request_tools(self):
+        """The model can only reach the discovery layer it knows about:
+        both the Assistant delegation list and the Helper system message
+        must name request_tools (owner 2026-08-31: 'intent shd know')."""
+        src = (_ROOT / 'hartos' / 'reuse_recipe.py').read_text(
+            encoding='utf-8', errors='replace')
+        self.assertIn("ask @Helper to call the 'request_tools' tool", src)
+        self.assertIn("FIRST call the 'request_tools' tool", src)
+
 
 if __name__ == '__main__':
     unittest.main()

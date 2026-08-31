@@ -1854,7 +1854,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                       "capability you need, e.g. 'text to speech' or 'crawl a "
                       "webpage'. Call this FIRST whenever your current tools "
                       "lack a capability - never tell the user something is "
-                      "unavailable without trying this.")
+                      "unavailable without trying this. If it finds no "
+                      "match, call it once more with different wording.")
 
         for tool_name, tool_func in svc_tools.items():
             tool_def = next((d for d in svc_defs if d['name'] == tool_name), None)
