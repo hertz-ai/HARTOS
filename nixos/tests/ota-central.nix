@@ -343,7 +343,11 @@ in
           # The request was CONSUMED (no path-unit retrigger loop).
           node.succeed("test ! -e " + OTA + "/apply-request.json")
           last = json.loads(node.succeed("cat " + OTA + "/last_apply.json"))
-          assert last["status"] == "applied", f"apply result not 'applied': {last}"
+          # "staged", not "applied": the engine registers the generation as the
+          # boot default and does NOT activate the running system (see the long
+          # note in hart-ota.nix). The update is real and complete as far as this
+          # unit is concerned; it takes effect on reboot.
+          assert last["status"] == "staged", f"apply result not 'staged': {last}"
           assert last["flake"] == "${approvedFlake}", \
               f"apply result flake is not central's pin: {last}"
           log = node.succeed("cat " + REBUILD_LOG)

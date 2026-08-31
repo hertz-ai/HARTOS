@@ -1047,6 +1047,21 @@ in
               echo "Last privileged apply:"
               ${pkgs.jq}/bin/jq . /var/lib/hart/ota/last_apply.json 2>/dev/null || true
             fi
+            # A staged generation is INVISIBLE without this. The engine registers
+            # it as the boot default and deliberately does not activate the
+            # running system, so nothing about the live machine changes and the
+            # operator has no other way to learn an update is waiting. Compare
+            # the booted system against the profile the bootloader will use: if
+            # they differ, a reboot is what applies the update.
+            if [ -e /run/hart/ota-reboot-required ] \
+               || [ "$(readlink -f /run/booted-system 2>/dev/null)" \
+                    != "$(readlink -f /nix/var/nix/profiles/system 2>/dev/null)" ]; then
+              echo ""
+              echo "REBOOT PENDING - a newer generation is staged as the boot default."
+              echo "  booted : $(readlink -f /run/booted-system 2>/dev/null || echo unknown)"
+              echo "  staged : $(readlink -f /nix/var/nix/profiles/system 2>/dev/null || echo unknown)"
+              echo "  Reboot to activate it; the previous generation stays bootable."
+            fi
             ;;
           check)
             # User-initiated poll — one of the two poll triggers (the other is
