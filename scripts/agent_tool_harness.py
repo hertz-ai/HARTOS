@@ -41,6 +41,15 @@ import sys
 import time
 import urllib.request
 
+# Windows consoles default to cp1252; a model reply containing an emoji
+# (U+1F916, battery run 2026-09-01) crashed probe_static's print. Never
+# let the REPORTER die on the content it reports.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):
+        pass
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import verify_agentic_after_restart as base  # noqa: E402  (post/log windows/preflight)
 
