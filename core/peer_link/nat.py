@@ -213,12 +213,28 @@ class NATTraversal:
         return None
 
     def _try_crossbar_relay(self) -> Optional[str]:
-        """Use Crossbar as relay (last resort)."""
-        crossbar_url = os.environ.get('CBURL', '')
-        if crossbar_url:
-            # Return the Crossbar URL — link_manager will use WAMP relay mode
-            return crossbar_url
-        return None
+        """The crossbar router URL, resolved canonically.
+
+        This was `os.environ.get('CBURL', '')`, so an unset CBURL made the
+        function return None and rung 5 was skipped in silence. CBURL is set
+        nowhere: not on central (measured in the live container), not in the
+        run scripts, not in the bundle. So the relay this ladder documents as
+        its last resort has never once been offered, while the router itself
+        has been up and reachable from the open internet on 8088.
+
+        core.wamp_url.resolve_router_url is the module that exists for exactly
+        this question. It honours WAMP_URL, which is the name the run scripts
+        already export, and otherwise composes core.constants.CENTRAL_HOST with
+        the registered 'crossbar' port, so a node can be pointed at a regional
+        host or at the router Nunba ships locally instead of being hardwired to
+        central. CBURL is still read FIRST as the legacy name, so any existing
+        deployment that sets it keeps exactly what it set.
+        """
+        legacy = os.environ.get('CBURL', '').strip()
+        if legacy:
+            return legacy
+        from core.wamp_url import resolve_router_url
+        return resolve_router_url()
 
     def get_external_ip(self) -> Optional[str]:
         """Get our external IP via STUN."""

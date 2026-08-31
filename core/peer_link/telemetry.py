@@ -95,8 +95,15 @@ class CentralConnection:
     """
 
     def __init__(self):
-        self._crossbar_url = os.environ.get(
-            'CBURL', 'ws://aws_rasa.hertzai.com:8088/ws')
+        # That literal was core.wamp_url.LEGACY_ROUTER_ALIAS spelled out by
+        # hand, which made this the fourth place the router host was written
+        # down. Both names resolve to the same machine (measured 2026-08-18 and
+        # recorded in tests/unit/test_wamp_router_url_resolves.py), so routing
+        # through the canonical resolver is a rename, not a redirect. CBURL
+        # still wins when set, so nothing configured today moves.
+        from core.wamp_url import resolve_router_url
+        self._crossbar_url = (os.environ.get('CBURL', '').strip()
+                              or resolve_router_url())
         self._realm = os.environ.get('CBREALM', 'realm1')
         self._connected = False
         self._disconnected_since: Optional[float] = None
