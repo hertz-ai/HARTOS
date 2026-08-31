@@ -279,7 +279,7 @@ def register_autogen_tools(
     """
     for name, (func, desc) in tools_dict.items():
         helper.register_for_llm(
-            name=name, api_style="function", description=desc
+            name=name, api_style="tool", description=desc
         )(func)
         assistant.register_for_execution(name=name)(func)
 

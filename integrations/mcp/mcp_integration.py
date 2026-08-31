@@ -337,14 +337,20 @@ class MCPToolRegistry:
             if mcp_schema:
                 new_sig = _synthesize_signature_from_schema(
                     mcp_schema, func_name=tool_name)
-                if new_sig is not None:
-                    try:
-                        tool_executor.__signature__ = new_sig
-                    except Exception as _attach_err:
-                        logger.debug(
-                            f"[mcp-schema] could not attach __signature__ "
-                            f"to {tool_name!r}: {type(_attach_err).__name__}: "
-                            f"{_attach_err} — keeping **kwargs: Any fallback")
+            else:
+                # Same zero-param trap as registry.py: bare **kwargs renders
+                # as {"description":"kwargs"} and llama-server 400s the whole
+                # request.  Empty Signature -> {"properties": {}} instead.
+                import inspect as _inspect
+                new_sig = _inspect.Signature(parameters=[])
+            if new_sig is not None:
+                try:
+                    tool_executor.__signature__ = new_sig
+                except Exception as _attach_err:
+                    logger.debug(
+                        f"[mcp-schema] could not attach __signature__ "
+                        f"to {tool_name!r}: {type(_attach_err).__name__}: "
+                        f"{_attach_err} — keeping **kwargs: Any fallback")
         except Exception as _import_err:
             # service_tools may not be importable in degraded environments
             # (cx_Freeze edge cases).  Stay on **kwargs: Any — no regression.

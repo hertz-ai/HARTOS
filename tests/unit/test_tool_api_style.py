@@ -20,19 +20,28 @@ visible.  This guard keeps the dead style from coming back.
 from pathlib import Path
 import unittest
 
-_REUSE = Path(__file__).resolve().parents[2] / 'hartos' / 'reuse_recipe.py'
+_ROOT = Path(__file__).resolve().parents[2]
+_REUSE = _ROOT / 'hartos' / 'reuse_recipe.py'
+# every package that registers autogen tools - agent_memory_tools.py held
+# 5 more api_style="function" sites the first reuse-only sweep missed
+_SWEEP_DIRS = ('hartos', 'core', 'integrations')
 
 
 class ToolApiStyleIsTool(unittest.TestCase):
 
     def test_no_function_api_style_registrations(self):
-        src = _REUSE.read_text(encoding='utf-8', errors='replace')
-        n_dead = src.count('api_style="function"') + src.count("api_style='function'")
+        offenders = []
+        for d in _SWEEP_DIRS:
+            for p in (_ROOT / d).rglob('*.py'):
+                src = p.read_text(encoding='utf-8', errors='replace')
+                n = src.count('api_style="function"') + src.count("api_style='function'")
+                if n:
+                    offenders.append(f'{p.relative_to(_ROOT)}: {n}')
         self.assertEqual(
-            n_dead, 0,
+            offenders, [],
             'api_style="function" populates the `functions` request field, '
             'which llama-server ignores - the tool never reaches the model. '
-            'Register with api_style="tool" instead.')
+            'Register with api_style="tool" instead: ' + '; '.join(offenders))
 
     def test_guard_is_not_vacuous(self):
         """The file must still register tools at all, and the tool style
