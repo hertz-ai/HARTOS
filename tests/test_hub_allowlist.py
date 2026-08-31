@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
+from core import hub_allowlist as hub
 from core.hub_allowlist import (
     DEFAULT_TRUSTED_ORGS,
     HubAllowlist,
@@ -109,3 +111,95 @@ def test_corrupt_config_falls_back_to_defaults(tmp_path):
     al = HubAllowlist(config_path=cfg)
     # Defaults restored
     assert al.is_trusted('hertz-ai') is True
+
+
+def test_unexpected_root_type_falls_back_to_defaults(tmp_path):
+    """A JSON scalar root (neither list nor dict) is invalid — the internal
+    ValueError must fail SAFE to defaults, exactly like a parse error."""
+    cfg = tmp_path / 'hub_allowlist.json'
+    cfg.write_text(json.dumps(42), encoding='utf-8')   # int root
+    al = HubAllowlist(config_path=cfg)
+    assert al.is_trusted('google') is True             # seeded, not crashed
+
+
+def test_dict_with_scalar_value_is_coerced_to_reason(tmp_path):
+    """Legacy dict {org: reason_string} (value not a dict) is coerced to a
+    proper entry rather than dropped — the reason string is preserved."""
+    cfg = tmp_path / 'hub_allowlist.json'
+    cfg.write_text(json.dumps({'acme': 'just a reason'}), encoding='utf-8')
+    al = HubAllowlist(config_path=cfg)
+    assert al.is_trusted('acme') is True
+    assert al.list()[0]['reason'] == 'just a reason'
+
+
+def test_add_rejects_interior_tab_and_newline(tmp_allowlist):
+    """The gate rejects '/' or WHITESPACE — that means any interior whitespace
+    (tab, newline), not just the ASCII space. An HF org id is [A-Za-z0-9-], so
+    a tab/newline is always malformed and must not slip past the supply-chain
+    gate on a `' ' in org` check that only caught the literal space."""
+    for bad in ('a\tb', 'a\nb', 'a\rb'):
+        with pytest.raises(ValueError, match="'/' or whitespace"):
+            tmp_allowlist.add(bad, 'should fail')
+        assert tmp_allowlist.is_trusted(bad) is False
+
+
+@pytest.mark.parametrize('junk', ['', None, 123, [], {}])
+def test_is_trusted_rejects_empty_and_non_string(tmp_allowlist, junk):
+    """The hot-path trust check must be junk-safe: empty / None / non-str all
+    return False without raising (never let bad input read as trusted)."""
+    assert tmp_allowlist.is_trusted(junk) is False
+
+
+@pytest.mark.parametrize('junk', ['', None, 123])
+def test_remove_rejects_empty_and_non_string(tmp_allowlist, junk):
+    """remove() is idempotent+junk-safe: bad input returns False, not a raise."""
+    assert tmp_allowlist.remove(junk) is False
+
+
+def test_remove_is_case_insensitive(tmp_allowlist):
+    """An operator revoking a takeover'd publisher must hit it regardless of
+    the casing it was stored under — else `Qwen` survives a `remove('qwen')`."""
+    tmp_allowlist.add('AcmeCorp', 'tenant')
+    assert tmp_allowlist.remove('acmecorp') is True     # different casing
+    assert tmp_allowlist.is_trusted('AcmeCorp') is False
+
+
+def test_save_oserror_is_swallowed_and_memory_survives(tmp_path, monkeypatch):
+    """A disk hiccup on the atomic replace must not break the operator flow:
+    the add still lands IN MEMORY, no exception escapes, and the failed write
+    simply doesn't persist (a reload won't see it)."""
+    cfg = tmp_path / 'hub_allowlist.json'
+    al = HubAllowlist(config_path=cfg)                  # seeds+saves cleanly
+
+    def _boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(hub.os, 'replace', _boom)
+    al.add('acme-corp', 'tenant')                       # must NOT raise
+    assert al.is_trusted('acme-corp') is True           # in-memory add survived
+    # replace failed -> nothing persisted -> a fresh reader won't see it
+    assert HubAllowlist(config_path=cfg).is_trusted('acme-corp') is False
+
+
+def test_default_path_is_under_home_dot_nunba():
+    """The default config path mirrors ~/.nunba/mcp.token so operators learn
+    one config root.  Pure Path construction — writes nothing."""
+    p = hub._default_path()
+    assert p.name == 'hub_allowlist.json'
+    assert p.parent.name == '.nunba'
+    assert p.parent.parent == Path.home()
+
+
+def test_get_allowlist_singleton_and_reset(monkeypatch, tmp_path):
+    """get_allowlist() memoizes one instance; reset_for_tests() clears it so a
+    test can swap the config path.  Keep the default off the real ~/.nunba."""
+    monkeypatch.setattr(hub, '_default_path',
+                        lambda: tmp_path / 'singleton.json')
+    hub.reset_for_tests()
+    try:
+        first = hub.get_allowlist()
+        assert hub.get_allowlist() is first             # memoized
+        hub.reset_for_tests()
+        assert hub.get_allowlist() is not first         # cleared -> new instance
+    finally:
+        hub.reset_for_tests()
