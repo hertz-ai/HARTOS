@@ -4172,6 +4172,21 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
 
     if next_id > len(user_tasks[user_prompt].actions):
         current_app.logger.info(f'[REUSE] All {len(user_tasks[user_prompt].actions)} actions completed')
+        # Reset for the NEXT incoming message from this same user_prompt.
+        # user_tasks[user_prompt] is a persistent, per-identity object —
+        # create_agents_for_user() (which builds a fresh Action(), current_action=1)
+        # only runs on this identity's FIRST-ever turn (guarded by
+        # `user_prompt not in user_agents`); every later turn reuses this
+        # SAME object and SAME actions list (reuse mode intentionally
+        # re-runs the same recipe per message). Leaving current_action at
+        # next_id here left it permanently out of range after the first
+        # completed turn — found live 2026-08-31: every subsequent message
+        # from the same self-chat identity immediately hit "Cannot access
+        # recipe for current action N" (the `current_action > len(actions)`
+        # guard a few hundred lines up), burned its bounded 4 retries doing
+        # nothing, and fell through to echoing the user's own prompt back
+        # as if it were the agent's reply.
+        user_tasks[user_prompt].current_action = 1
         # Meter the COMPLETED replay into the owning goal's spark ledger —
         # the daemon's completion gate closes goals on transacted spark only
         # (charged on finished work, never at dispatch). Mirrors the CREATE

@@ -44,6 +44,25 @@ class TestAdvanceReuseActionAllDone:
         assert ok is False
         assert done is True
 
+    def test_all_done_resets_current_action_for_next_turn(self, mock_flask_app):
+        """Found live 2026-08-31: on the "all actions done" path,
+        current_action was left at next_id (out of range) permanently.
+        user_tasks[user_prompt] is reused across every later message from
+        the same identity (create_agents_for_user's fresh Action() only
+        runs on that identity's first-ever turn), so every subsequent
+        message immediately hit "current_action > len(actions)", burned
+        its retries doing nothing, and fell through to echoing the user's
+        own prompt back instead of a real reply. Must reset to 1 so the
+        next turn (which re-runs the same recipe) starts sanely."""
+        user_prompt = 'u1_p1'
+        task = _FakeTask(1)
+        with patch.object(reuse_recipe, 'user_tasks', {user_prompt: task}), \
+             patch('reuse_recipe.force_state_through_valid_path', return_value=True), \
+             patch('reuse_recipe.get_action_state', return_value=ActionState.TERMINATED):
+            _advance_reuse_action(user_prompt, 1, prompt_id='p1')
+
+        assert task.current_action == 1
+
     def test_state_error_returns_all_done_false(self, mock_flask_app):
         user_prompt = 'u1_p1'
         with patch.object(reuse_recipe, 'user_tasks', {user_prompt: _FakeTask(2)}), \
