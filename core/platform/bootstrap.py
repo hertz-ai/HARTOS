@@ -545,6 +545,26 @@ def _verify_extension_signatures(extensions_dir: str) -> None:
     Does NOT block loading — verification is advisory for now.
     Production environments should set HART_REQUIRE_SIGNED_EXTENSIONS=1
     to enforce signatures.
+
+    READ THIS BEFORE HARDENING ANYTHING HERE. This gate cannot currently stop
+    any code from running, and tightening it does not change that:
+
+      * It iterates DIRECTORIES and quarantines by renaming `<dir>` to
+        `<dir>.badsig`. ExtensionRegistry.load_from_directory
+        (core/platform/extensions.py:239) loads top-level `.py` FILES and skips
+        anything that is not one. It never looks at directories, so a renamed
+        directory was never going to be loaded either way. The quarantine is
+        inert by construction.
+      * NOTHING in this repo writes a `manifest.sig`. There is no extension
+        signing pipeline, so in practice every extension takes the unsigned
+        branch above.
+
+    So the useful work here is honest REPORTING, not enforcement: say clearly
+    what was and was not verified. Making it fail closed adds real friction --
+    a rename is sticky and needs a human to undo -- in exchange for protection
+    that does not exist. If extension signing is ever wanted for real, wire the
+    verdict into load_from_directory and add a signer; until then, do not
+    mistake this for a control.
     """
     require_signed = os.environ.get('HART_REQUIRE_SIGNED_EXTENSIONS', '') == '1'
 
@@ -573,25 +593,52 @@ def _verify_extension_signatures(extensions_dir: str) -> None:
                 logger.debug("Extension '%s' is unsigned (advisory)", entry)
             continue
 
-        # Verify signature using master public key
+        # Verify the signature using the ONE extension-signature verifier in
+        # the repo: ExtensionSandbox.verify_signature (Ed25519 over the
+        # SHA-256 of the file bytes, checked against the hardcoded master
+        # public key).
+        #
+        # This block previously called ``security.master_key.verify_release``,
+        # WHICH HAS NEVER EXISTED -- no definition anywhere in the tree. The
+        # import raised ImportError on every extension, every boot, and the
+        # handler below logged it at DEBUG and moved on. So this gate has never
+        # once verified a signature.
+        #
+        # The failure was worse than "no checking", because it was asymmetric.
+        # The missing-signature branch above runs BEFORE this import and still
+        # works, so an extension with NO manifest.sig gets quarantined -- while
+        # an extension carrying any manifest.sig at all sailed through, even
+        # under HART_REQUIRE_SIGNED_EXTENSIONS=1. Supplying a garbage signature
+        # was strictly safer for an attacker than supplying none.
         try:
-            from security.master_key import verify_release
-            import json
-            with open(manifest_path, 'rb') as f:
-                manifest_bytes = f.read()
-            with open(sig_path, 'rb') as f:
-                sig_bytes = f.read()
+            from core.platform.extension_sandbox import ExtensionSandbox
+            with open(sig_path, 'r', encoding='utf-8') as f:
+                sig_hex = f.read().strip()
 
-            if not verify_release(manifest_bytes, sig_bytes):
+            if not ExtensionSandbox.verify_signature(manifest_path, sig_hex):
                 logger.warning(
-                    "Extension '%s' has INVALID signature — %s",
+                    "Extension '%s' has INVALID signature - %s",
                     entry, "skipping" if require_signed else "loading anyway (advisory)")
                 if require_signed:
                     try:
                         os.rename(ext_path, ext_path + '.badsig')
                     except OSError:
                         pass
-        except ImportError:
-            logger.debug("master_key not available — skipping signature verification")
         except Exception as e:
-            logger.warning("Extension '%s' signature check error: %s", entry, e)
+            # CANNOT-VERIFY IS NOT A GUILTY VERDICT, and it must not be punished
+            # like one. A missing verifier, an unreadable manifest.sig, a
+            # transient OSError -- none of these are evidence that an extension
+            # was tampered with, and the quarantine here is a RENAME: a sticky
+            # change to the user's install that survives reboots and needs a
+            # human to undo. Renaming on a transient read error would disable a
+            # legitimate extension permanently.
+            #
+            # I briefly made this arm fail closed (rename on any exception).
+            # That was wrong twice over: it contradicts this function's own
+            # contract ("Does NOT block loading -- verification is advisory for
+            # now"), and it bought nothing, for the reason in the note above
+            # _verify_extension_signatures. Reverted to log-and-continue.
+            logger.warning(
+                "Extension '%s' signature could not be verified (%s: %s) - "
+                "loading anyway; this gate is advisory",
+                entry, type(e).__name__, e)

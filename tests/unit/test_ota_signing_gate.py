@@ -70,18 +70,37 @@ def test_a_verified_release_advances(monkeypatch):
 
 @pytest.mark.parametrize('why,details', [
     ('bad_signature', 'Invalid master signature on release manifest'),
-    ('code_mismatch', 'Code hash mismatch: local=aaaa... manifest=bbbb...'),
     ('origin_failed', 'Origin attestation failed: not genuine HART OS'),
 ])
 def test_evidence_of_tampering_blocks_the_upgrade(monkeypatch, why, details):
-    """THE POINT OF THE STAGE. Each of these is a node being handed code that
-    is not what the master key signed. The pipeline must stop."""
+    """THE POINT OF THE STAGE. Each of these is a node being handed code the
+    master key did not sign. The pipeline must stop."""
     patch_verification(monkeypatch, {
         'passed': False, 'enforcement': 'hard',
         'reason': why, 'details': details})
     ok, reason = gate()._stage_sign()
     assert not ok, 'a %s must NOT advance the pipeline' % why
     assert 'FAILED' in reason
+
+
+def test_a_code_hash_mismatch_warns_but_does_not_block(monkeypatch):
+    """NOT tamper evidence today, so not a blocker.
+
+    CI computes the manifest's code_hash over a repo checkout; a node computes
+    it over a nix store path holding a different file set. They cannot match, so
+    blocking here would stop OTA fleet-wide the moment a manifest first ships --
+    on a signal that is wrong by construction. That is friction in the name of
+    security: it protects nothing and the outage looks like a breach.
+
+    Promote this to a block once HEVOLVE_CODE_HASH_PRECOMPUTED bakes the signed
+    hash into the image (security/node_integrity.py:277). The cryptographic
+    check above is unaffected and still blocks."""
+    patch_verification(monkeypatch, {
+        'passed': False, 'enforcement': 'hard', 'reason': 'code_mismatch',
+        'details': 'Code hash mismatch: local=aaaa... manifest=bbbb...'})
+    ok, reason = gate()._stage_sign()
+    assert ok, 'an un-comparable code hash must not block the fleet'
+    assert 'signature OK' in reason
 
 
 def test_no_manifest_advances_because_absence_is_not_tampering(monkeypatch):

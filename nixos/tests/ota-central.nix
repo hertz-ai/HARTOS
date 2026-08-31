@@ -448,16 +448,35 @@ in
           # vision init. Every other timing-sensitive assertion in this file already
           # uses wait_until_succeeds; this one was the outlier.
           #
-          # 240s, not 120s (2026-08-31): main() runs hevolve_verify_boot() FIRST,
-          # whose compute_code_hash() + compute_file_manifest() hash EVERY file in
-          # the tree against the signed release_manifest.json — a mandatory
-          # release-integrity step that legitimately costs ~90s on a loaded CI VM
-          # (the same whole-repo hash that flaked the tamper unit test) BEFORE
-          # bootstrap_local_subscribers() runs. So the OTA subscriber log lands
-          # ~180s in — well within boot_userspace_s=600 (the OS's own enforced boot
-          # budget, VM-verified by hart-boot-latency), but past the old 120s window.
-          # This is a slow-but-correct SECURE boot, not a regression; the wait now
-          # matches the legitimate secure-boot time instead of racing it.
+          # 240s, not 120s (2026-08-31). CAUTION, THE ORIGINAL REASON GIVEN HERE
+          # WAS WRONG, and it is still not fully diagnosed (2026-09-01).
+          #
+          # This comment used to say the delay was hevolve_verify_boot()'s
+          # compute_code_hash() + compute_file_manifest() hashing every file in
+          # the tree, "~90s on a loaded CI VM", before bootstrap_local_subscribers
+          # runs. That step DOES NOT EXECUTE here. hart_intelligence_entry.py:374
+          # returns immediately when release_manifest.json is absent, BEFORE
+          # reaching compute_code_hash at :397 -- and nothing in nixos/ packages a
+          # release_manifest.json into any configuration, so no node or test VM
+          # has one. The failing run also logged ZERO HevolveIntegrity lines.
+          #
+          # Nor is it the ResourceGovernor's provider discovery, which shows up in
+          # the journal around the same time (scans at ~200s/245s/295s, each probe
+          # bounded by PROBE_TIMEOUT_SECONDS=10): that runs on a daemon thread
+          # (core/resource_governor.py:713), so it competes for CPU on an
+          # oversubscribed runner but does not serialise ahead of the subscriber.
+          #
+          # What is actually true: hart_intelligence_entry is a ~12.6k-line module
+          # whose import-time startup is simply long, and CI runs four VMs per
+          # runner. 240s was picked to fit an observed boot, not from a measured
+          # cause, and it STILL times out -- so the number is a guess that is
+          # already wrong once.
+          #
+          # DO NOT just raise it again. Either measure what the backend is doing
+          # between unit-active and this log line, or assert the wiring property
+          # far more cheaply than by racing a full boot: this subtest only needs
+          # to know that the OTA leg was registered with the existing bus, which
+          # does not require waiting for the whole backend to finish starting.
           jb = node.wait_until_succeeds(
               "journalctl -u hart-backend --no-pager | "
               "grep -i 'Local subscribers bootstrapped' | tail -1",
