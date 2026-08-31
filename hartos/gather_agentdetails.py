@@ -322,7 +322,9 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
         return response
 
     except Exception as e:
-        return f"Error getting response: {str(e)}"
+        # #716: reply gets SPOKEN by TTS - never surface raw internals
+        from core.agent_tools import user_facing_error
+        return user_facing_error(e)
 
 
 from core.llm_outbound_logger import with_source as _with_source

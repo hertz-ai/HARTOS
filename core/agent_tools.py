@@ -33,6 +33,29 @@ tool_logger = logging.getLogger('tool_execution')
 # Generic registration helper
 # ---------------------------------------------------------------------------
 
+_INTERNAL_ERROR_MARKERS = ('context size', 'server_error', 'error code: 500',
+                           'traceback', 'connection', 'timed out', 'timeout',
+                           'memory slot')
+
+
+def user_facing_error(e):
+    """ONE user-facing string for an internal failure (#716).
+
+    Three sites (reuse get_agent_response, create get_response_group,
+    gather_agentdetails) returned raw exception text as the reply, so
+    TTS spoke lines like 'Context size has been exceeded' to the user
+    (observed live 2026-08-31, probe run 4).  Full tracebacks are
+    already logged at every call site - the reply only needs to be
+    honest and speakable.
+    """
+    text = str(e)
+    low = text.lower()
+    if any(m in low for m in _INTERNAL_ERROR_MARKERS) or len(text) > 200:
+        return ("I hit an internal snag finishing that - please try "
+                "again in a moment.")
+    return f"I couldn't finish that: {text[:160]}"
+
+
 def register_dual(helper, executor, func, name: str, description: str):
     """Register a single tool on both the LLM-calling and executing agents.
 

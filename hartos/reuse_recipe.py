@@ -3472,7 +3472,11 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         current_app.logger.info(f'Got some error {e}')
         error_message = traceback.format_exc()  # Capture full traceback
         current_app.logger.error(f"Error in get_agent_response:\n{error_message}")
-        return f"Error getting response: {str(e)}"
+        # #716: this string is the reply and gets SPOKEN by TTS - never
+        # return raw internals ('Context size has been exceeded' was read
+        # aloud to the user, observed live 2026-08-31)
+        from core.agent_tools import user_facing_error
+        return user_facing_error(e)
 
 
 def get_flow_number(user_id, prompt_id):

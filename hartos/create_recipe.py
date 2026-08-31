@@ -5146,7 +5146,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         current_app.logger.error(f"Unhandled exception in get_response_group: {e}")
         safe_set_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.ERROR, "Unhandled exception in get_response_group")
         current_app.logger.error(traceback.format_exc())
-        return f"An error occurred: {str(e)}"
+        # #716: reply gets SPOKEN by TTS - never surface raw internals
+        from core.agent_tools import user_facing_error
+        return user_facing_error(e)
 
 
 def get_total_flows(user_prompt):
