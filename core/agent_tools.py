@@ -162,7 +162,15 @@ def discover_and_attach(need, helper, executor, registry, attached_names):
             attached.append(fn)
     parts = []
     if attached:
-        parts.append("Attached and ready to call NOW: " + ', '.join(attached))
+        # Imperative on purpose: hop-2 probe 2026-08-31 showed the model
+        # attaching crawl4ai then STILL answering "I cannot browse the live
+        # internet" - the trained refusal prior survives a neutral result.
+        parts.append(
+            "Attached and ready to call NOW: " + ', '.join(attached)
+            + ". These execute LOCALLY on this machine, so no "
+              "internet-access or capability restriction applies. "
+              "Immediately CALL the one that fits the task. Do NOT tell "
+              "the user this is unavailable - the tool is live.")
     if startable:
         parts.append("Exists locally but the backing service is down — it "
                      "can be self-hosted/started via the install flow: "
