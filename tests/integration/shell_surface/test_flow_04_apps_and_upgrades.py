@@ -396,12 +396,28 @@ def test_ch04_scene7_upgrade_pipeline_check_advance_and_the_sign_gate(
     WHICH RUNGS A NODE CAN REACH AUTONOMOUSLY (as the code enforces it):
     BUILD (code hash), TEST (regression pass-rate gate), AUDIT (guardrail
     integrity + constitutional self-test) and BENCHMARK are all local,
-    self-service stages. SIGNING is the steward gate: _stage_sign shells out
-    to scripts/sign_release.py, which needs the master private key held by
-    the human steward (AI exclusion zone; this test neither runs nor mocks
-    that script). Only HEVOLVE_DEV_MODE=true skips it. So an /advance walk
-    CANNOT complete an apply autonomously in production: the pipeline stops
-    at SIGN until a human signs.
+    self-service stages. SIGNING is a VERIFICATION gate: _stage_sign proves
+    the release was signed by the master key (security.master_key.
+    full_boot_verification) and fails closed on a bad signature, a code-hash
+    mismatch or a failed origin attestation.
+
+    CORRECTED 2026-08-31. This paragraph used to say _stage_sign shells out
+    to scripts/sign_release.py and that the pipeline therefore "stops at SIGN
+    until a human signs" -- an AI exclusion zone. That was narration of a
+    crash, not a contract. sign_release.py is a CI script needing
+    MASTER_PRIVATE_KEY_HEX (a GitHub Actions secret); on a node it died on a
+    relative path (`//scripts/sign_release.py`) and took stage='failed', which
+    is not a gate that waits for anybody. It blocked every OTA on the .69 box
+    for a day. A node signing its own release would also defeat the check it
+    is standing at, so the stage now VERIFIES instead.
+
+    The human-in-the-loop control is real but lives elsewhere: hart.ota
+    .autoApply (nixos/modules/hart-ota.nix:313, default false -- "updates are
+    downloaded and staged but require manual approval"), enforced at the
+    switch. That is the knob a steward turns, not this rung.
+
+    This test still neither runs nor drives SIGNING; the gate's own behaviour
+    is covered by tests/unit/test_ota_signing_gate.py.
 
     FINDING (narrated, not driven): _stage_canary returns passed=False with
     detail 'canary started, check again later' on its FIRST call, and

@@ -45,31 +45,31 @@ def test_dispatcher_has_no_parallel_classifier():
 # ─── L3: Assistant-streak escalation to Helper ─────────────────────────
 
 def test_l3_module_state_present():
-    a = _module_assigns(_read('create_recipe.py'))
+    a = _module_assigns(_read('hartos/create_recipe.py'))
     assert '_ASSISTANT_STREAK_STATE' in a
     assert '_ASSISTANT_STREAK_THRESHOLD' in a
 
 
 def test_l3_threshold_sane():
-    a = _module_assigns(_read('create_recipe.py'))
+    a = _module_assigns(_read('hartos/create_recipe.py'))
     th = a['_ASSISTANT_STREAK_THRESHOLD'].value.value
     assert 2 <= th <= 5
 
 
 def test_l3_escalation_wired():
-    src = _read('create_recipe.py')
+    src = _read('hartos/create_recipe.py')
     assert 'ASSISTANT-STREAK-ESCALATE' in src
     assert '_ASSISTANT_STREAK_STATE.get(user_prompt' in src
     assert '_ASSISTANT_STREAK_STATE.pop(user_prompt' in src
 
 
 def test_l3_no_name_enumeration():
-    src = _read('create_recipe.py')
+    src = _read('hartos/create_recipe.py')
     assert "'Helper', 'Executor', 'StatusVerifier', 'ChatInstructor'" not in src
 
 
 def test_existing_loop_guard_unchanged():
-    a = _module_assigns(_read('create_recipe.py'))
+    a = _module_assigns(_read('hartos/create_recipe.py'))
     assert a['_STATE_TRANSITION_LOOP_THRESHOLD'].value.value == 5
 
 
@@ -89,7 +89,7 @@ def test_existing_loop_guard_unchanged():
 # autogen's GroupChatManager already honours between rounds.
 
 def test_early_terminate_guard_present():
-    src = _read('create_recipe.py')
+    src = _read('hartos/create_recipe.py')
     assert '[EARLY-TERMINATE]' in src, (
         "EARLY-TERMINATE guard missing — state_transition would loop "
         "on ChatInstructor's default_auto_reply='TERMINATE' for ~3min"
@@ -102,7 +102,7 @@ def test_early_terminate_runs_before_chat_instructor_routing():
     If the order flips, the routing branch fires first and the
     TERMINATE message gets ferried to Assistant — the exact regression
     this guard exists to prevent."""
-    src = _read('create_recipe.py')
+    src = _read('hartos/create_recipe.py')
     early_marker = src.find('[EARLY-TERMINATE]')
     # The speaker-routing line is the long ``or last_speaker.name == 'ChatInstructor'``
     # disjunction at ~line 2321.

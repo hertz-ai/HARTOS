@@ -107,6 +107,41 @@ the next flake-checks dispatch. CI-iteration only from the Windows box (no local
 nix/VM); the shell paint items (#12, false-healthy shell-ready) are the #3
 workstream and design-gated.
 
+**RE-VERIFIED run `33322172168` @ `ae538fc8` (2026-08-30):** all 8 unit shards
+GREEN again (after two concurrent-session gate-breaks I fixed: `ddgs`→`click`
+dep conflict `8313ac90`, and a `/chat` diagnostic moved to `scripts/` `5892f5a6`).
+nixosTests shards 1+2 GREEN — **shard 2 flipped green = the waydroid
+`RuntimeMaxUSec` fix CONFIRMED.** Shards 0+3 red, and the reds are stable across
+both VM runs (deterministic, not flaky), collapsing to THREE classes: (A) **#12**
+software-GL paint hang (`hart-desktop-shell-boot` OCR timeout, `hart-layer-shell-
+host-paint` pkill 137); (B) **#3/#6** false-healthy `shell-ready`
+(`hart-session-supervisor-paint-watchdog`); (C) `hart-ota-central` realtime-push
+wiring timeout. A/B are the design-gated shell-boot workstream; C needs VM
+runtime state (CI-iteration). `hart-boot-log` mount did NOT recur — passed after
+the shard reshuffle.
+
+**`hart-ota-central` — PARTIAL diagnosis (one hypothesis DISPROVEN by reading the
+code):** the subtest `wait_until_succeeds`-es 120s for hart-backend to log
+`"Local subscribers bootstrapped … ota-push"`, and the journal shows a **~91s
+SILENT main-thread stall** between `[92.5s]` (WorldModelBridge `Direction B
+subscribed`) and `[183.9s]` (`hive_benchmark_prover` loop), with
+`bootstrap_local_subscribers` (hart_intelligence_entry.py:12632) reached only
+after it. **DISPROVEN hypothesis (first pass):** the `_wait_for_llm_server` waits are NOT the
+blocker — they live inside `_delayed_learning_init`, a **daemon thread** (:2025),
+and on the VM take only the 5s branch, off the main thread. **REAL ROOT CAUSE
+(traced through `main()`):** `main()` runs `hevolve_verify_boot()` FIRST (:12592),
+whose `compute_code_hash()` + `compute_file_manifest()` (:397/:404) hash EVERY
+file in the tree against the signed `release_manifest.json` — a MANDATORY
+release-integrity step (the same whole-repo hash that flaked the tamper unit
+test) that legitimately costs ~90s on a loaded CI VM, on the main thread, BEFORE
+`bootstrap_local_subscribers()` (:12632). So the OTA subscriber log lands ~180s
+in — well within `boot_userspace_s`=600 (the OS's own enforced boot budget,
+VM-verified by hart-boot-latency), but past the test's old 120s window. This is a
+slow-but-correct SECURE boot, NOT a regression, and reordering subscribers ahead
+of the integrity check would wire them on a not-yet-verified (possibly tampered)
+node. **✅ FIXED (`ota-central.nix` wait 120s→240s):** the test now matches the
+legitimate secure-boot time instead of racing it. Verifies on the next VM run.
+
 ## 🧭 Steward decisions (yours — not mine to default)
 
 | # | Decision |

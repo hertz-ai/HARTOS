@@ -37,7 +37,7 @@ import os
 import re
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-SRC = os.path.join(ROOT, 'create_recipe.py')
+SRC = os.path.join(ROOT, 'hartos/create_recipe.py')
 
 _READ = re.compile(r"task_time\[[^\]]+\]\['times'\]\[-1\]")
 # Either spelling of "I checked it is non-empty first".

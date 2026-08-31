@@ -225,21 +225,40 @@ def _rust(name):
                      if not l.lstrip().startswith("//"))
 
 
-def test_the_claim_is_published_from_the_flip_path_not_config():
-    """THE contract. 'A flag is set' is a promise; 'this element was in the frame
-    that reached the screen' is evidence. Only the second is safe to act on,
-    because acting wrongly yields a desktop with no background and the paint
-    watchdog does not catch wrong-looking desktops."""
-    udev = _rust("udev.rs")
-    import re as _re
-    # The CALL site, not the `fn publish_native_chrome()` definition.
-    calls = [m.start() for m in _re.finditer(r"(?<!fn )publish_native_chrome\(\)", udev)]
-    assert calls, "publish_native_chrome is never called"
-    i = calls[0]
-    window = udev[max(0, i - 500): i]
-    assert "last_flip_at = Some(now)" in window, (
-        "the claim must be published where the frame is recorded as presented, "
-        "not from configuration or at startup")
+# ── MOVED TO RUST ───────────────────────────────────────────────────────────
+#
+# Three tests that used to live here regexed compositor/src/udev.rs as TEXT:
+#
+#   test_the_claim_is_published_from_the_flip_path_not_config
+#   test_the_claim_only_grows_within_a_session
+#   test_the_write_is_atomic
+#
+# They asserted source strings, not behaviour, which is the pattern CLAUDE.md
+# Gate 5 forbids. The first one proved the cost: it asserted the literal
+# `last_flip_at = Some(now)` sat within 500 characters before the publish call,
+# so it went RED when that call legitimately moved into the vblank reaper -- a
+# change that made the claim STRONGER (a real DrmEvent::VBlank proves scanout;
+# queue_frame's Ok does not, since Ok is also returned for a merely PARKED
+# frame). A test that fails when the code gets better, while never once proving
+# a claim actually grows or that a torn read is impossible, is worse than none.
+#
+# The invariants now live in compositor/src/udev.rs `mod tests`, against
+# extracted pure helpers (next_claim / claim_names / write_claim) plus a real
+# filesystem for the atomic write:
+#
+#   a_claim_only_ever_grows
+#   an_unchanged_claim_is_not_rewritten
+#   claiming_nothing_publishes_nothing
+#   claim_names_are_stable_and_ordered
+#   the_claim_is_written_atomically
+#   a_failed_publish_leaves_no_temp_file
+#
+# They run in CI under `cargo test --features smithay` (the Compositor nix
+# build job), which is the only place udev.rs compiles at all.
+#
+# STILL SOURCE-GREPPING BELOW, tracked in task #69: the comp_core.rs Err-arm
+# test and the hart-comp.nix session-start test. The Nix one wants an eval-time
+# flake check (precedent: otaTargetBootsRaw in nixos/flake.nix).
 
 
 def test_a_failed_element_import_does_not_claim_it():
@@ -253,25 +272,6 @@ def test_a_failed_element_import_does_not_claim_it():
         after_err = core[i: i + 300]
         assert mask not in after_err, (
             "%s sets its claim mask on the failure path" % elem)
-
-
-def test_the_claim_only_grows_within_a_session():
-    """The shell re-reads this on every render. Retracting a claim mid-session
-    would flicker the desktop between native and HTML chrome."""
-    udev = _rust("udev.rs")
-    i = udev.index("fn publish_native_chrome")
-    body = udev[i: i + 2200]
-    assert "prev | mask" in body, "the published claim must only ever grow"
-    assert "if next == prev" in body, "an unchanged claim must not be rewritten"
-
-
-def test_the_write_is_atomic():
-    """The shell polls this file on every render; a torn read would flicker."""
-    udev = _rust("udev.rs")
-    i = udev.index("fn publish_native_chrome")
-    body = udev[i: i + 2200]
-    assert "rename" in body, (
-        "write-then-rename, or a reader can observe a half-written claim")
 
 
 def test_the_claim_is_cleared_at_session_start():

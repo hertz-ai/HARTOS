@@ -77,7 +77,7 @@ WS_SOURCES = [
     'security/action_classifier.py',
     'security/dlp_engine.py',
     'security/rate_limiter_redis.py',
-    'threadlocal.py',
+    'hartos/threadlocal.py',
 ]
 
 

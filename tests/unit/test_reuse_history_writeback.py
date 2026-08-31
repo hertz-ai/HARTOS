@@ -22,7 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 _REUSE_SRC = (Path(__file__).resolve().parents[2] /
-              'reuse_recipe.py').read_text(encoding='utf-8')
+              'hartos/reuse_recipe.py').read_text(encoding='utf-8')
 
 
 def test_install_history_writeback_persists_appends(tmp_path, monkeypatch):

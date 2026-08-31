@@ -19,7 +19,7 @@ def test_atomic_write_produces_valid_readable_json(tmp_path):
 
 
 def test_create_recipe_config_saves_are_atomic():
-    src = (Path(__file__).resolve().parents[2] / 'create_recipe.py').read_text(encoding='utf-8')
+    src = (Path(__file__).resolve().parents[2] / 'hartos/create_recipe.py').read_text(encoding='utf-8')
     assert 'atomic_json_write(file_path, data' in src, \
         "recipe config saves must use the canonical atomic write"
     assert "with open(file_path, 'w') as f:" not in src, \

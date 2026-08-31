@@ -4981,7 +4981,7 @@ function loadKeyboardShortcutsPanel(el) {{
       html += '<div class="ds-section-label">'+group+'</div><div class="ds-stagger">';
       groups[group].forEach(key=>{{
         if(!sc[key]) return;
-        const label = key.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+        const label = key.replace(/_/g,' ').replace(/\b\\w/g,c=>c.toUpperCase());
         html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-muted">keyboard</span>'+
           '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+label+'</div></div>'+
           '<span class="ds-list-item-trailing"><code style="background:#1a1a1a;padding:2px 8px;border-radius:4px;font-size:12px;color:var(--hart-accent)">'+sc[key]+'</code></span></div>';
@@ -6890,15 +6890,15 @@ function renderAgentOverlay(ev) {{
     var md = ev.content||'';
     // Basic markdown→HTML: bold, italic, links, inline code, headers, lists
     md = md.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    md = md.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
-    md = md.replace(/\*(.+?)\*/g,'<em>$1</em>');
+    md = md.replace(/\\*\\*(.+?)\\*\\*/g,'<strong>$1</strong>');
+    md = md.replace(/\\*(.+?)\\*/g,'<em>$1</em>');
     md = md.replace(/`([^`]+)`/g,'<code style="background:rgba(255,255,255,0.08);padding:1px 4px;border-radius:3px;font-family:monospace;font-size:0.9em">$1</code>');
-    md = md.replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2" target="_blank" style="color:var(--hart-accent);text-decoration:underline">$1</a>');
+    md = md.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g,'<a href="$2" target="_blank" style="color:var(--hart-accent);text-decoration:underline">$1</a>');
     md = md.replace(/^### (.+)$/gm,'<div class="ds-body-md" style="font-weight:700;margin-top:6px">$1</div>');
     md = md.replace(/^## (.+)$/gm,'<div class="ds-body-md" style="font-weight:700;font-size:1.1em;margin-top:6px">$1</div>');
     md = md.replace(/^# (.+)$/gm,'<div class="ds-body-lg" style="font-weight:700;margin-top:6px">$1</div>');
     md = md.replace(/^[-*] (.+)$/gm,'<div style="padding-left:12px">&#8226; $1</div>');
-    md = md.replace(/^\d+\. (.+)$/gm,function(m,p1){{ return '<div style="padding-left:12px">'+m.split('.')[0]+'. '+p1+'</div>'; }});
+    md = md.replace(/^\\d+\\. (.+)$/gm,function(m,p1){{ return '<div style="padding-left:12px">'+m.split('.')[0]+'. '+p1+'</div>'; }});
     md = md.split(String.fromCharCode(10)).join('<br>');
     html += '<div class="ds-body-sm" style="line-height:1.5">'+md+'</div>';
 
@@ -6907,9 +6907,9 @@ function renderAgentOverlay(ev) {{
     var src = ev.src||ev.url||'';
     var alt = ev.alt||'Media';
     if(ev.title) html += '<div class="ds-body-sm" style="font-weight:600;margin-bottom:4px">'+(ev.title)+'</div>';
-    if(mediaType === 'video' || src.match(/\.(mp4|webm|ogg)($|\?)/i)) {{
+    if(mediaType === 'video' || src.match(/\\.(mp4|webm|ogg)($|\\?)/i)) {{
       html += '<video src="'+src+'" '+(ev.controls!==false?'controls':'')+' style="width:100%;border-radius:8px;max-height:160px" preload="metadata">'+alt+'</video>';
-    }} else if(mediaType === 'audio' || src.match(/\.(mp3|wav|ogg|aac)($|\?)/i)) {{
+    }} else if(mediaType === 'audio' || src.match(/\\.(mp3|wav|ogg|aac)($|\\?)/i)) {{
       html += '<audio src="'+src+'" '+(ev.controls!==false?'controls':'')+' style="width:100%">'+alt+'</audio>';
     }} else {{
       html += '<img src="'+src+'" alt="'+alt+'" style="width:100%;border-radius:8px;max-height:160px;object-fit:cover" onerror="this.hidden=true">';
@@ -6998,7 +6998,7 @@ function renderAgentOverlay(ev) {{
     // (un-pre-escaped) prop-name labels.
     var _cc = '';
     if(typeof ev._spec.template === 'string' && ev._spec.template) {{
-      _cc += String(ev._spec.template).replace(/\{{\{{(\w+)\}}\}}/g, function(_m, _k) {{
+      _cc += String(ev._spec.template).replace(/\\{{\\{{(\\w+)\\}}\\}}/g, function(_m, _k) {{
         return String(ev[_k] != null ? ev[_k] : '');
       }});
     }} else {{

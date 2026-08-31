@@ -34,6 +34,38 @@ STATE_FILE = _resolve_agent_engine_path('upgrade_state.json')
 BENCHMARK_DIR = _resolve_agent_engine_path('benchmarks')
 
 
+class _InProgress:
+    """A stage handler's third answer: "still working, ask me again".
+
+    advance_pipeline only ever understood pass or fail, and mapped EVERY
+    falsy result to _fail() -> stage='failed', which is terminal. That made
+    _stage_canary impossible to satisfy: its own first return is
+    ``(False, 'canary started, check again later')``, so the very act of
+    starting a canary marked the upgrade FAILED, and the "check again later"
+    it asks for could never happen. The contradiction was recorded in
+    tests/integration/shell_surface/test_flow_04_apps_and_upgrades.py as a
+    narrated finding before it was fixed here.
+
+    Deliberately FALSY, so any caller that still does a plain ``if passed:``
+    treats it as "did not pass" rather than accidentally advancing a stage
+    that has not finished. advance_pipeline checks identity BEFORE
+    truthiness, which is what separates "not yet" from "no".
+    """
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return 'IN_PROGRESS'
+
+
+#: Return this as a stage handler's first element to hold the pipeline on the
+#: current stage without failing it.
+IN_PROGRESS = _InProgress()
+
+
 class UpgradeStage(enum.Enum):
     IDLE = 'idle'
     BUILDING = 'building'
@@ -144,6 +176,13 @@ class UpgradeOrchestrator:
 
         try:
             passed, detail = handler()
+            if passed is IN_PROGRESS:
+                # Not a pass and NOT a failure. Hold this stage; the timer
+                # that drives advance will call us again. Reported as
+                # success=True because nothing went wrong -- a caller that
+                # treated this as an error would rollback a healthy canary.
+                return {'success': True, 'stage': current,
+                        'in_progress': True, 'detail': detail}
             if passed:
                 next_stage = self._next_stage(current)
                 with self._lock:
@@ -343,25 +382,73 @@ class UpgradeOrchestrator:
             return False, f'Benchmark stage error: {e}'
 
     def _stage_sign(self) -> tuple:
-        """Sign release. Skipped in dev mode."""
+        """VERIFY the release signature. A node does not sign; CI does.
+
+        This stage used to shell out to ``scripts/sign_release.py``. That was
+        wrong three times over, and it blocked every OTA on the .69 box from
+        2026-08-30 until it was found (pipeline reached ``signing`` and died,
+        pending_update.json stuck at ``"status": "available"``):
+
+          1. The path was RELATIVE. hart-ota-check.service sets no
+             WorkingDirectory, so systemd ran it from ``/`` and Python reported
+             ``can't open file '//scripts/sign_release.py'``. That is the error
+             that actually fired.
+          2. Behind it, ``sign_release.py`` is a CI script. Its own docstring:
+             "Release signing script for HevolveSocial CI/CD ... Requires
+             MASTER_PRIVATE_KEY_HEX environment variable (GitHub Actions
+             secret)." A consumer node has no master private key and must never
+             have one -- security/key_delegation.py:161 treats a central-tier
+             claim without that key as an error. Signing on a node would be
+             minting a release signature on the machine that is supposed to be
+             checking it.
+          3. It was called with NO argv, while the script requires --version,
+             --git-sha, --code-hash and --manifest-hash. Even with a key and an
+             absolute path it would have exited on argparse.
+
+        The node's actual job at this gate is the opposite one: prove the
+        release it is about to adopt was signed by the master key. That is
+        ``security.master_key.full_boot_verification`` -- manifest load,
+        master-signature check, code-hash comparison, origin attestation, and
+        it honours dev mode and enforcement mode itself. No new crypto here,
+        and no second verification path.
+
+        Fails CLOSED on evidence of tampering (bad signature, code mismatch,
+        failed attestation). Fails OPEN, loudly, when there is simply nothing
+        to verify -- see the ``no_manifest`` note in full_boot_verification:
+        no bundled desktop build ships a manifest, so blocking on absence would
+        disable OTA on 100% of desktops while catching no tampering.
+        """
         try:
-            from security.master_key import is_dev_mode
-            if is_dev_mode():
-                return True, 'dev mode — signing skipped'
+            from security.master_key import full_boot_verification
         except ImportError:
-            return True, 'master_key unavailable — skipping'
+            # Not every deployment ships the security package. Permissive, but
+            # never silent -- a swallowed ImportError is what let the dead
+            # verify_release call in bootstrap.py go unnoticed for so long.
+            logger.warning(
+                '[OTA] signing gate: security.master_key unavailable, '
+                'release signature NOT verified')
+            return True, 'master_key unavailable - signature NOT verified'
 
         try:
-            from core.subprocess_safe import hidden_popen_kwargs
-            result = subprocess.run(
-                [sys.executable, 'scripts/sign_release.py'],
-                capture_output=True, text=True, timeout=60,
-                **hidden_popen_kwargs())
-            if result.returncode == 0:
-                return True, 'release signed'
-            return False, f'sign_release.py failed: {result.stderr[:200]}'
+            result = full_boot_verification()
         except Exception as e:
-            return False, f'Signing error: {e}'
+            return False, f'Signature verification error: {e}'
+
+        if result.get('passed'):
+            return True, 'release signature verified: %s' % (
+                result.get('details') or 'ok')
+
+        reason = result.get('reason', '')
+        details = result.get('details') or reason or 'unknown'
+
+        if reason == 'no_manifest':
+            logger.warning('[OTA] signing gate: %s - nothing to verify, '
+                           'advancing', details)
+            return True, 'no release manifest - signature NOT verified'
+
+        # bad_signature / code_mismatch / origin_failed: real tampering
+        # evidence. This is the gate doing its job.
+        return False, f'release signature verification FAILED: {details}'
 
     def _stage_canary(self) -> tuple:
         """Deploy to 10% of nodes for canary_duration. Check health."""
@@ -369,7 +456,7 @@ class UpgradeOrchestrator:
             # First call: start canary deployment
             self._canary_start = time.time()
             self._start_canary_deployment()
-            return False, 'canary started, check again later'
+            return IN_PROGRESS, 'canary started, check again later'
 
         elapsed = time.time() - self._canary_start
         if elapsed < self._canary_duration:
@@ -378,7 +465,8 @@ class UpgradeOrchestrator:
             if not healthy:
                 self._canary_start = 0
                 return False, f'canary failed: {reason}'
-            return False, f'canary in progress ({elapsed:.0f}/{self._canary_duration}s)'
+            return IN_PROGRESS, (
+                f'canary in progress ({elapsed:.0f}/{self._canary_duration}s)')
 
         # Canary period complete
         healthy, reason = self._check_canary_health()

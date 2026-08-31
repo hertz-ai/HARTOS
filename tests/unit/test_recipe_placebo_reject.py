@@ -17,7 +17,7 @@ _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 
 def _load():
-    src = open(os.path.join(_ROOT, 'create_recipe.py'), encoding='utf-8').read()
+    src = open(os.path.join(_ROOT, 'hartos/create_recipe.py'), encoding='utf-8').read()
     block = re.search(
         r'_RECIPE_PLACEHOLDER_STRINGS = frozenset\(.*?\n\n\ndef _recipe_is_placebo.*?\n    except Exception:\n        return False\n',
         src, re.DOTALL).group(0)

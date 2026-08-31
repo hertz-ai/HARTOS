@@ -48,7 +48,7 @@ class ThereIsExactlyOneImplementation(unittest.TestCase):
     def test_the_pipeline_files_no_longer_define_it(self):
         """create_recipe and reuse_recipe called it twice each from their own
         88-line copy. Both now call the canonical one."""
-        for path in ('create_recipe.py', 'reuse_recipe.py'):
+        for path in ('hartos/create_recipe.py', 'hartos/reuse_recipe.py'):
             self.assertIsNone(
                 _fn(path, 'subscribe_and_return'),
                 "%s defines subscribe_and_return again — the 88-line duplicate is "
@@ -56,13 +56,13 @@ class ThereIsExactlyOneImplementation(unittest.TestCase):
                 % path)
 
     def test_helper_owns_the_canonical_copy(self):
-        n = _fn('helper.py', 'subscribe_and_return')
+        n = _fn('hartos/helper.py', 'subscribe_and_return')
         self.assertIsNotNone(n, "the canonical implementation is missing from helper.py")
         self.assertGreater(n.end_lineno - n.lineno, 20,
                            "helper.py's copy looks like a stub, not the real one")
 
     def test_every_call_site_goes_through_helper(self):
-        for path in ('create_recipe.py', 'reuse_recipe.py'):
+        for path in ('hartos/create_recipe.py', 'hartos/reuse_recipe.py'):
             src = open(os.path.join(REPO, path), encoding='utf-8',
                        errors='replace').read()
             bare = src.count('await subscribe_and_return(')
@@ -79,7 +79,7 @@ class TheTimeoutArithmeticStaysOutsideTheTry(unittest.TestCase):
     None because of the broad `except Exception: return None` below it."""
 
     def _canonical(self):
-        n = _fn('helper.py', 'subscribe_and_return')
+        n = _fn('hartos/helper.py', 'subscribe_and_return')
         self.assertIsNotNone(n)
         return n
 

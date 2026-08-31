@@ -320,7 +320,7 @@ def test_zoom_stub_keys_match_inline_shape():
 _LEAK_SENTENCE = "please evaluate the response i am giving"
 _CREATE_RECIPE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    'create_recipe.py')
+    'hartos/create_recipe.py')
 
 
 def _production_lines():

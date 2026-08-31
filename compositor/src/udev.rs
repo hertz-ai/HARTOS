@@ -177,9 +177,14 @@ struct SurfaceData {
     /// retries, so one dropped vblank degrades to a stutter — NOT a permanent freeze that
     /// the paint watchdog would turn into a boot loop (#166 + #186 robustness).
     flip_queued_at: Option<std::time::Instant>,
-    /// When this CRTC last actually PRESENTED (a flip was queued successfully). `None`
-    /// until the first. Diagnostic only: it feeds the silent-freeze beacon below and
-    /// changes no scheduling decision.
+    /// When this CRTC last actually PRESENTED — stamped from a real `DrmEvent::VBlank`
+    /// in `reap_completed_vblanks`, NOT from `queue_frame` returning Ok. That
+    /// distinction is the point: `queue_frame` also returns Ok when it merely PARKS a
+    /// frame behind an already-pending one, issuing no ioctl, so stamping on Ok let a
+    /// wedged CRTC refresh its own liveness and hid the freeze from the beacon below.
+    /// `None` until the first real scanout. Feeds the silent-freeze beacon, which now
+    /// also drives a recovery (`resync_flip_state`), so this is no longer purely
+    /// diagnostic — a wrong value here delays a real repair.
     last_flip_at: Option<std::time::Instant>,
     /// Rate-limiter for that beacon, so a frozen CRTC logs once every
     /// `SILENT_FREEZE_LOG_EVERY` instead of 60 times a second.
@@ -1052,6 +1057,74 @@ fn device_added(
     Ok(())
 }
 
+/// Put OUR flip gate back in step with the `DrmCompositor`'s — the SILENT FREEZE fix.
+///
+/// THE BUG THIS EXISTS FOR (real HW, 2026-08-29/30; 124 warnings over 10.4 minutes with
+/// `frozen_for_ms` rising 3046 → 623201 and never recovering, reproduced within 72s of a
+/// fresh boot). `awaiting_vblank` is OUR mirror of smithay's private `pending_frame`. Four
+/// sites used to clear the mirror without retiring the original:
+///
+///   • the lost-vblank hatch          • the session PAUSE path
+///   • the master-acquired path       • the GLES demotion path
+///
+/// Once `pending_frame` is orphaned — `Some`, with no flip actually in flight — smithay's
+/// `queue_frame` takes its "a frame is already pending" branch: it parks the new frame in
+/// `queued_frame`, ISSUES NO IOCTL, and returns `Ok(())` anyway. `present_surfaces` reads
+/// that `Ok` as a presentation. No flip means no vblank; no vblank means `frame_submitted`
+/// never runs; and `frame_submitted` is the ONLY thing that clears `pending_frame`. The
+/// CRTC is then wedged permanently, and the beacon reports the symptom (`render_frame`
+/// says "nothing changed") because the damage tracker is idempotent while nothing flips.
+///
+/// So the two calls below are BOTH required, in THIS ORDER:
+///   1. `frame_submitted()` — the only thing that retires `pending_frame`, and it also
+///      re-submits whatever was parked in `queued_frame`, which is a real flip.
+///   2. `reset_state()` — sets `reset_pending`, which forces the next `render_frame` to
+///      report `is_empty == false`. Without it the damage fixed point survives: buffer
+///      ages only advance through `queue_frame`, so a CRTC that stopped queueing can
+///      never age its way out.
+/// `reset_state()` alone would produce non-empty frames that `queue_frame` parks behind
+/// the still-orphaned `pending_frame` — busier, equally frozen.
+///
+/// Never panics and never returns an error (the never-fail floor, #186): a failed retire
+/// is logged and the tick moves on, exactly as every other flip-path error does.
+/// PURE: has this CRTC been silent long enough that we should RECOVER it, not just log?
+///
+/// Extracted (like `master_step` / `gles_should_demote` / `flip_action`) so the decision
+/// is unit-testable on a box with no DRM — the recovery itself needs smithay types and
+/// real hardware, but *when* it fires is arithmetic and must not be guessed at.
+///
+/// `since_last_present` is measured from a REAL vblank (see `SurfaceData::last_flip_at`).
+/// `None` means this CRTC has never presented at all; that cannot happen in practice
+/// because the field is seeded when the surface is built, and it deliberately does NOT
+/// trigger a recovery — with no baseline there is nothing to compare against, and a
+/// surface that has genuinely never scanned out is the fresh-boot master-handoff case
+/// that `acquire_drm_master` already owns.
+fn should_recover_frozen(since_last_present: Option<Duration>) -> bool {
+    since_last_present.map(|d| d >= SILENT_FREEZE_AFTER).unwrap_or(false)
+}
+
+fn resync_flip_state(crtc: &crtc::Handle, surface: &mut SurfaceData, reason: &str) {
+    match surface.compositor.frame_submitted() {
+        Ok(_) => {}
+        Err(err) => match flip_action(Err(classify_frame_error(&err))) {
+            FrameAction::DeviceInactive => info!(
+                ?crtc, reason,
+                "HART-comp DRM: flip-state resync on an inactive device — holding"
+            ),
+            _ => warn!(?err, ?crtc, reason,
+                       "HART-comp DRM: frame_submitted during resync failed — continuing"),
+        },
+    }
+    if let Err(err) = surface.compositor.reset_state() {
+        warn!(?err, ?crtc, reason,
+              "HART-comp DRM: reset_state during resync failed — next frame may report empty");
+    }
+    surface.awaiting_vblank = false;
+    surface.flip_queued_at = None;
+    warn!(?crtc, reason,
+          "HART-comp DRM: flip state resynced (pending_frame retired + swapchain reset)");
+}
+
 /// Reap every vblank that landed since the last tick (F1, #166). Called from the render
 /// tick BEFORE rendering: for each CRTC the VBlank source recorded in `vblank_completed`,
 /// mark its flip submitted (`frame_submitted()` — frees the just-scanned-out swapchain
@@ -1085,6 +1158,20 @@ fn reap_completed_vblanks(state: &mut State, devices: &mut HashMap<DrmNode, Devi
                 // The in-flight flip for this CRTC is now retired; the tick may queue again.
                 surface.awaiting_vblank = false;
                 surface.flip_queued_at = None;
+                // THIS CRTC HAS ACTUALLY PRESENTED. A DrmEvent::VBlank is the hardware
+                // saying it finished scanning a frame out — the only honest input to the
+                // silent-freeze beacon's "how long since anything reached the screen".
+                // It was previously stamped at queue_frame's Ok, which is also returned
+                // when smithay merely PARKS a frame behind a pending one (no ioctl, no
+                // flip), so a wedged CRTC kept refreshing its own liveness and the beacon
+                // could not see the stall it exists to find.
+                surface.last_flip_at = Some(std::time::Instant::now());
+                // NATIVE CHROME BRIDGE (part 4 of 4), moved here for the same reason.
+                // Its contract is evidence that the native bloom/orb REACHED THE SCREEN
+                // before the shell is told it may stand down and go transparent; a
+                // queued-but-parked frame is not that evidence, and claiming on it would
+                // turn the shell transparent over a frame nobody ever saw.
+                publish_native_chrome();
             }
         }
     }
@@ -1183,12 +1270,12 @@ fn acquire_drm_master(device: &mut DeviceData) -> bool {
             if let Err(err) = device.drm.activate(false) {
                 warn!(?err, "HART-comp DRM: activate() after taking master failed (active-flag/reset); frame retries next tick");
             }
-            for surface in device.surfaces.values_mut() {
-                if let Err(err) = surface.compositor.reset_state() {
-                    warn!(?err, "HART-comp DRM: surface reset_state() after taking master failed; frame retries next tick");
-                }
-                surface.awaiting_vblank = false;
-                surface.flip_queued_at = None;
+            for (crtc, surface) in device.surfaces.iter_mut() {
+                // Was reset_state() + a bare gate clear. reset_state alone is not enough:
+                // it makes the next render non-empty, but queue_frame still parks that
+                // frame behind an orphaned pending_frame. The shared resync retires the
+                // pending frame FIRST, then resets — see resync_flip_state.
+                resync_flip_state(crtc, surface, "master-acquired");
             }
             info!("HART-comp DRM: acquired DRM master via drmSetMaster (session active); scanning out");
             true
@@ -1244,9 +1331,12 @@ fn apply_pending_session(state: &mut State, devices: &mut HashMap<DrmNode, Devic
                 debug!(?err, "HART-comp DRM: release_master_lock on pause returned Err (expected on a double-drop; master already released)");
             }
             device.master = false;
-            for surface in device.surfaces.values_mut() {
-                surface.awaiting_vblank = false;
-                surface.flip_queued_at = None;
+            for (crtc, surface) in device.surfaces.iter_mut() {
+                // A paused device delivers no vblank, so the in-flight flip can never
+                // retire itself. Retire it HERE, together with our gate — clearing only
+                // the gate leaves pending_frame orphaned, and the CRTC comes back from
+                // the VT switch permanently unable to flip.
+                resync_flip_state(crtc, surface, "session-pause");
             }
             info!("HART-comp DRM: dropped DRM master (session paused)");
         }
@@ -1302,23 +1392,32 @@ fn build_gles_renderer(gbm: &GbmDevice<DrmDeviceFd>) -> Result<GlesRenderer, Box
 /// Best-effort throughout. If this file cannot be written the shell simply keeps
 /// drawing everything, which is exactly today's behaviour — the failure mode is
 /// "no speedup", never "no desktop".
-fn publish_native_chrome() {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    /// What we have already told the shell. Starts at 0 = "we claim nothing".
-    static PUBLISHED: AtomicU8 = AtomicU8::new(0);
-
-    let mask = crate::comp_core::NATIVE_CHROME_EMITTED.load(Ordering::Relaxed);
+/// The claim-growth decision. `None` means "publish nothing".
+///
+/// Extracted pure so the invariants below are testable without DRM, a session
+/// directory, or the process-global PUBLISHED cell -- the same idiom this file
+/// already uses for `should_recover_frozen`, `flip_action` and `master_step`.
+/// These three rules used to be asserted by REGEXING THIS SOURCE FILE from
+/// Python (tests/unit/test_native_chrome_bridge.py), which pinned the text
+/// rather than the behaviour: it went red when the call site legitimately moved
+/// to the vblank reaper, while never once proving the claim actually grows.
+fn next_claim(prev: u8, mask: u8) -> Option<u8> {
     if mask == 0 {
-        return;
+        return None;
     }
-    let prev = PUBLISHED.load(Ordering::Relaxed);
     // Only ever grow. A frame that happens to omit the orb (capture blocked, a
     // degenerate mode) must not retract a claim the shell has already acted on.
     let next = prev | mask;
     if next == prev {
-        return;
+        // Unchanged: do not rewrite. The shell polls this file on every render.
+        return None;
     }
+    Some(next)
+}
 
+/// Render a claim as the file's body. Order is fixed so an unchanged claim
+/// produces byte-identical output.
+fn claim_names(next: u8) -> String {
     let mut names: Vec<&str> = Vec::new();
     if next & crate::comp_core::NATIVE_CHROME_BLOOM != 0 {
         names.push("bloom");
@@ -1326,19 +1425,44 @@ fn publish_native_chrome() {
     if next & crate::comp_core::NATIVE_CHROME_ORB != 0 {
         names.push("orb");
     }
+    names.join(",")
+}
+
+/// Write the claim so a reader can never observe a half-written file.
+///
+/// Write-then-rename within one directory: rename(2) is atomic there, so the
+/// shell either sees the old claim or the new one, never a torn read. Returns
+/// false and cleans up on any failure.
+fn write_claim(dir: &std::path::Path, body: &str) -> bool {
+    let path = dir.join("native-chrome");
+    let tmp = dir.join(".native-chrome.tmp");
+    let wrote = std::fs::write(&tmp, body)
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .is_ok();
+    if !wrote {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    wrote
+}
+
+fn publish_native_chrome() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    /// What we have already told the shell. Starts at 0 = "we claim nothing".
+    static PUBLISHED: AtomicU8 = AtomicU8::new(0);
+
+    let mask = crate::comp_core::NATIVE_CHROME_EMITTED.load(Ordering::Relaxed);
+    let prev = PUBLISHED.load(Ordering::Relaxed);
+    let next = match next_claim(prev, mask) {
+        Some(n) => n,
+        None => return,
+    };
 
     // /run/hart/session is the group-writable (0770) dir the session may write;
     // /run/hart itself is 0750 owner-only. Writing the wrong one fails silently
-    // and defeats the whole bridge — the same perms trap already documented in
+    // and defeats the whole bridge, the same perms trap already documented in
     // liquid_ui_service.py for shell-render.
-    let path = "/run/hart/session/native-chrome";
-    let tmp = "/run/hart/session/.native-chrome.tmp";
-    // Write-then-rename so a reader never sees a half-written claim: the shell
-    // polls this on every render and a torn read would flicker the desktop.
-    let body = names.join(",");
-    let wrote = std::fs::write(tmp, &body)
-        .and_then(|()| std::fs::rename(tmp, path))
-        .is_ok();
+    let body = claim_names(next);
+    let wrote = write_claim(std::path::Path::new("/run/hart/session"), &body);
     if wrote {
         PUBLISHED.store(next, Ordering::Relaxed);
         info!(
@@ -1348,8 +1472,9 @@ fn publish_native_chrome() {
         );
     } else {
         // Do NOT retry-storm: a missing dir or a perms problem will not fix
-        // itself mid-session, and this runs on the flip path.
-        let _ = std::fs::remove_file(tmp);
+        // itself mid-session, and this runs on the flip path. write_claim has
+        // already removed the temp file.
+        warn!("native-chrome claim could not be published");
     }
 }
 
@@ -1431,9 +1556,12 @@ where
                 if !stalled {
                     continue;
                 }
-                warn!(?crtc, "HART-comp DRM: page-flip vblank lost (>100ms) — recovering, re-rendering");
-                surface.awaiting_vblank = false;
-                surface.flip_queued_at = None;
+                // Clearing our gate alone ORPHANS smithay's pending_frame here, and from
+                // then on queue_frame parks every frame instead of flipping it — the
+                // permanent freeze. Retire the pending frame too. (This hatch is the most
+                // likely entry point: it is the one that fires without any session or
+                // renderer event, so it can strike a healthy, busy compositor.)
+                resync_flip_state(crtc, surface, "vblank-lost");
             }
             // `render_frame` returns a result whose Ok BORROWS the compositor; reduce it to
             // the Copy `is_empty` bool immediately so no borrow of `surface.compositor` spans
@@ -1458,7 +1586,7 @@ where
                     // wedged. Those need opposite fixes, which is the whole reason this
                     // logs rather than guesses.
                     let frozen_for = surface.last_flip_at.map(|t| now.saturating_duration_since(t));
-                    let overdue = frozen_for.map(|d| d >= SILENT_FREEZE_AFTER).unwrap_or(false);
+                    let overdue = should_recover_frozen(frozen_for);
                     let due_to_log = surface
                         .last_stall_log_at
                         .map(|t| now.saturating_duration_since(t) >= SILENT_FREEZE_LOG_EVERY)
@@ -1485,8 +1613,28 @@ where
                              but this CRTC has not presented in a long time. layer_surfaces=0 means \
                              the shell is being sent NO frame callbacks (it can never commit again, \
                              so this is a symptom); layer_surfaces>0 with elements>0 means the scene \
-                             is intact and reaching the client, and the damage tracking is wedged."
+                             is intact and reaching the client, and EITHER the damage tracking is \
+                             wedged OR the submission pipeline is (an orphaned pending_frame with \
+                             no flip in flight, which is what the recovery below unwedges)."
                         );
+                    }
+                    // ── RECOVER, do not just observe (the 2026-08-30 fix) ──
+                    // This arm used to be `warn!` + `continue`, and the ONLY recovery in
+                    // this file — the lost-vblank hatch above — is gated on
+                    // `awaiting_vblank == true`, so it can never fire in this state
+                    // (every real capture showed `awaiting_vblank=false`). A CRTC that
+                    // reached here stayed frozen for as long as the box was up: measured
+                    // 10.4 minutes and still rising when the machine was rebooted.
+                    //
+                    // The resync is SELF-LIMITING, so this cannot become a spin: it
+                    // retires the orphaned pending_frame and resets the swapchain, the
+                    // next render therefore reports non-empty and actually flips, the
+                    // vblank reaper refreshes `last_flip_at`, and `overdue` goes false.
+                    // A genuinely idle-and-healthy CRTC pays one forced composite every
+                    // SILENT_FREEZE_AFTER — the same posture as the 200ms idle heartbeat
+                    // the scheduler already runs, and vastly cheaper than a dead screen.
+                    if overdue {
+                        resync_flip_state(crtc, surface, "silent-freeze");
                     }
                     continue;
                 }
@@ -1495,17 +1643,17 @@ where
                     Ok(()) => {
                         surface.awaiting_vblank = true;
                         surface.flip_queued_at = Some(now);
-                        // This CRTC just presented. Sole input to the silent-freeze
-                        // beacon's "how long since anything reached the screen".
-                        surface.last_flip_at = Some(now);
-                        // NATIVE CHROME BRIDGE (part 4 of 4). The frame just
-                        // accepted by the kernel is the FIRST evidence that the
-                        // native bloom/orb actually reached the screen, so this
-                        // is where the shell is told it may stand down. Claiming
-                        // from configuration instead would let a compositor that
-                        // composed but never flipped turn the shell transparent
-                        // over nothing.
-                        publish_native_chrome();
+                        // `last_flip_at` and `publish_native_chrome()` USED TO BE HERE
+                        // and have moved to `reap_completed_vblanks`, because this Ok
+                        // does NOT mean the frame reached the screen. smithay's
+                        // `queue_frame` returns Ok(()) on two different outcomes: it
+                        // issued the page-flip, OR a frame was already pending so it
+                        // parked this one in `queued_frame` and issued no ioctl at all.
+                        // Stamping "presented" here made the beacon blind to exactly
+                        // that second case — the CRTC parks every frame forever while
+                        // `frozen_for` resets on each tick, so the freeze never even
+                        // gets reported. A real DrmEvent::VBlank is the only proof of
+                        // scanout, and that is where both now live.
                     }
                     Err(err) => {
                         // A flip/commit ioctl error (the real-HW EACCES/EBUSY/ENODEV/
@@ -1660,12 +1808,10 @@ fn render_all(
         warn!("HART-comp DRM: GLES renderer fault — demoting to the pixman software floor (never-blank; the pixman renderer of record paints from the next tick)");
         *gles = None;
         for device in devices.values_mut() {
-            for surface in device.surfaces.values_mut() {
-                if let Err(err) = surface.compositor.reset_state() {
-                    warn!(?err, "HART-comp DRM: surface reset_state() after GLES demotion failed; retries next tick");
-                }
-                surface.awaiting_vblank = false;
-                surface.flip_queued_at = None;
+            for (crtc, surface) in device.surfaces.iter_mut() {
+                // Same shape as the master-acquired path: retire the pending frame, THEN
+                // reset, so the first pixman frame actually flips instead of parking.
+                resync_flip_state(crtc, surface, "gles-demotion");
             }
         }
         // The demotion reset the surfaces; the pixman renderer of record must paint them
@@ -1790,6 +1936,60 @@ mod tests {
     // Env reads/writes are process-global; serialize the override tests so they don't
     // race when the test binary runs them in parallel.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // ════════════════════════════════════════════════════════════════════════
+    // SILENT FREEZE recovery — when the beacon must ACT, not merely report.
+    //
+    // Real HW 2026-08-29/30: a CRTC stopped presenting and stayed stopped. 124
+    // warnings, `frozen_for_ms` climbing 3046 → 623201 over 10.4 minutes, still
+    // rising when the box was rebooted; reproduced within 72s of a fresh boot.
+    // Every capture showed `awaiting_vblank=false` and `master=true`, which is
+    // exactly the state the file's ONLY other recovery — the lost-vblank hatch —
+    // cannot reach, because that hatch is gated on `awaiting_vblank == true`.
+    // The arm that DID run was `warn!` + `continue`.
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn a_crtc_silent_past_the_threshold_is_recovered() {
+        assert!(should_recover_frozen(Some(SILENT_FREEZE_AFTER)),
+                "exactly at the threshold must recover (>=, not >)");
+        assert!(should_recover_frozen(Some(Duration::from_millis(623_201))),
+                "the measured real-HW freeze must recover");
+    }
+
+    #[test]
+    fn a_freshly_presenting_crtc_is_left_alone() {
+        // The cost of recovery is one forced composite + flip. A healthy CRTC
+        // must never pay it, or the fix becomes a 0.33Hz repaint on every idle
+        // desktop.
+        assert!(!should_recover_frozen(Some(Duration::ZERO)));
+        assert!(!should_recover_frozen(Some(Duration::from_millis(16))),
+                "one frame at 60Hz is not a freeze");
+        assert!(!should_recover_frozen(
+            Some(SILENT_FREEZE_AFTER - Duration::from_millis(1))),
+            "just under the threshold must not recover");
+    }
+
+    #[test]
+    fn a_crtc_that_never_presented_is_not_recovered_here() {
+        // `None` = no baseline to measure against. That is the fresh-boot
+        // master-handoff case, which `acquire_drm_master` owns; recovering it
+        // here would fight that state machine every tick before first scanout.
+        // In practice unreachable: last_flip_at is seeded when the surface is
+        // built. Pinned so a future "simplify" cannot turn it into a recovery.
+        assert!(!should_recover_frozen(None));
+    }
+
+    #[test]
+    fn the_recovery_threshold_is_far_above_a_frame_interval() {
+        // Guards against someone tuning SILENT_FREEZE_AFTER down to something
+        // that fires between ordinary frames and turns a healthy idle output
+        // into a permanent repaint loop.
+        assert!(SILENT_FREEZE_AFTER >= Duration::from_secs(1),
+                "a sub-second threshold would recover healthy idle CRTCs");
+        assert!(SILENT_FREEZE_LOG_EVERY >= SILENT_FREEZE_AFTER,
+                "log cadence must not outpace the condition it reports");
+    }
 
     #[test]
     fn drm_device_override_is_none_when_the_var_is_unset() {
@@ -2059,5 +2259,112 @@ mod tests {
                 "the demote decision tracks the RenderFrame variant exactly (no surprise outcome)"
             );
         }
+    }
+
+    // ── the native-chrome claim ─────────────────────────────────────────────
+    //
+    // These four invariants used to be checked by REGEXING THIS FILE from
+    // Python (tests/unit/test_native_chrome_bridge.py). That pinned the text,
+    // not the behaviour: it asserted the literal `last_flip_at = Some(now)`
+    // appeared within 500 characters before the publish call, so it went RED
+    // when the call site legitimately moved into the vblank reaper -- a change
+    // that made the claim STRONGER (a real DrmEvent::VBlank is proof of
+    // scanout; queue_frame's Ok is not) -- while never once proving a claim
+    // actually grows, or that a torn read is impossible.
+
+    use crate::comp_core::{NATIVE_CHROME_BLOOM, NATIVE_CHROME_ORB};
+
+    #[test]
+    fn a_claim_only_ever_grows() {
+        // The shell re-reads this on every render. Retracting mid-session would
+        // flicker the desktop between native and HTML chrome.
+        assert_eq!(
+            next_claim(NATIVE_CHROME_BLOOM, NATIVE_CHROME_ORB),
+            Some(NATIVE_CHROME_BLOOM | NATIVE_CHROME_ORB),
+            "a new element must be added to the claim, not replace it"
+        );
+        // A frame that omits the orb (capture blocked, a degenerate mode) must
+        // not retract a claim the shell has already acted on.
+        assert_eq!(
+            next_claim(NATIVE_CHROME_BLOOM | NATIVE_CHROME_ORB, NATIVE_CHROME_BLOOM),
+            None,
+            "a frame missing an element must not retract it"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_claim_is_not_rewritten() {
+        assert_eq!(
+            next_claim(NATIVE_CHROME_ORB, NATIVE_CHROME_ORB),
+            None,
+            "re-publishing an identical claim would rewrite the file on every flip"
+        );
+    }
+
+    #[test]
+    fn claiming_nothing_publishes_nothing() {
+        // mask == 0 means no native element reached the frame. Publishing an
+        // empty claim would tell the shell to stop painting chrome that nobody
+        // is drawing, which is the transparent-desktop failure.
+        assert_eq!(next_claim(0, 0), None);
+        assert_eq!(next_claim(NATIVE_CHROME_ORB, 0), None);
+    }
+
+    #[test]
+    fn claim_names_are_stable_and_ordered() {
+        // Byte-identical output for an identical claim, so a reader diffing the
+        // file sees no spurious change.
+        assert_eq!(claim_names(NATIVE_CHROME_BLOOM), "bloom");
+        assert_eq!(claim_names(NATIVE_CHROME_ORB), "orb");
+        assert_eq!(
+            claim_names(NATIVE_CHROME_BLOOM | NATIVE_CHROME_ORB),
+            "bloom,orb"
+        );
+        assert_eq!(claim_names(0), "");
+    }
+
+    #[test]
+    fn the_claim_is_written_atomically() {
+        // The real thing, on a real filesystem: after publishing, the file holds
+        // exactly the claim and NO temp file is left behind. A reader polling
+        // this directory can only ever observe a complete claim, because the
+        // content arrives by rename(2) within the same directory.
+        let dir = std::env::temp_dir().join(format!(
+            "hart-claim-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        assert!(write_claim(&dir, "bloom,orb"), "the claim should publish");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("native-chrome")).unwrap(),
+            "bloom,orb"
+        );
+        assert!(
+            !dir.join(".native-chrome.tmp").exists(),
+            "the temp file must not survive a successful publish"
+        );
+
+        // Republishing replaces the content wholesale, never appends.
+        assert!(write_claim(&dir, "orb"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("native-chrome")).unwrap(),
+            "orb"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_publish_leaves_no_temp_file() {
+        // A missing session dir is the documented perms trap (/run/hart is 0750
+        // owner-only). It must fail cleanly, not strew temp files on the flip
+        // path.
+        let missing = std::env::temp_dir()
+            .join(format!("hart-claim-absent-{}", std::process::id()))
+            .join("nope");
+        assert!(!write_claim(&missing, "orb"), "a missing dir cannot publish");
+        assert!(!missing.join(".native-chrome.tmp").exists());
     }
 }

@@ -134,7 +134,7 @@ class MasterTestSuite:
 
         # Check create_recipe.py
         try:
-            with open("create_recipe.py", "r", encoding="utf-8") as f:
+            with open("hartos/create_recipe.py", "r", encoding="utf-8") as f:
                 content = f.read()
 
             if "/home/hertzai2019/newauto/coding" in content:
@@ -148,7 +148,7 @@ class MasterTestSuite:
 
         # Check reuse_recipe.py
         try:
-            with open("reuse_recipe.py", "r", encoding="utf-8") as f:
+            with open("hartos/reuse_recipe.py", "r", encoding="utf-8") as f:
                 content = f.read()
 
             if "/home/hertzai2019/newauto/coding" in content:

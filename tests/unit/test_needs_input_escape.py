@@ -28,7 +28,7 @@ import os
 import re
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-_SRC_PATH = os.path.join(ROOT, 'create_recipe.py')
+_SRC_PATH = os.path.join(ROOT, 'hartos/create_recipe.py')
 _SRC = open(_SRC_PATH, encoding='utf-8').read()
 
 # Live repro payload: terminate token + two machine-appended skeleton lines.

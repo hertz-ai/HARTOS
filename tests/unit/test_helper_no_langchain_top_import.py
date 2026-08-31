@@ -53,10 +53,10 @@ def _module_top_imports(filepath: str) -> list[str]:
 
 
 @pytest.mark.parametrize('module_file', [
-    'helper.py',
-    'reuse_recipe.py',
-    'gather_agentdetails.py',
-    'create_recipe.py',
+    'hartos/helper.py',
+    'hartos/reuse_recipe.py',
+    'hartos/gather_agentdetails.py',
+    'hartos/create_recipe.py',
 ])
 def test_no_module_top_langchain_import(module_file):
     """Each module the cx_Freeze validate gate checks must avoid

@@ -99,7 +99,7 @@ class DryAuditTests(unittest.TestCase):
 
     def test_autogen_token_budget_not_hardcoded_in_recipe_files(self):
         """#170 — max_tokens=3500 must not appear in code (comments OK)."""
-        for path in ['create_recipe.py', 'reuse_recipe.py']:
+        for path in ['hartos/create_recipe.py', 'hartos/reuse_recipe.py']:
             full = os.path.join(REPO_ROOT, path)
             self.assertTrue(
                 os.path.exists(full), f'Missing source file: {full}')
