@@ -259,13 +259,37 @@ def probe_dynamic(misses):
         misses["dynamic"] = "ok"
 
 
+def preflight():
+    """App + :8080 are required.  :8081 (draft) is OPTIONAL here: #714
+    measured reuse dialing :8080, and live reuse traffic runs with the
+    draft server down (VRAM tiering evicts it by design) - base.preflight's
+    hard :8081 gate is from #720's era and would veto a valid run."""
+    print("== preflight ==")
+    try:
+        with urllib.request.urlopen(base.BASE + "/backend/health", timeout=10) as r:
+            print("  app        :", r.status)
+    except Exception as e:
+        print("  app        : UNREACHABLE", e)
+        return False
+    for port, required in ((8080, True), (8081, False)):
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:%d/health" % port,
+                                        timeout=8) as r:
+                print("  llama :%d : %s" % (port, r.status))
+        except Exception:
+            print("  llama :%d : DOWN%s" % (port, "" if required else " (draft - optional)"))
+            if required:
+                return False
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--strict", action="store_true",
                     help="exit 1 on any miss (post-fix acceptance)")
     args = ap.parse_args()
 
-    if not base.preflight():
+    if not preflight():
         print("\nPREFLIGHT FAILED - results would be meaningless.")
         return 1
 
