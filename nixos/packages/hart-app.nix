@@ -37,7 +37,11 @@ let
   # absent, which the codebase already tolerates ("flaml.automl is not
   # available" is a known benign warning on desktops).
   flamlPkg = python.pkgs.buildPythonPackage rec {
-    pname = "FLAML";
+    # pname must be the SDIST-FILENAME case, not the PyPI project-page case:
+    # fetchPypi derives mirror://pypi/.../${pname}-${version}.tar.gz and the
+    # uploaded file is lowercase `flaml-2.3.3.tar.gz` — "FLAML" 404'd on every
+    # mirror and failed the a0df600 iso-desktop build at fetch time.
+    pname = "flaml";
     version = "2.3.3";
     format = "setuptools";
     src = pkgs.fetchPypi {
