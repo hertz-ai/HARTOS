@@ -186,7 +186,7 @@ class GoalManager:
     def create_goal(db: Session, goal_type: str, title: str,
                     description: str = '', config: Optional[Dict] = None,
                     product_id: str = None, spark_budget: int = 200,
-                    created_by: str = None) -> Dict:
+                    created_by: str = None, priority: int = 0) -> Dict:
         """Create a new agent goal.
 
         GUARDRAILS: ConstitutionalFilter + HiveEthos applied before creation.
@@ -230,6 +230,15 @@ class GoalManager:
             spark_budget=spark_budget,
             created_by=created_by,
             status='active',
+            # Seeds have declared 'priority' since they were written (e.g.
+            # bootstrap_speech_companion: 7, 'safety-adjacent: kid-facing')
+            # but neither this signature nor this constructor accepted it,
+            # so EVERY row took the column default: measured 475/475 rows
+            # and 106/106 active rows at priority=0. The declared value was
+            # dead data. Persisting it changes no behaviour today -- nothing
+            # in agent_daemon/dispatch orders by priority yet -- but it makes
+            # the field truthful so an ordering decision becomes possible.
+            priority=priority,
         )
         db.add(goal)
         db.flush()
