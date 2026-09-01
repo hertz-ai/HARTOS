@@ -361,6 +361,7 @@ class EventBus:
         """
         try:
             from autobahn.asyncio.component import Component
+            from autobahn.wamp.types import SubscribeOptions
         except ImportError:
             logger.warning("autobahn not installed — WAMP bridge unavailable")
             return False
@@ -381,10 +382,10 @@ class EventBus:
             wamp_wildcard = f'{WAMP_TOPIC_PREFIX}.'
             try:
                 await session.subscribe(bus._on_wamp_event, wamp_wildcard,
-                                        options={'match': 'prefix'})
+                                        options=SubscribeOptions(match='prefix'))
                 logger.info("EventBus subscribed to WAMP prefix: %s", wamp_wildcard)
             except Exception as e:
-                logger.warning("WAMP wildcard subscribe failed: %s", e)
+                logger.warning("WAMP wildcard subscribe failed: %r", e)
 
         @component.on_leave
         async def on_leave(session, details):
