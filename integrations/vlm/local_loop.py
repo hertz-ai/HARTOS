@@ -176,8 +176,8 @@ def run_local_agentic_loop(
     Local agentic loop: screenshot → parse → LLM reason → execute → repeat.
 
     Supports two modes:
-        - Legacy (default): OmniParser screen parsing + separate LLM reasoning call
-        - Unified (HEVOLVE_VLM_UNIFIED=true): Single Qwen3-VL call for parsing + reasoning
+        - Unified (default): Single Qwen3-VL call for parsing + reasoning
+        - Legacy (HEVOLVE_VLM_UNIFIED=0): OmniParser screen parsing + separate LLM call
 
     Args:
         message: dict with keys from execute_windows_or_android_command:
@@ -206,8 +206,19 @@ def run_local_agentic_loop(
     exit_reason = 'max_iterations'
     consecutive_action_errors = 0
 
-    # Detect unified Qwen3-VL mode
-    use_unified = os.environ.get('HEVOLVE_VLM_UNIFIED', '').lower() in ('1', 'true')
+    # Unified Qwen3-VL is the DEFAULT (owner 2026-09-01: qwen3vl_backend
+    # replaced the OmniParser pipeline).  Before this, the flag defaulted
+    # OFF and only hie's langchain computer-action tool setdefault()ed it
+    # — the autogen leg (execute_windows_or_android_command via
+    # vlm_adapter) and the coding-agent executor entered the legacy
+    # branch, whose parse_screen needs the absent OmniParser repo
+    # (inprocess) or posts to :8080 which now belongs to llama-server
+    # (http).  Set HEVOLVE_VLM_UNIFIED=0 to opt back into legacy.
+    # Default-ON parse idiom (same as HEVOLVE_VLM_LOOP_SAFETY below):
+    # only an explicit 0/false/no opts out; unrecognized junk keeps the
+    # default instead of silently disabling the canonical branch.
+    use_unified = os.environ.get(
+        'HEVOLVE_VLM_UNIFIED', '').lower() not in ('0', 'false', 'no')
 
     if use_unified:
         from integrations.vlm.qwen3vl_backend import get_qwen3vl_backend

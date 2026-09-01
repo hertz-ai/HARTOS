@@ -144,19 +144,38 @@ class RemoteDesktopExecutor:
             executor = RemoteDesktopExecutor(url)
             return executor.execute(instruction)
 
-        # Local execution via existing VLM pipeline
+        # Local execution via the SAME canonical entry the other
+        # production callers use (reuse/create/hie all go through
+        # vlm_adapter, which owns tier selection + circuit breakers).
+        # The old direct call run_local_agentic_loop(instruction) was
+        # broken twice over: it omitted the required `tier` arg
+        # (TypeError) and passed a str where the loop expects the
+        # message dict — the bare except below swallowed it, so this
+        # leg had NEVER executed locally.
         try:
-            from integrations.vlm.local_loop import run_local_agentic_loop
-            result = run_local_agentic_loop(instruction)
+            from integrations.vlm.vlm_adapter import execute_vlm_instruction
+            result = execute_vlm_instruction({
+                'instruction_to_vlm_agent': instruction,
+                'enhanced_instruction': instruction,
+                'user_id': 'coding_agent',
+                'prompt_id': 'desktop_task',
+                'os_to_control': 'windows',
+            })
+            if result is None:
+                return {
+                    'success': False,
+                    'output': '',
+                    'error': 'no local VLM tier available (Crossbar-only topology)',
+                }
             return {
-                'success': True,
+                'success': result.get('status') == 'success',
                 'output': json.dumps(result, default=str),
             }
         except ImportError:
             return {
                 'success': False,
                 'output': '',
-                'error': 'VLM pipeline not available (pyautogui/OmniParser not installed)',
+                'error': 'VLM pipeline not available (pyautogui not installed)',
             }
         except Exception as e:
             return {
