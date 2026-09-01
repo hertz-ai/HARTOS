@@ -35,7 +35,8 @@ import time
 from flask import Blueprint, request, jsonify
 
 from integrations.coding_agent.claude_code_backend import (
-    invoke_claude, classify_failure, DEFAULT_INFERENCE_TIMEOUT_S,
+    invoke_claude, classify_failure, claude_code_available,
+    DEFAULT_INFERENCE_TIMEOUT_S,
 )
 
 logger = logging.getLogger('hartos_claude_code')
@@ -50,7 +51,20 @@ _sem = threading.BoundedSemaphore(_MAX_CONCURRENT)
 
 _FAIL_STATUS = {
     'overload': 503, 'auth': 503, 'timeout': 504,
-    'notfound': 502, 'other': 502,
+    # 'notfound' means the `claude` binary is not on this node at all. That is
+    # the SAME situation as a lapsed subscription, which this module already
+    # degrades rather than errors ("a lapsed subscription must not error the
+    # OS; it degrades to local"). It was mapped to 502, so a node without the
+    # binary returned an api_error instead of riding the fallback ladder down
+    # to a local model.
+    #
+    # Measured on central 2026-09-01: POST /chat/completions ->
+    # 502 {"message": "claude not on PATH"}. Central never registers the
+    # backend (model_registry gates on claude_code_available(), which is False
+    # there) so nothing in-process routed to it, but anything probing the
+    # endpoint directly got a hard error where a degrade was intended.
+    'notfound': 503,
+    'other': 502,
 }
 
 
@@ -151,6 +165,22 @@ def chat_completions():
 @claude_code_bp.route('/models', methods=['GET'])
 def list_models():
     """Minimal OpenAI /models so a client that probes the endpoint gets a sane
-    answer (some SDKs call it before the first completion)."""
+    answer (some SDKs call it before the first completion).
+
+    Reports what this NODE can actually serve. The list used to be a hardcoded
+    constant, so a node with no `claude` binary answered 200 with claude-code
+    listed while every completion failed — a probe of this route said "healthy"
+    about a backend that could not run.
+
+    That is not hypothetical: it cost me an hour on 2026-09-01. central answers
+    this route 200 with the model listed, and POST /chat/completions returns
+    "claude not on PATH". I read the 200 as the backend working and reasoned
+    from it. The blueprint mounts unconditionally (blueprint_registry) while
+    model_registry gates registration on claude_code_available(), so the two
+    can legitimately disagree — but the ROUTE should not claim capability the
+    node lacks.
+    """
+    if not claude_code_available():
+        return jsonify({'object': 'list', 'data': []}), 200
     return jsonify({'object': 'list', 'data': [
         {'id': 'claude-code', 'object': 'model', 'owned_by': 'hartos'}]}), 200
