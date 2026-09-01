@@ -81,6 +81,27 @@ def probe_agent_daemon() -> Dict[str, Any]:
         # silence that made this bug take an afternoon.
         out['model_registry_error'] = f'{type(e).__name__}: {e}'
 
+    # WHY the daemon last skipped a tick. Without this, a daemon that ticks
+    # and dispatches nothing is indistinguishable from one that never ticked:
+    # `_tick_count` increments BEFORE the yield gate, the yield path logs at
+    # DEBUG, and a tick that dispatches 0 goals logs nothing at all. Central
+    # sat in exactly that state on 2026-09-01 with 33 eligible goals and no
+    # dispatch since 11:21, and every externally-observable signal was healthy
+    # (goals present, personas idle, budget remaining, pressure normal).
+    #
+    # The reason is PROCESS-INTERNAL module state, so it cannot be read by
+    # importing dispatch in a fresh process — that returns a fresh None and
+    # lies. It has to come from inside the running process, which is what this
+    # probe already is. `get_last_yield_reason` is the existing canonical
+    # accessor (agent_daemon._tick reads it the same way); nothing new is
+    # derived here.
+    try:
+        from integrations.agent_engine.dispatch import get_last_yield_reason
+        out['last_yield_reason'] = get_last_yield_reason()
+    except Exception as e:
+        out['last_yield_reason'] = None
+        out['yield_reason_error'] = f'{type(e).__name__}: {e}'
+
     try:
         from integrations.agent_engine.agent_daemon import agent_daemon
         out['daemon_enabled'] = bool(agent_daemon._running)

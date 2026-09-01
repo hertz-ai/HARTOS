@@ -711,6 +711,29 @@ class GossipProtocol:
                 self._record_peer_failure(peer_url)
             self._heartbeat()
 
+    def _flush_health_row(self, db) -> bool:
+        """Commit one peer row's change immediately, before the next probe.
+
+        Exists so the health round never holds SQLite's write lock across a
+        network call -- see the rationale at the call site in
+        ``_health_check_round``.
+
+        A failed commit must NOT abort the round: the outer handler would
+        roll back the whole sweep (every status update and every #38 purge)
+        because one row lost a lock race. Roll back just this row, say so,
+        and let the next peer try on its own.
+        """
+        try:
+            db.commit()
+            return True
+        except Exception as e:
+            db.rollback()
+            logger.warning(
+                "Health round: per-row commit failed (%s: %s); rolled back "
+                "that row and continuing with the next peer",
+                type(e).__name__, e)
+            return False
+
     def _health_check_round(self):
         self._peer_backoff.prune_expired()
         from .models import get_db, PeerNode
@@ -775,6 +798,7 @@ class GossipProtocol:
                 if _bad_url:
                     db.delete(peer)
                     purged += 1
+                    self._flush_health_row(db)
                     continue
                 live_peers.append(peer)
                 reachable = self._ping_peer(peer.url)
@@ -788,6 +812,33 @@ class GossipProtocol:
                         peer.status = 'dead'
                     elif age > self.stale_threshold:
                         peer.status = 'stale'
+                # Commit THIS row before probing the next peer.
+                #
+                # The round previously accumulated every delete + status change
+                # in one session and committed only after the whole sweep. The
+                # first mutation opens SQLite's single write transaction, so the
+                # write lock was then held across all the remaining _ping_peer
+                # calls. That is a lock held across network I/O.
+                #
+                # It wedged central on 2026-09-01: a probe hung (pooled_get's
+                # timeout=3 bounds the socket, NOT the wait for a free pooled
+                # connection, and a hang raises nothing for the RequestException
+                # handler to catch), the loop never advanced, so the wall-clock
+                # budget below -- which is only checked BETWEEN peers -- never
+                # got to fire. The write lock stayed held for ~2h. The agent
+                # daemon's `UPDATE agent_goals SET last_dispatched_at` lost its
+                # 5s busy_timeout on every tick, which poisoned its session
+                # ("rolled back due to a previous exception during flush") and
+                # aborted the tick. Goals were selected and never recorded:
+                # max(last_dispatched_at) frozen while the daemon looked alive.
+                #
+                # Committing per row keeps the lock held for microseconds
+                # instead of for the length of a network sweep. A hung probe
+                # then stalls only THIS round, which the budget already covers,
+                # rather than every writer in the process. It also means the #38
+                # purge persists incrementally instead of being rolled back
+                # wholesale when the round cannot finish.
+                self._flush_health_row(db)
             # Dead is not deleted. The main query above excludes 'dead' rows,
             # so a peer that aged out during an outage was never re-pinged and
             # could only come back via an INBOUND announce — two nodes that
