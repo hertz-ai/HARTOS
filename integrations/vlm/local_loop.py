@@ -214,11 +214,8 @@ def run_local_agentic_loop(
     # branch, whose parse_screen needs the absent OmniParser repo
     # (inprocess) or posts to :8080 which now belongs to llama-server
     # (http).  Set HEVOLVE_VLM_UNIFIED=0 to opt back into legacy.
-    # Default-ON parse idiom (same as HEVOLVE_VLM_LOOP_SAFETY below):
-    # only an explicit 0/false/no opts out; unrecognized junk keeps the
-    # default instead of silently disabling the canonical branch.
-    use_unified = os.environ.get(
-        'HEVOLVE_VLM_UNIFIED', '').lower() not in ('0', 'false', 'no')
+    from core.config_cache import env_flag
+    use_unified = env_flag('HEVOLVE_VLM_UNIFIED', True)
 
     if use_unified:
         from integrations.vlm.qwen3vl_backend import get_qwen3vl_backend
@@ -601,10 +598,9 @@ def run_local_agentic_loop(
             # but ON in the loop is the right safe default — solo
             # /visual_agent calls keep their existing behaviour.
             action_payload = _build_action_payload(action_json, parsed)
-            _safety_on = os.environ.get(
-                'HEVOLVE_VLM_LOOP_SAFETY', '1').lower() not in ('0', 'false', 'no')
-            _verify_on = os.environ.get(
-                'HEVOLVE_VLM_LOOP_VERIFY', '0').lower() in ('1', 'true', 'yes')
+            from core.config_cache import env_flag as _env_flag
+            _safety_on = _env_flag('HEVOLVE_VLM_LOOP_SAFETY', True)
+            _verify_on = _env_flag('HEVOLVE_VLM_LOOP_VERIFY', False)
             result = execute_action(
                 action_payload, tier,
                 safety=_safety_on, verify=_verify_on)

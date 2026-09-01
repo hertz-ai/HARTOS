@@ -111,6 +111,44 @@ def reload_config():
     return get_config()
 
 
+# ---------------------------------------------------------------------------
+# Canonical env-flag accessors (owner 2026-09-01).  The 2026-09-01 sweep
+# found 1,039 os.environ.get sites / 623 distinct flags across HARTOS +
+# Nunba, 91 with DEFAULT DRIFT (same flag, different fallback per site —
+# e.g. HEVOLVE_AGENT_ENGINE_ENABLED defaulted 'false' at some sites and
+# 'true' at others) and bool parsing split across 3 idioms so the same
+# string meant different things per flag.  ONE parser each; migration
+# tracked in memory/project_env_flag_unification.md.
+# ---------------------------------------------------------------------------
+
+_TRUTHY = ('1', 'true', 'yes', 'on')
+_FALSY = ('0', 'false', 'no', 'off')
+
+
+def env_flag(name: str, default: bool) -> bool:
+    """Boolean env flag with ONE semantics for every flag:
+    explicit truthy -> True, explicit falsy -> False, unset or
+    unrecognized junk -> the declared default (junk never silently
+    flips a feature)."""
+    val = os.environ.get(name, '').strip().lower()
+    if val in _TRUTHY:
+        return True
+    if val in _FALSY:
+        return False
+    return default
+
+
+def env_int(name: str, default: int) -> int:
+    """Integer env value; '' and junk fall back to the default instead
+    of int('') crashing (the HEVOLVE_VLM_CAPTION_PORT class of bug —
+    and the default is typed int, never the '8080'-str-vs-8080-int
+    split the sweep found on HEVOLVE_LLM_PORT)."""
+    try:
+        return int(os.environ.get(name, '').strip() or default)
+    except (ValueError, TypeError):
+        return default
+
+
 # ── Endpoint Resolution ──
 # Single source of truth for API URLs.
 # In bundled Nunba mode (NUNBA_BUNDLED=1), all DB/action/prompt/vision
