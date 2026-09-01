@@ -65,7 +65,7 @@ class ModelBackend:
         return [self.config_list_entry]
 
     def is_dispatchable(self) -> bool:
-        """False for placeholder backends the router must not dial yet.
+        """False for backends the router must not dial as a chat endpoint.
 
         'distributed-shard' advertises the WAN shard cluster with a NON-endpoint
         base_url ('shard://cluster'); it becomes selectable only once the
@@ -73,8 +73,30 @@ class ModelBackend:
         selectors skip it so nothing dials the placeholder (the "Selection guard"
         promised in docs/architecture/SHARD_RUNTIME_HARTOS_SIDE.md). One check,
         used by every selector, keeps this a single source of truth.
+
+        shard:// was the only scheme excluded, but it is not the only
+        non-endpoint one. The registry also carries in-process media backends —
+        'inprocess://pocket_tts', 'inprocess://whisper', 'inprocess://luxtts',
+        'local://onnxruntime' — which are TTS/STT engines, not OpenAI-compatible
+        chat servers. They were registered at FAST tier with real-looking
+        accuracy scores and tiny latencies, so every latency-ordered selector
+        picked them ahead of the actual language models.
+
+        Measured on this desktop 2026-09-01, with six models registered:
+          pocket-tts-100m    fast   inprocess://   200ms  acc 0.85
+          qwen3.5-4b-local   fast   http://...            (the real fast model)
+          claude-code        expert http://...
+        get_fast_model() returned pocket-tts-100m — so speculative dispatch was
+        asking a SPEECH SYNTHESISER to draft chat completions, and
+        get_expert_model() on central returned whisper-stt-local for the same
+        reason. An endpoint that cannot answer /chat/completions must never win
+        a text-inference selection, whatever its latency.
+
+        The rule is therefore about the transport, not a name list: a
+        dispatchable backend is one the router can actually POST to.
         """
-        return not str(self.config_list_entry.get('base_url', '')).startswith('shard://')
+        url = str(self.config_list_entry.get('base_url', '') or '')
+        return url.startswith('http://') or url.startswith('https://')
 
     def to_dict(self) -> dict:
         return {
@@ -153,6 +175,10 @@ class ModelRegistry:
             candidates = [
                 m for m in self._models.values()
                 if m.tier == ModelTier.DRAFT
+                # Same guard as the other selectors. This one omitted it, so a
+                # non-endpoint backend at DRAFT tier would be handed to
+                # dispatch_draft_first as the first responder.
+                and m.is_dispatchable()
             ]
         if not candidates:
             return None
@@ -198,7 +224,13 @@ class ModelRegistry:
         """
         with self._lock:
             candidates = [m for m in self._models.values()
-                          if m.is_local and m.accuracy_score >= min_accuracy]
+                          if m.is_local and m.accuracy_score >= min_accuracy
+                          # Same guard as the other selectors. Without it the
+                          # in-process TTS/STT backends win here too: they are
+                          # is_local=True with high accuracy scores, so
+                          # 'local_only' and 'local_preferred' policies resolved
+                          # to a speech engine instead of the local Qwen.
+                          and m.is_dispatchable()]
         if not candidates:
             return None
         return max(candidates, key=lambda m: m.accuracy_score)
