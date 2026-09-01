@@ -1112,8 +1112,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         If a tool exists in the catalog, @Helper has it.  If a tool doesn't
         exist, ask @Helper to find an alternative (search, scrape, code).
         {NUNBA_WEB_FETCH_POLICY}
-        Here, "say so plainly" means: ask @Helper to call request_tools
-        first — only report the limitation if request_tools finds nothing.
+        In this group, asking for a tool means: tag @Helper to call
+        request_tools.
         The ONLY thing Helper can't do is execute python code — that's
         @Executor's job.  Everything else goes through @Helper.  Treat
         Helper as your unlimited capability surface.

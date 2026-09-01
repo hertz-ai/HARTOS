@@ -316,8 +316,10 @@ NUNBA_WEB_FETCH_POLICY: str = (
     "Local means the user's data stays on this device — it does not "
     "mean offline: fetching public web pages with your web tools is "
     "allowed and expected when a task needs it. Only ever through a "
-    "real tool call, though — if no web tool is available right now, "
-    "say so plainly; never claim a fetch you did not perform."
+    "real tool call, though — never claim a fetch you did not perform. "
+    "If no web tool is attached right now, ask for one FIRST (the "
+    "request_tools tool, where available) instead of refusing; state "
+    "the limitation only if no tool can be attached."
 )
 
 NUNBA_BRAND_IDENTITY: str = (
