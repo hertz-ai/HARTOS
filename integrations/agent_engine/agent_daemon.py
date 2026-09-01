@@ -182,6 +182,70 @@ def _send_hitl_notification(db, goal, task):
         logger.debug(f"HITL notification failed: {e}")
 
 
+
+def _settle_dispatched_goal(db, goal, goal_key):
+    """The ONE completion gate every dispatched goal must pass through.
+
+    Dispatch-style-independent by construction: it re-reads the goal from
+    the DB and judges only spark_spent, so synchronous (dispatch_goal) and
+    speculative (dispatch_speculative) handoffs are settled identically —
+    require spark_spent > 0 to complete; count noops otherwise; auto-pause
+    after 5 consecutive noops; continuous goals never auto-complete.
+    """
+    # Real completion gate: refresh from DB and require
+    # spark_spent > 0 (some real tool/LLM cost was incurred).
+    # Goals dispatched but doing zero work get a 'noop'
+    # counter; after 5 consecutive noops the goal is
+    # auto-paused so the daemon stops re-spinning it.
+    try:
+        db.refresh(goal)
+    except Exception:
+        pass  # refresh failure → fall through to attribute read
+    cfg = goal.config_json or {}
+    is_continuous = cfg.get('continuous', False)
+    spark_spent = goal.spark_spent or 0
+    # Completion = SPARK: the goal's purpose is spark
+    # transacted on real work (steward decision 2026-06-10 —
+    # a flow-recipe artifact proves a procedure RAN once, not
+    # that the goal's economic outcome happened, so recipe
+    # existence must NOT complete a goal). On all-local boxes
+    # spark_spent stays 0 today because estimate_llm_cost_
+    # spark prices local work at 0 — the fix is metering
+    # local work into spark, not weakening this gate.
+    if is_continuous:
+        # Continuous goals never auto-complete; cooldown gate
+        # higher up already prevents re-dispatch storms.
+        pass
+    elif spark_spent > 0:
+        goal.status = 'completed'
+        cfg['completed_at'] = datetime.utcnow().isoformat()
+        cfg.pop('noop_dispatch_count', None)
+        goal.config_json = cfg
+        logger.info(
+            f"Goal {goal_key} COMPLETED "
+            f"(spark_spent={spark_spent})")
+    else:
+        # Dispatched but zero real work — track and back off.
+        noop_count = int(cfg.get('noop_dispatch_count', 0)) + 1
+        cfg['noop_dispatch_count'] = noop_count
+        cfg['last_noop_dispatch'] = datetime.utcnow().isoformat()
+        if noop_count >= 5:
+            goal.status = 'paused'
+            cfg['pause_reason'] = (
+                f'Auto-paused: {noop_count} consecutive '
+                f'dispatches produced 0 spark — work is not '
+                f'reaching tool execution.  Investigate '
+                f'agent prompt or tool registration.')
+            cfg['paused_at'] = datetime.utcnow().isoformat()
+            logger.warning(
+                f"Goal {goal_key} AUTO-PAUSED after "
+                f"{noop_count} noop dispatches")
+        else:
+            logger.info(
+                f"Goal {goal_key} dispatched but "
+                f"spark_spent=0 (noop #{noop_count})")
+        goal.config_json = cfg
+
 class AgentDaemon:
     """Background daemon: active goals (any type) + idle agents → /chat dispatch."""
 
@@ -1300,7 +1364,20 @@ class AgentDaemon:
 
                 goal.last_dispatched_at = datetime.utcnow()
 
-                # Speculative dispatch if enabled and budget allows
+                # Speculative dispatch if enabled and budget allows.
+                #
+                # NO `continue` HERE ANY MORE — that word was defect (b),
+                # measured fleet-wide 2026-09-02 (Fetch-and-pull, central
+                # 94c0fd94 + desktop d47f4205; same signature on .69): with
+                # speculation enabled EVERY goal took this branch and skipped
+                # the completion gate below, so no goal could ever reach
+                # `completed`, accrue a noop count, or auto-pause. Central sat
+                # at ~90 dispatches/45min with zero recipes, zero prompts,
+                # zero completions. The gate (_settle_dispatched_goal) is
+                # DB-backed and dispatch-style-independent, so the SAME gate,
+                # noop counter and auto-pause now judge speculative handoffs.
+                result = None
+                speculated = False
                 if speculative_enabled:
                     try:
                         from .speculative_dispatcher import get_speculative_dispatcher
@@ -1314,13 +1391,20 @@ class AgentDaemon:
                             # Success — clear backoff
                             with _module_lock:
                                 _dispatch_backoff.pop(goal_key, None)
-                            continue
+                            speculated = True
+                            # Handed off — same truth as dispatch_goal's
+                            # non-None. Truthy so the failure/backoff arm
+                            # (synchronous failures only; speculation reports
+                            # none synchronously) is skipped and the
+                            # completion gate below runs.
+                            result = 'speculative-handoff'
                     except ImportError:
                         pass
 
-                result = dispatch_goal(prompt, str(agent['user_id']), goal.id, goal.goal_type)
-                dispatched += 1
-                self._wd_heartbeat()
+                if not speculated:
+                    result = dispatch_goal(prompt, str(agent['user_id']), goal.id, goal.goal_type)
+                    dispatched += 1
+                    self._wd_heartbeat()
 
                 # Track failures for exponential backoff
                 if result is None:
@@ -1372,60 +1456,12 @@ class AgentDaemon:
                     # `completed` on dispatch produced the dashboard lie where
                     # ~280 goals showed 'Completed' with 0/N spark earned.
                     #
-                    # Real completion gate: refresh from DB and require
-                    # spark_spent > 0 (some real tool/LLM cost was incurred).
-                    # Goals dispatched but doing zero work get a 'noop'
-                    # counter; after 5 consecutive noops the goal is
-                    # auto-paused so the daemon stops re-spinning it.
-                    try:
-                        db.refresh(goal)
-                    except Exception:
-                        pass  # refresh failure → fall through to attribute read
-                    cfg = goal.config_json or {}
-                    is_continuous = cfg.get('continuous', False)
-                    spark_spent = goal.spark_spent or 0
-                    # Completion = SPARK: the goal's purpose is spark
-                    # transacted on real work (steward decision 2026-06-10 —
-                    # a flow-recipe artifact proves a procedure RAN once, not
-                    # that the goal's economic outcome happened, so recipe
-                    # existence must NOT complete a goal). On all-local boxes
-                    # spark_spent stays 0 today because estimate_llm_cost_
-                    # spark prices local work at 0 — the fix is metering
-                    # local work into spark, not weakening this gate.
-                    if is_continuous:
-                        # Continuous goals never auto-complete; cooldown gate
-                        # higher up already prevents re-dispatch storms.
-                        pass
-                    elif spark_spent > 0:
-                        goal.status = 'completed'
-                        cfg['completed_at'] = datetime.utcnow().isoformat()
-                        cfg.pop('noop_dispatch_count', None)
-                        goal.config_json = cfg
-                        logger.info(
-                            f"Goal {goal_key} COMPLETED "
-                            f"(spark_spent={spark_spent})")
-                    else:
-                        # Dispatched but zero real work — track and back off.
-                        noop_count = int(cfg.get('noop_dispatch_count', 0)) + 1
-                        cfg['noop_dispatch_count'] = noop_count
-                        cfg['last_noop_dispatch'] = datetime.utcnow().isoformat()
-                        if noop_count >= 5:
-                            goal.status = 'paused'
-                            cfg['pause_reason'] = (
-                                f'Auto-paused: {noop_count} consecutive '
-                                f'dispatches produced 0 spark — work is not '
-                                f'reaching tool execution.  Investigate '
-                                f'agent prompt or tool registration.')
-                            cfg['paused_at'] = datetime.utcnow().isoformat()
-                            logger.warning(
-                                f"Goal {goal_key} AUTO-PAUSED after "
-                                f"{noop_count} noop dispatches")
-                        else:
-                            logger.info(
-                                f"Goal {goal_key} dispatched but "
-                                f"spark_spent=0 (noop #{noop_count})")
-                        goal.config_json = cfg
-
+                    # Real completion gate — extracted to
+                    # _settle_dispatched_goal so it is testable without
+                    # driving the 500-line _tick, and so no dispatch style can
+                    # skip it again (defect (b) was a `continue` doing exactly
+                    # that).
+                    _settle_dispatched_goal(db, goal, goal_key)
             # ── HITL: notify owners of APPROVAL_REQUIRED tasks ──
             try:
                 for goal in goals:
