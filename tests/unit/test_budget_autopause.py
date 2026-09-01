@@ -118,16 +118,32 @@ class BudgetAutoPauseTest(unittest.TestCase):
         self.assertFalse(budget_gate.pause_goal_for_budget(None, 'x'))
 
     # ── the gate wires it up ───────────────────────────────────────────
-    def test_pre_dispatch_gate_pauses_on_goal_budget_block(self):
+    def test_pre_dispatch_gate_refuses_but_does_NOT_write(self):
+        """The gate must not pause from in here.
+
+        Its only production caller is dispatch.dispatch_goal, which the daemons
+        invoke from inside a session held open across their whole loop
+        (agent_daemon 1021 -> single commit at 1712). Opening a second
+        connection and committing there puts a write inside that window, and a
+        long-lived reader is exactly what stops SQLite checkpointing the WAL --
+        the root cause of the lock storm this work started from. The daemon's
+        own pre-check pauses on the next tick instead.
+        """
         self.fx.add_goal('g-gate', budget=200, spent=200)
         with patch.object(budget_gate, 'check_goal_budget',
-                          return_value=(False, 0, 'insufficient_budget (0 < 11)')), \
-             patch.object(budget_gate, 'check_platform_affordability',
+                          return_value=(False, 0, 'insufficient_budget (0 < 11)')),              patch.object(budget_gate, 'check_platform_affordability',
                           return_value=(True, {})):
             allowed, reason = budget_gate.pre_dispatch_budget_gate('g-gate', 'prompt')
         self.assertFalse(allowed)
         self.assertIn('goal_budget_exceeded', reason)
-        self.assertEqual(self.fx.status_of('g-gate'), 'paused')
+        self.assertEqual(self.fx.status_of('g-gate'), 'active',
+                         'the gate wrote to the DB from inside the daemon session')
+
+    def test_gate_source_has_no_write_call(self):
+        import inspect
+        src = inspect.getsource(budget_gate.pre_dispatch_budget_gate)
+        self.assertNotIn('pause_goal_for_budget(', src,
+                         'gate must not open a second transaction on the hot path')
 
     def test_allowed_dispatch_does_not_pause(self):
         self.fx.add_goal('g-ok', budget=200, spent=10)

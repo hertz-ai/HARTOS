@@ -409,21 +409,47 @@ def pre_dispatch_budget_gate(goal_id: Optional[str],
     allowed, remaining, reason = check_goal_budget(goal_id, estimated_cost)
     if not allowed:
         logger.warning(f"Budget gate BLOCKED: goal={goal_id}, {reason}")
-        # A goal that cannot afford its next dispatch will not be able to
-        # afford the one after either: spark_budget is a one-shot cap set at
-        # creation and NOTHING in the tree replenishes it (no top-up, reset or
-        # refill path exists).  Leaving it 'active' makes the row lie — the
-        # daemon keeps selecting it, this gate keeps refusing it, and an
-        # operator reading `status` sees a healthy goal.
+        # A goal that cannot afford its next dispatch cannot afford the one
+        # after either, until a HUMAN acts: nothing in the daemon path raises
+        # spark_budget.  Top-up is real but operator-driven — see
+        # invalidate_goal_budget_cache ("admin top-up, manual goal edit,
+        # scheduled budget reset") and charge_goal_work_completed, which calls
+        # topping up "the steward lever".  An earlier draft of this comment
+        # claimed no top-up path existed at all; that was wrong, and the
+        # distinction matters because it is what makes pausing safe rather
+        # than terminal.
+        #
+        # Leaving it 'active' makes the row lie — the daemon keeps selecting
+        # it, this gate keeps refusing it, and an operator reading `status`
+        # sees a healthy goal.  The cost of pausing is that a top-up alone no
+        # longer resumes it; someone has to un-pause.  That is the right
+        # trade: a paused row with a reason is visible, an active row that can
+        # never dispatch is not.
+        #
+        # The pause is NOT performed here, deliberately.  This gate's only
+        # production caller is dispatch.dispatch_goal, and dispatch_goal is
+        # itself called from inside agent_daemon's and coding_daemon's dispatch
+        # loops, which hold ONE session open across the whole loop (agent_daemon
+        # 1021 -> its single commit at 1712).  Opening a second connection and
+        # committing from in here would put a write inside that window, and a
+        # long-lived reader is precisely what stops SQLite from checkpointing
+        # the WAL — the root cause of the lock storm this whole investigation
+        # started from.  An earlier draft of this function did exactly that.
+        #
+        # So the transition stays with the caller that already owns a session:
+        # agent_daemon's pre-check calls apply_budget_pause(goal, reason) on its
+        # own object, costing no extra transaction.  pause_goal_for_budget
+        # remains for a genuinely session-less caller, and is not used on the
+        # hot path.
         #
         # Measured on central 2026-09-01: goal 917cc152 sat 'active' with 2
         # spark left against an 11-spark estimate, re-blocked on every pass,
         # while self_heal/self_build/code_evolution sat at exactly 0 left.
         # agent_daemon already auto-pauses in its own read-only pre-check, but
         # that check estimates cost from a different prompt than the real
-        # dispatch, so goals in the gap between the two estimates never
-        # reached it.  Same decision, one home, both callers.
-        pause_goal_for_budget(goal_id, reason)
+        # dispatch, so goals in the gap between the two estimates are refused
+        # here and paused on the daemon's NEXT tick, once its own pre-check
+        # sees the same shortfall.  One tick later, and no nested write.
         return False, f'goal_budget_exceeded: {reason}'
 
     # Platform-level affordability
