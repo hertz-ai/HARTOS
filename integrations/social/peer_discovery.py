@@ -1891,6 +1891,29 @@ class GossipProtocol:
                 db.rollback()
                 logger.debug(f"Integrity round decay sweep failed: {_e}")
 
+            # 0b. Retention sweep — integrity_challenges is append-only and had
+            #     no expiry, so it grew to 300,092 rows / 386 MB (plus ~60 MB of
+            #     indexes) by 2026-09-01: 72% of central's 618 MB database.
+            #     That size is what broke the write path — the WAL checkpointer
+            #     could not finish against a file that large under continuous
+            #     daemon writes, so every writer blocked past busy_timeout and
+            #     the daemon logged "database is locked" on each tick, leaving
+            #     goal status updates unpersisted and goals re-dispatching
+            #     forever.  Sits here, beside the decay sweep, because that is
+            #     the one scheduled maintenance point this round has.
+            try:
+                from .integrity_service import IntegrityService as _IS2
+                _pruned = _IS2.prune_challenge_history(db)
+                if _pruned.get('deleted_total'):
+                    logger.info(
+                        f"Integrity round: pruned "
+                        f"{_pruned['deleted_total']} resolved challenge(s)"
+                        + (" (backlog remains)"
+                           if _pruned.get('more_remaining') else ""))
+            except Exception as _e:
+                db.rollback()
+                logger.debug(f"Integrity round retention sweep failed: {_e}")
+
             active_peers = db.query(PeerNode).filter(
                 PeerNode.status == 'active',
                 PeerNode.node_id != self.node_id,
