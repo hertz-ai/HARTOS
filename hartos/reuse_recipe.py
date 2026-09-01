@@ -451,6 +451,26 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
 
 
 
+def _coerce_instruction_text(value) -> str:
+    """Normalize a tool 'instructions' argument to plain text.
+
+    Qwen sometimes nests tool args (#653 family): live 2026-09-01
+    15:14:35 the hive-training agent passed a dict and
+    execute_windows_or_android_command crashed on .lower() before the
+    VLM loop could start.  A dict keeps its natural text field when one
+    exists; anything else stringifies rather than raising.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ('instructions', 'command', 'task', 'text'):
+            inner = value.get(key)
+            if isinstance(inner, str) and inner.strip():
+                return inner
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
 def execute_python_file(task_description: str, user_id: int, prompt_id: int, action_entry_point: int = 0):
     headers = {'Content-Type': 'application/json'}
     url = f'http://localhost:{_get_llm_port("backend")}/time_agent'
@@ -1445,6 +1465,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         """
         Executes a command on any desktop (Windows/Linux/macOS) or Android device. Uses pyautogui for cross-platform GUI automation.
         """
+        # Models sometimes nest the args (#653 family) — live 15:14:35
+        # crash: instructions arrived as a dict and :1508's .lower()
+        # raised AttributeError, killing the tool before the VLM loop.
+        instructions = _coerce_instruction_text(instructions)
         # Generate a unique key for this command
         command_key = f"windows_command_{user_id}_{prompt_id}"
 

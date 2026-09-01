@@ -187,3 +187,32 @@ class ReuseMainCoreFactory(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class InstructionCoercion(unittest.TestCase):
+    """Live 2026-09-01 15:14:35: the hive-training agent called
+    execute_windows_or_android_command with a DICT instructions arg and
+    the tool crashed on .lower() at the recipe matcher — before the VLM
+    loop.  The coercion helper is the single normalization point."""
+
+    def test_str_passes_through_untouched(self):
+        from hartos.reuse_recipe import _coerce_instruction_text
+        self.assertEqual(_coerce_instruction_text('open notepad'), 'open notepad')
+
+    def test_nested_dict_keeps_its_text_field(self):
+        from hartos.reuse_recipe import _coerce_instruction_text
+        self.assertEqual(
+            _coerce_instruction_text({'instructions': 'run benchmarks',
+                                      'os_to_control': 'windows'}),
+            'run benchmarks')
+        self.assertEqual(_coerce_instruction_text({'command': 'notepad'}),
+                         'notepad')
+
+    def test_textless_dict_and_non_str_stringify_not_raise(self):
+        from hartos.reuse_recipe import _coerce_instruction_text
+        out = _coerce_instruction_text({'foo': 1})
+        self.assertIn('"foo"', out)
+        # every output survives the crash site's exact expression
+        for v in ({'foo': 1}, 42, None, {'instructions': 'x'}):
+            coerced = _coerce_instruction_text(v)
+            ' '.join(coerced.lower().strip().split())
