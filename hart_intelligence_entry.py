@@ -1,5 +1,15 @@
 # Fix Windows encoding for non-ASCII characters (Telugu, emojis, etc.)
 import sys
+# Windows: use the SelectorEventLoop policy process-wide.  autobahn's asyncio
+# WAMP transport breaks on the default Windows ProactorEventLoop — the
+# EventBus WAMP bridge (core/platform/events.py connect_wamp) opens the TCP
+# socket to the relay but the session never joins (on_join never fires), so
+# the internet relay stays dark on Windows while a macOS/Linux peer connects
+# fine.  autobahn resolves its loop through the global policy, so this must be
+# set before any loop is created; hypercorn serves cleanly on a selector loop.
+if sys.platform == 'win32':
+    import asyncio as _asyncio_boot
+    _asyncio_boot.set_event_loop_policy(_asyncio_boot.WindowsSelectorEventLoopPolicy())
 from core.subprocess_safe import no_window_kwargs
 import io
 if sys.platform == 'win32' and 'pytest' not in sys.modules:
