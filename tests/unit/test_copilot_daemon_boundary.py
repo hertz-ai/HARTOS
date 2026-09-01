@@ -46,6 +46,7 @@ def _never_really_run_claude(monkeypatch):
     monkeypatch.setattr(d, 'hive_halted', lambda: False)
     monkeypatch.setattr(d, 'yield_to_user', lambda: False)
     monkeypatch.setattr(d, 'next_task', lambda: None)
+    monkeypatch.setattr(d, 'ensure_hive_session', lambda: 'idle')
     monkeypatch.setattr(d.os.path, 'exists', lambda p: False)
     # The workspace is real git on a real disk; stub it at its seam so these tests
     # exercise the DECISION logic, not git.
@@ -297,3 +298,97 @@ def test_copilot_unit_carries_the_backend_port():
     assert "127.0.0.1:6777" not in code, (
         "the backend port must come from config.hart.ports.backend, not a "
         "hardcoded 6777 that can drift from what the backend actually binds.")
+
+
+# ── gate 5½: the hive session self-heals, without violating gates 1-4 ───────
+#
+# ClaudeHiveSession is a process-global singleton in the backend with NO
+# persistence: every backend restart silently dropped the session, and the
+# daemon then polled an empty queue forever while honestly reporting an "idle
+# hive" — 30 days of zero task accepts on the real node traced to exactly
+# this. ensure_hive_session() reconnects ONLY from the disconnected state
+# (reconnecting a live session re-registers it and zeroes its stats), rides
+# the same public HTTP API the CLI uses, and runs INSIDE the gated tick so a
+# stopped/halted/yielding daemon never touches the network.
+
+# Captured at import, BEFORE the autouse fixture stubs the attr — the two
+# direct tests below must drive the REAL function, not their own stub.
+_REAL_ENSURE = d.ensure_hive_session
+
+
+class _Resp:
+    def __init__(self, code=200, body=None):
+        self.status_code = code
+        self._body = body or {}
+
+    def json(self):
+        return self._body
+
+
+def test_a_disconnected_session_is_reconnected(monkeypatch):
+    calls = []
+
+    class FakeRequests:
+        @staticmethod
+        def get(url, timeout=None):
+            calls.append(('get', url))
+            return _Resp(200, {'status': 'disconnected', 'session_id': ''})
+
+        @staticmethod
+        def post(url, json=None, timeout=None):
+            calls.append(('post', url, json))
+            return _Resp(200, {'success': True})
+
+    monkeypatch.setitem(sys.modules, 'requests', FakeRequests)
+    monkeypatch.setattr(d, 'backend', lambda: 'http://127.0.0.1:6777')
+    assert _REAL_ENSURE() == 'idle'
+    posts = [c for c in calls if c[0] == 'post']
+    assert len(posts) == 1 and posts[0][1].endswith('/api/hive/session/connect')
+    assert posts[0][2]['task_scope'] == 'own_repos'
+
+
+def test_a_live_session_is_left_alone(monkeypatch):
+    """Reconnecting a live session re-registers it (new id, zeroed stats) —
+    so idle and working sessions must not be touched."""
+    calls = []
+
+    class FakeRequests:
+        @staticmethod
+        def get(url, timeout=None):
+            return _Resp(200, {'status': 'idle', 'session_id': 'chs_x'})
+
+        @staticmethod
+        def post(url, json=None, timeout=None):
+            calls.append('post')
+            return _Resp(200, {})
+
+    monkeypatch.setitem(sys.modules, 'requests', FakeRequests)
+    monkeypatch.setattr(d, 'backend', lambda: 'http://127.0.0.1:6777')
+    assert _REAL_ENSURE() == 'idle'
+    assert calls == [], 'a live session was re-registered'
+
+
+def test_a_dead_backend_degrades_to_honest_unknown(monkeypatch):
+    """Mid-restart the backend answers nothing; the tick must not crash."""
+    class FakeRequests:
+        @staticmethod
+        def get(url, timeout=None):
+            raise OSError('connection refused')
+
+    monkeypatch.setitem(sys.modules, 'requests', FakeRequests)
+    monkeypatch.setattr(d, 'backend', lambda: 'http://127.0.0.1:6777')
+    assert _REAL_ENSURE() == 'unknown'
+
+
+def test_closed_gates_never_reach_the_session_ensure(monkeypatch, limiter):
+    """A stopped daemon must not so much as touch the network: the stop file
+    (gate 1) has to short-circuit BEFORE ensure_hive_session runs. Uses the
+    file's own stop-file idiom (the autouse fixture pins os.path.exists to
+    False, so a real tmp file is invisible here by design)."""
+    touched = []
+    monkeypatch.setattr(d, 'ensure_hive_session',
+                        lambda: touched.append(True))
+    monkeypatch.setattr(d.os.path, 'exists', lambda p: p == d.STOP_FILE)
+    out = d.tick(limiter)
+    assert out['action'] == 'stopped'
+    assert touched == [], 'a stopped daemon touched the hive session API'

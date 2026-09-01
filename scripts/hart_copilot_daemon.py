@@ -158,6 +158,53 @@ class RateLimiter:
 
 # ─── Work: what the co-pilot is asked to do ──────────────────────────────────
 
+def ensure_hive_session():
+    """Reconnect the hive session when the backend lost it. Returns the status.
+
+    ClaudeHiveSession is a PROCESS-GLOBAL singleton in the backend with no
+    persistence at all — no save, no load, no boot reconnect — so every backend
+    restart silently drops the session and this daemon then polls an empty
+    queue forever while reporting an "idle hive". Measured on .69: connected at
+    18:xx, rebooted, status back to {"status": "disconnected",
+    "session_id": ""} with nothing anywhere re-establishing it. The daemon is
+    the component whose JOB depends on that session existing, so the daemon is
+    where self-healing belongs: one status GET per tick (cheap, local), one
+    connect POST only in the disconnected state.
+
+    Deliberately NOT "connect every tick": api_connect on a live session
+    re-registers it — new session_id, stats reset to zero. Idle and working
+    sessions are left alone; only 'disconnected' triggers a connect. Both
+    calls ride the SAME public HTTP API the CLI and MCP bridge use — no new
+    ingress, no reach-around into backend internals.
+
+    Failure is reported, never raised: a backend mid-restart answers nothing,
+    and the tick must degrade to an honest idle, not crash the loop.
+    """
+    try:
+        import requests
+        base = backend()
+        r = requests.get(f'{base}/api/hive/session/status', timeout=10)
+        status = (r.json() or {}).get('status', '') if r.status_code == 200 else ''
+        if status and status != 'disconnected':
+            return status
+        import platform
+        user = os.environ.get('HART_COPILOT_HIVE_USER',
+                              'copilot@' + platform.node())
+        c = requests.post(
+            f'{base}/api/hive/session/connect',
+            json={'user_id': user, 'task_scope': 'own_repos'},
+            timeout=15)
+        if c.status_code == 200:
+            logger.info('copilot: hive session reconnected as %s', user)
+            return 'idle'
+        logger.warning('copilot: hive session reconnect refused: %s',
+                       c.status_code)
+        return 'disconnected'
+    except Exception as e:
+        logger.debug('copilot: hive session ensure failed (%s)', e)
+        return 'unknown'
+
+
 def next_task():
     """The next bounded unit of work, or None.
 
@@ -406,6 +453,12 @@ def tick(limiter, dry_run=False):
     if not limiter.allow():
         return {'action': 'rate-limited',
                 'reason': f'{limiter.max_per_hour} runs/hour cap reached'}
+
+    # The session the queue lives in must exist before polling it — otherwise
+    # a restarted backend makes every future tick an "idle hive" lie. Runs
+    # AFTER the stop/halt/yield/rate gates on purpose: a halted or yielding
+    # daemon must not so much as touch the network.
+    ensure_hive_session()
 
     task = next_task()
     if not task:
