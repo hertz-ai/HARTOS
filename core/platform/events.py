@@ -376,13 +376,26 @@ class EventBus:
         async def on_join(session, details):
             bus._wamp_session = session
             bus._wamp_connected = True
+            # TEMP diagnostics for the live cross-network relay test —
+            # lets a debug endpoint report the SAME raw fields the other
+            # side is comparing against (session id / authrole / etc.),
+            # since none of this was previously retained anywhere.
+            bus._wamp_debug = {
+                'transport_url': url,
+                'realm': realm,
+                'session_id': getattr(details, 'session', None),
+                'authid': getattr(details, 'authid', None),
+                'authrole': getattr(details, 'authrole', None),
+                'authmethod': getattr(details, 'authmethod', None),
+            }
             logger.info("EventBus WAMP bridge connected to %s (realm=%s)", url, realm)
 
             # Subscribe to the wildcard topic for all HARTOS events
             wamp_wildcard = f'{WAMP_TOPIC_PREFIX}.'
             try:
                 await session.subscribe(bus._on_wamp_event, wamp_wildcard,
-                                        options=SubscribeOptions(match='prefix'))
+                                        options=SubscribeOptions(match='prefix',
+                                                                  details_arg='details'))
                 logger.info("EventBus subscribed to WAMP prefix: %s", wamp_wildcard)
             except Exception as e:
                 logger.warning("WAMP wildcard subscribe failed: %r", e)
