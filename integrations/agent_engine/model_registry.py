@@ -507,6 +507,74 @@ def _register_defaults():
             cost_per_1k_tokens=0.5,
         ))
 
+    # 5b-ii. Qwen3.8 27B via Bitdeer — OpenAI-compatible, registers like GLM above.
+    #     QWEN_API_KEY is primary; BITDEER_API_KEY is accepted as the vendor's
+    #     own convention. QWEN_BASE_URL / QWEN_MODEL override endpoint and model.
+    #
+    #     MEASURED 2026-08-31 against the live endpoint, not assumed:
+    #       warm      114 completion tokens in 3.28s (~35 tok/s)
+    #       cold      12.6s and 26.8s on the first two calls, so the first
+    #                 request after an idle period pays a real spin-up
+    #       context   a 5556-token prompt was accepted with HTTP 200, so the
+    #                 advertised "4K" is the OUTPUT cap, not the window
+    #
+    #     IT IS A REASONING MODEL, and that is the integration hazard. It returns
+    #     the thinking in `reasoning_content` and leaves `content` EMPTY until the
+    #     budget covers reasoning AND answer: max_tokens=16 produced content='' with
+    #     finish_reason='length', while max_tokens=512 produced '391' correctly.
+    #     core/verified_llm.py:_extract_content already falls back to
+    #     reasoning_content, but the autogen dispatch path reads `content` only, so
+    #     a stingy budget here reads as a blank answer rather than an error. Hence
+    #     the max_tokens floor below: never send this model a budget so small that
+    #     it can only think.
+    # THE ZERO EXPIRES. The vendor stated free usage until 2026-09-08 (owner,
+    # 2026-08-31). Hardcoding a permanent 0 would be the expensive kind of
+    # silent: every cost-weighted routing decision keeps preferring this model
+    # on price while it quietly starts billing on the 9th, and nothing in the
+    # system would say so. So the promotional rate is dated, and once it lapses
+    # the model falls back to a placeholder in GLM's order of magnitude, which
+    # is honest as "not free, real number unknown" and stops price alone from
+    # selecting it. Set QWEN_RATE_PER_1K once the vendor publishes actual
+    # pricing, or QWEN_FREE_UNTIL if the promo is extended.
+    import datetime as _dt
+    _qwen_free_until = os.environ.get('QWEN_FREE_UNTIL', '2026-09-08')
+    _qwen_is_free = _dt.date.today().isoformat() <= _qwen_free_until
+    _qwen_rate = 0.0 if _qwen_is_free else float(
+        os.environ.get('QWEN_RATE_PER_1K', '0.5'))
+    # DO NOT health-check this endpoint with urllib. The vendor's edge rejects
+    # Python-urllib by User-Agent. Measured from inside the live central
+    # container, same key, same body, same second:
+    #   requests -> 200 | httpx -> 200 | urllib default UA -> 403 Forbidden
+    #   urllib with User-Agent 'curl/8.5.0' -> 200
+    # The openai SDK rides httpx, so dispatch is fine. A urllib-based prober
+    # (core/verified_llm.py uses urllib.request, though it defaults to the LOCAL
+    # llama endpoint) would report this model dead while it is perfectly healthy.
+    # If you ever point a urllib prober at a hosted provider, set a UA first.
+    #
+    # This also disproves the first read of that 403: it is NOT an IP block on
+    # central. curl from the host AND from inside the container both returned
+    # 200 in the same minute.
+    _qwen_key = os.environ.get('QWEN_API_KEY') or os.environ.get('BITDEER_API_KEY')
+    if _qwen_key:
+        model_registry.register(ModelBackend(
+            model_id='qwen3.8-27b',
+            display_name='Qwen3.8 27B (Bitdeer)',
+            tier=ModelTier.EXPERT,
+            config_list_entry={
+                'model': os.environ.get('QWEN_MODEL', 'Qwen/Qwen3.8-27B'),
+                'api_key': _qwen_key,
+                'base_url': os.environ.get(
+                    'QWEN_BASE_URL', 'https://api-inference.bitdeer.ai/v1'),
+                # Output cap is 4K. The floor matters more than the ceiling here:
+                # below a few hundred tokens this model returns empty content.
+                'max_tokens': int(os.environ.get('QWEN_MAX_TOKENS', '2048')),
+                'price': [_qwen_rate, _qwen_rate],
+            },
+            avg_latency_ms=3300.0,     # warm sample; cold start is far worse
+            accuracy_score=0.85,
+            cost_per_1k_tokens=_qwen_rate,
+        ))
+
     # 5c. Distributed shard cluster (WAN pipeline-parallel inference) — feature-flagged.
     #     A model too big for one node is served by K peers, each holding a
     #     contiguous LAYER range; only the hidden-state activation crosses the

@@ -41,6 +41,10 @@ autobahn==23.1.2
 # every fresh checkout (CI included) failed. 0.2.37 was never published to
 # PyPI under any name (pyautogen tops out at 0.2.35 in that line); 0.2.35
 # is the same 0.2 API and the full autogen test family passes against it.
+# ddgs SERP parsing (see the ddgs note above) - NOT transitive in this image
+lxml==6.1.2
+# ddgs HTTP layer, browser TLS impersonation - NOT transitive in this image
+primp==2.0.0
 pyautogen==0.2.35
 coloredlogs==15.0.1
 config==0.5.1
@@ -54,7 +58,15 @@ dataclasses-json==0.6.7
 # and tier D needs SEARXNG_URL which is set nowhere. So google_search returns []
 # on every install. ddgs survives because its transport (primp) does browser TLS
 # impersonation rather than being fingerprinted as a bot; verified against the
-# exact tier-A path, 5 rows with titles/urls/snippets. primp + lxml resolve
+# exact tier-A path, 5 rows with titles/urls/snippets. primp + lxml are
+# PINNED BELOW, not left transitive: this comment used to claim they
+# resolve transitively, and the image build proved otherwise. Measured
+# 2026-08-31 inside the live central container: ddgs imported fine while
+# primp and lxml were both ABSENT, so every tier-A query died with
+# ModuleNotFoundError: No module named 'lxml' and search was dead on
+# central for weeks. Adding them to a throwaway container off the same
+# image returned 3 real results from central's own IP, which also
+# refutes the datacenter-IP-block theory that #34 carried.
 # transitively and are deliberately not pinned here.
 ddgs==9.16.0
 dill==0.3.7

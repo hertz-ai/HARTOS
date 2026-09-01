@@ -131,8 +131,6 @@ class TheRpcHelperUsesTheResolver(unittest.TestCase):
             "the hardcoded router literal is back in helper.py")
 
 
-if __name__ == '__main__':
-    unittest.main()
 
 
 class TheCentralHostIsCanonicalised(unittest.TestCase):
@@ -238,3 +236,15 @@ class UnifyingTheHostDidNotCostTheFlexibility(unittest.TestCase):
             else:
                 os.environ['HEVOLVE_CENTRAL_DB_URL'] = prev
             importlib.reload(cc)
+
+
+# Must stay LAST. This block sat at line 134, ABOVE
+# TheCentralHostIsCanonicalised and UnifyingTheHostDidNotCostTheFlexibility.
+# Python runs a module top to bottom, so unittest.main() fired before those
+# classes were defined and then exited: `python tests/unit/<this>.py` printed
+# "Ran 13 tests ... OK" while ten tests below it never ran, and those ten are
+# the ones asserting the host is canonicalised and that a node can still be
+# pointed at its own or a regional router. pytest collects them either way,
+# which is exactly what hid it from the suite that documents this contract.
+if __name__ == '__main__':
+    unittest.main()

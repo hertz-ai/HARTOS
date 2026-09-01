@@ -1023,7 +1023,32 @@ jobs:
             esac
           done
 
-          if [[ "$HAS_DESKTOP" == "true" ]]; then
+          # --- GATE-VERDICT gate for the LATEST pointer --------------------
+          # The desktop-presence check above asks "are the artifacts THERE",
+          # which is not the same question as "did this build PASS".  GATE is
+          # already computed and stamped into the title and notes so a consumer
+          # "can tell a green-gated preview from a red-gated one AT DOWNLOAD
+          # TIME" — and then nothing consulted it when choosing the pointer
+          # that decides what DOWNLOAD TIME even means.
+          #
+          # Measured 2026-09-01: /releases/latest resolved to
+          # nightly-ead46e3-33450810556, publicly titled "HART OS nightly
+          # ead46e3 (gate FAILURE)", with prerelease=false.  It had desktop
+          # ISOs, so HAS_DESKTOP was true and it took the pointer.  Every other
+          # nightly was correctly prerelease=true, so this one red build WAS
+          # the default download, ahead of the signed v1.0.0 — and it is what
+          # the hevolve.ai/download "Releases" link resolves to.
+          #
+          # Same contract as the partial case: a red-gated nightly still
+          # PUBLISHES, because the artifacts are real and someone debugging the
+          # failure needs them.  It just never becomes what a first-time
+          # visitor downloads by default.  Its title already carries the gate
+          # verdict, so it is not retitled here.
+          if [[ "$HAS_DESKTOP" == "true" && "$GATE" != "success" ]]; then
+            echo "=== RED-GATED nightly (gate=${GATE}) — publishing WITHOUT the latest pointer ==="
+            gh release edit "$TAG" --repo "$REPO" --draft=false --latest=false --prerelease=true
+            echo "::warning title=Red-gated nightly::${TAG} failed the test gate (${GATE}); /releases/latest keeps pointing at the previous green nightly"
+          elif [[ "$HAS_DESKTOP" == "true" ]]; then
             echo "=== Publishing as latest (immutable after publish) ==="
             gh release edit "$TAG" --repo "$REPO" --draft=false --latest=true --prerelease=false
           else

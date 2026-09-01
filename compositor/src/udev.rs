@@ -1392,23 +1392,32 @@ fn build_gles_renderer(gbm: &GbmDevice<DrmDeviceFd>) -> Result<GlesRenderer, Box
 /// Best-effort throughout. If this file cannot be written the shell simply keeps
 /// drawing everything, which is exactly today's behaviour — the failure mode is
 /// "no speedup", never "no desktop".
-fn publish_native_chrome() {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    /// What we have already told the shell. Starts at 0 = "we claim nothing".
-    static PUBLISHED: AtomicU8 = AtomicU8::new(0);
-
-    let mask = crate::comp_core::NATIVE_CHROME_EMITTED.load(Ordering::Relaxed);
+/// The claim-growth decision. `None` means "publish nothing".
+///
+/// Extracted pure so the invariants below are testable without DRM, a session
+/// directory, or the process-global PUBLISHED cell -- the same idiom this file
+/// already uses for `should_recover_frozen`, `flip_action` and `master_step`.
+/// These three rules used to be asserted by REGEXING THIS SOURCE FILE from
+/// Python (tests/unit/test_native_chrome_bridge.py), which pinned the text
+/// rather than the behaviour: it went red when the call site legitimately moved
+/// to the vblank reaper, while never once proving the claim actually grows.
+fn next_claim(prev: u8, mask: u8) -> Option<u8> {
     if mask == 0 {
-        return;
+        return None;
     }
-    let prev = PUBLISHED.load(Ordering::Relaxed);
     // Only ever grow. A frame that happens to omit the orb (capture blocked, a
     // degenerate mode) must not retract a claim the shell has already acted on.
     let next = prev | mask;
     if next == prev {
-        return;
+        // Unchanged: do not rewrite. The shell polls this file on every render.
+        return None;
     }
+    Some(next)
+}
 
+/// Render a claim as the file's body. Order is fixed so an unchanged claim
+/// produces byte-identical output.
+fn claim_names(next: u8) -> String {
     let mut names: Vec<&str> = Vec::new();
     if next & crate::comp_core::NATIVE_CHROME_BLOOM != 0 {
         names.push("bloom");
@@ -1416,19 +1425,44 @@ fn publish_native_chrome() {
     if next & crate::comp_core::NATIVE_CHROME_ORB != 0 {
         names.push("orb");
     }
+    names.join(",")
+}
+
+/// Write the claim so a reader can never observe a half-written file.
+///
+/// Write-then-rename within one directory: rename(2) is atomic there, so the
+/// shell either sees the old claim or the new one, never a torn read. Returns
+/// false and cleans up on any failure.
+fn write_claim(dir: &std::path::Path, body: &str) -> bool {
+    let path = dir.join("native-chrome");
+    let tmp = dir.join(".native-chrome.tmp");
+    let wrote = std::fs::write(&tmp, body)
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .is_ok();
+    if !wrote {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    wrote
+}
+
+fn publish_native_chrome() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    /// What we have already told the shell. Starts at 0 = "we claim nothing".
+    static PUBLISHED: AtomicU8 = AtomicU8::new(0);
+
+    let mask = crate::comp_core::NATIVE_CHROME_EMITTED.load(Ordering::Relaxed);
+    let prev = PUBLISHED.load(Ordering::Relaxed);
+    let next = match next_claim(prev, mask) {
+        Some(n) => n,
+        None => return,
+    };
 
     // /run/hart/session is the group-writable (0770) dir the session may write;
     // /run/hart itself is 0750 owner-only. Writing the wrong one fails silently
-    // and defeats the whole bridge — the same perms trap already documented in
+    // and defeats the whole bridge, the same perms trap already documented in
     // liquid_ui_service.py for shell-render.
-    let path = "/run/hart/session/native-chrome";
-    let tmp = "/run/hart/session/.native-chrome.tmp";
-    // Write-then-rename so a reader never sees a half-written claim: the shell
-    // polls this on every render and a torn read would flicker the desktop.
-    let body = names.join(",");
-    let wrote = std::fs::write(tmp, &body)
-        .and_then(|()| std::fs::rename(tmp, path))
-        .is_ok();
+    let body = claim_names(next);
+    let wrote = write_claim(std::path::Path::new("/run/hart/session"), &body);
     if wrote {
         PUBLISHED.store(next, Ordering::Relaxed);
         info!(
@@ -1438,8 +1472,9 @@ fn publish_native_chrome() {
         );
     } else {
         // Do NOT retry-storm: a missing dir or a perms problem will not fix
-        // itself mid-session, and this runs on the flip path.
-        let _ = std::fs::remove_file(tmp);
+        // itself mid-session, and this runs on the flip path. write_claim has
+        // already removed the temp file.
+        warn!("native-chrome claim could not be published");
     }
 }
 
@@ -2224,5 +2259,112 @@ mod tests {
                 "the demote decision tracks the RenderFrame variant exactly (no surprise outcome)"
             );
         }
+    }
+
+    // ── the native-chrome claim ─────────────────────────────────────────────
+    //
+    // These four invariants used to be checked by REGEXING THIS FILE from
+    // Python (tests/unit/test_native_chrome_bridge.py). That pinned the text,
+    // not the behaviour: it asserted the literal `last_flip_at = Some(now)`
+    // appeared within 500 characters before the publish call, so it went RED
+    // when the call site legitimately moved into the vblank reaper -- a change
+    // that made the claim STRONGER (a real DrmEvent::VBlank is proof of
+    // scanout; queue_frame's Ok is not) -- while never once proving a claim
+    // actually grows, or that a torn read is impossible.
+
+    use crate::comp_core::{NATIVE_CHROME_BLOOM, NATIVE_CHROME_ORB};
+
+    #[test]
+    fn a_claim_only_ever_grows() {
+        // The shell re-reads this on every render. Retracting mid-session would
+        // flicker the desktop between native and HTML chrome.
+        assert_eq!(
+            next_claim(NATIVE_CHROME_BLOOM, NATIVE_CHROME_ORB),
+            Some(NATIVE_CHROME_BLOOM | NATIVE_CHROME_ORB),
+            "a new element must be added to the claim, not replace it"
+        );
+        // A frame that omits the orb (capture blocked, a degenerate mode) must
+        // not retract a claim the shell has already acted on.
+        assert_eq!(
+            next_claim(NATIVE_CHROME_BLOOM | NATIVE_CHROME_ORB, NATIVE_CHROME_BLOOM),
+            None,
+            "a frame missing an element must not retract it"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_claim_is_not_rewritten() {
+        assert_eq!(
+            next_claim(NATIVE_CHROME_ORB, NATIVE_CHROME_ORB),
+            None,
+            "re-publishing an identical claim would rewrite the file on every flip"
+        );
+    }
+
+    #[test]
+    fn claiming_nothing_publishes_nothing() {
+        // mask == 0 means no native element reached the frame. Publishing an
+        // empty claim would tell the shell to stop painting chrome that nobody
+        // is drawing, which is the transparent-desktop failure.
+        assert_eq!(next_claim(0, 0), None);
+        assert_eq!(next_claim(NATIVE_CHROME_ORB, 0), None);
+    }
+
+    #[test]
+    fn claim_names_are_stable_and_ordered() {
+        // Byte-identical output for an identical claim, so a reader diffing the
+        // file sees no spurious change.
+        assert_eq!(claim_names(NATIVE_CHROME_BLOOM), "bloom");
+        assert_eq!(claim_names(NATIVE_CHROME_ORB), "orb");
+        assert_eq!(
+            claim_names(NATIVE_CHROME_BLOOM | NATIVE_CHROME_ORB),
+            "bloom,orb"
+        );
+        assert_eq!(claim_names(0), "");
+    }
+
+    #[test]
+    fn the_claim_is_written_atomically() {
+        // The real thing, on a real filesystem: after publishing, the file holds
+        // exactly the claim and NO temp file is left behind. A reader polling
+        // this directory can only ever observe a complete claim, because the
+        // content arrives by rename(2) within the same directory.
+        let dir = std::env::temp_dir().join(format!(
+            "hart-claim-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        assert!(write_claim(&dir, "bloom,orb"), "the claim should publish");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("native-chrome")).unwrap(),
+            "bloom,orb"
+        );
+        assert!(
+            !dir.join(".native-chrome.tmp").exists(),
+            "the temp file must not survive a successful publish"
+        );
+
+        // Republishing replaces the content wholesale, never appends.
+        assert!(write_claim(&dir, "orb"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("native-chrome")).unwrap(),
+            "orb"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_publish_leaves_no_temp_file() {
+        // A missing session dir is the documented perms trap (/run/hart is 0750
+        // owner-only). It must fail cleanly, not strew temp files on the flip
+        // path.
+        let missing = std::env::temp_dir()
+            .join(format!("hart-claim-absent-{}", std::process::id()))
+            .join("nope");
+        assert!(!write_claim(&missing, "orb"), "a missing dir cannot publish");
+        assert!(!missing.join(".native-chrome.tmp").exists());
     }
 }

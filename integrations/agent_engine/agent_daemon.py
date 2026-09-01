@@ -1257,18 +1257,18 @@ class AgentDaemon:
                     if not bg_allowed:
                         # Immediately pause — budget won't change between daemon
                         # ticks, so retrying is wasteful.
-                        goal.status = 'paused'
-                        cfg = goal.config_json or {}
-                        cfg['pause_reason'] = (
-                            f'Auto-paused: budget gate blocked. '
-                            f'Reason: {bg_reason}')
-                        cfg['paused_at'] = datetime.utcnow().isoformat()
-                        goal.config_json = cfg
+                        #
+                        # The mutation itself lives in budget_gate, which is
+                        # also reached from pre_dispatch_budget_gate.  It used
+                        # to be written out inline here, so a goal blocked by
+                        # THAT path was logged and left 'active' forever, while
+                        # one blocked here was paused: two behaviours for one
+                        # decision.  The pause also now honours never_pause,
+                        # which this inline copy ignored.
+                        from .budget_gate import apply_budget_pause
+                        apply_budget_pause(goal, bg_reason)
                         with _module_lock:
                             _budget_blocked_goals.add(goal_key)
-                        logger.info(
-                            f"Goal {goal.id} AUTO-PAUSED by budget gate: "
-                            f"{bg_reason}")
                         continue
                     else:
                         # Budget passed — clear from blocked set if it was

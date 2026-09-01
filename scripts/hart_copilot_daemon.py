@@ -78,12 +78,35 @@ VERIFY_UNIT = 'hart-copilot-verify.service'
 
 
 def backend():
-    """The node's own backend, from the ONE canonical port source rather than a
-    hardcoded port or an env override that can drift from what is listening."""
+    """Where HARTOS is actually SERVING — not merely which port it is assigned.
+
+    get_port("backend") answers "which port is the backend ASSIGNED" (6777).
+    That is right on a standalone appliance, where 6777 really is listening, and
+    WRONG on a bundled desktop, where HARTOS runs in-process on the Flask port
+    (5000) and nothing binds 6777 at all. Dialling the assigned port there hits a
+    dead socket on every tick, and because next_task() treats any failure as "no
+    work", the daemon logs
+
+        {"action": "idle", "reason": "no task assigned by the hive"}
+
+    forever -- which reads as an idle hive rather than a broken dial. Diagnosed
+    on the desktop by @agent-4 (#71) and fixed there in Nunba a34b6244; this is
+    the same fix on the HARTOS side, which still carried the assigned-port
+    resolver.
+
+    get_local_backend_url() is the existing single resolver for exactly this: it
+    probes 'backend' then 'flask' and returns the first ACTUALLY LISTENING, so
+    the appliance still resolves 6777 and the desktop resolves 5000 without
+    either hardcoding the other's port. Verified on the Samsung appliance
+    2026-09-01: 6777 is bound and /api/hive/session/tasks answers
+    {"completed":[],"pending":[]}, so this change is a no-op there and a repair
+    on the desktop.
+    """
     try:
-        from core.port_registry import get_port
-        return f'http://127.0.0.1:{get_port("backend")}'
+        from core.port_registry import get_local_backend_url
+        return get_local_backend_url()
     except Exception:
+        # Same last-ditch default as before: the appliance's assigned port.
         return 'http://127.0.0.1:6777'
 
 

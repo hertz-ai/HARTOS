@@ -456,6 +456,24 @@ class PeerLink:
             'x25519_public': get_x25519_public_hex(),
             'trust_requested': self.trust.value,
             'protocol_version': 1,
+            # SYMMETRY: _complete_handshake on the far side does
+            # `self.capabilities = hello_data.get('capabilities', {})`, but nothing
+            # ever WROTE this field, so every peer that ACCEPTED a link recorded {}
+            # — only the ack direction (hello_ack below) ever carried capabilities.
+            # A one-way exchange is not an exchange: the dialer learned the
+            # acceptor's GPU/cpu/tier and the acceptor learned nothing, so
+            # link_manager's GPU-aware eviction scoring and any capability routing
+            # saw an empty dict for exactly half the fleet.
+            #
+            # This is the SAME read-before-write class this file already fixed once
+            # for `user_id_proof` (see the comment in the SAME_USER block below):
+            # a receiver read a field no sender wrote, it failed silently, and it
+            # looked like "the peer just didn't send it". That one cost every node
+            # its multi-device sync recipients. Fixing this BEFORE the inbound
+            # listener lands (bootstrap hook #5) matters — with no listener today
+            # the blast radius is nil, but the day the accept path goes live this
+            # would ship as silent data loss on every inbound link.
+            'capabilities': self._get_local_capabilities(),
             'timestamp': time.time(),
         }
 
@@ -866,21 +884,77 @@ class PeerLink:
 
     @staticmethod
     def _get_local_capabilities() -> dict:
-        """Get local node capabilities for handshake."""
-        caps = {'cpu_count': os.cpu_count() or 1}
+        """Get local node capabilities for handshake.
+
+        Reads the CANONICAL hardware profile
+        (``security.system_requirements.get_capabilities()``) rather than
+        re-detecting. That profile is built once by ``run_system_check()`` and
+        cached in a module global, so this is an O(1) read — no disk walk, no
+        GPU probe, and crucially no network probe, which matters because this
+        runs inside a connection handshake.
+
+        WHY IT USED TO RE-DETECT, AND WHY THAT WAS WORSE, NOT DIFFERENT: the old
+        body called ``os.cpu_count()`` and ``detect_gpu()`` directly and reported
+        NO RAM AND NO DISK AT ALL. A peer therefore learned our core count and
+        our GPU and nothing whatsoever about memory — while the gossip announce,
+        from the same machine in the same minute, advertised a full
+        ``hardware_summary`` including ``ram_gb`` via this very profile. One node,
+        two answers, and the smaller one on the link layer.
+
+        WIRE COMPATIBILITY IS DELIBERATE. The emitted key names are UNCHANGED —
+        ``cpu_count`` / ``gpu`` / ``vram_mb`` / ``tier`` — because they are read by
+        peers that may be running older code and by
+        ``link_manager._evict_weakest`` (``link.capabilities.get('gpu')``).
+        Renaming them to match the profile's own vocabulary would be exactly the
+        '#91 wrong-keys' break the comment below records. ``ram_gb`` is ADDED, and
+        additive fields are safe: an old peer ignores what it does not read.
+
+        ``tier`` STAYS on ``key_delegation.get_node_tier()`` and must not be
+        switched to ``caps.tier``. They are two different tiers that share a word:
+        key_delegation's is the TRUST/topology tier (central | regional | local),
+        system_requirements' is the CAPABILITY tier (what this box can run). The
+        handshake means the former.
+        """
+        caps = {}
+        hw = None
         try:
-            from integrations.service_tools.vram_manager import detect_gpu
-            gpu = detect_gpu()
-            # detect_gpu's contract is {name, total_gb, free_gb, cuda_available}
-            # (vram_manager.detect_gpu).  The prior 'available'/'device_name'/
-            # 'vram_total_mb' keys NEVER existed in that dict, so this block
-            # never ran and a GPU node silently advertised NO gpu/vram to its
-            # peers (the #91 wrong-keys class; compute_mesh reads it correctly).
-            if gpu.get('cuda_available'):
-                caps['gpu'] = gpu.get('name') or 'GPU'
-                caps['vram_mb'] = int(round((gpu.get('total_gb') or 0) * 1024))
+            from security.system_requirements import get_capabilities
+            profile = get_capabilities()
+            hw = getattr(profile, 'hardware', None) if profile else None
         except Exception:
-            pass
+            hw = None
+
+        if hw is not None:
+            caps['cpu_count'] = hw.cpu_cores or os.cpu_count() or 1
+            if hw.ram_gb:
+                caps['ram_gb'] = round(hw.ram_gb, 2)
+            if getattr(hw, 'cuda_available', False):
+                caps['gpu'] = getattr(hw, 'gpu_name', None) or 'GPU'
+                caps['vram_mb'] = int(round((hw.gpu_vram_gb or 0) * 1024))
+        else:
+            # The profile is None until run_system_check() has run (it is called
+            # from integrations/social/__init__.py at import). A link that is
+            # dialled before that must still advertise SOMETHING true, so fall
+            # back to the direct probes — the old behaviour, kept deliberately as
+            # a floor rather than as the primary path.
+            caps['cpu_count'] = os.cpu_count() or 1
+            try:
+                from integrations.service_tools.vram_manager import detect_gpu
+                gpu = detect_gpu()
+                # detect_gpu's contract is {name, total_gb, free_gb,
+                # cuda_available} (vram_manager.detect_gpu).  The prior
+                # 'available'/'device_name'/'vram_total_mb' keys NEVER existed in
+                # that dict, so this block never ran and a GPU node silently
+                # advertised NO gpu/vram to its peers (the #91 wrong-keys class;
+                # compute_mesh reads it correctly).
+                if gpu.get('cuda_available'):
+                    caps['gpu'] = gpu.get('name') or 'GPU'
+                    caps['vram_mb'] = int(round((gpu.get('total_gb') or 0) * 1024))
+            except Exception:
+                logger.debug(
+                    "peer_link: no cached hardware profile and the GPU probe "
+                    "failed — advertising cpu_count only", exc_info=True)
+
         try:
             from security.key_delegation import get_node_tier
             caps['tier'] = get_node_tier()

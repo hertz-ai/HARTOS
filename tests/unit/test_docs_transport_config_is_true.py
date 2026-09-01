@@ -47,15 +47,35 @@ class TheDocumentedDefaultsAreReal(unittest.TestCase):
                       "crossbar port; the registry says %s" % name)
 
     def test_peerlink_cburl_and_cbrealm_defaults(self):
-        src = open(os.path.join(REPO, 'core', 'peer_link', 'telemetry.py'),
-                   encoding='utf-8', errors='replace').read()
-        for var, pattern in (('CBURL', r"'CBURL',\s*'([^']+)'"),
-                             ('CBREALM', r"'CBREALM',\s*'([^']+)'")):
-            m = re.search(pattern, src)
-            self.assertIsNotNone(m, "%s default not found in telemetry.py" % var)
-            self.assertIn(m.group(1), _doc(),
-                          "configuration.md quotes the wrong %s default; the code "
-                          "says %s" % (var, m.group(1)))
+        """What a node ACTUALLY talks to when CBURL/CBREALM are unset.
+
+        This used to regex telemetry.py for a literal `'CBURL', '<default>'`,
+        which contradicts this file's own contract ("not a source-shape grep")
+        and duly broke when the code improved: 44aad83 routed the fallback
+        through core.wamp_url.resolve_router_url(), so the literal became `''`,
+        the `[^']+` regex matched nothing, and the test failed while the code
+        was MORE correct than before. Reading the resolved value instead cannot
+        fail that way.
+
+        CentralConnection.__init__ only assigns attributes -- it opens no
+        socket and starts no thread -- so constructing one is a safe way to ask
+        the code what it resolved.
+        """
+        import importlib
+
+        for var in ('CBURL', 'CBREALM'):
+            os.environ.pop(var, None)
+        telemetry = importlib.import_module('core.peer_link.telemetry')
+        conn = telemetry.CentralConnection()
+
+        for var, value in (('CBURL', conn._crossbar_url),
+                           ('CBREALM', conn._realm)):
+            self.assertTrue(
+                value, "%s resolved to nothing; a node would have no router" % var)
+            self.assertIn(
+                value, _doc(),
+                "configuration.md quotes the wrong %s default; with %s unset "
+                "the code resolves to %s" % (var, var, value))
 
     def test_the_canonical_host_constant_is_the_documented_one(self):
         from core.constants import CENTRAL_HOST, CENTRAL_HOST_LEGACY_ALIAS

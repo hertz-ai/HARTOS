@@ -202,3 +202,62 @@ class TestProfitDistribution:
         result = RevenueAggregator.distribute_trading_profits(db, 'port-1')
         assert not result.get('distributed')
         assert result['reason'] == 'no_profit'
+
+
+class TestTradingFundingBranchesAndSingleton:
+    """The remaining trading-funding decision branches + the module singleton —
+    financial control-flow the pipeline suite doesn't yet exercise directly."""
+
+    def test_distribute_profits_portfolio_not_found(self):
+        from integrations.agent_engine.revenue_aggregator import RevenueAggregator
+        db = MagicMock()
+        db.query.return_value.filter_by.return_value.first.return_value = None
+        assert RevenueAggregator.distribute_trading_profits(db, 'missing') == {
+            'error': 'portfolio_not_found'}
+
+    def test_check_and_fund_skips_when_active_trading_goal_exists(self, monkeypatch):
+        # platform_excess above the funding threshold so we reach the dedupe
+        # guard; an existing auto-funded goal must NOT be double-funded.
+        from integrations.agent_engine.revenue_aggregator import RevenueAggregator
+        monkeypatch.setattr(RevenueAggregator, 'get_revenue_streams',
+                            staticmethod(lambda db, period_days=30: {
+                                'platform_share': 5000.0, 'hosting_payouts': 0.0}))
+        db = MagicMock()
+        existing = MagicMock()
+        existing.id = 'goal-123'
+        db.query.return_value.filter.return_value.first.return_value = existing
+        out = RevenueAggregator.check_and_fund_trading(db)
+        assert out['funded'] is False
+        assert out['reason'] == 'active_trading_goal_exists'
+        assert out['goal_id'] == 'goal-123'
+
+    def test_check_and_fund_reports_goal_creation_failure(self, monkeypatch):
+        # no existing goal + GoalManager.create_goal raising -> the funder
+        # degrades to a clean 'goal_creation_failed', never a crash.
+        import sys
+        import types
+        from integrations.agent_engine.revenue_aggregator import RevenueAggregator
+        monkeypatch.setattr(RevenueAggregator, 'get_revenue_streams',
+                            staticmethod(lambda db, period_days=30: {
+                                'platform_share': 5000.0, 'hosting_payouts': 0.0}))
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = None
+        fake_gm = types.ModuleType('integrations.agent_engine.goal_manager')
+
+        class GoalManager:
+            @staticmethod
+            def create_goal(*a, **k):
+                raise RuntimeError('creation boom')
+
+        fake_gm.GoalManager = GoalManager
+        monkeypatch.setitem(sys.modules,
+                            'integrations.agent_engine.goal_manager', fake_gm)
+        assert RevenueAggregator.check_and_fund_trading(db) == {
+            'funded': False, 'error': 'goal_creation_failed'}
+
+    def test_get_revenue_aggregator_is_a_singleton(self):
+        import integrations.agent_engine.revenue_aggregator as ra
+        ra._revenue_aggregator = None
+        first = ra.get_revenue_aggregator()
+        assert ra.get_revenue_aggregator() is first
+        assert isinstance(first, ra.RevenueAggregator)

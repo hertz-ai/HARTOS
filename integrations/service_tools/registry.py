@@ -380,14 +380,24 @@ class ServiceToolRegistry:
         if params_schema:
             new_sig = _synthesize_signature_from_schema(
                 params_schema, func_name=func_name)
-            if new_sig is not None:
-                try:
-                    endpoint_executor.__signature__ = new_sig
-                except Exception as _attach_err:
-                    logger.debug(
-                        f"[tool-schema] could not attach __signature__ "
-                        f"to {func_name!r}: {type(_attach_err).__name__}: "
-                        f"{_attach_err} — keeping **kwargs: Any fallback")
+        else:
+            # Zero-param endpoint (pocket_tts_list_voices): the bare
+            # `**kwargs: Any` renders as {"description": "kwargs"} with no
+            # type, and llama-server rejects the WHOLE request: 'JSON schema
+            # conversion failed: Unrecognized schema: {"description":"kwargs"}'
+            # (live 400, 2026-08-31 18:34).  An empty Signature makes autogen
+            # emit {"type":"object","properties":{}} which the server accepts;
+            # the closure still takes **kwargs at call time, so execution is
+            # unchanged.
+            new_sig = inspect.Signature(parameters=[])
+        if new_sig is not None:
+            try:
+                endpoint_executor.__signature__ = new_sig
+            except Exception as _attach_err:
+                logger.debug(
+                    f"[tool-schema] could not attach __signature__ "
+                    f"to {func_name!r}: {type(_attach_err).__name__}: "
+                    f"{_attach_err} — keeping **kwargs: Any fallback")
 
         return endpoint_executor
 

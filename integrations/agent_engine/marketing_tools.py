@@ -590,4 +590,13 @@ def detect_goal_tags(prompt) -> list:
     if any(kw in lower for kw in news_keywords):
         tags.append('news')
 
+    media_keywords = [
+        'song', 'music', 'compose', 'melody', 'sing', 'vocals',
+        'voice clone', 'clone my voice', 'text to speech', 'tts',
+        'narrate', 'narration', 'audio book', 'audiobook', 'podcast',
+        'sound effect', 'jingle', 'soundtrack',
+    ]
+    if any(kw in lower for kw in media_keywords):
+        tags.append('media')
+
     return tags

@@ -194,6 +194,29 @@ class GlassShell(Gtk.Window):
         # with a fresh web process, and a repeat-crash walks the ladder. Without this
         # the cage floor froze blank forever (back-port of hart-layer-shell-host.nix).
         webview.connect('web-process-terminated', self._on_web_process_terminated)
+        # Sets the _last_load_failed guard so the LoadEvent.FINISHED that WebKit
+        # STILL emits after a FAILED load (it substitutes a stock error page) does
+        # NOT touch shell-ready. Mirrors hart-layer-shell-host.nix (GTK4).
+        webview.connect('load-failed', self._on_load_failed)
+        # Honest-paint state. shell-ready must mean the surface is MAPPED and the
+        # page load FINISHED CLEANLY -- not merely load-finished.
+        #
+        # THE BUG THIS CLOSES (documented as false-healthy #3/#6 in
+        # docs/architecture/OS_PARITY_CLOSURE_PLAN.md, prescribed in
+        # docs/internal/ux_degrading_design_choices_2026-07-24.md:1.6): this floor
+        # touched the marker on FINISHED ALONE. WebKit emits FINISHED for its stock
+        # error page too, so a :6800-connection-refused blank surface, or a window
+        # that never mapped, marked the tier HEALTHY. The paint-watchdog then could
+        # not legitimately drop it, and a black screen stayed up forever -- the
+        # never-black ladder defeated by its own health signal. The
+        # display-tiers-neverblack paint-ladder nixosTest fails on exactly this:
+        # every tier fell to the cage floor with NO paint, yet shell-ready existed.
+        #
+        # The GTK4 host already guards all three; this is the GTK3 floor catching up
+        # to it rather than a second scheme.
+        self._mapped = False
+        self._load_finished = False
+        self._last_load_failed = False
         webview.load_uri(os.environ.get('HART_SHELL_URL', 'http://localhost:${toString ui.port}'))
         s = webview.get_settings()
         s.set_enable_javascript(True)
@@ -213,6 +236,9 @@ class GlassShell(Gtk.Window):
         self.add(webview)
         self.connect('destroy', Gtk.main_quit)
         self.connect('key-press-event', self._on_key)
+        # The surface-is-actually-visible half of the honest first-paint signal.
+        # Connected BEFORE show_all(), which is what maps the window.
+        self.connect('map', self._on_map)
         self.show_all()
         self.fullscreen()
         # The cage WebView must explicitly grab keyboard focus after the window
@@ -222,7 +248,46 @@ class GlassShell(Gtk.Window):
         webview.grab_focus()
 
     def _on_load_changed(self, _webview, event):
+        # A NEW load clears the failure guard, so a transient failure (the shell
+        # port still coming up, a page-driven navigation) cannot strand this tier
+        # as permanently unhealthy: a later GOOD load still signals first-paint.
+        # Clearing here rather than only before the initial load_uri is what makes
+        # that guarantee true for every load, not just the first.
+        if event == WebKit2.LoadEvent.STARTED:
+            self._last_load_failed = False
+            return
+        # FINISHED alone is not paint. WebKit emits it for its stock error page as
+        # well, so a failed load must not reach the marker -- see _maybe_signal_painted.
         if event == WebKit2.LoadEvent.FINISHED:
+            self._load_finished = True
+            self._maybe_signal_painted()
+
+    def _on_map(self, _widget):
+        # The window is now mapped (visible). Second half of the honest signal;
+        # whichever of map / load-finished completes last fires the marker.
+        self._mapped = True
+        self._maybe_signal_painted()
+
+    def _on_load_failed(self, _webview, _event, failing_uri, error):
+        # Mark the load FAILED so the FINISHED WebKit still emits afterwards cannot
+        # touch shell-ready. A blank or error surface must read as HUNG so the
+        # supervisor drops to a working tier, NOT count as HEALTHY. Set FIRST, before
+        # the best-effort journal print, so the guard holds even if logging raises.
+        self._last_load_failed = True
+        import sys as _sys
+        try:
+            detail = getattr(error, 'message', error)
+            print('[hart-glass-shell] load FAILED (%s): %s -- NOT signalling paint'
+                  % (failing_uri, detail), file=_sys.stderr, flush=True)
+        except Exception:
+            pass
+        # False lets WebKit show its default error page; never raise out of a handler.
+        return False
+
+    def _maybe_signal_painted(self):
+        # HONEST first-paint: mapped AND cleanly finished. Called from BOTH _on_map
+        # and _on_load_changed so whichever completes second fires the marker.
+        if self._mapped and self._load_finished and not self._last_load_failed:
             _signal_painted()
 
     def _on_web_process_terminated(self, _webview, reason):

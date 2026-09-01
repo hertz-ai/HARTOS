@@ -69,6 +69,33 @@ FAIL2BAN_DURATIONS = {
 }
 FAIL2BAN_MAX_DURATION = timedelta(days=30)  # 4th+ offense: 30 days
 
+# ── Challenge History Retention ──
+# integrity_challenges is append-only telemetry: every gossip round writes one
+# row per peer per challenge type, and nothing ever deleted them.  Measured on
+# central 2026-09-01: 300,092 rows spanning 2026-06-03 → 2026-08-31, 386 MB of
+# table plus ~60 MB of indexes = 72% of a 618 MB database.  One day (08-21)
+# alone contributed 46,501 rows.
+#
+# That size is not merely wasteful, it broke the write path.  SQLite is in WAL
+# mode with wal_autocheckpoint=1000 pages (4 MB); against a 618 MB main file
+# the checkpointer could not finish under continuous daemon writes, so writers
+# blocked past busy_timeout=3000 and the daemon logged
+# "(sqlite3.OperationalError) database is locked" on every tick — goals were
+# dispatched and completed in memory but their status never persisted, so they
+# re-dispatched forever ("Task <id>_root already exists").
+#
+# A resolved 'passed' challenge has no forensic value after the audit window;
+# 'failed' and 'pending' do, so they are never swept here.  'timeout' is kept
+# longer because a cluster of them is itself the evidence of a flaky peer.
+CHALLENGE_RETENTION_DAYS = int(os.environ.get('CHALLENGE_RETENTION_DAYS', '14'))
+CHALLENGE_TIMEOUT_RETENTION_DAYS = int(
+    os.environ.get('CHALLENGE_TIMEOUT_RETENTION_DAYS', '30'))
+# Bounded per round so the sweep never holds the write lock long enough to be
+# the thing it is fixing.  The backlog drains across rounds instead.
+CHALLENGE_PRUNE_BATCH = int(os.environ.get('CHALLENGE_PRUNE_BATCH', '2000'))
+CHALLENGE_PRUNE_MAX_PER_ROUND = int(
+    os.environ.get('CHALLENGE_PRUNE_MAX_PER_ROUND', '10000'))
+
 
 class IntegrityService:
     """Central service for node integrity verification and anti-fraud."""
@@ -1163,6 +1190,83 @@ class IntegrityService:
             'decayed_count': decayed,
             'unbanned_count': unbanned,
             'total_with_score': len(peers_with_score),
+        }
+
+    @staticmethod
+    def prune_challenge_history(db: Session) -> Dict:
+        """Delete resolved integrity challenges past their retention window.
+
+        Runs on the integrity round, immediately after apply_fraud_score_decay,
+        for the same reason that sweep was moved there (2026-08-07): a
+        maintenance job with no scheduled caller never runs.  This one had no
+        caller at all because it did not exist, and the table had grown
+        unbounded since 2026-06-03.
+
+        Only terminal, non-forensic rows are eligible:
+          passed  -> deleted after CHALLENGE_RETENTION_DAYS (default 14)
+          timeout -> deleted after CHALLENGE_TIMEOUT_RETENTION_DAYS (default 30)
+          failed  -> never (evidence of an actual integrity violation)
+          pending -> never (may still be in flight; the timeout path owns it)
+
+        Deletes in bounded batches and stops at CHALLENGE_PRUNE_MAX_PER_ROUND so
+        a large backlog drains over several rounds rather than taking one long
+        write lock.  Each batch commits, so a mid-sweep failure keeps the rows
+        already removed.
+
+        Returns per-status counts and whether a backlog remains.
+        """
+        now = datetime.utcnow()
+        cutoffs = (
+            ('passed', now - timedelta(days=CHALLENGE_RETENTION_DAYS)),
+            ('timeout', now - timedelta(days=CHALLENGE_TIMEOUT_RETENTION_DAYS)),
+        )
+
+        deleted = {'passed': 0, 'timeout': 0}
+        budget = CHALLENGE_PRUNE_MAX_PER_ROUND
+        more_remaining = False
+
+        for status, cutoff in cutoffs:
+            while budget > 0:
+                batch = min(CHALLENGE_PRUNE_BATCH, budget)
+                # Select ids first: SQLite has no DELETE ... LIMIT unless it was
+                # compiled with SQLITE_ENABLE_UPDATE_DELETE_LIMIT, which the
+                # container's build is not.
+                ids = [
+                    r[0] for r in db.query(IntegrityChallenge.id).filter(
+                        IntegrityChallenge.status == status,
+                        IntegrityChallenge.created_at < cutoff,
+                    ).limit(batch).all()
+                ]
+                if not ids:
+                    break
+
+                db.query(IntegrityChallenge).filter(
+                    IntegrityChallenge.id.in_(ids)
+                ).delete(synchronize_session=False)
+                db.commit()
+
+                deleted[status] += len(ids)
+                budget -= len(ids)
+
+                if len(ids) < batch:
+                    break
+            else:
+                # Budget exhausted with rows still matching this cutoff.
+                more_remaining = True
+
+        total = deleted['passed'] + deleted['timeout']
+        if total:
+            logger.info(
+                f"Challenge history pruned: {deleted['passed']} passed "
+                f"(>{CHALLENGE_RETENTION_DAYS}d), {deleted['timeout']} timeout "
+                f"(>{CHALLENGE_TIMEOUT_RETENTION_DAYS}d)"
+                + (", backlog remains" if more_remaining else ""))
+
+        return {
+            'deleted_passed': deleted['passed'],
+            'deleted_timeout': deleted['timeout'],
+            'deleted_total': total,
+            'more_remaining': more_remaining,
         }
 
     @staticmethod

@@ -7,8 +7,10 @@
 # of its channel, stages it through the EXISTING UpgradeOrchestrator pipeline,
 # and — with autoApply=true — applies ACROSS THE PRIVILEGE BOUNDARY (task
 # #22): the unprivileged check unit writes an apply request; the root
-# hart-ota-apply path unit runs `nixos-rebuild switch --flake` with
-# rollback-on-failure, ALL with zero manual approval.
+# hart-ota-apply path unit STAGES with `nixos-rebuild boot --flake`, ALL with
+# zero manual approval. It does not activate the running system: the generation
+# becomes the boot default and takes effect on reboot (see hart-ota.nix for the
+# real-hardware incident that forced this).
 #
 # What it asserts (the task's four required behaviours):
 #   1. The check service HITS hart.ota.centralEndpoint and parses the approved
@@ -17,10 +19,10 @@
 #      `revision` AND the central flake_ref as `switch_flake`, and the
 #      orchestrator pipeline left IDLE→BUILDING (start_upgrade fired).
 #   3. autoApply APPLIES — when the pipeline reaches `completed`, the check
-#      service runs `nixos-rebuild switch --flake <CENTRAL flake>#hart-<variant>`
+#      service runs `nixos-rebuild boot --flake <CENTRAL flake>#hart-<variant>`
 #      with NO manual step (timer/oneshot-driven).
-#   4. A failed apply ROLLS BACK — when the switch exits non-zero, the service
-#      runs `nixos-rebuild switch --rollback`.
+#   4. A failed apply CHANGES NOTHING — staging never touches the running
+#      system, so a non-zero stage needs no recovery and must not attempt one.
 #
 # REUSE discipline: this drives the SAME hart-ota-check service + the SAME
 # UpgradeOrchestrator (start_upgrade/get_status) the production module uses —
@@ -106,12 +108,12 @@ let
   # Recording stub for the privileged switch path, prepended (mkBefore) on the
   # ROOT hart-ota-apply unit's path so it wins over the module's own
   # `path = [ pkgs.nixos-rebuild ]`. Records its full argv to ota/rebuild.log;
-  # `nixos-rebuild switch --flake …` exits non-zero IFF the FAIL_SWITCH
+  # `nixos-rebuild boot --flake …` exits non-zero IFF the FAIL_SWITCH
   # sentinel exists (drives the rollback subtest) — `--rollback` always
   # succeeds so the recovery path completes.
   rebuildStubs = pkgs.writeShellScriptBin "nixos-rebuild" ''
     echo "nixos-rebuild $*" >> /var/lib/hart/ota/rebuild.log
-    if [[ "$*" == *"switch --flake"* ]]; then
+    if [[ "$*" == *"boot --flake"* ]]; then
       if [[ -e /var/lib/hart/ota/FAIL_SWITCH ]]; then
         echo "[stub] simulated switch FAILURE" >&2
         exit 1
@@ -341,16 +343,20 @@ in
           # The request was CONSUMED (no path-unit retrigger loop).
           node.succeed("test ! -e " + OTA + "/apply-request.json")
           last = json.loads(node.succeed("cat " + OTA + "/last_apply.json"))
-          assert last["status"] == "applied", f"apply result not 'applied': {last}"
+          # "staged", not "applied": the engine registers the generation as the
+          # boot default and does NOT activate the running system (see the long
+          # note in hart-ota.nix). The update is real and complete as far as this
+          # unit is concerned; it takes effect on reboot.
+          assert last["status"] == "staged", f"apply result not 'staged': {last}"
           assert last["flake"] == "${approvedFlake}", \
               f"apply result flake is not central's pin: {last}"
           log = node.succeed("cat " + REBUILD_LOG)
           # The switch target is central's flake#hart-<variant>, applied with NO
           # manual step (oneshot/timer/path-driven) — the autonomy requirement.
-          assert "switch --flake ${approvedFlake}#hart-server" in log, \
+          assert "boot --flake ${approvedFlake}#hart-server" in log, \
               f"did not switch to the central-approved flake:\n{log}"
           # A successful switch must NOT roll back.
-          assert "switch --rollback" not in log, \
+          assert "--rollback" not in log, \
               f"unexpected rollback on a successful switch:\n{log}"
 
       # ── 3b. The privilege boundary itself (task #22 regression) ──
@@ -371,10 +377,10 @@ in
           node.succeed("systemctl is-active hart-ota-apply.path")
 
       # ── 4. A failed apply ROLLS BACK (canary/rollback safety must-not-regress) ──
-      with subtest("a failed switch triggers `nixos-rebuild switch --rollback`"):
+      with subtest("a failed stage leaves the running system untouched (nothing to roll back)"):
           # Re-arm `completed` and flip the failure sentinel so the stubbed
-          # switch exits non-zero — the module's `|| nixos-rebuild switch
-          # --rollback` recovery must fire.
+          # stage exits non-zero. Nothing should be recovered, because nothing
+          # was activated.
           node.succeed(
               "install -o hart -g hart -m640 /dev/stdin " + STATE + " <<'EOF'\n"
               + json.dumps({
@@ -388,23 +394,37 @@ in
           node.succeed("touch " + OTA + "/FAIL_SWITCH")
 
           node.succeed("systemctl start hart-ota-check.service")
-          # Async boundary again: rollback happens in hart-ota-apply. The
-          # rollback argv lands in rebuild.log only after the failed switch,
-          # so wait for the rollback line itself, not just the file.
+          # Async boundary again: the stage happens in hart-ota-apply, so wait
+          # for the stage argv itself to land in rebuild.log, not just the file.
           node.wait_until_succeeds(
-              "grep -q 'switch --rollback' " + REBUILD_LOG, timeout=30)
+              "grep -q 'boot --flake' " + REBUILD_LOG, timeout=30)
           log = node.succeed("cat " + REBUILD_LOG)
-          assert "switch --flake ${approvedFlake}#hart-server" in log, \
+          assert "boot --flake ${approvedFlake}#hart-server" in log, \
               f"failed-switch attempt not recorded:\n{log}"
           node.wait_until_succeeds(
               "test -e " + OTA + "/last_apply.json", timeout=30)
           last = json.loads(node.succeed("cat " + OTA + "/last_apply.json"))
-          assert last["status"] == "rolled_back", \
-              f"apply result not 'rolled_back' after failed switch: {last}"
+          assert last["status"] == "stage_failed", \
+              f"apply result not 'stage_failed' after a failed stage: {last}"
           apply_out = node.succeed(
               "journalctl -u hart-ota-apply -n 40 --no-pager")
-          assert "rolling back" in apply_out.lower(), \
-              f"apply unit did not log the rollback path:\n{apply_out}"
+          assert "nothing to roll back" in apply_out.lower(), \
+              f"apply unit did not report the untouched system:\n{apply_out}"
+
+          # THE STRONGER GUARANTEE. The old contract proved a rollback RAN
+          # after a failed apply. This proves the failure never reached the
+          # running system, so there is nothing to recover -- and in
+          # particular that the engine did NOT reach for the recovery path
+          # that broke on real hardware (`switch --rollback` both re-enters
+          # activation and needs a <nixpkgs> channel this node does not have).
+          assert "--rollback" not in log, \
+              f"a failed STAGE must not attempt a rollback:\n{log}"
+          assert "switch" not in log, \
+              f"the apply must never activate the running system:\n{log}"
+          # The booted system is still the one we started on.
+          node.succeed(
+              "test \"$(readlink -f /run/current-system)\" "
+              "= \"$(readlink -f /run/booted-system)\"")
 
       # ── 1(timer). The check timer is BOOT-ONLY — no periodic interval poll ──
       with subtest("hart-ota-check timer fires on boot only (no OnUnitActiveSec)"):
@@ -448,16 +468,35 @@ in
           # vision init. Every other timing-sensitive assertion in this file already
           # uses wait_until_succeeds; this one was the outlier.
           #
-          # 240s, not 120s (2026-08-31): main() runs hevolve_verify_boot() FIRST,
-          # whose compute_code_hash() + compute_file_manifest() hash EVERY file in
-          # the tree against the signed release_manifest.json — a mandatory
-          # release-integrity step that legitimately costs ~90s on a loaded CI VM
-          # (the same whole-repo hash that flaked the tamper unit test) BEFORE
-          # bootstrap_local_subscribers() runs. So the OTA subscriber log lands
-          # ~180s in — well within boot_userspace_s=600 (the OS's own enforced boot
-          # budget, VM-verified by hart-boot-latency), but past the old 120s window.
-          # This is a slow-but-correct SECURE boot, not a regression; the wait now
-          # matches the legitimate secure-boot time instead of racing it.
+          # 240s, not 120s (2026-08-31). CAUTION, THE ORIGINAL REASON GIVEN HERE
+          # WAS WRONG, and it is still not fully diagnosed (2026-09-01).
+          #
+          # This comment used to say the delay was hevolve_verify_boot()'s
+          # compute_code_hash() + compute_file_manifest() hashing every file in
+          # the tree, "~90s on a loaded CI VM", before bootstrap_local_subscribers
+          # runs. That step DOES NOT EXECUTE here. hart_intelligence_entry.py:374
+          # returns immediately when release_manifest.json is absent, BEFORE
+          # reaching compute_code_hash at :397 -- and nothing in nixos/ packages a
+          # release_manifest.json into any configuration, so no node or test VM
+          # has one. The failing run also logged ZERO HevolveIntegrity lines.
+          #
+          # Nor is it the ResourceGovernor's provider discovery, which shows up in
+          # the journal around the same time (scans at ~200s/245s/295s, each probe
+          # bounded by PROBE_TIMEOUT_SECONDS=10): that runs on a daemon thread
+          # (core/resource_governor.py:713), so it competes for CPU on an
+          # oversubscribed runner but does not serialise ahead of the subscriber.
+          #
+          # What is actually true: hart_intelligence_entry is a ~12.6k-line module
+          # whose import-time startup is simply long, and CI runs four VMs per
+          # runner. 240s was picked to fit an observed boot, not from a measured
+          # cause, and it STILL times out -- so the number is a guess that is
+          # already wrong once.
+          #
+          # DO NOT just raise it again. Either measure what the backend is doing
+          # between unit-active and this log line, or assert the wiring property
+          # far more cheaply than by racing a full boot: this subtest only needs
+          # to know that the OTA leg was registered with the existing bus, which
+          # does not require waiting for the whole backend to finish starting.
           jb = node.wait_until_succeeds(
               "journalctl -u hart-backend --no-pager | "
               "grep -i 'Local subscribers bootstrapped' | tail -1",

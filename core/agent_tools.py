@@ -13,6 +13,7 @@ Pattern mirrors:
 import json
 import logging
 import os
+import re as _re
 import threading
 import time
 import uuid
@@ -31,6 +32,29 @@ tool_logger = logging.getLogger('tool_execution')
 # ---------------------------------------------------------------------------
 # Generic registration helper
 # ---------------------------------------------------------------------------
+
+_INTERNAL_ERROR_MARKERS = ('context size', 'server_error', 'error code: 500',
+                           'traceback', 'connection', 'timed out', 'timeout',
+                           'memory slot')
+
+
+def user_facing_error(e):
+    """ONE user-facing string for an internal failure (#716).
+
+    Three sites (reuse get_agent_response, create get_response_group,
+    gather_agentdetails) returned raw exception text as the reply, so
+    TTS spoke lines like 'Context size has been exceeded' to the user
+    (observed live 2026-08-31, probe run 4).  Full tracebacks are
+    already logged at every call site - the reply only needs to be
+    honest and speakable.
+    """
+    text = str(e)
+    low = text.lower()
+    if any(m in low for m in _INTERNAL_ERROR_MARKERS) or len(text) > 200:
+        return ("I hit an internal snag finishing that - please try "
+                "again in a moment.")
+    return f"I couldn't finish that: {text[:160]}"
+
 
 def register_dual(helper, executor, func, name: str, description: str):
     """Register a single tool on both the LLM-calling and executing agents.
@@ -60,6 +84,162 @@ def register_core_tools(tools, helper, executor):
     """
     for name, desc, func in tools:
         register_dual(helper, executor, func, name, desc)
+
+
+def filter_service_tools(goal_tags, svc_tools, svc_defs, registry):
+    """Tier-1 hierarchical gate: keep only registry tools the goal unlocks.
+
+    Completes the 'progressive/hierarchical tool injection' design that
+    Tier 2 (goal-gated family loaders in create/reuse_recipe) already
+    follows: goal_manager.register_goal_type rows map goal tags to
+    ServiceToolRegistry capability tags, get_tool_tags reads them, and
+    this filter applies the intersection at the attach site.  Until now
+    the service loop registered EVERY tool unconditionally — measured
+    2026-08-31: 50 rendered defs cost 5,820 of the 6,144-token slot,
+    so a one-message conversation overflowed (12 'Context size has been
+    exceeded' rejections in one boot).
+
+    A goal with no unlocked tags gets NO service tools (need-to-know);
+    the always-on core closures and Tier-2 families are unaffected.
+
+    Args:
+        goal_tags: tags from marketing_tools.detect_goal_tags(goal)
+        svc_tools: {func_name: callable} from get_all_tool_functions()
+        svc_defs:  defs from get_tool_definitions() — each carries
+                   'name' (func name) and 'service_tool' (parent tool)
+        registry:  the ServiceToolRegistry (parent tools carry .tags)
+    """
+    from integrations.agent_engine.goal_manager import get_tool_tags
+    unlocked = set()
+    for t in goal_tags or []:
+        unlocked.update(get_tool_tags(t))
+    if not unlocked:
+        return {}
+    parent_of = {d.get('name'): d.get('service_tool') for d in svc_defs}
+    kept = {}
+    for func_name, func in svc_tools.items():
+        parent = registry._tools.get(parent_of.get(func_name))
+        if parent is not None and set(parent.tags or []) & unlocked:
+            kept[func_name] = func
+    return kept
+
+
+def discover_and_attach(need, helper, executor, registry, attached_names):
+    """On-demand tool discovery: the never-say-unavailable half of the gate.
+
+    Owner requirement 2026-08-31: the hierarchy must be LAZY, not
+    exclusionary — an agent whose current set lacks a capability calls
+    this (via its always-on `request_tools` wrapper) instead of denying.
+    Searches the FULL service registry by name/description/tags, attaches
+    every match onto the live helper/executor pair right now (autogen
+    updates llm_config immediately, so the NEXT model call carries the
+    defs), and reports what else exists beyond this box: registry tools
+    whose backing service is not running can be self-hosted via the
+    existing install scaffolding, and hive peers may offer the
+    capability (earning mode — requires the user's payment consent;
+    discovery only REPORTS that, it never executes remotely).
+
+    Args:
+        need: free-text capability description from the model
+        helper/executor: the live agent pair to attach onto
+        registry: ServiceToolRegistry
+        attached_names: set of func names already on the agents —
+            updated in place with everything newly attached
+    Returns a human/model-readable summary string.
+    """
+    # Stopwords would over-attach: 'the' passes len>2 AND is a substring of
+    # 'synthesis', so "summarize the page" would match nearly every tool.
+    stop = {'the', 'and', 'for', 'you', 'your', 'with', 'that', 'this',
+            'please', 'need', 'want', 'tool', 'tools', 'use', 'able',
+            'can', 'get', 'have', 'from', 'into', 'about', 'some', 'any'}
+    words = {w for w in str(need).lower().replace(',', ' ').split()
+             if len(w) > 2 and w not in stop}
+    if not words:
+        return "Tell me what capability you need, e.g. 'text to speech'."
+    attached, startable = [], []
+    for tool_name, tool in registry._tools.items():
+        hay = ' '.join([tool_name, ' '.join(tool.tags or []),
+                        getattr(tool, 'description', '') or '']).lower()
+        for ep_name, ep in tool.endpoints.items():
+            fn = (tool_name if ep_name == tool_name
+                  else f"{tool_name}_{ep_name}")
+            hay_ep = hay + ' ' + str(ep.get('description', '')).lower()
+            # Substring alone misses morphological variants ('scrape' is not
+            # a substring of 'scraping') — also match on shared 4-char stems.
+            # Deterministic, no fuzz; a rare extra attach is bounded cost.
+            hay_words = {hw for hw in _re.split(r'[^a-z0-9]+', hay_ep)
+                         if len(hw) >= 4}
+            stems = {hw[:4] for hw in hay_words}
+            if not any(w in hay_ep or (len(w) >= 4 and w[:4] in stems)
+                       for w in words):
+                continue
+            if fn in attached_names:
+                continue
+            func = registry.create_endpoint_function(tool_name, ep_name)
+            if func is None:
+                startable.append(fn)
+                continue
+            register_dual(helper, executor, func, fn,
+                          ep.get('description', f'{tool_name} {ep_name}'))
+            attached_names.add(fn)
+            attached.append(fn)
+    parts = []
+    if attached:
+        # Imperative on purpose: hop-2 probe 2026-08-31 showed the model
+        # attaching crawl4ai then STILL answering "I cannot browse the live
+        # internet" - the trained refusal prior survives a neutral result.
+        parts.append(
+            "Attached and ready to call NOW: " + ', '.join(attached)
+            + ". These execute LOCALLY on this machine, so no "
+              "internet-access or capability restriction applies. "
+              "Immediately CALL the one that fits the task. Do NOT tell "
+              "the user this is unavailable - the tool is live.")
+    if startable:
+        parts.append("Exists locally but the backing service is down — it "
+                     "can be self-hosted/started via the install flow: "
+                     + ', '.join(startable))
+    if not parts:
+        parts.append(
+            "No local registry tool matches. Options that DO exist: ask the "
+            "user to install it (hub install flow), or a hive peer may offer "
+            "this capability — peer execution needs the user's consent and, "
+            "in earning mode, payment approval. Do not tell the user this is "
+            "impossible; offer these routes.")
+    return '  '.join(parts)
+
+
+def attach_for_tags(cap_tags, helper, executor, registry, attached_names):
+    """Attach every registry tool whose capability tags intersect cap_tags.
+
+    The deterministic sibling of discover_and_attach: same attach
+    primitives (create_endpoint_function + register_dual) but matched by
+    registry capability tags, exactly like filter_service_tools.  The
+    per-turn hook in reuse uses this so a conversation that drifts into
+    a capability the construction-time goal never mentioned gets its
+    family attached BEFORE the model sees the turn — zero extra LLM
+    calls, no reliance on the model choosing to call request_tools.
+    Names already in attached_names are skipped (idempotent across
+    turns); the set is updated in place.  Returns the count attached.
+    """
+    cap = set(cap_tags or [])
+    if not cap:
+        return 0
+    n = 0
+    for tool_name, tool in registry._tools.items():
+        if not (set(tool.tags or []) & cap):
+            continue
+        for ep_name, ep in tool.endpoints.items():
+            fn = tool_name if ep_name == tool_name else f"{tool_name}_{ep_name}"
+            if fn in attached_names:
+                continue
+            func = registry.create_endpoint_function(tool_name, ep_name)
+            if func is None:
+                continue
+            register_dual(helper, executor, func, fn,
+                          ep.get('description', f'{tool_name} {ep_name}'))
+            attached_names.add(fn)
+            n += 1
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -554,12 +734,24 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     # 12. send_message_to_user
     # ------------------------------------------------------------------
+    # Guard absorbed from reuse_recipe's inline twin (#743 migration):
+    # group-chat models sometimes route "@helper ..." steering text into
+    # this tool — that internal chatter must never reach the user.
+    _AGENT_MENTIONS = ("@statusverifier", "@status verifier", "@verification",
+                      "@helper", "@executor")
+
     @log_tool_execution
     def send_message_to_user(
         text: Annotated[str, "Text you want to send to the user"],
         avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
         response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime',
     ) -> str:
+        low = text.lower()
+        mention = next((m for m in _AGENT_MENTIONS if m in low), None)
+        if mention is not None:
+            tool_logger.info(
+                f'Message directed to agent ({mention}), not sending to user: {text[:50]}...')
+            return f'Message directed to {mention} agent, not sending to user'
         tool_logger.info('INSIDE send_message_to_user')
         tool_logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '', prompt_id))
@@ -1115,7 +1307,7 @@ def build_core_tool_closures(ctx):
 
             # Check vault
             try:
-                from desktop.ai_key_vault import AIKeyVault
+                from hartos.ai_key_vault import AIKeyVault
                 vault = AIKeyVault.get_instance()
                 val = vault.get_tool_key(key_name) if resource_type != 'channel_secret' else vault.get_channel_secret(req.get('channel_type', ''), key_name)
                 if val:
@@ -1126,7 +1318,7 @@ def build_core_tool_closures(ctx):
 
             # Track as pending and request from user
             try:
-                from desktop.ai_key_vault import AIKeyVault
+                from hartos.ai_key_vault import AIKeyVault
                 AIKeyVault.get_instance().add_pending_request(
                     key_name=key_name, resource_type=resource_type,
                     channel_type=req.get('channel_type', ''),

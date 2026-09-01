@@ -1495,7 +1495,7 @@ except Exception as e:
 
 # ── Credential Vault API — frontend submits missing credentials ──────
 try:
-    from desktop.ai_key_vault import AIKeyVault as _VaultCls, is_local_request
+    from hartos.ai_key_vault import AIKeyVault as _VaultCls, is_local_request
 
     @app.route('/api/credentials/submit', methods=['POST'])
     @_json_endpoint
@@ -1702,8 +1702,15 @@ for _cfg_name in ('langchain_config.json', 'config.json'):
 from core.token_utils import count_tokens_for_text
 
 # api and keys — use config if available, otherwise keep existing env vars / empty
+# A key absent from this tuple can be set in config.json and still never reach
+# the code that reads it. That is how SEARXNG_URL sat configured-but-dead: the
+# reader consults os.environ only, and nothing copied it across. Add the env
+# name here whenever a new provider starts reading one.
 for _cfg_key in ('OPENAI_API_KEY', 'GOOGLE_CSE_ID', 'GOOGLE_API_KEY',
-                  'NEWS_API_KEY', 'SERPAPI_API_KEY'):
+                  'NEWS_API_KEY', 'SERPAPI_API_KEY',
+                  # Qwen3.8 27B via Bitdeer, registered as an EXPERT backend in
+                  # integrations/agent_engine/model_registry.py.
+                  'QWEN_API_KEY', 'QWEN_BASE_URL', 'QWEN_MODEL'):
     if _cfg_key in config:
         os.environ[_cfg_key] = config[_cfg_key]
     else:
@@ -4529,7 +4536,7 @@ def _handle_request_resource(input_text: str) -> str:
         return f"Resource '{key_name}' is already configured and available."
 
     try:
-        from desktop.ai_key_vault import AIKeyVault
+        from hartos.ai_key_vault import AIKeyVault
         vault = AIKeyVault.get_instance()
         if resource_type == 'channel_secret':
             val = vault.get_channel_secret(
@@ -4546,7 +4553,7 @@ def _handle_request_resource(input_text: str) -> str:
     # The backend will detect __SECRET_REQUEST__ and inject it into the response
     # Track as pending so /api/credentials/pending can list it
     try:
-        from desktop.ai_key_vault import AIKeyVault
+        from hartos.ai_key_vault import AIKeyVault
         AIKeyVault.get_instance().add_pending_request(
             key_name=key_name,
             resource_type=resource_type,

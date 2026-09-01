@@ -117,3 +117,91 @@ def test_extract_owner_name():
     assert extract_owner_name('Name: Bob, age 30') == 'Bob'
     assert extract_owner_name('') == ''
     assert extract_owner_name(None) == ''
+
+
+# ── build_identity_prompt: the remaining persona/generic branches ───────────
+
+def test_identity_includes_greeting_style_when_present():
+    # personality dict WITH a greeting_style must surface the greeting line
+    from hartos.agent_identity import build_identity_prompt
+    out = build_identity_prompt(
+        {'name': 'Vijai', 'goal': 'ship',
+         'personality': {'primary_traits': ['kind'], 'tone': 'warm',
+                         'greeting_style': 'Hey there!'}},
+        owner_name='Sam', user_details='')
+    assert 'Hey there!' in out
+
+
+def test_identity_generic_path_still_greets_a_named_owner():
+    # no config -> generic Hevolve identity, but a known owner is still named
+    from hartos.agent_identity import build_identity_prompt
+    out = build_identity_prompt(None, owner_name='Sam', user_details='')
+    assert 'Hevolve' in out and 'Sam' in out
+
+
+# ── generate_agent_handle: region.personality.name with input sanitizing ────
+
+def test_generate_agent_handle_happy_path():
+    from hartos.agent_identity import generate_agent_handle
+    assert generate_agent_handle(region='india', personality='sage',
+                                 name='kai') == 'india.sage.kai'
+
+
+def test_generate_agent_handle_defaults_region_and_bad_personality():
+    from hartos.agent_identity import generate_agent_handle
+    # region None -> 'local'; an unknown personality -> the 'curious' fallback
+    assert generate_agent_handle(personality='not_a_word',
+                                 name='kai') == 'local.curious.kai'
+
+
+def test_generate_agent_handle_sanitizes_region_and_name():
+    from hartos.agent_identity import generate_agent_handle
+    # region: lowercased + spaces stripped; name: only [a-z0-9_] kept
+    h = generate_agent_handle(region='  New Delhi ', personality='sage',
+                              name='Ka!i 99_x')
+    assert h == 'newdelhi.sage.kai99_x'
+
+
+def test_generate_agent_handle_empty_name_falls_back_to_random():
+    from hartos.agent_identity import generate_agent_handle, _generate_random_name
+    h = generate_agent_handle(region='india', personality='sage', name='')
+    assert h.startswith('india.sage.')
+    last = h.rsplit('.', 1)[1]
+    assert last and last.isalpha()          # a random pool name, not empty
+
+
+def test_generate_random_name_is_a_nonempty_alpha_string():
+    from hartos.agent_identity import _generate_random_name
+    n = _generate_random_name()
+    assert isinstance(n, str) and n and n.isalpha()
+
+
+def test_validate_personality_is_case_insensitive():
+    from hartos.agent_identity import validate_personality
+    assert validate_personality('curious') is True
+    assert validate_personality('CURIOUS') is True     # normalized via .lower()
+    assert validate_personality('not_a_real_word') is False
+
+
+def test_is_handle_locked_reads_the_flag():
+    from hartos.agent_identity import is_handle_locked
+    assert is_handle_locked({'handle_locked': True}) is True
+    assert is_handle_locked({'handle_locked': False}) is False
+    assert is_handle_locked({}) is False               # absent -> not locked
+
+
+# ── build_proactive_contact_prompt: agent reaching out first ────────────────
+
+def test_proactive_contact_prompt_names_agent_and_owner():
+    from hartos.agent_identity import build_proactive_contact_prompt
+    out = build_proactive_contact_prompt(
+        {'name': 'Kai', 'personality': {'tone': 'warm'}},
+        reason='checking in', owner_name='Sam')
+    assert 'Kai' in out and 'Sam' in out
+
+
+def test_proactive_contact_prompt_without_owner_addresses_the_user():
+    from hartos.agent_identity import build_proactive_contact_prompt
+    out = build_proactive_contact_prompt(
+        {'name': 'Kai'}, reason='update', owner_name='')
+    assert 'Kai' in out and 'the user' in out

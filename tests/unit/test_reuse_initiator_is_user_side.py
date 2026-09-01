@@ -19,7 +19,7 @@ import ast
 from pathlib import Path
 import unittest
 
-_REUSE = Path(__file__).resolve().parents[2] / 'hartos/reuse_recipe.py'
+_REUSE = Path(__file__).resolve().parents[2] / 'hartos' / 'reuse_recipe.py'
 # LLM-backed agents in reuse_recipe.  Steering messages initiated by any
 # of these enter the group as assistant-role turns.
 _LLM_AGENT_NAMES = {'assistant', 'helper'}

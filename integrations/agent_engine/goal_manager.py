@@ -2745,3 +2745,26 @@ register_goal_type('hive_training', _build_hive_training_prompt,
                     tool_tags=['coding', 'hive_embedding'])
 register_goal_type('hive_proof', _build_hive_proof_prompt,
                     tool_tags=['coding', 'hive_embedding'])
+
+
+# ─── Tier-1 capability unlocks ───
+# Which ServiceToolRegistry capability tags each DETECTABLE goal tag
+# (marketing_tools.detect_goal_tags vocabulary) unlocks.  Read by
+# core.agent_tools.filter_service_tools at the agent-construction
+# attach site; merged into the same _tool_tags store register_goal_type
+# writes, so get_tool_tags stays the ONE reader.  Registered types that
+# already carry capability rows (seo, news, thought_experiment,
+# paper_explanation) are merged, not replaced.
+_CAPABILITY_TAGS = {
+    'marketing': ['web', 'scraping', 'publish', 'seo', 'blog'],
+    'coding': ['github', 'pr', 'coding'],
+    'ip_protection': ['web'],
+    'revenue': ['payments'],
+    'self_build': [],
+    'outreach': ['web', 'publish'],
+    'sales': ['web'],
+    'news': ['web', 'scraping'],
+    'media': ['tts', 'speech', 'music', 'audio', 'generation', 'voice-cloning'],
+}
+for _gt, _caps in _CAPABILITY_TAGS.items():
+    _tool_tags[_gt] = sorted(set(_tool_tags.get(_gt, [])) | set(_caps))

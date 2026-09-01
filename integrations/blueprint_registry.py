@@ -69,6 +69,27 @@ def register_all_blueprints(app) -> dict:
         .create_benchmark_blueprint()
     ))
 
+    # ── Claude Code frontier endpoint (EXPERT tier) ──
+    # Registered HERE rather than at either entry point, because this module is
+    # the single place both of them call. hart_intelligence_entry.py:1103 also
+    # registers it on its own module-level app, but Nunba's frozen entry is
+    # app.py/main.py, so that registration landed on an app nobody serves: the
+    # desktop logged "registered" three times from the ToolsWarmup import while
+    # /api/claude/v1/models answered 404 on :5000. Adding it to main.py as well
+    # would have made a THIRD hand-maintained list. _try_register already skips
+    # a blueprint whose name is taken, so the duplicate entry-point registration
+    # is harmless until it is removed.
+    #
+    # Load-bearing: model_registry.py:464 points the EXPERT ModelBackend at
+    # 'http://127.0.0.1:<backend port>/api/claude/v1'. Without this mount the
+    # tier registers and then 404s on every call, so a node with a working,
+    # logged-in Claude Code silently never uses it.
+    _try_register('claude_code', lambda: (
+        __import__('integrations.providers.claude_code_endpoint',
+                   fromlist=['claude_code_bp'])
+        .claude_code_bp
+    ))
+
     # ── App Marketplace ──
     _try_register('marketplace', lambda: (
         __import__('integrations.agent_engine.app_marketplace',

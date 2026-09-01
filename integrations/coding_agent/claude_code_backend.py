@@ -20,7 +20,9 @@ exception and costs nothing: it imports only logging/subprocess/sys/typing, and
 both consumers already reach `integrations.*`, so `core.*` resolves for free.
 """
 import os
+import shutil
 import subprocess
+import sys
 
 from core.subprocess_safe import no_window_kwargs
 
@@ -52,7 +54,10 @@ def invoke_claude(prompt, *, mode='agentic', cwd=None, timeout_s=None,
         timeout_s = (DEFAULT_INFERENCE_TIMEOUT_S if mode == 'inference'
                      else DEFAULT_AGENTIC_TIMEOUT_S)
 
-    cmd = [CLAUDE_BIN, '-p', prompt]
+    # Resolved, not the bare name: a service unit or frozen app whose PATH
+    # lacks the install dir would otherwise detect the CLI and then fail to
+    # spawn it, reporting 'notfound' for a binary this node can see.
+    cmd = [_resolve_claude_bin() or CLAUDE_BIN, '-p', prompt]
     if mode == 'inference':
         # Pure completion: text out, and no tools so it responds rather than
         # acting on the host. (CLI tool-gating semantics are verified on the
@@ -113,26 +118,96 @@ def classify_failure(result):
     return 'other'
 
 
+def _resolve_claude_bin():
+    """Absolute path to the Claude Code CLI, or '' if this node has none.
+
+    shutil.which alone is not enough, because PATH differs by DEPLOYMENT SHAPE,
+    not just by OS. A frozen Nunba desktop app inherits the launcher's PATH; a
+    docker service and a HART OS systemd unit start with a minimal one; and the
+    installer drops the binary in a per-user directory none of them necessarily
+    carry. So: explicit override, then PATH, then the documented install
+    locations per platform. Resolving here also means invoke_claude spawns an
+    ABSOLUTE path, so detection and invocation can never disagree.
+    """
+    override = os.environ.get('HART_CLAUDE_BIN', '').strip()
+    if override:
+        # Verify even an absolute override exists, or a stale HART_CLAUDE_BIN
+        # makes claude_code_available() answer True for a binary that is not
+        # there and every call fails at spawn time instead of degrading.
+        if os.path.isabs(override):
+            return override if os.path.isfile(override) else ''
+        return shutil.which(override) or ''
+
+    found = shutil.which(CLAUDE_BIN)
+    if found:
+        return found
+
+    home = os.path.expanduser('~')
+    names = ('claude.exe', 'claude.cmd', 'claude') if os.name == 'nt' else ('claude',)
+    roots = [
+        os.path.join(home, '.local', 'bin'),              # native installer, all OSes
+        os.path.join(home, '.claude', 'local'),           # claude-code local install
+        os.path.join(home, 'AppData', 'Roaming', 'npm'),  # npm global, Windows
+        '/usr/local/bin', '/usr/bin',                     # linux, docker, HART OS
+        '/opt/homebrew/bin',                              # macOS apple silicon
+    ]
+    for root in roots:
+        for name in names:
+            cand = os.path.join(root, name)
+            if os.path.isfile(cand):
+                return cand
+    return ''
+
+
+def _claude_config_dir():
+    """Where Claude Code keeps its state, honouring the CLI's own override."""
+    d = os.environ.get('CLAUDE_CONFIG_DIR', '').strip()
+    return d if d else os.path.join(os.path.expanduser('~'), '.claude')
+
+
 def claude_code_available():
     """True if this node can actually run Claude Code: the binary resolves AND
     an authorized credential store exists. The EXPERT-tier registration gates
     on this so a logged-out node simply LACKS a local-frontier model (and falls
     back to hive experts / local), rather than registering a backend that 503s
     on every call.
+
+    Deliberately agnostic of OS and of deployment shape, because HARTOS ships
+    bundled inside Nunba, as a standalone docker image, and as HART OS itself,
+    and those authenticate differently:
+
+      env token     a container or HART OS unit is configured this way and has
+                    no home-directory state at all
+      config dir    the desktop case; CLAUDE_CONFIG_DIR overrides the location
+      keychain      macOS keeps the OAuth token in the login Keychain, so a
+                    logged-in mac has a config dir and NO credentials file.
+                    Requiring the file made every mac look logged out.
+
+    The previous version read os.environ['HOME'] directly. HOME is a POSIX
+    variable that Windows does not set, so this returned False on every Windows
+    node no matter what, two lines before it would have found the credentials
+    sitting right there. Measured on a Windows node with a working, logged-in
+    CLI: which() resolved claude.EXE, ~/.claude/.credentials.json existed, and
+    this still answered False.
     """
-    import shutil
-    if not shutil.which(CLAUDE_BIN):
+    if not _resolve_claude_bin():
         return False
-    home = os.environ.get('HOME', '')
-    if not home:
-        return False
-    # claude-code stores its oauth/creds under ~/.claude. Presence of that dir
-    # with a credentials file is the cheapest honest "is it logged in" check.
-    cdir = os.path.join(home, '.claude')
-    if not os.path.isdir(cdir):
-        return False
+
+    # A key or OAuth token is a first-class auth path for the CLI, and is how a
+    # container or a HART OS service unit is normally configured.
+    for var in ('ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'):
+        if os.environ.get(var, '').strip():
+            return True
+
+    cdir = _claude_config_dir()
     for name in ('.credentials.json', 'credentials.json'):
         if os.path.exists(os.path.join(cdir, name)):
             return True
-    # Some builds keep creds in .claude.json at HOME root.
-    return os.path.exists(os.path.join(home, '.claude.json'))
+
+    if os.path.exists(os.path.join(os.path.expanduser('~'), '.claude.json')):
+        return True
+
+    # macOS: the token lives in the Keychain, not on disk. A config dir plus a
+    # resolvable binary is the honest signal there; a stale one degrades to a
+    # 401 at call time, which classify_failure already maps cleanly.
+    return sys.platform == 'darwin' and os.path.isdir(cdir)

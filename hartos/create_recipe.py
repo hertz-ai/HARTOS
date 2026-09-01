@@ -1813,6 +1813,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # same crawl4ai/acestep/omniparser surface as REUSE.  Without this the
     # gather LLM has no real tool to map "fetch a webpage" onto and invents
     # fake tool names (2026-05-12 IPL refusal forensic).
+    goal_tags = []  # bound before the gated blocks; detected inside the try
     try:
         from integrations.service_tools import (
             service_tool_registry, Crawl4AITool, AceStepTool,
@@ -1828,6 +1829,35 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
         svc_tools = service_tool_registry.get_all_tool_functions()
         svc_defs = service_tool_registry.get_tool_definitions()
+
+        # Tier-1 hierarchical gate (mirrors reuse_recipe): ONE detection per
+        # constructor, consumed here and by the Tier-2 family loaders below.
+        # Ungated, 50 rendered defs cost 5,820 of the 6,144-token slot.
+        from integrations.agent_engine.marketing_tools import detect_goal_tags
+        from core.agent_tools import filter_service_tools
+        goal_tags = detect_goal_tags(task)
+        _n_all_svc = len(svc_tools)
+        svc_tools = filter_service_tools(goal_tags, svc_tools, svc_defs,
+                                         service_tool_registry)
+        tool_logger.info(
+            f"Tier-1 tool gate: goal_tags={goal_tags} kept "
+            f"{len(svc_tools)}/{_n_all_svc} service tools")
+
+        # Never-say-unavailable: always-on discovery that attaches gated-out
+        # or newly-needed tools mid-conversation (owner req 2026-08-31).
+        _attached_names = set(svc_tools)
+
+        def request_tools(need: str) -> str:
+            from core.agent_tools import discover_and_attach
+            return discover_and_attach(need, helper, assistant,
+                                       service_tool_registry, _attached_names)
+        register_dual(helper, assistant, request_tools, 'request_tools',
+                      "Discover and attach additional tools by describing the "
+                      "capability you need, e.g. 'text to speech' or 'crawl a "
+                      "webpage'. Call this FIRST whenever your current tools "
+                      "lack a capability - never tell the user something is "
+                      "unavailable without trying this. If it finds no "
+                      "match, call it once more with different wording.")
 
         for tool_name, tool_func in svc_tools.items():
             tool_def = next((d for d in svc_defs if d['name'] == tool_name), None)
@@ -1995,8 +2025,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
     # Goal-aware Tier 2 tool loading (marketing, coding, etc.)
     try:
-        from integrations.agent_engine.marketing_tools import detect_goal_tags, register_marketing_tools
-        goal_tags = detect_goal_tags(task)
+        # goal_tags comes from the single Tier-1 detection above — the
+        # second detect_goal_tags call this block used to make is gone.
+        from integrations.agent_engine.marketing_tools import register_marketing_tools
         if 'marketing' in goal_tags:
             register_marketing_tools(helper, assistant, user_id)
             tool_logger.info("Marketing tools loaded (Tier 2) based on prompt content")
@@ -5117,7 +5148,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         current_app.logger.error(f"Unhandled exception in get_response_group: {e}")
         safe_set_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.ERROR, "Unhandled exception in get_response_group")
         current_app.logger.error(traceback.format_exc())
-        return f"An error occurred: {str(e)}"
+        # #716: reply gets SPOKEN by TTS - never surface raw internals
+        from core.agent_tools import user_facing_error
+        return user_facing_error(e)
 
 
 def get_total_flows(user_prompt):

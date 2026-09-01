@@ -316,6 +316,80 @@ def _resolve_model_name(model_name: str) -> str:
     return model_name
 
 
+def pause_goal_for_budget(goal_id: Optional[str], reason: str) -> bool:
+    """Auto-pause a goal whose budget can no longer cover its next dispatch.
+
+    The single home for that decision.  agent_daemon's read-only pre-check and
+    pre_dispatch_budget_gate both land here rather than each mutating the row
+    their own way.
+
+    Honours ``never_pause`` in the goal's config.  That flag has existed since
+    goal_seeding.py:1326 set it on Guardian Convergence and was, until this
+    function, read by nothing at all — so a goal declaring itself unpausable
+    could still be paused by any code that felt like it.  A never_pause goal
+    that runs out of budget is left active and logged loudly instead: it is an
+    operator problem, not something to silence by pausing the goal against its
+    own declaration.
+
+    Returns True if the goal was actually paused.
+    """
+    if not goal_id:
+        return False
+    try:
+        # db_session is the canonical write path in models.py: commits on a
+        # clean exit, ROLLS BACK on exception, always closes.  Hand-rolling
+        # get_db/commit/close here (as an earlier draft of this function did)
+        # drops the rollback, which leaves a failed write sitting in the
+        # session until close discards it.
+        from integrations.social.models import db_session, AgentGoal
+        with db_session() as db:
+            goal = db.query(AgentGoal).filter_by(id=goal_id).first()
+            return apply_budget_pause(goal, reason)
+    except Exception as e:
+        logger.warning("Could not auto-pause goal %s after budget block: %s",
+                       goal_id, e)
+        return False
+
+
+def apply_budget_pause(goal, reason: str) -> bool:
+    """Mutate an already-loaded goal row. THE CALLER OWNS THE COMMIT.
+
+    Split from pause_goal_for_budget on purpose. agent_daemon holds one session
+    open across its whole dispatch loop and commits once at the end, so it must
+    mutate its OWN object: giving it a helper that opens a second session and
+    commits mid-loop would add a write transaction while the daemon holds a
+    read transaction, on the same SQLite file whose lock contention is what
+    started this investigation. Callers with no session (the dispatch gate) get
+    the wrapper above; callers with one get this. One decision, two adapters,
+    no second transaction.
+
+    Returns True if the goal was actually transitioned.
+    """
+    from datetime import datetime
+    if goal is None or goal.status != 'active':
+        return False
+
+    cfg = goal.config_json or {}
+    if cfg.get('never_pause'):
+        logger.warning(
+            "Goal %s is out of budget (%s) but declares never_pause, so it "
+            "stays active and will keep being refused. Top up spark_budget "
+            "or clear never_pause.", goal.id, reason)
+        return False
+
+    goal.status = 'paused'
+    cfg['pause_reason'] = (
+        f'Auto-paused: budget gate blocked. Reason: {reason}')
+    cfg['paused_at'] = datetime.utcnow().isoformat()
+    goal.config_json = cfg
+    # WARNING, not info: this is the state transition that explains why a goal
+    # stopped making progress, and the hevolve loggers run at WARNING in
+    # production, where INFO is invisible. A retention sweep that logged its
+    # own success at INFO ran unseen on central for exactly this reason.
+    logger.warning("Goal %s AUTO-PAUSED by budget gate: %s", goal.id, reason)
+    return True
+
+
 def pre_dispatch_budget_gate(goal_id: Optional[str],
                              prompt: str,
                              model_name: str = 'gpt-4o') -> Tuple[bool, str]:
@@ -335,6 +409,21 @@ def pre_dispatch_budget_gate(goal_id: Optional[str],
     allowed, remaining, reason = check_goal_budget(goal_id, estimated_cost)
     if not allowed:
         logger.warning(f"Budget gate BLOCKED: goal={goal_id}, {reason}")
+        # A goal that cannot afford its next dispatch will not be able to
+        # afford the one after either: spark_budget is a one-shot cap set at
+        # creation and NOTHING in the tree replenishes it (no top-up, reset or
+        # refill path exists).  Leaving it 'active' makes the row lie — the
+        # daemon keeps selecting it, this gate keeps refusing it, and an
+        # operator reading `status` sees a healthy goal.
+        #
+        # Measured on central 2026-09-01: goal 917cc152 sat 'active' with 2
+        # spark left against an 11-spark estimate, re-blocked on every pass,
+        # while self_heal/self_build/code_evolution sat at exactly 0 left.
+        # agent_daemon already auto-pauses in its own read-only pre-check, but
+        # that check estimates cost from a different prompt than the real
+        # dispatch, so goals in the gap between the two estimates never
+        # reached it.  Same decision, one home, both callers.
+        pause_goal_for_budget(goal_id, reason)
         return False, f'goal_budget_exceeded: {reason}'
 
     # Platform-level affordability
