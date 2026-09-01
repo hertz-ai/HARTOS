@@ -2757,14 +2757,15 @@ register_goal_type('hive_proof', _build_hive_proof_prompt,
 # paper_explanation) are merged, not replaced.
 _CAPABILITY_TAGS = {
     'marketing': ['web', 'scraping', 'publish', 'seo', 'blog'],
-    # Registry-vocabulary rows (each tag verified against a declared
-    # ServiceTool tag): web/crawling -> crawl4ai, github/pr -> gh_pr.
-    # NO 'computer-use' here (owner 2026-09-01): screen/GUI work is the
-    # always-on core tool execute_windows_or_android_command, whose VLM
-    # path runs on the main Qwen3-VL (qwen3vl_backend replaced the
-    # OmniParser pipeline); the omniparser ServiceTool wrapper is legacy
-    # and its base_url :8080 now belongs to llama-server.
-    'coding': ['github', 'pr', 'coding', 'web', 'crawling'],
+    # Registry-vocabulary rows: web/crawling -> crawl4ai, github/pr ->
+    # gh_pr.  'computer-use' declares the ARCHETYPE'S need (owner
+    # 2026-09-01: a coding agent looks at the desktop) — today that
+    # capability rides the always-on core tool
+    # execute_windows_or_android_command on the main Qwen3-VL
+    # (qwen3vl_backend replaced the OmniParser pipeline); the tag stays
+    # so any future qwen3vl-backed screen ServiceTool unlocks here.  The
+    # legacy omniparser wrapper no longer declares 'computer-use'.
+    'coding': ['github', 'pr', 'coding', 'web', 'crawling', 'computer-use'],
     'ip_protection': ['web'],
     'revenue': ['payments'],
     'self_build': [],

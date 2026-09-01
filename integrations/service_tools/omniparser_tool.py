@@ -62,7 +62,13 @@ class OmniParserTool:
                 },
             },
             health_endpoint="/probe",
-            tags=["computer-use", "screen", "ui", "automation", "omniparser"],
+            # LEGACY (owner 2026-09-01): replaced by the main Qwen3-VL
+            # (integrations/vlm/qwen3vl_backend.py); agents reach screen
+            # work via the core execute_windows_or_android_command tool.
+            # 'computer-use' removed so the capability vocabulary never
+            # resolves to this wrapper — its base_url localhost:8080 now
+            # belongs to llama-server and would dial the wrong service.
+            tags=["omniparser-legacy"],
             timeout=30,
         )
 

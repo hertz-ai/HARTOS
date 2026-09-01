@@ -85,9 +85,20 @@ class HierarchicalToolGate(unittest.TestCase):
         self.assertIn('coding', caps)   # existing rows preserved
         self.assertIn('github', caps)
         self.assertNotIn('web_search', caps)  # synonym drift guard
-        # screen/GUI work is the always-on core tool (qwen3vl_backend),
-        # NOT the legacy omniparser ServiceTool — owner ruling 2026-09-01
-        self.assertNotIn('computer-use', caps)
+        # The archetype DECLARES computer-use (owner: a coding agent
+        # looks at the desktop); today the capability rides the core
+        # execute_windows_or_android_command tool on the main Qwen3-VL.
+        self.assertIn('computer-use', caps)
+
+    def test_legacy_omniparser_wrapper_does_not_claim_computer_use(self):
+        """Owner 2026-09-01: omniparser was replaced by qwen3vl_backend.
+        The deprecated wrapper must never resolve for 'computer-use' —
+        its base_url localhost:8080 now belongs to llama-server, so an
+        agent attaching it would dial the wrong service."""
+        from integrations.service_tools.omniparser_tool import OmniParserTool
+        info = OmniParserTool.create_tool_info()
+        self.assertNotIn('computer-use', info.tags)
+        self.assertNotIn('screen', info.tags)
         # behavioral: the row actually UNLOCKS the web tool through the
         # real filter (fake crawl4ai declares ['web','scraping'])
         kept = filter_service_tools(['coding'], _SVC_TOOLS, _SVC_DEFS,
