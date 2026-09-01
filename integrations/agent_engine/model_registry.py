@@ -169,8 +169,16 @@ class ModelRegistry:
         models are tiny (<1B), always local, and are expected to emit a
         standby reply + routing signal before a heavier model is woken.
 
-        Returns None if no DRAFT tier model is registered, which makes the
-        dispatcher gracefully fall through to the normal path."""
+        When no DRAFT tier is registered, the MAIN LOCAL MODEL serves as the
+        draft. A dedicated sub-1B draft only earns its VRAM on a box with
+        headroom to host it alongside the main model; below that the same
+        llama.cpp server (``core.port_registry.get_local_llm_url``) answers
+        both roles, so draft-first still has a real first responder instead
+        of bailing out with ``no_draft_model`` and silently disabling the
+        selective-escalation path on every machine without a second model.
+
+        Returns None only when this node has no dispatchable local model at
+        all, which is the genuine "nothing can draft" case."""
         with self._lock:
             candidates = [
                 m for m in self._models.values()
@@ -180,6 +188,19 @@ class ModelRegistry:
                 # dispatch_draft_first as the first responder.
                 and m.is_dispatchable()
             ]
+            if not candidates:
+                # Fallback: the main local model doubles as the draft.
+                # EXPERT is excluded deliberately — `claude-code` registers
+                # is_local=True (it IS locally hosted), so a bare is_local
+                # filter would hand the frontier/background tier to the hot
+                # draft path and put a ~6s subscription call in front of
+                # every turn. The draft must be the cheap local responder.
+                candidates = [
+                    m for m in self._models.values()
+                    if m.is_local
+                    and m.tier != ModelTier.EXPERT
+                    and m.is_dispatchable()
+                ]
         if not candidates:
             return None
         return min(candidates, key=lambda m: m.avg_latency_ms)
