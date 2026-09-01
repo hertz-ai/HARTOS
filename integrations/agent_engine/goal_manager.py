@@ -2757,10 +2757,11 @@ register_goal_type('hive_proof', _build_hive_proof_prompt,
 # paper_explanation) are merged, not replaced.
 _CAPABILITY_TAGS = {
     'marketing': ['web', 'scraping', 'publish', 'seo', 'blog'],
-    # web_search + crawling: a coding agent reads docs and pages — the
-    # row lacked both (measured gap, owner ruling 2026-09-01; the rest
-    # of the programmer workbench is always-on core + @Executor).
-    'coding': ['github', 'pr', 'coding', 'web_search', 'crawling'],
+    # Registry-vocabulary rows (each tag verified against a declared
+    # ServiceTool tag): web/crawling -> crawl4ai, github/pr -> gh_pr,
+    # computer-use -> omniparser (owner 2026-09-01: a coding agent reads
+    # docs and looks at the desktop; execution is always-on core tools).
+    'coding': ['github', 'pr', 'coding', 'web', 'crawling', 'computer-use'],
     'ip_protection': ['web'],
     'revenue': ['payments'],
     'self_build': [],

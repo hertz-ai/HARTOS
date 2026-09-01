@@ -75,13 +75,23 @@ class HierarchicalToolGate(unittest.TestCase):
     # goal-tag vocabulary detection speaks, so downstream is untouched) ──
 
     def test_coding_row_covers_programmer_workbench(self):
-        """Wire 1: a coding agent must reach docs — measured gap: the
-        'coding' row lacked web_search + crawling entirely."""
+        """Wire 1: a coding agent must reach docs + the desktop — the
+        row lacked web/crawling/computer-use entirely.  Tags must speak
+        REGISTRY vocabulary (declared ServiceTool tags), not synonyms:
+        'web_search' matches nothing, 'web' matches crawl4ai."""
         caps = get_tool_tags('coding')
-        self.assertIn('web_search', caps)
+        self.assertIn('web', caps)
         self.assertIn('crawling', caps)
+        self.assertIn('computer-use', caps)
         self.assertIn('coding', caps)   # existing rows preserved
         self.assertIn('github', caps)
+        self.assertNotIn('web_search', caps)  # synonym drift guard
+        # behavioral: the row actually UNLOCKS the web tool through the
+        # real filter (fake crawl4ai declares ['web','scraping'])
+        kept = filter_service_tools(['coding'], _SVC_TOOLS, _SVC_DEFS,
+                                    _fake_registry())
+        self.assertIn('crawl4ai_crawl', kept)
+        self.assertNotIn('pocket_tts_synthesize', kept)
 
     def test_resolve_goal_tags_is_layered_union(self):
         """Wire 3: stored semantic tags UNION lexical detection — legacy
