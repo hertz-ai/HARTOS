@@ -2050,7 +2050,10 @@ class SpeculativeDispatcher:
                                       latency_ms: float):
         """Credit hive node for serving fast response → ad revenue eligibility.
 
-        GUARDRAIL: Only master_key_verified nodes get credit.
+        GUARDRAIL: Only nodes with PROVEN integrity get credit
+        (integrity_status == 'verified', written only by a passed challenge).
+        master_key_verified is derived from a self-reported code_hash, so
+        paying on it meant paying on an assertion any node can make.
         GUARDRAIL: ComputeDemocracy.adjusted_reward() — logarithmic, not linear.
         """
         if not node_id:
@@ -2060,7 +2063,7 @@ class SpeculativeDispatcher:
             db = get_db()
             try:
                 peer = db.query(PeerNode).filter_by(node_id=node_id).first()
-                if peer and peer.master_key_verified:
+                if peer and peer.integrity_status == 'verified':
                     peer.agent_count = (peer.agent_count or 0) + 1
                     db.commit()
             finally:

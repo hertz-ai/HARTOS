@@ -535,8 +535,15 @@ class UpgradeOrchestrator:
 
             db = get_db()
             try:
+                # PROOF, not a claim. master_key_verified is derived from a
+                # SELF-REPORTED code_hash (see integrity_service: a recognised
+                # hash now records 'claimed'), so targeting a canary with it
+                # meant choosing which machines receive a new build first on a
+                # value any node can assert for free. integrity_status
+                # 'verified' is written only by a passed challenge -- nonce
+                # round-trip plus signature plus consistency check.
                 active = db.query(PeerNode).filter_by(
-                    status='active', master_key_verified=True).all()
+                    status='active', integrity_status='verified').all()
                 canary_count = max(1, int(len(active) * self._canary_pct))
                 canary_nodes = active[:canary_count]
 

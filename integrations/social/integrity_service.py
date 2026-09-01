@@ -118,10 +118,23 @@ class IntegrityService:
             from security.release_hash_registry import get_release_hash_registry
             registry = get_release_hash_registry()
             if registry.is_known_release_hash(peer.code_hash):
-                peer.integrity_status = 'verified'
+                # 'claimed', NOT 'verified'. peer.code_hash is SELF-REPORTED:
+                # the announce signature proves "this key asserted this value",
+                # never "this is the code running", so a hostile node simply
+                # claims a hash from the registry. Recording that as verified
+                # is what made the two trust flags indistinguishable and let
+                # canary targeting and revenue credit run on a forgeable
+                # string. Only evaluate_challenge_response, which round-trips a
+                # nonce and checks consistency, may write 'verified'.
+                peer.integrity_status = 'claimed'
                 peer.last_attestation_at = datetime.utcnow()
-                return {'verified': True,
-                        'details': 'Code hash in release registry'}
+                # verified=True is the honest answer to THIS function's
+                # question ("does the hash match a known release?"). It is not
+                # a claim about what the peer is executing, which is why the
+                # RECORD above is 'claimed'.
+                return {'verified': True, 'proven': False,
+                        'details': 'Code hash in release registry (self-reported '
+                                   '-- awaiting challenge for proof)'}
         except Exception:
             pass
 
@@ -148,9 +161,14 @@ class IntegrityService:
                 return {'verified': False, 'details': 'Cannot compute local hash'}
 
         if peer.code_hash == expected:
-            peer.integrity_status = 'verified'
+            # Also a CLAIM: `expected` is compared against the same
+            # self-reported peer.code_hash. Matching our own build is a strong
+            # prior, not proof of what the peer is executing.
+            peer.integrity_status = 'claimed'
             peer.last_attestation_at = datetime.utcnow()
-            return {'verified': True, 'details': 'Code hash matches'}
+            return {'verified': True, 'proven': False,
+                    'details': 'Code hash matches (self-reported -- awaiting '
+                               'challenge for proof)'}
         else:
             IntegrityService.increase_fraud_score(
                 db, node_id, FRAUD_WEIGHTS['hash_mismatch'],
@@ -295,6 +313,30 @@ class IntegrityService:
         except Exception:
             return {'response': response, 'signature': ''}
 
+    
+    @staticmethod
+    def _revoke_proof(db: Session, node_id: str, reason: str) -> None:
+        """Drop a peer from 'verified' back to 'claimed' on a failed challenge.
+
+        Proof is a statement about the LAST answered challenge, not a permanent
+        badge. Without this a peer that passed once keeps 'verified' through
+        every subsequent failure -- and 'verified' is what gates canary
+        targeting and hive revenue credit.
+
+        Downgrades to 'claimed' rather than 'unverified' on purpose: whatever
+        the peer claimed about its build is still on record and still true as a
+        claim; only the PROOF is withdrawn.
+        """
+        try:
+            peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+            if peer is not None and peer.integrity_status == 'verified':
+                peer.integrity_status = 'claimed'
+                logger.info(
+                    "Integrity: proof revoked for %s (%s)", node_id[:8], reason)
+        except Exception:
+            # Never let bookkeeping break the evaluation result.
+            pass
+
     @staticmethod
     def evaluate_challenge_response(db: Session, challenge_id: str,
                                      response_data: dict,
@@ -318,6 +360,8 @@ class IntegrityService:
             IntegrityService.increase_fraud_score(
                 db, challenge.target_node_id, FRAUD_WEIGHTS['challenge_fail'],
                 'Challenge failed: nonce mismatch')
+            IntegrityService._revoke_proof(
+                db, challenge.target_node_id, 'nonce mismatch')
             return {'passed': False, 'details': 'Nonce mismatch'}
 
         # Verify signature if public key available
@@ -331,6 +375,8 @@ class IntegrityService:
                     IntegrityService.increase_fraud_score(
                         db, challenge.target_node_id, FRAUD_WEIGHTS['challenge_fail'],
                         'Challenge failed: invalid signature')
+                    IntegrityService._revoke_proof(
+                        db, challenge.target_node_id, 'invalid signature')
                     return {'passed': False, 'details': 'Invalid signature'}
             except Exception:
                 pass
@@ -419,15 +465,36 @@ class IntegrityService:
         challenge.result_details = details
         challenge.evaluated_at = datetime.utcnow()
 
+        # THE PROOF HAS TO LAND ON THE PEER, not only on the challenge row.
+        #
+        # This function is the only place in the codebase that actually proves
+        # anything about a peer: it round-trips a nonce (anti-replay), verifies
+        # the response signature, and checks the answer against what we already
+        # believe. Until now its verdict was written to challenge.status and the
+        # fraud score and NOWHERE ELSE, while peer.integrity_status was set to
+        # 'verified' by a self-reported code_hash. So the real proof was
+        # discarded and the forgeable claim was recorded -- and downstream
+        # consumers reading 'verified' were reading the claim.
+        _peer = db.query(PeerNode).filter_by(
+            node_id=challenge.target_node_id).first()
+
         if not passed:
             IntegrityService.increase_fraud_score(
                 db, challenge.target_node_id, FRAUD_WEIGHTS['challenge_fail'],
                 f'Challenge failed: {details}')
+            # A failed challenge must REVOKE proof. Leaving a stale 'verified'
+            # would let one early pass outlive every later failure. Same helper
+            # as the early-return failures above, so all three agree.
+            IntegrityService._revoke_proof(
+                db, challenge.target_node_id, details)
         else:
             # Successful challenge reduces fraud score slightly
             IntegrityService.decrease_fraud_score(
                 db, challenge.target_node_id, 2.0,
                 f'Challenge passed: {challenge.challenge_type}')
+            if _peer is not None:
+                _peer.integrity_status = 'verified'
+                _peer.last_attestation_at = datetime.utcnow()
 
         return {'passed': passed, 'details': details}
 
