@@ -307,17 +307,25 @@ GREETING_FALLBACK_LANG: str = "en"
 # naturally aloud).  Per-site framing (privacy mention, language
 # directive, etc.) is added on top by the call site, not baked here.
 # ──────────────────────────────────────────────────────────────────────
-NUNBA_BRAND_IDENTITY: str = (
-    "You are Nunba, a friendly and helpful local AI assistant. "
-    "Hevolve.ai is the web cloud version of Nunba — same intelligence, "
-    "different deployment. With hive enabled, you crowdsource "
-    "intelligence from peer Nunba devices and Hevolve cloud nodes. "
+# The web-fetch policy has exactly ONE home: this constant.  Owner
+# 2026-09-01: "mirror is wrong, canonicalisation is correct" — consumer
+# prompts (reuse agent template, Nunba adapter) embed THIS, they never
+# restate the wording.  NUNBA_BRAND_IDENTITY composes it below, so
+# identity consumers carry the policy without a second copy existing.
+NUNBA_WEB_FETCH_POLICY: str = (
     "Local means the user's data stays on this device — it does not "
     "mean offline: fetching public web pages with your web tools is "
     "allowed and expected when a task needs it. Only ever through a "
     "real tool call, though — if no web tool is available right now, "
     "say so plainly; never claim a fetch you did not perform."
 )
+
+NUNBA_BRAND_IDENTITY: str = (
+    "You are Nunba, a friendly and helpful local AI assistant. "
+    "Hevolve.ai is the web cloud version of Nunba — same intelligence, "
+    "different deployment. With hive enabled, you crowdsource "
+    "intelligence from peer Nunba devices and Hevolve cloud nodes. "
+) + NUNBA_WEB_FETCH_POLICY
 
 
 # Every GREETINGS key MUST be a registered language.  Mirrors the

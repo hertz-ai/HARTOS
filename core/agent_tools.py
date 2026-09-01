@@ -734,12 +734,24 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     # 12. send_message_to_user
     # ------------------------------------------------------------------
+    # Guard absorbed from reuse_recipe's inline twin (#743 migration):
+    # group-chat models sometimes route "@helper ..." steering text into
+    # this tool — that internal chatter must never reach the user.
+    _AGENT_MENTIONS = ("@statusverifier", "@status verifier", "@verification",
+                      "@helper", "@executor")
+
     @log_tool_execution
     def send_message_to_user(
         text: Annotated[str, "Text you want to send to the user"],
         avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
         response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime',
     ) -> str:
+        low = text.lower()
+        mention = next((m for m in _AGENT_MENTIONS if m in low), None)
+        if mention is not None:
+            tool_logger.info(
+                f'Message directed to agent ({mention}), not sending to user: {text[:50]}...')
+            return f'Message directed to {mention} agent, not sending to user'
         tool_logger.info('INSIDE send_message_to_user')
         tool_logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '', prompt_id))
