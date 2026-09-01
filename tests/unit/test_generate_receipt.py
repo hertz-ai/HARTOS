@@ -66,6 +66,84 @@ class GenerateReceiptTool(unittest.TestCase):
         out = gen(service='Hair', amount='800')
         self.assertRegex(out, r'\d{4}-\d{2}-\d{2}')
 
+    # ── owner-required fields (cost/date/timing/advance every time) ──
+
+    def test_balance_is_computed_not_trusted(self):
+        # "₹18k total, 5k advance" → balance 13,000 appears without the
+        # model ever doing arithmetic.
+        gen = _find(build_core_tool_closures(_ctx({})), 'generate_receipt')
+        out = gen(service='Bridal makeup', amount='18k', advance='5k')
+        self.assertIn('13,000', out)
+
+    def test_event_timing_renders(self):
+        gen = _find(build_core_tool_closures(_ctx({})), 'generate_receipt')
+        out = gen(service='Bridal makeup', amount='5000',
+                  event_timing='ready by 6am, event at 11am')
+        self.assertIn('ready by 6am, event at 11am', out)
+
+    def test_image_render_appends_media_marker(self):
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            self.skipTest('Pillow not installed')
+        import os
+        import tempfile
+        from unittest.mock import patch as _patch
+        tmp = tempfile.mkdtemp(prefix='receipt_gen_')
+        gen = _find(build_core_tool_closures(_ctx({})), 'generate_receipt')
+        with _patch('integrations.channels.response.receipt_image._receipts_dir',
+                    return_value=tmp):
+            out = gen(service='Party makeup', amount='8000', advance='2000',
+                      event_timing='7pm', render='image')
+        m = re.search(r'\[\[MEDIA:(.+?)\]\]', out)
+        self.assertIsNotNone(m, f'no media marker in: {out[-200:]}')
+        self.assertTrue(os.path.isfile(m.group(1)))
+
+
+class SetReceiptLogoTool(unittest.TestCase):
+
+    def _tools(self, agent_data):
+        return build_core_tool_closures(_ctx(agent_data))
+
+    def test_registered_as_a_core_tool(self):
+        self.assertIn('set_receipt_logo',
+                      [n for n, _, _ in self._tools({})])
+
+    def test_copies_logo_durably_and_stores_path_in_kv(self):
+        import os
+        import tempfile
+        from unittest.mock import patch as _patch
+        tmp_src = tempfile.mkdtemp(prefix='logo_src_')
+        tmp_data = tempfile.mkdtemp(prefix='logo_data_')
+        src = os.path.join(tmp_src, 'brand.png')
+        with open(src, 'wb') as f:
+            f.write(b'\x89PNG fake')
+        agent_data = {}
+        set_logo = _find(self._tools(agent_data), 'set_receipt_logo')
+        with _patch('core.platform_paths.get_data_dir',
+                    return_value=tmp_data):
+            out = set_logo(file_path=src)
+        self.assertIn('Logo saved', out)
+        stored = agent_data['testp']['receipt_logo_path']
+        self.assertTrue(os.path.isfile(stored))
+        self.assertTrue(os.path.realpath(stored).startswith(
+            os.path.realpath(tmp_data)))
+
+    def test_missing_file_asks_for_resend(self):
+        set_logo = _find(self._tools({}), 'set_receipt_logo')
+        out = set_logo(file_path=r'C:\nope\logo.png')
+        self.assertIn('not found', out)
+
+    def test_non_image_extension_rejected(self):
+        import os
+        import tempfile
+        bad = os.path.join(tempfile.mkdtemp(prefix='logo_bad_'), 'x.exe')
+        with open(bad, 'wb') as f:
+            f.write(b'MZ')
+        set_logo = _find(self._tools({}), 'set_receipt_logo')
+        out = set_logo(file_path=bad)
+        self.assertIn('not an image', out)
+
 
 if __name__ == '__main__':
     unittest.main()
