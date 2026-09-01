@@ -500,7 +500,7 @@ def build_core_tool_closures(ctx):
         TemplateEngine and returns the receipt text for the agent to send back
         over the same channel the request arrived on (WhatsApp, etc.).
         """
-        from integrations.channels.response.receipt_image import (
+        from integrations.service_tools.receipt_image import (
             compute_balance, render_receipt_png)
         balance = compute_balance(amount, advance) or ""
         template = get_data_by_key("receipt_template")

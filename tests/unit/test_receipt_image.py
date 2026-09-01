@@ -8,7 +8,7 @@ import os
 import tempfile
 import unittest
 
-from integrations.channels.response.receipt_image import (
+from integrations.service_tools.receipt_image import (
     compute_balance,
     parse_amount,
     render_receipt_png,

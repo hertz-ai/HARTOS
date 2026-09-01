@@ -704,9 +704,26 @@ def create_agents_for_role(user_id: str, prompt_id):
     # Uses module-level config_list (localhost:8080 for local, Azure for cloud)
     current_app.logger.info('INSIDE create_agents_for_role')
 
-    # Create a basic function calling config
+    # Create a basic function calling config.
+    #
+    # PER-DISPATCH MODEL ROUTING: /chat stashes the caller's chosen model_config
+    # in thread-local (hart_intelligence_entry:9200) and it MUST win over the
+    # import-time module `config_list`.  This is model-agnostic on purpose — it
+    # honours whatever tier the dispatcher selected (hive peer, cloud endpoint,
+    # or a locally hosted expert); no backend is special-cased here.
+    #
+    # No expert is MANDATORY.  When no override is set the local model serves
+    # the turn, and local-only is a fully supported configuration — an expert
+    # tier augments the agent, it is never a prerequisite for reaching a goal.
+    # Hence `or config_list`: the fallback is the contract, not a safety net.
+    #
+    # Without it the module-level list, bound once at import, silently answered
+    # every speculative EXPERT turn on the default local model: measured
+    # 2026-09-01 as 233 outbound calls all carrying model="local" while the
+    # dispatcher believed it had routed to the EXPERT tier.
+    # Same pattern as hart_intelligence_entry.create_agents_for_user (:7242).
     llm_config = {
-        "config_list": config_list,
+        "config_list": thread_local_data.get_model_config_override() or config_list,
         "cache_seed": None,
     }
 
@@ -915,9 +932,11 @@ def create_agents_for_role(user_id: str, prompt_id):
 def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]":
     """Create new assistant & user proxy agents for a user with basic configuration."""
     user_prompt = f'{user_id}_{prompt_id}'
-    # Create a basic function calling config
+    # Create a basic function calling config.
+    # Per-dispatch model routing — see create_agents_for_role above for why the
+    # thread-local override must win over the import-time module config_list.
     llm_config = {
-        "config_list": config_list,
+        "config_list": thread_local_data.get_model_config_override() or config_list,
         "cache_seed": None
     }
 

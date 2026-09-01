@@ -91,7 +91,7 @@ class GenerateReceiptTool(unittest.TestCase):
         from unittest.mock import patch as _patch
         tmp = tempfile.mkdtemp(prefix='receipt_gen_')
         gen = _find(build_core_tool_closures(_ctx({})), 'generate_receipt')
-        with _patch('integrations.channels.response.receipt_image._receipts_dir',
+        with _patch('integrations.service_tools.receipt_image._receipts_dir',
                     return_value=tmp):
             out = gen(service='Party makeup', amount='8000', advance='2000',
                       event_timing='7pm', render='image')

@@ -4,7 +4,11 @@ Turns the fields `generate_receipt` collected into a receipt IMAGE with the
 business logo composited, for delivery over the same channel the request
 arrived on (WhatsApp etc., via MediaAttachment).
 
-Deliberately mirrors integrations/social/og_image.py — the one existing PIL
+Lives in service_tools because it is a CAPABILITY (what the agent can
+produce), not channel machinery — it never imports an adapter and the
+reply path only ever sees the file path via a [[MEDIA:]] marker
+(owner placement ruling, 2026-09-01). Deliberately mirrors
+integrations/social/og_image.py — the one existing PIL
 composition in the tree (optional Pillow import, font ladder, wrapped text,
 brand footer) — rather than introducing a second image stack or a PDF
 library (cx_Freeze bundling cost; PNG ships everywhere WhatsApp does).
