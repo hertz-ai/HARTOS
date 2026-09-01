@@ -574,19 +574,49 @@ class GossipProtocol:
                     wd.heartbeat('gossip')
             except Exception:
                 pass
-            try:
-                if now - last_gossip >= self.gossip_interval:
-                    self._gossip_round()
-                    last_gossip = now
-                if now - last_health >= self.health_interval:
-                    self._health_check_round()
-                    last_health = now
-                if now - last_integrity >= integrity_interval:
-                    self._integrity_round()
-                    last_integrity = now
-            except Exception as e:
-                logger.debug(f"Gossip loop error: {e}")
+            # Each round is isolated.  These three used to share ONE
+            # try/except, which had two compounding failure modes: a raising
+            # _gossip_round() skipped health AND integrity for that tick, and
+            # it left last_gossip un-advanced, so the next tick retried gossip
+            # immediately, raised again, and starved the other two rounds
+            # permanently.  At logger.debug, that is invisible.
+            #
+            # Measured on central 2026-09-01: the newest integrity challenge
+            # was 2026-08-31 04:29, 24h stale, while inbound announces were
+            # being served normally (465 peers seen in 10 minutes).  The
+            # retention sweep that keeps integrity_challenges from growing
+            # unbounded is wired into _integrity_round, so 155,869 rows sat
+            # past their window with the code to remove them never reached.
+            #
+            # last_* is advanced even when a round FAILS: a round that throws
+            # every time must retry on its own schedule, not spin every 5s and
+            # crowd out its siblings.  Failures are logged at WARNING now,
+            # because a silent one cost a day.
+            if now - last_gossip >= self.gossip_interval:
+                self._run_round('gossip', self._gossip_round)
+                last_gossip = now
+            if now - last_health >= self.health_interval:
+                self._run_round('health', self._health_check_round)
+                last_health = now
+            if now - last_integrity >= integrity_interval:
+                self._run_round('integrity', self._integrity_round)
+                last_integrity = now
             time.sleep(5)
+
+    def _run_round(self, name: str, fn) -> bool:
+        """Run one background round, isolated from its siblings.
+
+        A failure in one round must never stop a DIFFERENT round from running.
+        Returns True if the round completed without raising.
+        """
+        try:
+            fn()
+            return True
+        except Exception as e:
+            logger.warning("Gossip loop: %s round failed (%s: %s); "
+                           "other rounds continue on their own schedule",
+                           name, type(e).__name__, e)
+            return False
 
     # ─── Gossip Round ───
 
