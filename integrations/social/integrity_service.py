@@ -92,7 +92,16 @@ CHALLENGE_TIMEOUT_RETENTION_DAYS = int(
     os.environ.get('CHALLENGE_TIMEOUT_RETENTION_DAYS', '30'))
 # Bounded per round so the sweep never holds the write lock long enough to be
 # the thing it is fixing.  The backlog drains across rounds instead.
-CHALLENGE_PRUNE_BATCH = int(os.environ.get('CHALLENGE_PRUNE_BATCH', '2000'))
+#
+# 2000 was still too large to win the lock race on a contended DB. Measured on
+# central 2026-09-01: with the table at 240,092 rows the DELETE ... WHERE id IN
+# (2000 ids) failed outright with "database is locked", so the sweep could not
+# run at all -- the operation that shrinks the table was blocked BY the
+# contention that the oversized table causes. A smaller write acquires and
+# releases faster, so it interleaves with the daemon's writers instead of
+# starving against them. Each batch commits, so throughput per round is barely
+# affected: the same 10,000-row cap is reached in more, shorter transactions.
+CHALLENGE_PRUNE_BATCH = int(os.environ.get('CHALLENGE_PRUNE_BATCH', '250'))
 CHALLENGE_PRUNE_MAX_PER_ROUND = int(
     os.environ.get('CHALLENGE_PRUNE_MAX_PER_ROUND', '10000'))
 
