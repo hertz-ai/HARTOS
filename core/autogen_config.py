@@ -38,6 +38,26 @@ def get_autogen_config_list() -> list:
             "api_key": 'dummy',
             "base_url": get_local_llm_url(),
             "price": [0, 0],
+            # Local llama-server runs ONE slot (--parallel 1) on 2 cores. The
+            # openai SDK's default max_retries=2 is catastrophic there, not
+            # helpful: a "failure" is contention/slowness, never a transient
+            # network blip, so a retry cannot succeed where the first attempt is
+            # still working — it only RESUBMITS the same multi-KB prompt into the
+            # busy slot, forcing a full kv-cache recompute and doubling the load
+            # on the one slot. Measured on .69 (image 94c0fd9): a cold recipe
+            # CREATE stalled at gather turn 6/12 for 10 min with repeated
+            # "openai._base_client: Retrying request" and only 1 completion
+            # served — the retries WERE the stall. Zero retries lets a slow-but-
+            # progressing generation finish (the shared http_client already
+            # grants a 600s read budget) and surfaces a real failure cleanly.
+            # This also just extends the house policy already stated for the
+            # requests path in core.http_pool ("localhost: 0 retries ... fail
+            # instantly, not block") to the openai/httpx path, which was the one
+            # local caller it never reached. autogen 0.2.35 routes max_retries to
+            # OpenAI.__init__ (a keyword-only ctor arg on every openai>=1.x), so
+            # it lands on the client, not on .create(). Cloud branches above keep
+            # the default retries: a real cloud 429/5xx genuinely is transient.
+            "max_retries": 0,
         }]
 
     # Attach the shared httpx client so autogen/openai reuse ONE SSL context
