@@ -261,6 +261,24 @@ class ModelRegistry:
 
         return self.get_fast_model(min_accuracy)
 
+    def speculation_pair(self, min_accuracy: float = 0.0):
+        """The (fast, expert) pair speculation would use, or (None, None).
+
+        Speculation needs two DIFFERENT dispatchable backends: a fast one to
+        draft and an expert one to verify. That rule was written inline in
+        SpeculativeDispatcher.should_speculate and then a second time in
+        core.health_probe when it needed to report the same thing — two copies
+        of one decision, which drift the moment either is touched.
+
+        It belongs here, beside the selectors it composes, so the dispatcher
+        and any probe ask the SAME question rather than each rebuilding it.
+        """
+        fast = self.get_fast_model(min_accuracy)
+        expert = self.get_expert_model()
+        if not fast or not expert or fast.model_id == expert.model_id:
+            return None, None
+        return fast, expert
+
     def list_models(self, tier: ModelTier = None) -> List[ModelBackend]:
         """List all models, optionally filtered by tier."""
         with self._lock:

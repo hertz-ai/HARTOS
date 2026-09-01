@@ -287,13 +287,12 @@ class SpeculativeDispatcher:
         if not passed:
             return False
 
-        # Need both a fast and expert model
-        fast = self._registry.get_fast_model()
-        expert = self._registry.get_expert_model()
+        # Need two DIFFERENT dispatchable backends — one to draft, one to
+        # verify. The rule lives on the registry so this and health_probe ask
+        # the same question instead of each rebuilding it.
+        fast, expert = self._registry.speculation_pair()
         if not fast or not expert:
             return False
-        if fast.model_id == expert.model_id:
-            return False  # Same model — no point speculating
 
         # Budget check (if goal has spark budget)
         if goal and goal.get('spark_budget', 0) > 0:

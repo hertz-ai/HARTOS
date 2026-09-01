@@ -32,7 +32,7 @@ class ProbeModelSelectionTest(unittest.TestCase):
 
     def test_reports_fast_and_expert(self):
         p = probe_agent_daemon()
-        for k in ('fast_model', 'expert_model', 'speculation_possible'):
+        for k in ('fast_model', 'expert_model'):
             self.assertIn(k, p, k + ' missing from the daemon probe')
 
     def test_speculation_possible_true_when_models_differ(self):
@@ -42,7 +42,6 @@ class ProbeModelSelectionTest(unittest.TestCase):
             p = probe_agent_daemon()
         self.assertEqual(p['fast_model'], 'fast-1')
         self.assertEqual(p['expert_model'], 'claude-code')
-        self.assertTrue(p['speculation_possible'])
 
     def test_false_when_no_expert(self):
         """The case that would explain copilot never being called."""
@@ -51,7 +50,7 @@ class ProbeModelSelectionTest(unittest.TestCase):
              patch.object(mr.model_registry, 'get_expert_model', return_value=None):
             p = probe_agent_daemon()
         self.assertIsNone(p['expert_model'])
-        self.assertFalse(p['speculation_possible'])
+        self.assertIsNone(p['fast_model'])
 
     def test_false_when_fast_and_expert_are_the_same(self):
         """should_speculate rejects this: no point speculating against itself."""
@@ -60,7 +59,8 @@ class ProbeModelSelectionTest(unittest.TestCase):
         with patch.object(mr.model_registry, 'get_fast_model', return_value=same), \
              patch.object(mr.model_registry, 'get_expert_model', return_value=same):
             p = probe_agent_daemon()
-        self.assertFalse(p['speculation_possible'])
+        self.assertIsNone(p['fast_model'])
+        self.assertIsNone(p['expert_model'])
 
     def test_registry_failure_is_reported_not_swallowed(self):
         from integrations.agent_engine import model_registry as mr
@@ -68,10 +68,21 @@ class ProbeModelSelectionTest(unittest.TestCase):
                           side_effect=RuntimeError('registry exploded')):
             p = probe_agent_daemon()
         self.assertIn('model_registry_error', p)
-        self.assertFalse(p['speculation_possible'])
+        self.assertIsNone(p['fast_model'])
 
     def test_probe_still_reports_the_flag(self):
         self.assertIn('speculative_enabled', probe_agent_daemon())
+
+    def test_probe_does_not_re_derive_the_rule(self):
+        """The DRY gate this module's own docstring declares: the probe must
+        DELEGATE to ModelRegistry.speculation_pair(), not rebuild the
+        fast/expert/differ test that should_speculate also uses."""
+        import inspect
+        from core import health_probe
+        src = inspect.getsource(health_probe.probe_agent_daemon)
+        self.assertIn('speculation_pair()', src)
+        self.assertNotIn('get_fast_model(', src)
+        self.assertNotIn('get_expert_model(', src)
 
 
 if __name__ == '__main__':

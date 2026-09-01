@@ -58,30 +58,27 @@ def probe_agent_daemon() -> Dict[str, Any]:
             os.environ.get('HEVOLVE_SPECULATIVE_ENABLED', 'false').lower() == 'true'
         ),
     }
-    # Which models the LIVE registry would pick. speculative_enabled alone is
-    # not enough to explain why the EXPERT tier never gets used: should_speculate
-    # ALSO requires a fast and an expert model that differ, and nothing exposed
-    # the registry's actual selection from the running process.
+    # Which models the LIVE registry would pick. speculative_enabled alone
+    # cannot explain why the EXPERT tier goes unused: speculation ALSO needs a
+    # fast and an expert backend that differ, and nothing exposed the running
+    # process's actual selection. A fresh import is a different registry
+    # object, and no MCP tool showed it — model_status reports the llama.cpp
+    # server, expert_agents counts personas. Both are adjacent subsystems that
+    # sound like the answer and are not.
     #
-    # Without this, diagnosing "the flag is on and copilot is still never
-    # called" meant guessing. On 2026-09-01 a fresh shell showed
-    # fast=pocket-tts-100m / expert=claude-code and every gate passing, while
-    # the running desktop still made zero copilot calls across ~40 minutes of
-    # active dispatch — and there was no way to tell whether the running
-    # process's registry agreed, because a fresh import is a different registry.
+    # The rule itself is NOT re-derived here. ModelRegistry.speculation_pair()
+    # owns it, so this reports what the dispatcher will actually decide rather
+    # than a second copy that can drift from it.
     try:
         from integrations.agent_engine.model_registry import model_registry
-        _fast = model_registry.get_fast_model()
-        _expert = model_registry.get_expert_model()
+        _fast, _expert = model_registry.speculation_pair()
         out['fast_model'] = _fast.model_id if _fast else None
         out['expert_model'] = _expert.model_id if _expert else None
-        # The exact condition should_speculate checks, precomputed so a reader
-        # does not have to re-derive it.
-        out['speculation_possible'] = bool(
-            _fast and _expert and _fast.model_id != _expert.model_id)
     except Exception as e:
         out['fast_model'] = out['expert_model'] = None
-        out['speculation_possible'] = False
+        # Reported, not swallowed: without this a registry exception looks
+        # identical to "no models registered", and that ambiguity is the same
+        # silence that made this bug take an afternoon.
         out['model_registry_error'] = f'{type(e).__name__}: {e}'
 
     try:
