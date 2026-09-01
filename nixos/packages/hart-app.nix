@@ -29,6 +29,26 @@ let
   # two tight ones: numpy is 1.x and pydantic is 1.10.x in nixpkgs 24.11.
   # Tests need network + API keys, so doCheck=false; pythonImportsCheck still
   # proves the package imports inside the closed build.
+  # flaml — required (not optional) by pyautogen 0.2.x: autogen.oai imports it
+  # at module top, so dropping it from the dep set fails pythonImportsCheck.
+  # NOT in the 24.11 pin either (the eval gate proved it: "undefined variable
+  # 'flaml'" x14 on 4beff37, every build skipped). Core install_requires is
+  # NumPy alone (PyPI requires_dist, non-extra) — the automl/tune extras stay
+  # absent, which the codebase already tolerates ("flaml.automl is not
+  # available" is a known benign warning on desktops).
+  flamlPkg = python.pkgs.buildPythonPackage rec {
+    pname = "FLAML";
+    version = "2.3.3";
+    format = "setuptools";
+    src = pkgs.fetchPypi {
+      inherit pname version;
+      hash = "sha256-8yN9PklwuTgA/xdTiTYqjebWivS8MzwhGTF5Hpsm3r4=";
+    };
+    propagatedBuildInputs = with python.pkgs; [ numpy ];
+    doCheck = false;
+    pythonImportsCheck = [ "flaml" ];
+  };
+
   pyautogenPkg = python.pkgs.buildPythonPackage rec {
     pname = "pyautogen";
     version = "0.2.35";
@@ -37,10 +57,9 @@ let
       inherit pname version;
       hash = "sha256-dELgu+iBBniginAaZF1XNPiHzMIjstIc2Vv2i+KYcqE=";
     };
-    propagatedBuildInputs = with python.pkgs; [
+    propagatedBuildInputs = (with python.pkgs; [
       diskcache
       docker
-      flaml
       numpy
       openai
       packaging
@@ -48,7 +67,7 @@ let
       python-dotenv
       termcolor
       tiktoken
-    ];
+    ]) ++ [ flamlPkg ];
     doCheck = false;
     pythonImportsCheck = [ "autogen" ];
   };
