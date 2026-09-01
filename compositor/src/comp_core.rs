@@ -870,12 +870,37 @@ pub fn process_input_event<S: CompState, B: InputBackend>(state: &mut S, event: 
     // one-shot liveness signal here. Done BEFORE the kill-switch gate: a delivered-then-
     // blocked event still proves the seat is alive. Matches by reference so `event` is not
     // consumed before the real routing below.
+    // T_input capture for the input-to-photon instrument (latency.rs, harness
+    // M0). Same by-reference match as the liveness beacon and BEFORE the
+    // kill-switch gate for the same reason: a delivered-then-blocked event
+    // still carries a true kernel timestamp, and refusing to record it would
+    // bias the estimator toward busy periods. `Event::time()` is libinput's
+    // CLOCK_MONOTONIC microseconds — the kernel stamp, taken before any of
+    // our code ran, which is the entire point of the instrument.
     match &event {
-        InputEvent::Keyboard { .. }
-        | InputEvent::PointerMotion { .. }
-        | InputEvent::PointerMotionAbsolute { .. }
-        | InputEvent::PointerButton { .. }
-        | InputEvent::PointerAxis { .. } => note_input_alive(),
+        InputEvent::Keyboard { event } => {
+            crate::latency::on_input(crate::latency::Kind::Key, event.time());
+            note_input_alive();
+        }
+        InputEvent::PointerMotion { event } => {
+            crate::latency::on_motion(event.time());
+            note_input_alive();
+        }
+        InputEvent::PointerMotionAbsolute { event } => {
+            crate::latency::on_motion(event.time());
+            note_input_alive();
+        }
+        InputEvent::PointerButton { event } => {
+            crate::latency::on_button(
+                event.state() == ButtonState::Pressed,
+                event.time(),
+            );
+            note_input_alive();
+        }
+        InputEvent::PointerAxis { event } => {
+            crate::latency::on_input(crate::latency::Kind::Scroll, event.time());
+            note_input_alive();
+        }
         _ => {}
     }
     if state.capture_blocked() {

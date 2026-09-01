@@ -155,6 +155,13 @@ mod winit;
 // the SAME socket surface (the moat on real hardware too). The verb BODIES live in
 // `comp_core`; this is the transport + dispatch. Off on the default dev-box build.
 // See src/ipc.rs.
+// Input-to-photon instrument (LATENCY_HARNESS.md M0). NO cfg gate on purpose:
+// the core is pure (no Smithay types, no clock reads — timestamps are
+// arguments), so its unit tests run in BOTH CI legs, including the default
+// no-feature build. Only the WIRING lives in udev.rs/comp_core.rs behind
+// their existing gates.
+mod latency;
+
 #[cfg(any(feature = "winit", feature = "smithay"))]
 mod ipc;
 
