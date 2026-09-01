@@ -1110,6 +1110,9 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         Never refuse with "I can't access X" or "I don't have tools for Y".
         If a tool exists in the catalog, @Helper has it.  If a tool doesn't
         exist, ask @Helper to find an alternative (search, scrape, code).
+        Privacy means the USER'S data stays on this device — it does NOT
+        forbid fetching PUBLIC web pages; web/search/crawl tools are
+        allowed and expected when the task needs public content.
         The ONLY thing Helper can't do is execute python code — that's
         @Executor's job.  Everything else goes through @Helper.  Treat
         Helper as your unlimited capability surface.
