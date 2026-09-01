@@ -336,16 +336,15 @@ def pause_goal_for_budget(goal_id: Optional[str], reason: str) -> bool:
     if not goal_id:
         return False
     try:
-        from integrations.social.models import get_db, AgentGoal
-        db = get_db()
-        try:
+        # db_session is the canonical write path in models.py: commits on a
+        # clean exit, ROLLS BACK on exception, always closes.  Hand-rolling
+        # get_db/commit/close here (as an earlier draft of this function did)
+        # drops the rollback, which leaves a failed write sitting in the
+        # session until close discards it.
+        from integrations.social.models import db_session, AgentGoal
+        with db_session() as db:
             goal = db.query(AgentGoal).filter_by(id=goal_id).first()
-            if not apply_budget_pause(goal, reason):
-                return False
-            db.commit()
-            return True
-        finally:
-            db.close()
+            return apply_budget_pause(goal, reason)
     except Exception as e:
         logger.warning("Could not auto-pause goal %s after budget block: %s",
                        goal_id, e)
