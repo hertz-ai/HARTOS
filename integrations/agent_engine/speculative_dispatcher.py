@@ -1727,6 +1727,24 @@ class SpeculativeDispatcher:
             payload['prompt_id'] = prompt_id
         if goal_id:
             payload['goal_id'] = goal_id
+        # #750: the inner /chat runs on a FRESH handler thread — only the
+        # payload can carry the originating rid (hie:9099 reads it, :9253
+        # binds it).  Without it the whole inner reuse group ran
+        # request_id='' -> classified background -> routed to the CLOSABLE
+        # bg client -> closed by this very turn's own 0->1 foreground edge
+        # -> RuntimeError 'client has been closed' (3x live 2026-09-01;
+        # llm_outbound.jsonl rid='' source=autogen.reuse).  The expert
+        # worker already rebound the user rid to thread-local (#162,
+        # _expert_background_task); daemon dispatches carry their
+        # daemon_<goal_id> rid, which is_genuine_user_request still
+        # classifies background — #162 behavior preserved.
+        try:
+            from hartos.threadlocal import thread_local_data as _tl
+            _rid = _tl.get_request_id() or ''
+        except Exception:
+            _rid = ''
+        if _rid:
+            payload['request_id'] = _rid
         if goal_type and goal_type != 'general':
             payload['goal_type'] = goal_type
         return payload

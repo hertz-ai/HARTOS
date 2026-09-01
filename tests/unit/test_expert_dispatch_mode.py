@@ -138,3 +138,25 @@ def test_classifier_prompt_bans_live_data_none():
     assert 'Never \\"none\\" for live/current data' in _SRC, (
         "delegate summary lacks the live-data ban — the criteria block "
         "and the summary disagree, and the draft follows the summary")
+
+
+def test_payload_carries_originating_rid_from_thread_local():
+    """#750: the inner /chat runs on a FRESH handler thread — only the
+    payload can carry the rid (hie:9099 reads it).  Without it every
+    inner reuse send ran request_id='' -> background -> the CLOSABLE bg
+    client -> closed by the turn's own foreground edge -> RuntimeError
+    'client has been closed' (3x live 2026-09-01)."""
+    from hartos.threadlocal import thread_local_data as tl
+    tl.set_request_id(request_id='user-rid-750')
+    try:
+        p = _payload(goal_id=None)
+        assert p.get('request_id') == 'user-rid-750'
+    finally:
+        tl.set_request_id(request_id='')
+
+
+def test_payload_omits_rid_when_thread_local_empty():
+    from hartos.threadlocal import thread_local_data as tl
+    tl.set_request_id(request_id='')
+    p = _payload(goal_id=None)
+    assert 'request_id' not in p
