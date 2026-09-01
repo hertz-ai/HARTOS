@@ -1831,9 +1831,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # Tier-1 hierarchical gate (mirrors reuse_recipe): ONE detection per
         # constructor, consumed here and by the Tier-2 family loaders below.
         # Ungated, 50 rendered defs cost 5,820 of the 6,144-token slot.
-        from integrations.agent_engine.marketing_tools import detect_goal_tags
+        from integrations.agent_engine.marketing_tools import resolve_goal_tags
         from core.agent_tools import filter_service_tools
-        goal_tags = detect_goal_tags(task)
+        # No stored record exists yet at creation — resolve_goal_tags(None, x)
+        # is exactly detect_goal_tags(x); the stored leg activates when the
+        # create flow starts stamping goal_tags on the agent record (Lever 2).
+        goal_tags = resolve_goal_tags(None, task)
         _n_all_svc = len(svc_tools)
         svc_tools = filter_service_tools(goal_tags, svc_tools, svc_defs,
                                          service_tool_registry)

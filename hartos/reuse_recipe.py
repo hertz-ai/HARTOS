@@ -945,9 +945,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         recipes[user_prompt] = config
         final_recipe[prompt_id] = config
     goal = ''
+    stored_goal_tags = None
     with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
         config = json.load(f)
         goal = config['goal']
+        # Optional semantic tags stamped on the agent record at creation
+        # (Lever 2, owner 2026-09-01).  Absent on legacy records — the
+        # gate below then resolves to pure detection, exactly as before.
+        stored_goal_tags = config.get('goal_tags')
 
     current_app.logger.info(f'Got goal as {goal}')
     role_actions = []
@@ -2112,9 +2117,9 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         # Tier-1 hierarchical gate: ONE detection per constructor, consumed
         # here and by the Tier-2 family loaders below.  Ungated, all 50
         # rendered defs cost 5,820 of the 6,144-token slot (2026-08-31).
-        from integrations.agent_engine.marketing_tools import detect_goal_tags
+        from integrations.agent_engine.marketing_tools import resolve_goal_tags
         from core.agent_tools import filter_service_tools
-        goal_tags = detect_goal_tags(goal or '')
+        goal_tags = resolve_goal_tags(stored_goal_tags, goal or '')
         _n_all_svc = len(svc_tools)
         svc_tools = filter_service_tools(goal_tags, svc_tools, svc_defs,
                                          service_tool_registry)

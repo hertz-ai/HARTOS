@@ -600,3 +600,23 @@ def detect_goal_tags(prompt) -> list:
         tags.append('media')
 
     return tags
+
+
+def resolve_goal_tags(stored_tags, text) -> list:
+    """Layered goal-tag resolution (owner ruling 2026-09-01: 'fuzzy +
+    semantic would be better').
+
+    ``stored_tags`` are the agent's semantic tags assigned at creation
+    and persisted on its record (same goal-tag vocabulary this module's
+    detector emits, so get_tool_tags/filter_service_tools downstream is
+    untouched).  They UNION with the lexical detector: a legacy record
+    without stored tags resolves to exactly ``detect_goal_tags(text)``
+    — the pre-existing behavior — and a tagged record can only GAIN
+    tags, never lose one.  Non-string entries in stored_tags are
+    dropped, not raised on (the record is user-writable JSON).
+    """
+    detected = detect_goal_tags(text)
+    stored = {t for t in (stored_tags or []) if isinstance(t, str) and t}
+    if not stored:
+        return detected
+    return sorted(stored | set(detected))

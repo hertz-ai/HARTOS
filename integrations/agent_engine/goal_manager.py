@@ -2757,7 +2757,10 @@ register_goal_type('hive_proof', _build_hive_proof_prompt,
 # paper_explanation) are merged, not replaced.
 _CAPABILITY_TAGS = {
     'marketing': ['web', 'scraping', 'publish', 'seo', 'blog'],
-    'coding': ['github', 'pr', 'coding'],
+    # web_search + crawling: a coding agent reads docs and pages — the
+    # row lacked both (measured gap, owner ruling 2026-09-01; the rest
+    # of the programmer workbench is always-on core + @Executor).
+    'coding': ['github', 'pr', 'coding', 'web_search', 'crawling'],
     'ip_protection': ['web'],
     'revenue': ['payments'],
     'self_build': [],
