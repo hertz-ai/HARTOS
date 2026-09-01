@@ -1919,7 +1919,12 @@ class GossipProtocol:
                 db.commit()
             except Exception as _e:
                 db.rollback()
-                logger.debug(f"Integrity round decay sweep failed: {_e}")
+                # WARNING, not debug. The hevolve_social logger runs at WARNING
+                # in production, so a debug line here is invisible and a sweep
+                # that throws on every round looks identical to one that has
+                # nothing to do.
+                logger.warning("Integrity round decay sweep failed (%s: %s)",
+                               type(_e).__name__, _e)
 
             # 0b. Retention sweep — integrity_challenges is append-only and had
             #     no expiry, so it grew to 300,092 rows / 386 MB (plus ~60 MB of
@@ -1942,7 +1947,18 @@ class GossipProtocol:
                            if _pruned.get('more_remaining') else ""))
             except Exception as _e:
                 db.rollback()
-                logger.debug(f"Integrity round retention sweep failed: {_e}")
+                # WARNING, not debug — and this one bit me directly. On central
+                # the sweep ran twice (300,092 -> 290,092 -> 280,092) and then
+                # stopped, with 135,869 rows still eligible and NOTHING in the
+                # logs either way: the success line is INFO and this failure
+                # line was debug, both invisible at the production WARNING
+                # level. The only observable was a row count that would not
+                # move, which is not a diagnosis.
+                #
+                # I wrote that blind spot into this file today while telling
+                # other agents that absence of an INFO log proves nothing.
+                logger.warning("Integrity round retention sweep failed (%s: %s)",
+                               type(_e).__name__, _e)
 
             active_peers = db.query(PeerNode).filter(
                 PeerNode.status == 'active',
