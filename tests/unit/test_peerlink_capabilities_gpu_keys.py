@@ -12,6 +12,7 @@ assert a GPU node now advertises gpu + vram_mb and a CPU node omits them.
 """
 import os
 import sys
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -21,9 +22,33 @@ import integrations.service_tools.vram_manager as vram  # noqa: E402
 from core.peer_link.link import PeerLink  # noqa: E402
 
 
+# ── ORDER-INDEPENDENCE, added 2026-09-01 ─────────────────────────────────────
+# `_get_local_capabilities` now reads the CANONICAL cached hardware profile
+# (security.system_requirements.get_capabilities()) and only falls back to a
+# direct detect_gpu() probe when that cache is empty.
+#
+# These two tests patch `detect_gpu`, so they exercise the FALLBACK. They used to
+# reach it by luck: get_capabilities() returns None until run_system_check() has
+# run, and nothing in a bare test process runs it. But `integrations/social/
+# __init__.py` calls run_system_check() AT IMPORT — so the moment any test in the
+# same pytest process imports integrations.social, the cache populates, the
+# profile branch wins, this patch is BYPASSED, and these assertions fail with the
+# real machine's VRAM instead of the mocked 8192. Order-dependent green.
+#
+# Measured 2026-09-01: cache empty -> vram_mb 8192 (passes); cache populated ->
+# vram_mb 24576 (fails). So force the branch instead of hoping for it. The
+# profile path has its own coverage in
+# tests/unit/test_peerlink_capabilities_use_canonical_profile.py.
+def _force_fallback():
+    """Pin get_capabilities() to None so the direct-probe branch is taken."""
+    stub = types.ModuleType('security.system_requirements')
+    stub.get_capabilities = lambda: None
+    return patch.dict(sys.modules, {'security.system_requirements': stub})
+
+
 def test_gpu_node_advertises_gpu_and_vram():
     """A CUDA node must advertise its GPU name + VRAM (the bug: it didn't)."""
-    with patch.object(vram, 'detect_gpu', return_value={
+    with _force_fallback(), patch.object(vram, 'detect_gpu', return_value={
             'name': 'RTX 3070', 'total_gb': 8.0,
             'free_gb': 3.0, 'cuda_available': True}):
         caps = PeerLink._get_local_capabilities()
@@ -34,7 +59,7 @@ def test_gpu_node_advertises_gpu_and_vram():
 
 def test_cpu_node_omits_gpu():
     """No CUDA -> no gpu/vram keys (and never crashes)."""
-    with patch.object(vram, 'detect_gpu', return_value={
+    with _force_fallback(), patch.object(vram, 'detect_gpu', return_value={
             'name': None, 'total_gb': 0.0,
             'free_gb': 0.0, 'cuda_available': False}):
         caps = PeerLink._get_local_capabilities()
