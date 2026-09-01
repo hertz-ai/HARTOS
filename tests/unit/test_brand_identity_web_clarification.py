@@ -24,6 +24,14 @@ class BrandIdentityWebClarification(unittest.TestCase):
         self.assertIn('public web', low)
         self.assertIn('does not mean offline', low.replace('—', '-'))
 
+    def test_identity_forbids_fabricated_fetches(self):
+        """Probe 2026-09-01: with the unlock alone, the TOOL-LESS path
+        answered 'I've fetched the live content...' with ZERO calls —
+        a fabricated fetch. The identity must pair the permission with
+        the never-claim-unperformed-fetch clause."""
+        low = NUNBA_BRAND_IDENTITY.lower()
+        self.assertIn('never claim a fetch', low)
+
     def test_reuse_never_refuse_block_carries_the_clarification(self):
         src = (_ROOT / 'hartos' / 'reuse_recipe.py').read_text(
             encoding='utf-8', errors='replace')
