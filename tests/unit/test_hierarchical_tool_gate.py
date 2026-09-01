@@ -82,10 +82,12 @@ class HierarchicalToolGate(unittest.TestCase):
         caps = get_tool_tags('coding')
         self.assertIn('web', caps)
         self.assertIn('crawling', caps)
-        self.assertIn('computer-use', caps)
         self.assertIn('coding', caps)   # existing rows preserved
         self.assertIn('github', caps)
         self.assertNotIn('web_search', caps)  # synonym drift guard
+        # screen/GUI work is the always-on core tool (qwen3vl_backend),
+        # NOT the legacy omniparser ServiceTool — owner ruling 2026-09-01
+        self.assertNotIn('computer-use', caps)
         # behavioral: the row actually UNLOCKS the web tool through the
         # real filter (fake crawl4ai declares ['web','scraping'])
         kept = filter_service_tools(['coding'], _SVC_TOOLS, _SVC_DEFS,

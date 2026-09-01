@@ -2758,10 +2758,13 @@ register_goal_type('hive_proof', _build_hive_proof_prompt,
 _CAPABILITY_TAGS = {
     'marketing': ['web', 'scraping', 'publish', 'seo', 'blog'],
     # Registry-vocabulary rows (each tag verified against a declared
-    # ServiceTool tag): web/crawling -> crawl4ai, github/pr -> gh_pr,
-    # computer-use -> omniparser (owner 2026-09-01: a coding agent reads
-    # docs and looks at the desktop; execution is always-on core tools).
-    'coding': ['github', 'pr', 'coding', 'web', 'crawling', 'computer-use'],
+    # ServiceTool tag): web/crawling -> crawl4ai, github/pr -> gh_pr.
+    # NO 'computer-use' here (owner 2026-09-01): screen/GUI work is the
+    # always-on core tool execute_windows_or_android_command, whose VLM
+    # path runs on the main Qwen3-VL (qwen3vl_backend replaced the
+    # OmniParser pipeline); the omniparser ServiceTool wrapper is legacy
+    # and its base_url :8080 now belongs to llama-server.
+    'coding': ['github', 'pr', 'coding', 'web', 'crawling'],
     'ip_protection': ['web'],
     'revenue': ['payments'],
     'self_build': [],
