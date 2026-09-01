@@ -224,6 +224,29 @@ sudo docker cp langchain_tmp:/tmp/release_manifest.json ./release_manifest.json
 docker rm -f langchain_tmp
 
 echo "=== Validate release manifest on Deepbox ==="
+# A DIRECTORY here is the specific failure that froze this deploy for hours on
+# 2026-09-01, so it is checked explicitly rather than left to `json.tool` to
+# report as a confusing IsADirectoryError. Line ~298 bind-mounts this path into
+# the container; if it is missing at `docker run`, Docker silently creates it
+# as a root-owned DIRECTORY, the container writes its manifest inside it, and
+# the next deploy's cleanup cannot unlink it as the deploy user. The whole
+# script then dies before `git reset --hard`, pinning the checkout at the SHA
+# named inside that very file.
+if [ -d release_manifest.json ]; then
+  echo "FATAL: release_manifest.json is a DIRECTORY, not a file." >&2
+  echo "  Docker created it as a bind-mount target because the file was" >&2
+  echo "  missing when the container started. Clear it with:" >&2
+  echo "    sudo rm -rf release_manifest.json" >&2
+  echo "  and re-run the deploy. Leaving it in place blocks EVERY future" >&2
+  echo "  deploy at the cleanup step, silently." >&2
+  exit 1
+fi
+if [ ! -f release_manifest.json ]; then
+  echo "FATAL: release_manifest.json was not produced by docker cp above." >&2
+  echo "  Refusing to continue: docker run would recreate it as a directory" >&2
+  echo "  and poison the next deploy." >&2
+  exit 1
+fi
 ls -l release_manifest.json
 file release_manifest.json
 python3 -m json.tool release_manifest.json >/dev/null
