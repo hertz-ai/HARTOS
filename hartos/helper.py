@@ -2396,7 +2396,18 @@ else:
         "model": 'Qwen3-VL-4B-Instruct',
         "api_key": 'dummy',
         "base_url": _llm_base,
-        "price": [0, 0]
+        "price": [0, 0],
+        # max_retries=0 on the LOCAL single-slot llama: the openai SDK default
+        # (2) turns a slow turn into a retry storm — it resubmits the multi-KB
+        # prompt into the one busy slot and forces a kv-cache recompute, so the
+        # multi-agent group chat (visual_agent/helper2/executor2/multi_role_agent2
+        # below all take this llm_config) never advances. Same fix and reason as
+        # hartos.gather_agentdetails and core.autogen_config's local branches;
+        # measured live on .69 (d5b0bfe, 2026-09-01). Cloud branch keeps default
+        # retries (a real 429/5xx is transient). The three inline local configs
+        # are a known parallel-path debt — consolidation is gated on auditing the
+        # 'Qwen3-VL-4B-Instruct' model-name consumers (see gather_agentdetails).
+        "max_retries": 0,
     }]
 
 llm_config = {

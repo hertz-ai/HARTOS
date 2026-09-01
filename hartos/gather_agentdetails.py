@@ -188,7 +188,30 @@ def create_agents_for_user(user_id: str, autonomous=False, initial_description=N
             "model": 'Qwen3-VL-4B-Instruct',
             "api_key": 'dummy',
             "base_url": get_local_llm_url(),
-            "price": [0, 0]
+            "price": [0, 0],
+            # Local llama-server is ONE slot (--parallel 1) on 2 cores. The
+            # openai SDK's default max_retries=2 turns a slow gather turn into a
+            # STALL, not a recovery: a retry cannot succeed where the first
+            # attempt is still generating — it resubmits the multi-KB prompt into
+            # the busy slot, forces a full kv-cache recompute, and the gather
+            # never advances. Measured live on .69 (d5b0bfe, 2026-09-01): a
+            # gather stalled at turn 6/12 for 10 min with repeated
+            # "openai._base_client: Retrying request"; with retries off it
+            # completed in 2 clean llama POSTs. Same fix, same reason as
+            # core.autogen_config.get_autogen_config_list's local branch.
+            #
+            # NOTE (parallel-path debt, deliberately not consolidated here):
+            # this inline config_list duplicates get_autogen_config_list. The
+            # honest fix is for gather to CALL that single source, but its local
+            # "model" is 'Qwen3-VL-4B-Instruct' (consumed by helper.py,
+            # hart_intelligence_entry.py, model_registry.py, local_loop.py and
+            # the llm_outbound_logger wire-trim layer), and that function's local
+            # model is 'local' — collapsing the two would silently change the
+            # model name those consumers key on. Consolidation is a follow-up
+            # gated on auditing those consumers; the retry fix must not wait on
+            # it, and must not regress the model name. Cloud branch above keeps
+            # default retries (a real 429/5xx is transient).
+            "max_retries": 0,
         }]
 
     # Create a basic function calling config
