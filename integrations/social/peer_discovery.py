@@ -720,9 +720,49 @@ class GossipProtocol:
             now = datetime.utcnow()
             purged = 0
             live_peers = []
+
+            # WALL-CLOCK BUDGET. This loop pings every non-dead peer serially at
+            # _ping_peer's 3s timeout. _background_loop runs gossip, health and
+            # integrity in sequence, so a long health round does not just delay
+            # itself -- it STARVES the integrity round behind it, which is due
+            # every 300s.
+            #
+            # Measured on central 2026-09-01: 566 non-dead rows x 3s = up to ~28
+            # minutes for ONE health round, against a 5-minute integrity
+            # interval. The integrity round had not produced a challenge in 29h
+            # and its retention sweep removed 0 rows across a fresh container,
+            # with NOTHING in the logs -- because nothing raised. The round was
+            # simply never reached. Calling the sweep by hand on that same
+            # container removed exactly 10,000 rows, proving the sweep was fine
+            # and only the scheduling was broken.
+            #
+            # 18c3e3cb isolated the rounds against EXCEPTIONS. This is the other
+            # half: isolation against DURATION. A round that cannot finish in
+            # its budget yields and resumes next tick instead of holding the
+            # loop.
+            _budget_s = float(os.environ.get(
+                'HEVOLVE_HEALTH_ROUND_BUDGET_S', '30'))
+            _started = time.time()
+            # Rotate the starting point so a budget cut does not re-check the
+            # same prefix forever and never reach the tail of the table.
+            if peers:
+                _cursor = getattr(self, '_health_cursor', 0) % len(peers)
+                peers = peers[_cursor:] + peers[:_cursor]
+            _examined = 0
+
             for peer in peers:
                 if not self._running:
                     break
+                if time.time() - _started > _budget_s:
+                    self._health_cursor = (
+                        getattr(self, '_health_cursor', 0) + _examined)
+                    logger.warning(
+                        "Health round hit its %.0fs budget after %d/%d peers; "
+                        "yielding so the integrity round is not starved "
+                        "(resumes from this point next round)",
+                        _budget_s, _examined, len(peers))
+                    break
+                _examined += 1
                 if peer.node_id == self.node_id:
                     continue
                 # #38: a structurally-unroutable row (loopback / docker-bridge /
@@ -792,7 +832,12 @@ class GossipProtocol:
                 pass
         except Exception as e:
             db.rollback()
-            logger.debug(f"Health check error: {e}")
+            # WARNING, not debug: this round owns peer liveness and the #38
+            # unroutable-row purge. A silent failure here leaves stale peers
+            # 'active' and the junk rows in place, which is what inflates every
+            # node count.
+            logger.warning("Health check round failed (%s: %s)",
+                           type(e).__name__, e)
         finally:
             db.close()
 
