@@ -246,6 +246,21 @@ def attach_for_tags(cap_tags, helper, executor, registry, attached_names):
 # Core tool closure factory
 # ---------------------------------------------------------------------------
 
+# Neutral fallback receipt (#752) used until the user accepts a custom template.
+# The accept-once flow overrides it via save_data_in_memory('receipt_template').
+# {var} placeholders are filled by the existing TemplateEngine.
+_DEFAULT_RECEIPT_TEMPLATE = (
+    "RECEIPT\n"
+    "{business_name}\n"
+    "Date: {date}\n"
+    "Received from: {client_name}\n"
+    "For: {service}\n"
+    "Amount: {currency} {amount}\n"
+    "{notes}\n"
+    "Thank you for your business."
+)
+
+
 def build_core_tool_closures(ctx):
     """Build session-scoped tool closures.  Returns list of (name, desc, func).
 
@@ -449,6 +464,53 @@ def build_core_tool_closures(ctx):
         "get_data_from_memory",
         "Returns all data from the internal Memory using key (alias of get_data_by_key)",
         get_data_by_key,
+    ))
+
+    # ------------------------------------------------------------------
+    # 5b. generate_receipt (#752 — receipt for a service, over any channel)
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def generate_receipt(
+        service: Annotated[str, "Service provided, e.g. 'Bridal makeup'."],
+        amount: Annotated[str, "Amount charged, e.g. '5000'."],
+        client_name: Annotated[str, "Client's name."] = "",
+        currency: Annotated[str, "Currency code or symbol, e.g. 'INR'."] = "INR",
+        date: Annotated[str, "Receipt date; defaults to today when omitted."] = "",
+        notes: Annotated[str, "Optional notes or line items."] = "",
+        business_name: Annotated[str, "Your business or artist name."] = "",
+    ) -> str:
+        """Fill the user's accepted receipt template with the given details.
+
+        Reuses the per-prompt KV store (save_data_in_memory / get_data_by_key)
+        as the "template they accept": the agent proposes a template, the user
+        confirms it, and it is saved under key 'receipt_template'.  Falls back to
+        a neutral default when none is stored.  Renders via the existing
+        TemplateEngine and returns the receipt text for the agent to send back
+        over the same channel the request arrived on (WhatsApp, etc.).
+        """
+        template = get_data_by_key("receipt_template")
+        if not template or template == "Key not found in stored data.":
+            template = _DEFAULT_RECEIPT_TEMPLATE
+        from integrations.channels.response.templates import TemplateEngine
+        return TemplateEngine().render(template, extra_vars={
+            "business_name": business_name,
+            "client_name": client_name,
+            "service": service,
+            "amount": amount,
+            "currency": currency,
+            "date": date or datetime.now().strftime("%Y-%m-%d"),
+            "notes": notes,
+        })
+
+    tools.append((
+        "generate_receipt",
+        "Generate a receipt for a service the user provided, using their "
+        "accepted receipt template and the given details (service, amount, "
+        "client name, currency, date, notes, business name). On first use, "
+        "propose a template; once the user confirms it, save it with "
+        "save_data_in_memory under key 'receipt_template'. Returns the receipt "
+        "text to send back to the user.",
+        generate_receipt,
     ))
 
     # ------------------------------------------------------------------
