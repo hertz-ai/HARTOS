@@ -497,6 +497,24 @@ def init_social(app):
             _os_fb.environ['HEVOLVE_AGENT_ENGINE_ENABLED'] = 'true'
 
     # Start decentralized gossip peer discovery (background thread)
+    #
+    # NOTE the asymmetry this used to have: the success line is INFO and the
+    # failure line is WARNING, but the SKIP had no line at all. So a node where
+    # _boot_verified came out False started no gossip, no LAN discovery, no
+    # integrity round -- and said nothing about it at any level. From outside,
+    # "gossip running fine" and "gossip never started" looked identical.
+    #
+    # That cost real time on 2026-09-01: central's retention sweep stopped
+    # draining (280,092 rows, 135,869 still eligible, 0 removed across ~24 min
+    # of a fresh container) with ZERO log lines of any kind -- no failure, no
+    # CRITICAL, no gossip line either way. Every visible branch was ruled out by
+    # elimination, which left the one branch that is invisible by construction.
+    # The else below removes that hiding place.
+    if not _boot_verified:
+        logger.warning(
+            "HevolveSocial: boot verification did not pass, so gossip, LAN "
+            "auto-discovery and the integrity round are ALL disabled on this "
+            "node. Peering, federation and challenge retention will not run.")
     if _boot_verified:
         try:
             from .peer_discovery import gossip
