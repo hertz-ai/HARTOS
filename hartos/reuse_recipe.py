@@ -1357,6 +1357,35 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             return "Visual watcher unavailable: HARTOS still initialising."
         return _handle(input_text)
 
+    # create_scheduled_jobs stays INLINE on the reuse-main leg: the
+    # factory's same-named tool is a create-flow STUB ("creation process
+    # will do it at the end" — end-of-creation machinery schedules), but
+    # a LIVE reuse agent must schedule NOW.  Two behaviors under one
+    # name = a #511 name collision; until that is resolved canonically,
+    # this restores the exact pre-#743 body (owner audit 2026-09-01
+    # found the swap had silently stubbed real scheduling).
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="tool",
+                             description="Use this to Create scheduled jobs")
+    @log_tool_execution
+    def create_scheduled_jobs(cron_expression: Annotated[
+        str, "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday)."],
+                              job_description: Annotated[str, "Description of the job to be performed"]) -> str:
+        current_app.logger.info('INSIDE create_scheduled_jobs')
+        if not scheduler.running:
+            scheduler.start()
+
+        try:
+            trigger = CronTrigger.from_crontab(cron_expression)
+            job_id = f"job_{int(time.time())}"
+            scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,
+                              args=[job_description, user_id, prompt_id, 0])
+            current_app.logger.info('Successfully created scheduler job')
+            return 'Successfully created scheduler job'
+        except Exception as e:
+            current_app.logger.info(f'Error in create_scheduled_jobs: {str(e)}')
+            return f"Error creating scheduled job: {str(e)}"
+
     # --- MemoryGraph provenance tools (remember, recall, backtrace) ---
     if memory_graph is not None:
         try:
@@ -1936,10 +1965,13 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         'get_data_by_key', 'get_user_id', 'get_prompt_id', 'Generate_video',
         'get_user_uploaded_file', 'get_user_camera_inp', 'get_chat_history',
         'search_visual_history', 'search_long_term_memory',
-        'save_to_long_term_memory', 'create_scheduled_jobs',
+        'save_to_long_term_memory',
         'send_message_to_user', 'send_presynthesized_video_to_user',
         'send_message_in_seconds', 'google_search',
     }
+    # create_scheduled_jobs is NOT in the filter: the factory's twin is a
+    # create-flow stub; the real live-scheduling version stays inline
+    # above (see the #511 name-collision note at its definition).
     register_core_tools(
         [t for t in core_tools if t[0] in _MAIN_LEG_CORE], helper, assistant)
 

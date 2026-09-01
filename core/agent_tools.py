@@ -347,6 +347,20 @@ def build_core_tool_closures(ctx):
             else:
                 tool_logger.warning(f"Failed to persist data to file for prompt_id {prompt_id}")
 
+            # Mirror to MemoryGraph (fire-and-forget).  Carried by
+            # reuse_recipe's inline twin before the #743 migration, lost
+            # in the swap, restored here (owner audit 2026-09-01).  Pairs
+            # with get_data_by_key's [KV] recall fallback below.
+            if memory_graph is not None:
+                try:
+                    threading.Thread(target=lambda: memory_graph.register(
+                        f"[KV] {key} = {json.dumps(validated_value)[:200]}",
+                        {'memory_type': 'fact', 'source_agent': 'helper',
+                         'session_id': user_prompt, 'kv_key': key},
+                    ), daemon=True).start()
+                except Exception:
+                    pass
+
             try:
                 stored_value = get_data_by_key(key)
                 tool_logger.info(f"VERIFICATION - READ BACK VALUE: {stored_value}")
@@ -410,6 +424,17 @@ def build_core_tool_closures(ctx):
                 d = d[k]
             return f'{d}'
         except KeyError:
+            # Fallback: check MemoryGraph for persisted [KV] data — the
+            # read half of save_data_in_memory's dual-write, carried by
+            # reuse_recipe's inline twin before the #743 migration and
+            # restored here (owner audit 2026-09-01).
+            if memory_graph is not None:
+                try:
+                    results = memory_graph.recall(f"[KV] {key}", mode='text', top_k=1)
+                    if results:
+                        return results[0].content
+                except Exception:
+                    pass
             return "Key not found in stored data."
 
     tools.append((
@@ -897,6 +922,20 @@ def build_core_tool_closures(ctx):
                     "user_id": user_id,
                     "prompt_id": prompt_id,
                 }))
+                # Dual-write to MemoryGraph (fire-and-forget).  Carried by
+                # reuse_recipe's inline twin before the #743 migration and
+                # lost in the swap — restored HERE so all three legs
+                # (main/time/visual) get graph provenance, not just reuse.
+                if memory_graph is not None:
+                    try:
+                        threading.Thread(target=lambda: memory_graph.register(
+                            content, {'memory_type': 'fact',
+                                      'source_agent': speaker,
+                                      'session_id': user_prompt,
+                                      'source': 'simplemem'},
+                        ), daemon=True).start()
+                    except Exception:
+                        pass
                 return "Saved to long-term memory."
             except Exception as e:
                 tool_logger.info(f"SimpleMem save error: {e}")
