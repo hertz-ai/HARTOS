@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import base64
 from typing import Optional, List, Dict, Any, Callable
 from datetime import datetime
@@ -275,7 +276,18 @@ class WhatsAppAdapter(ChannelAdapter, RoomCapableAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            # The embedded Baileys gateway's send route (whatsapp/gateway.js)
+            # reads {to, text} and returns 400 "to + text required" when `to`
+            # is absent — so every agent auto-reply through this adapter was
+            # failing at the gateway (inbound worked, the reply never sent).
+            # Inbound chat_id already IS a JID (gateway sets
+            # chat.id._serialized = key.remoteJid), so reply on it directly;
+            # normalise a bare number to a JID exactly as
+            # api_channels.whatsapp_send does.  chatId retained for
+            # whatsapp-web.js-style targets that read it instead.
+            to_jid = chat_id if "@" in chat_id else f"{re.sub(r'[^0-9]', '', chat_id)}@s.whatsapp.net"
             payload: Dict[str, Any] = {
+                "to": to_jid,
                 "chatId": chat_id,
                 "text": text,
             }
