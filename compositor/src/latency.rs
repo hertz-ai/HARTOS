@@ -506,15 +506,21 @@ mod tests {
 
     #[test]
     fn the_window_reports_p50_p99_max_against_the_budget() {
-        // 99 fast frames and one stutter: the mean would pass, p99 must fail.
-        let mut ls = vec![8_000u64; 99];
-        ls.push(19_000); // one 19ms drag frame > the 16ms budget
+        // 96 fast frames and FOUR stutters: >1% of the window, so p99 lands on
+        // a stutter by definition. (My first version used ONE stutter in 101
+        // samples and asserted p99 caught it -- that is statistically false:
+        // a single outlier sits beyond the 99th percentile. One-in-a-hundred
+        // events are max's job, which is also reported; p99's job is "this
+        // stutters repeatedly", and four-in-a-hundred is that.)
+        let mut ls = vec![8_000u64; 96];
+        ls.extend([19_000u64; 4]); // four 19ms drag frames > the 16ms budget
         let s = run_window(&ls);
         let drag = s.iter().find(|x| x.kind == Kind::Drag).unwrap();
         assert_eq!(drag.n, 101); // 100 + the window-closing frame
         assert_eq!(drag.p50_us, 8_000);
-        assert!(drag.p99_us >= 19_000, "p99 must surface the stutter");
-        assert!(!drag.pass, "one visible stutter in 100 frames is a FAIL");
+        assert!(drag.p99_us >= 19_000, "p99 must surface repeated stutter");
+        assert_eq!(drag.max_us, 19_000, "max reports the worst single frame");
+        assert!(!drag.pass, "four visible stutters in 100 frames is a FAIL");
     }
 
     #[test]
