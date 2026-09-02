@@ -449,6 +449,14 @@ pub trait CompState:
         set_capture_blocked_shared(self, on)
     }
 
+    /// NATIVE SHELL M3: is the native scene render path on? Default OFF, so the
+    /// WebView shell stays the desktop and this is a pure additive test path with no
+    /// regression. The DRM backend flips it from the HART_NATIVE_SHELL env at session
+    /// start (no nix option shipped until M6). Read once per frame; cheap bool.
+    fn native_shell_on(&self) -> bool {
+        false
+    }
+
     // ── IPC event fan-out (window.opened/closed/focused…). The winit backend pushes
     //    framed JSON to its `IpcState` subscribers; the DRM backend logs the edge.
     //    The shared WM edges call this so the event surface is identical on both. ──
@@ -1919,6 +1927,53 @@ where
 /// windows (faded) → Bottom/Background layers.
 /// Generic over R so BOTH backends build the identical frame; the backend then binds its
 /// framebuffer + draws this slice. This is the single source of the desktop's z-order.
+/// NATIVE SHELL M3 GL LOWERING (first cut): lower the native shell scene to render
+/// elements. Only Rect leaves (top bar, taskbar, hero and card tiles) become
+/// SolidColorRenderElements for now; Text (glyph atlas), Image (texture) and OrbSlot
+/// (reuse the M2 orb element) are the M3 remainder. Gated by `native_shell_on` at the
+/// call site, so with the flag OFF this never runs.
+///
+/// FIRST-CUT alloc note: builds the scene and one SolidColorBuffer per rect PER FRAME.
+/// That violates the zero-per-frame-alloc NFR on purpose: step one is proving the
+/// native scene scans out; step two retains the tree (rebuild on compose/resize only)
+/// and pools the buffers. Not shipped past M3 as-is.
+pub fn render_native_scene<S, R>(
+    state: &S,
+    size: Size<i32, Physical>,
+    elements: &mut Vec<HartRenderElement<R>>,
+) where
+    S: CompState,
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Send + Clone + 'static,
+{
+    let _ = state;
+    let home = crate::scene::HomeCompose::demo();
+    let theme = crate::scene::Theme::cosmic_default();
+    let tree = crate::scene::layout_home(size.w as f32, size.h as f32, &home, &theme);
+
+    let mut leaves: Vec<&crate::scene::SceneNode> = Vec::new();
+    tree.flatten(&mut leaves);
+    for leaf in leaves {
+        if let crate::scene::SceneNode::Rect { rect, color, .. } = leaf {
+            if rect.w < 1.0 || rect.h < 1.0 {
+                continue;
+            }
+            let mut buf = SolidColorBuffer::new(
+                (rect.w as i32, rect.h as i32),
+                [color.r, color.g, color.b, color.a],
+            );
+            let el = SolidColorRenderElement::from_buffer(
+                &mut buf,
+                (rect.x as i32, rect.y as i32),
+                Scale::from(1.0),
+                color.a,
+                Kind::Unspecified,
+            );
+            elements.push(HartRenderElement::Solid(el));
+        }
+    }
+}
+
 pub fn build_frame_elements<S, R>(
     state: &mut S,
     renderer: &mut R,
@@ -1949,6 +2004,13 @@ where
     } else {
         // ── 1. SOFTWARE CURSOR (below killswitch, above windows). ──
         build_cursor_elements(state, renderer, &mut elements);
+    }
+
+    // ── 1b. NATIVE SHELL M3 scene (gated OFF by default via native_shell_on). Pushed
+    //    here so native chrome sits above the app windows and below the cursor. A pure
+    //    additive path: flag off = no-op, the WebView shell is untouched. ──
+    if state.native_shell_on() {
+        render_native_scene(state, size, &mut elements);
     }
 
     let ws_alpha = workspace_fade_alpha(state);

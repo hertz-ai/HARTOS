@@ -119,6 +119,16 @@ mod bloom;
 #[cfg(any(feature = "winit", feature = "smithay"))]
 mod orb;
 
+// ── NATIVE SHELL PARITY PROGRAM, M3: the SceneNode foundation (top bar + hero +
+// rows + taskbar as a scene tree, text via glyph atlas). M0 named "land the
+// SceneNode enum + A2UI->Scene decoder" but never did, so latency.rs still reads
+// "there is no native scene graph". src/scene.rs is PURE geometry + the home_compose
+// decoder + the a2 layout, with its unit floor; comp_core lowers a SceneNode tree to
+// HartRenderElements on the render path. Same gate as bloom/orb (its only consumer is
+// comp_core), so the smithay doCheck exercises the layout + decode tests. ──
+#[cfg(any(feature = "winit", feature = "smithay"))]
+mod scene;
+
 // ── Phase-5 Smithay handler BODIES (CI-COMPILE only) ──
 // The real xdg-shell / XWayland / xdg-decoration / wlr-foreign-toplevel-management
 // handler bodies live in `wayland.rs`, gated behind the `smithay` cargo feature
