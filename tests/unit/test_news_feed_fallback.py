@@ -100,6 +100,44 @@ def test_working_urls_do_not_trigger_fallback(monkeypatch):
         'default feeds were fetched even though the supplied feed worked')
 
 
+def test_news_tools_registered_for_llm_on_both_agents():
+    """Both the Helper AND the Assistant must carry the news tools' LLM schema.
+
+    Live root cause (2026-09-03): the Assistant only had the tools in its
+    execution map, not its LLM schema, so when speaker-selection let the
+    Assistant propose a news tool, llama.cpp's --jinja grammar had no schema to
+    constrain it and the model free-formed the Qwen3 <tool_call> as plain text,
+    which autogen never executes.  Guard that the assistant.register_for_llm
+    line is not silently dropped.
+    """
+    llm = {'helper': set(), 'assistant': set()}
+    execu = {'helper': set(), 'assistant': set()}
+
+    def _mk(bucket_llm, bucket_exec):
+        class _Agent:
+            def register_for_llm(self, name=None, description=None):
+                def deco(fn):
+                    bucket_llm.add(name); return fn
+                return deco
+
+            def register_for_execution(self, name=None):
+                def deco(fn):
+                    bucket_exec.add(name); return fn
+                return deco
+        return _Agent()
+
+    helper = _mk(llm['helper'], execu['helper'])
+    assistant = _mk(llm['assistant'], execu['assistant'])
+    news_tools.register_news_tools(helper, assistant, '0')
+
+    assert 'fetch_news_feeds' in llm['helper']
+    assert 'fetch_news_feeds' in llm['assistant'], (
+        "Assistant lost its news-tool LLM schema — it will emit <tool_call> as "
+        "unexecuted text again (the 2026-09-03 live bug)")
+    # Execution still lives on the Assistant (the executor side is unchanged).
+    assert 'fetch_news_feeds' in execu['assistant']
+
+
 if __name__ == '__main__':
     import pytest
     raise SystemExit(pytest.main([__file__, '-v']))

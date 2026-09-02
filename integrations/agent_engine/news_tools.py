@@ -408,6 +408,21 @@ def register_news_tools(helper, assistant, user_id: str):
 
     for name, desc, func in tools:
         helper.register_for_llm(name=name, description=desc)(func)
+        # Give the Assistant the LLM SCHEMA too, not just execution.  Measured
+        # live 2026-09-03 (news agent 96264170748): when group-chat
+        # speaker-selection lets the Assistant — not the Helper — propose a news
+        # tool, the Assistant carried no schema for it, so llama.cpp's --jinja
+        # grammar could not constrain the call and the model free-formed Qwen3
+        # <tool_call> XML as PLAIN TEXT content (even mixing in parameters from
+        # other tools).  autogen never executes a text tool call, so
+        # fetch_news_feeds never ran and the agent produced no headlines, while
+        # get_trending_news (which the Helper happened to propose) executed fine.
+        # With the schema present the Assistant emits a STRUCTURED tool_calls
+        # that func_call_filter routes to its own function_map (the
+        # register_for_execution below) for real execution.  Deliberately dual
+        # here — diverges from the helper=llm/assistant=exec split on purpose; do
+        # not "simplify" it back.
+        assistant.register_for_llm(name=name, description=desc)(func)
         assistant.register_for_execution(name=name)(func)
 
     logger.info(f"Registered {len(tools)} news tools for user {user_id}")
