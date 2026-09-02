@@ -1121,7 +1121,12 @@ def drain_instruction_queue(user_id: str, max_tokens: int = 8000) -> Optional[st
                         base_url, user_id, inst, plan.batch_id,
                     )
                     if error:
-                        q.fail_instruction(iid, error)
+                        # A deferral is not the instruction's fault: the LLM
+                        # was busy or a human was using it. Burning an attempt
+                        # would dead-letter healthy work because someone was
+                        # typing.
+                        _transient = str(error).startswith('deferred:')
+                        q.fail_instruction(iid, error, transient=_transient)
                         logger.warning(f"Instruction [{iid}] failed: {error}")
                     else:
                         q.complete_instruction(iid, result)
@@ -1150,7 +1155,12 @@ def drain_instruction_queue(user_id: str, max_tokens: int = 8000) -> Optional[st
                         for future in concurrent.futures.as_completed(futures):
                             iid, result, error = future.result()
                             if error:
-                                q.fail_instruction(iid, error)
+                                # Same deferral exemption as the single-
+                                # instruction branch above: a busy LLM must
+                                # not burn an attempt.
+                                _transient = str(error).startswith('deferred:')
+                                q.fail_instruction(iid, error,
+                                                   transient=_transient)
                                 logger.warning(f"Instruction [{iid}] failed: {error}")
                             else:
                                 q.complete_instruction(iid, result)

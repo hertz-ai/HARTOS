@@ -74,6 +74,12 @@ _QUEUE_DIR = os.path.join(
 )
 
 
+# Real execution attempts an instruction gets before it is dead-lettered.
+# Deferrals (user active / LLM saturated) do not count — see fail_instruction.
+MAX_INSTRUCTION_ATTEMPTS = int(
+    os.environ.get('HEVOLVE_INSTRUCTION_MAX_ATTEMPTS', '5'))
+
+
 class InstructionStatus(str, Enum):
     QUEUED = 'queued'           # Waiting for compute
     BATCHED = 'batched'         # Included in a batch, not yet executed
@@ -90,6 +96,9 @@ class Instruction:
         'id', 'user_id', 'text', 'status', 'created_at',
         'updated_at', 'priority', 'tags', 'context',
         'related_goal_id', 'batch_id', 'result', 'error',
+        # How many times a REAL execution attempt failed. Deferrals (a human
+        # is using the LLM) are explicitly not counted — see fail_instruction.
+        'attempts',
     )
 
     def __init__(self, user_id: str, text: str, priority: int = 5,
@@ -111,9 +120,11 @@ class Instruction:
         self.batch_id = None
         self.result = None
         self.error = None
+        self.attempts = 0
 
     def to_dict(self) -> Dict:
         return {
+            'attempts': self.attempts,
             'id': self.id,
             'user_id': self.user_id,
             'text': self.text,
@@ -145,6 +156,10 @@ class Instruction:
         inst.batch_id = d.get('batch_id')
         inst.result = d.get('result')
         inst.error = d.get('error')
+        # Absent on queues written before the cap existed: those instructions
+        # start from 0 and get a full allowance rather than being dead-lettered
+        # on their first failure after an upgrade.
+        inst.attempts = int(d.get('attempts', 0) or 0)
         return inst
 
 
@@ -809,13 +824,40 @@ class InstructionQueue:
                         logger.debug(f"Ledger completion failed for [{ltid}]: {e}")
             self._save()
 
-    def fail_instruction(self, instruction_id: str, error: str):
-        """Mark a single instruction as failed and return to queue."""
+    def fail_instruction(self, instruction_id: str, error: str,
+                         transient: bool = False):
+        """Record a failed execution attempt.
+
+        Returns the instruction to the queue for another try, EXCEPT once it
+        has burned ``MAX_INSTRUCTION_ATTEMPTS`` real attempts, at which point
+        it is dead-lettered as FAILED and stops being re-dispatched.
+
+        There was no cap, so an instruction that could never succeed retried
+        for as long as the node ran. Measured on the live desktop
+        2026-09-02: the copilot queue drained the same 8 benchmark shards
+        every ~50s and every one failed HTTP 400, 88 failures in a day, and
+        it would have gone on forever because a failure put the instruction
+        straight back to QUEUED with nothing counting.
+
+        ``transient=True`` says "this was not the instruction's fault" — the
+        LLM was busy or a human was using it — and must NOT burn an attempt.
+        Counting deferrals would dead-letter healthy work purely because
+        someone was typing, which is worse than the bug this cap fixes.
+        """
         with self._lock:
             inst = self._instructions.get(instruction_id)
             if not inst:
                 return
-            inst.status = InstructionStatus.QUEUED
+            if not transient:
+                inst.attempts = int(getattr(inst, 'attempts', 0) or 0) + 1
+            if (not transient
+                    and inst.attempts >= MAX_INSTRUCTION_ATTEMPTS):
+                inst.status = InstructionStatus.FAILED
+                logger.warning(
+                    "Instruction [%s] dead-lettered after %d attempts: %s",
+                    instruction_id, inst.attempts, error)
+            else:
+                inst.status = InstructionStatus.QUEUED
             inst.batch_id = None
             inst.error = error
             inst.updated_at = datetime.utcnow().isoformat()
