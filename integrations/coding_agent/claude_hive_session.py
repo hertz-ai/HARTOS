@@ -411,6 +411,15 @@ class ClaudeHiveSession:
                 result['status'] = 'completed'
                 result['changes'] = execution_result.get('changes', [])
                 result['test_results'] = execution_result.get('test_results')
+                result['output'] = execution_result.get('output')
+                # The in-backend executor PARSES diffs and never APPLIES them
+                # (nothing on this path writes a file), so for a task whose
+                # deliverable is a code change the changes are PROPOSED, not
+                # landed.  Say so on the result rather than let a downstream
+                # reader take `changes` as evidence that the repo moved.
+                # Measured on .69 2026-09-02: a task "create copilot_proof.txt"
+                # reported completed at quality 0.50 with no file on disk.
+                result['changes_applied'] = False
 
             # Step 4: Score complexity
             result['complexity_score'] = self._score_complexity(
@@ -462,6 +471,13 @@ class ClaudeHiveSession:
                 ),
                 'test_output': result.get('test_results'),
                 'error': result.get('error'),
+                # Evidence the validator can actually judge. Without these two
+                # a result whose only property was "no error" cleared the 0.4
+                # quality gate and was paid Spark: validate_result's remaining
+                # checks are "no error reported" and "DLP clean", and an empty
+                # result passes both.
+                'output': result.get('output'),
+                'changes_applied': result.get('changes_applied', False),
             }
 
             reward_info = dispatcher.on_task_result(task_id, dispatcher_result)
@@ -539,6 +555,15 @@ class ClaudeHiveSession:
                 result['status'] = 'completed'
                 result['changes'] = execution_result.get('changes', [])
                 result['test_results'] = execution_result.get('test_results')
+                result['output'] = execution_result.get('output')
+                # The in-backend executor PARSES diffs and never APPLIES them
+                # (nothing on this path writes a file), so for a task whose
+                # deliverable is a code change the changes are PROPOSED, not
+                # landed.  Say so on the result rather than let a downstream
+                # reader take `changes` as evidence that the repo moved.
+                # Measured on .69 2026-09-02: a task "create copilot_proof.txt"
+                # reported completed at quality 0.50 with no file on disk.
+                result['changes_applied'] = False
 
             # 4. Score complexity
             result['complexity_score'] = self._score_complexity(
@@ -1008,6 +1033,13 @@ class ClaudeHiveSession:
         result = {
             'changes': [],
             'test_results': None,
+            # The pipeline's actual answer.  It used to be parsed for diffs and
+            # test markers and then DROPPED, so a task whose deliverable is not
+            # a diff (BENCHMARK, MODEL_ONBOARD) reported literally no evidence
+            # of anything and still validated — validate_result's remaining
+            # checks are "no error" and "DLP clean", which an empty result
+            # passes.  Retained so the validator has something to judge.
+            'output': None,
             'error': None,
         }
 
@@ -1031,6 +1063,7 @@ class ClaudeHiveSession:
             if response:
                 result['changes'] = self._parse_changes_from_response(response)
                 result['test_results'] = self._extract_test_results(response)
+                result['output'] = response[:4000]
             else:
                 result['error'] = 'Pipeline returned no response'
 

@@ -216,6 +216,50 @@ def validate_result(task: HiveTask, result: Dict) -> float:
       - No PII leakage (DLP scan)
       - Result dict contains expected keys
     """
+    # 0. EVIDENCE GATE — before any scoring.
+    #
+    # Checks 4 (no error reported) and 5 (DLP clean) are both satisfied by a
+    # result that contains NOTHING, and with no files_scope and no
+    # requires_tests that alone scores 2/3 = 0.67, clearing on_task_result's
+    # 0.4 gate. So a task that did no work was marked VALIDATED and paid
+    # Spark. Measured on .69 2026-09-02: a task to create a file reported
+    # completed at quality 0.50 with no file on disk, because the in-backend
+    # executor asks the LLM for a diff, parses it, and never applies it.
+    #
+    # What counts as evidence depends on what the task was FOR:
+    #   code-producing types  a diff or a changed file, and for a code change
+    #                         to be real it must have been APPLIED — a
+    #                         proposal is not a completion.
+    #   everything else       (BENCHMARK, MODEL_ONBOARD) the deliverable is
+    #                         not a diff, so the answer itself is the
+    #                         evidence: output, or test output.
+    # No evidence -> 0.0, which fails the gate, so the task is FAILED and
+    # earns nothing rather than being silently paid for text.
+    _CODE_TYPES = {
+        HiveTaskType.CODE_WRITE.value, HiveTaskType.CODE_TEST.value,
+        HiveTaskType.BUG_FIX.value, HiveTaskType.REFACTOR.value,
+        HiveTaskType.DOCUMENTATION.value, HiveTaskType.CODE_REVIEW.value,
+    }
+    _has_change = bool(result.get('files_changed') or result.get('diff'))
+    _has_answer = bool(result.get('output') or result.get('test_output'))
+    if task.task_type in _CODE_TYPES:
+        # `changes_applied` absent means the reporter did not say either way.
+        # Treat that as applied so an external executor that really does write
+        # files (the claude-code daemon) is not penalised for not carrying a
+        # flag it never had to set; the in-backend executor sets it False
+        # explicitly because it is the one that cannot apply.
+        _applied = result.get('changes_applied', True)
+        _has_evidence = _has_change and _applied
+    else:
+        _has_evidence = _has_change or _has_answer
+    if not _has_evidence:
+        logger.warning(
+            "Task %s reported no evidence of work (type=%s, changes=%s, "
+            "applied=%s, answer=%s) — scoring 0",
+            task.task_id[:8], task.task_type, _has_change,
+            result.get('changes_applied'), _has_answer)
+        return 0.0
+
     score = 0.0
     checks_total = 0
 
