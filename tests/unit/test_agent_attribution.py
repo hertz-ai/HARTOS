@@ -267,6 +267,78 @@ class TestTTLCleanup(unittest.TestCase):
         self.assertEqual(orch.get_stats()['total_timed_out'], 1)
 
 
+class TestIdleActionsAreNotInteractions(unittest.TestCase):
+    """An action that did nothing must not be recorded as training data.
+
+    agent_daemon opens a `proactive_hive_tick` action at the top of EVERY
+    tick and completes it at the bottom, so an idle node submitted one
+    "experience" every 30 seconds whose prompt was the sentence
+    "agent_daemon ran proactive_hive_tick (goal=None, parent=None, steps=0,
+    observations=0, success=1.0)".  Each one cost a ConversationEntry row
+    and an LLM call, because record_interaction runs redact_experience ->
+    secret_redactor._model_detect_pii, which POSTs the text to the
+    configured endpoint.
+
+    Measured on central 2026-09-02: conversation_entries held 389,972 rows
+    and 387,856 of them (99.5%) were that pair, two per tick since
+    2026-06-03.
+    """
+
+    def _bridge(self):
+        mock_bridge = MagicMock()
+        return mock_bridge, MagicMock(return_value=mock_bridge)
+
+    def _complete(self, orch, aid):
+        mock_bridge, mock_get = self._bridge()
+        with patch('integrations.agent_engine.world_model_bridge.get_world_model_bridge',
+                   mock_get):
+            with patch.object(orch, '_emit_completion_event'):
+                orch.complete_action(aid, outcome={'status': 'ok'})
+        return mock_bridge
+
+    def test_an_empty_tick_is_not_recorded(self):
+        """The exact shape the daemon produced 2,880 times a day per node."""
+        orch = AgentAttributionOrchestrator()
+        aid = orch.begin_action('agent_daemon', 'proactive_hive_tick',
+                                expected_outcome={'status': 'ok'})
+        bridge = self._complete(orch, aid)
+        bridge.record_interaction.assert_not_called()
+
+    def test_a_tick_that_did_something_is_still_recorded(self):
+        """A tick that explored or dispatched has steps and must survive."""
+        orch = AgentAttributionOrchestrator()
+        aid = orch.begin_action('agent_daemon', 'proactive_hive_tick',
+                                expected_outcome={'status': 'ok'})
+        orch.record_step(aid, 'hive_explore', decision='dispatched')
+        bridge = self._complete(orch, aid)
+        bridge.record_interaction.assert_called_once()
+
+    def test_an_action_with_a_goal_is_still_recorded(self):
+        """Goal-bound work never had steps recorded in some paths; the goal
+        itself is enough to make it a real interaction."""
+        orch = AgentAttributionOrchestrator()
+        aid = orch.begin_action('agent_daemon', 'goal_dispatch', goal_id='g1')
+        bridge = self._complete(orch, aid)
+        bridge.record_interaction.assert_called_once()
+
+    def test_an_action_with_only_an_observation_is_still_recorded(self):
+        orch = AgentAttributionOrchestrator()
+        aid = orch.begin_action('agent_daemon', 'proactive_hive_tick')
+        orch.record_observation(aid, 'sensor_reading', data={'x': 1})
+        bridge = self._complete(orch, aid)
+        bridge.record_interaction.assert_called_once()
+
+    def test_a_child_in_a_causal_chain_is_still_recorded(self):
+        """A child action has no steps of its own; the parent link IS the
+        attribution. An earlier revision of this gate checked only
+        goal/steps/observations and broke TestCausalChain."""
+        orch = AgentAttributionOrchestrator()
+        parent = orch.begin_action('root', 'orchestrate')
+        child = orch.begin_action('child', 'work', parent_action_id=parent)
+        bridge = self._complete(orch, child)
+        bridge.record_interaction.assert_called_once()
+
+
 class TestWorldModelBridgeIntegration(unittest.TestCase):
     """Validate that complete_action routes to WorldModelBridge.record_interaction."""
 
