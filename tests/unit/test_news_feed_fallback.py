@@ -138,6 +138,44 @@ def test_news_tools_registered_for_llm_on_both_agents():
     assert 'fetch_news_feeds' in execu['assistant']
 
 
+def test_executor_agent_gets_execution_registration():
+    """A non-proposer executor must be able to RUN the news tools.
+
+    Live root cause (2026-09-03): FIX A let the Assistant emit STRUCTURED
+    fetch_news_feeds tool_calls, but the tools' only execution target was the
+    Assistant itself — autogen won't let the same agent speak twice in a row to
+    run its own call, so the call stranded (no role=tool result).  Registering
+    execution on the dedicated executor agent lets func_call_filter route the
+    Assistant's calls to a non-proposer that runs them.  Guard the wiring.
+    """
+    exec_names = set()
+
+    class _Agent:
+        def register_for_llm(self, name=None, description=None):
+            def deco(fn):
+                return fn
+            return deco
+
+        def register_for_execution(self, name=None):
+            def deco(fn):
+                return fn
+            return deco
+
+    class _Executor:
+        def register_for_execution(self, name=None):
+            def deco(fn):
+                exec_names.add(name); return fn
+            return deco
+
+    news_tools.register_news_tools(_Agent(), _Agent(), '0', executor=_Executor())
+    assert 'fetch_news_feeds' in exec_names, (
+        "the executor agent did not get execution registration for "
+        "fetch_news_feeds — the Assistant's structured tool_calls will strand "
+        "again (the 2026-09-03 live bug)")
+    # No-executor call must still work (backward compatible).
+    news_tools.register_news_tools(_Agent(), _Agent(), '0')  # must not raise
+
+
 if __name__ == '__main__':
     import pytest
     raise SystemExit(pytest.main([__file__, '-v']))
