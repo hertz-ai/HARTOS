@@ -1055,6 +1055,37 @@ class ToolMessageHandler:
                     f"— both would cause OpenAI 400 (2+ assistant messages / "
                     f"alternation rule)."
                 )
+
+            if messages and not any(
+                    (m.get('role') or '').lower() == 'user'
+                    for m in messages):
+                # #725: mid-loop the reuse view can lose its user turn — a
+                # re-selected speaker spams an unexecuted <tool_call> (emitted
+                # as TEXT) so the view fills with role=assistant (+ maybe a
+                # role=tool result), and the coalesce above collapses the
+                # assistant run.  llama-server's Qwen3 template then raises a
+                # hard 500 "No user query found in messages." — and it needs a
+                # role=USER turn specifically (a role=tool result does NOT
+                # count as the user query; live-reproduced 2026-09-03, message
+                # view was [assistant(tool_calls), tool, assistant]).
+                # Guarantee one role=user turn.  Seed the REAL current action
+                # text (not a vague "continue") so the model still does the
+                # intended work.  Strict no-op when a user turn already
+                # survived.
+                _seed = "Please continue with the current task."
+                try:
+                    _t = self.user_tasks[self.user_prompt]
+                    _a = _t.get_action(_t.current_action - 1)
+                    if isinstance(_a, dict) and _a.get('action'):
+                        _seed = _a['action']
+                except Exception:
+                    pass
+                messages.insert(0, {'role': 'user', 'name': 'User',
+                                    'content': _seed})
+                current_app.logger.info(
+                    "[ROLE-ORDER-GUARD] seeded one user turn (no user/tool "
+                    "message survived coalesce) to satisfy the Qwen3 "
+                    "'No user query found in messages' template (#725).")
         except Exception as _guard_err:
             # Never break the upstream pipeline — if the guard itself
             # crashes, fall through with the original messages and let
