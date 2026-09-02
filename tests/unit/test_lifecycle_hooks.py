@@ -580,6 +580,15 @@ class TestTrackRecipeCompletion:
         result = lifecycle_hook_track_recipe_completion(UP, {"status": "pending"}, action)
         assert result["action"] == "allow"
 
+    @pytest.mark.parametrize("bad", [["status", "done"], [{"status": "done"}], "done", 7])
+    def test_non_dict_json_is_allowed_not_crashed(self, bad):
+        # Same retrieve_json call sites feed this hook; on a list it would have
+        # raised AttributeError on .get rather than TypeError on the index.
+        _walk_to_state(UP, 1, ActionState.RECIPE_REQUESTED)
+        action = _make_action_obj(current_action=1)
+        result = lifecycle_hook_track_recipe_completion(UP, bad, action)
+        assert result["action"] == "allow"
+
     def test_with_ttl_cache(self):
         _walk_to_state(UP, 1, ActionState.RECIPE_REQUESTED)
         action = _make_action_obj(current_action=1)
@@ -1029,6 +1038,27 @@ class TestProcessVerifierResponse:
         from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response
         action = _make_action_obj(current_action=1)
         result = lifecycle_hook_process_verifier_response(UP, None, action)
+        assert result["action"] == "allow"
+
+    # helper.retrieve_json returns json.loads(repair_json(...)), and repair_json
+    # turns model prose into a list as readily as a dict. On a list the old
+    # `'status' not in json_obj` guard was an ELEMENT test, so a list carrying
+    # the string 'status' reached `json_obj['status']` and raised
+    # "TypeError: list indices must be integers or slices, not str" — measured
+    # on central 2026-09-02 12:43:29Z and delivered to the user as
+    # "I couldn't finish that". These pin every non-dict shape to 'allow'.
+    @pytest.mark.parametrize("bad", [
+        ["status", "completed"],          # the shape that crashed production
+        [{"status": "completed"}],        # verifier answer wrapped in a list
+        "status: completed",              # parser handed back a bare string
+        42,
+    ])
+    def test_non_dict_json_is_allowed_not_crashed(self, bad):
+        from hartos.lifecycle_hooks import lifecycle_hook_process_verifier_response
+        set_action_state(UP, 1, ActionState.IN_PROGRESS)
+        set_action_state(UP, 1, ActionState.STATUS_VERIFICATION_REQUESTED)
+        action = _make_action_obj(current_action=1)
+        result = lifecycle_hook_process_verifier_response(UP, bad, action)
         assert result["action"] == "allow"
 
 
