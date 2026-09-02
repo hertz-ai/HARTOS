@@ -5721,6 +5721,26 @@ def _pooled_post_with_refusal_check(api_url, json=None, app_logger=None, **kwarg
     the only thing that changes is the prompt's tone.
     """
     body = json or {}
+    # Fit the request to the server's per-slot n_ctx budget BEFORE the POST.
+    # The httpx wire hook (core.llm_outbound_logger._apply_trim_to_request)
+    # trims autogen / openai-SDK traffic, but this wrapper posts through the
+    # requests pool (core.http_pool.pooled_post), which bypasses httpx — the
+    # "raw requests.post minority" the trim's own architecture note flags.  So
+    # a langchain ReAct follow-up prompt (the re-rendered full tool schema plus
+    # a large tool observation) reached llama-server untrimmed and 500'd with
+    # "request (N tokens) exceeds the available context size", after which the
+    # turn returned the generic error instead of an answer (live 2026-09-02,
+    # weather-in-London: 14,899 > 12,288 n_ctx).  Route through the ONE canonical
+    # trimmer both wire paths share — idempotent, no-ops on bodies that already
+    # fit — so no second trim implementation and no budget drift.  Best-effort:
+    # never block a chat turn on the optimisation; an untrimmed oversized body
+    # still fails loudly at llama-server exactly as it did before this line.
+    try:
+        from core.llm_outbound_logger import _trim_to_budget
+        body = _trim_to_budget(body)[0]
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "_pooled_post_with_refusal_check: wire-trim skipped", exc_info=True)
     # This is a COMPLETION, not an ordinary API call.  Without this the call
     # inherits http_pool.DEFAULT_TIMEOUT (3, 15) — a 15s read budget that is
     # shorter than a local 4B generation, so it could never succeed: it timed
