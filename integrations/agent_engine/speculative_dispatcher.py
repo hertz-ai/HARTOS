@@ -1865,16 +1865,24 @@ class SpeculativeDispatcher:
             return ''
 
         # Non-bundled: HTTP POST to the configured backend.
+        # Carries the same credential ``dispatch_goal`` sends: on the
+        # central tier security/middleware.py gate 2 answers a bare
+        # self-POST with 401 (measured 2026-09-02, 2ms), and this leg
+        # was silently dead there since it was added.
         try:
             import requests as _req
+            from integrations.agent_engine.dispatch import _internal_auth_headers
             base = os.environ.get(
                 'HEVOLVE_BASE_URL',
                 f'http://localhost:{get_port("backend")}',
             )
-            resp = _req.post(f'{base}/chat', json=payload, timeout=60)
+            resp = _req.post(f'{base}/chat', json=payload,
+                             headers=_internal_auth_headers(), timeout=60)
             if resp.status_code == 200:
                 return (resp.json() or {}).get('response') or ''
-            logger.debug(
+            # WARNING, not DEBUG: central emits no INFO/DEBUG after boot,
+            # so a dead leg at DEBUG is invisible to every operator.
+            logger.warning(
                 "local expert /chat HTTP returned %s", resp.status_code)
         except Exception as e:
             logger.debug("local expert HTTP dispatch failed: %s", e)
@@ -1973,13 +1981,21 @@ class SpeculativeDispatcher:
                 logger.debug(f"Direct draft dispatch failed ({model.model_id}): {e}")
             return ''
 
-        # HTTP mode: external HARTOS server
+        # HTTP mode: external HARTOS server. Same credential as
+        # ``dispatch_goal`` (see ``_dispatch_expert_langchain``): without
+        # it the central tier's gate 2 answers 401 and the fast path
+        # returns '' on every dispatch.
         import requests as req
+        from integrations.agent_engine.dispatch import _internal_auth_headers
         base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
         try:
-            resp = req.post(f'{base_url}/chat', json=payload, timeout=30)
+            resp = req.post(f'{base_url}/chat', json=payload,
+                            headers=_internal_auth_headers(), timeout=30)
             if resp.status_code == 200:
                 return resp.json().get('response', '')
+            logger.warning(
+                f"Model dispatch ({model.model_id}) /chat returned "
+                f"{resp.status_code}")
         except req.RequestException as e:
             logger.debug(f"Model dispatch failed ({model.model_id}): {e}")
         return ''
