@@ -18,6 +18,7 @@ Workflow:
 
 import logging
 import uuid
+import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -27,6 +28,29 @@ from agent_ledger.verification import TaskVerification, TaskBaseline
 from core.constants import HIVE_DEPTH
 
 logger = logging.getLogger(__name__)
+
+# A claimed task is treated as orphaned only once its claim is older than
+# this AND its lock is gone. DistributedTaskLock takes a 300s TTL renewed
+# every 90s by a heartbeat thread, so 2x the TTL means several missed
+# renewals: the owner is not slow, it is gone.
+_ORPHAN_AFTER_S = int(os.environ.get('HEVOLVE_TASK_ORPHAN_AFTER_S', '600'))
+
+
+def _claim_age_seconds(task):
+    """Seconds since this task was claimed, or None if unknown.
+
+    None means "cannot tell", and the caller treats that as "leave it
+    alone" — a missing or unparseable stamp must never be the reason a
+    live task is handed to a second worker.
+    """
+    stamp = (getattr(task, 'context', None) or {}).get('claimed_at')
+    if not stamp:
+        return None
+    try:
+        return (datetime.now()
+                - datetime.fromisoformat(str(stamp))).total_seconds()
+    except (TypeError, ValueError):
+        return None
 
 
 class HiveDepthExceeded(ValueError):
@@ -162,8 +186,66 @@ class DistributedTaskCoordinator:
         """
         for task_id in self._ledger.task_order:
             task = self._ledger.get_task(task_id)
-            if not task or task.status != TaskStatus.PENDING:
+            if not task:
                 continue
+
+            # ORPHAN RECOVERY: a task whose worker died is IN_PROGRESS in the
+            # ledger with no lock in Redis, and nothing ever put it back.
+            # claim_next_task only considers PENDING, so it was never
+            # re-claimed, its goal never grounded, and (since the completion
+            # gate started requiring the ledger) that goal sat in
+            # awaiting_verification until it auto-paused.  Measured on central
+            # 2026-09-02: 6 tasks IN_PROGRESS against a single-threaded worker
+            # that can hold at most one.
+            #
+            # DistributedTaskLock.reclaim_stale_tasks() exists for this and is
+            # NOT the fix: it deletes the Redis key and leaves the ledger
+            # untouched, so the task stays unclaimable.  Its only caller is a
+            # test.  The two facts have to be reconciled where they meet,
+            # which is here.
+            #
+            # Absence of the lock is a strong signal, not a race: try_claim_task
+            # takes a 300s TTL renewed every 90s by a heartbeat thread, so an
+            # unlocked IN_PROGRESS task means >300s with no renewal — the owner
+            # is gone.  A live worker's task keeps its lock and is skipped.
+            # ONLY leaf work units. A goal's ROOT task is IN_PROGRESS for as
+            # long as its children run and nothing ever locks it, so an
+            # orphan check that ignored parentage handed roots out as work —
+            # caught by test_coordinator_backends, which expected the child
+            # `task_...` and got the `goal_...` root instead.
+            if (task.status == TaskStatus.IN_PROGRESS
+                    and getattr(task, 'parent_task_id', None)
+                    and not getattr(task, 'child_task_ids', None)):
+                try:
+                    # BOTH conditions, not just the missing lock. Absence of a
+                    # lock alone is not evidence of death — a mocked or
+                    # momentarily unreachable lock oracle reads the same way,
+                    # and test_no_double_claim proved that recovering on that
+                    # alone lets a second worker steal a task a first worker is
+                    # actively running. Double execution is worse than a stall.
+                    # claimed_at is stamped below on every successful claim, so
+                    # an old stamp plus no lock is positive evidence that the
+                    # owner is gone.
+                    _age = _claim_age_seconds(task)
+                    if (_age is not None and _age > _ORPHAN_AFTER_S
+                            and not self._lock.is_task_locked(task_id)):
+                        logger.warning(
+                            "Task %s was IN_PROGRESS with no lock (worker "
+                            "died); returning it to PENDING", task_id)
+                        self._ledger.update_task_status(
+                            task_id, TaskStatus.PENDING)
+                        task.context.pop("claimed_by", None)
+                        self._ledger.save()
+                    else:
+                        continue        # genuinely in flight elsewhere
+                except Exception as e:
+                    logger.debug(
+                        "Orphan check failed for %s: %s", task_id, e)
+                    continue
+            elif task.status != TaskStatus.PENDING:
+                continue
+            # Roots and any other non-PENDING task fall through the elif above
+            # and are skipped exactly as before this recovery existed.
 
             # Check capability match
             if capabilities:
