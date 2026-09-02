@@ -370,7 +370,20 @@ class FederatedAggregator:
                 return None
 
             hivemind_state = {
-                'agent_count': hivemind_stats.get('agent_count', 0),
+                # HiveMind.get_stats() calls this `num_agents`
+                # (hevolveai embodied_ai/learning/hive_mind.py:358,
+                # "num_agents": len(self.cells)); nothing anywhere emits
+                # `agent_count`. So this read defaulted to 0 on EVERY node and
+                # every delta told the hive it hosted no agents — which is why
+                # /hive reports total_agents: 0 while nodes are demonstrably
+                # running agents.
+                #
+                # The RECEIVE side already knew: line ~979 reads
+                # `hive.get('num_agents', hive.get('agent_count'))`. This makes
+                # the send side symmetric instead of leaving the two halves of
+                # one wire format disagreeing about the field name.
+                'agent_count': hivemind_stats.get(
+                    'num_agents', hivemind_stats.get('agent_count', 0)),
                 'total_queries': bridge_stats.get('total_hivemind_queries', 0),
                 'avg_fusion_latency_ms': hivemind_stats.get(
                     'avg_fusion_latency_ms', 0),

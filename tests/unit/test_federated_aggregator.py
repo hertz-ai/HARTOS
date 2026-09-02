@@ -529,6 +529,52 @@ class TestGetStats(unittest.TestCase):
         self.assertIn('event_counters', delta)
         self.assertEqual(delta['event_counters'].get('inference.completed'), 2)
 
+    def _delta_with_hivemind(self, hivemind):
+        """Drive extract_local_delta with a given hivemind stats dict."""
+        mock_bridge = MagicMock()
+        mock_bridge.get_stats.return_value = {}
+        mock_bridge.get_learning_stats.return_value = {
+            'hivemind': hivemind, 'bridge': {},
+        }
+        import sys
+        mock_wmb = MagicMock()
+        mock_wmb.get_world_model_bridge = MagicMock(return_value=mock_bridge)
+        with patch.dict(sys.modules, {
+            'integrations.agent_engine.world_model_bridge': mock_wmb,
+            'security.node_integrity': MagicMock(
+                get_node_identity=MagicMock(
+                    return_value={'node_id': 'test', 'public_key': 'pk'}),
+                sign_json_payload=MagicMock(return_value='sig'),
+            ),
+            'security.hive_guardrails': MagicMock(
+                compute_guardrail_hash=MagicMock(return_value='hash'),
+            ),
+            'security.system_requirements': MagicMock(
+                get_tier_name=MagicMock(return_value='standard'),
+            ),
+        }):
+            return self.agg.extract_local_delta()
+
+    def test_delta_reports_agents_the_hivemind_actually_has(self):
+        """HiveMind.get_stats() emits `num_agents` (hevolveai
+        embodied_ai/learning/hive_mind.py:358, "num_agents": len(self.cells)).
+        Nothing emits `agent_count`, so reading only that key made EVERY node
+        tell the hive it hosted zero agents — which is why /hive reports
+        total_agents: 0 while nodes are demonstrably running agents."""
+        delta = self._delta_with_hivemind({'num_agents': 7})
+        self.assertIsNotNone(delta)
+        self.assertEqual(delta['hivemind_state']['agent_count'], 7)
+
+    def test_delta_still_honours_the_legacy_agent_count_key(self):
+        """A peer or an older stats producer that really does emit
+        `agent_count` must not regress to 0."""
+        delta = self._delta_with_hivemind({'agent_count': 4})
+        self.assertEqual(delta['hivemind_state']['agent_count'], 4)
+
+    def test_delta_reports_zero_when_the_hivemind_says_nothing(self):
+        delta = self._delta_with_hivemind({})
+        self.assertEqual(delta['hivemind_state']['agent_count'], 0)
+
 
 class TestWeightedAvgDict(unittest.TestCase):
     """Internal _weighted_avg_dict correctness."""
