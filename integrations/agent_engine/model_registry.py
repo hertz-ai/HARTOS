@@ -366,152 +366,129 @@ model_registry = ModelRegistry()
 # ─── Default backend registration ───
 
 def _register_defaults():
-    """Register default model backends. Only available if API keys are set."""
+    """Register default model backends.
 
-    # 0. Local Qwen3.5 0.8B — DRAFT tier first-responder for the
-    #    draft-first dispatcher. Its job is to emit an immediate standby
-    #    reply plus a JSON routing signal saying whether the request can
-    #    be handled locally or needs delegation to the 4B or the hive.
-    #    ~200-400ms on consumer GPUs. Its interactions flow through
-    #    WorldModelBridge.record_interaction so HevolveAI's continual
-    #    learner can distill expert→draft over time (the draft gets
-    #    better at knowing when to delegate vs answer directly).
-    #
-    #    The draft runs on port 8081 (vlm_caption) — NOT the main LLM
-    #    port 8080 where the 4B lives. Both servers stay resident so
-    #    draft-first pays real draft latency (~300ms) and normal chat
-    #    pays 4B latency (~700ms) without swapping. Nunba's
-    #    LlamaConfig.start_caption_server owns the 0.8B process and
-    #    main.py kicks it off during _deferred_platform_init.
-    from core.port_registry import get_local_llm_url, get_local_draft_url
-    _local_url = get_local_llm_url()
-    _draft_url = get_local_draft_url()
+    The text-LLM backends follow core.autogen_config, the ONE configured LLM:
 
-    model_registry.register(ModelBackend(
-        model_id='qwen3.5-0.8b-draft',
-        display_name='Qwen3.5 0.8B (Draft)',
-        tier=ModelTier.DRAFT,
-        config_list_entry={
-            'model': 'Qwen3.5-0.8B-Instruct',
-            'api_key': 'dummy',
-            'base_url': _draft_url,
-            'price': [0, 0],
-        },
-        avg_latency_ms=300.0,
-        accuracy_score=0.45,
-        cost_per_1k_tokens=0.0,
-        is_local=True,
-        hardware_dependent=True,
-        gpu_tdp_watts=80.0,
-    ))
+      api    exactly one text backend, 'configured-api', the endpoint the
+             user configured.  It serves every role: draft = fast = expert
+             (owner design for a node with an API key and no VRAM: the single
+             API is the only LLM it talks to).  No vendor entry registers
+             beside it.  A second LLM picked from a stray env key
+             (GROQ_API_KEY, DEEPSEEK_API_KEY, AZURE_OPENAI_API_KEY,
+             ANTHROPIC_API_KEY, GLM_API_KEY, QWEN_API_KEY) was the side door
+             that put central's goal turns on a model nobody configured
+             (#69), so those blocks are gone: an API is configured through
+             HEVOLVE_LLM_ENDPOINT_URL / HEVOLVE_LLM_MODEL_NAME /
+             HEVOLVE_LLM_API_KEY (Nunba's key vault exports exactly that) and
+             nowhere else.
+      local  the node's own llama-server(s): the 0.8B draft when a draft
+             server listens, and the 4B main model.
 
-    # 1. Local Qwen3.5-4B VL — default local model (256K context, vision+text, llama.cpp b8148+)
+    claude-code (the copilot's subscription, the frontier tier) and the
+    non-LLM media backends register in both kinds.
+    """
+    from core.autogen_config import resolve_llm_backend, OPENAI_SDK_DEFAULT_BASE
+    _kind, _entry = resolve_llm_backend()
 
-    model_registry.register(ModelBackend(
-        model_id='qwen3.5-4b-local',
-        display_name='Qwen3.5 4B VL (Local)',
-        tier=ModelTier.FAST,
-        config_list_entry={
-            'model': 'Qwen3.5-4B',
-            'api_key': 'dummy',
-            'base_url': _local_url,
-            'price': [0, 0],
-        },
-        avg_latency_ms=700.0,
-        accuracy_score=0.60,
-        cost_per_1k_tokens=0.0,
-        is_local=True,
-        hardware_dependent=True,
-        gpu_tdp_watts=170.0,
-    ))
-
-    # 1b. Local Qwen3-VL-4B — fallback for older llama.cpp installs
-    model_registry.register(ModelBackend(
-        model_id='qwen3-vl-4b-local',
-        display_name='Qwen3-VL 4B (Local)',
-        tier=ModelTier.FAST,
-        config_list_entry={
-            'model': 'Qwen3-VL-4B-Instruct',
-            'api_key': 'dummy',
-            'base_url': _local_url,
-            'price': [0, 0],
-        },
-        avg_latency_ms=800.0,
-        accuracy_score=0.55,
-        cost_per_1k_tokens=0.0,
-        is_local=True,
-        hardware_dependent=True,
-        gpu_tdp_watts=170.0,
-    ))
-
-    # 2. Groq (fast API — if key set)
-    if os.environ.get('GROQ_API_KEY'):
+    if _kind == 'api':
+        from integrations.agent_engine.budget_gate import spark_per_1k
+        _cfg = dict(_entry)
+        # autogen's client defaults to the openai base when the entry has no
+        # base_url; the selectors need the URL spelled out to know the
+        # backend is dispatchable, and llm_http_target posts there too.
+        _cfg.setdefault('base_url', OPENAI_SDK_DEFAULT_BASE)
         model_registry.register(ModelBackend(
-            model_id='groq-llama-3.1-8b',
-            display_name='Groq LLaMA 3.1 8B',
+            model_id='configured-api',
+            display_name='Configured API (%s)' % (_cfg.get('model') or 'no model name'),
             tier=ModelTier.FAST,
+            config_list_entry=_cfg,
+            avg_latency_ms=1500.0,     # prior; record_latency moves it
+            accuracy_score=0.85,       # prior; update_accuracy moves it
+            cost_per_1k_tokens=spark_per_1k(_cfg.get('model', '')),
+            # This node's own LLM: dispatch runs the full /chat pipeline
+            # (agents, tools), not the hive-peer POST that is_local=False
+            # selects in SpeculativeDispatcher._dispatch_expert_langchain.
+            is_local=True,
+            hardware_dependent=False,
+            gpu_tdp_watts=0.0,         # not this node's silicon
+        ))
+
+    if _kind == 'local':
+        # 0. Local Qwen3.5 0.8B — DRAFT tier first-responder for the
+        #    draft-first dispatcher. Its job is to emit an immediate standby
+        #    reply plus a JSON routing signal saying whether the request can
+        #    be handled locally or needs delegation to the 4B or the hive.
+        #    ~200-400ms on consumer GPUs. Its interactions flow through
+        #    WorldModelBridge.record_interaction so HevolveAI's continual
+        #    learner can distill expert→draft over time (the draft gets
+        #    better at knowing when to delegate vs answer directly).
+        #
+        #    The draft runs on port 8081 (vlm_caption) — NOT the main LLM
+        #    port 8080 where the 4B lives. Both servers stay resident so
+        #    draft-first pays real draft latency (~300ms) and normal chat
+        #    pays 4B latency (~700ms) without swapping. Nunba's
+        #    LlamaConfig.start_caption_server owns the 0.8B process and
+        #    main.py kicks it off during _deferred_platform_init.
+        from core.port_registry import get_local_llm_url, get_local_draft_url
+        _local_url = get_local_llm_url()
+        _draft_url = get_local_draft_url()
+
+        model_registry.register(ModelBackend(
+            model_id='qwen3.5-0.8b-draft',
+            display_name='Qwen3.5 0.8B (Draft)',
+            tier=ModelTier.DRAFT,
             config_list_entry={
-                'model': 'llama-3.1-8b-instant',
-                'api_key': os.environ['GROQ_API_KEY'],
-                'base_url': 'https://api.groq.com/openai/v1',
-                'price': [0.05, 0.08],
+                'model': 'Qwen3.5-0.8B-Instruct',
+                'api_key': 'dummy',
+                'base_url': _draft_url,
+                'price': [0, 0],
             },
             avg_latency_ms=300.0,
+            accuracy_score=0.45,
+            cost_per_1k_tokens=0.0,
+            is_local=True,
+            hardware_dependent=True,
+            gpu_tdp_watts=80.0,
+        ))
+
+        # 1. Local Qwen3.5-4B VL — default local model (256K context, vision+text, llama.cpp b8148+)
+
+        model_registry.register(ModelBackend(
+            model_id='qwen3.5-4b-local',
+            display_name='Qwen3.5 4B VL (Local)',
+            tier=ModelTier.FAST,
+            config_list_entry={
+                'model': 'Qwen3.5-4B',
+                'api_key': 'dummy',
+                'base_url': _local_url,
+                'price': [0, 0],
+            },
+            avg_latency_ms=700.0,
             accuracy_score=0.60,
-            cost_per_1k_tokens=0.1,
+            cost_per_1k_tokens=0.0,
+            is_local=True,
+            hardware_dependent=True,
+            gpu_tdp_watts=170.0,
         ))
 
-    # 3. DeepSeek V3 (balanced — if key set)
-    if os.environ.get('DEEPSEEK_API_KEY'):
+        # 1b. Local Qwen3-VL-4B — fallback for older llama.cpp installs
         model_registry.register(ModelBackend(
-            model_id='deepseek-v3',
-            display_name='DeepSeek V3',
-            tier=ModelTier.BALANCED,
+            model_id='qwen3-vl-4b-local',
+            display_name='Qwen3-VL 4B (Local)',
+            tier=ModelTier.FAST,
             config_list_entry={
-                'model': 'deepseek-chat',
-                'api_key': os.environ['DEEPSEEK_API_KEY'],
-                'base_url': 'https://api.deepseek.com/v1',
-                'price': [0.14, 0.28],
+                'model': 'Qwen3-VL-4B-Instruct',
+                'api_key': 'dummy',
+                'base_url': _local_url,
+                'price': [0, 0],
             },
-            avg_latency_ms=1500.0,
-            accuracy_score=0.82,
-            cost_per_1k_tokens=0.5,
-        ))
-
-    # 4. GPT-4.1 Azure (expert — if key set)
-    if os.environ.get('AZURE_OPENAI_API_KEY'):
-        model_registry.register(ModelBackend(
-            model_id='gpt-4.1-azure',
-            display_name='GPT-4.1 (Azure)',
-            tier=ModelTier.EXPERT,
-            config_list_entry={
-                'model': 'gpt-4.1',
-                'api_type': 'azure',
-                'api_key': os.environ['AZURE_OPENAI_API_KEY'],
-                'base_url': os.environ.get('AZURE_OPENAI_ENDPOINT', ''),
-                'api_version': '2024-12-01-preview',
-                'price': [0.0025, 0.01],
-            },
-            avg_latency_ms=3000.0,
-            accuracy_score=0.92,
-            cost_per_1k_tokens=2.5,
-        ))
-
-    # 5. Claude Sonnet (expert — if key set)
-    if os.environ.get('ANTHROPIC_API_KEY'):
-        model_registry.register(ModelBackend(
-            model_id='claude-sonnet',
-            display_name='Claude Sonnet 4.5',
-            tier=ModelTier.EXPERT,
-            config_list_entry={
-                'model': 'claude-sonnet-4-5-20250929',
-                'api_key': os.environ['ANTHROPIC_API_KEY'],
-                'base_url': 'https://api.anthropic.com/v1',
-                'price': [0.003, 0.015],
-            },
-            avg_latency_ms=2500.0,
-            accuracy_score=0.93,
-            cost_per_1k_tokens=1.5,
+            avg_latency_ms=800.0,
+            accuracy_score=0.55,
+            cost_per_1k_tokens=0.0,
+            is_local=True,
+            hardware_dependent=True,
+            gpu_tdp_watts=170.0,
         ))
 
     # 5a2. Claude Code (the SUBSCRIPTION path — NOT the API key above). The
@@ -552,99 +529,6 @@ def _register_defaults():
     except Exception as _cc_err:                    # never break registry init
         import logging as _l
         _l.getLogger(__name__).debug("claude-code backend not registered: %s", _cc_err)
-
-    # 5b. GLM 5.2 (Zhipu / Z.ai — expert tier, OpenAI-compatible API — if key set)
-    #     Zhipu exposes an OpenAI-compatible endpoint, so this registers exactly
-    #     like Groq/DeepSeek/Claude above (no special client). GLM_API_KEY is the
-    #     primary env var; ZHIPUAI_API_KEY (Zhipu's own convention) is accepted as
-    #     a fallback. base_url defaults to the international z.ai gateway — set
-    #     GLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4 for the mainland-China
-    #     endpoint. GLM_MODEL overrides the model string if the served version
-    #     differs (e.g. glm-4.6).
-    _glm_key = os.environ.get('GLM_API_KEY') or os.environ.get('ZHIPUAI_API_KEY')
-    if _glm_key:
-        model_registry.register(ModelBackend(
-            model_id='glm-5.2',
-            display_name='GLM 5.2 (Zhipu)',
-            tier=ModelTier.EXPERT,
-            config_list_entry={
-                'model': os.environ.get('GLM_MODEL', 'glm-5.2'),
-                'api_key': _glm_key,
-                'base_url': os.environ.get('GLM_BASE_URL', 'https://api.z.ai/api/paas/v4'),
-                'price': [0.0006, 0.0022],
-            },
-            avg_latency_ms=2000.0,
-            accuracy_score=0.90,
-            cost_per_1k_tokens=0.5,
-        ))
-
-    # 5b-ii. Qwen3.8 27B via Bitdeer — OpenAI-compatible, registers like GLM above.
-    #     QWEN_API_KEY is primary; BITDEER_API_KEY is accepted as the vendor's
-    #     own convention. QWEN_BASE_URL / QWEN_MODEL override endpoint and model.
-    #
-    #     MEASURED 2026-08-31 against the live endpoint, not assumed:
-    #       warm      114 completion tokens in 3.28s (~35 tok/s)
-    #       cold      12.6s and 26.8s on the first two calls, so the first
-    #                 request after an idle period pays a real spin-up
-    #       context   a 5556-token prompt was accepted with HTTP 200, so the
-    #                 advertised "4K" is the OUTPUT cap, not the window
-    #
-    #     IT IS A REASONING MODEL, and that is the integration hazard. It returns
-    #     the thinking in `reasoning_content` and leaves `content` EMPTY until the
-    #     budget covers reasoning AND answer: max_tokens=16 produced content='' with
-    #     finish_reason='length', while max_tokens=512 produced '391' correctly.
-    #     core/verified_llm.py:_extract_content already falls back to
-    #     reasoning_content, but the autogen dispatch path reads `content` only, so
-    #     a stingy budget here reads as a blank answer rather than an error. Hence
-    #     the max_tokens floor below: never send this model a budget so small that
-    #     it can only think.
-    # THE ZERO EXPIRES. The vendor stated free usage until 2026-09-08 (owner,
-    # 2026-08-31). Hardcoding a permanent 0 would be the expensive kind of
-    # silent: every cost-weighted routing decision keeps preferring this model
-    # on price while it quietly starts billing on the 9th, and nothing in the
-    # system would say so. So the promotional rate is dated, and once it lapses
-    # the model falls back to a placeholder in GLM's order of magnitude, which
-    # is honest as "not free, real number unknown" and stops price alone from
-    # selecting it. Set QWEN_RATE_PER_1K once the vendor publishes actual
-    # pricing, or QWEN_FREE_UNTIL if the promo is extended.
-    import datetime as _dt
-    _qwen_free_until = os.environ.get('QWEN_FREE_UNTIL', '2026-09-08')
-    _qwen_is_free = _dt.date.today().isoformat() <= _qwen_free_until
-    _qwen_rate = 0.0 if _qwen_is_free else float(
-        os.environ.get('QWEN_RATE_PER_1K', '0.5'))
-    # DO NOT health-check this endpoint with urllib. The vendor's edge rejects
-    # Python-urllib by User-Agent. Measured from inside the live central
-    # container, same key, same body, same second:
-    #   requests -> 200 | httpx -> 200 | urllib default UA -> 403 Forbidden
-    #   urllib with User-Agent 'curl/8.5.0' -> 200
-    # The openai SDK rides httpx, so dispatch is fine. A urllib-based prober
-    # (core/verified_llm.py uses urllib.request, though it defaults to the LOCAL
-    # llama endpoint) would report this model dead while it is perfectly healthy.
-    # If you ever point a urllib prober at a hosted provider, set a UA first.
-    #
-    # This also disproves the first read of that 403: it is NOT an IP block on
-    # central. curl from the host AND from inside the container both returned
-    # 200 in the same minute.
-    _qwen_key = os.environ.get('QWEN_API_KEY') or os.environ.get('BITDEER_API_KEY')
-    if _qwen_key:
-        model_registry.register(ModelBackend(
-            model_id='qwen3.8-27b',
-            display_name='Qwen3.8 27B (Bitdeer)',
-            tier=ModelTier.EXPERT,
-            config_list_entry={
-                'model': os.environ.get('QWEN_MODEL', 'Qwen/Qwen3.8-27B'),
-                'api_key': _qwen_key,
-                'base_url': os.environ.get(
-                    'QWEN_BASE_URL', 'https://api-inference.bitdeer.ai/v1'),
-                # Output cap is 4K. The floor matters more than the ceiling here:
-                # below a few hundred tokens this model returns empty content.
-                'max_tokens': int(os.environ.get('QWEN_MAX_TOKENS', '2048')),
-                'price': [_qwen_rate, _qwen_rate],
-            },
-            avg_latency_ms=3300.0,     # warm sample; cold start is far worse
-            accuracy_score=0.85,
-            cost_per_1k_tokens=_qwen_rate,
-        ))
 
     # 5c. Distributed shard cluster (WAN pipeline-parallel inference) — feature-flagged.
     #     A model too big for one node is served by K peers, each holding a

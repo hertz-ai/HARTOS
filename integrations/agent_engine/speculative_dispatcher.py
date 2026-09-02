@@ -1921,21 +1921,33 @@ class SpeculativeDispatcher:
         _bundled = bool(os.environ.get('NUNBA_BUNDLED') or getattr(__import__('sys'), 'frozen', False))
         if _bundled:
             try:
-                # Resolve the model's direct port from the catalog/port_registry
-                _port = None
-                if hasattr(model, 'port') and model.port:
-                    _port = model.port
-                if not _port:
-                    try:
-                        from core.port_registry import get_local_draft_url, get_local_llm_url
-                        _url = get_local_draft_url() or get_local_llm_url()
-                        if _url:
-                            # Extract port from URL like http://127.0.0.1:8081/v1
-                            import re as _re
-                            _m = _re.search(r':(\d+)', _url)
-                            _port = int(_m.group(1)) if _m else 8081
-                    except Exception:
-                        _port = 8081  # draft default
+                from core.autogen_config import resolve_llm_backend, llm_http_target
+                if resolve_llm_backend()[0] == 'api':
+                    # The ONE configured API is the draft as well (owner
+                    # design: draft = main on a node with an API key and no
+                    # VRAM): same URL, auth header and model name as every
+                    # other chat/completions caller.
+                    _draft_url, _draft_headers, _draft_model = llm_http_target(draft=True)
+                else:
+                    # Local kind: the node's own llama-server.  Resolve the
+                    # model's direct port from the catalog/port_registry.
+                    _port = None
+                    if hasattr(model, 'port') and model.port:
+                        _port = model.port
+                    if not _port:
+                        try:
+                            from core.port_registry import get_local_draft_url, get_local_llm_url
+                            _url = get_local_draft_url() or get_local_llm_url()
+                            if _url:
+                                # Extract port from URL like http://127.0.0.1:8081/v1
+                                import re as _re
+                                _m = _re.search(r':(\d+)', _url)
+                                _port = int(_m.group(1)) if _m else 8081
+                        except Exception:
+                            _port = 8081  # draft default
+                    _draft_url = f'http://127.0.0.1:{_port}/v1/chat/completions'
+                    _draft_headers = {}
+                    _draft_model = llm_http_target(draft=True)[2]
                 # ONE transport (task #10): pooled_post is port-scoped — a
                 # true draft-port call passes straight through (the draft
                 # server has its own slots), but when no draft server exists
@@ -1950,15 +1962,16 @@ class SpeculativeDispatcher:
                 # ``core.llm_outbound_logger.install()``; this is the only
                 # place draft-classifier prompts get a record.
                 _draft_body = {
-                    'model': 'llama',
+                    'model': _draft_model,
                     'messages': [{'role': 'user', 'content': prompt}],
                     'max_tokens': 500,
                     'temperature': 0.7,
                 }
                 _draft_start = time.time()
                 resp = _pooled_post(
-                    f'http://127.0.0.1:{_port}/v1/chat/completions',
+                    _draft_url,
                     json=_draft_body,
+                    headers=_draft_headers,
                     timeout=15,
                 )
                 try:

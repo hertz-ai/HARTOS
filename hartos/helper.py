@@ -2368,47 +2368,13 @@ def history(user_id,prompt_id,role,message):
         return "Memory object not found"
 
 
-# Mode-aware config_list: cloud/regional use external LLM, flat uses local llama.cpp
-_node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
-
-# The endpoint comes from ONE place regardless of tier. Previously the
-# regional/central branch read HEVOLVE_LLM_ENDPOINT_URL raw while every
-# resolver-based caller read HEVOLVE_LOCAL_LLM_URL, so the two paths could
-# disagree; on deepbox they only agreed because both vars were set to the same
-# gateway. get_local_llm_url() now includes HEVOLVE_LLM_ENDPOINT_URL among its
-# candidates, so it resolves correctly on a cloud tier with no local model AND
-# on a device where Nunba wrote ~/.nunba/llama_config.json.
-#
-# The tier branch remains, because model name and price genuinely differ: a
-# cloud model bills per token, the bundled local model does not. Only the
-# endpoint is unified.
-from core.port_registry import get_local_llm_url
-_llm_base = get_local_llm_url()
-if _node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
-    config_list = [{
-        "model": os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4.1-mini'),
-        "api_key": os.environ.get('HEVOLVE_LLM_API_KEY', 'dummy'),
-        "base_url": _llm_base,
-        "price": [0.0025, 0.01]
-    }]
-else:
-    config_list = [{
-        "model": 'Qwen3-VL-4B-Instruct',
-        "api_key": 'dummy',
-        "base_url": _llm_base,
-        "price": [0, 0],
-        # max_retries=0 on the LOCAL single-slot llama: the openai SDK default
-        # (2) turns a slow turn into a retry storm — it resubmits the multi-KB
-        # prompt into the one busy slot and forces a kv-cache recompute, so the
-        # multi-agent group chat (visual_agent/helper2/executor2/multi_role_agent2
-        # below all take this llm_config) never advances. Same fix and reason as
-        # hartos.gather_agentdetails and core.autogen_config's local branches;
-        # measured live on .69 (d5b0bfe, 2026-09-01). Cloud branch keeps default
-        # retries (a real 429/5xx is transient). The three inline local configs
-        # are a known parallel-path debt — consolidation is gated on auditing the
-        # 'Qwen3-VL-4B-Instruct' model-name consumers (see gather_agentdetails).
-        "max_retries": 0,
-    }]
+# The autogen config_list comes from core.autogen_config, the ONE place that
+# decides which LLM this node talks to (the configured endpoint, or the local
+# llama-server when none is configured).  This module used to rebuild it
+# inline with its own model names ('gpt-4.1-mini', 'Qwen3-VL-4B-Instruct'),
+# which is how a node could run a model nobody configured (#69).
+from core.autogen_config import get_autogen_config_list
+config_list = get_autogen_config_list()
 
 llm_config = {
     "config_list": config_list,

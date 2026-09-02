@@ -49,6 +49,22 @@ _MODEL_COST_MAP = {
 }
 
 
+def spark_per_1k(model_name: str) -> int:
+    """Spark per 1K tokens for a model name, by family prefix: 0 for the
+    local and free-tier families, 2 for a cloud model the map does not know.
+
+    ONE lookup for estimate_llm_cost_spark and for the registry's
+    'configured-api' backend, so the pre-dispatch estimate and the expert
+    path's reservation (ModelBackend.cost_per_1k_tokens) price the same model
+    the same way.
+    """
+    model_lower = (model_name or '').lower()
+    for prefix, cost in _MODEL_COST_MAP.items():
+        if prefix in model_lower:
+            return cost
+    return 2
+
+
 def _is_local_model() -> bool:
     """Detect whether the active LLM is a local model (zero Spark cost).
 
@@ -60,7 +76,7 @@ def _is_local_model() -> bool:
     return is_local_llm()
 
 
-def estimate_llm_cost_spark(prompt: str, model_name: str = 'gpt-4o') -> int:
+def estimate_llm_cost_spark(prompt: str, model_name: str = '') -> int:
     """Estimate Spark cost for an LLM call before execution.
 
     Uses tiktoken if available (already in codebase), falls back to word-count
@@ -75,13 +91,12 @@ def estimate_llm_cost_spark(prompt: str, model_name: str = 'gpt-4o') -> int:
     if _is_local_model():
         return 0
 
+    # The configured model when the caller named none (or the legacy 'gpt-4o'
+    # default): pricing follows what the node is actually configured to call.
+    model_name = _resolve_model_name(model_name)
+
     # Map model to per-1K cost (check BEFORE token counting — skip work for free models)
-    cost_per_1k = 2  # default for unknown cloud models
-    model_lower = (model_name or '').lower()
-    for prefix, cost in _MODEL_COST_MAP.items():
-        if prefix in model_lower:
-            cost_per_1k = cost
-            break
+    cost_per_1k = spark_per_1k(model_name)
 
     # Free-tier and local models cost 0 Spark even without the env var.
     # This catches cases where model_name is 'qwen', 'llama', 'phi', etc.
@@ -292,28 +307,31 @@ def check_platform_affordability() -> Tuple[bool, Dict]:
 
 # ── Combined gate ────────────────────────────────────────────────────
 
+# The default callers passed before the configured model became the default
+# (agent_daemon still sends it): it means "the model this node calls", never
+# literally gpt-4o.
+_LEGACY_DEFAULT_MODEL = 'gpt-4o'
+
+
 def _resolve_model_name(model_name: str) -> str:
     """Resolve the effective model name for cost estimation.
 
-    If the caller passes the default 'gpt-4o' but a local model is actually
-    active, return the local model name so pricing is correct (0 Spark).
+    An explicit name is trusted.  No name (or the legacy 'gpt-4o' default)
+    means the ONE configured LLM (core.autogen_config): its model name when
+    an API is configured, else the local model, which prices at 0 Spark.
+    Nothing here picks a model of its own.
     """
-    # If caller provided an explicit non-default model name, trust it
-    if model_name and model_name != 'gpt-4o':
+    if model_name and model_name != _LEGACY_DEFAULT_MODEL:
         return model_name
 
-    # Check if a local model is configured — override the default 'gpt-4o'
-    local_model = os.environ.get('HEVOLVE_LOCAL_LLM_MODEL', '')
-    if local_model:
-        return local_model
+    from core.autogen_config import resolve_llm_backend
+    kind, entry = resolve_llm_backend()
+    if kind == 'api':
+        return entry.get('model') or ''
 
-    # If the resolved LLM URL points to localhost, the active model
-    # is local even though we don't know the exact name — use 'llama'
+    # Local kind: the configured local model name when known, else 'llama',
     # which maps to 0 Spark in _MODEL_COST_MAP.
-    if _is_local_model():
-        return 'llama'
-
-    return model_name
+    return os.environ.get('HEVOLVE_LOCAL_LLM_MODEL', '') or 'llama'
 
 
 def pause_goal_for_budget(goal_id: Optional[str], reason: str) -> bool:
@@ -392,7 +410,7 @@ def apply_budget_pause(goal, reason: str) -> bool:
 
 def pre_dispatch_budget_gate(goal_id: Optional[str],
                              prompt: str,
-                             model_name: str = 'gpt-4o') -> Tuple[bool, str]:
+                             model_name: str = '') -> Tuple[bool, str]:
     """Combined pre-dispatch budget gate.
 
     1. Resolve effective model name (local vs cloud)

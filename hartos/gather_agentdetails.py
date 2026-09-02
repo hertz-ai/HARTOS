@@ -173,46 +173,14 @@ def create_agents_for_user(user_id: str, autonomous=False, initial_description=N
         autonomous: If True, the LLM answers its own questions (no human input)
         initial_description: When autonomous, the user's description of the desired agent
     """
-    # Mode-aware config_list: cloud/regional use external LLM, flat uses local llama.cpp
-    _node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
-    if _node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
-        config_list = [{
-            "model": os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4.1-mini'),
-            "api_key": os.environ.get('HEVOLVE_LLM_API_KEY', 'dummy'),
-            "base_url": os.environ['HEVOLVE_LLM_ENDPOINT_URL'],
-            "price": [0.0025, 0.01]
-        }]
-    else:
-        from core.port_registry import get_local_llm_url
-        config_list = [{
-            "model": 'Qwen3-VL-4B-Instruct',
-            "api_key": 'dummy',
-            "base_url": get_local_llm_url(),
-            "price": [0, 0],
-            # Local llama-server is ONE slot (--parallel 1) on 2 cores. The
-            # openai SDK's default max_retries=2 turns a slow gather turn into a
-            # STALL, not a recovery: a retry cannot succeed where the first
-            # attempt is still generating — it resubmits the multi-KB prompt into
-            # the busy slot, forces a full kv-cache recompute, and the gather
-            # never advances. Measured live on .69 (d5b0bfe, 2026-09-01): a
-            # gather stalled at turn 6/12 for 10 min with repeated
-            # "openai._base_client: Retrying request"; with retries off it
-            # completed in 2 clean llama POSTs. Same fix, same reason as
-            # core.autogen_config.get_autogen_config_list's local branch.
-            #
-            # NOTE (parallel-path debt, deliberately not consolidated here):
-            # this inline config_list duplicates get_autogen_config_list. The
-            # honest fix is for gather to CALL that single source, but its local
-            # "model" is 'Qwen3-VL-4B-Instruct' (consumed by helper.py,
-            # hart_intelligence_entry.py, model_registry.py, local_loop.py and
-            # the llm_outbound_logger wire-trim layer), and that function's local
-            # model is 'local' — collapsing the two would silently change the
-            # model name those consumers key on. Consolidation is a follow-up
-            # gated on auditing those consumers; the retry fix must not wait on
-            # it, and must not regress the model name. Cloud branch above keeps
-            # default retries (a real 429/5xx is transient).
-            "max_retries": 0,
-        }]
+    # The ONE configured LLM, decided in core.autogen_config: the configured
+    # endpoint, or the local llama-server when none is configured.  The
+    # inline copy this replaced carried its own model names ('gpt-4.1-mini',
+    # 'Qwen3-VL-4B-Instruct'); audited before removal: nothing keys on the
+    # local name (llm_outbound_logger only hands it to count_tokens_for_text,
+    # local_loop sets its own), so the canonical entry is a drop-in (#69).
+    from core.autogen_config import get_autogen_config_list
+    config_list = get_autogen_config_list()
 
     # Create a basic function calling config
     llm_config = {

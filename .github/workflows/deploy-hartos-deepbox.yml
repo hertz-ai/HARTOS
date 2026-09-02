@@ -48,7 +48,7 @@ jobs:
           # This bootstrap stays tiny; config flows via `envs:` below.
           # oauth.env is written HERE because the secret is multiline and
           # heredoc interpolation is the safe transport for it.
-          envs: DEPLOY_LOGS_PATH,DEPLOY_IMAGES_PATH,DEPLOY_MASTER_KEY_PATH,DEPLOY_ADVERTISE_URL,DEPLOY_AGENT_DATA_PATH,LLM_GATEWAY_URL,GROQ_API_KEY,LANGCHAIN_API_KEY,ALLOWED_HOSTS,CORS_ORIGINS,HART_OTA_HOST,HEVOLVE_ENFORCEMENT_MODE,HEVOLVE_NODE_TIER,LANGCHAIN_PROJECT
+          envs: DEPLOY_LOGS_PATH,DEPLOY_IMAGES_PATH,DEPLOY_MASTER_KEY_PATH,DEPLOY_ADVERTISE_URL,DEPLOY_AGENT_DATA_PATH,LLM_GATEWAY_URL,HEVOLVE_LLM_ENDPOINT_URL,HEVOLVE_LLM_MODEL_NAME,HEVOLVE_LLM_API_KEY,GROQ_API_KEY,LANGCHAIN_API_KEY,ALLOWED_HOSTS,CORS_ORIGINS,HART_OTA_HOST,HEVOLVE_ENFORCEMENT_MODE,HEVOLVE_NODE_TIER,LANGCHAIN_PROJECT
           script: |
             set -e
             cd ${{ secrets.DEPLOY_REPO_PATH }}
@@ -88,6 +88,12 @@ jobs:
           DEPLOY_ADVERTISE_URL: ${{ secrets.DEPLOY_ADVERTISE_URL }}
           DEPLOY_AGENT_DATA_PATH: ${{ secrets.DEPLOY_AGENT_DATA_PATH }}
           LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
+          # The ONE configured LLM for this node (core/autogen_config.py).
+          # Absent secrets leave the box .env untouched; set, they are the
+          # configuration and every deploy writes them into it.
+          HEVOLVE_LLM_ENDPOINT_URL: ${{ secrets.HEVOLVE_LLM_ENDPOINT_URL }}
+          HEVOLVE_LLM_MODEL_NAME: ${{ secrets.HEVOLVE_LLM_MODEL_NAME }}
+          HEVOLVE_LLM_API_KEY: ${{ secrets.HEVOLVE_LLM_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           LANGCHAIN_API_KEY: ${{ secrets.LANGCHAIN_API_KEY }}
           ALLOWED_HOSTS: ${{ secrets.ALLOWED_HOSTS }}

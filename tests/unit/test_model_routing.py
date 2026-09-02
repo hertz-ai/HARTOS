@@ -18,7 +18,11 @@ def _make_backend(model_id, is_local=False, accuracy=0.5,
         model_id=model_id,
         display_name=model_id,
         tier=ModelTier.FAST if is_local else ModelTier.EXPERT,
-        config_list_entry={'model': model_id, 'api_key': 'test'},
+        # base_url makes it dispatchable; the selectors skip a backend
+        # without an endpoint (is_dispatchable), which is what left every
+        # selector test in this file returning None.
+        config_list_entry={'model': model_id, 'api_key': 'test',
+                           'base_url': 'http://test.invalid/v1'},
         avg_latency_ms=latency,
         accuracy_score=accuracy,
         cost_per_1k_tokens=cost,
@@ -149,67 +153,146 @@ class TestThreadLocalTaskSource(unittest.TestCase):
         thread_local_data.clear_task_source()
 
 
-class TestGLMRegistration(unittest.TestCase):
-    """Behavioural test for the GLM 5.2 (Zhipu) backend registration.
+class TestConfiguredBackendRegistration(unittest.TestCase):
+    """Behavioural test for _register_defaults() following the ONE configured
+    LLM (core.autogen_config), #69.
 
-    Drives the real _register_defaults() with the env boundary monkeypatched,
-    then asserts the observable registry state (the registered ModelBackend's
-    config_list_entry) — not a source-string grep.
+    Drives the real _register_defaults() against a fresh registry with the
+    env boundary patched, then asserts the observable registry state.  The
+    vendor side doors (GROQ/DEEPSEEK/AZURE/ANTHROPIC/GLM/QWEN keys) used to
+    register a second text LLM beside the configured one; a stray key must
+    not pick a model any more.
     """
 
-    _GLM_ENV = ('GLM_API_KEY', 'ZHIPUAI_API_KEY', 'GLM_BASE_URL', 'GLM_MODEL')
+    _TRIO = ('HEVOLVE_LLM_ENDPOINT_URL', 'HEVOLVE_LLM_MODEL_NAME',
+             'HEVOLVE_LLM_API_KEY')
+    _CLEARED = _TRIO + (
+        'HEVOLVE_NODE_TIER', 'HEVOLVE_ACTIVE_CLOUD_PROVIDER',
+        'HEVOLVE_LOCAL_LLM_MODEL',
+        # the removed side doors
+        'GROQ_API_KEY', 'DEEPSEEK_API_KEY', 'AZURE_OPENAI_API_KEY',
+        'ANTHROPIC_API_KEY', 'GLM_API_KEY', 'ZHIPUAI_API_KEY', 'QWEN_API_KEY',
+        'QWEN_BASE_URL', 'QWEN_MODEL',
+        # optional local backends that would compete for the draft slot
+        'HEVOLVEAI_API_URL', 'HEVOLVE_VISION_LITE_ENABLED',
+    )
+    _LOCAL_IDS = {'qwen3.5-0.8b-draft', 'qwen3.5-4b-local', 'qwen3-vl-4b-local'}
+    _VENDOR_IDS = {'groq-llama-3.1-8b', 'deepseek-v3', 'gpt-4.1-azure',
+                   'claude-sonnet', 'glm-5.2', 'qwen3.8-27b'}
 
     def setUp(self):
-        # Snapshot + clear GLM env so each case is deterministic regardless of
-        # what the CI/host environment has set.
-        self._saved = {k: os.environ.get(k) for k in self._GLM_ENV}
-        for k in self._GLM_ENV:
+        self._saved = {k: os.environ.get(k) for k in self._CLEARED}
+        for k in self._CLEARED:
             os.environ.pop(k, None)
         from integrations.agent_engine import model_registry as mr
         self.mr = mr
-        mr.model_registry.unregister('glm-5.2')
+        # _register_defaults() writes into the module-global registry; give
+        # it a fresh one so the process-wide state is left alone.
+        self._real_registry = mr.model_registry
+        mr.model_registry = ModelRegistry()
 
     def tearDown(self):
-        self.mr.model_registry.unregister('glm-5.2')
+        self.mr.model_registry = self._real_registry
         for k, v in self._saved.items():
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
 
-    def test_registered_when_key_set(self):
-        os.environ['GLM_API_KEY'] = 'test-glm-key'
-        self.mr._register_defaults()
-        b = self.mr.model_registry.get_model('glm-5.2')
-        self.assertIsNotNone(b, 'GLM backend must register when GLM_API_KEY is set')
-        self.assertEqual(b.tier, self.mr.ModelTier.EXPERT)
-        self.assertFalse(b.is_local)
-        entry = b.config_list_entry
-        self.assertEqual(entry['api_key'], 'test-glm-key')
-        self.assertEqual(entry['model'], 'glm-5.2')
-        # OpenAI-compatible Zhipu endpoint (z.ai gateway by default)
-        self.assertEqual(entry['base_url'], 'https://api.z.ai/api/paas/v4')
+    def _ids(self):
+        return {m.model_id for m in self.mr.model_registry.list_models()}
 
-    def test_not_registered_without_key(self):
-        # setUp cleared every GLM/ZHIPUAI env var.
-        self.mr._register_defaults()
-        self.assertIsNone(
-            self.mr.model_registry.get_model('glm-5.2'),
-            'GLM backend must NOT register without a key',
-        )
+    def _configure_api(self):
+        os.environ['HEVOLVE_NODE_TIER'] = 'central'
+        os.environ['HEVOLVE_LLM_ENDPOINT_URL'] = 'https://api.example.test/v1'
+        os.environ['HEVOLVE_LLM_MODEL_NAME'] = 'Qwen/Qwen3.8-27B'
+        os.environ['HEVOLVE_LLM_API_KEY'] = 'test-key'
 
-    def test_zhipuai_key_fallback_and_overrides(self):
-        os.environ['ZHIPUAI_API_KEY'] = 'zp-key'
-        os.environ['GLM_BASE_URL'] = 'https://open.bigmodel.cn/api/paas/v4'
-        os.environ['GLM_MODEL'] = 'glm-4.6'
+    def test_api_kind_registers_the_configured_backend_only(self):
+        self._configure_api()
+        # A stray vendor key must not add a second text LLM.
+        os.environ['GLM_API_KEY'] = 'stray-glm'
+        os.environ['QWEN_API_KEY'] = 'stray-qwen'
+        os.environ['GROQ_API_KEY'] = 'stray-groq'
         self.mr._register_defaults()
-        b = self.mr.model_registry.get_model('glm-5.2')
-        self.assertIsNotNone(b)
+        ids = self._ids()
+        self.assertIn('configured-api', ids)
+        self.assertFalse(ids & self._VENDOR_IDS, ids & self._VENDOR_IDS)
+        self.assertFalse(ids & self._LOCAL_IDS, ids & self._LOCAL_IDS)
+        b = self.mr.model_registry.get_model('configured-api')
         entry = b.config_list_entry
-        self.assertEqual(entry['api_key'], 'zp-key')          # ZHIPUAI fallback
-        self.assertEqual(entry['model'], 'glm-4.6')           # GLM_MODEL override
-        self.assertEqual(entry['base_url'],
-                         'https://open.bigmodel.cn/api/paas/v4')  # GLM_BASE_URL override
+        self.assertEqual(entry['model'], 'Qwen/Qwen3.8-27B')
+        self.assertEqual(entry['api_key'], 'test-key')
+        self.assertEqual(entry['base_url'], 'https://api.example.test/v1')
+        self.assertEqual(b.tier, self.mr.ModelTier.FAST)
+        # Its own LLM: dispatch runs this node's full /chat pipeline.
+        self.assertTrue(b.is_local)
+        self.assertTrue(b.is_dispatchable())
+
+    def test_api_kind_the_configured_backend_serves_every_role(self):
+        self._configure_api()
+        self.mr._register_defaults()
+        reg = self.mr.model_registry
+        # claude-code registers wherever the copilot is logged in (the
+        # frontier tier, EXPERT, is_local); take it out so this asserts the
+        # single-backend collapse itself: draft = fast = local = expert.
+        reg.unregister('claude-code')
+        self.assertEqual(reg.get_draft_model().model_id, 'configured-api')
+        self.assertEqual(reg.get_fast_model().model_id, 'configured-api')
+        self.assertEqual(reg.get_local_model().model_id, 'configured-api')
+        self.assertEqual(reg.get_expert_model().model_id, 'configured-api')
+        # One backend: nothing to speculate between.
+        self.assertEqual(reg.speculation_pair(), (None, None))
+
+    def test_api_kind_prices_the_configured_model_like_the_budget_gate(self):
+        from integrations.agent_engine.budget_gate import spark_per_1k
+        self._configure_api()
+        self.mr._register_defaults()
+        b = self.mr.model_registry.get_model('configured-api')
+        self.assertEqual(b.cost_per_1k_tokens, spark_per_1k('Qwen/Qwen3.8-27B'))
+        os.environ['HEVOLVE_LLM_MODEL_NAME'] = 'gpt-4o'
+        self.mr.model_registry = ModelRegistry()
+        self.mr._register_defaults()
+        b = self.mr.model_registry.get_model('configured-api')
+        self.assertEqual(b.cost_per_1k_tokens, spark_per_1k('gpt-4o'))
+        self.assertEqual(b.config_list_entry['model'], 'gpt-4o')
+
+    def test_local_kind_registers_the_local_servers_and_no_vendor(self):
+        # No trio, flat tier: the node's own llama-server(s).
+        os.environ['GLM_API_KEY'] = 'stray-glm'
+        os.environ['QWEN_API_KEY'] = 'stray-qwen'
+        self.mr._register_defaults()
+        ids = self._ids()
+        self.assertTrue(self._LOCAL_IDS <= ids, ids)
+        self.assertNotIn('configured-api', ids)
+        self.assertFalse(ids & self._VENDOR_IDS, ids & self._VENDOR_IDS)
+        self.assertEqual(self.mr.model_registry.get_draft_model().model_id,
+                         'qwen3.5-0.8b-draft')
+
+    def test_vault_provider_without_endpoint_stays_local(self):
+        # anthropic/gemini/groq export no OpenAI-compatible endpoint: only
+        # the vendor SDK ladder in get_llm() reaches them, so the registry
+        # keeps the local servers rather than posting the key elsewhere.
+        os.environ['HEVOLVE_ACTIVE_CLOUD_PROVIDER'] = 'anthropic'
+        os.environ['HEVOLVE_LLM_API_KEY'] = 'sk-ant-test'
+        os.environ['HEVOLVE_LLM_MODEL_NAME'] = 'claude-sonnet-4-20250514'
+        self.mr._register_defaults()
+        ids = self._ids()
+        self.assertNotIn('configured-api', ids)
+        self.assertTrue(self._LOCAL_IDS <= ids, ids)
+
+    def test_vault_provider_with_endpoint_is_the_api_kind_on_a_flat_node(self):
+        os.environ['HEVOLVE_ACTIVE_CLOUD_PROVIDER'] = 'groq'
+        os.environ['HEVOLVE_LLM_API_KEY'] = 'gsk-test'
+        os.environ['HEVOLVE_LLM_MODEL_NAME'] = 'llama-3.3-70b-versatile'
+        os.environ['HEVOLVE_LLM_ENDPOINT_URL'] = 'https://api.groq.com/openai/v1'
+        self.mr._register_defaults()
+        ids = self._ids()
+        self.assertIn('configured-api', ids)
+        self.assertFalse(ids & self._LOCAL_IDS, ids & self._LOCAL_IDS)
+        entry = self.mr.model_registry.get_model('configured-api').config_list_entry
+        self.assertEqual(entry['base_url'], 'https://api.groq.com/openai/v1')
+        self.assertEqual(entry['model'], 'llama-3.3-70b-versatile')
 
 
 if __name__ == '__main__':
