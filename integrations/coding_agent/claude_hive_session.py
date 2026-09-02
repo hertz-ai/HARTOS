@@ -294,10 +294,32 @@ class ClaudeHiveSession:
         logger.info("Task %s accepted (pending=%d)", task_id,
                      len(self._pending_tasks))
 
-        # If the session is idle, immediately start working on the task
+        # If the session is idle, immediately start working on the task.
+        #
+        # CAUTION: the in-backend executor this triggers (_execute_task_steps ->
+        # _dispatch_to_pipeline) asks the LLM for a diff and PARSES it, but never
+        # APPLIES it — it writes no files. Measured live on .69 (2026-09-02): a
+        # coding task "create copilot_proof.txt" was marked completed at a fixed
+        # quality=0.50 with no file on disk. And auto-running it here CONSUMES the
+        # task before the external claude-code daemon (the real executor, `claude
+        # -p` in a repo clone, polling /api/hive/session/tasks) can pick it up —
+        # the daemon then ticks with task=null. So on a node whose executor is the
+        # claude-code daemon, this in-backend auto-run is a fabricating race that
+        # starves the real executor.
+        #
+        # Gated behind HEVOLVE_HIVE_INPROCESS_EXEC. Default '1' preserves the
+        # historical in-backend auto-run for EVERY existing deployment (zero
+        # behaviour change until a node opts out). A node that runs the
+        # claude-code daemon sets it to 0 so the task stays PENDING and the daemon
+        # executes it for real. Flipping the default is agent-3's call (owns this
+        # seam); this only makes the honest path reachable and needs live proof on
+        # .69 (currently unreachable) before the default moves.
+        _inproc_exec = os.environ.get(
+            'HEVOLVE_HIVE_INPROCESS_EXEC', '1').strip().lower() \
+            not in ('0', 'false', 'no', 'off')
         with self._lock:
             is_idle = (self.status == STATUS_IDLE and self.current_task is None)
-        if is_idle:
+        if is_idle and _inproc_exec:
             self._execute_next_task()
 
         return True
