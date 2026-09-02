@@ -504,6 +504,7 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         capture_blocked: false,
         // NATIVE SHELL M3: opt in per session via the env, default OFF (no regression).
         native_shell_on: std::env::var_os("HART_NATIVE_SHELL").is_some(),
+        native_home: None,
         black_buffer,
         // NATIVE SHELL M1 — empty until the first frame composes the backdrop at
         // the output's real mode (the 1920x1080 guess above is only the killswitch

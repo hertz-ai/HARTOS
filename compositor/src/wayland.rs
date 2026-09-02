@@ -246,6 +246,8 @@ pub struct State {
     /// session. Set from the HART_NATIVE_SHELL env at State construction (default OFF,
     /// so the WebView shell is unchanged). No nix option until M6 flips the default.
     pub native_shell_on: bool,
+    /// NATIVE SHELL M3: the latest home_compose scene from the shell.compose IPC verb.
+    pub native_home: Option<crate::scene::HomeCompose>,
     pub black_buffer: smithay::backend::renderer::element::solid::SolidColorBuffer,
     /// NATIVE SHELL M1 — the composed aura backdrop, cached across frames so the
     /// per-pixel compose runs once per (mode, theme) rather than every frame.
@@ -383,6 +385,12 @@ impl CompState for State {
     }
     fn native_shell_on(&self) -> bool {
         self.native_shell_on
+    }
+    fn native_home(&self) -> Option<&crate::scene::HomeCompose> {
+        self.native_home.as_ref()
+    }
+    fn set_native_home(&mut self, home: crate::scene::HomeCompose) {
+        self.native_home = Some(home);
     }
     fn set_capture_blocked_flag(&mut self, on: bool) {
         self.capture_blocked = on;

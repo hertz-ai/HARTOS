@@ -457,6 +457,14 @@ pub trait CompState:
         false
     }
 
+    /// NATIVE SHELL M3: the latest home_compose scene pushed over the `shell.compose`
+    /// IPC verb, or None to fall back to the demo scene. Default None / no-op setter,
+    /// so only the DRM backend stores it (winit dev build uses the demo).
+    fn native_home(&self) -> Option<&crate::scene::HomeCompose> {
+        None
+    }
+    fn set_native_home(&mut self, _home: crate::scene::HomeCompose) {}
+
     // ── IPC event fan-out (window.opened/closed/focused…). The winit backend pushes
     //    framed JSON to its `IpcState` subscribers; the DRM backend logs the edge.
     //    The shared WM edges call this so the event surface is identical on both. ──
@@ -1946,8 +1954,10 @@ pub fn render_native_scene<S, R>(
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Send + Clone + 'static,
 {
-    let _ = state;
-    let home = crate::scene::HomeCompose::demo();
+    let home = state
+        .native_home()
+        .cloned()
+        .unwrap_or_else(crate::scene::HomeCompose::demo);
     let theme = crate::scene::Theme::cosmic_default();
     let tree = crate::scene::layout_home(size.w as f32, size.h as f32, &home, &theme);
 
