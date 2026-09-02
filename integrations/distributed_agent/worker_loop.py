@@ -253,8 +253,18 @@ class DistributedWorkerLoop:
             'casual_conv': False,
         }
 
+        # The self-POST carries the credential dispatch.py mints. On the
+        # central/regional tiers security/middleware.py gate 2 answers a
+        # bare POST /chat with 401 "Authentication required (Bearer token)":
+        # measured on central 2026-09-02, every claimed task died here and
+        # the ledger re-dispatched it each tick ("Task <id>_root already
+        # exists"). Same helper as dispatch.py:862 and
+        # speculative_dispatcher.py:1880 (cdd379ad); this was the third site.
+        from integrations.agent_engine.dispatch import _internal_auth_headers
+
         try:
-            resp = pooled_post(f'{base_url}/chat', json=body, timeout=120)
+            resp = pooled_post(f'{base_url}/chat', json=body,
+                               headers=_internal_auth_headers(), timeout=120)
             if resp.status_code == 200:
                 result = resp.json()
                 response = result.get('response', '')
@@ -284,6 +294,12 @@ class DistributedWorkerLoop:
                     pass
 
                 return response
+            # WARNING, not DEBUG: central emits no INFO/DEBUG after boot, and
+            # this branch was a bare None, so the 401 above left no trace
+            # beyond "Worker execution failed".
+            logger.warning(
+                f"Worker local /chat returned HTTP {resp.status_code} for "
+                f"{task.task_id}")
         except requests.RequestException as e:
             logger.warning(f"Worker local /chat failed for {task.task_id}: {e}")
 

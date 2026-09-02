@@ -333,6 +333,55 @@ class TestDistributedWorkerLoop:
             mock_coordinator.submit_result.assert_called_once_with(
                 'task_abc123', wl._node_id, 'Generated content')
 
+    def test_worker_self_post_carries_daemon_credential(self, mock_coordinator,
+                                                        mock_task,
+                                                        mock_guardrails):
+        """The worker's /chat self-POST sends the credential
+        dispatch._internal_auth_headers mints. On the central tier
+        security/middleware.py gate 2 answers a bare POST with 401, so
+        every claimed task died silently there (measured 2026-09-02)."""
+        from integrations.distributed_agent.worker_loop import DistributedWorkerLoop
+        mock_coordinator.claim_next_task.return_value = mock_task
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {'response': 'Generated content'}
+        minted = {'Authorization': 'Bearer system-daemon-token'}
+
+        wl = DistributedWorkerLoop()
+        with patch.object(wl, '_get_coordinator', return_value=mock_coordinator),              patch('integrations.agent_engine.dispatch._internal_auth_headers',
+                   return_value=minted),              patch('integrations.distributed_agent.worker_loop.pooled_post',
+                   return_value=mock_resp) as mock_post:
+            wl._tick()
+            mock_post.assert_called_once()
+            assert mock_post.call_args.kwargs['headers'] == minted
+            mock_coordinator.submit_result.assert_called_once_with(
+                'task_abc123', wl._node_id, 'Generated content')
+
+    def test_worker_non_200_submits_nothing_and_warns(self, mock_coordinator,
+                                                      mock_task, mock_guardrails,
+                                                      caplog):
+        """A non-200 from our own /chat submits no result and leaves a
+        WARNING with the status code: central logs nothing below WARNING
+        after boot, and this branch used to be a bare None."""
+        import logging
+        from integrations.distributed_agent.worker_loop import DistributedWorkerLoop
+        mock_coordinator.claim_next_task.return_value = mock_task
+
+        denied = MagicMock()
+        denied.status_code = 401
+        denied.json.return_value = {
+            'error': 'Authentication required (Bearer token)'}
+
+        wl = DistributedWorkerLoop()
+        with patch.object(wl, '_get_coordinator', return_value=mock_coordinator),              patch('integrations.agent_engine.dispatch._internal_auth_headers',
+                   return_value=None),              patch('integrations.distributed_agent.worker_loop.pooled_post',
+                   return_value=denied),              caplog.at_level(logging.WARNING, logger='hevolve_social'):
+            wl._tick()
+            mock_coordinator.submit_result.assert_not_called()
+        assert any('401' in r.getMessage() and r.levelno == logging.WARNING
+                   for r in caplog.records)
+
     def test_worker_tick_handles_chat_failure(self, mock_coordinator, mock_task,
                                                mock_guardrails):
         """Worker handles /chat failure gracefully."""
