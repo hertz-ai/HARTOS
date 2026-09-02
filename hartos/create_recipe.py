@@ -830,14 +830,6 @@ class SubscriptionHandler:
         await component.stop()  # Stop the component after getting the response
 
 
-
-
-llm_config = {
-        "cache_seed": None,
-        "config_list": config_list,
-        "max_tokens": 1500
-    }
-
 def has_pending_tool_calls(messages):
     """Check if the last message contains tool calls that need execution."""
     if not messages:
@@ -2918,7 +2910,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
     manager = autogen.GroupChatManager(
         groupchat=group_chat,
-        llm_config={"config_list": config_list,"cache_seed": None,"max_tokens": 1500}
+        llm_config=get_llm_config()
     )
     # FIX: Ensure group_chat references the SAME object autogen uses internally.
     # GroupChatManager may store a different reference. The state_transition closure
@@ -3038,7 +3030,7 @@ def instantiate_executor_agent():
     executor = autogen.AssistantAgent(
         name="Executor",
         code_execution_config={"last_n_messages": 2, "work_dir": get_coding_workspace_dir(), "use_docker": False},
-        llm_config=llm_config,
+        llm_config=get_llm_config(),
         system_message=f"""You are an Executor agent.
 {_executor_cultural}
         Focus: Running, and debugging code.
@@ -3088,7 +3080,7 @@ def instantiate_executor_agent():
 def instantiate_status_verifier_agent(user_prompt):
     verify = autogen.AssistantAgent(
         name="StatusVerifier",
-        llm_config=llm_config,
+        llm_config=get_llm_config(),
         code_execution_config=False,
         system_message=""""You are a Status Verification Agent in a multi-agent system.
         AUTONOMOUS MODE: Prefer "completed" over "updated" or "pending". If the Assistant made a reasonable attempt (even simulated), mark "completed". Only use "updated" when the action definition itself needs changing. Do NOT return "updated" or "pending" just because user preferences are unknown — use sensible defaults.
@@ -3123,7 +3115,7 @@ def instantiate_helper_agent():
 
     helper = autogen.AssistantAgent(
         name="Helper",
-        llm_config=llm_config,
+        llm_config=get_llm_config(),
         code_execution_config=False,
         system_message=f"""You are a Helper Agent with a caring, supportive nature.
 {_helper_cultural}
@@ -3233,7 +3225,7 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
 
     assistant = autogen.AssistantAgent(
         name="Assistant",
-        llm_config=llm_config,
+        llm_config=get_llm_config(),
         code_execution_config={"last_n_messages": 2, "work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f"""{'AUTONOMOUS MODE: Do NOT ask the user questions. Use sensible defaults. Complete actions immediately without clarification.' if autonomous else 'INTERACTIVE MODE: You may ask the user clarifying questions to understand their vision before proceeding.'}
         Plain ASCII only in code and output — no emoji or non-ASCII characters.
@@ -3341,7 +3333,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
     time_agent = autogen.AssistantAgent(
         name='time_agent',
-        llm_config=llm_config,
+        llm_config=get_llm_config(),
         max_consecutive_auto_reply=10,
         is_termination_msg=_is_terminate_msg,
         code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
@@ -3369,7 +3361,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     )
     helper1 = autogen.AssistantAgent(
         name="Helper",
-        llm_config=llm_config,
+        llm_config=get_llm_config(),
         code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f"""You are Helper Agent. Help the {role} agent to complete the task:
 {get_cultural_prompt()}
@@ -3392,7 +3384,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     )
     executor1 = autogen.AssistantAgent(
         name="Executor",
-        llm_config=llm_config,
+        llm_config=get_llm_config(),
         code_execution_config={"last_n_messages":2,"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f'''You are a executor agent. focused solely on creating, running & debugging code.
             Your responsibilities:
@@ -3419,14 +3411,14 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     )
     multi_role_agent1 = autogen.AssistantAgent(
         name="multi_role_agent",
-        llm_config=llm_config,
+        llm_config=get_llm_config(),
         code_execution_config=False,
         system_message="""You will send message from multiple different personas, your job is to ask those question to assistant agent
         if you think some text was intended for some other agent, but i came to you send the same message to user""",
     )
     verify1 = autogen.AssistantAgent(
         name="StatusVerifier",
-        llm_config=llm_config,
+        llm_config=get_llm_config(),
         code_execution_config=False,
         system_message=""""You are an Status verification agent.
         Role: Track and verify the status of actions. Provide updates strictly in JSON format only when status is completed.
@@ -3609,7 +3601,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
     time_manager = autogen.GroupChatManager(
         groupchat=time_group_chat,
-        llm_config={"cache_seed": None,"config_list": config_list}
+        llm_config=get_llm_config()
     )
 
     time_agent_object['time_group_chat'] = time_group_chat
