@@ -2050,7 +2050,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         tool_logger.debug(f"Media tools registration skipped: {e}")
     try:
         from integrations.agent_engine.news_tools import register_news_tools
-        register_news_tools(helper1, time_agent, user_id)
+        register_news_tools(helper1, time_agent, user_id, executor=executor1)
     except Exception as e:
         tool_logger.debug(f"News tools registration skipped: {e}")
 
@@ -2401,7 +2401,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             # else fetch_news_feeds / mark_news_for_web 404 and the daily
             # refresh step fails silently.
             from integrations.agent_engine.news_tools import register_news_tools
-            register_news_tools(helper, assistant, user_id)
+            register_news_tools(helper, assistant, user_id, executor=executor)
             current_app.logger.info("News tools loaded (Tier 2) for reuse agent")
     except Exception as e:
         # Same observability promotion as create_recipe.py — a failure

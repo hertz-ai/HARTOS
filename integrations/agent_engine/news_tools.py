@@ -51,8 +51,19 @@ DEFAULT_NEWS_FEEDS = [
 ]
 
 
-def register_news_tools(helper, assistant, user_id: str):
-    """Register news curation and push notification tools with an AutoGen agent."""
+def register_news_tools(helper, assistant, user_id: str, executor=None):
+    """Register news curation and push notification tools with an AutoGen agent.
+
+    ``executor`` (optional): a group-chat agent, distinct from the proposer, that
+    can RUN the tool calls.  Needed because FIX A (2026-09-03) also registers the
+    tools for LLM on the Assistant so it emits STRUCTURED tool_calls — but the
+    Assistant is itself the only ``register_for_execution`` target, and autogen
+    will not let the same agent speak twice in a row to run its own call, so an
+    Assistant-proposed tool_call strands with no result (measured live: the
+    Assistant's fetch_news_feeds got no role=tool reply while the Helper's
+    get_trending_news executed).  Registering execution on a separate executor
+    lets func_call_filter route the Assistant's calls to it.
+    """
 
     def fetch_news_feeds(
         feed_urls: Annotated[str, "Comma-separated RSS/Atom feed URLs to fetch"],
@@ -424,5 +435,10 @@ def register_news_tools(helper, assistant, user_id: str):
         # not "simplify" it back.
         assistant.register_for_llm(name=name, description=desc)(func)
         assistant.register_for_execution(name=name)(func)
+        # Let a NON-proposer agent execute too, so the Assistant's own
+        # structured tool_calls are not stranded by the repeat-speaker rule
+        # (see the executor note in the docstring — measured live 2026-09-03).
+        if executor is not None:
+            executor.register_for_execution(name=name)(func)
 
     logger.info(f"Registered {len(tools)} news tools for user {user_id}")
