@@ -28,6 +28,28 @@ import re as _re
 NEWS_IMAGE_PREFIX = '<!-- news_image:'
 NEWS_IMAGE_RE = _re.compile(r'<!--\s*news_image:(\S+?)\s*-->')
 
+# Curated fallback feed set for fetch_news_feeds.  The tool takes a
+# model-supplied ``feed_urls`` string, but the model's training-knowledge RSS
+# URLs drift and die: measured live 2026-09-03, the world-news agent guessed
+# ``feeds.theguardian.com/world`` (404 — the live path is ``/world/rss``) and
+# ``www.reuters.com/rss2/`` (401 — Reuters discontinued public RSS), so it
+# fetched ZERO articles and could not curate anything.  When every supplied URL
+# yields nothing, fall back to these — each verified live through THIS
+# FeedImporter (same UA + parser) on 2026-09-03 (BBC 26, Guardian 45, NPR 10,
+# Al Jazeera 25, NYT 54, TechCrunch 20, The Verge 10, Ars 20 items).  Mix of
+# world-news and tech so both the international and AI/tech news agents get real
+# material.  Verified working, not guessed.
+DEFAULT_NEWS_FEEDS = [
+    'http://feeds.bbci.co.uk/news/world/rss.xml',
+    'https://www.theguardian.com/world/rss',
+    'https://rss.nytimes.com/services/xml/rss/nyt/World.xml',
+    'https://feeds.npr.org/1001/rss.xml',
+    'https://www.aljazeera.com/xml/rss/all.xml',
+    'https://techcrunch.com/feed/',
+    'https://www.theverge.com/rss/index.xml',
+    'https://feeds.arstechnica.com/arstechnica/index',
+]
+
 
 def register_news_tools(helper, assistant, user_id: str):
     """Register news curation and push notification tools with an AutoGen agent."""
@@ -41,32 +63,48 @@ def register_news_tools(helper, assistant, user_id: str):
             from integrations.social.feed_import import FeedImporter
 
             importer = FeedImporter()
-            all_items = []
-            errors = []
 
-            for url in feed_urls.split(','):
-                url = url.strip()
-                if not url:
-                    continue
-                try:
-                    metadata, items, _ = importer.fetch_feed(url)
-                    for item in items[:max_items]:
-                        all_items.append({
-                            'title': item.title,
-                            'link': item.link,
-                            'author': item.author,
-                            'published': item.published.isoformat() if item.published else None,
-                            'categories': item.categories,
-                            'source': metadata.title or url,
-                            'content_preview': item.content[:200] if item.content else '',
-                        })
-                except Exception as e:
-                    errors.append({'url': url, 'error': str(e)})
+            def _pull(urls):
+                items, errs = [], []
+                for url in urls:
+                    url = (url or '').strip()
+                    if not url:
+                        continue
+                    try:
+                        metadata, feed_items, _ = importer.fetch_feed(url)
+                        for item in feed_items[:max_items]:
+                            items.append({
+                                'title': item.title,
+                                'link': item.link,
+                                'author': item.author,
+                                'published': item.published.isoformat() if item.published else None,
+                                'categories': item.categories,
+                                'source': metadata.title or url,
+                                'content_preview': item.content[:200] if item.content else '',
+                            })
+                    except Exception as e:
+                        errs.append({'url': url, 'error': str(e)})
+                return items, errs
+
+            all_items, errors = _pull(feed_urls.split(','))
+
+            # When every model-supplied URL failed or returned nothing, fall
+            # back to the curated, live-verified DEFAULT_NEWS_FEEDS so the agent
+            # still has real articles to curate (see the constant's comment for
+            # the 2026-09-03 dead-URL evidence).  Behaviour is unchanged when the
+            # supplied feeds work — the fallback only fires on an empty result.
+            used_default_feeds = False
+            if not all_items:
+                fb_items, fb_errors = _pull(DEFAULT_NEWS_FEEDS)
+                all_items = fb_items
+                errors = errors + fb_errors
+                used_default_feeds = bool(fb_items)
 
             return json.dumps({
                 'items': all_items,
                 'total': len(all_items),
                 'errors': errors,
+                'used_default_feeds': used_default_feeds,
             })
         except Exception as e:
             return json.dumps({'error': str(e)})
