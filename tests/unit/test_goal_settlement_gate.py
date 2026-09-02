@@ -28,6 +28,9 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
+from datetime import datetime, timedelta  # noqa: E402
+from unittest.mock import patch  # noqa: E402
+
 from integrations.agent_engine.agent_daemon import _settle_dispatched_goal  # noqa: E402
 
 
@@ -108,3 +111,118 @@ def test_the_speculative_branch_reaches_the_gate():
         if '_settle_dispatched_goal' in window else window
     assert '\n                            continue' not in before_settle, \
         'a continue crept back between speculation and settlement (defect (b))'
+
+
+# ===================================================================
+# Grounding: spark is a proxy, and it was satisfied before the work
+# ===================================================================
+#
+# Measured on central 2026-09-02.  Two proxies both went true before the goal's
+# work existed:
+#   - spark_spent is a LIFETIME counter and the gate compared it to zero, so a
+#     goal that ever spent spark passed forever (a4734e50 carried 101 from the
+#     previous day).
+#   - the distributed branch returns the submitted goal id the instant
+#     submit_goal returns, so the gate ran before any work existed: a4734e50
+#     was completed at 12:39:36, its task claimed at 12:43:46, finished ~12:47.
+
+
+class _Coordinator:
+    """Seam-fake for the distributed coordinator's own accounting."""
+
+    def __init__(self, progress):
+        self._progress = progress
+
+    def get_goal_progress(self, goal_id):
+        return self._progress
+
+
+def _with_coordinator(progress):
+    """Patch the coordinator the gate imports from .dispatch."""
+    coord = _Coordinator(progress) if progress is not None else None
+    return patch('integrations.agent_engine.dispatch._get_distributed_coordinator',
+                 return_value=coord)
+
+
+def test_lifetime_spark_alone_no_longer_completes_a_goal():
+    """THE regression: 101 spark from yesterday, nothing spent this dispatch."""
+    g = Goal(spark=101, cfg={'spark_at_dispatch': 101})
+    _settle_dispatched_goal(Db(), g, 'g1')
+    assert g.status == 'active'
+    assert g.config_json['noop_dispatch_count'] == 1,         'a dispatch that spent nothing new is a noop, whatever the lifetime total'
+
+
+def test_new_spend_completes_when_there_is_no_ledger_entry():
+    """Purely local dispatch: no coordinator opinion, spend is the evidence."""
+    g = Goal(spark=141, cfg={'spark_at_dispatch': 101})
+    with _with_coordinator(None):
+        _settle_dispatched_goal(Db(), g, 'g1')
+    assert g.status == 'completed'
+    assert g.config_json['completion_grounding'] == 'local_dispatch_spend'
+
+
+def test_outstanding_ledger_tasks_block_completion_without_a_noop_strike():
+    g = Goal(spark=141, cfg={'spark_at_dispatch': 101})
+    with _with_coordinator({'total_tasks': 1, 'completed': 0}):
+        _settle_dispatched_goal(Db(), g, 'g1')
+    assert g.status == 'active', 'work in flight must not be reported complete'
+    assert 'awaiting_verification_since' in g.config_json
+    assert 'noop_dispatch_count' not in g.config_json,         'in-flight work must not collect noop strikes or it auto-pauses in 5 ticks'
+
+
+def test_all_ledger_tasks_done_completes_and_records_the_grounding():
+    g = Goal(spark=141, cfg={'spark_at_dispatch': 101,
+                             'awaiting_verification_since': '2026-09-02T12:39:36'})
+    with _with_coordinator({'total_tasks': 2, 'completed': 2}):
+        _settle_dispatched_goal(Db(), g, 'g1')
+    assert g.status == 'completed'
+    assert g.config_json['completion_grounding'] == 'ledger_tasks_complete'
+    assert 'awaiting_verification_since' not in g.config_json,         'completion must clear the waiting trail'
+
+
+def test_waiting_forever_is_bounded_by_a_pause_with_its_own_reason():
+    stale = (datetime.utcnow() - timedelta(seconds=3600)).isoformat()
+    g = Goal(spark=141, cfg={'spark_at_dispatch': 101,
+                             'awaiting_verification_since': stale})
+    with _with_coordinator({'total_tasks': 1, 'completed': 0}):
+        _settle_dispatched_goal(Db(), g, 'g1')
+    assert g.status == 'paused'
+    assert 'ledger never reported every task done' in g.config_json['pause_reason']
+
+
+def test_an_unreadable_wait_timestamp_keeps_waiting_rather_than_pausing():
+    """A clock or format problem must never be why a goal gets paused."""
+    g = Goal(spark=141, cfg={'spark_at_dispatch': 101,
+                             'awaiting_verification_since': 'not-a-timestamp'})
+    with _with_coordinator({'total_tasks': 1, 'completed': 0}):
+        _settle_dispatched_goal(Db(), g, 'g1')
+    assert g.status == 'active'
+
+
+def test_a_broken_coordinator_does_not_complete_or_block_the_goal():
+    """No opinion from the ledger degrades to the spend test, not to a stall."""
+    class Exploding:
+        def get_goal_progress(self, goal_id):
+            raise RuntimeError('redis gone')
+
+    g = Goal(spark=141, cfg={'spark_at_dispatch': 101})
+    with patch('integrations.agent_engine.dispatch._get_distributed_coordinator',
+               return_value=Exploding()):
+        _settle_dispatched_goal(Db(), g, 'g1')
+    assert g.status == 'completed'
+    assert g.config_json['completion_grounding'] == 'local_dispatch_spend'
+
+
+def test_a_goal_dispatched_before_this_code_shipped_still_settles():
+    """No spark_at_dispatch key: degrade to the old lifetime test, never block."""
+    g = Goal(spark=7)
+    with _with_coordinator(None):
+        _settle_dispatched_goal(Db(), g, 'g1')
+    assert g.status == 'completed'
+
+
+def test_continuous_goals_are_still_never_auto_completed_even_when_grounded():
+    g = Goal(spark=141, cfg={'continuous': True, 'spark_at_dispatch': 101})
+    with _with_coordinator({'total_tasks': 1, 'completed': 1}):
+        _settle_dispatched_goal(Db(), g, 'g1')
+    assert g.status == 'active'

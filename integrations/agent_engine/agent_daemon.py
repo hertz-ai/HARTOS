@@ -183,20 +183,83 @@ def _send_hitl_notification(db, goal, task):
 
 
 
+def _seconds_since_iso(iso_str):
+    """Age in seconds of an ISO timestamp, or None if it cannot be read.
+
+    None means "unknown", and every caller treats unknown as "keep waiting"
+    rather than as an expiry — a clock or format problem must never be the
+    reason a goal gets paused.
+    """
+    try:
+        stamp = datetime.fromisoformat(str(iso_str).replace('Z', ''))
+    except (TypeError, ValueError):
+        return None
+    return (datetime.utcnow() - stamp).total_seconds()
+
+
+def _goal_ledger_grounding(goal_id):
+    """Did the distributed ledger finish every task for this goal?
+
+    Returns True (all tasks done), False (tasks outstanding), or None when
+    this goal is not in the coordinator at all — a purely local dispatch,
+    which has no ledger to ground against and falls back to the spark test.
+
+    Read-only: `get_goal_progress` is the coordinator's OWN accounting
+    (per-task status + result_hash), so the rule is not re-derived here.
+    Note what this is NOT: `coordinator.verify_result()` re-hashes a stored
+    result against its stored hash, which detects record tampering, not
+    wrong work, so it is deliberately not used as the grounding signal.
+    """
+    try:
+        from .dispatch import _get_distributed_coordinator
+        coordinator = _get_distributed_coordinator()
+        if not coordinator:
+            return None
+        progress = coordinator.get_goal_progress(str(goal_id))
+        if not isinstance(progress, dict) or progress.get('error'):
+            return None
+        total = int(progress.get('total_tasks') or 0)
+        if total <= 0:
+            return None
+        return int(progress.get('completed') or 0) >= total
+    except Exception as e:
+        # Unreachable coordinator must not silently complete a goal, but it
+        # must not block one either: None = "no opinion", spark decides.
+        logger.debug(f"Ledger grounding unavailable for goal {goal_id}: {e}")
+        return None
+
+
 def _settle_dispatched_goal(db, goal, goal_key):
     """The ONE completion gate every dispatched goal must pass through.
 
     Dispatch-style-independent by construction: it re-reads the goal from
-    the DB and judges only spark_spent, so synchronous (dispatch_goal) and
-    speculative (dispatch_speculative) handoffs are settled identically —
-    require spark_spent > 0 to complete; count noops otherwise; auto-pause
-    after 5 consecutive noops; continuous goals never auto-complete.
+    the DB, so synchronous (dispatch_goal) and speculative
+    (dispatch_speculative) handoffs are settled identically.
+
+    A goal completes only when BOTH hold:
+      1. this dispatch cost something (spark_spent > spark_at_dispatch), and
+      2. the work is grounded — every ledger task for the goal is done.
+
+    Two proxies used to stand in for that and both were satisfied before the
+    work happened (measured on central 2026-09-02):
+      - `spark_spent > 0` reads a LIFETIME counter, so a goal that ever spent
+        spark passed forever.  Goal a4734e50 carried 101 spark from the day
+        before.
+      - the distributed branch (dispatch.py:737-752) returns the submitted
+        goal id the instant `submit_goal` returns, so the gate ran before any
+        work existed.  a4734e50 was marked completed at 12:39:36; its task was
+        claimed at 12:43:46 and finished around 12:47 — declared done four
+        minutes before the work started.
+
+    Three outcomes, not two.  Making the gate stricter without the middle one
+    would send every in-flight goal into the 5-strike noop pause within 2.5
+    minutes, which is worse than the bug it fixes:
+      completed             — spark spent this dispatch AND ledger grounded
+      awaiting_verification — spark spent, work genuinely in flight; no noop
+                              strike, bounded by HEVOLVE_GOAL_VERIFY_TIMEOUT_S
+      noop                  — no new spark at all; unchanged 5-strike pause
+    Continuous goals still never auto-complete.
     """
-    # Real completion gate: refresh from DB and require
-    # spark_spent > 0 (some real tool/LLM cost was incurred).
-    # Goals dispatched but doing zero work get a 'noop'
-    # counter; after 5 consecutive noops the goal is
-    # auto-paused so the daemon stops re-spinning it.
     try:
         db.refresh(goal)
     except Exception:
@@ -204,6 +267,13 @@ def _settle_dispatched_goal(db, goal, goal_key):
     cfg = goal.config_json or {}
     is_continuous = cfg.get('continuous', False)
     spark_spent = goal.spark_spent or 0
+    # Per-dispatch, not lifetime.  Absent key (a goal dispatched before this
+    # code shipped) degrades to the old `> 0` test rather than blocking.
+    spark_at_dispatch = cfg.get('spark_at_dispatch')
+    if spark_at_dispatch is None:
+        spark_this_dispatch = spark_spent
+    else:
+        spark_this_dispatch = spark_spent - int(spark_at_dispatch or 0)
     # Completion = SPARK: the goal's purpose is spark
     # transacted on real work (steward decision 2026-06-10 —
     # a flow-recipe artifact proves a procedure RAN once, not
@@ -216,14 +286,57 @@ def _settle_dispatched_goal(db, goal, goal_key):
         # Continuous goals never auto-complete; cooldown gate
         # higher up already prevents re-dispatch storms.
         pass
-    elif spark_spent > 0:
-        goal.status = 'completed'
-        cfg['completed_at'] = datetime.utcnow().isoformat()
-        cfg.pop('noop_dispatch_count', None)
-        goal.config_json = cfg
-        logger.info(
-            f"Goal {goal_key} COMPLETED "
-            f"(spark_spent={spark_spent})")
+    elif spark_this_dispatch > 0:
+        # Work cost something this time round. Now: did it LAND?
+        # goal_key IS str(goal.id) at the only call site, and it is the
+        # same string dispatch_goal_distributed submits as the coordinator
+        # goal id.  Using it keeps this gate judging its own arguments
+        # rather than reaching into the ORM object.
+        grounded = _goal_ledger_grounding(goal_key)
+        if grounded is False:
+            # In flight. Not a noop — do not touch the noop counter, and do
+            # not re-spin the goal — but do not sit here silently forever
+            # either: the pause below is the bound.
+            since = cfg.get('awaiting_verification_since')
+            if not since:
+                since = datetime.utcnow().isoformat()
+                cfg['awaiting_verification_since'] = since
+            cfg['last_verification_check'] = datetime.utcnow().isoformat()
+            waited = _seconds_since_iso(since)
+            timeout_s = int(os.environ.get(
+                'HEVOLVE_GOAL_VERIFY_TIMEOUT_S', '1800'))
+            if waited is not None and waited > timeout_s:
+                goal.status = 'paused'
+                cfg['pause_reason'] = (
+                    f'Auto-paused: work was dispatched and spark was spent, '
+                    f'but the ledger never reported every task done after '
+                    f'{int(waited)}s.  Check the distributed worker on this '
+                    f'node before resuming.')
+                cfg['paused_at'] = datetime.utcnow().isoformat()
+                logger.warning(
+                    f"Goal {goal_key} AUTO-PAUSED after {int(waited)}s "
+                    f"awaiting ledger grounding")
+            else:
+                logger.info(
+                    f"Goal {goal_key} awaiting verification "
+                    f"(spark_this_dispatch={spark_this_dispatch}, "
+                    f"ledger tasks outstanding)")
+            goal.config_json = cfg
+        else:
+            # grounded is True (every ledger task done) or None (no ledger
+            # entry for this goal — a purely local dispatch, where spend on
+            # this dispatch is the only evidence that exists).
+            goal.status = 'completed'
+            cfg['completed_at'] = datetime.utcnow().isoformat()
+            cfg['completion_grounding'] = (
+                'ledger_tasks_complete' if grounded else 'local_dispatch_spend')
+            cfg.pop('noop_dispatch_count', None)
+            cfg.pop('awaiting_verification_since', None)
+            goal.config_json = cfg
+            logger.info(
+                f"Goal {goal_key} COMPLETED "
+                f"(spark_this_dispatch={spark_this_dispatch}, "
+                f"grounding={cfg['completion_grounding']})")
     else:
         # Dispatched but zero real work — track and back off.
         noop_count = int(cfg.get('noop_dispatch_count', 0)) + 1
@@ -242,8 +355,8 @@ def _settle_dispatched_goal(db, goal, goal_key):
                 f"{noop_count} noop dispatches")
         else:
             logger.info(
-                f"Goal {goal_key} dispatched but "
-                f"spark_spent=0 (noop #{noop_count})")
+                f"Goal {goal_key} dispatched but this dispatch spent no "
+                f"spark (lifetime={spark_spent}, noop #{noop_count})")
         goal.config_json = cfg
 
 class AgentDaemon:
@@ -1363,6 +1476,18 @@ class AgentDaemon:
                     continue
 
                 goal.last_dispatched_at = datetime.utcnow()
+
+                # Snapshot spark BEFORE the handoff so the completion gate can
+                # ask "did THIS dispatch cost anything" instead of "has this
+                # goal ever cost anything".  goal.spark_spent is a lifetime
+                # counter on the row: goal a4734e50 carried spark_spent=101
+                # from 2026-09-01 and therefore passed the gate on every
+                # subsequent tick without doing any new work.  Written to
+                # config_json (no schema change) and consumed by
+                # _settle_dispatched_goal below.
+                _cfg_pre = goal.config_json or {}
+                _cfg_pre['spark_at_dispatch'] = goal.spark_spent or 0
+                goal.config_json = _cfg_pre
 
                 # Speculative dispatch if enabled and budget allows.
                 #
