@@ -77,6 +77,13 @@ LLAMA_CTX_SIZE_DEFAULT: int = 12288
 LLAMA_SLOTS_DEFAULT: int = 1
 WIRE_TRIM_SAFETY_MARGIN_TOKENS: int = 256       # headroom under the budget
 WIRE_TRIM_MARKER: str = '...[truncated head]...\n'
+# Seed injected at the wire when an outbound body carries no role='user'
+# turn.  llama-server's Qwen3 chat template raises a hard 500 "No user
+# query found in messages." whenever the messages array reaches it without
+# a user turn (a role='tool' result does NOT satisfy it).  The text is a
+# neutral continuation directive so the model still advances the task.
+WIRE_USER_SEED_TEXT: str = (
+    'Please continue with the current task and produce the final result now.')
 
 
 # ──────────────────────────────────────────────────────────────────────
