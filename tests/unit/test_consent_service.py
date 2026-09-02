@@ -68,15 +68,66 @@ def test_request_consent_emits_ask_on_new_row():
     assert payload['consent_type'] == 'data_access'
 
 
-def test_request_consent_dedup_stays_silent():
-    """A denied gate re-asks every tick (daemon 30s, screen capture 10s);
-    only the FIRST filing may notify or the tray floods."""
+def test_request_consent_reemits_ask_while_pending():
+    """Idempotent RE-ASK: a still-pending consent must re-fire on every poll
+    so a UI that subscribed AFTER the first emit (fresh boot, page reload /
+    'retry', a dropped notification) reliably gets asked -- previously the
+    ask fired exactly once and a missed ask was lost forever.  Every re-emit
+    carries a STABLE msg_id (the row id) so clients dedupe them into ONE card
+    (reliable delivery, zero spam)."""
+    with db_session() as db:
+        cid = ConsentService.request_consent(db, 'u1', 'screen_capture').id
+    with patch('integrations.social.consent_service._emit') as emit:
+        with db_session() as db:              # poll 2 (gate still denied)
+            ConsentService.request_consent(db, 'u1', 'screen_capture')
+        with db_session() as db:              # poll 3
+            ConsentService.request_consent(db, 'u1', 'screen_capture')
+    assert emit.call_count == 2               # re-asked both polls (was 0 pre-fix)
+    for call in emit.call_args_list:
+        assert call.args[0] == 'consent.request'
+        assert call.kwargs['msg_id'] == f'consent.request:{cid}'  # stable => 1 card
+
+
+def test_request_consent_no_reask_after_grant():
+    """Once granted, polling must NOT keep asking."""
+    with db_session() as db:
+        ConsentService.request_consent(db, 'u1', 'screen_capture')
+    with db_session() as db:
+        ConsentService.grant_consent(db, 'u1', 'screen_capture')
+    with patch('integrations.social.consent_service._emit') as emit:
+        with db_session() as db:
+            ConsentService.request_consent(db, 'u1', 'screen_capture')
+    emit.assert_not_called()
+
+
+def test_request_consent_no_reask_after_revoke():
+    """A revoked consent (user said no) must NOT be re-asked every poll."""
+    with db_session() as db:
+        ConsentService.request_consent(db, 'u1', 'screen_capture')
+        ConsentService.grant_consent(db, 'u1', 'screen_capture')
+    with db_session() as db:
+        ConsentService.revoke_consent(db, 'u1', 'screen_capture')
+    with patch('integrations.social.consent_service._emit') as emit:
+        with db_session() as db:
+            ConsentService.request_consent(db, 'u1', 'screen_capture')
+    emit.assert_not_called()
+
+
+def test_request_consent_reask_uses_stable_msgid_no_flood():
+    """A denied gate re-asks every tick (daemon 30s, screen capture 10s).
+    The ask now RE-FIRES on each poll (so a UI that missed the first emit
+    still gets asked), but every re-emit carries the SAME stable msg_id --
+    clients dedupe by msg_id, so the tray shows exactly ONE card, never the
+    flood the old emit-once design was avoiding."""
     with patch('integrations.social.consent_service._emit') as emit:
         with db_session() as db:
             ConsentService.request_consent(db, 'u1', 'data_access')
         with db_session() as db:
             ConsentService.request_consent(db, 'u1', 'data_access')
-    assert emit.call_count == 1
+    assert emit.call_count == 2                       # re-fires (reliable)
+    msgids = {c.kwargs.get('msg_id') for c in emit.call_args_list}
+    assert len(msgids) == 1                           # one stable id => one card
+    assert next(iter(msgids)).startswith('consent.request:')
 
 
 # ──────────────────────────────────────────────────────────────────────
