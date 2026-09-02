@@ -149,6 +149,128 @@ def get_last_yield_reason():
     return _last_yield_reason
 
 
+def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
+                        native_fallback=True):
+    """The ONE in-process call to this node's own /chat.  Returns
+    ``(status, text)`` where status is ``'ok'`` (text is the reply),
+    ``'deferred'`` (a human has the LLM, or it is saturated — retry later,
+    NOT a failure) or ``'unavailable'`` (no in-process route; the caller may
+    fall back to its HTTP tier).
+
+    ``native_fallback=False`` says "only use this if the Nunba adapter is
+    present".  On native HARTOS (central) the loopback POST already reaches
+    the right /chat, so a caller that has a working HTTP tier should not pay
+    to pull the Flask app into its own thread; the bug this function exists
+    to fix is bundled-only.  ``dispatch_goal`` keeps the native fallback it
+    has always had.
+
+    WHY THIS EXISTS
+    ───────────────
+    "POST my own /chat" was hand-rolled in three places and only ONE of them
+    did it correctly.  ``dispatch_goal`` resolves an in-process callable
+    first; ``_dispatch_single_instruction`` and
+    ``distributed_agent.worker_loop._execute_task`` went straight to
+    ``pooled_post(base_url + '/chat')``.
+
+    On a bundled desktop that raw POST does not reach HARTOS at all.  Nunba
+    registers its OWN ``/chat`` at that address (``routes/chatbot_routes.py``
+    ``app.route("/chat")``), it reads the body's ``text`` field, and HARTOS
+    speaks ``prompt`` — so every such call was answered
+    ``400 {"error": "Text is required"}``.  Measured on the live desktop
+    2026-09-02: the copilot instruction queue drained 8 benchmark shards
+    every ~50s and all 8 failed HTTP 400, 88 times in one day, and
+    ``instruction_queue.fail_instruction`` re-queues with no attempt cap, so
+    it would have retried forever.
+
+    The translator between the two dialects already exists and is
+    ``routes.hartos_backend_adapter.chat`` ("Maps Nunba's parameter names to
+    what hart_intelligence /chat expects: text -> prompt").  Going through it
+    is the whole fix; teaching Nunba's route to accept both dialects would
+    have made the divergence permanent.
+
+    Two correctness properties the hand-rolled callers also skipped, and
+    which every caller of this function now gets:
+      - the user-priority gate (a daemon must not take the LLM while a human
+        is chatting), and
+      - ``_local_llm_semaphore`` (one in-flight local LLM call), whose
+        absence is what pile-drove the local llama-server into the
+        watchdog-restart cascade this module already documents.
+    """
+    try:
+        try:
+            from routes.hartos_backend_adapter import chat as hevolve_chat
+        except ImportError:
+            try:
+                from hartos_backend_adapter import chat as hevolve_chat
+            except ImportError:
+                if not native_fallback:
+                    # Native HARTOS and the caller has its own HTTP tier that
+                    # already reaches the right /chat here. Say so rather than
+                    # importing the Flask app into this thread.
+                    return 'unavailable', None
+                # NATIVE HARTOS (no Nunba adapter — the module lives only in
+                # Nunba): call the in-process /chat via the app's OWN test
+                # client, the SAME canonical route the HTTP tier uses, minus
+                # the loopback socket, exactly as
+                # routes.hartos_backend_adapter.chat does in Nunba.  Reuses
+                # the /chat pipeline + _internal_auth_headers; no new dispatch
+                # path.  Any error here still lets the caller fall through to
+                # its HTTP tier (bounded-safe).
+                def hevolve_chat(text=None, user_id=None, agent_id=None,
+                                 create_agent=True, casual_conv=False,
+                                 autonomous=True, request_id=None, **_kw):
+                    from hart_intelligence_entry import app as _app
+                    _payload = {
+                        'prompt': text, 'user_id': user_id, 'prompt_id': agent_id,
+                        'create_agent': create_agent, 'casual_conv': casual_conv,
+                        'autonomous': autonomous, 'request_id': request_id,
+                        'task_source': 'own',
+                    }
+                    with _app.test_client() as _c:
+                        _r = _c.post('/chat', json=_payload,
+                                     headers=_internal_auth_headers())
+                        return _r.get_json() or {}
+    except Exception as e:
+        logger.debug(f"No in-process /chat route available: {e}")
+        return 'unavailable', None
+
+    # USER PRIORITY: if a user chatted recently, yield the LLM to them.
+    if is_user_recently_active():
+        logger.info(f"User active ({_USER_CHAT_COOLDOWN}s cooldown), "
+                    f"deferring local /chat for {daemon_id or prompt_id}")
+        return 'deferred', None
+
+    if not _local_llm_semaphore.acquire(timeout=5):
+        logger.info(f"LLM busy ({_LOCAL_LLM_MAX_CONCURRENT} in flight), "
+                    f"deferring local /chat for {daemon_id or prompt_id}")
+        return 'deferred', None
+
+    # Signal to the watchdog that this thread is in a legitimate LLM call.
+    _notify_watchdog_llm_start()
+    try:
+        # A daemon-specific request_id keeps background thinking traces out of
+        # user responses via drain_thinking_traces(), and is what
+        # dispatch.is_genuine_user_request reads to classify the turn.
+        request_id = f'daemon_{daemon_id}' if daemon_id is not None else None
+        result = hevolve_chat(
+            text=prompt, user_id=user_id, agent_id=prompt_id,
+            create_agent=True, casual_conv=False, autonomous=True,
+            request_id=request_id,
+        )
+    except Exception as e:
+        logger.warning(f"In-process /chat failed for {daemon_id or prompt_id}: {e}")
+        return 'unavailable', None
+    finally:
+        _local_llm_semaphore.release()
+        try:
+            _notify_watchdog_llm_end()
+        except Exception:
+            pass
+
+    result = result or {}
+    return 'ok', (result.get('text') or result.get('response', ''))
+
+
 def _note_yield_reason(reason) -> None:
     """Record the current yield reason; log at INFO only on TRANSITION so
     there's a clean trail ('yield gate CLOSED: governor_throttle' →
@@ -780,74 +902,17 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     #   Tier 3: llama.cpp fallback (direct LLM, no agent pipeline)
     resp = None
 
-    # Tier 1: Direct in-process import of hart_intelligence
-    # Guarded by semaphore to prevent concurrent request pile-up on
-    # local llama-server (causes exponential slowdown + watchdog restarts).
-    try:
-        try:
-            from routes.hartos_backend_adapter import chat as hevolve_chat
-        except ImportError:
-            try:
-                from hartos_backend_adapter import chat as hevolve_chat
-            except ImportError:
-                # NATIVE HARTOS (no Nunba adapter — the module lives only in Nunba):
-                # call the in-process /chat via the app's OWN test client — the SAME
-                # canonical route Tier-2 uses, minus the loopback socket, exactly as
-                # routes.hartos_backend_adapter.chat does in Nunba. Reuses the /chat
-                # pipeline + _internal_auth_headers; no new dispatch path. Any error
-                # here still falls through to the Tier-2 HTTP proxy below (bounded-safe).
-                def hevolve_chat(text=None, user_id=None, agent_id=None,
-                                 create_agent=True, casual_conv=False,
-                                 autonomous=True, request_id=None, **_kw):
-                    from hart_intelligence_entry import app as _app
-                    _payload = {
-                        'prompt': text, 'user_id': user_id, 'prompt_id': agent_id,
-                        'create_agent': create_agent, 'casual_conv': casual_conv,
-                        'autonomous': autonomous, 'request_id': request_id,
-                        'task_source': 'own',
-                    }
-                    with _app.test_client() as _c:
-                        _r = _c.post('/chat', json=_payload,
-                                     headers=_internal_auth_headers())
-                        return _r.get_json() or {}
-
-        # USER PRIORITY: if user chatted recently, skip this tick — let user have the LLM
-        if is_user_recently_active():
-            logger.info(f"User active ({_USER_CHAT_COOLDOWN}s cooldown), deferring dispatch for goal {goal_id}")
-            return None
-
-        # Try to acquire semaphore (non-blocking check first)
-        if not _local_llm_semaphore.acquire(timeout=5):
-            logger.info(f"LLM busy ({_LOCAL_LLM_MAX_CONCURRENT} in flight), "
-                        f"skipping dispatch for goal {goal_id}")
-            return None
-
-        # Signal to watchdog that this thread is in a legitimate LLM call
-        _notify_watchdog_llm_start()
-        try:
-            # Use a daemon-specific request_id so thinking traces from daemon
-            # dispatch are isolated from user chat traces. Without this, daemon
-            # traces leak into user responses via drain_thinking_traces().
-            _daemon_request_id = f'daemon_{goal_id}'
-            result = hevolve_chat(
-                text=prompt, user_id=user_id,
-                agent_id=prompt_id, create_agent=True, casual_conv=False,
-                autonomous=True, request_id=_daemon_request_id,
-            )
-        finally:
-            _local_llm_semaphore.release()
-            try:
-                _notify_watchdog_llm_end()
-            except Exception:
-                pass
-
-        response = result.get('text') or result.get('response', '')
-        if response:
-            return response
-    except ImportError:
-        pass  # Nunba adapter not available — fall through to Tier 2
-    except Exception as e:
-        logger.warning(f"Tier-1 dispatch failed for {goal_type} goal {goal_id}: {e}")
+    # Tier 1: the canonical in-process /chat call.  The adapter resolution,
+    # the user-priority gate and the local-LLM semaphore all live in
+    # local_chat_dispatch now, so the instruction queue and the distributed
+    # worker reach /chat exactly the way this goal path does instead of
+    # hand-rolling a raw POST that lands on Nunba's route.
+    _status, response = local_chat_dispatch(
+        prompt, user_id, prompt_id, daemon_id=goal_id)
+    if _status == 'deferred':
+        return None
+    if _status == 'ok' and response:
+        return response
 
     # Tier 2: HTTP proxy to HARTOS backend port
     # Circuit breaker: skip HTTP if server recently unresponsive
@@ -966,6 +1031,23 @@ def _dispatch_single_instruction(base_url: str, user_id: str, inst,
         'casual_conv': False,
         'task_source': 'own',
     }
+    # Canonical in-process route first — the SAME call dispatch_goal makes.
+    # This path used to go straight to the HTTP POST below, which on a bundled
+    # desktop lands on Nunba's /chat (it reads `text`, we send `prompt`) and
+    # was answered 400 "Text is required" every time: 88 failures in one day
+    # across the same 8 benchmark shards, re-queued forever because
+    # fail_instruction has no attempt cap.
+    _status, _text = local_chat_dispatch(
+        inst.text, user_id, body['prompt_id'], daemon_id=batch_id,
+        native_fallback=False)
+    if _status == 'ok' and _text:
+        return (inst.id, _text[:500], None)
+    if _status == 'deferred':
+        # A human has the LLM, or it is saturated. NOT a failure: reporting it
+        # as one burns an attempt and (once instructions get an attempt cap)
+        # would dead-letter healthy work just because the user was typing.
+        return (inst.id, None, 'deferred: user active or LLM busy')
+
     try:
         resp = pooled_post(f'{base_url}/chat', json=body,
                            headers=_internal_auth_headers(), timeout=300)

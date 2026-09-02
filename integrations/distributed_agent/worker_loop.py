@@ -253,6 +253,34 @@ class DistributedWorkerLoop:
             'casual_conv': False,
         }
 
+        # Canonical in-process route first — the SAME call dispatch_goal
+        # makes.  On a bundled desktop the raw POST below does not reach
+        # HARTOS at all: Nunba registers its own /chat there, it reads the
+        # body's `text` field and we send `prompt`, so the answer is
+        # 400 "Text is required".  local_chat_dispatch goes through
+        # routes.hartos_backend_adapter.chat, which is the declared
+        # translator between the two dialects, and it also applies the
+        # user-priority gate and the local-LLM semaphore that this loop
+        # skipped entirely.
+        from integrations.agent_engine.dispatch import (
+            _internal_auth_headers, local_chat_dispatch,
+        )
+
+        _status, _text = local_chat_dispatch(
+            prompt, user_id, prompt_id, daemon_id=task.task_id,
+            native_fallback=False)
+        if _status == 'ok' and _text:
+            return self._after_response(
+                _text, task, user_id=user_id, prompt_id=prompt_id,
+                prompt=prompt)
+        if _status == 'deferred':
+            # A human has the LLM. Returning None here re-queues the task for
+            # a later tick, which is the correct outcome — the alternative is
+            # taking the LLM away from the person using the machine.
+            logger.info(f"Worker deferring task {task.task_id}: local LLM "
+                        f"yielded to user activity")
+            return None
+
         # The self-POST carries the credential dispatch.py mints. On the
         # central/regional tiers security/middleware.py gate 2 answers a
         # bare POST /chat with 401 "Authentication required (Bearer token)":
@@ -260,40 +288,14 @@ class DistributedWorkerLoop:
         # the ledger re-dispatched it each tick ("Task <id>_root already
         # exists"). Same helper as dispatch.py:862 and
         # speculative_dispatcher.py:1880 (cdd379ad); this was the third site.
-        from integrations.agent_engine.dispatch import _internal_auth_headers
-
         try:
             resp = pooled_post(f'{base_url}/chat', json=body,
                                headers=_internal_auth_headers(), timeout=120)
             if resp.status_code == 200:
                 result = resp.json()
-                response = result.get('response', '')
-
-                # GUARDRAIL: post-response check
-                try:
-                    from security.hive_guardrails import GuardrailEnforcer
-                    passed, reason = GuardrailEnforcer.after_response(response)
-                    if not passed:
-                        logger.warning(f"Worker response filtered for {task.task_id}: {reason}")
-                        return None
-                except ImportError:
-                    return None
-
-                # Record to world model
-                try:
-                    from integrations.agent_engine.world_model_bridge import get_world_model_bridge
-                    bridge = get_world_model_bridge()
-                    bridge.record_interaction(
-                        user_id=user_id,
-                        prompt_id=prompt_id,
-                        prompt=prompt,
-                        response=response,
-                        goal_id=task.task_id,
-                    )
-                except Exception:
-                    pass
-
-                return response
+                return self._after_response(
+                    result.get('response', ''), task,
+                    user_id=user_id, prompt_id=prompt_id, prompt=prompt)
             # WARNING, not DEBUG: central emits no INFO/DEBUG after boot, and
             # this branch was a bare None, so the 401 above left no trace
             # beyond "Worker execution failed".
@@ -304,6 +306,48 @@ class DistributedWorkerLoop:
             logger.warning(f"Worker local /chat failed for {task.task_id}: {e}")
 
         return None
+
+    def _after_response(self, response, task, user_id=None, prompt_id=None,
+                        prompt=None):
+        """Guardrail + world-model recording for a worker reply.
+
+        Shared by both routes into /chat (the canonical in-process call and
+        the HTTP fallback) so a response can never reach the coordinator
+        having skipped the post-response guardrail on one path only.
+        """
+        if not response:
+            return None
+
+        # GUARDRAIL: post-response check (fail-closed)
+        try:
+            from security.hive_guardrails import GuardrailEnforcer
+            passed, reason = GuardrailEnforcer.after_response(response)
+            if not passed:
+                logger.warning(
+                    f"Worker response filtered for {task.task_id}: {reason}")
+                return None
+        except ImportError:
+            logger.error("CRITICAL: hive_guardrails not available — "
+                         "blocking worker response")
+            return None
+
+        # Record to world model
+        try:
+            from integrations.agent_engine.world_model_bridge import (
+                get_world_model_bridge,
+            )
+            bridge = get_world_model_bridge()
+            bridge.record_interaction(
+                user_id=user_id or self._node_id,
+                prompt_id=prompt_id or task.task_id,
+                prompt=prompt or task.description,
+                response=response,
+                goal_id=task.task_id,
+            )
+        except Exception:
+            pass
+
+        return response
 
     @staticmethod
     def _get_coordinator():
