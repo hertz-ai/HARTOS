@@ -711,12 +711,14 @@ class GossipProtocol:
                 self._record_peer_failure(peer_url)
             self._heartbeat()
 
-    def _flush_health_row(self, db) -> bool:
+    def _flush_health_row(self, db, round_name='Health round') -> bool:
         """Commit one peer row's change immediately, before the next probe.
 
-        Exists so the health round never holds SQLite's write lock across a
+        Exists so a gossip round never holds SQLite's write lock across a
         network call -- see the rationale at the call site in
-        ``_health_check_round``.
+        ``_health_check_round``.  ``_integrity_round`` uses it too (#71):
+        its guardrail audit and challenge steps make one network call per
+        active peer and used to commit once after the whole loop.
 
         A failed commit must NOT abort the round: the outer handler would
         roll back the whole sweep (every status update and every #38 purge)
@@ -729,9 +731,9 @@ class GossipProtocol:
         except Exception as e:
             db.rollback()
             logger.warning(
-                "Health round: per-row commit failed (%s: %s); rolled back "
+                "%s: per-row commit failed (%s: %s); rolled back "
                 "that row and continuing with the next peer",
-                type(e).__name__, e)
+                round_name, type(e).__name__, e)
             return False
 
     def _health_check_round(self):
@@ -2067,8 +2069,22 @@ class GossipProtocol:
 
                 # 1. Guardrail audit: re-verify ALL active peers' guardrail hashes.
                 #    This is the continuous audit - every node checks every other node.
+                #
+                #    Commit after EVERY peer, in this loop and the next.  Both
+                #    make one network call per active peer and used to commit
+                #    once after the whole loop, so from the first fraud-score
+                #    flush onward the round held SQLite's single write lock
+                #    across every remaining probe (5s GET here, a 30s POST
+                #    below).  Measured on a desktop 2026-09-02: 525 active
+                #    peers, most unroutable, one round ran for hours,
+                #    integrity_interval is 300s, and the agent daemon logged
+                #    "database is locked" on every tick with zero goal updates
+                #    persisted (#71).  Same shape, same fix as the health
+                #    round (374f5ab6); create_challenge also commits its own
+                #    row before it POSTs.
                 for peer in active_peers:
                     self._audit_peer_guardrails(db, peer)
+                    self._flush_health_row(db, round_name='Integrity round')
                     self._heartbeat()
 
                 # 2. Deep challenge: cycle through challenge types across all peers.
@@ -2083,6 +2099,7 @@ class GossipProtocol:
                             peer.url, challenge_type)
                     except Exception as e:
                         logger.debug(f"Challenge to {peer.node_id[:8]} failed: {e}")
+                    self._flush_health_row(db, round_name='Integrity round')
                     self._heartbeat()
                 try:
                     db.commit()

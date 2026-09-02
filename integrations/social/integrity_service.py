@@ -236,7 +236,17 @@ class IntegrityService:
             status='pending',
         )
         db.add(challenge)
-        db.flush()
+        # COMMIT, not flush, before the network call.  The INSERT takes
+        # SQLite's single write lock and a flush kept it until the caller
+        # committed, which for _integrity_round was after EVERY active peer
+        # had been sent a CHALLENGE_TIMEOUT_SECONDS POST.  Measured on a
+        # desktop 2026-09-02 (HARTOS d47f4205): 525 active peers, most of
+        # them unroutable, so one round held the lock for hours and the agent
+        # daemon logged "database is locked" on every tick with no goal
+        # update persisted (#71).  Same class as the health-round fix
+        # (374f5ab6).  The caller's later commit still covers the after-POST
+        # bookkeeping below (status, fraud score, last_challenge_at).
+        db.commit()
 
         # Send challenge to target node
         try:
