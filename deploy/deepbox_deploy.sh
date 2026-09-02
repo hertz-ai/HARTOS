@@ -354,6 +354,20 @@ ADV_ARGS=""
 # Flywheel state (goals DB, prospects, node keys) must survive rebuilds.
 AD="${DEPLOY_AGENT_DATA_PATH}"; [ -z "$AD" ] && AD=/opt/hzai-LLM-Langchain-Chatbot-Agent/agent_data; sudo mkdir -p "$AD"
 
+# ...and so must NUNBA_DATA_DIR. The Dockerfile sets ENV NUNBA_DATA_DIR=/app/data
+# and declares VOLUME ["/app/data"], and its own comment says in as many words
+# that the VOLUME "is NOT a substitute for [a -v], because a fresh container
+# gets a fresh anonymous volume", spelling out the exact bind to use. This
+# script never had it, so EVERY deploy handed central a brand-new empty
+# /app/data: banked recipes, saved prompts and the distributed coordinator's
+# JSON task state all destroyed on each release. Measured 2026-09-02: right
+# after a deploy the coordinator reported 0 tasks while 24 goals were
+# mid-flight, and /a2a lists 0 banked recipes.
+#
+# That is the flywheel's memory. A node that forgets everything it learned on
+# every release cannot be a better version of itself than yesterday.
+DD="${DEPLOY_DATA_PATH}"; [ -z "$DD" ] && DD=/opt/hzai-LLM-Langchain-Chatbot-Agent/data; sudo mkdir -p "$DD"
+
 sudo docker run -d --name langchain --restart unless-stopped \
   -p 6777:6777 \
   --env-file .env \
@@ -368,6 +382,7 @@ sudo docker run -d --name langchain --restart unless-stopped \
   -v ${DEPLOY_LOGS_PATH}:/app/logs \
   -v ${DEPLOY_IMAGES_PATH}:/app/output_images \
   -v "$AD":/app/agent_data \
+  -v "$DD":/app/data \
   -e HEVOLVE_KEY_DIR=/app/agent_data \
   -e HEVOLVE_AGENT_DATA=/app/agent_data \
   langchain_gpt:"$DEPLOY_COMMIT_SHORT"
@@ -502,6 +517,7 @@ if [ -z "$STATUS_JSON" ]; then
        -v ${DEPLOY_LOGS_PATH}:/app/logs \
        -v ${DEPLOY_IMAGES_PATH}:/app/output_images \
        -v "$AD":/app/agent_data \
+       -v "$DD":/app/data \
        -e HEVOLVE_KEY_DIR=/app/agent_data \
        -e HEVOLVE_AGENT_DATA=/app/agent_data \
        "$ROLLBACK_IMAGE"; then
