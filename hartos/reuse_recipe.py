@@ -932,6 +932,10 @@ def create_agents_for_role(user_id: str, prompt_id):
 def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]":
     """Create new assistant & user proxy agents for a user with basic configuration."""
     user_prompt = f'{user_id}_{prompt_id}'
+    # New session for this user_prompt: reset the fabrication-gate re-steer
+    # budget + the #725 message snapshot, so a re-run of the same agent gets
+    # full protection again instead of a budget spent for the process lifetime.
+    _reset_reuse_guard_state(user_prompt)
     # Create a basic function calling config.
     # Per-dispatch model routing — see create_agents_for_role above for why the
     # thread-local override must win over the import-time module config_list.
@@ -2944,6 +2948,22 @@ _reuse_resteer_counts = {}
 # list is empty.  This is a read-only fallback of the SAME conversation, not a
 # second history: when messages are present the behaviour is unchanged.
 _reuse_msg_snapshot = {}
+
+
+def _reset_reuse_guard_state(user_prompt):
+    """Drop this user_prompt's guard state at session creation.
+
+    _reuse_resteer_counts is keyed (user_prompt, action_id) and was never
+    cleared, so the one-shot fabrication re-steer budget was spent for the
+    PROCESS lifetime: a later session re-running the same agent got no
+    fabrication protection at all.  Also drops the #725 snapshot so a stale
+    'completed' view from a previous session cannot be re-read.  Other
+    user_prompts are untouched.
+    """
+    for k in [k for k in _reuse_resteer_counts
+              if isinstance(k, tuple) and k and k[0] == user_prompt]:
+        _reuse_resteer_counts.pop(k, None)
+    _reuse_msg_snapshot.pop(user_prompt, None)
 
 
 def _reuse_action_text(user_prompt, current_action):
