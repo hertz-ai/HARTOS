@@ -98,6 +98,24 @@ impl TextRasterizer {
     fn compose(&mut self, text: &str, size_px: f32, wi: u32, hi: u32, color: [f32; 4]) -> MemoryRenderBuffer {
         let mut rgba = vec![0u8; (wi * hi * 4) as usize];
 
+        // cosmic-text's shaper PANICS when the font database is empty (no face to fall
+        // back to), so an absent-fonts environment would crash the compositor rather
+        // than just render blank. A configured desktop has faces via fonts.packages,
+        // but the native shell must DEGRADE (blank text), never die, if fonts are
+        // somehow missing (early boot before the font path mounts, a misconfig). This
+        // also lets the render path run in a font-less CI sandbox. compose() only runs
+        // on a cache miss, so the check is free in steady state.
+        if self.font_system.db().len() == 0 {
+            return MemoryRenderBuffer::from_slice(
+                &rgba,
+                Fourcc::Argb8888,
+                (wi as i32, hi as i32),
+                1,
+                Transform::Normal,
+                None,
+            );
+        }
+
         let metrics = Metrics::new(size_px, size_px * 1.3);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(&mut self.font_system, Some(wi as f32), Some(hi as f32));
