@@ -241,6 +241,70 @@ class TestGoalDecomposition:
         parallel_tasks = [t for t in tasks if t.get('execution_mode') == 'parallel']
         assert len(parallel_tasks) == 3
 
+    def test_no_exit_demands_a_capability_no_worker_can_advertise(self):
+        """Measured on central 2026-09-03: every task of the three hive goals
+        demanded capability 'hive_growth' / 'hive_training', which
+        worker_loop._detect_capabilities can never emit, so no node in the fleet
+        could claim any of them and the goals never grounded.
+
+        decompose_goal_to_ledger has THREE exits (multi-task, single-task,
+        ImportError fallback) and every one of them set [goal_type]. This drives
+        the two reachable ones and pins that neither invents a demand."""
+        from core.constants import HIVE_WORKER_CAPABILITIES
+        from integrations.agent_engine.parallel_dispatch import decompose_goal_to_ledger
+
+        subtask_defs = {
+            'tasks': [{'description': 'a'}, {'description': 'b'}],
+            'parallel': True,
+        }
+        for goal_type in ('hive_growth', 'hive_training', 'autoresearch'):
+            assert goal_type not in HIVE_WORKER_CAPABILITIES
+
+            single, _ = decompose_goal_to_ledger('p', 'g', goal_type, 'u', None)
+            assert single[0]['capabilities'] == [], \
+                f'single-task exit demands {goal_type}, which is unclaimable'
+
+            multi, ledger = decompose_goal_to_ledger(
+                'p', f'g_{goal_type}', goal_type, 'u', subtask_defs)
+            assert ledger is not None
+            for t in multi:
+                assert t['capabilities'] == [], \
+                    f'multi-task exit demands {goal_type}, which is unclaimable'
+
+    def test_a_real_capability_is_still_demanded_on_every_exit(self):
+        """The five words that live in both vocabularies must keep routing."""
+        from integrations.agent_engine.parallel_dispatch import decompose_goal_to_ledger
+
+        single, _ = decompose_goal_to_ledger('p', 'gm', 'marketing', 'u', None)
+        assert single[0]['capabilities'] == ['marketing']
+
+        multi, _ = decompose_goal_to_ledger(
+            'p', 'gm2', 'coding', 'u',
+            {'tasks': [{'description': 'a'}, {'description': 'b'}], 'parallel': True})
+        assert all(t['capabilities'] == ['coding'] for t in multi)
+
+    def test_no_module_hardcodes_goal_type_as_a_capability(self):
+        """The rule lives in one place. A new exit that writes [goal_type] back
+        into the capability slot reintroduces the whole defect silently, because
+        the two vocabularies overlap on five words and it looks correct for
+        marketing."""
+        import os
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        offenders = []
+        for mod in ('integrations/agent_engine/parallel_dispatch.py',
+                    'integrations/agent_engine/dispatch.py',
+                    'integrations/distributed_agent/task_coordinator.py'):
+            path = os.path.join(root, mod)
+            with open(path, encoding='utf-8') as fh:
+                for n, line in enumerate(fh, 1):
+                    if re.search(r"'capabilities':\s*\[goal_type\]\s*,", line):
+                        offenders.append(f'{mod}:{n}')
+        assert not offenders, (
+            'goal_type is written straight into the capability slot at '
+            f'{offenders}; route it through HIVE_WORKER_CAPABILITIES instead')
+
     def test_sequential_subtask_decomposition(self):
         """Goal with sequential subtasks creates chained tasks."""
         from integrations.agent_engine.parallel_dispatch import decompose_goal_to_ledger
