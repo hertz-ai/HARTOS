@@ -480,6 +480,55 @@ pub fn layout_home(output_w: f32, output_h: f32, home: &HomeCompose, theme: &The
     }
 }
 
+/// The RETAINED scene tree. `layout_home` allocates a fresh node tree and clones every
+/// label on each call, so calling it per frame violates the zero-per-frame-alloc NFR
+/// this module's header states. This is "step two" of the native render path: the tree is
+/// rebuilt ONLY when something that actually changes LAYOUT changes (the output size, the
+/// composed home payload, or the theme), so a steady desktop walks a tree it already owns.
+///
+/// The pointer is deliberately NOT part of the key: hover changes the orb's energy scalar,
+/// never the layout, so cursor motion must never invalidate the tree.
+#[derive(Default)]
+pub struct SceneCache {
+    tree: Option<SceneNode>,
+    key_w: f32,
+    key_h: f32,
+    key_home: HomeCompose,
+    /// `Theme` has no `Default`, so the key starts as None and the first call is a miss.
+    key_theme: Option<Theme>,
+    rebuilds: u64,
+}
+
+impl SceneCache {
+    /// The tree for this size/home/theme, rebuilding only when one of them changed.
+    /// The comparison walks a handful of short strings; the rebuild it avoids allocates
+    /// the whole node tree and re-clones every label, so the compare is the cheap side.
+    pub fn tree_for(&mut self, w: f32, h: f32, home: &HomeCompose, theme: &Theme) -> &SceneNode {
+        let stale = self.tree.is_none()
+            || self.key_w != w
+            || self.key_h != h
+            || self.key_theme != Some(*theme)
+            || self.key_home != *home;
+        if stale {
+            self.tree = Some(layout_home(w, h, home, theme));
+            self.key_w = w;
+            self.key_h = h;
+            self.key_theme = Some(*theme);
+            self.key_home = home.clone();
+            self.rebuilds += 1;
+        }
+        self.tree
+            .as_ref()
+            .expect("the tree was just built when it was stale")
+    }
+
+    /// How many times the tree was actually rebuilt. This is the retention PROOF: a
+    /// steady desktop must not grow this per frame.
+    pub fn rebuilds(&self) -> u64 {
+        self.rebuilds
+    }
+}
+
 // ── A2UI decode: home_compose {hero, rows, mood} -> HomeCompose. Tolerant by design:
 //    a missing or wrong-typed field yields an empty section, never a panic, matching
 //    the JS consumer's samplePayload skeleton fallback (an accepted push overrides it,
@@ -676,5 +725,40 @@ mod tests {
         assert_eq!(root.pointer_orb_energy(Some(hero_pt)), 0.0);
         // No pointer contributes nothing: the flag-off / no-cursor default is unchanged.
         assert_eq!(root.pointer_orb_energy(None), 0.0);
+    }
+
+    #[test]
+    fn the_scene_tree_is_retained_and_rebuilt_only_when_layout_inputs_change() {
+        let theme = Theme::cosmic_default();
+        let home = sample();
+        let mut cache = SceneCache::default();
+
+        let _ = cache.tree_for(1600.0, 900.0, &home, &theme);
+        assert_eq!(cache.rebuilds(), 1, "the first frame builds the tree");
+
+        // A steady desktop: same size, same payload, same theme. However many frames run,
+        // the tree must NOT be rebuilt — this is the zero-per-frame-alloc NFR.
+        for _ in 0..10 {
+            let _ = cache.tree_for(1600.0, 900.0, &home, &theme);
+        }
+        assert_eq!(cache.rebuilds(), 1, "a steady desktop must not rebuild per frame");
+
+        // A resize changes layout, so it must rebuild.
+        let _ = cache.tree_for(1280.0, 800.0, &home, &theme);
+        assert_eq!(cache.rebuilds(), 2, "a resize must rebuild");
+
+        // A new compose changes layout, so it must rebuild.
+        let mut recomposed = home.clone();
+        recomposed.hero.title = "Your hive shipped a release".into();
+        let _ = cache.tree_for(1280.0, 800.0, &recomposed, &theme);
+        assert_eq!(cache.rebuilds(), 3, "a new compose must rebuild");
+
+        // And the retained tree is a REAL tree, not an empty placeholder: the cached nodes
+        // are what hover hit-tests against (the pointer is deliberately not part of the key).
+        let node_count = cache
+            .tree_for(1280.0, 800.0, &recomposed, &theme)
+            .node_count();
+        assert!(node_count > 1, "the retained tree must hold real nodes");
+        assert_eq!(cache.rebuilds(), 3, "re-reading the cached tree must not rebuild");
     }
 }

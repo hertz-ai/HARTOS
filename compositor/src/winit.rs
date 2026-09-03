@@ -281,6 +281,10 @@ pub struct State {
     pub text_rasterizer: crate::text_render::TextRasterizer,
     /// NATIVE SHELL M3 — rounded-rect buffer cache (cards, omnibox).
     pub rect_cache: crate::comp_core::RectCache,
+    /// NATIVE SHELL: the RETAINED scene tree. Rebuilt only when the output size, the
+    /// composed home payload or the theme changes, so a steady desktop stops rebuilding
+    /// its layout every frame (the zero-per-frame-alloc NFR).
+    pub scene_cache: crate::scene::SceneCache,
 }
 
 impl State {
@@ -393,8 +397,14 @@ impl CompState for State {
         &mut crate::text_render::TextRasterizer,
         &mut crate::comp_core::OrbCache,
         &mut crate::comp_core::RectCache,
+        &mut crate::scene::SceneCache,
     ) {
-        (&mut self.text_rasterizer, &mut self.orb, &mut self.rect_cache)
+        (
+            &mut self.text_rasterizer,
+            &mut self.orb,
+            &mut self.rect_cache,
+            &mut self.scene_cache,
+        )
     }
     /// winit OVERRIDE: the shared flag-flip/log PLUS fail any in-flight screencopy
     /// frames so no capture queued just-as-the-kill-engaged leaks a frame painted before
@@ -1144,6 +1154,7 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         orb: Default::default(),
         text_rasterizer: crate::text_render::TextRasterizer::new(),
         rect_cache: Default::default(),
+        scene_cache: Default::default(),
     };
 
     // 6. (No calloop Generic source for the Display â€” see step 1. The Display is

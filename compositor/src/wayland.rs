@@ -260,6 +260,10 @@ pub struct State {
     /// NATIVE SHELL M3 — rounded-rect buffers (cards, omnibox), composed once per
     /// unique size/radius/colour so the corner radius the scene specifies is drawn.
     pub rect_cache: crate::comp_core::RectCache,
+    /// NATIVE SHELL: the RETAINED scene tree. Rebuilt only when the output size, the
+    /// composed home payload or the theme changes, so a steady desktop stops rebuilding
+    /// its layout every frame (the zero-per-frame-alloc NFR).
+    pub scene_cache: crate::scene::SceneCache,
     /// M8 — the com.hart.Compositor IPC server's per-compositor state (the event
     /// fan-out subscribers). The DRM backend serves the SAME framed-JSON socket the
     /// winit backend does, so an agent arranges real windows on real hardware too.
@@ -418,8 +422,14 @@ impl CompState for State {
         &mut crate::text_render::TextRasterizer,
         &mut crate::comp_core::OrbCache,
         &mut crate::comp_core::RectCache,
+        &mut crate::scene::SceneCache,
     ) {
-        (&mut self.text_rasterizer, &mut self.orb, &mut self.rect_cache)
+        (
+            &mut self.text_rasterizer,
+            &mut self.orb,
+            &mut self.rect_cache,
+            &mut self.scene_cache,
+        )
     }
     fn emit_window_event(&mut self, event: &str, window: &Window, handle: &str) {
         // Fan the edge out over the SHARED framed-JSON IPC (the same socket the winit

@@ -559,20 +559,25 @@ pub trait CompState:
     /// every backend that can render the native scene supplies one.
     fn text_rasterizer_mut(&mut self) -> &mut crate::text_render::TextRasterizer;
 
-    /// Both native-scene caches at once, as DISJOINT field borrows. `lower_scene`
+    /// ALL native-scene caches at once, as DISJOINT field borrows. `lower_scene`
     /// walks one leaf list that interleaves Text runs (rasterizer) and OrbSlots
     /// (orb cache), so it must hold BOTH `&mut` across the loop — which the separate
     /// `text_rasterizer_mut`/`orb_mut` accessors cannot give (each borrows all of
-    /// `self`). One combined accessor split-borrows the two fields, so the lowering
+    /// `self`). One combined accessor split-borrows the fields, so the lowering
     /// stays a SINGLE path shared by `render_native_scene` (via State) and its test
     /// (via directly-constructed caches). Required so every native-capable backend
-    /// supplies both.
+    /// supplies all of them.
+    ///
+    /// The 4th is the RETAINED scene tree: it must come through this same accessor
+    /// rather than a separate method, because the lowering needs the tree borrowed at
+    /// the same time as the buffer caches, and two `&mut self` accessors cannot overlap.
     fn native_scene_caches(
         &mut self,
     ) -> (
         &mut crate::text_render::TextRasterizer,
         &mut OrbCache,
         &mut RectCache,
+        &mut crate::scene::SceneCache,
     );
 
     // ── IPC event fan-out (window.opened/closed/focused…). The winit backend pushes
@@ -2103,9 +2108,10 @@ pub fn render_native_scene<S, R>(
     // Read the pointer BEFORE the `&mut` cache borrow (both are plain owned values), so
     // the hover lift rides the same single lowering call. None on a pre-mode frame.
     let pointer = native_pointer_scene_pos(state, size);
-    let (rasterizer, orb_cache, rect_cache) = state.native_scene_caches();
+    let (rasterizer, orb_cache, rect_cache, scene_cache) = state.native_scene_caches();
     lower_scene(
-        &home, size, renderer, rasterizer, orb_cache, rect_cache, orb_energy, pointer, elements,
+        &home, size, renderer, rasterizer, orb_cache, rect_cache, scene_cache, orb_energy,
+        pointer, elements,
     );
 }
 
@@ -2121,6 +2127,7 @@ pub fn lower_scene<R>(
     rasterizer: &mut crate::text_render::TextRasterizer,
     orb_cache: &mut OrbCache,
     rect_cache: &mut RectCache,
+    scene_cache: &mut crate::scene::SceneCache,
     orb_energy: f32,
     pointer: Option<(f32, f32)>,
     elements: &mut Vec<HartRenderElement<R>>,
@@ -2128,8 +2135,13 @@ pub fn lower_scene<R>(
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Send + Clone + 'static,
 {
+    // RETAINED TREE (zero-per-frame-alloc, step two): the layout is rebuilt only when the
+    // size, the composed home, or the theme changes, so a steady desktop reuses the tree
+    // it already owns instead of allocating a fresh one every frame. The pointer is NOT a
+    // key, so hover costs no rebuild. `scene_cache` is a disjoint field borrow, so holding
+    // the tree across the loop does not conflict with the buffer caches below.
     let theme = crate::scene::Theme::cosmic_default();
-    let tree = crate::scene::layout_home(size.w as f32, size.h as f32, home, &theme);
+    let tree = scene_cache.tree_for(size.w as f32, size.h as f32, home, &theme);
 
     // M2 input half: the pointer energises the orb it sits over. Fold the hover lift into
     // the ambient energy ONCE here, against the SAME tree the leaves come from, so orb
@@ -3398,6 +3410,7 @@ mod native_render_tests {
         let mut rasterizer = crate::text_render::TextRasterizer::new();
         let mut orb = OrbCache::default();
         let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
 
         let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
         lower_scene(
@@ -3407,6 +3420,7 @@ mod native_render_tests {
             &mut rasterizer,
             &mut orb,
             &mut rects,
+            &mut scenes,
             0.5,
             None,
             &mut elements,
@@ -3467,6 +3481,7 @@ mod native_render_tests {
         let mut rasterizer = crate::text_render::TextRasterizer::new();
         let mut orb = OrbCache::default();
         let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
         let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
         lower_scene(
             &home,
@@ -3475,6 +3490,7 @@ mod native_render_tests {
             &mut rasterizer,
             &mut orb,
             &mut rects,
+            &mut scenes,
             0.5,
             None,
             &mut elements,
