@@ -2473,6 +2473,45 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                     current_app.logger.info(f"Detected mention of {mention} - directing message to appropriate agent")
                     return agent
 
+            # Assistant tool calls.  Service-tool schemas live on the Helper
+            # (register_dual(helper, assistant, ...)); the Assistant carries
+            # only execution maps.  So when the Assistant decides to call a
+            # tool ITSELF, llama's --jinja grammar has no schema to structure
+            # the call and the model free-forms Qwen <tool_call> XML as plain
+            # content, which autogen never executes.  Measured live 2026-09-03
+            # 22:38:00 and replayed deterministically against llama-server:
+            # right after the Helper's real google_search result the Assistant
+            # answered '<tool_call><function=google_search>...' six times in a
+            # row, the turn yielded nothing and Nunba fell back to a
+            # knowledge-cutoff answer.  Remedy = the same one news/revenue
+            # tools got (87fb8389 + 09afbcf3), scoped to the one tool that
+            # actually came up: mirror the Helper's schema for it onto the
+            # Assistant, register execution on the Executor (a distinct agent,
+            # so the repeat-speaker rule cannot strand the call), and let the
+            # Assistant re-issue the call structurally.  A structured call from
+            # the Assistant is routed to the Executor here because once two
+            # agents can execute it autogen's func_call_filter defers to this
+            # selector.  If the schema cannot be mirrored, hand the turn to the
+            # Helper, who carries it.
+            if last_speaker is assistant:
+                _last_msg = messages[-1]
+                if _last_msg.get("tool_calls"):
+                    current_app.logger.info(
+                        "reuse: structured tool_call from Assistant -> Executor runs it")
+                    return executor
+                from core.agent_tools import text_tool_call_name, mirror_tool_schema
+                _tc_name = text_tool_call_name(_last_msg.get("content"))
+                if _tc_name:
+                    if mirror_tool_schema(assistant, executor, helper, _tc_name):
+                        current_app.logger.info(
+                            f"reuse: Assistant emitted {_tc_name} as TEXT - mirrored the Helper's "
+                            f"schema onto the Assistant (execution on Executor); re-issuing structurally")
+                        return assistant
+                    current_app.logger.info(
+                        f"reuse: Assistant emitted {_tc_name} as TEXT and it cannot be mirrored "
+                        f"- routing to Helper, who carries the schema")
+                    return helper
+
             # Check for messages directed to the user
 
 

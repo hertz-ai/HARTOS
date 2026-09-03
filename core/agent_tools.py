@@ -10,6 +10,7 @@ Pattern mirrors:
   - integrations/channels/memory/agent_memory_tools.py → register_autogen_tools()
   - integrations/agent_engine/marketing_tools.py → register_marketing_tools()
 """
+import copy
 import json
 import logging
 import os
@@ -84,6 +85,75 @@ def register_core_tools(tools, helper, executor):
     """
     for name, desc, func in tools:
         register_dual(helper, executor, func, name, desc)
+
+
+def text_tool_call_name(content) -> Optional[str]:
+    """Name of a tool call the model emitted as TEXT, or None.
+
+    llama.cpp renders a structured ``tool_calls`` entry only when the request
+    carried that tool's schema.  An agent that holds a tool in its execution
+    map but not in its ``llm_config`` (the register_dual(helper, assistant)
+    split gives the Assistant exactly that) gets the model's Qwen
+    ``<tool_call>`` block back as plain content, which AutoGen never executes
+    — measured live 2026-09-03 22:38:00 on the reuse Assistant and replayed
+    deterministically.  Recognises both Qwen forms:
+    ``<tool_call>\\n<function=NAME>...`` (Qwen3.5 XML) and
+    ``<tool_call>{"name": "NAME", ...}</tool_call>`` (JSON).
+    """
+    if not isinstance(content, str) or '<tool_call' not in content:
+        return None
+    m = _re.search(r'<function=([A-Za-z0-9_.\-]+)>', content)
+    if m:
+        return m.group(1)
+    tail = content[content.index('<tool_call'):]
+    m = _re.search(r'"name"\s*:\s*"([A-Za-z0-9_.\-]+)"', tail)
+    return m.group(1) if m else None
+
+
+def mirror_tool_schema(target, executor, source, name: str) -> bool:
+    """Give ``target`` the LLM schema ``source`` already carries for ``name``.
+
+    Same remedy the news/revenue tools received (87fb8389 + 09afbcf3), scoped
+    to one tool: copy the schema so ``target``'s own calls come out
+    STRUCTURED (llama's --jinja grammar needs the schema in the request), and
+    register execution on ``executor`` — a distinct agent, because AutoGen's
+    repeat-speaker rule strands a call whose only executor is its proposer.
+    The callable is the one already registered for execution (target's own
+    map first, then source's, then executor's), so no second implementation
+    is introduced.  Idempotent per target via ``_hart_mirrored_tools``.
+
+    Returns True when the schema is (or already was) mirrored, False when
+    ``source`` carries no schema for ``name`` or nobody holds the callable.
+    """
+    done = getattr(target, '_hart_mirrored_tools', None)
+    if done is None:
+        done = set()
+        try:
+            target._hart_mirrored_tools = done
+        except Exception:
+            pass
+    if name in done:
+        return True
+    sig = None
+    for tool in ((getattr(source, 'llm_config', None) or {}).get('tools') or []):
+        if isinstance(tool, dict) and (tool.get('function') or {}).get('name') == name:
+            sig = tool
+            break
+    if sig is None:
+        return False
+    func = None
+    for holder in (target, source, executor):
+        fmap = getattr(holder, '_function_map', None) or {}
+        if name in fmap:
+            func = fmap[name]
+            break
+    if func is None:
+        return False
+    target.update_tool_signature(copy.deepcopy(sig), is_remove=False)
+    if executor is not None and executor is not target:
+        executor.register_for_execution(name=name)(func)
+    done.add(name)
+    return True
 
 
 def filter_service_tools(goal_tags, svc_tools, svc_defs, registry):
