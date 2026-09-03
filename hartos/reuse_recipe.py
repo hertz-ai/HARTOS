@@ -1136,8 +1136,20 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                 _resonance_profile = get_or_create_profile(str(user_id))
             except ImportError:
                 pass
-            _personality_block = build_personality_prompt(_saved_personality, resonance_profile=_resonance_profile)
-            _personality_block += build_proactive_vision_prompt(goal)
+            # REUSE = execution: the recipe IS the plan.  execution_mode=True
+            # suppresses the persona's "ask 1-2 clarifying questions before
+            # executing" behaviour, and we deliberately do NOT append
+            # build_proactive_vision_prompt(goal) here — its "understand the
+            # DEEPER VISION … ask 1-2 questions before executing the first
+            # action" block is a SECOND source of the same stall: it is what
+            # made the 4B open with discovery questions ("what deeper vision?")
+            # and send holding messages instead of running the saved recipe and
+            # synthesising from the real tool outputs (measured live 2026-09-03,
+            # agent 18088688973).  Both are CREATE-time behaviours; in REUSE the
+            # requirements are already gathered and banked in the recipe.
+            _personality_block = build_personality_prompt(
+                _saved_personality, resonance_profile=_resonance_profile,
+                execution_mode=True)
     except Exception:
         pass
 
@@ -2412,9 +2424,9 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     assistant.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     user_proxy.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
     helper.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory] calls and supporting backend processes. '
-    multi_role_agent.description = 'Acts as an external agent with multi-functional capabilities. Note: This agent should never be directly invoked.'
+    multi_role_agent.description = 'INTERNAL persona-routing helper — NOT a selectable speaker. Never choose multi_role_agent as the next role under any circumstances.'
     executor.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
-    verify.description = 'this is a verify status agent. which will verify the status of current action.'
+    verify.description = 'The status-verification agent. Select StatusVerifier immediately after Assistant, Helper, or Executor has done the work for the current action (produced a tool result or finished a reply): it checks whether that action is complete and then supplies the next action. Whenever the last message reports a result or finishes a step, choose StatusVerifier next.'
 
     time_agent.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     time_user.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
@@ -2428,6 +2440,15 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
 
     def state_transition(last_speaker, groupchat):
         messages = groupchat.messages
+        # #725 snapshot: keep the last non-empty view so get_agent_response can
+        # still see the 'completed' verdict + TERMINATE after autogen empties
+        # group_chat.messages.  Runs on every selection incl. the final
+        # TERMINATE turn, so the snapshot ends as [.., completed, TERMINATE].
+        try:
+            if messages:
+                _reuse_msg_snapshot[user_prompt] = list(messages)
+        except Exception:
+            pass
         try:
             request_id = f'{request_id_list[user_prompt]}'
             # Check for specific agent mentions FIRST - this should take precedence
@@ -2473,11 +2494,44 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
 
                     # Use known pipeline state, not LLM's claimed action_id
                     _known_aid = user_tasks[user_prompt].current_action
+                    _cp_yes = False
                     try:
-                        if individual_recipe[_known_aid - 1]['can_perform_without_user_input'] == 'yes':
-                            return assistant
+                        _cp_yes = individual_recipe[_known_aid - 1]['can_perform_without_user_input'] == 'yes'
                     except (IndexError, KeyError):
                         pass
+
+                    # DEAD-STATE HANDLING: StatusVerifier emits four states
+                    # (completed/error/pending/requires_breakdown) but only
+                    # 'completed' was handled — the other three fell through and
+                    # the action spun until the count==4 cap, never advancing and
+                    # (for requires_breakdown) silently discarding the subtasks.
+                    # Handle them per the StatusVerifier system_message: route
+                    # error/pending back to the helper to actually finish/fix the
+                    # work, and persist requires_breakdown's subtasks to the
+                    # ledger (the imported-but-unwired add_subtasks machinery).
+                    # Bounded by the loop's count==4; NEVER fake-advances — only a
+                    # truthful 'completed' advances, a persistent error/pending
+                    # ends the turn honestly instead of looping.
+                    _st = str(last_json.get('status', '')).lower()
+                    if _cp_yes and _st == 'requires_breakdown':
+                        _subs = last_json.get('subtasks') or []
+                        try:
+                            if _subs and user_prompt in user_ledgers:
+                                user_ledgers[user_prompt].add_subtasks(_known_aid, _subs)
+                                current_app.logger.info(
+                                    f'reuse: requires_breakdown -> persisted {len(_subs)} subtasks '
+                                    f'to ledger for action {_known_aid}; routing to helper to execute')
+                        except Exception as _bd_e:
+                            current_app.logger.warning(f'reuse: requires_breakdown add_subtasks failed: {_bd_e}')
+                        return helper
+                    if _cp_yes and _st in ('error', 'pending'):
+                        current_app.logger.info(
+                            f'reuse: non-terminal status {_st!r} for action {_known_aid} '
+                            f'-> routing to helper to continue (bounded)')
+                        return helper
+
+                    if _cp_yes:
+                        return assistant
             except Exception as e:
                 current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
 
@@ -2687,7 +2741,15 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         agents=[assistant, helper, user_proxy, multi_role_agent, executor, chat_instructor, verify],
         messages=[],
         max_round=10,
-        select_speaker_prompt_template=f"Read the above conversation, select the next person from [Assistant, Helper, Executor, ChatInstructor, StatusVerifier, multi_role_agent & User] & only return the role as agent. Return User only if the previous message demands it",
+        # {agentlist} is filled by autogen's select_speaker_prompt() with the
+        # ELIGIBLE candidate set — i.e. the last speaker is dropped when it is
+        # barred from repeating (allow_repeat_speaker=False, groupchat.py:509).
+        # A hardcoded list here diverged from that eligible set: the 4B was
+        # SHOWN Assistant, picked it, but the validator (_mentioned_agents,
+        # groupchat.py:853) checked against the Assistant-excluded set → endless
+        # "You didn't choose a speaker" reprompt. Must be a plain str (not f"")
+        # so the {agentlist} token survives to autogen's .format(agentlist=...).
+        select_speaker_prompt_template="Read the above conversation, select the next person from {agentlist} & only return the role as agent. Return User only if the previous message demands it",
         select_speaker_transform_messages=select_speaker_transforms,
         speaker_selection_method=state_transition,  # using an LLM to decide
         allow_repeat_speaker=False,  # Prevent same agent speaking twice
@@ -2806,6 +2868,16 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             def append(self, msg):
                 super().append(msg)
                 try:
+                    _d = msg if isinstance(msg, dict) else {}
+                    _tc = [(t.get('id') or '')[:8] for t in (_d.get('tool_calls') or [])]
+                    _ph = 'PH' if 'Placeholder response for historical' in str(_d.get('content') or '') else ''
+                    current_app.logger.info(
+                        "[APPEND-PROBE] n=%d role=%s name=%s tc=%s tcid=%s clen=%d %s" % (
+                            len(self), _d.get('role'), _d.get('name', ''), _tc,
+                            (_d.get('tool_call_id') or '')[:8], len(str(_d.get('content') or '')), _ph))
+                except Exception:
+                    pass
+                try:
                     self._hook(msg)
                 except Exception:
                     pass
@@ -2872,6 +2944,17 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
 # an action — after one re-steer it fails open and advances.
 _reuse_resteer_counts = {}
 
+# #725: autogen intermittently empties group_chat.messages after initiate_chat
+# returns, which blinds the advancement gate in get_agent_response (it reads
+# messages[-1]/[-2] to detect a 'completed' verdict + TERMINATE).  The verdict
+# IS seen inside state_transition, where groupchat.messages is still populated
+# on every speaker-selection turn — including the final TERMINATE turn.  So
+# state_transition snapshots the last NON-EMPTY view here, keyed by the same
+# user_prompt the loop uses, and the loop falls back to it ONLY when the live
+# list is empty.  This is a read-only fallback of the SAME conversation, not a
+# second history: when messages are present the behaviour is unchanged.
+_reuse_msg_snapshot = {}
+
 
 def _reuse_action_text(user_prompt, current_action):
     """Text of the current reuse action (1-based; get_action is 0-based, see
@@ -2922,7 +3005,13 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         # revwarm5407: get_api_revenue_stats never ran yet a memory tool did,
         # so any_tool_ran was true and the guard let the fabrication through.)
         executed = set()
-        for m in (getattr(group_chat, 'messages', None) or []):
+        # Fall back to the #725 snapshot when the live list has been emptied, so
+        # the fabrication guard still sees the tool results and does not fail
+        # open on an empty history (which would let a fabricated 'completed'
+        # advance unchecked).
+        _fab_msgs = (getattr(group_chat, 'messages', None)
+                     or _reuse_msg_snapshot.get(user_prompt) or [])
+        for m in _fab_msgs:
             if not isinstance(m, dict):
                 continue
             if m.get('role') == 'tool' and m.get('name'):
@@ -2972,6 +3061,18 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         register_groupchat_for_session(user_prompt, group_chat)
     except Exception:
         pass
+    try:
+        _amap = set((getattr(assistant, '_function_map', {}) or {}).keys())
+        _emap = set((getattr(group_chat, 'agent_by_name', lambda n: None)('Executor') and
+                     getattr(group_chat.agent_by_name('Executor'), '_function_map', {}) or {}).keys())
+        current_app.logger.info(
+            "[EXEC-MAP-PROBE] gsearch_in_assistant=%s assistant_fmap_n=%d gsearch_in_executor=%s sample=%s" % (
+                'google_search' in _amap, len(_amap), 'google_search' in _emap, sorted(_amap)[:12]))
+    except Exception as _ep:
+        try:
+            current_app.logger.info("[EXEC-MAP-PROBE] failed: %s" % _ep)
+        except Exception:
+            pass
     try:
         # Tier-1 per-turn attach: deterministic keyword scan of THIS message
         # unlocks families the construction-time goal never mentioned — zero
@@ -3029,14 +3130,18 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             # the `except IndexError` below -- which opens on the next line --
             # can never cover it; the turn died with "Error getting response:
             # list index out of range".  Guard as create_recipe.py:4385 does.
-            if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
+            # #725: read the live list, or the last-non-empty snapshot when
+            # autogen has emptied it, so the completed+TERMINATE verdict is not
+            # lost (which used to freeze every action at 1).
+            _live_msgs = group_chat.messages if group_chat.messages else _reuse_msg_snapshot.get(user_prompt, [])
+            if _live_msgs and _live_msgs[-1]['name'] == 'ChatInstructor' and _live_msgs[-1]['content'] == 'TERMINATE':
                 current_app.logger.info(
-                    f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
+                    f"group_chat.messages[-2]['content'] {_live_msgs[-2]['content'][:10]}..")
                 try:
                     try:
-                        json_obj = json.loads(group_chat.messages[-2]["content"])
+                        json_obj = json.loads(_live_msgs[-2]["content"])
                     except (json.JSONDecodeError, ValueError):
-                        json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
+                        json_obj = ast.literal_eval(_live_msgs[-2]["content"])
                     current_app.logger.info(f'got json object {json_obj}')
                     if json_obj['status'].lower() == 'completed':
                         _llm_action_id = int(json_obj.get("action_id", _reuse_current_action))
@@ -3062,6 +3167,13 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         _next, _ok = _advance_reuse_action(user_prompt, _reuse_current_action, "reuse-w1", prompt_id)
                         if not _ok:
                             return ''
+                        # advanced on a truthful completion: drop the consumed
+                        # snapshot so its 'completed' can't be re-read for the
+                        # next action, and refresh the per-action work budget so
+                        # a multi-action recipe can reach its final action (count
+                        # is otherwise a whole-turn cap that stops part-way).
+                        _reuse_msg_snapshot.pop(user_prompt, None)
+                        count = 0
                         user_message = _build_reuse_action_message(user_prompt, _next)
                         chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,
                                                       silent=False)
@@ -3071,7 +3183,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     return ''
                 except Exception:
                     try:
-                        json_obj = retrieve_json(group_chat.messages[-2]["content"])  # canonical parse (#95)
+                        json_obj = retrieve_json(_live_msgs[-2]["content"])  # canonical parse (#95)
                         if json_obj:
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
@@ -3099,6 +3211,8 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                                 _next2, _ok2 = _advance_reuse_action(user_prompt, _known, "reuse-w1-regex", prompt_id)
                                 if not _ok2:
                                     return ''
+                                _reuse_msg_snapshot.pop(user_prompt, None)
+                                count = 0
                                 user_message = _build_reuse_action_message(user_prompt, _next2)
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                               clear_history=False, silent=False)
@@ -3140,22 +3254,52 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     # StatusVerifier injection above: instructions must enter
                     # the group as user-role turns.
                     chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
+                    # UNBLOCK: after the work round, deterministically request a
+                    # StatusVerifier verdict.  The 4B never @mentions it on its
+                    # own (measured 0×), so the advancement chain
+                    # (StatusVerifier 'completed' -> state_transition:2468 ->
+                    # chat_instructor default_auto_reply 'TERMINATE' ->
+                    # loop:3040 -> _advance_reuse_action) never fired and the
+                    # action froze at 1.  Reuses the canonical verify message
+                    # and the deterministic @statusverifier route in
+                    # state_transition's agent_mapping (2438); bounded by the
+                    # count==4 break above so a non-'completed' verdict cannot
+                    # spin forever.
+                    try:
+                        _sv_ap = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
+                        # Build with concatenation (not one f-string) so the JSON
+                        # braces stay in plain string segments — matches the
+                        # canonical construction at the StatusVerifier injection
+                        # above; a lone '}' inside an f-string is a SyntaxError.
+                        _sv_msg = ('Hey @StatusVerifier Agent, Please verify the status of the action '
+                                   + f'{user_tasks[user_prompt].current_action}: {_sv_ap}'
+                                   + '\n performed and Respond in the following format '
+                                   + '{"status": "status here","action": "current action","action_id": '
+                                   + f'{user_tasks[user_prompt].current_action}'
+                                   + ',"message": "message here"}')
+                        chat_instructor.initiate_chat(recipient=manager, message=_sv_msg,
+                                                      clear_history=False, silent=False)
+                    except Exception as _sv_e:
+                        current_app.logger.warning(f'reuse: StatusVerifier steer failed: {_sv_e}')
 
             except Exception as e:
                 current_app.logger.error(f'WE have some indexx error here: {e}')
                 error_message = traceback.format_exc()  # Capture full traceback
                 current_app.logger.error(f"Error in get_agent_response indexx:\n{error_message}")
 
-            if not group_chat.messages:
-                # States the OBSERVATION only.  An earlier version of this line
-                # blamed transform_messages; that was never established -- the
-                # transform logs "N -> 1", never "-> 0", and it rewrites the
-                # per-reply view, not group_chat.messages.  Cause still open.
+            # Re-resolve after the injection block: the nested initiate_chats
+            # above just ran a real conversation whose verdict state_transition
+            # snapshotted, even though autogen may have emptied the live list.
+            # Only end the turn when BOTH the live list and the snapshot are
+            # empty (nothing happened) — not when autogen merely reset the
+            # accumulator (#725), which used to freeze every action at 1.
+            _live_msgs = group_chat.messages if group_chat.messages else _reuse_msg_snapshot.get(user_prompt, [])
+            if not _live_msgs:
                 current_app.logger.warning(
                     'reuse: group chat history is empty mid-loop - ending the '
                     'turn instead of raising IndexError (cause not established)')
                 break
-            last_message = group_chat.messages[-1]
+            last_message = _live_msgs[-1]
             content_lower = last_message['content'].lower()
             # Check if this message has already been sent to the user by state_transition
             # In get_agent_response

@@ -635,7 +635,8 @@ def generate_personality(role: str, goal: str, agent_name: str = "") -> AgentPer
 
 def build_personality_prompt(personality: AgentPersonality,
                              resonance_profile=None,
-                             user_language: str = '') -> str:
+                             user_language: str = '',
+                             execution_mode: bool = False) -> str:
     """Build a ~200 token system_message block encoding the personality.
 
     Injected into agent system_messages so they embody the personality
@@ -645,6 +646,17 @@ def build_personality_prompt(personality: AgentPersonality,
         personality: The base agent personality.
         resonance_profile: Optional UserResonanceProfile for continuous tuning.
         user_language: User's preferred language for regional tone code-mixing.
+        execution_mode: True for REUSE execution turns, where the saved recipe
+            IS the plan.  Suppresses the "ask 1-2 clarifying questions before
+            executing" proactive behaviour and swaps the "caring partner, not
+            just executing tasks" closing for an execution mandate.  Without
+            this, the persona makes the model stall with discovery questions /
+            holding messages instead of running the recipe and synthesising
+            from the real tool outputs (measured live 2026-09-03, agent
+            18088688973: it asked "what deeper vision?" and sent "as soon as I
+            have the brief I'll share it" DESPITE the google_search result
+            being present in context).  The recipe's own persona already
+            declares autonomous execution "without user intervention".
     """
     from hartos.cultural_wisdom import get_trait_by_name, PROACTIVE_BEHAVIORS
 
@@ -661,7 +673,11 @@ def build_personality_prompt(personality: AgentPersonality,
 
     # Build proactive instructions
     proactive_lines = []
-    if personality.proactive_vision_check:
+    # execution_mode (REUSE): the recipe IS the plan, so NEVER inject the
+    # "ask clarifying questions before executing" behaviour — it makes the
+    # model stall with discovery questions / holding messages instead of
+    # running the saved recipe and synthesising from the real tool outputs.
+    if personality.proactive_vision_check and not execution_mode:
         proactive_lines.append(
             "1. Before executing any complex task, ask the user 1-2 clarifying questions "
             "to understand their deeper vision and intent."
@@ -682,6 +698,17 @@ def build_personality_prompt(personality: AgentPersonality,
     )
 
     proactive_block = "\n    ".join(proactive_lines)
+
+    # Closing line: companion framing for chat, execution mandate for REUSE.
+    _closing = (
+        "Remember: EXECUTE the defined recipe NOW — run each action to completion "
+        "using the tools, then deliver the final result SYNTHESISED from the ACTUAL "
+        "tool outputs you received. Do NOT ask the user clarifying questions or send "
+        "holding / \"I'll get back to you\" messages; the plan is already defined — "
+        "carry it out and produce the result."
+        if execution_mode else
+        "Remember: You are not just executing tasks — you are a caring partner in the user's journey."
+    )
 
     base_prompt = f"""
 
@@ -708,7 +735,7 @@ forming a taste greater than either alone. This is how you think:
 
 SELF-AWARENESS:
 {personality.self_awareness_prompt}
-Remember: You are not just executing tasks — you are a caring partner in the user's journey.
+{_closing}
 """
 
     # Append regional tone (language-aware code-mixing)
