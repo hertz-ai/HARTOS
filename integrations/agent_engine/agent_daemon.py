@@ -1352,12 +1352,19 @@ class AgentDaemon:
                             f"(cooldown={_CONTINUOUS_COOLDOWN_S}s), skipping")
                         continue
 
-                # ── PARALLEL DISPATCH: check for goals with parallel subtasks ──
-                parallel_dispatched = self._try_parallel_dispatch(
-                    goal, idle_agents, dispatched, max_concurrent)
-                if parallel_dispatched > 0:
-                    dispatched += parallel_dispatched
-                    continue
+                # PARALLEL DISPATCH is selected further down, next to the
+                # speculative and direct styles, so all three share ONE
+                # last_dispatched_at stamp, ONE spark snapshot and ONE
+                # completion gate.
+                #
+                # It used to run HERE and `continue`, which skipped all three
+                # — the exact defect (b) the speculative branch already had
+                # (see the note there).  Measured on central 2026-09-03: the
+                # three hive goals fanned out on every 30s tick while their
+                # rows still read last_dispatched_at=2026-09-01 21:05, spark
+                # frozen, and _settle_dispatched_goal never ran once — so the
+                # flywheel looked idle for two days while it was in fact
+                # dispatching continuously into a queue nothing could claim.
 
                 # Find next unused agent (don't skip goal if current agent is taken)
                 agent = None
@@ -1502,8 +1509,22 @@ class AgentDaemon:
                 # DB-backed and dispatch-style-independent, so the SAME gate,
                 # noop counter and auto-pause now judge speculative handoffs.
                 result = None
-                speculated = False
-                if speculative_enabled:
+                handed_off = False
+
+                # PARALLEL: the goal's ledger has independently-runnable
+                # subtasks, so fan them out across the idle agents instead of
+                # dispatching the goal prompt once.  Treated as a handoff
+                # exactly like speculation: truthy result, backoff cleared,
+                # and the completion gate below still judges it.
+                parallel_dispatched = self._try_parallel_dispatch(
+                    goal, idle_agents, dispatched, max_concurrent)
+                if parallel_dispatched > 0:
+                    dispatched += parallel_dispatched
+                    with _module_lock:
+                        _dispatch_backoff.pop(goal_key, None)
+                    handed_off = True
+                    result = 'parallel-handoff'
+                elif speculative_enabled:
                     try:
                         from .speculative_dispatcher import get_speculative_dispatcher
                         dispatcher = get_speculative_dispatcher()
@@ -1516,7 +1537,7 @@ class AgentDaemon:
                             # Success — clear backoff
                             with _module_lock:
                                 _dispatch_backoff.pop(goal_key, None)
-                            speculated = True
+                            handed_off = True
                             # Handed off — same truth as dispatch_goal's
                             # non-None. Truthy so the failure/backoff arm
                             # (synchronous failures only; speculation reports
@@ -1526,7 +1547,7 @@ class AgentDaemon:
                     except ImportError:
                         pass
 
-                if not speculated:
+                if not handed_off:
                     result = dispatch_goal(prompt, str(agent['user_id']), goal.id, goal.goal_type)
                     dispatched += 1
                     self._wd_heartbeat()

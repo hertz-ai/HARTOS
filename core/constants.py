@@ -120,6 +120,37 @@ WIRE_USER_SEED_TEXT: str = (
 HIVE_DEPTH: int = 3
 
 
+# ──────────────────────────────────────────────────────────────────────
+# HIVE_WORKER_CAPABILITIES — the complete vocabulary of capability names
+# a worker node can advertise.
+#
+# A distributed task carries context['capabilities_required']; a worker
+# claims it only when one of ITS capabilities appears in that list
+# (task_coordinator.claim_next_task).  So a requirement naming anything
+# outside this set can never be satisfied by any node in the fleet, and
+# the task sits PENDING forever.
+#
+# This is a DIFFERENT vocabulary from goal_type (marketing, hive_growth,
+# hive_training, autoresearch, robot, …).  The two overlap by accident on
+# five words, which is exactly why writing a goal_type into the capability
+# field looked correct for years: a 'marketing' goal matched, while a
+# 'hive_growth' goal produced an unclaimable task.  Measured on central
+# 2026-09-03 — three hive goals re-dispatched every 30s since 09-01 with
+# every one of their tasks unclaimable.
+#
+# Single source of truth — consumed by:
+#   - integrations.distributed_agent.worker_loop._detect_capabilities
+#     (what this node advertises)
+#   - integrations.agent_engine.dispatch._decompose_goal
+#     (what a task is allowed to demand)
+# ──────────────────────────────────────────────────────────────────────
+HIVE_WORKER_BASE_CAPABILITIES = ('marketing', 'news', 'finance', 'revenue')
+HIVE_WORKER_TIERED_CAPABILITIES = (
+    'coding', 'ip_protection', 'provision', 'vision')
+HIVE_WORKER_CAPABILITIES = frozenset(
+    HIVE_WORKER_BASE_CAPABILITIES + HIVE_WORKER_TIERED_CAPABILITIES)
+
+
 # ISO 639-1 → language name mapping.
 # Used by hart_intelligence_entry (system prompt), speculative_dispatcher
 # (draft language prompt), and _persist_language (validation).

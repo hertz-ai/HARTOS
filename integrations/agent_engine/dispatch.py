@@ -654,10 +654,19 @@ def _decompose_goal(prompt: str, goal_id: str, goal_type: str,
     except Exception:
         pass
 
+    # capabilities are NOT goal types.  A worker claims a task only when one
+    # of the names here is in its own advertised set
+    # (worker_loop._detect_capabilities), so demanding a goal_type that is not
+    # also a capability name — hive_growth, hive_training, autoresearch,
+    # thought_experiment, … — makes the task unclaimable by every node that
+    # exists.  Demand it only when it is genuinely a capability; otherwise
+    # demand nothing, which is the truth: these goals need no special hardware
+    # or credential, just a worker.
+    from core.constants import HIVE_WORKER_CAPABILITIES
     return [{
         'task_id': f'{goal_id}_task_0',
         'description': prompt[:500],
-        'capabilities': [goal_type],
+        'capabilities': [goal_type] if goal_type in HIVE_WORKER_CAPABILITIES else [],
     }]
 
 

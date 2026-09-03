@@ -113,6 +113,53 @@ def test_the_speculative_branch_reaches_the_gate():
         'a continue crept back between speculation and settlement (defect (b))'
 
 
+def test_the_parallel_branch_reaches_the_gate():
+    """The SAME defect, one branch earlier — measured on central 2026-09-03.
+
+    _try_parallel_dispatch ran BEFORE the last_dispatched_at stamp and ended in
+    `continue`, so a goal whose ledger has parallel subtasks skipped the stamp,
+    the spark snapshot and the settlement gate on every tick. Central's three
+    hive goals fanned out every 30s for two days while their rows still read
+    last_dispatched_at=2026-09-01 21:05 and spark frozen — a flywheel that
+    looked stopped precisely because it was spinning without accounting.
+
+    Pinned structurally, like its speculative twin: the parallel attempt must
+    sit AFTER the stamp, and nothing may `continue` between it and the gate."""
+    import inspect
+    import integrations.agent_engine.agent_daemon as ad
+    src = inspect.getsource(ad.AgentDaemon._tick) if hasattr(ad, 'AgentDaemon') \
+        else open(ad.__file__, encoding='utf-8').read()
+
+    stamp = src.index('goal.last_dispatched_at = datetime.utcnow()')
+    attempt = src.index('self._try_parallel_dispatch(')
+    assert attempt > stamp, (
+        '_try_parallel_dispatch runs before the last_dispatched_at stamp, so a '
+        'parallel goal is dispatched without ever being recorded as dispatched')
+
+    settle = src.index('_settle_dispatched_goal(db, goal, goal_key)')
+    assert settle > attempt, 'the settlement gate no longer follows the parallel branch'
+    between = src[attempt:settle]
+    assert 'parallel-handoff' in between, \
+        'the handoff sentinel is gone — the fall-through fix was reverted'
+    assert '\n                    continue' not in between, \
+        'a continue crept back between the parallel handoff and settlement'
+
+
+def test_a_parallel_handoff_does_not_also_dispatch_the_goal_prompt():
+    """Fanning out subtasks and then ALSO dispatching the parent prompt would
+    double-spend the goal. The direct dispatch must be gated on the shared
+    handoff flag, not on the speculative flag alone."""
+    import inspect
+    import integrations.agent_engine.agent_daemon as ad
+    src = inspect.getsource(ad.AgentDaemon._tick) if hasattr(ad, 'AgentDaemon') \
+        else open(ad.__file__, encoding='utf-8').read()
+    assert 'if not handed_off:' in src, \
+        'the direct-dispatch guard no longer covers every handoff style'
+    assert 'if not speculated:' not in src, \
+        'the guard still reads the speculation-only flag, so a parallel ' \
+        'handoff falls through and dispatches the parent prompt as well'
+
+
 # ===================================================================
 # Grounding: spark is a proxy, and it was satisfied before the work
 # ===================================================================

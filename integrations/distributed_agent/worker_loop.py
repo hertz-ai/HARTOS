@@ -17,7 +17,7 @@ import requests
 from typing import Optional
 from core.http_pool import pooled_post
 
-from core.constants import HIVE_DEPTH
+from core.constants import HIVE_DEPTH, HIVE_WORKER_BASE_CAPABILITIES
 from core.port_registry import get_port
 
 logger = logging.getLogger('hevolve_social')
@@ -51,7 +51,7 @@ class DistributedWorkerLoop:
 
     def _detect_capabilities(self):
         """Detect this node's capabilities from system_requirements."""
-        caps = ['marketing', 'news', 'finance', 'revenue']  # Base capabilities
+        caps = list(HIVE_WORKER_BASE_CAPABILITIES)  # Base capabilities
         try:
             from security.system_requirements import get_capabilities
             hw = get_capabilities()
