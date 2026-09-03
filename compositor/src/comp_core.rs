@@ -3412,4 +3412,70 @@ mod native_render_tests {
             );
         }
     }
+
+    #[test]
+    fn demo_scene_composites_visible_pixels_on_pixman() {
+        use smithay::backend::renderer::{Bind, ExportMem, Offscreen};
+
+        // Compose the lowered scene into an offscreen pixman image OVER a magenta
+        // sentinel the scene never paints, then read the pixels back. This is the
+        // on-screen COMPOSITE proof the import test does not give: the elements must
+        // actually PAINT onto a framebuffer, with the right byte order and premultiply,
+        // not merely be produced. Pure CPU (pixman), so it runs headless in CI without
+        // a GPU or the thermal-blocked box.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (640, 400).into();
+        let buf_size: Size<i32, BufferCoord> = (640, 400).into();
+
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        lower_scene(
+            &home,
+            size,
+            &mut renderer,
+            &mut rasterizer,
+            &mut orb,
+            &mut rects,
+            0.5,
+            &mut elements,
+        );
+
+        let mut image = renderer
+            .create_buffer(Fourcc::Argb8888, buf_size)
+            .expect("offscreen image");
+        let mut target = renderer.bind(&mut image).expect("bind offscreen");
+        let full: Rectangle<i32, Physical> = Rectangle::from_size(size);
+        {
+            let mut frame = renderer
+                .render(&mut target, size, Transform::Normal)
+                .expect("begin frame");
+            frame
+                .clear(Color32F::new(1.0, 0.0, 1.0, 1.0), &[full])
+                .expect("clear to sentinel");
+            draw_render_elements(&mut frame, 1.0, &elements, &[full]).expect("draw scene");
+            let _ = frame.finish().expect("finish frame");
+        }
+
+        let region: Rectangle<i32, BufferCoord> = Rectangle::from_size(buf_size);
+        let mapping = renderer
+            .copy_framebuffer(&target, region, Fourcc::Argb8888)
+            .expect("copy_framebuffer");
+        let bytes = renderer.map_texture(&mapping).expect("map_texture");
+
+        // Argb8888 little-endian = [B,G,R,A]; the opaque magenta clear reads
+        // B=255,G=0,R=255. Count pixels the scene painted over it: the chrome (top bar,
+        // taskbar, hero, orb, text) must cover a real fraction of the frame.
+        let total = (size.w * size.h) as usize;
+        let painted = bytes
+            .chunks_exact(4)
+            .filter(|px| !(px[0] > 250 && px[1] < 5 && px[2] > 250))
+            .count();
+        assert!(
+            painted > total / 20,
+            "native scene painted only {painted}/{total} px over the clear sentinel"
+        );
+    }
 }
