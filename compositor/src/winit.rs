@@ -279,6 +279,8 @@ pub struct State {
     /// NATIVE SHELL M3 text: cosmic-text rasterizer. The dev build carries it too
     /// (the trait method is required); native_shell_on is off by default here.
     pub text_rasterizer: crate::text_render::TextRasterizer,
+    /// NATIVE SHELL M3 — rounded-rect buffer cache (cards, omnibox).
+    pub rect_cache: crate::comp_core::RectCache,
 }
 
 impl State {
@@ -387,8 +389,12 @@ impl CompState for State {
     }
     fn native_scene_caches(
         &mut self,
-    ) -> (&mut crate::text_render::TextRasterizer, &mut crate::comp_core::OrbCache) {
-        (&mut self.text_rasterizer, &mut self.orb)
+    ) -> (
+        &mut crate::text_render::TextRasterizer,
+        &mut crate::comp_core::OrbCache,
+        &mut crate::comp_core::RectCache,
+    ) {
+        (&mut self.text_rasterizer, &mut self.orb, &mut self.rect_cache)
     }
     /// winit OVERRIDE: the shared flag-flip/log PLUS fail any in-flight screencopy
     /// frames so no capture queued just-as-the-kill-engaged leaks a frame painted before
@@ -1137,6 +1143,7 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         // NATIVE SHELL M2 — the voice orb, same lazy-compose contract.
         orb: Default::default(),
         text_rasterizer: crate::text_render::TextRasterizer::new(),
+        rect_cache: Default::default(),
     };
 
     // 6. (No calloop Generic source for the Display â€” see step 1. The Display is

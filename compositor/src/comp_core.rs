@@ -367,6 +367,94 @@ impl OrbCache {
     }
 }
 
+/// Rasterize a rounded rectangle of `color` into a premultiplied [B,G,R,A] buffer,
+/// anti-aliased at the corners via a rounded-box signed-distance field. The scene
+/// carries a `radius` on the card / omnibox rects that a `SolidColorRenderElement`
+/// (always a hard quad) cannot express, so those rects lower through a cached
+/// MemoryRenderBuffer of THIS shape instead. Byte order + premultiply match
+/// text_render.rs and bloom.rs (Argb8888 little-endian = B,G,R,A, premultiplied).
+fn rounded_rect_rgba(w: u32, h: u32, radius: f32, color: [f32; 4]) -> Vec<u8> {
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    let hw = w as f32 / 2.0;
+    let hh = h as f32 / 2.0;
+    // A radius past half the short side is just a fuller pill / circle.
+    let r = radius.clamp(0.0, hw.min(hh));
+    let ca = color[3].clamp(0.0, 1.0);
+    let cr = color[0].clamp(0.0, 1.0);
+    let cg = color[1].clamp(0.0, 1.0);
+    let cb = color[2].clamp(0.0, 1.0);
+    for y in 0..h {
+        for x in 0..w {
+            // Pixel centre relative to the rect centre.
+            let px = x as f32 + 0.5 - hw;
+            let py = y as f32 + 0.5 - hh;
+            // Rounded-box SDF (<=0 inside): distance to the shape's edge.
+            let qx = px.abs() - (hw - r);
+            let qy = py.abs() - (hh - r);
+            let dist =
+                (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r;
+            // ~1px anti-aliased coverage across the edge.
+            let cov = (0.5 - dist).clamp(0.0, 1.0);
+            if cov <= 0.0 {
+                continue;
+            }
+            let a = ca * cov;
+            let idx = ((y * w + x) * 4) as usize;
+            rgba[idx] = (cb * a * 255.0) as u8;
+            rgba[idx + 1] = (cg * a * 255.0) as u8;
+            rgba[idx + 2] = (cr * a * 255.0) as u8;
+            rgba[idx + 3] = (a * 255.0) as u8;
+        }
+    }
+    rgba
+}
+
+/// Caches rounded-rect buffers keyed by (size, radius, colour) so the per-pixel SDF
+/// rasterization runs ONCE per unique rect (cards are a single size), never per
+/// frame. Mirrors OrbCache / TextRasterizer: compose once, reuse the buffer, so the
+/// per-frame cost of a rounded panel is a GPU blit, not a CPU rasterize.
+#[derive(Default)]
+pub struct RectCache {
+    cache: std::collections::HashMap<(u32, u32, u32, u32, u32, u32, u32), MemoryRenderBuffer>,
+}
+
+impl RectCache {
+    /// The rounded-rect buffer for these dims / radius / colour, composed on first
+    /// use. `None` for a degenerate size (the caller then draws nothing for it).
+    pub fn rounded(
+        &mut self,
+        w: i32,
+        h: i32,
+        radius: f32,
+        color: [f32; 4],
+    ) -> Option<&MemoryRenderBuffer> {
+        if w < 1 || h < 1 {
+            return None;
+        }
+        let key = (
+            w as u32,
+            h as u32,
+            radius.to_bits(),
+            color[0].to_bits(),
+            color[1].to_bits(),
+            color[2].to_bits(),
+            color[3].to_bits(),
+        );
+        if !self.cache.contains_key(&key) {
+            let rgba = rounded_rect_rgba(w as u32, h as u32, radius, color);
+            let buf = MemoryRenderBuffer::from_slice(
+                &rgba,
+                Fourcc::Argb8888,
+                (w, h),
+                1,
+                Transform::Normal,
+                None,
+            );
+            self.cache.insert(key, buf);
+        }
+        self.cache.get(&key)
+    }
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // THE `CompState` trait — the backend-agnostic accessor surface the shared WM brain
@@ -481,7 +569,11 @@ pub trait CompState:
     /// supplies both.
     fn native_scene_caches(
         &mut self,
-    ) -> (&mut crate::text_render::TextRasterizer, &mut OrbCache);
+    ) -> (
+        &mut crate::text_render::TextRasterizer,
+        &mut OrbCache,
+        &mut RectCache,
+    );
 
     // ── IPC event fan-out (window.opened/closed/focused…). The winit backend pushes
     //    framed JSON to its `IpcState` subscribers; the DRM backend logs the edge.
@@ -1985,8 +2077,10 @@ pub fn render_native_scene<S, R>(
         .cloned()
         .unwrap_or_else(crate::scene::HomeCompose::demo);
     let orb_energy = state.orb_energy();
-    let (rasterizer, orb_cache) = state.native_scene_caches();
-    lower_scene(&home, size, renderer, rasterizer, orb_cache, orb_energy, elements);
+    let (rasterizer, orb_cache, rect_cache) = state.native_scene_caches();
+    lower_scene(
+        &home, size, renderer, rasterizer, orb_cache, rect_cache, orb_energy, elements,
+    );
 }
 
 /// Lower a `HomeCompose` to render elements against the concrete caches — the
@@ -2000,6 +2094,7 @@ pub fn lower_scene<R>(
     renderer: &mut R,
     rasterizer: &mut crate::text_render::TextRasterizer,
     orb_cache: &mut OrbCache,
+    rect_cache: &mut RectCache,
     orb_energy: f32,
     elements: &mut Vec<HartRenderElement<R>>,
 ) where
@@ -2013,22 +2108,54 @@ pub fn lower_scene<R>(
     tree.flatten(&mut leaves);
     for leaf in leaves {
         match leaf {
-            crate::scene::SceneNode::Rect { rect, color, .. } => {
+            crate::scene::SceneNode::Rect { rect, color, radius } => {
                 if rect.w < 1.0 || rect.h < 1.0 {
                     continue;
                 }
-                let mut buf = SolidColorBuffer::new(
-                    (rect.w as i32, rect.h as i32),
-                    [color.r, color.g, color.b, color.a],
-                );
-                let el = SolidColorRenderElement::from_buffer(
-                    &mut buf,
-                    (rect.x as i32, rect.y as i32),
-                    Scale::from(1.0),
-                    color.a,
-                    Kind::Unspecified,
-                );
-                elements.push(HartRenderElement::Solid(el));
+                if *radius > 0.5 {
+                    // Rounded (cards, omnibox): lower through a cached rounded-rect
+                    // buffer so the corner radius the scene specifies is actually
+                    // drawn. A SolidColorRenderElement is always a hard quad, so this
+                    // is the ONLY way the native chrome gets soft corners like the
+                    // shell has. Alpha is baked into the premultiplied buffer, so the
+                    // element alpha is 1.0.
+                    if let Some(buffer) = rect_cache.rounded(
+                        rect.w as i32,
+                        rect.h as i32,
+                        *radius,
+                        [color.r, color.g, color.b, color.a],
+                    ) {
+                        let origin: Point<f64, Physical> =
+                            Point::from((rect.x as f64, rect.y as f64));
+                        match MemoryRenderBufferRenderElement::from_buffer(
+                            renderer,
+                            origin,
+                            buffer,
+                            Some(1.0),
+                            None,
+                            Some((rect.w as i32, rect.h as i32).into()),
+                            Kind::Unspecified,
+                        ) {
+                            Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                            Err(err) => warn!(?err, "native scene: rounded rect import failed"),
+                        }
+                    }
+                } else {
+                    // Sharp (desktop ground, bars): the cheap solid quad, no per-pixel
+                    // rasterize.
+                    let mut buf = SolidColorBuffer::new(
+                        (rect.w as i32, rect.h as i32),
+                        [color.r, color.g, color.b, color.a],
+                    );
+                    let el = SolidColorRenderElement::from_buffer(
+                        &mut buf,
+                        (rect.x as i32, rect.y as i32),
+                        Scale::from(1.0),
+                        color.a,
+                        Kind::Unspecified,
+                    );
+                    elements.push(HartRenderElement::Solid(el));
+                }
             }
             crate::scene::SceneNode::Text {
                 rect,
@@ -3195,6 +3322,24 @@ mod tests {
         assert!(WS_FADE_MS > 0 && WS_FADE_MS <= 500, "ws fade should be a short ramp");
         assert!(FADE_IN_MS > 0 && FADE_IN_MS <= 500, "map fade should be a short ramp");
     }
+
+    #[test]
+    fn rounded_rect_cuts_corners_and_fills_the_centre() {
+        // A 12px radius on a 40x40 box: the exact corner pixel is outside the arc and
+        // must be fully transparent, while the centre and the straight top edge are
+        // fully covered. This is precisely what a hard SolidColorRenderElement cannot
+        // express, so it is the reason rounded rects lower through a buffer.
+        let (w, h) = (40u32, 40u32);
+        let rgba = rounded_rect_rgba(w, h, 12.0, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
+        let alpha_at = |x: u32, y: u32| rgba[((y * w + x) * 4 + 3) as usize];
+        assert_eq!(alpha_at(0, 0), 0, "top-left corner must be cut away");
+        assert!(alpha_at(w / 2, h / 2) > 250, "centre must be opaque");
+        assert!(alpha_at(w / 2, 0) > 250, "the straight top edge must be covered");
+        // A zero radius is a plain filled rect: the corner is now covered too.
+        let sharp = rounded_rect_rgba(w, h, 0.0, [1.0, 1.0, 1.0, 1.0]);
+        assert!(sharp[3] > 250, "radius 0 fills the corner");
+    }
 }
 
 // NATIVE SHELL PARITY PROGRAM, M3 render proof. Gated on `smithay` because it uses
@@ -3220,6 +3365,7 @@ mod native_render_tests {
         let home = crate::scene::HomeCompose::demo();
         let mut rasterizer = crate::text_render::TextRasterizer::new();
         let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
 
         let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
         lower_scene(
@@ -3228,6 +3374,7 @@ mod native_render_tests {
             &mut renderer,
             &mut rasterizer,
             &mut orb,
+            &mut rects,
             0.5,
             &mut elements,
         );
@@ -3240,24 +3387,19 @@ mod native_render_tests {
             elements.len()
         );
 
-        // Panels/ground lower to Solid rects; the orb (and text, when a font is
-        // present) lower to Memory elements. A Memory element exists ONLY when
-        // `MemoryRenderBufferRenderElement::from_buffer` returned Ok, so its presence
+        // The orb slots, the rounded card/omnibox rects, and (with a font) the text
+        // runs all lower to Memory elements — each exists ONLY when
+        // `MemoryRenderBufferRenderElement::from_buffer` returned Ok, so their presence
         // is evidence the MemoryRenderBuffer -> PixmanRenderer ImportMem path actually
-        // works — the demo scene always carries orb slots, so this never depends on
-        // fonts being installed in the sandbox.
-        let solids = elements
-            .iter()
-            .filter(|e| matches!(e, HartRenderElement::Solid(_)))
-            .count();
+        // works. The demo always carries orb slots, so this never depends on fonts
+        // being installed in the sandbox.
         let memory = elements
             .iter()
             .filter(|e| matches!(e, HartRenderElement::Memory(_)))
             .count();
-        assert!(solids >= 1, "expected panel/ground rects, got {solids}");
         assert!(
             memory >= 1,
-            "orb/text buffers must import as Memory elements, got {memory}"
+            "orb/rounded-rect/text buffers must import as Memory elements, got {memory}"
         );
 
         // Every lowered element has a positive on-screen footprint — nothing collapsed

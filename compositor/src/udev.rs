@@ -513,6 +513,8 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         bloom: Default::default(),
         // NATIVE SHELL M2 — composed on the first frame at the real output size.
         orb: Default::default(),
+        // NATIVE SHELL M3 — rounded-rect buffers, composed on first use per card size.
+        rect_cache: Default::default(),
         ipc: crate::ipc::IpcState::default(),
         // F1 (#166) — no flips in flight at boot; the VBlank source populates this.
         vblank_completed: std::collections::HashSet::new(),

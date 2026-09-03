@@ -257,6 +257,9 @@ pub struct State {
     /// NATIVE SHELL M2 — the voice orb, composed once and animated per frame by
     /// scale+alpha on the GPU.
     pub orb: crate::comp_core::OrbCache,
+    /// NATIVE SHELL M3 — rounded-rect buffers (cards, omnibox), composed once per
+    /// unique size/radius/colour so the corner radius the scene specifies is drawn.
+    pub rect_cache: crate::comp_core::RectCache,
     /// M8 — the com.hart.Compositor IPC server's per-compositor state (the event
     /// fan-out subscribers). The DRM backend serves the SAME framed-JSON socket the
     /// winit backend does, so an agent arranges real windows on real hardware too.
@@ -411,8 +414,12 @@ impl CompState for State {
     }
     fn native_scene_caches(
         &mut self,
-    ) -> (&mut crate::text_render::TextRasterizer, &mut crate::comp_core::OrbCache) {
-        (&mut self.text_rasterizer, &mut self.orb)
+    ) -> (
+        &mut crate::text_render::TextRasterizer,
+        &mut crate::comp_core::OrbCache,
+        &mut crate::comp_core::RectCache,
+    ) {
+        (&mut self.text_rasterizer, &mut self.orb, &mut self.rect_cache)
     }
     fn emit_window_event(&mut self, event: &str, window: &Window, handle: &str) {
         // Fan the edge out over the SHARED framed-JSON IPC (the same socket the winit
