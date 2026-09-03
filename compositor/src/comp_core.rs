@@ -416,9 +416,46 @@ fn rounded_rect_rgba(w: u32, h: u32, radius: f32, color: [f32; 4]) -> Vec<u8> {
 #[derive(Default)]
 pub struct RectCache {
     cache: std::collections::HashMap<(u32, u32, u32, u32, u32, u32, u32), MemoryRenderBuffer>,
+    /// POOL for the sharp-rect path. The first cut built a `SolidColorBuffer` per rect per
+    /// frame, which is the other half of the zero-per-frame-alloc NFR (the retained tree in
+    /// `scene::SceneCache` was the first). Buffers are handed out in paint order and reused
+    /// next frame via `update`, so a steady desktop allocates none.
+    solids: Vec<SolidColorBuffer>,
+    /// How far into `solids` this frame has got. Reset by `begin_frame`.
+    solid_next: usize,
+    /// How many solid buffers were ever actually allocated. The pooling PROOF: a steady
+    /// desktop must not grow this per frame.
+    solid_allocs: u64,
 }
 
 impl RectCache {
+    /// Start a frame: hand out pooled solids from the top again. Paint order is
+    /// deterministic for a given tree, so frame N+1 reuses the same buffer for the same
+    /// rect. Must be called once per lowering, before any `solid` call.
+    pub fn begin_frame(&mut self) {
+        self.solid_next = 0;
+    }
+
+    /// The next pooled solid buffer, sized and coloured for this rect. Allocates only
+    /// while the pool is still shorter than the frame needs; afterwards it is `update` on
+    /// a buffer this cache already owns.
+    pub fn solid(&mut self, w: i32, h: i32, color: [f32; 4]) -> &mut SolidColorBuffer {
+        if self.solid_next == self.solids.len() {
+            self.solids.push(SolidColorBuffer::new((w, h), color));
+            self.solid_allocs += 1;
+        } else {
+            self.solids[self.solid_next].update((w, h), color);
+        }
+        let idx = self.solid_next;
+        self.solid_next += 1;
+        &mut self.solids[idx]
+    }
+
+    /// Total solid buffers ever allocated (test hook for the pooling proof).
+    pub fn solid_allocs(&self) -> u64 {
+        self.solid_allocs
+    }
+
     /// The rounded-rect buffer for these dims / radius / colour, composed on first
     /// use. `None` for a degenerate size (the caller then draws nothing for it).
     pub fn rounded(
@@ -2081,10 +2118,13 @@ fn native_pointer_scene_pos<S: CompState>(
 /// `lower_scene` (State-free, so it is render-tested); this wrapper just pulls the scene
 /// and caches off `state`.
 ///
-/// FIRST-CUT alloc note: builds the scene and one SolidColorBuffer per rect PER FRAME.
-/// That violates the zero-per-frame-alloc NFR on purpose: step one is proving the
-/// native scene scans out; step two retains the tree (rebuild on compose/resize only)
-/// and pools the buffers. Not shipped past M3 as-is.
+/// Alloc note: step two is now DONE both halves. The scene tree is retained
+/// (`scene::SceneCache`, rebuilt only on a real layout change) and the sharp-rect
+/// SolidColorBuffers are pooled (`RectCache::solid`, reused via `update`), so a steady
+/// desktop allocates neither per frame. What still allocates per frame: the `HomeCompose`
+/// clone below (it must, to drop the state borrow before taking the `&mut` caches, so
+/// removing it needs the accessor to split-borrow the home) and the per-frame `elements`
+/// and leaf vectors.
 pub fn render_native_scene<S, R>(
     state: &mut S,
     renderer: &mut R,
@@ -2143,6 +2183,9 @@ pub fn lower_scene<R>(
     let theme = crate::scene::Theme::cosmic_default();
     let tree = scene_cache.tree_for(size.w as f32, size.h as f32, home, &theme);
 
+    // Hand out pooled solid buffers from the top for this frame (see RectCache::solid).
+    rect_cache.begin_frame();
+
     // M2 input half: the pointer energises the orb it sits over. Fold the hover lift into
     // the ambient energy ONCE here, against the SAME tree the leaves come from, so orb
     // reactivity rides the existing orb path (orb::motion_at clamps the sum to 0..=1).
@@ -2186,13 +2229,15 @@ pub fn lower_scene<R>(
                     }
                 } else {
                     // Sharp (desktop ground, bars): the cheap solid quad, no per-pixel
-                    // rasterize.
-                    let mut buf = SolidColorBuffer::new(
-                        (rect.w as i32, rect.h as i32),
+                    // rasterize. The buffer comes from the POOL, so a steady desktop
+                    // reuses the one it handed out last frame instead of allocating.
+                    let buf = rect_cache.solid(
+                        rect.w as i32,
+                        rect.h as i32,
                         [color.r, color.g, color.b, color.a],
                     );
                     let el = SolidColorRenderElement::from_buffer(
-                        &mut buf,
+                        buf,
                         (rect.x as i32, rect.y as i32),
                         Scale::from(1.0),
                         color.a,
@@ -3458,6 +3503,68 @@ mod native_render_tests {
                 "element lowered with empty geometry: {g:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_steady_desktop_reuses_its_buffers_instead_of_allocating_each_frame() {
+        // The zero-per-frame-alloc NFR, proven the way a frame loop actually runs: same
+        // caches, same scene, repeated lowerings, with the element vector rebuilt each
+        // time exactly as build_frame_elements does.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (1280, 800).into();
+
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+
+        let mut first = 0usize;
+        let mut solids_after_first_frame = 0u64;
+        for frame in 0..6 {
+            // A fresh element vector each pass, exactly as build_frame_elements does, so
+            // the previous frame's elements are dropped before the buffers are reused.
+            let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+            lower_scene(
+                &home,
+                size,
+                &mut renderer,
+                &mut rasterizer,
+                &mut orb,
+                &mut rects,
+                &mut scenes,
+                0.5,
+                None,
+                &mut elements,
+            );
+            if frame == 0 {
+                first = elements.len();
+                solids_after_first_frame = rects.solid_allocs();
+                assert!(first > 0, "the demo scene lowered to nothing");
+                assert_eq!(scenes.rebuilds(), 1, "the first frame builds the tree once");
+                assert!(
+                    solids_after_first_frame > 0,
+                    "the demo scene has sharp rects, so the first frame allocates solids"
+                );
+            } else {
+                assert_eq!(
+                    elements.len(),
+                    first,
+                    "a steady desktop must lower the same element set every frame"
+                );
+            }
+        }
+
+        assert_eq!(
+            scenes.rebuilds(),
+            1,
+            "a steady desktop must not rebuild the scene tree per frame"
+        );
+        assert_eq!(
+            rects.solid_allocs(),
+            solids_after_first_frame,
+            "five further frames must reuse the pooled solids, not allocate new ones"
+        );
     }
 
     #[test]
