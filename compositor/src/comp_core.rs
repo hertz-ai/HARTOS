@@ -2045,6 +2045,29 @@ where
 /// windows (faded) → Bottom/Background layers.
 /// Generic over R so BOTH backends build the identical frame; the backend then binds its
 /// framebuffer + draws this slice. This is the single source of the desktop's z-order.
+/// NATIVE SHELL M2 input: the pointer position mapped into the native scene's own
+/// coordinate space (the physical `size` the scene is laid out in), or None when there
+/// is no output geometry yet (pre-mode) or the cursor is off this output. Used ONLY to
+/// energise the orb under the cursor, so returning None simply means no hover lift and
+/// today's flag-off behaviour stays byte-identical. The pointer lives in the GLOBAL
+/// logical space, so it is made output-local and scaled into physical coords, which keeps
+/// the hit-test aligned with the painted orb on a HiDPI output too.
+fn native_pointer_scene_pos<S: CompState>(
+    state: &S,
+    size: Size<i32, Physical>,
+) -> Option<(f32, f32)> {
+    let loc = state.pointer().current_location();
+    let geo = state.space().output_geometry(state.output())?;
+    if geo.size.w <= 0 || geo.size.h <= 0 {
+        return None;
+    }
+    let lx = loc.x - geo.loc.x as f64;
+    let ly = loc.y - geo.loc.y as f64;
+    let sx = size.w as f64 / geo.size.w as f64;
+    let sy = size.h as f64 / geo.size.h as f64;
+    Some(((lx * sx) as f32, (ly * sy) as f32))
+}
+
 /// NATIVE SHELL M3 GL LOWERING: lower the native shell scene to render elements.
 /// Rect leaves (top bar, taskbar, hero and card tiles) become SolidColorRenderElements;
 /// Text runs are shaped + rasterized into cached MemoryRenderBuffers; OrbSlots reuse the
@@ -2077,9 +2100,12 @@ pub fn render_native_scene<S, R>(
         .cloned()
         .unwrap_or_else(crate::scene::HomeCompose::demo);
     let orb_energy = state.orb_energy();
+    // Read the pointer BEFORE the `&mut` cache borrow (both are plain owned values), so
+    // the hover lift rides the same single lowering call. None on a pre-mode frame.
+    let pointer = native_pointer_scene_pos(state, size);
     let (rasterizer, orb_cache, rect_cache) = state.native_scene_caches();
     lower_scene(
-        &home, size, renderer, rasterizer, orb_cache, rect_cache, orb_energy, elements,
+        &home, size, renderer, rasterizer, orb_cache, rect_cache, orb_energy, pointer, elements,
     );
 }
 
@@ -2096,6 +2122,7 @@ pub fn lower_scene<R>(
     orb_cache: &mut OrbCache,
     rect_cache: &mut RectCache,
     orb_energy: f32,
+    pointer: Option<(f32, f32)>,
     elements: &mut Vec<HartRenderElement<R>>,
 ) where
     R: Renderer + ImportAll + ImportMem,
@@ -2103,6 +2130,11 @@ pub fn lower_scene<R>(
 {
     let theme = crate::scene::Theme::cosmic_default();
     let tree = crate::scene::layout_home(size.w as f32, size.h as f32, home, &theme);
+
+    // M2 input half: the pointer energises the orb it sits over. Fold the hover lift into
+    // the ambient energy ONCE here, against the SAME tree the leaves come from, so orb
+    // reactivity rides the existing orb path (orb::motion_at clamps the sum to 0..=1).
+    let orb_energy = orb_energy + tree.pointer_orb_energy(pointer);
 
     let mut leaves: Vec<&crate::scene::SceneNode> = Vec::new();
     tree.flatten(&mut leaves);
@@ -3376,6 +3408,7 @@ mod native_render_tests {
             &mut orb,
             &mut rects,
             0.5,
+            None,
             &mut elements,
         );
 
@@ -3443,6 +3476,7 @@ mod native_render_tests {
             &mut orb,
             &mut rects,
             0.5,
+            None,
             &mut elements,
         );
 

@@ -302,6 +302,25 @@ impl SceneNode {
         }
         Some(self)
     }
+
+    /// Extra orb energy contributed by the pointer at `pointer` (in the SAME logical
+    /// coords the scene was laid out in), so the native orb energises under the cursor
+    /// exactly as the WebView shell's orb does. Returns 0.0 when the pointer is absent
+    /// or is not over an `OrbSlot`. This is the M2 input-half hook: the render path adds
+    /// this scalar to the ambient orb energy it already computes, so pointer reactivity
+    /// rides the EXISTING orb path (one orb, no easing) and `orb::motion_at` clamps the
+    /// sum into 0..=1. HOVER only in this cut; the press/drag latch is the next step and
+    /// will read a `pressed` flag alongside this same `hit_test`.
+    pub fn pointer_orb_energy(&self, pointer: Option<(f32, f32)>) -> f32 {
+        const HOVER_LIFT: f32 = 0.35;
+        match pointer {
+            Some((px, py)) => match self.hit_test(px, py) {
+                Some(SceneNode::OrbSlot { .. }) => HOVER_LIFT,
+                _ => 0.0,
+            },
+            None => 0.0,
+        }
+    }
 }
 
 // ── Layout constants. The 40/44 are the SAME strip dims the compositor publishes at
@@ -631,5 +650,31 @@ mod tests {
         assert_eq!(hc.rows[0].label, "Continue");
         assert_eq!(hc.rows[0].cards[0].image.as_deref(), Some("a.png"));
         assert_eq!(hc.mood.as_deref(), Some("cosmic"));
+    }
+
+    #[test]
+    fn pointer_over_the_orb_lifts_its_energy_and_nowhere_else() {
+        let (w, h) = (1600.0, 900.0);
+        let root = layout_home(w, h, &sample(), &Theme::cosmic_default());
+        // The large home orb's centre must energise the orb.
+        let mut orb_centre = None;
+        if let SceneNode::Container { children, .. } = &root {
+            for c in children {
+                if let SceneNode::OrbSlot { rect, compact: false } = c {
+                    orb_centre = Some((rect.x + rect.w * 0.5, rect.y + rect.h * 0.5));
+                }
+            }
+        }
+        let (ox, oy) = orb_centre.expect("a home orb slot");
+        assert!(
+            root.pointer_orb_energy(Some((ox, oy))) > 0.0,
+            "the orb must energise when the cursor is over it"
+        );
+        // A point in the hero-title column (left of the floated orb) is NOT the orb, so
+        // it lifts nothing — hover is targeted, not a whole-desktop glow.
+        let hero_pt = (EDGE_PAD + 4.0, TOP_BAR_H + EDGE_PAD + 4.0);
+        assert_eq!(root.pointer_orb_energy(Some(hero_pt)), 0.0);
+        // No pointer contributes nothing: the flag-off / no-cursor default is unchanged.
+        assert_eq!(root.pointer_orb_energy(None), 0.0);
     }
 }
