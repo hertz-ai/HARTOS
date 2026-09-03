@@ -2963,6 +2963,15 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                        user_id: int, prompt_id: int, request_id: str) -> str:
     """Get a single response from the agent for the given message."""
     user_prompt = f'{user_id}_{prompt_id}'
+    # Register this session's group chat so the fabrication gate in
+    # _advance_reuse_action can reach it (via get_registered_groupchat) on
+    # EVERY advance path — w1/w2/regex.  Reuse never registered it before, so
+    # the gate silently no-op'd (get_registered_groupchat returned None).
+    try:
+        from hartos.lifecycle_hooks import register_groupchat_for_session
+        register_groupchat_for_session(user_prompt, group_chat)
+    except Exception:
+        pass
     try:
         # Tier-1 per-turn attach: deterministic keyword scan of THIS message
         # unlocks families the construction-time goal never mentioned — zero
