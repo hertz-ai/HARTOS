@@ -130,6 +130,35 @@ def test_an_explicit_base_url_wins(daemon, listening, monkeypatch):
     assert daemon.backend() == 'http://10.0.0.5:9999'
 
 
+def test_bundled_cold_boot_falls_back_to_flask_not_backend(listening, monkeypatch):
+    """THE BOOT-RACE REGRESSION (live-pinned 2026-09-03). On the bundled
+    desktop, consumers that resolve DURING boot (before flask binds :5000) --
+    e.g. the claude-code copilot backend registered at import in
+    model_registry._register_defaults -- must NOT get the topology-blind
+    :6777 fallback. That baked a dead :6777 into the copilot's base_url, so
+    every copilot-routed reuse turn dialled a closed socket. The cold-boot
+    fallback must match where THIS node serves: flask on bundled."""
+    import core.port_registry as pr
+    import core.config_cache as cc
+    listening['open'] = set()  # nothing listening yet (boot race)
+    monkeypatch.setattr(cc, 'is_bundled', lambda: True)
+    url = pr.get_local_backend_url()
+    assert port_of(url) == pr.get_port('flask'), (
+        'bundled cold-boot resolved %s (expected the flask port %d) -- the '
+        'copilot backend would register at a dead :6777'
+        % (url, pr.get_port('flask')))
+
+
+def test_standalone_cold_boot_still_falls_back_to_backend(listening, monkeypatch):
+    """Appliance (not frozen): cold-boot fallback stays backend (6777)."""
+    import core.port_registry as pr
+    import core.config_cache as cc
+    listening['open'] = set()
+    monkeypatch.setattr(cc, 'is_bundled', lambda: False)
+    url = pr.get_local_backend_url()
+    assert port_of(url) == pr.get_port('backend'), url
+
+
 def test_backend_never_raises(daemon, monkeypatch):
     """The resolver is called on every poll tick. If it can raise, one bad
     import wedges the co-pilot shut -- the failure mode this daemon exists to

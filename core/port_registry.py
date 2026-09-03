@@ -239,7 +239,21 @@ def get_local_backend_url() -> str:
     for svc in ('backend', 'flask'):
         if _is_port_listening(get_port(svc)):
             return f'http://localhost:{get_port(svc)}'
-    return f'http://localhost:{get_port("backend")}'
+    # Cold boot: neither port is listening yet. The fallback must match where
+    # THIS node will actually serve, not a topology-blind 'backend'. A bundled
+    # desktop serves HARTOS in-process on the flask port (5000) and NEVER binds
+    # backend (6777); a standalone appliance serves on backend. The old blind
+    # 'backend' fallback baked :6777 into any consumer that resolved during the
+    # boot race — e.g. the claude-code copilot backend registers at import
+    # (_register_defaults), BEFORE flask binds, so every copilot-routed reuse
+    # turn then dialled a dead :6777 socket (WinError 10061 -> _tier:direct
+    # stale answer; live-pinned 2026-09-03 with a :6777 socket sniffer).
+    try:
+        from core.config_cache import is_bundled as _is_bundled
+        _cold = 'flask' if _is_bundled() else 'backend'
+    except Exception:
+        _cold = 'backend'
+    return f'http://localhost:{get_port(_cold)}'
 
 
 def get_lan_ip() -> str:
