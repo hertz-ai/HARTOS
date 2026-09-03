@@ -117,6 +117,25 @@ def chat_completions():
         return jsonify({'error': {'message': 'no user content in messages',
                                   'type': 'invalid_request_error'}}), 400
 
+    # CAPABILITY GUARD: this tier runs `claude -p` in mode='inference' as a pure
+    # text-completion engine — it is TOOL-LESS (the copilot cannot execute
+    # HARTOS's registered tools such as google_search/crawl4ai, and its own
+    # WebSearch/WebFetch are ungranted in a non-interactive session).  A request
+    # that carries a non-empty tools[] REQUIRES tool execution; answering it here
+    # would fabricate a tool-less reply (measured 2026-09-03: reuse search action
+    # got "web search is blocked … here's from my knowledge instead").  Decline
+    # with the SAME 503-to-fallback contract the capacity guard below uses, so
+    # HARTOS routes the tool turn to a tool-capable tier (local has the tools).
+    # NOT a hardwire: pure-reasoning turns (no tools[]) still run here unchanged.
+    if data.get('tools'):
+        logger.info('claude-code endpoint: request carries %d tool(s) but this '
+                    'tier is tool-less — 503 to fallback (tool-capable tier)',
+                    len(data.get('tools') or []))
+        return jsonify({'error': {
+            'message': 'claude-code tier cannot execute tools; route tool turns '
+                       'to a tool-capable tier',
+            'type': 'api_error', 'category': 'no_tools'}}), 503
+
     # Cap concurrent claude -p processes. Non-blocking acquire: at capacity we
     # 503 so the caller's fallback picks a local model instead of queueing.
     if not _sem.acquire(blocking=False):
