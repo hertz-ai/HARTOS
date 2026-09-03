@@ -502,6 +502,9 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         cursor_hotspot: cur_hotspot,
         ws_switch_at: None,
         capture_blocked: false,
+        // NATIVE SHELL M3: opt in per session via the env, default OFF (no regression).
+        native_shell_on: std::env::var_os("HART_NATIVE_SHELL").is_some(),
+        native_home: None,
         black_buffer,
         // NATIVE SHELL M1 — empty until the first frame composes the backdrop at
         // the output's real mode (the 1920x1080 guess above is only the killswitch
@@ -1172,6 +1175,13 @@ fn reap_completed_vblanks(state: &mut State, devices: &mut HashMap<DrmNode, Devi
                 // queued-but-parked frame is not that evidence, and claiming on it would
                 // turn the shell transparent over a frame nobody ever saw.
                 publish_native_chrome();
+                // T_photon for the latency instrument: this vblank IS the
+                // photon side of every input bound to the frame it completes.
+                // Summaries surface once per 10s window; the journal line is
+                // the harness §3 contract, greppable as `hart-latency`.
+                for s in crate::latency::on_frame_presented() {
+                    info!("{}", s.journal_line());
+                }
             }
         }
     }
@@ -1643,6 +1653,12 @@ where
                     Ok(()) => {
                         surface.awaiting_vblank = true;
                         surface.flip_queued_at = Some(now);
+                        // Bind pending inputs to THIS frame for the latency
+                        // instrument. Queue-time is the right binding point
+                        // even though presentation is proven only at the
+                        // vblank: the batch rides FIFO and is measured against
+                        // the flip that actually completes (harness M0).
+                        crate::latency::on_frame_queued();
                         // `last_flip_at` and `publish_native_chrome()` USED TO BE HERE
                         // and have moved to `reap_completed_vblanks`, because this Ok
                         // does NOT mean the frame reached the screen. smithay's

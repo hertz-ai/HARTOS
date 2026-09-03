@@ -17,6 +17,7 @@ from sqlalchemy import (
     Column, String, Text, Integer, Float, Boolean,
     DateTime, JSON, ForeignKey, UniqueConstraint, Index, func
 )
+from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import relationship
 
 # Import from parent models.py — these are already defined before models.py
@@ -2125,7 +2126,23 @@ class AgentGoal(Base):
     priority = Column(Integer, default=0)
 
     # Type-specific config (repo_url for coding, channels for marketing, etc.)
-    config_json = Column(JSON, default=dict)
+    # MutableDict, not a bare JSON column.  Every writer in the tree uses the
+    # pattern `cfg = goal.config_json or {}` / mutate / `goal.config_json = cfg`,
+    # which reassigns the SAME dict object.  On a plain JSON column SQLAlchemy
+    # sees no change and silently drops the write, while any scalar set in the
+    # same block (goal.status) persists normally.
+    #
+    # Proven on central 2026-09-01: 40 goals sat status='paused' and NOT ONE
+    # carried a pause_reason, though all four pause paths write one
+    # (agent_daemon dispatch-failure and noop, coding_daemon dispatch-failure,
+    # budget_gate).  Reproduced in isolation: status persisted, config_json came
+    # back as the pre-edit dict, and assigning a NEW dict persisted fine.
+    #
+    # The silent half is worse than the missing reason. coding_daemon tracks
+    # `_dispatch_failures` through the same pattern, so the counter never
+    # incremented past its first write: goals could never reach the 5-failure
+    # threshold and that auto-pause has never been able to fire at all.
+    config_json = Column(MutableDict.as_mutable(JSON), default=dict)
 
     # Marketing-specific (nullable for non-marketing goals)
     product_id = Column(String(64), ForeignKey('products.id'), nullable=True, index=True)

@@ -379,6 +379,15 @@ fn dispatch_request<S: CompState>(
             Response::ok(id, json!({ "windows": ipc_list_windows(state) }))
         }
 
+        // ── NATIVE SHELL M3 shell.compose(hero, rows, mood) — the A2UI home feed
+        //    drives the native scene (same payload the WebView consumes). Stored on
+        //    State; the render loop lays it out when native_shell_on. ──
+        "shell.compose" | "ShellCompose" => {
+            let home = crate::scene::decode_home_compose(args);
+            state.set_native_home(home);
+            Response::ok(id, json!({ "composed": true }))
+        }
+
         // â”€â”€ Â§4.2 window.focus(handle) â€” keyboard focus + raise â”€â”€
         "window.focus" | "FocusWindow" => match arg_handle(args) {
             Some(h) => {

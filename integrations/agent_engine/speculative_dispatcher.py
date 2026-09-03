@@ -290,13 +290,12 @@ class SpeculativeDispatcher:
         if not passed:
             return False
 
-        # Need both a fast and expert model
-        fast = self._registry.get_fast_model()
-        expert = self._registry.get_expert_model()
+        # Need two DIFFERENT dispatchable backends — one to draft, one to
+        # verify. The rule lives on the registry so this and health_probe ask
+        # the same question instead of each rebuilding it.
+        fast, expert = self._registry.speculation_pair()
         if not fast or not expert:
             return False
-        if fast.model_id == expert.model_id:
-            return False  # Same model — no point speculating
 
         # Budget check (if goal has spark budget)
         if goal and goal.get('spark_budget', 0) > 0:
@@ -1794,6 +1793,24 @@ class SpeculativeDispatcher:
             payload['prompt_id'] = prompt_id
         if goal_id:
             payload['goal_id'] = goal_id
+        # #750: the inner /chat runs on a FRESH handler thread — only the
+        # payload can carry the originating rid (hie:9099 reads it, :9253
+        # binds it).  Without it the whole inner reuse group ran
+        # request_id='' -> classified background -> routed to the CLOSABLE
+        # bg client -> closed by this very turn's own 0->1 foreground edge
+        # -> RuntimeError 'client has been closed' (3x live 2026-09-01;
+        # llm_outbound.jsonl rid='' source=autogen.reuse).  The expert
+        # worker already rebound the user rid to thread-local (#162,
+        # _expert_background_task); daemon dispatches carry their
+        # daemon_<goal_id> rid, which is_genuine_user_request still
+        # classifies background — #162 behavior preserved.
+        try:
+            from hartos.threadlocal import thread_local_data as _tl
+            _rid = _tl.get_request_id() or ''
+        except Exception:
+            _rid = ''
+        if _rid:
+            payload['request_id'] = _rid
         if goal_type and goal_type != 'general':
             payload['goal_type'] = goal_type
         return payload
@@ -1924,8 +1941,13 @@ class SpeculativeDispatcher:
             return ''
 
         # Non-bundled: HTTP POST to the configured backend.
+        # Carries the same credential ``dispatch_goal`` sends: on the
+        # central tier security/middleware.py gate 2 answers a bare
+        # self-POST with 401 (measured 2026-09-02, 2ms), and this leg
+        # was silently dead there since it was added.
         try:
             import requests as _req
+            from integrations.agent_engine.dispatch import _internal_auth_headers
             base = os.environ.get(
                 'HEVOLVE_BASE_URL',
                 f'http://localhost:{get_port("backend")}',
@@ -1940,10 +1962,13 @@ class SpeculativeDispatcher:
             # like "expert produced nothing" and the standby stays final,
             # with no error surfaced anywhere.
             _timeout = int(os.environ.get('HEVOLVE_CHANNEL_AGENT_TIMEOUT', '120'))
-            resp = _req.post(f'{base}/chat', json=payload, timeout=_timeout)
+            resp = _req.post(f'{base}/chat', json=payload,
+                             headers=_internal_auth_headers(), timeout=_timeout)
             if resp.status_code == 200:
                 return (resp.json() or {}).get('response') or ''
-            logger.debug(
+            # WARNING, not DEBUG: central emits no INFO/DEBUG after boot,
+            # so a dead leg at DEBUG is invisible to every operator.
+            logger.warning(
                 "local expert /chat HTTP returned %s", resp.status_code)
         except Exception as e:
             logger.debug("local expert HTTP dispatch failed: %s", e)
@@ -1985,59 +2010,96 @@ class SpeculativeDispatcher:
             _port = model.port
         if not _port:
             try:
-                from core.port_registry import get_local_draft_url, get_local_llm_url
-                _url = get_local_draft_url() or get_local_llm_url()
-                if _url:
-                    # Extract port from URL like http://127.0.0.1:8081/v1
-                    import re as _re
-                    _m = _re.search(r':(\d+)', _url)
-                    _port = int(_m.group(1)) if _m else 8081
-            except Exception:
-                _port = 8081  # draft default
-        try:
-            # ONE transport (task #10): pooled_post is port-scoped — a true
-            # draft-port call passes straight through (the draft server has
-            # its own slots), but when no draft server exists and _port fell
-            # back to the MAIN llama port, the call is admitted through the
-            # slot-aware scheduler like every other main-server call. A raw
-            # requests.post here would hit the main server UNSCHEDULED on
-            # draft-less boxes — invisible to inflight() and unpreemptable by
-            # a user turn (#162 hazard).
-            from core.http_pool import pooled_post as _pooled_post
-            # Manual log_outbound call here because the requests transport
-            # bypasses the global httpx hook installed in
-            # ``core.llm_outbound_logger.install()``; this is the only place
-            # draft-classifier prompts get a record.
-            _draft_body = {
-                'model': 'llama',
-                'messages': [{'role': 'user', 'content': prompt}],
-                'max_tokens': 500,
-                'temperature': 0.7,
-            }
-            _draft_start = time.time()
-            resp = _pooled_post(
-                f'http://127.0.0.1:{_port}/v1/chat/completions',
-                json=_draft_body,
-                timeout=15,
-            )
-            try:
-                from core.llm_outbound_logger import log_outbound as _log_ob
-                _log_ob(
-                    _draft_body,
-                    source='dispatcher.draft',
-                    response_status=resp.status_code,
-                    latency_ms=round((time.time() - _draft_start) * 1000, 1),
+                from core.autogen_config import resolve_llm_backend, llm_http_target
+                if resolve_llm_backend()[0] == 'api':
+                    # The ONE configured API is the draft as well (owner
+                    # design: draft = main on a node with an API key and no
+                    # VRAM): same URL, auth header and model name as every
+                    # other chat/completions caller.
+                    _draft_url, _draft_headers, _draft_model = llm_http_target(draft=True)
+                else:
+                    # Local kind: the node's own llama-server.  Resolve the
+                    # model's direct port from the catalog/port_registry.
+                    _port = None
+                    if hasattr(model, 'port') and model.port:
+                        _port = model.port
+                    if not _port:
+                        try:
+                            from core.port_registry import get_local_draft_url, get_local_llm_url
+                            _url = get_local_draft_url() or get_local_llm_url()
+                            if _url:
+                                # Extract port from URL like http://127.0.0.1:8081/v1
+                                import re as _re
+                                _m = _re.search(r':(\d+)', _url)
+                                _port = int(_m.group(1)) if _m else 8081
+                        except Exception:
+                            _port = 8081  # draft default
+                    _draft_url = f'http://127.0.0.1:{_port}/v1/chat/completions'
+                    _draft_headers = {}
+                    _draft_model = llm_http_target(draft=True)[2]
+                # ONE transport (task #10): pooled_post is port-scoped — a
+                # true draft-port call passes straight through (the draft
+                # server has its own slots), but when no draft server exists
+                # and _port fell back to the MAIN llama port, the call is
+                # admitted through the slot-aware scheduler like every other
+                # main-server call. The old raw requests.post here hit the
+                # main server UNSCHEDULED on draft-less boxes — invisible to
+                # inflight() and unpreemptable by a user turn (#162 hazard).
+                from core.http_pool import pooled_post as _pooled_post
+                # Manual log_outbound call here because the requests
+                # transport bypasses the global httpx hook installed in
+                # ``core.llm_outbound_logger.install()``; this is the only
+                # place draft-classifier prompts get a record.
+                _draft_body = {
+                    'model': _draft_model,
+                    'messages': [{'role': 'user', 'content': prompt}],
+                    'max_tokens': 500,
+                    'temperature': 0.7,
+                }
+                _draft_start = time.time()
+                resp = _pooled_post(
+                    _draft_url,
+                    json=_draft_body,
+                    headers=_draft_headers,
+                    timeout=15,
                 )
-            except Exception:
-                pass
+                try:
+                    from core.llm_outbound_logger import log_outbound as _log_ob
+                    _log_ob(
+                        _draft_body,
+                        source='dispatcher.draft',
+                        response_status=resp.status_code,
+                        latency_ms=round((time.time() - _draft_start) * 1000, 1),
+                    )
+                except Exception:
+                    pass
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if 'choices' in data:
+                        return data['choices'][0]['message']['content']
+                    elif 'error' in data:
+                        logger.debug(f"Draft model error: {data['error']}")
+            except Exception as e:
+                logger.debug(f"Direct draft dispatch failed ({model.model_id}): {e}")
+            return ''
+
+        # HTTP mode: external HARTOS server. Same credential as
+        # ``dispatch_goal`` (see ``_dispatch_expert_langchain``): without
+        # it the central tier's gate 2 answers 401 and the fast path
+        # returns '' on every dispatch.
+        import requests as req
+        from integrations.agent_engine.dispatch import _internal_auth_headers
+        base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
+        try:
+            resp = req.post(f'{base_url}/chat', json=payload,
+                            headers=_internal_auth_headers(), timeout=30)
             if resp.status_code == 200:
-                data = resp.json()
-                if 'choices' in data:
-                    return data['choices'][0]['message']['content']
-                elif 'error' in data:
-                    logger.debug(f"Draft model error: {data['error']}")
-        except Exception as e:
-            logger.debug(f"Direct draft dispatch failed ({model.model_id}): {e}")
+                return resp.json().get('response', '')
+            logger.warning(
+                f"Model dispatch ({model.model_id}) /chat returned "
+                f"{resp.status_code}")
+        except req.RequestException as e:
+            logger.debug(f"Model dispatch failed ({model.model_id}): {e}")
         return ''
 
     def _deliver_expert_response(self, user_id: str, prompt_id: str,
@@ -2202,7 +2264,10 @@ class SpeculativeDispatcher:
                                       latency_ms: float):
         """Credit hive node for serving fast response → ad revenue eligibility.
 
-        GUARDRAIL: Only master_key_verified nodes get credit.
+        GUARDRAIL: Only nodes with PROVEN integrity get credit
+        (integrity_status == 'verified', written only by a passed challenge).
+        master_key_verified is derived from a self-reported code_hash, so
+        paying on it meant paying on an assertion any node can make.
         GUARDRAIL: ComputeDemocracy.adjusted_reward() — logarithmic, not linear.
         """
         if not node_id:
@@ -2212,7 +2277,7 @@ class SpeculativeDispatcher:
             db = get_db()
             try:
                 peer = db.query(PeerNode).filter_by(node_id=node_id).first()
-                if peer and peer.master_key_verified:
+                if peer and peer.integrity_status == 'verified':
                     peer.agent_count = (peer.agent_count or 0) + 1
                     db.commit()
             finally:

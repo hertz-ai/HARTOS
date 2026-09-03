@@ -389,12 +389,33 @@ app.post('/api/sessions/:id/messages/send', async (req, res) => {
   if (!ctx || !ctx.authenticated) {
     return res.status(409).json({ error: 'not_authenticated' });
   }
-  const { to, text } = req.body || {};
+  const { to, text, media, mimetype, filename } = req.body || {};
   if (!to || !text) {
     return res.status(400).json({ error: 'to + text required' });
   }
   try {
-    const result = await ctx.sock.sendMessage(to, { text });
+    // Media leg (#752): the Python adapter base64-encodes the file into
+    // req.body.media (whatsapp_adapter.py:299-305). Baileys wants a
+    // Buffer under a type-keyed field; images ride {image, caption} so
+    // the receipt text arrives as the picture's caption in one bubble.
+    // NOT yet live-verified against a paired device (flagged on the
+    // board) — the text-only path below stays the proven one.
+    let content = { text };
+    if (media) {
+      const buf = Buffer.from(media, 'base64');
+      const mt = String(mimetype || 'image/png');
+      if (mt.startsWith('image/')) {
+        content = { image: buf, caption: text, mimetype: mt };
+      } else if (mt.startsWith('video/')) {
+        content = { video: buf, caption: text, mimetype: mt };
+      } else if (mt.startsWith('audio/')) {
+        content = { audio: buf, mimetype: mt };
+      } else {
+        content = { document: buf, mimetype: mt,
+                    fileName: String(filename || 'file'), caption: text };
+      }
+    }
+    const result = await ctx.sock.sendMessage(to, content);
     res.json({
       success: true,
       messageId: result && result.key && result.key.id,

@@ -340,7 +340,41 @@ class AgentAttributionOrchestrator:
         Uses the EXISTING record_interaction API — goal_id field is
         first-class. Attribution chain goes in the prompt field as
         structured JSON so HevolveAI can parse credit assignments.
+
+        An action that did nothing is not an interaction.  agent_daemon
+        opens a `proactive_hive_tick` action at the top of EVERY tick
+        (agent_daemon.py:519) and completes it at the bottom (:681), so an
+        idle node submitted one "experience" every 30 seconds whose prompt
+        was the sentence "agent_daemon ran proactive_hive_tick (goal=None,
+        parent=None, steps=0, observations=0, success=1.0)" and whose
+        response was '{"status": "ok", ...}'.  Each one costs a
+        ConversationEntry row and an LLM call, because
+        world_model_bridge.record_interaction runs redact_experience ->
+        secret_redactor._model_detect_pii, which POSTs the text to the
+        configured local endpoint.
+
+        Measured on central 2026-09-02: conversation_entries held 389,972
+        rows and 387,856 of them (99.5%) were that pair, two per tick since
+        2026-06-03 — so every channel inbox and FULL_HISTORY query pages
+        through them, and HevolveAI's distillation is fed "success=1.0" for
+        an idle loop ~2,880 times a day per node.
+
+        A tick that explored, benchmarked or dispatched has steps or
+        observations and still records its chain exactly as before.  So
+        does anything carrying a goal, and anything with a parent: a child
+        action in a causal chain legitimately has no steps of its own, and
+        the parent link is exactly the attribution being recorded (pinned by
+        TestCausalChain.test_parent_appears_in_chain_summary, which this
+        gate broke when it only checked goal/steps/observations).
         """
+        if (not action.goal_id and not action.parent_action_id
+                and not action.steps and not action.observations):
+            logger.debug(
+                "Attribution: %s did nothing (no goal, no parent, no steps, "
+                "no observations) — not recorded as an interaction",
+                action.action_type)
+            return
+
         try:
             from integrations.agent_engine.world_model_bridge import (
                 get_world_model_bridge,

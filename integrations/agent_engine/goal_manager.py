@@ -186,7 +186,7 @@ class GoalManager:
     def create_goal(db: Session, goal_type: str, title: str,
                     description: str = '', config: Optional[Dict] = None,
                     product_id: str = None, spark_budget: int = 200,
-                    created_by: str = None) -> Dict:
+                    created_by: str = None, priority: int = 0) -> Dict:
         """Create a new agent goal.
 
         GUARDRAILS: ConstitutionalFilter + HiveEthos applied before creation.
@@ -230,6 +230,15 @@ class GoalManager:
             spark_budget=spark_budget,
             created_by=created_by,
             status='active',
+            # Seeds have declared 'priority' since they were written (e.g.
+            # bootstrap_speech_companion: 7, 'safety-adjacent: kid-facing')
+            # but neither this signature nor this constructor accepted it,
+            # so EVERY row took the column default: measured 475/475 rows
+            # and 106/106 active rows at priority=0. The declared value was
+            # dead data. Persisting it changes no behaviour today -- nothing
+            # in agent_daemon/dispatch orders by priority yet -- but it makes
+            # the field truthful so an ordering decision becomes possible.
+            priority=priority,
         )
         db.add(goal)
         db.flush()
@@ -2757,7 +2766,15 @@ register_goal_type('hive_proof', _build_hive_proof_prompt,
 # paper_explanation) are merged, not replaced.
 _CAPABILITY_TAGS = {
     'marketing': ['web', 'scraping', 'publish', 'seo', 'blog'],
-    'coding': ['github', 'pr', 'coding'],
+    # Registry-vocabulary rows: web/crawling -> crawl4ai, github/pr ->
+    # gh_pr.  'computer-use' declares the ARCHETYPE'S need (owner
+    # 2026-09-01: a coding agent looks at the desktop) — today that
+    # capability rides the always-on core tool
+    # execute_windows_or_android_command on the main Qwen3-VL
+    # (qwen3vl_backend replaced the OmniParser pipeline); the tag stays
+    # so any future qwen3vl-backed screen ServiceTool unlocks here.  The
+    # legacy omniparser wrapper no longer declares 'computer-use'.
+    'coding': ['github', 'pr', 'coding', 'web', 'crawling', 'computer-use'],
     'ip_protection': ['web'],
     'revenue': ['payments'],
     'self_build': [],

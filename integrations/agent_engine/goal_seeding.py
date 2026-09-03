@@ -2369,6 +2369,7 @@ def seed_bootstrap_goals(db, platform_product_id: Optional[str] = None) -> int:
             product_id=product_id,
             spark_budget=goal_data['spark_budget'],
             created_by='system_bootstrap',
+            priority=goal_data.get('priority', 0),
         )
         if result.get('success'):
             count += 1
@@ -2466,6 +2467,7 @@ def auto_remediate_loopholes(db) -> int:
             config=template['config'],
             spark_budget=template['spark_budget'],
             created_by='auto_remediation',
+            priority=template.get('priority', 0),
         )
         if result.get('success'):
             count += 1

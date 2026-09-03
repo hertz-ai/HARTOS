@@ -48,11 +48,30 @@ jobs:
           # This bootstrap stays tiny; config flows via `envs:` below.
           # oauth.env is written HERE because the secret is multiline and
           # heredoc interpolation is the safe transport for it.
-          envs: DEPLOY_LOGS_PATH,DEPLOY_IMAGES_PATH,DEPLOY_MASTER_KEY_PATH,DEPLOY_ADVERTISE_URL,DEPLOY_AGENT_DATA_PATH,LLM_GATEWAY_URL,GROQ_API_KEY,LANGCHAIN_API_KEY,ALLOWED_HOSTS,CORS_ORIGINS,HART_OTA_HOST,HEVOLVE_ENFORCEMENT_MODE,HEVOLVE_NODE_TIER,LANGCHAIN_PROJECT
+          envs: DEPLOY_LOGS_PATH,DEPLOY_IMAGES_PATH,DEPLOY_MASTER_KEY_PATH,DEPLOY_ADVERTISE_URL,DEPLOY_AGENT_DATA_PATH,LLM_GATEWAY_URL,HEVOLVE_LLM_ENDPOINT_URL,HEVOLVE_LLM_MODEL_NAME,HEVOLVE_LLM_API_KEY,GROQ_API_KEY,LANGCHAIN_API_KEY,ALLOWED_HOSTS,CORS_ORIGINS,HART_OTA_HOST,HEVOLVE_ENFORCEMENT_MODE,HEVOLVE_NODE_TIER,LANGCHAIN_PROJECT
           script: |
             set -e
             cd ${{ secrets.DEPLOY_REPO_PATH }}
-            rm -rf release_manifest.json
+            # sudo, and not a bare rm: release_manifest.json is written by
+            # `sudo docker cp` in deepbox_deploy.sh, so it lands ROOT-owned,
+            # and it is also a bind-mount source for the container. If the
+            # host path is ever missing when the container starts, Docker
+            # CREATES IT AS A ROOT-OWNED DIRECTORY, the container's manifest
+            # then lands inside it as release_manifest.json/release_manifest.json,
+            # and this line -- running as the deploy user -- can no longer
+            # unlink it. With `set -e` that aborts the script BEFORE the
+            # `git reset --hard origin/main` two lines down, so the checkout
+            # silently freezes at whatever SHA was last deployed and every
+            # later push appears to deploy while changing nothing.
+            #
+            # That is not hypothetical. Measured 2026-09-01: the box sat at
+            # 3abea78b for hours with the workflow red on
+            # "rm: cannot remove 'release_manifest.json/release_manifest.json':
+            # Permission denied", while the directory's own contents named
+            # "version": "3abea78b" -- the deploy was pinned by its own
+            # leftover artifact. Four separate fixes were pushed and none
+            # reached production.
+            sudo rm -rf release_manifest.json
             git fetch origin --prune
             git checkout main
             git reset --hard origin/main
@@ -69,6 +88,12 @@ jobs:
           DEPLOY_ADVERTISE_URL: ${{ secrets.DEPLOY_ADVERTISE_URL }}
           DEPLOY_AGENT_DATA_PATH: ${{ secrets.DEPLOY_AGENT_DATA_PATH }}
           LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
+          # The ONE configured LLM for this node (core/autogen_config.py).
+          # Absent secrets leave the box .env untouched; set, they are the
+          # configuration and every deploy writes them into it.
+          HEVOLVE_LLM_ENDPOINT_URL: ${{ secrets.HEVOLVE_LLM_ENDPOINT_URL }}
+          HEVOLVE_LLM_MODEL_NAME: ${{ secrets.HEVOLVE_LLM_MODEL_NAME }}
+          HEVOLVE_LLM_API_KEY: ${{ secrets.HEVOLVE_LLM_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           LANGCHAIN_API_KEY: ${{ secrets.LANGCHAIN_API_KEY }}
           ALLOWED_HOSTS: ${{ secrets.ALLOWED_HOSTS }}

@@ -246,6 +246,24 @@ def attach_for_tags(cap_tags, helper, executor, registry, attached_names):
 # Core tool closure factory
 # ---------------------------------------------------------------------------
 
+# Neutral fallback receipt (#752) used until the user accepts a custom template.
+# The accept-once flow overrides it via save_data_in_memory('receipt_template').
+# {var} placeholders are filled by the existing TemplateEngine.
+_DEFAULT_RECEIPT_TEMPLATE = (
+    "RECEIPT\n"
+    "{business_name}\n"
+    "Date: {date}\n"
+    "Received from: {client_name}\n"
+    "For: {service}\n"
+    "Event timing: {event_timing}\n"
+    "Amount: {currency} {amount}\n"
+    "Advance received: {currency} {advance}\n"
+    "Balance due: {currency} {balance}\n"
+    "{notes}\n"
+    "Thank you for your business."
+)
+
+
 def build_core_tool_closures(ctx):
     """Build session-scoped tool closures.  Returns list of (name, desc, func).
 
@@ -347,6 +365,20 @@ def build_core_tool_closures(ctx):
             else:
                 tool_logger.warning(f"Failed to persist data to file for prompt_id {prompt_id}")
 
+            # Mirror to MemoryGraph (fire-and-forget).  Carried by
+            # reuse_recipe's inline twin before the #743 migration, lost
+            # in the swap, restored here (owner audit 2026-09-01).  Pairs
+            # with get_data_by_key's [KV] recall fallback below.
+            if memory_graph is not None:
+                try:
+                    threading.Thread(target=lambda: memory_graph.register(
+                        f"[KV] {key} = {json.dumps(validated_value)[:200]}",
+                        {'memory_type': 'fact', 'source_agent': 'helper',
+                         'session_id': user_prompt, 'kv_key': key},
+                    ), daemon=True).start()
+                except Exception:
+                    pass
+
             try:
                 stored_value = get_data_by_key(key)
                 tool_logger.info(f"VERIFICATION - READ BACK VALUE: {stored_value}")
@@ -410,6 +442,17 @@ def build_core_tool_closures(ctx):
                 d = d[k]
             return f'{d}'
         except KeyError:
+            # Fallback: check MemoryGraph for persisted [KV] data — the
+            # read half of save_data_in_memory's dual-write, carried by
+            # reuse_recipe's inline twin before the #743 migration and
+            # restored here (owner audit 2026-09-01).
+            if memory_graph is not None:
+                try:
+                    results = memory_graph.recall(f"[KV] {key}", mode='text', top_k=1)
+                    if results:
+                        return results[0].content
+                except Exception:
+                    pass
             return "Key not found in stored data."
 
     tools.append((
@@ -424,6 +467,131 @@ def build_core_tool_closures(ctx):
         "get_data_from_memory",
         "Returns all data from the internal Memory using key (alias of get_data_by_key)",
         get_data_by_key,
+    ))
+
+    # ------------------------------------------------------------------
+    # 5b. generate_receipt (#752 — receipt for a service, over any channel)
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def generate_receipt(
+        service: Annotated[str, "Service provided, e.g. 'Bridal makeup'."],
+        amount: Annotated[str, "Amount charged, e.g. '5000'."],
+        client_name: Annotated[str, "Client's name."] = "",
+        currency: Annotated[str, "Currency code or symbol, e.g. 'INR'."] = "INR",
+        date: Annotated[str, "Receipt date; defaults to today when omitted."] = "",
+        notes: Annotated[str, "Optional notes or line items."] = "",
+        business_name: Annotated[str, "Your business or artist name."] = "",
+        advance: Annotated[str, "Advance already received against the total, e.g. '5000'. Required every time; use '0' when none."] = "",
+        event_timing: Annotated[str, "Event-day timing, e.g. 'ready by 6am, event at 11am'. Required every time."] = "",
+        render: Annotated[str, "'text' (default) or 'image' for the branded PNG receipt with the saved logo."] = "text",
+    ) -> str:
+        """Fill the user's accepted receipt template with the given details.
+
+        Balance is computed HERE (total - advance), never by the model -
+        money math is deterministic code. render='image' additionally
+        produces the branded PNG (logo saved once via set_receipt_logo)
+        and appends a [[MEDIA:<path>]] marker that the channel reply path
+        converts into a real image attachment on the same channel.
+
+        Reuses the per-prompt KV store (save_data_in_memory / get_data_by_key)
+        as the "template they accept": the agent proposes a template, the user
+        confirms it, and it is saved under key 'receipt_template'.  Falls back to
+        a neutral default when none is stored.  Renders via the existing
+        TemplateEngine and returns the receipt text for the agent to send back
+        over the same channel the request arrived on (WhatsApp, etc.).
+        """
+        from integrations.service_tools.receipt_image import (
+            compute_balance, render_receipt_png)
+        balance = compute_balance(amount, advance) or ""
+        template = get_data_by_key("receipt_template")
+        if not template or template == "Key not found in stored data.":
+            template = _DEFAULT_RECEIPT_TEMPLATE
+        fields = {
+            "business_name": business_name,
+            "client_name": client_name,
+            "service": service,
+            "amount": amount,
+            "currency": currency,
+            "date": date or datetime.now().strftime("%Y-%m-%d"),
+            "notes": notes,
+            "advance": advance,
+            "event_timing": event_timing,
+            "balance": balance,
+        }
+        from integrations.channels.response.templates import TemplateEngine
+        text = TemplateEngine().render(template, extra_vars=fields)
+        if str(render).lower() != "image":
+            return text
+        logo_path = get_data_by_key("receipt_logo_path")
+        if logo_path == "Key not found in stored data.":
+            logo_path = None
+        png = render_receipt_png(fields, logo_path=logo_path)
+        if not png:
+            return (text + "\n(Image receipt unavailable on this install - "
+                    "sent as text instead.)")
+        return text + "\n[[MEDIA:" + png + "]]"
+
+    tools.append((
+        "generate_receipt",
+        "Generate a receipt for a service the user provided, using their "
+        "accepted receipt template. EVERY receipt must collect: total amount, "
+        "date, event-day timing, and advance received (use '0' if none) - ask "
+        "for any that are missing, confirm the parsed values back to the user, "
+        "THEN call this. Balance due is computed automatically. On first use, "
+        "propose a template; once the user confirms it, save it with "
+        "save_data_in_memory under key 'receipt_template'. Pass render='image' "
+        "to produce the branded PNG receipt (set the logo once via "
+        "set_receipt_logo). Returns the receipt to send back to the user.",
+        generate_receipt,
+    ))
+
+    # ------------------------------------------------------------------
+    # 5c. set_receipt_logo (#752 leg B - capture the logo ONCE, durably)
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def set_receipt_logo(
+        file_path: Annotated[str, "Path to the uploaded logo image file on this machine."],
+    ) -> str:
+        """Persist the business logo for all future receipts.
+
+        Inbound channel media lands in short-lived locations (the upload
+        TTLCache lives 2 hours), so the logo is COPIED once to the durable
+        data dir and its path stored in the per-prompt KV under
+        'receipt_logo_path' - the same store the accepted template uses.
+        """
+        import shutil
+        src = str(file_path or "").strip().strip('"')
+        if not src or not os.path.isfile(src):
+            return ("Logo file not found at '" + src + "'. Ask the user to "
+                    "send the logo image again, then retry with its saved path.")
+        ext = os.path.splitext(src)[1].lower()
+        if ext not in ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'):
+            return ("'" + ext + "' is not an image type I can put on a "
+                    "receipt - please send PNG or JPG.")
+        try:
+            from core.platform_paths import get_data_dir
+            dest_dir = os.path.join(get_data_dir(), 'receipt_assets', str(prompt_id))
+        except ImportError:
+            dest_dir = os.path.join(os.path.expanduser('~/Documents/Nunba/data'),
+                                    'receipt_assets', str(prompt_id))
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, 'logo' + ext)
+        try:
+            shutil.copy2(src, dest)
+        except OSError as e:
+            tool_logger.error("set_receipt_logo copy failed: %s" % e)
+            return "Could not save the logo: %s" % e
+        save_data_in_memory('receipt_logo_path', dest)
+        return ("Logo saved for all future receipts (" + os.path.basename(dest)
+                + "). It will appear on every image receipt from now on.")
+
+    tools.append((
+        "set_receipt_logo",
+        "Save the user's business logo ONCE for all future receipts. Call this "
+        "when the user sends their logo image (get the file path from the "
+        "uploaded file). The logo is stored durably and composited onto every "
+        "render='image' receipt.",
+        set_receipt_logo,
     ))
 
     # ------------------------------------------------------------------
@@ -897,6 +1065,20 @@ def build_core_tool_closures(ctx):
                     "user_id": user_id,
                     "prompt_id": prompt_id,
                 }))
+                # Dual-write to MemoryGraph (fire-and-forget).  Carried by
+                # reuse_recipe's inline twin before the #743 migration and
+                # lost in the swap — restored HERE so all three legs
+                # (main/time/visual) get graph provenance, not just reuse.
+                if memory_graph is not None:
+                    try:
+                        threading.Thread(target=lambda: memory_graph.register(
+                            content, {'memory_type': 'fact',
+                                      'source_agent': speaker,
+                                      'session_id': user_prompt,
+                                      'source': 'simplemem'},
+                        ), daemon=True).start()
+                    except Exception:
+                        pass
                 return "Saved to long-term memory."
             except Exception as e:
                 tool_logger.info(f"SimpleMem save error: {e}")

@@ -173,32 +173,14 @@ def create_agents_for_user(user_id: str, autonomous=False, initial_description=N
         autonomous: If True, the LLM answers its own questions (no human input)
         initial_description: When autonomous, the user's description of the desired agent
     """
-    # Mode-aware config_list: cloud/regional use external LLM, flat uses local llama.cpp
-    _node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
-    if _node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
-        config_list = [{
-            "model": os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4.1-mini'),
-            "api_key": os.environ.get('HEVOLVE_LLM_API_KEY', 'dummy'),
-            "base_url": os.environ['HEVOLVE_LLM_ENDPOINT_URL'],
-            "price": [0.0025, 0.01]
-        }]
-    else:
-        from core.port_registry import get_local_llm_url
-        # get_local_llm_url() returns a "/v1"-suffixed URL for direct HTTP
-        # callers (e.g. "http://127.0.0.1:8080/v1"), but autogen 0.2.x's
-        # own client wrapper appends its own "/v1" when constructing the
-        # request (its docs example uses a bare "http://127.0.0.1:8080",
-        # no "/v1") — passing the already-suffixed URL through doubles it
-        # to ".../v1/v1/chat/completions", a 404 every single time.
-        _local_llm_url = get_local_llm_url().rstrip('/')
-        if _local_llm_url.endswith('/v1'):
-            _local_llm_url = _local_llm_url[: -len('/v1')]
-        config_list = [{
-            "model": 'Qwen3-VL-4B-Instruct',
-            "api_key": 'dummy',
-            "base_url": _local_llm_url,
-            "price": [0, 0]
-        }]
+    # The ONE configured LLM, decided in core.autogen_config: the configured
+    # endpoint, or the local llama-server when none is configured.  The
+    # inline copy this replaced carried its own model names ('gpt-4.1-mini',
+    # 'Qwen3-VL-4B-Instruct'); audited before removal: nothing keys on the
+    # local name (llm_outbound_logger only hands it to count_tokens_for_text,
+    # local_loop sets its own), so the canonical entry is a drop-in (#69).
+    from core.autogen_config import get_autogen_config_list
+    config_list = get_autogen_config_list()
 
     # Create a basic function calling config
     llm_config = {

@@ -8,6 +8,74 @@ let
   python = pkgs.python310;
 
   # Python environment with all dependencies
+  # pyautogen 0.2.35 — the multi-agent framework the ONE agentic pipeline
+  # runs on. Same failure class as json_repair below, one dependency deeper:
+  # measured live on .69 (2026-09-01, image ead46e3), POST /chat returned
+  #   503 {"error": "Agent creation requires the 'pyautogen' package",
+  #        "reason": "optional_capability_missing"}
+  # so CREATE/REUSE recipes — the node's entire agentic surface — were
+  # unavailable on the appliance while working on every pip-installed desktop.
+  #
+  # Version contract comes from requirements.txt: pyautogen==0.2.35 exactly
+  # ("0.2.37 was never published to PyPI under any name; 0.2.35 is the same
+  # 0.2 API and the full autogen test family passes against it"). NOT in this
+  # nixpkgs pin (pkgs/development/python-modules/pyautogen: 404 at 50ab793),
+  # hence fetchPypi rather than an attr — and deliberately NOT a newer
+  # pyautogen/ag2 0.4.x, which shares the import name but breaks the 0.2 API.
+  #
+  # Runtime deps are the sdist's requires_dist verbatim (PyPI JSON,
+  # non-extra): diskcache docker flaml numpy<2 openai>=1.3 packaging
+  # pydantic>=1.10,<3 python-dotenv termcolor tiktoken. The pin satisfies the
+  # two tight ones: numpy is 1.x and pydantic is 1.10.x in nixpkgs 24.11.
+  # Tests need network + API keys, so doCheck=false; pythonImportsCheck still
+  # proves the package imports inside the closed build.
+  # flaml — required (not optional) by pyautogen 0.2.x: autogen.oai imports it
+  # at module top, so dropping it from the dep set fails pythonImportsCheck.
+  # NOT in the 24.11 pin either (the eval gate proved it: "undefined variable
+  # 'flaml'" x14 on 4beff37, every build skipped). Core install_requires is
+  # NumPy alone (PyPI requires_dist, non-extra) — the automl/tune extras stay
+  # absent, which the codebase already tolerates ("flaml.automl is not
+  # available" is a known benign warning on desktops).
+  flamlPkg = python.pkgs.buildPythonPackage rec {
+    # pname must be the SDIST-FILENAME case, not the PyPI project-page case:
+    # fetchPypi derives mirror://pypi/.../${pname}-${version}.tar.gz and the
+    # uploaded file is lowercase `flaml-2.3.3.tar.gz` — "FLAML" 404'd on every
+    # mirror and failed the a0df600 iso-desktop build at fetch time.
+    pname = "flaml";
+    version = "2.3.3";
+    format = "setuptools";
+    src = pkgs.fetchPypi {
+      inherit pname version;
+      hash = "sha256-8yN9PklwuTgA/xdTiTYqjebWivS8MzwhGTF5Hpsm3r4=";
+    };
+    propagatedBuildInputs = with python.pkgs; [ numpy ];
+    doCheck = false;
+    pythonImportsCheck = [ "flaml" ];
+  };
+
+  pyautogenPkg = python.pkgs.buildPythonPackage rec {
+    pname = "pyautogen";
+    version = "0.2.35";
+    format = "setuptools";
+    src = pkgs.fetchPypi {
+      inherit pname version;
+      hash = "sha256-dELgu+iBBniginAaZF1XNPiHzMIjstIc2Vv2i+KYcqE=";
+    };
+    propagatedBuildInputs = (with python.pkgs; [
+      diskcache
+      docker
+      numpy
+      openai
+      packaging
+      pydantic
+      python-dotenv
+      termcolor
+      tiktoken
+    ]) ++ [ flamlPkg ];
+    doCheck = false;
+    pythonImportsCheck = [ "autogen" ];
+  };
+
   pythonEnv = python.withPackages (ps: with ps; [
     # Core framework
     flask
@@ -132,8 +200,9 @@ let
     # dead on the node. Pure-python, tiny; present in this nixpkgs pin.
     json-repair
 
-    # AutoGen (multi-agent framework)
-    # autogen  # May need overlay or fetchPypi
+    # AutoGen (multi-agent framework) — see pyautogenPkg above for the
+    # version contract and the live 503 this closes.
+    pyautogenPkg
   ]);
 in
 pkgs.stdenv.mkDerivation {

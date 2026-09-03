@@ -665,6 +665,17 @@ in
           '')
           )
           ++ (with pkgs; [ curl coreutils networkmanager ])
+          # gtk-launch — THE linux launch verb of the app bridge (app_bridge_service
+          # .launch_app dispatches cli:gtk-launch by contract, "no parallel
+          # launcher"). Measured live on .69 (2026-09-01, image ead46e3):
+          #   POST /api/shell/launch {"app_id": "org.gnome.Calculator"}
+          #   -> {"ok": false, "error": "CLI execution failed: [Errno 2]
+          #       No such file or directory: 'gtk-launch'"}
+          # so typed-name app opening was dead on the appliance. The bridge runs
+          # IN-PROCESS in this unit for the shell route, so the binary must be on
+          # THIS unit's PATH; gtk3 was already a systemPackage for WebKit but its
+          # bin never reached the service environment.
+          ++ [ pkgs.gtk3 ]
           ++ lib.optional (pkgs ? pulseaudio)   pkgs.pulseaudio    # pactl   - audio
           ++ lib.optional (pkgs ? iproute2)     pkgs.iproute2      # ip      - network
           ++ lib.optional (pkgs ? upower)       pkgs.upower        # upower  - battery/power

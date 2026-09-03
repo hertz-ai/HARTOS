@@ -13,11 +13,74 @@ Populated by:
   3. This node's OWN running code hash — same build as me is my build
   4. Runtime discovery — hashes from verified peers (bounded, thread-safe)
 
-Usage at perimeter:
-  from security.release_hash_registry import ReleaseHashRegistry
-  registry = ReleaseHashRegistry()
-  if not registry.is_known_release_hash(peer_code_hash):
-      reject_peer()
+Usage at perimeter (READ THE SUPERSESSION NOTE BELOW FIRST -- this is a
+TRUST SIGNAL, not an admission gate):
+
+  from security.release_hash_registry import get_release_hash_registry
+  registry = get_release_hash_registry()
+  master_key_verified = registry.is_known_release_hash(peer_code_hash)
+  # peer is admitted either way; the flag records HOW MUCH we trust it
+
+WHAT SUPERSEDED WHAT, AND WHY THE OLD PATHS ARE STILL HERE
+===========================================================
+Three things changed meaning over time. None of the old code is dead; each was
+DEMOTED from a hard gate to an input, and the inputs are load-bearing. Knowing
+which is which is the difference between reading this file correctly and
+concluding the network cannot federate.
+
+1. REJECT-ON-UNKNOWN-HASH  ->  ADMIT-AND-RECORD
+   Was: `if not is_known_release_hash(peer): reject_peer()` (the example this
+        docstring used to show).
+   Now: the peer is admitted with master_key_verified=False and
+        hash_trusted_source='untrusted' (peer_discovery.py, see the long note at
+        the admission site).
+   Why: an announced code_hash is SELF-REPORTED. The signature proves "this key
+        asserted this value", never "this is the code running", so a hostile node
+        just claims a known-good hash. The gate never stopped an attacker; it
+        only stopped honest nodes on unpublished builds. Measured: it held the
+        live network at ZERO federating peers out of 69 registered nodes.
+   Retained because: the flag it produces still decides real things --
+        canary node selection (upgrade_orchestrator.py:539 filters
+        master_key_verified=True), hive revenue credit
+        (speculative_dispatcher.py:2063, "only master_key_verified nodes get
+        credit"), moat scoring (ip_service.py:420), plus visibility tier and
+        fraud_score. Deleting the check would silently zero all of those.
+   Strict mode still exists for a locked cluster where every node genuinely runs
+        one published build: HEVOLVE_REQUIRE_KNOWN_CODE_HASH=1, guarded by
+        has_trust_basis() so it cannot be switched on into a vacuum and partition
+        the very cluster it was meant to protect.
+
+2. CODE-HASH-AS-PROVENANCE  ->  CHALLENGE / ATTESTATION
+   Was: treating a matching hash as proof of what a peer is running.
+   Now: /api/social/integrity/challenge and .../challenge-response
+        (integrations/social/discovery.py:758,776; driven from
+        integrity_service.py:190) prove the RUNNING code by round-trip.
+   Why: see above -- a self-reported value cannot prove itself. A signed list of
+        legitimate hashes would not fix that either; it would still be trusting
+        the peer's claim about which entry it matches.
+   Retained because: the hash is a free first-pass signal that arrives with the
+        announce, before any round-trip. It is a cheap prior, not a proof.
+
+3. RELEASE MANIFEST AS THE NODE-SIDE TRUST BASIS  ->  _KNOWN_HASHES
+   Was: _load_from_manifest() as the general answer for every deployment.
+   Now: BY DESIGN the signed release_manifest.json exists on CENTRAL ONLY. No
+        HART OS appliance and no desktop bundle ships one, and none is expected
+        to (verified on hardware: full_boot_verification returns
+        reason='no_manifest' on a live node). Everyone else trusts peers via
+        _KNOWN_HASHES, populated at release time by
+        scripts/update_release_hashes.py (see .github/workflows/release-sign.yml).
+   Retained because: on central the manifest IS present and IS the authoritative
+        basis, and it stays the documented fallback if the registry is
+        unavailable. Do NOT "fix" a node's missing manifest by shipping one --
+        CI computes code_hash over a repo checkout while a node computes it over
+        a /nix/store path, so they cannot match, and the mismatch would fire
+        fleet-wide.
+
+Note the structural limit of _KNOWN_HASHES that follows from (3): the table is
+baked into each build, and a tree cannot contain its own hash, so a build only
+ever learns the hashes of builds that came BEFORE it. Older nodes therefore
+cannot recognise newer ones, and a build from an untagged main commit appears in
+no table at all. That is precisely why admission no longer depends on it.
 """
 import logging
 import os

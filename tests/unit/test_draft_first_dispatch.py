@@ -502,6 +502,37 @@ class TestLoopPrevention:
         assert 'speculative' not in captured['json']
         assert 'create_agent' not in captured['json']
 
+    def test_inner_dispatch_sends_daemon_credential(
+            self, dispatcher, monkeypatch):
+        """_dispatch_to_model's HTTP-mode /chat call carries the same
+        credential dispatch_goal sends (dispatch._internal_auth_headers).
+        Without it the central tier's gate 2 answers 401 and the fast
+        path returned '' on every dispatch, silently (measured
+        2026-09-02)."""
+        _mock_guardrails(monkeypatch)
+        monkeypatch.delenv('NUNBA_BUNDLED', raising=False)
+        monkeypatch.setattr(sys, 'frozen', False, raising=False)
+        minted = {'X-API-Key': 'node-key'}
+        captured = {}
+        def fake_post(url, **kwargs):
+            captured['headers'] = kwargs.get('headers')
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {'response': 'ok'}
+            return resp
+
+        with patch('integrations.agent_engine.dispatch.'
+                   '_internal_auth_headers', return_value=minted), \
+                patch('requests.post', side_effect=fake_post):
+            out = dispatcher._dispatch_to_model(
+                dispatcher._registry.get_draft_model(),
+                'some prompt', user_id='u1', prompt_id='p1',
+                goal_type='general', goal_id=None,
+            )
+
+        assert out == 'ok'
+        assert captured['headers'] == minted
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Graceful degradation paths

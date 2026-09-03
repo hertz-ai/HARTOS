@@ -140,7 +140,11 @@ in
         # curl is NOT on the unit's minimal PATH (the Model-Bus probe uses it).
         # waydroid + gnugrep are needed by the Android subsystem probe
         # (`waydroid status | grep …`); they are not in the default unit PATH.
-        path = with pkgs; [ curl coreutils waydroid gnugrep ];
+        # gtk3 for gtk-launch: the SemanticRouter's linux launch verb
+        # (cli:gtk-launch). Same live 503-class failure as documented in
+        # hart-liquid-ui.nix — the :6810 /v1/route leg dispatches launches in
+        # THIS process, so the launcher must be on THIS PATH too.
+        path = with pkgs; [ curl coreutils waydroid gnugrep gtk3 ];
 
         environment = {
           HEVOLVE_DATA_DIR = cfg.dataDir;

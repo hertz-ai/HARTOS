@@ -9,6 +9,7 @@ import asyncio
 import concurrent.futures
 import logging
 import os
+import re
 from typing import Dict, Optional, Callable, Any, List
 from dataclasses import dataclass, field
 from core.port_registry import get_port
@@ -45,6 +46,66 @@ _AGENT_HANDLER_POOL = concurrent.futures.ThreadPoolExecutor(
     max_workers=int(os.environ.get('HEVOLVE_CHANNEL_AGENT_WORKERS', '4')),
     thread_name_prefix='channel-agent',
 )
+
+# ``[[MEDIA:<path>]]`` — the contract between agent tools that produce a
+# file (generate_receipt render='image' is the first) and the channel
+# reply path.  The marker is stripped from the text and becomes a real
+# MediaAttachment on the SAME channel the request arrived on.  Only
+# files under the app's own data dir are honoured: the marker text
+# passes through an LLM, so an arbitrary path here would let a prompted
+# model attach any file on disk to an outbound message.
+_MEDIA_MARKER = re.compile(r"\[\[MEDIA:([^\[\]]+)\]\]")
+
+_MEDIA_MIME = {
+    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp', '.gif': 'image/gif', '.pdf': 'application/pdf',
+    '.mp4': 'video/mp4', '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg',
+}
+
+
+def _media_allowlist_root() -> str:
+    try:
+        from core.platform_paths import get_data_dir
+        return os.path.realpath(get_data_dir())
+    except ImportError:
+        return os.path.realpath(
+            os.path.expanduser('~/Documents/Nunba/data'))
+
+
+def extract_media_markers(text):
+    """Split agent text into (clean_text, [MediaAttachment,...]).
+
+    Markers pointing outside the data dir, at missing files, or at
+    unknown types are dropped from the attachment list but still
+    stripped from the text (the user should never see raw markers).
+    """
+    if not text or '[[MEDIA:' not in text:
+        return text, []
+    from .base import MessageType
+    root = _media_allowlist_root()
+    media = []
+    for raw in _MEDIA_MARKER.findall(text):
+        path = os.path.realpath(raw.strip().strip('"'))
+        if not path.startswith(root):
+            logger.warning('media marker outside data dir dropped: %s', raw)
+            continue
+        if not os.path.isfile(path):
+            logger.warning('media marker file missing, dropped: %s', path)
+            continue
+        ext = os.path.splitext(path)[1].lower()
+        mime = _MEDIA_MIME.get(ext)
+        if mime is None:
+            logger.warning('media marker type %s not sendable, dropped', ext)
+            continue
+        mtype = (MessageType.IMAGE if mime.startswith('image')
+                 else MessageType.VIDEO if mime.startswith('video')
+                 else MessageType.AUDIO if mime.startswith('audio')
+                 else MessageType.DOCUMENT)
+        media.append(MediaAttachment(
+            type=mtype, file_path=path, mime_type=mime,
+            file_name=os.path.basename(path)))
+    clean = _MEDIA_MARKER.sub('', text).strip()
+    return clean, media
 
 
 @dataclass
@@ -184,11 +245,25 @@ class ChannelRegistry:
             # returned '' and simply vanished.  Silence is the worst possible
             # failure mode on a chat channel; say something instead.
             if response and str(response).strip():
-                await adapter.send_message(
-                    chat_id=message.chat_id,
-                    text=response,
-                    reply_to=message.id,
-                )
+                # Send response back to channel.  Tool-produced files ride
+                # [[MEDIA:...]] markers (generate_receipt render='image');
+                # they become real attachments here, on the same channel.
+                clean_text, media = extract_media_markers(response)
+                try:
+                    await adapter.send_message(
+                        chat_id=message.chat_id,
+                        text=clean_text or response,
+                        reply_to=message.id,
+                        media=media or None,
+                    )
+                except TypeError:
+                    # An adapter predating the media kwarg still gets the
+                    # text — never lose the reply over an attachment.
+                    await adapter.send_message(
+                        chat_id=message.chat_id,
+                        text=clean_text or response,
+                        reply_to=message.id,
+                    )
             elif response is None:
                 # None means the handler DELIBERATELY declined this message --
                 # currently a group message with no bot mention, skipped under

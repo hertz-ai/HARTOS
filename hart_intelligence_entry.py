@@ -1,5 +1,15 @@
 # Fix Windows encoding for non-ASCII characters (Telugu, emojis, etc.)
 import sys
+# Windows: use the SelectorEventLoop policy process-wide.  autobahn's asyncio
+# WAMP transport breaks on the default Windows ProactorEventLoop — the
+# EventBus WAMP bridge (core/platform/events.py connect_wamp) opens the TCP
+# socket to the relay but the session never joins (on_join never fires), so
+# the internet relay stays dark on Windows while a macOS/Linux peer connects
+# fine.  autobahn resolves its loop through the global policy, so this must be
+# set before any loop is created; hypercorn serves cleanly on a selector loop.
+if sys.platform == 'win32':
+    import asyncio as _asyncio_boot
+    _asyncio_boot.set_event_loop_policy(_asyncio_boot.WindowsSelectorEventLoopPolicy())
 from core.subprocess_safe import no_window_kwargs
 import io
 
@@ -645,21 +655,19 @@ def _record_lifecycle(status, user_id, prompt_id, details=''):
 # ============================================================================
 class ChatQwen3VL(LLM):
     """
-    Custom LangChain LLM wrapper for a local OpenAI-compatible API server.
+    LangChain LLM wrapper over the ONE configured LLM (an OpenAI-compatible
+    chat/completions endpoint: the configured API, or the local llama-server
+    when none is configured; see core.autogen_config).
 
-    In bundled Nunba mode, automatically targets the llama.cpp server that
-    Nunba already starts on port 8080 (CPU inference). Otherwise falls back
-    to Qwen3-VL on port 8000 or any HEVOLVE_LOCAL_LLM_URL override.
-
-    Features:
-    - OpenAI-compatible API interface
-    - Multimodal support (text + images)
-    - Zero API costs (local server)
-    - Drop-in replacement for ChatOpenAI
+    Posts through _pooled_post_with_refusal_check like every other
+    chat/completions caller in this module, so it shares the refusal guard,
+    the completion timeout and the auth header.  base_url / model_name are
+    left None to follow GPT_API / LLM_MODEL_NAME; set them only for an
+    explicit, deliberate override.
     """
 
-    base_url: str = None  # resolved lazily via get_local_llm_url()
-    model_name: str = "local"
+    base_url: str = None   # None: GPT_API (the configured backend)
+    model_name: str = None  # None: LLM_MODEL_NAME
     temperature: float = 0.7
     max_tokens: int = 1500
 
@@ -678,12 +686,10 @@ class ChatQwen3VL(LLM):
         Returns:
             The generated response text
         """
-        if not self.base_url:
-            from core.port_registry import get_local_llm_url
-            self.base_url = get_local_llm_url()
+        _url = f"{self.base_url}/chat/completions" if self.base_url else GPT_API
 
         payload = {
-            "model": self.model_name,
+            "model": self.model_name or LLM_MODEL_NAME,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": self.temperature,
             "max_tokens": self.max_tokens
@@ -693,14 +699,13 @@ class ChatQwen3VL(LLM):
             payload["stop"] = stop
 
         _log = logging.getLogger(__name__)
-        # Primary: HevolveAI embodied-ai on port 8000.
         # Route through _pooled_post_with_refusal_check (same helper CustomGPT
-        # uses) so this langchain wrapper gets the SAME refusal-override guard —
+        # uses) so this langchain wrapper gets the SAME refusal-override guard;
         # previously only CustomGPT had it, so a draft refusal from THIS wrapper
         # flowed straight to the user (the drifted parallel path).
         try:
             response = _pooled_post_with_refusal_check(
-                f"{self.base_url}/chat/completions",
+                _url,
                 json=payload,
                 timeout=60
             )
@@ -708,16 +713,21 @@ class ChatQwen3VL(LLM):
             data = response.json()
             return data["choices"][0]["message"]["content"]
         except Exception as e:
-            _log.warning(f"[LocalLLM] {self.base_url} unavailable: {e}")
+            _log.warning(f"[LLM] {_url} unavailable: {e}")
 
-        # Fallback: resolved LLM URL (handles port conflicts, warm starts)
+        # Local kind only: re-resolve the llama URL (port conflicts, warm
+        # starts).  With a configured API there is nothing else to try: the
+        # single API is the only LLM this node talks to, never a local
+        # fallback behind the user's back.
+        if LLM_KIND != 'local':
+            raise
         from core.port_registry import get_local_llm_url
-        _llm_url = get_local_llm_url()
-        if _llm_url not in self.base_url:
+        _llm_url = get_local_llm_url().rstrip('/') + '/chat/completions'
+        if _llm_url != _url:
             try:
                 _log.info(f"[LocalLLM] Falling back to llama.cpp at {_llm_url}")
                 response = _pooled_post_with_refusal_check(
-                    f"{_llm_url}/chat/completions",
+                    _llm_url,
                     json=payload,
                     timeout=120
                 )
@@ -740,17 +750,15 @@ class ChatQwen3VL(LLM):
         }
 
 
-# Flag to switch between OpenAI and Qwen3-VL
-USE_QWEN3VL = True  # Set to False to use OpenAI instead
-
-def get_llm(model_name="gpt-3.5-turbo", temperature=0.7, max_tokens=1500):
+def get_llm(temperature=0.7, max_tokens=1500):
     """
     Get LLM instance based on configuration.
 
     Priority:
     1. Wizard-configured cloud provider (HEVOLVE_ACTIVE_CLOUD_PROVIDER env var)
-    2. ChatQwen3VL (local) if USE_QWEN3VL flag is True
-    3. ChatOpenAI fallback
+       through its vendor SDK.  The model is the one the vault exported; there
+       is no vendor default to fall back on.
+    2. ChatQwen3VL over the ONE configured backend (GPT_API / LLM_MODEL_NAME).
     """
     _active = os.environ.get('HEVOLVE_ACTIVE_CLOUD_PROVIDER', '')
 
@@ -758,7 +766,7 @@ def get_llm(model_name="gpt-3.5-turbo", temperature=0.7, max_tokens=1500):
         try:
             from langchain_anthropic import ChatAnthropic
             return ChatAnthropic(
-                model=os.environ.get('ANTHROPIC_MODEL', 'claude-sonnet-4-20250514'),
+                model=os.environ.get('ANTHROPIC_MODEL') or LLM_MODEL_NAME,
                 api_key=os.environ['ANTHROPIC_API_KEY'],
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -770,7 +778,7 @@ def get_llm(model_name="gpt-3.5-turbo", temperature=0.7, max_tokens=1500):
         try:
             from langchain_google_genai import ChatGoogleGenerativeAI
             return ChatGoogleGenerativeAI(
-                model=os.environ.get('GOOGLE_MODEL', 'gemini-2.0-flash'),
+                model=os.environ.get('GOOGLE_MODEL') or LLM_MODEL_NAME,
                 google_api_key=os.environ['GOOGLE_API_KEY'],
                 temperature=temperature,
                 max_output_tokens=max_tokens,
@@ -782,7 +790,7 @@ def get_llm(model_name="gpt-3.5-turbo", temperature=0.7, max_tokens=1500):
         try:
             from langchain_groq import ChatGroq
             return ChatGroq(
-                model=os.environ.get('GROQ_MODEL', 'llama-3.3-70b-versatile'),
+                model=os.environ.get('GROQ_MODEL') or LLM_MODEL_NAME,
                 api_key=os.environ['GROQ_API_KEY'],
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -792,27 +800,16 @@ def get_llm(model_name="gpt-3.5-turbo", temperature=0.7, max_tokens=1500):
 
     if _active in ('openai', 'azure_openai', 'custom_openai') and os.environ.get('OPENAI_API_KEY'):
         _kwargs = dict(
-            model_name=os.environ.get('OPENAI_MODEL', model_name),
+            model_name=os.environ.get('OPENAI_MODEL') or LLM_MODEL_NAME,
             temperature=temperature,
             max_tokens=max_tokens,
         )
         if _active == 'custom_openai':
-            from core.port_registry import get_local_llm_url
-            _kwargs['openai_api_base'] = get_local_llm_url()
+            # The endpoint the vault exported, the same one autogen uses.
+            _kwargs['openai_api_base'] = _llm_entry.get('base_url') or os.environ.get('CUSTOM_LLM_BASE_URL', '')
         return ChatOpenAI(**_kwargs)
 
-    if USE_QWEN3VL:
-        return ChatQwen3VL(
-            model_name="Qwen3.5-4B",
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
-
-    return ChatOpenAI(
-        model_name=model_name,
-        temperature=temperature,
-        max_tokens=max_tokens
-    )
+    return ChatQwen3VL(temperature=temperature, max_tokens=max_tokens)
 # ============================================================================
 
 
@@ -1558,18 +1555,20 @@ try:
         # of truth is correct in both topologies. Explicit HEVOLVE_API_URL still
         # wins if set, for operators who want to pin it.
         base = os.environ.get('HEVOLVE_API_URL')
-        if not base:
-            try:
-                from core.port_registry import get_local_llm_url
-                base = get_local_llm_url()
-            except Exception:
-                base = 'http://localhost:8000'
-        base = base.rstrip('/')
-        # The resolver returns a base already ending in /v1; a bare host does
-        # not. Build the completions path without doubling /v1.
-        target = base + ('/chat/completions' if base.endswith('/v1')
-                         else '/v1/chat/completions')
-        headers = {'Content-Type': 'application/json'}
+        if base:
+            base = base.rstrip('/')
+            # A pinned base may or may not end in /v1; build the completions
+            # path without doubling it.
+            target = base + ('/chat/completions' if base.endswith('/v1')
+                             else '/v1/chat/completions')
+            headers = {'Content-Type': 'application/json'}
+        else:
+            # The ONE configured backend (core.autogen_config): the local
+            # model on a device, the configured API on central, same as every
+            # other chat/completions caller in this module.
+            target = GPT_API
+            headers = dict(LLM_AUTH_HEADERS)
+            headers['Content-Type'] = 'application/json'
         try:
             resp = _req.post(
                 target,
@@ -1706,11 +1705,12 @@ from core.token_utils import count_tokens_for_text
 # the code that reads it. That is how SEARXNG_URL sat configured-but-dead: the
 # reader consults os.environ only, and nothing copied it across. Add the env
 # name here whenever a new provider starts reading one.
+# The LLM itself is NOT configured here: HEVOLVE_LLM_ENDPOINT_URL /
+# HEVOLVE_LLM_MODEL_NAME / HEVOLVE_LLM_API_KEY are the ONE configured LLM
+# (core/autogen_config.py); a vendor-named key (QWEN_*, GLM_*, GROQ_*) picks
+# nothing any more (#69).
 for _cfg_key in ('OPENAI_API_KEY', 'GOOGLE_CSE_ID', 'GOOGLE_API_KEY',
-                  'NEWS_API_KEY', 'SERPAPI_API_KEY',
-                  # Qwen3.8 27B via Bitdeer, registered as an EXPERT backend in
-                  # integrations/agent_engine/model_registry.py.
-                  'QWEN_API_KEY', 'QWEN_BASE_URL', 'QWEN_MODEL'):
+                  'NEWS_API_KEY', 'SERPAPI_API_KEY'):
     if _cfg_key in config:
         os.environ[_cfg_key] = config[_cfg_key]
     else:
@@ -1720,9 +1720,11 @@ for _cfg_key in ('OPENAI_API_KEY', 'GOOGLE_CSE_ID', 'GOOGLE_API_KEY',
 _node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
 _active_cloud = os.environ.get('HEVOLVE_ACTIVE_CLOUD_PROVIDER', '')
 if _node_tier in ('regional', 'central'):
+    # No default model name: the configured endpoint decides the model, and an
+    # endpoint without a name is reported by core.autogen_config, not guessed.
     os.environ.setdefault('HEVOLVE_LLM_ENDPOINT_URL', config.get('OPENAI_API_BASE', ''))
     os.environ.setdefault('HEVOLVE_LLM_API_KEY', config.get('OPENAI_API_KEY', ''))
-    os.environ.setdefault('HEVOLVE_LLM_MODEL_NAME', config.get('OPENAI_MODEL', 'gpt-4'))
+    os.environ.setdefault('HEVOLVE_LLM_MODEL_NAME', config.get('OPENAI_MODEL', ''))
 elif _active_cloud and os.environ.get('HEVOLVE_LLM_API_KEY'):
     # Wizard-configured cloud provider (flat mode desktop user).
     # Vault already populated HEVOLVE_LLM_* env vars via export_to_env() in app.py.
@@ -1732,7 +1734,7 @@ elif _active_cloud and os.environ.get('HEVOLVE_LLM_API_KEY'):
 if config.get('CLOUD_FALLBACK_URL'):
     os.environ.setdefault('HEVOLVE_CLOUD_FALLBACK_URL', config['CLOUD_FALLBACK_URL'])
     os.environ.setdefault('HEVOLVE_CLOUD_FALLBACK_KEY', config.get('CLOUD_FALLBACK_KEY', ''))
-    os.environ.setdefault('HEVOLVE_CLOUD_FALLBACK_MODEL', config.get('CLOUD_FALLBACK_MODEL', 'gpt-4'))
+    os.environ.setdefault('HEVOLVE_CLOUD_FALLBACK_MODEL', config.get('CLOUD_FALLBACK_MODEL', ''))
 # Zep removed — replaced by SimpleMem (local, zero-latency)
 # ZEP_API_URL / ZEP_API_KEY no longer needed
 # API endpoints — fall back to IP_ADDRESS sub-dict or empty when keys missing.
@@ -1765,17 +1767,35 @@ def _resolve_llm_endpoint(registry_fn_name: str, env_var: str) -> str:
     return url
 
 
-# Main LLM endpoint (4B on :8080). Config.json first, then registry/env fallback.
-GPT_API = config.get('GPT_API', _ip.get('gpt3_url', ''))
-if not GPT_API:
-    GPT_API = _resolve_llm_endpoint('get_local_llm_url', 'HEVOLVE_LOCAL_LLM_URL')
+# The ONE LLM this process talks to, decided in core.autogen_config from the
+# configured trio (HEVOLVE_LLM_ENDPOINT_URL / _MODEL_NAME / _API_KEY).  Every
+# chat/completions POST in this module goes to GPT_API or DRAFT_GPT_API with
+# LLM_MODEL_NAME in the body, and _pooled_post_with_refusal_check adds
+# LLM_AUTH_HEADERS on the way out; no site picks a model or a port of its own.
+from core.autogen_config import resolve_llm_backend, llm_http_target
+LLM_KIND, _llm_entry = resolve_llm_backend()
+LLM_MODEL_NAME = _llm_entry['model']
+if LLM_KIND == 'api':
+    # A configured endpoint (central, a regional node with a key, a desktop
+    # with a cloud provider): the single API serves every role, so the draft
+    # slot IS the main model.  config.json's GPT_API (the bundled llama URL)
+    # must not win here: on central it named a server that never ran inside
+    # the container (#69).
+    GPT_API, LLM_AUTH_HEADERS, _ = llm_http_target()
+    DRAFT_GPT_API = GPT_API
+else:
+    LLM_AUTH_HEADERS = {}
+    # Main LLM endpoint (4B on :8080). Config.json first, then registry/env fallback.
+    GPT_API = config.get('GPT_API', _ip.get('gpt3_url', ''))
+    if not GPT_API:
+        GPT_API = _resolve_llm_endpoint('get_local_llm_url', 'HEVOLVE_LOCAL_LLM_URL')
 
-# Draft LLM endpoint — the 0.8B on :8081 that serves casual_conv=True.
-# When casual_conv=True, CustomGPT._call() posts here instead of GPT_API.
-# The 0.8B responds in ~300ms with a short reply. If the response signals
-# delegate=local (needs tools/reasoning), the caller re-dispatches with
-# casual_conv=False which hits GPT_API (the 4B on :8080).
-DRAFT_GPT_API = _resolve_llm_endpoint('get_local_draft_url', 'HEVOLVE_LOCAL_DRAFT_URL')
+    # Draft LLM endpoint: the 0.8B on :8081 that serves casual_conv=True.
+    # When casual_conv=True, CustomGPT._call() posts here instead of GPT_API.
+    # The 0.8B responds in ~300ms with a short reply. If the response signals
+    # delegate=local (needs tools/reasoning), the caller re-dispatches with
+    # casual_conv=False which hits GPT_API (the 4B on :8080).
+    DRAFT_GPT_API = _resolve_llm_endpoint('get_local_draft_url', 'HEVOLVE_LOCAL_DRAFT_URL')
 FAV_TEACHER_API = config.get('FAV_TEACHER_API', '')
 DREAMBOOTH_API = config.get('DREAMBOOTH_API', '')
 STABLE_DIFF_API = config.get('STABLE_DIFF_API', '')
@@ -2276,9 +2296,9 @@ except Exception as e:
 
 # llm_math = LLMMathChain(ChatOpenAI(model_name="gpt-3.5-turbo"))
 # Old: llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
-# New: Using get_llm() to automatically use Qwen3-VL or OpenAI based on USE_QWEN3VL flag
+# get_llm() serves the configured backend (core.autogen_config); no model name here
 try:
-    llm_math = LLMMathChain(llm=get_llm(model_name="gpt-3.5-turbo"))
+    llm_math = LLMMathChain(llm=get_llm())
 except Exception as _llm_math_err:
     # NEVER silent.  On the 2026-08-07 nightly this except swallowed the
     # constructor error, llm_math stayed None for the whole boot, and every
@@ -3049,17 +3069,17 @@ def _handle_screenshot_tool(input_text: str) -> str:
         screenshot.resize((VLM_IMG_W, VLM_IMG_H)).save(buf, 'JPEG', quality=50)
         b64 = base64.b64encode(buf.getvalue()).decode('ascii')
 
-        _llm_port = int(os.environ.get('HEVOLVE_LLM_PORT', 8080))
         resp = pooled_post(
-            f'http://127.0.0.1:{_llm_port}/v1/chat/completions',
+            GPT_API,
             json={
-                'model': 'local',
+                'model': LLM_MODEL_NAME,
                 'messages': [{'role': 'user', 'content': [
                     {'type': 'text', 'text': f'Describe what you see on this screen. Question: {input_text}'},
                     {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{b64}'}}
                 ]}],
                 'max_tokens': 300,
             },
+            headers=LLM_AUTH_HEADERS,
             timeout=15,
         )
         if resp.status_code == 200:
@@ -5787,11 +5807,30 @@ def _pooled_post_with_refusal_check(api_url, json=None, app_logger=None, **kwarg
     When active AND the reply matches _REFUSAL_PATTERN, retries ONCE with
     a forceful tool-use directive prepended to the user message.  The
     directive tells the model not to refuse and to invoke a tool instead.
-    Both endpoints (DRAFT_GPT_API and GPT_API) point at the same 4B
-    Qwen3.5 on this machine, so the retry stays on the same wire — the
-    only thing that changes is the prompt's tone.
+    The retry goes back to the same api_url, so it stays on the same wire;
+    the only thing that changes is the prompt's tone.
     """
     body = json or {}
+    # Fit the request to the server's per-slot n_ctx budget BEFORE the POST.
+    # The httpx wire hook (core.llm_outbound_logger._apply_trim_to_request)
+    # trims autogen / openai-SDK traffic, but this wrapper posts through the
+    # requests pool (core.http_pool.pooled_post), which bypasses httpx — the
+    # "raw requests.post minority" the trim's own architecture note flags.  So
+    # a langchain ReAct follow-up prompt (the re-rendered full tool schema plus
+    # a large tool observation) reached llama-server untrimmed and 500'd with
+    # "request (N tokens) exceeds the available context size", after which the
+    # turn returned the generic error instead of an answer (live 2026-09-02,
+    # weather-in-London: 14,899 > 12,288 n_ctx).  Route through the ONE canonical
+    # trimmer both wire paths share — idempotent, no-ops on bodies that already
+    # fit — so no second trim implementation and no budget drift.  Best-effort:
+    # never block a chat turn on the optimisation; an untrimmed oversized body
+    # still fails loudly at llama-server exactly as it did before this line.
+    try:
+        from core.llm_outbound_logger import _trim_to_budget
+        body = _trim_to_budget(body)[0]
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "_pooled_post_with_refusal_check: wire-trim skipped", exc_info=True)
     # This is a COMPLETION, not an ordinary API call.  Without this the call
     # inherits http_pool.DEFAULT_TIMEOUT (3, 15) — a 15s read budget that is
     # shorter than a local 4B generation, so it could never succeed: it timed
@@ -5800,8 +5839,15 @@ def _pooled_post_with_refusal_check(api_url, json=None, app_logger=None, **kwarg
     # setdefault, so an explicit caller timeout still wins.  Applies to the
     # refusal-retry POST below too — both go through **kwargs.
     kwargs.setdefault('timeout', LLM_COMPLETION_TIMEOUT)
+    # The configured backend's credential (core.autogen_config) rides on every
+    # POST that targets it; an explicit caller header still wins.  A local
+    # llama-server has LLM_AUTH_HEADERS == {} and gets nothing.
+    if LLM_AUTH_HEADERS and api_url in (GPT_API, DRAFT_GPT_API):
+        _hdrs = dict(LLM_AUTH_HEADERS)
+        _hdrs.update(kwargs.get('headers') or {})
+        kwargs['headers'] = _hdrs
     response = pooled_post(api_url, json=body, **kwargs)
-    # Default ON — only explicit opt-out (0/false/no/off) skips the override.
+    # Default ON: only explicit opt-out (0/false/no/off) skips the override.
     if os.environ.get('HEVOLVE_LANGCHAIN_REFUSAL_OVERRIDE', '1').strip().lower() in ('0', 'false', 'no', 'off'):
         return response
     try:
@@ -5976,7 +6022,7 @@ class CustomGPT(LLM):
                     response = _pooled_post_with_refusal_check(
                         _api,
                         json={
-                            "model": "llama",
+                            "model": LLM_MODEL_NAME,
                             "messages": [{"role": "user", "content": prompt}],
                             "max_tokens": 200,
                             "temperature": 0.7
@@ -5995,7 +6041,7 @@ class CustomGPT(LLM):
                     response = _pooled_post_with_refusal_check(
                         GPT_API,
                         json={
-                            "model": "llama",
+                            "model": LLM_MODEL_NAME,
                             "messages": [{"role": "user", "content": prompt}],
                             "max_tokens": 200,  # Reduced from 1000 for faster responses
                             "temperature": 0.7
@@ -6040,7 +6086,7 @@ class CustomGPT(LLM):
                 response = _pooled_post_with_refusal_check(
                     GPT_API,
                     json={
-                        "model": "llama",
+                        "model": LLM_MODEL_NAME,
                         "messages": [{"role": "user", "content": prompt}],
                         "max_tokens": 1000
                     })
@@ -6061,7 +6107,7 @@ class CustomGPT(LLM):
                     response = _pooled_post_with_refusal_check(
                         _api,
                         json={
-                            "model": "llama",
+                            "model": LLM_MODEL_NAME,
                             "messages": [{"role": "user", "content": prompt}],
                             "max_tokens": 1000
                         }
@@ -6080,7 +6126,7 @@ class CustomGPT(LLM):
                         response = _pooled_post_with_refusal_check(
                             GPT_API,
                             json={
-                                "model": "llama",
+                                "model": LLM_MODEL_NAME,
                                 "messages": [{"role": "user", "content": prompt}],
                                 "max_tokens": 1000
                             }
@@ -6116,7 +6162,7 @@ class CustomGPT(LLM):
                 response = _pooled_post_with_refusal_check(
                     GPT_API,
                     json={
-                        "model": "llama",
+                        "model": LLM_MODEL_NAME,
                         "messages": [{"role": "user", "content": prompt}],
                         "max_tokens": 1000
                     }
@@ -6948,22 +6994,23 @@ def parse_visual_context(inp: str):
 
         prompt_text = f'Instruction: Respond in second person point of view\ninput:-{inp}'
 
-        # Tier 0: Qwen+mmproj on local llama-server (already running, zero extra VRAM)
-        _llm_port = int(os.environ.get('HEVOLVE_LLM_PORT', 8080))
+        # Tier 0: the configured LLM (locally Qwen+mmproj on the llama-server
+        # that is already running, zero extra VRAM)
         try:
             import base64 as _b64
             with open(image_path, 'rb') as _imgf:
                 _img_b64 = _b64.b64encode(_imgf.read()).decode('ascii')
             _vlm_resp = requests.post(
-                f'http://127.0.0.1:{_llm_port}/v1/chat/completions',
+                GPT_API,
                 json={
-                    'model': 'local',
+                    'model': LLM_MODEL_NAME,
                     'messages': [{'role': 'user', 'content': [
                         {'type': 'text', 'text': prompt_text},
                         {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{_img_b64}'}}
                     ]}],
                     'max_tokens': 300,
                 },
+                headers=LLM_AUTH_HEADERS,
                 timeout=15,
             )
             if _vlm_resp.status_code == 200:
@@ -8089,13 +8136,14 @@ def _review_proposed_plan(plan, max_rounds_remaining):
         )
         # Reuse pooled_post that gather_info uses; same endpoint
         r = pooled_post(
-            get_local_llm_url() + '/chat/completions',
+            GPT_API,
             json={
-                'model': 'Qwen3-VL-4B-Instruct',
+                'model': LLM_MODEL_NAME,
                 'messages': [{'role': 'user', 'content': review_prompt}],
                 'temperature': 0.0,
                 'max_tokens': 256,
             },
+            headers=LLM_AUTH_HEADERS,
             timeout=60,
         )
         text = r.json()['choices'][0]['message']['content']
@@ -11273,22 +11321,25 @@ def download_recipe_bundle(prompt_id):
 
 
 def _get_active_backend_info() -> dict:
-    """Get which LLM backend is currently serving inference."""
+    """Get which LLM backend is currently serving inference: the decision
+    core.autogen_config makes from the configured trio, taken fresh so the
+    status reflects a hot-reloaded vault export."""
     tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
-    if tier in ('regional', 'central'):
+    kind, entry = resolve_llm_backend()
+    if kind == 'api':
         return {
             'type': 'external',
-            'display_name': f"External ({os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'unknown')})",
-            'model': os.environ.get('HEVOLVE_LLM_MODEL_NAME', ''),
-            'url': os.environ.get('HEVOLVE_LLM_ENDPOINT_URL', ''),
+            'display_name': f"External ({entry['model'] or 'unknown'})",
+            'model': entry['model'],
+            'url': entry.get('base_url', ''),
             'mode': tier,
         }
     cloud_url = os.environ.get('HEVOLVE_CLOUD_FALLBACK_URL', '')
     return {
         'type': 'local_llamacpp',
         'display_name': 'llama.cpp (Nunba)',
-        'model': 'Qwen3.5-4B',
-        'mode': 'flat',
+        'model': entry['model'],
+        'mode': tier,
         'cloud_fallback_configured': bool(cloud_url),
     }
 
@@ -11655,14 +11706,15 @@ Example response format:
 
         app.logger.info(f"Zero-shot classification request - Text: {input_text[:100]}..., Labels: {labels}")
 
-        # Call Llama API
+        # Call the configured LLM
         response = pooled_post(
             GPT_API,
             json={
-                "model": "llama",
+                "model": LLM_MODEL_NAME,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 500
-            }
+            },
+            headers=LLM_AUTH_HEADERS,
         )
 
         app.logger.info(f"GPT API response status: {response.status_code}")

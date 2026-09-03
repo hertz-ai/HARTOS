@@ -331,6 +331,50 @@ class TestLocalDispatch:
         # Original prompt — no "improve this draft" wrapping
         assert body['prompt'] == 'tell me a story'
 
+    def test_local_non_bundled_sends_daemon_credential(self, monkeypatch,
+                                                       caplog):
+        """The self-POST to our own /chat carries the credential
+        ``dispatch.py:_internal_auth_headers`` mints. On the central tier
+        gate 2 answers a bare self-POST with 401, and the expert leg was
+        dead there (measured 2026-09-02). A non-200 from our own backend
+        is logged at WARNING: central emits nothing below WARNING after
+        boot, so a DEBUG line is the same as no line."""
+        import logging
+        monkeypatch.delenv('NUNBA_BUNDLED', raising=False)
+        monkeypatch.setattr(sys, 'frozen', False, raising=False)
+
+        from integrations.agent_engine.speculative_dispatcher import (
+            SpeculativeDispatcher,
+        )
+        from integrations.agent_engine.model_registry import (
+            ModelRegistry, ModelBackend, ModelTier,
+        )
+        d = SpeculativeDispatcher(model_registry=ModelRegistry())
+        local = ModelBackend(
+            model_id='qwen-27b-local', display_name='27B',
+            tier=ModelTier.EXPERT,
+            config_list_entry={
+                'model': 'qwen-27b', 'api_key': 'k',
+                'base_url': 'http://127.0.0.1:8080/v1',
+            },
+            is_local=True,
+        )
+        minted = {'Authorization': 'Bearer system-daemon-token'}
+        denied = MagicMock(status_code=401)
+        denied.json.return_value = {
+            'error': 'Authentication required (Bearer token)'}
+        with patch('integrations.agent_engine.dispatch.'
+                   '_internal_auth_headers', return_value=minted), \
+                patch('requests.post', return_value=denied) as post, \
+                caplog.at_level(logging.WARNING):
+            out = d._dispatch_expert_langchain(
+                local, 'p', 'u', 'pid', 'general', None)
+        assert out == ''
+        post.assert_called_once()
+        assert post.call_args.kwargs['headers'] == minted
+        assert any('401' in r.getMessage() and r.levelno == logging.WARNING
+                   for r in caplog.records)
+
     def test_none_model_returns_empty(self):
         from integrations.agent_engine.speculative_dispatcher import (
             SpeculativeDispatcher,

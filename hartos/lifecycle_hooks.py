@@ -1103,7 +1103,16 @@ def lifecycle_hook_track_status_verification_request(user_prompt: str, user_task
 
 def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, user_tasks) -> dict:
     """4-6. Process verifier response: completed/pending/error"""
-    if not json_obj or 'status' not in json_obj:
+    # isinstance before the membership test: helper.retrieve_json returns
+    # json.loads(repair_json(...)), and repair_json turns model prose into a
+    # LIST as readily as a dict.  On a list `'status' not in json_obj` is an
+    # ELEMENT test, so a list containing the string 'status' passed this guard
+    # and `json_obj['status']` below raised
+    # "TypeError: list indices must be integers or slices, not str" —
+    # measured on central 2026-09-02 12:43:29Z, the first goal turn after the
+    # LLM was repaired, delivered to the user as "I couldn't finish that".
+    # Same idiom already used for this value at create_recipe.py:2392 and 4921.
+    if not isinstance(json_obj, dict) or 'status' not in json_obj:
         return {'action': 'allow', 'message': None}
 
     if hasattr(user_tasks, 'get') and not hasattr(user_tasks, 'current_action'):
@@ -1242,7 +1251,11 @@ def lifecycle_hook_track_recipe_request(user_prompt: str, user_tasks, group_chat
 def lifecycle_hook_track_recipe_completion(user_prompt: str, json_obj: dict, user_tasks) -> dict:
     """10. Track when recipe is received and saved"""
 
-    if not json_obj or 'status' not in json_obj or json_obj.get('status', '').lower() != 'done':
+    # Same list-vs-dict guard as lifecycle_hook_process_verifier_response: this
+    # one would raise AttributeError on .get rather than TypeError, but it is
+    # fed by the same retrieve_json call sites.
+    if (not isinstance(json_obj, dict) or 'status' not in json_obj
+            or json_obj.get('status', '').lower() != 'done'):
         return {'action': 'allow', 'message': None}
 
     if hasattr(user_tasks, 'get') and not hasattr(user_tasks, 'current_action'):

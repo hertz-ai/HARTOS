@@ -86,8 +86,14 @@ def _audit(event_type: str, actor_id: str, action: str, detail: dict):
             event_type, actor_id, e)
 
 
-def _emit(topic: str, data: dict):
-    """Best-effort EventBus broadcast + push to frontend via WAMP/SSE."""
+def _emit(topic: str, data: dict, msg_id: str = None):
+    """Best-effort EventBus broadcast + push to frontend via WAMP/SSE.
+
+    ``msg_id``: optional stable idempotency key.  ``on_notification`` honours a
+    caller-supplied msg_id and every client dedupes by it, so passing a STABLE
+    id (e.g. the consent row id) lets a producer re-emit the same ask on every
+    poll for reliable delivery while the UI still shows exactly one card.  A
+    ``None`` msg_id falls through to a fresh per-emit id (one-shot events)."""
     try:
         from core.platform.events import emit_event
         emit_event(topic, data)
@@ -99,13 +105,16 @@ def _emit(topic: str, data: dict):
     if user_id:
         try:
             from integrations.social.realtime import on_notification
-            on_notification(user_id, {
+            note = {
                 'type': topic,  # consent.granted, consent.revoked, consent.request
                 'consent_type': data.get('consent_type', ''),
                 'agent_id': data.get('agent_id'),
                 'scope': data.get('scope', '*'),
                 'reason': data.get('reason', ''),
-            })
+            }
+            if msg_id:
+                note['msg_id'] = msg_id
+            on_notification(user_id, note)
         except Exception:
             pass
 
@@ -136,6 +145,37 @@ class ConsentService:
             UserConsent.agent_id == agent_id,
         ).first()
         if existing:
+            # Idempotent RE-ASK: the old code returned silently here, so the
+            # ask _emit fired exactly once at row creation -- if the UI wasn't
+            # subscribed then (fresh boot, a page reload / "retry", a dropped
+            # notification) the pending ask was invisible forever while the
+            # gate kept denying every tick.  Re-emit on every poll so whatever
+            # UI is connected NOW receives it; the stable msg_id makes clients
+            # dedupe every re-emit into a single card -- reliable, zero spam.
+            #
+            # Re-ask ONLY while the combination is genuinely UNDECIDED.
+            # grant_consent is append-only (a granted row coexists with the
+            # old pending one) and revoke mutates a row to granted=False +
+            # revoked_at, so `existing.granted` on the .first() row is not
+            # authoritative -- query for any GRANTED or REVOKED row instead:
+            # a grant means "already yes" and a revoke means "user said no",
+            # both of which must silence the ask.
+            from sqlalchemy import or_
+            decided = db.query(UserConsent).filter(
+                UserConsent.user_id == user_id,
+                UserConsent.consent_type == consent_type,
+                UserConsent.scope == scope,
+                UserConsent.agent_id == agent_id,
+                or_(UserConsent.granted == True,
+                    UserConsent.revoked_at.isnot(None)),
+            ).first()
+            if decided is None:
+                _emit('consent.request', {
+                    'user_id': user_id,
+                    'consent_type': consent_type,
+                    'scope': scope,
+                    'agent_id': agent_id,
+                }, msg_id=f'consent.request:{existing.id}')
             return existing
 
         consent = UserConsent(
@@ -150,17 +190,14 @@ class ConsentService:
         db.flush()
         # Delivery, sibling-parity: grant_consent / auto_grant_with_notice
         # / announce_revocation all _emit, and _emit's own comment always
-        # listed consent.request as a topic -- but this filing site never
-        # called it, so pending asks were invisible until the user opened
-        # the UserConsent page (the hie L6891 bypass rationale).  NEW rows
-        # only: the dedup return above stays silent, so a denied gate
-        # polling every tick pushes exactly ONE ask per combination.
+        # listed consent.request as a topic.  Stable msg_id (row id) so this
+        # first ask and every re-ask above collapse to ONE card client-side.
         _emit('consent.request', {
             'user_id': user_id,
             'consent_type': consent_type,
             'scope': scope,
             'agent_id': agent_id,
-        })
+        }, msg_id=f'consent.request:{consent.id}')
         return consent
 
     @staticmethod

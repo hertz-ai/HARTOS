@@ -1252,6 +1252,63 @@ in
       wants = [ "plymouth-quit-wait.service" ];
     };
 
+    # ── Protect the compositor's FIRST PAINT from boot-time inference ──────────
+    # hart-llm's model-load (~68s of CPU/IO warmup on the fleet i7-3630QM) and
+    # hart-agent-daemon's autonomous goal dispatch are only `wantedBy hart.target`
+    # with NO ordering against the session, so they run INSIDE hart-comp's
+    # shellPaintTimeoutSeconds window and can push first paint past the budget.
+    # The supervisor then HANG-drops native to sway. The one fresh-boot
+    # re-promotion (session-tier.hang) recovers native, but only on the NEXT boot
+    # (measured on .69 2026-09-02: boot 1 dropped to sway under a llama model-load
+    # + dispatch burst, boot 2 latched hart-comp on the byte-identical binary).
+    # A latency-first appliance must latch native on the FIRST boot, so this
+    # oneshot orders both heavy inference services AFTER the session has actually
+    # painted — shell-ready is touched by WHICHEVER tier wins, so it resolves the
+    # same whether native paints or sway does after a drop. It is a pure ordering
+    # gate: NOT wanted/required by its consumers, greetd depends on neither it nor
+    # hart-llm (no cycle — the session paints on its own and this only observes),
+    # and it is bounded to the paint budget + margin, after which inference is
+    # released regardless. A genuinely non-painting session is the supervisor's
+    # own drop-path problem; this gate never blocks the boot on it.
+    #
+    # Defined here (not in hart-llm.nix/hart-agent.nix) because this module OWNS
+    # the shell-ready marker and is enabled exactly when a compositor exists —
+    # server/edge have no supervisor, so no gate, so inference starts immediately
+    # as before. One gate consumed by both services: no per-service duplication.
+    systemd.services.hart-await-first-paint = {
+      description = "Hold boot-time inference until the session's first paint (first-paint latency guard)";
+      wantedBy = [ "hart.target" ];
+      before = [ "hart-llm.service" "hart-agent-daemon.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        User = "hart";
+        Group = "hart";
+        # Must exceed the wait BOUND below so systemd never kills the gate before
+        # it releases inference on its own terms.
+        TimeoutStartSec = toString (sup.shellPaintTimeoutSeconds + 60);
+        ExecStart = pkgs.writeShellScript "hart-await-first-paint" ''
+          READY="${readyFlag}"
+          # paint budget + margin: in every non-degenerate boot SOME tier (native,
+          # or sway a few seconds after a native drop) touches shell-ready before
+          # this elapses, so inference only ever starts pre-paint when the session
+          # is genuinely stuck — and then the supervisor is already dropping it.
+          BOUND=${toString (sup.shellPaintTimeoutSeconds + 30)}
+          waited=0
+          while [ "$waited" -lt "$BOUND" ]; do
+            if [ -e "$READY" ]; then
+              echo "[hart-await-first-paint] session painted after ''${waited}s — releasing inference" >&2
+              exit 0
+            fi
+            ${pkgs.coreutils}/bin/sleep 1
+            waited=$((waited + 1))
+          done
+          echo "[hart-await-first-paint] no paint marker after ''${BOUND}s — releasing inference anyway (session drop-path owns the black-screen case)" >&2
+          exit 0
+        '';
+      };
+    };
+
     # ── greetd: the out-of-process supervisor (NOT a Python thread) ──
     # greetd relaunches its session command whenever the session exits, which
     # is exactly the relaunch primitive the selector wrapper rides on. The

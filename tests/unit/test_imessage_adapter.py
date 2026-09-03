@@ -189,7 +189,7 @@ class TestIMessageConversion:
         msg_data = {
             "guid": "msg-guid",
             "text": "My own message",
-            "is_from_me": True,
+            "isFromMe": True,
             "date_created": 1699000000000,
             "handle": {},
             "chat": {"guid": "chat-guid", "style": 45},

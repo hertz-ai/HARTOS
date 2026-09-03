@@ -119,6 +119,16 @@ mod bloom;
 #[cfg(any(feature = "winit", feature = "smithay"))]
 mod orb;
 
+// ── NATIVE SHELL PARITY PROGRAM, M3: the SceneNode foundation (top bar + hero +
+// rows + taskbar as a scene tree, text via glyph atlas). M0 named "land the
+// SceneNode enum + A2UI->Scene decoder" but never did, so latency.rs still reads
+// "there is no native scene graph". src/scene.rs is PURE geometry + the home_compose
+// decoder + the a2 layout, with its unit floor; comp_core lowers a SceneNode tree to
+// HartRenderElements on the render path. Same gate as bloom/orb (its only consumer is
+// comp_core), so the smithay doCheck exercises the layout + decode tests. ──
+#[cfg(any(feature = "winit", feature = "smithay"))]
+mod scene;
+
 // ── Phase-5 Smithay handler BODIES (CI-COMPILE only) ──
 // The real xdg-shell / XWayland / xdg-decoration / wlr-foreign-toplevel-management
 // handler bodies live in `wayland.rs`, gated behind the `smithay` cargo feature
@@ -155,6 +165,13 @@ mod winit;
 // the SAME socket surface (the moat on real hardware too). The verb BODIES live in
 // `comp_core`; this is the transport + dispatch. Off on the default dev-box build.
 // See src/ipc.rs.
+// Input-to-photon instrument (LATENCY_HARNESS.md M0). NO cfg gate on purpose:
+// the core is pure (no Smithay types, no clock reads — timestamps are
+// arguments), so its unit tests run in BOTH CI legs, including the default
+// no-feature build. Only the WIRING lives in udev.rs/comp_core.rs behind
+// their existing gates.
+mod latency;
+
 #[cfg(any(feature = "winit", feature = "smithay"))]
 mod ipc;
 

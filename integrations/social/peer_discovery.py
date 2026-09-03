@@ -711,6 +711,31 @@ class GossipProtocol:
                 self._record_peer_failure(peer_url)
             self._heartbeat()
 
+    def _flush_health_row(self, db, round_name='Health round') -> bool:
+        """Commit one peer row's change immediately, before the next probe.
+
+        Exists so a gossip round never holds SQLite's write lock across a
+        network call -- see the rationale at the call site in
+        ``_health_check_round``.  ``_integrity_round`` uses it too (#71):
+        its guardrail audit and challenge steps make one network call per
+        active peer and used to commit once after the whole loop.
+
+        A failed commit must NOT abort the round: the outer handler would
+        roll back the whole sweep (every status update and every #38 purge)
+        because one row lost a lock race. Roll back just this row, say so,
+        and let the next peer try on its own.
+        """
+        try:
+            db.commit()
+            return True
+        except Exception as e:
+            db.rollback()
+            logger.warning(
+                "%s: per-row commit failed (%s: %s); rolled back "
+                "that row and continuing with the next peer",
+                round_name, type(e).__name__, e)
+            return False
+
     def _health_check_round(self):
         self._peer_backoff.prune_expired()
         from .models import get_db, PeerNode
@@ -720,9 +745,49 @@ class GossipProtocol:
             now = datetime.utcnow()
             purged = 0
             live_peers = []
+
+            # WALL-CLOCK BUDGET. This loop pings every non-dead peer serially at
+            # _ping_peer's 3s timeout. _background_loop runs gossip, health and
+            # integrity in sequence, so a long health round does not just delay
+            # itself -- it STARVES the integrity round behind it, which is due
+            # every 300s.
+            #
+            # Measured on central 2026-09-01: 566 non-dead rows x 3s = up to ~28
+            # minutes for ONE health round, against a 5-minute integrity
+            # interval. The integrity round had not produced a challenge in 29h
+            # and its retention sweep removed 0 rows across a fresh container,
+            # with NOTHING in the logs -- because nothing raised. The round was
+            # simply never reached. Calling the sweep by hand on that same
+            # container removed exactly 10,000 rows, proving the sweep was fine
+            # and only the scheduling was broken.
+            #
+            # 18c3e3cb isolated the rounds against EXCEPTIONS. This is the other
+            # half: isolation against DURATION. A round that cannot finish in
+            # its budget yields and resumes next tick instead of holding the
+            # loop.
+            _budget_s = float(os.environ.get(
+                'HEVOLVE_HEALTH_ROUND_BUDGET_S', '30'))
+            _started = time.time()
+            # Rotate the starting point so a budget cut does not re-check the
+            # same prefix forever and never reach the tail of the table.
+            if peers:
+                _cursor = getattr(self, '_health_cursor', 0) % len(peers)
+                peers = peers[_cursor:] + peers[:_cursor]
+            _examined = 0
+
             for peer in peers:
                 if not self._running:
                     break
+                if time.time() - _started > _budget_s:
+                    self._health_cursor = (
+                        getattr(self, '_health_cursor', 0) + _examined)
+                    logger.warning(
+                        "Health round hit its %.0fs budget after %d/%d peers; "
+                        "yielding so the integrity round is not starved "
+                        "(resumes from this point next round)",
+                        _budget_s, _examined, len(peers))
+                    break
+                _examined += 1
                 if peer.node_id == self.node_id:
                     continue
                 # #38: a structurally-unroutable row (loopback / docker-bridge /
@@ -735,6 +800,7 @@ class GossipProtocol:
                 if _bad_url:
                     db.delete(peer)
                     purged += 1
+                    self._flush_health_row(db)
                     continue
                 live_peers.append(peer)
                 reachable = self._ping_peer(peer.url)
@@ -748,6 +814,33 @@ class GossipProtocol:
                         peer.status = 'dead'
                     elif age > self.stale_threshold:
                         peer.status = 'stale'
+                # Commit THIS row before probing the next peer.
+                #
+                # The round previously accumulated every delete + status change
+                # in one session and committed only after the whole sweep. The
+                # first mutation opens SQLite's single write transaction, so the
+                # write lock was then held across all the remaining _ping_peer
+                # calls. That is a lock held across network I/O.
+                #
+                # It wedged central on 2026-09-01: a probe hung (pooled_get's
+                # timeout=3 bounds the socket, NOT the wait for a free pooled
+                # connection, and a hang raises nothing for the RequestException
+                # handler to catch), the loop never advanced, so the wall-clock
+                # budget below -- which is only checked BETWEEN peers -- never
+                # got to fire. The write lock stayed held for ~2h. The agent
+                # daemon's `UPDATE agent_goals SET last_dispatched_at` lost its
+                # 5s busy_timeout on every tick, which poisoned its session
+                # ("rolled back due to a previous exception during flush") and
+                # aborted the tick. Goals were selected and never recorded:
+                # max(last_dispatched_at) frozen while the daemon looked alive.
+                #
+                # Committing per row keeps the lock held for microseconds
+                # instead of for the length of a network sweep. A hung probe
+                # then stalls only THIS round, which the budget already covers,
+                # rather than every writer in the process. It also means the #38
+                # purge persists incrementally instead of being rolled back
+                # wholesale when the round cannot finish.
+                self._flush_health_row(db)
             # Dead is not deleted. The main query above excludes 'dead' rows,
             # so a peer that aged out during an outage was never re-pinged and
             # could only come back via an INBOUND announce — two nodes that
@@ -792,7 +885,12 @@ class GossipProtocol:
                 pass
         except Exception as e:
             db.rollback()
-            logger.debug(f"Health check error: {e}")
+            # WARNING, not debug: this round owns peer liveness and the #38
+            # unroutable-row purge. A silent failure here leaves stale peers
+            # 'active' and the junk rows in place, which is what inflates every
+            # node count.
+            logger.warning("Health check round failed (%s: %s)",
+                           type(e).__name__, e)
         finally:
             db.close()
 
@@ -1919,7 +2017,12 @@ class GossipProtocol:
                 db.commit()
             except Exception as _e:
                 db.rollback()
-                logger.debug(f"Integrity round decay sweep failed: {_e}")
+                # WARNING, not debug. The hevolve_social logger runs at WARNING
+                # in production, so a debug line here is invisible and a sweep
+                # that throws on every round looks identical to one that has
+                # nothing to do.
+                logger.warning("Integrity round decay sweep failed (%s: %s)",
+                               type(_e).__name__, _e)
 
             # 0b. Retention sweep — integrity_challenges is append-only and had
             #     no expiry, so it grew to 300,092 rows / 386 MB (plus ~60 MB of
@@ -1942,7 +2045,18 @@ class GossipProtocol:
                            if _pruned.get('more_remaining') else ""))
             except Exception as _e:
                 db.rollback()
-                logger.debug(f"Integrity round retention sweep failed: {_e}")
+                # WARNING, not debug — and this one bit me directly. On central
+                # the sweep ran twice (300,092 -> 290,092 -> 280,092) and then
+                # stopped, with 135,869 rows still eligible and NOTHING in the
+                # logs either way: the success line is INFO and this failure
+                # line was debug, both invisible at the production WARNING
+                # level. The only observable was a row count that would not
+                # move, which is not a diagnosis.
+                #
+                # I wrote that blind spot into this file today while telling
+                # other agents that absence of an INFO log proves nothing.
+                logger.warning("Integrity round retention sweep failed (%s: %s)",
+                               type(_e).__name__, _e)
 
             active_peers = db.query(PeerNode).filter(
                 PeerNode.status == 'active',
@@ -1955,8 +2069,22 @@ class GossipProtocol:
 
                 # 1. Guardrail audit: re-verify ALL active peers' guardrail hashes.
                 #    This is the continuous audit - every node checks every other node.
+                #
+                #    Commit after EVERY peer, in this loop and the next.  Both
+                #    make one network call per active peer and used to commit
+                #    once after the whole loop, so from the first fraud-score
+                #    flush onward the round held SQLite's single write lock
+                #    across every remaining probe (5s GET here, a 30s POST
+                #    below).  Measured on a desktop 2026-09-02: 525 active
+                #    peers, most unroutable, one round ran for hours,
+                #    integrity_interval is 300s, and the agent daemon logged
+                #    "database is locked" on every tick with zero goal updates
+                #    persisted (#71).  Same shape, same fix as the health
+                #    round (374f5ab6); create_challenge also commits its own
+                #    row before it POSTs.
                 for peer in active_peers:
                     self._audit_peer_guardrails(db, peer)
+                    self._flush_health_row(db, round_name='Integrity round')
                     self._heartbeat()
 
                 # 2. Deep challenge: cycle through challenge types across all peers.
@@ -1971,6 +2099,7 @@ class GossipProtocol:
                             peer.url, challenge_type)
                     except Exception as e:
                         logger.debug(f"Challenge to {peer.node_id[:8]} failed: {e}")
+                    self._flush_health_row(db, round_name='Integrity round')
                     self._heartbeat()
                 try:
                     db.commit()

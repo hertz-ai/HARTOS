@@ -110,6 +110,7 @@ class TestLoopExitsOnDone:
 
         with patch(_PATCH_SCREENSHOT, return_value=FAKE_SCREENSHOT_B64), \
              patch(_PATCH_EXECUTE, return_value={"output": "ok"}), \
+             patch.dict(os.environ, {'HEVOLVE_VLM_UNIFIED': '0'}), \
              patch(_PATCH_PARSE_SCREEN, return_value=_FAKE_PARSED), \
              patch(_PATCH_SLEEP), \
              patch(_PATCH_LLM, side_effect=llm_side):
@@ -137,6 +138,7 @@ class TestLoop3Iterations:
 
         with patch(_PATCH_SCREENSHOT, return_value=FAKE_SCREENSHOT_B64), \
              patch(_PATCH_EXECUTE, return_value={"output": "ok"}), \
+             patch.dict(os.environ, {'HEVOLVE_VLM_UNIFIED': '0'}), \
              patch(_PATCH_PARSE_SCREEN, return_value=_FAKE_PARSED), \
              patch(_PATCH_SLEEP), \
              patch(_PATCH_LLM, side_effect=llm_side):
@@ -168,6 +170,7 @@ class TestLoopMaxIterationsCap:
 
         with patch(_PATCH_SCREENSHOT, return_value=FAKE_SCREENSHOT_B64), \
              patch(_PATCH_EXECUTE, return_value={"output": "ok"}), \
+             patch.dict(os.environ, {'HEVOLVE_VLM_UNIFIED': '0'}), \
              patch(_PATCH_PARSE_SCREEN, return_value=_FAKE_PARSED), \
              patch(_PATCH_SLEEP), \
              patch(_PATCH_LLM, side_effect=always_in_progress):
@@ -197,6 +200,7 @@ class TestLoopErrorContinues:
 
         with patch(_PATCH_SCREENSHOT, return_value=FAKE_SCREENSHOT_B64), \
              patch(_PATCH_EXECUTE, return_value={"output": "ok"}), \
+             patch.dict(os.environ, {'HEVOLVE_VLM_UNIFIED': '0'}), \
              patch(_PATCH_PARSE_SCREEN, return_value=_FAKE_PARSED), \
              patch(_PATCH_SLEEP), \
              patch(_PATCH_LLM, side_effect=llm_side):
@@ -515,3 +519,34 @@ class TestTaskbarShortcutFiresOnce:
             % backend.try_taskbar_pre_check.call_count)
         # And the run got past the shortcut into real steps.
         assert result['exit_reason'] == 'done'
+
+
+class TestUnifiedQwen3VLIsTheDefault:
+    def test_no_env_var_still_selects_qwen3vl_backend(self):
+        """Owner 2026-09-01: qwen3vl_backend REPLACED the OmniParser
+        pipeline — the selector must take the unified branch when
+        HEVOLVE_VLM_UNIFIED is absent.  Before this guard, only the
+        langchain-side _handle_computer_action_tool setdefault()ed the
+        flag, so the autogen leg (execute_windows_or_android_command)
+        entered the LEGACY OmniParser branch on any boot where the
+        langchain tool had not run first — and legacy 'http' tier posts
+        to localhost:8080, which now belongs to llama-server."""
+        backend = _taskbar_backend([_vlm_json(status='DONE', reasoning='done')])
+        legacy = MagicMock(
+            side_effect=AssertionError('legacy omniparser branch taken'))
+        env_without_flag = {k: v for k, v in os.environ.items()
+                            if k != 'HEVOLVE_VLM_UNIFIED'}
+        with patch.dict(sys.modules, {'pyautogui': _fake_pyautogui()}), \
+             patch.dict(os.environ, env_without_flag, clear=True), \
+             patch(_PATCH_SCREENSHOT, return_value=FAKE_SCREENSHOT_B64), \
+             patch(_PATCH_EXECUTE, return_value={'output': 'ok'}), \
+             patch(_PATCH_SLEEP), \
+             patch('integrations.vlm.local_omniparser.parse_screen', legacy), \
+             patch('integrations.vlm.qwen3vl_backend.get_qwen3vl_backend',
+                   return_value=backend) as get_backend:
+            run_local_agentic_loop(_DEFAULT_MESSAGE, tier='inprocess',
+                                   max_iterations=1)
+        assert get_backend.called, (
+            'unified Qwen3-VL backend was not selected without the env var '
+            '— the selector still defaults to the replaced OmniParser leg')
+        assert not legacy.called

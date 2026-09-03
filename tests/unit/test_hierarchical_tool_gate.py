@@ -69,6 +69,73 @@ class HierarchicalToolGate(unittest.TestCase):
 
     def test_detect_media_vocabulary(self):
         self.assertIn('media', detect_goal_tags('compose a song about rain'))
+
+    # ── Lever 2 wires (owner-ratified 2026-09-01: half-VRAM budget makes
+    # tag precision the primary overflow fix; stored tags speak the SAME
+    # goal-tag vocabulary detection speaks, so downstream is untouched) ──
+
+    def test_coding_row_covers_programmer_workbench(self):
+        """Wire 1: a coding agent must reach docs + the desktop — the
+        row lacked web/crawling/computer-use entirely.  Tags must speak
+        REGISTRY vocabulary (declared ServiceTool tags), not synonyms:
+        'web_search' matches nothing, 'web' matches crawl4ai."""
+        caps = get_tool_tags('coding')
+        self.assertIn('web', caps)
+        self.assertIn('crawling', caps)
+        self.assertIn('coding', caps)   # existing rows preserved
+        self.assertIn('github', caps)
+        self.assertNotIn('web_search', caps)  # synonym drift guard
+        # The archetype DECLARES computer-use (owner: a coding agent
+        # looks at the desktop); today the capability rides the core
+        # execute_windows_or_android_command tool on the main Qwen3-VL.
+        self.assertIn('computer-use', caps)
+
+    def test_legacy_omniparser_wrapper_does_not_claim_computer_use(self):
+        """Owner 2026-09-01: omniparser was replaced by qwen3vl_backend.
+        The deprecated wrapper must never resolve for 'computer-use' —
+        its base_url localhost:8080 now belongs to llama-server, so an
+        agent attaching it would dial the wrong service."""
+        from integrations.service_tools.omniparser_tool import OmniParserTool
+        info = OmniParserTool.create_tool_info()
+        self.assertNotIn('computer-use', info.tags)
+        self.assertNotIn('screen', info.tags)
+        # behavioral: the row actually UNLOCKS the web tool through the
+        # real filter (fake crawl4ai declares ['web','scraping'])
+        kept = filter_service_tools(['coding'], _SVC_TOOLS, _SVC_DEFS,
+                                    _fake_registry())
+        self.assertIn('crawl4ai_crawl', kept)
+        self.assertNotIn('pocket_tts_synthesize', kept)
+
+    def test_resolve_goal_tags_is_layered_union(self):
+        """Wire 3: stored semantic tags UNION lexical detection — legacy
+        records (no stored tags) resolve to exactly today's detection,
+        so behavior can only gain tags, never lose."""
+        from integrations.agent_engine.marketing_tools import resolve_goal_tags
+        # legacy: None/empty stored == pure detection (byte-equal path)
+        self.assertEqual(resolve_goal_tags(None, 'fix the bug fix in repo'),
+                         detect_goal_tags('fix the bug fix in repo'))
+        self.assertEqual(resolve_goal_tags([], 'compose a song about rain'),
+                         detect_goal_tags('compose a song about rain'))
+        # stored-only: text detects nothing, stored carries the tag
+        self.assertEqual(resolve_goal_tags(['coding'], 'a helpful assistant'),
+                         ['coding'])
+        # union: both sides contribute, deduped + sorted
+        got = resolve_goal_tags(['coding'], 'compose a song about rain')
+        self.assertIn('coding', got)
+        self.assertIn('media', got)
+        # junk in stored is dropped, not crashed on
+        self.assertEqual(resolve_goal_tags([None, 42, 'coding'], ''), ['coding'])
+
+    def test_reuse_and_create_gates_resolve_stored_tags(self):
+        """Wire 3 call sites: both constructors resolve via
+        resolve_goal_tags (detection PRESERVED inside it — no lost
+        calls); reuse reads goal_tags from the SAME agent-record load
+        that already supplies `goal`."""
+        reuse = (_ROOT / 'hartos' / 'reuse_recipe.py').read_text(encoding='utf-8')
+        create = (_ROOT / 'hartos' / 'create_recipe.py').read_text(encoding='utf-8')
+        self.assertIn("config.get('goal_tags')", reuse)
+        self.assertIn('resolve_goal_tags(', reuse)
+        self.assertIn('resolve_goal_tags(', create)
         self.assertNotIn('media', detect_goal_tags('summarize this text file'))
 
     def test_discover_attaches_gated_out_tool(self):
@@ -112,10 +179,11 @@ class HierarchicalToolGate(unittest.TestCase):
             self.assertIn(route, out)
 
     def test_single_detection_and_gate_in_both_constructors(self):
-        """Parity + no-parallel-path: sanctioned detection sites only.
-        create: 1 (construction).  reuse: 2 (construction + the per-turn
-        hook in get_agent_response that attaches families when the
-        conversation drifts — deterministic, zero extra LLM calls).
+        """Parity + no-parallel-path: sanctioned resolution sites only.
+        Construction gates now call resolve_goal_tags (stored ∪ detected,
+        Lever 2); reuse keeps ONE extra detect_goal_tags in the per-turn
+        drift hook (message-driven, stored tags already resolved at
+        construction).  create: 1 resolution.  reuse: 2.
         Any count above these means a detection regrew somewhere."""
         expected_detect = {'create_recipe.py': 1, 'reuse_recipe.py': 2}
         for fname, n_expected in expected_detect.items():
@@ -125,13 +193,14 @@ class HierarchicalToolGate(unittest.TestCase):
             # inside a #510 history comment
             code = [ln for ln in src.splitlines()
                     if not ln.lstrip().startswith('#')]
-            n_detect = sum('detect_goal_tags(' in ln for ln in code)
+            n_detect = sum(('detect_goal_tags(' in ln)
+                           or ('resolve_goal_tags(' in ln) for ln in code)
             n_filter = sum('filter_service_tools(' in ln for ln in code)
             self.assertEqual(
                 n_detect, n_expected,
-                f'{fname}: expected exactly {n_expected} detect_goal_tags '
-                f'call(s) (construction gate; reuse also has the per-turn '
-                f'attach hook)')
+                f'{fname}: expected exactly {n_expected} goal-tag '
+                f'resolution call(s) (construction gate; reuse also has '
+                f'the per-turn attach hook)')
             self.assertEqual(
                 n_filter, 1,
                 f'{fname}: expected exactly one Tier-1 gate call')

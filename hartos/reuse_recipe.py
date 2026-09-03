@@ -630,6 +630,26 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
 
 
 
+def _coerce_instruction_text(value) -> str:
+    """Normalize a tool 'instructions' argument to plain text.
+
+    Qwen sometimes nests tool args (#653 family): live 2026-09-01
+    15:14:35 the hive-training agent passed a dict and
+    execute_windows_or_android_command crashed on .lower() before the
+    VLM loop could start.  A dict keeps its natural text field when one
+    exists; anything else stringifies rather than raising.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ('instructions', 'command', 'task', 'text'):
+            inner = value.get(key)
+            if isinstance(inner, str) and inner.strip():
+                return inner
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
 def execute_python_file(task_description: str, user_id: int, prompt_id: int, action_entry_point: int = 0):
     headers = {'Content-Type': 'application/json'}
     url = f'http://localhost:{_get_llm_port("backend")}/time_agent'
@@ -863,9 +883,26 @@ def create_agents_for_role(user_id: str, prompt_id):
     # Uses module-level config_list (localhost:8080 for local, Azure for cloud)
     current_app.logger.info('INSIDE create_agents_for_role')
 
-    # Create a basic function calling config
+    # Create a basic function calling config.
+    #
+    # PER-DISPATCH MODEL ROUTING: /chat stashes the caller's chosen model_config
+    # in thread-local (hart_intelligence_entry:9200) and it MUST win over the
+    # import-time module `config_list`.  This is model-agnostic on purpose — it
+    # honours whatever tier the dispatcher selected (hive peer, cloud endpoint,
+    # or a locally hosted expert); no backend is special-cased here.
+    #
+    # No expert is MANDATORY.  When no override is set the local model serves
+    # the turn, and local-only is a fully supported configuration — an expert
+    # tier augments the agent, it is never a prerequisite for reaching a goal.
+    # Hence `or config_list`: the fallback is the contract, not a safety net.
+    #
+    # Without it the module-level list, bound once at import, silently answered
+    # every speculative EXPERT turn on the default local model: measured
+    # 2026-09-01 as 233 outbound calls all carrying model="local" while the
+    # dispatcher believed it had routed to the EXPERT tier.
+    # Same pattern as hart_intelligence_entry.create_agents_for_user (:7242).
     llm_config = {
-        "config_list": config_list,
+        "config_list": thread_local_data.get_model_config_override() or config_list,
         "cache_seed": None,
     }
 
@@ -1074,9 +1111,11 @@ def create_agents_for_role(user_id: str, prompt_id):
 def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]":
     """Create new assistant & user proxy agents for a user with basic configuration."""
     user_prompt = f'{user_id}_{prompt_id}'
-    # Create a basic function calling config
+    # Create a basic function calling config.
+    # Per-dispatch model routing — see create_agents_for_role above for why the
+    # thread-local override must win over the import-time module config_list.
     llm_config = {
-        "config_list": config_list,
+        "config_list": thread_local_data.get_model_config_override() or config_list,
         "cache_seed": None
     }
 
@@ -1124,9 +1163,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         recipes[user_prompt] = config
         final_recipe[prompt_id] = config
     goal = ''
+    stored_goal_tags = None
     with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
         config = json.load(f)
         goal = config['goal']
+        # Optional semantic tags stamped on the agent record at creation
+        # (Lever 2, owner 2026-09-01).  Absent on legacy records — the
+        # gate below then resolves to pure detection, exactly as before.
+        stored_goal_tags = config.get('goal_tags')
 
     current_app.logger.info(f'Got goal as {goal}')
     role_actions = []
@@ -1291,8 +1335,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         If a tool exists in the catalog, @Helper has it.  If a tool doesn't
         exist, ask @Helper to find an alternative (search, scrape, code).
         {NUNBA_WEB_FETCH_POLICY}
-        Here, "say so plainly" means: ask @Helper to call request_tools
-        first — only report the limitation if request_tools finds nothing.
+        In this group, asking for a tool means: tag @Helper to call
+        request_tools.
         The ONLY thing Helper can't do is execute python code — that's
         @Executor's job.  Everything else goes through @Helper.  Treat
         Helper as your unlimited capability surface.
@@ -1536,6 +1580,35 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             return "Visual watcher unavailable: HARTOS still initialising."
         return _handle(input_text)
 
+    # create_scheduled_jobs stays INLINE on the reuse-main leg: the
+    # factory's same-named tool is a create-flow STUB ("creation process
+    # will do it at the end" — end-of-creation machinery schedules), but
+    # a LIVE reuse agent must schedule NOW.  Two behaviors under one
+    # name = a #511 name collision; until that is resolved canonically,
+    # this restores the exact pre-#743 body (owner audit 2026-09-01
+    # found the swap had silently stubbed real scheduling).
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="tool",
+                             description="Use this to Create scheduled jobs")
+    @log_tool_execution
+    def create_scheduled_jobs(cron_expression: Annotated[
+        str, "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday)."],
+                              job_description: Annotated[str, "Description of the job to be performed"]) -> str:
+        current_app.logger.info('INSIDE create_scheduled_jobs')
+        if not scheduler.running:
+            scheduler.start()
+
+        try:
+            trigger = CronTrigger.from_crontab(cron_expression)
+            job_id = f"job_{int(time.time())}"
+            scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,
+                              args=[job_description, user_id, prompt_id, 0])
+            current_app.logger.info('Successfully created scheduler job')
+            return 'Successfully created scheduler job'
+        except Exception as e:
+            current_app.logger.info(f'Error in create_scheduled_jobs: {str(e)}')
+            return f"Error creating scheduled job: {str(e)}"
+
     # --- MemoryGraph provenance tools (remember, recall, backtrace) ---
     if memory_graph is not None:
         try:
@@ -1590,6 +1663,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         """
         Executes a command on any desktop (Windows/Linux/macOS) or Android device. Uses pyautogui for cross-platform GUI automation.
         """
+        # Models sometimes nest the args (#653 family) — live 15:14:35
+        # crash: instructions arrived as a dict and :1508's .lower()
+        # raised AttributeError, killing the tool before the VLM loop.
+        instructions = _coerce_instruction_text(instructions)
         # Generate a unique key for this command
         command_key = f"windows_command_{user_id}_{prompt_id}"
 
@@ -2115,10 +2192,13 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         'get_data_by_key', 'get_user_id', 'get_prompt_id', 'Generate_video',
         'get_user_uploaded_file', 'get_user_camera_inp', 'get_chat_history',
         'search_visual_history', 'search_long_term_memory',
-        'save_to_long_term_memory', 'create_scheduled_jobs',
+        'save_to_long_term_memory',
         'send_message_to_user', 'send_presynthesized_video_to_user',
         'send_message_in_seconds', 'google_search',
     }
+    # create_scheduled_jobs is NOT in the filter: the factory's twin is a
+    # create-flow stub; the real live-scheduling version stays inline
+    # above (see the #511 name-collision note at its definition).
     register_core_tools(
         [t for t in core_tools if t[0] in _MAIN_LEG_CORE], helper, assistant)
 
@@ -2261,9 +2341,9 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         # Tier-1 hierarchical gate: ONE detection per constructor, consumed
         # here and by the Tier-2 family loaders below.  Ungated, all 50
         # rendered defs cost 5,820 of the 6,144-token slot (2026-08-31).
-        from integrations.agent_engine.marketing_tools import detect_goal_tags
+        from integrations.agent_engine.marketing_tools import resolve_goal_tags
         from core.agent_tools import filter_service_tools
-        goal_tags = detect_goal_tags(goal or '')
+        goal_tags = resolve_goal_tags(stored_goal_tags, goal or '')
         _n_all_svc = len(svc_tools)
         svc_tools = filter_service_tools(goal_tags, svc_tools, svc_defs,
                                          service_tool_registry)

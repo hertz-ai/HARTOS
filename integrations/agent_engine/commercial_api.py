@@ -449,6 +449,88 @@ def require_api_key(f):
 commercial_api_bp = Blueprint('commercial_api', __name__)
 
 
+def _metered_backend_chat(prompt: str, prompt_id: str):
+    """The ONE self-POST the metered endpoints make to this node's own /chat.
+
+    Returns ``(ok, text, status_code)``.
+
+    These two call sites were the 4th and 5th instances of the cdd379ad
+    defect: ``cdd379ad`` fixed the speculative-dispatcher legs, ``272c4315``
+    called itself "the third instance" (worker_loop) and ``503d8e98``
+    consolidated them -- all three caller audits missed the *billed* ones.
+
+    Bare, the self-POST is answered 401 by ``security/middleware.py`` gate 2
+    on the central/regional tiers.  ``pooled_post`` does NOT call
+    ``raise_for_status()`` (``core/http_pool.py``), so that 401 never raised,
+    the callers' ``except`` never fired, ``.json()`` yielded the error body,
+    ``.get('response')`` yielded ``''`` and the customer was handed
+    ``success: True`` with an empty answer -- and billed for it.
+
+    Deliberately NOT routed through ``dispatch.local_chat_dispatch``: that
+    helper applies the daemon yield policy (``is_user_recently_active()`` ->
+    ``'deferred'``) which exists to stop *background* work stealing the LLM
+    from a human.  A paying customer's synchronous request is not background
+    work, so inheriting that gate would trade this bug for a worse one.  What
+    is shared with the other callers is the credential helper itself.
+    """
+    from core.http_pool import pooled_post
+    from integrations.agent_engine.dispatch import _internal_auth_headers
+
+    try:
+        result = pooled_post(
+            f'http://localhost:{get_port("backend")}/chat',
+            json={
+                'user_id': g.api_key['user_id'],
+                'prompt_id': prompt_id,
+                'prompt': prompt,
+                'create_agent': False,
+            },
+            headers=_internal_auth_headers(),
+            timeout=120)
+    except Exception as e:
+        # 502: we could not reach our own backend at all.
+        logger.warning(f"Metered {prompt_id} /chat transport error: {e}")
+        return False, '', 502
+
+    status = getattr(result, 'status_code', 200)
+    if status != 200:
+        # WARNING, not DEBUG: central emits nothing below WARNING after boot,
+        # which is why this leg was dead silently.  Same reasoning as the
+        # sibling fixes in speculative_dispatcher.py and worker_loop.py.
+        logger.warning(
+            f"Metered {prompt_id} /chat returned HTTP {status}")
+        return False, '', status
+
+    data = result.json() if hasattr(result, 'json') else {}
+    return True, (data.get('response') or ''), 200
+
+
+def _metered_backend_failure(endpoint: str, tokens_in: int, elapsed_ms: int,
+                             status: int):
+    """Record a metered call whose backend produced nothing, and tell the
+    customer the truth.
+
+    Billing 0 tokens is not a new policy -- ``require_api_key`` already
+    states it for the 429 path: "No log_usage() is called ... the backend was
+    never invoked, so no inference tokens are recorded."  The row is still
+    written (audit that the call happened, and its real status) but
+    ``cost_credits`` computes to 0 because both token counts are 0.
+
+    ``reserve_quota`` has already consumed one unit of monthly quota by this
+    point; that is the documented pre-execution reservation and is
+    deliberately left alone here.
+    """
+    CommercialAPIService.log_usage(
+        g.api_db, g.api_key['id'], endpoint,
+        tokens_in=0, tokens_out=0, compute_ms=elapsed_ms,
+        status_code=status)
+    return jsonify({
+        'success': False,
+        'error': 'Intelligence backend unavailable; this call was not billed',
+        'usage': {'tokens_in': 0, 'tokens_out': 0, 'compute_ms': elapsed_ms},
+    }), 503
+
+
 @commercial_api_bp.route('/api/v1/intelligence/chat', methods=['POST'])
 @require_api_key
 def intelligence_chat():
@@ -459,31 +541,20 @@ def intelligence_chat():
         return jsonify({'success': False, 'error': 'prompt required'}), 400
 
     t0 = time.time()
-    response_text = ''
     tokens_in = len(prompt.split())
-    tokens_out = 0
 
-    try:
-        from core.http_pool import pooled_post
-        result = pooled_post(f'http://localhost:{get_port("backend")}/chat', json={
-            'user_id': g.api_key['user_id'],
-            'prompt_id': 'api_intelligence',
-            'prompt': prompt,
-            'create_agent': False,
-        }, timeout=120)
-        resp_data = result.json() if hasattr(result, 'json') else {}
-        response_text = resp_data.get('response', '')
-        tokens_out = len(response_text.split())
-    except Exception as e:
-        logger.warning(f"Intelligence endpoint error: {e}")
-        response_text = 'Intelligence service temporarily unavailable'
-
+    ok, response_text, status = _metered_backend_chat(prompt, 'api_intelligence')
     elapsed_ms = int((time.time() - t0) * 1000)
 
+    if not ok:
+        return _metered_backend_failure(
+            '/v1/intelligence/chat', tokens_in, elapsed_ms, status)
+
+    tokens_out = len(response_text.split())
     CommercialAPIService.log_usage(
         g.api_db, g.api_key['id'], '/v1/intelligence/chat',
         tokens_in=tokens_in, tokens_out=tokens_out,
-        compute_ms=elapsed_ms)
+        compute_ms=elapsed_ms, status_code=200)
 
     return jsonify({
         'success': True,
@@ -507,26 +578,18 @@ def intelligence_analyze():
     prompt = f"Analyze the following document and answer: {question}\n\n{document[:5000]}"
     tokens_in = len(prompt.split())
 
-    try:
-        from core.http_pool import pooled_post
-        result = pooled_post(f'http://localhost:{get_port("backend")}/chat', json={
-            'user_id': g.api_key['user_id'],
-            'prompt_id': 'api_analyze',
-            'prompt': prompt,
-            'create_agent': False,
-        }, timeout=120)
-        resp = result.json() if hasattr(result, 'json') else {}
-        response_text = resp.get('response', '')
-        tokens_out = len(response_text.split())
-    except Exception as e:
-        logger.warning(f"Analysis endpoint error: {e}")
-        response_text = 'Analysis service temporarily unavailable'
-        tokens_out = 0
-
+    ok, response_text, status = _metered_backend_chat(prompt, 'api_analyze')
     elapsed_ms = int((time.time() - t0) * 1000)
+
+    if not ok:
+        return _metered_backend_failure(
+            '/v1/intelligence/analyze', tokens_in, elapsed_ms, status)
+
+    tokens_out = len(response_text.split())
     CommercialAPIService.log_usage(
         g.api_db, g.api_key['id'], '/v1/intelligence/analyze',
-        tokens_in=tokens_in, tokens_out=tokens_out, compute_ms=elapsed_ms)
+        tokens_in=tokens_in, tokens_out=tokens_out, compute_ms=elapsed_ms,
+        status_code=200)
 
     return jsonify({'success': True, 'analysis': response_text,
                     'usage': {'tokens_in': tokens_in, 'tokens_out': tokens_out,

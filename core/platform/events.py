@@ -394,8 +394,7 @@ class EventBus:
             wamp_wildcard = f'{WAMP_TOPIC_PREFIX}.'
             try:
                 await session.subscribe(bus._on_wamp_event, wamp_wildcard,
-                                        options=SubscribeOptions(match='prefix',
-                                                                  details_arg='details'))
+                                        options=SubscribeOptions(match='prefix', details_arg='details'))
                 logger.info("EventBus subscribed to WAMP prefix: %s", wamp_wildcard)
             except Exception as e:
                 logger.warning("WAMP wildcard subscribe failed: %r", e)

@@ -88,6 +88,82 @@ class TestAgentCreation:
                     # Should handle gracefully, not crash
                     pass
 
+    @staticmethod
+    def _llm_configs_passed(mocks):
+        """Every dict llm_config handed to a mocked autogen constructor."""
+        cfgs = []
+        for m in mocks.values():
+            for call in m.call_args_list:
+                cfg = call.kwargs.get('llm_config')
+                if isinstance(cfg, dict):
+                    cfgs.append(cfg)
+        return cfgs
+
+    def test_create_agents_honors_model_config_override(self, test_user_id, test_prompt_id, mock_flask_app, sample_config_json):
+        """#55, create path. The dispatcher stashes the model it chose for the
+        turn in thread-local before /chat reaches recipe(); every constructor
+        here used to read a module dict that captured config_list at import,
+        so an EXPERT turn created its agents on the default model. Assert the
+        override reaches every llm_config passed to autogen, with the same
+        max_tokens the module dict carried, and that with no override the
+        constructors fall back to config_list."""
+        from hartos.threadlocal import thread_local_data
+        override = [{"model": "expert-override", "api_key": "test",
+                     "base_url": "https://expert.example/v1"}]
+        fallback = [{"model": "test", "api_key": "test"}]
+        with patch('hartos.create_recipe.config_list', fallback):
+            thread_local_data.set_model_config_override(override)
+            try:
+                stack, mocks = _agent_mocks()
+                with stack:
+                    create_agents(test_user_id, "Test task", test_prompt_id)
+                    cfgs = self._llm_configs_passed(mocks)
+            finally:
+                thread_local_data.clear_model_config_override()
+            assert cfgs, "no llm_config reached any autogen constructor"
+            assert all(c['config_list'] == override for c in cfgs), cfgs
+            assert all(c.get('max_tokens') == 1500 for c in cfgs), cfgs
+
+            stack, mocks = _agent_mocks()
+            with stack:
+                create_agents(test_user_id, "Test task", test_prompt_id)
+                cfgs = self._llm_configs_passed(mocks)
+            assert cfgs
+            assert all(c['config_list'] == fallback for c in cfgs), cfgs
+
+    def test_create_time_agents_honors_model_config_override(self, test_user_id, test_prompt_id, sample_actions, mock_flask_app):
+        """Same contract for the time-agent constructors and their manager,
+        which recipe() builds on the request thread while the override is
+        live. From the scheduler thread there is no override and they fall
+        back to config_list, which is the pre-fix behaviour."""
+        from hartos.threadlocal import thread_local_data
+        override = [{"model": "expert-override", "api_key": "test",
+                     "base_url": "https://expert.example/v1"}]
+        fallback = [{"model": "test", "api_key": "test"}]
+        user_prompt = f'{test_user_id}_{test_prompt_id}'
+        mock_tasks = {user_prompt: Action(sample_actions)}
+        mock_recipe = {test_prompt_id: {"actions": sample_actions}}
+        with patch('hartos.create_recipe.config_list', fallback),                 patch('hartos.create_recipe.user_tasks', mock_tasks),                 patch('hartos.create_recipe.final_recipe', mock_recipe):
+            thread_local_data.set_model_config_override(override)
+            try:
+                stack, mocks = _agent_mocks()
+                with stack:
+                    create_time_agents(test_user_id, test_prompt_id, 'creator',
+                                       'test goal', sample_actions)
+                    cfgs = self._llm_configs_passed(mocks)
+            finally:
+                thread_local_data.clear_model_config_override()
+            assert cfgs, "no llm_config reached any autogen constructor"
+            assert all(c['config_list'] == override for c in cfgs), cfgs
+
+            stack, mocks = _agent_mocks()
+            with stack:
+                create_time_agents(test_user_id, test_prompt_id, 'creator',
+                                   'test goal', sample_actions)
+                cfgs = self._llm_configs_passed(mocks)
+            assert cfgs
+            assert all(c['config_list'] == fallback for c in cfgs), cfgs
+
     def test_create_time_agents_success(self, test_user_id, test_prompt_id, sample_actions, mock_flask_app):
         """Test time-based agent creation succeeds"""
         user_prompt = f'{test_user_id}_{test_prompt_id}'

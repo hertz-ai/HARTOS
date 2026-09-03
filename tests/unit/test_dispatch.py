@@ -756,7 +756,38 @@ class TestDrainInstructionQueue:
             result = dispatch_mod.drain_instruction_queue('u1')
 
         assert result is None
-        mock_q.fail_instruction.assert_called_once_with('i1', 'HTTP 500')
+        # transient=False is the load-bearing half: an HTTP 500 IS the
+        # instruction's problem and must burn one of its attempts, unlike a
+        # deferral (user active / LLM busy), which must not.
+        mock_q.fail_instruction.assert_called_once_with(
+            'i1', 'HTTP 500', transient=False)
+
+    def test_a_deferral_is_recorded_as_transient(self):
+        """A busy LLM must not consume the instruction's attempt allowance —
+        otherwise the new cap dead-letters healthy work because a human was
+        typing."""
+        inst = self._make_instruction('i1', 'hello')
+        plan = SimpleNamespace(
+            waves=[[inst]],
+            total_instructions=1,
+            batch_id='batch_004',
+        )
+        mock_q = MagicMock()
+        mock_q.acquire_drain_lock.return_value = True
+        mock_q.pull_execution_plan.return_value = plan
+        mock_queue_mod = MagicMock()
+        mock_queue_mod.get_queue.return_value = mock_q
+
+        with patch.dict('sys.modules', {
+            'integrations.agent_engine.instruction_queue': mock_queue_mod,
+        }), patch.object(dispatch_mod, 'local_chat_dispatch',
+                         return_value=('deferred', None)):
+            result = dispatch_mod.drain_instruction_queue('u1')
+
+        assert result is None
+        args, kwargs = mock_q.fail_instruction.call_args
+        assert kwargs.get('transient') is True, \
+            'a deferral must not burn an attempt'
 
     def test_all_fail_returns_none(self):
         """Returns None when all instructions fail."""

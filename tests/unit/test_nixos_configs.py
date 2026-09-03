@@ -4328,3 +4328,57 @@ class TestNoEvalTimeReadOfAnInterpolatedSource:
             "the timeout must still be derived from spectrum.json, via path "
             "concatenation")
         assert 'readFile "${hartSrc}' not in src
+
+
+class TestFirstPaintInferenceGate:
+    """The compositor's first paint must not be starved by boot-time inference.
+
+    hart-llm's ~68s model-load warmup and hart-agent-daemon's autonomous goal
+    dispatch are heavy and, left only `wantedBy hart.target`, run inside
+    hart-comp's shellPaintTimeoutSeconds window — pushing first paint past the
+    budget so the supervisor HANG-drops native to sway (recovered only on the
+    NEXT boot via re-promotion). hart-await-first-paint orders both AFTER the
+    session's shell-ready marker so native latches on the FIRST boot. These
+    assertions pin the ordering so a refactor can't silently drop it.
+    """
+
+    def _sup(self):
+        return read_nix(os.path.join(MODULES_DIR, "hart-session-supervisor.nix"))
+
+    def test_gate_service_exists(self):
+        assert "hart-await-first-paint" in self._sup(), (
+            "the first-paint inference gate service is gone — boot-time inference "
+            "can starve the compositor's first paint again")
+
+    def test_gate_orders_before_both_inference_services(self):
+        src = self._sup()
+        i = src.index("hart-await-first-paint =")
+        block = src[i:i + 1600]
+        assert 'before = [' in block and 'hart-llm.service' in block \
+            and 'hart-agent-daemon.service' in block, (
+            "the gate must be ordered BEFORE both hart-llm and hart-agent-daemon; "
+            "dropping either lets that service race first paint")
+
+    def test_gate_is_ordering_only_never_a_hard_requirement(self):
+        """A failed/absent gate must never keep inference (or the boot) stuck: it
+        is `before` its consumers, never `requires`/`wants`-ed BY them, and it
+        releases on a bounded timeout."""
+        src = self._sup()
+        i = src.index("hart-await-first-paint =")
+        block = src[i:i + 1600]
+        # consumers must not hard-depend on the gate
+        assert "requires = [" not in block, (
+            "the gate must be pure ordering, not a requirement that can wedge boot")
+        # bounded release: derives its wait from the same paint budget
+        assert "shellPaintTimeoutSeconds" in block, (
+            "the gate's wait bound must derive from shellPaintTimeoutSeconds, not "
+            "a hardcoded number that drifts from the watchdog it protects")
+
+    def test_gate_waits_on_the_canonical_shell_ready_marker(self):
+        src = self._sup()
+        i = src.index("hart-await-first-paint =")
+        block = src[i:i + 1600]
+        assert "readyFlag" in block, (
+            "the gate must wait on the same shell-ready marker the supervisor's "
+            "own paint watchdog uses (readyFlag), so it resolves for whichever "
+            "tier paints — not a private path")
