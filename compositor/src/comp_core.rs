@@ -471,6 +471,18 @@ pub trait CompState:
     /// every backend that can render the native scene supplies one.
     fn text_rasterizer_mut(&mut self) -> &mut crate::text_render::TextRasterizer;
 
+    /// Both native-scene caches at once, as DISJOINT field borrows. `lower_scene`
+    /// walks one leaf list that interleaves Text runs (rasterizer) and OrbSlots
+    /// (orb cache), so it must hold BOTH `&mut` across the loop — which the separate
+    /// `text_rasterizer_mut`/`orb_mut` accessors cannot give (each borrows all of
+    /// `self`). One combined accessor split-borrows the two fields, so the lowering
+    /// stays a SINGLE path shared by `render_native_scene` (via State) and its test
+    /// (via directly-constructed caches). Required so every native-capable backend
+    /// supplies both.
+    fn native_scene_caches(
+        &mut self,
+    ) -> (&mut crate::text_render::TextRasterizer, &mut OrbCache);
+
     // ── IPC event fan-out (window.opened/closed/focused…). The winit backend pushes
     //    framed JSON to its `IpcState` subscribers; the DRM backend logs the edge.
     //    The shared WM edges call this so the event surface is identical on both. ──
@@ -1941,11 +1953,13 @@ where
 /// windows (faded) → Bottom/Background layers.
 /// Generic over R so BOTH backends build the identical frame; the backend then binds its
 /// framebuffer + draws this slice. This is the single source of the desktop's z-order.
-/// NATIVE SHELL M3 GL LOWERING (first cut): lower the native shell scene to render
-/// elements. Only Rect leaves (top bar, taskbar, hero and card tiles) become
-/// SolidColorRenderElements for now; Text (glyph atlas), Image (texture) and OrbSlot
-/// (reuse the M2 orb element) are the M3 remainder. Gated by `native_shell_on` at the
-/// call site, so with the flag OFF this never runs.
+/// NATIVE SHELL M3 GL LOWERING: lower the native shell scene to render elements.
+/// Rect leaves (top bar, taskbar, hero and card tiles) become SolidColorRenderElements;
+/// Text runs are shaped + rasterized into cached MemoryRenderBuffers; OrbSlots reuse the
+/// M2 orb texture. Image (texture) is the remaining leaf kind. Gated by `native_shell_on`
+/// at the call site, so with the flag OFF this never runs. The actual lowering lives in
+/// `lower_scene` (State-free, so it is render-tested); this wrapper just pulls the scene
+/// and caches off `state`.
 ///
 /// FIRST-CUT alloc note: builds the scene and one SolidColorBuffer per rect PER FRAME.
 /// That violates the zero-per-frame-alloc NFR on purpose: step one is proving the
@@ -1961,12 +1975,39 @@ pub fn render_native_scene<S, R>(
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Send + Clone + 'static,
 {
+    // Pull the scene + caches OFF `state` here, then hand the concrete pieces to
+    // `lower_scene`. The demo scene is the fallback until a `shell.compose` IPC feed
+    // stores one. Energy is read before the cache borrow (a plain f32). This is the
+    // ONLY caller that goes through State; the render test calls `lower_scene`
+    // directly with constructed caches, so there is one lowering path, not two.
     let home = state
         .native_home()
         .cloned()
         .unwrap_or_else(crate::scene::HomeCompose::demo);
+    let orb_energy = state.orb_energy();
+    let (rasterizer, orb_cache) = state.native_scene_caches();
+    lower_scene(&home, size, renderer, rasterizer, orb_cache, orb_energy, elements);
+}
+
+/// Lower a `HomeCompose` to render elements against the concrete caches — the
+/// State-free core of `render_native_scene`, so it is unit-testable with a
+/// `PixmanRenderer` + freshly-constructed caches (no compositor State needed). The
+/// leaf list interleaves Text (needs `rasterizer`) and OrbSlot (needs `orb_cache`),
+/// which is why both `&mut` are passed together rather than fetched per-leaf.
+pub fn lower_scene<R>(
+    home: &crate::scene::HomeCompose,
+    size: Size<i32, Physical>,
+    renderer: &mut R,
+    rasterizer: &mut crate::text_render::TextRasterizer,
+    orb_cache: &mut OrbCache,
+    orb_energy: f32,
+    elements: &mut Vec<HartRenderElement<R>>,
+) where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Send + Clone + 'static,
+{
     let theme = crate::scene::Theme::cosmic_default();
-    let tree = crate::scene::layout_home(size.w as f32, size.h as f32, &home, &theme);
+    let tree = crate::scene::layout_home(size.w as f32, size.h as f32, home, &theme);
 
     let mut leaves: Vec<&crate::scene::SceneNode> = Vec::new();
     tree.flatten(&mut leaves);
@@ -1999,7 +2040,7 @@ pub fn render_native_scene<S, R>(
                 if rect.w < 1.0 || rect.h < 1.0 || text.is_empty() {
                     continue;
                 }
-                let buffer = state.text_rasterizer_mut().rasterize(
+                let buffer = rasterizer.rasterize(
                     text,
                     *size_px,
                     rect.w as i32,
@@ -2030,8 +2071,7 @@ pub fn render_native_scene<S, R>(
                     continue;
                 }
                 let side = (size.w.min(size.h) as f32 * 0.30) as i32;
-                let energy = state.orb_energy();
-                if let Some((buffer, motion)) = state.orb_mut().current(side, energy) {
+                if let Some((buffer, motion)) = orb_cache.current(side, orb_energy) {
                     let dst = (rect.w.min(rect.h) * motion.scale) as i32;
                     if dst < 1 {
                         continue;
@@ -3154,5 +3194,80 @@ mod tests {
     fn workspace_fade_constant_is_short_and_positive() {
         assert!(WS_FADE_MS > 0 && WS_FADE_MS <= 500, "ws fade should be a short ramp");
         assert!(FADE_IN_MS > 0 && FADE_IN_MS <= 500, "map fade should be a short ramp");
+    }
+}
+
+// NATIVE SHELL PARITY PROGRAM, M3 render proof. Gated on `smithay` because it uses
+// the real `PixmanRenderer` (the never-fail software floor, no GPU) to exercise the
+// SAME `lower_scene` the DRM/pixman frame path runs. This closes the gap the other
+// tests leave: scene.rs proves LAYOUT, text_render.rs proves colour packing, and the
+// build proves the API TYPE-checks — but only actually lowering a scene against a
+// live renderer proves the buffers IMPORT and the elements are produced. Runs headless
+// in CI (pixman is pure CPU), so the native chrome is validated without the box.
+#[cfg(all(test, feature = "smithay"))]
+mod native_render_tests {
+    use super::*;
+    use smithay::backend::renderer::element::Element;
+    use smithay::backend::renderer::pixman::PixmanRenderer;
+
+    #[test]
+    fn demo_scene_lowers_and_imports_buffers_on_pixman() {
+        // The never-fail software renderer of record — allocates with no GPU, so this
+        // holds in any CI sandbox.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (1280, 800).into();
+
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        lower_scene(
+            &home,
+            size,
+            &mut renderer,
+            &mut rasterizer,
+            &mut orb,
+            0.5,
+            &mut elements,
+        );
+
+        // The demo home is a full desktop (top bar + hero + rows + taskbar), so it
+        // lowers to a non-trivial element set, not one stray rect.
+        assert!(
+            elements.len() >= 3,
+            "demo scene lowered to only {} elements",
+            elements.len()
+        );
+
+        // Panels/ground lower to Solid rects; the orb (and text, when a font is
+        // present) lower to Memory elements. A Memory element exists ONLY when
+        // `MemoryRenderBufferRenderElement::from_buffer` returned Ok, so its presence
+        // is evidence the MemoryRenderBuffer -> PixmanRenderer ImportMem path actually
+        // works — the demo scene always carries orb slots, so this never depends on
+        // fonts being installed in the sandbox.
+        let solids = elements
+            .iter()
+            .filter(|e| matches!(e, HartRenderElement::Solid(_)))
+            .count();
+        let memory = elements
+            .iter()
+            .filter(|e| matches!(e, HartRenderElement::Memory(_)))
+            .count();
+        assert!(solids >= 1, "expected panel/ground rects, got {solids}");
+        assert!(
+            memory >= 1,
+            "orb/text buffers must import as Memory elements, got {memory}"
+        );
+
+        // Every lowered element has a positive on-screen footprint — nothing collapsed
+        // to zero area (the <1px skip) or lowered with an empty box.
+        for e in &elements {
+            let g = e.geometry(Scale::from(1.0));
+            assert!(
+                g.size.w > 0 && g.size.h > 0,
+                "element lowered with empty geometry: {g:?}"
+            );
+        }
     }
 }

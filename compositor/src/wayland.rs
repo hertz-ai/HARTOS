@@ -409,6 +409,11 @@ impl CompState for State {
     fn orb_mut(&mut self) -> &mut crate::comp_core::OrbCache {
         &mut self.orb
     }
+    fn native_scene_caches(
+        &mut self,
+    ) -> (&mut crate::text_render::TextRasterizer, &mut crate::comp_core::OrbCache) {
+        (&mut self.text_rasterizer, &mut self.orb)
+    }
     fn emit_window_event(&mut self, event: &str, window: &Window, handle: &str) {
         // Fan the edge out over the SHARED framed-JSON IPC (the same socket the winit
         // backend serves), AND mirror it to the WindowRecord-typed summon/foreign sink

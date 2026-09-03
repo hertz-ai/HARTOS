@@ -385,6 +385,11 @@ impl CompState for State {
     fn text_rasterizer_mut(&mut self) -> &mut crate::text_render::TextRasterizer {
         &mut self.text_rasterizer
     }
+    fn native_scene_caches(
+        &mut self,
+    ) -> (&mut crate::text_render::TextRasterizer, &mut crate::comp_core::OrbCache) {
+        (&mut self.text_rasterizer, &mut self.orb)
+    }
     /// winit OVERRIDE: the shared flag-flip/log PLUS fail any in-flight screencopy
     /// frames so no capture queued just-as-the-kill-engaged leaks a frame painted before
     /// the black surface (winit owns the read-back queue; the DRM backend has none yet,
