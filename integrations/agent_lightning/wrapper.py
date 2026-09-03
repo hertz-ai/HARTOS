@@ -233,7 +233,49 @@ class AgentLightningWrapper:
                                 # retrying, fall through to report+fallback.
                                 break
 
-                    # Retries exhausted (or a different error surfaced).
+                    # Retries exhausted with the SAME (tools-bearing) request.
+                    # Final recovery: the model keeps botching tool-call JSON,
+                    # but the conversation already carries the tool RESULTS it
+                    # needs — measured 2026-09-03 on the Auto Research agent,
+                    # google_search returned real 2024 articles into history and
+                    # then the synthesis turn 500'd on its OWN malformed tool
+                    # call.  Re-sampling with tools present just reproduces the
+                    # bad call.  Force ONE tool-less resample so the model
+                    # synthesises PROSE from what it already has instead of
+                    # emitting another unparseable call.  Reuses AutoGen's own
+                    # client construction (OpenAIWrapper), restored in finally;
+                    # only fires after the tools-bearing retries are exhausted,
+                    # so the happy path and the "recovered on retry" path above
+                    # are untouched.
+                    try:
+                        _cfg = getattr(self.agent, 'llm_config', None)
+                        if isinstance(_cfg, dict) and _cfg.get('tools'):
+                            from autogen import OpenAIWrapper
+                            _saved_cfg = _cfg
+                            _saved_client = getattr(self.agent, 'client', None)
+                            try:
+                                _cfg_notools = {k: v for k, v in _cfg.items()
+                                                if k != 'tools'}
+                                self.agent.llm_config = _cfg_notools
+                                self.agent.client = OpenAIWrapper(**_cfg_notools)
+                                _text = original_func(*args, **kwargs)
+                            finally:
+                                self.agent.llm_config = _saved_cfg
+                                if _saved_client is not None:
+                                    self.agent.client = _saved_client
+                            if _text:
+                                logger.info(
+                                    "[TOOLCALL-PARSE-500] recovered via "
+                                    "tool-less synthesis — model produced a "
+                                    "reply from the tool results already in "
+                                    "history instead of a fresh tool call")
+                                return _text
+                    except Exception as _tl_e:
+                        logger.warning(
+                            "[TOOLCALL-PARSE-500] tool-less synthesis retry "
+                            "failed (%s) — falling back to the apology string",
+                            _tl_e)
+
                     # Route to the canonical self-heal pipeline so a
                     # SUSTAINED pattern of toolcall-500s on this agent's
                     # model creates a self_heal goal (e.g. "enable
