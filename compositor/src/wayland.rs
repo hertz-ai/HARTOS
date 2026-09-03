@@ -248,6 +248,8 @@ pub struct State {
     pub native_shell_on: bool,
     /// NATIVE SHELL M3: the latest home_compose scene from the shell.compose IPC verb.
     pub native_home: Option<crate::scene::HomeCompose>,
+    /// NATIVE SHELL M3 text: cosmic-text rasterizer (FontSystem enumerated once).
+    pub text_rasterizer: crate::text_render::TextRasterizer,
     pub black_buffer: smithay::backend::renderer::element::solid::SolidColorBuffer,
     /// NATIVE SHELL M1 — the composed aura backdrop, cached across frames so the
     /// per-pixel compose runs once per (mode, theme) rather than every frame.
@@ -391,6 +393,9 @@ impl CompState for State {
     }
     fn set_native_home(&mut self, home: crate::scene::HomeCompose) {
         self.native_home = Some(home);
+    }
+    fn text_rasterizer_mut(&mut self) -> &mut crate::text_render::TextRasterizer {
+        &mut self.text_rasterizer
     }
     fn set_capture_blocked_flag(&mut self, on: bool) {
         self.capture_blocked = on;

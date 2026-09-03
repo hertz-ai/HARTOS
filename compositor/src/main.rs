@@ -129,6 +129,12 @@ mod orb;
 #[cfg(any(feature = "winit", feature = "smithay"))]
 mod scene;
 
+// NATIVE SHELL M3 text: cosmic-text shaping+rasterization into cached
+// MemoryRenderBuffers (src/text_render.rs). Gated like scene/bloom/orb; its only
+// consumer is comp_core's native-scene lowering.
+#[cfg(any(feature = "winit", feature = "smithay"))]
+mod text_render;
+
 // ── Phase-5 Smithay handler BODIES (CI-COMPILE only) ──
 // The real xdg-shell / XWayland / xdg-decoration / wlr-foreign-toplevel-management
 // handler bodies live in `wayland.rs`, gated behind the `smithay` cargo feature

@@ -276,6 +276,9 @@ pub struct State {
     /// NATIVE SHELL M2 — the voice orb, composed once and animated per frame by
     /// scale+alpha on the GPU.
     pub orb: crate::comp_core::OrbCache,
+    /// NATIVE SHELL M3 text: cosmic-text rasterizer. The dev build carries it too
+    /// (the trait method is required); native_shell_on is off by default here.
+    pub text_rasterizer: crate::text_render::TextRasterizer,
 }
 
 impl State {
@@ -378,6 +381,9 @@ impl CompState for State {
     }
     fn orb_mut(&mut self) -> &mut crate::comp_core::OrbCache {
         &mut self.orb
+    }
+    fn text_rasterizer_mut(&mut self) -> &mut crate::text_render::TextRasterizer {
+        &mut self.text_rasterizer
     }
     /// winit OVERRIDE: the shared flag-flip/log PLUS fail any in-flight screencopy
     /// frames so no capture queued just-as-the-kill-engaged leaks a frame painted before
@@ -1125,6 +1131,7 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         bloom: Default::default(),
         // NATIVE SHELL M2 — the voice orb, same lazy-compose contract.
         orb: Default::default(),
+        text_rasterizer: crate::text_render::TextRasterizer::new(),
     };
 
     // 6. (No calloop Generic source for the Display â€” see step 1. The Display is

@@ -62,6 +62,7 @@ default = []
 smithay = [
     "dep:smithay",
     "dep:calloop",
+    "dep:cosmic-text",
     # M8 — the com.hart.Compositor IPC server (src/ipc.rs) is now SHARED by both
     # backends (re-gated to `any(winit, smithay)`), so the DRM build needs its
     # framed-JSON deps too. Same two crates the winit feature pulls — symmetric.
@@ -99,6 +100,7 @@ smithay = [
 winit = [
     "dep:smithay",
     "dep:calloop",
+    "dep:cosmic-text",
     # M4 — the com.hart.Compositor IPC server (src/ipc.rs) speaks framed JSON over a
     # Unix socket. `serde` is already in the tree (smithay pulls it); `serde_json` is
     # the only direct add. Both keyed to the feature that compiles ipc.rs so the
@@ -116,6 +118,7 @@ winit = [
 ]
 
 [dependencies]
+cosmic-text = { version = "0.14.2", optional = true }
 # The DEFAULT (no-feature) build is PURE LOGIC: the Phase-3 render-path/boot-config
 # never-fail-floor decision AND the Phase-5 window bookkeeping (handle minting + the
 # manifest↔toplevel map + the no-phantom-window SummonApp state machine — all

@@ -367,6 +367,7 @@ impl OrbCache {
     }
 }
 
+
 // ════════════════════════════════════════════════════════════════════════════
 // THE `CompState` trait — the backend-agnostic accessor surface the shared WM brain
 // drives. Each backend's concrete `State` impls it by handing back references to the
@@ -464,6 +465,11 @@ pub trait CompState:
         None
     }
     fn set_native_home(&mut self, _home: crate::scene::HomeCompose) {}
+
+    /// NATIVE SHELL M3 text: the cosmic-text rasterizer, held on State so
+    /// FontSystem::new() (font enumeration) runs ONCE, not per frame. Required so
+    /// every backend that can render the native scene supplies one.
+    fn text_rasterizer_mut(&mut self) -> &mut crate::text_render::TextRasterizer;
 
     // ── IPC event fan-out (window.opened/closed/focused…). The winit backend pushes
     //    framed JSON to its `IpcState` subscribers; the DRM backend logs the edge.
@@ -1946,7 +1952,8 @@ where
 /// native scene scans out; step two retains the tree (rebuild on compose/resize only)
 /// and pools the buffers. Not shipped past M3 as-is.
 pub fn render_native_scene<S, R>(
-    state: &S,
+    state: &mut S,
+    renderer: &mut R,
     size: Size<i32, Physical>,
     elements: &mut Vec<HartRenderElement<R>>,
 ) where
@@ -1964,22 +1971,57 @@ pub fn render_native_scene<S, R>(
     let mut leaves: Vec<&crate::scene::SceneNode> = Vec::new();
     tree.flatten(&mut leaves);
     for leaf in leaves {
-        if let crate::scene::SceneNode::Rect { rect, color, .. } = leaf {
-            if rect.w < 1.0 || rect.h < 1.0 {
-                continue;
+        match leaf {
+            crate::scene::SceneNode::Rect { rect, color, .. } => {
+                if rect.w < 1.0 || rect.h < 1.0 {
+                    continue;
+                }
+                let mut buf = SolidColorBuffer::new(
+                    (rect.w as i32, rect.h as i32),
+                    [color.r, color.g, color.b, color.a],
+                );
+                let el = SolidColorRenderElement::from_buffer(
+                    &mut buf,
+                    (rect.x as i32, rect.y as i32),
+                    Scale::from(1.0),
+                    color.a,
+                    Kind::Unspecified,
+                );
+                elements.push(HartRenderElement::Solid(el));
             }
-            let mut buf = SolidColorBuffer::new(
-                (rect.w as i32, rect.h as i32),
-                [color.r, color.g, color.b, color.a],
-            );
-            let el = SolidColorRenderElement::from_buffer(
-                &mut buf,
-                (rect.x as i32, rect.y as i32),
-                Scale::from(1.0),
-                color.a,
-                Kind::Unspecified,
-            );
-            elements.push(HartRenderElement::Solid(el));
+            crate::scene::SceneNode::Text {
+                rect,
+                text,
+                size_px,
+                color,
+                ..
+            } => {
+                if rect.w < 1.0 || rect.h < 1.0 || text.is_empty() {
+                    continue;
+                }
+                let buffer = state.text_rasterizer_mut().rasterize(
+                    text,
+                    *size_px,
+                    rect.w as i32,
+                    rect.h as i32,
+                    [color.r, color.g, color.b, color.a],
+                );
+                let origin: Point<f64, Physical> = Point::from((rect.x as f64, rect.y as f64));
+                match MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    origin,
+                    buffer,
+                    Some(1.0),
+                    None,
+                    Some((rect.w as i32, rect.h as i32).into()),
+                    Kind::Unspecified,
+                ) {
+                    Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                    Err(err) => warn!(?err, "native scene: text run import failed"),
+                }
+            }
+            // Image + OrbSlot lowering are the M3 remainder; Container only groups.
+            _ => {}
         }
     }
 }
@@ -2020,7 +2062,7 @@ where
     //    here so native chrome sits above the app windows and below the cursor. A pure
     //    additive path: flag off = no-op, the WebView shell is untouched. ──
     if state.native_shell_on() {
-        render_native_scene(state, size, &mut elements);
+        render_native_scene(state, renderer, size, &mut elements);
     }
 
     let ws_alpha = workspace_fade_alpha(state);
