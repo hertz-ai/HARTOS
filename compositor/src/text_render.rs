@@ -24,7 +24,7 @@ use smithay::utils::Transform;
 /// The identity of one rasterized run. `size_bits`/`color` are the bit patterns of
 /// the f32 inputs so the key is `Eq + Hash` (f32 is neither). The box (w,h) is part
 /// of the key because layout width changes the wrap/clip.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct RunKey {
     text: String,
     size_bits: u32,
