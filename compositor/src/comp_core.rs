@@ -2020,21 +2020,25 @@ pub fn render_native_scene<S, R>(
                     Err(err) => warn!(?err, "native scene: text run import failed"),
                 }
             }
-            crate::scene::SceneNode::OrbSlot { rect, compact } => {
-                // The scene now OWNS the orb: the hardcoded M2 placement below is
-                // gated off when native_shell_on, so there is ONE orb path, not two.
-                // Only the large home orb for now; the compact top-bar orb-sm is a
-                // later refinement, so skip it.
-                if *compact || rect.w < 1.0 || rect.h < 1.0 {
+            crate::scene::SceneNode::OrbSlot { rect, .. } => {
+                // The scene OWNS the orb (the hardcoded M2 draw is gated off when
+                // native_shell_on), so ONE orb path. Both the large home orb and the
+                // compact top-bar orb-sm share ONE cached texture composed at a fixed
+                // size and render at their own slot size via GPU scale, so two slots in
+                // one frame never thrash the single-buffer OrbCache.
+                if rect.w < 1.0 || rect.h < 1.0 {
                     continue;
                 }
-                let side = rect.w.min(rect.h) as i32;
+                let side = (size.w.min(size.h) as f32 * 0.30) as i32;
                 let energy = state.orb_energy();
                 if let Some((buffer, motion)) = state.orb_mut().current(side, energy) {
-                    let drawn = (side as f32 * motion.scale) as i32;
+                    let dst = (rect.w.min(rect.h) * motion.scale) as i32;
+                    if dst < 1 {
+                        continue;
+                    }
                     let origin: Point<f64, Physical> = Point::from((
-                        (rect.x + (rect.w - drawn as f32) / 2.0) as f64,
-                        (rect.y + (rect.h - drawn as f32) / 2.0) as f64,
+                        (rect.x + (rect.w - dst as f32) / 2.0) as f64,
+                        (rect.y + (rect.h - dst as f32) / 2.0) as f64,
                     ));
                     match MemoryRenderBufferRenderElement::from_buffer(
                         renderer,
@@ -2042,7 +2046,7 @@ pub fn render_native_scene<S, R>(
                         buffer,
                         Some(motion.alpha),
                         None,
-                        Some((drawn, drawn).into()),
+                        Some((dst, dst).into()),
                         Kind::Unspecified,
                     ) {
                         Ok(e) => elements.push(HartRenderElement::Memory(e)),
