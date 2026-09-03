@@ -75,7 +75,18 @@ AUTOGEN_HISTORY_LIMIT: int = 50                  # message-count limit, unchange
 #                              across slots; default 1)
 LLAMA_CTX_SIZE_DEFAULT: int = 12288
 LLAMA_SLOTS_DEFAULT: int = 1
-WIRE_TRIM_SAFETY_MARGIN_TOKENS: int = 256       # headroom under the budget
+# headroom under the budget.  MUST cover the tokens llama-server ADDS when it
+# renders the Qwen chat template that count_tokens_for_messages never sees:
+# per-message <|im_start|>{role}\n ... <|im_end|>\n wrapping (~4-8 tok/msg over
+# ~40-msg reuse group chats) plus the tool/system block framing.  MEASURED LIVE
+# 2026-09-03: a reuse body the wire-trim passed as fitting its 9984 budget was
+# billed n_prompt_tokens=12567 by llama-server (400 exceed_context_size) — a
+# 2583-token gap the old 256 margin could not absorb, so the "zero-tolerance
+# overflow" guard let it through and the reuse turn died.  The body's raw
+# content tokenized to only 10421 (real /tokenize), so this is template-render
+# overhead, NOT a tokenizer under-count.  Reserve enough to cover it with head-
+# room; the cost is a slightly shorter trimmed history, which autogen tolerates.
+WIRE_TRIM_SAFETY_MARGIN_TOKENS: int = 2816       # 256 base + ~2560 template-render reserve
 WIRE_TRIM_MARKER: str = '...[truncated head]...\n'
 # Seed injected at the wire when an outbound body carries no role='user'
 # turn.  llama-server's Qwen3 chat template raises a hard 500 "No user
