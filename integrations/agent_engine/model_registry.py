@@ -508,8 +508,20 @@ def _register_defaults():
     try:
         from integrations.coding_agent.claude_code_backend import claude_code_available
         if claude_code_available():
-            from core.port_registry import get_port
-            _cc_base = 'http://127.0.0.1:%s/api/claude/v1' % get_port('backend')
+            # base_url must dial where HARTOS is actually SERVING, not the port it
+            # was ASSIGNED. get_port('backend') answers 6777, which is DEAD on the
+            # bundled desktop (HARTOS runs in-process on the Flask port 5000) — a
+            # reuse turn routed to this copilot backend then hits a closed socket
+            # (WinError 10061 -> openai APIConnectionError -> '_tier: direct'
+            # fallback, live-pinned 2026-09-03). Same #71 bug the co-pilot daemon
+            # carried (fixed a34b6244); get_local_backend_url is the ONE canonical
+            # resolver — it probes 'backend' then 'flask' and returns the first
+            # ACTUALLY LISTENING (standalone backend:6777 / bundled flask:5000),
+            # with HEVOLVE_BASE_URL winning. No hardcoded port, no parallel path.
+            # Guarded by tests/unit/test_copilot_backend_resolution.py +
+            # test_copilot_model_registry_base_url.
+            from core.port_registry import get_local_backend_url
+            _cc_base = get_local_backend_url().rstrip('/') + '/api/claude/v1'
             model_registry.register(ModelBackend(
                 model_id='claude-code',
                 display_name='Claude Code (Frontier, subscription)',
