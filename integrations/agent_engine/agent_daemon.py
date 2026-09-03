@@ -1366,17 +1366,24 @@ class AgentDaemon:
                 # flywheel looked idle for two days while it was in fact
                 # dispatching continuously into a queue nothing could claim.
 
-                # Find next unused agent (don't skip goal if current agent is taken)
-                agent = None
-                while dispatched < len(idle_agents) and dispatched < max_concurrent:
-                    candidate = idle_agents[dispatched]
-                    if candidate['user_id'] not in used_agents:
-                        agent = candidate
-                        break
-                    dispatched += 1
+                # Find the next agent nobody has taken this tick.
+                #
+                # This used to walk `dispatched` as a CURSOR into idle_agents
+                # while that same variable is also the dispatch COUNT the loop
+                # compares against max_concurrent.  Stepping over an
+                # already-taken agent therefore burned a concurrency slot, so
+                # on central (max_concurrent == 1, the headroom ceiling) the
+                # first taken agent ended the entire tick.
+                #
+                # Line-traced live 2026-09-03: the loop examined 2 of 5 goals,
+                # dispatched none, and still logged "dispatched 1 goal(s)" --
+                # the 1 was this cursor, not a dispatch.
+                agent = next(
+                    (c for c in idle_agents
+                     if c['user_id'] not in used_agents),
+                    None)
                 if agent is None:
                     break  # No more available agents
-                used_agents.add(agent['user_id'])
 
                 # Load product if marketing goal
                 product_dict = None
@@ -1481,6 +1488,14 @@ class AgentDaemon:
                         f"({backoff_info['failures']} failures, "
                         f"resume in {backoff_info['skip_until'] - time.time():.0f}s)")
                     continue
+
+                # Reserve the agent only now that the goal has cleared every
+                # gate.  Reserving it at selection time meant a goal skipped
+                # afterwards -- above all by build_prompt returning None, which
+                # every robot goal does on a host with no robot hardware, and
+                # central has none -- permanently consumed an idle agent and
+                # starved every goal behind it in the rotation.
+                used_agents.add(agent['user_id'])
 
                 goal.last_dispatched_at = datetime.utcnow()
 
