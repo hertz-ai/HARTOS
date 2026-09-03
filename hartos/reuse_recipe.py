@@ -2867,6 +2867,79 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     return assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group
 
 
+# One-shot re-steer budget per (user_prompt, action_id).  Bounds the
+# fabricated-completion guard below so it can NEVER loop or permanently stall
+# an action — after one re-steer it fails open and advances.
+_reuse_resteer_counts = {}
+
+
+def _reuse_action_text(user_prompt, current_action):
+    """Text of the current reuse action (1-based; get_action is 0-based, see
+    the StatusVerifier steering site).  Fail-open: '' on any error."""
+    try:
+        task = user_tasks.get(user_prompt)
+        if task is None:
+            return ''
+        return str(task.get_action(current_action - 1) or '')
+    except Exception:
+        return ''
+
+
+def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
+    """Registered tool names the current action NAMES but that produced ZERO
+    tool results anywhere in the group chat — i.e. a fabricated 'completed'.
+
+    Deliberately COARSE + fail-open (returns [] unless certain): only flags
+    when (a) the action text names a registered tool AND (b) the whole chat has
+    no role=='tool' result at all.  This catches the pure-fabrication case
+    (live 2026-09-03: revenue agent claimed get_api_revenue_stats returned 90%
+    with zero tool_execution) while NEVER stalling an action once any tool has
+    run, and NEVER touching prose actions that name no tool.
+    """
+    try:
+        text = _reuse_action_text(user_prompt, current_action).lower()
+        if not text:
+            return []
+        names = set()
+        for ag in agents:
+            try:
+                names.update((getattr(ag, '_function_map', None) or {}).keys())
+            except Exception:
+                pass
+            cfg = getattr(ag, 'llm_config', None)
+            if isinstance(cfg, dict):
+                for t in (cfg.get('tools') or []):
+                    fn = ((t or {}).get('function') or {}).get('name')
+                    if fn:
+                        names.add(fn)
+        referenced = [n for n in names if n and len(n) > 3 and n.lower() in text]
+        if not referenced:
+            return []
+        any_tool_ran = any(
+            isinstance(m, dict) and m.get('role') == 'tool'
+            for m in (getattr(group_chat, 'messages', None) or [])
+        )
+        if any_tool_ran:
+            return []
+        return referenced
+    except Exception:
+        return []
+
+
+def _reuse_should_resteer(user_prompt, action_id, group_chat, agents):
+    """(True, tool_name) if the action's 'completed' claim is fabricated and
+    the one-shot re-steer budget is unused (consumes it); else (False, None).
+    Fail-open on any uncertainty."""
+    fab = _reuse_fabricated_tools(user_prompt, action_id, group_chat, agents)
+    if not fab:
+        return (False, None)
+    key = (user_prompt, action_id)
+    if _reuse_resteer_counts.get(key, 0) >= 1:
+        return (False, None)
+    _reuse_resteer_counts[key] = _reuse_resteer_counts.get(key, 0) + 1
+    return (True, fab[0])
+
+
 def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "autogen.UserProxyAgent",
                        helper: "autogen.AssistantAgent", user_proxy: "autogen.UserProxyAgent",
                        manager: "autogen.GroupChatManager", group_chat: "autogen.GroupChat", message: str, role: str,
@@ -2945,6 +3018,21 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                             current_app.logger.warning(
                                 f"[HALLUCINATION?] LLM claims action_id={_llm_action_id} "
                                 f"but pipeline assigned {_reuse_current_action}")
+                        _rs_do, _rs_tool = _reuse_should_resteer(
+                            user_prompt, _reuse_current_action, group_chat, (assistant, helper))
+                        if _rs_do:
+                            current_app.logger.warning(
+                                f"[FABRICATED-COMPLETE] action {_reuse_current_action} reported "
+                                f"completed but its tool {_rs_tool} produced no result (0 tool "
+                                f"executions in chat) — re-steering once to actually run it")
+                            chat_instructor.initiate_chat(
+                                recipient=manager,
+                                message=("Do NOT mark this action complete — you have not actually "
+                                         f"called the required tool. Call {_rs_tool} now and use the "
+                                         "REAL value it returns; do not invent numbers. Then report "
+                                         "status."),
+                                clear_history=False, silent=False)
+                            continue
                         _next, _ok = _advance_reuse_action(user_prompt, _reuse_current_action, "reuse-w1", prompt_id)
                         if not _ok:
                             return ''
@@ -2967,6 +3055,21 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                                     current_app.logger.warning(
                                         f"[HALLUCINATION?] LLM claims action_id={_llm_claimed} "
                                         f"but pipeline has {_known}")
+                                _rs_do2, _rs_tool2 = _reuse_should_resteer(
+                                    user_prompt, _known, group_chat, (assistant, helper))
+                                if _rs_do2:
+                                    current_app.logger.warning(
+                                        f"[FABRICATED-COMPLETE] action {_known} reported completed "
+                                        f"but its tool {_rs_tool2} produced no result — re-steering "
+                                        f"once to actually run it")
+                                    chat_instructor.initiate_chat(
+                                        recipient=manager,
+                                        message=("Do NOT mark this action complete — you have not "
+                                                 f"actually called the required tool. Call {_rs_tool2} "
+                                                 "now and use the REAL value it returns; do not invent "
+                                                 "numbers. Then report status."),
+                                        clear_history=False, silent=False)
+                                    continue
                                 _next2, _ok2 = _advance_reuse_action(user_prompt, _known, "reuse-w1-regex", prompt_id)
                                 if not _ok2:
                                     return ''
