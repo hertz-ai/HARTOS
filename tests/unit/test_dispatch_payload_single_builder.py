@@ -52,12 +52,22 @@ def test_optional_fields_only_when_meaningful():
     assert 'goal_type' not in _build(goal_type='general')
 
 
-def test_both_dispatch_methods_use_the_one_builder():
-    import re
-    from pathlib import Path
-    src = Path(SpeculativeDispatcher.__module__.replace('.', '/') + '.py')
-    # resolve via the module file
-    import integrations.agent_engine.speculative_dispatcher as m
-    text = Path(m.__file__).read_text(encoding='utf-8')
-    assert text.count('self._build_dispatch_payload(') == 2, \
-        "both dispatch methods must call the one shared builder"
+def test_only_the_expert_path_uses_the_chat_shaped_builder():
+    """2026-08-19: _dispatch_to_model no longer builds an inner-/chat
+    payload at all — it hits the draft model's /v1/chat/completions
+    directly (see test_draft_first_dispatch.py::TestLoopPrevention), so it
+    has no reason to call _build_dispatch_payload any more. Only
+    _dispatch_expert_langchain still routes through /chat (it needs the
+    full tool registry for a real answer) and must keep using the shared
+    builder so its payload can't drift from this file's pinned fields."""
+    import inspect
+    from integrations.agent_engine.speculative_dispatcher import SpeculativeDispatcher as _SD
+    assert 'self._build_dispatch_payload(' not in inspect.getsource(
+        _SD._dispatch_to_model), (
+        "_dispatch_to_model must not build a /chat-shaped payload — it "
+        "should call the model server directly, never round-trip through "
+        "/chat (that re-enters the full HARTOS pipeline, see the 2026-08-19 "
+        "duplicate-turn fix)")
+    assert 'self._build_dispatch_payload(' in inspect.getsource(
+        _SD._dispatch_expert_langchain), (
+        "_dispatch_expert_langchain must keep using the one shared builder")

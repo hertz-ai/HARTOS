@@ -30,7 +30,18 @@ from unittest.mock import AsyncMock, MagicMock
 
 # ─── Slack ──────────────────────────────────────────────────────────
 
+_FAKE_SLACK_MODULES = (
+    'slack_bolt', 'slack_bolt.async_app', 'slack_bolt.adapter',
+    'slack_bolt.adapter.socket_mode',
+    'slack_bolt.adapter.socket_mode.async_handler',
+    'slack_sdk', 'slack_sdk.web', 'slack_sdk.web.async_client',
+    'slack_sdk.errors',
+)
+_installed_fake_slack = False
+
+
 def _install_fake_slack():
+    global _installed_fake_slack
     if 'slack_bolt' in sys.modules:
         return
     slack_bolt = types.ModuleType('slack_bolt')
@@ -70,6 +81,7 @@ def _install_fake_slack():
     sys.modules['slack_sdk.web'] = web_mod
     sys.modules['slack_sdk.web.async_client'] = async_client_mod
     sys.modules['slack_sdk.errors'] = errors_mod
+    _installed_fake_slack = True
 
 
 _install_fake_slack()
@@ -79,6 +91,20 @@ from integrations.channels.room_capable import (  # noqa: E402
 )
 from integrations.channels.slack_adapter import SlackAdapter  # noqa: E402
 from slack_sdk.errors import SlackApiError  # noqa: E402
+
+# Undo _install_fake_slack() now, not in a teardown_module: pytest COLLECTS
+# (imports) every test file before it EXECUTES any of them, so a
+# later-collected module that needs the real slack_sdk (e.g.
+# test_slack_send_result_raw.py imports slack_sdk.web.async_slack_response,
+# which this file's minimal stand-in doesn't have) would already have failed
+# to import by the time any teardown_module ran. slack_adapter and
+# SlackApiError above already hold their own bound references, so removing
+# the sys.modules entries here is safe. Only remove what this module
+# actually installed: if 'slack_bolt' was already present (real or another
+# fake), leave it.
+if _installed_fake_slack:
+    for _name in _FAKE_SLACK_MODULES:
+        sys.modules.pop(_name, None)
 
 
 def _make_slack(channels: dict | None = None,
@@ -347,18 +373,26 @@ class MatrixRoomCapableTest(unittest.TestCase):
 
 def _install_fake_teams():
     """Best-effort stubs for Teams' SDK surface — only shapes
-    ``TeamsAdapter`` references at module-import time."""
+    ``TeamsAdapter`` references at import time. Only called at the point
+    teams_adapter is actually imported (not at this file's own module
+    level): a bare ``types.ModuleType('aiohttp')`` with zero attributes
+    left sitting in sys.modules breaks every OTHER file's real
+    ``from aiohttp import ...`` for the rest of the pytest session.
+    Returns the module names this call actually added, so the caller can
+    remove exactly those and nothing else (a name already present, real
+    or another fake, is left alone).
+    """
+    added = []
     for mod_name in ('botbuilder', 'botbuilder.core',
                      'botbuilder.schema', 'aiohttp'):
         if mod_name not in sys.modules:
             sys.modules[mod_name] = types.ModuleType(mod_name)
+            added.append(mod_name)
     # Coarse-grained: re-route any deep symbol access to a permissive
     # MagicMock if the stub was created above.  This is sufficient for
     # the import-time surface; the adapter's stub join_room / leave_room
     # never call into the SDK anyway.
-
-
-_install_fake_teams()
+    return added
 
 
 class StubAdaptersTest(unittest.TestCase):
@@ -402,34 +436,43 @@ class RoomCapableContractTest(unittest.TestCase):
     """
 
     def test_every_room_capable_adapter_overrides_join_and_leave(self):
-        # Walk all adapter classes that import RoomCapableAdapter.
-        targets = [
-            ('integrations.channels.discord_adapter', 'DiscordAdapter'),
-            ('integrations.channels.slack_adapter', 'SlackAdapter'),
-            ('integrations.channels.telegram_adapter', 'TelegramAdapter'),
-            ('integrations.channels.extensions.matrix_adapter',
-             'MatrixAdapter'),
-            ('integrations.channels.extensions.teams_adapter',
-             'TeamsAdapter'),
-            ('integrations.channels.whatsapp_adapter', 'WhatsAppAdapter'),
-        ]
-        for mod_name, cls_name in targets:
-            try:
-                mod = __import__(mod_name, fromlist=[cls_name])
-                cls = getattr(mod, cls_name)
-            except Exception:
-                # If the heavy import chain isn't available in this
-                # test env, skip — not a contract failure.
-                continue
-            self.assertTrue(
-                issubclass(cls, RoomCapableAdapter),
-                f"{cls_name} must subclass RoomCapableAdapter")
-            self.assertNotEqual(
-                cls.join_room, RoomCapableAdapter.join_room,
-                f"{cls_name}.join_room must override the Mixin default")
-            self.assertNotEqual(
-                cls.leave_room, RoomCapableAdapter.leave_room,
-                f"{cls_name}.leave_room must override the Mixin default")
+        # teams_adapter's own `import aiohttp`/botbuilder need SOMETHING
+        # importable at ITS import time; installed here, right where it's
+        # used, and removed in the finally below rather than left to leak
+        # into every other test file collected/run afterward.
+        installed = _install_fake_teams()
+        try:
+            # Walk all adapter classes that import RoomCapableAdapter.
+            targets = [
+                ('integrations.channels.discord_adapter', 'DiscordAdapter'),
+                ('integrations.channels.slack_adapter', 'SlackAdapter'),
+                ('integrations.channels.telegram_adapter', 'TelegramAdapter'),
+                ('integrations.channels.extensions.matrix_adapter',
+                 'MatrixAdapter'),
+                ('integrations.channels.extensions.teams_adapter',
+                 'TeamsAdapter'),
+                ('integrations.channels.whatsapp_adapter', 'WhatsAppAdapter'),
+            ]
+            for mod_name, cls_name in targets:
+                try:
+                    mod = __import__(mod_name, fromlist=[cls_name])
+                    cls = getattr(mod, cls_name)
+                except Exception:
+                    # If the heavy import chain isn't available in this
+                    # test env, skip — not a contract failure.
+                    continue
+                self.assertTrue(
+                    issubclass(cls, RoomCapableAdapter),
+                    f"{cls_name} must subclass RoomCapableAdapter")
+                self.assertNotEqual(
+                    cls.join_room, RoomCapableAdapter.join_room,
+                    f"{cls_name}.join_room must override the Mixin default")
+                self.assertNotEqual(
+                    cls.leave_room, RoomCapableAdapter.leave_room,
+                    f"{cls_name}.leave_room must override the Mixin default")
+        finally:
+            for mod_name in installed:
+                sys.modules.pop(mod_name, None)
 
 
 if __name__ == '__main__':

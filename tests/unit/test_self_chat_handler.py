@@ -13,6 +13,7 @@ import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 
 # Arbitrary fake number for all fixtures — NEVER use a real one.
@@ -163,6 +164,23 @@ def test_handle_agent_500_returns_none(mock_post, handler, fake_message):
 
 
 @patch("integrations.channels.self_chat.pooled_post")
+def test_handle_honors_channel_agent_timeout_env_var(mock_post, handler,
+                                                       fake_message,
+                                                       monkeypatch):
+    """flask_integration._handle_message reads HEVOLVE_CHANNEL_AGENT_TIMEOUT
+    for every other channel; self_chat.py hardcoded 120 regardless, so a
+    self-chat turn gave up 5x sooner than an operator-configured budget on
+    the exact same slow local multi-agent turn."""
+    monkeypatch.setenv("HEVOLVE_CHANNEL_AGENT_TIMEOUT", "600")
+    mock_post.return_value = MagicMock(
+        status_code=200,
+        json=lambda: {"response": "ok"},
+    )
+    handler.handle(fake_message, None)
+    assert mock_post.call_args.kwargs["timeout"] == 600
+
+
+@patch("integrations.channels.self_chat.pooled_post")
 def test_handle_empty_reply_falls_back_to_noted(mock_post, handler,
                                                  fake_message):
     mock_post.return_value = MagicMock(
@@ -171,3 +189,23 @@ def test_handle_empty_reply_falls_back_to_noted(mock_post, handler,
     )
     reply = handler.handle(fake_message, None)
     assert reply == "✓ noted"
+
+
+@patch("integrations.channels.self_chat.pooled_post")
+def test_handle_timeout_still_replies_in_thread(mock_post, handler,
+                                                 fake_message):
+    """Found live 2026-08-31: a timed-out agent call returned the
+    "(timed out — try again)" text WITHOUT ever calling
+    _send_reply_in_thread, so the user got total silence — not even a
+    timeout notice. Every other return path in handle() sends a reply;
+    this one must too."""
+    mock_post.side_effect = requests.Timeout("boom")
+
+    reply = handler.handle(fake_message, None)
+
+    assert reply == "(timed out — try again)"
+    handler.registry.send_to_channel.assert_called_once()
+    args = handler.registry.send_to_channel.call_args.args
+    assert args[0] == "whatsapp"
+    assert args[1] == fake_message.chat_id
+    assert args[2] == "(timed out — try again)"

@@ -12,6 +12,19 @@ if sys.platform == 'win32':
     _asyncio_boot.set_event_loop_policy(_asyncio_boot.WindowsSelectorEventLoopPolicy())
 from core.subprocess_safe import no_window_kwargs
 import io
+
+# Diagnostic escape hatch: `kill -USR1 <pid>` dumps every thread's stack to
+# stderr (the server log).  Added while chasing a chat turn that hangs with
+# the local model idle -- py-spy needs root on macOS, this does not.  Costs
+# nothing until the signal is actually sent.
+try:
+    import faulthandler as _faulthandler
+    import signal as _signal
+    if hasattr(_signal, 'SIGUSR1'):
+        _faulthandler.register(_signal.SIGUSR1, all_threads=True, chain=True)
+except Exception:
+    pass
+
 if sys.platform == 'win32' and 'pytest' not in sys.modules:
     # Force UTF-8 encoding for stdout/stderr to prevent crashes with non-ASCII characters
     # Skip when running under pytest — pytest wraps stdout/stderr for capture,
@@ -1007,10 +1020,25 @@ if _is_bundled:
     # so ALL module loggers (hevolveai, langchain, etc.) are captured.
     app.logger.propagate = True
 else:
-    # Standalone: only Flask's logger gets the handlers
+    # Standalone: app.logger gets the handlers directly, AND (2026-08-06
+    # fix) so does root. Module-level loggers (logging.getLogger(__name__),
+    # used throughout integrations/channels/*.py and integrations/social/
+    # api_channels.py -- the actual channel-dispatch code, e.g. "Routing
+    # message from <channel>...") are children of ROOT, not of app.logger,
+    # so without this every one of those lines was silently dropped in
+    # standalone runs: confirmed live, zero lines from flask_integration/
+    # discord_adapter/api_channels across hours of real Discord testing,
+    # while reuse_recipe/helper (which use current_app.logger, routed
+    # below) logged constantly. Guarded by the same dedup tag the bundled
+    # branch above uses, so a module re-import never double-attaches.
     app.logger.addHandler(stream_handler)
     app.logger.addHandler(handler)
     app.logger.propagate = False
+    if not any(getattr(h, _HARTOS_HANDLER_TAG, False) for h in _root.handlers):
+        setattr(handler, _HARTOS_HANDLER_TAG, True)
+        setattr(stream_handler, _HARTOS_HANDLER_TAG, True)
+        _root.addHandler(handler)
+        _root.addHandler(stream_handler)
 
 # Security: Audit logging — redact API keys, JWTs, passwords from all logs
 try:
@@ -3776,6 +3804,9 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
     ).start()
 
 
+_whatsapp_adapter_lock = threading.Lock()
+
+
 def _ensure_whatsapp_live_adapter(
     user_id, sid: str = None, base: str = None,
 ) -> dict:
@@ -3811,41 +3842,100 @@ def _ensure_whatsapp_live_adapter(
         )
         integration = get_channel_integration()
 
-        existing = integration.registry.get('whatsapp')
-        if existing is not None:
+        # This function is called on every /whatsapp/qr poll (the mobile
+        # app's QRScannerScreen polls every ~3s) plus the chat-based
+        # Connect_Channel path — under concurrent requests, the
+        # check-then-register below was NOT atomic: two threads could
+        # both see "not registered yet" before either finished
+        # registering, each construct + register their OWN adapter with
+        # its OWN WebSocket connection to the gateway. The gateway then
+        # broadcasts every inbound message to ALL connected sockets, so
+        # N racing registrations meant N independent self_chat.handle()
+        # calls (and N separate /chat + LLM calls) for the SAME message —
+        # confirmed live 2026-07-28 as repeated near-duplicate replies
+        # sent to a real WhatsApp self-chat a few seconds apart. The lock
+        # makes the whole check+register sequence atomic so only ONE
+        # adapter (and one WebSocket connection) is ever created per
+        # process, no matter how many requests race here.
+        with _whatsapp_adapter_lock:
+            existing = integration.registry.get('whatsapp')
+            if existing is not None:
+                return {
+                    'success': True,
+                    'message': f'whatsapp adapter already registered '
+                               f'(account_id={getattr(existing, "_account_id", "?")})',
+                }
+
+            from integrations.channels.whatsapp_adapter import (
+                create_whatsapp_adapter,
+            )
+            gw_base = base or _os.environ.get(
+                'WHATSAPP_GATEWAY_URL',
+                f"http://127.0.0.1:"
+                f"{_os.environ.get('WHATSAPP_GATEWAY_PORT', '3000')}",
+            )
+            # Fetch the gateway's own-identity lookup so self-chat detection
+            # (SelfChatHandler.is_self_message) has something to match against
+            # — without this, owner_phone/owner_lid are never set and a
+            # self-chat message can never be recognized, regardless of which
+            # JID scheme WhatsApp uses for that account (own_jid for
+            # phone-based accounts, own_lid for LID/privacy-ID accounts).
+            own_jid = own_lid = None
+            try:
+                import json as _json
+                import urllib.request as _urlreq
+                with _urlreq.urlopen(
+                    f"{gw_base.rstrip('/')}/api/sessions/{sid}/status",
+                    timeout=5.0,
+                ) as _resp:
+                    _status = _json.loads(_resp.read().decode('utf-8', errors='replace'))
+                own_jid = _status.get('own_jid')
+                own_lid = _status.get('own_lid')
+            except Exception as _status_err:
+                log.warning(
+                    "_ensure_whatsapp_live_adapter: could not fetch own "
+                    "identity from gateway (self-chat detection will be "
+                    "unavailable until it succeeds): %s", _status_err)
+
+            adapter = create_whatsapp_adapter(
+                api_url=gw_base, account_id=sid,
+                phone_number=own_jid, owner_lid=own_lid,
+            )
+            integration.registry.register(adapter)
+
+            loop = integration._loop
+            if not (loop and loop.is_running()):
+                # Entrypoints that skip hartos_bootstrap's full sequence (e.g.
+                # the standalone hart_intelligence_entry.py used for local/dev
+                # testing) never call FlaskChannelIntegration.start() at all,
+                # so _loop stays None forever and every adapter sits
+                # registered-but-never-started — messages reach the gateway
+                # but nothing is listening. start() is idempotent (no-ops if
+                # already running) and cheap (an empty registry.start_all()
+                # the first time), so it's safe to trigger on-demand here
+                # rather than requiring the full boot sequence to have run.
+                integration.start()
+                for _ in range(50):  # ~5s for the background thread to spin up
+                    loop = integration._loop
+                    if loop and loop.is_running():
+                        break
+                    time.sleep(0.1)
+                else:
+                    return {
+                        'success': False,
+                        'error': 'channel event loop failed to start '
+                                 '(FlaskChannelIntegration.start() ran but '
+                                 '_loop never became live)',
+                    }
+            _aio.run_coroutine_threadsafe(adapter.start(), loop)
+            log.info(
+                "whatsapp live adapter registration scheduled "
+                "(account_id=%s, base=%s)", sid, gw_base,
+            )
             return {
                 'success': True,
-                'message': f'whatsapp adapter already registered '
-                           f'(account_id={getattr(existing, "_account_id", "?")})',
+                'message': f'whatsapp adapter registration scheduled for {sid}',
             }
-
-        from integrations.channels.whatsapp_adapter import (
-            create_whatsapp_adapter,
-        )
-        gw_base = base or _os.environ.get(
-            'WHATSAPP_GATEWAY_URL',
-            f"http://127.0.0.1:"
-            f"{_os.environ.get('WHATSAPP_GATEWAY_PORT', '3000')}",
-        )
-        adapter = create_whatsapp_adapter(api_url=gw_base, account_id=sid)
-        integration.registry.register(adapter)
-
-        loop = integration._loop
-        if not (loop and loop.is_running()):
-            return {
-                'success': False,
-                'error': 'channel event loop not running '
-                         '(FlaskChannelIntegration.start() never called)',
-            }
-        _aio.run_coroutine_threadsafe(adapter.start(), loop)
-        log.info(
-            "whatsapp live adapter registration scheduled "
-            "(account_id=%s, base=%s)", sid, gw_base,
-        )
-        return {
-            'success': True,
-            'message': f'whatsapp adapter registration scheduled for {sid}',
-        }
     except Exception as e:
         log.warning("_ensure_whatsapp_live_adapter failed: %r", e)
         return {'success': False, 'error': repr(e)[:300]}
@@ -8879,6 +8969,23 @@ except Exception:
     logging.getLogger(__name__).exception("<module>: swallowed Exception")
 
 
+@app.teardown_request
+def _disarm_turn_deadline(_exc=None):
+    """Disarm this request's wall-clock turn deadline, whatever happened.
+
+    Flask reuses worker threads, and the deadline lives in thread-local state.
+    A deadline left armed would be inherited by the NEXT request on the same
+    thread and expire it instantly.  teardown_request runs on every exit path
+    -- return, abort, or exception -- which a try/finally inside chat() could
+    not cover without wrapping several hundred lines and many returns.
+    """
+    try:
+        from reuse_recipe import _clear_turn_deadline
+        _clear_turn_deadline('')
+    except Exception:
+        pass
+
+
 @app.errorhandler(ImportError)
 def _optional_capability_missing(exc):
     """An absent OPTIONAL dependency is a known state, not a server fault.
@@ -8956,6 +9063,20 @@ def _config_is_buildable(cfg) -> bool:
 @app.route('/chat', methods=['POST'])
 @_mark_foreground
 def chat():
+    # TEMP DIAGNOSTIC (2026-08-19) -- pin the exact double-entry point.
+    # Gated off by default; remove once the caller is identified.
+    if os.environ.get('HEVOLVE_CHAT_ENTRY_TRACE', '').lower() in ('1', 'true', 'yes'):
+        import uuid as _uuid_dbg
+        import threading as _th_dbg
+        _entry_id = _uuid_dbg.uuid4().hex[:8]
+        try:
+            _raw_body = request.get_data(cache=True, as_text=True)
+        except Exception as _rb_e:
+            _raw_body = f'<unreadable: {_rb_e}>'
+        app.logger.warning(
+            f'[CHAT-ENTRY-TRACE] id={_entry_id} thread={_th_dbg.current_thread().name} '
+            f'remote={request.remote_addr!r} body_len={len(_raw_body)} '
+            f'body={_raw_body[:200]!r}')
     # ── G6: Authentication gate ──
     # Three-layer auth: API key > JWT > body user_id (backward compat)
     # HEVOLVE_API_KEY env var: if set, all requests MUST provide it.
@@ -9148,6 +9269,25 @@ def chat():
     req_tool = data.get('tools', None)
     file_id = data.get('file_id', None)
     prompt_id = data.get('prompt_id', None)
+
+    # ── Wall-clock bound on this turn, armed HERE rather than deeper in ──
+    #
+    # reuse_recipe.get_agent_response also arms it, but only as a fallback for
+    # callers that never come through /chat.  Arming at the request entry is
+    # what makes the bound mean what a user experiences: measured 2026-08-12
+    # on real Discord traffic, ~84s elapses between the message arriving and
+    # initiate_chat starting (routing, identity resolution, agent setup), so a
+    # 150s bound armed at initiate_chat let a real turn run 234s end-to-end.
+    #
+    # Thread-local, so it covers exactly this request; the teardown_request
+    # hook below disarms it on every exit path (chat() has many returns and no
+    # single try/finally to hang it off).
+    try:
+        from reuse_recipe import _begin_turn_deadline as _arm_turn_deadline
+        _arm_turn_deadline(f'{user_id}_{prompt_id}')
+    except Exception as _dl_err:      # never block a turn on the bound itself
+        app.logger.debug(f'turn deadline not armed: {_dl_err}')
+
     create_agent = data.get('create_agent', None)
     casual_conv = data.get('casual_conv', False)
     autonomous = data.get('autonomous', False)
@@ -9623,6 +9763,17 @@ def chat():
                     # escalates (Computer_Action/Shell are casual-only, so tasks
                     # route via Create_Agent -> CREATE).
                 else:
+                    # Only now — having decided to serve the draft's reply
+                    # as the final answer — fire the background expert.
+                    # The three branches above this one fall through to
+                    # their OWN synchronous full turn for this same prompt
+                    # instead of returning here; scheduling unconditionally
+                    # at classification time (the old behaviour) ran that
+                    # same turn again in the background for those cases —
+                    # the root cause of the 2026-08 duplicate-turn
+                    # investigation. See
+                    # speculative_dispatcher.schedule_expert_for_draft.
+                    dispatcher.schedule_expert_for_draft(result)
                     return _chat_reply(
                         user_id, request_id, result['response'],
                         Agent_status='Draft-First Mode',
@@ -10379,15 +10530,27 @@ def evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_
 
 
 def set_flags_to_enter_reuse_mode(no_of_flow, user_id, prompt_id=''):
+    """This only ever runs from the "all flows complete -> REUSE" branch
+    (its one call site) -- it has never meant "enter review mode", hence
+    the rename. It used to set review_agents[_ak] = True unconditionally,
+    which poisoned the SAME request's own outcome: the "resuming
+    in-progress creation" check a few lines later in chat() reads that
+    same key and stomps this function's correct create_agent=False
+    return value back to True, permanently trapping every later message
+    for this (user, prompt) in the creation flow even though the agent
+    was already fully built. Confirmed independently two ways: live
+    2026-08-23 09:42 (#684) as "Agent Already Created Successfully" raw
+    stub replies with the message never executed, and again 2026-08-24
+    testing a brand-new Slack binding against prompt_id=8888, where every
+    single message -- including the very first one from a user who had
+    never touched the agent before -- got stuck the same way.
+
+    All flow recipes exist -> the agent is BUILT; this turn is a
+    conversation, not a fresh creation.
+    """
     app.logger.info(f'{no_of_flow} Recipe Json exist Going to reuse')
     create_agent = False
     _ak = f'{user_id}_{prompt_id}'
-    # All flow recipes exist -> the agent is BUILT; this turn is a
-    # conversation.  review=True here sent every first turn on a
-    # completed agent into Phase-2 recipe(), which short-circuited
-    # 'Agent Already Created Successfully' — raw 34-char stub as the
-    # visible reply, message never executed, 'resumed - action
-    # complete' churn 16x (live 2026-08-23 09:42, #684).
     review_agents[_ak] = False
     conversation_agent[_ak] = True
     _touch_agent_timestamp(_ak)
@@ -12729,6 +12892,56 @@ def main():
         logging.getLogger(__name__).error(
             "Agent engine init failed — no seeded goal will ever execute on "
             "this node: %s", e, exc_info=True)
+
+    # Channel adapters: same class of gap as the agent engine above.
+    # hartos_bootstrap.py calls FlaskChannelIntegration.start() as part of the
+    # bundled boot sequence, but this standalone launcher never did — so
+    # `_loop` stayed None and every persisted UserChannelBinding sat dead
+    # until an unrelated WhatsApp code path happened to trigger start() on
+    # demand (see _ensure_whatsapp_live_adapter).  In practice that meant
+    # Discord/Telegram/Slack had to be re-bound by hand after every restart,
+    # even though the bindings table exists precisely to survive one.
+    #
+    # start() rehydrates adapters from those bindings and is idempotent, so a
+    # launcher that already started channels (Nunba) is unaffected.
+    try:
+        from integrations.channels.flask_integration import (
+            get_channel_integration, register_status_routes,
+        )
+        _channels = get_channel_integration()
+        # Inbound webhook seam, same omission as above: hartos_bootstrap and
+        # run_debug both call this, standalone never did — so the
+        # /channels/webhook/<channel_type> route did not exist here at all and
+        # EVERY webhook-based channel (google_chat, line, messenger,
+        # instagram, twitter, viber, wechat, zalo) was unreachable inbound,
+        # returning 404 to the provider. Must run before _serve_app.
+        try:
+            _channels.register_webhook_routes(app)
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "Inbound channel webhook routes not registered — webhook-based "
+                "channels cannot receive messages on this node: %s", e,
+                exc_info=True)
+        # Same class of gap again: hartos_bootstrap/run_debug reach these two
+        # routes via init_channels(app), which standalone never called — so
+        # GET /channels/status and POST /channels/send 404'd here even
+        # though _channels itself is live. register_status_routes wires them
+        # onto the SAME get_channel_integration() singleton rather than
+        # going through init_channels(), which would construct a second,
+        # separate FlaskChannelIntegration and orphan whatever this one
+        # already has running (e.g. a WhatsApp adapter started early by
+        # _ensure_whatsapp_live_adapter).
+        try:
+            register_status_routes(app, _channels)
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "/channels/status and /channels/send not registered: %s", e,
+                exc_info=True)
+        _channels.start()
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "Channel adapters not started — persisted channel bindings will "
+            "stay disconnected on this node: %s", e, exc_info=True)
 
     from core.port_registry import get_port
     _serve_app(app, host='0.0.0.0', port=get_port('backend'))

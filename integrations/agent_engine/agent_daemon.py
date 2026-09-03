@@ -584,22 +584,37 @@ class AgentDaemon:
         Delegates to the canonical ``NodeWatchdog.sleep_with_heartbeat``
         helper so a 480s exponential-backoff sleep can't silently age
         the heartbeat past the 300s frozen threshold. See the helper's
-        docstring for the full incident context. When the watchdog
-        isn't available (test mode, early boot) this falls back to a
-        plain ``time.sleep`` so behavior is unchanged.
+        docstring for the full incident context.
+
+        2026-08-06 fix: get_watchdog() used to be checked ONCE, at the
+        top of this call. agent_daemon.start() can fire before the
+        watchdog singleton exists and this thread gets registered
+        (integrations/social/__init__.py registers it later in boot) --
+        so the very first call, the long HEVOLVE_DAEMON_BOOT_DELAY
+        boot-grace sleep, hit get_watchdog() is None and committed to
+        the ENTIRE sleep (hours, when boot-delay is set high) in a bare
+        time.sleep() with zero heartbeats. By the time registration
+        happened moments later, the thread already looked stale, and
+        the watchdog force-restarted it every ~5 minutes for the rest
+        of the process's life -- defeating HEVOLVE_DAEMON_BOOT_DELAY
+        entirely. Now re-checks get_watchdog() every chunk instead of
+        once (also picks up self._running going False sooner, though a
+        full interruptible stop() still needs its own fix separately).
         """
-        try:
-            from security.node_watchdog import get_watchdog
-            wd = get_watchdog()
-            if wd is not None:
-                wd.sleep_with_heartbeat(
-                    'agent_daemon', seconds,
-                    stop_check=lambda: not self._running,
-                )
+        end = time.monotonic() + seconds
+        while self._running:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
                 return
-        except Exception:
-            pass
-        time.sleep(seconds)
+            chunk = min(10.0, remaining)
+            try:
+                from security.node_watchdog import get_watchdog
+                wd = get_watchdog()
+                if wd is not None:
+                    wd.heartbeat('agent_daemon')
+            except Exception:
+                pass
+            time.sleep(chunk)
 
     def _proactive_hive_tick(self):
         """Proactive hive daemon tick — exploration, self-promotion, and compute optimization.

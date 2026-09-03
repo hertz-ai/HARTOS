@@ -45,12 +45,33 @@ class ToolApiStyleIsTool(unittest.TestCase):
 
     def test_guard_is_not_vacuous(self):
         """The file must still register tools at all, and the tool style
-        must actually be in use - otherwise this guard checks nothing."""
+        must actually be in use - otherwise the sibling guard above checks
+        nothing.
+
+        2026-09-03: most of reuse_recipe.py's own register_for_llm calls
+        moved to core/agent_tools.py's register_core_tools()/register_dual()
+        -- the single source of truth for the core tool closures shared
+        with create_recipe.py -- so reuse_recipe.py now calls that instead
+        of repeating 20+ decorators inline, and register_dual's own
+        register_for_llm call (core/agent_tools.py) omits api_style
+        entirely, relying on autogen 0.3.2's "tool" default rather than
+        writing the literal api_style="tool" string. Counting either
+        vocabulary in reuse_recipe.py alone therefore undercounts; check
+        the canonical factory is wired in AND still builds a real tool set.
+        """
         src = _REUSE.read_text(encoding='utf-8', errors='replace')
-        self.assertGreater(src.count('register_for_llm'), 20,
-                           'register_for_llm vocabulary changed - re-point this guard')
-        self.assertGreater(src.count('api_style="tool"'), 20,
-                           'expected the 26 flipped registrations to use api_style="tool"')
+        self.assertIn(
+            'register_core_tools', src,
+            'reuse_recipe no longer wires the canonical core tool '
+            'registration (core.agent_tools.register_core_tools) - without '
+            'it there is no tool set left for the api_style guard above to '
+            'check')
+        _core_src = (_ROOT / 'core' / 'agent_tools.py').read_text(
+            encoding='utf-8', errors='replace')
+        self.assertGreater(
+            _core_src.count('tools.append(('), 20,
+            'core/agent_tools.py build_core_tool_closures() tool count '
+            'dropped - re-point this guard')
 
 
 if __name__ == '__main__':

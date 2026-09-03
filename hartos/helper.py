@@ -299,11 +299,14 @@ def _log_serp_outcome(tier: str, resp, rows) -> None:
         hit = next((m for m in _CHALLENGE_MARKERS if m in body.lower()), None)
         detail = (f"looks BLOCKED (page contains {hit!r})" if hit
                   else "no challenge markers, treat as a genuine empty result")
-        current_app.logger.warning(
+        _fallback_logger.warning(
             "keyless SERP tier %s: HTTP %s, fetched %d bytes, parsed 0 rows: %s",
             tier, getattr(resp, 'status_code', '?'), len(body), detail)
-    except Exception:
-        pass
+    except Exception as e:
+        # This function is diagnostic-only; a failure here must never
+        # affect the caller, but silently means the outage-vs-empty-result
+        # ambiguity this exists to resolve goes unlogged too.
+        _fallback_logger.debug(f"_log_serp_outcome itself failed: {e}")
 
 
 def _ddg_html_serp(query: str, max_results: int = 5) -> List[dict]:
@@ -399,8 +402,8 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
         rows = [r for r in rows if r['url']]
         if rows:
             return rows
-    except Exception:
-        pass
+    except Exception as e:
+        _fallback_logger.debug(f"_keyless_serp tier A (ddgs) failed, falling through: {e}")
     rows = _mojeek_serp(query, max_results)             # Tier B — Mojeek (primary)
     if rows:
         return rows
@@ -1948,8 +1951,10 @@ def get_frame(user_id, frame_store=None):
                     current_app.logger.info(
                         f"Frame for user_id {user_id} from FrameStore")
                     return frame[:, :, ::-1]  # BGR → RGB
-    except Exception:
-        pass
+    except Exception as e:
+        # Falls through to the Redis path below; log why FrameStore
+        # was skipped rather than silently landing on the legacy path.
+        _fallback_logger.debug(f"FrameStore lookup failed for user_id {user_id}: {e}")
 
     # Fallback: Redis (legacy path)
     serialized_frame = redis_client.get(user_id)
@@ -2111,10 +2116,7 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
     try:
         user_id = int(session_id.replace("user_", ""))
     except Exception as e:
-        try:
-            current_app.logger.warning(f"get_time_based_history: bad session_id {session_id}: {e}")
-        except Exception:
-            pass
+        _fallback_logger.warning(f"get_time_based_history: bad session_id {session_id}: {e}")
         return _json.dumps({'res': []})
 
     window = resolve_recall_window(start_date, end_date)
@@ -2150,22 +2152,16 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
                     db.close()
                 except Exception:
                     pass
-            try:
-                current_app.logger.info(
-                    f"Time-filtered history: {len(results)} rows in "
-                    f"{time.time() - start_time:.3f}s (window={win_lo}..{win_hi})"
-                )
-            except Exception:
-                pass
+            _fallback_logger.info(
+                f"Time-filtered history: {len(results)} rows in "
+                f"{time.time() - start_time:.3f}s (window={win_lo}..{win_hi})"
+            )
             return _json.dumps({'res_in_filter': results})
         except Exception as e:
-            try:
-                current_app.logger.warning(
-                    f"Time-filtered ConversationEntry query failed, "
-                    f"falling back to semantic: {e}"
-                )
-            except Exception:
-                pass
+            _fallback_logger.warning(
+                f"Time-filtered ConversationEntry query failed, "
+                f"falling back to semantic: {e}"
+            )
 
     try:
         from integrations.channels.memory.simplemem_langchain import SimpleMemChatMemory
@@ -2186,19 +2182,13 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
             final_res = {'res_in_filter': serialized}
         else:
             final_res = {'res_in_filter': []}
-        try:
-            current_app.logger.info(
-                f"SimpleMem search took {time.time() - start_time:.3f}s, "
-                f"{len(results)} results"
-            )
-        except Exception:
-            pass
+        _fallback_logger.info(
+            f"SimpleMem search took {time.time() - start_time:.3f}s, "
+            f"{len(results)} results"
+        )
         return _json.dumps(final_res)
     except Exception as e:
-        try:
-            current_app.logger.warning(f"SimpleMem search failed: {e}")
-        except Exception:
-            pass
+        _fallback_logger.warning(f"SimpleMem search failed: {e}")
         return _json.dumps({'res': []})
 
 def parse_date(date_str):

@@ -1803,3 +1803,103 @@ def hierarchy_inventory():
         return jsonify({'success': False, 'error': str(e)}), 500
     finally:
         db.close()
+
+
+# ─── TEMP: live internet-relay message test (remove after Ramesh cross-network test) ───
+
+_RELAY_TEST_LOG = []
+_RELAY_TEST_LOG_MAX = 100
+_relay_test_subscribed = False
+
+
+def _our_node_ids():
+    ids = set()
+    try:
+        from .peer_discovery import gossip
+        if gossip.node_id:
+            ids.add(gossip.node_id)
+    except Exception:
+        pass
+    try:
+        from security.node_integrity import get_node_identity
+        ids.add(get_node_identity().get('node_id', ''))
+    except Exception:
+        pass
+    return ids
+
+
+def _on_relay_test_event(topic, data, **kwargs):
+    # Our own system.health.snapshot / bus.telemetry.node fire every
+    # ~15-20s and were flooding the capped log, evicting the rare
+    # cross-node entry we actually care about before anyone looked. Skip
+    # anything that's identifiably ours; any deliberate debug.* test
+    # topic (debug.relay_test, debug.round.*, etc.) is rare enough — and
+    # worth seeing even when it's our own send, to confirm it actually
+    # went out — that it's always kept regardless of origin.
+    if not topic.startswith('debug.'):
+        nid = (data or {}).get('node_id') or (data or {}).get('from_node') or ''
+        if nid and any(nid.startswith(o) for o in _our_node_ids() if o):
+            return
+        if topic == 'system.health.snapshot' and (data or {}).get('platform') == 'Darwin':
+            return
+    _RELAY_TEST_LOG.append({'received_at': _time.time(), 'topic': topic, 'data': data})
+    del _RELAY_TEST_LOG[:-_RELAY_TEST_LOG_MAX]
+
+
+@discovery_bp.route('/api/social/_debug/relay_test/send', methods=['POST'])
+def _debug_relay_test_send():
+    """TEMP: publish a distinctive event over the EventBus/WAMP relay bridge."""
+    global _relay_test_subscribed
+    from core.platform.events import emit_event
+    from core.platform.registry import get_registry
+    from .peer_discovery import gossip
+    import uuid
+    if not _relay_test_subscribed:
+        try:
+            registry = get_registry()
+            if registry.has('events'):
+                bus = registry.get('events')
+                # Narrow on purpose: '*' would also capture this process's
+                # OWN purely-local events (config changes, resource-governor
+                # ticks, etc.), flooding the 20-entry cap before a real
+                # cross-node relay event had a chance to land in it.
+                bus.on('debug.relay_test', _on_relay_test_event)
+                bus.on('system.health.*', _on_relay_test_event)
+                bus.on('bus.telemetry.*', _on_relay_test_event)
+                bus.on('debug.round.*', _on_relay_test_event)
+                _relay_test_subscribed = True
+        except Exception as e:
+            logger.warning("relay_test: could not subscribe locally: %r", e)
+    data = request.get_json(force=True, silent=True) or {}
+    topic = data.get('topic', 'debug.relay_test')
+    payload = {
+        'from_node': gossip.node_id,
+        'message': data.get('message', 'ping'),
+        'nonce': uuid.uuid4().hex[:8],
+        'sent_at': _time.time(),
+    }
+    emit_event(topic, payload, async_=False)
+    return jsonify({'success': True, 'topic': topic, 'sent': payload})
+
+
+@discovery_bp.route('/api/social/_debug/relay_test/log')
+def _debug_relay_test_log():
+    """TEMP: what this node has received over the relay via debug.relay_test."""
+    return jsonify({'success': True, 'received': _RELAY_TEST_LOG})
+
+
+@discovery_bp.route('/api/social/_debug/relay_test/session')
+def _debug_relay_test_session():
+    """TEMP: raw WAMP session diagnostics, for comparing against a peer's."""
+    from core.platform.registry import get_registry
+    registry = get_registry()
+    if not registry.has('events'):
+        return jsonify({'success': False, 'error': 'events bus not bootstrapped'})
+    bus = registry.get('events')
+    return jsonify({
+        'success': True,
+        'wamp_connected': bus._wamp_connected,
+        'session': getattr(bus, '_wamp_debug', None),
+        'subscribed_topic': 'com.hartos.event.',
+        'match_policy': 'prefix',
+    })
