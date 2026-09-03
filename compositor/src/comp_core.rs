@@ -3415,7 +3415,10 @@ mod native_render_tests {
 
     #[test]
     fn demo_scene_composites_visible_pixels_on_pixman() {
-        use smithay::backend::renderer::{Bind, ExportMem, Offscreen};
+        // Color32F / Frame / draw_render_elements are cfg-gated to the winit path in
+        // this module's own imports, so bring them in directly for the smithay test.
+        use smithay::backend::renderer::utils::draw_render_elements;
+        use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen};
 
         // Compose the lowered scene into an offscreen pixman image OVER a magenta
         // sentinel the scene never paints, then read the pixels back. This is the
