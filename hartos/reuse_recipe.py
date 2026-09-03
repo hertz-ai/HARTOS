@@ -3344,6 +3344,30 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
     Mark action COMPLETED → TERMINATED, advance to next action, set ASSIGNED → IN_PROGRESS.
     Returns (next_action_id, True) if advanced, or (None, False) if all actions done or state error.
     """
+    # FABRICATION GATE (canonical single point — EVERY advance path calls this):
+    # refuse to mark a tool-naming action COMPLETED when its specific tool never
+    # executed in the group chat.  The StatusVerifier LLM self-attests
+    # "completed"/"done" and the model fabricates the tool's output (live
+    # 2026-09-03: revenue agent "92% verified", zero get_api_revenue_stats
+    # execution).  Bounded to ONE refusal per action then fails open (advances)
+    # so it can never permanently stall.  Reaches the group chat + agents via the
+    # session registry, so it works no matter which loop (w1/w2/main) advanced.
+    try:
+        from hartos.lifecycle_hooks import get_registered_groupchat
+        _gc = get_registered_groupchat(user_prompt)
+        if _gc is not None:
+            _agents = list(getattr(_gc, 'agents', None) or [])
+            _fab = _reuse_fabricated_tools(user_prompt, current_action_id, _gc, _agents)
+            _rk = (user_prompt, current_action_id)
+            if _fab and _reuse_resteer_counts.get(_rk, 0) < 1:
+                _reuse_resteer_counts[_rk] = _reuse_resteer_counts.get(_rk, 0) + 1
+                current_app.logger.warning(
+                    f"[FABRICATED-COMPLETE] refusing to advance action "
+                    f"{current_action_id}: its tool(s) {_fab} produced NO result "
+                    f"in the group chat (fabricated completion) — holding for one retry")
+                return None, False
+    except Exception as _fg_err:
+        current_app.logger.debug(f"[FAB-GUARD] advance-gate skipped: {_fg_err}")
     # Mark current action done
     ok1 = force_state_through_valid_path(user_prompt, current_action_id,
                                          ActionState.COMPLETED, f"{reason}: confirmed")
