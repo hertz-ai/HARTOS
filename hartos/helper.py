@@ -1072,7 +1072,10 @@ class ToolMessageHandler:
                 # text (not a vague "continue") so the model still does the
                 # intended work.  Strict no-op when a user turn already
                 # survived.
-                _seed = "Please continue with the current task."
+                # Fallback text is the wire's canonical seed (ONE source:
+                # core.constants) — the real action text below is preferred.
+                from core.constants import WIRE_USER_SEED_TEXT
+                _seed = WIRE_USER_SEED_TEXT
                 try:
                     _t = self.user_tasks[self.user_prompt]
                     _a = _t.get_action(_t.current_action - 1)
