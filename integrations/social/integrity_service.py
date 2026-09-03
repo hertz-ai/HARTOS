@@ -352,9 +352,12 @@ class IntegrityService:
                 peer.integrity_status = 'claimed'
                 logger.info(
                     "Integrity: proof revoked for %s (%s)", node_id[:8], reason)
-        except Exception:
-            # Never let bookkeeping break the evaluation result.
-            pass
+        except Exception as e:
+            # Never let bookkeeping break the evaluation result, but a
+            # silent failure here means a peer that should have lost
+            # 'verified' keeps it — log it so that's visible.
+            logger.debug("Integrity: proof revocation bookkeeping failed for %s: %s",
+                        node_id[:8], e)
 
     @staticmethod
     def evaluate_challenge_response(db: Session, challenge_id: str,

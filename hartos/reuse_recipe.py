@@ -3552,8 +3552,9 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             # which is the one thing the traceback alone could never tell us.
             # (main independently added an `and group_chat.messages` guard on
             # the line below this block for the same symptom, #725 "cause not
-            # established" — moot here since this break already prevents that
-            # line from ever running on an empty groupchat.)
+            # established" — NOT moot: live-reproduced 2026-08-30 reaching that
+            # line with an empty groupchat despite this break, so the guard
+            # below stays.)
             if not group_chat.messages:
                 try:
                     _mgr_chat = getattr(manager, 'groupchat', None)
@@ -3577,7 +3578,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     f'{id(_mgr_list) if _mgr_list is not None else "n/a"})')
                 break
 
-            if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
+            if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                 current_app.logger.info(
                     f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                 try:

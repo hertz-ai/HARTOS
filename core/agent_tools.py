@@ -376,8 +376,8 @@ def build_core_tool_closures(ctx):
                         {'memory_type': 'fact', 'source_agent': 'helper',
                          'session_id': user_prompt, 'kv_key': key},
                     ), daemon=True).start()
-                except Exception:
-                    pass
+                except Exception as e:
+                    tool_logger.debug("MemoryGraph mirror failed for key %s: %s", key, e)
 
             try:
                 stored_value = get_data_by_key(key)
@@ -451,8 +451,8 @@ def build_core_tool_closures(ctx):
                     results = memory_graph.recall(f"[KV] {key}", mode='text', top_k=1)
                     if results:
                         return results[0].content
-                except Exception:
-                    pass
+                except Exception as e:
+                    tool_logger.debug("MemoryGraph recall fallback failed for key %s: %s", key, e)
             return "Key not found in stored data."
 
     tools.append((
@@ -1077,8 +1077,8 @@ def build_core_tool_closures(ctx):
                                       'session_id': user_prompt,
                                       'source': 'simplemem'},
                         ), daemon=True).start()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        tool_logger.debug("MemoryGraph mirror failed for simplemem save: %s", e)
                 return "Saved to long-term memory."
             except Exception as e:
                 tool_logger.info(f"SimpleMem save error: {e}")
