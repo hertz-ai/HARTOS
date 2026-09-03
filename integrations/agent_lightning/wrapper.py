@@ -19,6 +19,26 @@ from .rewards import RewardCalculator, RewardType
 logger = logging.getLogger(__name__)
 
 
+def _is_recoverable_generation_failure(exc) -> bool:
+    """True when the serving engine failed to produce THIS generation.
+
+    Decided by the OpenAI-compatible exception class and status range every
+    engine speaks (llama.cpp, vLLM, TGI, hosted) — never by an engine's
+    message text.  5xx: the engine could not serve the reply (llama.cpp
+    --jinja answers 500 when the model's tool-call text will not parse;
+    other engines fail their own way).  A connection dropped or timed out
+    mid-generation is the same class of event.  4xx is the caller's request
+    (context overflow, auth) and is left to its own handlers.
+    """
+    try:
+        import openai
+    except ImportError:
+        return False
+    if isinstance(exc, openai.APIConnectionError):
+        return True
+    return isinstance(exc, openai.APIStatusError) and exc.status_code >= 500
+
+
 class AgentLightningWrapper:
     """
     Wraps an AutoGen agent with Agent Lightning instrumentation
@@ -173,80 +193,57 @@ class AgentLightningWrapper:
                     if self.tracer and span_id:
                         self.tracer.emit_reward(span_id, reward)
 
-                # ── HIGH #5: llama.cpp tool-call JSON parse 500 graceful fallback ──
-                # When the model emits a tool-call whose `arguments` field
-                # contains unescaped quotes / emojis / truncated strings,
-                # llama.cpp rejects the response with HTTP 500 and the
-                # signature `Failed to parse tool call arguments as JSON`
-                # (live evidence langchain.log 2026-05-14: 22 occurrences).
-                # Today the exception propagates up → get_response_group
-                # transitions the action to `error` → lifecycle FSM rejects
-                # the transition repeatedly (600+ "Invalid transition"
-                # lines) → the STUCK-LOOP guard at create_recipe.py:1954
-                # eventually fires after 5 stuck iterations and emits a
-                # generic fallback.  Net cost: ~20-30 wasted llama.cpp
-                # completions before recovery.
-                #
-                # Short-circuit here instead: detect the parse-500 by its
-                # canonical error-message signature, return a coherent
-                # fallback string immediately, and let autogen treat it as
-                # a normal reply.  No lifecycle churn, no extra LLM
-                # completions, user gets a single clean reply within the
-                # same turn.  Same fallback pattern as the loop-break
-                # guard so the user-visible UX is consistent across both
-                # failure modes.
-                _err_str = str(e)
-                _is_toolcall_parse_500 = (
-                    '500' in _err_str
-                    and 'Failed to parse tool call arguments' in _err_str
-                )
-                if _is_toolcall_parse_500:
-                    # A malformed-JSON tool call is almost always a
-                    # SAMPLING FLUKE — one bad token (unescaped quote,
-                    # emoji, mid-string truncation) in an otherwise-valid
-                    # structure.  Autogen agents sample at temp>0, so
-                    # simply re-running generate_reply re-samples and the
-                    # fluke usually clears.  Retry up to _TOOLCALL_500_RETRIES
-                    # times BEFORE giving up — this converts "tool call
-                    # always lost on a bad sample" into "tool call
-                    # recovered when it's a fluke (the common case)".
-                    _TOOLCALL_500_RETRIES = 2
-                    for _attempt in range(1, _TOOLCALL_500_RETRIES + 1):
+                # The engine failed to serve THIS generation (5xx, or the
+                # connection dropped/timed out mid-reply).  Classified by
+                # exception class and status range, never by an engine's
+                # message text (_is_recoverable_generation_failure), so one
+                # ladder covers llama.cpp, vLLM/TGI or a hosted endpoint.
+                # Before this ladder the exception propagated:
+                # get_response_group moved the action to `error`, the
+                # lifecycle FSM rejected the transition repeatedly (600+
+                # "Invalid transition" lines) and the STUCK-LOOP guard fired
+                # after 5 stuck iterations — ~20-30 wasted completions per
+                # incident (langchain.log 2026-05-14, 22 occurrences).
+                if _is_recoverable_generation_failure(e):
+                    # Re-sample the same request first: a single bad sample
+                    # (unescaped quote, emoji or mid-string truncation in a
+                    # tool call; a dropped socket) is the common cause, and
+                    # autogen agents sample at temp>0, so re-running
+                    # generate_reply usually clears it.
+                    _GEN_RETRIES = 2
+                    _last_exc = e
+                    for _attempt in range(1, _GEN_RETRIES + 1):
                         logger.warning(
-                            "[TOOLCALL-PARSE-500] malformed tool-call JSON "
-                            "(attempt %d/%d) — re-sampling generate_reply. "
-                            "Error: %s",
-                            _attempt, _TOOLCALL_500_RETRIES, _err_str[:200])
+                            "[LLM-GEN-FAIL] %s (attempt %d/%d) — re-sampling "
+                            "generate_reply. Error: %s",
+                            type(_last_exc).__name__, _attempt, _GEN_RETRIES,
+                            str(_last_exc)[:200])
                         try:
                             _retry_result = original_func(*args, **kwargs)
                             logger.info(
-                                "[TOOLCALL-PARSE-500] recovered on retry %d "
-                                "— re-sample produced parseable output",
+                                "[LLM-GEN-FAIL] recovered on retry %d",
                                 _attempt)
                             return _retry_result
                         except Exception as _retry_exc:
-                            _err_str = str(_retry_exc)
-                            if not ('500' in _err_str and
-                                    'Failed to parse tool call arguments'
-                                    in _err_str):
-                                # A DIFFERENT failure on retry — stop
-                                # retrying, fall through to report+fallback.
+                            _last_exc = _retry_exc
+                            if not _is_recoverable_generation_failure(_retry_exc):
+                                # A different class of failure on retry —
+                                # stop re-sampling, fall through to the
+                                # tool-less attempt + report.
                                 break
 
                     # Retries exhausted with the SAME (tools-bearing) request.
-                    # Final recovery: the model keeps botching tool-call JSON,
-                    # but the conversation already carries the tool RESULTS it
-                    # needs — measured 2026-09-03 on the Auto Research agent,
-                    # google_search returned real 2024 articles into history and
-                    # then the synthesis turn 500'd on its OWN malformed tool
-                    # call.  Re-sampling with tools present just reproduces the
-                    # bad call.  Force ONE tool-less resample so the model
-                    # synthesises PROSE from what it already has instead of
-                    # emitting another unparseable call.  Reuses AutoGen's own
-                    # client construction (OpenAIWrapper), restored in finally;
-                    # only fires after the tools-bearing retries are exhausted,
-                    # so the happy path and the "recovered on retry" path above
-                    # are untouched.
+                    # Final recovery: the model keeps failing on a structured
+                    # reply, but the conversation already carries the tool
+                    # RESULTS it needs — measured 2026-09-03 on the Auto
+                    # Research agent (installed build): google_search returned
+                    # real 2024 articles into history and the synthesis turn
+                    # then failed on its OWN tool-call output.  Re-sampling
+                    # with tools present reproduces the bad call.  Force ONE
+                    # tool-less re-sample so the model writes PROSE from what
+                    # it already has.  Reuses AutoGen's own client construction
+                    # (OpenAIWrapper), restored in finally; only fires after the
+                    # retries above, so the happy path is untouched.
                     try:
                         _cfg = getattr(self.agent, 'llm_config', None)
                         if isinstance(_cfg, dict) and _cfg.get('tools'):
@@ -265,25 +262,24 @@ class AgentLightningWrapper:
                                     self.agent.client = _saved_client
                             if _text:
                                 logger.info(
-                                    "[TOOLCALL-PARSE-500] recovered via "
-                                    "tool-less synthesis — model produced a "
-                                    "reply from the tool results already in "
-                                    "history instead of a fresh tool call")
+                                    "[LLM-GEN-FAIL] recovered via tool-less "
+                                    "synthesis — model produced a reply from "
+                                    "the tool results already in history "
+                                    "instead of a fresh tool call")
                                 return _text
                     except Exception as _tl_e:
                         logger.warning(
-                            "[TOOLCALL-PARSE-500] tool-less synthesis retry "
-                            "failed (%s) — falling back to the apology string",
-                            _tl_e)
+                            "[LLM-GEN-FAIL] tool-less synthesis retry failed "
+                            "(%s) — returning the fallback reply", _tl_e)
 
-                    # Route to the canonical self-heal pipeline so a
-                    # SUSTAINED pattern of toolcall-500s on this agent's
-                    # model creates a self_heal goal (e.g. "enable
-                    # grammar-constrained / json_schema tool output on the
-                    # llama-server request for <model>").  Same helper
-                    # every subsystem uses — pattern_key
+                    # Route to the canonical self-heal pipeline so a SUSTAINED
+                    # pattern on this agent's model creates a self_heal goal.
+                    # Same helper every subsystem uses — pattern_key
                     # 'RuntimeError::llm.<agent_id>::generate_reply' lets
                     # SelfHealingDispatcher cluster repeated occurrences.
+                    _failure_kind = ('generation_5xx'
+                                     if getattr(e, 'status_code', None)
+                                     else 'generation_connection')
                     try:
                         from hartos.exception_collector import report_subsystem_failure
                         report_subsystem_failure(
@@ -291,25 +287,22 @@ class AgentLightningWrapper:
                             identifier=str(self.agent_id),
                             exc=e,
                             function='generate_reply',
-                            failure_kind='toolcall_json_parse_500',
-                            retries_exhausted=_TOOLCALL_500_RETRIES,
+                            failure_kind=_failure_kind,
+                            retries_exhausted=_GEN_RETRIES,
                         )
                     except Exception:
                         pass
 
                     logger.error(
-                        "[TOOLCALL-PARSE-500] llama.cpp rejected the "
-                        "model's tool-call output after %d retries "
-                        "(malformed JSON in arguments — unescaped quotes / "
-                        "emojis / mid-string truncation).  Returning "
-                        "graceful fallback string instead of propagating "
-                        "the 500, to avoid lifecycle FSM churn.  Error: "
-                        "%s", _TOOLCALL_500_RETRIES, _err_str[:300])
+                        "[LLM-GEN-FAIL] engine failed this generation after %d "
+                        "retries and a tool-less attempt (%s: %s).  Returning "
+                        "the fallback reply instead of propagating, to avoid "
+                        "lifecycle FSM churn.", _GEN_RETRIES,
+                        type(_last_exc).__name__, str(_last_exc)[:300])
                     return (
-                        "I had trouble producing the structured response "
-                        "for that — the underlying model emitted output "
-                        "that couldn't be parsed.  Could you rephrase the "
-                        "request, or try breaking it into smaller steps?"
+                        "I had trouble getting a usable response from the "
+                        "model for that step.  Could you rephrase the request, "
+                        "or try breaking it into smaller steps?"
                     )
 
                 raise
