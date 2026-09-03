@@ -2642,11 +2642,26 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                 current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
                 return None
 
-            return "auto"
+            # Deterministic fallback — NEVER return the string "auto".  Returning
+            # "auto" tells autogen to run _auto_select_speaker (groupchat.py:743),
+            # which spins up an internal `checking_agent` and asks llama to pick
+            # the next speaker.  That agent is OUTSIDE the AgentLightningWrapper,
+            # and with --jinja llama-server returns 500 "Failed to parse tool
+            # call arguments as JSON" whenever the 4B emits a stray <tool_call>
+            # in that reply (measured live 2026-09-03 23:26 on the installed
+            # build: select_speaker -> _auto_select_speaker -> checking_agent
+            # -> openai.InternalServerError 500).  Because the call is unwrapped
+            # the 500 propagates out of initiate_chat, the reuse turn dies, and
+            # Nunba falls back to a direct-4B knowledge answer with the real
+            # tool results unused.  Route deterministically instead: after the
+            # Assistant produced work, hand to the StatusVerifier to check it;
+            # otherwise hand back to the Assistant orchestrator.  Same agents
+            # the mappings above already use — no LLM speaker-selection call.
+            return verify if last_speaker is assistant else assistant
         except Exception as e:
             current_app.logger.error(f"Error in state_transition: {e}")
             current_app.logger.error(traceback.format_exc())
-            return "auto"
+            return assistant
 
     def state_transition1(last_speaker, groupchat):
         current_app.logger.info('INSIDE TIMER STATE TRANSITION')
