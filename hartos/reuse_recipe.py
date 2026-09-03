@@ -2393,7 +2393,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             # observe commercial-API revenue and the flywheel can't
             # close the marketing/revenue loop.
             from integrations.agent_engine.revenue_tools import register_revenue_tools
-            register_revenue_tools(helper, assistant, user_id)
+            register_revenue_tools(helper, assistant, user_id, executor=executor)
             current_app.logger.info("Revenue tools loaded (Tier 2) for reuse agent")
         if 'news' in goal_tags:
             # News tools parity with create_recipe.py — a Herald (news) recipe

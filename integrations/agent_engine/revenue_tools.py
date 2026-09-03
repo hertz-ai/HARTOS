@@ -10,8 +10,18 @@ from typing import Annotated, Optional
 logger = logging.getLogger('hevolve_social')
 
 
-def register_revenue_tools(helper, assistant, user_id: str):
-    """Register revenue tools with an AutoGen agent (Tier 2)."""
+def register_revenue_tools(helper, assistant, user_id: str, executor=None):
+    """Register revenue tools with an AutoGen agent (Tier 2).
+
+    Registration mirrors the news_tools fix (HARTOS 87fb8389 + 09afbcf3):
+    the tool schema goes on BOTH the Helper and the Assistant (so whichever
+    agent speaker-selection lets propose a tool emits a STRUCTURED tool_call,
+    not <tool_call> text that autogen never executes), and execution is
+    registered on a distinct ``executor`` too (so the Assistant's own
+    structured calls don't strand on the repeat-speaker rule).  Without this,
+    get_api_revenue_stats never runs — the agent talks without acting.
+    See feedback_autogen_tool_call_as_text.
+    """
 
     def get_api_revenue_stats() -> str:
         """Get total API revenue (per-token usage + subscription upgrades),
@@ -212,6 +222,9 @@ def register_revenue_tools(helper, assistant, user_id: str):
 
     for name, desc, func in tools:
         helper.register_for_llm(name=name, description=desc)(func)
+        assistant.register_for_llm(name=name, description=desc)(func)
         assistant.register_for_execution(name=name)(func)
+        if executor is not None:
+            executor.register_for_execution(name=name)(func)
 
     logger.info(f"Registered {len(tools)} revenue tools for user {user_id}")
