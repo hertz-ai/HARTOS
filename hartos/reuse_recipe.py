@@ -826,7 +826,12 @@ def create_agents_for_role(user_id: str, prompt_id):
                 current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
                 # retrieve: action 1 -> action 2
                 return None
-            return "auto"
+            # Speaker order is pipeline state, never a model decision (same
+            # rule as the main reuse group): the Assistant asks the role
+            # question -> the user agent answers it; anything else (the
+            # Helper) hands back to the Assistant.  user_proxy was routed
+            # above.
+            return user_proxy if last_speaker is assistant else assistant
 
         # Seed autogen with recent messages from shared LangChain/autogen buffer
         try:
@@ -2642,21 +2647,21 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                 current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
                 return None
 
-            # Deterministic fallback — NEVER return the string "auto".  Returning
-            # "auto" tells autogen to run _auto_select_speaker (groupchat.py:743),
-            # which spins up an internal `checking_agent` and asks llama to pick
-            # the next speaker.  That agent is OUTSIDE the AgentLightningWrapper,
-            # and with --jinja llama-server returns 500 "Failed to parse tool
-            # call arguments as JSON" whenever the 4B emits a stray <tool_call>
-            # in that reply (measured live 2026-09-03 23:26 on the installed
-            # build: select_speaker -> _auto_select_speaker -> checking_agent
-            # -> openai.InternalServerError 500).  Because the call is unwrapped
-            # the 500 propagates out of initiate_chat, the reuse turn dies, and
-            # Nunba falls back to a direct-4B knowledge answer with the real
-            # tool results unused.  Route deterministically instead: after the
-            # Assistant produced work, hand to the StatusVerifier to check it;
-            # otherwise hand back to the Assistant orchestrator.  Same agents
-            # the mappings above already use — no LLM speaker-selection call.
+            # Speaker order is pipeline state, never a model decision.  This
+            # group is a fixed loop (Assistant proposes -> Executor runs the
+            # tool -> Assistant synthesises -> StatusVerifier judges ->
+            # ChatInstructor advances) and every hop is already decided above
+            # from what just happened: @mention, tool call, verifier verdict,
+            # who spoke.  The only speakers that can reach this line are the
+            # Assistant with a plain turn (no tool call, no mention, no
+            # verdict: its work is done -> verify it) and the StatusVerifier
+            # or another agent with an unparseable turn (-> back to the
+            # Assistant); Helper, Executor, user_proxy and ChatInstructor were
+            # routed at the name check above.  Returning "auto" would spend an
+            # extra model call per hop to guess what this state already
+            # knows, and that call runs outside the AgentLightningWrapper, so
+            # any engine failure inside it ends the whole turn (measured
+            # 2026-09-03 23:26 on the installed build).
             return verify if last_speaker is assistant else assistant
         except Exception as e:
             current_app.logger.error(f"Error in state_transition: {e}")
@@ -2711,7 +2716,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                     send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
                 except Exception:
                     pass
-                return "auto"
+                return verify1 if last_speaker is time_agent else time_agent
 
         if messages[-1]["role"] == 'function':
             current_app.logger.info('The last speaker was function returning assistant')
@@ -2723,7 +2728,11 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
             # retrieve: action 1 -> action 2
             return None
-        return "auto"
+        # Speaker order is pipeline state, never a model decision (same rule
+        # as the main reuse group): the timer agent's plain turn -> verify1
+        # judges it; anything else -> back to the timer agent.  user_proxy,
+        # multi_role_agent, Helper and Executor were routed above.
+        return verify1 if last_speaker is time_agent else time_agent
 
     def state_transition2(last_speaker, groupchat):
         current_app.logger.info('INSIDE VISUAL STATE TRANSITION')
@@ -2769,7 +2778,9 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
             # retrieve: action 1 -> action 2
             return None
-        return "auto"
+        # Same rule as the main reuse group: the visual agent's plain turn ->
+        # verify2 judges it; anything else -> back to the visual agent.
+        return verify2 if last_speaker is visual_agent else visual_agent
 
     def publish_intermediate_thoughts_to_user(last_speaker, messages):
         # Delegates to the module-level publisher in create_recipe so
@@ -3002,6 +3013,19 @@ _reuse_resteer_counts = {}
 # list is empty.  This is a read-only fallback of the SAME conversation, not a
 # second history: when messages are present the behaviour is unchanged.
 _reuse_msg_snapshot = {}
+
+
+def _reuse_live_messages(group_chat, user_prompt):
+    """The reuse turn's messages: the live group list, else the #725
+    snapshot above.  Every reader of "what happened this turn" — the
+    advancement loop and the final reply extraction in get_agent_response —
+    goes through here so they see the same history.  Measured 2026-09-03
+    23:37 (Auto Research, installed build): the loop resolved a real
+    google_search result + 'completed' verdict through the snapshot, then
+    the extraction read the bare live list, found it empty and returned ''.
+    """
+    live = getattr(group_chat, 'messages', None)
+    return live if live else _reuse_msg_snapshot.get(user_prompt, [])
 
 
 def _reset_reuse_guard_state(user_prompt):
@@ -3345,7 +3369,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             # Only end the turn when BOTH the live list and the snapshot are
             # empty (nothing happened) — not when autogen merely reset the
             # accumulator (#725), which used to freeze every action at 1.
-            _live_msgs = group_chat.messages if group_chat.messages else _reuse_msg_snapshot.get(user_prompt, [])
+            _live_msgs = _reuse_live_messages(group_chat, user_prompt)
             if not _live_msgs:
                 current_app.logger.warning(
                     'reuse: group chat history is empty mid-loop - ending the '
@@ -3391,14 +3415,18 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
 
         # if individual_recipe[currentaction_id-1]['can_perform_without_user_input'] == 'yes':
         #     return assistant
-        if not group_chat.messages:
+        # Same resolver as the loop above: autogen may have emptied the live
+        # list after the last nested initiate_chat (#725) while the snapshot
+        # still holds the verdict and the tool results.
+        _final_msgs = _reuse_live_messages(group_chat, user_prompt)
+        if not _final_msgs:
             current_app.logger.warning(
-                'reuse: no messages to extract a reply from after trimming')
+                'reuse: no messages to extract a reply from (live list and snapshot both empty)')
             return ''
-        last_message = group_chat.messages[-1]
+        last_message = _final_msgs[-1]
         # len>1 matters: a lone TERMINATE would send [-2] off the front.
-        if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
-            last_message = group_chat.messages[-2]
+        if last_message['content'] == 'TERMINATE' and len(_final_msgs) > 1:
+            last_message = _final_msgs[-2]
 
         content_lower = last_message['content'].lower()
 
