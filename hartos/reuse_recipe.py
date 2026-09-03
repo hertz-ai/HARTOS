@@ -2868,16 +2868,6 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             def append(self, msg):
                 super().append(msg)
                 try:
-                    _d = msg if isinstance(msg, dict) else {}
-                    _tc = [(t.get('id') or '')[:8] for t in (_d.get('tool_calls') or [])]
-                    _ph = 'PH' if 'Placeholder response for historical' in str(_d.get('content') or '') else ''
-                    current_app.logger.info(
-                        "[APPEND-PROBE] n=%d role=%s name=%s tc=%s tcid=%s clen=%d %s" % (
-                            len(self), _d.get('role'), _d.get('name', ''), _tc,
-                            (_d.get('tool_call_id') or '')[:8], len(str(_d.get('content') or '')), _ph))
-                except Exception:
-                    pass
-                try:
                     self._hook(msg)
                 except Exception:
                     pass
@@ -3061,18 +3051,6 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         register_groupchat_for_session(user_prompt, group_chat)
     except Exception:
         pass
-    try:
-        _amap = set((getattr(assistant, '_function_map', {}) or {}).keys())
-        _emap = set((getattr(group_chat, 'agent_by_name', lambda n: None)('Executor') and
-                     getattr(group_chat.agent_by_name('Executor'), '_function_map', {}) or {}).keys())
-        current_app.logger.info(
-            "[EXEC-MAP-PROBE] gsearch_in_assistant=%s assistant_fmap_n=%d gsearch_in_executor=%s sample=%s" % (
-                'google_search' in _amap, len(_amap), 'google_search' in _emap, sorted(_amap)[:12]))
-    except Exception as _ep:
-        try:
-            current_app.logger.info("[EXEC-MAP-PROBE] failed: %s" % _ep)
-        except Exception:
-            pass
     try:
         # Tier-1 per-turn attach: deterministic keyword scan of THIS message
         # unlocks families the construction-time goal never mentioned — zero
