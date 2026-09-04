@@ -226,10 +226,14 @@ impl HomeCompose {
             rows: vec![
                 Row {
                     label: "Continue".to_string(),
+                    note: None,
+                    see_all: Some("panel:continue".to_string()),
                     cards: vec![Card::default(), Card::default(), Card::default()],
                 },
                 Row {
                     label: "For you".to_string(),
+                    note: None,
+                    see_all: None,
                     cards: vec![Card::default(), Card::default()],
                 },
             ],
@@ -250,6 +254,12 @@ pub struct Hero {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Row {
     pub label: String,
+    /// A short qualifier the shell draws beside the label (`row.note`).
+    pub note: Option<String>,
+    /// The panel a row's "See all" opens (`row.see_all`). Present means the row HAS a
+    /// See-all affordance; the shell only draws one when the payload carries a target,
+    /// so an absent value must draw nothing rather than a dead control.
+    pub see_all: Option<String>,
     pub cards: Vec<Card>,
 }
 
@@ -478,6 +488,12 @@ const TAB_PAD_X: f32 = 10.0;
 const TAB_GAP: f32 = 2.0;
 const HERO_H: f32 = 200.0;
 const ROW_LABEL_H: f32 = 22.0;
+const ROW_LABEL_PX: f32 = 15.0;
+/// The note and the See-all are secondary to the label, so they sit a step smaller.
+const ROW_NOTE_PX: f32 = 13.0;
+const ROW_HEAD_GAP: f32 = 10.0;
+/// The shell's own wording (hartHome.js `see.textContent`), not a paraphrase.
+const SEE_ALL: &str = "See all";
 const ROW_GAP: f32 = 14.0;
 const CARD_W: f32 = 210.0;
 const CARD_H: f32 = 128.0;
@@ -653,13 +669,47 @@ pub fn layout_home(
         if cursor_y + row_block_h > content.bottom() {
             break;
         }
+        // ── Row header: label, an optional note beside it, and an optional right-anchored
+        //    "See all". The label keeps a measured box now rather than the whole row width,
+        //    so the note can sit AFTER it; right-anchoring the See-all is the third thing
+        //    the measure buys, and it is the reason TextAlign::Right was never needed:
+        //    knowing the width lets layout place a left-aligned run exactly.
+        let label_w = measure.text_width(&row.label, ROW_LABEL_PX);
         root.push(SceneNode::Text {
-            rect: Rect::new(content.x, cursor_y, content.w, ROW_LABEL_H),
+            rect: Rect::new(content.x, cursor_y, label_w.ceil() + 2.0, ROW_LABEL_H),
             text: row.label.clone(),
-            size_px: 15.0,
+            size_px: ROW_LABEL_PX,
             color: theme.card_ink,
             align: TextAlign::Left,
         });
+        if let Some(note) = &row.note {
+            let note_w = measure.text_width(note, ROW_NOTE_PX);
+            let note_x = content.x + label_w + ROW_HEAD_GAP;
+            if note_x + note_w <= content.right() {
+                root.push(SceneNode::Text {
+                    rect: Rect::new(note_x, cursor_y, note_w.ceil() + 2.0, ROW_LABEL_H),
+                    text: note.clone(),
+                    size_px: ROW_NOTE_PX,
+                    color: theme.hero_copy,
+                    align: TextAlign::Left,
+                });
+            }
+        }
+        if row.see_all.is_some() {
+            let see_w = measure.text_width(SEE_ALL, ROW_NOTE_PX);
+            let see_x = content.right() - see_w;
+            // Only if it clears the label (and any note): a cramped row drops the
+            // affordance rather than overlapping the text it belongs to.
+            if see_x > content.x + label_w + ROW_HEAD_GAP {
+                root.push(SceneNode::Text {
+                    rect: Rect::new(see_x, cursor_y, see_w.ceil() + 2.0, ROW_LABEL_H),
+                    text: SEE_ALL.to_string(),
+                    size_px: ROW_NOTE_PX,
+                    color: theme.accent,
+                    align: TextAlign::Left,
+                });
+            }
+        }
         let cards_y = cursor_y + ROW_LABEL_H;
         let mut card_x = content.x;
         for card in row.cards.iter() {
@@ -812,6 +862,20 @@ pub fn decode_home_compose(v: &serde_json::Value) -> HomeCompose {
             }
             rows.push(Row {
                 label: s(r.get("label")),
+                // Both are already in the payload the HTML shell reads (hartHome.js
+                // row.note / row.see_all); the native scene was simply dropping them.
+                // An empty string is treated as absent, so a blank field cannot produce
+                // a See-all that opens nothing.
+                note: r
+                    .get("note")
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string),
+                see_all: r
+                    .get("see_all")
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string),
                 cards,
             });
         }
@@ -837,12 +901,19 @@ mod tests {
             rows: vec![
                 Row {
                     label: "Continue".into(),
+                    note: Some("3 in progress".into()),
+                    see_all: Some("panel:continue".into()),
                     cards: vec![
                         Card { title: "Recipe A".into(), subtitle: None, image: None },
                         Card { title: "Recipe B".into(), subtitle: None, image: Some("b.png".into()) },
                     ],
                 },
-                Row { label: "For you".into(), cards: vec![Card::default()] },
+                Row {
+                    label: "For you".into(),
+                    note: None,
+                    see_all: None,
+                    cards: vec![Card::default()],
+                },
             ],
             mood: Some("cosmic".into()),
         }
@@ -1136,6 +1207,82 @@ mod tests {
             .filter(|(t, _)| NAV_TABS.contains(&t.as_str()))
             .count();
         assert!(shown < NAV_TABS.len(), "a narrow bar must drop tabs");
+    }
+
+    #[test]
+    fn a_row_header_carries_its_note_and_a_right_anchored_see_all() {
+        let (w, h) = (1600.0, 900.0);
+        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let mut runs: Vec<(String, Rect)> = Vec::new();
+        root.for_each_leaf(&mut |_, leaf| {
+            if let SceneNode::Text { rect, text, .. } = leaf {
+                runs.push((text.clone(), *rect));
+            }
+        });
+        let find = |t: &str| runs.iter().find(|(s, _)| s == t).map(|(_, r)| *r);
+
+        let label = find("Continue").expect("the row label");
+        let note = find("3 in progress").expect("the row note");
+        let see = find(SEE_ALL).expect("a see-all on the row that carries a target");
+        // The note sits AFTER the label on the same header line, not on top of it. That
+        // is only expressible because the label's box is measured rather than the full
+        // row width, which is what it used to be.
+        assert!(note.x > label.right(), "the note must follow the label");
+        assert_eq!(note.y, label.y, "note and label share the header line");
+        // See-all is anchored to the right edge of the content band.
+        let content_right = w - EDGE_PAD;
+        assert!(
+            (see.right() - content_right).abs() < 3.0,
+            "see-all should sit at the right edge, ended at {} against {}",
+            see.right(),
+            content_right
+        );
+        assert!(see.x > note.right(), "see-all must clear the header text");
+        assert_eq!(see.y, label.y);
+
+        // Exactly one See-all: the second row carries no target, so it must draw none.
+        assert_eq!(runs.iter().filter(|(s, _)| s == SEE_ALL).count(), 1);
+        assert!(find("For you").is_some(), "the second row still has its label");
+    }
+
+    #[test]
+    fn a_row_with_no_see_all_target_draws_no_affordance() {
+        // A dead control is worse than none: the shell only draws See-all when the
+        // payload names something for it to open.
+        let mut hc = sample();
+        for r in hc.rows.iter_mut() {
+            r.see_all = None;
+            r.note = None;
+        }
+        let root = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &mut MonoMeasure);
+        let mut seen = 0;
+        root.for_each_leaf(&mut |_, leaf| {
+            if let SceneNode::Text { text, .. } = leaf {
+                if text == SEE_ALL {
+                    seen += 1;
+                }
+            }
+        });
+        assert_eq!(seen, 0);
+    }
+
+    #[test]
+    fn decode_reads_the_row_note_and_see_all_target() {
+        let v = serde_json::json!({
+            "rows": [
+                { "label": "Continue", "note": "3 in progress", "see_all": "panel:continue" },
+                { "label": "Bare" },
+                { "label": "Blank", "see_all": "", "note": "" }
+            ]
+        });
+        let hc = decode_home_compose(&v);
+        assert_eq!(hc.rows[0].note.as_deref(), Some("3 in progress"));
+        assert_eq!(hc.rows[0].see_all.as_deref(), Some("panel:continue"));
+        assert_eq!(hc.rows[1].note, None);
+        assert_eq!(hc.rows[1].see_all, None);
+        // An empty string is absent, not a target that opens nothing.
+        assert_eq!(hc.rows[2].see_all, None);
+        assert_eq!(hc.rows[2].note, None);
     }
 
     #[test]
