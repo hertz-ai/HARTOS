@@ -1995,15 +1995,33 @@ pub fn workspace_fade_alpha<S: CompState>(state: &S) -> f32 {
 /// Is any effect still animating (a window mid-fade, or a workspace crossfade in
 /// flight)? The loop forces a redraw next iteration while true.
 pub fn effects_animating<S: CompState>(state: &S) -> bool {
-    if let Some(t) = state.ws_switch_at() {
-        if t.elapsed().as_millis() < WS_FADE_MS {
-            return true;
-        }
-    }
-    state
+    let ws_fading = state
+        .ws_switch_at()
+        .is_some_and(|t| t.elapsed().as_millis() < WS_FADE_MS);
+    let map_animating = state
         .space()
         .elements()
-        .any(|w| w.user_data().get::<MapAnim>().map(|a| a.animating()).unwrap_or(false))
+        .any(|w| w.user_data().get::<MapAnim>().map(|a| a.animating()).unwrap_or(false));
+    scene_animates(state.native_shell_on(), ws_fading, map_animating)
+}
+
+/// PURE: does the scene animate CONTINUOUSLY, so the tick must composite rather than
+/// coast on the idle heartbeat? Split out for the same reason `wants_paint` is split from
+/// `should_paint`: the rule is then unit-testable without building a compositor State.
+///
+/// The native shell counts because its orb BREATHES. `orb::motion_at` is a function of
+/// the clock, so while the native scene is drawn the desktop is animating by
+/// construction, and the 200ms idle heartbeat would render that breath as a 5 Hz stutter,
+/// against the program's 60fps NFR. What makes this affordable rather than the
+/// "catastrophic at 60Hz" full repaint is damage tracking: the tick composites, but only
+/// the orb's own region actually changed, which is exactly the case damage tracking
+/// exists for (and which the element-identity test pins down).
+///
+/// It is gated on the flag, not on the orb's existence, because the orb is drawn beneath
+/// the WebView shell today and OCCLUDED by it: invisible breathing must not cost the
+/// shipped desktop its idle saving. So flag off, behaviour is exactly what it was.
+pub fn scene_animates(native_shell_on: bool, ws_fading: bool, map_animating: bool) -> bool {
+    native_shell_on || ws_fading || map_animating
 }
 
 /// Build the software-cursor render element(s) at the pointer location, PREPENDED so the
@@ -3662,6 +3680,24 @@ mod native_render_tests {
             rounded_after_first_frame,
             "a steady desktop must not re-rasterize its rounded rects"
         );
+    }
+
+    #[test]
+    fn the_native_shell_counts_as_animating_so_the_orb_is_not_throttled_to_the_heartbeat() {
+        // The frame-budget gate skips a tick when nothing is dirty and nothing animates,
+        // falling back to a 200ms idle heartbeat. The native orb breathes off the clock,
+        // so without this the flip to the native shell would quietly render that breath
+        // at 5 Hz: a stutter, not a breath, and against the 60fps NFR.
+        assert!(
+            scene_animates(true, false, false),
+            "a drawn native scene animates by construction, its orb never stops breathing"
+        );
+        // Flag OFF is untouched, which is what keeps the shipped WebView desktop's idle
+        // saving: the orb still breathes down there, but occluded, so it costs nothing.
+        assert!(!scene_animates(false, false, false));
+        // The two effects that already forced a paint still do, with the flag off.
+        assert!(scene_animates(false, true, false), "a workspace fade must play out");
+        assert!(scene_animates(false, false, true), "a map animation must play out");
     }
 
     #[test]
