@@ -426,6 +426,10 @@ pub struct RectCache {
     /// How many solid buffers were ever actually allocated. The pooling PROOF: a steady
     /// desktop must not grow this per frame.
     solid_allocs: u64,
+    /// How many rounded-rect buffers were ever composed. The other half of the same
+    /// proof: a rounded rect is a per-pixel SDF rasterize, so recomposing one per frame
+    /// would be far more expensive than the solid pool it sits beside.
+    rounded_composes: u64,
 }
 
 impl RectCache {
@@ -488,8 +492,14 @@ impl RectCache {
                 None,
             );
             self.cache.insert(key, buf);
+            self.rounded_composes += 1;
         }
         self.cache.get(&key)
+    }
+
+    /// Total rounded-rect buffers ever composed (test hook for the compose-once proof).
+    pub fn rounded_composes(&self) -> u64 {
+        self.rounded_composes
     }
 }
 
@@ -3576,6 +3586,8 @@ mod native_render_tests {
 
         let mut first = 0usize;
         let mut solids_after_first_frame = 0u64;
+        let mut text_after_first_frame = 0u64;
+        let mut rounded_after_first_frame = 0u64;
         for frame in 0..6 {
             // A fresh element vector each pass, exactly as build_frame_elements does, so
             // the previous frame's elements are dropped before the buffers are reused.
@@ -3596,11 +3608,25 @@ mod native_render_tests {
             if frame == 0 {
                 first = elements.len();
                 solids_after_first_frame = rects.solid_allocs();
+                text_after_first_frame = rasterizer.composes();
+                rounded_after_first_frame = rects.rounded_composes();
                 assert!(first > 0, "the demo scene lowered to nothing");
                 assert_eq!(scenes.rebuilds(), 1, "the first frame builds the tree once");
                 assert!(
                     solids_after_first_frame > 0,
                     "the demo scene has sharp rects, so the first frame allocates solids"
+                );
+                assert!(
+                    rounded_after_first_frame > 0,
+                    "the demo scene has rounded cards, so the first frame composes some"
+                );
+                // Without this the compose-once assertion below could hold simply because
+                // nothing was ever composed. The bar and hero carry real runs, and the
+                // counter advances even with no fonts installed (compose returns a blank
+                // buffer but is still a compose), so this holds in a bare sandbox too.
+                assert!(
+                    text_after_first_frame > 0,
+                    "the demo scene has text runs, so the first frame composes some"
                 );
             } else {
                 assert_eq!(
@@ -3620,6 +3646,21 @@ mod native_render_tests {
             rects.solid_allocs(),
             solids_after_first_frame,
             "five further frames must reuse the pooled solids, not allocate new ones"
+        );
+        // COMPOSE-ONCE, the other binding NFR. These two are the expensive per-pixel work
+        // in a frame: shaping and drawing a text run, and rasterizing a rounded-rect SDF.
+        // A cache key that accidentally carried something unstable would redo all of it
+        // every frame and the element counts above would still match, so these assertions
+        // are the only thing standing between a cached desktop and a re-rasterized one.
+        assert_eq!(
+            rasterizer.composes(),
+            text_after_first_frame,
+            "a steady desktop must not re-shape its text runs"
+        );
+        assert_eq!(
+            rects.rounded_composes(),
+            rounded_after_first_frame,
+            "a steady desktop must not re-rasterize its rounded rects"
         );
     }
 

@@ -48,6 +48,11 @@ pub struct TextRasterizer {
     font_system: FontSystem,
     swash_cache: SwashCache,
     cache: HashMap<RunKey, MemoryRenderBuffer>,
+    /// How many runs were ever actually shaped and drawn. The compose-once PROOF: a
+    /// steady desktop must not grow this per frame. Without it, a key that accidentally
+    /// carried something unstable would re-shape every run every frame and nothing would
+    /// notice, which is the expensive failure this cache exists to prevent.
+    composes: u64,
 }
 
 impl Default for TextRasterizer {
@@ -62,7 +67,13 @@ impl TextRasterizer {
             font_system: FontSystem::new(),
             swash_cache: SwashCache::new(),
             cache: HashMap::new(),
+            composes: 0,
         }
+    }
+
+    /// Total runs ever composed (test hook for the compose-once proof).
+    pub fn composes(&self) -> u64 {
+        self.composes
     }
 
     /// Shape `text` at `size_px` on ONE unwrapped line and report its advance width.
@@ -116,6 +127,7 @@ impl TextRasterizer {
         if !self.cache.contains_key(&key) {
             let buf = self.compose(text, size_px, wi, hi, color);
             self.cache.insert(key.clone(), buf);
+            self.composes += 1;
         }
         // Present after the insert above.
         self.cache.get(&key).expect("just inserted")
