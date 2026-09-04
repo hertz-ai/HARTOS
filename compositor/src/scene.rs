@@ -335,13 +335,35 @@ impl SceneNode {
     /// frames), so the walk itself allocates nothing per node, honouring the
     /// zero-per-frame-alloc NFR.
     pub fn flatten<'a>(&'a self, out: &mut Vec<&'a SceneNode>) {
+        self.for_each_leaf(&mut |_, leaf| out.push(leaf));
+    }
+
+    /// Hand every LEAF to `f` in paint order, with its paint-order index. This is the ONE
+    /// traversal the render path uses; `flatten` is a thin collector over it for tests.
+    ///
+    /// A callback rather than a returned Vec because a `Vec<&SceneNode>` borrows the tree
+    /// the cache owns, so it cannot be retained across frames the way the tree and the
+    /// buffer pools are. Collecting one per lowering was the last per-frame heap traffic
+    /// the zero-per-frame-alloc NFR named, after the retained tree and the solid pool.
+    pub fn for_each_leaf<'a>(&'a self, f: &mut impl FnMut(usize, &'a SceneNode)) {
+        let mut next = 0usize;
+        self.walk_leaves(&mut next, f);
+    }
+
+    /// `dyn` deliberately: a recursive generic `impl FnMut` can infer the inner callback
+    /// as `&mut F` at each level and monomorphize without end. One indirect call per leaf
+    /// is far cheaper than the allocation this walk exists to avoid.
+    fn walk_leaves<'a>(&'a self, next: &mut usize, f: &mut dyn FnMut(usize, &'a SceneNode)) {
         match self {
             SceneNode::Container { children, .. } => {
                 for child in children {
-                    child.flatten(out);
+                    child.walk_leaves(next, f);
                 }
             }
-            leaf => out.push(leaf),
+            leaf => {
+                f(*next, leaf);
+                *next += 1;
+            }
         }
     }
     /// The DEEPEST node whose rect contains the point, in paint order (last child
@@ -898,6 +920,49 @@ mod tests {
         // Last painted leaf is the taskbar rect (front-most opaque strip).
         assert!(matches!(leaves.last(), Some(SceneNode::Rect { rect, .. }) if (rect.h - TASKBAR_H).abs() < 0.01));
         assert!(leaves.len() >= 6);
+    }
+
+    #[test]
+    fn the_leaf_walk_and_the_hover_index_share_one_index_space() {
+        // The card highlight works by comparing `hover_leaf`'s index against the index the
+        // lowering's walk hands it. Those are two different traversals, so if they ever
+        // disagreed the wrong node would light up, and nothing else would catch it. This
+        // pins them together.
+        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+
+        let mut walked: Vec<(usize, Rect)> = Vec::new();
+        root.for_each_leaf(&mut |i, leaf| walked.push((i, leaf.rect())));
+        // Indices are contiguous from zero, in paint order.
+        for (n, (i, _)) in walked.iter().enumerate() {
+            assert_eq!(*i, n);
+        }
+        // The same leaves, in the same order, as the collector built on top of it.
+        let mut flat = Vec::new();
+        root.flatten(&mut flat);
+        assert_eq!(flat.len(), walked.len());
+        for (n, leaf) in flat.iter().enumerate() {
+            assert_eq!(leaf.rect(), walked[n].1);
+        }
+        // And a card's hover index addresses that card's own background in THAT space.
+        let mut card = None;
+        if let SceneNode::Container { children, .. } = &root {
+            for c in children {
+                if let SceneNode::Container {
+                    rect,
+                    interactive: true,
+                    ..
+                } = c
+                {
+                    card = Some(*rect);
+                    break;
+                }
+            }
+        }
+        let cr = card.expect("a card group");
+        let idx = root
+            .hover_leaf(Some((cr.x + cr.w * 0.5, cr.y + cr.h * 0.5)))
+            .expect("a card is a hover target");
+        assert_eq!(walked[idx].1, cr);
     }
 
     #[test]

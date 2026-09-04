@@ -2234,13 +2234,15 @@ pub fn lower_scene<R>(
     // above read one consistent pointer position.
     let hover_leaf = tree.hover_leaf(pointer);
 
-    let mut leaves: Vec<&crate::scene::SceneNode> = Vec::new();
-    tree.flatten(&mut leaves);
-    for (idx, leaf) in leaves.into_iter().enumerate() {
+    // Walked by CALLBACK, not collected into a Vec: a list of leaf references borrows the
+    // tree the cache owns and so cannot be retained across frames, which made collecting
+    // one the last per-frame allocation the NFR named. `return` inside the closure skips
+    // this leaf, exactly where the loop said `continue`.
+    tree.for_each_leaf(&mut |idx, leaf| {
         match leaf {
             crate::scene::SceneNode::Rect { rect, color, radius } => {
                 if rect.w < 1.0 || rect.h < 1.0 {
-                    continue;
+                    return;
                 }
                 // The hover lift: the SAME rect, one brighter colour, so hovering changes
                 // no geometry and no element count. The rounded cache keys on colour, so a
@@ -2306,7 +2308,7 @@ pub fn lower_scene<R>(
                 ..
             } => {
                 if rect.w < 1.0 || rect.h < 1.0 || text.is_empty() {
-                    continue;
+                    return;
                 }
                 let buffer = rasterizer.rasterize(
                     text,
@@ -2336,13 +2338,13 @@ pub fn lower_scene<R>(
                 // size and render at their own slot size via GPU scale, so two slots in
                 // one frame never thrash the single-buffer OrbCache.
                 if rect.w < 1.0 || rect.h < 1.0 {
-                    continue;
+                    return;
                 }
                 let side = (size.w.min(size.h) as f32 * 0.30) as i32;
                 if let Some((buffer, motion)) = orb_cache.current(side, orb_energy) {
                     let dst = (rect.w.min(rect.h) * motion.scale) as i32;
                     if dst < 1 {
-                        continue;
+                        return;
                     }
                     let origin: Point<f64, Physical> = Point::from((
                         (rect.x + (rect.w - dst as f32) / 2.0) as f64,
@@ -2365,7 +2367,7 @@ pub fn lower_scene<R>(
             // Image lowering is the M3 remainder; Container only groups.
             _ => {}
         }
-    }
+    });
 }
 
 pub fn build_frame_elements<S, R>(
