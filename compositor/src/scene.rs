@@ -247,8 +247,15 @@ impl HomeCompose {
     pub fn demo() -> HomeCompose {
         HomeCompose {
             hero: Hero {
-                title: "HART OS".to_string(),
-                copy: "Native shell, drawn by the compositor.".to_string(),
+                eyebrow: "Earned on the hive".to_string(),
+                amount: Some(1284),
+                amount_unit: "Spark".to_string(),
+                agents: 3,
+                tasks: 41,
+                local: true,
+                payout_pending: true,
+                primary: Some("Resume".to_string()),
+                secondary: Some("Ask anything".to_string()),
             },
             // Every card carries real text. `Card::default()` has an EMPTY title, and the
             // lowering skips an empty run, so a default-card demo drew blank tiles: the
@@ -259,7 +266,7 @@ impl HomeCompose {
             // actually walk those paths.
             rows: vec![
                 Row {
-                    label: "Continue".to_string(),
+                    title: "Continue".to_string(),
                     note: Some("picked up where you left off".to_string()),
                     see_all: Some("panel:continue".to_string()),
                     cards: vec![
@@ -293,7 +300,7 @@ impl HomeCompose {
                     ],
                 },
                 Row {
-                    label: "For you".to_string(),
+                    title: "For you".to_string(),
                     note: None,
                     see_all: None,
                     cards: vec![
@@ -323,18 +330,41 @@ impl HomeCompose {
     }
 }
 
-/// The hero copy. The checklist (b/hero) says the hero is SHORT and lets the orb speak
-/// the rest, so this is a headline plus a one-line subhead, never a paragraph wall.
+/// The EARNINGS hero (P4), which is what both producers of this payload actually emit:
+/// an eyebrow, a big Spark number, an honest meta strip and two calls to action.
+///
+/// This used to be `{ title, copy }`. Neither key exists in either producer
+/// (`_home_sanitize_hero` and the backbone builder both emit the shape below), so the
+/// native hero decoded two fields that were always empty and rendered NOTHING on a live
+/// compose. It looked correct only because the demo payload filled the imagined names.
+/// The checklist's "hero is SHORT, let the orb speak" still holds: this is a number and a
+/// strip, never a paragraph.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Hero {
-    pub title: String,
-    pub copy: String,
+    /// Small line above the number. Producers default it to "Earned on the hive".
+    pub eyebrow: String,
+    /// The Spark figure. None means there was no positive balance to lead with, and the
+    /// producers omit the whole hero in that case rather than showing a zero.
+    pub amount: Option<i64>,
+    /// Unit beside the number, defaulted to "Spark" by both producers.
+    pub amount_unit: String,
+    pub agents: i64,
+    pub tasks: i64,
+    /// Whether the work was done locally, which the shell says in the stat line.
+    pub local: bool,
+    pub payout_pending: bool,
+    /// Labels only. The actions behind them are not wired natively yet, and a button
+    /// that looks live but does nothing is the same lie as a hoverable dead tab.
+    pub primary: Option<String>,
+    pub secondary: Option<String>,
 }
 
 /// One horizontal row of cards (the Netflix-home rows, a2 "2-3 rows").
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Row {
-    pub label: String,
+    /// The row heading. Named `title` for the key both producers emit: it was `label`,
+    /// which neither sends, so every row on a live compose drew an empty heading.
+    pub title: String,
     /// A short qualifier the shell draws beside the label (`row.note`).
     pub note: Option<String>,
     /// The panel a row's "See all" opens (`row.see_all`). Present means the row HAS a
@@ -612,6 +642,15 @@ const TAB_PX: f32 = 13.0;
 const TAB_PAD_X: f32 = 10.0;
 const TAB_GAP: f32 = 2.0;
 const HERO_H: f32 = 200.0;
+const HERO_EYEBROW_PX: f32 = 13.0;
+const HERO_AMOUNT_PX: f32 = 40.0;
+const HERO_UNIT_PX: f32 = 16.0;
+/// Both producers default the unit to this, so a payload that omits it still reads right.
+const HERO_UNIT_FALLBACK: &str = "Spark";
+const HERO_META_PX: f32 = 13.0;
+const HERO_BTN_PX: f32 = 13.0;
+const HERO_BTN_H: f32 = 30.0;
+const HERO_BTN_PAD_X: f32 = 14.0;
 const ROW_LABEL_H: f32 = 22.0;
 const ROW_LABEL_PX: f32 = 15.0;
 /// The note and the See-all are secondary to the label, so they sit a step smaller.
@@ -865,23 +904,128 @@ pub fn layout_home(
         (output_h - TOP_BAR_H - TASKBAR_H - 2.0 * EDGE_PAD).max(0.0),
     );
 
-    // ── Hero: title + copy on the left, the large orb floated to the right (c7). ──
+    // ── Hero (P4, the EARNINGS hero): eyebrow, the big Spark figure with its unit, an
+    //    honest meta strip, then the two calls to action. The large orb floats right (c7).
+    //    Laid out top down from the content band, each part skipped when the payload has
+    //    nothing for it, so a hero without an amount is short rather than gappy.
     let orb_home = HERO_H.min(content.h).max(0.0);
     let hero_text_w = (content.w - orb_home - EDGE_PAD).max(0.0);
-    root.push(SceneNode::Text {
-        rect: Rect::new(content.x, content.y, hero_text_w, 48.0),
-        text: home.hero.title.clone(),
-        size_px: 34.0,
-        color: theme.hero_title,
-        align: TextAlign::Left,
-    });
-    root.push(SceneNode::Text {
-        rect: Rect::new(content.x, content.y + 56.0, hero_text_w, 60.0),
-        text: home.hero.copy.clone(),
-        size_px: 16.0,
-        color: theme.hero_copy,
-        align: TextAlign::Left,
-    });
+    let mut hero_y = content.y;
+    if !home.hero.eyebrow.is_empty() {
+        root.push(SceneNode::Text {
+            rect: Rect::new(content.x, hero_y, hero_text_w, HERO_EYEBROW_PX * 1.4),
+            text: home.hero.eyebrow.clone(),
+            size_px: HERO_EYEBROW_PX,
+            color: theme.hero_copy,
+            align: TextAlign::Left,
+        });
+        hero_y += HERO_EYEBROW_PX * 1.6;
+    }
+    if let Some(amount) = home.hero.amount {
+        // The number and its unit are two runs on one line, the unit sitting right after
+        // the figure ends. That is the measure again: the figure's width is not known
+        // until it is shaped, and it changes with the balance.
+        let figure = amount.to_string();
+        let fw = measure.text_width(&figure, HERO_AMOUNT_PX);
+        root.push(SceneNode::Text {
+            rect: Rect::new(content.x, hero_y, fw.ceil() + 2.0, HERO_AMOUNT_PX * 1.3),
+            text: figure,
+            size_px: HERO_AMOUNT_PX,
+            color: theme.hero_title,
+            align: TextAlign::Left,
+        });
+        let unit = if home.hero.amount_unit.is_empty() {
+            HERO_UNIT_FALLBACK
+        } else {
+            &home.hero.amount_unit
+        };
+        let uw = measure.text_width(unit, HERO_UNIT_PX);
+        root.push(SceneNode::Text {
+            rect: Rect::new(
+                content.x + fw + 8.0,
+                // Sat on the figure's baseline rather than its box top, so the unit reads
+                // as part of the number instead of floating above it.
+                hero_y + (HERO_AMOUNT_PX - HERO_UNIT_PX) * 0.9,
+                uw.ceil() + 2.0,
+                HERO_UNIT_PX * 1.3,
+            ),
+            text: unit.to_string(),
+            size_px: HERO_UNIT_PX,
+            color: theme.accent,
+            align: TextAlign::Left,
+        });
+        hero_y += HERO_AMOUNT_PX * 1.35;
+    }
+    // The meta strip: a payout pill, then the agents/tasks stat. Built as ONE run rather
+    // than several, because the shell writes it as one sentence with separators and
+    // splitting it would need per-fragment spacing the scene has no reason to own.
+    let mut strip: Vec<String> = Vec::new();
+    if home.hero.payout_pending {
+        strip.push("Payout pending".to_string());
+    }
+    if home.hero.agents != 0 || home.hero.tasks != 0 {
+        fn plural<'a>(n: i64, one: &'a str, many: &'a str) -> &'a str {
+            if n == 1 {
+                one
+            } else {
+                many
+            }
+        }
+        strip.push(format!(
+            "{} {} · {} {}",
+            home.hero.agents,
+            plural(home.hero.agents, "agent", "agents"),
+            home.hero.tasks,
+            plural(home.hero.tasks, "task", "tasks"),
+        ));
+        if home.hero.local {
+            strip.push("fully local".to_string());
+        }
+    }
+    if !strip.is_empty() {
+        root.push(SceneNode::Text {
+            rect: Rect::new(content.x, hero_y, hero_text_w, HERO_META_PX * 1.4),
+            text: strip.join(" · "),
+            size_px: HERO_META_PX,
+            color: theme.hero_copy,
+            align: TextAlign::Left,
+        });
+        hero_y += HERO_META_PX * 1.9;
+    }
+    // Calls to action. Labels only: nothing routes a hero action natively yet, so these
+    // draw as the shell's two buttons but are not hover targets, the same call made for
+    // the nav tabs.
+    let mut cta_x = content.x;
+    for (label, primary) in [(&home.hero.primary, true), (&home.hero.secondary, false)] {
+        let Some(label) = label else { continue };
+        let lw = measure.text_width(label, HERO_BTN_PX);
+        let bw = lw.ceil() + 2.0 * HERO_BTN_PAD_X;
+        if cta_x + bw > content.x + hero_text_w {
+            break;
+        }
+        root.push(SceneNode::Rect {
+            rect: Rect::new(cta_x, hero_y, bw, HERO_BTN_H),
+            color: if primary { theme.accent } else { theme.omnibox_bg },
+            radius: HERO_BTN_H * 0.5,
+        });
+        root.push(SceneNode::Text {
+            rect: Rect::new(
+                cta_x + HERO_BTN_PAD_X,
+                hero_y + (HERO_BTN_H - HERO_BTN_PX * 1.3) * 0.5,
+                lw.ceil() + 2.0,
+                HERO_BTN_PX * 1.3,
+            ),
+            text: label.clone(),
+            size_px: HERO_BTN_PX,
+            color: if primary {
+                theme.on_accent_ink
+            } else {
+                theme.card_ink
+            },
+            align: TextAlign::Left,
+        });
+        cta_x += bw + 10.0;
+    }
     root.push(SceneNode::OrbSlot {
         rect: Rect::new(content.right() - orb_home, content.y, orb_home, orb_home),
         compact: false,
@@ -900,10 +1044,10 @@ pub fn layout_home(
         //    so the note can sit AFTER it; right-anchoring the See-all is the third thing
         //    the measure buys, and it is the reason TextAlign::Right was never needed:
         //    knowing the width lets layout place a left-aligned run exactly.
-        let label_w = measure.text_width(&row.label, ROW_LABEL_PX);
+        let label_w = measure.text_width(&row.title, ROW_LABEL_PX);
         root.push(SceneNode::Text {
             rect: Rect::new(content.x, cursor_y, label_w.ceil() + 2.0, ROW_LABEL_H),
-            text: row.label.clone(),
+            text: row.title.clone(),
             size_px: ROW_LABEL_PX,
             color: theme.card_ink,
             align: TextAlign::Left,
@@ -1186,10 +1330,34 @@ pub fn decode_home_compose(v: &serde_json::Value) -> HomeCompose {
     use serde_json::Value;
     let s = |x: Option<&Value>| x.and_then(Value::as_str).unwrap_or("").to_string();
 
+    // The keys BOTH producers emit (`_home_sanitize_hero` and the backbone builder), not
+    // the `{title, copy}` this used to read, which neither has ever sent.
     let hero = match v.get("hero") {
         Some(h) => Hero {
-            title: s(h.get("title")),
-            copy: s(h.get("copy")),
+            eyebrow: s(h.get("eyebrow")),
+            amount: h.get("amount").and_then(Value::as_i64),
+            amount_unit: s(h.get("amount_unit")),
+            agents: h.get("agents").and_then(Value::as_i64).unwrap_or(0),
+            tasks: h.get("tasks").and_then(Value::as_i64).unwrap_or(0),
+            local: h.get("local").and_then(Value::as_bool).unwrap_or(false),
+            payout_pending: h
+                .get("payout_pending")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            // Only the LABEL: the action and target beside it in the payload drive
+            // behaviour the native scene does not route yet.
+            primary: h
+                .get("primary")
+                .and_then(|p| p.get("label"))
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string),
+            secondary: h
+                .get("secondary")
+                .and_then(|p| p.get("label"))
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string),
         },
         None => Hero::default(),
     };
@@ -1236,7 +1404,8 @@ pub fn decode_home_compose(v: &serde_json::Value) -> HomeCompose {
                 }
             }
             rows.push(Row {
-                label: s(r.get("label")),
+                // `title`, the key both producers emit; `label` was never sent.
+                title: s(r.get("title")),
                 // Both are already in the payload the HTML shell reads (hartHome.js
                 // row.note / row.see_all); the native scene was simply dropping them.
                 // An empty string is treated as absent, so a blank field cannot produce
@@ -1270,12 +1439,19 @@ mod tests {
     fn sample() -> HomeCompose {
         HomeCompose {
             hero: Hero {
-                title: "Your hive earned $12 overnight".into(),
-                copy: "3 agents ran 41 tasks. Ask the orb for the details.".into(),
+                eyebrow: "Earned on the hive".into(),
+                amount: Some(12),
+                amount_unit: "Spark".into(),
+                agents: 3,
+                tasks: 41,
+                local: true,
+                payout_pending: true,
+                primary: Some("Resume".into()),
+                secondary: Some("Ask anything".into()),
             },
             rows: vec![
                 Row {
-                    label: "Continue".into(),
+                    title: "Continue".into(),
                     note: Some("3 in progress".into()),
                     see_all: Some("panel:continue".into()),
                     cards: vec![
@@ -1300,7 +1476,7 @@ mod tests {
                     ],
                 },
                 Row {
-                    label: "For you".into(),
+                    title: "For you".into(),
                     note: None,
                     see_all: None,
                     cards: vec![Card::default()],
@@ -1437,23 +1613,117 @@ mod tests {
 
     #[test]
     fn decode_is_tolerant_of_missing_and_wrong_typed_fields() {
-        let v = serde_json::json!({ "hero": { "title": "hi" }, "rows": "not-an-array" });
+        let v = serde_json::json!({ "hero": { "eyebrow": "hi" }, "rows": "not-an-array" });
         let hc = decode_home_compose(&v);
-        assert_eq!(hc.hero.title, "hi");
-        assert_eq!(hc.hero.copy, "");
+        assert_eq!(hc.hero.eyebrow, "hi");
+        // Absent keys are absent, never invented: no amount means the producers had no
+        // positive balance to lead with, and a zero would be a different claim.
+        assert_eq!(hc.hero.amount, None);
+        assert_eq!(hc.hero.amount_unit, "");
+        assert_eq!(hc.hero.agents, 0);
+        assert!(!hc.hero.payout_pending);
+        assert_eq!(hc.hero.primary, None);
         assert!(hc.rows.is_empty());
         assert!(hc.mood.is_none());
     }
 
     #[test]
+    fn decode_reads_the_hero_shape_both_producers_actually_emit() {
+        // Copied from _home_sanitize_hero's own output, so this fails if the native
+        // decoder drifts from the payload again rather than only when someone notices
+        // the hero is blank on the box.
+        let v = serde_json::json!({
+            "hero": {
+                "eyebrow": "Earned on the hive",
+                "amount": 1284, "amount_unit": "Spark",
+                "local": true, "payout_pending": true,
+                "primary": {"label": "Resume", "action": "resume", "target": "recipes"},
+                "secondary": {"label": "Ask anything", "action": "ask"},
+                "agents": 3, "tasks": 41
+            },
+            "rows": [{"title": "Continue", "cards": [{"title": "A"}]}]
+        });
+        let hc = decode_home_compose(&v);
+        assert_eq!(hc.hero.eyebrow, "Earned on the hive");
+        assert_eq!(hc.hero.amount, Some(1284));
+        assert_eq!(hc.hero.amount_unit, "Spark");
+        assert_eq!((hc.hero.agents, hc.hero.tasks), (3, 41));
+        assert!(hc.hero.local && hc.hero.payout_pending);
+        // The LABEL out of the action object, not the object itself.
+        assert_eq!(hc.hero.primary.as_deref(), Some("Resume"));
+        assert_eq!(hc.hero.secondary.as_deref(), Some("Ask anything"));
+        assert_eq!(hc.rows[0].title, "Continue");
+    }
+
+    #[test]
+    fn the_hero_lays_out_its_number_unit_stat_and_actions() {
+        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let mut runs: Vec<(String, Rect)> = Vec::new();
+        root.for_each_leaf(&mut |_, leaf| {
+            if let SceneNode::Text { rect, text, .. } = leaf {
+                runs.push((text.clone(), *rect));
+            }
+        });
+        let find = |t: &str| runs.iter().find(|(s, _)| s == t).map(|(_, r)| *r);
+
+        let eyebrow = find("Earned on the hive").expect("the eyebrow");
+        let amount = find("12").expect("the amount figure");
+        let unit = find("Spark").expect("the unit beside it");
+        assert!(amount.y > eyebrow.y, "the figure sits under the eyebrow");
+        assert!(unit.x > amount.right() - 1.0, "the unit follows the figure");
+        assert!(
+            unit.y > amount.y,
+            "the unit sits on the figure's baseline, not its box top"
+        );
+
+        // The stat line is ONE run reading as a sentence, with the pill folded in.
+        let stat = runs
+            .iter()
+            .find(|(s, _)| s.contains("3 agents") && s.contains("41 tasks"))
+            .expect("the agents/tasks stat");
+        assert!(stat.0.contains("Payout pending"), "the payout pill leads the strip");
+        assert!(stat.0.contains("fully local"), "and the local claim closes it");
+        assert!(stat.1.y > amount.y, "the strip is under the number");
+
+        // Both actions draw, primary first.
+        let p = find("Resume").expect("the primary action");
+        let s = find("Ask anything").expect("the secondary action");
+        assert!(s.x > p.x, "primary leads");
+        assert!(p.y > stat.1.y, "the actions close the hero");
+    }
+
+    #[test]
+    fn a_hero_with_no_amount_is_short_rather_than_gappy() {
+        // The producers omit the hero entirely when there is no positive balance, but a
+        // partial payload must still lay out: each part is skipped, not left as a hole.
+        let mut hc = sample();
+        hc.rows[0].cards.clear();
+        hc.hero = Hero {
+            eyebrow: "Nothing yet".into(),
+            ..Hero::default()
+        };
+        let root = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &mut MonoMeasure);
+        let mut texts = Vec::new();
+        root.for_each_leaf(&mut |_, leaf| {
+            if let SceneNode::Text { text, .. } = leaf {
+                texts.push(text.clone());
+            }
+        });
+        assert!(texts.contains(&"Nothing yet".to_string()));
+        assert!(!texts.iter().any(|t| t.contains("agents")), "no stat without agents");
+        assert!(!texts.contains(&"Spark".to_string()), "no unit without a figure");
+        assert!(!texts.contains(&"Resume".to_string()), "no action without a label");
+    }
+
+    #[test]
     fn decode_reads_rows_and_cards() {
         let v = serde_json::json!({
-            "rows": [{ "label": "Continue", "cards": [{ "title": "A", "image": "a.png" }] }],
+            "rows": [{ "title": "Continue", "cards": [{ "title": "A", "image": "a.png" }] }],
             "mood": "cosmic"
         });
         let hc = decode_home_compose(&v);
         assert_eq!(hc.rows.len(), 1);
-        assert_eq!(hc.rows[0].label, "Continue");
+        assert_eq!(hc.rows[0].title, "Continue");
         assert_eq!(hc.rows[0].cards[0].image.as_deref(), Some("a.png"));
         assert_eq!(hc.mood.as_deref(), Some("cosmic"));
     }
@@ -2154,7 +2424,7 @@ mod tests {
 
         // A new compose changes layout, so it must rebuild.
         let mut recomposed = home.clone();
-        recomposed.hero.title = "Your hive shipped a release".into();
+        recomposed.hero.eyebrow = "Shipped a release".into();
         let _ = cache.tree_for(1280.0, 800.0, &recomposed, &theme, &mut MonoMeasure);
         assert_eq!(cache.rebuilds(), 3, "a new compose must rebuild");
 
