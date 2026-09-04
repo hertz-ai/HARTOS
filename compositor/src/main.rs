@@ -466,6 +466,73 @@ fn note_first_scanout_once(latch: &std::sync::atomic::AtomicBool, scanned_out: b
     }
 }
 
+// ── shell-ready, written by the COMPOSITOR when the native scene is what painted ──
+//
+// The session supervisor's paint watchdog reads HEALTHY off the shell-ready marker, and
+// until now the only thing that ever wrote it was the WebView host (hart-layer-shell-host,
+// on LoadEvent.FINISHED with its surface mapped). That is fine while the WebView IS the
+// desktop. It stops being fine at the M6 flip, which demotes it: if the host stops running,
+// nothing writes the marker, the watchdog calls Tier-1 unhealthy, and the ladder demotes
+// straight back off the native shell. The flip would undo itself and look like a crash.
+//
+// So the native path writes it too, which is what this program's Rules already ask for
+// ("write shell-ready on first composed frame containing the scene"). Two writers of one
+// advisory marker is safe: the supervisor checks that it EXISTS, and both resolve the path
+// through the same `HART_SHELL_READY_FLAG` contract, so they cannot disagree about where.
+
+/// Default path of the shell-ready paint marker. Same "env override, else pinned default"
+/// contract as its first-scanout and input-alive siblings, and deliberately the SAME env
+/// var the WebView host reads, so the two writers share one path with no divergence.
+#[allow(dead_code)] // consumed by note_native_shell_ready_once (smithay udev) + tests
+const SHELL_READY_MARKER_DEFAULT: &str = "/run/hart/session/shell-ready";
+
+/// PURE: resolve where the shell-ready marker is written.
+#[allow(dead_code)] // consumed by note_native_shell_ready_once (smithay udev) + tests
+fn shell_ready_marker_path() -> String {
+    match std::env::var("HART_SHELL_READY_FLAG") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => SHELL_READY_MARKER_DEFAULT.to_string(),
+    }
+}
+
+/// PURE: should the COMPOSITOR emit shell-ready on this vblank? True exactly when it has
+/// not already, a real scanout just completed, and the frame that scanned out actually
+/// carried the native scene.
+///
+/// All three conditions matter. Dropping `scene_painted` would make the compositor claim a
+/// painted shell whenever the flag was merely set, which is the false-healthy the whole
+/// marker family exists to avoid. Dropping `scanned_out` would claim it off a frame that
+/// was only built, which is a WEAKER bar than the WebView host holds itself to (mapped and
+/// painted, not started), and the native writer must not be the sloppier of the two.
+#[allow(dead_code)] // consumed by note_native_shell_ready_once (smithay udev) + tests
+fn native_shell_ready_step(already_marked: bool, scanned_out: bool, scene_painted: bool) -> bool {
+    !already_marked && scanned_out && scene_painted
+}
+
+/// Emit shell-ready from the native path EXACTLY ONCE, on the first real scanout of a frame
+/// that carried the scene. Same caller-owned latch idiom as `note_first_scanout_once`, so
+/// the once-only behaviour is testable with no DRM. Best-effort: an unwritable marker
+/// leaves the journal line as the signal and never blocks a flip.
+#[allow(dead_code)] // called from the smithay udev backend's reap_completed_vblanks
+fn note_native_shell_ready_once(
+    latch: &std::sync::atomic::AtomicBool,
+    scanned_out: bool,
+    scene_painted: bool,
+) {
+    if !native_shell_ready_step(latch.load(Ordering::Relaxed), scanned_out, scene_painted) {
+        return;
+    }
+    if latch.swap(true, Ordering::Relaxed) {
+        return; // lost the race to a concurrent caller
+    }
+    let path = shell_ready_marker_path();
+    if write_scanout_marker(&path) {
+        tracing::info!(marker = %path, "hart-comp: the NATIVE scene scanned out — shell-ready written by the compositor, so the paint watchdog holds without the WebView host");
+    } else {
+        tracing::info!("hart-comp: native scene scanned out (shell-ready write skipped — advisory only)");
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // #137 — FRAME-BUDGET repaint scheduler (on-demand rendering; stop the idle 60Hz burn)
 // ════════════════════════════════════════════════════════════════════════════
@@ -1236,6 +1303,56 @@ mod tests {
         assert!(!first_scanout_step(true, true), "already marked => never re-emit");
         assert!(!first_scanout_step(false, false), "no scanout => nothing to mark");
         assert!(!first_scanout_step(true, false), "marked + no scanout => no-op");
+    }
+
+    #[test]
+    fn the_native_shell_ready_step_needs_a_scanout_AND_a_scene() {
+        // Three conditions, and each one is load-bearing. Without `scene_painted` the
+        // compositor would claim a painted shell whenever the flag was merely set, which
+        // is the false-healthy this whole marker family exists to avoid. Without
+        // `scanned_out` it would claim off a frame that was only BUILT, a weaker bar than
+        // the WebView host holds itself to (mapped and painted, not started), and the
+        // native writer must not be the sloppier of the two.
+        assert!(native_shell_ready_step(false, true, true), "scanned out with the scene => emit");
+        assert!(!native_shell_ready_step(true, true, true), "already marked => never re-emit");
+        assert!(
+            !native_shell_ready_step(false, false, true),
+            "a built frame that never scanned out is not a painted shell"
+        );
+        assert!(
+            !native_shell_ready_step(false, true, false),
+            "a scanout of a frame WITHOUT the scene says nothing about the native shell"
+        );
+    }
+
+    #[test]
+    fn the_compositor_writes_shell_ready_once_when_the_native_scene_scans_out() {
+        use std::sync::atomic::AtomicBool;
+        let mut marker = std::env::temp_dir();
+        marker.push(format!("hart-native-ready-{}.marker", std::process::id()));
+        let marker_s = marker.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&marker);
+        // This is the ONLY test that touches HART_SHELL_READY_FLAG, so the process-global
+        // set cannot race another case (same discipline as the scanout beacon's test).
+        std::env::set_var("HART_SHELL_READY_FLAG", &marker_s);
+        assert_eq!(shell_ready_marker_path(), marker_s, "the env override resolves the path");
+
+        let latch = AtomicBool::new(false);
+        // A scanout with no native scene in the frame writes nothing: that is the WebView
+        // desktop running normally, and the host owns the marker there.
+        note_native_shell_ready_once(&latch, true, false);
+        assert!(!marker.exists(), "no scene means no native claim");
+        // A native frame that never reached the display writes nothing either.
+        note_native_shell_ready_once(&latch, false, true);
+        assert!(!marker.exists(), "a frame that never scanned out is not evidence");
+
+        note_native_shell_ready_once(&latch, true, true);
+        assert_eq!(std::fs::read(&marker).unwrap(), b"1\n", "the scene scanned out, so mark it");
+
+        let _ = std::fs::remove_file(&marker);
+        note_native_shell_ready_once(&latch, true, true);
+        assert!(!marker.exists(), "one-shot: a later scanout never re-writes");
+        std::env::remove_var("HART_SHELL_READY_FLAG");
     }
 
     #[test]

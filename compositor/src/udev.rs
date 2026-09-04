@@ -114,7 +114,8 @@ use crate::comp_core::{self, HartRenderElement};
 use crate::shared::send_frame_callbacks;
 use crate::wayland::{ClientState, State};
 use crate::{
-    note_first_scanout_once, select_render_path, BootConfig, RenderPath, WindowRegistry,
+    note_first_scanout_once, note_native_shell_ready_once, select_render_path, BootConfig,
+    RenderPath, WindowRegistry,
     HART_SPLASH_RGBA,
 };
 
@@ -125,6 +126,11 @@ use crate::{
 /// WebView fires it from its own client buffer even if nothing reached the display). The
 /// pure decision + path + write live in main.rs (unit-tested); this owns only the latch.
 static FIRST_SCANOUT: AtomicBool = AtomicBool::new(false);
+
+/// One-shot latch for the compositor's own shell-ready write, the native twin of the
+/// marker the WebView host owns today. Same split as above: the pure decision, the path
+/// and the write live in main.rs; this owns only the latch.
+static NATIVE_SHELL_READY: AtomicBool = AtomicBool::new(false);
 
 /// Color formats DrmCompositor will try for the primary plane framebuffer. The pixman
 /// software floor + virtually all KMS drivers support Argb8888/Xrgb8888 — the never-
@@ -1200,6 +1206,18 @@ fn reap_completed_vblanks(state: &mut State, devices: &mut HashMap<DrmNode, Devi
     // Tier-1 (master lost / never flipped) never writes it and the supervisor can catch it.
     // `completed` is guaranteed non-empty here (the early return above), so a reap == a scanout.
     note_first_scanout_once(&FIRST_SCANOUT, true);
+    // And the native twin of the shell-ready marker: the same completed page-flip, but only
+    // when the frame carried the native scene. Written from HERE rather than at build time
+    // for the same reason the chrome bridge moved here: a queued-but-parked frame is not
+    // evidence that anything reached the screen, and shell-ready is exactly the claim that
+    // something did. Without this the M6 flip demotes the WebView host that is today the
+    // only writer, the paint watchdog stops seeing HEALTHY, and the ladder drops back off
+    // the native shell on its own.
+    note_native_shell_ready_once(
+        &NATIVE_SHELL_READY,
+        true,
+        crate::comp_core::NATIVE_SCENE_PAINTED.load(std::sync::atomic::Ordering::Relaxed),
+    );
 }
 
 /// What to do about DRM master for one device this attempt. PURE policy (no Smithay types),

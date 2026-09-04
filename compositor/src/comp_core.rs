@@ -149,6 +149,13 @@ pub static LAYERS_PAINTED: std::sync::atomic::AtomicUsize =
 /// detail into the backend-agnostic accessor surface for no gain.
 pub static NATIVE_CHROME_EMITTED: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
+/// Set once the native scene has actually put elements into a frame. Read by the
+/// compositor's shell-ready writer, which must mean "the scene really painted" rather than
+/// "the flag was set": a marker that fires off configuration instead of pixels is the
+/// false-healthy this whole marker family exists to avoid.
+pub static NATIVE_SCENE_PAINTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub const NATIVE_CHROME_BLOOM: u8 = 1 << 0;
 pub const NATIVE_CHROME_ORB: u8 = 1 << 1;
 
@@ -2481,7 +2488,15 @@ where
         // skipped precisely when the native shell is on, and the shell would then keep
         // its own HTML orb: two orbs breathing over each other, the browser still paying
         // the per-frame cost, and the entire point of the native orb lost.
-        native_mask |= render_native_scene(state, renderer, size, &mut elements);
+        let scene_mask = render_native_scene(state, renderer, size, &mut elements);
+        native_mask |= scene_mask;
+        if scene_mask != 0 {
+            // Evidence for the compositor's shell-ready writer, and note it is the SCENE's
+            // own mask, not the accumulated one: the bloom below sets a bit whether or not
+            // the native shell drew anything, so ORing first would let the backdrop alone
+            // claim a painted native shell.
+            NATIVE_SCENE_PAINTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     let ws_alpha = workspace_fade_alpha(state);
