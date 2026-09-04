@@ -98,6 +98,42 @@ def test_no_layout_rule_hardcodes_the_bar_heights(shell_html):
         "the JS layout sites should read the live bar heights via hartBarPx")
 
 
+SCENE_SRC = os.path.join(REPO, "compositor", "src", "scene.rs")
+
+
+def _rust_const_px(name):
+    """The value of a `pub const NAME: f32 = N.0;` in the native scene."""
+    src = open(SCENE_SRC, encoding="utf-8").read()
+    m = re.search(r"pub const %s:\s*f32\s*=\s*([0-9]+)\.?[0-9]*\s*;" % name, src)
+    assert m, "%s not found in scene.rs" % name
+    return int(m.group(1))
+
+
+def test_the_native_scene_draws_the_same_strips_the_shell_reserves(published):
+    """THE DRIFT CLASS AGAIN, in the language the guard above cannot see.
+
+    The native compositor scene paints its own top bar and taskbar, and it sizes
+    them from two Rust constants. The shell meanwhile publishes the reservation
+    from the CSS the browser actually applies, and every window-placement path
+    subtracts THAT. So the moment the two disagree, the native bar and the space
+    reserved for it are different sizes: either a dead band of desktop no window
+    may use, or windows tucked under a bar that is drawing over them, which is
+    the exact 2026-08-29 report this whole contract exists to prevent.
+
+    The guard above scans the served shell for hardcoded 40/44. It cannot see
+    Rust, and 40/44 is precisely what scene.rs hardcodes, so this pins the two
+    together until the native scene becomes the thing that PUBLISHES the
+    reservation (the M6 question: once the compositor paints the chrome, the
+    compositor is what knows its size, and the direction of this contract has to
+    invert).
+    """
+    r = L.publish_panel_reservation(":root{--hart-topbar-height:40px}")
+    assert _rust_const_px("TOP_BAR_H") == r["top"], (
+        "scene.rs TOP_BAR_H and the published top reservation have drifted")
+    assert _rust_const_px("TASKBAR_H") == r["bottom"], (
+        "scene.rs TASKBAR_H and the published bottom reservation have drifted")
+
+
 def test_a_failed_theme_load_still_reserves_the_bar_it_actually_paints(
         published, monkeypatch):
     """Replaces the fallback-constant grep AND the source index-ordering check.
