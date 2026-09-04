@@ -357,6 +357,52 @@ image-source contract), and the clock, which is the only one that also needs an
 input the compose feed does not carry, since the shell's clock is local time and
 not part of the A2UI payload.
 
+### BEFORE FLIPPING M6: four obligations nothing enforces
+Found by reading the consumers rather than the compositor, which is the only way
+any of them show up: each crosses a process boundary, so no Rust test and no
+headless run can fail on them. Two are code, two are contract decisions that
+touch the shell and must not be settled unilaterally.
+
+1. **shell-ready has no native writer.** The supervisor's paint watchdog reads
+   HEALTHY off `/run/hart/session/shell-ready`, and the ONLY thing that ever
+   writes it is the WebView host (hart-layer-shell-host.nix, on
+   LoadEvent.FINISHED with the surface mapped). M6 demotes the WebView. If it
+   stops running, nothing writes the marker, the watchdog calls Tier-1 unhealthy
+   and the ladder demotes straight back off the native shell. This program's own
+   Rules section already says "write shell-ready on first composed frame
+   containing the scene"; that is still unbuilt. Note the honest-paint bar the
+   WebView host holds itself to: the marker means MAPPED and painted, not
+   "started", so the native writer owes the same.
+
+2. **The panel reservation points the wrong way.** The shell publishes how much
+   chrome it owns and `work_area` subtracts it from every placement path. Once
+   the compositor paints the bars, the compositor is what knows their size, so
+   the contract has to invert and the native scene has to become the publisher.
+   Until it does, scene.rs hardcodes 40/44 against a value the theme can move,
+   which is the 2026-08-29 "taskbar unreachable" report waiting to happen again
+   through the new renderer. Pinned meanwhile by
+   tests/unit/test_panel_reservation.py so the two cannot drift silently.
+
+3. **The taskbar has no feed.** The native taskbar is an empty strip and the
+   obvious fill is wrong: the shell's taskbar lists ITS OWN web panels, which are
+   DOM elements inside one fullscreen WebView surface, so the compositor cannot
+   see them. Building chips from `space().elements()` would show different things
+   than the shell shows, which is a parallel path. The content has to arrive over
+   the same feed as home_compose. Contract decision.
+
+4. **Image lowering has no source contract.** SceneNode::Image is decoded and
+   laid out but never lowered, because what a card's `image` string denotes (URL,
+   app-icon id, a path the compositor may read) is the shell's to define.
+   Contract decision.
+
+Already handled, listed so nobody re-derives them: the scene claims
+NATIVE_CHROME_ORB itself (the M2 block that used to set it is skipped exactly
+when the flag is on, so the flip would otherwise have left two orbs breathing);
+a drawn native scene holds the frame-budget gate open (its orb breathes off the
+clock, and the 200ms idle heartbeat would have rendered that at 5 Hz); and the
+scene is skipped under the killswitch (it is hidden anyway, and holding the gate
+open behind a blacked-out screen is the worst time to composite at full rate).
+
 ### How compositor Rust is actually verified from here
 `python .hart-devenv/deepbox-check.py [cargo args]` ships compositor/ to a
 container on deepbox and runs cargo there in about 50 seconds. Use
