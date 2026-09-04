@@ -1165,7 +1165,19 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         pass
 
     response_format = {"message2userfinal": "Your message here"}
-    agent_prompt = f'''You are a Helpful {role} Assistant. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
+    # DATE-CONTEXT: the local model's training cutoff makes it assume an earlier
+    # year — it refused "2026" research as "the future" and injected "2024" into
+    # its own search queries (measured live 2026-09-05, agent 18088688973).
+    # State today's date as ground truth so current/future-year work is treated
+    # as real and searchable.  Reused for the StatusVerifier below (one source).
+    _date_ctx = (
+        f"CURRENT DATE: today is {datetime.now().strftime('%A, %B %d, %Y')}. "
+        f"Treat this as the present; do NOT assume an earlier year or refuse a "
+        f"task as 'in the future'. Current-year information is real and searchable."
+    )
+    agent_prompt = f'''{_date_ctx}
+
+You are a Helpful {role} Assistant. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
 {get_cultural_prompt()}
 {_personality_block}
 
@@ -1357,6 +1369,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         """,
         is_termination_msg=_is_terminate_msg,
     )
+    # Give the StatusVerifier the same date ground-truth as the Assistant so it
+    # does not reject current/future-year work as impossible (see DATE-CONTEXT).
+    try:
+        verify.update_system_message(_date_ctx + "\n\n" + verify.system_message)
+    except Exception:
+        pass
 
     chat_instructor = autogen.UserProxyAgent(
         name="ChatInstructor",
