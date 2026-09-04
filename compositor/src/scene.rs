@@ -520,6 +520,35 @@ const OMNIBOX_W: f32 = 420.0;
 const ORB_SM: f32 = 28.0;
 /// Wordmark type size. The shell sets it in the bar's own scale, not the hero's.
 const WORDMARK_PX: f32 = 15.0;
+/// A text box of `ink_w` centred inside a slot at `slot_x` of width `slot_w`, CLAMPED so
+/// it can never exceed the slot.
+///
+/// The clamp is the point. Icons are ligature names, so a measure that lacks the face
+/// reports the width of the WORD ("notifications") rather than of the one glyph it
+/// becomes, which is several times the 32px button it has to sit in. Sizing a slot's
+/// contents from an untrusted measurement is how a tray glyph ends up drawn over the
+/// clock, so the slot wins and the run is clipped instead.
+fn centered_box(ink_w: f32, slot_x: f32, slot_w: f32, y: f32, h: f32) -> Rect {
+    let w = (ink_w.ceil() + 2.0).min(slot_w).max(0.0);
+    Rect::new(slot_x + (slot_w - w) * 0.5, y, w, h)
+}
+
+/// The tray glyphs (`.top-bar-right .tray-btn`), in the shell's left-to-right order.
+/// Ligature names, so they ride the ordinary text path like every other icon.
+const TRAY_GLYPHS: [&str; 3] = ["notifications", "palette", "shield"];
+const TRAY_BTN: f32 = 32.0;
+const TRAY_PX: f32 = 18.0;
+const TRAY_GAP: f32 = 8.0;
+const AVATAR_D: f32 = 28.0;
+const AVATAR_PX: f32 = 13.0;
+/// The shell hardcodes this letter in its own markup, so it is the same letter rather
+/// than a guess at whose account it is.
+const AVATAR_INITIAL: &str = "H";
+const OMNIBOX_GLYPH: &str = "search";
+const OMNIBOX_PX: f32 = 14.0;
+/// The shortcut hint at the far end of the pill (the shell's `.tbo-kbd`).
+const OMNIBOX_KBD: &str = "Super K";
+const KBD_PX: f32 = 11.0;
 /// The shell's five primary destinations (`.top-bar-nav .tb-tab`), in its order.
 const NAV_TABS: [&str; 5] = ["Home", "Agents", "Apps", "Hive", "Earn"];
 /// Which tab reads as current. The native scene only lays out the HOME canvas, so home
@@ -567,6 +596,10 @@ pub fn layout_home(
     measure: &mut dyn TextMeasure,
 ) -> SceneNode {
     let mut root: Vec<SceneNode> = Vec::new();
+    // Asked ONCE for the whole layout rather than per glyph: it walks the font database,
+    // and the answer cannot change within a single layout pass. Every icon on this
+    // desktop is a ligature name, so this one bool decides whether ANY of them draw.
+    let icons_available = measure.has_icon_face();
 
     // ── Top bar (fixed, 40px): background, centre omnibox pill, right orb-sm. ──
     let bar = Rect::new(0.0, 0.0, output_w, TOP_BAR_H);
@@ -663,19 +696,103 @@ pub fn layout_home(
         color: theme.omnibox_bg,
         radius: (TOP_BAR_H - 12.0) * 0.5,
     });
+    // Inside the pill, the shell's own three parts: a search glyph, the prompt, and the
+    // shortcut hint pushed to the far end. The hint is right-anchored, which is the
+    // measure again; before it there was nowhere to put it.
+    let pill_ink_y = (TOP_BAR_H - OMNIBOX_PX * 1.3) * 0.5;
+    let mut pill_x = pill.x + 12.0;
+    if icons_available {
+        let gw = measure.text_width(OMNIBOX_GLYPH, OMNIBOX_PX);
+        bar_children.push(SceneNode::Text {
+            rect: Rect::new(pill_x, pill_ink_y, gw.ceil() + 2.0, OMNIBOX_PX * 1.3),
+            text: OMNIBOX_GLYPH.to_string(),
+            size_px: OMNIBOX_PX,
+            color: theme.omnibox_ink,
+            align: TextAlign::Left,
+        });
+        pill_x += gw + 8.0;
+    }
     bar_children.push(SceneNode::Text {
-        rect: pill.inset(12.0),
+        rect: Rect::new(
+            pill_x,
+            pill_ink_y,
+            (pill.right() - 12.0 - pill_x).max(0.0),
+            OMNIBOX_PX * 1.3,
+        ),
         text: "Ask or search anything".to_string(),
         size_px: 14.0,
         color: theme.omnibox_ink,
         align: TextAlign::Left,
     });
-    let orb_sm_rect = Rect::new(
-        output_w - EDGE_PAD - ORB_SM,
-        (TOP_BAR_H - ORB_SM) * 0.5,
-        ORB_SM,
-        ORB_SM,
-    );
+    let kbd_w = measure.text_width(OMNIBOX_KBD, KBD_PX);
+    let kbd_x = pill.right() - 12.0 - kbd_w;
+    if kbd_x > pill_x {
+        bar_children.push(SceneNode::Text {
+            rect: Rect::new(
+                kbd_x,
+                (TOP_BAR_H - KBD_PX * 1.3) * 0.5,
+                kbd_w.ceil() + 2.0,
+                KBD_PX * 1.3,
+            ),
+            text: OMNIBOX_KBD.to_string(),
+            size_px: KBD_PX,
+            color: theme.omnibox_ink,
+            align: TextAlign::Left,
+        });
+    }
+
+    // ── The bar's right cluster, laid out from the RIGHT EDGE inward so it stays put as
+    //    the output widens: tray glyphs, then the avatar, then the orb-sm, which is the
+    //    shell's order read right to left. The clock sits outermost in the shell and is
+    //    absent here: it needs a time source the scene has no input for, and reserving a
+    //    slot for something that never draws would leave a hole in the cluster.
+    let mut right_x = output_w - EDGE_PAD;
+    if icons_available {
+        for glyph in TRAY_GLYPHS.iter().rev() {
+            right_x -= TRAY_BTN;
+            let b = centered_box(
+                measure.text_width(glyph, TRAY_PX),
+                right_x,
+                TRAY_BTN,
+                (TOP_BAR_H - TRAY_PX * 1.3) * 0.5,
+                TRAY_PX * 1.3,
+            );
+            bar_children.push(SceneNode::Text {
+                rect: b,
+                text: (*glyph).to_string(),
+                size_px: TRAY_PX,
+                color: theme.omnibox_ink,
+                align: TextAlign::Left,
+            });
+            right_x -= TRAY_GAP;
+        }
+    }
+    // Avatar: a filled disc with the account initial. The shell hardcodes the letter in
+    // its markup, so this is the same letter, not a guess at a user's name.
+    right_x -= AVATAR_D;
+    let av = Rect::new(right_x, (TOP_BAR_H - AVATAR_D) * 0.5, AVATAR_D, AVATAR_D);
+    bar_children.push(SceneNode::Rect {
+        rect: av,
+        color: theme.omnibox_bg,
+        radius: AVATAR_D * 0.5,
+    });
+    bar_children.push(SceneNode::Text {
+        rect: centered_box(
+            measure.text_width(AVATAR_INITIAL, AVATAR_PX),
+            av.x,
+            AVATAR_D,
+            (TOP_BAR_H - AVATAR_PX * 1.3) * 0.5,
+            AVATAR_PX * 1.3,
+        ),
+        text: AVATAR_INITIAL.to_string(),
+        size_px: AVATAR_PX,
+        color: theme.bar_ink,
+        align: TextAlign::Left,
+    });
+    right_x -= TRAY_GAP;
+
+    right_x -= ORB_SM;
+    let orb_sm_rect = Rect::new(right_x, (TOP_BAR_H - ORB_SM) * 0.5, ORB_SM, ORB_SM);
     bar_children.push(SceneNode::OrbSlot {
         rect: orb_sm_rect,
         compact: true,
@@ -715,10 +832,6 @@ pub fn layout_home(
         rect: Rect::new(content.right() - orb_home, content.y, orb_home, orb_home),
         compact: false,
     });
-
-    // Asked ONCE rather than per card: it walks the font database, and the answer cannot
-    // change within a layout.
-    let icons_available = measure.has_icon_face();
 
     // ── Rows: cap at 3 (a2 "2-3 rows"), each a label + a strip of cards, emitted only
     //    while they fit inside the content band so the desktop never scrolls. ──
@@ -799,12 +912,12 @@ pub fn layout_home(
                     color: theme.chip_bg,
                     radius: 10.0,
                 });
-                let gw = measure.text_width(name, CARD_ICON_PX);
                 card_children.push(SceneNode::Text {
-                    rect: Rect::new(
-                        cr.x + 14.0 + (CARD_ICON_BOX - gw).max(0.0) * 0.5,
+                    rect: centered_box(
+                        measure.text_width(name, CARD_ICON_PX),
+                        cr.x + 14.0,
+                        CARD_ICON_BOX,
                         cr.y + 12.0 + (CARD_ICON_BOX - CARD_ICON_PX * 1.3) * 0.5,
-                        gw.ceil() + 2.0,
                         CARD_ICON_PX * 1.3,
                     ),
                     text: name.clone(),
@@ -1596,6 +1709,77 @@ mod tests {
         fn has_icon_face(&self) -> bool {
             true
         }
+    }
+
+    #[test]
+    fn the_bars_right_cluster_reads_in_the_shells_order_from_the_right_edge() {
+        let (w, h) = (1600.0, 900.0);
+        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &mut IconMeasure);
+        let runs = bar_runs(&root);
+        let at = |t: &str| runs.iter().find(|(s, _)| s == t).map(|(_, r)| *r);
+
+        // Right to left: shield, palette, notifications, then the avatar, then the orb-sm.
+        let shield = at("shield").expect("a shield glyph");
+        let palette = at("palette").expect("a palette glyph");
+        let notif = at("notifications").expect("a notifications glyph");
+        let avatar = at(AVATAR_INITIAL).expect("the avatar initial");
+        assert!(shield.x > palette.x, "shield is outermost");
+        assert!(palette.x > notif.x, "then palette, then notifications");
+        assert!(notif.x > avatar.x, "the avatar sits inside the tray");
+        assert!(
+            shield.right() <= w - EDGE_PAD + 0.01,
+            "the cluster stays inside the edge pad"
+        );
+
+        // The orb-sm is inboard of the avatar now, which is where the shell puts it.
+        let mut orb_sm_x = None;
+        if let SceneNode::Container { children, .. } = &root {
+            for c in children {
+                if let SceneNode::Container { children, .. } = c {
+                    for n in children {
+                        if let SceneNode::OrbSlot { rect, compact: true } = n {
+                            orb_sm_x = Some(rect.x);
+                        }
+                    }
+                }
+            }
+        }
+        let ox = orb_sm_x.expect("a compact orb slot in the bar");
+        assert!(ox < avatar.x, "the orb-sm is inboard of the avatar");
+
+        // Everything in the cluster stays on the bar's line.
+        for (label, r) in &runs {
+            assert!(
+                r.y >= 0.0 && r.bottom() <= TOP_BAR_H + 0.01,
+                "{label} escapes the 40px strip"
+            );
+        }
+
+        // With no icon face the glyphs vanish but the avatar and the orb do not: they are
+        // not ligatures, so a missing font must not take them with it.
+        let plain = layout_home(w, h, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let pruns = bar_runs(&plain);
+        assert!(!pruns.iter().any(|(s, _)| s == "shield"));
+        assert!(pruns.iter().any(|(s, _)| s == AVATAR_INITIAL), "the avatar survives");
+    }
+
+    #[test]
+    fn the_omnibox_pill_carries_its_glyph_prompt_and_shortcut_hint() {
+        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &mut IconMeasure);
+        let runs = bar_runs(&root);
+        let at = |t: &str| runs.iter().find(|(s, _)| s == t).map(|(_, r)| *r);
+        let glyph = at(OMNIBOX_GLYPH).expect("the search glyph");
+        let prompt = at("Ask or search anything").expect("the prompt");
+        let kbd = at(OMNIBOX_KBD).expect("the shortcut hint");
+        assert!(prompt.x > glyph.x, "the prompt follows the glyph");
+        assert!(kbd.x > prompt.x, "the hint is pushed to the far end");
+
+        let pill_right = (1600.0 - OMNIBOX_W) * 0.5 + OMNIBOX_W;
+        assert!(
+            kbd.right() <= pill_right - 6.0,
+            "the hint stays inside the pill, ended at {} against {pill_right}",
+            kbd.right()
+        );
     }
 
     #[test]
