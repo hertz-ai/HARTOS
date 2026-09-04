@@ -453,6 +453,40 @@ clock, and the 200ms idle heartbeat would have rendered that at 5 Hz); and the
 scene is skipped under the killswitch (it is hidden anyway, and holding the gate
 open behind a blacked-out screen is the worst time to composite at full rate).
 
+### The native home now decodes what the producers actually send
+Worth recording how this went wrong, because it was invisible for a long time and
+the same trap is open for every future field. The native decoder had been written
+against an IMAGINED payload: `Hero` read `title` and `copy`, `Row` read `label`,
+`Card` read `subtitle`. Not one of those four keys is emitted by any producer. On
+a live compose the desktop therefore rendered a blank hero and unlabelled rows,
+while looking perfect in every unit test and every headless render, because
+`HomeCompose::demo` filled the imagined names.
+
+The authority is `liquid_ui_service.py`: `_home_sanitize_hero`,
+`_home_sanitize_card` and the row builder beside them, plus the backbone builder
+that emits the same shapes. Read those before adding any scene field. They are
+allowlists, so a key not on them cannot arrive no matter what the LLM writes.
+
+Decoded and drawn now: the earnings hero (eyebrow, amount, unit, agents, tasks,
+local, payout_pending, the two action labels), row title/note/see_all/accent, and
+card title/meta/progress/icon/badge/live. Deliberately NOT decoded: `usd_equiv`
+and `spark_series`, which hartHome.js reads but no producer emits, and card
+`format`, same. Adding those would repeat the exact mistake above.
+
+### Two row variants left, and one of them needs a renderer capability
+`row.flagship` is BEHAVIOUR, not appearance: it stops refresh() replacing that row
+with live dashboard rows. Nothing for the scene to draw.
+
+`row.ranked` is the hive leaderboard, and it is the first parity item the native
+path cannot currently match rather than merely has not. A ranked card drops its
+tile entirely (transparent background, no border) and draws a 116px rank numeral
+overhanging the bottom-left corner, with `color: transparent` and a 3px
+`-webkit-text-stroke`. That is OUTLINED text. `text_render` composites glyph
+COVERAGE into a buffer and has no stroke, so the honest options are to add stroked
+text to the rasterizer (coverage, dilate, subtract the original) or to approximate
+with a low-alpha filled numeral. The second is a visible difference dressed up as
+parity, so it should be a decision rather than something quietly shipped.
+
 ### How compositor Rust is actually verified from here
 `python .hart-devenv/deepbox-check.py [cargo args]` ships compositor/ to a
 container on deepbox and runs cargo there in about 50 seconds. Use
