@@ -211,6 +211,20 @@ pub struct Theme {
 /// The spectrum names, positionally matched to `Theme::spectrum`.
 const SPECTRUM_NAMES: [&str; 6] = ["teal", "cyan", "blue", "violet", "magenta", "amber"];
 
+/// A palette literal, degrading to `fallback` instead of panicking.
+///
+/// The strings below are compile-time constants copied from the shell's CSS, so the
+/// fallback is unreachable in practice. It exists because this runs inside the process
+/// that owns scanout: a mistyped hex should cost one wrong colour, not the desktop. That
+/// is the same posture the text path already takes with an empty font database, and the
+/// reason `from_hex` returns Option rather than panicking in the first place.
+fn palette(hex: &str, fallback: Color) -> Color {
+    match Color::from_hex(hex) {
+        Some(c) => c,
+        None => fallback,
+    }
+}
+
 impl Theme {
     /// Resolve a row's accent NAME to its hue, or None for a name outside the spectrum.
     /// Callers fall back by ROW INDEX rather than to a fixed colour, which is what the
@@ -235,7 +249,9 @@ impl Theme {
     /// a near-black cosmic bar, neutral ink. A safe fallback when no `mood` was pushed;
     /// a real compose overrides via the palette owner upstream.
     pub fn cosmic_default() -> Theme {
-        let teal = Color::from_hex("#00E6C3").unwrap();
+        // A visible neutral as the fallback, never TRANSPARENT: a colour that vanishes
+        // hides the mistake, and a grey square does not.
+        let teal = palette("#00E6C3", Color::rgba(0.5, 0.5, 0.5, 1.0));
         Theme {
             bar_bg: Color::rgba(0.043, 0.047, 0.063, 0.72),
             bar_ink: Color::rgba(0.92, 0.95, 0.98, 1.0),
@@ -248,20 +264,20 @@ impl Theme {
             accent: teal,
             // #9B5CFF, the shell's --hart-a2, so the native wordmark reads exactly as the
             // HTML one does rather than inventing a second brand purple.
-            accent2: Color::from_hex("#9B5CFF").unwrap(),
+            accent2: palette("#9B5CFF", Color::rgba(0.5, 0.5, 0.5, 1.0)),
             // The shell's own card-badge ink and --hart-amb-4 default, so a native chip
             // reads as the same component rather than a lookalike.
-            on_accent_ink: Color::from_hex("#04140F").unwrap(),
-            live_dot: Color::from_hex("#FF2E9A").unwrap(),
+            on_accent_ink: palette("#04140F", Color::rgba(0.0, 0.0, 0.0, 1.0)),
+            live_dot: palette("#FF2E9A", Color::rgba(0.5, 0.5, 0.5, 1.0)),
             chip_bg: Color::rgba(0.031, 0.047, 0.078, 0.72),
             // hartBrandArt's SPECTRUM_HEX, in its order.
             spectrum: [
                 teal,
-                Color::from_hex("#29C5FF").unwrap(),
-                Color::from_hex("#3B82F6").unwrap(),
-                Color::from_hex("#9B5CFF").unwrap(),
-                Color::from_hex("#FF2E9A").unwrap(),
-                Color::from_hex("#FFC83D").unwrap(),
+                palette("#29C5FF", teal),
+                palette("#3B82F6", teal),
+                palette("#9B5CFF", teal),
+                palette("#FF2E9A", teal),
+                palette("#FFC83D", teal),
             ],
             taskbar_bg: Color::rgba(0.043, 0.047, 0.063, 0.85),
         }
@@ -1654,6 +1670,29 @@ mod tests {
             .hover_leaf(Some((cr.x + cr.w * 0.5, cr.y + cr.h * 0.5)))
             .expect("a card is a hover target");
         assert_eq!(walked[idx].1, cr);
+    }
+
+    #[test]
+    fn a_mistyped_palette_literal_costs_a_colour_not_the_desktop() {
+        // Theme construction runs inside the process that owns scanout, so a bad hex must
+        // degrade rather than unwind. The fallback is deliberately a VISIBLE neutral and
+        // never transparent: a colour that vanishes hides the mistake.
+        let fallback = Color::rgba(0.5, 0.5, 0.5, 1.0);
+        assert_eq!(palette("#00E6C3", fallback), Color::from_hex("#00E6C3").unwrap());
+        assert_eq!(palette("not-a-colour", fallback), fallback);
+        assert_eq!(palette("", fallback), fallback);
+        assert!(palette("#zzz", fallback).a > 0.0, "the fallback must be visible");
+        // And the shipped theme really is the shell's palette, not a wall of fallbacks.
+        let t = Theme::cosmic_default();
+        assert_ne!(t.accent, fallback);
+        assert_ne!(t.accent2, fallback);
+        assert!(t.spectrum.iter().all(|c| *c != fallback), "every spectrum hue parsed");
+        // The six are distinct, which is the whole point of rotating through them.
+        for i in 0..t.spectrum.len() {
+            for j in (i + 1)..t.spectrum.len() {
+                assert_ne!(t.spectrum[i], t.spectrum[j], "spectrum {i} and {j} collide");
+            }
+        }
     }
 
     #[test]
