@@ -3147,6 +3147,28 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         while True:
             current_app.logger.info('inside reuse while1')
 
+            # #725 ROOT-CAUSE FIX (proven live 2026-09-05: nappend=0, conversation in
+            # manager._oai_messages).  In this reuse flow autogen accumulates the
+            # exchange in the agents' pairwise _oai_messages, NOT in group_chat.messages
+            # (which the factory wrapped as a _GraphHookedList that never gets appended
+            # to).  Every group_chat.messages read below therefore saw an empty list and
+            # the turn bailed "empty mid-loop" — the general reuse blocker.  Sync the
+            # group log from the manager's richest conversation buffer (autogen's own
+            # store — no parallel path) so the existing reads work unchanged.  Cheap:
+            # only runs when the group log is empty.
+            try:
+                if not group_chat.messages:
+                    _mgr_msgs = getattr(manager, '_oai_messages', None)
+                    if _mgr_msgs:
+                        _conv = max(_mgr_msgs.values(), key=len, default=None)
+                        if _conv:
+                            group_chat.messages.extend(_conv)
+                            current_app.logger.info(
+                                f"[725-SYNC] group_chat.messages empty — synced "
+                                f"{len(_conv)} msgs from manager._oai_messages")
+            except Exception as _sync_err:
+                current_app.logger.debug(f"[725-SYNC] skipped: {_sync_err}")
+
             # === LEDGER v2.0: Heartbeat + Budget/SLA using KNOWN state ===
             _reuse_current_action = user_tasks[user_prompt].current_action
             _reuse_ledger = user_ledgers.get(user_prompt)
@@ -3296,11 +3318,13 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 current_app.logger.error(f"Error in get_agent_response indexx:\n{error_message}")
 
             if not group_chat.messages:
-                # States the OBSERVATION only (#725): the transform rewrites the
-                # per-reply view, not group_chat.messages.  Cause still open.
+                # Defensive: the loop-top #725 sync (extend from
+                # manager._oai_messages) normally keeps this populated once a
+                # conversation exists.  If it is still empty here, end the turn
+                # gracefully rather than raise IndexError on messages[-1].
                 current_app.logger.warning(
                     'reuse: group chat history is empty mid-loop - ending the '
-                    'turn instead of raising IndexError (cause not established)')
+                    'turn instead of raising IndexError')
                 break
             last_message = group_chat.messages[-1]
             content_lower = last_message['content'].lower()
