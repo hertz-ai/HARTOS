@@ -518,6 +518,8 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         // NATIVE SHELL: retained scene tree, built on the first frame then reused until
         // the size, the composed home or the theme changes.
         scene_cache: Default::default(),
+        // NATIVE SHELL M2 press half: no buttons held at boot.
+        pointer_buttons_down: 0,
         ipc: crate::ipc::IpcState::default(),
         // F1 (#166) — no flips in flight at boot; the VBlank source populates this.
         vblank_completed: std::collections::HashSet::new(),

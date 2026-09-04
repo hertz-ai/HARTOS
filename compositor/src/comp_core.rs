@@ -583,6 +583,20 @@ pub trait CompState:
         false
     }
 
+    /// NATIVE SHELL M2 press half: how many pointer buttons the seat currently holds
+    /// down, maintained by the shared `on_pointer_button` via `note_pointer_button`.
+    /// The native scene reads `pointer_pressed` so the orb reacts to a click held over
+    /// it. Defaults keep the press reaction OFF for any backend that does not store the
+    /// count, which is exactly today's behaviour (additive, no regression). A count
+    /// rather than a bool so two buttons held then one released stays pressed; the
+    /// release decrement saturates, so a stray release never underflows. Known edge,
+    /// accepted: a release swallowed by the capture killswitch can leave the count high
+    /// until the next click, which only over-energises the orb cosmetically.
+    fn note_pointer_button(&mut self, _down: bool) {}
+    fn pointer_pressed(&self) -> bool {
+        false
+    }
+
     /// NATIVE SHELL M3: the latest home_compose scene pushed over the `shell.compose`
     /// IPC verb, or None to fall back to the demo scene. Default None / no-op setter,
     /// so only the DRM backend stores it (winit dev build uses the demo).
@@ -1577,6 +1591,10 @@ pub fn on_pointer_button<S: CompState, B: InputBackend>(state: &mut S, evt: B::P
     let serial = SERIAL_COUNTER.next_serial();
     let button = evt.button_code();
     let button_state = evt.state();
+    // M2 press half: keep the seat's held-button count current for the native scene
+    // (the orb's press reaction). One line on the SAME shared handler both backends
+    // route through, so there is no second button path.
+    state.note_pointer_button(button_state == ButtonState::Pressed);
     if button_state == ButtonState::Pressed {
         update_keyboard_focus(state, state.pointer().current_location(), serial);
     }
@@ -2145,13 +2163,15 @@ pub fn render_native_scene<S, R>(
         .cloned()
         .unwrap_or_else(crate::scene::HomeCompose::demo);
     let orb_energy = state.orb_energy();
-    // Read the pointer BEFORE the `&mut` cache borrow (both are plain owned values), so
-    // the hover lift rides the same single lowering call. None on a pre-mode frame.
+    // Read the pointer + held-button state BEFORE the `&mut` cache borrow (all plain
+    // owned values), so hover AND press ride the same single lowering call. None on a
+    // pre-mode frame.
     let pointer = native_pointer_scene_pos(state, size);
+    let pressed = state.pointer_pressed();
     let (rasterizer, orb_cache, rect_cache, scene_cache) = state.native_scene_caches();
     lower_scene(
         &home, size, renderer, rasterizer, orb_cache, rect_cache, scene_cache, orb_energy,
-        pointer, elements,
+        pointer, pressed, elements,
     );
 }
 
@@ -2170,6 +2190,7 @@ pub fn lower_scene<R>(
     scene_cache: &mut crate::scene::SceneCache,
     orb_energy: f32,
     pointer: Option<(f32, f32)>,
+    pressed: bool,
     elements: &mut Vec<HartRenderElement<R>>,
 ) where
     R: Renderer + ImportAll + ImportMem,
@@ -2186,10 +2207,11 @@ pub fn lower_scene<R>(
     // Hand out pooled solid buffers from the top for this frame (see RectCache::solid).
     rect_cache.begin_frame();
 
-    // M2 input half: the pointer energises the orb it sits over. Fold the hover lift into
-    // the ambient energy ONCE here, against the SAME tree the leaves come from, so orb
-    // reactivity rides the existing orb path (orb::motion_at clamps the sum to 0..=1).
-    let orb_energy = orb_energy + tree.pointer_orb_energy(pointer);
+    // M2 input half: the pointer energises the orb it sits over (more while a button is
+    // held). Fold the lift into the ambient energy ONCE here, against the SAME tree the
+    // leaves come from, so orb reactivity rides the existing orb path (orb::motion_at
+    // clamps the sum to 0..=1).
+    let orb_energy = orb_energy + tree.pointer_orb_energy(pointer, pressed);
 
     let mut leaves: Vec<&crate::scene::SceneNode> = Vec::new();
     tree.flatten(&mut leaves);
@@ -3468,6 +3490,7 @@ mod native_render_tests {
             &mut scenes,
             0.5,
             None,
+            false,
             &mut elements,
         );
 
@@ -3535,6 +3558,7 @@ mod native_render_tests {
                 &mut scenes,
                 0.5,
                 None,
+                false,
                 &mut elements,
             );
             if frame == 0 {
@@ -3600,6 +3624,7 @@ mod native_render_tests {
             &mut scenes,
             0.5,
             None,
+            false,
             &mut elements,
         );
 
