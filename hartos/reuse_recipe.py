@@ -3028,6 +3028,34 @@ def _reuse_live_messages(group_chat, user_prompt):
     return live if live else _reuse_msg_snapshot.get(user_prompt, [])
 
 
+def _reuse_locate_verdict(messages):
+    """The StatusVerifier's latest verdict message in this turn, or None.
+
+    The advance branches used to require the exact shape
+    [.., verdict, ChatInstructor "TERMINATE"] and read messages[-2].  Autogen
+    does produce that shape when the verifier's verdict ends a round — but
+    the loop's OWN steers (`chat_instructor.initiate_chat("Hey @StatusVerifier
+    ...")`) are also ChatInstructor messages and land on top of it, so every
+    re-check saw a steer at [-1], never the sentinel, and the verdict sat
+    stranded one or more slots below.  Measured 2026-09-04 02:54:30 (Auto
+    Research, installed build): 'completed' verdict + TERMINATE, then four
+    steers in ~1s until count==4; current_action never advanced and the
+    turn's reply was the steer text.  Walk back from the tail to the newest
+    StatusVerifier message instead; only ChatInstructor turns (sentinel,
+    steers, action prompts) may sit above it — anything else means the
+    conversation moved on and there is no fresh verdict.
+    """
+    for m in reversed(messages or []):
+        if not isinstance(m, dict):
+            continue
+        name = m.get('name')
+        if name == 'StatusVerifier':
+            return m
+        if name != 'ChatInstructor':
+            return None
+    return None
+
+
 def _reset_reuse_guard_state(user_prompt):
     """Drop this user_prompt's guard state at session creation.
 
@@ -3209,15 +3237,19 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             # #725: read the live list, or the last-non-empty snapshot when
             # autogen has emptied it, so the completed+TERMINATE verdict is not
             # lost (which used to freeze every action at 1).
-            _live_msgs = group_chat.messages if group_chat.messages else _reuse_msg_snapshot.get(user_prompt, [])
-            if _live_msgs and _live_msgs[-1]['name'] == 'ChatInstructor' and _live_msgs[-1]['content'] == 'TERMINATE':
+            _live_msgs = _reuse_live_messages(group_chat, user_prompt)
+            # The verdict is wherever the verifier left it under the
+            # ChatInstructor's sentinel AND the loop's own steers — not at a
+            # fixed [-2] (see _reuse_locate_verdict).
+            _verdict_msg = _reuse_locate_verdict(_live_msgs)
+            if _verdict_msg is not None:
                 current_app.logger.info(
-                    f"group_chat.messages[-2]['content'] {_live_msgs[-2]['content'][:10]}..")
+                    f"reuse: verifier verdict {_verdict_msg['content'][:10]}..")
                 try:
                     try:
-                        json_obj = json.loads(_live_msgs[-2]["content"])
+                        json_obj = json.loads(_verdict_msg["content"])
                     except (json.JSONDecodeError, ValueError):
-                        json_obj = ast.literal_eval(_live_msgs[-2]["content"])
+                        json_obj = ast.literal_eval(_verdict_msg["content"])
                     current_app.logger.info(f'got json object {json_obj}')
                     if json_obj['status'].lower() == 'completed':
                         _llm_action_id = int(json_obj.get("action_id", _reuse_current_action))
@@ -3259,7 +3291,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     return ''
                 except Exception:
                     try:
-                        json_obj = retrieve_json(_live_msgs[-2]["content"])  # canonical parse (#95)
+                        json_obj = retrieve_json(_verdict_msg["content"])  # canonical parse (#95)
                         if json_obj:
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
@@ -3911,15 +3943,18 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                             if _w2_task.is_sla_breached() and not _w2_task.sla_breached:
                                 _w2_task.mark_sla_breached()
 
-                    # Same empty-history hazard as the while1 loop above.
-                    if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
+                    # Same empty-history hazard as the while1 loop above, and
+                    # the same verdict placement: read it wherever the verifier
+                    # left it under the ChatInstructor's sentinel/steers.
+                    _w2_verdict = _reuse_locate_verdict(group_chat.messages)
+                    if _w2_verdict is not None:
                         current_app.logger.info(
-                            f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
+                            f"reuse: verifier verdict {_w2_verdict['content'][:10]}..")
                         try:
                             try:
-                                json_obj = json.loads(group_chat.messages[-2]["content"])
+                                json_obj = json.loads(_w2_verdict["content"])
                             except (json.JSONDecodeError, ValueError):
-                                json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
+                                json_obj = ast.literal_eval(_w2_verdict["content"])
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
                                 _llm_aid = int(json_obj.get("action_id", _w2_current))
@@ -3936,7 +3971,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 continue
                         except Exception:
                             try:
-                                json_obj = retrieve_json(group_chat.messages[-2]["content"])  # canonical parse (#95)
+                                json_obj = retrieve_json(_w2_verdict["content"])  # canonical parse (#95)
                                 if json_obj:
                                     current_app.logger.info(f'got json object {json_obj}')
                                     if json_obj['status'].lower() == 'completed':
