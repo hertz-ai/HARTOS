@@ -386,12 +386,33 @@ touch the shell and must not be settled unilaterally.
    through the new renderer. Pinned meanwhile by
    tests/unit/test_panel_reservation.py so the two cannot drift silently.
 
-3. **The taskbar has no feed.** The native taskbar is an empty strip and the
-   obvious fill is wrong: the shell's taskbar lists ITS OWN web panels, which are
-   DOM elements inside one fullscreen WebView surface, so the compositor cannot
-   see them. Building chips from `space().elements()` would show different things
-   than the shell shows, which is a parallel path. The content has to arrive over
-   the same feed as home_compose. Contract decision.
+3. **Three surfaces need bar content that home_compose does not carry.** These
+   looked like separate gaps and are one decision, which is whether the A2UI feed
+   grows a second payload for chrome state or a new IPC verb carries it.
+
+   - **Taskbar.** The shell's taskbar lists ITS OWN web panels, DOM elements
+     inside one fullscreen WebView surface, so the compositor cannot see them.
+     Filling chips from `space().elements()` would show different things than the
+     shell shows, which is a parallel path, not a shortcut.
+   - **Agent status** (the bar's centre). Populated by a poll of
+     `/api/social/dashboard/agents`, filtered to running agents, four chips max.
+     Not in home_compose at all. The compositor must not grow an HTTP client to
+     fetch it: wrong process, wrong user, and a network dependency on the render
+     path.
+   - **Clock.** The one that looks like it should be free, and is not. The
+     compositor has a monotonic clock but formatting LOCAL time needs a timezone,
+     and this crate sets `unsafe_code = "deny"` so `libc::localtime_r` is out.
+     That leaves a timezone crate, and local-offset on Unix inside a
+     multithreaded process is a known hazard. The shell already knows the local
+     time; sending it is cheaper and safer than the compositor learning
+     timezones. Its slot is deliberately not reserved in the layout meanwhile,
+     because space held for something that never draws is a hole in the cluster.
+
+   Everything ELSE in P5 is done and needed no contract: brand wordmark, nav
+   tabs, omnibox with its search glyph and shortcut hint, orb-sm, avatar, tray
+   glyphs. The glyphs were the surprise, and the general lesson is worth keeping:
+   an icon here is a LIGATURE NAME in a Material face, so it is text, and the
+   fonts are already installed. Reach for the text path before an image pipeline.
 
 4. **Image lowering.** Was recorded as "no source contract". That was wrong, and
    the real picture splits in two, one half of which is nearly free.
