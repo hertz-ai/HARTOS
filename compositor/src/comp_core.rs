@@ -4090,5 +4090,48 @@ mod native_render_tests {
             painted > total / 20,
             "native scene painted only {painted}/{total} px over the clear sentinel"
         );
+
+        // STRUCTURE, not just coverage. A fraction-of-the-frame count says something was
+        // drawn; it does not say the desktop has a top bar and a taskbar. Both strips are
+        // full-width rects, so every pixel of both must be off the sentinel, and a hole in
+        // either is the flicker class the DRM path already fights showing up in lowering
+        // instead. This is the assertion that would have caught the demo drawing blank
+        // tiles, which coverage alone happily passed.
+        let (w, h) = (size.w as usize, size.h as usize);
+        let is_sentinel =
+            |px: &[u8]| px[0] > 250 && px[1] < 5 && px[2] > 250;
+        let row_sentinels = |y: usize| -> usize {
+            (0..w)
+                .filter(|x| {
+                    let i = (y * w + x) * 4;
+                    is_sentinel(&bytes[i..i + 4])
+                })
+                .count()
+        };
+        for y in 0..crate::scene::TOP_BAR_H as usize {
+            assert_eq!(
+                row_sentinels(y),
+                0,
+                "row {y} of the top bar left {} px unpainted",
+                row_sentinels(y)
+            );
+        }
+        for y in (h - crate::scene::TASKBAR_H as usize)..h {
+            assert_eq!(
+                row_sentinels(y),
+                0,
+                "row {y} of the taskbar left {} px unpainted",
+                row_sentinels(y)
+            );
+        }
+        // And the band between them is not empty: the hero, the orb and the cards live
+        // there, so a desktop that painted only its two bars is not a desktop.
+        let mid = (crate::scene::TOP_BAR_H as usize..h - crate::scene::TASKBAR_H as usize)
+            .map(|y| w - row_sentinels(y))
+            .sum::<usize>();
+        assert!(
+            mid > w,
+            "the content band painted only {mid} px, so nothing but the bars drew"
+        );
     }
 }
