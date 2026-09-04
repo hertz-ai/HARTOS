@@ -3665,6 +3665,52 @@ mod native_render_tests {
     }
 
     #[test]
+    fn a_steady_desktop_keeps_its_element_identities_so_damage_tracking_works() {
+        // Damage-tracked redraw is a binding NFR and it rests on something no other test
+        // here checks. The compositor decides what changed by comparing each element's ID
+        // and commit counter against the previous frame. If the lowering handed back fresh
+        // identities every frame, every frame would be FULLY damaged, a static desktop
+        // would repaint end to end at 60Hz, and every count-based assertion in this file
+        // would still pass while it happened. Element identity comes from the underlying
+        // buffer, so this is what the retained tree, the solid pool and the compose-once
+        // caches actually buy at the damage level, as opposed to the allocation level.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (1280, 800).into();
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+
+        let idents = |els: &Vec<HartRenderElement<PixmanRenderer>>| {
+            els.iter()
+                .map(|e| (e.id().clone(), e.current_commit()))
+                .collect::<Vec<_>>()
+        };
+
+        let mut first: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        lower_scene(
+            &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
+            0.5, None, false, &mut first,
+        );
+        let a = idents(&first);
+        assert!(!a.is_empty(), "the demo scene lowered to nothing");
+        drop(first);
+
+        let mut second: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        lower_scene(
+            &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
+            0.5, None, false, &mut second,
+        );
+        assert_eq!(
+            idents(&second),
+            a,
+            "an unchanged desktop must present the SAME element identities, or the \
+             compositor sees a whole new frame and damages everything"
+        );
+    }
+
+    #[test]
     fn hovering_a_card_recolours_it_without_changing_the_frame_shape() {
         // The card slice of M2 input. A highlight is a different COLOUR for a rect the
         // scene already draws, so the lowered frame must carry exactly the same elements,
