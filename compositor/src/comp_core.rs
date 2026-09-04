@@ -2002,7 +2002,24 @@ pub fn effects_animating<S: CompState>(state: &S) -> bool {
         .space()
         .elements()
         .any(|w| w.user_data().get::<MapAnim>().map(|a| a.animating()).unwrap_or(false));
-    scene_animates(state.native_shell_on(), ws_fading, map_animating)
+    scene_animates(
+        native_scene_drawn(state.native_shell_on(), state.capture_blocked()),
+        ws_fading,
+        map_animating,
+    )
+}
+
+/// PURE: is the native scene actually drawn this frame? The flag alone is not the answer.
+/// Under the privacy killswitch an opaque full-output black solid is pushed above
+/// everything, so the scene beneath it is invisible: lowering it is wasted work, and
+/// because a drawn native scene holds the frame-budget gate open (see `scene_animates`),
+/// counting it would composite at full rate behind a blacked-out screen.
+///
+/// ONE predicate for both decisions, so "we draw it" and "it animates" can never drift
+/// apart. The bloom backdrop and the M2 orb already carry the same `!capture_blocked`
+/// condition inline; this is the M3 scene joining them rather than a new policy.
+pub fn native_scene_drawn(native_shell_on: bool, capture_blocked: bool) -> bool {
+    native_shell_on && !capture_blocked
 }
 
 /// PURE: does the scene animate CONTINUOUSLY, so the tick must composite rather than
@@ -2432,8 +2449,12 @@ where
 
     // ── 1b. NATIVE SHELL M3 scene (gated OFF by default via native_shell_on). Pushed
     //    here so native chrome sits above the app windows and below the cursor. A pure
-    //    additive path: flag off = no-op, the WebView shell is untouched. ──
-    if state.native_shell_on() {
+    //    additive path: flag off = no-op, the WebView shell is untouched. Skipped under
+    //    the killswitch for the SAME reason the bloom and the M2 orb below are: the black
+    //    solid pushed above already hides it, so lowering it is pure waste, and since a
+    //    drawn native scene holds the frame-budget gate open it would otherwise composite
+    //    at full rate behind a blacked-out screen. ──
+    if native_scene_drawn(state.native_shell_on(), state.capture_blocked()) {
         render_native_scene(state, renderer, size, &mut elements);
     }
 
@@ -3698,6 +3719,25 @@ mod native_render_tests {
         // The two effects that already forced a paint still do, with the flag off.
         assert!(scene_animates(false, true, false), "a workspace fade must play out");
         assert!(scene_animates(false, false, true), "a map animation must play out");
+    }
+
+    #[test]
+    fn the_killswitch_stops_the_native_scene_being_drawn_or_holding_the_gate_open() {
+        // The killswitch pushes an opaque full-output black solid ABOVE everything, so
+        // the native scene under it is invisible either way and nothing leaks. What it
+        // must not do is keep costing: lowering a hidden scene is waste, and because a
+        // drawn native scene holds the frame-budget gate open, an unguarded one would
+        // composite at full rate behind a blacked-out screen.
+        assert!(native_scene_drawn(true, false), "flag on, not blocked: drawn");
+        assert!(!native_scene_drawn(true, true), "the killswitch hides it, so skip it");
+        assert!(!native_scene_drawn(false, false), "flag off: never drawn");
+        assert!(!native_scene_drawn(false, true));
+        // And the gate agrees, because both decisions read the same predicate.
+        assert!(!scene_animates(native_scene_drawn(true, true), false, false));
+        assert!(scene_animates(native_scene_drawn(true, false), false, false));
+        // A real animation still plays out under the killswitch: correctness first, the
+        // saving is only ever about the native scene.
+        assert!(scene_animates(native_scene_drawn(true, true), true, false));
     }
 
     #[test]
