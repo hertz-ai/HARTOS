@@ -199,7 +199,35 @@ pub struct Theme {
     pub live_dot: Color,
     /// The translucent ground a live tag sits on, dark enough to read over card art.
     pub chip_bg: Color,
+    /// The brand SPECTRUM, in the shell's own order (teal, cyan, blue, violet, magenta,
+    /// amber). A row names one of these and its note and its cards' progress bars take
+    /// that hue, which is what stops a stack of rows reading flat. The names stay wire
+    /// strings resolved HERE, the same rule `mood` follows: the palette lives in the
+    /// theme, never as a second table inside the layout.
+    pub spectrum: [Color; 6],
     pub taskbar_bg: Color,
+}
+
+/// The spectrum names, positionally matched to `Theme::spectrum`.
+const SPECTRUM_NAMES: [&str; 6] = ["teal", "cyan", "blue", "violet", "magenta", "amber"];
+
+impl Theme {
+    /// Resolve a row's accent NAME to its hue, or None for a name outside the spectrum.
+    /// Callers fall back by ROW INDEX rather than to a fixed colour, which is what the
+    /// shell does and the reason consecutive rows do not all read teal.
+    pub fn spectrum_named(&self, name: &str) -> Option<Color> {
+        SPECTRUM_NAMES
+            .iter()
+            .position(|n| *n == name)
+            .map(|i| self.spectrum[i])
+    }
+
+    /// The hue a row at `index` carries: its own accent when it names a real one, else
+    /// the spectrum rotated by position.
+    pub fn row_accent(&self, name: Option<&str>, index: usize) -> Color {
+        name.and_then(|n| self.spectrum_named(n))
+            .unwrap_or(self.spectrum[index % self.spectrum.len()])
+    }
 }
 
 impl Theme {
@@ -226,6 +254,15 @@ impl Theme {
             on_accent_ink: Color::from_hex("#04140F").unwrap(),
             live_dot: Color::from_hex("#FF2E9A").unwrap(),
             chip_bg: Color::rgba(0.031, 0.047, 0.078, 0.72),
+            // hartBrandArt's SPECTRUM_HEX, in its order.
+            spectrum: [
+                teal,
+                Color::from_hex("#29C5FF").unwrap(),
+                Color::from_hex("#3B82F6").unwrap(),
+                Color::from_hex("#9B5CFF").unwrap(),
+                Color::from_hex("#FF2E9A").unwrap(),
+                Color::from_hex("#FFC83D").unwrap(),
+            ],
             taskbar_bg: Color::rgba(0.043, 0.047, 0.063, 0.85),
         }
     }
@@ -267,6 +304,7 @@ impl HomeCompose {
             rows: vec![
                 Row {
                     title: "Continue".to_string(),
+                    accent: Some("cyan".to_string()),
                     note: Some("picked up where you left off".to_string()),
                     see_all: Some("panel:continue".to_string()),
                     cards: vec![
@@ -301,6 +339,7 @@ impl HomeCompose {
                 },
                 Row {
                     title: "For you".to_string(),
+                    accent: Some("amber".to_string()),
                     note: None,
                     see_all: None,
                     cards: vec![
@@ -367,6 +406,9 @@ pub struct Row {
     pub title: String,
     /// A short qualifier the shell draws beside the label (`row.note`).
     pub note: Option<String>,
+    /// The row's spectrum accent NAME (`row.accent`), kept as the wire string and
+    /// resolved by the theme, the same way `mood` is. Absent means rotate by position.
+    pub accent: Option<String>,
     /// The panel a row's "See all" opens (`row.see_all`). Present means the row HAS a
     /// See-all affordance; the shell only draws one when the payload carries a target,
     /// so an absent value must draw nothing rather than a dead control.
@@ -1034,7 +1076,7 @@ pub fn layout_home(
     // ── Rows: cap at 3 (a2 "2-3 rows"), each a label + a strip of cards, emitted only
     //    while they fit inside the content band so the desktop never scrolls. ──
     let mut cursor_y = content.y + HERO_H + EDGE_PAD;
-    for row in home.rows.iter().take(3) {
+    for (row_index, row) in home.rows.iter().take(3).enumerate() {
         let row_block_h = ROW_LABEL_H + CARD_H;
         if cursor_y + row_block_h > content.bottom() {
             break;
@@ -1044,6 +1086,10 @@ pub fn layout_home(
         //    so the note can sit AFTER it; right-anchoring the See-all is the third thing
         //    the measure buys, and it is the reason TextAlign::Right was never needed:
         //    knowing the width lets layout place a left-aligned run exactly.
+        // The row's hue. It tints exactly what the shell tints with it: this row's note
+        // and its cards' progress fills (.hh-row-note and .hh-card-prog both read
+        // --hh-acc). Without it every row was teal and a stack of them read flat.
+        let row_accent = theme.row_accent(row.accent.as_deref(), row_index);
         let label_w = measure.text_width(&row.title, ROW_LABEL_PX);
         root.push(SceneNode::Text {
             rect: Rect::new(content.x, cursor_y, label_w.ceil() + 2.0, ROW_LABEL_H),
@@ -1060,7 +1106,7 @@ pub fn layout_home(
                     rect: Rect::new(note_x, cursor_y, note_w.ceil() + 2.0, ROW_LABEL_H),
                     text: note.clone(),
                     size_px: ROW_NOTE_PX,
-                    color: theme.hero_copy,
+                    color: row_accent,
                     align: TextAlign::Left,
                 });
             }
@@ -1222,7 +1268,7 @@ pub fn layout_home(
                 if filled >= 1.0 {
                     card_children.push(SceneNode::Rect {
                         rect: Rect::new(cr.x, cr.bottom() - CARD_PROG_H, filled, CARD_PROG_H),
-                        color: theme.accent,
+                        color: row_accent,
                         radius: 0.0,
                     });
                 }
@@ -1410,6 +1456,11 @@ pub fn decode_home_compose(v: &serde_json::Value) -> HomeCompose {
                 // row.note / row.see_all); the native scene was simply dropping them.
                 // An empty string is treated as absent, so a blank field cannot produce
                 // a See-all that opens nothing.
+                accent: r
+                    .get("accent")
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string),
                 note: r
                     .get("note")
                     .and_then(Value::as_str)
@@ -1452,6 +1503,7 @@ mod tests {
             rows: vec![
                 Row {
                     title: "Continue".into(),
+                    accent: Some("magenta".into()),
                     note: Some("3 in progress".into()),
                     see_all: Some("panel:continue".into()),
                     cards: vec![
@@ -1477,6 +1529,7 @@ mod tests {
                 },
                 Row {
                     title: "For you".into(),
+                    accent: None,
                     note: None,
                     see_all: None,
                     cards: vec![Card::default()],
@@ -1690,6 +1743,66 @@ mod tests {
         let s = find("Ask anything").expect("the secondary action");
         assert!(s.x > p.x, "primary leads");
         assert!(p.y > stat.1.y, "the actions close the hero");
+    }
+
+    #[test]
+    fn a_rows_accent_tints_its_note_and_its_cards_progress() {
+        let theme = Theme::cosmic_default();
+        let root = layout_home(1600.0, 900.0, &sample(), &theme, &mut MonoMeasure);
+        // The sample's first row names magenta; its note must carry that hue, not the
+        // functional teal every row used to get.
+        let magenta = theme.spectrum_named("magenta").expect("magenta is in the spectrum");
+        let mut note_color = None;
+        root.for_each_leaf(&mut |_, leaf| {
+            if let SceneNode::Text { text, color, .. } = leaf {
+                if text == "3 in progress" {
+                    note_color = Some(*color);
+                }
+            }
+        });
+        assert_eq!(note_color, Some(magenta), "the note takes the ROW's accent");
+
+        // And the progress FILL in that row, which is the other thing --hh-acc paints.
+        let fills: Vec<Color> = if let SceneNode::Container { children, .. } = &root {
+            children
+                .iter()
+                .filter_map(|c| match c {
+                    SceneNode::Container {
+                        interactive: true,
+                        children,
+                        ..
+                    } => children.iter().find_map(|n| match n {
+                        SceneNode::Rect { rect, color, .. }
+                            if (rect.h - CARD_PROG_H).abs() < 0.01 && *color != theme.omnibox_bg =>
+                        {
+                            Some(*color)
+                        }
+                        _ => None,
+                    }),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        assert!(!fills.is_empty(), "the sample has a progress fill");
+        assert!(fills.iter().all(|c| *c == magenta), "fills take the row accent");
+    }
+
+    #[test]
+    fn a_row_without_an_accent_rotates_by_position_rather_than_repeating() {
+        // The shell falls back to spec[idx % len], which is what stops a stack of rows
+        // all reading teal. A fixed default would lose exactly that.
+        let theme = Theme::cosmic_default();
+        assert_eq!(theme.row_accent(None, 0), theme.spectrum[0]);
+        assert_eq!(theme.row_accent(None, 1), theme.spectrum[1]);
+        assert_ne!(theme.row_accent(None, 0), theme.row_accent(None, 1));
+        // Past the end it wraps rather than panicking on a fourth row.
+        assert_eq!(theme.row_accent(None, 7), theme.spectrum[1]);
+        // A named accent wins over position, and an unknown name falls back to position
+        // rather than to a hardcoded hue.
+        assert_eq!(theme.row_accent(Some("amber"), 0), theme.spectrum[5]);
+        assert_eq!(theme.row_accent(Some("chartreuse"), 2), theme.spectrum[2]);
     }
 
     #[test]
@@ -2176,9 +2289,17 @@ mod tests {
 
         // A live tag carries its dot; a badge does not.
         let theme = Theme::cosmic_default();
+        // Matched on SIZE as well as colour. The live dot is --hart-amb-4, which is also
+        // magenta in the row spectrum, so a row that names magenta paints its progress
+        // fills the same hue: colour alone would count those too.
         let dots = |ls: &Vec<SceneNode>| {
             ls.iter()
-                .filter(|n| matches!(n, SceneNode::Rect { color, .. } if *color == theme.live_dot))
+                .filter(|n| {
+                    matches!(n, SceneNode::Rect { rect, color, .. }
+                        if *color == theme.live_dot
+                            && (rect.w - CARD_LIVE_DOT).abs() < 0.01
+                            && (rect.h - CARD_LIVE_DOT).abs() < 0.01)
+                })
                 .count()
         };
         assert_eq!(dots(&leaves), 1, "the live tag has exactly one indicator dot");
