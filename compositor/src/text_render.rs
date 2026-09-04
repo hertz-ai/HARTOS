@@ -254,6 +254,18 @@ impl TextMeasure for TextRasterizer {
     fn text_width(&mut self, text: &str, size_px: f32) -> f32 {
         self.measure(text, size_px)
     }
+
+    /// True when fontconfig has handed us a Material family. The box installs both
+    /// `material-icons` and `material-symbols` (hart-subsystems.nix bundles them so the
+    /// shell's icons work offline), and cosmic-text's fontdb reads the same fontconfig, so
+    /// on a configured desktop this is simply true. A sandbox without them says false and
+    /// the layout drops the icon rather than drawing its name as a word.
+    fn has_icon_face(&self) -> bool {
+        self.font_system
+            .db()
+            .faces()
+            .any(|f| f.families.iter().any(|(name, _)| name.starts_with("Material")))
+    }
 }
 
 #[cfg(test)]

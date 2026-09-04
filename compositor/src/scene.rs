@@ -135,6 +135,20 @@ impl Color {
 pub trait TextMeasure {
     /// The advance width in LOGICAL px of `text` at `size_px`, on ONE unwrapped line.
     fn text_width(&mut self, text: &str, size_px: f32) -> f32;
+
+    /// Whether the Material ligature face the shell's icons rely on is loaded.
+    ///
+    /// A card icon is not an image: it is the icon's NAME ("storage") shaped by a font
+    /// that resolves the name as a ligature. Which means that without the face, the name
+    /// renders as the literal WORD, and that is not hypothetical: it is exactly what a
+    /// fresh offline ISO did before the shell bundled its fonts, showing "lock" and
+    /// "notifications" as text across the tray.
+    ///
+    /// Defaults to FALSE so the failure is a missing icon rather than a stray word, and
+    /// so a measure that knows nothing about fonts (the unit tests') never claims one.
+    fn has_icon_face(&self) -> bool {
+        false
+    }
 }
 
 /// A font-free measure: every character is a fixed fraction of the size. Unit tests use
@@ -288,6 +302,9 @@ pub struct Card {
     /// Completion 0..=1 (`card.progress`, the shell's `hh-card-prog` bar). Clamped at
     /// decode, matching the sanitizer, so a malformed value cannot draw past the card.
     pub progress: Option<f32>,
+    /// A Material Symbols LIGATURE NAME (`card.icon`, e.g. "storage"), drawn only when
+    /// the card has no art, exactly as the shell does. It is text, not an image.
+    pub icon: Option<String>,
     /// A short label in the card's top-right corner (`card.badge`).
     pub badge: Option<String>,
     /// A running-agent tag (`card.live`), which SUPERSEDES `badge`: the shell draws one
@@ -533,6 +550,9 @@ const CARD_CHIP_PAD_X: f32 = 8.0;
 const CARD_CHIP_INSET: f32 = 12.0;
 const CARD_LIVE_DOT: f32 = 8.0;
 const CARD_LIVE_GAP: f32 = 6.0;
+/// The shell's `.hh-card-ic`: a 34px rounded tile holding a 20px glyph.
+const CARD_ICON_BOX: f32 = 34.0;
+const CARD_ICON_PX: f32 = 20.0;
 
 /// Build the home-desktop scene for an output of `output_w` x `output_h` LOGICAL px.
 /// The layout is the checklist's a2 canvas: a fixed 40px top bar, a hero with the orb
@@ -696,6 +716,10 @@ pub fn layout_home(
         compact: false,
     });
 
+    // Asked ONCE rather than per card: it walks the font database, and the answer cannot
+    // change within a layout.
+    let icons_available = measure.has_icon_face();
+
     // ── Rows: cap at 3 (a2 "2-3 rows"), each a label + a strip of cards, emitted only
     //    while they fit inside the content band so the desktop never scrolls. ──
     let mut cursor_y = content.y + HERO_H + EDGE_PAD;
@@ -764,6 +788,32 @@ pub fn layout_home(
                     radius: 12.0,
                 });
             }
+            // ── Icon glyph, top left, and ONLY when the card has no art: the shell draws
+            //    it as `card.icon && !hasImage`, because the glyph is the stand-in FOR the
+            //    missing picture, not a decoration beside one. It is a ligature name in a
+            //    Material face, so it goes down the ordinary text path; `icons_available`
+            //    is what stops it rendering as the literal word when the face is absent.
+            if let (Some(name), None, true) = (&card.icon, &card.image, icons_available) {
+                card_children.push(SceneNode::Rect {
+                    rect: Rect::new(cr.x + 14.0, cr.y + 12.0, CARD_ICON_BOX, CARD_ICON_BOX),
+                    color: theme.chip_bg,
+                    radius: 10.0,
+                });
+                let gw = measure.text_width(name, CARD_ICON_PX);
+                card_children.push(SceneNode::Text {
+                    rect: Rect::new(
+                        cr.x + 14.0 + (CARD_ICON_BOX - gw).max(0.0) * 0.5,
+                        cr.y + 12.0 + (CARD_ICON_BOX - CARD_ICON_PX * 1.3) * 0.5,
+                        gw.ceil() + 2.0,
+                        CARD_ICON_PX * 1.3,
+                    ),
+                    text: name.clone(),
+                    size_px: CARD_ICON_PX,
+                    color: theme.card_ink,
+                    align: TextAlign::Left,
+                });
+            }
+
             // ── Badge / live tag, top right. The shell draws LIVE **or** badge, never
             //    both (hartHome.js: `if (card.live) ... else if (card.badge)`), because a
             //    running agent supersedes whatever the card was otherwise labelled. Same
@@ -999,6 +1049,11 @@ pub fn decode_home_compose(v: &serde_json::Value) -> HomeCompose {
                             .and_then(Value::as_f64)
                             .filter(|p| (0.0..=1.0).contains(p))
                             .map(|p| p as f32),
+                        icon: c
+                            .get("icon")
+                            .and_then(Value::as_str)
+                            .filter(|t| !t.is_empty())
+                            .map(str::to_string),
                         badge: c
                             .get("badge")
                             .and_then(Value::as_str)
@@ -1061,6 +1116,7 @@ mod tests {
                             title: "Recipe A".into(),
                             meta: Some("2 min left".into()),
                             progress: Some(0.6),
+                            icon: Some("storage".into()),
                             badge: Some("NEW".into()),
                             live: None,
                             image: None,
@@ -1069,6 +1125,7 @@ mod tests {
                             title: "Recipe B".into(),
                             meta: None,
                             progress: None,
+                            icon: None,
                             badge: None,
                             live: None,
                             image: Some("b.png".into()),
@@ -1526,6 +1583,68 @@ mod tests {
             }
         }
         panic!("no card laid out")
+    }
+
+    /// A measure that claims the Material face, so the icon path can be exercised
+    /// without a font stack. Widths come from `MonoMeasure`, which is what the rest of
+    /// these tests already lay out with.
+    struct IconMeasure;
+    impl TextMeasure for IconMeasure {
+        fn text_width(&mut self, text: &str, size_px: f32) -> f32 {
+            MonoMeasure.text_width(text, size_px)
+        }
+        fn has_icon_face(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_card_icon_needs_the_face_and_draws_only_when_there_is_no_art() {
+        // The icon is a LIGATURE NAME, so without the face it renders as the word
+        // "storage" across the card. That is not hypothetical: literal "lock" and
+        // "notifications" across the tray is what a fresh offline ISO did before the
+        // shell bundled its fonts. So no face means no icon.
+        let hc = sample();
+        let root = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &mut MonoMeasure);
+        let mut seen = 0;
+        root.for_each_leaf(&mut |_, leaf| {
+            if let SceneNode::Text { text, .. } = leaf {
+                if text == "storage" {
+                    seen += 1;
+                }
+            }
+        });
+        assert_eq!(seen, 0, "no Material face means the icon must NOT be drawn");
+
+        // With the face, it draws, in a tile at the card's top left.
+        let root = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &mut IconMeasure);
+        let mut icon = None;
+        root.for_each_leaf(&mut |_, leaf| {
+            if let SceneNode::Text { rect, text, .. } = leaf {
+                if text == "storage" {
+                    icon = Some(*rect);
+                }
+            }
+        });
+        let ir = icon.expect("the icon glyph draws when the face is there");
+        let card = first_card(&hc)[0].rect();
+        assert!(ir.x < card.x + card.w * 0.5, "the icon hugs the LEFT edge");
+        assert!(ir.y < card.y + card.h * 0.5, "and the top");
+
+        // A card WITH art draws no icon: the glyph stands in FOR the missing picture,
+        // it is not a decoration beside one (the shell's `card.icon && !hasImage`).
+        let mut arted = sample();
+        arted.rows[0].cards[0].image = Some("/shell/static/app_art/a.png".into());
+        let root = layout_home(1600.0, 900.0, &arted, &Theme::cosmic_default(), &mut IconMeasure);
+        let mut seen = 0;
+        root.for_each_leaf(&mut |_, leaf| {
+            if let SceneNode::Text { text, .. } = leaf {
+                if text == "storage" {
+                    seen += 1;
+                }
+            }
+        });
+        assert_eq!(seen, 0, "art supersedes the icon");
     }
 
     #[test]
