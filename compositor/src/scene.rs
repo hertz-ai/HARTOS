@@ -119,6 +119,38 @@ impl Color {
     }
 }
 
+/// How wide a run of text will be once the renderer shapes it.
+///
+/// `layout_home` is pure geometry and cannot shape, which is why every text node it
+/// emitted before this was either left-aligned in a known box or a fixed slot: nothing
+/// could be right-anchored, centred, or placed immediately after another run. That single
+/// missing capability, not five missing features, is what kept the P5 top bar at an
+/// omnibox and an orb (no wordmark, no nav tabs, no clock) and left `TextAlign` with no
+/// consumer. The renderer already shapes in order to rasterize, so it can answer this
+/// without a second text stack anywhere.
+///
+/// `&mut self` because shaping mutates the font system's caches. That is affordable
+/// precisely because the tree is RETAINED: a measure runs on a real layout rebuild, never
+/// per frame.
+pub trait TextMeasure {
+    /// The advance width in LOGICAL px of `text` at `size_px`, on ONE unwrapped line.
+    fn text_width(&mut self, text: &str, size_px: f32) -> f32;
+}
+
+/// A font-free measure: every character is a fixed fraction of the size. Unit tests use
+/// it so scene layout stays testable with no font stack at all, and the renderer falls
+/// back to it when its font database is empty, which keeps a font-less box laying out
+/// sanely instead of collapsing every run to zero width.
+pub struct MonoMeasure;
+
+impl TextMeasure for MonoMeasure {
+    fn text_width(&mut self, text: &str, size_px: f32) -> f32 {
+        // 0.52 em is close to the average advance of a UI sans at these sizes. It only
+        // has to be plausible: nothing measured this way is claimed to be exact.
+        text.chars().count() as f32 * size_px * 0.52
+    }
+}
+
 /// Horizontal text alignment inside a `Text` node's rect.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TextAlign {
@@ -142,6 +174,9 @@ pub struct Theme {
     pub card_bg: Color,
     pub card_ink: Color,
     pub accent: Color,
+    /// The SECOND brand hue (the shell's `--hart-a2`). The wordmark is two-tone, so the
+    /// palette needs both; every other native surface still uses `accent` alone.
+    pub accent2: Color,
     pub taskbar_bg: Color,
 }
 
@@ -161,6 +196,9 @@ impl Theme {
             card_bg: Color::rgba(1.0, 1.0, 1.0, 0.06),
             card_ink: Color::rgba(0.90, 0.93, 0.97, 1.0),
             accent: teal,
+            // #9B5CFF, the shell's --hart-a2, so the native wordmark reads exactly as the
+            // HTML one does rather than inventing a second brand purple.
+            accent2: Color::from_hex("#9B5CFF").unwrap(),
             taskbar_bg: Color::rgba(0.043, 0.047, 0.063, 0.85),
         }
     }
@@ -406,6 +444,8 @@ pub const TASKBAR_H: f32 = 44.0;
 const EDGE_PAD: f32 = 24.0;
 const OMNIBOX_W: f32 = 420.0;
 const ORB_SM: f32 = 28.0;
+/// Wordmark type size. The shell sets it in the bar's own scale, not the hero's.
+const WORDMARK_PX: f32 = 15.0;
 const HERO_H: f32 = 200.0;
 const ROW_LABEL_H: f32 = 22.0;
 const ROW_GAP: f32 = 14.0;
@@ -418,7 +458,13 @@ const CARD_GAP: f32 = 14.0;
 /// floated to its right (c7), 2-3 card rows, and a fixed 44px taskbar. It never
 /// scrolls: rows past the content area are simply not emitted (deep content opens in
 /// an app, a2), so the desktop always fits one screen.
-pub fn layout_home(output_w: f32, output_h: f32, home: &HomeCompose, theme: &Theme) -> SceneNode {
+pub fn layout_home(
+    output_w: f32,
+    output_h: f32,
+    home: &HomeCompose,
+    theme: &Theme,
+    measure: &mut dyn TextMeasure,
+) -> SceneNode {
     let mut root: Vec<SceneNode> = Vec::new();
 
     // ── Top bar (fixed, 40px): background, centre omnibox pill, right orb-sm. ──
@@ -428,6 +474,38 @@ pub fn layout_home(output_w: f32, output_h: f32, home: &HomeCompose, theme: &The
         color: theme.bar_bg,
         radius: 0.0,
     }];
+    // ── Brand wordmark (P5, the shell's start-btn treatment): "HART" in the accent then
+    //    "OS" in the second brand hue. Two runs, so the second must begin exactly where
+    //    the first ends. This is the layout that was impossible before `TextMeasure`:
+    //    without a width there is no way to butt one run against another. The logo IMAGE
+    //    beside it in the HTML shell waits on Image lowering (the image-source contract).
+    let mark_h = WORDMARK_PX * 1.3;
+    let mark_y = (TOP_BAR_H - mark_h) * 0.5;
+    let hart_w = measure.text_width("HART", WORDMARK_PX);
+    let gap_w = measure.text_width(" ", WORDMARK_PX);
+    // A shaped run needs its whole advance to fit the buffer it is composed into, so the
+    // box is the measured width rounded up with a pixel of slack rather than trusting an
+    // exact float to survive the f32 -> i32 the lowering does.
+    bar_children.push(SceneNode::Text {
+        rect: Rect::new(EDGE_PAD, mark_y, hart_w.ceil() + 2.0, mark_h),
+        text: "HART".to_string(),
+        size_px: WORDMARK_PX,
+        color: theme.accent,
+        align: TextAlign::Left,
+    });
+    bar_children.push(SceneNode::Text {
+        rect: Rect::new(
+            EDGE_PAD + hart_w + gap_w,
+            mark_y,
+            measure.text_width("OS", WORDMARK_PX).ceil() + 2.0,
+            mark_h,
+        ),
+        text: "OS".to_string(),
+        size_px: WORDMARK_PX,
+        color: theme.accent2,
+        align: TextAlign::Left,
+    });
+
     let pill = Rect::new(
         (output_w - OMNIBOX_W) * 0.5,
         6.0,
@@ -593,14 +671,23 @@ impl SceneCache {
     /// The tree for this size/home/theme, rebuilding only when one of them changed.
     /// The comparison walks a handful of short strings; the rebuild it avoids allocates
     /// the whole node tree and re-clones every label, so the compare is the cheap side.
-    pub fn tree_for(&mut self, w: f32, h: f32, home: &HomeCompose, theme: &Theme) -> &SceneNode {
+    /// `measure` is only ever consulted on a REBUILD, which is the point of retaining the
+    /// tree: shaping the bar's runs is not something a steady desktop should pay for.
+    pub fn tree_for(
+        &mut self,
+        w: f32,
+        h: f32,
+        home: &HomeCompose,
+        theme: &Theme,
+        measure: &mut dyn TextMeasure,
+    ) -> &SceneNode {
         let stale = self.tree.is_none()
             || self.key_w != w
             || self.key_h != h
             || self.key_theme != Some(*theme)
             || self.key_home != *home;
         if stale {
-            self.tree = Some(layout_home(w, h, home, theme));
+            self.tree = Some(layout_home(w, h, home, theme, measure));
             self.key_w = w;
             self.key_h = h;
             self.key_theme = Some(*theme);
@@ -688,7 +775,7 @@ mod tests {
 
     #[test]
     fn top_bar_is_the_fixed_40px_strip_at_the_top() {
-        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default());
+        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
         let bar = root.hit_test(800.0, 5.0).expect("a node at the top strip");
         // The topmost hit in the bar band is a bar child, and the bar rect is 40px.
         assert!(bar.rect().y < TOP_BAR_H);
@@ -697,7 +784,7 @@ mod tests {
     #[test]
     fn taskbar_is_the_fixed_44px_strip_at_the_bottom() {
         let (w, h) = (1600.0, 900.0);
-        let root = layout_home(w, h, &sample(), &Theme::cosmic_default());
+        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
         let hit = root.hit_test(w * 0.5, h - 2.0).expect("a node at the bottom strip");
         assert!((hit.rect().h - TASKBAR_H).abs() < 0.01);
         assert!((hit.rect().y - (h - TASKBAR_H)).abs() < 0.01);
@@ -706,7 +793,7 @@ mod tests {
     #[test]
     fn home_orb_floats_to_the_right_of_the_hero() {
         let (w, h) = (1600.0, 900.0);
-        let root = layout_home(w, h, &sample(), &Theme::cosmic_default());
+        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
         // The large orb (compact=false) sits in the right portion of the content band.
         let mut orb_x = None;
         if let SceneNode::Container { children, .. } = &root {
@@ -723,7 +810,7 @@ mod tests {
     fn rows_never_overflow_the_one_screen_canvas() {
         // A tiny output must not emit rows that fall below the taskbar (a2: fits one
         // screen, deep content opens an app instead of scrolling).
-        let root = layout_home(1600.0, 320.0, &sample(), &Theme::cosmic_default());
+        let root = layout_home(1600.0, 320.0, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
         let bottom = 320.0 - TASKBAR_H;
         fn assert_within(n: &SceneNode, limit: f32) {
             if let SceneNode::Container { children, .. } = n {
@@ -748,7 +835,7 @@ mod tests {
 
     #[test]
     fn flatten_yields_leaves_in_paint_order_no_containers() {
-        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default());
+        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
         let mut leaves = Vec::new();
         root.flatten(&mut leaves);
         // No Container survives the flatten.
@@ -792,9 +879,78 @@ mod tests {
     }
 
     #[test]
+    fn the_wordmark_butts_its_two_runs_together_using_the_measure() {
+        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let theme = Theme::cosmic_default();
+        // Both runs live in the top bar, in reading order.
+        let mut hart = None;
+        let mut os = None;
+        if let SceneNode::Container { children, .. } = &root {
+            for c in children {
+                if let SceneNode::Container { rect, children, .. } = c {
+                    if rect.y != 0.0 {
+                        continue;
+                    }
+                    for n in children {
+                        if let SceneNode::Text { rect, text, .. } = n {
+                            if text == "HART" {
+                                hart = Some(*rect);
+                            }
+                            if text == "OS" {
+                                os = Some(*rect);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let (h, o) = (hart.expect("a HART run"), os.expect("an OS run"));
+        // OS begins after HART ends, by about one space, which is the whole point of
+        // having a measure: without one the second run has nowhere to start.
+        let space = MonoMeasure.text_width(" ", WORDMARK_PX);
+        let gap = o.x - (h.x + MonoMeasure.text_width("HART", WORDMARK_PX));
+        assert!(
+            (gap - space).abs() < 0.51,
+            "OS should sit one space past HART, gap was {gap} against a {space} space"
+        );
+        // Each box is wide enough to hold the run it will be asked to shape into.
+        assert!(h.w >= MonoMeasure.text_width("HART", WORDMARK_PX));
+        assert!(o.w >= MonoMeasure.text_width("OS", WORDMARK_PX));
+        // The two-tone treatment: the runs carry the two BRAND hues, not the bar ink.
+        let mut colors = Vec::new();
+        if let SceneNode::Container { children, .. } = &root {
+            for c in children {
+                if let SceneNode::Container { rect, children, .. } = c {
+                    if rect.y != 0.0 {
+                        continue;
+                    }
+                    for n in children {
+                        if let SceneNode::Text { text, color, .. } = n {
+                            if text == "HART" || text == "OS" {
+                                colors.push(*color);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(colors, vec![theme.accent, theme.accent2]);
+        // Both sit inside the fixed 40px strip.
+        assert!(h.y >= 0.0 && h.bottom() <= TOP_BAR_H + 0.01);
+    }
+
+    #[test]
+    fn the_font_free_measure_scales_with_length_and_size() {
+        let mut m = MonoMeasure;
+        assert_eq!(m.text_width("", 15.0), 0.0);
+        assert!(m.text_width("HART OS", 15.0) > m.text_width("HART", 15.0));
+        assert!(m.text_width("HART", 30.0) > m.text_width("HART", 15.0));
+    }
+
+    #[test]
     fn hovering_a_card_marks_its_own_background_leaf_and_nothing_else_does() {
         let (w, h) = (1600.0, 900.0);
-        let root = layout_home(w, h, &sample(), &Theme::cosmic_default());
+        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
         // Find a card: the interactive group layout_home emits once per card.
         let mut card = None;
         if let SceneNode::Container { children, .. } = &root {
@@ -853,7 +1009,7 @@ mod tests {
     #[test]
     fn pointer_over_the_orb_lifts_its_energy_and_nowhere_else() {
         let (w, h) = (1600.0, 900.0);
-        let root = layout_home(w, h, &sample(), &Theme::cosmic_default());
+        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
         // The large home orb's centre must energise the orb.
         let mut orb_centre = None;
         if let SceneNode::Container { children, .. } = &root {
@@ -887,30 +1043,30 @@ mod tests {
         let home = sample();
         let mut cache = SceneCache::default();
 
-        let _ = cache.tree_for(1600.0, 900.0, &home, &theme);
+        let _ = cache.tree_for(1600.0, 900.0, &home, &theme, &mut MonoMeasure);
         assert_eq!(cache.rebuilds(), 1, "the first frame builds the tree");
 
         // A steady desktop: same size, same payload, same theme. However many frames run,
         // the tree must NOT be rebuilt — this is the zero-per-frame-alloc NFR.
         for _ in 0..10 {
-            let _ = cache.tree_for(1600.0, 900.0, &home, &theme);
+            let _ = cache.tree_for(1600.0, 900.0, &home, &theme, &mut MonoMeasure);
         }
         assert_eq!(cache.rebuilds(), 1, "a steady desktop must not rebuild per frame");
 
         // A resize changes layout, so it must rebuild.
-        let _ = cache.tree_for(1280.0, 800.0, &home, &theme);
+        let _ = cache.tree_for(1280.0, 800.0, &home, &theme, &mut MonoMeasure);
         assert_eq!(cache.rebuilds(), 2, "a resize must rebuild");
 
         // A new compose changes layout, so it must rebuild.
         let mut recomposed = home.clone();
         recomposed.hero.title = "Your hive shipped a release".into();
-        let _ = cache.tree_for(1280.0, 800.0, &recomposed, &theme);
+        let _ = cache.tree_for(1280.0, 800.0, &recomposed, &theme, &mut MonoMeasure);
         assert_eq!(cache.rebuilds(), 3, "a new compose must rebuild");
 
         // And the retained tree is a REAL tree, not an empty placeholder: the cached nodes
         // are what hover hit-tests against (the pointer is deliberately not part of the key).
         let node_count = cache
-            .tree_for(1280.0, 800.0, &recomposed, &theme)
+            .tree_for(1280.0, 800.0, &recomposed, &theme, &mut MonoMeasure)
             .node_count();
         assert!(node_count > 1, "the retained tree must hold real nodes");
         assert_eq!(cache.rebuilds(), 3, "re-reading the cached tree must not rebuild");

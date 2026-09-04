@@ -2214,7 +2214,10 @@ pub fn lower_scene<R>(
     // key, so hover costs no rebuild. `scene_cache` is a disjoint field borrow, so holding
     // the tree across the loop does not conflict with the buffer caches below.
     let theme = crate::scene::Theme::cosmic_default();
-    let tree = scene_cache.tree_for(size.w as f32, size.h as f32, home, &theme);
+    // The rasterizer doubles as the layout's text measure (it already shapes), so the bar
+    // can butt one run against another. It is a disjoint borrow from `scene_cache`, and
+    // the reborrow ends when `tree_for` returns, leaving it free for the lowering below.
+    let tree = scene_cache.tree_for(size.w as f32, size.h as f32, home, &theme, rasterizer);
 
     // Hand out pooled solid buffers from the top for this frame (see RectCache::solid).
     rect_cache.begin_frame();
@@ -3629,8 +3632,18 @@ mod native_render_tests {
         let home = crate::scene::HomeCompose::demo();
         let theme = crate::scene::Theme::cosmic_default();
 
-        // The centre of the first card, read from the same layout the lowering walks.
-        let tree = crate::scene::layout_home(size.w as f32, size.h as f32, &home, &theme);
+        // The centre of the first card, read from the same layout the lowering walks. It
+        // must be measured by the SAME rasterizer the lowering hands to tree_for: a
+        // different measure could place the cards elsewhere, the hover point would miss,
+        // and the test would pass by comparing two UNhovered frames.
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let tree = crate::scene::layout_home(
+            size.w as f32,
+            size.h as f32,
+            &home,
+            &theme,
+            &mut rasterizer,
+        );
         let mut card = None;
         if let crate::scene::SceneNode::Container { children, .. } = &tree {
             for c in children {
@@ -3646,8 +3659,13 @@ mod native_render_tests {
             }
         }
         let centre = card.expect("the demo home lays out cards");
+        // The hover point must actually LAND on that card, or the two lowerings below
+        // would both be unhovered and compare equal for the wrong reason.
+        assert!(
+            tree.hover_leaf(Some(centre)).is_some(),
+            "the chosen point must be a real hover target"
+        );
 
-        let mut rasterizer = crate::text_render::TextRasterizer::new();
         let mut orb = OrbCache::default();
         let mut rects = RectCache::default();
         let mut scenes = crate::scene::SceneCache::default();

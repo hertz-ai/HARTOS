@@ -330,29 +330,37 @@ milestone that regresses latency fails even if it looks better.
   uinput device is not granted to the compositor's libseat session, so synthetic
   motion never reaches the input path and emits no samples).
 
-### The next piece of INFRASTRUCTURE the parity leg needs: a text measure
-P5 cannot be finished as specified and neither can the row See-all affordance,
-and the reason is one missing capability, not five missing features.
-`layout_home` is pure geometry with no way to ask how wide a string will be, so
-every text node it emits today is either left-aligned in a known box or a
-fixed-size slot. That is why the native bar has only the omnibox pill and the
-orb-sm: the two-tone HART OS wordmark, the five nav tabs, the avatar letter, the
-right-anchored clock and a right-aligned See-all all need an advance width at
-LAYOUT time. It is also why `TextAlign` is currently dropped by the rasterizer
-with no consumer.
+### Text measure: LANDED, and it unblocks the rest of P5
+P5 could not be finished as specified, and neither could the row See-all
+affordance, for one reason rather than five: `layout_home` is pure geometry and
+had no way to ask how wide a string would be, so every text node it emitted was
+either left-aligned in a known box or a fixed-size slot. That is why the native
+bar had only the omnibox pill and the orb-sm, and why `TextAlign` sat unused.
 
-The fix, when a compiler is reachable, is a `TextMeasure` trait DEFINED in
-scene.rs (so scene.rs stays smithay-free and pure) and IMPLEMENTED by
+`scene::TextMeasure` is now that capability: the trait is DEFINED in scene.rs (so
+scene.rs stays pure, with no text stack dependency) and IMPLEMENTED by
 `text_render::TextRasterizer`, which already shapes with cosmic-text and so
-already has the layout. `layout_home` and `SceneCache::tree_for` take it;
-`lower_scene` already holds a `&mut TextRasterizer` next to the cache as a
-disjoint local, so passing it costs no borrow rework. Measuring must take `&mut
-self` because cosmic-text shaping does. Because the tree is retained, a measure
-runs only on a real layout rebuild, never per frame. Tests get a stub
-implementation with a fixed advance so scene.rs keeps unit-testing without fonts.
+already knows the answer. `layout_home` and `SceneCache::tree_for` take it, and
+`lower_scene` hands over the `&mut TextRasterizer` it already holds beside the
+caches as a disjoint borrow. It takes `&mut self` because cosmic-text shaping
+does, which is affordable only because the tree is retained: a measure runs on a
+real layout rebuild, never per frame. `scene::MonoMeasure` is the font-free
+fallback, used by unit tests so scene layout stays testable with no fonts, and by
+the rasterizer itself when its font database is empty (cosmic-text panics on an
+empty database, so this is the same guard `compose` carries).
 
-DO NOT write this blind. It needs `cosmic_text::LayoutRun`'s width field, which
-is version-specific (the pin is cosmic-text 0.14.2), and this repo is developed
-from a Windows host with no cargo and no vendored crate source, so the API cannot
-be checked locally. CI is the only checker. Land it as its own commit with a
-working push, not stacked behind unverified ones.
+First consumer: the two-tone HART OS wordmark, whose second run has to begin
+exactly where the first ends. Still to do on the bar, all now unblocked and none
+needing new infrastructure: the five nav tabs, the avatar letter, the three tray
+glyphs (blocked separately on Image lowering, which needs the shell's
+image-source contract), and the clock, which is the only one that also needs an
+input the compose feed does not carry, since the shell's clock is local time and
+not part of the A2UI payload.
+
+### How compositor Rust is actually verified from here
+`python .hart-devenv/deepbox-check.py [cargo args]` ships compositor/ to a
+container on deepbox and runs cargo there in about 50 seconds. Use
+`deepbox-check.py test --features smithay`, not just the default check: `cargo
+check` does NOT compile `#[cfg(test)]` code, so a check-clean tree can still have
+broken tests. A test filter goes BEFORE any `--`. That container has fonts, so
+the real cosmic-text shaping path is exercised, not only the fallback.

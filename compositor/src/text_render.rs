@@ -21,6 +21,8 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 use smithay::utils::Transform;
 
+use crate::scene::TextMeasure;
+
 /// The identity of one rasterized run. `size_bits`/`color` are the bit patterns of
 /// the f32 inputs so the key is `Eq + Hash` (f32 is neither). The box (w,h) is part
 /// of the key because layout width changes the wrap/clip.
@@ -61,6 +63,33 @@ impl TextRasterizer {
             swash_cache: SwashCache::new(),
             cache: HashMap::new(),
         }
+    }
+
+    /// Shape `text` at `size_px` on ONE unwrapped line and report its advance width.
+    /// This is the same shaping `compose` does, minus the rasterization, so the layout and
+    /// the glyphs it later draws agree by construction rather than by a fudge factor.
+    /// Not cached: it runs on a scene-tree rebuild, which the retained tree already makes
+    /// rare, so a cache here would hold strings that are never asked for twice.
+    fn measure(&mut self, text: &str, size_px: f32) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        // The same empty-font-DB guard compose() carries: cosmic-text's shaper panics with
+        // no face to fall back to, so degrade to the font-free estimate rather than die.
+        if self.font_system.db().len() == 0 {
+            return crate::scene::MonoMeasure.text_width(text, size_px);
+        }
+        let metrics = Metrics::new(size_px, size_px * 1.3);
+        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        // No width bound: a measure must never wrap, or a long run would report the width
+        // of its wrapped box instead of its own advance.
+        buffer.set_size(&mut self.font_system, None, None);
+        buffer.set_text(&mut self.font_system, text, &Attrs::new(), Shaping::Advanced);
+        buffer.shape_until_scroll(&mut self.font_system, false);
+        buffer
+            .layout_runs()
+            .map(|run| run.line_w)
+            .fold(0.0_f32, f32::max)
     }
 
     /// Rasterize `text` at `size_px` into a `w x h` premultiplied-ARGB buffer at
@@ -181,6 +210,15 @@ impl TextRasterizer {
     }
 }
 
+/// The scene's measure, answered by the renderer that already shapes. Keeping the trait
+/// in scene.rs (pure geometry, no smithay) and the impl here is what lets layout ask for
+/// a width without scene.rs ever depending on a text stack.
+impl TextMeasure for TextRasterizer {
+    fn text_width(&mut self, text: &str, size_px: f32) -> f32 {
+        self.measure(text, size_px)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +245,22 @@ mod tests {
         assert_eq!(mk("hi", 14.0, 10, 10), mk("hi", 14.0, 10, 10));
         assert_ne!(mk("hi", 14.0, 10, 10), mk("hi", 15.0, 10, 10));
         assert_ne!(mk("hi", 14.0, 10, 10), mk("hi", 14.0, 20, 10));
+    }
+
+    #[test]
+    fn the_measure_is_finite_and_grows_with_length_and_size() {
+        // Holds on BOTH paths: with faces present this is cosmic-text's shaped advance,
+        // and with an empty font database it is the MonoMeasure fallback. A layout that
+        // consumed a NaN or a zero here would place every run on top of the last one, so
+        // these are the properties the layout actually depends on.
+        let mut r = TextRasterizer::new();
+        assert_eq!(r.text_width("", 15.0), 0.0);
+        let hart = r.text_width("HART", 15.0);
+        assert!(hart.is_finite() && hart > 0.0, "measured {hart}");
+        assert!(r.text_width("HART OS", 15.0) > hart);
+        assert!(r.text_width("HART", 30.0) > hart);
+        // Measuring must not WRAP: a long run reports its own advance, not a box width.
+        let long = "HART OS native shell parity program wordmark run";
+        assert!(r.text_width(long, 15.0) > r.text_width("HART OS", 15.0) * 3.0);
     }
 }
