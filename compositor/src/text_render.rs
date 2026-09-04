@@ -35,6 +35,18 @@ struct RunKey {
     color: u32,
 }
 
+/// The most runs kept alive at once.
+///
+/// Every distinct (text, size, box, colour) holds a full RGBA buffer, and a hero line at
+/// 34px across a wide box is a quarter of a megabyte. The cache key includes the STRING,
+/// and the strings arrive from the A2UI feed: they are agent-written and change every time
+/// the home recomposes. So an unbounded map is not a cache, it is a log of everything the
+/// agent has ever said, held in the compositor for the life of the session, on a box that
+/// already runs close to its memory limit.
+///
+/// A live desktop shows a few dozen runs, so this is a wide margin around normal use.
+const MAX_CACHED_RUNS: usize = 256;
+
 fn pack_color(c: [f32; 4]) -> u32 {
     let b = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u32;
     (b(c[0]) << 24) | (b(c[1]) << 16) | (b(c[2]) << 8) | b(c[3])
@@ -74,6 +86,11 @@ impl TextRasterizer {
     /// Total runs ever composed (test hook for the compose-once proof).
     pub fn composes(&self) -> u64 {
         self.composes
+    }
+
+    /// How many runs are cached right now (test hook for the bounded-cache proof).
+    pub fn cached_runs(&self) -> usize {
+        self.cache.len()
     }
 
     /// Shape `text` at `size_px` on ONE unwrapped line and report its advance width.
@@ -125,6 +142,14 @@ impl TextRasterizer {
             color: pack_color(color),
         };
         if !self.cache.contains_key(&key) {
+            // Dropped wholesale rather than evicted one at a time. A run that has fallen
+            // out of the live set is never asked for again, so the handful that ARE live
+            // simply recompose once on the next frames, while maintaining an LRU ordering
+            // would cost something every frame to save a recompose that happens once in
+            // many thousands. The margin above the live set is what keeps this rare.
+            if self.cache.len() >= MAX_CACHED_RUNS {
+                self.cache.clear();
+            }
             let buf = self.compose(text, size_px, wi, hi, color);
             self.cache.insert(key.clone(), buf);
             self.composes += 1;
@@ -257,6 +282,32 @@ mod tests {
         assert_eq!(mk("hi", 14.0, 10, 10), mk("hi", 14.0, 10, 10));
         assert_ne!(mk("hi", 14.0, 10, 10), mk("hi", 15.0, 10, 10));
         assert_ne!(mk("hi", 14.0, 10, 10), mk("hi", 14.0, 20, 10));
+    }
+
+    #[test]
+    fn the_run_cache_stays_bounded_under_an_agent_written_feed() {
+        // The key includes the STRING, and the strings come from the A2UI feed, so they
+        // change every time the agent recomposes the home. Unbounded, this cache would
+        // hold a full RGBA buffer for every line the agent has ever written.
+        let mut r = TextRasterizer::new();
+        let white = [1.0, 1.0, 1.0, 1.0];
+        for i in 0..(MAX_CACHED_RUNS * 3) {
+            let _ = r.rasterize(&format!("earned ${i} overnight"), 12.0, 24, 14, white);
+        }
+        assert!(
+            r.cached_runs() <= MAX_CACHED_RUNS,
+            "cache grew to {} past its {MAX_CACHED_RUNS} cap",
+            r.cached_runs()
+        );
+        assert!(r.cached_runs() > 0, "it must still actually be a cache");
+
+        // And it is still a cache after a sweep: a run asked for twice composes once.
+        let before = r.composes();
+        let _ = r.rasterize("steady", 12.0, 24, 14, white);
+        let after_first = r.composes();
+        let _ = r.rasterize("steady", 12.0, 24, 14, white);
+        assert_eq!(after_first, before + 1, "the first ask composes");
+        assert_eq!(r.composes(), after_first, "the second ask must hit the cache");
     }
 
     #[test]

@@ -415,6 +415,11 @@ fn rounded_rect_rgba(w: u32, h: u32, radius: f32, color: [f32; 4]) -> Vec<u8> {
 /// per-frame cost of a rounded panel is a GPU blit, not a CPU rasterize.
 #[derive(Default)]
 pub struct RectCache {
+    /// Unbounded on purpose, unlike the text cache which had to gain a cap: every part of
+    /// this key comes from LAYOUT, never from the feed. Sizes are the layout constants
+    /// plus a handful that track the output width, radii are constants, and colours are
+    /// the theme's plus one hover lift per card. That is a few dozen combinations for a
+    /// given output, not a set that grows with what the agent writes.
     cache: std::collections::HashMap<(u32, u32, u32, u32, u32, u32, u32), MemoryRenderBuffer>,
     /// POOL for the sharp-rect path. The first cut built a `SolidColorBuffer` per rect per
     /// frame, which is the other half of the zero-per-frame-alloc NFR (the retained tree in
