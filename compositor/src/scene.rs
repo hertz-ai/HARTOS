@@ -177,6 +177,14 @@ pub struct Theme {
     /// The SECOND brand hue (the shell's `--hart-a2`). The wordmark is two-tone, so the
     /// palette needs both; every other native surface still uses `accent` alone.
     pub accent2: Color,
+    /// Ink for text sitting ON `accent` (the shell's card badge, dark on teal). A role,
+    /// not a hue: any accent bright enough to need dark text uses this.
+    pub on_accent_ink: Color,
+    /// The live indicator dot (the shell's `--hart-amb-4`), which rides the ambient mood
+    /// rather than the functional accent, so it stays distinct from a badge.
+    pub live_dot: Color,
+    /// The translucent ground a live tag sits on, dark enough to read over card art.
+    pub chip_bg: Color,
     pub taskbar_bg: Color,
 }
 
@@ -199,6 +207,11 @@ impl Theme {
             // #9B5CFF, the shell's --hart-a2, so the native wordmark reads exactly as the
             // HTML one does rather than inventing a second brand purple.
             accent2: Color::from_hex("#9B5CFF").unwrap(),
+            // The shell's own card-badge ink and --hart-amb-4 default, so a native chip
+            // reads as the same component rather than a lookalike.
+            on_accent_ink: Color::from_hex("#04140F").unwrap(),
+            live_dot: Color::from_hex("#FF2E9A").unwrap(),
+            chip_bg: Color::rgba(0.031, 0.047, 0.078, 0.72),
             taskbar_bg: Color::rgba(0.043, 0.047, 0.063, 0.85),
         }
     }
@@ -275,6 +288,11 @@ pub struct Card {
     /// Completion 0..=1 (`card.progress`, the shell's `hh-card-prog` bar). Clamped at
     /// decode, matching the sanitizer, so a malformed value cannot draw past the card.
     pub progress: Option<f32>,
+    /// A short label in the card's top-right corner (`card.badge`).
+    pub badge: Option<String>,
+    /// A running-agent tag (`card.live`), which SUPERSEDES `badge`: the shell draws one
+    /// or the other, never both, so the pair is decoded separately and resolved at layout.
+    pub live: Option<String>,
     /// An image ref (URL or app-icon id). Lowered to a texture element; None draws
     /// the card as a solid tile with just its text.
     pub image: Option<String>,
@@ -506,7 +524,15 @@ const CARD_W: f32 = 210.0;
 const CARD_H: f32 = 128.0;
 const CARD_GAP: f32 = 14.0;
 const CARD_META_H: f32 = 16.0;
-const CARD_PROG_H: f32 = 3.0;
+/// 5px, the shell's own `.hh-card-prog { height: 5px }`.
+const CARD_PROG_H: f32 = 5.0;
+const CARD_CHIP_PX: f32 = 12.0;
+const CARD_CHIP_H: f32 = 20.0;
+const CARD_CHIP_PAD_X: f32 = 8.0;
+/// The shell insets both the badge and the live tag 12px from the card's top right.
+const CARD_CHIP_INSET: f32 = 12.0;
+const CARD_LIVE_DOT: f32 = 8.0;
+const CARD_LIVE_GAP: f32 = 6.0;
 
 /// Build the home-desktop scene for an output of `output_w` x `output_h` LOGICAL px.
 /// The layout is the checklist's a2 canvas: a fixed 40px top bar, a hero with the orb
@@ -738,6 +764,64 @@ pub fn layout_home(
                     radius: 12.0,
                 });
             }
+            // ── Badge / live tag, top right. The shell draws LIVE **or** badge, never
+            //    both (hartHome.js: `if (card.live) ... else if (card.badge)`), because a
+            //    running agent supersedes whatever the card was otherwise labelled. Same
+            //    inset for either, so a card never shifts its chip when it goes live.
+            let chip = card
+                .live
+                .as_ref()
+                .map(|t| (t, true))
+                .or_else(|| card.badge.as_ref().map(|t| (t, false)));
+            if let Some((label, is_live)) = chip {
+                let ink_w = measure.text_width(label, CARD_CHIP_PX);
+                let dot_w = if is_live {
+                    CARD_LIVE_DOT + CARD_LIVE_GAP
+                } else {
+                    0.0
+                };
+                let chip_w = ink_w.ceil() + 2.0 * CARD_CHIP_PAD_X + dot_w;
+                let chip_x = cr.right() - CARD_CHIP_INSET - chip_w;
+                let chip_y = cr.y + CARD_CHIP_INSET;
+                // A live tag is a pill on a dark ground; a badge is a filled accent
+                // block with dark ink on it.
+                card_children.push(SceneNode::Rect {
+                    rect: Rect::new(chip_x, chip_y, chip_w, CARD_CHIP_H),
+                    color: if is_live { theme.chip_bg } else { theme.accent },
+                    radius: if is_live { CARD_CHIP_H * 0.5 } else { 8.0 },
+                });
+                let mut ink_x = chip_x + CARD_CHIP_PAD_X;
+                if is_live {
+                    card_children.push(SceneNode::Rect {
+                        rect: Rect::new(
+                            ink_x,
+                            chip_y + (CARD_CHIP_H - CARD_LIVE_DOT) * 0.5,
+                            CARD_LIVE_DOT,
+                            CARD_LIVE_DOT,
+                        ),
+                        color: theme.live_dot,
+                        radius: CARD_LIVE_DOT * 0.5,
+                    });
+                    ink_x += CARD_LIVE_DOT + CARD_LIVE_GAP;
+                }
+                card_children.push(SceneNode::Text {
+                    rect: Rect::new(
+                        ink_x,
+                        chip_y + (CARD_CHIP_H - CARD_CHIP_PX * 1.3) * 0.5,
+                        ink_w.ceil() + 2.0,
+                        CARD_CHIP_PX * 1.3,
+                    ),
+                    text: label.clone(),
+                    size_px: CARD_CHIP_PX,
+                    color: if is_live {
+                        theme.card_ink
+                    } else {
+                        theme.on_accent_ink
+                    },
+                    align: TextAlign::Left,
+                });
+            }
+
             // Title, then the meta line under it, then the progress bar pinned to the
             // card's bottom edge: the shell's own body order (hh-card-title, hh-card-meta,
             // hh-card-prog). The title sits a line higher when there is a meta to carry,
@@ -915,6 +999,16 @@ pub fn decode_home_compose(v: &serde_json::Value) -> HomeCompose {
                             .and_then(Value::as_f64)
                             .filter(|p| (0.0..=1.0).contains(p))
                             .map(|p| p as f32),
+                        badge: c
+                            .get("badge")
+                            .and_then(Value::as_str)
+                            .filter(|t| !t.is_empty())
+                            .map(str::to_string),
+                        live: c
+                            .get("live")
+                            .and_then(Value::as_str)
+                            .filter(|t| !t.is_empty())
+                            .map(str::to_string),
                         image: c.get("image").and_then(Value::as_str).map(str::to_string),
                     });
                 }
@@ -967,12 +1061,16 @@ mod tests {
                             title: "Recipe A".into(),
                             meta: Some("2 min left".into()),
                             progress: Some(0.6),
+                            badge: Some("NEW".into()),
+                            live: None,
                             image: None,
                         },
                         Card {
                             title: "Recipe B".into(),
                             meta: None,
                             progress: None,
+                            badge: None,
+                            live: None,
                             image: Some("b.png".into()),
                         },
                     ],
@@ -1410,6 +1508,74 @@ mod tests {
             .filter(|n| matches!(n, SceneNode::Rect { rect, .. } if (rect.h - CARD_PROG_H).abs() < 0.01))
             .count();
         assert_eq!(bars2, 0, "no progress in the payload means no bar");
+    }
+
+    /// The leaves of the first card laid out from `hc`.
+    fn first_card(hc: &HomeCompose) -> Vec<SceneNode> {
+        let root = layout_home(1600.0, 900.0, hc, &Theme::cosmic_default(), &mut MonoMeasure);
+        if let SceneNode::Container { children, .. } = &root {
+            for c in children {
+                if let SceneNode::Container {
+                    interactive: true,
+                    children,
+                    ..
+                } = c
+                {
+                    return children.clone();
+                }
+            }
+        }
+        panic!("no card laid out")
+    }
+
+    #[test]
+    fn a_live_tag_supersedes_a_badge_and_never_draws_beside_it() {
+        // hartHome.js is `if (card.live) ... else if (card.badge)`: a running agent
+        // supersedes whatever the card was otherwise labelled, and drawing both would put
+        // two chips in the same corner.
+        let mut hc = sample();
+        hc.rows[0].cards[0].badge = Some("NEW".into());
+        hc.rows[0].cards[0].live = Some("RUNNING".into());
+        let leaves = first_card(&hc);
+        let texts: Vec<String> = leaves
+            .iter()
+            .filter_map(|n| match n {
+                SceneNode::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"RUNNING".to_string()), "the live tag draws");
+        assert!(!texts.contains(&"NEW".to_string()), "the badge must NOT draw beside it");
+
+        // A live tag carries its dot; a badge does not.
+        let theme = Theme::cosmic_default();
+        let dots = |ls: &Vec<SceneNode>| {
+            ls.iter()
+                .filter(|n| matches!(n, SceneNode::Rect { color, .. } if *color == theme.live_dot))
+                .count()
+        };
+        assert_eq!(dots(&leaves), 1, "the live tag has exactly one indicator dot");
+
+        hc.rows[0].cards[0].live = None;
+        let badged = first_card(&hc);
+        assert_eq!(dots(&badged), 0, "a badge has no dot");
+    }
+
+    #[test]
+    fn the_card_chip_sits_inside_the_card_at_its_top_right() {
+        let leaves = first_card(&sample());
+        let card_rect = leaves[0].rect();
+        let chip = leaves
+            .iter()
+            .find_map(|n| match n {
+                SceneNode::Text { rect, text, .. } if text == "NEW" => Some(*rect),
+                _ => None,
+            })
+            .expect("the badge label");
+        assert!(chip.right() <= card_rect.right(), "the chip stays inside the card");
+        assert!(chip.x > card_rect.x + card_rect.w * 0.5, "it hugs the RIGHT edge");
+        assert!(chip.y >= card_rect.y, "and the top");
+        assert!(chip.bottom() < card_rect.bottom(), "well clear of the title");
     }
 
     #[test]
