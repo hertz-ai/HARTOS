@@ -2471,13 +2471,38 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                     current_app.logger.info(f"Detected mention of {mention} - directing message to appropriate agent")
                     return agent
 
-            # A structured tool call proposed by the Assistant runs on the
-            # Executor: the Assistant cannot take the next turn itself, and the
-            # news/revenue registrations put execution on the Executor too.
-            if last_speaker is assistant and messages[-1].get("tool_calls"):
-                current_app.logger.info(
-                    "reuse: structured tool_call from Assistant -> Executor runs it")
-                return executor
+            # A tool call routes to the agent whose function_map actually holds
+            # the function — autogen's own func_call_filter rule
+            # (groupchat.py _prepare_and_select_agents: agents that
+            # can_execute_function(funcs)).  A custom speaker_selection_method
+            # returns BEFORE that filter runs, so it must be applied here;
+            # hardcoding one executor sent google_search to an agent whose map
+            # lacked it -> "Function google_search not found", the tool never
+            # ran and the turn fell back to a knowledge-cutoff answer (live
+            # 2026-09-05 01:25).  register_dual puts service-tool execution on
+            # the executor and core-tool execution on the assistant, so which
+            # agent runs a call is per-tool; ask, don't assume.
+            _last = messages[-1]
+            _funcs = []
+            if isinstance(_last, dict):
+                if _last.get("function_call"):
+                    _funcs.append((_last["function_call"] or {}).get("name"))
+                for _tc in (_last.get("tool_calls") or []):
+                    if (_tc or {}).get("type") == "function":
+                        _funcs.append((_tc.get("function") or {}).get("name"))
+            _funcs = [f for f in _funcs if f]
+            # Return the first agent that can execute, exactly as autogen's
+            # func_call_filter does — an early return, so allow_repeat_speaker
+            # is not applied (a tool whose executor IS the proposer still runs).
+            if _funcs:
+                for _ag in groupchat.agents:
+                    try:
+                        if _ag.can_execute_function(_funcs):
+                            current_app.logger.info(
+                                f"reuse: tool_call {_funcs} -> {_ag.name} (holds the function)")
+                            return _ag
+                    except Exception:
+                        pass
 
             # Check for messages directed to the user
 
