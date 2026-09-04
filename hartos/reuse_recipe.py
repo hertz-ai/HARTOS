@@ -2813,6 +2813,30 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         ]
     )
 
+    def _reuse_group_terminate(msg):
+        """End an action's group chat on its real completion signal.
+
+        The manager previously carried NO is_termination_msg, so it fell back to
+        the default (content == 'TERMINATE') and ran to max_round.  A completed
+        action is signalled by the StatusVerifier verdict {'status':'completed'},
+        which does not contain 'TERMINATE'; state_transition treats it as
+        action-terminal (returns chat_instructor expecting a 'TERMINATE' that a
+        human_input_mode='NEVER' UserProxy does not reliably emit), so the group
+        spun to max_round=10 and get_agent_response never regained control to
+        advance.  Measured live 2026-09-05: action 1 verdict 'completed' at
+        03:29:12 yet current_action_id stayed 1 (send_message_to_user looped to
+        the cap).  Terminating on the verdict lets initiate_chat return so the
+        w1/w2 loop advances via the SAME _advance_reuse_action path — no parallel
+        path, reuses _is_terminate_msg + retrieve_json.
+        """
+        if _is_terminate_msg(msg):
+            return True
+        try:
+            _vj = retrieve_json((msg or {}).get('content') or '')
+            return isinstance(_vj, dict) and str(_vj.get('status', '')).lower() == 'completed'
+        except Exception:
+            return False
+
     group_chat = autogen.GroupChat(
         agents=[assistant, helper, user_proxy, multi_role_agent, executor, chat_instructor, verify],
         messages=[],
@@ -2835,7 +2859,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
     manager = autogen.GroupChatManager(
         groupchat=group_chat,
-        llm_config={"cache_seed": None, "config_list": config_list}
+        llm_config={"cache_seed": None, "config_list": config_list},
+        is_termination_msg=_reuse_group_terminate,
     )
 
     group_chat_1 = autogen.GroupChat(
@@ -2851,7 +2876,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
     manager_1 = autogen.GroupChatManager(
         groupchat=group_chat_1,
-        llm_config={"cache_seed": None, "config_list": config_list}
+        llm_config={"cache_seed": None, "config_list": config_list},
+        is_termination_msg=_reuse_group_terminate,
     )
 
     group_chat_2 = autogen.GroupChat(
@@ -2867,7 +2893,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
     manager_2 = autogen.GroupChatManager(
         groupchat=group_chat_2,
-        llm_config={"cache_seed": None, "config_list": config_list}
+        llm_config={"cache_seed": None, "config_list": config_list},
+        is_termination_msg=_reuse_group_terminate,
     )
 
     visual_agent_group = {}
@@ -3135,37 +3162,39 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         _reuse_task.mark_sla_breached()
                         current_app.logger.warning(f"[SLA] Task {_reuse_task_id} SLA breached in reuse loop")
 
-            # ROBUST COMPLETION-ADVANCE: the TERMINATE gate below only advances
-            # when a ChatInstructor 'TERMINATE' lands at messages[-1], which does
-            # NOT reliably happen after a 'completed' verdict — measured live
-            # 2026-09-05: action 1's verdict was {'status':'completed','action_id':1}
-            # twice, "GOT COMPLETED FOR ACTION" fired, yet the loop self-looped on
-            # action 1 (24x current_action_id:1) and actions 2-6 never ran.  When
-            # the verifier tail carries a 'completed' verdict FOR THE CURRENT action
-            # (action_id matched, one-advance-per-action guarded so a stale verdict
-            # cannot double-advance), advance via the SAME _advance_reuse_action the
-            # TERMINATE path uses — no parallel path, purely additive (falls through
-            # untouched when no such verdict is present).
+            # ROBUST COMPLETION-ADVANCE.  With the manager now terminating on the
+            # StatusVerifier 'completed' verdict (is_termination_msg=
+            # _reuse_group_terminate), initiate_chat RETURNS the moment an action
+            # completes and group_chat.messages[-1] IS that verdict.  The
+            # ChatInstructor-'TERMINATE'-at-[-1] gate below does NOT fire on this
+            # path (name=StatusVerifier, content=JSON), so advance here off the
+            # TERMINAL verdict, using the KNOWN pipeline action — do NOT require the
+            # LLM to echo action_id (the verdict shape is inconsistent: some carry
+            # 'action_id', some don't) and read only [-1] not a [-4:] tail (history
+            # accumulates across actions under clear_history=False, so a prior
+            # action's verdict lingers — [-1] is always the just-terminated action).
+            # One-advance-per-action guarded.  Measured live 2026-09-05: 'completed'
+            # fired at 03:29:12 yet current_action_id stayed 1 because the group ran
+            # to max_round without terminating and this loop never regained control.
+            # Same _advance_reuse_action the TERMINATE path uses — no parallel path.
             try:
-                if group_chat.messages and _reuse_current_action not in _reuse_advanced_actions:
-                    for _rc_m in reversed(group_chat.messages[-4:]):
-                        _rc_vj = retrieve_json((_rc_m or {}).get('content') or '')
-                        if (isinstance(_rc_vj, dict)
-                                and str(_rc_vj.get('status', '')).lower() == 'completed'
-                                and str(_rc_vj.get('action_id', '')) == str(_reuse_current_action)):
-                            _reuse_advanced_actions.add(_reuse_current_action)
-                            current_app.logger.info(
-                                f"reuse-w1-completed: verifier verdict completed for action "
-                                f"{_reuse_current_action} — advancing (TERMINATE gate independent)")
-                            _rc_next, _rc_ok = _advance_reuse_action(
-                                user_prompt, _reuse_current_action, "reuse-w1-completed", prompt_id)
-                            if not _rc_ok:
-                                return ''
-                            _rc_msg = _build_reuse_action_message(user_prompt, _rc_next)
-                            chat_instructor.initiate_chat(
-                                recipient=manager, message=_rc_msg,
-                                clear_history=False, silent=False)
-                            break
+                _term = group_chat.messages[-1] if group_chat.messages else None
+                _term_vj = retrieve_json((_term or {}).get('content') or '') if _term else None
+                if (isinstance(_term_vj, dict)
+                        and str(_term_vj.get('status', '')).lower() == 'completed'
+                        and _reuse_current_action not in _reuse_advanced_actions):
+                    _reuse_advanced_actions.add(_reuse_current_action)
+                    current_app.logger.info(
+                        f"reuse-w1-completed: terminal 'completed' verdict for action "
+                        f"{_reuse_current_action} — advancing (manager terminated on verdict)")
+                    _rc_next, _rc_ok = _advance_reuse_action(
+                        user_prompt, _reuse_current_action, "reuse-w1-completed", prompt_id)
+                    if not _rc_ok:
+                        return ''
+                    _rc_msg = _build_reuse_action_message(user_prompt, _rc_next)
+                    chat_instructor.initiate_chat(
+                        recipient=manager, message=_rc_msg,
+                        clear_history=False, silent=False)
             except Exception as _rc_err:
                 current_app.logger.debug(f"robust completion-advance skipped: {_rc_err}")
             if _reuse_current_action in _reuse_advanced_actions:
