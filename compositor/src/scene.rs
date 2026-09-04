@@ -267,7 +267,14 @@ pub struct Row {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Card {
     pub title: String,
-    pub subtitle: Option<String>,
+    /// The qualifier under the title (`card.meta`, the shell's `hh-card-meta`). Named for
+    /// the key the feed actually carries: this field used to be `subtitle`, which the
+    /// home-card sanitizer has never emitted, so it decoded to None on every card ever
+    /// composed while the real text was dropped.
+    pub meta: Option<String>,
+    /// Completion 0..=1 (`card.progress`, the shell's `hh-card-prog` bar). Clamped at
+    /// decode, matching the sanitizer, so a malformed value cannot draw past the card.
+    pub progress: Option<f32>,
     /// An image ref (URL or app-icon id). Lowered to a texture element; None draws
     /// the card as a solid tile with just its text.
     pub image: Option<String>,
@@ -498,6 +505,8 @@ const ROW_GAP: f32 = 14.0;
 const CARD_W: f32 = 210.0;
 const CARD_H: f32 = 128.0;
 const CARD_GAP: f32 = 14.0;
+const CARD_META_H: f32 = 16.0;
+const CARD_PROG_H: f32 = 3.0;
 
 /// Build the home-desktop scene for an output of `output_w` x `output_h` LOGICAL px.
 /// The layout is the checklist's a2 canvas: a fixed 40px top bar, a hero with the orb
@@ -729,13 +738,50 @@ pub fn layout_home(
                     radius: 12.0,
                 });
             }
+            // Title, then the meta line under it, then the progress bar pinned to the
+            // card's bottom edge: the shell's own body order (hh-card-title, hh-card-meta,
+            // hh-card-prog). The title sits a line higher when there is a meta to carry,
+            // so the pair stays inside the card rather than the meta hanging off it.
+            let has_meta = card.meta.is_some();
+            let title_y = if has_meta {
+                cr.bottom() - 34.0 - CARD_META_H
+            } else {
+                cr.bottom() - 34.0
+            };
             card_children.push(SceneNode::Text {
-                rect: Rect::new(cr.x + 12.0, cr.bottom() - 34.0, cr.w - 24.0, 22.0),
+                rect: Rect::new(cr.x + 12.0, title_y, cr.w - 24.0, 22.0),
                 text: card.title.clone(),
                 size_px: 14.0,
                 color: theme.card_ink,
                 align: TextAlign::Left,
             });
+            if let Some(meta) = &card.meta {
+                card_children.push(SceneNode::Text {
+                    rect: Rect::new(cr.x + 12.0, title_y + 22.0, cr.w - 24.0, CARD_META_H),
+                    text: meta.clone(),
+                    size_px: 12.0,
+                    color: theme.hero_copy,
+                    align: TextAlign::Left,
+                });
+            }
+            if let Some(p) = card.progress {
+                // A completion bar, so ZERO must read as an empty track rather than as no
+                // bar at all: a card at 0% and a card with no progress are different
+                // states, and collapsing them would silently lose one.
+                card_children.push(SceneNode::Rect {
+                    rect: Rect::new(cr.x, cr.bottom() - CARD_PROG_H, cr.w, CARD_PROG_H),
+                    color: theme.omnibox_bg,
+                    radius: 0.0,
+                });
+                let filled = cr.w * p.clamp(0.0, 1.0);
+                if filled >= 1.0 {
+                    card_children.push(SceneNode::Rect {
+                        rect: Rect::new(cr.x, cr.bottom() - CARD_PROG_H, filled, CARD_PROG_H),
+                        color: theme.accent,
+                        radius: 0.0,
+                    });
+                }
+            }
             root.push(SceneNode::Container {
                 rect: cr,
                 // A card is the one thing on this desktop the cursor reacts to, and the
@@ -855,7 +901,20 @@ pub fn decode_home_compose(v: &serde_json::Value) -> HomeCompose {
                 for c in cs {
                     cards.push(Card {
                         title: s(c.get("title")),
-                        subtitle: c.get("subtitle").and_then(Value::as_str).map(str::to_string),
+                        meta: c
+                            .get("meta")
+                            .and_then(Value::as_str)
+                            .filter(|t| !t.is_empty())
+                            .map(str::to_string),
+                        // Out-of-range is DROPPED, not clamped: the sanitizer only ever
+                        // emits 0..=1, so a value outside it means the payload did not
+                        // come from there and guessing at intent would draw a confident
+                        // wrong bar.
+                        progress: c
+                            .get("progress")
+                            .and_then(Value::as_f64)
+                            .filter(|p| (0.0..=1.0).contains(p))
+                            .map(|p| p as f32),
                         image: c.get("image").and_then(Value::as_str).map(str::to_string),
                     });
                 }
@@ -904,8 +963,18 @@ mod tests {
                     note: Some("3 in progress".into()),
                     see_all: Some("panel:continue".into()),
                     cards: vec![
-                        Card { title: "Recipe A".into(), subtitle: None, image: None },
-                        Card { title: "Recipe B".into(), subtitle: None, image: Some("b.png".into()) },
+                        Card {
+                            title: "Recipe A".into(),
+                            meta: Some("2 min left".into()),
+                            progress: Some(0.6),
+                            image: None,
+                        },
+                        Card {
+                            title: "Recipe B".into(),
+                            meta: None,
+                            progress: None,
+                            image: Some("b.png".into()),
+                        },
                     ],
                 },
                 Row {
@@ -1264,6 +1333,124 @@ mod tests {
             }
         });
         assert_eq!(seen, 0);
+    }
+
+    #[test]
+    fn a_card_carries_its_meta_line_and_its_progress_bar() {
+        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        // The first card in the sample has both; the second has neither.
+        let mut cards: Vec<Vec<SceneNode>> = Vec::new();
+        if let SceneNode::Container { children, .. } = &root {
+            for c in children {
+                if let SceneNode::Container {
+                    interactive: true,
+                    children,
+                    ..
+                } = c
+                {
+                    cards.push(children.clone());
+                }
+            }
+        }
+        assert!(cards.len() >= 2, "the sample lays out at least two cards");
+
+        let texts = |ch: &Vec<SceneNode>| -> Vec<String> {
+            ch.iter()
+                .filter_map(|n| match n {
+                    SceneNode::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(texts(&cards[0]).contains(&"2 min left".to_string()), "the meta line draws");
+        assert!(texts(&cards[1]).is_empty() || !texts(&cards[1]).contains(&"2 min left".to_string()));
+
+        // Title above meta, both inside the card.
+        let card_rect = cards[0]
+            .first()
+            .map(|n| n.rect())
+            .expect("the card background");
+        let mut title_y = None;
+        let mut meta_y = None;
+        for n in &cards[0] {
+            if let SceneNode::Text { rect, text, .. } = n {
+                if text == "Recipe A" {
+                    title_y = Some(rect.y);
+                }
+                if text == "2 min left" {
+                    meta_y = Some(rect.bottom());
+                }
+            }
+        }
+        let (ty, mb) = (title_y.expect("a title"), meta_y.expect("a meta"));
+        assert!(mb > ty, "the meta sits under the title");
+        assert!(
+            mb <= card_rect.bottom() + 0.01,
+            "the meta must stay inside the card, ended at {mb} against {}",
+            card_rect.bottom()
+        );
+
+        // The progress bar is a track plus a fill, pinned to the bottom edge, and the
+        // fill is a fraction of the card rather than the whole width.
+        let bars: Vec<Rect> = cards[0]
+            .iter()
+            .filter_map(|n| match n {
+                SceneNode::Rect { rect, .. } if (rect.h - CARD_PROG_H).abs() < 0.01 => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bars.len(), 2, "a 0.6 progress draws a track and a fill");
+        assert!((bars[0].w - card_rect.w).abs() < 0.01, "the track spans the card");
+        assert!(bars[1].w < bars[0].w && bars[1].w > 0.0, "the fill is a fraction of it");
+        assert!((bars[0].bottom() - card_rect.bottom()).abs() < 0.01, "pinned to the bottom");
+
+        // The card without progress draws no bar at all.
+        let bars2 = cards[1]
+            .iter()
+            .filter(|n| matches!(n, SceneNode::Rect { rect, .. } if (rect.h - CARD_PROG_H).abs() < 0.01))
+            .count();
+        assert_eq!(bars2, 0, "no progress in the payload means no bar");
+    }
+
+    #[test]
+    fn zero_progress_still_draws_an_empty_track() {
+        // A card at 0% and a card with no progress at all are different states. Drawing
+        // nothing for the first would silently collapse them into the second.
+        let mut hc = sample();
+        hc.rows[0].cards[0].progress = Some(0.0);
+        let root = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &mut MonoMeasure);
+        let mut bars = 0;
+        root.for_each_leaf(&mut |_, leaf| {
+            if let SceneNode::Rect { rect, .. } = leaf {
+                if (rect.h - CARD_PROG_H).abs() < 0.01 {
+                    bars += 1;
+                }
+            }
+        });
+        assert_eq!(bars, 1, "zero draws the track and no fill");
+    }
+
+    #[test]
+    fn decode_reads_the_card_meta_and_clamps_progress() {
+        let v = serde_json::json!({
+            "rows": [{ "label": "R", "cards": [
+                { "title": "A", "meta": "2 min left", "progress": 0.42 },
+                { "title": "B" },
+                { "title": "C", "meta": "", "progress": 4.0 },
+                { "title": "D", "progress": -1.0 }
+            ] }]
+        });
+        let cards = &decode_home_compose(&v).rows[0].cards;
+        assert_eq!(cards[0].meta.as_deref(), Some("2 min left"));
+        assert_eq!(cards[0].progress, Some(0.42));
+        assert_eq!(cards[1].meta, None);
+        assert_eq!(cards[1].progress, None);
+        // Empty meta is absent, and an out-of-range progress is DROPPED rather than
+        // clamped: it cannot have come from the sanitizer, so drawing a confident bar
+        // from it would be inventing a number.
+        assert_eq!(cards[2].meta, None);
+        assert_eq!(cards[2].progress, None);
+        assert_eq!(cards[3].progress, None);
     }
 
     #[test]
