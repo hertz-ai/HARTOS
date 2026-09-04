@@ -3716,6 +3716,15 @@ mod native_render_tests {
                     text_after_first_frame > 0,
                     "the demo scene has text runs, so the first frame composes some"
                 );
+                // The demo is the payload the box shows before any compose arrives, and
+                // an empty title lowers to nothing, so a demo of default cards would
+                // render blank tiles. Every card carries text; this catches a regression
+                // back to Card::default() in the one payload that must look like a
+                // desktop unaided.
+                assert!(
+                    text_after_first_frame >= 12,
+                    "the demo must carry real card text, only {text_after_first_frame} runs"
+                );
             } else {
                 assert_eq!(
                     elements.len(),

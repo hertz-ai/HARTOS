@@ -250,18 +250,72 @@ impl HomeCompose {
                 title: "HART OS".to_string(),
                 copy: "Native shell, drawn by the compositor.".to_string(),
             },
+            // Every card carries real text. `Card::default()` has an EMPTY title, and the
+            // lowering skips an empty run, so a default-card demo drew blank tiles: the
+            // worst possible thing for the one payload whose whole job is to prove the
+            // scene renders, and the first thing the box would show at the M6 flip before
+            // any compose arrives. These also exercise the full card vocabulary (icon,
+            // badge, live, meta, progress) so the render tests that lower this payload
+            // actually walk those paths.
             rows: vec![
                 Row {
                     label: "Continue".to_string(),
-                    note: None,
+                    note: Some("picked up where you left off".to_string()),
                     see_all: Some("panel:continue".to_string()),
-                    cards: vec![Card::default(), Card::default(), Card::default()],
+                    cards: vec![
+                        Card {
+                            title: "Morning briefing".to_string(),
+                            meta: Some("4 min left".to_string()),
+                            progress: Some(0.62),
+                            icon: Some("summarize".to_string()),
+                            badge: None,
+                            live: None,
+                            image: None,
+                        },
+                        Card {
+                            title: "Inbox triage".to_string(),
+                            meta: Some("12 unread".to_string()),
+                            progress: Some(0.25),
+                            icon: Some("inbox".to_string()),
+                            badge: None,
+                            live: Some("running".to_string()),
+                            image: None,
+                        },
+                        Card {
+                            title: "Storage report".to_string(),
+                            meta: Some("92% used".to_string()),
+                            progress: Some(0.92),
+                            icon: Some("storage".to_string()),
+                            badge: None,
+                            live: None,
+                            image: None,
+                        },
+                    ],
                 },
                 Row {
                     label: "For you".to_string(),
                     note: None,
                     see_all: None,
-                    cards: vec![Card::default(), Card::default()],
+                    cards: vec![
+                        Card {
+                            title: "Hive earnings".to_string(),
+                            meta: Some("last 24h".to_string()),
+                            progress: None,
+                            icon: Some("hive".to_string()),
+                            badge: Some("NEW".to_string()),
+                            live: None,
+                            image: None,
+                        },
+                        Card {
+                            title: "Agent recipes".to_string(),
+                            meta: Some("3 ready to run".to_string()),
+                            progress: None,
+                            icon: Some("auto_awesome".to_string()),
+                            badge: None,
+                            live: None,
+                            image: None,
+                        },
+                    ],
                 },
             ],
             mood: None,
