@@ -156,6 +156,21 @@ pub static NATIVE_CHROME_EMITTED: std::sync::atomic::AtomicU8 =
 pub static NATIVE_SCENE_PAINTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Everything one lowering needs off the backend `State`, handed back together.
+///
+/// One accessor rather than five because these are DISJOINT fields and two `&mut self`
+/// accessors cannot overlap: the tree has to be borrowed alongside the buffer caches for
+/// the whole walk. The composed home rides along as a SHARED borrow, which is what let the
+/// per-frame clone go. Named because the tuple is wide enough that spelling it at every
+/// implementor was its own kind of noise.
+pub type NativeSceneCaches<'a> = (
+    Option<&'a crate::scene::HomeCompose>,
+    &'a mut crate::text_render::TextRasterizer,
+    &'a mut OrbCache,
+    &'a mut RectCache,
+    &'a mut crate::scene::SceneCache,
+);
+
 pub const NATIVE_CHROME_BLOOM: u8 = 1 << 0;
 pub const NATIVE_CHROME_ORB: u8 = 1 << 1;
 
@@ -651,15 +666,7 @@ pub trait CompState:
     /// frame just to end the state borrow before taking the caches, which is the last
     /// per-frame heap traffic the zero-alloc NFR named. None means no `shell.compose`
     /// has landed and the caller falls back to `scene::demo_ref()`.
-    fn native_scene_caches(
-        &mut self,
-    ) -> (
-        Option<&crate::scene::HomeCompose>,
-        &mut crate::text_render::TextRasterizer,
-        &mut OrbCache,
-        &mut RectCache,
-        &mut crate::scene::SceneCache,
-    );
+    fn native_scene_caches(&mut self) -> NativeSceneCaches<'_>;
 
     // ── IPC event fan-out (window.opened/closed/focused…). The winit backend pushes
     //    framed JSON to its `IpcState` subscribers; the DRM backend logs the edge.

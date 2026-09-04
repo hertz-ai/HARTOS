@@ -104,7 +104,7 @@ impl TextRasterizer {
         }
         // The same empty-font-DB guard compose() carries: cosmic-text's shaper panics with
         // no face to fall back to, so degrade to the font-free estimate rather than die.
-        if self.font_system.db().len() == 0 {
+        if self.font_system.db().is_empty() {
             return crate::scene::MonoMeasure.text_width(text, size_px);
         }
         let metrics = Metrics::new(size_px, size_px * 1.3);
@@ -171,7 +171,7 @@ impl TextRasterizer {
         // somehow missing (early boot before the font path mounts, a misconfig). This
         // also lets the render path run in a font-less CI sandbox. compose() only runs
         // on a cache miss, so the check is free in steady state.
-        if self.font_system.db().len() == 0 {
+        if self.font_system.db().is_empty() {
             return MemoryRenderBuffer::from_slice(
                 &rgba,
                 Fourcc::Argb8888,
