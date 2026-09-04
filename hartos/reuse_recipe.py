@@ -3069,22 +3069,35 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         referenced = [n for n in names if n and len(n) > 3 and n.lower() in text]
         if not referenced:
             return []
-        # Which of the referenced tools ACTUALLY executed?  A tool ran if the
-        # chat carries a role=='tool' result named for it OR an assistant
-        # tool_call for it.  (The earlier coarse "any tool ran anywhere" check
-        # was defeated by unrelated MemoryGraph tool results — live
-        # revwarm5407: get_api_revenue_stats never ran yet a memory tool did,
-        # so any_tool_ran was true and the guard let the fabrication through.)
+        # Which of the referenced tools ACTUALLY executed?  A tool ran if a
+        # role=='tool' result named for it OR an assistant tool_call for it
+        # appears ANYWHERE the conversation is recorded — the group-chat log OR
+        # any agent's pairwise _oai_messages buffer.  Scanning only
+        # group_chat.messages was blind to tool activity autogen records in an
+        # agent buffer but not the (hooked) group log: live 2026-09-05 Trading
+        # 33204307184, google_search made a real HTTP 200 (primp) yet
+        # executed=[] because its assistant tool_call + role=tool result lived
+        # in the Helper<->Assistant buffer, not group_chat.messages — so the
+        # guard could not tell a real completion from a fabricated one.  Still
+        # keyed on the SPECIFIC function name (never "any tool ran"), so the
+        # revwarm5407 defeat — an unrelated MemoryGraph tool marking a
+        # never-run get_api_revenue_stats as executed — cannot recur.
         executed = set()
-        for m in (getattr(group_chat, 'messages', None) or []):
-            if not isinstance(m, dict):
-                continue
-            if m.get('role') == 'tool' and m.get('name'):
-                executed.add(m.get('name'))
-            for tc in (m.get('tool_calls') or []):
-                fn = ((tc or {}).get('function') or {}).get('name')
-                if fn:
-                    executed.add(fn)
+        _msg_lists = [getattr(group_chat, 'messages', None) or []]
+        for ag in agents:
+            conv = getattr(ag, '_oai_messages', None)
+            if isinstance(conv, dict):
+                _msg_lists.extend(conv.values())
+        for _ml in _msg_lists:
+            for m in (_ml or []):
+                if not isinstance(m, dict):
+                    continue
+                if m.get('role') == 'tool' and m.get('name'):
+                    executed.add(m.get('name'))
+                for tc in (m.get('tool_calls') or []):
+                    fn = ((tc or {}).get('function') or {}).get('name')
+                    if fn:
+                        executed.add(fn)
         unrun = [n for n in referenced if n not in executed]
         try:
             current_app.logger.info(
