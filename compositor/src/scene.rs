@@ -1286,6 +1286,45 @@ mod tests {
     }
 
     #[test]
+    fn a_degenerate_output_lays_out_without_panicking_or_inverting_a_rect() {
+        // The never-fail floor, applied to layout. This runs inside the compositor's own
+        // render path, so a panic here is not a wrong-looking desktop, it is NO desktop:
+        // the process that owns scanout dies. A zero or 1px output is reachable in
+        // practice (a mode not yet set, a CRTC coming back from DPMS, a hotplug race),
+        // and every arm of this layout subtracts fixed chrome from the output size, which
+        // is exactly the arithmetic that goes negative first.
+        for (w, h) in [
+            (0.0, 0.0),
+            (1.0, 1.0),
+            (0.0, 900.0),
+            (1600.0, 0.0),
+            (320.0, 40.0),
+            (2.0, 84.0), // exactly the two strips, so the content band is empty
+        ] {
+            let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+            let mut checked = 0;
+            root.for_each_leaf(&mut |_, leaf| {
+                let r = leaf.rect();
+                assert!(
+                    r.w >= 0.0 && r.h >= 0.0,
+                    "{w}x{h} produced an INVERTED rect {r:?}, which reaches the lowering \
+                     as a negative buffer size"
+                );
+                assert!(
+                    r.w.is_finite() && r.h.is_finite() && r.x.is_finite() && r.y.is_finite(),
+                    "{w}x{h} produced a non-finite rect {r:?}"
+                );
+                checked += 1;
+            });
+            // A hit test at the origin and off the canvas must also be total.
+            let _ = root.hit_test(0.0, 0.0);
+            let _ = root.hover_leaf(Some((-5.0, -5.0)));
+            let _ = root.pointer_orb_energy(Some((w * 2.0, h * 2.0)), true);
+            assert!(checked > 0, "{w}x{h} emitted no leaves at all");
+        }
+    }
+
+    #[test]
     fn the_font_free_measure_scales_with_length_and_size() {
         let mut m = MonoMeasure;
         assert_eq!(m.text_width("", 15.0), 0.0);

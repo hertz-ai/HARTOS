@@ -3771,6 +3771,38 @@ mod native_render_tests {
     }
 
     #[test]
+    fn a_degenerate_output_lowers_without_panicking() {
+        // The layout half of this is proven in scene.rs; this is the other half, where a
+        // bad rect would actually land: buffer allocation and texture import. A zero-size
+        // output is reachable while a mode is being set or a CRTC returns from DPMS, and
+        // the compositor cannot afford a panic on the render path at any size.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+
+        for (w, h) in [(0, 0), (1, 1), (0, 900), (1600, 0), (320, 40), (2, 84)] {
+            let size: Size<i32, Physical> = (w, h).into();
+            let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+            lower_scene(
+                &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
+                0.5, Some((10.0, 10.0)), true, &mut elements,
+            );
+            // Whatever survived must still have a real footprint: the <1px skips exist so
+            // nothing reaches the renderer with an empty or inverted box.
+            for e in &elements {
+                let g = e.geometry(Scale::from(1.0));
+                assert!(
+                    g.size.w > 0 && g.size.h > 0,
+                    "{w}x{h} lowered an element with empty geometry {g:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_native_scene_claims_the_orb_it_draws() {
         // The shell hides its own HTML orb only when the compositor claims 'orb' through
         // NATIVE_CHROME_EMITTED (liquid_ui_service.read_native_chrome). The M2 block that
