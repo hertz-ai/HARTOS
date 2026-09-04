@@ -2508,20 +2508,22 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
 
 
 
-            # Process JSON responses from StatusVerifier
-            temp_message = messages[-1]["content"].replace("'", '"')
-            pattern = r'\{.*?\}'  # getting all json from text
-            matches = re.findall(pattern, temp_message, re.DOTALL)
-
+            # Process JSON responses from StatusVerifier.  Parse with the
+            # canonical retrieve_json (json / repair_json / ast / regex), NOT a
+            # naive single-to-double quote swap + non-greedy brace regex +
+            # json.loads: swapping every quote corrupts apostrophes in the
+            # verdict (developer's becomes developer"s), json.loads then dies on
+            # "Expecting ',' delimiter", the 'completed' status is never read,
+            # and the action loops until the count cap (measured live
+            # 2026-09-05: 21 parse-fails on one Auto Research turn, action never
+            # advanced).  Same fix the sibling parse site below carries (#95).
             try:
-                json_objects = [json.loads(match) for match in matches]
-                current_app.logger.info(f'Got Json as {len(json_objects)}')
+                last_json = retrieve_json(messages[-1]["content"])
 
-                if json_objects:
-                    last_json = json_objects[-1]
+                if isinstance(last_json, dict) and last_json:
                     current_app.logger.info(f'last json as {last_json}')
 
-                    if 'status' in last_json.keys() and last_json['status'].lower() == 'completed':
+                    if 'status' in last_json.keys() and str(last_json.get('status', '')).lower() == 'completed':
                         current_app.logger.info('GOT COMPLETED FOR ACTION in state_transition')
                         # Don't trust LLM's action_id — use known pipeline state
                         # The actual advancement happens in get_agent_response/chat_agent loops
