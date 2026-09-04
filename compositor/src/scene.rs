@@ -446,6 +446,14 @@ const OMNIBOX_W: f32 = 420.0;
 const ORB_SM: f32 = 28.0;
 /// Wordmark type size. The shell sets it in the bar's own scale, not the hero's.
 const WORDMARK_PX: f32 = 15.0;
+/// The shell's five primary destinations (`.top-bar-nav .tb-tab`), in its order.
+const NAV_TABS: [&str; 5] = ["Home", "Agents", "Apps", "Hive", "Earn"];
+/// Which tab reads as current. The native scene only lays out the HOME canvas, so home
+/// IS the active destination; this becomes state the moment a tab can navigate.
+const ACTIVE_TAB: usize = 0;
+const TAB_PX: f32 = 13.0;
+const TAB_PAD_X: f32 = 10.0;
+const TAB_GAP: f32 = 2.0;
 const HERO_H: f32 = 200.0;
 const ROW_LABEL_H: f32 = 22.0;
 const ROW_GAP: f32 = 14.0;
@@ -479,10 +487,20 @@ pub fn layout_home(
     //    the first ends. This is the layout that was impossible before `TextMeasure`:
     //    without a width there is no way to butt one run against another. The logo IMAGE
     //    beside it in the HTML shell waits on Image lowering (the image-source contract).
+    // The omnibox pill is computed HERE, before the wordmark and tabs are placed, because
+    // the tabs need to know where the pill starts in order to stop short of it. It is
+    // still PUSHED in paint order below.
+    let pill = Rect::new(
+        (output_w - OMNIBOX_W) * 0.5,
+        6.0,
+        OMNIBOX_W,
+        TOP_BAR_H - 12.0,
+    );
     let mark_h = WORDMARK_PX * 1.3;
     let mark_y = (TOP_BAR_H - mark_h) * 0.5;
     let hart_w = measure.text_width("HART", WORDMARK_PX);
     let gap_w = measure.text_width(" ", WORDMARK_PX);
+    let os_w = measure.text_width("OS", WORDMARK_PX);
     // A shaped run needs its whole advance to fit the buffer it is composed into, so the
     // box is the measured width rounded up with a pixel of slack rather than trusting an
     // exact float to survive the f32 -> i32 the lowering does.
@@ -497,7 +515,7 @@ pub fn layout_home(
         rect: Rect::new(
             EDGE_PAD + hart_w + gap_w,
             mark_y,
-            measure.text_width("OS", WORDMARK_PX).ceil() + 2.0,
+            os_w.ceil() + 2.0,
             mark_h,
         ),
         text: "OS".to_string(),
@@ -506,12 +524,47 @@ pub fn layout_home(
         align: TextAlign::Left,
     });
 
-    let pill = Rect::new(
-        (output_w - OMNIBOX_W) * 0.5,
-        6.0,
-        OMNIBOX_W,
-        TOP_BAR_H - 12.0,
-    );
+    // ── Nav tabs (P5): the shell's five primary destinations, each sized to its own
+    //    label, which is the second thing the measure buys. A tab is emitted only while
+    //    it fits BEFORE the omnibox pill, the same discipline the card rows use for the
+    //    taskbar, so a narrow output drops tabs from the right instead of drawing them
+    //    under the pill. They are deliberately NOT hover targets: nothing routes a tab
+    //    activation yet, and an affordance that reacts but does nothing is a lie. Wrap
+    //    them as interactive groups when a tab actually navigates.
+    let tab_h = TAB_PX * 2.0;
+    let tab_y = (TOP_BAR_H - tab_h) * 0.5;
+    let tab_ink_h = TAB_PX * 1.3;
+    let tab_ink_y = (TOP_BAR_H - tab_ink_h) * 0.5;
+    let mut tab_x = EDGE_PAD + hart_w + gap_w + os_w + EDGE_PAD;
+    for (i, label) in NAV_TABS.iter().enumerate() {
+        let ink_w = measure.text_width(label, TAB_PX);
+        let slot = ink_w.ceil() + 2.0 * TAB_PAD_X;
+        if tab_x + slot > pill.x - TAB_GAP {
+            break;
+        }
+        // The active tab carries the same faint surface the omnibox pill does, so the
+        // bar reads as one material rather than two.
+        if i == ACTIVE_TAB {
+            bar_children.push(SceneNode::Rect {
+                rect: Rect::new(tab_x, tab_y, slot, tab_h),
+                color: theme.omnibox_bg,
+                radius: tab_h * 0.5,
+            });
+        }
+        bar_children.push(SceneNode::Text {
+            rect: Rect::new(tab_x + TAB_PAD_X, tab_ink_y, ink_w.ceil() + 2.0, tab_ink_h),
+            text: label.to_string(),
+            size_px: TAB_PX,
+            color: if i == ACTIVE_TAB {
+                theme.bar_ink
+            } else {
+                theme.omnibox_ink
+            },
+            align: TextAlign::Left,
+        });
+        tab_x += slot + TAB_GAP;
+    }
+
     bar_children.push(SceneNode::Rect {
         rect: pill,
         color: theme.omnibox_bg,
@@ -937,6 +990,87 @@ mod tests {
         assert_eq!(colors, vec![theme.accent, theme.accent2]);
         // Both sit inside the fixed 40px strip.
         assert!(h.y >= 0.0 && h.bottom() <= TOP_BAR_H + 0.01);
+    }
+
+    /// Every Text run inside the fixed top bar, in paint order.
+    fn bar_runs(root: &SceneNode) -> Vec<(String, Rect)> {
+        let mut out = Vec::new();
+        if let SceneNode::Container { children, .. } = root {
+            for c in children {
+                if let SceneNode::Container { rect, children, .. } = c {
+                    if rect.y != 0.0 || rect.h != TOP_BAR_H {
+                        continue;
+                    }
+                    for n in children {
+                        if let SceneNode::Text { rect, text, .. } = n {
+                            out.push((text.clone(), *rect));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_nav_tabs_are_laid_out_left_to_right_each_sized_to_its_own_label() {
+        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let runs = bar_runs(&root);
+        let tabs: Vec<_> = runs
+            .iter()
+            .filter(|(t, _)| NAV_TABS.contains(&t.as_str()))
+            .collect();
+        assert_eq!(tabs.len(), NAV_TABS.len(), "a wide bar fits every tab");
+        // In the shell's order, strictly left to right, never overlapping.
+        for w in tabs.windows(2) {
+            assert!(
+                w[1].1.x > w[0].1.right(),
+                "{} must start after {} ends",
+                w[1].0,
+                w[0].0
+            );
+        }
+        for (i, (label, _)) in tabs.iter().enumerate() {
+            assert_eq!(label.as_str(), NAV_TABS[i]);
+        }
+        // Sized to the LABEL, not a uniform slot: Agents is wider than Apps.
+        let width_of = |name: &str| tabs.iter().find(|(t, _)| t == name).unwrap().1.w;
+        assert!(width_of("Agents") > width_of("Apps"));
+        // They stop short of the omnibox pill and stay inside the strip.
+        let pill_x = (1600.0 - OMNIBOX_W) * 0.5;
+        for (label, r) in &tabs {
+            assert!(r.right() <= pill_x, "{label} runs under the omnibox");
+            assert!(r.y >= 0.0 && r.bottom() <= TOP_BAR_H + 0.01);
+        }
+        // They begin after the wordmark rather than on top of it.
+        let os = runs.iter().find(|(t, _)| t == "OS").expect("an OS run");
+        assert!(tabs[0].1.x > os.1.x);
+    }
+
+    #[test]
+    fn a_narrow_bar_drops_tabs_instead_of_drawing_them_under_the_omnibox() {
+        // The same discipline the card rows use: emit only what fits. A bar barely wider
+        // than its own pill has no room for tabs at all, and must show none rather than
+        // overlap.
+        let root = layout_home(
+            OMNIBOX_W + 120.0,
+            900.0,
+            &sample(),
+            &Theme::cosmic_default(),
+            &mut MonoMeasure,
+        );
+        let runs = bar_runs(&root);
+        let pill_x = ((OMNIBOX_W + 120.0) - OMNIBOX_W) * 0.5;
+        for (label, r) in &runs {
+            if NAV_TABS.contains(&label.as_str()) {
+                assert!(r.right() <= pill_x, "{label} overlapped the omnibox");
+            }
+        }
+        let shown = runs
+            .iter()
+            .filter(|(t, _)| NAV_TABS.contains(&t.as_str()))
+            .count();
+        assert!(shown < NAV_TABS.len(), "a narrow bar must drop tabs");
     }
 
     #[test]
