@@ -2201,12 +2201,15 @@ fn native_pointer_scene_pos<S: CompState>(
 /// clone below (it must, to drop the state borrow before taking the `&mut` caches, so
 /// removing it needs the accessor to split-borrow the home) and the per-frame `elements`
 /// and leaf vectors.
+/// Returns the NATIVE_CHROME_* mask this frame actually emitted, so the shell bridge can
+/// stand down the HTML chrome the compositor has taken over. See `lower_scene`.
 pub fn render_native_scene<S, R>(
     state: &mut S,
     renderer: &mut R,
     size: Size<i32, Physical>,
     elements: &mut Vec<HartRenderElement<R>>,
-) where
+) -> u8
+where
     S: CompState,
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Send + Clone + 'static,
@@ -2234,7 +2237,7 @@ pub fn render_native_scene<S, R>(
     lower_scene(
         home, size, renderer, rasterizer, orb_cache, rect_cache, scene_cache, orb_energy,
         pointer, pressed, elements,
-    );
+    )
 }
 
 /// Lower a `HomeCompose` to render elements against the concrete caches — the
@@ -2254,10 +2257,19 @@ pub fn lower_scene<R>(
     pointer: Option<(f32, f32)>,
     pressed: bool,
     elements: &mut Vec<HartRenderElement<R>>,
-) where
+) -> u8
+where
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Send + Clone + 'static,
 {
+    // What native chrome this lowering ACTUALLY emitted, accumulated only on a successful
+    // push exactly as the M2 orb and bloom blocks do. The shell bridge stands its own HTML
+    // chrome down on the strength of this (liquid_ui_service.read_native_chrome), so a
+    // claim that is not backed by real pixels would blank the orb on both sides, and a
+    // claim that is missing leaves TWO orbs breathing on top of each other with the
+    // WebView still paying the per-frame cost the native orb exists to remove.
+    let mut emitted: u8 = 0;
+
     // RETAINED TREE (zero-per-frame-alloc, step two): the layout is rebuilt only when the
     // size, the composed home, or the theme changes, so a steady desktop reuses the tree
     // it already owns instead of allocating a fresh one every frame. The pointer is NOT a
@@ -2409,7 +2421,10 @@ pub fn lower_scene<R>(
                         Some((dst, dst).into()),
                         Kind::Unspecified,
                     ) {
-                        Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                        Ok(e) => {
+                            elements.push(HartRenderElement::Memory(e));
+                            emitted |= NATIVE_CHROME_ORB;
+                        }
                         Err(err) => warn!(?err, "native scene: orb import failed"),
                     }
                 }
@@ -2418,6 +2433,7 @@ pub fn lower_scene<R>(
             _ => {}
         }
     });
+    emitted
 }
 
 pub fn build_frame_elements<S, R>(
@@ -2460,7 +2476,12 @@ where
     //    drawn native scene holds the frame-budget gate open it would otherwise composite
     //    at full rate behind a blacked-out screen. ──
     if native_scene_drawn(state.native_shell_on(), state.capture_blocked()) {
-        render_native_scene(state, renderer, size, &mut elements);
+        // The scene CLAIMS the chrome it draws. Without this the flag would silently
+        // un-claim the orb, because the M2 block below that used to set the bit is
+        // skipped precisely when the native shell is on, and the shell would then keep
+        // its own HTML orb: two orbs breathing over each other, the browser still paying
+        // the per-frame cost, and the entire point of the native orb lost.
+        native_mask |= render_native_scene(state, renderer, size, &mut elements);
     }
 
     let ws_alpha = workspace_fade_alpha(state);
@@ -3724,6 +3745,38 @@ mod native_render_tests {
         // The two effects that already forced a paint still do, with the flag off.
         assert!(scene_animates(false, true, false), "a workspace fade must play out");
         assert!(scene_animates(false, false, true), "a map animation must play out");
+    }
+
+    #[test]
+    fn the_native_scene_claims_the_orb_it_draws() {
+        // The shell hides its own HTML orb only when the compositor claims 'orb' through
+        // NATIVE_CHROME_EMITTED (liquid_ui_service.read_native_chrome). The M2 block that
+        // used to set that bit is skipped exactly when the native shell is on, so the
+        // scene must claim it itself or the flip ships two orbs, one breathing under the
+        // other, with the WebView still burning a core on the one nobody needed.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (1280, 800).into();
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+
+        let emitted = lower_scene(
+            &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
+            0.5, None, false, &mut elements,
+        );
+        assert_eq!(
+            emitted & NATIVE_CHROME_ORB,
+            NATIVE_CHROME_ORB,
+            "the home scene draws an orb, so it must claim one"
+        );
+        // The claim is only ever made on a real push, so it cannot outrun the pixels.
+        assert!(!elements.is_empty());
+        // Bloom is NOT the scene's to claim: the backdrop block still emits it, and
+        // claiming it here would blank the shell's backdrop against nothing.
+        assert_eq!(emitted & NATIVE_CHROME_BLOOM, 0);
     }
 
     #[test]
