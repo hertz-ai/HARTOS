@@ -363,7 +363,10 @@ any of them show up: each crosses a process boundary, so no Rust test and no
 headless run can fail on them. Two are code, two are contract decisions that
 touch the shell and must not be settled unilaterally.
 
-1. **shell-ready has no native writer.** The supervisor's paint watchdog reads
+1. **shell-ready has no native writer.** DONE (the compositor now writes it from
+   the vblank reaper when the frame that scanned out carried the scene; three
+   conditions, each load-bearing, and flag-off is byte-identical). Kept here for
+   the reasoning: The supervisor's paint watchdog reads
    HEALTHY off `/run/hart/session/shell-ready`, and the ONLY thing that ever
    writes it is the WebView host (hart-layer-shell-host.nix, on
    LoadEvent.FINISHED with the surface mapped). M6 demotes the WebView. If it
