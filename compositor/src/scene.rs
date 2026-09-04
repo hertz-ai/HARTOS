@@ -1,6 +1,6 @@
 //! NATIVE SHELL PARITY PROGRAM, M3 scene plumbing: the `SceneNode` foundation that
-//! M0 named ("land the SceneNode enum + A2UI->Scene decoder") but never landed, so
-//! `latency.rs` still reads "there is no native scene graph". This module is PURE
+//! M0 named ("land the SceneNode enum + A2UI->Scene decoder") but never landed, which
+//! is why `latency.rs` used to read "there is no native scene graph". This module is PURE
 //! geometry + data: no smithay, no Wayland, no GL. `comp_core` lowers a `SceneNode`
 //! tree into `HartRenderElement`s on the render path (gated to any(winit, smithay));
 //! this file carries the layout + decode logic and its unit floor so the smithay

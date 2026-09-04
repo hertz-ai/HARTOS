@@ -121,8 +121,8 @@ mod orb;
 
 // ── NATIVE SHELL PARITY PROGRAM, M3: the SceneNode foundation (top bar + hero +
 // rows + taskbar as a scene tree, text via glyph atlas). M0 named "land the
-// SceneNode enum + A2UI->Scene decoder" but never did, so latency.rs still reads
-// "there is no native scene graph". src/scene.rs is PURE geometry + the home_compose
+// SceneNode enum + A2UI->Scene decoder" but never did, which is why latency.rs used
+// to read "there is no native scene graph". src/scene.rs is PURE geometry + the home_compose
 // decoder + the a2 layout, with its unit floor; comp_core lowers a SceneNode tree to
 // HartRenderElements on the render path. Same gate as bloom/orb (its only consumer is
 // comp_core), so the smithay doCheck exercises the layout + decode tests. ──

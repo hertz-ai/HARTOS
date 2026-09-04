@@ -9,11 +9,15 @@
 //! are proxies by construction; ours is not, because hart-comp owns both ends.
 //!
 //! WHAT THIS M0 SLICE IS, HONESTLY:
-//!   * attribution is `shell` for every sample — there is no native scene graph
-//!     to hit-test yet, and the harness explicitly wants the WEB shell measured
-//!     by the same instrument ("'native is faster' is a demonstrated delta, not
-//!     a claim"). Today's numbers are the WebView-era baseline the M6 flip will
-//!     be judged against. Per-component attribution arrives with SceneNode ids.
+//!   * attribution is `shell` for every sample. The scene graph now EXISTS and
+//!     hit-tests (scene.rs `hit_test` / `hover_leaf`, both already on the live
+//!     pointer path for the orb and card hover), so the blocker has moved: what
+//!     is missing is carrying a node identity from the input that produced a
+//!     sample through to the frame that presented it. The harness also wants the
+//!     WEB shell measured by the same instrument ("'native is faster' is a
+//!     demonstrated delta, not a claim"), so a single `shell` attribution stays
+//!     correct for the baseline the M6 flip is judged against. Per-component
+//!     attribution arrives with SceneNode ids.
 //!   * one frame stream, not per-CRTC: the appliance is single-display; on a
 //!     multi-head box samples from two CRTCs would interleave into one stream.
 //!     Refined together with attribution.

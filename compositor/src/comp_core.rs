@@ -2197,17 +2197,25 @@ fn native_pointer_scene_pos<S: CompState>(
 /// Rect leaves (top bar, taskbar, hero and card tiles) become SolidColorRenderElements;
 /// Text runs are shaped + rasterized into cached MemoryRenderBuffers; OrbSlots reuse the
 /// M2 orb texture. Image (texture) is the remaining leaf kind. Gated by `native_shell_on`
-/// at the call site, so with the flag OFF this never runs. The actual lowering lives in
-/// `lower_scene` (State-free, so it is render-tested); this wrapper just pulls the scene
-/// and caches off `state`.
+/// and the killswitch at the call site (`native_scene_drawn`), so with the flag OFF, or
+/// while capture is blocked, this never runs. The actual lowering lives in `lower_scene`
+/// (State-free, so it is render-tested); this wrapper just pulls the scene and caches off
+/// `state`.
 ///
-/// Alloc note: step two is now DONE both halves. The scene tree is retained
-/// (`scene::SceneCache`, rebuilt only on a real layout change) and the sharp-rect
-/// SolidColorBuffers are pooled (`RectCache::solid`, reused via `update`), so a steady
-/// desktop allocates neither per frame. What still allocates per frame: the `HomeCompose`
-/// clone below (it must, to drop the state borrow before taking the `&mut` caches, so
-/// removing it needs the accessor to split-borrow the home) and the per-frame `elements`
-/// and leaf vectors.
+/// Alloc note: the zero-per-frame-alloc NFR is MET, in four parts. The scene tree is
+/// retained (`scene::SceneCache`, rebuilt only on a real layout change); the sharp-rect
+/// SolidColorBuffers are pooled (`RectCache::solid`, reused via `update`); the composed
+/// home rides out of the accessor as a borrow rather than a clone; and the leaves are
+/// walked by callback (`SceneNode::for_each_leaf`) rather than collected, which is what a
+/// list of leaf references needs, since it borrows the tree the cache owns and so could
+/// never be retained the way the tree and the pools are.
+///
+/// The one allocation left per frame is the caller's own `elements` vector, which is
+/// architectural: smithay's render path takes a slice of elements, so the frame has to
+/// build one. It is not counted against the NFR here for that reason. The claim is
+/// structural rather than measured: no counting allocator is installed, so what the tests
+/// pin is that the tree-rebuild, solid-allocation, text-compose and rounded-compose counts
+/// all stay flat across a steady desktop's frames.
 /// Returns the NATIVE_CHROME_* mask this frame actually emitted, so the shell bridge can
 /// stand down the HTML chrome the compositor has taken over. See `lower_scene`.
 pub fn render_native_scene<S, R>(
