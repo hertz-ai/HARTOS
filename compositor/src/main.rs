@@ -527,9 +527,9 @@ fn note_native_shell_ready_once(
     }
     let path = shell_ready_marker_path();
     if write_scanout_marker(&path) {
-        tracing::info!(marker = %path, "hart-comp: the NATIVE scene scanned out — shell-ready written by the compositor, so the paint watchdog holds without the WebView host");
+        tracing::info!(marker = %path, "hart-comp: the NATIVE scene scanned out, so shell-ready is written by the compositor and the paint watchdog holds without the WebView host");
     } else {
-        tracing::info!("hart-comp: native scene scanned out (shell-ready write skipped — advisory only)");
+        tracing::info!("hart-comp: native scene scanned out (shell-ready write skipped, the marker is advisory only)");
     }
 }
 
