@@ -3116,6 +3116,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                                           clear_history=False)
 
         count = 0
+        _reuse_advanced_actions = set()  # one robust completion-advance per action id
         while True:
             current_app.logger.info('inside reuse while1')
 
@@ -3133,6 +3134,42 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     if _reuse_task.is_sla_breached() and not _reuse_task.sla_breached:
                         _reuse_task.mark_sla_breached()
                         current_app.logger.warning(f"[SLA] Task {_reuse_task_id} SLA breached in reuse loop")
+
+            # ROBUST COMPLETION-ADVANCE: the TERMINATE gate below only advances
+            # when a ChatInstructor 'TERMINATE' lands at messages[-1], which does
+            # NOT reliably happen after a 'completed' verdict — measured live
+            # 2026-09-05: action 1's verdict was {'status':'completed','action_id':1}
+            # twice, "GOT COMPLETED FOR ACTION" fired, yet the loop self-looped on
+            # action 1 (24x current_action_id:1) and actions 2-6 never ran.  When
+            # the verifier tail carries a 'completed' verdict FOR THE CURRENT action
+            # (action_id matched, one-advance-per-action guarded so a stale verdict
+            # cannot double-advance), advance via the SAME _advance_reuse_action the
+            # TERMINATE path uses — no parallel path, purely additive (falls through
+            # untouched when no such verdict is present).
+            try:
+                if group_chat.messages and _reuse_current_action not in _reuse_advanced_actions:
+                    for _rc_m in reversed(group_chat.messages[-4:]):
+                        _rc_vj = retrieve_json((_rc_m or {}).get('content') or '')
+                        if (isinstance(_rc_vj, dict)
+                                and str(_rc_vj.get('status', '')).lower() == 'completed'
+                                and str(_rc_vj.get('action_id', '')) == str(_reuse_current_action)):
+                            _reuse_advanced_actions.add(_reuse_current_action)
+                            current_app.logger.info(
+                                f"reuse-w1-completed: verifier verdict completed for action "
+                                f"{_reuse_current_action} — advancing (TERMINATE gate independent)")
+                            _rc_next, _rc_ok = _advance_reuse_action(
+                                user_prompt, _reuse_current_action, "reuse-w1-completed", prompt_id)
+                            if not _rc_ok:
+                                return ''
+                            _rc_msg = _build_reuse_action_message(user_prompt, _rc_next)
+                            chat_instructor.initiate_chat(
+                                recipient=manager, message=_rc_msg,
+                                clear_history=False, silent=False)
+                            break
+            except Exception as _rc_err:
+                current_app.logger.debug(f"robust completion-advance skipped: {_rc_err}")
+            if _reuse_current_action in _reuse_advanced_actions:
+                continue
 
             # group_chat.messages can be empty here (live 2026-08-30).  CAUSE
             # NOT ESTABLISHED -- see #725; transform_messages was my first
