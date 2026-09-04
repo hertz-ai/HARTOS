@@ -648,15 +648,11 @@ def build_personality_prompt(personality: AgentPersonality,
         user_language: User's preferred language for regional tone code-mixing.
         execution_mode: True for REUSE execution turns, where the saved recipe
             IS the plan.  Suppresses the "ask 1-2 clarifying questions before
-            executing" proactive behaviour and swaps the "caring partner, not
-            just executing tasks" closing for an execution mandate.  Without
-            this, the persona makes the model stall with discovery questions /
-            holding messages instead of running the recipe and synthesising
-            from the real tool outputs (measured live 2026-09-03, agent
-            18088688973: it asked "what deeper vision?" and sent "as soon as I
-            have the brief I'll share it" DESPITE the google_search result
-            being present in context).  The recipe's own persona already
-            declares autonomous execution "without user intervention".
+            executing" proactive behaviour, which is a CREATE-time behaviour:
+            in REUSE it made the model open with discovery questions instead
+            of running the saved recipe (measured live 2026-09-03, agent
+            18088688973: it asked "what deeper vision?").  The recipe's own
+            persona already declares autonomous execution.
     """
     from hartos.cultural_wisdom import get_trait_by_name, PROACTIVE_BEHAVIORS
 
@@ -699,17 +695,6 @@ def build_personality_prompt(personality: AgentPersonality,
 
     proactive_block = "\n    ".join(proactive_lines)
 
-    # Closing line: companion framing for chat, execution mandate for REUSE.
-    _closing = (
-        "Remember: EXECUTE the defined recipe NOW — run each action to completion "
-        "using the tools, then deliver the final result SYNTHESISED from the ACTUAL "
-        "tool outputs you received. Do NOT ask the user clarifying questions or send "
-        "holding / \"I'll get back to you\" messages; the plan is already defined — "
-        "carry it out and produce the result."
-        if execution_mode else
-        "Remember: You are not just executing tasks — you are a caring partner in the user's journey."
-    )
-
     base_prompt = f"""
 
 YOUR PERSONALITY:
@@ -735,7 +720,7 @@ forming a taste greater than either alone. This is how you think:
 
 SELF-AWARENESS:
 {personality.self_awareness_prompt}
-{_closing}
+Remember: You are not just executing tasks — you are a caring partner in the user's journey.
 """
 
     # Append regional tone (language-aware code-mixing)

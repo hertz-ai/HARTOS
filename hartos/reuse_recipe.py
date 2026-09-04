@@ -937,10 +937,12 @@ def create_agents_for_role(user_id: str, prompt_id):
 def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]":
     """Create new assistant & user proxy agents for a user with basic configuration."""
     user_prompt = f'{user_id}_{prompt_id}'
-    # New session for this user_prompt: reset the fabrication-gate re-steer
-    # budget + the #725 message snapshot, so a re-run of the same agent gets
-    # full protection again instead of a budget spent for the process lifetime.
-    _reset_reuse_guard_state(user_prompt)
+    # New session: the fabrication gate's one-shot budget is keyed
+    # (user_prompt, action_id); clear this session's entries so a re-run of
+    # the same agent gets the budget back instead of one spent for the
+    # process lifetime.
+    for _k in [k for k in _reuse_resteer_counts if k[0] == user_prompt]:
+        _reuse_resteer_counts.pop(_k, None)
     # Create a basic function calling config.
     # Per-dispatch model routing — see create_agents_for_role above for why the
     # thread-local override must win over the import-time module config_list.
@@ -2433,9 +2435,9 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     assistant.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     user_proxy.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
     helper.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory] calls and supporting backend processes. '
-    multi_role_agent.description = 'INTERNAL persona-routing helper — NOT a selectable speaker. Never choose multi_role_agent as the next role under any circumstances.'
+    multi_role_agent.description = 'Acts as an external agent with multi-functional capabilities. Note: This agent should never be directly invoked.'
     executor.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
-    verify.description = 'The status-verification agent. Select StatusVerifier immediately after Assistant, Helper, or Executor has done the work for the current action (produced a tool result or finished a reply): it checks whether that action is complete and then supplies the next action. Whenever the last message reports a result or finishes a step, choose StatusVerifier next.'
+    verify.description = 'this is a verify status agent. which will verify the status of current action.'
 
     time_agent.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     time_user.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
@@ -2449,15 +2451,6 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
 
     def state_transition(last_speaker, groupchat):
         messages = groupchat.messages
-        # #725 snapshot: keep the last non-empty view so get_agent_response can
-        # still see the 'completed' verdict + TERMINATE after autogen empties
-        # group_chat.messages.  Runs on every selection incl. the final
-        # TERMINATE turn, so the snapshot ends as [.., completed, TERMINATE].
-        try:
-            if messages:
-                _reuse_msg_snapshot[user_prompt] = list(messages)
-        except Exception:
-            pass
         try:
             request_id = f'{request_id_list[user_prompt]}'
             # Check for specific agent mentions FIRST - this should take precedence
@@ -2478,44 +2471,13 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                     current_app.logger.info(f"Detected mention of {mention} - directing message to appropriate agent")
                     return agent
 
-            # Assistant tool calls.  Service-tool schemas live on the Helper
-            # (register_dual(helper, assistant, ...)); the Assistant carries
-            # only execution maps.  So when the Assistant decides to call a
-            # tool ITSELF, llama's --jinja grammar has no schema to structure
-            # the call and the model free-forms Qwen <tool_call> XML as plain
-            # content, which autogen never executes.  Measured live 2026-09-03
-            # 22:38:00 and replayed deterministically against llama-server:
-            # right after the Helper's real google_search result the Assistant
-            # answered '<tool_call><function=google_search>...' six times in a
-            # row, the turn yielded nothing and Nunba fell back to a
-            # knowledge-cutoff answer.  Remedy = the same one news/revenue
-            # tools got (87fb8389 + 09afbcf3), scoped to the one tool that
-            # actually came up: mirror the Helper's schema for it onto the
-            # Assistant, register execution on the Executor (a distinct agent,
-            # so the repeat-speaker rule cannot strand the call), and let the
-            # Assistant re-issue the call structurally.  A structured call from
-            # the Assistant is routed to the Executor here because once two
-            # agents can execute it autogen's func_call_filter defers to this
-            # selector.  If the schema cannot be mirrored, hand the turn to the
-            # Helper, who carries it.
-            if last_speaker is assistant:
-                _last_msg = messages[-1]
-                if _last_msg.get("tool_calls"):
-                    current_app.logger.info(
-                        "reuse: structured tool_call from Assistant -> Executor runs it")
-                    return executor
-                from core.agent_tools import text_tool_call_name, mirror_tool_schema
-                _tc_name = text_tool_call_name(_last_msg.get("content"))
-                if _tc_name:
-                    if mirror_tool_schema(assistant, executor, helper, _tc_name):
-                        current_app.logger.info(
-                            f"reuse: Assistant emitted {_tc_name} as TEXT - mirrored the Helper's "
-                            f"schema onto the Assistant (execution on Executor); re-issuing structurally")
-                        return assistant
-                    current_app.logger.info(
-                        f"reuse: Assistant emitted {_tc_name} as TEXT and it cannot be mirrored "
-                        f"- routing to Helper, who carries the schema")
-                    return helper
+            # A structured tool call proposed by the Assistant runs on the
+            # Executor: the Assistant cannot take the next turn itself, and the
+            # news/revenue registrations put execution on the Executor too.
+            if last_speaker is assistant and messages[-1].get("tool_calls"):
+                current_app.logger.info(
+                    "reuse: structured tool_call from Assistant -> Executor runs it")
+                return executor
 
             # Check for messages directed to the user
 
@@ -2998,90 +2960,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     return assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group
 
 
-# One-shot re-steer budget per (user_prompt, action_id).  Bounds the
-# fabricated-completion guard below so it can NEVER loop or permanently stall
-# an action — after one re-steer it fails open and advances.
+# One-shot budget per (user_prompt, action_id) for the fabrication gate in
+# _advance_reuse_action: one refusal, then it fails open and advances, so it
+# can never loop or permanently stall an action.
 _reuse_resteer_counts = {}
-
-# #725: autogen intermittently empties group_chat.messages after initiate_chat
-# returns, which blinds the advancement gate in get_agent_response (it reads
-# messages[-1]/[-2] to detect a 'completed' verdict + TERMINATE).  The verdict
-# IS seen inside state_transition, where groupchat.messages is still populated
-# on every speaker-selection turn — including the final TERMINATE turn.  So
-# state_transition snapshots the last NON-EMPTY view here, keyed by the same
-# user_prompt the loop uses, and the loop falls back to it ONLY when the live
-# list is empty.  This is a read-only fallback of the SAME conversation, not a
-# second history: when messages are present the behaviour is unchanged.
-_reuse_msg_snapshot = {}
-
-
-def _reuse_live_messages(group_chat, user_prompt):
-    """The reuse turn's messages: the live group list, else the #725
-    snapshot above.  Every reader of "what happened this turn" — the
-    advancement loop and the final reply extraction in get_agent_response —
-    goes through here so they see the same history.  Measured 2026-09-03
-    23:37 (Auto Research, installed build): the loop resolved a real
-    google_search result + 'completed' verdict through the snapshot, then
-    the extraction read the bare live list, found it empty and returned ''.
-    """
-    live = getattr(group_chat, 'messages', None)
-    return live if live else _reuse_msg_snapshot.get(user_prompt, [])
-
-
-def _reuse_locate_verdict(messages):
-    """The StatusVerifier's latest verdict message in this turn, or None.
-
-    The advance branches used to require the exact shape
-    [.., verdict, ChatInstructor "TERMINATE"] and read messages[-2].  Autogen
-    does produce that shape when the verifier's verdict ends a round — but
-    the loop's OWN steers (`chat_instructor.initiate_chat("Hey @StatusVerifier
-    ...")`) are also ChatInstructor messages and land on top of it, so every
-    re-check saw a steer at [-1], never the sentinel, and the verdict sat
-    stranded one or more slots below.  Measured 2026-09-04 02:54:30 (Auto
-    Research, installed build): 'completed' verdict + TERMINATE, then four
-    steers in ~1s until count==4; current_action never advanced and the
-    turn's reply was the steer text.  Walk back from the tail to the newest
-    StatusVerifier message instead; only ChatInstructor turns (sentinel,
-    steers, action prompts) may sit above it — anything else means the
-    conversation moved on and there is no fresh verdict.
-    """
-    for m in reversed(messages or []):
-        if not isinstance(m, dict):
-            continue
-        name = m.get('name')
-        if name == 'StatusVerifier':
-            return m
-        if name != 'ChatInstructor':
-            return None
-    return None
-
-
-def _reset_reuse_guard_state(user_prompt):
-    """Drop this user_prompt's guard state at session creation.
-
-    _reuse_resteer_counts is keyed (user_prompt, action_id) and was never
-    cleared, so the one-shot fabrication re-steer budget was spent for the
-    PROCESS lifetime: a later session re-running the same agent got no
-    fabrication protection at all.  Also drops the #725 snapshot so a stale
-    'completed' view from a previous session cannot be re-read.  Other
-    user_prompts are untouched.
-    """
-    for k in [k for k in _reuse_resteer_counts
-              if isinstance(k, tuple) and k and k[0] == user_prompt]:
-        _reuse_resteer_counts.pop(k, None)
-    _reuse_msg_snapshot.pop(user_prompt, None)
-
-
-def _reuse_action_text(user_prompt, current_action):
-    """Text of the current reuse action (1-based; get_action is 0-based, see
-    the StatusVerifier steering site).  Fail-open: '' on any error."""
-    try:
-        task = user_tasks.get(user_prompt)
-        if task is None:
-            return ''
-        return str(task.get_action(current_action - 1) or '')
-    except Exception:
-        return ''
 
 
 def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
@@ -3089,14 +2971,15 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
     tool results anywhere in the group chat — i.e. a fabricated 'completed'.
 
     Deliberately COARSE + fail-open (returns [] unless certain): only flags
-    when (a) the action text names a registered tool AND (b) the whole chat has
-    no role=='tool' result at all.  This catches the pure-fabrication case
-    (live 2026-09-03: revenue agent claimed get_api_revenue_stats returned 90%
-    with zero tool_execution) while NEVER stalling an action once any tool has
-    run, and NEVER touching prose actions that name no tool.
+    when (a) the action text names a registered tool AND (b) the chat carries
+    no tool result or tool call for it.  This catches the pure-fabrication
+    case (live 2026-09-03: revenue agent claimed get_api_revenue_stats
+    returned 90% with zero tool_execution) while NEVER stalling an action
+    once its tool has run, and NEVER touching prose actions that name no tool.
     """
     try:
-        text = _reuse_action_text(user_prompt, current_action).lower()
+        task = user_tasks.get(user_prompt)
+        text = str(task.get_action(current_action - 1) or '').lower() if task else ''
         if not text:
             return []
         names = set()
@@ -3121,13 +3004,7 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         # revwarm5407: get_api_revenue_stats never ran yet a memory tool did,
         # so any_tool_ran was true and the guard let the fabrication through.)
         executed = set()
-        # Fall back to the #725 snapshot when the live list has been emptied, so
-        # the fabrication guard still sees the tool results and does not fail
-        # open on an empty history (which would let a fabricated 'completed'
-        # advance unchecked).
-        _fab_msgs = (getattr(group_chat, 'messages', None)
-                     or _reuse_msg_snapshot.get(user_prompt) or [])
-        for m in _fab_msgs:
+        for m in (getattr(group_chat, 'messages', None) or []):
             if not isinstance(m, dict):
                 continue
             if m.get('role') == 'tool' and m.get('name'):
@@ -3146,20 +3023,6 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         return unrun
     except Exception:
         return []
-
-
-def _reuse_should_resteer(user_prompt, action_id, group_chat, agents):
-    """(True, tool_name) if the action's 'completed' claim is fabricated and
-    the one-shot re-steer budget is unused (consumes it); else (False, None).
-    Fail-open on any uncertainty."""
-    fab = _reuse_fabricated_tools(user_prompt, action_id, group_chat, agents)
-    if not fab:
-        return (False, None)
-    key = (user_prompt, action_id)
-    if _reuse_resteer_counts.get(key, 0) >= 1:
-        return (False, None)
-    _reuse_resteer_counts[key] = _reuse_resteer_counts.get(key, 0) + 1
-    return (True, fab[0])
 
 
 def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "autogen.UserProxyAgent",
@@ -3234,22 +3097,14 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             # the `except IndexError` below -- which opens on the next line --
             # can never cover it; the turn died with "Error getting response:
             # list index out of range".  Guard as create_recipe.py:4385 does.
-            # #725: read the live list, or the last-non-empty snapshot when
-            # autogen has emptied it, so the completed+TERMINATE verdict is not
-            # lost (which used to freeze every action at 1).
-            _live_msgs = _reuse_live_messages(group_chat, user_prompt)
-            # The verdict is wherever the verifier left it under the
-            # ChatInstructor's sentinel AND the loop's own steers — not at a
-            # fixed [-2] (see _reuse_locate_verdict).
-            _verdict_msg = _reuse_locate_verdict(_live_msgs)
-            if _verdict_msg is not None:
+            if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                 current_app.logger.info(
-                    f"reuse: verifier verdict {_verdict_msg['content'][:10]}..")
+                    f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                 try:
                     try:
-                        json_obj = json.loads(_verdict_msg["content"])
+                        json_obj = json.loads(group_chat.messages[-2]["content"])
                     except (json.JSONDecodeError, ValueError):
-                        json_obj = ast.literal_eval(_verdict_msg["content"])
+                        json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                     current_app.logger.info(f'got json object {json_obj}')
                     if json_obj['status'].lower() == 'completed':
                         _llm_action_id = int(json_obj.get("action_id", _reuse_current_action))
@@ -3257,31 +3112,9 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                             current_app.logger.warning(
                                 f"[HALLUCINATION?] LLM claims action_id={_llm_action_id} "
                                 f"but pipeline assigned {_reuse_current_action}")
-                        _rs_do, _rs_tool = _reuse_should_resteer(
-                            user_prompt, _reuse_current_action, group_chat, (assistant, helper))
-                        if _rs_do:
-                            current_app.logger.warning(
-                                f"[FABRICATED-COMPLETE] action {_reuse_current_action} reported "
-                                f"completed but its tool {_rs_tool} produced no result (0 tool "
-                                f"executions in chat) — re-steering once to actually run it")
-                            chat_instructor.initiate_chat(
-                                recipient=manager,
-                                message=("Do NOT mark this action complete — you have not actually "
-                                         f"called the required tool. Call {_rs_tool} now and use the "
-                                         "REAL value it returns; do not invent numbers. Then report "
-                                         "status."),
-                                clear_history=False, silent=False)
-                            continue
                         _next, _ok = _advance_reuse_action(user_prompt, _reuse_current_action, "reuse-w1", prompt_id)
                         if not _ok:
                             return ''
-                        # advanced on a truthful completion: drop the consumed
-                        # snapshot so its 'completed' can't be re-read for the
-                        # next action, and refresh the per-action work budget so
-                        # a multi-action recipe can reach its final action (count
-                        # is otherwise a whole-turn cap that stops part-way).
-                        _reuse_msg_snapshot.pop(user_prompt, None)
-                        count = 0
                         user_message = _build_reuse_action_message(user_prompt, _next)
                         chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,
                                                       silent=False)
@@ -3291,7 +3124,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     return ''
                 except Exception:
                     try:
-                        json_obj = retrieve_json(_verdict_msg["content"])  # canonical parse (#95)
+                        json_obj = retrieve_json(group_chat.messages[-2]["content"])  # canonical parse (#95)
                         if json_obj:
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
@@ -3301,26 +3134,9 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                                     current_app.logger.warning(
                                         f"[HALLUCINATION?] LLM claims action_id={_llm_claimed} "
                                         f"but pipeline has {_known}")
-                                _rs_do2, _rs_tool2 = _reuse_should_resteer(
-                                    user_prompt, _known, group_chat, (assistant, helper))
-                                if _rs_do2:
-                                    current_app.logger.warning(
-                                        f"[FABRICATED-COMPLETE] action {_known} reported completed "
-                                        f"but its tool {_rs_tool2} produced no result — re-steering "
-                                        f"once to actually run it")
-                                    chat_instructor.initiate_chat(
-                                        recipient=manager,
-                                        message=("Do NOT mark this action complete — you have not "
-                                                 f"actually called the required tool. Call {_rs_tool2} "
-                                                 "now and use the REAL value it returns; do not invent "
-                                                 "numbers. Then report status."),
-                                        clear_history=False, silent=False)
-                                    continue
                                 _next2, _ok2 = _advance_reuse_action(user_prompt, _known, "reuse-w1-regex", prompt_id)
                                 if not _ok2:
                                     return ''
-                                _reuse_msg_snapshot.pop(user_prompt, None)
-                                count = 0
                                 user_message = _build_reuse_action_message(user_prompt, _next2)
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                               clear_history=False, silent=False)
@@ -3362,52 +3178,20 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     # StatusVerifier injection above: instructions must enter
                     # the group as user-role turns.
                     chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
-                    # UNBLOCK: after the work round, deterministically request a
-                    # StatusVerifier verdict.  The 4B never @mentions it on its
-                    # own (measured 0×), so the advancement chain
-                    # (StatusVerifier 'completed' -> state_transition:2468 ->
-                    # chat_instructor default_auto_reply 'TERMINATE' ->
-                    # loop:3040 -> _advance_reuse_action) never fired and the
-                    # action froze at 1.  Reuses the canonical verify message
-                    # and the deterministic @statusverifier route in
-                    # state_transition's agent_mapping (2438); bounded by the
-                    # count==4 break above so a non-'completed' verdict cannot
-                    # spin forever.
-                    try:
-                        _sv_ap = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
-                        # Build with concatenation (not one f-string) so the JSON
-                        # braces stay in plain string segments — matches the
-                        # canonical construction at the StatusVerifier injection
-                        # above; a lone '}' inside an f-string is a SyntaxError.
-                        _sv_msg = ('Hey @StatusVerifier Agent, Please verify the status of the action '
-                                   + f'{user_tasks[user_prompt].current_action}: {_sv_ap}'
-                                   + '\n performed and Respond in the following format '
-                                   + '{"status": "status here","action": "current action","action_id": '
-                                   + f'{user_tasks[user_prompt].current_action}'
-                                   + ',"message": "message here"}')
-                        chat_instructor.initiate_chat(recipient=manager, message=_sv_msg,
-                                                      clear_history=False, silent=False)
-                    except Exception as _sv_e:
-                        current_app.logger.warning(f'reuse: StatusVerifier steer failed: {_sv_e}')
 
             except Exception as e:
                 current_app.logger.error(f'WE have some indexx error here: {e}')
                 error_message = traceback.format_exc()  # Capture full traceback
                 current_app.logger.error(f"Error in get_agent_response indexx:\n{error_message}")
 
-            # Re-resolve after the injection block: the nested initiate_chats
-            # above just ran a real conversation whose verdict state_transition
-            # snapshotted, even though autogen may have emptied the live list.
-            # Only end the turn when BOTH the live list and the snapshot are
-            # empty (nothing happened) — not when autogen merely reset the
-            # accumulator (#725), which used to freeze every action at 1.
-            _live_msgs = _reuse_live_messages(group_chat, user_prompt)
-            if not _live_msgs:
+            if not group_chat.messages:
+                # States the OBSERVATION only (#725): the transform rewrites the
+                # per-reply view, not group_chat.messages.  Cause still open.
                 current_app.logger.warning(
                     'reuse: group chat history is empty mid-loop - ending the '
                     'turn instead of raising IndexError (cause not established)')
                 break
-            last_message = _live_msgs[-1]
+            last_message = group_chat.messages[-1]
             content_lower = last_message['content'].lower()
             # Check if this message has already been sent to the user by state_transition
             # In get_agent_response
@@ -3447,18 +3231,14 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
 
         # if individual_recipe[currentaction_id-1]['can_perform_without_user_input'] == 'yes':
         #     return assistant
-        # Same resolver as the loop above: autogen may have emptied the live
-        # list after the last nested initiate_chat (#725) while the snapshot
-        # still holds the verdict and the tool results.
-        _final_msgs = _reuse_live_messages(group_chat, user_prompt)
-        if not _final_msgs:
+        if not group_chat.messages:
             current_app.logger.warning(
-                'reuse: no messages to extract a reply from (live list and snapshot both empty)')
+                'reuse: no messages to extract a reply from after trimming')
             return ''
-        last_message = _final_msgs[-1]
+        last_message = group_chat.messages[-1]
         # len>1 matters: a lone TERMINATE would send [-2] off the front.
-        if last_message['content'] == 'TERMINATE' and len(_final_msgs) > 1:
-            last_message = _final_msgs[-2]
+        if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
+            last_message = group_chat.messages[-2]
 
         content_lower = last_message['content'].lower()
 
@@ -3943,18 +3723,15 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                             if _w2_task.is_sla_breached() and not _w2_task.sla_breached:
                                 _w2_task.mark_sla_breached()
 
-                    # Same empty-history hazard as the while1 loop above, and
-                    # the same verdict placement: read it wherever the verifier
-                    # left it under the ChatInstructor's sentinel/steers.
-                    _w2_verdict = _reuse_locate_verdict(group_chat.messages)
-                    if _w2_verdict is not None:
+                    # Same empty-history hazard as the while1 loop above.
+                    if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                         current_app.logger.info(
-                            f"reuse: verifier verdict {_w2_verdict['content'][:10]}..")
+                            f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                         try:
                             try:
-                                json_obj = json.loads(_w2_verdict["content"])
+                                json_obj = json.loads(group_chat.messages[-2]["content"])
                             except (json.JSONDecodeError, ValueError):
-                                json_obj = ast.literal_eval(_w2_verdict["content"])
+                                json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
                                 _llm_aid = int(json_obj.get("action_id", _w2_current))
@@ -3971,7 +3748,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 continue
                         except Exception:
                             try:
-                                json_obj = retrieve_json(_w2_verdict["content"])  # canonical parse (#95)
+                                json_obj = retrieve_json(group_chat.messages[-2]["content"])  # canonical parse (#95)
                                 if json_obj:
                                     current_app.logger.info(f'got json object {json_obj}')
                                     if json_obj['status'].lower() == 'completed':

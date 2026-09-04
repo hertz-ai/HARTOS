@@ -228,49 +228,9 @@ class AgentLightningWrapper:
                             _last_exc = _retry_exc
                             if not _is_recoverable_generation_failure(_retry_exc):
                                 # A different class of failure on retry —
-                                # stop re-sampling, fall through to the
-                                # tool-less attempt + report.
+                                # stop re-sampling, fall through to report
+                                # + fallback.
                                 break
-
-                    # Retries exhausted with the SAME (tools-bearing) request.
-                    # Final recovery: the model keeps failing on a structured
-                    # reply, but the conversation already carries the tool
-                    # RESULTS it needs — measured 2026-09-03 on the Auto
-                    # Research agent (installed build): google_search returned
-                    # real 2024 articles into history and the synthesis turn
-                    # then failed on its OWN tool-call output.  Re-sampling
-                    # with tools present reproduces the bad call.  Force ONE
-                    # tool-less re-sample so the model writes PROSE from what
-                    # it already has.  Reuses AutoGen's own client construction
-                    # (OpenAIWrapper), restored in finally; only fires after the
-                    # retries above, so the happy path is untouched.
-                    try:
-                        _cfg = getattr(self.agent, 'llm_config', None)
-                        if isinstance(_cfg, dict) and _cfg.get('tools'):
-                            from autogen import OpenAIWrapper
-                            _saved_cfg = _cfg
-                            _saved_client = getattr(self.agent, 'client', None)
-                            try:
-                                _cfg_notools = {k: v for k, v in _cfg.items()
-                                                if k != 'tools'}
-                                self.agent.llm_config = _cfg_notools
-                                self.agent.client = OpenAIWrapper(**_cfg_notools)
-                                _text = original_func(*args, **kwargs)
-                            finally:
-                                self.agent.llm_config = _saved_cfg
-                                if _saved_client is not None:
-                                    self.agent.client = _saved_client
-                            if _text:
-                                logger.info(
-                                    "[LLM-GEN-FAIL] recovered via tool-less "
-                                    "synthesis — model produced a reply from "
-                                    "the tool results already in history "
-                                    "instead of a fresh tool call")
-                                return _text
-                    except Exception as _tl_e:
-                        logger.warning(
-                            "[LLM-GEN-FAIL] tool-less synthesis retry failed "
-                            "(%s) — returning the fallback reply", _tl_e)
 
                     # Route to the canonical self-heal pipeline so a SUSTAINED
                     # pattern on this agent's model creates a self_heal goal.
@@ -295,9 +255,9 @@ class AgentLightningWrapper:
 
                     logger.error(
                         "[LLM-GEN-FAIL] engine failed this generation after %d "
-                        "retries and a tool-less attempt (%s: %s).  Returning "
-                        "the fallback reply instead of propagating, to avoid "
-                        "lifecycle FSM churn.", _GEN_RETRIES,
+                        "retries (%s: %s).  Returning the fallback reply "
+                        "instead of propagating, to avoid lifecycle FSM "
+                        "churn.", _GEN_RETRIES,
                         type(_last_exc).__name__, str(_last_exc)[:300])
                     return (
                         "I had trouble getting a usable response from the "
