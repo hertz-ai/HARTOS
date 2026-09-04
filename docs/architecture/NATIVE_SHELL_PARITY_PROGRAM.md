@@ -316,3 +316,43 @@ milestone that regresses latency fails even if it looks better.
 ## Status
 - 2026-07-20: program created (this doc). M0/M1 next; owner: hive session +
   steward review at each milestone flip.
+- 2026-09-05: M0..M3 LANDED and CI-green on main; M4 partly wired; M6 not flipped,
+  so `hart.comp.nativeShell` / `HART_NATIVE_SHELL` is still default OFF and the box
+  shows the WebView shell. What exists natively: bloom, orb, the scene tree
+  (`scene.rs`: SceneNode + layout_home + hit_test + flatten), GL/pixman lowering
+  (`comp_core::lower_scene`), cosmic-text run rasterization with a per-run cache,
+  rounded rects, the `shell.compose` IPC verb feeding a live HomeCompose, pointer
+  reactivity (orb hover + press, card hover), a retained scene tree and a pooled
+  solid buffer (the zero-per-frame-alloc NFR). Proven HEADLESS in CI: the demo
+  scene lowers, its buffers import, and it composites real pixels over a sentinel
+  on a pixman target. NOT proven: on-screen DRM scanout, fps, and input-to-photon
+  p50/p99. Those need a person at the box (see the injection-seat finding: a
+  uinput device is not granted to the compositor's libseat session, so synthetic
+  motion never reaches the input path and emits no samples).
+
+### The next piece of INFRASTRUCTURE the parity leg needs: a text measure
+P5 cannot be finished as specified and neither can the row See-all affordance,
+and the reason is one missing capability, not five missing features.
+`layout_home` is pure geometry with no way to ask how wide a string will be, so
+every text node it emits today is either left-aligned in a known box or a
+fixed-size slot. That is why the native bar has only the omnibox pill and the
+orb-sm: the two-tone HART OS wordmark, the five nav tabs, the avatar letter, the
+right-anchored clock and a right-aligned See-all all need an advance width at
+LAYOUT time. It is also why `TextAlign` is currently dropped by the rasterizer
+with no consumer.
+
+The fix, when a compiler is reachable, is a `TextMeasure` trait DEFINED in
+scene.rs (so scene.rs stays smithay-free and pure) and IMPLEMENTED by
+`text_render::TextRasterizer`, which already shapes with cosmic-text and so
+already has the layout. `layout_home` and `SceneCache::tree_for` take it;
+`lower_scene` already holds a `&mut TextRasterizer` next to the cache as a
+disjoint local, so passing it costs no borrow rework. Measuring must take `&mut
+self` because cosmic-text shaping does. Because the tree is retained, a measure
+runs only on a real layout rebuild, never per frame. Tests get a stub
+implementation with a fixed advance so scene.rs keeps unit-testing without fonts.
+
+DO NOT write this blind. It needs `cosmic_text::LayoutRun`'s width field, which
+is version-specific (the pin is cosmic-text 0.14.2), and this repo is developed
+from a Windows host with no cargo and no vendored crate source, so the API cannot
+be checked locally. CI is the only checker. Land it as its own commit with a
+working push, not stacked behind unverified ones.
