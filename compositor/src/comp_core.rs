@@ -622,9 +622,17 @@ pub trait CompState:
     /// The 4th is the RETAINED scene tree: it must come through this same accessor
     /// rather than a separate method, because the lowering needs the tree borrowed at
     /// the same time as the buffer caches, and two `&mut self` accessors cannot overlap.
+    ///
+    /// The 1st is the composed home as a SHARED borrow riding alongside those `&mut`s
+    /// (disjoint fields, so this is one split borrow, not a conflict). It is here purely
+    /// to kill an allocation: `render_native_scene` used to CLONE the HomeCompose every
+    /// frame just to end the state borrow before taking the caches, which is the last
+    /// per-frame heap traffic the zero-alloc NFR named. None means no `shell.compose`
+    /// has landed and the caller falls back to `scene::demo_ref()`.
     fn native_scene_caches(
         &mut self,
     ) -> (
+        Option<&crate::scene::HomeCompose>,
         &mut crate::text_render::TextRasterizer,
         &mut OrbCache,
         &mut RectCache,
@@ -2154,23 +2162,20 @@ pub fn render_native_scene<S, R>(
     R::TextureId: Send + Clone + 'static,
 {
     // Pull the scene + caches OFF `state` here, then hand the concrete pieces to
-    // `lower_scene`. The demo scene is the fallback until a `shell.compose` IPC feed
-    // stores one. Energy is read before the cache borrow (a plain f32). This is the
-    // ONLY caller that goes through State; the render test calls `lower_scene`
-    // directly with constructed caches, so there is one lowering path, not two.
-    let home = state
-        .native_home()
-        .cloned()
-        .unwrap_or_else(crate::scene::HomeCompose::demo);
+    // `lower_scene`. Energy, pointer and button state are read FIRST because they are
+    // plain owned values and the accessor below takes `&mut state`. This is the ONLY
+    // caller that goes through State; the render test calls `lower_scene` directly with
+    // constructed caches, so there is one lowering path, not two.
     let orb_energy = state.orb_energy();
-    // Read the pointer + held-button state BEFORE the `&mut` cache borrow (all plain
-    // owned values), so hover AND press ride the same single lowering call. None on a
-    // pre-mode frame.
     let pointer = native_pointer_scene_pos(state, size);
     let pressed = state.pointer_pressed();
-    let (rasterizer, orb_cache, rect_cache, scene_cache) = state.native_scene_caches();
+    // The home now rides OUT of the accessor as a shared borrow beside the `&mut`
+    // caches, so the frame no longer clones a HomeCompose just to release the state
+    // borrow. `demo_ref` is the allocation-free fallback until `shell.compose` lands.
+    let (home, rasterizer, orb_cache, rect_cache, scene_cache) = state.native_scene_caches();
+    let home = home.unwrap_or_else(crate::scene::demo_ref);
     lower_scene(
-        &home, size, renderer, rasterizer, orb_cache, rect_cache, scene_cache, orb_energy,
+        home, size, renderer, rasterizer, orb_cache, rect_cache, scene_cache, orb_energy,
         pointer, pressed, elements,
     );
 }

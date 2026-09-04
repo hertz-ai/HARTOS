@@ -487,6 +487,16 @@ pub fn layout_home(output_w: f32, output_h: f32, home: &HomeCompose, theme: &The
     }
 }
 
+/// The demo home as a process-wide singleton, so the render path can fall back to it
+/// by REFERENCE instead of building (or cloning) one per frame. `HomeCompose::demo` is
+/// deterministic and never mutated, which is exactly what makes a `OnceLock` sound here.
+/// This is what lets `render_native_scene` hand `lower_scene` a borrowed home in the
+/// no-compose case without an allocation.
+pub fn demo_ref() -> &'static HomeCompose {
+    static DEMO: std::sync::OnceLock<HomeCompose> = std::sync::OnceLock::new();
+    DEMO.get_or_init(HomeCompose::demo)
+}
+
 /// The RETAINED scene tree. `layout_home` allocates a fresh node tree and clones every
 /// label on each call, so calling it per frame violates the zero-per-frame-alloc NFR
 /// this module's header states. This is "step two" of the native render path: the tree is

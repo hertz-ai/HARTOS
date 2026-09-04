@@ -423,12 +423,15 @@ impl CompState for State {
     fn native_scene_caches(
         &mut self,
     ) -> (
+        Option<&crate::scene::HomeCompose>,
         &mut crate::text_render::TextRasterizer,
         &mut crate::comp_core::OrbCache,
         &mut crate::comp_core::RectCache,
         &mut crate::scene::SceneCache,
     ) {
+        // Disjoint fields, so the shared home borrow and the &mut caches coexist.
         (
+            self.native_home.as_ref(),
             &mut self.text_rasterizer,
             &mut self.orb,
             &mut self.rect_cache,

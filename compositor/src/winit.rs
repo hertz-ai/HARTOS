@@ -398,12 +398,15 @@ impl CompState for State {
     fn native_scene_caches(
         &mut self,
     ) -> (
+        Option<&crate::scene::HomeCompose>,
         &mut crate::text_render::TextRasterizer,
         &mut crate::comp_core::OrbCache,
         &mut crate::comp_core::RectCache,
         &mut crate::scene::SceneCache,
     ) {
+        // The winit dev build stores no composed home, so the caller uses the demo.
         (
+            None,
             &mut self.text_rasterizer,
             &mut self.orb,
             &mut self.rect_cache,
