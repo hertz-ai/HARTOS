@@ -103,6 +103,20 @@ impl Color {
             _ => None,
         }
     }
+
+    /// This colour lifted toward white by `amount` (0.0 unchanged, 1.0 white), with alpha
+    /// untouched so a hover never changes how opaque a card is. Lifting toward white
+    /// rather than scaling the channels is what keeps a near-black card visibly reactive:
+    /// a multiply would leave a dark card almost unchanged.
+    pub fn lift(self, amount: f32) -> Color {
+        let k = amount.clamp(0.0, 1.0);
+        Color::rgba(
+            self.r + (1.0 - self.r) * k,
+            self.g + (1.0 - self.g) * k,
+            self.b + (1.0 - self.b) * k,
+            self.a,
+        )
+    }
 }
 
 /// Horizontal text alignment inside a `Text` node's rect.
@@ -219,6 +233,13 @@ pub struct Card {
 pub enum SceneNode {
     Container {
         rect: Rect,
+        /// Whether this group is a HOVER TARGET: a pointer resting inside it lifts the
+        /// background it already draws (see `hover_leaf`). Cards are interactive; the top
+        /// bar and the root are structural groups that must never react. This one bool is
+        /// the whole "interactive node" notion the native shell needs today, carried by
+        /// the group that already exists rather than a new node kind, because reacting to
+        /// a cursor is a property of a group, not a thing that paints.
+        interactive: bool,
         children: Vec<SceneNode>,
     },
     Rect {
@@ -328,7 +349,54 @@ impl SceneNode {
             None => 0.0,
         }
     }
+
+    /// The index, in `flatten` paint order, of the leaf that must paint its HOVER state
+    /// this frame, or None when the pointer is absent or over nothing interactive. That
+    /// leaf is the background `Rect` of the top-most interactive `Container` under the
+    /// cursor, which is why a group only counts as a target when its FIRST child is a
+    /// Rect: the highlight is a lift of a background the scene already draws, never an
+    /// extra node, so hover changes no geometry and no element count.
+    ///
+    /// An INDEX is what the lowering wants (not a rect, not a borrowed node): it walks the
+    /// same flattened leaves in the same order, so a counter comparison is exact, needs no
+    /// float compare, and takes no second borrow of the tree.
+    pub fn hover_leaf(&self, pointer: Option<(f32, f32)>) -> Option<usize> {
+        let (px, py) = pointer?;
+        let mut next = 0usize;
+        let mut found = None;
+        self.hover_leaf_walk(px, py, &mut next, &mut found);
+        found
+    }
+
+    /// Paint-order walk behind `hover_leaf`. `next` counts the leaves already passed, so
+    /// at the moment an interactive container is entered `next` IS the index its first
+    /// leaf will take. Later hits overwrite, which is exactly top-most (and deepest) wins,
+    /// matching `hit_test`'s rule with one walk and no allocation.
+    fn hover_leaf_walk(&self, px: f32, py: f32, next: &mut usize, found: &mut Option<usize>) {
+        match self {
+            SceneNode::Container {
+                rect,
+                interactive,
+                children,
+            } => {
+                if *interactive
+                    && rect.contains(px, py)
+                    && matches!(children.first(), Some(SceneNode::Rect { .. }))
+                {
+                    *found = Some(*next);
+                }
+                for child in children {
+                    child.hover_leaf_walk(px, py, next, found);
+                }
+            }
+            _ => *next += 1,
+        }
+    }
 }
+
+/// How far a hovered card lifts its background toward white. Small on purpose: the
+/// shell's card hover is a nudge that says "this one", not a flash.
+pub const CARD_HOVER_LIFT: f32 = 0.08;
 
 // ── Layout constants. The 40/44 are the SAME strip dims the compositor publishes at
 //    /run/hart/session/panel-reservation (top=40 bottom=44), named ONCE here so the
@@ -390,6 +458,7 @@ pub fn layout_home(output_w: f32, output_h: f32, home: &HomeCompose, theme: &The
     });
     root.push(SceneNode::Container {
         rect: bar,
+        interactive: false,
         children: bar_children,
     });
 
@@ -466,6 +535,9 @@ pub fn layout_home(output_w: f32, output_h: f32, home: &HomeCompose, theme: &The
             });
             root.push(SceneNode::Container {
                 rect: cr,
+                // A card is the one thing on this desktop the cursor reacts to, and the
+                // background rect pushed FIRST above is what the hover lifts.
+                interactive: true,
                 children: card_children,
             });
             card_x += CARD_W + CARD_GAP;
@@ -483,6 +555,7 @@ pub fn layout_home(output_w: f32, output_h: f32, home: &HomeCompose, theme: &The
 
     SceneNode::Container {
         rect: Rect::new(0.0, 0.0, output_w, output_h),
+        interactive: false,
         children: root,
     }
 }
@@ -716,6 +789,65 @@ mod tests {
         assert_eq!(hc.rows[0].label, "Continue");
         assert_eq!(hc.rows[0].cards[0].image.as_deref(), Some("a.png"));
         assert_eq!(hc.mood.as_deref(), Some("cosmic"));
+    }
+
+    #[test]
+    fn hovering_a_card_marks_its_own_background_leaf_and_nothing_else_does() {
+        let (w, h) = (1600.0, 900.0);
+        let root = layout_home(w, h, &sample(), &Theme::cosmic_default());
+        // Find a card: the interactive group layout_home emits once per card.
+        let mut card = None;
+        if let SceneNode::Container { children, .. } = &root {
+            for c in children {
+                if let SceneNode::Container {
+                    rect,
+                    interactive: true,
+                    ..
+                } = c
+                {
+                    card = Some(*rect);
+                    break;
+                }
+            }
+        }
+        let cr = card.expect("a card group");
+        let centre = (cr.x + cr.w * 0.5, cr.y + cr.h * 0.5);
+
+        let idx = root
+            .hover_leaf(Some(centre))
+            .expect("a card must be a hover target");
+        let mut leaves = Vec::new();
+        root.flatten(&mut leaves);
+        // The marked leaf is THAT card's own background rect: not a neighbour's, not its
+        // title text. The highlight lifts a background the scene already draws.
+        match leaves[idx] {
+            SceneNode::Rect { rect, .. } => assert_eq!(*rect, cr),
+            other => panic!("hover marked a {other:?}, not the card background"),
+        }
+
+        // The top bar and the bare hero column are structural, not hover targets, so the
+        // cursor resting on them lifts nothing.
+        assert_eq!(root.hover_leaf(Some((w * 0.5, 4.0))), None);
+        assert_eq!(
+            root.hover_leaf(Some((EDGE_PAD + 4.0, TOP_BAR_H + EDGE_PAD + 4.0))),
+            None
+        );
+        // No pointer, no highlight (the default every frame before the cursor moves).
+        assert_eq!(root.hover_leaf(None), None);
+    }
+
+    #[test]
+    fn the_hover_lift_brightens_and_leaves_alpha_alone() {
+        let base = Color::rgba(0.1, 0.2, 0.3, 0.5);
+        let lit = base.lift(CARD_HOVER_LIFT);
+        assert!(lit.r > base.r && lit.g > base.g && lit.b > base.b);
+        assert_eq!(lit.a, base.a, "hover must not change how opaque a card is");
+        // No lift is identity, and the amount is clamped at both ends.
+        assert_eq!(base.lift(0.0), base);
+        assert_eq!(base.lift(-1.0), base);
+        let white = base.lift(5.0);
+        assert!((white.r - 1.0).abs() < 1e-6 && (white.b - 1.0).abs() < 1e-6);
+        assert_eq!(white.a, base.a);
     }
 
     #[test]

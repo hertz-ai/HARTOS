@@ -2218,14 +2218,29 @@ pub fn lower_scene<R>(
     // clamps the sum to 0..=1).
     let orb_energy = orb_energy + tree.pointer_orb_energy(pointer, pressed);
 
+    // M2 input half, card slice: which leaf paints its hover state this frame (the
+    // background of the interactive group under the cursor), or None. Resolved ONCE here
+    // against the SAME tree the leaves come from, so the card highlight and the orb lift
+    // above read one consistent pointer position.
+    let hover_leaf = tree.hover_leaf(pointer);
+
     let mut leaves: Vec<&crate::scene::SceneNode> = Vec::new();
     tree.flatten(&mut leaves);
-    for leaf in leaves {
+    for (idx, leaf) in leaves.into_iter().enumerate() {
         match leaf {
             crate::scene::SceneNode::Rect { rect, color, radius } => {
                 if rect.w < 1.0 || rect.h < 1.0 {
                     continue;
                 }
+                // The hover lift: the SAME rect, one brighter colour, so hovering changes
+                // no geometry and no element count. The rounded cache keys on colour, so a
+                // hovered card composes ONE extra buffer on the first frame of the hover
+                // and reuses it for every frame after, never per frame.
+                let color = if hover_leaf == Some(idx) {
+                    color.lift(crate::scene::CARD_HOVER_LIFT)
+                } else {
+                    *color
+                };
                 if *radius > 0.5 {
                     // Rounded (cards, omnibox): lower through a cached rounded-rect
                     // buffer so the corner radius the scene specifies is actually
@@ -3593,6 +3608,102 @@ mod native_render_tests {
             rects.solid_allocs(),
             solids_after_first_frame,
             "five further frames must reuse the pooled solids, not allocate new ones"
+        );
+    }
+
+    #[test]
+    fn hovering_a_card_recolours_it_without_changing_the_frame_shape() {
+        // The card slice of M2 input. A highlight is a different COLOUR for a rect the
+        // scene already draws, so the lowered frame must carry exactly the same elements,
+        // in the same order, at the same geometry, hovered or not. That invariant is what
+        // makes hover free: no relayout, no extra element, no damage beyond the card.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (1280, 800).into();
+        let home = crate::scene::HomeCompose::demo();
+        let theme = crate::scene::Theme::cosmic_default();
+
+        // The centre of the first card, read from the same layout the lowering walks.
+        let tree = crate::scene::layout_home(size.w as f32, size.h as f32, &home, &theme);
+        let mut card = None;
+        if let crate::scene::SceneNode::Container { children, .. } = &tree {
+            for c in children {
+                if let crate::scene::SceneNode::Container {
+                    rect,
+                    interactive: true,
+                    ..
+                } = c
+                {
+                    card = Some((rect.x + rect.w * 0.5, rect.y + rect.h * 0.5));
+                    break;
+                }
+            }
+        }
+        let centre = card.expect("the demo home lays out cards");
+
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+        let geo = |els: &Vec<HartRenderElement<PixmanRenderer>>| -> Vec<(i32, i32, i32, i32)> {
+            els.iter()
+                .map(|e| {
+                    let g = e.geometry(Scale::from(1.0));
+                    (g.loc.x, g.loc.y, g.size.w, g.size.h)
+                })
+                .collect()
+        };
+
+        let mut plain: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        lower_scene(
+            &home,
+            size,
+            &mut renderer,
+            &mut rasterizer,
+            &mut orb,
+            &mut rects,
+            &mut scenes,
+            0.5,
+            None,
+            false,
+            &mut plain,
+        );
+        let plain_geo = geo(&plain);
+        let rebuilds = scenes.rebuilds();
+        let solids = rects.solid_allocs();
+        assert!(!plain_geo.is_empty(), "the demo scene lowered to nothing");
+        // Drop before re-lowering, exactly as the frame loop does, so the pooled buffers
+        // are free to be handed out again.
+        drop(plain);
+
+        let mut hovered: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        lower_scene(
+            &home,
+            size,
+            &mut renderer,
+            &mut rasterizer,
+            &mut orb,
+            &mut rects,
+            &mut scenes,
+            0.5,
+            Some(centre),
+            false,
+            &mut hovered,
+        );
+
+        assert_eq!(
+            geo(&hovered),
+            plain_geo,
+            "a hover must not move, add or drop a single element"
+        );
+        assert_eq!(
+            scenes.rebuilds(),
+            rebuilds,
+            "hover must not rebuild the retained tree"
+        );
+        assert_eq!(
+            rects.solid_allocs(),
+            solids,
+            "a card highlight is a rounded rect, so it must not touch the solid pool"
         );
     }
 
