@@ -2173,7 +2173,14 @@ pub fn render_native_scene<S, R>(
     // caches, so the frame no longer clones a HomeCompose just to release the state
     // borrow. `demo_ref` is the allocation-free fallback until `shell.compose` lands.
     let (home, rasterizer, orb_cache, rect_cache, scene_cache) = state.native_scene_caches();
-    let home = home.unwrap_or_else(crate::scene::demo_ref);
+    // A `match`, not `unwrap_or_else`: passing a `fn() -> &'static HomeCompose` makes the
+    // compiler unify the Option's item type WITH 'static, which would demand that the
+    // borrow of `state` outlive the program. The arms of a match unify at the shorter
+    // lifetime instead, and the 'static demo simply coerces down to it.
+    let home = match home {
+        Some(h) => h,
+        None => crate::scene::demo_ref(),
+    };
     lower_scene(
         home, size, renderer, rasterizer, orb_cache, rect_cache, scene_cache, orb_energy,
         pointer, pressed, elements,
