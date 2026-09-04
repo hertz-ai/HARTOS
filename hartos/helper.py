@@ -902,6 +902,86 @@ def retrieve_json(json_message):
         return json_obj
 
 
+def ensure_tool_call_arguments_json(messages):
+    """Coerce every tool_call / function_call ``arguments`` field to a valid
+    JSON-object string, in place, and return the same list.
+
+    Why this exists (measured live 2026-09-05 02:16, Auto Research reuse on the
+    installed build): the local model emitted a tool_call whose ``arguments``
+    was a natural-language sentence, not JSON.  llama.cpp's OpenAI-compatible
+    server is lenient on tool-call OUTPUT (it returns whatever the model put in
+    the arguments position) but STRICT on INPUT — when a later request carries
+    an assistant message whose tool_call arguments string is not valid JSON, it
+    returns HTTP 500 "Failed to parse tool call arguments as JSON" and refuses
+    the whole generation.  A single malformed call therefore poisons EVERY
+    subsequent request in the group chat, and the reuse turn dies before any
+    action completes (a plain completion re-probe returned 200 in the same
+    window, proving the server was healthy and the fault was the args).
+
+    This is the tool-call sibling of ``validate_messages``' ROLE-ORDER-GUARD:
+    purely defensive, a no-op when the model emits valid JSON args, enforcing
+    the OpenAI/autogen contract ("arguments is a JSON string") rather than any
+    engine-specific error text — so it stays engine-neutral.
+
+    Coercion per malformed call: keep it if ``json.loads`` already succeeds;
+    else ``repair_json`` and keep the repaired text only if it parses to a
+    dict; else fall back to ``"{}"`` — a well-formed empty-args call.  The
+    executor then reports a missing argument and the model re-steers, which is
+    strictly better than a 500 that aborts the entire turn.
+    """
+    if not messages:
+        return messages
+    coerced = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        fns = []
+        for tc in (msg.get('tool_calls') or []):
+            if isinstance(tc, dict) and isinstance(tc.get('function'), dict):
+                fns.append(tc['function'])
+        if isinstance(msg.get('function_call'), dict):
+            fns.append(msg['function_call'])
+        for fn in fns:
+            args = fn.get('arguments')
+            if isinstance(args, dict):
+                # Some code paths store the arguments as an object already —
+                # the wire wants a string, so serialize (never a 500 risk).
+                fn['arguments'] = json.dumps(args)
+                continue
+            if args is None:
+                fn['arguments'] = '{}'
+                coerced += 1
+                continue
+            if not isinstance(args, str):
+                args = str(args)
+            try:
+                json.loads(args)
+                continue  # already valid JSON — leave untouched
+            except Exception:
+                pass
+            fixed = '{}'
+            try:
+                repaired = repair_json(args)
+                obj = (repaired if isinstance(repaired, (dict, list))
+                       else json.loads(repaired))
+                if isinstance(obj, dict):
+                    fixed = json.dumps(obj)
+            except Exception:
+                fixed = '{}'
+            fn['arguments'] = fixed
+            coerced += 1
+    if coerced:
+        try:
+            current_app.logger.info(
+                f"[TOOL-ARGS-GUARD] coerced {coerced} malformed tool_call "
+                f"argument(s) to valid JSON — would otherwise cause llama 500 "
+                f"'Failed to parse tool call arguments as JSON' on the next "
+                f"request and abort the turn.")
+        except Exception:
+            pass
+    return messages
+
+
 class ToolMessageHandler:
     """Handles tool messages in the conversation history to prevent tool_call_id errors.
 
@@ -940,6 +1020,12 @@ class ToolMessageHandler:
         return None
 
     def validate_messages(self, messages: List[Dict]) -> List[Dict]:
+        # TOOL-ARGS-GUARD: coerce any malformed tool_call arguments to valid
+        # JSON before anything downstream (or the model server) sees them.  A
+        # non-JSON arguments string makes llama.cpp 500 "Failed to parse tool
+        # call arguments as JSON" on EVERY subsequent request and aborts the
+        # turn — sibling of the ROLE-ORDER-GUARD below (see module function).
+        messages = ensure_tool_call_arguments_json(messages)
         for i, msg in enumerate(messages):
             if 'content' in msg and msg['content'] is None:
                 # Log detailed information about the problematic message
