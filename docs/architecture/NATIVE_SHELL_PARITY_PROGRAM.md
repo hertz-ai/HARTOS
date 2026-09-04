@@ -393,10 +393,36 @@ touch the shell and must not be settled unilaterally.
    than the shell shows, which is a parallel path. The content has to arrive over
    the same feed as home_compose. Contract decision.
 
-4. **Image lowering has no source contract.** SceneNode::Image is decoded and
-   laid out but never lowered, because what a card's `image` string denotes (URL,
-   app-icon id, a path the compositor may read) is the shell's to define.
-   Contract decision.
+4. **Image lowering.** Was recorded as "no source contract". That was wrong, and
+   the real picture splits in two, one half of which is nearly free.
+
+   **Card icons are TEXT, not images.** `card.icon` is a Material Symbols NAME
+   ("storage", "sd_card_alert") and hartBrandArt's glyphHTML puts it in a span
+   with the icon font, which resolves the name as a LIGATURE. Anything that is
+   not a Material name (an emoji) renders as plain text too. So the native path
+   needs no image pipeline for icons at all: it needs the Material face loaded
+   into the same cosmic-text FontSystem that already shapes every other run, and
+   `Shaping::Advanced` (already used) does ligature substitution. The obstacle is
+   packaging, not rendering: the shell bundles the face as `.woff2` for the
+   browser, fontdb reads TTF/OTF, and the box's fonts.packages carries only noto
+   and liberation. Get an OTF/TTF of the face in front of fontdb and icons come
+   out of the existing text path.
+
+   **Card art is real files on disk**, so no HTTP is needed. The sanitizer already
+   constrains `card.image` to two prefixes, and both resolve to directories:
+   `/shell/static/app_art/...` is the service's own static dir, and
+   `/shell/agent-art/<slug>` resolves through HART_AGENT_ART_DIR (the documented
+   seam, default /var/lib/hart/agent-art) then the bundled app_art/agents. Slugs
+   are `[a-z0-9-]` only, so they cannot encode traversal. Formats are png, webp,
+   jpg, jpeg and svg.
+
+   What is left is a genuine decision with two credible answers, and it is the
+   SVG that decides it. (a) The compositor reads and decodes: it needs a root
+   path handed in (a deployment fact) plus decoders, and svg means a full
+   renderer, which is a large dependency to put inside the process that owns
+   scanout. (b) The shell hands over decoded pixels through the existing IPC: it
+   already has the bytes and a renderer, but the IPC is framed JSON, so this needs
+   a binary channel rather than base64 at image sizes. Not settled here.
 
 Already handled, listed so nobody re-derives them: the scene claims
 NATIVE_CHROME_ORB itself (the M2 block that used to set it is skipped exactly
