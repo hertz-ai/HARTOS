@@ -1332,6 +1332,21 @@ impl HomeMetrics {
     }
 }
 
+/// Every row's `(content_width, view_width)` for this home on this output, in the order
+/// `RowScroll` indexes them.
+///
+/// One place computes this, so the input path's clamp, the layout's band and the
+/// re-clamp after a resize cannot drift apart. The `take(3)` is a2's "2-3 rows", the same
+/// cap the layout applies, rather than a second opinion about how many rows there are.
+pub fn row_extents(home: &HomeCompose, output_w: f32, output_h: f32) -> Vec<(f32, f32)> {
+    let view = row_view_width(output_w, output_h);
+    home.rows
+        .iter()
+        .take(MAX_ROWS)
+        .map(|r| (RowScroll::content_width(r.cards.len()), view))
+        .collect()
+}
+
 /// How wide a row's visible strip is on this output: the content band's width.
 ///
 /// Exposed so the input path can CLAMP a scroll without re-deriving the gutter. Deriving
@@ -3738,6 +3753,46 @@ mod tests {
         assert_eq!(row0(&before), row0(&after), "the untouched row did not move");
         assert_ne!(row1(&before), row1(&after), "the scrolled row did");
         assert!(!row1(&after).is_empty(), "and it still shows cards");
+    }
+
+    #[test]
+    fn the_row_extents_are_the_ones_the_layout_and_the_input_both_use() {
+        // `row_extents` is what the frame path re-clamps against after a resize or a new
+        // compose. If it disagreed with the band the layout draws, a row would be pulled
+        // back to the wrong place, or not pulled back at all and render empty.
+        let mut hc = sample();
+        let proto = hc.rows[0].cards[0].clone();
+        hc.rows[0].cards = (0..12).map(|_| proto.clone()).collect();
+        let (w, h) = (1920.0, 1080.0);
+        let ext = row_extents(&hc, w, h);
+        assert_eq!(ext.len(), hc.rows.len().min(MAX_ROWS), "one entry per laid-out row");
+        assert_eq!(ext[0].0, RowScroll::content_width(12), "row 0 carries twelve cards");
+        assert_eq!(ext[0].1, row_view_width(w, h), "and the layout's own band width");
+
+        // The cap is a2's, not a second opinion: a feed with more rows than the desktop
+        // lays out must not produce extents for rows that were never drawn.
+        let mut many = sample();
+        let row = many.rows[0].clone();
+        many.rows = (0..8).map(|_| row.clone()).collect();
+        assert_eq!(row_extents(&many, w, h).len(), MAX_ROWS);
+
+        // And the round trip: scroll to the end, shrink the feed, re-clamp, and the row
+        // is back at its start rather than showing nothing.
+        let mut sc = RowScroll::default();
+        sc.scroll(0, 10_000.0, ext[0].0, ext[0].1);
+        assert!(sc.get(0) > 0.0, "the twelve-card row had somewhere to go");
+        let mut small = sample();
+        small.rows[0].cards.truncate(2);
+        sc.reclamp(&row_extents(&small, w, h));
+        assert_eq!(sc.get(0), 0.0, "a two-card row is pinned back to its start");
+
+        // MORE extents than there are offset slots must not index past the array. The
+        // `take` in `reclamp` is what stops that, and it is load-bearing rather than
+        // tidy: a feed with eight rows reaches this if the caller forgets to cap.
+        let mut wide = RowScroll::default();
+        let many_ext: Vec<(f32, f32)> = (0..8).map(|_| (5000.0, 100.0)).collect();
+        wide.reclamp(&many_ext);
+        assert_eq!(wide.get(MAX_ROWS - 1), 0.0, "the last real row is still readable");
     }
 
     #[test]

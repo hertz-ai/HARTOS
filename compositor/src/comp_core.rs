@@ -2510,7 +2510,24 @@ where
     let animate = state.motion_hardware() && !theme_potato() && !motion_reduced();
     // Read here too, for the same reason: `lower_scene` is state-free so the layout can
     // be render-tested with constructed caches, and the offset is state.
-    let scroll = state.row_scroll();
+    //
+    // RE-CLAMPED against the live extents first. A row scrolled to its end and then given
+    // fewer cards, or shown on a narrower output, would otherwise keep an offset past its
+    // own content and render EMPTY, with every card off the left edge. Clamping an
+    // in-range value changes nothing, so a steady desktop writes back the same struct and
+    // the cache key does not move: this costs a handful of float compares, not a rebuild.
+    let mut scroll = state.row_scroll();
+    {
+        let extents = state
+            .native_home()
+            .map(|h| crate::scene::row_extents(h, size.w as f32, size.h as f32))
+            .unwrap_or_default();
+        let before = scroll;
+        scroll.reclamp(&extents);
+        if scroll != before {
+            state.set_row_scroll(scroll);
+        }
+    }
     // The home now rides OUT of the accessor as a shared borrow beside the `&mut`
     // caches, so the frame no longer clones a HomeCompose just to release the state
     // borrow. `demo_ref` is the allocation-free fallback until `shell.compose` lands.
