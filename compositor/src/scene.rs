@@ -2784,6 +2784,183 @@ mod tests {
         assert_eq!(plain_art.w, CARD_W, "an ordinary card's art is inset:0");
     }
 
+    // == THE WIRE CONTRACT =====================================================
+    // Every native-scene bug found so far has been one bug: the decoder was written
+    // against an IMAGINED payload. `Hero` read `title` and `copy`, `Row` read `label`,
+    // `Card` read `subtitle`, and not one of those four keys is emitted by any producer,
+    // so a live compose rendered a blank hero and unlabelled rows while every test here
+    // passed. Then `card.image_url` turned out to be the key news and app cards actually
+    // carry, so those decoded as art-less and drew a glyph the shell suppresses.
+    //
+    // No test above can catch that class, because they build their fixtures from the same
+    // misunderstanding the decoder has. Only a fixture the REAL producer wrote can.
+    // `fixtures/home_compose_sanitized.json` is the verbatim output of
+    // liquid_ui_service._sanitize_home_payload, the single authority on what reaches a
+    // client, and tests/unit/test_panel_reservation.py regenerates it and fails if the
+    // producer's shape has moved. Python pins what is SENT; these pin that it is DRAWN.
+
+    fn wire_fixture() -> HomeCompose {
+        let v: serde_json::Value =
+            serde_json::from_str(crate::wire_fixture::HOME_COMPOSE_SANITIZED)
+                .expect("the fixture is the sanitizer's own output");
+        decode_home_compose(&v)
+    }
+
+    fn drawn_texts(root: &SceneNode) -> Vec<String> {
+        let mut leaves: Vec<&SceneNode> = Vec::new();
+        root.flatten(&mut leaves);
+        leaves
+            .iter()
+            .filter_map(|n| match n {
+                SceneNode::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_field_the_shell_actually_sends_reaches_the_native_desktop() {
+        let home = wire_fixture();
+        assert_eq!(home.hero.amount, Some(1284), "the hero figure");
+        assert_eq!(home.hero.amount_unit, "Spark");
+        assert_eq!(home.hero.eyebrow, "Earned on the hive");
+        assert_eq!((home.hero.agents, home.hero.tasks), (3, 7));
+        assert_eq!(home.rows.len(), 2, "both rows survived the decode");
+
+        let cont = &home.rows[0];
+        assert_eq!(cont.title, "Continue");
+        assert_eq!(cont.accent.as_deref(), Some("teal"));
+        assert_eq!(cont.see_all.as_deref(), Some("recipes"));
+        assert!(!cont.ranked);
+        assert_eq!(cont.cards[0].progress, Some(0.62));
+        assert_eq!(cont.cards[0].icon.as_deref(), Some("code"));
+        assert_eq!(cont.cards[0].meta.as_deref(), Some("3 files changed"));
+        assert_eq!(cont.cards[1].live.as_deref(), Some("RUNNING"));
+        // The one that was silently wrong: a news card carries `image_url`, not `image`,
+        // and reading only the latter made every one of them look art-less.
+        assert_eq!(
+            cont.cards[1].photo.as_deref(),
+            Some("https://example.invalid/a.jpg"),
+            "image_url is a photo, exactly as the shell's own imgSrc treats it"
+        );
+        let top = &home.rows[1];
+        assert!(top.ranked, "the leaderboard row is ranked");
+        assert_eq!(top.accent.as_deref(), Some("magenta"));
+        assert_eq!(top.cards[0].badge.as_deref(), Some("NEW"));
+        assert_eq!(
+            top.cards[1].photo.as_deref(),
+            Some("/shell/static/app_art/a.svg"),
+            "and a same-origin `image` is the same photo slot"
+        );
+
+        // Every one of those must actually be DRAWN, not merely decoded.
+        let root =
+            layout_home(1920.0, 1080.0, &home, &Theme::cosmic_default(), &mut MonoMeasure);
+        let drawn = drawn_texts(&root);
+        for want in [
+            "Earned on the hive",
+            "1284",
+            "Spark",
+            "Continue",
+            "Refactor the parser",
+            "3 files changed",
+            "Morning briefing",
+            "12 sources",
+            "RUNNING",
+            "Top agents",
+            "Scout",
+            "412 tasks",
+            "Archivist",
+            "388 tasks",
+            "NEW",
+            SEE_ALL,
+            "Resume",
+            "Ask anything",
+        ] {
+            assert!(
+                drawn.iter().any(|t| t == want),
+                "the shell sent {want:?} and the native desktop never drew it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ranked_row_from_a_real_payload_is_drawn_as_cards_not_holes() {
+        // The leaderboard is the shape that rendered as numerals floating on the desktop
+        // ground: a ranked card's background is transparent by design and the art it is
+        // made of was never lowered. Assert it from the REAL payload, because a
+        // hand-built fixture is exactly what missed this the first time.
+        let home = wire_fixture();
+        let root =
+            layout_home(1920.0, 1080.0, &home, &Theme::cosmic_default(), &mut MonoMeasure);
+        let mut leaves: Vec<&SceneNode> = Vec::new();
+        root.flatten(&mut leaves);
+
+        let arts: Vec<&SceneNode> = leaves
+            .iter()
+            .copied()
+            .filter(|n| matches!(n, SceneNode::Art { .. }))
+            .collect();
+        let cards: usize = home.rows.iter().map(|r| r.cards.len()).sum();
+        assert_eq!(arts.len(), cards, "every card has an art tile, ranked or not");
+        for art in &arts {
+            if let SceneNode::Art { from, to, rect, .. } = art {
+                assert!(from.a > 0.9 && to.a > 0.9, "art is a ground, never a hole");
+                assert_ne!(from, to, "two stops, so the brand gradient and not a fill");
+                assert!(rect.w > 1.0 && rect.h > 1.0, "and it has a real box");
+            }
+        }
+        // The two rows name different accents, so they must not paint the same colour: a
+        // desktop where every row read teal is what the accent decode was added to fix.
+        let hue = |n: &SceneNode| match n {
+            SceneNode::Art { to, .. } => (to.r, to.g, to.b),
+            _ => unreachable!("filtered to Art above"),
+        };
+        assert_ne!(
+            hue(arts[0]),
+            hue(arts[home.rows[0].cards.len()]),
+            "the teal row and the magenta row must not paint the same colour"
+        );
+
+        // The rank numerals are OUTLINES, one per ranked card and none elsewhere.
+        let strokes: Vec<&String> = leaves
+            .iter()
+            .filter_map(|n| match n {
+                SceneNode::Text { text, stroke, .. } if *stroke > 0.0 => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(strokes.len(), home.rows[1].cards.len(), "one numeral per ranked card");
+        assert_eq!(strokes[0], "1", "ranks are 1-based");
+    }
+
+    #[test]
+    fn a_payload_the_sanitizer_would_never_emit_still_cannot_break_the_desktop() {
+        // The decoder is deliberately tolerant, and this is what that has to mean: a
+        // section degrades rather than the desktop blanking or panicking. Worth asserting
+        // beside the happy path, because that tolerance is why a producer change shows up
+        // as a missing label rather than a crash, which is how the imagined-key bugs
+        // stayed invisible for so long.
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"hero": 5, "rows": "no"}),
+            serde_json::json!({"rows": [{"title": "x", "cards": [{}]}]}),
+            serde_json::json!({"hero": {"amount": "lots"}, "rows": []}),
+        ] {
+            let home = decode_home_compose(&bad);
+            let root =
+                layout_home(1920.0, 1080.0, &home, &Theme::cosmic_default(), &mut MonoMeasure);
+            let mut leaves: Vec<&SceneNode> = Vec::new();
+            root.flatten(&mut leaves);
+            // The fixed chrome is unconditional: whatever the payload, there is a bar and
+            // a taskbar, so the desktop is never a void the user cannot get out of.
+            assert!(
+                leaves.len() > 4,
+                "a malformed payload must leave the chrome standing: {bad}"
+            );
+        }
+    }
+
     #[test]
     fn the_shells_two_breakpoints_still_fit_every_row_on_a_real_panel() {
         // The scale correction is only safe if the desktop still keeps its promise: rows

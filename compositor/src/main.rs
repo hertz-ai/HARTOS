@@ -129,6 +129,13 @@ mod orb;
 #[cfg(any(feature = "winit", feature = "smithay"))]
 mod scene;
 
+// The A2UI payload the SHELL actually produces, frozen so scene.rs's decode tests run
+// against the real producer's output rather than against their own idea of it. Test-only
+// (the const inside is `#[cfg(test)]`), and a `.rs` file rather than the `.json` it plainly
+// is because the crane source filter ships `*.rs` only. See src/wire_fixture.rs.
+#[cfg(all(test, any(feature = "winit", feature = "smithay")))]
+mod wire_fixture;
+
 // NATIVE SHELL M3 text: cosmic-text shaping+rasterization into cached
 // MemoryRenderBuffers (src/text_render.rs). Gated like scene/bloom/orb; its only
 // consumer is comp_core's native-scene lowering.

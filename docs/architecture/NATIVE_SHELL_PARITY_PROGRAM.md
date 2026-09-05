@@ -683,3 +683,45 @@ lowering rather than fetched twice. If they could disagree, the failure is a
 stuttering orb (animating while the gate holds the rate down) or a gate held open
 for an orb standing still, and both are the kind of thing that only shows up on
 hardware.
+
+### The wire contract: what the shell SENDS is now pinned to what the desktop DRAWS
+Every bug found in the native decoder has been one bug wearing a different key. It
+was written against an IMAGINED payload: `hero.title`, `hero.copy`, `row.label`,
+`card.subtitle`, four keys no producer has ever emitted, so a live compose would
+have rendered a blank hero and unlabelled rows. Then `card.image_url` turned out to
+be what news and app cards actually carry, so those decoded as art-less and drew
+the icon glyph the shell suppresses.
+
+Unit tests on either side are structurally incapable of catching this, and it is
+worth being precise about why: each side builds its own fixtures, so a decoder
+written against the wrong shape is tested against the wrong shape, forever. The
+only fixture that can catch it is one the REAL producer wrote.
+
+`liquid_ui_service._sanitize_home_payload` is that producer. It is the single
+authority on what reaches a client (the LLM composes freely; that function is the
+only thing between its output and the wire). `tests/unit/test_native_wire_contract.py`
+runs it on a realistic home carrying every shape that has ever gone wrong, and
+pins the result into `compositor/src/wire_fixture.rs`, which scene.rs's own tests
+decode and assert every field of, right through to the text runs the layout emits.
+
+Both directions are proven by mutation: drop `image_url` from the fixture and the
+Python half fails as stale while the Rust half fails as undrawn; revert the decoder
+to reading only `image` and the Rust half fails alone.
+
+Three details that matter for whoever touches this next:
+
+**It is a `.rs` file, not the `.json` it plainly is.** hart-comp.nix's crane source
+filter keeps `Cargo.toml`/`Cargo.lock` and `*.rs` ONLY, so a `.json` beside the
+crate would be filtered out of the build sandbox and `include_str!` would fail in
+CI while passing on a dev box. The Python half reads and rewrites the raw string
+literal inside it.
+
+**A second test guards the guard.** A fixture that quietly lost its interesting
+cases would still pass the comparison while proving nothing, so the shapes it must
+carry are asserted by name: an `image_url`-only card, a same-origin `image` card, a
+ranked row, two different accents, a progress bar, a live tag, a badge, a See-all.
+
+**Regenerating without reading the diff is the failure mode this exists to
+prevent.** The test's own message says so and carries the command. A wire change is
+allowed; a wire change the decoder has not been taught is what put four phantom
+keys in the tree.
