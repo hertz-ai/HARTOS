@@ -473,19 +473,24 @@ card title/meta/progress/icon/badge/live. Deliberately NOT decoded: `usd_equiv`
 and `spark_series`, which hartHome.js reads but no producer emits, and card
 `format`, same. Adding those would repeat the exact mistake above.
 
-### Two row variants left, and one of them needs a renderer capability
+### Both row variants are handled
 `row.flagship` is BEHAVIOUR, not appearance: it stops refresh() replacing that row
 with live dashboard rows. Nothing for the scene to draw.
 
-`row.ranked` is the hive leaderboard, and it is the first parity item the native
-path cannot currently match rather than merely has not. A ranked card drops its
-tile entirely (transparent background, no border) and draws a 116px rank numeral
-overhanging the bottom-left corner, with `color: transparent` and a 3px
-`-webkit-text-stroke`. That is OUTLINED text. `text_render` composites glyph
-COVERAGE into a buffer and has no stroke, so the honest options are to add stroked
-text to the rasterizer (coverage, dilate, subtract the original) or to approximate
-with a low-alpha filled numeral. The second is a visible difference dressed up as
-parity, so it should be a decision rather than something quietly shipped.
+`row.ranked` is the hive leaderboard and it is DONE. It was recorded here as
+needing a decision, between adding stroked text to the rasterizer and
+approximating with a low-alpha fill. Only the approximation needed permission;
+building the capability is just parity work, so the capability was built.
+`text_render` now takes a stroke width: gather the glyph's coverage, dilate by the
+stroke, subtract the original, and the middle stays hollow, which is what an
+outline is. The dilation is separable (horizontal max then vertical), turning r
+squared per pixel into 2r, which matters at 116px. The stroke joins the run's
+cache identity, since a stroked run and a filled one are different pictures of the
+same string.
+
+It was paid for by retiring `TextAlign`, which was written at twenty construction
+sites and read at none. Layout aligns by computing x now that it can measure, so
+alignment never reaches the rasterizer at all.
 
 ### How compositor Rust is actually verified from here
 `python .hart-devenv/deepbox-check.py [cargo args]` ships compositor/ to a
