@@ -55,6 +55,8 @@ makes this worth more than another feature.
 | The shell surface works chapter by chapter with the OS boundary SEALED | `tests/integration/shell_surface/`, 449 pass: boot and first paint, session and personalize, system controls, network, apps and upgrades, events and sinks | 2026-09-05, pass |
 | The earnings, health and delegation paths hold end to end | `test_compute_earnings_e2e.py`, `test_health_endpoints.py`, `test_task_delegation_bridge.py`, 22 pass | 2026-09-05, pass |
 | An A2UI push wakes the SSE stream without waiting on a durable write | `test_liquid_ui_sse_event_driven.py` 4/4; the audit commit sat ahead of the wake and cost 5.8s to 11.5s per push, now 0.000s | 2026-09-05, pass |
+| The native scene layer is not the frame-rate bottleneck | `scene_cost_fits_the_frame_budget` on an i7-7700K, release: a full relayout WITH real cosmic-text shaping is p99 219us, 1.3% of a 16.667ms frame; geometry alone is 2us | 2026-09-05, measured |
+| A steady desktop pays no layout at all | same run: a retained-tree hit is p50 and p99 both under 1us, and `rebuilds()` does not move on an unchanged key | 2026-09-05, measured |
 
 Read the sealed rows for what they are. `shell_surface/conftest.py` guarantees a
 poweroff/format/nmcli test can never touch the host, and chapter 00 asserts that

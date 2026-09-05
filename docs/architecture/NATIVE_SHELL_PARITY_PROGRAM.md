@@ -1577,3 +1577,35 @@ rather than baked into the file that was read, so it stays unproven.
 
 The reusable part: "blocked on hardware" is a claim like any other, and the
 machine you are already using for something else may be able to test it.
+
+### What the scene actually costs, measured
+"Without any latency" had never been given a number for this layer. It has one
+now, taken in a release build on an i7-7700K at 4.2GHz, which is real hardware
+rather than a CI runner:
+
+```
+hart-scene-cost nodes=73 budget=16667us
+hart-scene-cost layout_shaped  p50=200us p99=219us (1.3% of a frame)
+hart-scene-cost layout_rebuild p50=2us   p99=2us   (0.0% of a frame)
+hart-scene-cost retained_hit   p50=0us   p99=0us   (0.00% of a frame)
+```
+
+Three numbers because they answer different questions. `retained_hit` is what a
+steady desktop pays per frame: the key compare that avoids a rebuild, under a
+microsecond, and `rebuilds()` does not move. `layout_rebuild` is the geometry
+alone through the font-free estimate. `layout_shaped` is the same rebuild through
+the REAL cosmic-text shaper, which is what a scroll actually costs, because a wheel
+event changes the scroll key and re-shapes every run the tree emits.
+
+The gap between 2us and 200us IS the shaping cost, which is why both are reported
+rather than the flattering one. Even so, the worst interactive case uses 1.3% of a
+frame, roughly 75x of headroom.
+
+The useful conclusion is where NOT to look. Whatever latency the desktop has on the
+box, the scene layer is not it, by two orders of magnitude. That points at the
+renderer, the DRM path and compositing, which is where `latency.rs` measures and
+which still needs the hardware to read.
+
+The test is `#[ignore]`d because a measurement on a shared runner is noise, and its
+assertions are multiples of the budget rather than tight bounds, so it catches a
+tenfold regression and never a busy afternoon.

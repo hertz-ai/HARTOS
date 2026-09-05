@@ -3872,6 +3872,117 @@ mod tests {
             .collect()
     }
 
+    /// What the scene actually COSTS, in microseconds, on the machine running this.
+    ///
+    /// `#[ignore]` because it is a measurement, not a pass/fail on a shared runner, and
+    /// because the numbers are only meaningful on real hardware. Run it there:
+    ///
+    ///     cargo test --features smithay -- --ignored --nocapture scene_cost
+    ///
+    /// The assertions are deliberately loose, a multiple of the budget rather than a
+    /// tight bound, so this fails only on a REGRESSION of the kind that would be visible
+    /// (a layout that got ten times slower), never on a noisy box.
+    ///
+    /// Why these two numbers and not a frame timer: the NFR is compose-once plus
+    /// damage-tracked redraw, so a steady desktop pays the CACHED number every frame and
+    /// the REBUILD number only when the size, the theme, the scroll offset or the composed
+    /// home actually changed. Scrolling a row is the interactive case that pays a rebuild
+    /// per wheel event, which is why the rebuild number is the one that has to fit inside
+    /// a frame.
+    #[test]
+    #[ignore = "a measurement; run with --ignored on real hardware"]
+    fn scene_cost_fits_the_frame_budget() {
+        use std::time::Instant;
+        const FRAME_US: u128 = 16_667;   // 60fps
+        let home = sample();
+        let theme = Theme::cosmic_default();
+
+        // A cold layout, then the median of many, so one unlucky allocation does not
+        // become the reported number.
+        let mut samples: Vec<u128> = Vec::new();
+        for i in 0..200u32 {
+            let scroll = RowScroll::default();
+            let t = Instant::now();
+            let tree = layout_home(1920.0, 1080.0, &home, &theme, &scroll, &mut MonoMeasure);
+            let us = t.elapsed().as_micros();
+            std::hint::black_box(&tree);
+            if i >= 20 {
+                samples.push(us);
+            }
+        }
+        samples.sort_unstable();
+        let p50 = samples[samples.len() / 2];
+        let p99 = samples[samples.len() * 99 / 100];
+
+        // And the retained path, which is what a steady frame actually pays.
+        let mut cache = SceneCache::default();
+        let scroll = RowScroll::default();
+        cache.tree_for(1920.0, 1080.0, &home, &theme, &scroll, &mut MonoMeasure);
+        let before = cache.rebuilds();
+        let mut hits: Vec<u128> = Vec::new();
+        for _ in 0..2000 {
+            let t = Instant::now();
+            let tree = cache.tree_for(1920.0, 1080.0, &home, &theme, &scroll, &mut MonoMeasure);
+            hits.push(t.elapsed().as_micros());
+            std::hint::black_box(tree);
+        }
+        hits.sort_unstable();
+        let hit_p50 = hits[hits.len() / 2];
+        let hit_p99 = hits[hits.len() * 99 / 100];
+
+        // The same rebuild through the REAL shaper. MonoMeasure above is the font-free
+        // estimate, so the number it produces is the geometry alone and would flatter the
+        // rebuild path; a rebuild actually shapes every run it emits. Reported separately
+        // rather than replacing it, because the gap between the two IS the shaping cost.
+        let mut shaped: Vec<u128> = Vec::new();
+        {
+            let mut r = crate::text_render::TextRasterizer::new();
+            for i in 0..60u32 {
+                let scroll = RowScroll::default();
+                let t = Instant::now();
+                let tree = layout_home(1920.0, 1080.0, &home, &theme, &scroll, &mut r);
+                let us = t.elapsed().as_micros();
+                std::hint::black_box(&tree);
+                if i >= 10 {
+                    shaped.push(us);
+                }
+            }
+        }
+        shaped.sort_unstable();
+        let sh_p50 = shaped[shaped.len() / 2];
+        let sh_p99 = shaped[shaped.len() * 99 / 100];
+
+        let mut leaves: Vec<&SceneNode> = Vec::new();
+        cache.tree().unwrap().flatten(&mut leaves);
+
+        println!("
+hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
+        println!("hart-scene-cost layout_shaped  p50={}us p99={}us ({:.1}% of a frame)",
+                 sh_p50, sh_p99, sh_p99 as f64 * 100.0 / FRAME_US as f64);
+        println!("hart-scene-cost layout_rebuild p50={}us p99={}us ({:.1}% of a frame)",
+                 p50, p99, p99 as f64 * 100.0 / FRAME_US as f64);
+        println!("hart-scene-cost retained_hit   p50={}us p99={}us ({:.2}% of a frame)",
+                 hit_p50, hit_p99, hit_p99 as f64 * 100.0 / FRAME_US as f64);
+
+        assert_eq!(
+            cache.rebuilds(),
+            before,
+            "COMPOSE-ONCE VIOLATED: the retained tree rebuilt on an unchanged key, so a              steady desktop pays a full layout every frame"
+        );
+        assert!(
+            p99 < FRAME_US * 4,
+            "a scroll rebuild costs p99={p99}us against a {FRAME_US}us frame; a wheel              event now misses several frames"
+        );
+        assert!(
+            sh_p99 < FRAME_US * 4,
+            "a SHAPED scroll rebuild costs p99={sh_p99}us against a {FRAME_US}us frame"
+        );
+        assert!(
+            hit_p99 < FRAME_US / 4,
+            "a retained-tree hit costs p99={hit_p99}us; the compare that avoids the              rebuild has itself become a frame cost"
+        );
+    }
+
     #[test]
     fn the_payout_pill_is_an_amber_badge_and_not_another_grey_sentence() {
         // `payout_pending` is the home's statement that the money is NOT real yet. The
