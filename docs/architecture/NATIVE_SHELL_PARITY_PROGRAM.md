@@ -924,3 +924,39 @@ absolute px, so it inherits nothing from the root font-size, and a user who has
 asked for larger text gets a scaled tray and an unscaled desktop today. Making the
 native scene scale its own type would not fix that; it would make the two
 renderers disagree. The fix belongs where the sizes are declared.
+
+### The vignette, and how subtle it actually is
+`.hart-vignette` is emitted by the shell UNCONDITIONALLY: no potato gate, no GPU
+gate, always there. The ledger files it under Field/M1, which is the milestone the
+compositor has supposedly done, and the native scene had nothing like it. Standing
+the WebView down at M6 would have taken the framing with it and left the desktop
+reading flat at the corners.
+
+It is folded into the bloom's own buffer rather than pushed as a second element.
+It is deterministic given the output size, so it recomposes exactly when the
+backdrop does, costs no extra per-frame blit, and lands in the right place in the
+stack for free: in the shell it sits at z-index 2 with only the grain between it
+and the bloom canvas at z 1, and all chrome is above it. Here the native scene is
+pushed after the backdrop, so the same is true. Multiplying is exact because the
+backdrop is opaque: black at alpha `a` over an opaque ground is that ground scaled
+by `1 - a`, with no alpha term left over.
+
+**The number worth writing down: it is about a 7% darkening at the corner of a
+16:9 screen, not the 30% the last stop names.** The ellipse is 120% of the box in
+each axis, so the far corner sits only t = 0.66 along the gradient ray. Anyone
+reimplementing this by eye would make it several times too strong. The test pins
+that figure rather than merely asserting "darker at the edges".
+
+Two of the tests here were written wrong first, and the mutation checks are what
+said so, which is worth recording because both mistakes are easy ones:
+
+**A "corner darker than centre" check against the real palette proves nothing.**
+The bloom's own blobs already make the centre brighter in every channel, so that
+assertion passes with the vignette entirely removed. Composing against a palette
+whose ambient hues are all black isolates it: every pixel is then exactly `base *
+factor`, which is a statement about the vignette rather than about the blobs.
+
+**Summing the channels hides a partial application.** Darkening only two of three
+still makes a summed corner darker than a summed centre, while tinting the whole
+desktop. Each channel is checked on its own now, and dropping any one of the three
+multiplies fails.

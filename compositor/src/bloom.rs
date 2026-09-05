@@ -242,6 +242,45 @@ pub fn theme_palette_from(dir: &str, id: &str) -> BloomPalette {
     palette_from(&SettingsFile::for_id(dir, id))
 }
 
+// `.hart-vignette` (liquid_ui_service l.2430), which the shell emits UNCONDITIONALLY
+// (no potato gate, no GPU gate): `radial-gradient(120% 120% at 50% 38%, transparent 56%,
+// rgba(0,0,0,0.30) 100%)`. It is the framing that keeps the desktop from reading flat at
+// the corners, the ledger files it under Field/M1, and the native scene had nothing like
+// it, so standing the WebView down at M6 would have taken the framing with it.
+//
+// Folded into the bloom's own buffer rather than pushed as a second element: it is
+// deterministic given the output size, so it recomposes exactly when the backdrop does,
+// costs no extra per-frame blit, and lands in the right place in the stack for free. In
+// the shell it sits at z-index 2 with nothing but the grain between it and the bloom
+// canvas at z 1, and every piece of chrome is above it; here the native scene is pushed
+// after the backdrop, so the same thing is true.
+/// Ellipse radii as a fraction of the box, the CSS `120% 120%`.
+const VIGNETTE_R: (f32, f32) = (1.2, 1.2);
+/// Centre, the CSS `at 50% 38%`.
+const VIGNETTE_C: (f32, f32) = (0.5, 0.38);
+/// Where the darkening starts along the gradient ray (`transparent 56%`).
+const VIGNETTE_INNER: f32 = 0.56;
+/// Peak darkening at the ellipse edge (`rgba(0,0,0,0.30)`).
+const VIGNETTE_ALPHA: f32 = 0.30;
+
+/// The vignette's darkening factor at a pixel: 1.0 = untouched, 0.70 at full strength.
+///
+/// PURE, so the gradient's shape is testable without composing a buffer. `t` is the
+/// normalised elliptical distance from the centre; CSS holds the last stop's colour
+/// beyond the ending shape, so past `t = 1` the factor stays at its darkest rather than
+/// continuing to fall, which matters because the corners of a 16:9 output are outside a
+/// 120%/120% ellipse.
+fn vignette_factor(x: f32, y: f32, w: f32, h: f32) -> f32 {
+    let dx = (x - VIGNETTE_C.0 * w) / (VIGNETTE_R.0 * w).max(1.0);
+    let dy = (y - VIGNETTE_C.1 * h) / (VIGNETTE_R.1 * h).max(1.0);
+    let t = (dx * dx + dy * dy).sqrt();
+    if t <= VIGNETTE_INNER {
+        return 1.0;
+    }
+    let ramp = ((t - VIGNETTE_INNER) / (1.0 - VIGNETTE_INNER)).min(1.0);
+    1.0 - VIGNETTE_ALPHA * ramp
+}
+
 /// One additive radial blob: centre as a fraction of the output, radius as a
 /// fraction of the longer edge, peak intensity 0..1. Mirrors hartBloom.js.
 struct Blob {
@@ -311,6 +350,13 @@ pub fn compose(width: i32, height: i32, pal: &BloomPalette) -> Vec<u8> {
                 g += hue[1] as f32 * f;
                 b += hue[2] as f32 * f;
             }
+            // The vignette darkens what the blobs just built. Multiplying is exact
+            // here because the backdrop is OPAQUE: black at alpha `a` over an opaque
+            // ground is that ground scaled by `1 - a`, with no alpha term left over.
+            let vg = vignette_factor(fx, fy, w as f32, h as f32);
+            r *= vg;
+            g *= vg;
+            b *= vg;
             let i = row + x * 4;
             // Argb8888 little-endian => bytes are B, G, R, A. Opaque alpha, and the
             // colour is already "premultiplied" because alpha is 255.
@@ -358,6 +404,102 @@ mod tests {
             "violet lead ({:?}) is not brighter than the far corner ({:?}) -- the bloom is flat",
             lead,
             corner
+        );
+    }
+
+    #[test]
+    fn the_vignette_frames_the_desktop_the_way_the_shell_does() {
+        // `.hart-vignette` is emitted unconditionally by the shell, so standing the
+        // WebView down at M6 would have taken the framing with it and left the corners
+        // reading flat. Check the SHAPE, not just that something changed: untouched
+        // inside the transparent stop, darkening beyond it, darkest at the edge.
+        let (w, h) = (1920.0, 1080.0);
+        let c = (VIGNETTE_C.0 * w, VIGNETTE_C.1 * h);
+        assert_eq!(vignette_factor(c.0, c.1, w, h), 1.0, "the centre is untouched");
+
+        // Just inside the transparent stop: still untouched. Just outside: darkening.
+        let inner_x = c.0 + VIGNETTE_INNER * VIGNETTE_R.0 * w * 0.99;
+        let outer_x = c.0 + VIGNETTE_INNER * VIGNETTE_R.0 * w * 1.01;
+        assert_eq!(vignette_factor(inner_x, c.1, w, h), 1.0, "inside the clear stop");
+        assert!(
+            vignette_factor(outer_x, c.1, w, h) < 1.0,
+            "past the clear stop it starts to darken"
+        );
+
+        // HOW SUBTLE IT ACTUALLY IS, which is the part worth pinning. The ellipse is
+        // 120% of the box in EACH axis, so on a 16:9 output the far corner is only
+        // t = 0.66 along the ray: about a 7% darkening, not the 30% the last stop names.
+        // Anyone reimplementing this by eye would make it several times too strong.
+        let corner = vignette_factor(0.0, h, w, h);
+        assert!(
+            (corner - 0.929).abs() < 0.01,
+            "the 16:9 corner should sit at ~0.93, got {corner}"
+        );
+        assert!(corner > 1.0 - VIGNETTE_ALPHA, "the box never reaches the last stop");
+
+        // Past the ending shape CSS holds the last stop rather than continuing to fall.
+        // No pixel of a real output gets there, but the clamp is what stops a wider
+        // aspect from going black in the corners.
+        let far = vignette_factor(c.0 + 10.0 * w, c.1, w, h);
+        assert!(
+            (far - (1.0 - VIGNETTE_ALPHA)).abs() < 1e-6,
+            "beyond the ellipse it holds at the last stop: {far}"
+        );
+        assert!(far > 0.0, "it is a darkening, never a blackout");
+
+        // Monotonic outward along the ray: a vignette that brightened anywhere would be
+        // a banding artifact rather than framing.
+        let mut prev = 1.0;
+        for i in 0..=20 {
+            let x = c.0 + (i as f32 / 20.0) * VIGNETTE_R.0 * w;
+            let f = vignette_factor(x, c.1, w, h);
+            assert!(f <= prev + 1e-6, "brightened at step {i}: {f} after {prev}");
+            prev = f;
+        }
+    }
+
+    #[test]
+    fn the_compose_applies_the_vignette_to_every_channel() {
+        // The factor is one thing; that the COMPOSE applies it is another, and the two
+        // have to be checked separately or a correct gradient can sit unused.
+        //
+        // ISOLATED from the blob field, with ambient hues that add nothing, so every
+        // pixel is exactly `base * vignette_factor`. This measures the vignette rather
+        // than the bloom's own centre-bright falloff, which matters: a "corner darker
+        // than centre" check against the real palette passes with NO vignette at all,
+        // and passes with only two of the three channels darkened. Both were written
+        // that way first and both mutations sailed through.
+        let (w, h) = (320, 180);
+        let flat = BloomPalette {
+            base: [200, 150, 100],
+            amb: [[0, 0, 0]; 4],
+        };
+        let px = compose(w, h, &flat);
+        for (x, y) in [
+            (0usize, 0usize),
+            (w as usize - 1, h as usize - 1),
+            (w as usize / 2, (h as f32 * VIGNETTE_C.1) as usize),
+        ] {
+            let i = (y * w as usize + x) * 4;
+            let vg = vignette_factor(x as f32, y as f32, w as f32, h as f32);
+            // B, G, R in memory order, against the palette's R, G, B.
+            for (byte, base) in [
+                (px[i], flat.base[2]),
+                (px[i + 1], flat.base[1]),
+                (px[i + 2], flat.base[0]),
+            ] {
+                let want = (base as f32 * vg) as u8;
+                assert_eq!(
+                    byte, want,
+                    "at ({x},{y}) the vignette must scale every channel: {byte} vs {want}"
+                );
+            }
+        }
+        // Every pixel stays opaque: the vignette darkens the ground, it does not punch a
+        // hole in it, and a transparent backdrop would show the clear colour through.
+        assert!(
+            (0..(w as usize * h as usize)).all(|i| px[i * 4 + 3] == 255),
+            "the backdrop must stay opaque"
         );
     }
 
