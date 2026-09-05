@@ -96,15 +96,28 @@ except Exception as _search_err:
     search = None
 
 
+# The control token autogen agents emit to end a round — the same literal the
+# UserProxyAgents carry as ``default_auto_reply``.  Named here, next to the
+# predicate that consumes it, so the guard below and the check agree by
+# construction instead of by two copies of a string.
+_TERMINATE_TOKEN = "TERMINATE"
+
+
 def _is_terminate_msg(msg: dict) -> bool:
     """Null-safe AutoGen termination check.
 
     AutoGen tool-call messages can have content=None.
     Using ``"TERMINATE" in msg.get("content")`` crashes with TypeError
     when content is None.  This helper guards against that.
+
+    Deliberately a SUBSTRING match: autogen's own convention is that a model
+    ends its final answer with "… TERMINATE", so the token has to be honoured
+    mid-content.  That is exactly why a CONSUMED token must never be merged
+    into unrelated content — see the stale-terminate rule in
+    ``validate_messages``.
     """
     content = msg.get("content") if isinstance(msg, dict) else None
-    return content is not None and "TERMINATE" in content
+    return content is not None and _TERMINATE_TOKEN in content
 try:
     redis_client = redis.StrictRedis(
         host=os.environ.get('REDIS_HOST', 'localhost'),
@@ -1093,6 +1106,8 @@ class ToolMessageHandler:
             # loudest, which is when you need it.
             _dropped: List[str] = []
             _coalesced: List[str] = []
+            _stale_terms: List[str] = []
+            _last_idx = len(messages) - 1
             for i, msg in enumerate(messages):
                 role = (msg.get('role') or '').lower()
                 content = msg.get('content')
@@ -1102,6 +1117,31 @@ class ToolMessageHandler:
                     if content is None or (isinstance(content, str) and content.strip() == ''):
                         _dropped.append(f"{i}({msg.get('name','unknown')})")
                         continue
+                # Drop a CONSUMED bare TERMINATE — same class of artifact as the
+                # empty placeholder above: a control token, already acted on,
+                # carrying no content for the turn being built.
+                #
+                # It matters because the coalescing below CONCATENATES contents.
+                # A stale token merged into a later message makes
+                # _is_terminate_msg (a substring match, by design) fire on that
+                # message, and autogen applies this transform BEFORE any reply
+                # function (conversable_agent.py:2059) — so
+                # check_termination_and_human_reply returns (True, None),
+                # generate_reply returns None, and run_chat breaks
+                # (groupchat.py:1190) without ever calling the model.
+                #
+                # Measured live 2026-09-05, agent 88601674818 action 3: three
+                # attempts in 137 ms, llama-server /slots byte-identical across
+                # the turn, retry budget spent, HITL question repeating forever.
+                #
+                # Only a token that is NOT the last message qualifies.  A live
+                # TERMINATE still terminates — dropping that would loop the
+                # group chat forever, the opposite failure.
+                if (not has_calls and i < _last_idx
+                        and isinstance(content, str)
+                        and content.strip() == _TERMINATE_TOKEN):
+                    _stale_terms.append(f"{i}({msg.get('name','unknown')})")
+                    continue
                 # Coalesce consecutive same-role messages
                 if cleaned:
                     prev = cleaned[-1]
@@ -1125,17 +1165,21 @@ class ToolMessageHandler:
             # One line per invocation, only when the guard actually acted.
             # Indices are capped so a pathological turn cannot reintroduce the
             # unbounded growth this replaced — the count stays exact either way.
-            if _dropped or _coalesced:
+            if _dropped or _coalesced or _stale_terms:
                 _cap = 12
                 _d = ', '.join(_dropped[:_cap]) + (
                     f" (+{len(_dropped) - _cap} more)" if len(_dropped) > _cap else '')
                 _c = ', '.join(_coalesced[:_cap]) + (
                     f" (+{len(_coalesced) - _cap} more)" if len(_coalesced) > _cap else '')
+                _s = ', '.join(_stale_terms[:_cap]) + (
+                    f" (+{len(_stale_terms) - _cap} more)" if len(_stale_terms) > _cap else '')
                 current_app.logger.info(
                     f"[ROLE-ORDER-GUARD] {len(messages)} msgs out of "
-                    f"{len(_dropped) + len(_coalesced) + len(messages)} in; "
+                    f"{len(_dropped) + len(_coalesced) + len(_stale_terms) + len(messages)} in; "
                     f"dropped {len(_dropped)} empty assistant placeholder(s)"
                     f"{' at ' + _d if _dropped else ''}; "
+                    f"dropped {len(_stale_terms)} consumed TERMINATE token(s)"
+                    f"{' at ' + _s if _stale_terms else ''}; "
                     f"coalesced {len(_coalesced)} consecutive same-role pair(s)"
                     f"{' at ' + _c if _coalesced else ''} "
                     f"— both would cause OpenAI 400 (2+ assistant messages / "
