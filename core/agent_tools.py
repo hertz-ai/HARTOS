@@ -1026,9 +1026,23 @@ def build_core_tool_closures(ctx):
     ))
 
     # ------------------------------------------------------------------
-    # Conditional: SimpleMem long-term memory
+    # Conditional: long-term memory — SimpleMem preferred, MemoryGraph fallback
     # ------------------------------------------------------------------
-    if simplemem_store is not None:
+    # Gated on EITHER store, not SimpleMem alone.  SimpleMem only constructs
+    # when `sm_config.enabled and sm_config.api_key` (reuse_recipe.py:963,
+    # create_recipe.py:886 — byte-identical twins), so a local desktop with no
+    # cloud key silently got neither tool, while nine prompt sites kept
+    # instructing the model to call save_to_long_term_memory by name.  Measured
+    # live 2026-09-05 (Auto Research 18088688973): of the 18 _MAIN_LEG_CORE
+    # tools, these two — and only these two, the only two gated here — were
+    # missing from all 6 wire bodies.  The model skipped the save step with no
+    # error, then read an empty store 24x and asserted completion on nothing.
+    #
+    # MemoryGraph needs no key, initialized 27x in that same log with 0
+    # failures (including for this agent), and was ALREADY the dual-write
+    # target below and the read-back path in get_data_by_key.  So it backs the
+    # tools when SimpleMem is absent rather than the capability disappearing.
+    if simplemem_store is not None or memory_graph is not None:
         from core.event_loop import get_or_create_event_loop
 
         @log_tool_execution
@@ -1036,14 +1050,24 @@ def build_core_tool_closures(ctx):
             query: Annotated[str, "Natural language query to search long-term memory"],
         ) -> str:
             """Search compressed long-term memory using semantic retrieval."""
+            if simplemem_store is not None:
+                try:
+                    loop = get_or_create_event_loop()
+                    results = loop.run_until_complete(simplemem_store.search(query))
+                    if results:
+                        return results[0].content
+                    return "No relevant memories found."
+                except Exception as e:
+                    tool_logger.info(f"SimpleMem search error: {e}")
+                    return "Memory search unavailable."
+            # MemoryGraph leg — same contract, local store, no API key.
             try:
-                loop = get_or_create_event_loop()
-                results = loop.run_until_complete(simplemem_store.search(query))
+                results = memory_graph.recall(query, mode='hybrid', top_k=5)
                 if results:
-                    return results[0].content
+                    return '\n'.join(r.content for r in results[:5])
                 return "No relevant memories found."
             except Exception as e:
-                tool_logger.info(f"SimpleMem search error: {e}")
+                tool_logger.info(f"MemoryGraph search error: {e}")
                 return "Memory search unavailable."
 
         tools.append((
@@ -1058,6 +1082,24 @@ def build_core_tool_closures(ctx):
             speaker: Annotated[str, "Who said this (e.g. 'User', 'Assistant', 'System')"] = "System",
         ) -> str:
             """Save important information to compressed long-term memory."""
+            if simplemem_store is None:
+                # MemoryGraph leg.  SYNCHRONOUS on purpose: the dual-write
+                # below can be fire-and-forget because SimpleMem already
+                # persisted, but when the graph is the ONLY store, a detached
+                # thread would let this return "Saved" for a write that never
+                # landed — the fabricated success this whole fix exists to
+                # remove.  Report what actually happened.
+                try:
+                    memory_graph.register(
+                        content, {'memory_type': 'fact',
+                                  'source_agent': speaker,
+                                  'session_id': user_prompt,
+                                  'source': 'memory_graph'},
+                    )
+                    return "Saved to long-term memory."
+                except Exception as e:
+                    tool_logger.info(f"MemoryGraph save error: {e}")
+                    return "Failed to save to long-term memory."
             try:
                 loop = get_or_create_event_loop()
                 loop.run_until_complete(simplemem_store.add(content, {

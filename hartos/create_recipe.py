@@ -892,8 +892,21 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 simplemem_store = SimpleMemStore(sm_config)
                 user_simplemem[user_prompt] = simplemem_store
                 tool_logger.info(f"[SIMPLEMEM] Initialized for {user_prompt}")
+            else:
+                # Twin of reuse_recipe.py's silent exit — same defect on the
+                # CREATE side, so recipes are authored by an agent that also
+                # lost the tools its own prompts name.
+                tool_logger.info(
+                    "[SIMPLEMEM] Not configured (enabled=%s, api_key=%s) — "
+                    "long-term memory runs on MemoryGraph for %s",
+                    bool(sm_config.enabled), bool(sm_config.api_key),
+                    user_prompt)
         except Exception as e:
             tool_logger.warning(f"[SIMPLEMEM] Init failed: {e}")
+    else:
+        tool_logger.info(
+            "[SIMPLEMEM] Package unavailable — long-term memory runs on "
+            "MemoryGraph for %s", user_prompt)
 
     # Initialize MemoryGraph for provenance-aware memory
     memory_graph = None

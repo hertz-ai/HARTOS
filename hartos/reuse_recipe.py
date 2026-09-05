@@ -969,8 +969,22 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                 simplemem_store = SimpleMemStore(sm_config)
                 user_simplemem[user_prompt] = simplemem_store
                 current_app.logger.info(f"SimpleMem initialized for {user_prompt}")
+            else:
+                # THE silent exit.  Measured 2026-09-05: the live log had
+                # "SimpleMem initialized" 0 times AND "SimpleMem init failed"
+                # 0 times — this branch left no trace at all, so a keyless
+                # desktop lost both long-term memory tools invisibly.  Say it.
+                current_app.logger.info(
+                    "SimpleMem not configured (enabled=%s, api_key=%s) — "
+                    "long-term memory runs on MemoryGraph for %s",
+                    bool(sm_config.enabled), bool(sm_config.api_key),
+                    user_prompt)
         except Exception as e:
             current_app.logger.warning(f"SimpleMem init failed: {e}")
+    else:
+        current_app.logger.info(
+            "SimpleMem package unavailable — long-term memory runs on "
+            "MemoryGraph for %s", user_prompt)
 
     # Initialize MemoryGraph for provenance-aware memory
     memory_graph = None
