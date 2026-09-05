@@ -85,6 +85,15 @@ pub enum Kind {
     Hover,
     Scroll,
     Key,
+    /// The input that STARTED an animation, measured to the first frame that shows it.
+    ///
+    /// Not another way of saying Press or Key: those measure "the thing I touched
+    /// reacted", this measures "the transition I asked for began". A workspace switch
+    /// whose keypress echoes instantly but whose fade starts 200ms later is a pass on
+    /// `key` and a failure the user actually sees, and only this bucket can tell them
+    /// apart. The budget is looser (33ms, two frames) for the same reason: an animation
+    /// is allowed one frame to be composed before the frame that shows it.
+    AnimateStart,
 }
 
 impl Kind {
@@ -95,6 +104,7 @@ impl Kind {
             Kind::Hover => "hover",
             Kind::Scroll => "scroll",
             Kind::Key => "key",
+            Kind::AnimateStart => "animate-start",
         }
     }
     /// latency_budgets.json `_defaults`, mirrored (see module doc).
@@ -102,9 +112,17 @@ impl Kind {
         match self {
             Kind::Drag | Kind::Hover | Kind::Scroll => 16,
             Kind::Press | Kind::Key => 25,
+            Kind::AnimateStart => 33,
         }
     }
-    const ALL: [Kind; 5] = [Kind::Press, Kind::Drag, Kind::Hover, Kind::Scroll, Kind::Key];
+    const ALL: [Kind; 6] = [
+        Kind::Press,
+        Kind::Drag,
+        Kind::Hover,
+        Kind::Scroll,
+        Kind::Key,
+        Kind::AnimateStart,
+    ];
     fn idx(self) -> usize {
         match self {
             Kind::Press => 0,
@@ -112,6 +130,7 @@ impl Kind {
             Kind::Hover => 2,
             Kind::Scroll => 3,
             Kind::Key => 4,
+            Kind::AnimateStart => 5,
         }
     }
 }
@@ -131,6 +150,10 @@ impl Kind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
     Shell,
+    /// The whole-desktop workspace transition. The only surface here that is NOT a
+    /// `scene::Component`: it is not a thing on the desktop, it is the desktop changing,
+    /// and latency_budgets.json gives it its own row with `animate-start` alone.
+    WorkspaceSwitch,
     Orb,
     TopBar,
     Omnibox,
@@ -143,6 +166,7 @@ impl Surface {
     pub fn label(self) -> &'static str {
         match self {
             Surface::Shell => "shell",
+            Surface::WorkspaceSwitch => "workspace-switch",
             Surface::Orb => "orb",
             Surface::TopBar => "top-bar",
             Surface::Omnibox => "omnibox",
@@ -150,8 +174,9 @@ impl Surface {
             Surface::HomeCard => "home-card",
         }
     }
-    const ALL: [Surface; 6] = [
+    const ALL: [Surface; 7] = [
         Surface::Shell,
+        Surface::WorkspaceSwitch,
         Surface::Orb,
         Surface::TopBar,
         Surface::Omnibox,
@@ -161,11 +186,12 @@ impl Surface {
     fn idx(self) -> usize {
         match self {
             Surface::Shell => 0,
-            Surface::Orb => 1,
-            Surface::TopBar => 2,
-            Surface::Omnibox => 3,
-            Surface::Taskbar => 4,
-            Surface::HomeCard => 5,
+            Surface::WorkspaceSwitch => 1,
+            Surface::Orb => 2,
+            Surface::TopBar => 3,
+            Surface::Omnibox => 4,
+            Surface::Taskbar => 5,
+            Surface::HomeCard => 6,
         }
     }
 }
@@ -235,10 +261,10 @@ pub struct LatencyCore {
     inflight_dropped: u64,
     button_down: bool,
     window_start_us: Option<u64>,
-    /// [surface][kind]. Thirty fixed buckets, allocated once and reused: an input rate
-    /// this cannot cover does not exist, and a map would put an allocation on the input
-    /// path for no benefit.
-    window: [[Vec<u64>; 5]; 6],
+    /// [surface][kind]. Forty-two fixed buckets, allocated once and reused: an input
+    /// rate this cannot cover does not exist, and a map would put an allocation on the
+    /// input path for no benefit.
+    window: [[Vec<u64>; 6]; 7],
 }
 
 impl LatencyCore {
@@ -287,6 +313,28 @@ impl LatencyCore {
             self.pending_dropped += 1;
         }
         self.pending.push((surface, kind, event_us));
+    }
+
+    /// The input just processed turned out to START an animation.
+    ///
+    /// Re-kinds the most recent pending input rather than recording a second sample: the
+    /// keypress and the transition it caused are ONE interaction, and counting it twice
+    /// would put the same photon in two buckets. Whatever surface the pointer was over is
+    /// replaced too, because a workspace switch is not about the thing under the cursor.
+    ///
+    /// Called AFTER the event is applied, which is the only moment the compositor can
+    /// know: an animation starting is a consequence, not a property of the event. The
+    /// input's own kernel timestamp is untouched, so the sample still measures from the
+    /// key the user pressed to the frame that showed the fade.
+    ///
+    /// A no-op when the batch has already been bound to a frame (nothing to re-kind), and
+    /// when no input is pending at all, which is what a client-caused animation looks
+    /// like from here: those are correctly not attributed to any input.
+    pub fn note_animation_started(&mut self, surface: Surface) {
+        if let Some(last) = self.pending.last_mut() {
+            last.0 = surface;
+            last.1 = Kind::AnimateStart;
+        }
     }
 
     /// A frame carrying current damage was handed to DRM (`queue_frame` Ok).
@@ -422,6 +470,14 @@ pub fn on_input(surface: Surface, kind: Kind, event_us: u64) {
     let g = global();
     if let Ok(mut c) = g.core.lock() {
         c.note_input(surface, kind, event_us, instant_us());
+    }
+}
+
+/// The input just handled started an animation (see `note_animation_started`).
+pub fn on_animation_started(surface: Surface) {
+    let g = global();
+    if let Ok(mut c) = g.core.lock() {
+        c.note_animation_started(surface);
     }
 }
 
@@ -669,6 +725,59 @@ mod tests {
     }
 
     #[test]
+    fn the_key_that_starts_a_transition_is_measured_as_the_transition() {
+        // A workspace switch whose keypress echoes instantly but whose fade starts
+        // 200ms later passes `key` and fails the user. The two are ONE interaction, so
+        // the input is RE-KINDED rather than counted twice: the same photon must not
+        // land in two buckets.
+        let mut c = LatencyCore::new();
+        c.note_input(Surface::Shell, Kind::Key, 1_000, 1_000); // offset 0
+        c.note_animation_started(Surface::WorkspaceSwitch);
+        c.frame_queued();
+        c.frame_presented(31_000);
+        // Nothing in the plain `key` bucket: it became the transition.
+        assert!(c.window[Surface::Shell.idx()][Kind::Key.idx()].is_empty());
+        let ws = &c.window[Surface::WorkspaceSwitch.idx()][Kind::AnimateStart.idx()];
+        assert_eq!(ws, &vec![30_000], "measured from the KEY, not from the fade's start");
+
+        // And the budget it is checked against is the looser animation one: 30ms is a
+        // FAIL for a 25ms keypress and a PASS for a 33ms animation start. Getting this
+        // wrong in either direction is a verdict about the wrong thing.
+        assert_eq!(Kind::Key.budget_ms(), 25);
+        assert_eq!(Kind::AnimateStart.budget_ms(), 33);
+    }
+
+    #[test]
+    fn an_animation_nobody_asked_for_is_attributed_to_nobody() {
+        // A client mapping its own window animates without any input causing it. Whatever
+        // key happens to be pending is NOT the cause, and re-kinding it would invent a
+        // number. With no pending input there is nothing to re-kind, which is the correct
+        // and only honest outcome.
+        let mut c = LatencyCore::new();
+        c.note_animation_started(Surface::WorkspaceSwitch);
+        c.frame_queued();
+        assert!(c.frame_presented(10_000).is_empty(), "no sample was fabricated");
+        assert!(c
+            .window
+            .iter()
+            .all(|per_kind| per_kind.iter().all(|w| w.is_empty())));
+
+        // An input already bound to an earlier frame is likewise past re-kinding: the
+        // photon it is waiting on is not this animation's.
+        let mut c = LatencyCore::new();
+        c.note_input(Surface::Shell, Kind::Key, 1_000, 1_000);
+        c.frame_queued();
+        c.note_animation_started(Surface::WorkspaceSwitch);
+        c.frame_presented(9_000);
+        assert_eq!(
+            c.window[Surface::Shell.idx()][Kind::Key.idx()],
+            vec![8_000],
+            "the bound sample stays the keypress it was"
+        );
+        assert!(c.window[Surface::WorkspaceSwitch.idx()][Kind::AnimateStart.idx()].is_empty());
+    }
+
+    #[test]
     fn every_surface_label_is_a_bare_slug_and_they_are_all_distinct() {
         // The labels are the keys of latency_budgets.json's `components` map, joined to
         // it by a Python guard. A duplicate here would silently merge two components'
@@ -677,7 +786,8 @@ mod tests {
         let labels: Vec<&str> = Surface::ALL.iter().map(|s| s.label()).collect();
         assert_eq!(
             labels,
-            ["shell", "orb", "top-bar", "omnibox", "taskbar", "home-card"]
+            ["shell", "workspace-switch", "orb", "top-bar", "omnibox", "taskbar",
+             "home-card"]
         );
         for (i, a) in labels.iter().enumerate() {
             assert!(!a.is_empty() && !a.contains(' '), "{a:?} is not a bare slug");
@@ -687,7 +797,7 @@ mod tests {
         }
         // The index each one buckets under must be unique and in range, since the window
         // is a fixed array rather than a map.
-        let mut seen = [false; 6];
+        let mut seen = [false; 7];
         for s in Surface::ALL {
             assert!(!seen[s.idx()], "two surfaces share bucket {}", s.idx());
             seen[s.idx()] = true;

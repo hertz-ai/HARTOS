@@ -110,6 +110,25 @@ A budget may only be RAISED with a recorded justification in the same commit.
   different numbers), and a relative-motion sample is attributed to the surface
   the pointer is LEAVING, because T_input is captured before the event is applied.
 
+- 2026-09-05: `animate-start` joined the measured kinds. udev.rs snapshots
+  `ws_switch_at` around `process_input_event`; an input that moved it RE-KINDS its
+  own pending sample to AnimateStart on the `workspace-switch` surface, so the
+  keypress and the transition it caused stay one interaction and one photon lands
+  in one bucket. It is measured from the KEY, not from the fade's own start, which
+  is what makes a switch whose key echoes instantly and whose fade begins 200ms
+  later show up as the failure the user actually sees rather than a passing `key`.
+
+  A window MAP animation is deliberately still not attributed: it is usually the
+  client's own doing, and blaming whatever key happened to be pending would be a
+  made-up number. With no pending input there is nothing to re-kind, which is the
+  honest outcome and is asserted.
+
+  That leaves `window-move` and `resize` as the only declared-but-unmeasured
+  kinds, and only because the compositor does not perform those interactions at
+  all: move_request and resize_request are deliberate no-ops (the WM owns
+  geometry; the affordance is Phase-8). The exemption list in
+  test_latency_budget_coverage.py carries that reason and fails if it grows.
+
 ## Measured off the render path: the agentic UI push costs ~400ms
 Not an input-to-photon number, and not the compositor's, but it sits directly in
 front of the desktop the instrument measures, so it belongs beside it.

@@ -205,12 +205,12 @@ UNMEASURED_KINDS = {
         "exists for the affordance, which is Phase-8 polish."),
     "resize": (
         "same as window-move: resize_request is the matching deliberate no-op."),
-    "animate-start": (
-        "needs input-to-animation causality, not just input-to-photon: which "
-        "input STARTED the workspace fade or the window map. The compositor has "
-        "both clocks (ws_switch_at, MapAnim) but nothing carries the causing "
-        "input through to them."),
 }
+# `animate-start` LEFT this list on 2026-09-05: udev.rs snapshots ws_switch_at
+# around process_input_event, and an input that moved it re-kinds its own pending
+# sample to AnimateStart on the workspace-switch surface. A window MAP animation
+# is deliberately still not attributed: it is usually the client's own doing, and
+# blaming whatever key happened to be pending would be a made-up number.
 
 
 def _measured_kinds():

@@ -283,6 +283,21 @@ def test_no_component_overrides_the_default_budget_for_its_kind():
                 "surface before landing it." % (name, kind, value, defaults[kind]))
 
 
+# Surfaces the INSTRUMENT names that the SCENE cannot point at, and why. Every
+# other Surface must be a scene Component, or a sample would be attributed to
+# something no hit-test can reach.
+NOT_SCENE_SURFACES = {
+    # Bare desktop, WebView chrome, and everything measured while the native scene
+    # is not on screen. Deliberate: the harness wants the web shell measured by the
+    # same instrument so "native is faster" is a delta, not a claim.
+    "shell",
+    # Not a thing ON the desktop, the desktop CHANGING. A workspace transition has
+    # no hit box, so it is named by the action that starts it rather than by a
+    # point, and latency_budgets.json gives it a row with `animate-start` alone.
+    "workspace-switch",
+}
+
+
 def test_the_instrument_and_the_scene_agree_on_the_surface_names():
     """The bridge between the two enums.
 
@@ -300,6 +315,12 @@ def test_the_instrument_and_the_scene_agree_on_the_surface_names():
     assert "shell" in labels, (
         "the unattributed surface must stay `shell`, or every historical number "
         "changes format")
-    assert labels - {"shell"} == set(_component_keys()), (
+    assert labels - NOT_SCENE_SURFACES == set(_component_keys()), (
         "latency.rs and scene.rs disagree on the attributable surfaces: %s "
-        "against %s" % (sorted(labels - {"shell"}), sorted(_component_keys())))
+        "against %s. A surface the instrument names but the scene cannot point "
+        "at needs an entry in NOT_SCENE_SURFACES saying why."
+        % (sorted(labels - NOT_SCENE_SURFACES), sorted(_component_keys())))
+    for name in NOT_SCENE_SURFACES:
+        assert name in labels, (
+            "%r is exempted from the scene bridge but latency.rs no longer names "
+            "it; drop the exemption" % name)

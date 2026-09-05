@@ -648,7 +648,20 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            // Did THIS input start the workspace transition? Snapshot before, compare
+            // after: an animation starting is a consequence of the event, not a property
+            // of it, so this is the only moment the answer exists. The workspace fade is
+            // the one animation an input demonstrably causes (a keyboard shortcut runs
+            // `switch_to_workspace`, which stamps the clock); a window MAP animation is
+            // usually the client's own doing, and attributing that to whatever key
+            // happened to be pending would be a made-up number.
+            let ws_before = comp_core::CompState::ws_switch_at(state);
             state.process_input_event(event);
+            if comp_core::CompState::ws_switch_at(state) != ws_before {
+                crate::latency::on_animation_started(
+                    crate::latency::Surface::WorkspaceSwitch,
+                );
+            }
             // #137 — an input event moved the cursor / changed focus / clicked: the pointer
             // (a composited software cursor) and any focus/raise must re-paint. Mark the
             // frame-budget scheduler damaged so the next render tick composites, keeping the
