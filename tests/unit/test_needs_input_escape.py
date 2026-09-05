@@ -97,6 +97,59 @@ def test_needs_input_branch_resets_counter_and_returns_question():
         'group-chat tail')
 
 
+def test_user_input_gate_asks_the_question_instead_of_breaking():
+    """The USER-INPUT-GATE must ask too — `break` hands over the chat tail.
+
+    Live 2026-09-06 00:13-00:23 on the installed build: agent 12165936867
+    ("Regional News Curator"), driven as its OWN owner c23d388c-..., http
+    200 in 593.9s.  The gate fired 8x ("Action 3 flagged as blocked on user
+    input (can_perform_without_user_input='no')") and broke the outer loop
+    at iteration #6.  What reached the user was the group-chat tail:
+
+        success: True
+        text: "Successfully added diverse local RSS feeds (city papers,
+               regional outlets) to the configured list ..."
+
+    with NO recipe written.  The gate's own log line claims "the agent's
+    question is in the assistant's last message" — it was not; it was a
+    success claim.  The user is told the work succeeded, is never shown a
+    question, and so never answers, which is why the agent stays half
+    built (48 of 134 disk agents carry actions and no _recipe.json).
+
+    This is the same defect the `_attempt > 3` escape already fixed 640
+    lines below; that fix's own comment names it: "breaking out here fell
+    through to the tail-message return, which handed the user the raw
+    'TERMINATE\\n Metadata/skeleton...' text."
+
+    The gate must ALSO preserve messages[user_prompt]: `break` reached the
+    tail write at :5137, and :4213 reads that list next turn to decide
+    resume.  (The `_attempt > 3` site deliberately does NOT write it — it
+    never did — so the two sites differ on purpose; do not "unify" them
+    without measuring that behaviour change.)
+    """
+    m = re.search(
+        r'_blocked_action_id is not None and _blocked_action_id == current_action_id:\n'
+        r'(.*?)(?=\n\s+except Exception as _gate_err)', _SRC, re.DOTALL)
+    assert m, 'USER-INPUT-GATE outer-loop block not found'
+    block = m.group(1)
+
+    assert 'return _needs_input_reply(' in block, (
+        'the USER-INPUT-GATE must RETURN the HITL question. Live 2026-09-06 it '
+        'used a bare `break`, so get_response_group fell through to the '
+        "tail-message return and the user got the Assistant's success claim "
+        '("Successfully added diverse local RSS feeds...") instead of the '
+        'question — the build could never resume.')
+
+    assert not re.search(r'^\s+break\s*$', block, re.M), (
+        'a bare `break` remains in the gate block — that is the exact '
+        'fall-through to the tail-message return this test pins.')
+
+    assert 'messages[user_prompt] = group_chat.messages' in block, (
+        'returning early skips the tail write at :5137 that the old `break` '
+        'reached; :4213 reads messages[user_prompt] next turn to decide '
+        'resume, so the gate must preserve it or resume behaviour regresses.')
+
+
 def test_terminate_dodge_uses_tolerant_matcher_at_reply_sites():
     """The three reply-extraction sites in get_response_group must use
     _is_terminate, not exact equality that the skeleton suffix defeats."""

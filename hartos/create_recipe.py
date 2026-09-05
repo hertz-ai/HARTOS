@@ -4354,13 +4354,32 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     user_tasks[user_prompt], '_needs_user_input_action_id', None,
                 )
                 if _blocked_action_id is not None and _blocked_action_id == current_action_id:
+                    # ASK, don't break.  `break` fell through to the tail-message
+                    # return at the bottom of this function, which hands the user
+                    # whatever the Assistant last said.  Measured live 2026-09-06
+                    # on agent 12165936867: this gate fired 8x, the loop broke at
+                    # iteration #6, and the user received "Successfully added
+                    # diverse local RSS feeds..." with success=True and NO recipe
+                    # written.  The question was never asked, so the user could
+                    # not answer and the build could never resume.  Same failure
+                    # the `_attempt > 3` escape below already fixed.
+                    try:
+                        _blocked_text = user_tasks[user_prompt].get_action(
+                            current_action_id - 1)
+                    except Exception:
+                        _blocked_text = ''
                     current_app.logger.info(
-                        f"[USER-INPUT-GATE] OUTER loop breaking at iteration "
+                        f"[USER-INPUT-GATE] OUTER loop returning at iteration "
                         f"#{while_loop_iterations}: Action {current_action_id} is "
-                        f"flagged as needing user input.  Returning control to user; "
-                        f"the agent's question is in the assistant's last message."
+                        f"flagged as needing user input.  Asking the user for it."
                     )
-                    break
+                    # The old `break` reached the tail write at the end of this
+                    # function; :4213 reads this list next turn to decide resume,
+                    # so returning early must still store it.  (The `_attempt > 3`
+                    # escape deliberately does NOT — it never did.  The two sites
+                    # differ on purpose; do not unify without measuring that.)
+                    messages[user_prompt] = group_chat.messages
+                    return _needs_input_reply(current_action_id, _blocked_text)
             except Exception as _gate_err:
                 current_app.logger.debug(
                     f"[USER-INPUT-GATE] outer-loop gate check failed (non-blocking): {_gate_err}"
