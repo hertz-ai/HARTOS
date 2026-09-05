@@ -1078,3 +1078,36 @@ That closes the accessibility file: `reduced_motion`, `font_scale`,
 `large_cursor` and `high_contrast` all reach the native desktop now.
 `screen_reader` and `sticky_keys` are input and assistive-tech concerns with
 nothing for the renderer to mirror.
+
+### Tier-1 summon is machinery without a trigger
+Sweeping the IPC the way the theme and accessibility files were swept: what verbs
+does the compositor accept, and what does the shell send? The verb sets look
+mismatched at first and are not. `hart_wm_client` is the Tier-2 sway shim and
+talks to `swaymsg`, not to the compositor socket, so its `window.fullscreen`,
+`window.summon` and `window.switch_workspace` are its own vocabulary. The IPC
+surface itself came back clean.
+
+What the sweep DID find is one level down. `SummonApp` has:
+
+- a resolver with a timeout, `PendingSummon`, `summon_precheck` for inert
+  platforms, and no-phantom-handle correctness, all unit-tested;
+- `State::resolve_summon` called on every real toplevel map;
+- `State::expire_summons` called from the render tick every frame;
+- and NOTHING that ever begins a summon. `State.pending` is initialised to
+  `Vec::new()` and never pushed to. `SummonResolver::begin`'s only callers are
+  main.rs's own tests. There is no `window.summon` verb in the IPC dispatch.
+
+So the expiry walks an always-empty vec sixty times a second and a summon can
+never resolve. Both sides describe this path as real: hart_wm_client returns an
+honest `unsupported` at Tier-2 and points at Tier-1 as where the map is awaited,
+and HART_OS_NATIVE_ARCHITECTURE §5.4 makes real-map success a release gate.
+Neither is wrong about the design; both are wrong about it being reachable today.
+
+**Not implemented, deliberately.** The missing piece is a launch, and app-launch
+is DROPPED by owner direction. Recording it is the whole action: the next reader
+of that code sees a complete, tested resolver and would reasonably assume it runs.
+
+It is left wired rather than removed, because the no-phantom-window correctness is
+already proven and the trigger is the only absent part. The state field carries
+the same note at its declaration, so it cannot be found by reading the code alone
+and misread as live.

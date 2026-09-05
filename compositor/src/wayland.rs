@@ -150,6 +150,23 @@ pub struct State {
     /// manifest ↔ toplevel map (the "AppRegistry window-handle field").
     pub windows: WindowRegistry,
     /// SummonApps awaiting a real map, keyed by manifest id.
+    /// UNREACHABLE IN THE LIVE COMPOSITOR, stated here rather than discovered at M6.
+    ///
+    /// Nothing ever pushes to this. `udev.rs` initialises it to `Vec::new()`, the render
+    /// tick drains it through `expire_summons` every frame, and `resolve_summon` reads it
+    /// on every real map, but there is no IPC verb that begins a summon and no live caller
+    /// of `SummonResolver::begin` (its only callers are main.rs's own tests). So the
+    /// expiry walks an always-empty vec forever and a summon can never resolve.
+    ///
+    /// The machinery is correct and unit-tested; what is missing is the trigger, and that
+    /// is app-launch, which the owner has DROPPED. Both sides currently describe Tier-1 as
+    /// where SummonApp awaits a real map: hart_wm_client returns an honest `unsupported`
+    /// at Tier-2 and points here, and HART_OS_NATIVE_ARCHITECTURE §5.4 makes real-map
+    /// success a release gate. Neither is wrong about the DESIGN; both are wrong about it
+    /// being reachable today.
+    ///
+    /// Left wired rather than removed: deleting it would throw away the no-phantom-window
+    /// correctness that is already proven, and the trigger is the only missing piece.
     pub pending: Vec<PendingSummon>,
 
     // ── Smithay protocol state ──
