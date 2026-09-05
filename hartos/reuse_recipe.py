@@ -187,6 +187,7 @@ from hartos.helper_ledger import (
 from hartos.lifecycle_hooks import (
     sync_action_state_to_ledger, register_ledger_for_session,
     ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
+    clear_action_states,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -1064,7 +1065,18 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     # Perform topological sorting
     # sorted_actions = topological_sort(role_actions)
 
-    # Create Action with Smart Ledger integration for persistent task tracking
+    # Create Action with Smart Ledger integration for persistent task tracking.
+    #
+    # Clear this session's ActionStates FIRST.  They are process-global and keyed
+    # only by user_prompt, so a CREATE that ran earlier in this same process left
+    # every action TERMINATED (its flow-complete force-terminate).  Without the
+    # reset, the loop below reads those terminals and `[AUTO-ADVANCE]`s through
+    # the whole recipe without executing anything — measured live 2026-09-05 on
+    # agent 90210554431: 4 actions skipped in 14 ms, zero tool calls, while the
+    # identical run on a fresh process executed google_search for real.
+    # A new Action object IS a new run; its states must start where a new run
+    # starts.  See lifecycle_hooks.clear_action_states.
+    clear_action_states(user_prompt)
     user_tasks[user_prompt] = Action(role_actions)
 
     # Initialize or load Smart Ledger for this user with production backend (Redis with JSON fallback)
