@@ -74,6 +74,50 @@ def register_dual(helper, executor, func, name: str, description: str):
     return func
 
 
+# The core closures the MAIN agent leg carries — the helper/assistant pair
+# that drives a user-facing turn, in BOTH the create and reuse pipelines.
+#
+# Canonical home is here, beside build_core_tool_closures() that produces the
+# closures, so the two legs agree by construction.  It was previously a local
+# `_MAIN_LEG_CORE` inside reuse_recipe only, which is why create's identical
+# helper/assistant pair silently carried EVERY core closure instead.
+#
+# Why it has to be a filter at all — measured live 2026-09-05, CREATE of agent
+# 88601674818 action 6:
+#
+#   wire-trim: the TOOL SCHEMA alone is 10544 tokens against an n_ctx of 12288
+#   (72 tool(s)) — no amount of message trimming can make this fit.
+#   -> 400 request (13378 tokens) exceeds the available context size (12288)
+#
+# The turn that 400'd was asking the Helper to WRITE A JSON RECIPE for one
+# step, while carrying payments, video, channel, camera, receipt, Instagram
+# and coding tools it cannot use.  filter_service_tools() already gates the
+# SERVICE registry, but says so explicitly of this set: "the always-on core
+# closures and Tier-2 families are unaffected" — so nothing bounded it.
+#
+# create_scheduled_jobs is deliberately absent: the factory's twin is a
+# create-flow stub and the real live-scheduling version stays inline in
+# reuse_recipe (see the #511 name-collision note at its definition).
+MAIN_LEG_CORE_TOOLS = frozenset({
+    'txt2img', 'img2txt', 'save_data_in_memory', 'get_saved_metadata',
+    'get_data_by_key', 'get_user_id', 'get_prompt_id', 'Generate_video',
+    'get_user_uploaded_file', 'get_user_camera_inp', 'get_chat_history',
+    'search_visual_history', 'search_long_term_memory',
+    'save_to_long_term_memory',
+    'send_message_to_user', 'send_presynthesized_video_to_user',
+    'send_message_in_seconds', 'google_search',
+})
+
+
+def main_leg_core_tools(tools):
+    """The subset of ``tools`` the main helper/assistant leg registers.
+
+    ONE filter for both pipelines — call this rather than re-deriving the
+    name set, so create and reuse can never drift apart again.
+    """
+    return [t for t in tools if t[0] in MAIN_LEG_CORE_TOOLS]
+
+
 def register_core_tools(tools, helper, executor):
     """Register (name, desc, func) tuples on an AutoGen helper/executor pair.
 

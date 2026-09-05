@@ -1078,7 +1078,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # --- Core tools (defined once in core/agent_tools.py) ---
     from core.agent_tools import (
         build_core_tool_closures, register_core_tools, register_memory_graph_tools,
-        register_dual,
+        register_dual, main_leg_core_tools,
     )
     _tool_ctx = {
         'user_id': user_id, 'prompt_id': prompt_id,
@@ -1094,7 +1094,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         'save_conversation_db': save_conversation_db,
     }
     core_tools = build_core_tool_closures(_tool_ctx)
-    register_core_tools(core_tools, helper, assistant)
+    # Same name filter the reuse pipeline's identical helper/assistant leg
+    # uses (core.agent_tools.MAIN_LEG_CORE_TOOLS).  This call registered ALL
+    # core closures — the asymmetry that put 72 tools / 10,544 schema tokens
+    # into a 12,288-token slot and 400'd every create turn once a flow grew
+    # (measured live 2026-09-05, agent 88601674818 action 6).  The other
+    # families below (channels, media, memory-graph, service registry) are
+    # unchanged; only the unbounded core set is brought in line.
+    register_core_tools(main_leg_core_tools(core_tools), helper, assistant)
     register_memory_graph_tools(memory_graph, helper, assistant, user_id, user_prompt)
 
     # Channel tools: send to channels, register channels, list status, get context

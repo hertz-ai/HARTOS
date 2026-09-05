@@ -2037,7 +2037,10 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
     context_handling.add_to_agent(chat_instructor1)
 
     # --- Core tools for time_agent (defined once in core/agent_tools.py) ---
-    from core.agent_tools import build_core_tool_closures, register_core_tools, register_dual
+    from core.agent_tools import (
+        build_core_tool_closures, register_core_tools, register_dual,
+        main_leg_core_tools,
+    )
     # #509: reuse canonical log_tool_execution from core.tool_logging
     # (was passthrough no-op before — tools in reuse_recipe paths weren't
     # emitting publish_chat_stage UI status, weren't getting structured
@@ -2067,20 +2070,12 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
     # Name-filtered to exactly the set the main leg registered before the
     # migration: zero schema growth, no new tools; per-tag gating at the
     # factory is the next step and depends on this consolidation.
-    _MAIN_LEG_CORE = {
-        'txt2img', 'img2txt', 'save_data_in_memory', 'get_saved_metadata',
-        'get_data_by_key', 'get_user_id', 'get_prompt_id', 'Generate_video',
-        'get_user_uploaded_file', 'get_user_camera_inp', 'get_chat_history',
-        'search_visual_history', 'search_long_term_memory',
-        'save_to_long_term_memory',
-        'send_message_to_user', 'send_presynthesized_video_to_user',
-        'send_message_in_seconds', 'google_search',
-    }
-    # create_scheduled_jobs is NOT in the filter: the factory's twin is a
-    # create-flow stub; the real live-scheduling version stays inline
-    # above (see the #511 name-collision note at its definition).
-    register_core_tools(
-        [t for t in core_tools if t[0] in _MAIN_LEG_CORE], helper, assistant)
+    #
+    # The name set moved to core.agent_tools.MAIN_LEG_CORE_TOOLS (beside the
+    # factory that builds the closures) so create_recipe's identical
+    # helper/assistant leg applies the SAME filter — it had none, and shipped
+    # all 72 tools / 10,544 schema tokens into a 12,288-token slot.
+    register_core_tools(main_leg_core_tools(core_tools), helper, assistant)
 
     # Channel tools: send to channels, register channels, list status, get context
     try:
