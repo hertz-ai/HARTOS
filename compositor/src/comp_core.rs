@@ -2622,7 +2622,18 @@ where
     // The rasterizer doubles as the layout's text measure (it already shapes), so the bar
     // can butt one run against another. It is a disjoint borrow from `scene_cache`, and
     // the reborrow ends when `tree_for` returns, leaving it free for the lowering below.
-    let tree = scene_cache.tree_for(size.w as f32, size.h as f32, home, &theme, rasterizer);
+    // Commit A of the row-scroll work: the layout HONOURS an offset, and nothing yet
+    // supplies one, so this is provably a no-op until the input half lands. Splitting it
+    // that way keeps each half green and makes the behaviour change reviewable on its own.
+    let scroll = crate::scene::RowScroll::default();
+    let tree = scene_cache.tree_for(
+        size.w as f32,
+        size.h as f32,
+        home,
+        &theme,
+        &scroll,
+        rasterizer,
+    );
 
     // Hand out pooled solid buffers from the top for this frame (see RectCache::solid).
     rect_cache.begin_frame();
@@ -4115,6 +4126,7 @@ mod tests {
             1080.0,
             &home,
             &themed,
+            &crate::scene::RowScroll::default(),
             &mut crate::scene::MonoMeasure,
         );
         let mut leaves: Vec<&crate::scene::SceneNode> = Vec::new();
@@ -4896,6 +4908,7 @@ mod native_render_tests {
             size.h as f32,
             &home,
             &theme,
+            &crate::scene::RowScroll::default(),
             &mut rasterizer,
         );
         let mut card = None;

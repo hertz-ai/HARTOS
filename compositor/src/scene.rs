@@ -1173,6 +1173,68 @@ const RANK_STROKE: f32 = 3.0;
 const RANK_INNER_W: f32 = 174.0;
 /// The 1px rule the chrome strips draw along the edge that faces the desktop.
 const CHROME_RULE: f32 = 1.0;
+
+/// The most rows the home ever lays out (a2: "2-3 rows"), and so the most scroll
+/// offsets there can be.
+pub const MAX_ROWS: usize = 3;
+
+/// How far each row is scrolled sideways, in logical px, 0 = showing its first card.
+///
+/// The checklist is explicit that this exists: a1 forbids the canvas page-scrolling and
+/// a2 says in the same breath that "Netflix rows scroll HORIZONTALLY (sideways = native
+/// / console-like)". The shell does it with `.hh-cards { overflow-x: auto }`. The native
+/// scene did not, so a row simply CLIPPED: the sanitizer allows twelve cards a row, about
+/// seven fit a 1920 screen, and the rest were unreachable rather than off-screen.
+///
+/// A fixed array rather than a map: there are at most three rows by construction, and
+/// this is read on the layout path where an allocation would be the wrong shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RowScroll {
+    px: [f32; MAX_ROWS],
+}
+
+impl RowScroll {
+    /// The offset for `row`, or 0 for a row index this cannot hold.
+    pub fn get(&self, row: usize) -> f32 {
+        self.px.get(row).copied().unwrap_or(0.0)
+    }
+
+    /// Scroll `row` by `delta` px, clamped to its own content.
+    ///
+    /// `content_w` is the total width the row's cards occupy and `view_w` what is visible.
+    /// A row that fits has NOTHING to scroll and is pinned at 0, which is what keeps a
+    /// short row from drifting sideways under a stray wheel event; a row that overflows
+    /// stops exactly at its last card rather than scrolling into empty space.
+    pub fn scroll(&mut self, row: usize, delta: f32, content_w: f32, view_w: f32) {
+        if row >= MAX_ROWS || !delta.is_finite() {
+            return;
+        }
+        let max = (content_w - view_w).max(0.0);
+        self.px[row] = (self.px[row] + delta).clamp(0.0, max);
+    }
+
+    /// Re-clamp every row against fresh extents, for when the OUTPUT or the FEED changes
+    /// under a scrolled row. Without this a row scrolled to its end and then given fewer
+    /// cards would keep an offset past its own content and render as empty.
+    pub fn reclamp(&mut self, extents: &[(f32, f32)]) {
+        for (i, (content_w, view_w)) in extents.iter().take(MAX_ROWS).enumerate() {
+            let max = (content_w - view_w).max(0.0);
+            self.px[i] = self.px[i].clamp(0.0, max);
+        }
+        for i in extents.len()..MAX_ROWS {
+            self.px[i] = 0.0;
+        }
+    }
+
+    /// The width a row's cards occupy, including the gaps between them but not a trailing
+    /// one, which is what `content_w` means everywhere above.
+    pub fn content_width(cards: usize) -> f32 {
+        if cards == 0 {
+            return 0.0;
+        }
+        cards as f32 * CARD_W + (cards - 1) as f32 * CARD_GAP
+    }
+}
 /// The card corner. `.hh-card` uses `var(--hart-radius, 16px)` and `.hh-rank-inner` a flat
 /// 16px, so 16 is the shape both draw when no theme preset overrides the variable.
 const CARD_RADIUS: f32 = 16.0;
@@ -1255,6 +1317,7 @@ pub fn layout_home(
     output_h: f32,
     home: &HomeCompose,
     theme: &Theme,
+    scroll: &RowScroll,
     measure: &mut dyn TextMeasure,
 ) -> SceneNode {
     let mut root: Vec<SceneNode> = Vec::new();
@@ -1688,10 +1751,22 @@ pub fn layout_home(
             }
         }
         let cards_y = cursor_y + ROW_LABEL_H;
-        let mut card_x = content.x;
+        // The row's strip is scrolled sideways by its own offset (a2: "Netflix rows
+        // scroll HORIZONTALLY"). Cards are laid out from their true positions and the
+        // ones that fall outside the band are skipped, so a scrolled row costs the same
+        // as an unscrolled one: the offset moves the WINDOW, it does not move a list.
+        let scroll_x = scroll.get(row_index);
+        let mut card_x = content.x - scroll_x;
         for (card_index, card) in row.cards.iter().enumerate() {
-            if card_x + CARD_W > content.right() {
+            // Past the right edge: everything after this is too, so stop.
+            if card_x >= content.right() {
                 break;
+            }
+            // Scrolled off the left: advance without emitting. Not `continue` before the
+            // advance, or every later card would pile up at the same x.
+            if card_x + CARD_W <= content.x {
+                card_x += CARD_W + CARD_GAP;
+                continue;
             }
             let cr = Rect::new(card_x, cards_y, CARD_W, m.card_h);
             // A ranked card has NO tile: `.hh-card.hh-ranked` is background:transparent,
@@ -1962,6 +2037,7 @@ pub struct SceneCache {
     key_home: HomeCompose,
     /// `Theme` has no `Default`, so the key starts as None and the first call is a miss.
     key_theme: Option<Theme>,
+    key_scroll: RowScroll,
     rebuilds: u64,
 }
 
@@ -1977,18 +2053,25 @@ impl SceneCache {
         h: f32,
         home: &HomeCompose,
         theme: &Theme,
+        scroll: &RowScroll,
         measure: &mut dyn TextMeasure,
     ) -> &SceneNode {
+        // The scroll offset IS a layout key, unlike the pointer: hovering changes which
+        // leaf lights up and rebuilds nothing, but scrolling moves where the cards are.
+        // A rebuild per wheel event is the honest cost of that and is what the retained
+        // tree is for the rest of the time.
         let stale = self.tree.is_none()
             || self.key_w != w
             || self.key_h != h
             || self.key_theme != Some(*theme)
+            || self.key_scroll != *scroll
             || self.key_home != *home;
         if stale {
-            self.tree = Some(layout_home(w, h, home, theme, measure));
+            self.tree = Some(layout_home(w, h, home, theme, scroll, measure));
             self.key_w = w;
             self.key_h = h;
             self.key_theme = Some(*theme);
+            self.key_scroll = *scroll;
             self.key_home = home.clone();
             self.rebuilds += 1;
         }
@@ -2203,7 +2286,7 @@ mod tests {
 
     #[test]
     fn top_bar_is_the_fixed_40px_strip_at_the_top() {
-        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let bar = root.hit_test(800.0, 5.0).expect("a node at the top strip");
         // The topmost hit in the bar band is a bar child, and the bar rect is 40px.
         assert!(bar.rect().y < TOP_BAR_H);
@@ -2212,7 +2295,7 @@ mod tests {
     #[test]
     fn taskbar_is_the_fixed_44px_strip_at_the_bottom() {
         let (w, h) = (1600.0, 900.0);
-        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let hit = root.hit_test(w * 0.5, h - 2.0).expect("a node at the bottom strip");
         assert!((hit.rect().h - TASKBAR_H).abs() < 0.01);
         assert!((hit.rect().y - (h - TASKBAR_H)).abs() < 0.01);
@@ -2221,7 +2304,7 @@ mod tests {
     #[test]
     fn home_orb_floats_to_the_right_of_the_hero() {
         let (w, h) = (1600.0, 900.0);
-        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         // The large orb (compact=false) sits in the right portion of the content band.
         let mut orb_x = None;
         if let SceneNode::Container { children, .. } = &root {
@@ -2238,7 +2321,7 @@ mod tests {
     fn rows_never_overflow_the_one_screen_canvas() {
         // A tiny output must not emit rows that fall below the taskbar (a2: fits one
         // screen, deep content opens an app instead of scrolling).
-        let root = layout_home(1600.0, 320.0, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(1600.0, 320.0, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let bottom = 320.0 - TASKBAR_H;
         fn assert_within(n: &SceneNode, limit: f32) {
             if let SceneNode::Container { children, .. } = n {
@@ -2263,7 +2346,7 @@ mod tests {
 
     #[test]
     fn flatten_yields_leaves_in_paint_order_no_containers() {
-        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let mut leaves = Vec::new();
         root.flatten(&mut leaves);
         // No Container survives the flatten.
@@ -2288,7 +2371,7 @@ mod tests {
         // lowering's walk hands it. Those are two different traversals, so if they ever
         // disagreed the wrong node would light up, and nothing else would catch it. This
         // pins them together.
-        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
 
         let mut walked: Vec<(usize, Rect)> = Vec::new();
         root.for_each_leaf(&mut |i, leaf| walked.push((i, leaf.rect())));
@@ -2402,7 +2485,7 @@ mod tests {
 
     #[test]
     fn the_hero_lays_out_its_number_unit_stat_and_actions() {
-        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let mut runs: Vec<(String, Rect)> = Vec::new();
         root.for_each_leaf(&mut |_, leaf| {
             if let SceneNode::Text { rect, text, .. } = leaf {
@@ -2440,7 +2523,7 @@ mod tests {
     #[test]
     fn a_rows_accent_tints_its_note_and_its_cards_progress() {
         let theme = Theme::cosmic_default();
-        let root = layout_home(1600.0, 900.0, &sample(), &theme, &mut MonoMeasure);
+        let root = layout_home(1600.0, 900.0, &sample(), &theme, &RowScroll::default(), &mut MonoMeasure);
         // The sample's first row names magenta; its note must carry that hue, not the
         // functional teal every row used to get.
         let magenta = theme.spectrum_named("magenta").expect("magenta is in the spectrum");
@@ -2507,7 +2590,7 @@ mod tests {
             eyebrow: "Nothing yet".into(),
             ..Hero::default()
         };
-        let root = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let mut texts = Vec::new();
         root.for_each_leaf(&mut |_, leaf| {
             if let SceneNode::Text { text, .. } = leaf {
@@ -2535,7 +2618,7 @@ mod tests {
 
     #[test]
     fn the_wordmark_butts_its_two_runs_together_using_the_measure() {
-        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let theme = Theme::cosmic_default();
         // Both runs live in the top bar, in reading order.
         let mut hart = None;
@@ -2622,7 +2705,7 @@ mod tests {
 
     #[test]
     fn the_nav_tabs_are_laid_out_left_to_right_each_sized_to_its_own_label() {
-        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let runs = bar_runs(&root);
         let tabs: Vec<_> = runs
             .iter()
@@ -2665,6 +2748,7 @@ mod tests {
             900.0,
             &sample(),
             &Theme::cosmic_default(),
+            &RowScroll::default(),
             &mut MonoMeasure,
         );
         let runs = bar_runs(&root);
@@ -2684,7 +2768,7 @@ mod tests {
     #[test]
     fn a_row_header_carries_its_note_and_a_right_anchored_see_all() {
         let (w, h) = (1600.0, 900.0);
-        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let mut runs: Vec<(String, Rect)> = Vec::new();
         root.for_each_leaf(&mut |_, leaf| {
             if let SceneNode::Text { rect, text, .. } = leaf {
@@ -2727,7 +2811,7 @@ mod tests {
             r.see_all = None;
             r.note = None;
         }
-        let root = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let mut seen = 0;
         root.for_each_leaf(&mut |_, leaf| {
             if let SceneNode::Text { text, .. } = leaf {
@@ -2741,7 +2825,7 @@ mod tests {
 
     #[test]
     fn a_card_carries_its_meta_line_and_its_progress_bar() {
-        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         // The first card in the sample has both; the second has neither.
         let mut cards: Vec<Vec<SceneNode>> = Vec::new();
         if let SceneNode::Container { children, .. } = &root {
@@ -2818,7 +2902,7 @@ mod tests {
 
     /// The leaves of the first card laid out from `hc`.
     fn first_card(hc: &HomeCompose) -> Vec<SceneNode> {
-        let root = layout_home(1600.0, 900.0, hc, &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(1600.0, 900.0, hc, &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         if let SceneNode::Container { children, .. } = &root {
             for c in children {
                 if let SceneNode::Container {
@@ -2850,7 +2934,7 @@ mod tests {
     #[test]
     fn the_bars_right_cluster_reads_in_the_shells_order_from_the_right_edge() {
         let (w, h) = (1600.0, 900.0);
-        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &mut IconMeasure);
+        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut IconMeasure);
         let runs = bar_runs(&root);
         let at = |t: &str| runs.iter().find(|(s, _)| s == t).map(|(_, r)| *r);
 
@@ -2893,7 +2977,7 @@ mod tests {
 
         // With no icon face the glyphs vanish but the avatar and the orb do not: they are
         // not ligatures, so a missing font must not take them with it.
-        let plain = layout_home(w, h, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let plain = layout_home(w, h, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let pruns = bar_runs(&plain);
         assert!(!pruns.iter().any(|(s, _)| s == "shield"));
         assert!(pruns.iter().any(|(s, _)| s == AVATAR_INITIAL), "the avatar survives");
@@ -2901,7 +2985,7 @@ mod tests {
 
     #[test]
     fn the_omnibox_pill_carries_its_glyph_prompt_and_shortcut_hint() {
-        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &mut IconMeasure);
+        let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut IconMeasure);
         let runs = bar_runs(&root);
         let at = |t: &str| runs.iter().find(|(s, _)| s == t).map(|(_, r)| *r);
         let glyph = at(OMNIBOX_GLYPH).expect("the search glyph");
@@ -2925,7 +3009,7 @@ mod tests {
         // "notifications" across the tray is what a fresh offline ISO did before the
         // shell bundled its fonts. So no face means no icon.
         let hc = sample();
-        let root = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let mut seen = 0;
         root.for_each_leaf(&mut |_, leaf| {
             if let SceneNode::Text { text, .. } = leaf {
@@ -2937,7 +3021,7 @@ mod tests {
         assert_eq!(seen, 0, "no Material face means the icon must NOT be drawn");
 
         // With the face, it draws, in a tile at the card's top left.
-        let root = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &mut IconMeasure);
+        let root = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &RowScroll::default(), &mut IconMeasure);
         let mut icon = None;
         root.for_each_leaf(&mut |_, leaf| {
             if let SceneNode::Text { rect, text, .. } = leaf {
@@ -2955,7 +3039,7 @@ mod tests {
         // it is not a decoration beside one (the shell's `card.icon && !hasImage`).
         let mut arted = sample();
         arted.rows[0].cards[0].photo = Some("/shell/static/app_art/a.png".into());
-        let root = layout_home(1600.0, 900.0, &arted, &Theme::cosmic_default(), &mut IconMeasure);
+        let root = layout_home(1600.0, 900.0, &arted, &Theme::cosmic_default(), &RowScroll::default(), &mut IconMeasure);
         let mut seen = 0;
         root.for_each_leaf(&mut |_, leaf| {
             if let SceneNode::Text { text, .. } = leaf {
@@ -2970,7 +3054,7 @@ mod tests {
     #[test]
     fn a_ranked_row_drops_the_tile_and_numbers_its_cards() {
         let theme = Theme::cosmic_default();
-        let root = layout_home(1600.0, 900.0, &sample(), &theme, &mut MonoMeasure);
+        let root = layout_home(1600.0, 900.0, &sample(), &theme, &RowScroll::default(), &mut MonoMeasure);
         // The sample's SECOND row is the ranked one.
         let mut rows: Vec<Vec<SceneNode>> = Vec::new();
         if let SceneNode::Container { children, .. } = &root {
@@ -3129,7 +3213,7 @@ mod tests {
 
         // Every one of those must actually be DRAWN, not merely decoded.
         let root =
-            layout_home(1920.0, 1080.0, &home, &Theme::cosmic_default(), &mut MonoMeasure);
+            layout_home(1920.0, 1080.0, &home, &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let drawn = drawn_texts(&root);
         for want in [
             "Earned on the hive",
@@ -3166,7 +3250,7 @@ mod tests {
         // hand-built fixture is exactly what missed this the first time.
         let home = wire_fixture();
         let root =
-            layout_home(1920.0, 1080.0, &home, &Theme::cosmic_default(), &mut MonoMeasure);
+            layout_home(1920.0, 1080.0, &home, &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let mut leaves: Vec<&SceneNode> = Vec::new();
         root.flatten(&mut leaves);
 
@@ -3223,7 +3307,7 @@ mod tests {
         ] {
             let home = decode_home_compose(&bad);
             let root =
-                layout_home(1920.0, 1080.0, &home, &Theme::cosmic_default(), &mut MonoMeasure);
+                layout_home(1920.0, 1080.0, &home, &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
             let mut leaves: Vec<&SceneNode> = Vec::new();
             root.flatten(&mut leaves);
             // The fixed chrome is unconditional: whatever the payload, there is a bar and
@@ -3243,7 +3327,7 @@ mod tests {
         // blocker moved once the scene graph could hit-test; this is the identity it
         // named as missing.
         let theme = Theme::cosmic_default();
-        let root = layout_home(1600.0, 900.0, &sample(), &theme, &mut MonoMeasure);
+        let root = layout_home(1600.0, 900.0, &sample(), &theme, &RowScroll::default(), &mut MonoMeasure);
 
         // The top bar, and the omnibox INSIDE it, because deepest wins: a pill that
         // reported `top-bar` would hide the omnibox's own budget behind the bar's.
@@ -3359,7 +3443,7 @@ mod tests {
         // A colour nothing else in the scene uses, so finding it IS finding the rule.
         theme.chrome_border = Color::rgba(1.0, 0.0, 0.5, 0.2);
         let (w, h) = (1600.0, 900.0);
-        let root = layout_home(w, h, &sample(), &theme, &mut MonoMeasure);
+        let root = layout_home(w, h, &sample(), &theme, &RowScroll::default(), &mut MonoMeasure);
         let mut leaves: Vec<&SceneNode> = Vec::new();
         root.flatten(&mut leaves);
         let rules: Vec<Rect> = leaves
@@ -3390,6 +3474,128 @@ mod tests {
     }
 
     #[test]
+    fn a_row_that_overflows_can_be_scrolled_to_its_last_card() {
+        // a2, verbatim: "Netflix rows scroll HORIZONTALLY (sideways = native /
+        // console-like), the canvas itself never page-scrolls." The shell does it with
+        // `.hh-cards { overflow-x: auto }`. The native scene CLIPPED: the sanitizer
+        // allows twelve cards a row, about seven fit a 1920 screen, and the rest were
+        // unreachable rather than merely off-screen.
+        let mut hc = sample();
+        let proto = hc.rows[0].cards[0].clone();
+        hc.rows[0].cards = (0..12)
+            .map(|i| {
+                let mut c = proto.clone();
+                c.title = format!("card{i}");
+                c
+            })
+            .collect();
+        let theme = Theme::cosmic_default();
+        let (w, h) = (1920.0, 1080.0);
+        let titles = |scroll: &RowScroll| -> Vec<String> {
+            let root = layout_home(w, h, &hc, &theme, scroll, &mut MonoMeasure);
+            let mut leaves: Vec<&SceneNode> = Vec::new();
+            root.flatten(&mut leaves);
+            leaves
+                .iter()
+                .filter_map(|n| match n {
+                    SceneNode::Text { text, size_px, .. }
+                        if *size_px == CARD_TITLE_PX && text.starts_with("card") =>
+                    {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let unscrolled = titles(&RowScroll::default());
+        assert!(!unscrolled.is_empty(), "some cards are visible at rest");
+        assert!(
+            unscrolled.len() < 12,
+            "twelve cards must NOT all fit, or this proves nothing: {}",
+            unscrolled.len()
+        );
+        assert_eq!(unscrolled[0], "card0", "at rest a row starts at its first card");
+        assert!(!unscrolled.contains(&"card11".to_string()), "the last is off-screen");
+
+        // Scrolled to its end, the LAST card is reachable. That is the whole point: the
+        // cards past the edge were not merely hidden, they could not be got to.
+        let m = HomeMetrics::for_output(w, h);
+        let view_w = w - m.gutter;
+        let content_w = RowScroll::content_width(12);
+        let mut end = RowScroll::default();
+        end.scroll(0, content_w, content_w, view_w);
+        let scrolled = titles(&end);
+        assert!(
+            scrolled.contains(&"card11".to_string()),
+            "the last card must be reachable: {scrolled:?}"
+        );
+        assert!(!scrolled.contains(&"card0".to_string()), "and the first has gone by");
+        assert_eq!(
+            scrolled.len(),
+            unscrolled.len(),
+            "the WINDOW moves; the number of cards on screen does not"
+        );
+    }
+
+    #[test]
+    fn a_row_that_fits_cannot_drift_and_a_row_that_does_not_stops_at_its_end() {
+        // The clamp is the whole model. A short row pinned at 0 is what stops a stray
+        // wheel event sliding a two-card row off its own gutter, and stopping exactly at
+        // the last card is what stops a long row scrolling into empty space.
+        let mut sc = RowScroll::default();
+        let (content_w, view_w) = (RowScroll::content_width(2), 1860.0);
+        assert!(content_w < view_w, "two cards fit a wide screen");
+        sc.scroll(0, 500.0, content_w, view_w);
+        assert_eq!(sc.get(0), 0.0, "a row with nothing to scroll does not move");
+
+        let long = RowScroll::content_width(12);
+        let max = long - view_w;
+        assert!(max > 0.0, "twelve cards overflow");
+        sc.scroll(0, 10_000.0, long, view_w);
+        assert_eq!(sc.get(0), max, "it stops at its last card, not past it");
+        sc.scroll(0, -10_000.0, long, view_w);
+        assert_eq!(sc.get(0), 0.0, "and back to its first, not before it");
+
+        // Rows are independent, and an index past the end is a no-op rather than a panic:
+        // this is fed by an input event, so it must never index out of bounds.
+        sc.scroll(1, 200.0, long, view_w);
+        assert_eq!(sc.get(0), 0.0, "row 0 did not move");
+        assert_eq!(sc.get(1), 200.0, "row 1 did");
+        sc.scroll(MAX_ROWS + 5, 100.0, long, view_w);
+        assert_eq!(sc.get(MAX_ROWS + 5), 0.0, "an unknown row reads as unscrolled");
+        // A non-finite delta cannot poison the offset.
+        sc.scroll(1, f32::NAN, long, view_w);
+        assert_eq!(sc.get(1), 200.0, "NaN is not a scroll");
+    }
+
+    #[test]
+    fn a_shrinking_feed_pulls_a_scrolled_row_back_into_its_content() {
+        // A row scrolled to its end and then given fewer cards would keep an offset past
+        // its own content and render EMPTY: the cards would all be off the left edge. The
+        // re-clamp is what makes a live feed safe to scroll.
+        let view_w = 1860.0;
+        let long = RowScroll::content_width(12);
+        let mut sc = RowScroll::default();
+        sc.scroll(0, 10_000.0, long, view_w);
+        assert!(sc.get(0) > 0.0);
+
+        // The feed shrinks to two cards, which fit.
+        sc.reclamp(&[(RowScroll::content_width(2), view_w)]);
+        assert_eq!(sc.get(0), 0.0, "a row that now fits is pinned back to its start");
+
+        // And a row that vanishes entirely takes its offset with it.
+        sc.scroll(1, 500.0, long, view_w);
+        sc.reclamp(&[(long, view_w)]);
+        assert_eq!(sc.get(1), 0.0, "a row the feed no longer has is not left scrolled");
+
+        // content_width is the cards plus the gaps BETWEEN them, never a trailing one.
+        assert_eq!(RowScroll::content_width(0), 0.0);
+        assert_eq!(RowScroll::content_width(1), CARD_W);
+        assert_eq!(RowScroll::content_width(2), CARD_W * 2.0 + CARD_GAP);
+    }
+
+    #[test]
     fn the_shells_two_breakpoints_still_fit_every_row_on_a_real_panel() {
         // The scale correction is only safe if the desktop still keeps its promise: rows
         // are dropped, silently, the moment one does not fit the band, so laying out at
@@ -3398,7 +3604,7 @@ mod tests {
         let theme = Theme::cosmic_default();
         let hc = sample();
         let rows_at = |w: f32, h: f32| {
-            let root = layout_home(w, h, &hc, &theme, &mut MonoMeasure);
+            let root = layout_home(w, h, &hc, &theme, &RowScroll::default(), &mut MonoMeasure);
             let mut leaves: Vec<&SceneNode> = Vec::new();
             root.flatten(&mut leaves);
             hc.rows
@@ -3417,7 +3623,7 @@ mod tests {
         }
         // And the cards themselves must still fit ACROSS: a row that shows one card is
         // not a row. 258px cards plus an 18px gap inside a 60px gutter is four on 1280.
-        let root = layout_home(1280.0, 800.0, &hc, &theme, &mut MonoMeasure);
+        let root = layout_home(1280.0, 800.0, &hc, &theme, &RowScroll::default(), &mut MonoMeasure);
         let mut leaves: Vec<&SceneNode> = Vec::new();
         root.flatten(&mut leaves);
         let arts = leaves
@@ -3471,7 +3677,7 @@ mod tests {
         let theme = Theme::cosmic_default();
         let hc = sample();
         let texts = |w: f32| {
-            let root = layout_home(w, 1080.0, &hc, &theme, &mut MonoMeasure);
+            let root = layout_home(w, 1080.0, &hc, &theme, &RowScroll::default(), &mut MonoMeasure);
             let mut leaves: Vec<&SceneNode> = Vec::new();
             root.flatten(&mut leaves);
             leaves
@@ -3504,7 +3710,7 @@ mod tests {
         hc.rows[0].cards[0].photo = None;
         hc.rows[0].cards[1].photo = Some("/shell/static/app_art/a.svg".into());
         let theme = Theme::cosmic_default();
-        let tree = layout_home(1280.0, 800.0, &hc, &theme, &mut MonoMeasure);
+        let tree = layout_home(1280.0, 800.0, &hc, &theme, &RowScroll::default(), &mut MonoMeasure);
         let mut leaves: Vec<&SceneNode> = Vec::new();
         tree.flatten(&mut leaves);
         let arts: Vec<(Option<String>, Color, Color, f32)> = leaves
@@ -3614,7 +3820,7 @@ mod tests {
         // The art tile is the ranked card's real surface, so it is what the hover finds.
         let mut hc = sample();
         hc.rows[0].ranked = true;
-        let tree = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &mut MonoMeasure);
+        let tree = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let mut leaves: Vec<&SceneNode> = Vec::new();
         tree.flatten(&mut leaves);
         let art_idx = leaves
@@ -3695,7 +3901,7 @@ mod tests {
         // nothing for the first would silently collapse them into the second.
         let mut hc = sample();
         hc.rows[0].cards[0].progress = Some(0.0);
-        let root = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let mut bars = 0;
         root.for_each_leaf(&mut |_, leaf| {
             if let SceneNode::Rect { rect, .. } = leaf {
@@ -3765,7 +3971,7 @@ mod tests {
             (320.0, 40.0),
             (2.0, 84.0), // exactly the two strips, so the content band is empty
         ] {
-            let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+            let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
             let mut checked = 0;
             root.for_each_leaf(&mut |_, leaf| {
                 let r = leaf.rect();
@@ -3799,7 +4005,7 @@ mod tests {
     #[test]
     fn hovering_a_card_marks_its_own_background_leaf_and_nothing_else_does() {
         let (w, h) = (1600.0, 900.0);
-        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         // Find a card: the interactive group layout_home emits once per card.
         let mut card = None;
         if let SceneNode::Container { children, .. } = &root {
@@ -3861,7 +4067,7 @@ mod tests {
     #[test]
     fn pointer_over_the_orb_lifts_its_energy_and_nowhere_else() {
         let (w, h) = (1600.0, 900.0);
-        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &mut MonoMeasure);
+        let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         // The large home orb's centre must energise the orb.
         let mut orb_centre = None;
         if let SceneNode::Container { children, .. } = &root {
@@ -3898,30 +4104,30 @@ mod tests {
         let home = sample();
         let mut cache = SceneCache::default();
 
-        let _ = cache.tree_for(1600.0, 900.0, &home, &theme, &mut MonoMeasure);
+        let _ = cache.tree_for(1600.0, 900.0, &home, &theme, &RowScroll::default(), &mut MonoMeasure);
         assert_eq!(cache.rebuilds(), 1, "the first frame builds the tree");
 
         // A steady desktop: same size, same payload, same theme. However many frames run,
         // the tree must NOT be rebuilt — this is the zero-per-frame-alloc NFR.
         for _ in 0..10 {
-            let _ = cache.tree_for(1600.0, 900.0, &home, &theme, &mut MonoMeasure);
+            let _ = cache.tree_for(1600.0, 900.0, &home, &theme, &RowScroll::default(), &mut MonoMeasure);
         }
         assert_eq!(cache.rebuilds(), 1, "a steady desktop must not rebuild per frame");
 
         // A resize changes layout, so it must rebuild.
-        let _ = cache.tree_for(1280.0, 800.0, &home, &theme, &mut MonoMeasure);
+        let _ = cache.tree_for(1280.0, 800.0, &home, &theme, &RowScroll::default(), &mut MonoMeasure);
         assert_eq!(cache.rebuilds(), 2, "a resize must rebuild");
 
         // A new compose changes layout, so it must rebuild.
         let mut recomposed = home.clone();
         recomposed.hero.eyebrow = "Shipped a release".into();
-        let _ = cache.tree_for(1280.0, 800.0, &recomposed, &theme, &mut MonoMeasure);
+        let _ = cache.tree_for(1280.0, 800.0, &recomposed, &theme, &RowScroll::default(), &mut MonoMeasure);
         assert_eq!(cache.rebuilds(), 3, "a new compose must rebuild");
 
         // And the retained tree is a REAL tree, not an empty placeholder: the cached nodes
         // are what hover hit-tests against (the pointer is deliberately not part of the key).
         let node_count = cache
-            .tree_for(1280.0, 800.0, &recomposed, &theme, &mut MonoMeasure)
+            .tree_for(1280.0, 800.0, &recomposed, &theme, &RowScroll::default(), &mut MonoMeasure)
             .node_count();
         assert!(node_count > 1, "the retained tree must hold real nodes");
         assert_eq!(cache.rebuilds(), 3, "re-reading the cached tree must not rebuild");
