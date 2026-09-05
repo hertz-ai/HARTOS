@@ -3173,7 +3173,9 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         except Exception as _e:
             current_app.logger.debug(f"turn attach skipped: {_e}")
 
-        result = user_proxy.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
+        result = user_proxy.initiate_chat(manager,
+                                          message=_reuse_seed_message(user_prompt, message),
+                                          speaker_selection={"speaker": "assistant"},
                                           clear_history=False)
 
         count = 0
@@ -3633,6 +3635,41 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
     safe_set_state(user_prompt, next_id, ActionState.ASSIGNED, f"{reason}: next assigned")
     safe_set_state(user_prompt, next_id, ActionState.IN_PROGRESS, f"{reason}: starting")
     return next_id, True
+
+
+def _reuse_seed_message(user_prompt, message):
+    """The opening turn's message: the user's words PLUS the current action's
+    execution command.
+
+    Actions 2..N are commanded explicitly — every advance posts
+    ``_build_reuse_action_message`` ("Perform this action -> Action #N: ...
+    follow these steps: [{... 'tool_name': 'google_search' ...}]").  Action 1
+    never was: the loop opened with the raw user text and nothing told the
+    group chat to execute anything.
+
+    Measured live 2026-09-05 (Trading 33204307184, 467s drive, from
+    llm_outbound.jsonl): of 39 autogen.reuse calls, 0 carried "Perform this
+    action ->" while 30 carried the recipe in their SYSTEM prompt.  So the
+    agents could SEE the recipe but were never told to run step 1 —
+    google_search executed 0x, `Retrieved current_action_id: 1` 44x, no
+    advance, no outcome.  A closed loop: no action-1 command -> nothing
+    executes -> nothing completes -> no advance -> the builder never runs.
+
+    It stayed hidden because agents whose request happens to imply action 1
+    (18088688973 "what is Tokyo's population" -> google_search) work off the
+    raw question alone; only meta requests ("run my recipe") stall.
+
+    ADDITIVE, never a replacement — the user's intent must reach the chat, and
+    the agents that already succeed on the raw text must not regress.  Fail-safe:
+    any problem reading the recipe returns the user's message unchanged, which
+    is exactly today's behaviour.
+    """
+    try:
+        current_action_id = user_tasks[user_prompt].current_action
+        return f"{message}\n\n{_build_reuse_action_message(user_prompt, current_action_id)}"
+    except Exception as _seed_err:
+        current_app.logger.debug(f"[REUSE-SEED] skipped: {_seed_err}")
+        return message
 
 
 def _build_reuse_action_message(user_prompt, action_id):
