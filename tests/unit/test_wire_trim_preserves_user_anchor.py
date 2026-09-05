@@ -61,15 +61,52 @@ def test_trim_keeps_the_last_user_message(monkeypatch):
         '("No user query found in messages."), so this request 500s' % roles)
 
 
-def test_trim_without_any_user_message_is_unchanged_behavior(monkeypatch):
-    """A producer that never sent a user message is out of this fix's scope —
-    the trimmer must not invent one, only refuse to delete an existing one."""
+def test_a_body_with_no_user_message_gets_exactly_one_seeded(monkeypatch):
+    """This case left THIS fix's scope four days after it was written.
+
+    aa40350 (2026-08-30) added this file and said a producer that never sent a
+    user message was out of scope: preserve an existing anchor, never invent
+    one. 339e891 (2026-09-03) then found the other half of the same 500 in the
+    wild -- a body reaching llama-server with no user turn AT ALL trips the same
+    Qwen3 template raise, and the preserve-only logic could not help because
+    there was nothing to preserve. So the trimmer now seeds one, and says so in
+    the log.
+
+    That is the current contract, so this pins it rather than the superseded
+    scope note. What "must not invent" still means, and is asserted below, is
+    that seeding is idempotent: it never adds a SECOND user turn.
+    """
+    from core.constants import WIRE_USER_SEED_TEXT
     msgs = [_msg('system', 's' * 400)]
     for i in range(12):
         msgs.append(_msg('assistant', 'a' * 300))
         msgs.append(_msg('tool', '{"r": %d}' % i))
     out = _trim_with_tiny_budget(monkeypatch, msgs)
-    assert all(m.get('role') != 'user' for m in out)
+
+    users = [m for m in out if m.get('role') == 'user']
+    assert len(users) == 1, (
+        'a user-less body must come back with exactly one seeded user turn, '
+        'got %d (roles=%r)' % (len(users), [m.get('role') for m in out]))
+    assert users[0].get('content') == WIRE_USER_SEED_TEXT, (
+        'the seed must be the shared constant, not a string invented here')
+    # Seeded AFTER the system message: the template anchors backward from the
+    # tool turns, and a user turn ahead of the system prompt is a different
+    # conversation shape.
+    assert out[0].get('role') == 'system'
+    assert out[1].get('role') == 'user'
+
+
+def test_seeding_is_idempotent_when_a_user_turn_already_exists(monkeypatch):
+    """The half of "must not invent one" that survived: a body that HAS a user
+    turn is never given a second one, so the seed cannot displace the real
+    anchor the template is meant to find."""
+    from core.constants import WIRE_USER_SEED_TEXT
+    out = _trim_with_tiny_budget(monkeypatch, _long_conversation())
+    users = [m for m in out if m.get('role') == 'user']
+    assert len(users) == 1, 'seeded a duplicate user turn (roles=%r)' % (
+        [m.get('role') for m in out],)
+    assert users[0].get('content') != WIRE_USER_SEED_TEXT, (
+        "the real user task was replaced by the seed placeholder")
 
 
 def test_trim_still_reaches_budget_with_anchor_kept(monkeypatch):
