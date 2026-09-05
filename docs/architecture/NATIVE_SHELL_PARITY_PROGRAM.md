@@ -1181,3 +1181,41 @@ compares it against the band the layout actually emits at three panel sizes.
 The scroll is a cache KEY, unlike the pointer: scrolling moves where the cards are
 while hovering only changes which leaf lights up. A rebuild per wheel event is the
 honest cost of that.
+
+
+### The mutation check itself was the unreliable instrument
+Every fix in this run was verified by breaking the code on purpose and requiring a
+test to notice. Doing that by hand went wrong three distinct ways, and each one
+made a check REPORT a result it had not measured, which is worse than not checking
+at all:
+
+**Restoring with `git checkout --` reverts to the last COMMIT.** Four times an
+assertion added since the checkpoint vanished on restore, and the next mutation
+ran against the weaker test that preceded it. Caught each time only by grepping
+for the assertion's own text afterwards.
+
+**Restoring from a `.bak` written at mutate time cements damage.** If the file was
+already broken, the snapshot captures the breakage and hands it back. `latency.rs`
+reached zero bytes that way; git had it, nothing was lost, but the "restore" is
+what did it.
+
+**An ambiguous anchor mutates the FIRST match.** `.take(MAX_ROWS)` appears twice
+in scene.rs, so a check aimed at `row_extents` silently mutated `reclamp` and then
+reported "not caught" about code it had never touched. That one had a silver
+lining: it revealed `reclamp`'s cap guards a direct index into a three-slot array,
+which is now tested.
+
+A harness now removes all three, and the rules it enforces are the point rather
+than the script: snapshot in memory immediately before the edit, refuse to run at
+all unless the anchor matches EXACTLY once, restore in a `finally`, and then VERIFY
+the restore rather than trusting it.
+
+It lives in `.hart-devenv/` beside `deepbox-check.py`, which is excluded from the
+repo (`.git/info/exclude`) because that directory holds machine-local tooling: a
+LAN address, a port, a username and a key path. So the tool is not in this commit
+and this section is the part that travels. Anyone rebuilding it needs only those
+four rules.
+
+Worth stating plainly, because it is the lesson under all of them: a mutation
+check that can quietly measure the wrong thing is a confidence machine, and
+confidence is exactly what these guards exist to withhold until it is earned.
