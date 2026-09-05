@@ -107,6 +107,82 @@ def _messages_to_prompt(messages):
     return system_text, prompt
 
 
+def _tools_to_prompt(tools):
+    """OpenAI tools[] -> an instruction block appended to the prompt.
+
+    In autogen the LLM never EXECUTES a tool: it names one, and the executor
+    agent runs the registered Python closure in HARTOS's own process.  So a
+    text-completion engine can serve a tool turn perfectly well — it only has
+    to name the call.  `--allowedTools ''` (claude_code_backend, mode
+    'inference') stays exactly as it is: that flag governs Claude's OWN tools
+    (file edits, bash, web), which must remain off.  These are HARTOS's.
+    """
+    lines = []
+    for t in tools or []:
+        fn = (t or {}).get('function') or {}
+        name = fn.get('name')
+        if not name:
+            continue
+        params = ', '.join((fn.get('parameters') or {}).get('properties') or {})
+        desc = (fn.get('description') or '').strip()
+        lines.append('- %s(%s)%s' % (name, params, ' — ' + desc if desc else ''))
+    if not lines:
+        return ''
+    return (
+        '\n\nYou may call ONE of the tools below. To call one, reply with ONLY '
+        'a JSON object and nothing else:\n'
+        '{"name": "<tool name>", "arguments": {<arguments>}}\n'
+        'No prose before or after it. If no tool is needed, just answer '
+        'normally in plain text.\n\nTools:\n' + '\n'.join(lines))
+
+
+def _parse_tool_call(text, tools):
+    """Model reply -> OpenAI tool_calls list, or None when it is plain prose.
+
+    Argument repair is autogen's OWN helper — the same
+    ConversableAgent._format_json_str that execute_function uses before
+    json.loads — so a reply this endpoint accepts is exactly a reply autogen
+    can execute.  Nothing bespoke is parsed here.
+    """
+    offered = {((t or {}).get('function') or {}).get('name')
+               for t in (tools or [])}
+    offered.discard(None)
+    if not offered:
+        return None
+    blob = (text or '').strip()
+    if blob.startswith('```'):                      # ```json … ``` fence
+        blob = blob.split('```')[1] if '```' in blob[3:] else blob[3:]
+        if blob.lstrip().startswith('json'):
+            blob = blob.lstrip()[4:]
+        blob = blob.strip()
+    if not blob.startswith('{'):
+        return None
+    try:
+        call = json.loads(blob)
+    except ValueError:
+        try:
+            from autogen.agentchat.conversable_agent import ConversableAgent
+            call = json.loads(ConversableAgent._format_json_str(blob))
+        except Exception:
+            return None
+    if not isinstance(call, dict):
+        return None
+    name = call.get('name')
+    # A name the caller never offered is prose, not a call: emitting it would
+    # hand autogen a tool_call it cannot execute, and the turn would die
+    # holding an unanswerable tool_call_id.
+    if name not in offered:
+        return None
+    args = call.get('arguments')
+    if not isinstance(args, str):
+        args = json.dumps(args if isinstance(args, dict) else {})
+    return [{
+        'id': 'call_claudecode_%d' % int(time.time() * 1000),
+        'type': 'function',
+        'function': {'name': name, 'arguments': args},
+    }]
+
+
 @claude_code_bp.route('/chat/completions', methods=['POST'])
 def chat_completions():
     data = request.get_json(silent=True) or {}
@@ -117,24 +193,26 @@ def chat_completions():
         return jsonify({'error': {'message': 'no user content in messages',
                                   'type': 'invalid_request_error'}}), 400
 
-    # CAPABILITY GUARD: this tier runs `claude -p` in mode='inference' as a pure
-    # text-completion engine — it is TOOL-LESS (the copilot cannot execute
-    # HARTOS's registered tools such as google_search/crawl4ai, and its own
-    # WebSearch/WebFetch are ungranted in a non-interactive session).  A request
-    # that carries a non-empty tools[] REQUIRES tool execution; answering it here
-    # would fabricate a tool-less reply (measured 2026-09-03: reuse search action
-    # got "web search is blocked … here's from my knowledge instead").  Decline
-    # with the SAME 503-to-fallback contract the capacity guard below uses, so
-    # HARTOS routes the tool turn to a tool-capable tier (local has the tools).
-    # NOT a hardwire: pure-reasoning turns (no tools[]) still run here unchanged.
-    if data.get('tools'):
-        logger.info('claude-code endpoint: request carries %d tool(s) but this '
-                    'tier is tool-less — 503 to fallback (tool-capable tier)',
-                    len(data.get('tools') or []))
-        return jsonify({'error': {
-            'message': 'claude-code tier cannot execute tools; route tool turns '
-                       'to a tool-capable tier',
-            'type': 'api_error', 'category': 'no_tools'}}), 503
+    # A tool turn is served here like on any other OpenAI endpoint: carry
+    # tools[] into the prompt so the model can NAME a call.  It never executes
+    # one — autogen's executor runs the registered closure in HARTOS's process,
+    # exactly as it does for the local model.
+    #
+    # This replaces a guard that 503'd every request carrying tools[].  That
+    # guard read `--allowedTools ''` (which correctly disables Claude's OWN
+    # tools) as "this tier cannot do tools at all" and refused work it could
+    # do.  Measured live 2026-09-05 (CREATE of agent 88601674818): the 503 was
+    # classified by agent_lightning/wrapper as a recoverable GENERATION failure
+    # (status >= 500), re-sampled twice against a deterministic refusal, then
+    # answered with a canned reply — burning the create loop's retry budget in
+    # 212 ms and stalling the HITL ask forever (3/3, ~0.3 s each).
+    #
+    # The 2026-09-03 symptom the guard was reacting to ("web search is blocked
+    # … here's from my knowledge instead") was this shim never sending tools[]
+    # at all: the model was asked to use tools it had never been shown.
+    tools = data.get('tools') or []
+    if tools:
+        prompt += _tools_to_prompt(tools)
 
     # Cap concurrent claude -p processes. Non-blocking acquire: at capacity we
     # 503 so the caller's fallback picks a local model instead of queueing.
@@ -166,6 +244,17 @@ def chat_completions():
     # the number never turns into a charge.
     pt = max(1, len(prompt) // 4)
     ct = max(1, len(text) // 4)
+    # A named tool becomes the standard tool_calls shape, so autogen pairs the
+    # result by tool_call_id and executes it like any other provider's call.
+    _calls = _parse_tool_call(text, tools)
+    if _calls:
+        logger.info('claude-code endpoint: model named tool %s',
+                    _calls[0]['function']['name'])
+        _message = {'role': 'assistant', 'content': None, 'tool_calls': _calls}
+        _finish = 'tool_calls'
+    else:
+        _message = {'role': 'assistant', 'content': text}
+        _finish = 'stop'
     return jsonify({
         'id': 'chatcmpl-claudecode-%d' % int(time.time() * 1000),
         'object': 'chat.completion',
@@ -173,8 +262,8 @@ def chat_completions():
         'model': model,
         'choices': [{
             'index': 0,
-            'message': {'role': 'assistant', 'content': text},
-            'finish_reason': 'stop',
+            'message': _message,
+            'finish_reason': _finish,
         }],
         'usage': {'prompt_tokens': pt, 'completion_tokens': ct,
                   'total_tokens': pt + ct},
