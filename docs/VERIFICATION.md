@@ -51,6 +51,16 @@ makes this worth more than another feature.
 | A learning delta produced on A is merged and counted by B | same run, step 4: delta accepted, read back FROM B rather than inferred from A's 200 | 2026-09-05, pass |
 | A hive node bootstraps a newcomer better than a solo node | `tests/standalone/network_beats_solo_proof.py`: joiner inherits 2 community-validated heuristics pooled from 3 peers; the solo node hands over `{}` | 2026-09-05, pass |
 | The experiment lifecycle advances on its own schedule without inventing outcomes | `tests/standalone/experiment_lifecycle_proof.py` 9/9, `decided` rows stay 0 | 2026-09-05, pass |
+| No deployed shell route crashes on a plain request | `test_surface_drive_all.py` drives all 329 registered routes through a real `test_client`; every one returns a controlled status, zero 500s | 2026-09-05, pass |
+| The shell surface works chapter by chapter with the OS boundary SEALED | `tests/integration/shell_surface/`, 449 pass: boot and first paint, session and personalize, system controls, network, apps and upgrades, events and sinks | 2026-09-05, pass |
+| The earnings, health and delegation paths hold end to end | `test_compute_earnings_e2e.py`, `test_health_endpoints.py`, `test_task_delegation_bridge.py`, 22 pass | 2026-09-05, pass |
+| An A2UI push wakes the SSE stream without waiting on a durable write | `test_liquid_ui_sse_event_driven.py` 4/4; the audit commit sat ahead of the wake and cost 5.8s to 11.5s per push, now 0.000s | 2026-09-05, pass |
+
+Read the sealed rows for what they are. `shell_surface/conftest.py` guarantees a
+poweroff/format/nmcli test can never touch the host, and chapter 00 asserts that
+seal. So those 449 exercise the REAL handlers with the OS calls faked. They are
+not hardware, and a row here never becomes one; what they rule out is a whole
+class of crash and regression before hardware is involved.
 
 ## Unverified
 
