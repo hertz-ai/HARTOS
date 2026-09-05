@@ -181,3 +181,95 @@ def test_standalone_checker_is_the_same_logic_and_passes():
     budgets = mod.load_budgets()
     errs = mod.check_static(budgets)
     assert not errs, "static budget invariants failed: " + "; ".join(errs)
+
+# ── The OTHER direction: can the instrument actually MEASURE what is declared? ──
+#
+# Every test above asks whether a surface has a budget. None asks whether the
+# thing that takes the measurement has a bucket for it. That gap is how the
+# per-COMPONENT half of this table sat unread for its whole life: 23 rows, and
+# latency.rs reported `component=shell` for every sample, so each one was checked
+# against the _defaults and a slow orb was indistinguishable from a slow
+# marketplace. That half is fixed (scene.rs names the surface, latency.rs buckets
+# on it). This pins the KIND half so it cannot go the same way.
+
+LATENCY_SRC = os.path.join(REPO, "compositor", "src", "latency.rs")
+
+# Declared in latency_budgets.json, deliberately NOT measured yet, with the reason.
+# Shrinking this list is the goal; GROWING it silently is what the test prevents.
+UNMEASURED_KINDS = {
+    "window-move": (
+        "the compositor does not perform interactive window moves at all. "
+        "wayland.rs's move_request is an intentional no-op: 'interactive "
+        "resize/move are driven by the AI-native placement policy, not by the "
+        "client grabbing the pointer (the WM owns geometry)'. The budget row "
+        "exists for the affordance, which is Phase-8 polish."),
+    "resize": (
+        "same as window-move: resize_request is the matching deliberate no-op."),
+    "animate-start": (
+        "needs input-to-animation causality, not just input-to-photon: which "
+        "input STARTED the workspace fade or the window map. The compositor has "
+        "both clocks (ws_switch_at, MapAnim) but nothing carries the causing "
+        "input through to them."),
+}
+
+
+def _measured_kinds():
+    """The interaction kinds latency.rs can actually bucket a sample into."""
+    src = open(LATENCY_SRC, encoding="utf-8").read()
+    block = re.search(r"impl Kind \{(.*?)\n    const ALL", src, re.S)
+    assert block, "latency.rs no longer has a Kind::label to read"
+    kinds = set(re.findall(r'Kind::\w+ => "([^"]+)"', block.group(1)))
+    assert kinds, "Kind::label names no kinds at all"
+    return kinds
+
+
+def test_the_instrument_can_measure_every_kind_it_claims_to(budgets):
+    """A kind the instrument cannot bucket is a budget nothing will ever check.
+
+    Two failure directions, both real:
+      * a NEW budget kind lands and no bucket is added, so every sample of it is
+        silently dropped and the row reads as covered;
+      * the instrument grows a kind the budget file does not declare, so its
+        samples are checked against nothing.
+    """
+    measured = _measured_kinds()
+    declared = set(VALID_KINDS)
+    assert measured <= declared, (
+        "latency.rs measures %s, which latency_budgets.json does not declare"
+        % sorted(measured - declared))
+    gap = declared - measured
+    assert gap == set(UNMEASURED_KINDS), (
+        "the set of declared-but-unmeasured kinds changed to %s. If a kind became "
+        "measurable, delete its UNMEASURED_KINDS entry. If a NEW kind was "
+        "declared, either give latency.rs a bucket for it or record here why it "
+        "cannot be measured yet: a budget nothing measures reads as coverage "
+        "while measuring nothing." % sorted(gap))
+    # And every unmeasured kind must still be a real declared budget somewhere,
+    # or the exemption is protecting a row that no longer exists.
+    every = set(budgets["_defaults"])
+    for rows in budgets.get("components", {}).values():
+        every |= {k for k in rows if not k.startswith("_")}
+    for kind in UNMEASURED_KINDS:
+        assert kind in every, (
+            "%r is exempted from measurement but is no longer budgeted anywhere; "
+            "drop the exemption" % kind)
+
+
+def test_the_measured_kinds_carry_the_budget_the_file_declares(budgets):
+    """latency.rs mirrors the _defaults as consts because the budget file lives
+    outside the crate and crane's source filter would drop it. A mirror that
+    drifts reports PASS against a number nobody agreed to."""
+    src = open(LATENCY_SRC, encoding="utf-8").read()
+    block = re.search(r"fn budget_ms\(self\) -> u64 \{(.*?)\n    \}", src, re.S)
+    assert block, "latency.rs no longer has a readable budget_ms"
+    body = block.group(1)
+    defaults = budgets["_defaults"]
+    for kind in sorted(_measured_kinds()):
+        want = defaults[kind]
+        # `Kind::Drag | Kind::Hover | Kind::Scroll => 16,` groups equal budgets.
+        variant = "".join(p.capitalize() for p in kind.split("-"))
+        arm = re.search(r"[^\n]*Kind::%s\b[^\n]*=> (\d+)," % variant, body)
+        assert arm, "latency.rs::budget_ms has no arm for %s" % kind
+        assert int(arm.group(1)) == want, (
+            "latency.rs budgets %s at %sms, the file says %sms"
+            % (kind, arm.group(1), want))
