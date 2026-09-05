@@ -3935,11 +3935,15 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
                 user_journey[user_prompt] = 'UseBot'
                 create_schedule(prompt_id, user_id)
-                action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
-                steps = [
-                    {x['steps']: {'tool_name': x.get('tool_name', None), 'code': x.get('generalized_functions', None)}}
-                    for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action - 1]['recipe']]
-                message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action}:{action_message}\n follow these steps: {steps}"
+                # ONE builder for the action command.  This was a verbatim
+                # inline copy — same get_action lookup, same steps
+                # comprehension, same template — so the str() coercion that
+                # fixed the builder left THIS copy still raising
+                # TypeError("unhashable type: 'list'") on a list-valued
+                # `steps`, and it never carried the builder's
+                # `action_id - 1 < len(recipe_actions)` bounds check either.
+                message = _build_reuse_action_message(
+                    user_prompt, user_tasks[user_prompt].current_action)
                 # message = "let's perform the actions availabe in sequence\nIMP instruction: keep track of action id you are working on."
                 result = chat_instructor.initiate_chat(manager, message=message,
                                                        speaker_selection={"speaker": "assistant"}, clear_history=False)

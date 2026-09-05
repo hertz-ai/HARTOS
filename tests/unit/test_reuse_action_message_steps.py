@@ -120,6 +120,38 @@ class ReuseActionMessageSteps(unittest.TestCase):
                          'str-valued steps must render byte-identically to '
                          'pre-fix — this is the no-regression gate')
 
+    def test_action_message_is_built_in_exactly_one_place(self):
+        """One builder, no inline copies.
+
+        chat_agent carried a verbatim third copy of the builder — same
+        get_action lookup, same steps comprehension, same f-string — and it
+        was NOT covered by the str() fix, so it kept the crash.  It also
+        lacked the canonical builder's `action_id - 1 < len(recipe_actions)`
+        bounds check.  A duplicate like that is exactly how the two diverge
+        again next time, so pin the count.
+        """
+        # Count only EXECUTABLE f-strings.  A raw src.count() also catches
+        # this module's own docstrings and a commented-out line, which are
+        # references, not implementations — counting those would make the
+        # guard fire on prose.
+        import ast
+        import inspect as _i
+        tree = ast.parse(_i.getsource(rr))
+        sites = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.JoinedStr)
+            and any(isinstance(v, ast.Constant)
+                    and isinstance(v.value, str)
+                    and 'Perform this action -> Action #' in v.value
+                    for v in node.values)
+        ]
+        self.assertEqual(
+            1, len(sites),
+            'the action-message template must be BUILT in exactly ONE place '
+            f'(the canonical builder); found {len(sites)} f-strings at lines '
+            f'{[n.lineno for n in sites]}. Call _build_reuse_action_message '
+            'instead of inlining it.')
+
     def test_builder_does_not_key_a_dict_on_raw_step_content(self):
         # Root-cause pin: using model-authored content as a dict key is what
         # made the builder type-dependent in the first place.
