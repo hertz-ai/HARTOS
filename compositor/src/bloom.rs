@@ -172,6 +172,41 @@ impl SettingsFile {
         }
     }
 
+    /// An `rgba(r, g, b, a)` value: three 0..255 channels and a 0..1 alpha.
+    ///
+    /// The theme writes its translucent colours this way rather than as hex, which is why
+    /// `glass_border` could not be read before: `hex` finds no `#RRGGBB` and returns None,
+    /// so the chrome strips had no separator and the shell's own 1px rule between the bars
+    /// and the desktop simply did not exist natively. Spacing varies across the shipped
+    /// themes (`rgba(255,255,255,0.10)` and `rgba(2, 136, 209, 0.15)` are both in the
+    /// tree), so every field is trimmed.
+    pub fn rgba(&self, key: &str) -> Option<([u8; 3], f32)> {
+        let text = self.text.as_ref()?;
+        let k = format!("\"{}\"", key);
+        let i = text.find(&k)?;
+        let rest = &text[i + k.len()..];
+        let c = rest.find(':')?;
+        let v = rest[c + 1..].trim_start();
+        let open = v.find("rgba(")?;
+        // Only accept it as the value itself, not something further down the file.
+        if v[..open].trim_matches(['"', ' ']).len() > 1 {
+            return None;
+        }
+        let body = &v[open + 5..];
+        let close = body.find(')')?;
+        let mut parts = body[..close].split(',');
+        let ch = |p: Option<&str>| -> Option<u8> {
+            let n = p?.trim().parse::<f32>().ok()?;
+            Some(n.clamp(0.0, 255.0) as u8)
+        };
+        let rgb = [ch(parts.next())?, ch(parts.next())?, ch(parts.next())?];
+        let a = parts.next()?.trim().parse::<f32>().ok()?;
+        if !a.is_finite() {
+            return None;
+        }
+        Some((rgb, a.clamp(0.0, 1.0)))
+    }
+
     /// The `#RRGGBB` value of `key`, or None when the key is absent or malformed.
     pub fn hex(&self, key: &str) -> Option<[u8; 3]> {
         let text = self.text.as_ref()?;

@@ -2535,6 +2535,9 @@ fn theme_from_files(
             // the shell's own arithmetic so both renderers land on the same integer.
             a11y_scaled(file.num("icon_size"), a11y.num("font_scale")),
             file.num("border_radius"),
+            file.rgba("glass_border").map(|([r, g, b], a)| {
+                crate::scene::Color::rgba(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a)
+            }),
         )
 }
 
@@ -4068,6 +4071,55 @@ mod tests {
         // pixel string, so 20 * 1.13 is a 23px glyph on both renderers, not 22.6 on one.
         assert_eq!(a11y_scaled(Some(20.0), Some(1.13)), Some(23.0));
         assert_eq!(a11y_scaled(Some(20.0), Some(1.12)), Some(22.0), "and rounds DOWN too");
+    }
+
+    #[test]
+    fn the_chrome_strips_take_their_rule_colour_from_the_theme() {
+        // `--hart-glass-border` is written as `rgba(...)`, not hex, which is exactly why
+        // it could not be read before: `hex` finds no `#RRGGBB` and returns None, so the
+        // native strips had no separator at all and their edge was wherever the
+        // translucency happened to stop. It varies real amounts by theme, so it is not a
+        // constant that could have been mirrored.
+        let dir = std::env::temp_dir().join("hart_border_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("cyber.json");
+        std::fs::write(
+            &f,
+            r#"{"colors":{"accent":"FF0090","glass_border":"rgba(255, 0, 144, 0.2)"}}"#,
+        )
+        .unwrap();
+        let t = theme_from_files(
+            &crate::bloom::SettingsFile::load(&f),
+            &crate::bloom::SettingsFile::load(std::path::Path::new("/nope.json")),
+        );
+        assert_eq!(t.chrome_border.r, 1.0);
+        assert_eq!(t.chrome_border.g, 0.0);
+        assert!((t.chrome_border.b - 144.0 / 255.0).abs() < 1e-6);
+        assert!((t.chrome_border.a - 0.2).abs() < 1e-6, "the ALPHA is the point");
+
+        // Spacing varies across the shipped themes and both forms are in the tree.
+        let tight = dir.join("aura.json");
+        std::fs::write(&tight, r#"{"colors":{"glass_border":"rgba(255,255,255,0.10)"}}"#)
+            .unwrap();
+        let t2 = theme_from_files(
+            &crate::bloom::SettingsFile::load(&tight),
+            &crate::bloom::SettingsFile::load(std::path::Path::new("/nope.json")),
+        );
+        assert_eq!((t2.chrome_border.r, t2.chrome_border.g, t2.chrome_border.b), (1.0, 1.0, 1.0));
+        assert!((t2.chrome_border.a - 0.10).abs() < 1e-6);
+
+        // A theme with no glass_border keeps the shell's own ThemeService-failure
+        // fallback rather than drawing nothing: a missing key must not delete the rule.
+        let bare = dir.join("bare.json");
+        std::fs::write(&bare, r#"{"colors":{"accent":"00E6C3"}}"#).unwrap();
+        assert_eq!(
+            theme_from_files(
+                &crate::bloom::SettingsFile::load(&bare),
+                &crate::bloom::SettingsFile::load(std::path::Path::new("/nope.json")),
+            )
+            .chrome_border,
+            crate::scene::Theme::cosmic_default().chrome_border
+        );
     }
 
     #[test]

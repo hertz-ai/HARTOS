@@ -229,6 +229,12 @@ pub struct Theme {
     /// DEFAULT theme sets 22, and the themes span 4 to 22, so a fixed 16 was already the
     /// wrong shape on aura before any of them was chosen.
     pub card_radius: f32,
+    /// `colors.glass_border`, the shell's `--hart-glass-border`: the 1px rule the top bar
+    /// draws along its bottom and the taskbar along its top. It is the line that separates
+    /// chrome from desktop, and the native strips had none, so their edge was wherever the
+    /// translucency happened to stop. It varies REAL amounts by theme (aura white at .10,
+    /// arctic blue at .15, cyberpunk pink at .2), so it is not a constant.
+    pub chrome_border: Color,
 }
 
 /// The spectrum names, positionally matched to `Theme::spectrum`.
@@ -368,6 +374,10 @@ impl Theme {
             top_bar_h: TOP_BAR_H,
             icon_px: 20.0,
             card_radius: 16.0,
+            // The built-in css_vars fallback (liquid_ui_service l.1764), which is what
+            // the shell renders with when ThemeService cannot be consulted. An unreadable
+            // theme file here is the same situation, so it takes the same value.
+            chrome_border: Color::rgba(0.0, 230.0 / 255.0, 195.0 / 255.0, 0.18),
         }
     }
 
@@ -386,7 +396,11 @@ impl Theme {
         top_bar_h: Option<f32>,
         icon_px: Option<f32>,
         card_radius: Option<f32>,
+        chrome_border: Option<Color>,
     ) -> Theme {
+        if let Some(c) = chrome_border {
+            self.chrome_border = c;
+        }
         if let Some(h) = top_bar_h {
             self.top_bar_h = h.clamp(16.0, 128.0);
         }
@@ -1124,6 +1138,8 @@ const RANK_STROKE: f32 = 3.0;
 /// 174px wide, pinned to the card's right edge and full height, leaving the numeral the
 /// gutter to its left. Everything the shell appends to a card goes INSIDE this box.
 const RANK_INNER_W: f32 = 174.0;
+/// The 1px rule the chrome strips draw along the edge that faces the desktop.
+const CHROME_RULE: f32 = 1.0;
 /// The card corner. `.hh-card` uses `var(--hart-radius, 16px)` and `.hh-rank-inner` a flat
 /// 16px, so 16 is the shape both draw when no theme preset overrides the variable.
 const CARD_RADIUS: f32 = 16.0;
@@ -1358,6 +1374,16 @@ pub fn layout_home(
             stroke: 0.0,
         });
     }
+    // `.top-bar { border-bottom: 1px solid var(--hart-glass-border) }`, and nothing else:
+    // the rule explicitly sets `border-top: 0` and `border-radius: 0`, so the bar has ONE
+    // edge. Without it the strip simply ends wherever its translucency stops, which is
+    // the difference between chrome that sits on the desktop and chrome that dissolves
+    // into it.
+    bar_children.push(SceneNode::Rect {
+        rect: Rect::new(0.0, theme.top_bar_h - CHROME_RULE, output_w, CHROME_RULE),
+        color: theme.chrome_border,
+        radius: 0.0,
+    });
     bar_children.push(SceneNode::Container {
         rect: pill,
         // Not a hover target: nothing routes an omnibox activation yet, and an
@@ -1848,11 +1874,20 @@ pub fn layout_home(
         rect: taskbar,
         interactive: false,
         component: Some(Component::Taskbar),
-        children: vec![SceneNode::Rect {
-            rect: taskbar,
-            color: theme.taskbar_bg,
-            radius: 0.0,
-        }],
+        children: vec![
+            SceneNode::Rect {
+                rect: taskbar,
+                color: theme.taskbar_bg,
+                radius: 0.0,
+            },
+            // `.taskbar { border-top: 1px solid var(--hart-glass-border) }`: the mirror of
+            // the top bar's rule, on the edge that faces the desktop.
+            SceneNode::Rect {
+                rect: Rect::new(taskbar.x, taskbar.y, taskbar.w, CHROME_RULE),
+                color: theme.chrome_border,
+                radius: 0.0,
+            },
+        ],
     });
 
     SceneNode::Container {
@@ -2197,8 +2232,15 @@ mod tests {
         assert!(leaves.iter().all(|n| !matches!(n, SceneNode::Container { .. })));
         // First painted leaf is the top-bar background rect (back of the paint order).
         assert!(matches!(leaves.first(), Some(SceneNode::Rect { rect, .. }) if rect.y == 0.0));
-        // Last painted leaf is the taskbar rect (front-most opaque strip).
-        assert!(matches!(leaves.last(), Some(SceneNode::Rect { rect, .. }) if (rect.h - TASKBAR_H).abs() < 0.01));
+        // Last painted leaf is the taskbar's 1px rule, which is drawn ON TOP of the strip
+        // itself: `.taskbar { border-top: 1px solid var(--hart-glass-border) }` is the
+        // edge that faces the desktop, so it is the front-most thing in the whole scene.
+        assert!(matches!(leaves.last(), Some(SceneNode::Rect { rect, .. })
+                         if (rect.h - CHROME_RULE).abs() < 0.01));
+        // And the strip itself is right behind it.
+        let strip = leaves[leaves.len() - 2];
+        assert!(matches!(strip, SceneNode::Rect { rect, .. }
+                         if (rect.h - TASKBAR_H).abs() < 0.01));
         assert!(leaves.len() >= 6);
     }
 
@@ -3246,6 +3288,47 @@ mod tests {
             }
             assert!(!a.is_empty() && !a.contains(' '), "a key must be a bare slug");
         }
+    }
+
+    #[test]
+    fn both_chrome_strips_draw_their_rule_on_the_edge_that_faces_the_desktop() {
+        // `.top-bar { border-bottom: 1px solid var(--hart-glass-border); border-top: 0 }`
+        // and `.taskbar { border-top: 1px ... }`. One edge each, facing the desktop, and
+        // the native strips had neither: their edge was wherever the translucency
+        // happened to stop, which is chrome dissolving into the desktop rather than
+        // sitting on it.
+        let mut theme = Theme::cosmic_default();
+        // A colour nothing else in the scene uses, so finding it IS finding the rule.
+        theme.chrome_border = Color::rgba(1.0, 0.0, 0.5, 0.2);
+        let (w, h) = (1600.0, 900.0);
+        let root = layout_home(w, h, &sample(), &theme, &mut MonoMeasure);
+        let mut leaves: Vec<&SceneNode> = Vec::new();
+        root.flatten(&mut leaves);
+        let rules: Vec<Rect> = leaves
+            .iter()
+            .filter_map(|n| match n {
+                SceneNode::Rect { rect, color, .. } if *color == theme.chrome_border => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rules.len(), 2, "one rule per strip, no more: {rules:?}");
+        for r in &rules {
+            assert_eq!(r.h, CHROME_RULE, "a rule is one pixel tall");
+            assert_eq!(r.w, w, "and spans the output");
+        }
+        // The top bar's sits on its BOTTOM edge, the taskbar's on its TOP edge.
+        let top = rules.iter().find(|r| r.y < h * 0.5).expect("the top bar's rule");
+        let bottom = rules.iter().find(|r| r.y > h * 0.5).expect("the taskbar's rule");
+        assert!(
+            (top.bottom() - theme.top_bar_h).abs() < 0.01,
+            "the top bar's rule ends exactly at the bar's edge: {top:?}"
+        );
+        assert!(
+            (bottom.y - (h - TASKBAR_H)).abs() < 0.01,
+            "the taskbar's rule starts exactly at the strip's edge: {bottom:?}"
+        );
     }
 
     #[test]

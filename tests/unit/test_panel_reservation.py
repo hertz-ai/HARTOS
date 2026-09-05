@@ -582,3 +582,48 @@ def test_the_compositor_reads_the_accessibility_file_the_shell_reads():
         "back to the GPU floor alone and a declared preference does nothing")
     assert "motion_reduced" in comp, (
         "the scene_animates gate no longer takes a reduced-motion input")
+
+def test_every_shipped_theme_declares_a_rule_colour_the_compositor_can_read():
+    """The 1px line between chrome and desktop, in the shape the reader accepts.
+
+    `--hart-glass-border` is written as `rgba(...)` rather than hex, which is
+    exactly why the native strips had no separator: the compositor's colour reader
+    only knew `#RRGGBB`, found nothing, and drew no rule at all, so the bar's edge
+    was wherever its translucency happened to stop.
+
+    The Rust side cannot check this: the theme JSONs live outside the crate and
+    crane's source filter ships only `*.rs`, so a Rust test looking for them finds
+    an empty directory in CI and in the container. It belongs here, where both
+    trees are readable, like the rest of the cross-language pins in this file.
+    """
+    import glob
+    # The shape bloom.rs::rgba accepts: three numeric channels and an alpha, with
+    # any spacing. Both `rgba(255,255,255,0.10)` and `rgba(2, 136, 209, 0.15)` are
+    # in the shipped set today.
+    shape = re.compile(r"^rgba\(\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*,\s*([\d.]+)\s*\)$")
+    seen = 0
+    for path in sorted(glob.glob(os.path.join(
+            REPO, "nixos", "assets", "conky-themes", "*.json"))):
+        colors = json.load(open(path, encoding="utf-8")).get("colors", {})
+        value = colors.get("glass_border")
+        assert value, "%s declares no glass_border, so its chrome has no edge" % (
+            os.path.basename(path))
+        m = shape.match(value.strip())
+        assert m, (
+            "%s writes glass_border as %r, which the compositor's reader cannot "
+            "parse; it accepts rgba(r,g,b,a) only" % (os.path.basename(path), value))
+        alpha = float(m.group(1))
+        assert 0.0 < alpha <= 1.0, (
+            "%s has an invisible rule (alpha %s)" % (os.path.basename(path), alpha))
+        seen += 1
+    assert seen >= 8, "expected the shipped theme set, found %d" % seen
+
+    # And the compositor actually reads that key and draws with it.
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+    assert 'rgba("glass_border")' in comp, (
+        "the compositor no longer reads glass_border, so the chrome strips are "
+        "back to having no edge")
+    assert "theme.chrome_border" in scene, (
+        "the scene no longer draws with the rule colour it reads")

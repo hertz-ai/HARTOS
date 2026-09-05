@@ -960,3 +960,27 @@ factor`, which is a statement about the vignette rather than about the blobs.
 still makes a summed corner darker than a summed centre, while tinting the whole
 desktop. Each channel is checked on its own now, and dropping any one of the three
 multiplies fails.
+
+### The 1px rule between chrome and desktop, and why it was invisible
+`.top-bar` draws `border-bottom: 1px solid var(--hart-glass-border)` and explicitly
+sets `border-top: 0`; `.taskbar` draws the mirror on its top edge. One edge each,
+facing the desktop. The native strips had neither, so their edge was wherever the
+translucency happened to stop, which is chrome dissolving into the desktop rather
+than sitting on it.
+
+The reason it was missed is worth keeping: `--hart-glass-border` is written as
+`rgba(...)`, not hex. The compositor's colour reader only knew `#RRGGBB`, so it
+found nothing, returned None, and the caller drew no rule at all. A value the
+reader cannot parse fails exactly like a value that is not there, which is the
+quietest failure shape there is.
+
+It varies real amounts by theme (aura white at .10, arctic blue at .15, cyberpunk
+pink at .2), so it was never a constant that could have been mirrored.
+
+The shipped-theme check moved to Python after being written in Rust first: the
+theme JSONs live outside the crate and crane's source filter ships only `*.rs`, so
+a Rust test looking for them finds an empty directory both in the container and in
+CI. It found zero themes and said so, which is the right failure but the wrong
+home. The rule now sits with the other cross-language pins, asserting that every
+shipped theme declares a border in the shape the reader accepts, that its alpha is
+visible, and that the compositor both reads the key and draws with it.
