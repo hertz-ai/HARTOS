@@ -579,12 +579,17 @@ def _win_release_held_volumes(handles, log=None):
         k = ctypes.WinDLL("kernel32", use_last_error=True)
     except Exception:
         return
+    _say = log or (lambda m: None)
     for h in handles:
         try:
             k.CloseHandle(h)
-        except Exception:
-            pass
-    (log or (lambda m: None))("  released %d held volume lock(s)" % len(handles))
+        except Exception as e:
+            # Best-effort: the handle is released when this process exits either
+            # way. Said out loud because a leaked lock is exactly what makes the
+            # NEXT flash fail to open the disk, and silence there sends the
+            # search to the wrong place.
+            _say("  (releasing a volume lock failed: %s)" % e)
+    _say("  released %d held volume lock(s)" % len(handles))
 
 
 def _prepare_windows_device(disk, dd, log, clean=True):
@@ -641,7 +646,7 @@ class _WinExclusiveWriter:
     buffer. Idempotent: the retry rewrites the identical bytes at the identical
     offset."""
 
-    def __init__(self, disk_number, disk=None):
+    def __init__(self, disk_number, disk=None, log=None):
         import ctypes
         from ctypes import wintypes
         self.ctypes, self.wintypes = ctypes, wintypes
@@ -661,6 +666,10 @@ class _WinExclusiveWriter:
         # Volume locks held for the WHOLE write (Rufus-style). Empty until the
         # first re-arm needs them; see `_rearm`.
         self._held = []
+        # The flasher's own log sink. Threaded in so `_rearm` can SAY why a step
+        # failed: a re-arm that keeps failing is what makes a flash crawl, and
+        # without this the reason is not in the transcript.
+        self._log = log or (lambda m: None)
         self.h = self._open()
 
     def _open(self):
@@ -719,23 +728,28 @@ class _WinExclusiveWriter:
         image's ACCESS_DENIED (5) never converged and the flash crawled. Keeping
         every volume handle open for the rest of the write is what makes the
         re-arm terminate: the ESP cannot come back to claim its byte span."""
+        # Each step below is best-effort: the reopen at the end is the real
+        # test, and any of these can legitimately fail on a disk whose volumes
+        # have already gone. They are LOGGED rather than swallowed because a
+        # re-arm that keeps failing is how the flash crawls, and the reason it
+        # crawled has to be readable from the transcript.
         try:
             self._close_drive()
-        except Exception:
-            pass
+        except Exception as e:
+            self._log("  (re-arm: closing the drive handle failed: %s)" % e)
         _win_automount(False)
         try:
             _dismount_windows(self._disk)          # drive-letter volumes
-        except Exception:
-            pass                        # best-effort: the reopen is the real test
+        except Exception as e:
+            self._log("  (re-arm: dismounting lettered volumes failed: %s)" % e)
         try:
             # Lock+HOLD every volume on the disk, including the letterless ESP.
             # Additive across re-arms: a later table write can create a volume
             # that did not exist at the previous re-arm.
             self._held.extend(
                 _win_dismount_disk_volumes(self._disk_number, hold=True) or [])
-        except Exception:
-            pass                        # best-effort: the reopen is the real test
+        except Exception as e:
+            self._log("  (re-arm: locking the disk's volumes failed: %s)" % e)
         self.h = self._open()
 
     def write_at(self, byte_offset, fobj):
@@ -1958,7 +1972,7 @@ def flash_raw(tag, variant, disk, tmp, progress=None, log=None, verify=True,
     writer = None
     if IS_WIN:
         _prepare_windows_device(disk, dd, log, clean=True)
-        writer = _WinExclusiveWriter(disk["number"], disk)
+        writer = _WinExclusiveWriter(disk["number"], disk, log=log)
     reader = _XZPartsReader(srcs, log, progress=progress, total_compressed=total_comp)
     try:
         if writer is not None:
@@ -2084,7 +2098,7 @@ def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
         # RESUME (start_part>0): keep the disk's already-written parts — skip the
         # destructive diskpart clean, only automount-off + dismount.
         _prepare_windows_device(disk, dd, log, clean=(start_part <= 0))
-        writer = _WinExclusiveWriter(disk["number"], disk)   # held exclusive for all parts
+        writer = _WinExclusiveWriter(disk["number"], disk, log=log)  # held exclusive for all parts
     try:
         for idx, (p, off) in enumerate(zip(parts, offs)):
             if idx < start_part:
