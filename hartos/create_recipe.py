@@ -5403,7 +5403,7 @@ def request_recipe_for_action_last(current_action_id, prompt_id, role, user_prom
     safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED, "recipe start")
     message = RECIPE_CREATE_PROMPT_PREFIX + ''' that includes only the necessary steps for this action from history, along with a suitable name. Provide the output in the following JSON format:
                         { "status": "done", "action": "''' + str(user_tasks[user_prompt].get_action(user_tasks[
-                                                                                                                      user_prompt].current_action - 1)) + '''","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
+                                                                                                                      user_prompt].current_action - 1)) + '''","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"If this step uses a tool, put the EXACT name of one of the tools provided to you in this request. Do not invent a name. If no provided tool fits, leave this empty string.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
                         Recipe Requirements:
                         1. Generalized Python Functions: Give the code which was created and executed successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
                         2. Avoid directly storing any specific information provided by the author in the recipe. Use placeholders for variables instead.
@@ -5419,8 +5419,20 @@ def request_recipe_for_action(current_action_id, prompt_id, role, user_prompt, p
     user_tasks[user_prompt].fallback = False
     safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED, "recipe start")
     metadata = strip_json_values(agent_data[prompt_id])
+    # Name the action the recipe is FOR, exactly as request_recipe_for_action_last
+    # already does.  This builder sent the literal placeholder "Describe the
+    # action performed here", so the only strong word in the whole prompt was
+    # "recipe" — and the model wrote a FOOD recipe.  Measured 2026-09-05 in
+    # agent 88601674818, a GitHub release monitor whose saved flow recipe
+    # contains "Generate a detailed recipe for preparing a classic chocolate
+    # cake using standard kitchen tools and ingredients" with steps about
+    # sifting flour and cocoa powder.  The census in
+    # memory/feedback_recipe_jargon_cooking_contamination.md put this at
+    # 25/123 saved recipes (20%); this is the producer.
+    _action_text = str(user_tasks[user_prompt].get_action(
+        user_tasks[user_prompt].current_action - 1))
     message = RECIPE_CREATE_PROMPT_PREFIX + ''' that includes only the necessary steps for this action, along with a suitable name. Provide the output in the following JSON format:
-                        { "status": "done", "action": "Describe the action performed here","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
+                        { "status": "done", "action": "''' + _action_text + '''","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"If this step uses a tool, put the EXACT name of one of the tools provided to you in this request. Do not invent a name. If no provided tool fits, leave this empty string.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
                         Recipe Requirements:
                         1. Generalized Python Functions: Give the code which was created and excuted successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
                         2. Avoid directly storing any specific information provided by the author in the recipe. Use placeholders for variables instead.
@@ -5461,6 +5473,15 @@ _RECIPE_PLACEHOLDER_STRINGS = frozenset({
     'steps here',
     'only include tool name here if used for this step.',
     'action here',
+    # Current tool_name instruction.  The template changed when the field was
+    # constrained to real tool names (the model was inventing "Baking Pan",
+    # "github_api_client", "nlp_parser_tool" — 20 invented names in agent
+    # 88601674818 alone, none of which resolve at REUSE).  Without this entry
+    # the guard would still be looking for the OLD wording and would pass an
+    # echo of the new one straight through — a vacuous guard.
+    'if this step uses a tool, put the exact name of one of the tools '
+    'provided to you in this request. do not invent a name. if no provided '
+    'tool fits, leave this empty string.',
 })
 
 
