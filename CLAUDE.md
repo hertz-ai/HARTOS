@@ -2,6 +2,33 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## RULE 0 — NEVER ASSUME (ranked above every other rule in this file)
+
+**Owner ruling 2026-09-05.  Outranks every protocol below and any
+ship-mode urgency.  It is not advice.**
+
+1. **Never assume.**  If a measurement of the exact claim does not
+   exist, the claim is not made.  "Probably", "consistent with", "the
+   logs suggest" are assumptions wearing a hedge.  When unmeasured, the
+   answer is **"I have not checked"**.
+2. **Grep only LOCATES.**  A grep hit is a pointer, never evidence, and
+   never a basis for a conclusion or an edit.
+3. **Read the FULL file — every file the grep matched, end to end.**
+   Not a window around the hit.  Partial reads are the documented cause
+   of this codebase's wrong diagnoses and parallel-path regressions.
+4. **Verify to the user-visible outcome**, not the furthest log line
+   reached.  A pipeline that "ran" has produced nothing until the user's
+   actual result is read back.
+
+Measured cost of breaking this (single session, 2026-09-05): six
+conclusions asserted then withdrawn — a real registered tool called
+"fictional"; a missing log marker read as "no tool executed" when those
+tools cannot emit it; and a 179-second reuse turn analysed entirely
+from internal logs while the response the user actually received said
+*"Your local AI is busy with another task right now."*
+
+Full rule + evidence table: Nunba `memory/feedback_never_assume.md`.
+
 ## Project Overview
 
 **HART OS - Hevolve Hive Agentic Runtime**
