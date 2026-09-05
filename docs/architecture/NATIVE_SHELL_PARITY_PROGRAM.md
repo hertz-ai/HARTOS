@@ -809,3 +809,44 @@ What the box will now print, per 10s window, is a line per surface per interacti
 kind with its own verdict. That is the difference between "the desktop is slow"
 and "the cards are slow and the orb is fine", which is the whole reason the budget
 file was written with 23 rows.
+
+### Obligation 2's actual bug, found by looking at the themes
+The obligation reads "the panel reservation points the wrong way", and the
+inversion it asks for is a contract change with a shell side. But it also names a
+concrete bug inside it: "scene.rs hardcodes 40/44 against a value the theme can
+move". That half needed no contract at all, and it was not hypothetical.
+
+Reading the ten shipped themes: FOUR of them move the top bar height (36, 38, 40,
+44), three move the tray icon size (18, 20, 22), and every one of them sets its own
+corner radius, spanning 4 to 22. The shell publishes the panel reservation from
+`shell.topbar_height` and renders from the same variable. The native scene drew a
+fixed 40. So on `potato` the native bar would have drawn 40px over a 36px
+reservation, which is the 2026-08-29 "taskbar unreachable" report arriving through
+the new renderer, and on the DEFAULT theme the cards were already drawing a 16px
+corner against aura's 22.
+
+All three now come out of the theme file, through the reader the colour
+unification added. One number each, read by both renderers, so they cannot drift.
+
+**The taskbar deliberately did NOT join them.** The theme has no key for it: it is
+a Python constant beside a CSS literal, and inventing a theme key here would be a
+third source rather than one. The existing guard keeps pinning those two, and the
+reservation guard now says plainly that its two halves are different kinds of
+thing: the top cannot drift by construction, the bottom still can and is watched.
+
+Two details:
+
+**The numbers are clamped, because they come from a file.** A zero or negative bar
+inverts the content band's arithmetic and an enormous one leaves no desktop. The
+bounds are wide, and a guard asserts no shipped theme is altered by them, reading
+the bounds OUT of the Rust rather than restating them, because a restated bound is
+how a tightened clamp would pass unnoticed.
+
+**scene.rs's constants are now the FALLBACK for an unreadable theme**, and they
+equal the fallbacks theme_service publishes for the same case. That is what the
+reservation guard compares now; a separate guard asserts both sides read the same
+theme keys by name, since agreeing today is exactly what the hardcoded 40 also did.
+
+What is still open in obligation 2 is only the inversion itself: who PUBLISHES the
+reservation once the compositor paints the chrome. That remains a contract question
+with a shell side.

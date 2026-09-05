@@ -212,6 +212,23 @@ pub struct Theme {
     /// theme, never as a second table inside the layout.
     pub spectrum: [Color; 6],
     pub taskbar_bg: Color,
+    /// `shell.topbar_height`, the shell's `--hart-topbar-height`. NOT a constant, because
+    /// four of the ten shipped themes move it (36, 38, 40, 44) and the SHELL publishes
+    /// the panel reservation from this same number: a native bar that drew a fixed 40
+    /// would overdraw a 36px reservation, which is the 2026-08-29 "taskbar unreachable"
+    /// report arriving through the new renderer.
+    ///
+    /// The taskbar's height is deliberately NOT here: the theme has no key for it, it is
+    /// a Python constant beside a CSS literal, and test_panel_reservation.py pins those
+    /// two together. Inventing a theme key for it here would be a third source.
+    pub top_bar_h: f32,
+    /// `shell.icon_size`, the shell's `--hart-icon-size`: the tray glyph size. Moves with
+    /// the theme too (18, 20, 22).
+    pub icon_px: f32,
+    /// `shell.border_radius`, the shell's `--hart-radius`: the card corner. The shipped
+    /// DEFAULT theme sets 22, and the themes span 4 to 22, so a fixed 16 was already the
+    /// wrong shape on aura before any of them was chosen.
+    pub card_radius: f32,
 }
 
 /// The spectrum names, positionally matched to `Theme::spectrum`.
@@ -346,7 +363,40 @@ impl Theme {
                 palette("#FFC83D", teal),
             ],
             taskbar_bg: Color::rgba(0.043, 0.047, 0.063, 0.85),
+            // The theme_service fallbacks, which are what the shell renders with when a
+            // theme omits the key. Overridden per theme by `with_shell_metrics`.
+            top_bar_h: TOP_BAR_H,
+            icon_px: 20.0,
+            card_radius: 16.0,
         }
+    }
+
+    /// This theme with the active theme file's SHELL METRICS folded in.
+    ///
+    /// Separate from `with_theme_colors` because these are not colours and their failure
+    /// mode is different: a wrong colour is ugly, a wrong bar height is a band of desktop
+    /// windows can be placed under. Each is `None`-tolerant and keeps the shipped value,
+    /// so an unreadable theme is byte-identical to before this existed.
+    ///
+    /// Clamped, because these come from a file: a zero or negative bar would invert the
+    /// content band's arithmetic, and an enormous one would leave no desktop at all. The
+    /// bounds are generous enough that every shipped theme passes untouched.
+    pub fn with_shell_metrics(
+        mut self,
+        top_bar_h: Option<f32>,
+        icon_px: Option<f32>,
+        card_radius: Option<f32>,
+    ) -> Theme {
+        if let Some(h) = top_bar_h {
+            self.top_bar_h = h.clamp(16.0, 128.0);
+        }
+        if let Some(i) = icon_px {
+            self.icon_px = i.clamp(8.0, 64.0);
+        }
+        if let Some(r) = card_radius {
+            self.card_radius = r.clamp(0.0, 64.0);
+        }
+        self
     }
 
     /// This theme with the ACTIVE theme file's colours folded in, each one optional.
@@ -1167,7 +1217,7 @@ pub fn layout_home(
     let m = HomeMetrics::for_output(output_w, output_h);
 
     // ── Top bar (fixed, 40px): background, centre omnibox pill, right orb-sm. ──
-    let bar = Rect::new(0.0, 0.0, output_w, TOP_BAR_H);
+    let bar = Rect::new(0.0, 0.0, output_w, theme.top_bar_h);
     let mut bar_children = vec![SceneNode::Rect {
         rect: bar,
         color: theme.bar_bg,
@@ -1185,9 +1235,9 @@ pub fn layout_home(
     // max where there is room and is squeezed no further than the min. Centring it on the
     // output is what the flex centre column resolves to on a bar this simple.
     let pill_w = OMNIBOX_W.min(output_w).max(m.omnibox_min_w.min(output_w));
-    let pill = Rect::new((output_w - pill_w) * 0.5, 6.0, pill_w, TOP_BAR_H - 12.0);
+    let pill = Rect::new((output_w - pill_w) * 0.5, 6.0, pill_w, theme.top_bar_h - 12.0);
     let mark_h = WORDMARK_PX * 1.3;
-    let mark_y = (TOP_BAR_H - mark_h) * 0.5;
+    let mark_y = (theme.top_bar_h - mark_h) * 0.5;
     let hart_w = measure.text_width("HART", WORDMARK_PX);
     let gap_w = measure.text_width(" ", WORDMARK_PX);
     let os_w = measure.text_width("OS", WORDMARK_PX);
@@ -1222,9 +1272,9 @@ pub fn layout_home(
     //    activation yet, and an affordance that reacts but does nothing is a lie. Wrap
     //    them as interactive groups when a tab actually navigates.
     let tab_h = TAB_PX * 2.0;
-    let tab_y = (TOP_BAR_H - tab_h) * 0.5;
+    let tab_y = (theme.top_bar_h - tab_h) * 0.5;
     let tab_ink_h = TAB_PX * 1.3;
-    let tab_ink_y = (TOP_BAR_H - tab_ink_h) * 0.5;
+    let tab_ink_y = (theme.top_bar_h - tab_ink_h) * 0.5;
     let mut tab_x = BAR_PAD_X + hart_w + gap_w + os_w + BAR_PAD_X;
     for (i, label) in NAV_TABS.iter().take(m.nav_tabs).enumerate() {
         let ink_w = measure.text_width(label, TAB_PX);
@@ -1262,12 +1312,12 @@ pub fn layout_home(
     let mut pill_children = vec![SceneNode::Rect {
         rect: pill,
         color: theme.omnibox_bg,
-        radius: (TOP_BAR_H - 12.0) * 0.5,
+        radius: (theme.top_bar_h - 12.0) * 0.5,
     }];
     // Inside the pill, the shell's own three parts: a search glyph, the prompt, and the
     // shortcut hint pushed to the far end. The hint is right-anchored, which is the
     // measure again; before it there was nowhere to put it.
-    let pill_ink_y = (TOP_BAR_H - OMNIBOX_PX * 1.3) * 0.5;
+    let pill_ink_y = (theme.top_bar_h - OMNIBOX_PX * 1.3) * 0.5;
     let mut pill_x = pill.x + 12.0;
     if icons_available {
         let gw = measure.text_width(OMNIBOX_GLYPH, OMNIBOX_PX);
@@ -1298,7 +1348,7 @@ pub fn layout_home(
         pill_children.push(SceneNode::Text {
             rect: Rect::new(
                 kbd_x,
-                (TOP_BAR_H - KBD_PX * 1.3) * 0.5,
+                (theme.top_bar_h - KBD_PX * 1.3) * 0.5,
                 kbd_w.ceil() + 2.0,
                 KBD_PX * 1.3,
             ),
@@ -1328,16 +1378,16 @@ pub fn layout_home(
         for glyph in TRAY_GLYPHS.iter().rev() {
             right_x -= TRAY_BTN;
             let b = centered_box(
-                measure.text_width(glyph, TRAY_PX),
+                measure.text_width(glyph, theme.icon_px),
                 right_x,
                 TRAY_BTN,
-                (TOP_BAR_H - TRAY_PX * 1.3) * 0.5,
-                TRAY_PX * 1.3,
+                (theme.top_bar_h - theme.icon_px * 1.3) * 0.5,
+                theme.icon_px * 1.3,
             );
             bar_children.push(SceneNode::Text {
                 rect: b,
                 text: (*glyph).to_string(),
-                size_px: TRAY_PX,
+                size_px: theme.icon_px,
                 color: theme.omnibox_ink,
                 stroke: 0.0,
             });
@@ -1347,7 +1397,7 @@ pub fn layout_home(
     // Avatar: a filled disc with the account initial. The shell hardcodes the letter in
     // its markup, so this is the same letter, not a guess at a user's name.
     right_x -= AVATAR_D;
-    let av = Rect::new(right_x, (TOP_BAR_H - AVATAR_D) * 0.5, AVATAR_D, AVATAR_D);
+    let av = Rect::new(right_x, (theme.top_bar_h - AVATAR_D) * 0.5, AVATAR_D, AVATAR_D);
     bar_children.push(SceneNode::Rect {
         rect: av,
         color: theme.omnibox_bg,
@@ -1358,7 +1408,7 @@ pub fn layout_home(
             measure.text_width(AVATAR_INITIAL, AVATAR_PX),
             av.x,
             AVATAR_D,
-            (TOP_BAR_H - AVATAR_PX * 1.3) * 0.5,
+            (theme.top_bar_h - AVATAR_PX * 1.3) * 0.5,
             AVATAR_PX * 1.3,
         ),
         text: AVATAR_INITIAL.to_string(),
@@ -1369,7 +1419,7 @@ pub fn layout_home(
     right_x -= TRAY_GAP;
 
     right_x -= ORB_SM;
-    let orb_sm_rect = Rect::new(right_x, (TOP_BAR_H - ORB_SM) * 0.5, ORB_SM, ORB_SM);
+    let orb_sm_rect = Rect::new(right_x, (theme.top_bar_h - ORB_SM) * 0.5, ORB_SM, ORB_SM);
     bar_children.push(SceneNode::OrbSlot {
         rect: orb_sm_rect,
         compact: true,
@@ -1388,9 +1438,9 @@ pub fn layout_home(
     // gutter would drop a card the shell shows.
     let content = Rect::new(
         m.gutter,
-        TOP_BAR_H + CONTENT_PAD_Y,
+        theme.top_bar_h + CONTENT_PAD_Y,
         (output_w - m.gutter).max(0.0),
-        (output_h - TOP_BAR_H - TASKBAR_H - 2.0 * CONTENT_PAD_Y).max(0.0),
+        (output_h - theme.top_bar_h - TASKBAR_H - 2.0 * CONTENT_PAD_Y).max(0.0),
     );
 
     // ── Hero (P4, the EARNINGS hero): eyebrow, the big Spark figure with its unit, an
@@ -1588,7 +1638,7 @@ pub fn layout_home(
                 card_children.push(SceneNode::Rect {
                     rect: cr,
                     color: theme.card_bg,
-                    radius: CARD_RADIUS,
+                    radius: theme.card_radius,
                 });
             }
             if row.ranked {
@@ -1633,7 +1683,7 @@ pub fn layout_home(
                 from: art_from,
                 to: art_to,
                 angle_deg: art_angle,
-                radius: CARD_RADIUS,
+                radius: theme.card_radius,
                 photo: card.photo.clone(),
             });
             // ── Icon glyph, top left, and ONLY when the card has no photo: the shell draws

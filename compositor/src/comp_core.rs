@@ -2457,14 +2457,23 @@ fn theme_from_file(file: &crate::bloom::ThemeFile) -> crate::scene::Theme {
                 )
             })
     };
-    crate::scene::Theme::cosmic_default().with_theme_colors(
-        hue("background"),
-        hue("accent"),
-        hue("secondary"),
-        hue("text"),
-        hue("muted"),
-        hue("surface"),
-    )
+    crate::scene::Theme::cosmic_default()
+        .with_theme_colors(
+            hue("background"),
+            hue("accent"),
+            hue("secondary"),
+            hue("text"),
+            hue("muted"),
+            hue("surface"),
+        )
+        // The same three keys theme_service emits as --hart-topbar-height,
+        // --hart-icon-size and --hart-radius, so the native scene and the browser are
+        // sized by one number each rather than two that happen to agree today.
+        .with_shell_metrics(
+            file.num("topbar_height"),
+            file.num("icon_size"),
+            file.num("border_radius"),
+        )
 }
 
 /// State-free core of `render_native_scene`, so it is unit-testable with a
@@ -3894,6 +3903,85 @@ mod tests {
             (themed.bar_bg.r * 255.0).round() as u8,
             pal.base[0],
             "the bar and the backdrop must ground on one colour"
+        );
+    }
+
+    #[test]
+    fn a_theme_that_moves_the_bar_moves_the_native_bar_with_it() {
+        // The shell publishes the panel reservation from `shell.topbar_height`, and the
+        // native scene drew a fixed 40. Four of the ten shipped themes move that number
+        // (36, 38, 40, 44), so on `potato` the native bar would have drawn 40px over a
+        // 36px reservation: the 2026-08-29 "taskbar unreachable" report arriving through
+        // the new renderer. Every shipped theme also carries its own corner radius, and
+        // the DEFAULT one (aura) sets 22 against the hardcoded 16, so the cards were
+        // already the wrong shape before anyone chose a theme.
+        let dir = std::env::temp_dir().join("hart_shell_metrics_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("potato.json");
+        std::fs::write(
+            &f,
+            r#"{"id":"potato","colors":{"accent":"00E6C3"},
+               "shell":{"topbar_height":36,"icon_size":18,"border_radius":4}}"#,
+        )
+        .unwrap();
+        let themed = theme_from_file(&crate::bloom::ThemeFile::load(&f));
+        assert_eq!(themed.top_bar_h, 36.0, "the bar takes the theme's height");
+        assert_eq!(themed.icon_px, 18.0, "and the tray its glyph size");
+        assert_eq!(themed.card_radius, 4.0, "and the cards their corner");
+
+        // And the LAYOUT actually uses them: a shorter bar means the content band starts
+        // higher, which is the whole point. Asserting the theme field alone would pass
+        // while the layout still read a constant.
+        let home = crate::scene::HomeCompose::demo();
+        let tree = crate::scene::layout_home(
+            1920.0,
+            1080.0,
+            &home,
+            &themed,
+            &mut crate::scene::MonoMeasure,
+        );
+        let mut leaves: Vec<&crate::scene::SceneNode> = Vec::new();
+        tree.flatten(&mut leaves);
+        let bar = leaves
+            .iter()
+            .find_map(|n| match n {
+                crate::scene::SceneNode::Rect { rect, .. }
+                    if rect.x == 0.0 && rect.y == 0.0 && rect.w == 1920.0 =>
+                {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .expect("the top bar strip");
+        assert_eq!(bar.h, 36.0, "the bar the scene DRAWS is the theme's height");
+    }
+
+    #[test]
+    fn a_theme_cannot_hand_the_compositor_an_absurd_bar() {
+        // These numbers come from a FILE. A zero or negative bar inverts the content
+        // band's arithmetic and an enormous one leaves no desktop, so they are clamped
+        // rather than trusted. The bounds are wide enough that every shipped theme passes
+        // through untouched, which the guard test asserts from the other side.
+        let dir = std::env::temp_dir().join("hart_shell_metrics_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("absurd.json");
+        std::fs::write(
+            &f,
+            r#"{"id":"absurd","shell":{"topbar_height":0,"icon_size":9999,
+               "border_radius":-40}}"#,
+        )
+        .unwrap();
+        let themed = theme_from_file(&crate::bloom::ThemeFile::load(&f));
+        assert!(themed.top_bar_h >= 16.0, "a zero bar is clamped, not drawn");
+        assert!(themed.icon_px <= 64.0, "a giant glyph is clamped");
+        assert!(themed.card_radius >= 0.0, "a negative radius is clamped");
+        // A non-numeric value is not a number at all: keep the shipped default.
+        let g = dir.join("text.json");
+        std::fs::write(&g, r#"{"shell":{"topbar_height":"tall"}}"#).unwrap();
+        assert_eq!(
+            theme_from_file(&crate::bloom::ThemeFile::load(&g)).top_bar_h,
+            crate::scene::Theme::cosmic_default().top_bar_h,
+            "a malformed height keeps the shipped bar"
         );
     }
 

@@ -22,6 +22,7 @@ Run:
   pytest tests/unit/test_panel_reservation.py -v
 """
 
+import json
 import os
 import re
 import sys
@@ -112,26 +113,86 @@ def _rust_const_px(name):
 def test_the_native_scene_draws_the_same_strips_the_shell_reserves(published):
     """THE DRIFT CLASS AGAIN, in the language the guard above cannot see.
 
-    The native compositor scene paints its own top bar and taskbar, and it sizes
-    them from two Rust constants. The shell meanwhile publishes the reservation
-    from the CSS the browser actually applies, and every window-placement path
+    The native compositor scene paints its own top bar and taskbar. The shell
+    meanwhile publishes the reservation, and every window-placement path
     subtracts THAT. So the moment the two disagree, the native bar and the space
     reserved for it are different sizes: either a dead band of desktop no window
     may use, or windows tucked under a bar that is drawing over them, which is
     the exact 2026-08-29 report this whole contract exists to prevent.
 
-    The guard above scans the served shell for hardcoded 40/44. It cannot see
-    Rust, and 40/44 is precisely what scene.rs hardcodes, so this pins the two
-    together until the native scene becomes the thing that PUBLISHES the
-    reservation (the M6 question: once the compositor paints the chrome, the
-    compositor is what knows its size, and the direction of this contract has to
-    invert).
+    The two halves are no longer the same KIND of thing, which is the point:
+
+      TOP: both sides now read `shell.topbar_height` out of the active theme, so
+      they cannot drift by construction. scene.rs's TOP_BAR_H is the FALLBACK for
+      an unreadable theme, and must equal the fallback theme_service publishes for
+      the same case. Four of the ten shipped themes move this number, so a fixed
+      Rust constant was a live bug, not a hypothetical one.
+
+      BOTTOM: the theme has no key for the taskbar. It is a Python constant beside
+      a CSS literal, so it CAN drift, and this is still the only thing stopping it.
     """
     r = L.publish_panel_reservation(":root{--hart-topbar-height:40px}")
     assert _rust_const_px("TOP_BAR_H") == r["top"], (
-        "scene.rs TOP_BAR_H and the published top reservation have drifted")
+        "scene.rs TOP_BAR_H and the published top fallback have drifted")
     assert _rust_const_px("TASKBAR_H") == r["bottom"], (
         "scene.rs TASKBAR_H and the published bottom reservation have drifted")
+
+
+def test_the_native_bar_reads_the_same_theme_key_the_shell_publishes_from():
+    """The half that a constant comparison cannot cover.
+
+    theme_service emits `--hart-topbar-height` from `shell.topbar_height`, the
+    shell publishes the reservation from that variable, and the native scene now
+    sizes its bar from the SAME key rather than a constant that happened to agree.
+    Assert both readers by name, since agreeing today is what a hardcoded 40 also
+    did.
+    """
+    theme_src = open(os.path.join(REPO, "integrations", "agent_engine",
+                                  "theme_service.py"), encoding="utf-8").read()
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+    for key, var in (("topbar_height", "--hart-topbar-height"),
+                     ("icon_size", "--hart-icon-size"),
+                     ("border_radius", "--hart-radius")):
+        assert re.search(r"%s:.*shell\.get\(\"%s\"" % (re.escape(var), key),
+                         theme_src), (
+            "theme_service no longer emits %s from shell.%s" % (var, key))
+        assert 'file.num("%s")' % key in comp, (
+            "the native scene no longer reads shell.%s, so it is back to a "
+            "constant the theme can move out from under it" % key)
+
+
+def test_no_shipped_theme_is_clamped_by_the_native_scene():
+    """The compositor clamps these because they arrive from a file, and a zero
+    bar would invert the content band's arithmetic. The bounds have to be wide
+    enough that no real theme is silently altered, or the clamp becomes its own
+    drift: the browser would render the theme's number and the native scene a
+    different one.
+    """
+    import glob
+    # Read the bounds OUT of the Rust rather than restating them here. A copy would
+    # let someone tighten the clamp and leave this passing, which is the exact
+    # duplicate-number failure every other guard in this file exists to stop.
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+    fields = {"topbar_height": "top_bar_h", "icon_size": "icon_px",
+              "border_radius": "card_radius"}
+    bounds = {}
+    for key, field in fields.items():
+        m = re.search(r"self\.%s = \w+\.clamp\(([0-9.]+), ([0-9.]+)\)"
+                      % re.escape(field), scene)
+        assert m, "scene.rs no longer clamps %s, so its bounds cannot be read" % field
+        bounds[key] = (float(m.group(1)), float(m.group(2)))
+    for path in sorted(glob.glob(os.path.join(
+            REPO, "nixos", "assets", "conky-themes", "*.json"))):
+        shell = json.load(open(path, encoding="utf-8")).get("shell", {})
+        for key, (lo, hi) in bounds.items():
+            if key not in shell:
+                continue
+            v = shell[key]
+            assert lo <= v <= hi, (
+                "%s sets %s=%s, which the native scene clamps to [%s, %s]: the "
+                "browser would draw the theme's number and the compositor a "
+                "different one" % (os.path.basename(path), key, v, lo, hi))
 
 
 def _css_decl(css, selector, prop):

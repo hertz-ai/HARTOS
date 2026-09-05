@@ -116,6 +116,34 @@ impl ThemeFile {
         ThemeFile::load(&Path::new(dir).join(format!("{}.json", id)))
     }
 
+    /// The NUMERIC value of `key`, or None when it is absent or not a number.
+    ///
+    /// The shell's three shell-metric variables (`--hart-topbar-height`,
+    /// `--hart-icon-size`, `--hart-radius`) come straight from this file's `shell` block,
+    /// and the native scene hardcoded all three. Four of the ten shipped themes move the
+    /// bar height and every one of them moves the corner radius, so that was not a
+    /// theoretical drift: on `potato` the native bar would draw 40px over a 36px
+    /// reservation, which is the 2026-08-29 "taskbar unreachable" report through a new
+    /// renderer.
+    ///
+    /// Unquoted, unlike `hex`: JSON numbers carry no quotes, so this scans to the value
+    /// separator and parses what follows up to the next delimiter. A malformed value
+    /// yields None and the caller keeps its shipped default, the same posture every other
+    /// read here takes.
+    pub fn num(&self, key: &str) -> Option<f32> {
+        let text = self.text.as_ref()?;
+        let k = format!("\"{}\"", key);
+        let i = text.find(&k)?;
+        let rest = &text[i + k.len()..];
+        let c = rest.find(':')?;
+        let v = rest[c + 1..]
+            .trim_start()
+            .split([',', '}', '\n'])
+            .next()?
+            .trim();
+        v.parse::<f32>().ok().filter(|n| n.is_finite())
+    }
+
     /// The `#RRGGBB` value of `key`, or None when the key is absent or malformed.
     pub fn hex(&self, key: &str) -> Option<[u8; 3]> {
         let text = self.text.as_ref()?;
