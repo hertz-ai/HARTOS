@@ -728,6 +728,14 @@ pub enum Component {
     Omnibox,
     Taskbar,
     HomeCard,
+    /// A card rail, carrying WHICH row it is.
+    ///
+    /// The index is not decoration: a wheel event has to reach the row under the pointer,
+    /// and the tree is the only thing that knows where the rows are. Deriving it from
+    /// geometry outside the layout would be a second copy of everything the layout
+    /// decides, which is the mistake that left `EDGE_PAD` at a value belonging to neither
+    /// of its two jobs. It does not affect the budget key: every row is `home-row`.
+    HomeRow(usize),
 }
 
 impl Component {
@@ -745,6 +753,17 @@ impl Component {
             Component::Omnibox => crate::latency::Surface::Omnibox,
             Component::Taskbar => crate::latency::Surface::Taskbar,
             Component::HomeCard => crate::latency::Surface::HomeCard,
+            Component::HomeRow(_) => crate::latency::Surface::HomeRow,
+        }
+    }
+
+    /// The row index, for a component that is a row. `None` for everything else, which is
+    /// what makes "scroll the thing under the pointer" a total function rather than a
+    /// guess: a wheel over the top bar scrolls no row at all.
+    pub fn row_index(self) -> Option<usize> {
+        match self {
+            Component::HomeRow(i) => Some(i),
+            _ => None,
         }
     }
 }
@@ -974,6 +993,12 @@ impl SceneNode {
             // bare desktop, which has no budget row and must not borrow one.
             _ => {}
         }
+    }
+
+    /// Which card row a point is over, if any. One walk, the same deepest-wins rule as
+    /// `component_at`, and no geometry duplicated outside the layout that placed it.
+    pub fn row_at(&self, px: f32, py: f32) -> Option<usize> {
+        self.component_at(px, py).and_then(Component::row_index)
     }
 
     /// The index, in `flatten` paint order, of the leaf that must paint its HOVER state
@@ -1714,8 +1739,13 @@ pub fn layout_home(
         // and its cards' progress fills (.hh-row-note and .hh-card-prog both read
         // --hh-acc). Without it every row was teal and a stack of them read flat.
         let row_accent = theme.row_accent(row.accent.as_deref(), row_index);
+        // `.hh-row` is a real element in the shell and the budget table has a `home-row`
+        // entry for it; the native scene had neither, so every part of a row was a
+        // root-level leaf and a wheel event had nothing to land on. Collecting them is
+        // what lets a scroll find its row without re-deriving the layout's geometry.
+        let mut row_children: Vec<SceneNode> = Vec::new();
         let label_w = measure.text_width(&row.title, ROW_LABEL_PX);
-        root.push(SceneNode::Text {
+        row_children.push(SceneNode::Text {
             rect: Rect::new(content.x, cursor_y, label_w.ceil() + 2.0, ROW_LABEL_H),
             text: row.title.clone(),
             size_px: ROW_LABEL_PX,
@@ -1726,7 +1756,7 @@ pub fn layout_home(
             let note_w = measure.text_width(note, ROW_NOTE_PX);
             let note_x = content.x + label_w + ROW_HEAD_GAP;
             if note_x + note_w <= content.right() {
-                root.push(SceneNode::Text {
+                row_children.push(SceneNode::Text {
                     rect: Rect::new(note_x, cursor_y, note_w.ceil() + 2.0, ROW_LABEL_H),
                     text: note.clone(),
                     size_px: ROW_NOTE_PX,
@@ -1741,7 +1771,7 @@ pub fn layout_home(
             // Only if it clears the label (and any note): a cramped row drops the
             // affordance rather than overlapping the text it belongs to.
             if see_x > content.x + label_w + ROW_HEAD_GAP {
-                root.push(SceneNode::Text {
+                row_children.push(SceneNode::Text {
                     rect: Rect::new(see_x, cursor_y, see_w.ceil() + 2.0, ROW_LABEL_H),
                     text: SEE_ALL.to_string(),
                     size_px: ROW_NOTE_PX,
@@ -1968,7 +1998,7 @@ pub fn layout_home(
                     });
                 }
             }
-            root.push(SceneNode::Container {
+            row_children.push(SceneNode::Container {
                 rect: cr,
                 // A card is the one thing on this desktop the cursor reacts to, and the
                 // background rect pushed FIRST above is what the hover lifts.
@@ -1978,6 +2008,15 @@ pub fn layout_home(
             });
             card_x += CARD_W + CARD_GAP;
         }
+        // The band the wheel lands on: the row's own strip, header included, spanning the
+        // content width. Not interactive, because a row is not a hover target in the
+        // shell either; its CARDS are, and they are its children.
+        root.push(SceneNode::Container {
+            rect: Rect::new(content.x, cursor_y, content.w, row_block_h),
+            interactive: false,
+            component: Some(Component::HomeRow(row_index)),
+            children: row_children,
+        });
         cursor_y += row_block_h + ROW_GAP;
     }
 
@@ -2307,8 +2346,10 @@ mod tests {
         let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         // The large orb (compact=false) sits in the right portion of the content band.
         let mut orb_x = None;
-        if let SceneNode::Container { children, .. } = &root {
-            for c in children {
+        {
+            let mut all: Vec<&SceneNode> = Vec::new();
+            walk_groups(&root, &mut all);
+            for c in all {
                 if let SceneNode::OrbSlot { rect, compact: false } = c {
                     orb_x = Some(rect.x);
                 }
@@ -2335,8 +2376,10 @@ mod tests {
             }
         }
         // Only assert on content-band text (skip the omnibox placeholder in the bar).
-        if let SceneNode::Container { children, .. } = &root {
-            for c in children {
+        {
+            let mut all: Vec<&SceneNode> = Vec::new();
+            walk_groups(&root, &mut all);
+            for c in all {
                 if c.rect().y >= TOP_BAR_H {
                     assert_within(c, bottom);
                 }
@@ -2388,8 +2431,10 @@ mod tests {
         }
         // And a card's hover index addresses that card's own background in THAT space.
         let mut card = None;
-        if let SceneNode::Container { children, .. } = &root {
-            for c in children {
+        {
+            let mut all: Vec<&SceneNode> = Vec::new();
+            walk_groups(&root, &mut all);
+            for c in all {
                 if let SceneNode::Container {
                     rect,
                     interactive: true,
@@ -2538,9 +2583,12 @@ mod tests {
         assert_eq!(note_color, Some(magenta), "the note takes the ROW's accent");
 
         // And the progress FILL in that row, which is the other thing --hh-acc paints.
-        let fills: Vec<Color> = if let SceneNode::Container { children, .. } = &root {
-            children
+        let mut groups: Vec<&SceneNode> = Vec::new();
+        walk_groups(&root, &mut groups);
+        let fills: Vec<Color> = {
+            groups
                 .iter()
+                .copied()
                 .filter_map(|c| match c {
                     SceneNode::Container {
                         interactive: true,
@@ -2557,8 +2605,6 @@ mod tests {
                     _ => None,
                 })
                 .collect()
-        } else {
-            Vec::new()
         };
         assert!(!fills.is_empty(), "the sample has a progress fill");
         assert!(fills.iter().all(|c| *c == magenta), "fills take the row accent");
@@ -2623,8 +2669,10 @@ mod tests {
         // Both runs live in the top bar, in reading order.
         let mut hart = None;
         let mut os = None;
-        if let SceneNode::Container { children, .. } = &root {
-            for c in children {
+        {
+            let mut all: Vec<&SceneNode> = Vec::new();
+            walk_groups(&root, &mut all);
+            for c in all {
                 if let SceneNode::Container { rect, children, .. } = c {
                     if rect.y != 0.0 {
                         continue;
@@ -2656,8 +2704,10 @@ mod tests {
         assert!(o.w >= MonoMeasure.text_width("OS", WORDMARK_PX));
         // The two-tone treatment: the runs carry the two BRAND hues, not the bar ink.
         let mut colors = Vec::new();
-        if let SceneNode::Container { children, .. } = &root {
-            for c in children {
+        {
+            let mut all: Vec<&SceneNode> = Vec::new();
+            walk_groups(&root, &mut all);
+            for c in all {
                 if let SceneNode::Container { rect, children, .. } = c {
                     if rect.y != 0.0 {
                         continue;
@@ -2828,8 +2878,10 @@ mod tests {
         let root = layout_home(1600.0, 900.0, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         // The first card in the sample has both; the second has neither.
         let mut cards: Vec<Vec<SceneNode>> = Vec::new();
-        if let SceneNode::Container { children, .. } = &root {
-            for c in children {
+        {
+            let mut all: Vec<&SceneNode> = Vec::new();
+            walk_groups(&root, &mut all);
+            for c in all {
                 if let SceneNode::Container {
                     interactive: true,
                     children,
@@ -2900,22 +2952,47 @@ mod tests {
         assert_eq!(bars2, 0, "no progress in the payload means no bar");
     }
 
+
+    /// Every Container in the tree, so a test can find a card group without knowing how
+    /// deep the layout nested it. Cards used to be root's direct children and now sit
+    /// inside their row's group, which is what `.hh-row` is in the shell.
+    fn walk_groups<'a>(node: &'a SceneNode, out: &mut Vec<&'a SceneNode>) {
+        if let SceneNode::Container { children, .. } = node {
+            for c in children {
+                out.push(c);
+                walk_groups(c, out);
+            }
+        }
+    }
+
     /// The leaves of the first card laid out from `hc`.
     fn first_card(hc: &HomeCompose) -> Vec<SceneNode> {
         let root = layout_home(1600.0, 900.0, hc, &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
-        if let SceneNode::Container { children, .. } = &root {
+        first_interactive(&root).expect("no card laid out")
+    }
+
+    /// The children of the first INTERACTIVE group, wherever it sits in the tree.
+    ///
+    /// Depth-agnostic on purpose: cards used to be root's direct children and are now
+    /// inside their row's group, which is what `.hh-row` is in the shell. A helper that
+    /// pins depth fails on every regrouping without anything being wrong.
+    fn first_interactive(node: &SceneNode) -> Option<Vec<SceneNode>> {
+        if let SceneNode::Container {
+            interactive,
+            children,
+            ..
+        } = node
+        {
+            if *interactive {
+                return Some(children.clone());
+            }
             for c in children {
-                if let SceneNode::Container {
-                    interactive: true,
-                    children,
-                    ..
-                } = c
-                {
-                    return children.clone();
+                if let Some(found) = first_interactive(c) {
+                    return Some(found);
                 }
             }
         }
-        panic!("no card laid out")
+        None
     }
 
     /// A measure that claims the Material face, so the icon path can be exercised
@@ -2953,8 +3030,10 @@ mod tests {
 
         // The orb-sm is inboard of the avatar now, which is where the shell puts it.
         let mut orb_sm_x = None;
-        if let SceneNode::Container { children, .. } = &root {
-            for c in children {
+        {
+            let mut all: Vec<&SceneNode> = Vec::new();
+            walk_groups(&root, &mut all);
+            for c in all {
                 if let SceneNode::Container { children, .. } = c {
                     for n in children {
                         if let SceneNode::OrbSlot { rect, compact: true } = n {
@@ -3057,8 +3136,10 @@ mod tests {
         let root = layout_home(1600.0, 900.0, &sample(), &theme, &RowScroll::default(), &mut MonoMeasure);
         // The sample's SECOND row is the ranked one.
         let mut rows: Vec<Vec<SceneNode>> = Vec::new();
-        if let SceneNode::Container { children, .. } = &root {
-            for c in children {
+        {
+            let mut all: Vec<&SceneNode> = Vec::new();
+            walk_groups(&root, &mut all);
+            for c in all {
                 if let SceneNode::Container {
                     interactive: true,
                     children,
@@ -3342,18 +3423,57 @@ mod tests {
         );
 
         // A card, found through the tree rather than by guessing at its geometry.
-        let card = match &root {
-            SceneNode::Container { children, .. } => children
-                .iter()
-                .find(|c| matches!(c, SceneNode::Container { interactive: true, .. }))
-                .map(|c| c.rect())
-                .expect("a card was laid out"),
-            _ => unreachable!("the root is a container"),
-        };
+        let mut groups: Vec<&SceneNode> = Vec::new();
+        walk_groups(&root, &mut groups);
+        let card = groups
+            .iter()
+            .find(|c| matches!(c, SceneNode::Container { interactive: true, .. }))
+            .map(|c| c.rect())
+            .expect("a card was laid out");
         assert_eq!(
             root.component_at(card.x + card.w * 0.5, card.y + card.h * 0.5),
-            Some(Component::HomeCard)
+            Some(Component::HomeCard),
+            "deepest wins: a card inside a row names the CARD"
         );
+        // And the row band around it names the row, carrying its index so a wheel event
+        // can reach it. A point on the row's header is over the row and over no card.
+        let row = groups
+            .iter()
+            .find_map(|c| match c {
+                SceneNode::Container {
+                    component: Some(Component::HomeRow(i)),
+                    rect,
+                    ..
+                } => Some((*i, *rect)),
+                _ => None,
+            })
+            .expect("a row band was laid out");
+        // EVERY row carries its OWN index. A band that always said 0 would send every
+        // wheel event to the first row, which is the failure a single-row check misses.
+        let indices: Vec<usize> = groups
+            .iter()
+            .filter_map(|c| match c {
+                SceneNode::Container {
+                    component: Some(Component::HomeRow(i)),
+                    ..
+                } => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert!(indices.len() >= 2, "the sample lays out more than one row");
+        assert_eq!(
+            indices,
+            (0..indices.len()).collect::<Vec<_>>(),
+            "row bands carry 0, 1, 2 in order"
+        );
+        assert_eq!(row.0, 0, "the first row is index 0");
+        assert_eq!(
+            root.component_at(row.1.right() - 2.0, row.1.y + 2.0),
+            Some(Component::HomeRow(0)),
+            "the row's own band names the row"
+        );
+        assert_eq!(root.row_at(card.x + card.w * 0.5, card.y + card.h * 0.5), None,
+                   "a point on a CARD is not a scroll target for the row");
 
         // The orb is a LEAF, not a group: OrbSlot already is the orb, so it names itself
         // without a container wrapped around it saying the same thing twice.
@@ -4008,8 +4128,10 @@ mod tests {
         let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         // Find a card: the interactive group layout_home emits once per card.
         let mut card = None;
-        if let SceneNode::Container { children, .. } = &root {
-            for c in children {
+        {
+            let mut all: Vec<&SceneNode> = Vec::new();
+            walk_groups(&root, &mut all);
+            for c in all {
                 if let SceneNode::Container {
                     rect,
                     interactive: true,
@@ -4070,8 +4192,10 @@ mod tests {
         let root = layout_home(w, h, &sample(), &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         // The large home orb's centre must energise the orb.
         let mut orb_centre = None;
-        if let SceneNode::Container { children, .. } = &root {
-            for c in children {
+        {
+            let mut all: Vec<&SceneNode> = Vec::new();
+            walk_groups(&root, &mut all);
+            for c in all {
                 if let SceneNode::OrbSlot { rect, compact: false } = c {
                     orb_centre = Some((rect.x + rect.w * 0.5, rect.y + rect.h * 0.5));
                 }

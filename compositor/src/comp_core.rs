@@ -4911,20 +4911,30 @@ mod native_render_tests {
             &crate::scene::RowScroll::default(),
             &mut rasterizer,
         );
-        let mut card = None;
-        if let crate::scene::SceneNode::Container { children, .. } = &tree {
-            for c in children {
-                if let crate::scene::SceneNode::Container {
-                    rect,
-                    interactive: true,
-                    ..
-                } = c
-                {
-                    card = Some((rect.x + rect.w * 0.5, rect.y + rect.h * 0.5));
-                    break;
+        // Depth-agnostic: cards sit inside their ROW's group now, which is what
+        // `.hh-row` is in the shell, so a walk that only looked at root's children
+        // found none. A test that pins tree depth fails on every regrouping without
+        // anything actually being wrong.
+        fn first_card_centre(node: &crate::scene::SceneNode) -> Option<(f32, f32)> {
+            if let crate::scene::SceneNode::Container {
+                rect,
+                interactive,
+                children,
+                ..
+            } = node
+            {
+                if *interactive {
+                    return Some((rect.x + rect.w * 0.5, rect.y + rect.h * 0.5));
+                }
+                for c in children {
+                    if let Some(found) = first_card_centre(c) {
+                        return Some(found);
+                    }
                 }
             }
+            None
         }
+        let card = first_card_centre(&tree);
         let centre = card.expect("the demo home lays out cards");
         // The hover point must actually LAND on that card, or the two lowerings below
         // would both be unhovered and compare equal for the wrong reason.

@@ -159,6 +159,7 @@ pub enum Surface {
     Omnibox,
     Taskbar,
     HomeCard,
+    HomeRow,
 }
 
 impl Surface {
@@ -172,9 +173,10 @@ impl Surface {
             Surface::Omnibox => "omnibox",
             Surface::Taskbar => "taskbar",
             Surface::HomeCard => "home-card",
+            Surface::HomeRow => "home-row",
         }
     }
-    const ALL: [Surface; 7] = [
+    const ALL: [Surface; 8] = [
         Surface::Shell,
         Surface::WorkspaceSwitch,
         Surface::Orb,
@@ -182,6 +184,7 @@ impl Surface {
         Surface::Omnibox,
         Surface::Taskbar,
         Surface::HomeCard,
+        Surface::HomeRow,
     ];
     fn idx(self) -> usize {
         match self {
@@ -192,6 +195,7 @@ impl Surface {
             Surface::Omnibox => 4,
             Surface::Taskbar => 5,
             Surface::HomeCard => 6,
+            Surface::HomeRow => 7,
         }
     }
 }
@@ -264,7 +268,7 @@ pub struct LatencyCore {
     /// [surface][kind]. Forty-two fixed buckets, allocated once and reused: an input
     /// rate this cannot cover does not exist, and a map would put an allocation on the
     /// input path for no benefit.
-    window: [[Vec<u64>; 6]; 7],
+    window: [[Vec<u64>; 6]; 8],
 }
 
 impl LatencyCore {
@@ -787,7 +791,7 @@ mod tests {
         assert_eq!(
             labels,
             ["shell", "workspace-switch", "orb", "top-bar", "omnibox", "taskbar",
-             "home-card"]
+             "home-card", "home-row"]
         );
         for (i, a) in labels.iter().enumerate() {
             assert!(!a.is_empty() && !a.contains(' '), "{a:?} is not a bare slug");
@@ -797,7 +801,7 @@ mod tests {
         }
         // The index each one buckets under must be unique and in range, since the window
         // is a fixed array rather than a map.
-        let mut seen = [false; 7];
+        let mut seen = [false; 8];
         for s in Surface::ALL {
             assert!(!seen[s.idx()], "two surfaces share bucket {}", s.idx());
             seen[s.idx()] = true;

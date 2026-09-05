@@ -214,8 +214,12 @@ def _component_keys():
         r"pub fn surface\(self\) -> crate::latency::Surface \{(.*?)\n    \}",
         scene, re.S)
     assert block, "scene.rs no longer maps Component into latency::Surface"
-    variants = re.findall(r"Component::\w+ => crate::latency::Surface::(\w+)",
-                          block.group(1))
+    # `(?:\(\w+\))?` because a variant may carry a payload: `Component::HomeRow(_)`
+    # is a row plus its index. Without it the arm reads as absent, which is how this
+    # guard first reported the row surface as unmapped rather than unreadable.
+    variants = re.findall(
+        r"Component::\w+(?:\(\w+\))? => crate::latency::Surface::(\w+)",
+        block.group(1))
     assert variants, "the Component-to-Surface mapping names nothing"
 
     latency = open(os.path.join(REPO, "compositor", "src", "latency.rs"),
@@ -266,7 +270,8 @@ def test_the_attributable_components_are_the_ones_the_native_shell_draws():
     demonstrated delta rather than a claim.
     """
     keys = set(_component_keys())
-    assert keys == {"orb", "top-bar", "omnibox", "taskbar", "home-card"}, (
+    assert keys == {"orb", "top-bar", "omnibox", "taskbar", "home-card",
+                    "home-row"}, (
         "the set of attributable native surfaces changed: %s. That is allowed, "
         "but a new one must be a surface the native scene actually DRAWS and "
         "must have a row in latency_budgets.json." % sorted(keys))
