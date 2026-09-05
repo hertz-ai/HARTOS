@@ -761,3 +761,55 @@ def test_high_contrast_reaches_the_native_chrome_with_the_shells_own_literals():
         "the compositor no longer reads high_contrast")
     assert "with_high_contrast" in comp and "with_high_contrast" in scene, (
         "the contrast fold is not wired into the theme resolution")
+
+def test_the_native_chrome_uses_the_shells_own_no_blur_floor_gradient():
+    """The native path has no backdrop-filter, permanently, so the shell's
+    no-blur floor is its spec rather than the blurred `.glass` above it.
+
+    hartResponsive.css spells that floor out with two real-HW bugs recorded
+    beside it: a flat colourless grey "read MONOCHROMATIC" (2026-07-12) and
+    translucent edges let the home bleed through into "cluttered/overlap"
+    (2026-07-15). The native strips were a flat colourless dark at 72% alpha,
+    which is both of those at once. Pin the literals, because they are literals
+    and a native copy of them drifts silently.
+    """
+    css = open(os.path.join(REPO, "integrations", "agent_engine", "static",
+                            "hartResponsive.css"), encoding="utf-8").read()
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    m = re.search(
+        r"body\.webkit-flat[^{]*\{[^}]*?background:\s*linear-gradient\(\s*"
+        r"(\d+)deg,\s*rgba\(([\d, .]+)\),\s*rgba\(([\d, .]+)\)\s*(\d+)%,\s*"
+        r"rgba\(([\d, .]+)\)\s*\)", css, re.S)
+    assert m, (
+        "hartResponsive.css no longer carries the flat-floor chrome gradient, or "
+        "it is no longer a three-stop linear-gradient the compositor can mirror")
+    angle, first, second, at, third = m.groups()
+
+    def rgba_bits(text):
+        parts = [p.strip() for p in text.split(",")]
+        return [int(float(parts[0])), int(float(parts[1])), int(float(parts[2])),
+                float(parts[3])]
+
+    # Anchored on the multi-line INITIALISER, not `pub chrome_fill: [Color; 3],`:
+    # the field declaration matches a looser pattern and captures "Color; 3", which
+    # then reports "zero stops" about a literal it never looked at.
+    block = re.search(r"chrome_fill: \[\n(.*?)\n\s*\],\n", scene, re.S)
+    assert block, "scene.rs no longer declares a chrome_fill triple"
+    stops = re.findall(r"Color::rgba\(\s*([\d.]+) / 255\.0,\s*([\d.]+) / 255\.0,"
+                       r"\s*([\d.]+) / 255\.0,\s*([\d.]+),?\s*\)", block.group(1))
+    assert len(stops) == 3, "the chrome fill must be three stops, got %d" % len(stops)
+
+    for got, want_text, which in zip(stops, (first, second, third),
+                                     ("first", "middle", "last")):
+        want = rgba_bits(want_text)
+        have = [int(float(got[0])), int(float(got[1])), int(float(got[2])),
+                float(got[3])]
+        assert have == want, (
+            "the %s chrome stop is %s and the shell's floor is %s"
+            % (which, have, want))
+
+    assert "chrome_fill_at: %s," % (int(at) / 100.0) in scene, (
+        "the middle stop sits at %s%% in the shell" % at)
+    assert "chrome_fill_angle: %s.0," % angle in scene, (
+        "the shell's floor gradient runs at %sdeg" % angle)

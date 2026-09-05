@@ -417,7 +417,16 @@ impl OrbCache {
 /// clockwise, so 135 runs top-left to bottom-right. The gradient line is centred on the
 /// tile and its length is `|w*sin| + |h*cos|`, which is what makes the last stop land
 /// exactly on the far corner rather than short of it.
-fn rounded_rect_rgba(w: u32, h: u32, radius: f32, from: [f32; 4], to: [f32; 4], angle_deg: f32) -> Vec<u8> {
+fn rounded_rect_rgba(
+    w: u32,
+    h: u32,
+    radius: f32,
+    from: [f32; 4],
+    mid: [f32; 4],
+    mid_at: f32,
+    to: [f32; 4],
+    angle_deg: f32,
+) -> Vec<u8> {
     let mut rgba = vec![0u8; (w * h * 4) as usize];
     let hw = w as f32 / 2.0;
     let hh = h as f32 / 2.0;
@@ -452,7 +461,21 @@ fn rounded_rect_rgba(w: u32, h: u32, radius: f32, from: [f32; 4], to: [f32; 4], 
             } else {
                 ((px * dx + py * dy) * inv_len + 0.5).clamp(0.0, 1.0)
             };
-            let ch = |i: usize| (from[i] + (to[i] - from[i]) * t).clamp(0.0, 1.0);
+            // Three stops, because the shell's own no-blur floor is a three-stop ramp
+            // (teal leads, violet accents) and a two-stop copy of it loses the accent.
+            // A TWO-stop gradient is this with `mid` on the line between the ends, so
+            // there is one ramp here and not a second code path for the simpler case.
+            let ch = |i: usize| {
+                let v = if t <= mid_at {
+                    let k = if mid_at > 0.0 { t / mid_at } else { 0.0 };
+                    from[i] + (mid[i] - from[i]) * k
+                } else {
+                    let span = (1.0 - mid_at).max(f32::EPSILON);
+                    let k = (t - mid_at) / span;
+                    mid[i] + (to[i] - mid[i]) * k
+                };
+                v.clamp(0.0, 1.0)
+            };
             let a = ch(3) * cov;
             let idx = ((y * w + x) * 4) as usize;
             rgba[idx] = (ch(2) * a * 255.0) as u8;
@@ -477,7 +500,7 @@ pub struct RectCache {
     /// given output, not a set that grows with what the agent writes.
     #[allow(clippy::type_complexity)]
     cache: std::collections::HashMap<
-        (u32, u32, u32, [u32; 4], [u32; 4], u32),
+        (u32, u32, u32, [u32; 4], [u32; 4], u32, [u32; 4], u32),
         MemoryRenderBuffer,
     >,
     /// POOL for the sharp-rect path. The first cut built a `SolidColorBuffer` per rect per
@@ -535,7 +558,7 @@ impl RectCache {
     ) -> Option<&MemoryRenderBuffer> {
         // A flat fill is the degenerate gradient, so it goes through the same tile: one
         // rasterizer, one cache, one compose-once counter.
-        self.tile(w, h, radius, color, color, 0.0)
+        self.tile(w, h, radius, color, color, 0.5, color, 0.0)
     }
 
     /// The card-art buffer: the same rounded tile, filled with the scene's two-stop
@@ -550,16 +573,42 @@ impl RectCache {
         to: [f32; 4],
         angle_deg: f32,
     ) -> Option<&MemoryRenderBuffer> {
-        self.tile(w, h, radius, from, to, angle_deg)
+        // Two stops is three with the middle ON the line between the ends, which is
+        // exactly the ramp it already was: same pixels, no second path.
+        let mid = [
+            (from[0] + to[0]) * 0.5,
+            (from[1] + to[1]) * 0.5,
+            (from[2] + to[2]) * 0.5,
+            (from[3] + to[3]) * 0.5,
+        ];
+        self.tile(w, h, radius, from, mid, 0.5, to, angle_deg)
+    }
+
+    /// A THREE-stop tile, for the one place the shell uses one: its no-blur chrome floor.
+    pub fn gradient3(
+        &mut self,
+        w: i32,
+        h: i32,
+        radius: f32,
+        from: [f32; 4],
+        mid: [f32; 4],
+        mid_at: f32,
+        to: [f32; 4],
+        angle_deg: f32,
+    ) -> Option<&MemoryRenderBuffer> {
+        self.tile(w, h, radius, from, mid, mid_at, to, angle_deg)
     }
 
     /// The one composed-tile path behind `rounded` and `gradient`.
+    #[allow(clippy::too_many_arguments)]
     fn tile(
         &mut self,
         w: i32,
         h: i32,
         radius: f32,
         from: [f32; 4],
+        mid: [f32; 4],
+        mid_at: f32,
         to: [f32; 4],
         angle_deg: f32,
     ) -> Option<&MemoryRenderBuffer> {
@@ -569,12 +618,14 @@ impl RectCache {
         let bits = |c: [f32; 4]| [c[0].to_bits(), c[1].to_bits(), c[2].to_bits(), c[3].to_bits()];
         // A solid tile keys its angle as zero whatever was passed, so the same colour at
         // two angles is one buffer rather than two identical ones.
-        let angle_key = if from == to { 0.0f32 } else { angle_deg };
+        let angle_key = if from == to && mid == to { 0.0f32 } else { angle_deg };
         let key = (
             w as u32,
             h as u32,
             radius.to_bits(),
             bits(from),
+            bits(mid),
+            mid_at.to_bits(),
             bits(to),
             angle_key.to_bits(),
         );
@@ -590,7 +641,8 @@ impl RectCache {
         match cache.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
             std::collections::hash_map::Entry::Vacant(e) => {
-                let rgba = rounded_rect_rgba(w as u32, h as u32, radius, from, to, angle_deg);
+                let rgba =
+                rounded_rect_rgba(w as u32, h as u32, radius, from, mid, mid_at, to, angle_deg);
                 *rounded_composes += 1;
                 Some(e.insert(MemoryRenderBuffer::from_slice(
                     &rgba,
@@ -2844,9 +2896,11 @@ where
                     Err(err) => warn!(?err, "native scene: text run import failed"),
                 }
             }
-            crate::scene::SceneNode::Art {
+            crate::scene::SceneNode::Fill {
                 rect,
                 from,
+                mid,
+                mid_at,
                 to,
                 angle_deg,
                 radius,
@@ -2862,19 +2916,22 @@ where
                 // Hovering an art tile lifts BOTH stops, so the whole tile brightens by the
                 // same amount and the gradient keeps its shape. This is the ranked card's
                 // only hover state, its background being transparent by design.
-                let (from, to) = if hover_leaf == Some(idx) {
+                let (from, mid, to) = if hover_leaf == Some(idx) {
                     (
                         from.lift(crate::scene::CARD_HOVER_LIFT),
+                        mid.lift(crate::scene::CARD_HOVER_LIFT),
                         to.lift(crate::scene::CARD_HOVER_LIFT),
                     )
                 } else {
-                    (*from, *to)
+                    (*from, *mid, *to)
                 };
-                if let Some(buffer) = rect_cache.gradient(
+                if let Some(buffer) = rect_cache.gradient3(
                     rect.w as i32,
                     rect.h as i32,
                     *radius,
                     [from.r, from.g, from.b, from.a],
+                    [mid.r, mid.g, mid.b, mid.a],
+                    *mid_at,
                     [to.r, to.g, to.b, to.a],
                     *angle_deg,
                 ) {
@@ -4125,6 +4182,17 @@ mod tests {
         assert!(FADE_IN_MS > 0 && FADE_IN_MS <= 500, "map fade should be a short ramp");
     }
 
+    /// The stop halfway between two, which is what a TWO-stop gradient's middle is.
+    /// Written out here so the two-stop tests read as two-stop tests.
+    fn mid_of(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+        [
+            (a[0] + b[0]) * 0.5,
+            (a[1] + b[1]) * 0.5,
+            (a[2] + b[2]) * 0.5,
+            (a[3] + b[3]) * 0.5,
+        ]
+    }
+
     #[test]
     fn rounded_rect_cuts_corners_and_fills_the_centre() {
         // A 12px radius on a 40x40 box: the exact corner pixel is outside the arc and
@@ -4133,14 +4201,14 @@ mod tests {
         // express, so it is the reason rounded rects lower through a buffer.
         let (w, h) = (40u32, 40u32);
         let white = [1.0, 1.0, 1.0, 1.0];
-        let rgba = rounded_rect_rgba(w, h, 12.0, white, white, 0.0);
+        let rgba = rounded_rect_rgba(w, h, 12.0, white, mid_of(white, white), 0.5, white, 0.0);
         assert_eq!(rgba.len(), (w * h * 4) as usize);
         let alpha_at = |x: u32, y: u32| rgba[((y * w + x) * 4 + 3) as usize];
         assert_eq!(alpha_at(0, 0), 0, "top-left corner must be cut away");
         assert!(alpha_at(w / 2, h / 2) > 250, "centre must be opaque");
         assert!(alpha_at(w / 2, 0) > 250, "the straight top edge must be covered");
         // A zero radius is a plain filled rect: the corner is now covered too.
-        let sharp = rounded_rect_rgba(w, h, 0.0, white, white, 0.0);
+        let sharp = rounded_rect_rgba(w, h, 0.0, white, mid_of(white, white), 0.5, white, 0.0);
         assert!(sharp[3] > 250, "radius 0 fills the corner");
     }
 
@@ -4230,7 +4298,9 @@ mod tests {
         let bar = leaves
             .iter()
             .find_map(|n| match n {
-                crate::scene::SceneNode::Rect { rect, .. }
+                // The strip is a Fill, not a Rect: the shell's no-blur chrome floor is a
+                // three-stop ramp, so the native strips are gradient tiles.
+                crate::scene::SceneNode::Fill { rect, .. }
                     if rect.x == 0.0 && rect.y == 0.0 && rect.w == 1920.0 =>
                 {
                     Some(*rect)
@@ -4475,7 +4545,7 @@ mod tests {
         let black = [0.0, 0.0, 0.0, 1.0];
         let red = [1.0, 0.0, 0.0, 1.0];
         // 180deg points straight DOWN the tile, so t runs with y and the probe is exact.
-        let g = rounded_rect_rgba(w, h, 0.0, black, red, 180.0);
+        let g = rounded_rect_rgba(w, h, 0.0, black, mid_of(black, red), 0.5, red, 180.0);
         let red_at = |buf: &[u8], x: u32, y: u32| buf[((y * w + x) * 4 + 2) as usize];
         let top = red_at(&g, w / 2, 1);
         let bottom = red_at(&g, w / 2, h - 2);
@@ -4483,14 +4553,14 @@ mod tests {
         assert!(bottom > 239, "the far end must have reached the TO colour");
         assert!(bottom > top, "the fill must ramp from `from` to `to`, not average them");
         // 0deg is the same line reversed, so the ramp must invert rather than repeat.
-        let up = rounded_rect_rgba(w, h, 0.0, black, red, 0.0);
+        let up = rounded_rect_rgba(w, h, 0.0, black, mid_of(black, red), 0.5, red, 0.0);
         assert!(
             red_at(&up, w / 2, 1) > red_at(&up, w / 2, h - 2),
             "the angle must actually steer the gradient"
         );
         // A solid tile is the degenerate case and must stay perfectly flat, whatever
         // angle it is handed: that is what lets `rounded` share this one rasterizer.
-        let flat = rounded_rect_rgba(w, h, 0.0, red, red, 135.0);
+        let flat = rounded_rect_rgba(w, h, 0.0, red, mid_of(red, red), 0.5, red, 135.0);
         assert_eq!(
             red_at(&flat, 1, 1),
             red_at(&flat, w - 2, h - 2),

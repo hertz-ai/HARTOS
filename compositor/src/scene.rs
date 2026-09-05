@@ -238,6 +238,23 @@ pub struct Theme {
     /// How thick that rule is. 1px normally; `html.a11y-contrast .glass` doubles it, which
     /// is the whole reason this is not the `CHROME_RULE` constant it started as.
     pub chrome_rule_px: f32,
+    /// The three stops the chrome strips are filled with, and where the middle sits.
+    ///
+    /// The shell's `.glass` is a translucent white over a `backdrop-filter: blur`. The
+    /// native path has NO blur, so copying that alpha would put unreadable chrome over
+    /// the aurora. The shell already has a floor for exactly this case,
+    /// `body.webkit-flat` / `body.gpu-software`, whose own comment says why: "cairo
+    /// cannot paint backdrop-filter, so the frosted brand colour collapsed to grey".
+    /// That floor is the native path's PERMANENT situation, so its value is the spec.
+    ///
+    /// It is a three-stop diagonal at 98.5%: teal leads, violet accents. Both halves of
+    /// that carry a real-HW bug: a flat colourless grey "read MONOCHROMATIC" (2026-07-12)
+    /// and translucent edges let the home bleed through into "cluttered/overlap"
+    /// (2026-07-15). The native chrome was a flat colourless dark at 72%, which is both
+    /// of those at once.
+    pub chrome_fill: [Color; 3],
+    pub chrome_fill_at: f32,
+    pub chrome_fill_angle: f32,
 }
 
 /// The spectrum names, positionally matched to `Theme::spectrum`.
@@ -386,6 +403,16 @@ impl Theme {
             // theme file here is the same situation, so it takes the same value.
             chrome_border: Color::rgba(0.0, 230.0 / 255.0, 195.0 / 255.0, 0.18),
             chrome_rule_px: CHROME_RULE,
+            // hartResponsive.css's flat-floor literals, verbatim:
+            // linear-gradient(155deg, rgba(7,29,26,.985), rgba(20,22,32,.985) 46%,
+            //                 rgba(25,16,37,.985))
+            chrome_fill: [
+                Color::rgba(7.0 / 255.0, 29.0 / 255.0, 26.0 / 255.0, 0.985),
+                Color::rgba(20.0 / 255.0, 22.0 / 255.0, 32.0 / 255.0, 0.985),
+                Color::rgba(25.0 / 255.0, 16.0 / 255.0, 37.0 / 255.0, 0.985),
+            ],
+            chrome_fill_at: 0.46,
+            chrome_fill_angle: 155.0,
         }
     }
 
@@ -411,6 +438,11 @@ impl Theme {
         // pill carry their own backgrounds in the shell and are not `.glass`.
         self.bar_bg = glass;
         self.taskbar_bg = glass;
+        // A ramp is a legibility hazard under high contrast, and the shell agrees: its
+        // rule is a flat `background:#0a0a12`, which overrides the floor's gradient
+        // because the class is the later source. Three identical stops IS that flat fill
+        // through the same tile, rather than a second fill path for one case.
+        self.chrome_fill = [glass; 3];
         self.chrome_border = solid("#FFFFFF");
         let text = solid("#FFFFFF");
         self.bar_ink = text;
@@ -816,18 +848,30 @@ pub enum SceneNode {
         /// times and read zero is not a contract, it is weight.
         stroke: f32,
     },
-    /// A card's art tile: a two-stop linear gradient, plus the photo that belongs over it.
+    /// A GRADIENT-FILLED area, with the photo that belongs over it when there is one.
     ///
-    /// This replaced `Image { rect, source, radius }`, which was constructed at exactly one
+    /// Two users, and naming it for either would mislead about the other. `.hh-card-art`
+    /// is a brand gradient with an optional `<img>` fading in on top; the chrome strips'
+    /// no-blur floor is a three-stop diagonal with no picture at all. Both are "an element
+    /// whose background is a ramp", which is what this is. It was called `Art` while cards
+    /// were its only user, and a reader would reasonably have taken every one of these for
+    /// a card once the top bar became one too.
+    ///
+    /// It replaced `Image { rect, source, radius }`, which was constructed at exactly one
     /// site, lowered nowhere, and emitted ONLY when the payload named a picture. That is
     /// the wrong shape for what the shell draws: `.hh-card-art` is always present, its
     /// background is always the brand gradient, and the photo is an `<img>` that fades in
     /// on top. Modelling the picture as the tile meant a ranked card, whose own background
     /// is `transparent` because the art IS the card, rendered as nothing at all.
-    Art {
+    Fill {
         rect: Rect,
         /// The gradient's first stop, at the angle's start edge (the shell's `light`).
         from: Color,
+        /// The MIDDLE stop and where along the ramp it sits. Card art has two stops and
+        /// puts this on the line between the ends, which is the same ramp; the chrome
+        /// strips have a real third stop, because the shell's no-blur floor does.
+        mid: Color,
+        mid_at: f32,
         /// Its last stop (the shell's `dark`).
         to: Color,
         /// CSS gradient angle in degrees: 0 points UP the tile, increasing clockwise.
@@ -853,7 +897,7 @@ impl SceneNode {
             SceneNode::Container { rect, .. }
             | SceneNode::Rect { rect, .. }
             | SceneNode::Text { rect, .. }
-            | SceneNode::Art { rect, .. }
+            | SceneNode::Fill { rect, .. }
             | SceneNode::OrbSlot { rect, .. } => *rect,
         }
     }
@@ -1041,7 +1085,7 @@ impl SceneNode {
                 // satisfy this test, and lifting a transparent colour shows nothing.
                 let mut claiming = *interactive && rect.contains(px, py);
                 for child in children {
-                    if claiming && matches!(child, SceneNode::Rect { .. } | SceneNode::Art { .. })
+                    if claiming && matches!(child, SceneNode::Rect { .. } | SceneNode::Fill { .. })
                     {
                         *found = Some(*next);
                         claiming = false;
@@ -1347,6 +1391,24 @@ pub fn row_extents(home: &HomeCompose, output_w: f32, output_h: f32) -> Vec<(f32
         .collect()
 }
 
+/// The fill for a chrome strip: the shell's no-blur floor gradient, as an `Art` tile.
+///
+/// An `Art` node rather than a `Rect` because the fill is a RAMP, and the tile path
+/// already caches one compose per (size, stops) exactly as the backdrop does. A strip is
+/// one buffer for the life of a mode, so this is a blit per frame either way.
+fn chrome_fill_node(rect: Rect, theme: &Theme) -> SceneNode {
+    SceneNode::Fill {
+        rect,
+        from: theme.chrome_fill[0],
+        mid: theme.chrome_fill[1],
+        mid_at: theme.chrome_fill_at,
+        to: theme.chrome_fill[2],
+        angle_deg: theme.chrome_fill_angle,
+        radius: 0.0,
+        photo: None,
+    }
+}
+
 /// How wide a row's visible strip is on this output: the content band's width.
 ///
 /// Exposed so the input path can CLAMP a scroll without re-deriving the gutter. Deriving
@@ -1379,11 +1441,7 @@ pub fn layout_home(
 
     // ── Top bar (fixed, 40px): background, centre omnibox pill, right orb-sm. ──
     let bar = Rect::new(0.0, 0.0, output_w, theme.top_bar_h);
-    let mut bar_children = vec![SceneNode::Rect {
-        rect: bar,
-        color: theme.bar_bg,
-        radius: 0.0,
-    }];
+    let mut bar_children = vec![chrome_fill_node(bar, theme)];
     // ── Brand wordmark (P5, the shell's start-btn treatment): "HART" in the accent then
     //    "OS" in the second brand hue. Two runs, so the second must begin exactly where
     //    the first ends. This is the layout that was impossible before `TextMeasure`:
@@ -1871,9 +1929,14 @@ pub fn layout_home(
             };
             let (art_from, art_to, art_angle) =
                 theme.art_stops(row.accent.as_deref(), row_index, card_index);
-            card_children.push(SceneNode::Art {
+            card_children.push(SceneNode::Fill {
                 rect: ab,
                 from: art_from,
+                // Card art is TWO stops, so its middle sits on the line between the ends:
+                // the same ramp the two-stop tile always drew, said once here rather than
+                // as a second gradient path in the rasterizer.
+                mid: art_from.mix(art_to, 0.5),
+                mid_at: 0.5,
                 to: art_to,
                 angle_deg: art_angle,
                 radius: theme.card_radius,
@@ -2051,11 +2114,7 @@ pub fn layout_home(
         interactive: false,
         component: Some(Component::Taskbar),
         children: vec![
-            SceneNode::Rect {
-                rect: taskbar,
-                color: theme.taskbar_bg,
-                radius: 0.0,
-            },
+            chrome_fill_node(taskbar, theme),
             // `.taskbar { border-top: 1px solid var(--hart-glass-border) }`: the mirror of
             // the top bar's rule, on the edge that faces the desktop.
             SceneNode::Rect {
@@ -2418,8 +2477,9 @@ mod tests {
         root.flatten(&mut leaves);
         // No Container survives the flatten.
         assert!(leaves.iter().all(|n| !matches!(n, SceneNode::Container { .. })));
-        // First painted leaf is the top-bar background rect (back of the paint order).
-        assert!(matches!(leaves.first(), Some(SceneNode::Rect { rect, .. }) if rect.y == 0.0));
+        // First painted leaf is the top bar's own fill (back of the paint order). It is a
+        // Fill rather than a Rect because the shell's no-blur chrome floor is a ramp.
+        assert!(matches!(leaves.first(), Some(SceneNode::Fill { rect, .. }) if rect.y == 0.0));
         // Last painted leaf is the taskbar's 1px rule, which is drawn ON TOP of the strip
         // itself: `.taskbar { border-top: 1px solid var(--hart-glass-border) }` is the
         // edge that faces the desktop, so it is the front-most thing in the whole scene.
@@ -2427,7 +2487,7 @@ mod tests {
                          if (rect.h - CHROME_RULE).abs() < 0.01));
         // And the strip itself is right behind it.
         let strip = leaves[leaves.len() - 2];
-        assert!(matches!(strip, SceneNode::Rect { rect, .. }
+        assert!(matches!(strip, SceneNode::Fill { rect, .. }
                          if (rect.h - TASKBAR_H).abs() < 0.01));
         assert!(leaves.len() >= 6);
     }
@@ -2977,6 +3037,27 @@ mod tests {
     }
 
 
+    /// Every leaf inside a container tagged with `want`, so a test can say "the cards'
+    /// fills" rather than "every Fill node". The two stopped being the same thing when
+    /// the chrome strips became gradient fills too, and a test that counts node KINDS
+    /// says something about the renderer where it meant to say something about cards.
+    fn leaves_of<'a>(node: &'a SceneNode, want: Component, out: &mut Vec<&'a SceneNode>) {
+        if let SceneNode::Container {
+            component,
+            children,
+            ..
+        } = node
+        {
+            let here = *component == Some(want);
+            for c in children {
+                if here && !matches!(c, SceneNode::Container { .. }) {
+                    out.push(c);
+                }
+                leaves_of(c, want, out);
+            }
+        }
+    }
+
     /// Every Container in the tree, so a test can find a card group without knowing how
     /// deep the layout nested it. Cards used to be root's direct children and now sit
     /// inside their row's group, which is what `.hh-row` is in the shell.
@@ -3217,7 +3298,7 @@ mod tests {
         let art = ranked
             .iter()
             .find_map(|n| match n {
-                SceneNode::Art { rect, .. } => Some(*rect),
+                SceneNode::Fill { rect, .. } => Some(*rect),
                 _ => None,
             })
             .expect("a ranked card is made of its art");
@@ -3240,7 +3321,7 @@ mod tests {
         let plain_art = plain
             .iter()
             .find_map(|n| match n {
-                SceneNode::Art { rect, .. } => Some(*rect),
+                SceneNode::Fill { rect, .. } => Some(*rect),
                 _ => None,
             })
             .expect("every card has art");
@@ -3359,15 +3440,19 @@ mod tests {
         let mut leaves: Vec<&SceneNode> = Vec::new();
         root.flatten(&mut leaves);
 
-        let arts: Vec<&SceneNode> = leaves
+        // The CARDS' fills, not every fill in the scene: the chrome strips are gradient
+        // fills too now, and counting node kinds would count them as cards.
+        let mut card_leaves: Vec<&SceneNode> = Vec::new();
+        leaves_of(&root, Component::HomeCard, &mut card_leaves);
+        let arts: Vec<&SceneNode> = card_leaves
             .iter()
             .copied()
-            .filter(|n| matches!(n, SceneNode::Art { .. }))
+            .filter(|n| matches!(n, SceneNode::Fill { .. }))
             .collect();
         let cards: usize = home.rows.iter().map(|r| r.cards.len()).sum();
         assert_eq!(arts.len(), cards, "every card has an art tile, ranked or not");
         for art in &arts {
-            if let SceneNode::Art { from, to, rect, .. } = art {
+            if let SceneNode::Fill { from, to, rect, .. } = art {
                 assert!(from.a > 0.9 && to.a > 0.9, "art is a ground, never a hole");
                 assert_ne!(from, to, "two stops, so the brand gradient and not a fill");
                 assert!(rect.w > 1.0 && rect.h > 1.0, "and it has a real box");
@@ -3376,7 +3461,7 @@ mod tests {
         // The two rows name different accents, so they must not paint the same colour: a
         // desktop where every row read teal is what the accent decode was added to fix.
         let hue = |n: &SceneNode| match n {
-            SceneNode::Art { to, .. } => (to.r, to.g, to.b),
+            SceneNode::Fill { to, .. } => (to.r, to.g, to.b),
             _ => unreachable!("filtered to Art above"),
         };
         assert_ne!(
@@ -3574,6 +3659,57 @@ mod tests {
             crate::latency::Surface::Shell,
             "a named component must never map to the unattributed surface"
         );
+    }
+
+    #[test]
+    fn the_chrome_strips_take_the_shells_no_blur_floor_not_its_blurred_glass() {
+        // `.glass` is a translucent white over a `backdrop-filter: blur`. The native path
+        // has NO blur, so copying that alpha would put unreadable chrome over the aurora.
+        // The shell has a floor for exactly this case and its comment says why: "cairo
+        // cannot paint backdrop-filter, so the frosted brand colour collapsed to grey".
+        // That floor is the native path's PERMANENT situation, so its value is the spec.
+        let theme = Theme::cosmic_default();
+        let root = layout_home(1600.0, 900.0, &sample(), &theme, &RowScroll::default(), &mut MonoMeasure);
+        let mut leaves: Vec<&SceneNode> = Vec::new();
+        root.flatten(&mut leaves);
+        let strips: Vec<&SceneNode> = leaves
+            .iter()
+            .copied()
+            .filter(|n| matches!(n, SceneNode::Fill { rect, .. } if rect.w == 1600.0))
+            .collect();
+        assert_eq!(strips.len(), 2, "the top bar and the taskbar, both filled");
+
+        for st in &strips {
+            if let SceneNode::Fill { from, mid, to, mid_at, angle_deg, .. } = st {
+                // OPAQUE at every stop. Translucent edges let the home bleed through into
+                // the "cluttered/overlap" real-HW bug (2026-07-15); the floor's answer was
+                // to make every stop 0.985.
+                for c in [from, mid, to] {
+                    assert!(c.a > 0.98, "every stop is opaque: {}", c.a);
+                }
+                // And NOT monochromatic. A flat colourless grey "read MONOCHROMATIC" on
+                // real hardware (2026-07-12); teal leads and violet accents, so the ends
+                // must differ in hue rather than only in brightness.
+                assert_ne!(from, to, "the ends are different colours");
+                assert!(from.g > from.b, "the first stop leads TEAL");
+                assert!(to.b > to.g, "the last stop accents VIOLET");
+                assert_eq!(*mid_at, theme.chrome_fill_at);
+                assert_eq!(*angle_deg, theme.chrome_fill_angle);
+            }
+        }
+    }
+
+    #[test]
+    fn high_contrast_flattens_the_chrome_ramp_rather_than_tinting_it() {
+        // The a11y class sets a flat `background:#0a0a12` and is a LATER source than the
+        // floor's gradient, so it wins. A ramp under high contrast is a legibility hazard,
+        // and three identical stops is that flat fill through the same tile rather than a
+        // second fill path for one case.
+        let hc = Theme::cosmic_default().with_high_contrast();
+        assert_eq!(hc.chrome_fill[0], hc.chrome_fill[1]);
+        assert_eq!(hc.chrome_fill[1], hc.chrome_fill[2]);
+        assert_eq!(hc.chrome_fill[0], hc.bar_bg, "and it is the class's own colour");
+        assert_eq!(hc.chrome_fill[0].a, 1.0, "solid, which is the point of the setting");
     }
 
     #[test]
@@ -3914,7 +4050,7 @@ mod tests {
         root.flatten(&mut leaves);
         let arts = leaves
             .iter()
-            .filter(|n| matches!(n, SceneNode::Art { .. }))
+            .filter(|n| matches!(n, SceneNode::Fill { .. }))
             .count();
         assert!(arts >= 3, "a narrow panel still shows a strip of cards, got {arts}");
     }
@@ -3998,11 +4134,11 @@ mod tests {
         let theme = Theme::cosmic_default();
         let tree = layout_home(1280.0, 800.0, &hc, &theme, &RowScroll::default(), &mut MonoMeasure);
         let mut leaves: Vec<&SceneNode> = Vec::new();
-        tree.flatten(&mut leaves);
+        leaves_of(&tree, Component::HomeCard, &mut leaves);
         let arts: Vec<(Option<String>, Color, Color, f32)> = leaves
             .into_iter()
             .filter_map(|n| match n {
-                SceneNode::Art {
+                SceneNode::Fill {
                     photo,
                     from,
                     to,
@@ -4070,7 +4206,7 @@ mod tests {
         let art = leaves
             .iter()
             .find_map(|n| match n {
-                SceneNode::Art { rect, .. } => Some(*rect),
+                SceneNode::Fill { rect, .. } => Some(*rect),
                 _ => None,
             })
             .expect("the art box");
@@ -4109,10 +4245,19 @@ mod tests {
         let tree = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let mut leaves: Vec<&SceneNode> = Vec::new();
         tree.flatten(&mut leaves);
+        // The first fill in the tree is the TOP BAR's now, so ask for the first one that
+        // belongs to a card. A test that says "the first Fill" is describing the
+        // renderer's node order where it means to describe a card.
+        let mut card_leaves: Vec<&SceneNode> = Vec::new();
+        leaves_of(&tree, Component::HomeCard, &mut card_leaves);
+        let card_art = card_leaves
+            .iter()
+            .find(|n| matches!(n, SceneNode::Fill { .. }))
+            .expect("the first card's art");
         let art_idx = leaves
             .iter()
-            .position(|n| matches!(n, SceneNode::Art { .. }))
-            .expect("the first card's art");
+            .position(|n| std::ptr::eq(*n, *card_art))
+            .expect("the card's art is in the flattened order");
         let art_rect = leaves[art_idx].rect();
         let inside = (art_rect.x + art_rect.w * 0.5, art_rect.y + art_rect.h * 0.5);
         assert_eq!(

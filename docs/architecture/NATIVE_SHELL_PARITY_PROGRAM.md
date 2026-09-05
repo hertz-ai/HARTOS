@@ -1219,3 +1219,51 @@ four rules.
 Worth stating plainly, because it is the lesson under all of them: a mutation
 check that can quietly measure the wrong thing is a confidence machine, and
 confidence is exactly what these guards exist to withhold until it is earned.
+
+### The chrome strips were the pre-fix look, twice over
+The top bar and the taskbar are `.glass`: a translucent white over a
+`backdrop-filter: blur`. The native path has NO blur and never will on this
+renderer, so copying that alpha would put unreadable chrome over the aurora. That
+is why the apparent mismatch could not just be "fixed" toward the blurred value.
+
+The shell already has a floor for exactly this case. `body.webkit-flat` and
+`body.gpu-software` replace the glass with a flat-rastered fill, and its comment
+says why: "cairo cannot paint backdrop-filter, so the frosted brand colour
+collapsed to grey". The native path is permanently in that situation, so the
+FLOOR's value is its spec, not the blurred rule above it.
+
+That value is `linear-gradient(155deg, rgba(7,29,26,.985), rgba(20,22,32,.985)
+46%, rgba(25,16,37,.985))`: a three-stop diagonal, teal leading, violet accenting,
+opaque at every stop. Both properties carry a recorded real-HW bug:
+
+- a flat colourless grey "read MONOCHROMATIC" (2026-07-12, the mockup gap);
+- translucent edges let the home bleed through, the "cluttered/overlap" report
+  (2026-07-15), which is why every stop is 0.985 rather than 0.07 at the ends.
+
+The native chrome was `rgba(11,12,16,0.72)`: flat, colourless, and translucent.
+It reproduced both fixed bugs at once.
+
+Three things came out of doing it:
+
+**The rasterizer took a third stop rather than growing a second path.** A TWO-stop
+gradient is the three-stop one with its middle on the line between the ends, so
+card art passes a derived midpoint and gets byte-identical pixels through the same
+ramp. The 280 tests that existed stayed green across that change, which is the
+proof it is the same arithmetic.
+
+**`SceneNode::Art` became `SceneNode::Fill`.** It was named for its only user, and
+the moment the top bar became one too, "every Art node is a card's" stopped being
+true. Several tests were counting Fill nodes to count cards; they ask for the
+leaves of a `HomeCard` container now, which says what they mean and survives the
+next regrouping.
+
+**High contrast flattens the ramp rather than tinting it.** The a11y class sets a
+flat `background:#0a0a12` and is a later source than the floor, so it wins. Three
+identical stops IS that flat fill through the same tile, rather than a second fill
+path for one case.
+
+The Python pin parses the gradient out of hartResponsive.css and compares all
+three stops, the midpoint and the angle. Writing it turned up the same
+ambiguous-anchor bug as the mutation harness: `chrome_fill: \[` matched the FIELD
+DECLARATION `pub chrome_fill: [Color; 3],` before the initialiser, captured
+"Color; 3", and reported "zero stops" about a literal it had never looked at.
