@@ -144,8 +144,18 @@ impl Color {
 /// precisely because the tree is RETAINED: a measure runs on a real layout rebuild, never
 /// per frame.
 pub trait TextMeasure {
-    /// The advance width in LOGICAL px of `text` at `size_px`, on ONE unwrapped line.
-    fn text_width(&mut self, text: &str, size_px: f32) -> f32;
+    /// The advance width in LOGICAL px of `text` at `size_px` and `weight`, on ONE
+    /// unwrapped line.
+    ///
+    /// `weight` is a CSS weight number, which is the vocabulary the shell's own rules are
+    /// written in and the vocabulary cosmic-text's `Weight` is a newtype over, so it
+    /// passes through both without a translation table. It has to be part of the MEASURE
+    /// and not only the paint: a bold face is wider, and this width is what decides where
+    /// the next run starts. Measuring "0" at 400 and painting it at 800 puts the unit
+    /// inside the numeral. `letter_spacing` is here for exactly the same reason: 3px
+    /// between every pair of letters of "EARNED ON THE HIVE" is over 50px of width that a
+    /// spacing-free measure would not know about.
+    fn text_width(&mut self, text: &str, size_px: f32, weight: u16, letter_spacing: f32) -> f32;
 
     /// Whether the Material ligature face the shell's icons rely on is loaded.
     ///
@@ -169,10 +179,17 @@ pub trait TextMeasure {
 pub struct MonoMeasure;
 
 impl TextMeasure for MonoMeasure {
-    fn text_width(&mut self, text: &str, size_px: f32) -> f32 {
+    fn text_width(&mut self, text: &str, size_px: f32, _weight: u16, letter_spacing: f32) -> f32 {
         // 0.52 em is close to the average advance of a UI sans at these sizes. It only
-        // has to be plausible: nothing measured this way is claimed to be exact.
-        text.chars().count() as f32 * size_px * 0.52
+        // has to be plausible: nothing measured this way is claimed to be exact. Weight
+        // is ignored rather than approximated with a fudge factor, because a made-up
+        // bold ratio would be a second wrong answer dressed as a better one.
+        //
+        // Letter spacing IS added, because it is not a property of the face: it is a
+        // literal number of px inserted after each character, so it is exactly as knowable
+        // here as it is in the shaper.
+        let n = text.chars().count() as f32;
+        n * size_px * 0.52 + (n - 1.0).max(0.0) * letter_spacing
     }
 }
 
@@ -887,6 +904,32 @@ pub enum SceneNode {
         /// layout aligns by computing x now that it can measure. A field written twenty
         /// times and read zero is not a contract, it is weight.
         stroke: f32,
+        /// The CSS weight number of the shell rule this run mirrors.
+        ///
+        /// Every text element on this desktop has an explicit weight and all but two are
+        /// 600 or heavier: the eyebrow and the card titles are 700, the Spark figure and
+        /// the avatar are 800, the rank numeral is 900. The native scene painted every one
+        /// of them at 400, because both `set_text` calls passed a bare `Attrs::new()`, so
+        /// the whole typographic hierarchy the design is built on collapsed into one
+        /// weight. The image ships Inter and Noto Sans, both with real bold faces, so this
+        /// is a request the font system can actually answer.
+        ///
+        /// A CSS number rather than an enum: it is what the shell's rules say, what
+        /// cosmic-text's `Weight` wraps, and what the cross-language guard compares.
+        weight: u16,
+        /// `letter-spacing` in px, which is 0 for every run but two.
+        ///
+        /// The exception is the reason this exists: `.hh-eyebrow` is `letter-spacing: 3px`
+        /// at 16px, which is close to a fifth of an em between every pair of letters. That
+        /// is not a refinement of the label, it IS the label's character, and without it
+        /// the native eyebrow read as an ordinary small line of text rather than the
+        /// spaced-out brand mark over the money figure.
+        ///
+        /// Px rather than em because that is the unit the rule uses, and because the
+        /// shaper takes px. The one em-based rule in the mirrored set (`.start-btn span`
+        /// at `.02em`) is resolved against its own font-size at the construction site,
+        /// where both numbers are already in view.
+        letter_spacing: f32,
     },
     /// A card's drop shadow: the shape blurred, offset, and painted UNDER it.
     ///
@@ -1521,9 +1564,9 @@ pub fn layout_home(
     let pill = Rect::new((output_w - pill_w) * 0.5, 6.0, pill_w, theme.top_bar_h - 12.0);
     let mark_h = WORDMARK_PX * 1.3;
     let mark_y = (theme.top_bar_h - mark_h) * 0.5;
-    let hart_w = measure.text_width("HART", WORDMARK_PX);
-    let gap_w = measure.text_width(" ", WORDMARK_PX);
-    let os_w = measure.text_width("OS", WORDMARK_PX);
+    let hart_w = measure.text_width("HART", WORDMARK_PX, 600, WORDMARK_PX * 0.02);
+    let gap_w = measure.text_width(" ", WORDMARK_PX, 600, WORDMARK_PX * 0.02);
+    let os_w = measure.text_width("OS", WORDMARK_PX, 600, WORDMARK_PX * 0.02);
     // A shaped run needs its whole advance to fit the buffer it is composed into, so the
     // box is the measured width rounded up with a pixel of slack rather than trusting an
     // exact float to survive the f32 -> i32 the lowering does.
@@ -1533,6 +1576,10 @@ pub fn layout_home(
         size_px: WORDMARK_PX,
         color: theme.accent,
         stroke: 0.0,
+        // .top-bar .start-btn span
+        weight: 600,
+        // .start-btn span letter-spacing: .02em
+        letter_spacing: WORDMARK_PX * 0.02,
     });
     bar_children.push(SceneNode::Text {
         rect: Rect::new(
@@ -1545,6 +1592,10 @@ pub fn layout_home(
         size_px: WORDMARK_PX,
         color: theme.accent2,
         stroke: 0.0,
+        // .top-bar .start-btn span
+        weight: 600,
+        // .start-btn span letter-spacing: .02em
+        letter_spacing: WORDMARK_PX * 0.02,
     });
 
     // ── Nav tabs (P5): the shell's five primary destinations, each sized to its own
@@ -1560,7 +1611,7 @@ pub fn layout_home(
     let tab_ink_y = (theme.top_bar_h - tab_ink_h) * 0.5;
     let mut tab_x = BAR_PAD_X + hart_w + gap_w + os_w + BAR_PAD_X;
     for (i, label) in NAV_TABS.iter().take(m.nav_tabs).enumerate() {
-        let ink_w = measure.text_width(label, TAB_PX);
+        let ink_w = measure.text_width(label, TAB_PX, 600, 0.0);
         let slot = ink_w.ceil() + 2.0 * m.tab_pad_x;
         if tab_x + slot > pill.x - TAB_GAP {
             break;
@@ -1584,6 +1635,9 @@ pub fn layout_home(
                 theme.omnibox_ink
             },
             stroke: 0.0,
+            // .tb-tab
+            weight: 600,
+            letter_spacing: 0.0,
         });
         tab_x += slot + TAB_GAP;
     }
@@ -1603,13 +1657,16 @@ pub fn layout_home(
     let pill_ink_y = (theme.top_bar_h - OMNIBOX_PX * 1.3) * 0.5;
     let mut pill_x = pill.x + 12.0;
     if icons_available {
-        let gw = measure.text_width(OMNIBOX_GLYPH, OMNIBOX_PX);
+        let gw = measure.text_width(OMNIBOX_GLYPH, OMNIBOX_PX, 400, 0.0);
         pill_children.push(SceneNode::Text {
             rect: Rect::new(pill_x, pill_ink_y, gw.ceil() + 2.0, OMNIBOX_PX * 1.3),
             text: OMNIBOX_GLYPH.to_string(),
             size_px: OMNIBOX_PX,
             color: theme.omnibox_ink,
             stroke: 0.0,
+            // a ligature glyph, the icon face has one weight
+            weight: 400,
+            letter_spacing: 0.0,
         });
         pill_x += gw + 8.0;
     }
@@ -1624,8 +1681,11 @@ pub fn layout_home(
         size_px: OMNIBOX_PX,
         color: theme.omnibox_ink,
         stroke: 0.0,
+        // .top-bar-omni
+        weight: 500,
+        letter_spacing: 0.0,
     });
-    let kbd_w = measure.text_width(OMNIBOX_KBD, KBD_PX);
+    let kbd_w = measure.text_width(OMNIBOX_KBD, KBD_PX, 700, 0.0);
     let kbd_x = pill.right() - 12.0 - kbd_w;
     if m.show_kbd && kbd_x > pill_x {
         pill_children.push(SceneNode::Text {
@@ -1639,6 +1699,9 @@ pub fn layout_home(
             size_px: KBD_PX,
             color: theme.omnibox_ink,
             stroke: 0.0,
+            // .top-bar-omni .tbo-kbd
+            weight: 700,
+            letter_spacing: 0.0,
         });
     }
     // `.top-bar { border-bottom: 1px solid var(--hart-glass-border) }`, and nothing else:
@@ -1676,7 +1739,7 @@ pub fn layout_home(
         for glyph in TRAY_GLYPHS.iter().rev() {
             right_x -= TRAY_BTN;
             let b = centered_box(
-                measure.text_width(glyph, theme.icon_px),
+                measure.text_width(glyph, theme.icon_px, 400, 0.0),
                 right_x,
                 TRAY_BTN,
                 (theme.top_bar_h - theme.icon_px * 1.3) * 0.5,
@@ -1688,6 +1751,9 @@ pub fn layout_home(
                 size_px: theme.icon_px,
                 color: theme.omnibox_ink,
                 stroke: 0.0,
+                // a ligature glyph, the icon face has one weight
+                weight: 400,
+                letter_spacing: 0.0,
             });
             right_x -= TRAY_GAP;
         }
@@ -1703,7 +1769,7 @@ pub fn layout_home(
     });
     bar_children.push(SceneNode::Text {
         rect: centered_box(
-            measure.text_width(AVATAR_INITIAL, AVATAR_PX),
+            measure.text_width(AVATAR_INITIAL, AVATAR_PX, 800, 0.0),
             av.x,
             AVATAR_D,
             (theme.top_bar_h - AVATAR_PX * 1.3) * 0.5,
@@ -1713,6 +1779,9 @@ pub fn layout_home(
         size_px: AVATAR_PX,
         color: theme.bar_ink,
         stroke: 0.0,
+        // .top-bar-avatar
+        weight: 800,
+        letter_spacing: 0.0,
     });
     right_x -= TRAY_GAP;
 
@@ -1751,10 +1820,22 @@ pub fn layout_home(
     if !home.hero.eyebrow.is_empty() {
         root.push(SceneNode::Text {
             rect: Rect::new(content.x, hero_y, hero_text_w, HERO_EYEBROW_PX * 1.4),
-            text: home.hero.eyebrow.clone(),
+            // `.hh-eyebrow` is `text-transform: uppercase`. The payload says "Earned on
+            // the hive" and the shell paints "EARNED ON THE HIVE"; the transform is a
+            // property of the SURFACE, not of the text, which is why the case lives here
+            // and the wire keeps the sentence the composer wrote.
+            text: home.hero.eyebrow.to_uppercase(),
             size_px: HERO_EYEBROW_PX,
-            color: theme.hero_copy,
+            // `.hh-eyebrow { color: var(--hh-teal) }`, the brand accent, not the muted
+            // body colour this had. It is the label over the money figure and the only
+            // teal thing in the hero besides the figure itself, so painting it grey took
+            // the whole visual link between the two.
+            color: theme.accent,
             stroke: 0.0,
+            // .hh-eyebrow
+            weight: 700,
+            // .hh-eyebrow letter-spacing: 3px
+            letter_spacing: 3.0,
         });
         hero_y += HERO_EYEBROW_PX * 1.6;
     }
@@ -1763,20 +1844,23 @@ pub fn layout_home(
         // the figure ends. That is the measure again: the figure's width is not known
         // until it is shaped, and it changes with the balance.
         let figure = amount.to_string();
-        let fw = measure.text_width(&figure, m.amount_px);
+        let fw = measure.text_width(&figure, m.amount_px, 800, 0.0);
         root.push(SceneNode::Text {
             rect: Rect::new(content.x, hero_y, fw.ceil() + 2.0, m.amount_px * 1.3),
             text: figure,
             size_px: m.amount_px,
             color: theme.hero_title,
             stroke: 0.0,
+            // .hh-amount
+            weight: 800,
+            letter_spacing: 0.0,
         });
         let unit = if home.hero.amount_unit.is_empty() {
             HERO_UNIT_FALLBACK
         } else {
             &home.hero.amount_unit
         };
-        let uw = measure.text_width(unit, m.unit_px);
+        let uw = measure.text_width(unit, m.unit_px, 700, 0.0);
         root.push(SceneNode::Text {
             rect: Rect::new(
                 content.x + fw + 8.0,
@@ -1790,6 +1874,9 @@ pub fn layout_home(
             size_px: m.unit_px,
             color: theme.accent,
             stroke: 0.0,
+            // .hh-amount-unit
+            weight: 700,
+            letter_spacing: 0.0,
         });
         hero_y += m.amount_px * 1.35;
     }
@@ -1826,6 +1913,9 @@ pub fn layout_home(
             size_px: HERO_META_PX,
             color: theme.hero_copy,
             stroke: 0.0,
+            // .hh-hero-meta inherits the home body weight
+            weight: 400,
+            letter_spacing: 0.0,
         });
         hero_y += HERO_META_PX * 1.9;
     }
@@ -1835,7 +1925,7 @@ pub fn layout_home(
     let mut cta_x = content.x;
     for (label, primary) in [(&home.hero.primary, true), (&home.hero.secondary, false)] {
         let Some(label) = label else { continue };
-        let lw = measure.text_width(label, HERO_BTN_PX);
+        let lw = measure.text_width(label, HERO_BTN_PX, 700, 0.0);
         let bw = lw.ceil() + 2.0 * HERO_BTN_PAD_X;
         if cta_x + bw > content.x + hero_text_w {
             break;
@@ -1884,6 +1974,9 @@ pub fn layout_home(
                 theme.card_ink
             },
             stroke: 0.0,
+            // .hh-btn
+            weight: 700,
+            letter_spacing: 0.0,
         });
         cta_x += bw + 10.0;
     }
@@ -1914,16 +2007,19 @@ pub fn layout_home(
         // root-level leaf and a wheel event had nothing to land on. Collecting them is
         // what lets a scroll find its row without re-deriving the layout's geometry.
         let mut row_children: Vec<SceneNode> = Vec::new();
-        let label_w = measure.text_width(&row.title, ROW_LABEL_PX);
+        let label_w = measure.text_width(&row.title, ROW_LABEL_PX, 700, 0.0);
         row_children.push(SceneNode::Text {
             rect: Rect::new(content.x, cursor_y, label_w.ceil() + 2.0, ROW_LABEL_H),
             text: row.title.clone(),
             size_px: ROW_LABEL_PX,
             color: theme.card_ink,
             stroke: 0.0,
+            // .hh-row-title
+            weight: 700,
+            letter_spacing: 0.0,
         });
         if let Some(note) = &row.note {
-            let note_w = measure.text_width(note, ROW_NOTE_PX);
+            let note_w = measure.text_width(note, ROW_NOTE_PX, 600, 0.0);
             let note_x = content.x + label_w + ROW_HEAD_GAP;
             if note_x + note_w <= content.right() {
                 row_children.push(SceneNode::Text {
@@ -1932,11 +2028,14 @@ pub fn layout_home(
                     size_px: ROW_NOTE_PX,
                     color: row_accent,
                     stroke: 0.0,
+                    // .hh-row-note
+                    weight: 600,
+                    letter_spacing: 0.0,
                 });
             }
         }
         if row.see_all.is_some() {
-            let see_w = measure.text_width(SEE_ALL, ROW_NOTE_PX);
+            let see_w = measure.text_width(SEE_ALL, ROW_NOTE_PX, 600, 0.0);
             let see_x = content.right() - see_w;
             // Only if it clears the label (and any note): a cramped row drops the
             // affordance rather than overlapping the text it belongs to.
@@ -1947,6 +2046,9 @@ pub fn layout_home(
                     size_px: ROW_NOTE_PX,
                     color: theme.accent,
                     stroke: 0.0,
+                    // .hh-see-all
+                    weight: 600,
+                    letter_spacing: 0.0,
                 });
             }
         }
@@ -1999,7 +2101,7 @@ pub fn layout_home(
                 // draws: transparent fill, 3px stroke. Its own box, not the card's, so a
                 // two-digit rank is not clipped at ten.
                 let label = (card_index + 1).to_string();
-                let nw = measure.text_width(&label, RANK_PX);
+                let nw = measure.text_width(&label, RANK_PX, 900, 0.0);
                 card_children.push(SceneNode::Text {
                     rect: Rect::new(
                         cr.x - 6.0,
@@ -2011,6 +2113,9 @@ pub fn layout_home(
                     size_px: RANK_PX,
                     color: theme.rank_ink,
                     stroke: RANK_STROKE,
+                    // .hh-rank-num
+                    weight: 900,
+                    letter_spacing: 0.0,
                 });
             }
             // ── The art tile, which EVERY card has, and which is also the box every other
@@ -2094,7 +2199,7 @@ pub fn layout_home(
                 });
                 card_children.push(SceneNode::Text {
                     rect: centered_box(
-                        measure.text_width(name, CARD_ICON_PX),
+                        measure.text_width(name, CARD_ICON_PX, 400, 0.0),
                         ab.x + CARD_ICON_INSET_X,
                         CARD_ICON_BOX,
                         ab.y + CARD_CHIP_INSET + (CARD_ICON_BOX - CARD_ICON_PX * 1.3) * 0.5,
@@ -2104,6 +2209,9 @@ pub fn layout_home(
                     size_px: CARD_ICON_PX,
                     color: theme.card_ink,
                     stroke: 0.0,
+                    // a ligature glyph, the icon face has one weight
+                    weight: 400,
+                    letter_spacing: 0.0,
                 });
             }
 
@@ -2117,7 +2225,7 @@ pub fn layout_home(
                 .map(|t| (t, true))
                 .or_else(|| card.badge.as_ref().map(|t| (t, false)));
             if let Some((label, is_live)) = chip {
-                let ink_w = measure.text_width(label, CARD_CHIP_PX);
+                let ink_w = measure.text_width(label, CARD_CHIP_PX, if is_live { 600 } else { 700 }, 0.0);
                 let dot_w = if is_live {
                     CARD_LIVE_DOT + CARD_LIVE_GAP
                 } else {
@@ -2162,6 +2270,9 @@ pub fn layout_home(
                         theme.on_accent_ink
                     },
                     stroke: 0.0,
+                    // .hh-card-live 600 / .hh-card-badge 700
+                    weight: if is_live { 600 } else { 700 },
+                    letter_spacing: 0.0,
                 });
             }
 
@@ -2186,6 +2297,9 @@ pub fn layout_home(
                 size_px: CARD_TITLE_PX,
                 color: theme.card_ink,
                 stroke: 0.0,
+                // .hh-card-title
+                weight: 700,
+                letter_spacing: 0.0,
             });
             if let Some(meta) = &card.meta {
                 card_children.push(SceneNode::Text {
@@ -2199,6 +2313,9 @@ pub fn layout_home(
                     size_px: CARD_META_PX,
                     color: theme.hero_copy,
                     stroke: 0.0,
+                    // .hh-card-meta inherits
+                    weight: 400,
+                    letter_spacing: 0.0,
                 });
             }
             if let Some(p) = card.progress {
@@ -2757,7 +2874,13 @@ mod tests {
         });
         let find = |t: &str| runs.iter().find(|(s, _)| s == t).map(|(_, r)| *r);
 
-        let eyebrow = find("Earned on the hive").expect("the eyebrow");
+        // UPPERCASE because `.hh-eyebrow` is `text-transform: uppercase`: the payload
+        // carries the composer's sentence and the surface shouts it.
+        let eyebrow = find("EARNED ON THE HIVE").expect("the eyebrow");
+        assert!(
+            find("Earned on the hive").is_none(),
+            "the eyebrow is drawn as sent, so the shell's uppercase transform is missing"
+        );
         let amount = find("12").expect("the amount figure");
         let unit = find("Spark").expect("the unit beside it");
         assert!(amount.y > eyebrow.y, "the figure sits under the eyebrow");
@@ -2861,7 +2984,7 @@ mod tests {
                 texts.push(text.clone());
             }
         });
-        assert!(texts.contains(&"Nothing yet".to_string()));
+        assert!(texts.contains(&"NOTHING YET".to_string()), "the eyebrow, uppercased");
         assert!(!texts.iter().any(|t| t.contains("agents")), "no stat without agents");
         assert!(!texts.contains(&"Spark".to_string()), "no unit without a figure");
         assert!(!texts.contains(&"Resume".to_string()), "no action without a label");
@@ -2911,15 +3034,15 @@ mod tests {
         let (h, o) = (hart.expect("a HART run"), os.expect("an OS run"));
         // OS begins after HART ends, by about one space, which is the whole point of
         // having a measure: without one the second run has nowhere to start.
-        let space = MonoMeasure.text_width(" ", WORDMARK_PX);
-        let gap = o.x - (h.x + MonoMeasure.text_width("HART", WORDMARK_PX));
+        let space = MonoMeasure.text_width(" ", WORDMARK_PX, 600, WORDMARK_PX * 0.02);
+        let gap = o.x - (h.x + MonoMeasure.text_width("HART", WORDMARK_PX, 600, WORDMARK_PX * 0.02));
         assert!(
             (gap - space).abs() < 0.51,
             "OS should sit one space past HART, gap was {gap} against a {space} space"
         );
         // Each box is wide enough to hold the run it will be asked to shape into.
-        assert!(h.w >= MonoMeasure.text_width("HART", WORDMARK_PX));
-        assert!(o.w >= MonoMeasure.text_width("OS", WORDMARK_PX));
+        assert!(h.w >= MonoMeasure.text_width("HART", WORDMARK_PX, 600, WORDMARK_PX * 0.02));
+        assert!(o.w >= MonoMeasure.text_width("OS", WORDMARK_PX, 600, WORDMARK_PX * 0.02));
         // The two-tone treatment: the runs carry the two BRAND hues, not the bar ink.
         let mut colors = Vec::new();
         {
@@ -3239,8 +3362,8 @@ mod tests {
     /// these tests already lay out with.
     struct IconMeasure;
     impl TextMeasure for IconMeasure {
-        fn text_width(&mut self, text: &str, size_px: f32) -> f32 {
-            MonoMeasure.text_width(text, size_px)
+        fn text_width(&mut self, text: &str, size_px: f32, weight: u16, ls: f32) -> f32 {
+            MonoMeasure.text_width(text, size_px, weight, ls)
         }
         fn has_icon_face(&self) -> bool {
             true
@@ -3507,6 +3630,90 @@ mod tests {
         decode_home_compose(&v)
     }
 
+    /// Every drawn run as (text, weight, letter_spacing), so a test can say what a run is
+    /// SET IN rather than only what it says.
+    fn drawn_runs(root: &SceneNode) -> Vec<(String, u16, f32)> {
+        let mut leaves: Vec<&SceneNode> = Vec::new();
+        root.flatten(&mut leaves);
+        leaves
+            .iter()
+            .filter_map(|n| match n {
+                SceneNode::Text {
+                    text,
+                    weight,
+                    letter_spacing,
+                    ..
+                } => Some((text.clone(), *weight, *letter_spacing)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_run_is_set_in_the_weight_its_shell_rule_asks_for() {
+        // The shell gives every text element an explicit font-weight and all but two are
+        // 600 or heavier. Both `set_text` calls passed a bare `Attrs::new()`, so the whole
+        // desktop was painted at 400 and the design's typographic hierarchy, the thing
+        // that makes a title a title, did not exist on the native path.
+        let home = sample();
+        let root = layout_home(
+            1920.0,
+            1080.0,
+            &home,
+            &Theme::cosmic_default(),
+            &RowScroll::default(),
+            &mut IconMeasure,
+        );
+        let runs = drawn_runs(&root);
+        let of = |t: &str| {
+            runs.iter()
+                .find(|(s, _, _)| s == t)
+                .unwrap_or_else(|| panic!("no run drew {t:?}"))
+        };
+
+        // The hero, top to bottom: the eyebrow, the figure, its unit.
+        assert_eq!(of("EARNED ON THE HIVE").1, 700, ".hh-eyebrow");
+        assert_eq!(of("EARNED ON THE HIVE").2, 3.0, ".hh-eyebrow letter-spacing");
+        assert_eq!(of("Spark").1, 700, ".hh-amount-unit");
+        assert_eq!(
+            runs.iter()
+                .find(|(t, _, _)| t.chars().all(|c| c.is_ascii_digit()) && t.len() > 1)
+                .expect("the Spark figure")
+                .1,
+            800,
+            ".hh-amount is the heaviest thing in the hero"
+        );
+        // The chrome.
+        assert_eq!(of("HART").1, 600, ".start-btn span");
+        assert!(of("HART").2 > 0.0, ".start-btn span letter-spacing: .02em");
+        assert_eq!(of("Home").1, 600, ".tb-tab");
+        assert_eq!(of(OMNIBOX_KBD).1, 700, ".tbo-kbd");
+        assert_eq!(of(AVATAR_INITIAL).1, 800, ".top-bar-avatar");
+        // The rows and their cards.
+        assert_eq!(of("Continue").1, 700, ".hh-row-title");
+        assert_eq!(of(SEE_ALL).1, 600, ".hh-see-all");
+        assert_eq!(of("Resume").1, 700, ".hh-btn");
+
+        // And the negative: NOTHING is left at the shaper's default except the runs whose
+        // rule genuinely says so. A new construction site that forgets its weight lands
+        // here rather than shipping a flat surface.
+        let plain: Vec<&String> = runs
+            .iter()
+            .filter(|(_, w, _)| *w == 400)
+            .map(|(t, _, _)| t)
+            .collect();
+        for t in &plain {
+            let is_icon = t.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+            let is_meta = t.contains('·') || home.rows.iter().any(|r| {
+                r.cards.iter().any(|c| c.meta.as_deref() == Some(t.as_str()))
+            });
+            assert!(
+                is_icon || is_meta,
+                "{t:?} is drawn at the default weight but is not a ligature glyph or an                  inheriting meta line, so its shell rule was never read"
+            );
+        }
+    }
+
     fn drawn_texts(root: &SceneNode) -> Vec<String> {
         let mut leaves: Vec<&SceneNode> = Vec::new();
         root.flatten(&mut leaves);
@@ -3559,7 +3766,10 @@ mod tests {
             layout_home(1920.0, 1080.0, &home, &Theme::cosmic_default(), &RowScroll::default(), &mut MonoMeasure);
         let drawn = drawn_texts(&root);
         for want in [
-            "Earned on the hive",
+            // The eyebrow is the one field a surface rule rewrites on its way to the
+            // screen (`.hh-eyebrow` is uppercase), so it is checked in the form the
+            // shell paints. Everything else below is drawn exactly as sent.
+            "EARNED ON THE HIVE",
             "1284",
             "Spark",
             "Continue",
@@ -4730,9 +4940,9 @@ mod tests {
     #[test]
     fn the_font_free_measure_scales_with_length_and_size() {
         let mut m = MonoMeasure;
-        assert_eq!(m.text_width("", 15.0), 0.0);
-        assert!(m.text_width("HART OS", 15.0) > m.text_width("HART", 15.0));
-        assert!(m.text_width("HART", 30.0) > m.text_width("HART", 15.0));
+        assert_eq!(m.text_width("", 15.0, 400, 0.0), 0.0);
+        assert!(m.text_width("HART OS", 15.0, 400, 0.0) > m.text_width("HART", 15.0, 400, 0.0));
+        assert!(m.text_width("HART", 30.0, 400, 0.0) > m.text_width("HART", 15.0, 400, 0.0));
     }
 
     #[test]

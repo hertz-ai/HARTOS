@@ -2969,6 +2969,8 @@ where
                 size_px,
                 color,
                 stroke,
+                weight,
+                letter_spacing,
             } => {
                 if rect.w < 1.0 || rect.h < 1.0 || text.is_empty() {
                     return;
@@ -2980,6 +2982,8 @@ where
                     rect.h as i32,
                     [color.r, color.g, color.b, color.a],
                     *stroke,
+                    *weight,
+                    *letter_spacing,
                 );
                 let origin: Point<f64, Physical> = Point::from((rect.x as f64, rect.y as f64));
                 match MemoryRenderBufferRenderElement::from_buffer(

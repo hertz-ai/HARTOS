@@ -1392,3 +1392,49 @@ to landscape today; the native scene drawing every card landscape IS parity, and
 lighting the feature up would be new work, not this program's. `card.empty` is
 synthesized client-side for a row with no cards, and the sanitizer drops empty
 rows before they reach the wire, so it never travels either.
+
+### The whole desktop was set in one weight
+Both of `text_render.rs`'s `set_text` calls passed a bare `Attrs::new()`. That is
+the shaper's default, which is Regular. Meanwhile every single text element on this
+desktop has an explicit `font-weight` in the shell's rules and all but two are 600
+or heavier: the eyebrow, the card titles, the row titles and the CTA are 700, the
+Spark figure and the avatar are 800, the rank numeral is 900. So the native path
+painted a design built on typographic hierarchy at one flat weight, and a title
+stopped looking like a title.
+
+The image already ships Inter and Noto Sans, both with real bold faces, so this was
+a request the font system could always have answered. `SceneNode::Text` now carries
+`weight` as a CSS NUMBER, which is what the shell's rules say and what
+`cosmic_text::Weight` is a newtype over, so it passes end to end without a mapping
+table.
+
+The measure had to take it too. `text_width` is what decides where the next run
+starts, so measuring the Spark figure at 400 and painting it at 800 would put the
+unit inside the numeral. Both shaping calls now go through one `attrs_for`, because
+two call sites that must agree will eventually not.
+
+`letter_spacing` came with it, for one element. `.hh-eyebrow` is `letter-spacing:
+3px` at 16px, close to a fifth of an em between every pair of letters, and that is
+not a refinement of the label, it IS the label. cosmic-text's `Attrs` exposes it, so
+it rides the same path; the mono fallback measure adds it arithmetically, since
+spacing is a literal px count after each character rather than a property of a face.
+
+**The eyebrow was wrong in three ways at once**, all in `.hh-eyebrow`: it is teal,
+uppercase and letter-spaced, and the native drew it muted grey, as sent, and tight.
+It is the label directly over the money figure and the only other teal thing in the
+hero, so the muted version broke the visual link between the label and the number it
+names. `text-transform` is a property of the SURFACE, so the uppercasing lives in the
+scene and the wire keeps the sentence the composer actually wrote.
+
+Each native construction site names its shell rule in a comment directly above its
+weight. That is what makes the cross-language pin possible at all: it reads
+`// .hh-row-title` + `weight: 700` on one side against `.hh-row-title { font-weight:
+700 }` on the other, so a designer changing a weight in the CSS fails the guard
+instead of silently splitting the two surfaces. The Rust side adds the negative
+case: a run left at the shaper's default must be a ligature glyph or an inheriting
+meta line, or the site never read its rule.
+
+Two remainders, named rather than hidden. The `<b>` inside `.hh-stat` is 800 against
+the line's own 400, which needs the stat split into four measured runs; and
+`.hh-pill` / `.hh-local-mini` are an amber badge and a teal shield-dot that the
+native still folds into one grey sentence. Both are now expressible; neither is done.

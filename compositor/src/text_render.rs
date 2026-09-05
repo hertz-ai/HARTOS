@@ -16,12 +16,29 @@
 
 use std::collections::HashMap;
 
-use cosmic_text::{Attrs, Buffer, Color as CtColor, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{
+    Attrs, Buffer, Color as CtColor, FontSystem, Metrics, Shaping, SwashCache, Weight,
+};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 use smithay::utils::Transform;
 
 use crate::scene::TextMeasure;
+
+/// How a run is shaped: the CSS weight and letter-spacing the scene asked for.
+///
+/// One function because measure and paint MUST agree. They were two bare `Attrs::new()`
+/// calls, which agreed only because neither asked for anything; the moment one of them
+/// carried a weight and the other did not, every measured width would have been the width
+/// of a different face than the one painted.
+///
+/// `cosmic_text::Weight` is a newtype over the same CSS number the shell's rules are
+/// written in, so this is a wrap, not a mapping table.
+fn attrs_for(weight: u16, letter_spacing: f32) -> Attrs<'static> {
+    Attrs::new()
+        .weight(Weight(weight))
+        .letter_spacing(letter_spacing.max(0.0))
+}
 
 /// The identity of one rasterized run. `size_bits`/`color` are the bit patterns of
 /// the f32 inputs so the key is `Eq + Hash` (f32 is neither). The box (w,h) is part
@@ -36,6 +53,12 @@ struct RunKey {
     /// Outline width in px, as bits. Part of the identity because a stroked run and a
     /// filled one are different pictures of the same string.
     stroke_bits: u32,
+    /// The CSS weight. Part of the identity for the same reason: the same string at the
+    /// same size in bold is a different picture, and without this the first run to be
+    /// cached would answer for every weight after it.
+    weight: u16,
+    /// Letter spacing in px, as bits, for the same reason again.
+    tracking_bits: u32,
 }
 
 /// The most runs kept alive at once.
@@ -137,21 +160,21 @@ impl TextRasterizer {
     /// the glyphs it later draws agree by construction rather than by a fudge factor.
     /// Not cached: it runs on a scene-tree rebuild, which the retained tree already makes
     /// rare, so a cache here would hold strings that are never asked for twice.
-    fn measure(&mut self, text: &str, size_px: f32) -> f32 {
+    fn measure(&mut self, text: &str, size_px: f32, weight: u16, letter_spacing: f32) -> f32 {
         if text.is_empty() {
             return 0.0;
         }
         // The same empty-font-DB guard compose() carries: cosmic-text's shaper panics with
         // no face to fall back to, so degrade to the font-free estimate rather than die.
         if self.font_system.db().is_empty() {
-            return crate::scene::MonoMeasure.text_width(text, size_px);
+            return crate::scene::MonoMeasure.text_width(text, size_px, weight, letter_spacing);
         }
         let metrics = Metrics::new(size_px, size_px * 1.3);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         // No width bound: a measure must never wrap, or a long run would report the width
         // of its wrapped box instead of its own advance.
         buffer.set_size(&mut self.font_system, None, None);
-        buffer.set_text(&mut self.font_system, text, &Attrs::new(), Shaping::Advanced);
+        buffer.set_text(&mut self.font_system, text, &attrs_for(weight, letter_spacing), Shaping::Advanced);
         buffer.shape_until_scroll(&mut self.font_system, false);
         buffer
             .layout_runs()
@@ -171,6 +194,8 @@ impl TextRasterizer {
         h: i32,
         color: [f32; 4],
         stroke_px: f32,
+        weight: u16,
+        letter_spacing: f32,
     ) -> &MemoryRenderBuffer {
         let wi = w.max(1) as u32;
         let hi = h.max(1) as u32;
@@ -181,6 +206,8 @@ impl TextRasterizer {
             h: hi,
             color: pack_color(color),
             stroke_bits: stroke_px.max(0.0).to_bits(),
+            weight,
+            tracking_bits: letter_spacing.max(0.0).to_bits(),
         };
         if !self.cache.contains_key(&key) {
             // Dropped wholesale rather than evicted one at a time. A run that has fallen
@@ -191,7 +218,7 @@ impl TextRasterizer {
             if self.cache.len() >= MAX_CACHED_RUNS {
                 self.cache.clear();
             }
-            let buf = self.compose(text, size_px, wi, hi, color, stroke_px);
+            let buf = self.compose(text, size_px, wi, hi, color, stroke_px, weight, letter_spacing);
             self.cache.insert(key.clone(), buf);
             self.composes += 1;
         }
@@ -202,7 +229,17 @@ impl TextRasterizer {
     /// The actual compose: shape the run, draw its glyph coverage into a
     /// premultiplied-ARGB byte buffer (B,G,R,A little-endian, matching bloom.rs), and
     /// wrap it as a `MemoryRenderBuffer`.
-    fn compose(&mut self, text: &str, size_px: f32, wi: u32, hi: u32, color: [f32; 4], stroke_px: f32) -> MemoryRenderBuffer {
+    fn compose(
+        &mut self,
+        text: &str,
+        size_px: f32,
+        wi: u32,
+        hi: u32,
+        color: [f32; 4],
+        stroke_px: f32,
+        weight: u16,
+        letter_spacing: f32,
+    ) -> MemoryRenderBuffer {
         let mut rgba = vec![0u8; (wi * hi * 4) as usize];
 
         // cosmic-text's shaper PANICS when the font database is empty (no face to fall
@@ -226,7 +263,7 @@ impl TextRasterizer {
         let metrics = Metrics::new(size_px, size_px * 1.3);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(&mut self.font_system, Some(wi as f32), Some(hi as f32));
-        buffer.set_text(&mut self.font_system, text, &Attrs::new(), Shaping::Advanced);
+        buffer.set_text(&mut self.font_system, text, &attrs_for(weight, letter_spacing), Shaping::Advanced);
         // `draw` is `&self`, so the run must be shaped first (shaping needs `&mut`).
         buffer.shape_until_scroll(&mut self.font_system, false);
 
@@ -348,8 +385,8 @@ impl TextRasterizer {
 /// in scene.rs (pure geometry, no smithay) and the impl here is what lets layout ask for
 /// a width without scene.rs ever depending on a text stack.
 impl TextMeasure for TextRasterizer {
-    fn text_width(&mut self, text: &str, size_px: f32) -> f32 {
-        self.measure(text, size_px)
+    fn text_width(&mut self, text: &str, size_px: f32, weight: u16, letter_spacing: f32) -> f32 {
+        self.measure(text, size_px, weight, letter_spacing)
     }
 
     /// True when fontconfig has handed us a Material family. The box installs both
@@ -388,6 +425,8 @@ mod tests {
             h,
             color: 0,
             stroke_bits: 0,
+            weight: 400,
+            tracking_bits: 0,
         };
         assert_eq!(mk("hi", 14.0, 10, 10), mk("hi", 14.0, 10, 10));
         assert_ne!(mk("hi", 14.0, 10, 10), mk("hi", 15.0, 10, 10));
@@ -419,11 +458,11 @@ mod tests {
         let mut r = TextRasterizer::new();
         let white = [1.0, 1.0, 1.0, 1.0];
         let before = r.composes();
-        let _ = r.rasterize("7", 40.0, 60, 60, white, 0.0);
-        let _ = r.rasterize("7", 40.0, 60, 60, white, 3.0);
+        let _ = r.rasterize("7", 40.0, 60, 60, white, 0.0, 400, 0.0);
+        let _ = r.rasterize("7", 40.0, 60, 60, white, 3.0, 400, 0.0);
         assert_eq!(r.composes(), before + 2, "fill and outline compose separately");
         // And each is still cached in its own right.
-        let _ = r.rasterize("7", 40.0, 60, 60, white, 3.0);
+        let _ = r.rasterize("7", 40.0, 60, 60, white, 3.0, 400, 0.0);
         assert_eq!(r.composes(), before + 2, "the outline is cached like any run");
     }
 
@@ -435,7 +474,7 @@ mod tests {
         let mut r = TextRasterizer::new();
         let white = [1.0, 1.0, 1.0, 1.0];
         for i in 0..(MAX_CACHED_RUNS * 3) {
-            let _ = r.rasterize(&format!("earned ${i} overnight"), 12.0, 24, 14, white, 0.0);
+            let _ = r.rasterize(&format!("earned ${i} overnight"), 12.0, 24, 14, white, 0.0, 400, 0.0);
         }
         assert!(
             r.cached_runs() <= MAX_CACHED_RUNS,
@@ -446,9 +485,9 @@ mod tests {
 
         // And it is still a cache after a sweep: a run asked for twice composes once.
         let before = r.composes();
-        let _ = r.rasterize("steady", 12.0, 24, 14, white, 0.0);
+        let _ = r.rasterize("steady", 12.0, 24, 14, white, 0.0, 400, 0.0);
         let after_first = r.composes();
-        let _ = r.rasterize("steady", 12.0, 24, 14, white, 0.0);
+        let _ = r.rasterize("steady", 12.0, 24, 14, white, 0.0, 400, 0.0);
         assert_eq!(after_first, before + 1, "the first ask composes");
         assert_eq!(r.composes(), after_first, "the second ask must hit the cache");
     }
@@ -460,13 +499,13 @@ mod tests {
         // consumed a NaN or a zero here would place every run on top of the last one, so
         // these are the properties the layout actually depends on.
         let mut r = TextRasterizer::new();
-        assert_eq!(r.text_width("", 15.0), 0.0);
-        let hart = r.text_width("HART", 15.0);
+        assert_eq!(r.text_width("", 15.0, 400, 0.0), 0.0);
+        let hart = r.text_width("HART", 15.0, 400, 0.0);
         assert!(hart.is_finite() && hart > 0.0, "measured {hart}");
-        assert!(r.text_width("HART OS", 15.0) > hart);
-        assert!(r.text_width("HART", 30.0) > hart);
+        assert!(r.text_width("HART OS", 15.0, 400, 0.0) > hart);
+        assert!(r.text_width("HART", 30.0, 400, 0.0) > hart);
         // Measuring must not WRAP: a long run reports its own advance, not a box width.
         let long = "HART OS native shell parity program wordmark run";
-        assert!(r.text_width(long, 15.0) > r.text_width("HART OS", 15.0) * 3.0);
+        assert!(r.text_width(long, 15.0, 400, 0.0) > r.text_width("HART OS", 15.0, 400, 0.0) * 3.0);
     }
 }

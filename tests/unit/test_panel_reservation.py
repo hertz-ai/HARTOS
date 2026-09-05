@@ -960,3 +960,94 @@ def test_the_card_scrim_reaches_the_native_cards_with_the_shells_own_stops():
             assert "card_scrim_at: %s," % (int(g_at.group(1)) / 100.0) not in scene, (
                 "the native scene took the body.gpu-hardware scrim, which applies "
                 "only when the WebView composites")
+
+def test_every_native_run_carries_the_weight_its_shell_rule_declares():
+    """The typographic hierarchy, pinned across the two languages.
+
+    Both cosmic-text `set_text` calls passed a bare `Attrs::new()`, so every run on
+    the native desktop was painted at 400 while the shell gives every text element
+    an explicit weight and all but two are 600 or heavier. A title stopped being a
+    title.
+
+    Each native construction site now names its shell rule in a comment directly
+    above its weight, which is what makes this comparable at all: the pin reads
+    `// .hh-row-title` + `weight: 700` on one side and `.hh-row-title { font-weight:
+    700 }` on the other, so a designer changing a weight in the CSS fails here
+    instead of silently splitting the two surfaces.
+    """
+    css = _css_strip_comments(open(os.path.join(
+        REPO, "integrations", "agent_engine", "static", "hartHome.css"),
+        encoding="utf-8").read())
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    declared = {}
+    for m in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        sel = " ".join(m.group(1).split())
+        w = re.search(r"font-weight:\s*(\d+)", m.group(2))
+        if w:
+            declared[sel] = int(w.group(1))
+
+    # Every `// <selector>` + `weight: N` pair the scene carries.
+    pairs = re.findall(r"//\s*(\.[a-z0-9 .-]+)\n\s*weight: (\d+),", scene)
+    assert len(pairs) >= 8, (
+        "the native scene stopped naming its shell rules above its weights, so this "
+        "guard can no longer compare them (found %d)" % len(pairs))
+
+    checked = 0
+    for sel, got in pairs:
+        sel = sel.strip()
+        if sel not in declared:
+            continue
+        assert declared[sel] == int(got), (
+            "%s is font-weight %d in hartHome.css and %s in the native scene"
+            % (sel, declared[sel], got))
+        checked += 1
+    assert checked >= 6, (
+        "only %d native weights matched a shell rule by name; the comment markers "
+        "have drifted from the selectors and this pin is running on air" % checked)
+
+    # The two that matter most, named explicitly so a rename cannot quietly drop
+    # them from the loop above: the label over the money figure and the figure.
+    assert declared[".hh-eyebrow"] == 700
+    assert declared[".hh-amount"] == 800
+    assert re.search(r"//\s*\.hh-eyebrow\n\s*weight: 700,", scene), (
+        "the eyebrow lost its 700")
+    assert re.search(r"//\s*\.hh-amount\n\s*weight: 800,", scene), (
+        "the Spark figure lost its 800")
+
+
+def test_the_eyebrow_is_the_brand_label_the_shell_paints():
+    """`.hh-eyebrow` is teal, uppercase and letter-spaced; the native drew none of it.
+
+    It is the label directly over the Spark figure and the only other teal thing in
+    the hero, so painting it in the muted body colour broke the visual link between
+    the label and the number it names. `text-transform` and `letter-spacing` are
+    properties of the SURFACE, so they live in the scene and the wire keeps the
+    sentence the composer actually wrote.
+    """
+    css = _css_strip_comments(open(os.path.join(
+        REPO, "integrations", "agent_engine", "static", "hartHome.css"),
+        encoding="utf-8").read())
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    rule = re.search(r"(?m)^\.hh-eyebrow \{(.*?)^\}", css, re.S)
+    assert rule, "hartHome.css no longer has a .hh-eyebrow rule"
+    body = rule.group(1)
+
+    assert "text-transform: uppercase" in body
+    assert "home.hero.eyebrow.to_uppercase()" in scene, (
+        "the native eyebrow is drawn as sent, so the uppercase transform is gone")
+
+    # The construction site itself, anchored on the run's own text expression so the
+    # colour read here is the eyebrow's and not some neighbouring node's.
+    site = scene.split("home.hero.eyebrow.to_uppercase()")[1]
+    site = site[:site.index("});")]
+    assert "var(--hh-teal)" in body, "the eyebrow stopped being teal in the shell"
+    assert "color: theme.accent," in site, (
+        "the native eyebrow is not painted in the accent")
+
+    ls = re.search(r"letter-spacing:\s*([\d.]+)px", body)
+    assert ls, "the eyebrow stopped being letter-spaced in the shell"
+    assert "letter_spacing: %s," % float(ls.group(1)) in scene, (
+        "the native eyebrow does not carry the shell's %spx letter-spacing"
+        % ls.group(1))
