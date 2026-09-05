@@ -58,6 +58,8 @@ makes this worth more than another feature.
 | An A2UI push wakes the SSE stream without waiting on a durable write | `test_liquid_ui_sse_event_driven.py` 4/4; the audit commit sat ahead of the wake and cost 5.8s to 11.5s per push, now 0.000s | 2026-09-05, pass |
 | The native scene layer is not the frame-rate bottleneck | `scene_cost_fits_the_frame_budget` on an i7-7700K, release: a full relayout WITH real cosmic-text shaping is p99 219us, 1.3% of a 16.667ms frame; geometry alone is 2us | 2026-09-05, measured |
 | A steady desktop pays no layout at all | same run: a retained-tree hit is p50 and p99 both under 1us, and `rebuilds()` does not move on an unchanged key | 2026-09-05, measured |
+| Windows / macOS capability parity is COMPUTED, not asserted | `OS_PARITY_MATRIX.md`, 30 rows, gated by `test_nixos_configs.py::TestParityMatrix`: 30 pass. 28 present, 2 deliberately partial (remote-desktop control and firewall writes are steward-gated ingress on purpose), 0 gaps | 2026-09-05, pass |
+| The matrix cannot advertise a route that does not exist | same gate: every `/api/shell/...` the matrix cites is checked against the registered routes, and the honest-gap test parametrizes over the gap list, which is now EMPTY (hence its skip) | 2026-09-05, pass |
 
 Read the sealed rows for what they are. `shell_surface/conftest.py` guarantees a
 poweroff/format/nmcli test can never touch the host, and chapter 00 asserts that
