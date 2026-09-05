@@ -437,13 +437,24 @@ touch the shell and must not be settled unilaterally.
    are `[a-z0-9-]` only, so they cannot encode traversal. Formats are png, webp,
    jpg, jpeg and svg.
 
-   What is left is a genuine decision with two credible answers, and it is the
-   SVG that decides it. (a) The compositor reads and decodes: it needs a root
-   path handed in (a deployment fact) plus decoders, and svg means a full
-   renderer, which is a large dependency to put inside the process that owns
-   scanout. (b) The shell hands over decoded pixels through the existing IPC: it
-   already has the bytes and a renderer, but the IPC is framed JSON, so this needs
-   a binary channel rather than base64 at image sizes. Not settled here.
+   What is left is a genuine decision, and the SVG decides it. MEASURED rather
+   than assumed, because "it might be SVG" and "it is all SVG" are different
+   problems: every one of the 51 bundled art files is `.svg`. There is no PNG
+   fallback path to lean on, so no card art draws at all without an SVG renderer.
+
+   The subset in use is narrow though, which is the part that makes this
+   tractable. Across all 51: gradients in 12 (linear and radial), and ZERO uses of
+   filters, `<text>`, masks, clipPaths or patterns. Filters and text are the two
+   hardest parts of SVG and neither appears. Each file is about 1.5 KB, drawn at
+   `preserveAspectRatio='xMidYMid slice'`, so they fill and crop rather than
+   letterbox.
+
+   So the options are: (a) the compositor renders them, which given that subset is
+   `usvg` + `tiny-skia` (pure Rust, no C dependencies) rather than a browser-grade
+   engine, plus a root path handed in as a deployment fact; or (b) the shell hands
+   over decoded pixels through the existing IPC, since it already has both the
+   bytes and a renderer, but that IPC is framed JSON and would need a binary
+   channel rather than base64 at image sizes. Not settled here.
 
 Already handled, listed so nobody re-derives them: the scene claims
 NATIVE_CHROME_ORB itself (the M2 block that used to set it is skipped exactly
