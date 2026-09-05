@@ -1360,3 +1360,35 @@ The test distinguishes the scrim from the art by what a scrim IS, a wash that
 starts transparent, rather than by its position among a card's children. Two card
 tests had been counting fills to count cards, which stopped meaning that the
 moment a card had two.
+
+### The third emphasis did nothing
+Sweeping the home wire for the usual defect (a declared contract nothing consumes)
+turned it up on the shell side rather than the native one. The home prompt offers
+the curator `"emphasis": <flagship|ranked|normal>`. `_home_curate` maps flagship
+onto the row, `_sanitize_home_payload` validates and forwards it, and
+`test_home_producer.py` pins that the flag arrives. Nothing then read it.
+`ranked` restyles every card in its row and `normal` is the absence of both, so
+one of the three emphases the curator is offered was a no-op the whole way down.
+
+The protection that DID hold was accidental. `_replaceRow` matches on a DISPLAY
+TITLE, so the "Flagship agents" row survived the live dashboard only by never
+colliding with 'Continue' or 'Recipes'. Retitling the row, or a curated row of its
+own titled 'Continue', silently handed it over. `_replaceRow` now reads the flag,
+which is what its own comment already claimed happened.
+
+One trap in the fix worth naming: `fetchRecipes` passes `appendIfMissing`, so a
+"found but protected" row that fell through to the append would put a SECOND row
+under the same title on the home, which is worse than the replacement it was
+protecting against. The guard covers that case explicitly.
+
+The native path needs nothing here. `flagship` governs how the client merges live
+fetches into a payload; the native scene receives an already-composed home and
+runs no such merge, so mirroring the flag would be adding a mechanism, not parity.
+
+Two neighbours were checked and deliberately left alone. `card.format` is read by
+`makeCard` and styled by `.hh-wide` / `.hh-portrait` / `.hh-square`, but no
+producer sets it and the sanitizer does not carry it, so all four formats collapse
+to landscape today; the native scene drawing every card landscape IS parity, and
+lighting the feature up would be new work, not this program's. `card.empty` is
+synthesized client-side for a row with no cards, and the sanitizer drops empty
+rows before they reach the wire, so it never travels either.
