@@ -134,6 +134,68 @@ def test_the_native_scene_draws_the_same_strips_the_shell_reserves(published):
         "scene.rs TASKBAR_H and the published bottom reservation have drifted")
 
 
+def test_the_native_card_art_is_the_shells_own_brand_gradient():
+    """THE SAME DRIFT CLASS, across the same language boundary, one layer in.
+
+    Every card on the home desktop is painted as a brand-spectrum hue darkened
+    toward ink across two stops. hartBrandArt.js is the single source of that
+    art language for the shell, and its own header says why it exists: the home
+    cards and the desktop icons had each grown a copy, with different ink,
+    different darkening and a different hue order, and they drifted apart.
+
+    The native compositor scene now paints the same tiles from Rust constants,
+    which is a THIRD copy in a language neither that module nor any JS test can
+    see. So pin it: the ink, both blend factors and the angle list must be the
+    literals hartBrandArt.js uses, and the ranked card's art box must be the
+    width hartHome.css gives `.hh-rank-inner`. A card that reads darker, flatter
+    or differently angled than the shell's is the exact failure this catches,
+    and it is invisible to every other test in the tree.
+    """
+    brand = open(os.path.join(REPO, "integrations", "agent_engine", "static",
+                              "hartBrandArt.js"), encoding="utf-8").read()
+    home_css = open(os.path.join(REPO, "integrations", "agent_engine", "static",
+                                 "hartHome.css"), encoding="utf-8").read()
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    ink = re.search(r"var INK = \[(\d+), (\d+), (\d+)\]", brand)
+    assert ink, "hartBrandArt.js no longer declares INK as a literal triple"
+    rust_ink = re.search(
+        r"const ART_INK: Color = Color::rgba\("
+        r"(\d+)\.0 / 255\.0, (\d+)\.0 / 255\.0, (\d+)\.0 / 255\.0", scene)
+    assert rust_ink, "scene.rs no longer declares ART_INK from 0..255 literals"
+    assert rust_ink.groups() == ink.groups(), (
+        "the native art ink and hartBrandArt's INK have drifted: "
+        "%s vs %s" % (rust_ink.groups(), ink.groups()))
+
+    # The two darkening factors, named in the shell by which stop they make.
+    dark = re.search(r"var dark = blend\(base, INK, ([0-9.]+)\)", brand)
+    light = re.search(r"var light = blend\(second, INK, ([0-9.]+)\)", brand)
+    assert dark and light, "hartBrandArt.js gradient() no longer blends two stops"
+    assert re.search(r"base\.mix\(ART_INK, %s\)" % re.escape(dark.group(1)), scene), (
+        "the native DARK stop no longer uses the shell's %s" % dark.group(1))
+    assert re.search(r"second\.mix\(ART_INK, %s\)" % re.escape(light.group(1)), scene), (
+        "the native LIGHT stop no longer uses the shell's %s" % light.group(1))
+
+    angles = re.search(r"var ang = \[(\d+), (\d+), (\d+)\]", brand)
+    assert angles, "hartBrandArt.js no longer picks from three literal angles"
+    rust_angles = re.search(
+        r"const ART_ANGLES: \[f32; 3\] = \[([0-9.]+), ([0-9.]+), ([0-9.]+)\]", scene)
+    assert rust_angles, "scene.rs no longer declares ART_ANGLES"
+    assert [float(a) for a in rust_angles.groups()] ==         [float(a) for a in angles.groups()], (
+        "the native gradient angles and the shell's have drifted")
+
+    # `.hh-card.hh-ranked .hh-rank-inner { width: 174px }`: the art box of a
+    # leaderboard card, and the box its title, chip and progress bar sit in.
+    inner = re.search(r"\.hh-rank-inner\s*\{[^}]*?width:\s*(\d+)px", home_css,
+                      re.S)
+    assert inner, "hartHome.css no longer sizes .hh-rank-inner"
+    rust_inner = re.search(r"const RANK_INNER_W: f32 = ([0-9.]+);", scene)
+    assert rust_inner, "scene.rs no longer declares RANK_INNER_W"
+    assert float(rust_inner.group(1)) == float(inner.group(1)), (
+        "the ranked card's native art box is %s but the shell's is %s"
+        % (rust_inner.group(1), inner.group(1)))
+
+
 def test_a_failed_theme_load_still_reserves_the_bar_it_actually_paints(
         published, monkeypatch):
     """Replaces the fallback-constant grep AND the source index-ordering check.

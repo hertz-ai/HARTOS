@@ -389,22 +389,35 @@ impl OrbCache {
     }
 }
 
-/// Rasterize a rounded rectangle of `color` into a premultiplied [B,G,R,A] buffer,
-/// anti-aliased at the corners via a rounded-box signed-distance field. The scene
-/// carries a `radius` on the card / omnibox rects that a `SolidColorRenderElement`
-/// (always a hard quad) cannot express, so those rects lower through a cached
-/// MemoryRenderBuffer of THIS shape instead. Byte order + premultiply match
+/// Rasterize a rounded rectangle into a premultiplied [B,G,R,A] buffer, anti-aliased at
+/// the corners via a rounded-box signed-distance field, filled with a linear gradient from
+/// `from` to `to` along `angle_deg`. A SOLID tile is this with `from == to`, which is why
+/// there is one rasterizer and not two: the scene's card art and its card background are
+/// the same shape with a different fill, and a second copy of the SDF is exactly the drift
+/// the shell's own brand-art module was written to end.
+///
+/// The scene carries a `radius` on the card / omnibox / art rects that a
+/// `SolidColorRenderElement` (always a hard quad) cannot express, so those lower through a
+/// cached MemoryRenderBuffer of THIS shape instead. Byte order + premultiply match
 /// text_render.rs and bloom.rs (Argb8888 little-endian = B,G,R,A, premultiplied).
-fn rounded_rect_rgba(w: u32, h: u32, radius: f32, color: [f32; 4]) -> Vec<u8> {
+///
+/// `angle_deg` follows CSS `linear-gradient`: 0 points UP the tile and the angle increases
+/// clockwise, so 135 runs top-left to bottom-right. The gradient line is centred on the
+/// tile and its length is `|w*sin| + |h*cos|`, which is what makes the last stop land
+/// exactly on the far corner rather than short of it.
+fn rounded_rect_rgba(w: u32, h: u32, radius: f32, from: [f32; 4], to: [f32; 4], angle_deg: f32) -> Vec<u8> {
     let mut rgba = vec![0u8; (w * h * 4) as usize];
     let hw = w as f32 / 2.0;
     let hh = h as f32 / 2.0;
     // A radius past half the short side is just a fuller pill / circle.
     let r = radius.clamp(0.0, hw.min(hh));
-    let ca = color[3].clamp(0.0, 1.0);
-    let cr = color[0].clamp(0.0, 1.0);
-    let cg = color[1].clamp(0.0, 1.0);
-    let cb = color[2].clamp(0.0, 1.0);
+    let solid = from == to;
+    // Screen space has y DOWN, so the CSS "up" axis is -y: the unit vector along the
+    // gradient line is (sin, -cos).
+    let rad = angle_deg.to_radians();
+    let (dx, dy) = (rad.sin(), -rad.cos());
+    let len = (w as f32 * dx).abs() + (h as f32 * dy).abs();
+    let inv_len = if len > 0.0 { 1.0 / len } else { 0.0 };
     for y in 0..h {
         for x in 0..w {
             // Pixel centre relative to the rect centre.
@@ -420,11 +433,19 @@ fn rounded_rect_rgba(w: u32, h: u32, radius: f32, color: [f32; 4]) -> Vec<u8> {
             if cov <= 0.0 {
                 continue;
             }
-            let a = ca * cov;
+            // Position along the gradient line, 0 at the first stop's end. The projection
+            // is centred, so shifting by half the length puts 0 at the start edge.
+            let t = if solid {
+                0.0
+            } else {
+                ((px * dx + py * dy) * inv_len + 0.5).clamp(0.0, 1.0)
+            };
+            let ch = |i: usize| (from[i] + (to[i] - from[i]) * t).clamp(0.0, 1.0);
+            let a = ch(3) * cov;
             let idx = ((y * w + x) * 4) as usize;
-            rgba[idx] = (cb * a * 255.0) as u8;
-            rgba[idx + 1] = (cg * a * 255.0) as u8;
-            rgba[idx + 2] = (cr * a * 255.0) as u8;
+            rgba[idx] = (ch(2) * a * 255.0) as u8;
+            rgba[idx + 1] = (ch(1) * a * 255.0) as u8;
+            rgba[idx + 2] = (ch(0) * a * 255.0) as u8;
             rgba[idx + 3] = (a * 255.0) as u8;
         }
     }
@@ -442,7 +463,11 @@ pub struct RectCache {
     /// plus a handful that track the output width, radii are constants, and colours are
     /// the theme's plus one hover lift per card. That is a few dozen combinations for a
     /// given output, not a set that grows with what the agent writes.
-    cache: std::collections::HashMap<(u32, u32, u32, u32, u32, u32, u32), MemoryRenderBuffer>,
+    #[allow(clippy::type_complexity)]
+    cache: std::collections::HashMap<
+        (u32, u32, u32, [u32; 4], [u32; 4], u32),
+        MemoryRenderBuffer,
+    >,
     /// POOL for the sharp-rect path. The first cut built a `SolidColorBuffer` per rect per
     /// frame, which is the other half of the zero-per-frame-alloc NFR (the retained tree in
     /// `scene::SceneCache` was the first). Buffers are handed out in paint order and reused
@@ -496,35 +521,79 @@ impl RectCache {
         radius: f32,
         color: [f32; 4],
     ) -> Option<&MemoryRenderBuffer> {
+        // A flat fill is the degenerate gradient, so it goes through the same tile: one
+        // rasterizer, one cache, one compose-once counter.
+        self.tile(w, h, radius, color, color, 0.0)
+    }
+
+    /// The card-art buffer: the same rounded tile, filled with the scene's two-stop
+    /// gradient. Keyed on both stops and the angle, so the whole desktop's art is a
+    /// handful of buffers (six hues by three angles at one card size), each composed once.
+    pub fn gradient(
+        &mut self,
+        w: i32,
+        h: i32,
+        radius: f32,
+        from: [f32; 4],
+        to: [f32; 4],
+        angle_deg: f32,
+    ) -> Option<&MemoryRenderBuffer> {
+        self.tile(w, h, radius, from, to, angle_deg)
+    }
+
+    /// The one composed-tile path behind `rounded` and `gradient`.
+    fn tile(
+        &mut self,
+        w: i32,
+        h: i32,
+        radius: f32,
+        from: [f32; 4],
+        to: [f32; 4],
+        angle_deg: f32,
+    ) -> Option<&MemoryRenderBuffer> {
         if w < 1 || h < 1 {
             return None;
         }
+        let bits = |c: [f32; 4]| [c[0].to_bits(), c[1].to_bits(), c[2].to_bits(), c[3].to_bits()];
+        // A solid tile keys its angle as zero whatever was passed, so the same colour at
+        // two angles is one buffer rather than two identical ones.
+        let angle_key = if from == to { 0.0f32 } else { angle_deg };
         let key = (
             w as u32,
             h as u32,
             radius.to_bits(),
-            color[0].to_bits(),
-            color[1].to_bits(),
-            color[2].to_bits(),
-            color[3].to_bits(),
+            bits(from),
+            bits(to),
+            angle_key.to_bits(),
         );
-        if !self.cache.contains_key(&key) {
-            let rgba = rounded_rect_rgba(w as u32, h as u32, radius, color);
-            let buf = MemoryRenderBuffer::from_slice(
-                &rgba,
-                Fourcc::Argb8888,
-                (w, h),
-                1,
-                Transform::Normal,
-                None,
-            );
-            self.cache.insert(key, buf);
-            self.rounded_composes += 1;
+        // Destructured so the counter and the map are DISJOINT borrows: that is what lets
+        // the vacant arm bump `rounded_composes` while still holding the entry, and so
+        // lets one `entry` lookup replace the contains_key/insert/get triple this used to
+        // hash the key three times for.
+        let Self {
+            cache,
+            rounded_composes,
+            ..
+        } = self;
+        match cache.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let rgba = rounded_rect_rgba(w as u32, h as u32, radius, from, to, angle_deg);
+                *rounded_composes += 1;
+                Some(e.insert(MemoryRenderBuffer::from_slice(
+                    &rgba,
+                    Fourcc::Argb8888,
+                    (w, h),
+                    1,
+                    Transform::Normal,
+                    None,
+                )))
+            }
         }
-        self.cache.get(&key)
     }
 
-    /// Total rounded-rect buffers ever composed (test hook for the compose-once proof).
+    /// Total composed tiles ever rasterized, solid and gradient alike (test hook for the
+    /// compose-once proof).
     pub fn rounded_composes(&self) -> u64 {
         self.rounded_composes
     }
@@ -2416,6 +2485,56 @@ where
                     Err(err) => warn!(?err, "native scene: text run import failed"),
                 }
             }
+            crate::scene::SceneNode::Art {
+                rect,
+                from,
+                to,
+                angle_deg,
+                radius,
+                // The photo is not lowered yet (M3 remainder). The gradient beneath it is
+                // what the shell paints first and never removes, so the card is a card
+                // with or without one; before this, a card the feed gave a picture drew
+                // its picture's ABSENCE, and a ranked card drew nothing whatsoever.
+                photo: _,
+            } => {
+                if rect.w < 1.0 || rect.h < 1.0 {
+                    return;
+                }
+                // Hovering an art tile lifts BOTH stops, so the whole tile brightens by the
+                // same amount and the gradient keeps its shape. This is the ranked card's
+                // only hover state, its background being transparent by design.
+                let (from, to) = if hover_leaf == Some(idx) {
+                    (
+                        from.lift(crate::scene::CARD_HOVER_LIFT),
+                        to.lift(crate::scene::CARD_HOVER_LIFT),
+                    )
+                } else {
+                    (*from, *to)
+                };
+                if let Some(buffer) = rect_cache.gradient(
+                    rect.w as i32,
+                    rect.h as i32,
+                    *radius,
+                    [from.r, from.g, from.b, from.a],
+                    [to.r, to.g, to.b, to.a],
+                    *angle_deg,
+                ) {
+                    let origin: Point<f64, Physical> =
+                        Point::from((rect.x as f64, rect.y as f64));
+                    match MemoryRenderBufferRenderElement::from_buffer(
+                        renderer,
+                        origin,
+                        buffer,
+                        Some(1.0),
+                        None,
+                        Some((rect.w as i32, rect.h as i32).into()),
+                        Kind::Unspecified,
+                    ) {
+                        Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                        Err(err) => warn!(?err, "native scene: card art import failed"),
+                    }
+                }
+            }
             crate::scene::SceneNode::OrbSlot { rect, .. } => {
                 // The scene OWNS the orb (the hardcoded M2 draw is gated off when
                 // native_shell_on), so ONE orb path. Both the large home orb and the
@@ -2452,7 +2571,7 @@ where
                     }
                 }
             }
-            // Image lowering is the M3 remainder; Container only groups.
+            // Container only groups; it paints nothing of its own.
             _ => {}
         }
     });
@@ -3579,15 +3698,50 @@ mod tests {
         // fully covered. This is precisely what a hard SolidColorRenderElement cannot
         // express, so it is the reason rounded rects lower through a buffer.
         let (w, h) = (40u32, 40u32);
-        let rgba = rounded_rect_rgba(w, h, 12.0, [1.0, 1.0, 1.0, 1.0]);
+        let white = [1.0, 1.0, 1.0, 1.0];
+        let rgba = rounded_rect_rgba(w, h, 12.0, white, white, 0.0);
         assert_eq!(rgba.len(), (w * h * 4) as usize);
         let alpha_at = |x: u32, y: u32| rgba[((y * w + x) * 4 + 3) as usize];
         assert_eq!(alpha_at(0, 0), 0, "top-left corner must be cut away");
         assert!(alpha_at(w / 2, h / 2) > 250, "centre must be opaque");
         assert!(alpha_at(w / 2, 0) > 250, "the straight top edge must be covered");
         // A zero radius is a plain filled rect: the corner is now covered too.
-        let sharp = rounded_rect_rgba(w, h, 0.0, [1.0, 1.0, 1.0, 1.0]);
+        let sharp = rounded_rect_rgba(w, h, 0.0, white, white, 0.0);
         assert!(sharp[3] > 250, "radius 0 fills the corner");
+    }
+
+    #[test]
+    fn a_gradient_tile_actually_varies_along_its_angle() {
+        // The card art is the ONLY thing on the desktop whose fill is not constant, so
+        // "it drew something" is not enough: a solid fill would satisfy a coverage check
+        // and still be the flat tile this replaced. Probe the two ends of the gradient
+        // line and require them to differ, then require the same tile at a different
+        // angle to differ from it as well (which a fill ignoring `angle_deg` would fail).
+        let (w, h) = (64u32, 64u32);
+        let black = [0.0, 0.0, 0.0, 1.0];
+        let red = [1.0, 0.0, 0.0, 1.0];
+        // 180deg points straight DOWN the tile, so t runs with y and the probe is exact.
+        let g = rounded_rect_rgba(w, h, 0.0, black, red, 180.0);
+        let red_at = |buf: &[u8], x: u32, y: u32| buf[((y * w + x) * 4 + 2) as usize];
+        let top = red_at(&g, w / 2, 1);
+        let bottom = red_at(&g, w / 2, h - 2);
+        assert!(top < 16, "the first stop end must still be the FROM colour");
+        assert!(bottom > 239, "the far end must have reached the TO colour");
+        assert!(bottom > top, "the fill must ramp from `from` to `to`, not average them");
+        // 0deg is the same line reversed, so the ramp must invert rather than repeat.
+        let up = rounded_rect_rgba(w, h, 0.0, black, red, 0.0);
+        assert!(
+            red_at(&up, w / 2, 1) > red_at(&up, w / 2, h - 2),
+            "the angle must actually steer the gradient"
+        );
+        // A solid tile is the degenerate case and must stay perfectly flat, whatever
+        // angle it is handed: that is what lets `rounded` share this one rasterizer.
+        let flat = rounded_rect_rgba(w, h, 0.0, red, red, 135.0);
+        assert_eq!(
+            red_at(&flat, 1, 1),
+            red_at(&flat, w - 2, h - 2),
+            "from == to must fill flat"
+        );
     }
 }
 

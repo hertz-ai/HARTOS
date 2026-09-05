@@ -77,7 +77,6 @@ impl Color {
     pub const fn rgba(r: f32, g: f32, b: f32, a: f32) -> Self {
         Color { r, g, b, a }
     }
-    pub const TRANSPARENT: Color = Color::rgba(0.0, 0.0, 0.0, 0.0);
     /// Parse `#RRGGBB` or `#RRGGBBAA` (leading `#` optional). Returns None on any
     /// malformed input so a bad theme value falls back to a caller default rather
     /// than panicking mid-compose. This is the ONLY hex parser the scene uses.
@@ -104,18 +103,30 @@ impl Color {
         }
     }
 
+    /// This colour moved `t` of the way toward `other` (0.0 unchanged, 1.0 `other`), with
+    /// ALPHA untouched: the mix answers "what hue", never "how opaque", so a blend can
+    /// never quietly change whether the thing behind shows through.
+    ///
+    /// The one channel-blend primitive the scene has. `lift` is this toward white, and the
+    /// card art's two stops are this toward ink, which is the same arithmetic the shell's
+    /// `HartBrandArt.blend` runs; a second implementation of it is how the desktop icon
+    /// layer and the home cards drifted apart in the first place (hartBrandArt.js header).
+    pub fn mix(self, other: Color, t: f32) -> Color {
+        let k = t.clamp(0.0, 1.0);
+        Color::rgba(
+            self.r + (other.r - self.r) * k,
+            self.g + (other.g - self.g) * k,
+            self.b + (other.b - self.b) * k,
+            self.a,
+        )
+    }
+
     /// This colour lifted toward white by `amount` (0.0 unchanged, 1.0 white), with alpha
     /// untouched so a hover never changes how opaque a card is. Lifting toward white
     /// rather than scaling the channels is what keeps a near-black card visibly reactive:
     /// a multiply would leave a dark card almost unchanged.
     pub fn lift(self, amount: f32) -> Color {
-        let k = amount.clamp(0.0, 1.0);
-        Color::rgba(
-            self.r + (1.0 - self.r) * k,
-            self.g + (1.0 - self.g) * k,
-            self.b + (1.0 - self.b) * k,
-            self.a,
-        )
+        self.mix(Color::rgba(1.0, 1.0, 1.0, self.a), amount)
     }
 }
 
@@ -237,7 +248,65 @@ impl Theme {
         name.and_then(|n| self.spectrum_named(n))
             .unwrap_or(self.spectrum[index % self.spectrum.len()])
     }
+
+    /// A card's art-tile gradient: `(from, to, angle_deg)`, the port of the shell's
+    /// `HartBrandArt.gradient(baseHex, seed)` with `seed` = the card's index in its row.
+    ///
+    /// This is the surface EVERY card has. The shell paints it unconditionally
+    /// (`art.style.background = gradientArt(...)`) and only then fades a photo in over it,
+    /// with the comment "no empty flash". So a card without a photo is not a flat tile: it
+    /// is its row's hue darkened toward ink across two stops. The native scene drew the
+    /// flat tile, and drew a ranked card as NOTHING at all, because a ranked card's own
+    /// background is transparent by design and the art it is made of was never lowered.
+    ///
+    /// Angles and blend factors are the shell's literals, not a re-derivation:
+    /// `[135,150,165][seed % 3]`, `blend(base, INK, 0.46)` for the darker stop,
+    /// `blend(second, INK, 0.20)` for the lighter one.
+    pub fn art_stops(
+        &self,
+        accent: Option<&str>,
+        row_index: usize,
+        card_index: usize,
+    ) -> (Color, Color, f32) {
+        let n = self.spectrum.len();
+        // The shell resolves the row's accent to a NAME first (`row.accent || spec[idx]`)
+        // and only then asks SPECTRUM_HEX for it, so the two branches below are its two,
+        // not an interpretation of them.
+        let (base, second) = match accent {
+            //   A name outside the spectrum: `spectrumHex[accent]` is undefined, which
+            //   drops `gradient()` into its no-hex branch and folds in a NEIGHBOUR hue for
+            //   iridescence, seeded by the CARD index. The wire sanitizer coerces the
+            //   accent into the spectrum, so this is the hand-written-payload path.
+            Some(name) => match self.spectrum_named(name) {
+                Some(hue) => (hue, hue),
+                None => (
+                    self.spectrum[card_index % n],
+                    self.spectrum[(card_index + 2) % n],
+                ),
+            },
+            //   No accent at all: the row's positional hue, and an explicit hex from there
+            //   on, so both stops are that one hue.
+            None => {
+                let hue = self.spectrum[row_index % n];
+                (hue, hue)
+            }
+        };
+        (
+            second.mix(ART_INK, 0.20),
+            base.mix(ART_INK, 0.46),
+            ART_ANGLES[card_index % ART_ANGLES.len()],
+        )
+    }
 }
+
+/// The deep ink every art tile darkens toward: hartBrandArt.js `INK = [14,14,17]`, with
+/// its own note that it is neutral near-black and NOT navy, so blending toward it does not
+/// blue-shift the hue away from the row's accent.
+const ART_INK: Color = Color::rgba(14.0 / 255.0, 14.0 / 255.0, 17.0 / 255.0, 1.0);
+
+/// The three gradient angles a row cycles through, so neighbouring cards do not read as
+/// one repeated tile. The shell's own list, in its order.
+const ART_ANGLES: [f32; 3] = [135.0, 150.0, 165.0];
 
 impl Theme {
     /// The checklist b-section default anchors: teal accent (#00E6C3, the orb default),
@@ -329,7 +398,7 @@ impl HomeCompose {
                             icon: Some("summarize".to_string()),
                             badge: None,
                             live: None,
-                            image: None,
+                            photo: None,
                         },
                         Card {
                             title: "Inbox triage".to_string(),
@@ -338,7 +407,7 @@ impl HomeCompose {
                             icon: Some("inbox".to_string()),
                             badge: None,
                             live: Some("running".to_string()),
-                            image: None,
+                            photo: None,
                         },
                         Card {
                             title: "Storage report".to_string(),
@@ -347,7 +416,7 @@ impl HomeCompose {
                             icon: Some("storage".to_string()),
                             badge: None,
                             live: None,
-                            image: None,
+                            photo: None,
                         },
                     ],
                 },
@@ -365,7 +434,7 @@ impl HomeCompose {
                             icon: Some("hive".to_string()),
                             badge: Some("NEW".to_string()),
                             live: None,
-                            image: None,
+                            photo: None,
                         },
                         Card {
                             title: "Agent recipes".to_string(),
@@ -374,7 +443,7 @@ impl HomeCompose {
                             icon: Some("auto_awesome".to_string()),
                             badge: None,
                             live: None,
-                            image: None,
+                            photo: None,
                         },
                     ],
                 },
@@ -454,15 +523,24 @@ pub struct Card {
     /// A running-agent tag (`card.live`), which SUPERSEDES `badge`: the shell draws one
     /// or the other, never both, so the pair is decoded separately and resolved at layout.
     pub live: Option<String>,
-    /// An image ref (URL or app-icon id). Lowered to a texture element; None draws
-    /// the card as a solid tile with just its text.
-    pub image: Option<String>,
+    /// The card's PHOTO, if the payload named one. Not the card's art: every card has art
+    /// (the brand gradient, see `Theme::art_stops`), and a photo is what fades in over it.
+    ///
+    /// Decoded from `card.image` OR `card.image_url`, in that priority, because that is the
+    /// shell's own `imgSrc` and, more to the point, its `hasImage`. Reading only `image`
+    /// meant a news or app card, which carries `image_url` (liquid_ui_service stamps art
+    /// there), decoded as photo-less and so drew the icon glyph the shell suppresses.
+    ///
+    /// Still not LOWERED: the photo layer is the M3 remainder. What changed is that its
+    /// absence is no longer the difference between a card and a hole.
+    pub photo: Option<String>,
 }
 
 /// The scene tree the compositor renders. Wayland-FREE and GL-FREE: `comp_core`
-/// lowers each variant to a `HartRenderElement` (Rect -> SolidColorBuffer, Text ->
-/// glyph-atlas Memory texture, Image -> Memory texture, OrbSlot -> the existing M2
-/// orb element). A `Container` only groups and positions; it paints nothing itself.
+/// lowers each variant to a `HartRenderElement` (Rect -> SolidColorBuffer or a cached
+/// rounded tile, Text -> glyph-atlas Memory texture, Art -> a cached gradient tile,
+/// OrbSlot -> the existing M2 orb element). A `Container` only groups and positions; it
+/// paints nothing itself.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SceneNode {
     Container {
@@ -501,10 +579,27 @@ pub enum SceneNode {
         /// times and read zero is not a contract, it is weight.
         stroke: f32,
     },
-    Image {
+    /// A card's art tile: a two-stop linear gradient, plus the photo that belongs over it.
+    ///
+    /// This replaced `Image { rect, source, radius }`, which was constructed at exactly one
+    /// site, lowered nowhere, and emitted ONLY when the payload named a picture. That is
+    /// the wrong shape for what the shell draws: `.hh-card-art` is always present, its
+    /// background is always the brand gradient, and the photo is an `<img>` that fades in
+    /// on top. Modelling the picture as the tile meant a ranked card, whose own background
+    /// is `transparent` because the art IS the card, rendered as nothing at all.
+    Art {
         rect: Rect,
-        source: String,
+        /// The gradient's first stop, at the angle's start edge (the shell's `light`).
+        from: Color,
+        /// Its last stop (the shell's `dark`).
+        to: Color,
+        /// CSS gradient angle in degrees: 0 points UP the tile, increasing clockwise.
+        angle_deg: f32,
+        /// Corner radius in logical px, matching the tile the art fills.
         radius: f32,
+        /// The photo drawn over the gradient once image lowering lands (M3 remainder).
+        /// Carried here, not dropped, so the contract stays visible in the tree.
+        photo: Option<String>,
     },
     /// Where the native M2 orb draws. `compact` is the orb-sm docked in the top bar
     /// (checklist c7); the large home orb is `compact = false`.
@@ -521,7 +616,7 @@ impl SceneNode {
             SceneNode::Container { rect, .. }
             | SceneNode::Rect { rect, .. }
             | SceneNode::Text { rect, .. }
-            | SceneNode::Image { rect, .. }
+            | SceneNode::Art { rect, .. }
             | SceneNode::OrbSlot { rect, .. } => *rect,
         }
     }
@@ -620,10 +715,10 @@ impl SceneNode {
 
     /// The index, in `flatten` paint order, of the leaf that must paint its HOVER state
     /// this frame, or None when the pointer is absent or over nothing interactive. That
-    /// leaf is the background `Rect` of the top-most interactive `Container` under the
-    /// cursor, which is why a group only counts as a target when its FIRST child is a
-    /// Rect: the highlight is a lift of a background the scene already draws, never an
-    /// extra node, so hover changes no geometry and no element count.
+    /// leaf is the SURFACE of the top-most interactive `Container` under the cursor: its
+    /// first child that actually paints a ground, a `Rect` or an `Art`. The highlight is a
+    /// lift of something the scene already draws, never an extra node, so hover changes no
+    /// geometry and no element count.
     ///
     /// An INDEX is what the lowering wants (not a rect, not a borrowed node): it walks the
     /// same flattened leaves in the same order, so a counter comparison is exact, needs no
@@ -636,10 +731,10 @@ impl SceneNode {
         found
     }
 
-    /// Paint-order walk behind `hover_leaf`. `next` counts the leaves already passed, so
-    /// at the moment an interactive container is entered `next` IS the index its first
-    /// leaf will take. Later hits overwrite, which is exactly top-most (and deepest) wins,
-    /// matching `hit_test`'s rule with one walk and no allocation.
+    /// Paint-order walk behind `hover_leaf`. `next` counts the leaves already passed, so at
+    /// the moment a child is reached `next` IS the index that child's first leaf will take.
+    /// Later hits overwrite, which is exactly top-most (and deepest) wins, matching
+    /// `hit_test`'s rule with one walk and no allocation.
     fn hover_leaf_walk(&self, px: f32, py: f32, next: &mut usize, found: &mut Option<usize>) {
         match self {
             SceneNode::Container {
@@ -647,13 +742,21 @@ impl SceneNode {
                 interactive,
                 children,
             } => {
-                if *interactive
-                    && rect.contains(px, py)
-                    && matches!(children.first(), Some(SceneNode::Rect { .. }))
-                {
-                    *found = Some(*next);
-                }
+                // Claim the group's SURFACE: the first child that paints a ground. For an
+                // ordinary card that is child zero, its background Rect. For a RANKED card
+                // it is the Art tile, which is not first, because the shell appends the
+                // rank numeral before the art so the art paints OVER it. Searching rather
+                // than demanding child zero is what lets the numeral keep that order and
+                // still leaves the ranked card with a hover, which it never had: its first
+                // child used to be a fully transparent placeholder rect, added only to
+                // satisfy this test, and lifting a transparent colour shows nothing.
+                let mut claiming = *interactive && rect.contains(px, py);
                 for child in children {
+                    if claiming && matches!(child, SceneNode::Rect { .. } | SceneNode::Art { .. })
+                    {
+                        *found = Some(*next);
+                        claiming = false;
+                    }
                     child.hover_leaf_walk(px, py, next, found);
                 }
             }
@@ -750,6 +853,13 @@ const CARD_ICON_PX: f32 = 20.0;
 /// `.hh-rank-num`: a 116px numeral with a 3px stroke, overhanging its card.
 const RANK_PX: f32 = 116.0;
 const RANK_STROKE: f32 = 3.0;
+/// `.hh-card.hh-ranked .hh-rank-inner`: the art box of a leaderboard card is a fixed
+/// 174px wide, pinned to the card's right edge and full height, leaving the numeral the
+/// gutter to its left. Everything the shell appends to a card goes INSIDE this box.
+const RANK_INNER_W: f32 = 174.0;
+/// The card corner. `.hh-card` uses `var(--hart-radius, 16px)` and `.hh-rank-inner` a flat
+/// 16px, so 16 is the shape both draw when no theme preset overrides the variable.
+const CARD_RADIUS: f32 = 16.0;
 
 /// Build the home-desktop scene for an output of `output_w` x `output_h` LOGICAL px.
 /// The layout is the checklist's a2 canvas: a fixed 40px top bar, a hero with the orb
@@ -1167,18 +1277,16 @@ pub fn layout_home(
             }
             let cr = Rect::new(card_x, cards_y, CARD_W, CARD_H);
             // A ranked card has NO tile: `.hh-card.hh-ranked` is background:transparent,
-            // border:none, so the numeral and the art are the whole card. It still needs a
-            // first-child Rect to be a hover target (see `hover_leaf`), so it gets a fully
-            // transparent one rather than a special case in the hit test.
-            let mut card_children = vec![SceneNode::Rect {
-                rect: cr,
-                color: if row.ranked {
-                    Color::TRANSPARENT
-                } else {
-                    theme.card_bg
-                },
-                radius: 12.0,
-            }];
+            // border:none, so the numeral and the art ARE the whole card. It gets no
+            // background node at all now that its art tile can anchor the hover.
+            let mut card_children: Vec<SceneNode> = Vec::new();
+            if !row.ranked {
+                card_children.push(SceneNode::Rect {
+                    rect: cr,
+                    color: theme.card_bg,
+                    radius: CARD_RADIUS,
+                });
+            }
             if row.ranked {
                 // The rank numeral, overhanging the card's bottom-left exactly as the
                 // shell places it, drawn as an OUTLINE because that is what the shell
@@ -1199,30 +1307,48 @@ pub fn layout_home(
                     stroke: RANK_STROKE,
                 });
             }
-            if let Some(src) = &card.image {
-                card_children.push(SceneNode::Image {
-                    rect: cr,
-                    source: src.clone(),
-                    radius: 12.0,
-                });
-            }
-            // ── Icon glyph, top left, and ONLY when the card has no art: the shell draws
+            // ── The art tile, which EVERY card has, and which is also the box every other
+            //    thing on the card is positioned in: the shell appends the glyph, the
+            //    live/badge chip, the title+meta body and the progress bar to `artWrap`,
+            //    NOT to the card. On an ordinary card `.hh-card-art` is `inset: 0`, so the
+            //    two boxes coincide. On a ranked one `artWrap` is `.hh-rank-inner`, a fixed
+            //    174px box pinned to the card's right edge, full height, with the numeral
+            //    overhanging the gutter to its left. Positioning the content against the
+            //    CARD instead put all of it 84px left of where the shell puts it, and sized
+            //    the title and the progress bar to the wrong width.
+            let ab = if row.ranked {
+                let w = RANK_INNER_W.min(cr.w);
+                Rect::new(cr.right() - w, cr.y, w, cr.h)
+            } else {
+                cr
+            };
+            let (art_from, art_to, art_angle) =
+                theme.art_stops(row.accent.as_deref(), row_index, card_index);
+            card_children.push(SceneNode::Art {
+                rect: ab,
+                from: art_from,
+                to: art_to,
+                angle_deg: art_angle,
+                radius: CARD_RADIUS,
+                photo: card.photo.clone(),
+            });
+            // ── Icon glyph, top left, and ONLY when the card has no photo: the shell draws
             //    it as `card.icon && !hasImage`, because the glyph is the stand-in FOR the
             //    missing picture, not a decoration beside one. It is a ligature name in a
             //    Material face, so it goes down the ordinary text path; `icons_available`
             //    is what stops it rendering as the literal word when the face is absent.
-            if let (Some(name), None, true) = (&card.icon, &card.image, icons_available) {
+            if let (Some(name), None, true) = (&card.icon, &card.photo, icons_available) {
                 card_children.push(SceneNode::Rect {
-                    rect: Rect::new(cr.x + 14.0, cr.y + 12.0, CARD_ICON_BOX, CARD_ICON_BOX),
+                    rect: Rect::new(ab.x + 14.0, ab.y + 12.0, CARD_ICON_BOX, CARD_ICON_BOX),
                     color: theme.chip_bg,
                     radius: 10.0,
                 });
                 card_children.push(SceneNode::Text {
                     rect: centered_box(
                         measure.text_width(name, CARD_ICON_PX),
-                        cr.x + 14.0,
+                        ab.x + 14.0,
                         CARD_ICON_BOX,
-                        cr.y + 12.0 + (CARD_ICON_BOX - CARD_ICON_PX * 1.3) * 0.5,
+                        ab.y + 12.0 + (CARD_ICON_BOX - CARD_ICON_PX * 1.3) * 0.5,
                         CARD_ICON_PX * 1.3,
                     ),
                     text: name.clone(),
@@ -1249,8 +1375,8 @@ pub fn layout_home(
                     0.0
                 };
                 let chip_w = ink_w.ceil() + 2.0 * CARD_CHIP_PAD_X + dot_w;
-                let chip_x = cr.right() - CARD_CHIP_INSET - chip_w;
-                let chip_y = cr.y + CARD_CHIP_INSET;
+                let chip_x = ab.right() - CARD_CHIP_INSET - chip_w;
+                let chip_y = ab.y + CARD_CHIP_INSET;
                 // A live tag is a pill on a dark ground; a badge is a filled accent
                 // block with dark ink on it.
                 card_children.push(SceneNode::Rect {
@@ -1290,18 +1416,18 @@ pub fn layout_home(
                 });
             }
 
-            // Title, then the meta line under it, then the progress bar pinned to the
-            // card's bottom edge: the shell's own body order (hh-card-title, hh-card-meta,
+            // Title, then the meta line under it, then the progress bar pinned to the art
+            // box's bottom edge: the shell's own body order (hh-card-title, hh-card-meta,
             // hh-card-prog). The title sits a line higher when there is a meta to carry,
-            // so the pair stays inside the card rather than the meta hanging off it.
+            // so the pair stays inside the box rather than the meta hanging off it.
             let has_meta = card.meta.is_some();
             let title_y = if has_meta {
-                cr.bottom() - 34.0 - CARD_META_H
+                ab.bottom() - 34.0 - CARD_META_H
             } else {
-                cr.bottom() - 34.0
+                ab.bottom() - 34.0
             };
             card_children.push(SceneNode::Text {
-                rect: Rect::new(cr.x + 12.0, title_y, cr.w - 24.0, 22.0),
+                rect: Rect::new(ab.x + 12.0, title_y, ab.w - 24.0, 22.0),
                 text: card.title.clone(),
                 size_px: 14.0,
                 color: theme.card_ink,
@@ -1309,7 +1435,7 @@ pub fn layout_home(
             });
             if let Some(meta) = &card.meta {
                 card_children.push(SceneNode::Text {
-                    rect: Rect::new(cr.x + 12.0, title_y + 22.0, cr.w - 24.0, CARD_META_H),
+                    rect: Rect::new(ab.x + 12.0, title_y + 22.0, ab.w - 24.0, CARD_META_H),
                     text: meta.clone(),
                     size_px: 12.0,
                     color: theme.hero_copy,
@@ -1321,14 +1447,14 @@ pub fn layout_home(
                 // bar at all: a card at 0% and a card with no progress are different
                 // states, and collapsing them would silently lose one.
                 card_children.push(SceneNode::Rect {
-                    rect: Rect::new(cr.x, cr.bottom() - CARD_PROG_H, cr.w, CARD_PROG_H),
+                    rect: Rect::new(ab.x, ab.bottom() - CARD_PROG_H, ab.w, CARD_PROG_H),
                     color: theme.omnibox_bg,
                     radius: 0.0,
                 });
-                let filled = cr.w * p.clamp(0.0, 1.0);
+                let filled = ab.w * p.clamp(0.0, 1.0);
                 if filled >= 1.0 {
                     card_children.push(SceneNode::Rect {
-                        rect: Rect::new(cr.x, cr.bottom() - CARD_PROG_H, filled, CARD_PROG_H),
+                        rect: Rect::new(ab.x, ab.bottom() - CARD_PROG_H, filled, CARD_PROG_H),
                         color: row_accent,
                         radius: 0.0,
                     });
@@ -1506,7 +1632,22 @@ pub fn decode_home_compose(v: &serde_json::Value) -> HomeCompose {
                             .and_then(Value::as_str)
                             .filter(|t| !t.is_empty())
                             .map(str::to_string),
-                        image: c.get("image").and_then(Value::as_str).map(str::to_string),
+                        // `image` then `image_url`, the shell's own `imgSrc` priority. Both,
+                        // because the second is what a news or app card actually carries
+                        // and reading only the first made every one of them look photo-less
+                        // (and so drew the icon glyph the shell suppresses). Empty strings
+                        // are filtered like every other optional text key here: a present
+                        // but blank source is not a picture.
+                        photo: c
+                            .get("image")
+                            .and_then(Value::as_str)
+                            .filter(|t| !t.is_empty())
+                            .or_else(|| {
+                                c.get("image_url")
+                                    .and_then(Value::as_str)
+                                    .filter(|t| !t.is_empty())
+                            })
+                            .map(str::to_string),
                     });
                 }
             }
@@ -1577,7 +1718,7 @@ mod tests {
                             icon: Some("storage".into()),
                             badge: Some("NEW".into()),
                             live: None,
-                            image: None,
+                            photo: None,
                         },
                         Card {
                             title: "Recipe B".into(),
@@ -1586,7 +1727,7 @@ mod tests {
                             icon: None,
                             badge: None,
                             live: None,
-                            image: Some("b.png".into()),
+                            photo: Some("b.png".into()),
                         },
                     ],
                 },
@@ -1924,7 +2065,7 @@ mod tests {
         let hc = decode_home_compose(&v);
         assert_eq!(hc.rows.len(), 1);
         assert_eq!(hc.rows[0].title, "Continue");
-        assert_eq!(hc.rows[0].cards[0].image.as_deref(), Some("a.png"));
+        assert_eq!(hc.rows[0].cards[0].photo.as_deref(), Some("a.png"));
         assert_eq!(hc.mood.as_deref(), Some("cosmic"));
     }
 
@@ -2342,7 +2483,7 @@ mod tests {
         // A card WITH art draws no icon: the glyph stands in FOR the missing picture,
         // it is not a decoration beside one (the shell's `card.icon && !hasImage`).
         let mut arted = sample();
-        arted.rows[0].cards[0].image = Some("/shell/static/app_art/a.png".into());
+        arted.rows[0].cards[0].photo = Some("/shell/static/app_art/a.png".into());
         let root = layout_home(1600.0, 900.0, &arted, &Theme::cosmic_default(), &mut IconMeasure);
         let mut seen = 0;
         root.for_each_leaf(&mut |_, leaf| {
@@ -2388,35 +2529,199 @@ mod tests {
         assert_eq!(numerals[0].0, "1", "ranks are 1-based");
         assert_eq!(numerals[0].2, RANK_STROKE, "drawn as an outline, not a fill");
 
-        // The ranked card's tile is transparent: the numeral and the art ARE the card.
-        // It still has a background rect so it stays a hover target.
-        let ranked_bg = rows
+        // The ranked card has NO background tile at all: `.hh-card.hh-ranked` is
+        // background:transparent / border:none, so the numeral and the ART are the card.
+        // It leads with the numeral, matching the shell's own append order (num, then the
+        // art box, so the art paints over the numeral's overhang).
+        let ranked = rows
             .iter()
             .find(|leaves| {
                 leaves
                     .iter()
                     .any(|n| matches!(n, SceneNode::Text { stroke, .. } if *stroke > 0.0))
             })
-            .and_then(|leaves| leaves.first())
             .expect("the ranked card");
-        match ranked_bg {
-            SceneNode::Rect { color, .. } => assert_eq!(*color, Color::TRANSPARENT),
-            other => panic!("a card must lead with its background rect, got {other:?}"),
-        }
-        // An unranked card keeps its tile.
-        let plain_bg = rows
+        assert!(
+            matches!(ranked.first(), Some(SceneNode::Text { stroke, .. }) if *stroke > 0.0),
+            "a ranked card leads with its numeral, got {:?}",
+            ranked.first()
+        );
+        assert!(
+            !ranked
+                .iter()
+                .any(|n| matches!(n, SceneNode::Rect { color, .. } if *color == theme.card_bg)),
+            "a ranked card must not draw the ordinary card tile"
+        );
+        // Its art box is `.hh-rank-inner`: 174px wide, pinned to the card's RIGHT edge,
+        // full height. This is also the box its title and chip live in.
+        let art = ranked
+            .iter()
+            .find_map(|n| match n {
+                SceneNode::Art { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("a ranked card is made of its art");
+        assert_eq!(art.w, RANK_INNER_W, "the rank art box is a fixed width");
+        assert_eq!(art.h, CARD_H, "and full card height");
+        // An unranked card keeps its tile, and its art fills it.
+        let plain = rows
             .iter()
             .find(|leaves| {
                 !leaves
                     .iter()
                     .any(|n| matches!(n, SceneNode::Text { stroke, .. } if *stroke > 0.0))
             })
-            .and_then(|leaves| leaves.first())
             .expect("an unranked card");
-        match plain_bg {
-            SceneNode::Rect { color, .. } => assert_eq!(*color, theme.card_bg),
+        match plain.first() {
+            Some(SceneNode::Rect { color, .. }) => assert_eq!(*color, theme.card_bg),
             other => panic!("expected a tile, got {other:?}"),
         }
+        let plain_art = plain
+            .iter()
+            .find_map(|n| match n {
+                SceneNode::Art { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("every card has art");
+        assert_eq!(plain_art.w, CARD_W, "an ordinary card's art is inset:0");
+    }
+
+    #[test]
+    fn every_card_carries_art_whether_or_not_the_feed_named_a_picture() {
+        // The shell paints `art.style.background = gradientArt(...)` unconditionally and
+        // only then fades a photo in over it, with its own note "no empty flash". The
+        // scene emitted an art node ONLY when the payload named a picture, so a card
+        // without one drew a flat tile and a RANKED card, whose background is transparent
+        // by design, drew nothing at all.
+        let mut hc = sample();
+        hc.rows[0].cards[0].photo = None;
+        hc.rows[0].cards[1].photo = Some("/shell/static/app_art/a.svg".into());
+        let theme = Theme::cosmic_default();
+        let tree = layout_home(1280.0, 800.0, &hc, &theme, &mut MonoMeasure);
+        let mut leaves: Vec<&SceneNode> = Vec::new();
+        tree.flatten(&mut leaves);
+        let arts: Vec<(Option<String>, Color, Color, f32)> = leaves
+            .into_iter()
+            .filter_map(|n| match n {
+                SceneNode::Art {
+                    photo,
+                    from,
+                    to,
+                    angle_deg,
+                    ..
+                } => Some((photo.clone(), *from, *to, *angle_deg)),
+                _ => None,
+            })
+            .collect();
+        let cards: usize = hc.rows.iter().map(|r| r.cards.len()).sum();
+        assert_eq!(arts.len(), cards, "one art tile per card, photo or not");
+        assert!(arts[0].0.is_none(), "the first card named no picture");
+        assert!(arts[1].0.is_some(), "the second carries its photo for later");
+        // Both stops of every tile must be REAL colour, never transparent: a transparent
+        // art tile is the hole this fixed.
+        for (_, from, to, _) in &arts {
+            assert!(from.a > 0.9 && to.a > 0.9, "art is an opaque ground");
+            assert_ne!(from, to, "two stops, not a flat fill");
+        }
+        // The angle cycles per card so a row does not read as one repeated tile.
+        assert_ne!(arts[0].3, arts[1].3, "neighbouring cards differ in angle");
+    }
+
+    #[test]
+    fn art_stops_are_the_shells_own_arithmetic() {
+        // Ported from hartBrandArt.gradient: blend(base, INK, 0.46) is the darker stop,
+        // blend(second, INK, 0.20) the lighter, and the angle is [135,150,165][seed % 3].
+        // Pinned against the hue directly, so a drift in either factor fails here rather
+        // than showing up as a desktop that reads darker or flatter than the shell's.
+        let theme = Theme::cosmic_default();
+        let magenta = theme.spectrum_named("magenta").expect("in the spectrum");
+        let (from, to, angle) = theme.art_stops(Some("magenta"), 0, 0);
+        assert_eq!(angle, 135.0, "seed 0 takes the first angle");
+        assert_eq!(from, magenta.mix(ART_INK, 0.20), "the light stop");
+        assert_eq!(to, magenta.mix(ART_INK, 0.46), "the dark stop");
+        assert!(to.r < from.r, "the second stop is the darker one");
+        // A row with no accent takes its POSITIONAL hue, both stops, exactly as the shell
+        // does with `row.accent || spec[idx]` resolving to a real name before the lookup.
+        let (f1, t1, _) = theme.art_stops(None, 3, 0);
+        let hue3 = theme.spectrum[3];
+        assert_eq!(f1, hue3.mix(ART_INK, 0.20));
+        assert_eq!(t1, hue3.mix(ART_INK, 0.46));
+        // A name OUTSIDE the spectrum is the shell's no-hex branch: `spectrumHex[name]` is
+        // undefined, so gradient() folds in a neighbour hue two places along, seeded by
+        // the CARD index. Two different hues, not one.
+        let (f2, t2, angle2) = theme.art_stops(Some("chartreuse"), 0, 1);
+        assert_eq!(angle2, 150.0, "seed 1 takes the second angle");
+        assert_eq!(f2, theme.spectrum[3].mix(ART_INK, 0.20), "the neighbour hue");
+        assert_eq!(t2, theme.spectrum[1].mix(ART_INK, 0.46), "the card's own hue");
+        // The angle list wraps rather than running off its end.
+        assert_eq!(theme.art_stops(None, 0, 3).2, 135.0, "seed 3 wraps to the first");
+    }
+
+    #[test]
+    fn a_ranked_cards_content_sits_in_its_art_box_not_its_card_box() {
+        // Everything the shell builds for a card is appended to `artWrap`: the glyph, the
+        // live/badge chip, the title+meta body, the progress bar. On a ranked card that is
+        // `.hh-rank-inner`, the 174px box on the card's right, NOT the card. Positioning
+        // against the card put every one of them 84px left of where the shell puts them.
+        let mut hc = sample();
+        hc.rows[0].ranked = true;
+        hc.rows[0].cards[0].photo = None;
+        hc.rows[0].cards[0].badge = Some("NEW".into());
+        let leaves = first_card(&hc);
+        let art = leaves
+            .iter()
+            .find_map(|n| match n {
+                SceneNode::Art { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("the art box");
+        let title = leaves
+            .iter()
+            .find_map(|n| match n {
+                SceneNode::Text { rect, text, .. } if *text == hc.rows[0].cards[0].title => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .expect("the title");
+        assert!(
+            title.x >= art.x && title.right() <= art.right() + 0.01,
+            "the title belongs inside the art box: title {title:?} art {art:?}"
+        );
+        // The badge is inset from the ART box's right edge, which for a ranked card is
+        // also the card's, so check the left edge: it must clear the numeral's gutter.
+        let badge = leaves
+            .iter()
+            .find_map(|n| match n {
+                SceneNode::Text { rect, text, .. } if text == "NEW" => Some(*rect),
+                _ => None,
+            })
+            .expect("the badge");
+        assert!(badge.x > art.x, "the chip sits inside the art box");
+    }
+
+    #[test]
+    fn a_ranked_card_can_finally_show_a_hover() {
+        // Its background used to be a fully transparent rect, kept only so `hover_leaf`
+        // would find a first-child Rect, and lifting a transparent colour shows nothing.
+        // The art tile is the ranked card's real surface, so it is what the hover finds.
+        let mut hc = sample();
+        hc.rows[0].ranked = true;
+        let tree = layout_home(1600.0, 900.0, &hc, &Theme::cosmic_default(), &mut MonoMeasure);
+        let mut leaves: Vec<&SceneNode> = Vec::new();
+        tree.flatten(&mut leaves);
+        let art_idx = leaves
+            .iter()
+            .position(|n| matches!(n, SceneNode::Art { .. }))
+            .expect("the first card's art");
+        let art_rect = leaves[art_idx].rect();
+        let inside = (art_rect.x + art_rect.w * 0.5, art_rect.y + art_rect.h * 0.5);
+        assert_eq!(
+            tree.hover_leaf(Some(inside)),
+            Some(art_idx),
+            "the pointer over a ranked card must light its art tile"
+        );
+        assert_eq!(tree.hover_leaf(None), None, "no pointer, no hover");
     }
 
     #[test]
