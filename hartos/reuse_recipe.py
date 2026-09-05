@@ -2620,13 +2620,15 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                     # DEAD-STATE HANDLING: StatusVerifier emits four states
                     # (completed/error/pending/requires_breakdown) but only
                     # 'completed' was handled — the other three fell through and
-                    # the action spun until the count==4 cap, never advancing and
-                    # (for requires_breakdown) silently discarding the subtasks.
+                    # the action spun until the turn's round cap, never advancing
+                    # and (for requires_breakdown) silently discarding the subtasks.
                     # Handle them per the StatusVerifier system_message: route
                     # error/pending back to the helper to actually finish/fix the
                     # work, and persist requires_breakdown's subtasks to the
                     # ledger (the imported-but-unwired add_subtasks machinery).
-                    # Bounded by the loop's count==4; NEVER fake-advances — only a
+                    # Bounded by the loop's round budget (_reuse_turn_round_budget,
+                    # recipe-derived — it was a literal 4 when this was written);
+                    # NEVER fake-advances — only a
                     # truthful 'completed' advances, a persistent error/pending
                     # ends the turn honestly instead of looping.
                     _st = str(last_json.get('status', '')).lower()
@@ -3034,6 +3036,35 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 _reuse_resteer_counts = {}
 _REUSE_FAB_STEER_MAX = 3
 
+
+def _reuse_turn_round_budget(user_prompt):
+    """Iteration budget for ONE reuse turn, derived from the recipe it runs.
+
+    Both reuse loops used a literal ``if count == 4: break``.  That budgets the
+    whole turn for what a SINGLE action may legitimately need: the fabrication
+    gate allows ``_REUSE_FAB_STEER_MAX`` (3) re-steers per action before it
+    advances anyway, so one action can honestly consume 4 rounds.
+
+    Measured live 2026-09-05 driving every saved agent through /chat: six
+    agents stopped at EXACTLY action 4 regardless of how long their recipe
+    was — 4/24, 4/15, 4/15, 4/6, 4/6, 4/6 — and the only two that "finished"
+    were the two whose recipes are SHORTER than the cap (4/3 and 4/2).  Their
+    logs carry `state_transition with action id 1..4`, so advancement was
+    working; the turn simply ran out of rounds.  75 of the 127 saved agents
+    have >= 2 actions and the largest has 24, so a fixed 4 truncates most of
+    the population.
+
+    Budget per action what one action may need, plus a small constant so a
+    single-action recipe keeps its previous headroom.  The loop's other exits
+    (budget exhausted, SLA breach, empty history, '@user') are unchanged —
+    this only stops the counter from ending a turn that is still progressing.
+    """
+    try:
+        n_actions = len(user_tasks[user_prompt].actions)
+    except Exception:
+        n_actions = 1
+    return max(4, n_actions * (_REUSE_FAB_STEER_MAX + 1) + 4)
+
 # Unrun tool names recorded by the fabrication gate for the refusal it just
 # returned, keyed the same way, and consumed by _reuse_fab_steer_message.
 _reuse_fab_pending = {}
@@ -3237,6 +3268,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                                           clear_history=False)
 
         count = 0
+        _round_budget = _reuse_turn_round_budget(user_prompt)
         _reuse_advanced_actions = set()  # one robust completion-advance per action id
         while True:
             current_app.logger.info('inside reuse while1')
@@ -3380,7 +3412,11 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         continue
             try:
                 # Safely access recipes
-                if count == 4:
+                if count >= _round_budget:
+                    current_app.logger.warning(
+                        f"[REUSE-ROUNDS] while1 exhausted {_round_budget} rounds at "
+                        f"action {user_tasks[user_prompt].current_action}/"
+                        f"{len(user_tasks[user_prompt].actions)} — ending turn")
                     break
 
                 count += 1
@@ -4007,6 +4043,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                                        speaker_selection={"speaker": "assistant"}, clear_history=False)
 
                 count = 0
+                _round_budget = _reuse_turn_round_budget(user_prompt)
                 while True:
                     current_app.logger.info('inside while2')
 
@@ -4079,7 +4116,11 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                                               silent=False)
                                 continue
                     count += 1
-                    if count == 4:
+                    if count >= _round_budget:
+                        current_app.logger.warning(
+                            f"[REUSE-ROUNDS] while2 exhausted {_round_budget} rounds at "
+                            f"action {user_tasks[user_prompt].current_action}/"
+                            f"{len(user_tasks[user_prompt].actions)} — ending turn")
                         break
                     # role = get_role(user_id,prompt_id)
                     last_message = group_chat.messages[-1]
