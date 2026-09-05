@@ -1332,6 +1332,15 @@ impl HomeMetrics {
     }
 }
 
+/// How wide a row's visible strip is on this output: the content band's width.
+///
+/// Exposed so the input path can CLAMP a scroll without re-deriving the gutter. Deriving
+/// it there would be a second copy of a number `HomeMetrics` already resolves, and the
+/// two would agree until a breakpoint moved.
+pub fn row_view_width(output_w: f32, output_h: f32) -> f32 {
+    (output_w - HomeMetrics::for_output(output_w, output_h).gutter).max(0.0)
+}
+
 /// Build the home-desktop scene for an output of `output_w` x `output_h` LOGICAL px.
 /// The layout is the checklist's a2 canvas: a fixed 40px top bar, a hero with the orb
 /// floated to its right (c7), 2-3 card rows, and a fixed 44px taskbar. It never
@@ -3656,6 +3665,108 @@ mod tests {
             unscrolled.len(),
             "the WINDOW moves; the number of cards on screen does not"
         );
+    }
+
+    #[test]
+    fn a_wheel_over_a_row_moves_that_row_and_no_other() {
+        // The whole path in one place: find the row under a point, apply a delta with the
+        // extents that row actually has, lay out again, and see DIFFERENT cards. Each
+        // piece is tested on its own; this is the one that would catch them being wired
+        // to each other wrongly, which is the failure no unit of them can see.
+        let mut hc = sample();
+        let proto = hc.rows[0].cards[0].clone();
+        for r in hc.rows.iter_mut() {
+            r.cards = (0..12)
+                .map(|i| {
+                    let mut c = proto.clone();
+                    c.title = format!("{}#{i}", r.title);
+                    c
+                })
+                .collect();
+        }
+        let theme = Theme::cosmic_default();
+        let (w, h) = (1920.0, 1080.0);
+        let shown = |sc: &RowScroll| -> Vec<String> {
+            let root = layout_home(w, h, &hc, &theme, sc, &mut MonoMeasure);
+            let mut leaves: Vec<&SceneNode> = Vec::new();
+            root.flatten(&mut leaves);
+            leaves
+                .iter()
+                .filter_map(|n| match n {
+                    SceneNode::Text { text, size_px, .. } if *size_px == CARD_TITLE_PX => {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Which row is under a point in the SECOND row's band? Ask the tree, exactly as
+        // the input path does, rather than computing a y from the layout constants.
+        let root = layout_home(w, h, &hc, &theme, &RowScroll::default(), &mut MonoMeasure);
+        let mut groups: Vec<&SceneNode> = Vec::new();
+        walk_groups(&root, &mut groups);
+        let band = groups
+            .iter()
+            .find_map(|c| match c {
+                SceneNode::Container {
+                    component: Some(Component::HomeRow(1)),
+                    rect,
+                    ..
+                } => Some(*rect),
+                _ => None,
+            })
+            .expect("the sample lays out a second row");
+        // A point on the row's own strip, clear of its cards: its right edge, top line.
+        let point = (band.right() - 2.0, band.y + 2.0);
+        assert_eq!(root.row_at(point.0, point.1), Some(1), "the tree names row 1");
+
+        let before = shown(&RowScroll::default());
+        let mut sc = RowScroll::default();
+        let view_w = row_view_width(w, h);
+        sc.scroll(1, 600.0, RowScroll::content_width(12), view_w);
+        let after = shown(&sc);
+
+        // Row 1 moved; row 0 did not. Titles are prefixed by their row, so this is not a
+        // count comparison that a shifted-everything bug would also satisfy.
+        let row0 = |v: &[String]| -> Vec<String> {
+            v.iter().filter(|t| t.starts_with("Continue")).cloned().collect()
+        };
+        let row1 = |v: &[String]| -> Vec<String> {
+            v.iter().filter(|t| !t.starts_with("Continue")).cloned().collect()
+        };
+        assert_eq!(row0(&before), row0(&after), "the untouched row did not move");
+        assert_ne!(row1(&before), row1(&after), "the scrolled row did");
+        assert!(!row1(&after).is_empty(), "and it still shows cards");
+    }
+
+    #[test]
+    fn the_view_width_the_input_clamps_against_is_the_one_the_layout_uses() {
+        // The clamp lives on the input path and the band on the layout path, so they are
+        // two readings of one number. If they disagreed a row would stop short of its
+        // last card or scroll past it, and nothing else would notice.
+        for (w, h) in [(1920.0, 1080.0), (1366.0, 768.0), (1280.0, 800.0)] {
+            let theme = Theme::cosmic_default();
+            let root = layout_home(w, h, &sample(), &theme, &RowScroll::default(), &mut MonoMeasure);
+            let mut groups: Vec<&SceneNode> = Vec::new();
+            walk_groups(&root, &mut groups);
+            let band = groups
+                .iter()
+                .find_map(|c| match c {
+                    SceneNode::Container {
+                        component: Some(Component::HomeRow(_)),
+                        rect,
+                        ..
+                    } => Some(*rect),
+                    _ => None,
+                })
+                .expect("a row band");
+            assert_eq!(
+                row_view_width(w, h),
+                band.w,
+                "at {w}x{h} the clamp and the band must be the same width"
+            );
+        }
     }
 
     #[test]

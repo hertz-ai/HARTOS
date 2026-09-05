@@ -263,6 +263,10 @@ pub struct State {
     /// session. Set from the HART_NATIVE_SHELL env at State construction (default OFF,
     /// so the WebView shell is unchanged). No nix option until M6 flips the default.
     pub native_shell_on: bool,
+    /// How far each card row is scrolled sideways (a2: "Netflix rows scroll
+    /// HORIZONTALLY"). Lives on State rather than in the scene cache because it survives
+    /// a relayout: a resize must not throw away where the user had scrolled to.
+    pub row_scroll: crate::scene::RowScroll,
     /// Is the live renderer the GPU one? The native mirror of the shell's
     /// `body.gpu-hardware`, refreshed by the DRM render tick from whether its
     /// `GlesRenderer` still exists, so a mid-session demotion to the pixman floor stands
@@ -422,6 +426,12 @@ impl CompState for State {
     }
     fn native_shell_on(&self) -> bool {
         self.native_shell_on
+    }
+    fn row_scroll(&self) -> crate::scene::RowScroll {
+        self.row_scroll
+    }
+    fn set_row_scroll(&mut self, s: crate::scene::RowScroll) {
+        self.row_scroll = s;
     }
     fn motion_hardware(&self) -> bool {
         self.motion_hardware

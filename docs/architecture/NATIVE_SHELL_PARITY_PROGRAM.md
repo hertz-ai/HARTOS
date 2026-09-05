@@ -1144,3 +1144,40 @@ to reach it.
 
 Worth doing at the end of any run of changes. Dead code is where the compiler
 tells you a contract has come loose, and it costs one `cargo check` to read.
+
+### Rows scroll sideways now, which the checklist has asked for all along
+a2 says it in the same breath as the rule against page scroll: "Netflix rows
+scroll HORIZONTALLY (sideways = native / console-like), the canvas itself never
+page-scrolls." The shell does it with `.hh-cards { overflow-x: auto }`. The native
+scene CLIPPED: the sanitizer allows twelve cards a row, about seven fit a 1920
+screen, and the rest were unreachable rather than merely off-screen.
+latency_budgets.json has been carrying a `home-row: {scroll: 16}` entry for an
+interaction that could not happen.
+
+Landed in three parts so each was green and reviewable on its own: the clamped
+offset model, the row becoming a group, and the input wiring. The first two
+changed no behaviour at all.
+
+Three things worth keeping:
+
+**A notch is 120px, because that is the browser's step.** libinput reports a mouse
+notch as 15 units, so the per-unit distance is 8. The shell's `overflow-x` rails
+already move by the browser's step, so the same gesture travels the same distance
+on both renderers; a different constant here would make the two desktops feel
+different under the same hand.
+
+**The vertical wheel scrolls a horizontal rail.** That is what a browser does over
+an `overflow-x` element with nothing to scroll vertically, so it is already what
+this desktop's users get from the shell. A sideways swipe scrolls it too and the
+two axes are SUMMED rather than one winning, so a diagonal touchpad gesture moves
+the row by what the finger actually travelled.
+
+**The clamp and the band are one number, asserted.** The clamp lives on the input
+path and the band on the layout path, so they are two readings of the view width.
+If they disagreed a row would stop short of its last card or scroll past it, and
+nothing else would notice, so `row_view_width` is the single reading and a test
+compares it against the band the layout actually emits at three panel sizes.
+
+The scroll is a cache KEY, unlike the pointer: scrolling moves where the cards are
+while hovering only changes which leaf lights up. A rebuild per wheel event is the
+honest cost of that.

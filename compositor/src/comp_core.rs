@@ -737,6 +737,15 @@ pub trait CompState:
         false
     }
 
+    /// How far each card row is scrolled sideways. Default-empty for a backend that
+    /// keeps no scroll state, which is also the honest answer for the WebView desktop:
+    /// its rows scroll themselves.
+    fn row_scroll(&self) -> crate::scene::RowScroll {
+        crate::scene::RowScroll::default()
+    }
+    /// Record a new scroll state. A no-op for a backend that keeps none.
+    fn set_row_scroll(&mut self, _s: crate::scene::RowScroll) {}
+
     /// The retained native scene tree, for asking what a point is over. None for a
     /// backend that keeps no scene, which is also the honest answer for the WebView
     /// desktop: nothing native is laid out, so nothing native can be named.
@@ -1788,9 +1797,77 @@ pub fn on_pointer_axis<S: CompState, B: InputBackend>(state: &mut S, evt: B::Poi
             frame = frame.stop(Axis::Vertical);
         }
     }
+    // A2's card rails, before the frame goes to the client: a wheel over a row scrolls
+    // THAT row sideways. Handled here rather than as a client event because the rows are
+    // ours, painted by the compositor; a client under the pointer still gets its frame
+    // below, exactly as it did.
+    // libinput reports axis amounts as f64; the scene works in f32 logical px.
+    scroll_row_under_pointer(state, vertical as f32, horizontal as f32);
+
     let pointer = state.pointer().clone();
     pointer.axis(state, frame);
     pointer.frame(state);
+}
+
+/// One wheel notch, in logical px of row travel.
+///
+/// libinput reports a mouse notch as 15 units (or 120 in the v120 axis, normalised to 15
+/// above), and a touchpad reports continuous units. Eight px per unit puts a notch at
+/// 120px, which is the browser's own wheel step and so what the shell's `overflow-x`
+/// rails already move by: the same gesture travels the same distance on both renderers.
+const SCROLL_PX_PER_UNIT: f32 = 8.0;
+
+/// PURE: how far one axis event moves a row, in logical px.
+///
+/// Extracted like `gles_should_demote` / `flip_action` / `master_step`, and for the same
+/// reason: the decision is unit-testable on any dev box while the state-touching glue
+/// around it is not. A vertical wheel scrolls a horizontal rail, which is what a browser
+/// does over an `overflow-x` element with nothing to scroll vertically, and so what this
+/// desktop's users already get from the shell. A sideways swipe scrolls it too, and the
+/// two are SUMMED rather than one winning: a diagonal touchpad gesture should move the
+/// row by what the finger actually travelled.
+fn row_scroll_delta(vertical: f32, horizontal: f32) -> f32 {
+    let d = (vertical + horizontal) * SCROLL_PX_PER_UNIT;
+    if d.is_finite() {
+        d
+    } else {
+        0.0
+    }
+}
+
+/// Scroll the card row under the pointer, if a card row is under the pointer.
+///
+/// A vertical wheel scrolls a horizontal rail, which is what a browser does over an
+/// `overflow-x` element with nothing to scroll vertically, and so what this desktop's
+/// users already expect from the shell. A horizontal wheel or a two-finger sideways swipe
+/// scrolls it too, and the two are summed rather than fought over.
+fn scroll_row_under_pointer<S: CompState>(state: &mut S, vertical: f32, horizontal: f32) {
+    if !native_scene_drawn(state.native_shell_on(), state.capture_blocked()) {
+        return;
+    }
+    let delta = row_scroll_delta(vertical, horizontal);
+    if delta == 0.0 {
+        return;
+    }
+    let size = output_physical_size(state);
+    let Some((px, py)) = native_pointer_scene_pos(state, size) else {
+        return;
+    };
+    let Some(row) = state.native_tree().and_then(|t| t.row_at(px, py)) else {
+        return;
+    };
+    // The row's own extents, from the payload that laid it out. A row with fewer cards
+    // than fit has nothing to scroll and the clamp pins it, which is what stops a stray
+    // wheel sliding a two-card row off its gutter.
+    let cards = state
+        .native_home()
+        .map(|h| h.rows.get(row).map(|r| r.cards.len()).unwrap_or(0))
+        .unwrap_or(0);
+    let content_w = crate::scene::RowScroll::content_width(cards);
+    let view_w = crate::scene::row_view_width(size.w as f32, size.h as f32);
+    let mut sc = state.row_scroll();
+    sc.scroll(row, delta, content_w, view_w);
+    state.set_row_scroll(sc);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2431,6 +2508,9 @@ where
     // SAME bool `effects_animating` gates the frame budget on, so the orb's motion and
     // the frame rate that carries it can never disagree.
     let animate = state.motion_hardware() && !theme_potato() && !motion_reduced();
+    // Read here too, for the same reason: `lower_scene` is state-free so the layout can
+    // be render-tested with constructed caches, and the offset is state.
+    let scroll = state.row_scroll();
     // The home now rides OUT of the accessor as a shared borrow beside the `&mut`
     // caches, so the frame no longer clones a HomeCompose just to release the state
     // borrow. `demo_ref` is the allocation-free fallback until `shell.compose` lands.
@@ -2445,7 +2525,7 @@ where
     };
     lower_scene(
         home, size, renderer, rasterizer, orb_cache, rect_cache, scene_cache, orb_energy,
-        pointer, pressed, animate, elements,
+        pointer, pressed, animate, &scroll, elements,
     )
 }
 
@@ -2599,6 +2679,9 @@ pub fn lower_scene<R>(
     // state-free. The two must agree, or the orb animates while the gate holds the frame
     // rate down (a stuttering orb) or the gate stays open for an orb standing still.
     animate: bool,
+    // `scroll`: how far each card row is pushed sideways. A parameter, not a read, so the
+    // lowering stays state-free and the render test can drive a scrolled desktop.
+    scroll: &crate::scene::RowScroll,
     elements: &mut Vec<HartRenderElement<R>>,
 ) -> u8
 where
@@ -2622,16 +2705,12 @@ where
     // The rasterizer doubles as the layout's text measure (it already shapes), so the bar
     // can butt one run against another. It is a disjoint borrow from `scene_cache`, and
     // the reborrow ends when `tree_for` returns, leaving it free for the lowering below.
-    // Commit A of the row-scroll work: the layout HONOURS an offset, and nothing yet
-    // supplies one, so this is provably a no-op until the input half lands. Splitting it
-    // that way keeps each half green and makes the behaviour change reviewable on its own.
-    let scroll = crate::scene::RowScroll::default();
     let tree = scene_cache.tree_for(
         size.w as f32,
         size.h as f32,
         home,
         &theme,
-        &scroll,
+        scroll,
         rasterizer,
     );
 
@@ -4146,6 +4225,29 @@ mod tests {
     }
 
     #[test]
+    fn a_wheel_notch_moves_a_row_by_the_browsers_own_step() {
+        // libinput reports a mouse notch as 15 units (its v120 axis is normalised to 15
+        // by the caller), so a notch has to land on 120px: that is the browser's wheel
+        // step, and the shell's `overflow-x` rails already move by it. The same gesture
+        // must travel the same distance on both renderers or the two desktops feel
+        // different under the same hand.
+        assert_eq!(row_scroll_delta(15.0, 0.0), 120.0, "one notch is one browser step");
+        assert_eq!(row_scroll_delta(-15.0, 0.0), -120.0, "and back the other way");
+
+        // A sideways swipe scrolls it too, and the two are SUMMED rather than one
+        // winning: a diagonal touchpad gesture moves the row by what the finger
+        // travelled, not by whichever axis happened to be tested first.
+        assert_eq!(row_scroll_delta(0.0, 15.0), 120.0, "horizontal alone works");
+        assert_eq!(row_scroll_delta(5.0, 10.0), 120.0, "and a diagonal sums");
+        assert_eq!(row_scroll_delta(10.0, -10.0), 0.0, "opposing axes cancel");
+
+        // Nothing non-finite reaches the offset: this comes from a device.
+        assert_eq!(row_scroll_delta(f32::NAN, 0.0), 0.0);
+        assert_eq!(row_scroll_delta(f32::INFINITY, 0.0), 0.0);
+        assert_eq!(row_scroll_delta(0.0, 0.0), 0.0, "a null event moves nothing");
+    }
+
+    #[test]
     fn high_contrast_makes_the_chrome_solid_and_doubles_its_rule() {
         // `html.a11y-contrast` overrides four tokens and thickens the glass border. The
         // native scene read its colours from the theme file and knew nothing about the
@@ -4419,6 +4521,7 @@ mod native_render_tests {
             None,
             false,
             true,
+            &crate::scene::RowScroll::default(),
             &mut elements,
         );
 
@@ -4490,7 +4593,8 @@ mod native_render_tests {
                 None,
                 false,
                 true,
-            &mut elements,
+                &crate::scene::RowScroll::default(),
+                &mut elements,
             );
             if frame == 0 {
                 first = elements.len();
@@ -4597,7 +4701,8 @@ mod native_render_tests {
             lower_scene(
                 &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
                 0.5, Some((10.0, 10.0)), true, true,
-            &mut elements,
+                &crate::scene::RowScroll::default(),
+                &mut elements,
             );
             // Whatever survived must still have a real footprint: the <1px skips exist so
             // nothing reaches the renderer with an empty or inverted box.
@@ -4629,7 +4734,7 @@ mod native_render_tests {
 
         let emitted = lower_scene(
             &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
-            0.5, None, false, true, &mut elements,
+            0.5, None, false, true, &crate::scene::RowScroll::default(), &mut elements,
         );
         assert_eq!(
             emitted & NATIVE_CHROME_ORB,
@@ -4868,7 +4973,7 @@ mod native_render_tests {
         let mut first: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
         lower_scene(
             &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
-            0.5, None, false, true, &mut first,
+            0.5, None, false, true, &crate::scene::RowScroll::default(), &mut first,
         );
         let a = idents(&first);
         assert!(!a.is_empty(), "the demo scene lowered to nothing");
@@ -4877,7 +4982,7 @@ mod native_render_tests {
         let mut second: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
         lower_scene(
             &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
-            0.5, None, false, true, &mut second,
+            0.5, None, false, true, &crate::scene::RowScroll::default(), &mut second,
         );
         assert_eq!(
             idents(&second),
@@ -4968,6 +5073,7 @@ mod native_render_tests {
             None,
             false,
             true,
+            &crate::scene::RowScroll::default(),
             &mut plain,
         );
         let plain_geo = geo(&plain);
@@ -4991,6 +5097,7 @@ mod native_render_tests {
             Some(centre),
             false,
             true,
+            &crate::scene::RowScroll::default(),
             &mut hovered,
         );
 
@@ -5046,6 +5153,7 @@ mod native_render_tests {
             None,
             false,
             true,
+            &crate::scene::RowScroll::default(),
             &mut elements,
         );
 
