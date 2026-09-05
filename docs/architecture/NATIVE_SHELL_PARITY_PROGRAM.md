@@ -363,6 +363,13 @@ any of them show up: each crosses a process boundary, so no Rust test and no
 headless run can fail on them. Two are code, two are contract decisions that
 touch the shell and must not be settled unilaterally.
 
+Obligation 4 has since split again on re-measurement: the card ART half is built
+and needed no contract at all, leaving only the optional photo layer. See it
+below. The lesson generalises: measure what the shell actually PAINTS before
+recording something as blocked, because "the card shows a picture" and "the card
+shows a gradient with an optional picture over it" are different problems, and
+only the first one is blocked.
+
 1. **shell-ready has no native writer.** DONE (the compositor now writes it from
    the vblank reaper when the frame that scanned out carried the scene; three
    conditions, each load-bearing, and flag-off is byte-identical). Kept here for
@@ -429,32 +436,43 @@ touch the shell and must not be settled unilaterally.
    and liberation. Get an OTF/TTF of the face in front of fontdb and icons come
    out of the existing text path.
 
-   **Card art is real files on disk**, so no HTTP is needed. The sanitizer already
-   constrains `card.image` to two prefixes, and both resolve to directories:
-   `/shell/static/app_art/...` is the service's own static dir, and
-   `/shell/agent-art/<slug>` resolves through HART_AGENT_ART_DIR (the documented
-   seam, default /var/lib/hart/agent-art) then the bundled app_art/agents. Slugs
-   are `[a-z0-9-]` only, so they cannot encode traversal. Formats are png, webp,
-   jpg, jpeg and svg.
+   **Card art was never the picture.** This was measured wrong the first time and
+   the correction is worth keeping, because the wrong reading turned a mostly-done
+   thing into a blocked decision. `.hh-card-art` is one element whose BACKGROUND is
+   a brand-spectrum gradient and whose optional `<img>` child fades in over it.
+   hartHome.js paints the gradient unconditionally, with its own comment "no empty
+   flash", and only then attaches a photo. So the surface every card always has is
+   a gradient, computed from the row's accent hue and the card's index, and the
+   picture is decoration on top of it that most cards never carry.
 
-   What is left is a genuine decision, and the SVG decides it. MEASURED rather
-   than assumed, because "it might be SVG" and "it is all SVG" are different
-   problems: every one of the 51 bundled art files is `.svg`. There is no PNG
-   fallback path to lean on, so no card art draws at all without an SVG renderer.
+   That surface is now drawn (`SceneNode::Art`), from hartBrandArt's own literals,
+   through the same cached rounded-tile rasterizer the solid rects use, with a
+   cross-language guard pinning the two together. It needed no dependency, no
+   decoder and no new IPC, and it closed the three visible defects the picture
+   reading had hidden: a RANKED card drew nothing at all (its own background is
+   transparent because the art is the card), every other card drew a flat tile,
+   and a card carrying `image_url` rather than `image` decoded as art-less and so
+   drew the icon glyph the shell suppresses.
 
-   The subset in use is narrow though, which is the part that makes this
-   tractable. Across all 51: gradients in 12 (linear and radial), and ZERO uses of
-   filters, `<text>`, masks, clipPaths or patterns. Filters and text are the two
-   hardest parts of SVG and neither appears. Each file is about 1.5 KB, drawn at
-   `preserveAspectRatio='xMidYMid slice'`, so they fill and crop rather than
-   letterbox.
+   What is left is only the photo layer, and it is now cosmetic rather than
+   structural. The files are real paths on disk, so no HTTP is needed: the
+   sanitizer constrains `card.image` to two prefixes, `/shell/static/app_art/...`
+   (the service's own static dir) and `/shell/agent-art/<slug>` (through
+   HART_AGENT_ART_DIR, default /var/lib/hart/agent-art, then the bundled
+   app_art/agents). Slugs are `[a-z0-9-]` only, so they cannot encode traversal.
 
-   So the options are: (a) the compositor renders them, which given that subset is
-   `usvg` + `tiny-skia` (pure Rust, no C dependencies) rather than a browser-grade
-   engine, plus a root path handed in as a deployment fact; or (b) the shell hands
-   over decoded pixels through the existing IPC, since it already has both the
-   bytes and a renderer, but that IPC is framed JSON and would need a binary
-   channel rather than base64 at image sizes. Not settled here.
+   Every one of the 51 bundled files is `.svg`, so there is no PNG path to lean
+   on. The subset is narrow: gradients in 12 (linear and radial), and ZERO uses of
+   filters, `<text>`, masks, clipPaths or patterns, which are the hard parts. Each
+   is about 1.5 KB, drawn `preserveAspectRatio='xMidYMid slice'`, so they fill and
+   crop rather than letterbox.
+
+   The options stay (a) the compositor renders them, which for that subset is
+   `usvg` + `tiny-skia` (pure Rust, no C dependencies) plus a root path handed in
+   as a deployment fact; or (b) the shell hands over decoded pixels through the
+   existing IPC, which is framed JSON and would need a binary channel rather than
+   base64 at image sizes. Not settled here, and no longer urgent: a card without
+   its photo is now a correct card, not a hole.
 
 Already handled, listed so nobody re-derives them: the scene claims
 NATIVE_CHROME_ORB itself (the M2 block that used to set it is skipped exactly
@@ -510,3 +528,44 @@ container on deepbox and runs cargo there in about 50 seconds. Use
 check` does NOT compile `#[cfg(test)]` code, so a check-clean tree can still have
 broken tests. A test filter goes BEFORE any `--`. That container has fonts, so
 the real cosmic-text shaping path is exercised, not only the fallback.
+
+### The native home was drawn at two thirds of the shell's scale
+The other half of the decoder lesson, and a sharper one, because it survived
+every test in the tree. In scene.rs every layout constant that carried a CSS
+citation in its comment was correct, and every constant that did not was a guess
+left over from the M3 sketch. Nothing could tell them apart, so the whole desktop
+was laid out small: the hero figure at 40px against `.hh-amount`'s 88, row
+headings at 15 against 23, cards at 210x128 against 258x150, the omnibox 420 wide
+with 14px ink against 360 and 13.
+
+The Rust tests all passed throughout, and that is the point. They pin
+RELATIONSHIPS, because relationships are what a layout test can assert without
+duplicating the layout: the note follows the label, the See-all clears it, the
+chip stays in its corner, the progress bar spans the card. Every one of those
+holds at any scale. A test suite made entirely of relationship assertions cannot
+see a uniform scale error, and a uniform scale error is exactly what a first cut
+produces.
+
+`EDGE_PAD` was two of those bugs in one constant. It served both the top bar's
+inset (`.top-bar` pads 12) and the content gutter (`--hh-gutter` is 60) at a value
+of 24, belonging to neither, so the bar was indented twice as far as the shell's
+and the content less than half. One name for two measurements is worth looking
+for elsewhere.
+
+The responsive layer was missing outright. hartHome.css has four sizing media
+blocks and the compositor honoured none of them, which matters more than it
+sounds: a row that does not fit the band is dropped SILENTLY, so laying a
+1366x768 panel out at full desktop scale costs a row with no error anywhere.
+`HomeMetrics::for_output` resolves all four in the cascade's own order, and the
+order is load-bearing, since max-width:1400 and max-height:820 both set the hero
+figure and the later block wins.
+
+Both directions are now pinned. A Rust test asserts every common panel size still
+fits all its rows and a strip of cards, because correcting a scale UPWARD is
+precisely what could cost one. A Python test in test_panel_reservation.py reads
+hartHome.css and scene.rs side by side, matching each media block by what it
+DECLARES rather than by its position in the file, so a new breakpoint the
+compositor has not implemented fails the build instead of quietly rendering a
+different desktop. That guard is the same shape as the bar-height one above, and
+for the same reason: the drift is across a language boundary, so it has to be
+checked somewhere that can read both.
