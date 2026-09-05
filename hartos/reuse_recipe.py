@@ -2912,107 +2912,40 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
     visual_agent_group['group_chat_2'] = group_chat_2
     visual_agent_group['manager_2'] = manager_2
 
-    # Auto-ingest group_chat messages into SimpleMem + shared LangChain buffer
-    # This ensures autogen writes go to the SAME PersistentChatHistory that LangChain reads,
-    # eliminating redundant conversation storage and keeping both frameworks in sync.
-    _shared_hook_factory = None
+    # Group-chat write-back — shared PersistentChatHistory + SimpleMem +
+    # MemoryGraph — through the CANONICAL installer, the same one
+    # create_agents_for_role already uses (L871).
+    #
+    # This block used to hand-roll the wrapping and carried three defects the
+    # canonical installer does not have:
+    #   1. it captured `gc.messages.append` and called it from inside the hook,
+    #      so every message was appended a SECOND time into the pre-wrap list —
+    #      an orphan nothing reads.  The canonical installer documents this
+    #      exact hazard and hands the factory a no-op instead;
+    #   2. its list subclass was defined INSIDE the for-loop, so the
+    #      `isinstance(gc.messages, _HookedList)` re-check below compared
+    #      against the LAST iteration's class object and was False for
+    #      group_chat and group_chat_1;
+    #   3. those two therefore got DOUBLE-wrapped, which silently killed their
+    #      shared-history + SimpleMem write-back: an outer list subclass's
+    #      append calls plain list.append, never the inner subclass's append.
+    # One wrap, one sink fan-out, one place to fix.
+    def _graph_sink(msg, graph=memory_graph, session=user_prompt):
+        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+        speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
+        if content and len(content.strip()) > 5:
+            graph.register_conversation(speaker, content, session)
+
     try:
-        from integrations.channels.memory.shared_history import create_autogen_history_hook
-        _shared_hook_factory = create_autogen_history_hook(user_id, simplemem_store)
-    except Exception:
-        pass
-
-    for gc in [group_chat, group_chat_1, group_chat_2]:
-        _original_append = gc.messages.append
-
-        def _make_hook(orig_append, store=simplemem_store, shared_factory=_shared_hook_factory):
-            def _unified_ingest_hook(msg):
-                orig_append(msg)
-                # Skip seeded messages (already in buffer)
-                if isinstance(msg, dict) and msg.get('_from_shared'):
-                    return
-                content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-                if not content or len(content.strip()) <= 5 or content == 'TERMINATE':
-                    return
-                speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
-                # SimpleMem ingest
-                if store is not None:
-                    try:
-                        loop = get_or_create_event_loop()
-                        loop.run_until_complete(store.add(content, {
-                            "sender_name": speaker,
-                            "user_id": user_id,
-                            "prompt_id": prompt_id,
-                        }))
-                    except Exception:
-                        pass
-                # Shared PersistentChatHistory write-back (dedup-aware)
-                if shared_factory is not None:
-                    try:
-                        from langchain_core.messages import HumanMessage, AIMessage
-                        from integrations.channels.memory.shared_history import _get_persistent_history
-                        hist = _get_persistent_history(user_id)
-                        if hist:
-                            role = msg.get("role", "assistant") if isinstance(msg, dict) else "assistant"
-                            lc_msg = HumanMessage(content=content) if role == "user" else AIMessage(content=content)
-                            # Dedup: skip if last buffer message has same content
-                            last_msgs = hist.messages[-3:] if hist.messages else []
-                            if not any(m.content == content for m in last_msgs):
-                                from datetime import datetime
-                                hist.add_message(lc_msg, metadata={
-                                    'timestamp': datetime.now().isoformat(),
-                                    'source': 'autogen',
-                                })
-                    except Exception:
-                        pass
-            return _unified_ingest_hook
-
-        # Use wrapper list (plain list.append is read-only in Python)
-        class _HookedList(list):
-            def __init__(self, data, hook):
-                super().__init__(data)
-                self._hook = hook
-            def append(self, msg):
-                super().append(msg)
-                try:
-                    self._hook(msg)
-                except Exception:
-                    pass
-        gc.messages = _HookedList(gc.messages, _make_hook(_original_append))
-
-    # Auto-ingest group_chat messages into MemoryGraph (provenance tracking)
-    if memory_graph is not None:
+        from integrations.channels.memory.shared_history import install_history_writeback
         for gc in [group_chat, group_chat_1, group_chat_2]:
-            def _make_graph_hook(graph=memory_graph, session=user_prompt):
-                def _graph_ingest_hook(msg):
-                    try:
-                        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-                        speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
-                        if content and len(content.strip()) > 5:
-                            graph.register_conversation(speaker, content, session)
-                    except Exception:
-                        pass
-                return _graph_ingest_hook
-            if isinstance(gc.messages, _HookedList):
-                # Already hooked — chain the graph hook into the existing one
-                _existing_hook = gc.messages._hook
-                _graph_h = _make_graph_hook()
-                def _chained(msg, _eh=_existing_hook, _gh=_graph_h):
-                    _eh(msg)
-                    _gh(msg)
-                gc.messages._hook = _chained
-            else:
-                class _GraphHookedList(list):
-                    def __init__(self, data, hook):
-                        super().__init__(data)
-                        self._hook = hook
-                    def append(self, msg):
-                        super().append(msg)
-                        try:
-                            self._hook(msg)
-                        except Exception:
-                            pass
-                gc.messages = _GraphHookedList(gc.messages, _make_graph_hook())
+            install_history_writeback(
+                gc, user_id, simplemem_store,
+                extra_sinks=[_graph_sink] if memory_graph is not None else None,
+                simplemem_metadata={'prompt_id': prompt_id})
+    except Exception:
+        current_app.logger.debug(
+            'group-chat history write-back skipped', exc_info=True)
 
     # ── System Introspection Tools ─────────────────────────────────
     # Register self-awareness tools (GPU tier, active models, TTS
