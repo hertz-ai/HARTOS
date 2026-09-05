@@ -3036,6 +3036,24 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 _reuse_resteer_counts = {}
 _REUSE_FAB_STEER_MAX = 3
 
+# The MIRROR of the fabrication gate.  That gate catches an action CLAIMING
+# completion whose tool never ran.  This one catches the opposite, measured
+# live 2026-09-05 on Scout2 (77712340019): google_search really ran (three
+# HTTP 200s to brave/wikipedia/grokipedia at 19:45:24-25) and the agent wrote
+# the correct 2-bullet summary from the results — then reported
+# {'status': 'pending', 'action_id': 1}.  Every advance site gates on
+# status == 'completed', so none fired, the turn ended on '@user', and
+# current_action_id never left 1.  Five agents in the sweep sit at 1/N this way.
+#
+# An under-reporting model must not strand a finished action, but "pending"
+# is also the honest answer when an action genuinely needs another tool call.
+# So steer first, bounded, and only then proceed — and only ever when the
+# action's own tools are EVIDENCED to have executed (_reuse_fabricated_tools
+# returns nothing outstanding).  Advancing without that evidence would be the
+# "force-completed by a nudge" the verification contract forbids.
+_reuse_pending_counts = {}
+_REUSE_PENDING_STEER_MAX = 2
+
 
 def _reuse_turn_round_budget(user_prompt):
     """Iteration budget for ONE reuse turn, derived from the recipe it runs.
@@ -3089,6 +3107,45 @@ def _reuse_fab_steer_message(user_prompt, current_action_id):
         f"Do not report this action as completed. @Helper call {names} now with "
         f"real arguments and report the actual returned result."
     )
+
+
+def _reuse_action_is_autonomous(user_prompt, action_id):
+    """True when the recipe marks this action runnable without the user.
+
+    Reads the same ``can_perform_without_user_input`` field the recipe author
+    writes and the prompt at L1296 instructs the model to honour.  Absent or
+    unparseable -> False, so an unknown action is never auto-advanced.
+    """
+    try:
+        action = user_tasks[user_prompt].actions[action_id - 1]
+        return str(action.get('can_perform_without_user_input', '')).lower() == 'yes'
+    except Exception:
+        return False
+
+
+def _reuse_outstanding_tools(user_prompt, action_id, group_chat):
+    """The action's named tools that have NOT executed in this group chat.
+
+    Thin adapter over ``_reuse_fabricated_tools`` (the fabrication gate's own
+    predicate) so the under-reported-completion branch asks exactly the
+    question the gate asks, instead of growing a second notion of "did the
+    tool run".  Empty result == every tool this action names really executed.
+    On any error returns a non-empty sentinel, so uncertainty blocks the
+    advance rather than permitting it.
+    """
+    try:
+        agents = list(getattr(group_chat, 'agents', None) or [])
+        return _reuse_fabricated_tools(user_prompt, action_id, group_chat, agents)
+    except Exception as err:
+        # The log must never be able to fail the fail-closed path itself:
+        # current_app raises outside an app context, which would let the
+        # exception escape and hand the caller a green light instead of the
+        # blocking sentinel.  Caught by test_error_reports_outstanding_tools.
+        try:
+            current_app.logger.debug(f"_reuse_outstanding_tools: {err}")
+        except Exception:
+            pass
+        return ['<unknown>']
 
 
 def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
@@ -3344,6 +3401,55 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     continue
             except Exception as _rc_err:
                 current_app.logger.debug(f"robust completion-advance skipped: {_rc_err}")
+
+            # UNDER-REPORTED COMPLETION (mirror of the fabrication gate above).
+            # 'pending' from an autonomous action whose tools have EVIDENTLY run
+            # is a reporting failure, not unfinished work — see the
+            # _REUSE_PENDING_STEER_MAX comment for the Scout2 measurement.
+            # Steer first (bounded), then let the normal advance path decide;
+            # that path re-runs the fabrication gate, so nothing advances whose
+            # tool did not actually execute.
+            try:
+                _pend = group_chat.messages[-1] if group_chat.messages else None
+                _pend_vj = retrieve_json((_pend or {}).get('content') or '') if _pend else None
+                if (isinstance(_pend_vj, dict)
+                        and str(_pend_vj.get('status', '')).lower() == 'pending'
+                        and _reuse_current_action not in _reuse_advanced_actions
+                        and _reuse_action_is_autonomous(user_prompt, _reuse_current_action)
+                        and not _reuse_outstanding_tools(user_prompt, _reuse_current_action,
+                                                        group_chat)):
+                    _pk = (user_prompt, _reuse_current_action)
+                    _pn = _reuse_pending_counts.get(_pk, 0)
+                    if _pn < _REUSE_PENDING_STEER_MAX:
+                        _reuse_pending_counts[_pk] = _pn + 1
+                        current_app.logger.info(
+                            f"[UNDER-REPORTED] action {_reuse_current_action} says "
+                            f"'pending' but its tools already executed — steering for a "
+                            f"truthful verdict (attempt {_pn + 1}/{_REUSE_PENDING_STEER_MAX})")
+                        chat_instructor.initiate_chat(
+                            recipient=manager,
+                            message=(
+                                "Your tool for this action has already executed and returned "
+                                "its result. Do not re-run it. Either report this action "
+                                "completed, or state the exact remaining step that still "
+                                "needs a tool call."),
+                            clear_history=False, silent=False)
+                        continue
+                    _reuse_advanced_actions.add(_reuse_current_action)
+                    current_app.logger.warning(
+                        f"[UNDER-REPORTED] action {_reuse_current_action} still reports "
+                        f"'pending' after {_REUSE_PENDING_STEER_MAX} steers while its tools "
+                        f"are evidenced as executed — advancing on the tool evidence")
+                    if not _advance_or_steer(
+                            user_prompt, _reuse_current_action,
+                            "reuse-under-reported", prompt_id,
+                            manager, chat_instructor,
+                            advanced_latch=_reuse_advanced_actions):
+                        return ''
+                    continue
+            except Exception as _ur_err:
+                current_app.logger.debug(f"under-reported advance skipped: {_ur_err}")
+
             if _reuse_current_action in _reuse_advanced_actions:
                 continue
 
