@@ -284,32 +284,63 @@ class TestExecuteDesktopTask:
         assert post.call_args.args[0] == 'http://remote:9999/execute'
         assert result['success'] is True
 
+    # These faked `local_loop.run_local_agentic_loop`, which the executor stopped
+    # calling. Its old direct call omitted the required `tier` arg and passed a
+    # str where the loop wants a message dict, and the bare except swallowed the
+    # TypeError, so the local leg had NEVER executed. The fix routed it through
+    # `vlm_adapter.execute_vlm_instruction`, the canonical entry reuse/create/hie
+    # all use, which owns tier selection and the circuit breakers.
+    #
+    # Faking the old module left the REAL adapter in the path: it tried its tiers,
+    # called the fake with `tier=` (a signature the fakes did not have), swallowed
+    # that as a tier failure, and returned None. All three tests then landed on
+    # the Crossbar-only early return instead of their own arrangements.
+    #
+    # Faking the adapter is also the right seam for a unit test of the EXECUTOR:
+    # its contract is "call the canonical entry and translate what comes back",
+    # not "drive tier selection".
+    def _fake_adapter(self, fn):
+        mod = types.ModuleType('integrations.vlm.vlm_adapter')
+        mod.execute_vlm_instruction = fn
+        return mock.patch.dict(sys.modules,
+                               {'integrations.vlm.vlm_adapter': mod})
+
     def test_local_target_import_error_degrades_cleanly(self):
         with mock.patch.dict(sys.modules,
-                             {'integrations.vlm.local_loop': None}):
+                             {'integrations.vlm.vlm_adapter': None}):
             result = _exec().execute_desktop_task('open chrome', target='local')
         assert result['success'] is False
         assert 'VLM pipeline not available' in result['error']
 
     def test_local_target_success(self):
-        fake = types.ModuleType('integrations.vlm.local_loop')
-        fake.run_local_agentic_loop = lambda instruction: {'steps': 2,
-                                                            'instr': instruction}
-        with mock.patch.dict(sys.modules,
-                             {'integrations.vlm.local_loop': fake}):
+        with self._fake_adapter(
+                lambda msg: {'status': 'success', 'steps': 2,
+                             'instr': msg['instruction_to_vlm_agent']}):
             result = _exec().execute_desktop_task('do thing', target='local')
         assert result['success'] is True
         assert 'do thing' in result['output']  # json.dumps of the dict
 
-    def test_local_target_runtime_exception_captured(self):
-        fake = types.ModuleType('integrations.vlm.local_loop')
+    def test_local_target_reports_a_failed_run_as_failure(self):
+        """`success` is read off the loop's OWN status, not from "it returned"."""
+        with self._fake_adapter(lambda msg: {'status': 'incomplete',
+                                             'exit_reason': 'max_iterations'}):
+            result = _exec().execute_desktop_task('do thing', target='local')
+        assert result['success'] is False
+        assert 'max_iterations' in result['output']
 
-        def _boom(instruction):
+    def test_local_target_no_tier_is_reported_not_swallowed(self):
+        """The adapter returns None when no local tier can run it, which is a
+        different outcome from a run that failed, and says so."""
+        with self._fake_adapter(lambda msg: None):
+            result = _exec().execute_desktop_task('do thing', target='local')
+        assert result['success'] is False
+        assert 'no local VLM tier' in result['error']
+
+    def test_local_target_runtime_exception_captured(self):
+        def _boom(msg):
             raise RuntimeError('vlm exploded')
 
-        fake.run_local_agentic_loop = _boom
-        with mock.patch.dict(sys.modules,
-                             {'integrations.vlm.local_loop': fake}):
+        with self._fake_adapter(_boom):
             result = _exec().execute_desktop_task('do thing', target='local')
         assert result['success'] is False
         assert result['error'] == 'vlm exploded'
