@@ -2140,6 +2140,7 @@ pub fn effects_animating<S: CompState>(state: &S) -> bool {
     scene_animates(
         native_scene_drawn(state.native_shell_on(), state.capture_blocked()),
         state.motion_hardware(),
+        motion_reduced(),
         ws_fading,
         map_animating,
     )
@@ -2176,9 +2177,19 @@ pub fn native_scene_drawn(native_shell_on: bool, capture_blocked: bool) -> bool 
 pub fn scene_animates(
     native_scene_drawn: bool,
     motion_hardware: bool,
+    motion_reduced: bool,
     ws_fading: bool,
     map_animating: bool,
 ) -> bool {
+    // REDUCED MOTION is not a performance floor and is not overridable by one: it is the
+    // user saying stop. The shell has three independent motion kill-switches and the CSS
+    // parity ledger is explicit that all three must exist natively; this is the one that
+    // is a stated preference rather than a hardware verdict, so it wins over everything,
+    // including the transients below. A workspace fade the user asked not to see is
+    // exactly what `prefers-reduced-motion` exists to stop.
+    if motion_reduced {
+        return false;
+    }
     // The native scene animates because its ORB breathes, and the orb breathes only on
     // hardware, exactly as `body.gpu-hardware #hart-voice-orb` does. Without the second
     // condition a drawn native scene held this gate open forever, so the pixman software
@@ -2407,7 +2418,7 @@ where
     // Read BEFORE `native_scene_caches` takes its `&mut` borrow of state, and it is the
     // SAME bool `effects_animating` gates the frame budget on, so the orb's motion and
     // the frame rate that carries it can never disagree.
-    let animate = state.motion_hardware();
+    let animate = state.motion_hardware() && !motion_reduced();
     // The home now rides OUT of the accessor as a shared borrow beside the `&mut`
     // caches, so the frame no longer clones a HomeCompose just to release the state
     // borrow. `demo_ref` is the allocation-free fallback until `shell.compose` lands.
@@ -2427,6 +2438,17 @@ where
 }
 
 /// Lower a `HomeCompose` to render elements against the concrete caches — the
+/// Has the user declared reduced motion? Resolved ONCE, like the theme beside it, and
+/// carrying the same documented gap: a runtime PUT to /api/shell/accessibility lives in
+/// the shell process's memory and reaches this at the next start.
+///
+/// A `OnceLock` because the frame path must not touch the disk, and the answer is a
+/// declarative setting rather than something that changes under us.
+fn motion_reduced() -> bool {
+    static REDUCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REDUCED.get_or_init(crate::bloom::reduced_motion)
+}
+
 /// The scene's colours, resolved ONCE from the same theme file the backdrop reads.
 ///
 /// A `OnceLock` rather than a per-frame call because resolving it touches the disk, and
@@ -2438,14 +2460,14 @@ where
 fn active_theme() -> &'static crate::scene::Theme {
     static ACTIVE: std::sync::OnceLock<crate::scene::Theme> = std::sync::OnceLock::new();
     ACTIVE.get_or_init(|| {
-        let file = crate::bloom::ThemeFile::active();
+        let file = crate::bloom::SettingsFile::active();
         theme_from_file(&file)
     })
 }
 
 /// Fold a loaded theme file's colours into the shipped defaults. Split out so it is
 /// testable against a real file with no environment and no OnceLock in the way.
-fn theme_from_file(file: &crate::bloom::ThemeFile) -> crate::scene::Theme {
+fn theme_from_file(file: &crate::bloom::SettingsFile) -> crate::scene::Theme {
     let hue = |key: &str| {
         file.hex(key)
             .map(|[r, g, b]| {
@@ -2861,7 +2883,7 @@ where
         let short = size.w.min(size.h);
         let side = (short as f32 * 0.30) as i32;
         let energy = state.orb_energy();
-        let animate = state.motion_hardware();
+        let animate = state.motion_hardware() && !motion_reduced();
         if let Some((buffer, motion)) = state.orb_mut().current(side, energy, animate) {
             // Breathing scales about the CENTRE, so the top-left moves by half
             // the growth. Computed from the motion rather than stored, so there
@@ -3876,7 +3898,7 @@ mod tests {
                "surface":"241118","ambient_1":"FF8A4C"}}"#,
         )
         .unwrap();
-        let file = crate::bloom::ThemeFile::load(&f);
+        let file = crate::bloom::SettingsFile::load(&f);
         let themed = theme_from_file(&file);
         let shipped = crate::scene::Theme::cosmic_default();
         assert_ne!(themed.accent, shipped.accent, "the theme's accent must win");
@@ -3924,7 +3946,7 @@ mod tests {
                "shell":{"topbar_height":36,"icon_size":18,"border_radius":4}}"#,
         )
         .unwrap();
-        let themed = theme_from_file(&crate::bloom::ThemeFile::load(&f));
+        let themed = theme_from_file(&crate::bloom::SettingsFile::load(&f));
         assert_eq!(themed.top_bar_h, 36.0, "the bar takes the theme's height");
         assert_eq!(themed.icon_px, 18.0, "and the tray its glyph size");
         assert_eq!(themed.card_radius, 4.0, "and the cards their corner");
@@ -3971,7 +3993,7 @@ mod tests {
                "border_radius":-40}}"#,
         )
         .unwrap();
-        let themed = theme_from_file(&crate::bloom::ThemeFile::load(&f));
+        let themed = theme_from_file(&crate::bloom::SettingsFile::load(&f));
         assert!(themed.top_bar_h >= 16.0, "a zero bar is clamped, not drawn");
         assert!(themed.icon_px <= 64.0, "a giant glyph is clamped");
         assert!(themed.card_radius >= 0.0, "a negative radius is clamped");
@@ -3979,7 +4001,7 @@ mod tests {
         let g = dir.join("text.json");
         std::fs::write(&g, r#"{"shell":{"topbar_height":"tall"}}"#).unwrap();
         assert_eq!(
-            theme_from_file(&crate::bloom::ThemeFile::load(&g)).top_bar_h,
+            theme_from_file(&crate::bloom::SettingsFile::load(&g)).top_bar_h,
             crate::scene::Theme::cosmic_default().top_bar_h,
             "a malformed height keeps the shipped bar"
         );
@@ -3990,7 +4012,7 @@ mod tests {
         // The fallback is the safety property: this runs in the process that owns
         // scanout, so an unreadable theme must cost nothing at all rather than a colour
         // the user cannot explain. Byte-identical to before the file was ever read.
-        let missing = crate::bloom::ThemeFile::load(std::path::Path::new("/definitely/not/here.json"));
+        let missing = crate::bloom::SettingsFile::load(std::path::Path::new("/definitely/not/here.json"));
         assert_eq!(theme_from_file(&missing), crate::scene::Theme::cosmic_default());
         // A file that parses but names nothing we use is the same case.
         let dir = std::env::temp_dir().join("hart_scene_theme_test");
@@ -3998,7 +4020,7 @@ mod tests {
         let f = dir.join("bare.json");
         std::fs::write(&f, r#"{"id":"bare","font":{"size":14}}"#).unwrap();
         assert_eq!(
-            theme_from_file(&crate::bloom::ThemeFile::load(&f)),
+            theme_from_file(&crate::bloom::SettingsFile::load(&f)),
             crate::scene::Theme::cosmic_default()
         );
     }
@@ -4225,15 +4247,15 @@ mod native_render_tests {
         // so without this the flip to the native shell would quietly render that breath
         // at 5 Hz: a stutter, not a breath, and against the 60fps NFR.
         assert!(
-            scene_animates(true, true, false, false),
+            scene_animates(true, true, false, false, false),
             "a drawn native scene animates by construction, its orb never stops breathing"
         );
         // Flag OFF is untouched, which is what keeps the shipped WebView desktop's idle
         // saving: the orb still breathes down there, but occluded, so it costs nothing.
-        assert!(!scene_animates(false, true, false, false));
+        assert!(!scene_animates(false, true, false, false, false));
         // The two effects that already forced a paint still do, with the flag off.
-        assert!(scene_animates(false, true, true, false), "a workspace fade must play out");
-        assert!(scene_animates(false, true, false, true), "a map animation must play out");
+        assert!(scene_animates(false, true, false, true, false), "a workspace fade must play out");
+        assert!(scene_animates(false, true, false, false, true), "a map animation must play out");
     }
 
     #[test]
@@ -4313,11 +4335,11 @@ mod native_render_tests {
         assert!(!native_scene_drawn(false, false), "flag off: never drawn");
         assert!(!native_scene_drawn(false, true));
         // And the gate agrees, because both decisions read the same predicate.
-        assert!(!scene_animates(native_scene_drawn(true, true), true, false, false));
-        assert!(scene_animates(native_scene_drawn(true, false), true, false, false));
+        assert!(!scene_animates(native_scene_drawn(true, true), true, false, false, false));
+        assert!(scene_animates(native_scene_drawn(true, false), true, false, false, false));
         // A real animation still plays out under the killswitch: correctness first, the
         // saving is only ever about the native scene.
-        assert!(scene_animates(native_scene_drawn(true, true), true, true, false));
+        assert!(scene_animates(native_scene_drawn(true, true), true, false, true, false));
     }
 
     #[test]
@@ -4331,21 +4353,94 @@ mod native_render_tests {
         // nothing else, and liquid_ui_service records why (real-HW 2026-07-12, GPU-only
         // effects on a CPU renderer hung the whole shell).
         assert!(
-            scene_animates(true, true, false, false),
+            scene_animates(true, true, false, false, false),
             "GPU-composited with the scene drawn: the orb breathes"
         );
         assert!(
-            !scene_animates(true, false, false, false),
+            !scene_animates(true, false, false, false, false),
             "on the software floor a still native desktop must let the gate close"
         );
         // Transients are unconditional: a workspace fade and a map animation are a few
         // hundred milliseconds of motion the user just asked for, not a permanent hold,
         // and they must play out on the floor too.
-        assert!(scene_animates(true, false, true, false), "a ws fade plays on the floor");
-        assert!(scene_animates(true, false, false, true), "so does a map animation");
+        assert!(scene_animates(true, false, false, true, false), "a ws fade plays on the floor");
+        assert!(scene_animates(true, false, false, false, true), "so does a map animation");
         assert!(
-            !scene_animates(false, false, false, false),
+            !scene_animates(false, false, false, false, false),
             "nothing drawn, nothing animating, nothing to hold the gate open"
+        );
+    }
+
+    #[test]
+    fn declared_reduced_motion_stops_the_desktop_moving_at_all() {
+        // The CSS parity ledger's rule 4: the shell has THREE independent motion
+        // kill-switches and all three must exist natively. The native scene honoured only
+        // the GPU floor, so a user who had declared reduced motion would still have got a
+        // breathing orb the moment the shell went native.
+        //
+        // It is not a performance floor and is not overridden by one. On the fastest GPU
+        // in the fleet, with the scene drawn, reduced motion still means still.
+        assert!(
+            scene_animates(true, true, false, false, false),
+            "GPU, not reduced: the orb breathes"
+        );
+        assert!(
+            !scene_animates(true, true, true, false, false),
+            "reduced motion wins over a perfectly capable GPU"
+        );
+        // And it wins over the TRANSIENTS too, which is the difference between this and
+        // the hardware floor: a workspace fade the user asked not to see is exactly what
+        // the preference exists to stop, where a slow CPU is a reason to skip the breath
+        // and still show the fade.
+        assert!(scene_animates(true, false, false, true, false), "ws fade on the CPU floor");
+        assert!(
+            !scene_animates(true, true, true, true, true),
+            "nothing animates when the user said stop"
+        );
+    }
+
+    #[test]
+    fn the_reduced_motion_flag_is_read_from_the_file_the_shell_reads() {
+        // shell_os_apis.py seeds _A11Y_SETTINGS from /etc/hart/accessibility.json at
+        // import; this reads the same key out of the same shape. Absent file, absent key
+        // and a non-boolean all mean "not declared", which is what the shell defaults to.
+        let dir = std::env::temp_dir().join("hart_a11y_test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let on = dir.join("on.json");
+        std::fs::write(&on, r#"{"font_scale":1.0,"reduced_motion":true}"#).unwrap();
+        assert_eq!(
+            crate::bloom::SettingsFile::load(&on).flag("reduced_motion"),
+            Some(true)
+        );
+        let off = dir.join("off.json");
+        std::fs::write(&off, r#"{"reduced_motion":false,"high_contrast":true}"#).unwrap();
+        assert_eq!(
+            crate::bloom::SettingsFile::load(&off).flag("reduced_motion"),
+            Some(false)
+        );
+        assert_eq!(
+            crate::bloom::SettingsFile::load(&off).flag("high_contrast"),
+            Some(true),
+            "the reader is not special-cased to one key"
+        );
+        // Missing key, missing file, and a value that is not a bool: all None, so the
+        // caller keeps the shipped default rather than guessing.
+        let bare = dir.join("bare.json");
+        std::fs::write(&bare, r#"{"font_scale":1.25,"reduced_motion":"yes"}"#).unwrap();
+        assert_eq!(
+            crate::bloom::SettingsFile::load(&bare).flag("reduced_motion"),
+            None,
+            "a string is not a JSON bool"
+        );
+        assert_eq!(
+            crate::bloom::SettingsFile::load(&bare).flag("large_cursor"),
+            None
+        );
+        assert_eq!(
+            crate::bloom::SettingsFile::load(std::path::Path::new("/definitely/not/here.json"))
+                .flag("reduced_motion"),
+            None
         );
     }
 

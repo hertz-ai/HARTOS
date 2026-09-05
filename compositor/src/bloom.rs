@@ -66,29 +66,33 @@ fn hex3(s: &str) -> Option<[u8; 3]> {
     Some([h(0)?, h(2)?, h(4)?])
 }
 
-/// One loaded theme JSON, and the ONE reader for it in this process.
+/// One loaded settings JSON, and the ONE reader for that shape in this process.
 ///
-/// The backdrop and the native scene both need colours out of the same file, and the
-/// scene's `Theme` was a hardcoded copy of what this file already carries, which is a
-/// parallel theme table inside a single binary: exactly what Gate 4 forbids and exactly
-/// what a user changing their theme would have discovered, the backdrop restyling under
-/// a desktop that did not. So the file is loaded once and both read it through here.
+/// Born as the theme reader: the backdrop and the native scene both need colours out of
+/// `conky-themes/<id>.json`, and the scene's `Theme` was a hardcoded copy of what that
+/// file already carries, which is a parallel theme table inside a single binary, exactly
+/// what Gate 4 forbids and exactly what a user changing their theme would have
+/// discovered, the backdrop restyling under a desktop that did not.
+///
+/// It reads `/etc/hart/accessibility.json` too, which is the same shape and the same
+/// posture, so the name is the shape rather than the subject. Two files, one scanner:
+/// a second copy of this is how the drift it was written to end would start again.
 ///
 /// No JSON dependency is pulled in for it even though the crate has one: the file is a
 /// flat `"key": "VALUE"` map for every field either consumer needs, so a scan per key is
 /// enough, cannot panic on malformed input, and cannot be made to allocate by a hostile
 /// file. Any key that does not parse leaves the caller's default in place.
-pub struct ThemeFile {
+pub struct SettingsFile {
     text: Option<String>,
 }
 
-impl ThemeFile {
+impl SettingsFile {
     /// Load the theme JSON at `path`. A missing or unreadable file is not an error: it
     /// yields a file that answers None to everything, so every caller keeps its shipped
     /// default. This is the desktop's own colours; an unreadable theme must degrade to
     /// the shipped look, never to a void.
-    pub fn load(path: &Path) -> ThemeFile {
-        ThemeFile {
+    pub fn load(path: &Path) -> SettingsFile {
+        SettingsFile {
             text: std::fs::read_to_string(path).ok(),
         }
     }
@@ -97,23 +101,23 @@ impl ThemeFile {
     ///
     /// `HART_THEME_DIR` / `HART_THEME` follow the convention the conky + liquid-ui
     /// modules already export, so this reads the same file the HTML shell is handed.
-    pub fn active() -> ThemeFile {
+    pub fn active() -> SettingsFile {
         let dir = std::env::var("HART_THEME_DIR").unwrap_or_else(|_| THEME_DIR_DEFAULT.to_string());
         let id = std::env::var("HART_THEME").unwrap_or_else(|_| "aura".to_string());
-        ThemeFile::for_id(&dir, &id)
+        SettingsFile::for_id(&dir, &id)
     }
 
     /// The resolution rule with the environment read out of the way, so it is testable
     /// without mutating process-global state (cargo runs tests as threads in one
     /// process, and an env-mutating test would race every other test here).
-    pub fn for_id(dir: &str, id: &str) -> ThemeFile {
+    pub fn for_id(dir: &str, id: &str) -> SettingsFile {
         // Reject an id that could escape the theme directory. It reaches us from the
         // environment, and a path separator would let it name any file on disk; a bad id
         // falls back to the shipped look rather than reading around.
         if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
-            return ThemeFile { text: None };
+            return SettingsFile { text: None };
         }
-        ThemeFile::load(&Path::new(dir).join(format!("{}.json", id)))
+        SettingsFile::load(&Path::new(dir).join(format!("{}.json", id)))
     }
 
     /// The NUMERIC value of `key`, or None when it is absent or not a number.
@@ -144,6 +148,30 @@ impl ThemeFile {
         v.parse::<f32>().ok().filter(|n| n.is_finite())
     }
 
+    /// The BOOLEAN value of `key`, or None when it is absent or not a JSON bool.
+    ///
+    /// `/etc/hart/accessibility.json` carries `reduced_motion`, and the CSS parity ledger
+    /// is explicit that the shell's three motion kill-switches must all exist natively.
+    /// The native scene honoured only the GPU floor, so a user who had declared reduced
+    /// motion still got a breathing orb the moment the shell went native.
+    ///
+    /// Only the DECLARATIVE file is visible from here. A runtime PUT to
+    /// /api/shell/accessibility lives in the shell process's memory, so it reaches the
+    /// compositor at the next start, which is the same documented gap the theme and the
+    /// backdrop palette already carry rather than a new one.
+    pub fn flag(&self, key: &str) -> Option<bool> {
+        let text = self.text.as_ref()?;
+        let k = format!("\"{}\"", key);
+        let i = text.find(&k)?;
+        let rest = &text[i + k.len()..];
+        let c = rest.find(':')?;
+        match rest[c + 1..].trim_start() {
+            v if v.starts_with("true") => Some(true),
+            v if v.starts_with("false") => Some(false),
+            _ => None,
+        }
+    }
+
     /// The `#RRGGBB` value of `key`, or None when the key is absent or malformed.
     pub fn hex(&self, key: &str) -> Option<[u8; 3]> {
         let text = self.text.as_ref()?;
@@ -159,14 +187,14 @@ impl ThemeFile {
     }
 }
 
-/// The backdrop palette out of a theme JSON. A thin consumer of `ThemeFile` now, so the
+/// The backdrop palette out of a theme JSON. A thin consumer of `SettingsFile` now, so the
 /// scan lives in one place rather than once per thing that needs a colour.
 pub fn palette_from_theme_file(path: &Path) -> BloomPalette {
-    palette_from(&ThemeFile::load(path))
+    palette_from(&SettingsFile::load(path))
 }
 
 /// The backdrop palette from an already-loaded file.
-pub fn palette_from(file: &ThemeFile) -> BloomPalette {
+pub fn palette_from(file: &SettingsFile) -> BloomPalette {
     let mut p = BloomPalette::default();
     if let Some(v) = file.hex("background") {
         p.base = v;
@@ -184,6 +212,19 @@ pub fn palette_from(file: &ThemeFile) -> BloomPalette {
 /// renderers read one palette source (Gate 4: no parallel theme table).
 const THEME_DIR_DEFAULT: &str = "/run/current-system/sw/share/hart/conky-themes";
 
+/// Where the shell reads its declarative accessibility state
+/// (shell_os_apis.py seeds `_A11Y_SETTINGS` from this exact path at import).
+pub const A11Y_SETTINGS_PATH: &str = "/etc/hart/accessibility.json";
+
+/// Does the user want motion stood down? Reads the same declarative file the shell does.
+/// FALSE when the file is absent or the key is missing, which is the shipped default and
+/// what `_A11Y_SETTINGS` seeds `reduced_motion` to.
+pub fn reduced_motion() -> bool {
+    SettingsFile::load(Path::new(A11Y_SETTINGS_PATH))
+        .flag("reduced_motion")
+        .unwrap_or(false)
+}
+
 /// Resolve the active palette from the environment, degrading at every step.
 ///
 /// `HART_THEME_DIR` / `HART_THEME` follow the convention the conky + liquid-ui
@@ -191,14 +232,14 @@ const THEME_DIR_DEFAULT: &str = "/run/current-system/sw/share/hart/conky-themes"
 /// rather than a void, because this is the DESKTOP BACKDROP: an unreadable theme
 /// file must never produce a black screen the user cannot explain.
 pub fn theme_palette() -> BloomPalette {
-    palette_from(&ThemeFile::active())
+    palette_from(&SettingsFile::active())
 }
 
 /// The resolution rule itself, with the environment read out of the way. Kept as its own
 /// entry point because the tests drive it directly; the id-safety and the fallback both
-/// live in `ThemeFile::for_id` now, so this is the same rule, not a second one.
+/// live in `SettingsFile::for_id` now, so this is the same rule, not a second one.
 pub fn theme_palette_from(dir: &str, id: &str) -> BloomPalette {
-    palette_from(&ThemeFile::for_id(dir, id))
+    palette_from(&SettingsFile::for_id(dir, id))
 }
 
 /// One additive radial blob: centre as a fraction of the output, radius as a

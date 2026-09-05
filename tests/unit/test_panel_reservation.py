@@ -539,3 +539,46 @@ def test_rendering_the_shell_publishes_the_reservation_it_served(published):
          if l.strip()))
     assert got["top"] == _css_px(html, r"--hart-topbar-height:\s*(\d+)px")
     assert got["bottom"] == _css_px(html, r"--hart-taskbar-height:\s*(\d+)px")
+
+def test_the_compositor_reads_the_accessibility_file_the_shell_reads():
+    """The CSS parity ledger's rule 4: the shell has three independent motion
+    kill-switches and all three must exist natively. The native scene honoured
+    only the GPU floor, so a user who had declared reduced motion still got a
+    breathing orb the moment the shell went native.
+
+    It reads the DECLARATIVE file, which is the one both sides can see:
+    shell_os_apis.py seeds _A11Y_SETTINGS from it at import, and a runtime PUT
+    to /api/shell/accessibility lives in that process's memory and reaches the
+    compositor at its next start (the same documented gap the theme carries).
+
+    Two paths and one key, in two languages. Pin them, because a path that
+    agrees today is exactly what the hardcoded bar height also did.
+    """
+    shell = open(os.path.join(REPO, "integrations", "agent_engine",
+                              "shell_os_apis.py"), encoding="utf-8").read()
+    bloom = open(os.path.join(REPO, "compositor", "src", "bloom.rs"),
+                 encoding="utf-8").read()
+
+    m = re.search(r"open\('([^']*accessibility[^']*)'\)", shell)
+    assert m, "shell_os_apis.py no longer seeds a11y from a declarative file"
+    want = m.group(1)
+    r = re.search(r'A11Y_SETTINGS_PATH: &str = "([^"]+)";', bloom)
+    assert r, "bloom.rs no longer names the accessibility file"
+    assert r.group(1) == want, (
+        "the compositor reads %r but the shell seeds from %r, so a declared "
+        "reduced-motion setting would reach one renderer and not the other"
+        % (r.group(1), want))
+
+    assert "'reduced_motion'" in shell, (
+        "shell_os_apis.py no longer carries a reduced_motion setting")
+    assert 'flag("reduced_motion")' in bloom, (
+        "bloom.rs no longer reads reduced_motion out of that file")
+    # And the gate actually CONSULTS it. Reading a setting nothing acts on is the
+    # same dead-contract shape as a budget row nothing measures.
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+    assert "crate::bloom::reduced_motion" in comp, (
+        "comp_core no longer calls bloom::reduced_motion, so the motion gate is "
+        "back to the GPU floor alone and a declared preference does nothing")
+    assert "motion_reduced" in comp, (
+        "the scene_animates gate no longer takes a reduced-motion input")

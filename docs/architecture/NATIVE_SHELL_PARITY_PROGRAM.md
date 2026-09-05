@@ -850,3 +850,48 @@ theme keys by name, since agreeing today is exactly what the hardcoded 40 also d
 What is still open in obligation 2 is only the inversion itself: who PUBLISHES the
 reservation once the compositor paints the chrome. That remains a contract question
 with a shell side.
+
+### The parity ledger's rule 4, and the one motion switch the scene honoured
+NATIVE_SHELL_CSS_PARITY_LEDGER.md is a binding contract and only one thing in the
+tree reads it, for something else entirely. Its rule 4 is unambiguous: "Three
+independent motion kill-switches must all exist natively: the
+`prefers-reduced-motion` media query, the `html.a11y-rmotion` class mirror
+(server-applied from `get_a11y_settings()`), and the potato tier."
+
+The native scene honoured none of them. It gained the GPU floor earlier today,
+which is rule 5's first DEGRADATION floor and a different thing: a slow renderer
+is a reason to skip the breath, a stated preference is a reason to stop.
+
+So a user who had declared reduced motion would have got a breathing orb the
+moment the shell went native. That is an accessibility guarantee, not a nicety.
+
+`/etc/hart/accessibility.json` is the declarative half, and it is the half both
+renderers can see: shell_os_apis.py seeds `_A11Y_SETTINGS` from that exact path at
+import. The compositor reads the same key out of the same file through the same
+scanner the theme uses, and a Python guard pins the path, the key, and the fact
+that the gate actually consults it, because reading a setting nothing acts on is
+the same dead-contract shape as a budget row nothing measures.
+
+Three things worth keeping:
+
+**It wins over the transients, unlike the hardware floor.** A workspace fade the
+user asked not to see is exactly what the preference exists to stop, where a slow
+CPU is a reason to skip the perpetual breath and still show the fade. The gate
+returns false before it looks at anything else.
+
+**The reader stopped being theme-specific and says so.** `ThemeFile` became
+`SettingsFile`: two files, one scanner, named for the shape rather than the
+subject. A second copy of it is how the drift it was written to end would start
+again.
+
+**Only the DECLARATIVE half is visible.** A runtime PUT to
+/api/shell/accessibility lives in the shell process's memory. It reaches the
+compositor at the next start, which is the same documented gap the theme and the
+backdrop palette already carry rather than a new one; whoever lands the
+theme-change signal should carry this with it.
+
+The other two switches stay unbuilt and are now stated rather than merely absent:
+`prefers-reduced-motion` is an OS/browser preference with no native equivalent the
+compositor can read today, and the potato tier is Python-side, stripping animation
+strings before they are emitted, so it has nothing to mirror until the native
+scene has an equivalent tier notion.
