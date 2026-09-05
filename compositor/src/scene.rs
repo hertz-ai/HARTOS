@@ -255,6 +255,12 @@ pub struct Theme {
     pub chrome_fill: [Color; 3],
     pub chrome_fill_at: f32,
     pub chrome_fill_angle: f32,
+    /// `.hh-card`'s `box-shadow: 0 16px 38px rgba(0,0,0,0.46)`, as (offset_y, blur) and a
+    /// colour. Kept on every tier by the shell's own instruction: it rasters once and
+    /// composites cheaply forever, so shedding it would be gutting rather than degrading.
+    pub card_shadow: Color,
+    pub card_shadow_dy: f32,
+    pub card_shadow_blur: f32,
 }
 
 /// The spectrum names, positionally matched to `Theme::spectrum`.
@@ -366,7 +372,10 @@ impl Theme {
             omnibox_ink: Color::rgba(0.80, 0.85, 0.90, 1.0),
             hero_title: Color::rgba(0.97, 0.98, 1.0, 1.0),
             hero_copy: Color::rgba(0.78, 0.83, 0.90, 1.0),
-            card_bg: Color::rgba(1.0, 1.0, 1.0, 0.06),
+            // `.hh-card { background: #0E1320 }`: an opaque literal, not a glass wash.
+            // It is the backstop under the art rather than a visible surface, but a
+            // 6%-white backstop shows through as a pale ghost wherever the art does not.
+            card_bg: palette("#0E1320", Color::rgba(0.5, 0.5, 0.5, 1.0)),
             card_ink: Color::rgba(0.90, 0.93, 0.97, 1.0),
             accent: teal,
             // #9B5CFF, the shell's --hart-a2, so the native wordmark reads exactly as the
@@ -413,6 +422,9 @@ impl Theme {
             ],
             chrome_fill_at: 0.46,
             chrome_fill_angle: 155.0,
+            card_shadow: Color::rgba(0.0, 0.0, 0.0, 0.46),
+            card_shadow_dy: 16.0,
+            card_shadow_blur: 38.0,
         }
     }
 
@@ -848,6 +860,29 @@ pub enum SceneNode {
         /// times and read zero is not a contract, it is weight.
         stroke: f32,
     },
+    /// A card's drop shadow: the shape blurred, offset, and painted UNDER it.
+    ///
+    /// `.hh-card`'s own comment is the reason this exists and the reason it survives the
+    /// software floor: "STATIC drop-shadow = the mockup's card depth. It rasters ONCE and
+    /// composites cheaply forever, so the software floor KEEPS it (degrade gracefully,
+    /// not gut) ... Without this the software home read as flat rectangles." The native
+    /// cards had none, which is that reported symptom exactly.
+    ///
+    /// `rect` is the CASTER's box; the lowering expands it by the blur and offsets it, so
+    /// the scene says "this card casts a shadow" rather than carrying a second geometry
+    /// that could drift from the card's own.
+    Shadow {
+        rect: Rect,
+        radius: f32,
+        /// CSS blur-radius. The shadow's edge ramps across this distance, centred on the
+        /// shape's edge, which is what a Gaussian of `blur/2` does closely enough that no
+        /// convolution is needed.
+        blur: f32,
+        /// CSS vertical offset. Depth on this desktop is always straight down: the shell
+        /// has no shadow with a horizontal offset.
+        offset_y: f32,
+        color: Color,
+    },
     /// A GRADIENT-FILLED area, with the photo that belongs over it when there is one.
     ///
     /// Two users, and naming it for either would mislead about the other. `.hh-card-art`
@@ -898,6 +933,7 @@ impl SceneNode {
             | SceneNode::Rect { rect, .. }
             | SceneNode::Text { rect, .. }
             | SceneNode::Fill { rect, .. }
+            | SceneNode::Shadow { rect, .. }
             | SceneNode::OrbSlot { rect, .. } => *rect,
         }
     }
@@ -1885,6 +1921,19 @@ pub fn layout_home(
             // border:none, so the numeral and the art ARE the whole card. It gets no
             // background node at all now that its art tile can anchor the hover.
             let mut card_children: Vec<SceneNode> = Vec::new();
+            // FIRST, so it paints under everything the card draws, exactly as a
+            // box-shadow paints under its own box. A ranked card has no tile and no
+            // shadow either: `.hh-card.hh-ranked` clears the background AND the border,
+            // and its art tile is what carries the depth.
+            if !row.ranked {
+                card_children.push(SceneNode::Shadow {
+                    rect: cr,
+                    radius: theme.card_radius,
+                    blur: theme.card_shadow_blur,
+                    offset_y: theme.card_shadow_dy,
+                    color: theme.card_shadow,
+                });
+            }
             if !row.ranked {
                 card_children.push(SceneNode::Rect {
                     rect: cr,
@@ -3314,10 +3363,33 @@ mod tests {
                     .any(|n| matches!(n, SceneNode::Text { stroke, .. } if *stroke > 0.0))
             })
             .expect("an unranked card");
-        match plain.first() {
+        // The card leads with its SHADOW, which paints under everything it draws, exactly
+        // as a box-shadow paints under its own box. Its tile is right behind it.
+        assert!(
+            matches!(plain.first(), Some(SceneNode::Shadow { .. })),
+            "an ordinary card casts a shadow first: {:?}",
+            plain.first()
+        );
+        match plain.get(1) {
             Some(SceneNode::Rect { color, .. }) => assert_eq!(*color, theme.card_bg),
-            other => panic!("expected a tile, got {other:?}"),
+            other => panic!("expected a tile behind the shadow, got {other:?}"),
         }
+        // It carries the THEME's spec, not values of its own, so the cross-language pin
+        // on those literals is pinning what actually gets drawn.
+        if let Some(SceneNode::Shadow { blur, offset_y, color, radius, rect }) = plain.first() {
+            assert_eq!(*blur, theme.card_shadow_blur);
+            assert_eq!(*offset_y, theme.card_shadow_dy);
+            assert_eq!(*color, theme.card_shadow);
+            assert_eq!(*radius, theme.card_radius, "it is the CARD's corner, softened");
+            assert_eq!(rect.w, CARD_W, "and the card's own box, not a second geometry");
+            assert!(*blur > 0.0, "a zero blur is a hard rectangle, not depth");
+        }
+        // A RANKED card has neither: `.hh-card.hh-ranked` clears the background and the
+        // border, so there is no box to cast one, and its art tile carries the depth.
+        assert!(
+            !ranked.iter().any(|n| matches!(n, SceneNode::Shadow { .. })),
+            "a ranked card has no box to cast a shadow"
+        );
         let plain_art = plain
             .iter()
             .find_map(|n| match n {

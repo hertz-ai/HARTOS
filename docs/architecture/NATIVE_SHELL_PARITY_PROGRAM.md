@@ -1267,3 +1267,39 @@ three stops, the midpoint and the angle. Writing it turned up the same
 ambiguous-anchor bug as the mutation harness: `chrome_fill: \[` matched the FIELD
 DECLARATION `pub chrome_fill: [Color; 3],` before the initialiser, captured
 "Color; 3", and reported "zero stops" about a literal it had never looked at.
+
+### The cards were flat rectangles, which the shell had already named
+`.hh-card`'s own comment is the whole argument for this one: "STATIC drop-shadow =
+the mockup's card depth. It rasters ONCE and composites cheaply forever, so the
+software floor KEEPS it (degrade gracefully, not gut): only the per-frame
+hover-scale + transition are GPU-gated. **Without this the software home read as
+flat rectangles.**"
+
+The native cards had no shadow. That last sentence is a report of the exact
+symptom the native desktop would have shown.
+
+`SceneNode::Shadow` carries the CASTER's box rather than a pre-expanded one, so
+the scene says "this card casts a shadow" and the lowering grows it by the blur;
+a second geometry beside the card's own is the kind of thing that drifts.
+
+**The blur is approximated, and it is worth saying which way.** A CSS box-shadow
+is the shape convolved with a Gaussian of about `blur/2`. This ramps the alpha
+across `blur`, centred on the edge, with a smoothstep instead: a fraction of a
+pixel of softness lost at the extremes, and no convolution at all. That trade is
+the point rather than a shortcut, because the shell keeps this shadow on every
+tier PRECISELY because it "rasters ONCE and composites cheaply forever", and a
+real per-card blur would make it the opposite of what it is for.
+
+One buffer serves every card, since they are all one size, and a test asserts
+exactly that: twelve cards, one compose. It shares the tile cache with a sentinel
+in the key, and a second test proves a shadow and a tile of the same dimensions
+cannot answer for each other, because a collision there would hand a card its own
+shadow as its art.
+
+A RANKED card casts none: `.hh-card.hh-ranked` clears the background AND the
+border, so there is no box to cast one, and its art tile carries the depth.
+
+`card_bg` was wrong beside it in the same way the chrome was: `#0E1320` is an
+opaque literal in the shell and the native value was white at 6%. It is the
+backstop under the art rather than a visible surface, but a pale wash shows
+through as a ghost anywhere the art does not reach.

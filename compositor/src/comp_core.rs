@@ -487,6 +487,52 @@ fn rounded_rect_rgba(
     rgba
 }
 
+/// Rasterize a DROP SHADOW: the rounded box, blurred, into a premultiplied buffer.
+///
+/// The buffer is the caster grown by `blur` on every side, so the caller draws it at
+/// `(rect.x - blur, rect.y + offset_y - blur)` and the shape lands where the box is.
+///
+/// APPROXIMATED, and worth saying which way. A CSS box-shadow is the shape convolved with
+/// a Gaussian of about `blur/2`; this ramps the alpha across `blur` centred on the edge
+/// with a smoothstep instead. The difference is a fraction of a pixel of softness at the
+/// extremes and no convolution at all, which matters because this is the software floor's
+/// depth: the shell keeps this shadow on every tier precisely because it "rasters ONCE and
+/// composites cheaply forever", and a real blur here would make it the opposite.
+fn shadow_rgba(w: u32, h: u32, radius: f32, blur: f32, color: [f32; 4]) -> Vec<u8> {
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    // The CASTER sits inset by `blur` inside this buffer.
+    let bw = w as f32 - 2.0 * blur;
+    let bh = h as f32 - 2.0 * blur;
+    let (hw, hh) = (bw / 2.0, bh / 2.0);
+    let r = radius.clamp(0.0, hw.min(hh).max(0.0));
+    let cx = w as f32 / 2.0;
+    let cy = h as f32 / 2.0;
+    let ramp = blur.max(f32::EPSILON);
+    for y in 0..h {
+        for x in 0..w {
+            let px = x as f32 + 0.5 - cx;
+            let py = y as f32 + 0.5 - cy;
+            let qx = px.abs() - (hw - r);
+            let qy = py.abs() - (hh - r);
+            let dist =
+                (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r;
+            // 1 well inside, 0 a blur-radius outside, smooth across the edge.
+            let t = (0.5 - dist / ramp).clamp(0.0, 1.0);
+            let cov = t * t * (3.0 - 2.0 * t);
+            if cov <= 0.0 {
+                continue;
+            }
+            let a = color[3].clamp(0.0, 1.0) * cov;
+            let i = ((y * w + x) * 4) as usize;
+            rgba[i] = (color[2] * a * 255.0) as u8;
+            rgba[i + 1] = (color[1] * a * 255.0) as u8;
+            rgba[i + 2] = (color[0] * a * 255.0) as u8;
+            rgba[i + 3] = (a * 255.0) as u8;
+        }
+    }
+    rgba
+}
+
 /// Caches rounded-rect buffers keyed by (size, radius, colour) so the per-pixel SDF
 /// rasterization runs ONCE per unique rect (cards are a single size), never per
 /// frame. Mirrors OrbCache / TextRasterizer: compose once, reuse the buffer, so the
@@ -582,6 +628,59 @@ impl RectCache {
             (from[3] + to[3]) * 0.5,
         ];
         self.tile(w, h, radius, from, mid, 0.5, to, angle_deg)
+    }
+
+    /// The blurred shadow buffer for a caster of these dims. Same cache, same
+    /// compose-once counter: a desktop of identical cards composes exactly one.
+    ///
+    /// Keyed through the tile map by putting the blur where the angle goes and a sentinel
+    /// radius, so a shadow and a tile of the same size can never collide.
+    pub fn shadow(
+        &mut self,
+        w: i32,
+        h: i32,
+        radius: f32,
+        blur: f32,
+        color: [f32; 4],
+    ) -> Option<&MemoryRenderBuffer> {
+        let (bw, bh) = (w + 2.0_f32.mul_add(blur, 0.0) as i32, h + (2.0 * blur) as i32);
+        if bw < 1 || bh < 1 {
+            return None;
+        }
+        let bits = |c: [f32; 4]| [c[0].to_bits(), c[1].to_bits(), c[2].to_bits(), c[3].to_bits()];
+        // `SHADOW` in the mid slot: a marker no colour can produce, so the key space is
+        // shared with the tiles without either being able to answer for the other.
+        const SHADOW: [u32; 4] = [u32::MAX, u32::MAX, u32::MAX, u32::MAX];
+        let key = (
+            bw as u32,
+            bh as u32,
+            radius.to_bits(),
+            bits(color),
+            SHADOW,
+            blur.to_bits(),
+            bits(color),
+            0u32,
+        );
+        let Self {
+            cache,
+            rounded_composes,
+            ..
+        } = self;
+        match cache.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let rgba = shadow_rgba(bw as u32, bh as u32, radius, blur, color);
+                *rounded_composes += 1;
+                Some(e.insert(MemoryRenderBuffer::from_slice(
+                    &rgba,
+                    Fourcc::Argb8888,
+                    (bw, bh),
+                    1,
+                    Transform::Normal,
+                    None,
+                )))
+            }
+        }
     }
 
     /// A THREE-stop tile, for the one place the shell uses one: its no-blur chrome floor.
@@ -2951,6 +3050,47 @@ where
                     }
                 }
             }
+            crate::scene::SceneNode::Shadow {
+                rect,
+                radius,
+                blur,
+                offset_y,
+                color,
+            } => {
+                if rect.w < 1.0 || rect.h < 1.0 || *blur <= 0.0 {
+                    return;
+                }
+                if let Some(buffer) = rect_cache.shadow(
+                    rect.w as i32,
+                    rect.h as i32,
+                    *radius,
+                    *blur,
+                    [color.r, color.g, color.b, color.a],
+                ) {
+                    // The buffer is the caster grown by `blur` on every side, so it is
+                    // drawn back by that much and down by the CSS offset.
+                    let origin: Point<f64, Physical> = Point::from((
+                        (rect.x - blur) as f64,
+                        (rect.y + offset_y - blur) as f64,
+                    ));
+                    let side = (
+                        rect.w as i32 + (2.0 * blur) as i32,
+                        rect.h as i32 + (2.0 * blur) as i32,
+                    );
+                    match MemoryRenderBufferRenderElement::from_buffer(
+                        renderer,
+                        origin,
+                        buffer,
+                        Some(1.0),
+                        None,
+                        Some(side.into()),
+                        Kind::Unspecified,
+                    ) {
+                        Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                        Err(err) => warn!(?err, "native scene: card shadow import failed"),
+                    }
+                }
+            }
             crate::scene::SceneNode::OrbSlot { rect, .. } => {
                 // The scene OWNS the orb (the hardcoded M2 draw is gated off when
                 // native_shell_on), so ONE orb path. Both the large home orb and the
@@ -4532,6 +4672,64 @@ mod tests {
             theme_from_file(&crate::bloom::SettingsFile::load(&f)),
             crate::scene::Theme::cosmic_default()
         );
+    }
+
+    #[test]
+    fn a_card_shadow_is_dark_under_the_card_and_gone_a_blur_away() {
+        // `.hh-card`'s own comment: the static drop-shadow "rasters ONCE and composites
+        // cheaply forever, so the software floor KEEPS it (degrade gracefully, not gut)
+        // ... Without this the software home read as flat rectangles." The native cards
+        // had none, which is that reported symptom exactly.
+        let (cw, ch, blur) = (100u32, 60u32, 20.0f32);
+        let px = shadow_rgba(cw + 40, ch + 40, 16.0, blur, [0.0, 0.0, 0.0, 0.46]);
+        let (w, h) = (cw + 40, ch + 40);
+        let at = |x: u32, y: u32| px[((y * w + x) * 4 + 3) as usize];
+
+        // Solid under the middle of the caster, at the colour's own alpha.
+        let mid = at(w / 2, h / 2);
+        assert!(mid >= 115 && mid <= 118, "the core is the shadow's alpha, got {mid}");
+        // Gone at the buffer's edge, a full blur out from the shape.
+        assert_eq!(at(0, 0), 0, "the corner of the buffer is clear");
+        assert_eq!(at(w - 1, h - 1), 0, "and so is the far one");
+        // And MONOTONIC outward across the edge: a shadow that brightened partway would
+        // be a ring rather than a falloff.
+        let mut prev = 255u8;
+        for x in (w / 2)..w {
+            let a = at(x, h / 2);
+            assert!(a <= prev, "brightened at x={x}: {a} after {prev}");
+            prev = a;
+        }
+        // Softness scales with the blur: the same caster with twice the blur reaches
+        // further, which is what makes 38px depth read as depth rather than an outline.
+        let wide = shadow_rgba(cw + 80, ch + 80, 16.0, 40.0, [0.0, 0.0, 0.0, 0.46]);
+        let ww = cw + 80;
+        let edge_of = |buf: &[u8], stride: u32, y: u32| -> u32 {
+            (0..stride)
+                .filter(|x| buf[((y * stride + x) * 4 + 3) as usize] > 0)
+                .count() as u32
+        };
+        assert!(
+            edge_of(&wide, ww, (ch + 80) / 2) > edge_of(&px, w, h / 2),
+            "a bigger blur covers more of its row"
+        );
+    }
+
+    #[test]
+    fn every_card_on_the_desktop_shares_one_composed_shadow() {
+        // The whole reason the shell keeps this on the software floor is that it rasters
+        // once. A per-card compose would make it the opposite of what it is for, and the
+        // cards are all one size, so one buffer must serve the lot.
+        let mut rects = RectCache::default();
+        let black = [0.0, 0.0, 0.0, 0.46];
+        for _ in 0..12 {
+            assert!(rects.shadow(258, 150, 16.0, 38.0, black).is_some());
+        }
+        assert_eq!(rects.rounded_composes(), 1, "twelve cards, one composed shadow");
+
+        // A shadow and a TILE of the same size are different buffers: they share the
+        // cache, so a key collision would hand a card its own shadow as its art.
+        assert!(rects.gradient(258, 150, 16.0, black, black, 0.0).is_some());
+        assert_eq!(rects.rounded_composes(), 2, "the tile composed separately");
     }
 
     #[test]

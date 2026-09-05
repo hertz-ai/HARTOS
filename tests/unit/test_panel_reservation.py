@@ -813,3 +813,39 @@ def test_the_native_chrome_uses_the_shells_own_no_blur_floor_gradient():
         "the middle stop sits at %s%% in the shell" % at)
     assert "chrome_fill_angle: %s.0," % angle in scene, (
         "the shell's floor gradient runs at %sdeg" % angle)
+
+def test_the_card_depth_the_shell_keeps_on_every_tier_reaches_the_native_cards():
+    """`.hh-card`'s drop shadow, which the shell explicitly refuses to shed.
+
+    Its own comment is the argument: the shadow "rasters ONCE and composites
+    cheaply forever, so the software floor KEEPS it (degrade gracefully, not gut)
+    ... Without this the software home read as flat rectangles." The native cards
+    had none, which is that reported symptom exactly, so this pins the three
+    numbers that make it depth rather than an outline.
+    """
+    css = open(os.path.join(REPO, "integrations", "agent_engine", "static",
+                            "hartHome.css"), encoding="utf-8").read()
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    rule = re.search(r"(?m)^\.hh-card \{(.*?)^\}", css, re.S)
+    assert rule, "hartHome.css no longer has a .hh-card rule"
+    m = re.search(r"box-shadow:\s*0\s+(\d+)px\s+(\d+)px\s+rgba\(0,\s*0,\s*0,\s*([\d.]+)\)",
+                  rule.group(1))
+    assert m, (
+        "`.hh-card` no longer carries a plain `0 <dy> <blur> rgba(0,0,0,a)` shadow; "
+        "the native mirror can only follow that shape")
+    dy, blur, alpha = m.group(1), m.group(2), m.group(3)
+
+    assert "card_shadow_dy: %s.0," % dy in scene, (
+        "the shell offsets the card shadow %spx down and the native scene does not" % dy)
+    assert "card_shadow_blur: %s.0," % blur in scene, (
+        "the shell blurs it over %spx; a smaller one reads as an outline, a zero "
+        "one as a hard rectangle" % blur)
+    assert "card_shadow: Color::rgba(0.0, 0.0, 0.0, %s)," % alpha in scene, (
+        "the shadow's alpha drifted from the shell's %s" % alpha)
+
+    # And it is actually CAST, rather than being three numbers nothing reads.
+    assert "SceneNode::Shadow {" in scene, "the scene declares no shadow node"
+    assert "color: theme.card_shadow," in scene, (
+        "the card no longer casts the theme's shadow, so the numbers above are "
+        "pinning something that never reaches a pixel")
