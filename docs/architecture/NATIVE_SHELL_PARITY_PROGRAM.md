@@ -1047,3 +1047,34 @@ did not ask for.
 The native scene reads its colours from the theme file rather than from that
 class, so a high-contrast desktop would go native at ordinary contrast. It is the
 same shape as the two settings already mirrored and belongs next.
+
+### High contrast completes the accessibility sweep
+`html.a11y-contrast` is four token overrides plus a doubled glass border:
+`--hart-muted:#e8eef2`, `--hart-glass-bg:#0a0a12`, `--hart-glass-border:#ffffff`,
+`--hart-text:#ffffff`, and `.glass{background:#0a0a12;border-width:2px}`. The
+native scene read its colours from the theme file and knew nothing about the
+class, so a high-contrast desktop would have gone native at ordinary contrast:
+translucent bars, a faint rule, dim secondary text. The whole set of things the
+setting exists to remove.
+
+It is applied LAST, after the theme's own colours and metrics, because that is
+what the cascade does: the class is a later source than `css_vars`, so a theme
+cannot opt out of an accessibility setting.
+
+**This is the one place a palette gets to set OPACITY, on purpose.** `#0a0a12`
+carries no alpha, so the chrome goes solid. The "alpha belongs to the surface
+treatment" rule that governs the ordinary colour fold is the wrong rule here,
+since translucency is exactly what high contrast exists to remove, so it is
+overridden deliberately rather than by oversight.
+
+The guard was written weak first and it is worth saying how. It searched the whole
+of scene.rs for each literal and PASSED while the value was mutated, because the
+doc comment above the function quotes the CSS rule verbatim: prose satisfied a
+check meant for code. It now extracts the function body and requires each literal
+inside a `solid(...)` call, and the mutation fails as it should. A guard that can
+be satisfied by a comment about the thing is not a guard.
+
+That closes the accessibility file: `reduced_motion`, `font_scale`,
+`large_cursor` and `high_contrast` all reach the native desktop now.
+`screen_reader` and `sticky_keys` are input and assistive-tech concerns with
+nothing for the renderer to mirror.

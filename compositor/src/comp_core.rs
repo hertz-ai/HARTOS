@@ -2536,6 +2536,10 @@ fn theme_from_files(
     file: &crate::bloom::SettingsFile,
     a11y: &crate::bloom::SettingsFile,
 ) -> crate::scene::Theme {
+    // Applied LAST, after the theme's own colours and metrics, because that is what the
+    // cascade does: `html.a11y-contrast` is a later source than `css_vars`, so it wins
+    // over whatever the theme chose. A theme cannot opt out of high contrast.
+    let contrast = a11y.flag("high_contrast").unwrap_or(false);
     let hue = |key: &str| {
         file.hex(key)
             .map(|[r, g, b]| {
@@ -2547,7 +2551,7 @@ fn theme_from_files(
                 )
             })
     };
-    crate::scene::Theme::cosmic_default()
+    let themed = crate::scene::Theme::cosmic_default()
         .with_theme_colors(
             hue("background"),
             hue("accent"),
@@ -2568,7 +2572,11 @@ fn theme_from_files(
             file.rgba("glass_border").map(|([r, g, b], a)| {
                 crate::scene::Color::rgba(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a)
             }),
-        )
+        );
+    if contrast {
+        return themed.with_high_contrast();
+    }
+    themed
 }
 
 /// State-free core of `render_native_scene`, so it is unit-testable with a
@@ -4123,6 +4131,58 @@ mod tests {
             })
             .expect("the top bar strip");
         assert_eq!(bar.h, 36.0, "the bar the scene DRAWS is the theme's height");
+    }
+
+    #[test]
+    fn high_contrast_makes_the_chrome_solid_and_doubles_its_rule() {
+        // `html.a11y-contrast` overrides four tokens and thickens the glass border. The
+        // native scene read its colours from the theme file and knew nothing about the
+        // class, so a high-contrast desktop would have gone native at ordinary contrast:
+        // translucent bars, a faint rule, and dim secondary text, which is the whole set
+        // of things the setting exists to remove.
+        let dir = std::env::temp_dir().join("hart_contrast_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let theme = dir.join("t.json");
+        std::fs::write(
+            &theme,
+            r#"{"colors":{"background":"04050B","text":"F2F4FF","muted":"9AA0C6",
+               "glass_border":"rgba(255,255,255,0.10)"}}"#,
+        )
+        .unwrap();
+        let on = dir.join("on.json");
+        std::fs::write(&on, r#"{"high_contrast":true}"#).unwrap();
+        let off = dir.join("off.json");
+        std::fs::write(&off, r#"{"high_contrast":false}"#).unwrap();
+
+        let plain = theme_from_files(
+            &crate::bloom::SettingsFile::load(&theme),
+            &crate::bloom::SettingsFile::load(&off),
+        );
+        let hc = theme_from_files(
+            &crate::bloom::SettingsFile::load(&theme),
+            &crate::bloom::SettingsFile::load(&on),
+        );
+
+        // The chrome goes SOLID. This is the one place a palette sets opacity, and on
+        // purpose: translucency is what high contrast exists to remove.
+        assert!(plain.bar_bg.a < 1.0, "the ordinary bar is translucent");
+        assert_eq!(hc.bar_bg.a, 1.0, "the high-contrast bar is not");
+        assert_eq!(hc.taskbar_bg, hc.bar_bg, "both strips take the same solid");
+
+        // The rule goes white and DOUBLES.
+        assert_eq!(hc.chrome_border, crate::scene::Color::rgba(1.0, 1.0, 1.0, 1.0));
+        assert_eq!(hc.chrome_rule_px, plain.chrome_rule_px * 2.0);
+
+        // Ink goes to pure white and the secondary ink to near-white, so the two are
+        // still distinguishable rather than collapsed into one.
+        assert_eq!(hc.card_ink, crate::scene::Color::rgba(1.0, 1.0, 1.0, 1.0));
+        assert_ne!(hc.hero_copy, hc.hero_title, "muted stays a step below text");
+        assert!(hc.hero_copy.r > plain.hero_copy.r, "and it is far brighter than before");
+
+        // A theme cannot opt out: the class is a LATER source than css_vars, so it wins
+        // over whatever the theme chose. Applying it before the theme would let a theme
+        // with its own glass_border quietly undo the accessibility setting.
+        assert_ne!(hc.chrome_border, plain.chrome_border);
     }
 
     #[test]

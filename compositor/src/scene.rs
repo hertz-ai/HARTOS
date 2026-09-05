@@ -235,6 +235,9 @@ pub struct Theme {
     /// translucency happened to stop. It varies REAL amounts by theme (aura white at .10,
     /// arctic blue at .15, cyberpunk pink at .2), so it is not a constant.
     pub chrome_border: Color,
+    /// How thick that rule is. 1px normally; `html.a11y-contrast .glass` doubles it, which
+    /// is the whole reason this is not the `CHROME_RULE` constant it started as.
+    pub chrome_rule_px: f32,
 }
 
 /// The spectrum names, positionally matched to `Theme::spectrum`.
@@ -378,7 +381,42 @@ impl Theme {
             // the shell renders with when ThemeService cannot be consulted. An unreadable
             // theme file here is the same situation, so it takes the same value.
             chrome_border: Color::rgba(0.0, 230.0 / 255.0, 195.0 / 255.0, 0.18),
+            chrome_rule_px: CHROME_RULE,
         }
+    }
+
+    /// This theme forced into HIGH CONTRAST, exactly as `html.a11y-contrast` does.
+    ///
+    /// The shell's rule is four token overrides plus a doubled glass border:
+    /// `--hart-muted:#e8eef2; --hart-glass-bg:#0a0a12; --hart-glass-border:#ffffff;
+    /// --hart-text:#ffffff` and `.glass{background:#0a0a12;border-width:2px}`. The native
+    /// scene read its colours from the theme file and knew nothing about the class, so a
+    /// high-contrast desktop would have gone native at ordinary contrast.
+    ///
+    /// This is the ONE place a palette gets to set OPACITY, and deliberately: `#0a0a12`
+    /// has no alpha, so the chrome goes solid. Translucency is precisely the thing high
+    /// contrast exists to remove, so the "alpha belongs to the surface treatment" rule
+    /// that governs `with_theme_colors` is the wrong rule here and is overridden on
+    /// purpose rather than by oversight.
+    ///
+    /// The literals are the shell's own, not a re-derivation.
+    pub fn with_high_contrast(mut self) -> Theme {
+        let solid = |hex: &str| palette(hex, Color::rgba(1.0, 1.0, 1.0, 1.0));
+        let glass = solid("#0A0A12");
+        // `.glass` is the top bar and the taskbar here; the home cards and the omnibox
+        // pill carry their own backgrounds in the shell and are not `.glass`.
+        self.bar_bg = glass;
+        self.taskbar_bg = glass;
+        self.chrome_border = solid("#FFFFFF");
+        let text = solid("#FFFFFF");
+        self.bar_ink = text;
+        self.hero_title = text;
+        self.card_ink = text;
+        let muted = solid("#E8EEF2");
+        self.omnibox_ink = muted;
+        self.hero_copy = muted;
+        self.chrome_rule_px = CHROME_RULE * 2.0;
+        self
     }
 
     /// This theme with the active theme file's SHELL METRICS folded in.
@@ -1380,7 +1418,12 @@ pub fn layout_home(
     // the difference between chrome that sits on the desktop and chrome that dissolves
     // into it.
     bar_children.push(SceneNode::Rect {
-        rect: Rect::new(0.0, theme.top_bar_h - CHROME_RULE, output_w, CHROME_RULE),
+        rect: Rect::new(
+            0.0,
+            theme.top_bar_h - theme.chrome_rule_px,
+            output_w,
+            theme.chrome_rule_px,
+        ),
         color: theme.chrome_border,
         radius: 0.0,
     });
@@ -1883,7 +1926,7 @@ pub fn layout_home(
             // `.taskbar { border-top: 1px solid var(--hart-glass-border) }`: the mirror of
             // the top bar's rule, on the edge that faces the desktop.
             SceneNode::Rect {
-                rect: Rect::new(taskbar.x, taskbar.y, taskbar.w, CHROME_RULE),
+                rect: Rect::new(taskbar.x, taskbar.y, taskbar.w, theme.chrome_rule_px),
                 color: theme.chrome_border,
                 radius: 0.0,
             },

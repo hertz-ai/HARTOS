@@ -713,3 +713,51 @@ def test_the_large_cursor_toggle_reaches_the_arrow_the_compositor_draws():
     assert lo <= size <= hi, (
         "nix exports XCURSOR_SIZE=%d but the compositor clamps to [%d, %d], so "
         "the large cursor would be silently resized" % (size, lo, hi))
+
+def test_high_contrast_reaches_the_native_chrome_with_the_shells_own_literals():
+    """The last of the accessibility settings, pinned to the CSS it mirrors.
+
+    `html.a11y-contrast` is four token overrides plus a doubled glass border, and
+    they are literals rather than derivations, so a native copy can drift from
+    them silently. Read the served rule and require the compositor to carry the
+    same values.
+    """
+    service = open(SERVICE_SRC, encoding="utf-8").read()
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+
+    rule = re.search(r"html\.a11y-contrast\{([^}]*)\}", service)
+    assert rule, "the shell no longer defines html.a11y-contrast"
+    tokens = dict(re.findall(r"--hart-([\w-]+):\s*(#[0-9a-fA-F]{6})", rule.group(1)))
+    assert tokens, "the contrast rule no longer overrides any colour token"
+
+    # Look at the CODE, not the file. The first version of this searched the whole
+    # of scene.rs and passed while the value was mutated, because the doc comment
+    # above the function quotes the CSS rule verbatim: prose satisfied it.
+    body = re.search(
+        r"pub fn with_high_contrast\(mut self\) -> Theme \{(.*?)\n    \}",
+        scene, re.S)
+    assert body, "scene.rs no longer has a readable with_high_contrast"
+    used = {m.upper() for m in re.findall(r'solid\("(#[0-9a-fA-F]{6})"\)', body.group(1))}
+    assert used, "with_high_contrast sets no colours at all"
+    for token, value in tokens.items():
+        assert value.upper() in used, (
+            "html.a11y-contrast sets --hart-%s to %s and with_high_contrast does "
+            "not use that literal, so a high-contrast desktop goes native at "
+            "ordinary contrast (it uses %s)"
+            % (token, value, sorted(used)))
+
+    # The doubled border, which is a WIDTH rather than a colour.
+    w = re.search(r"html\.a11y-contrast \.glass\{[^}]*border-width:\s*(\d+)px",
+                  service)
+    assert w, "the contrast rule no longer thickens the glass border"
+    assert "CHROME_RULE * %s.0" % w.group(1) in scene, (
+        "the shell doubles its rule to %spx under high contrast and the native "
+        "scene does not" % w.group(1))
+
+    # And the flag is actually consulted, applied LAST so a theme cannot undo it.
+    assert 'flag("high_contrast")' in comp, (
+        "the compositor no longer reads high_contrast")
+    assert "with_high_contrast" in comp and "with_high_contrast" in scene, (
+        "the contrast fold is not wired into the theme resolution")
