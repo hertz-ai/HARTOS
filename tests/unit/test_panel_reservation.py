@@ -134,6 +134,131 @@ def test_the_native_scene_draws_the_same_strips_the_shell_reserves(published):
         "scene.rs TASKBAR_H and the published bottom reservation have drifted")
 
 
+def _css_decl(css, selector, prop):
+    """The value of `prop` in the LAST rule matching `selector` (cascade order)."""
+    found = None
+    # `^\s*` so a rule nested inside a media block is found too; it is the same
+    # selector at the same specificity, just indented.
+    for m in re.finditer(r"(?m)^\s*%s\s*\{(.*?)\}" % re.escape(selector), css, re.S):
+        d = re.search(r"(?<![-\w])%s:\s*([^;]+);" % re.escape(prop), m.group(1))
+        if d:
+            found = d.group(1).strip()
+    return found
+
+
+def _css_outside_media(css):
+    """The stylesheet with every @media block removed: the BASE cascade.
+
+    A base lookup has to ignore the overrides, or `.hh-amount` resolves to the
+    58px a short screen gets and the pin silently checks the wrong number.
+    """
+    return re.sub(r"@media[^{]*\{.*?\n\}", "", css, flags=re.S)
+
+
+def test_the_native_home_is_laid_out_at_the_shells_own_scale():
+    """The whole native desktop was drawn at about two thirds of the shell's size.
+
+    Every constant in scene.rs that carried a CSS citation was right; every one that
+    did not was a first-cut guess, and nothing could see the difference. The hero
+    figure was 40px against the shell's 88, the row headings 15 against 23, the
+    cards 210x128 against 258x150. Laid side by side at M6 that is not the same
+    desktop, and no Rust test could catch it because they all pin RELATIONSHIPS
+    (the note follows the label, the See-all clears it) rather than sizes.
+
+    So pin the sizes here, where both languages are readable at once. The values
+    the shell makes responsive are pinned as the literals in HomeMetrics; the rest
+    as plain consts.
+    """
+    css = open(os.path.join(REPO, "integrations", "agent_engine", "static",
+                            "hartHome.css"), encoding="utf-8").read()
+    base = _css_outside_media(css)
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    def px(value):
+        m = re.search(r"(\d+(?:\.\d+)?)px", value or "")
+        assert m, "not a px value: %r" % (value,)
+        return float(m.group(1))
+
+    def rust_const(name):
+        m = re.search(r"const %s: f32 = ([0-9.]+);" % name, scene)
+        assert m, "%s is no longer a plain literal in scene.rs" % name
+        return float(m.group(1))
+
+    # ── the fixed scale: one CSS declaration, one Rust const ──
+    for const, selector, prop in [
+        ("HERO_EYEBROW_PX", ".hh-eyebrow", "font-size"),
+        ("HERO_META_PX", ".hh-hero-meta", "font-size"),
+        ("HERO_BTN_PX", ".hh-btn", "font-size"),
+        ("ROW_LABEL_PX", ".hh-row-title", "font-size"),
+        ("ROW_NOTE_PX", ".hh-row-note", "font-size"),
+        ("CARD_TITLE_PX", ".hh-card-title", "font-size"),
+        ("CARD_META_PX", ".hh-card-meta", "font-size"),
+        ("CARD_W", ".hh-card", "width"),
+        ("CARD_PROG_H", ".hh-card-prog", "height"),
+        ("CARD_ICON_BOX", ".hh-card-ic", "width"),
+        ("RANK_PX", ".hh-rank-num", "font-size"),
+    ]:
+        want = _css_decl(base, selector, prop)
+        assert want, "hartHome.css no longer declares %s on %s" % (prop, selector)
+        assert rust_const(const) == px(want), (
+            "%s is %s but %s { %s } is %s"
+            % (const, rust_const(const), selector, prop, want))
+
+    # ── the RESPONSIVE four, pinned as the literals HomeMetrics carries ──
+    metrics = re.search(r"fn for_output\(.*?\n    \}", scene, re.S)
+    assert metrics, "HomeMetrics::for_output is no longer a readable block"
+    metrics = metrics.group(0)
+    base_gutter = px(re.search(r"--hh-gutter:\s*([^;]+);", base).group(1))
+    assert re.search(r"gutter: %s," % base_gutter, metrics), (
+        "the base gutter drifted from --hh-gutter (%s)" % base_gutter)
+    assert re.search(r"amount_px: %s," % px(_css_decl(base, ".hh-amount", "font-size")),
+                     metrics), "the base hero figure drifted from .hh-amount"
+    assert re.search(r"unit_px: %s," % px(_css_decl(base, ".hh-amount-unit", "font-size")),
+                     metrics), "the hero unit drifted from .hh-amount-unit"
+    assert re.search(r"card_h: %s," % px(_css_decl(base, ".hh-card", "height")),
+                     metrics), "the base card height drifted from .hh-card"
+
+    # EVERY media block in the home CSS, matched by what it declares rather than by
+    # position, and each one's overrides. Four blocks: two scale the content, two
+    # reshape the bar. The compositor must carry all four or it is a partial port.
+    blocks = re.findall(r"@media \((max-width|max-height): (\d+)px\)\s*\{(.*?)\n\}",
+                        css, re.S)
+    assert len(blocks) >= 4, "expected the home CSS's four sizing media blocks"
+    seen = 0
+    for axis_css, bound, block in blocks:
+        axis = "output_w" if axis_css == "max-width" else "output_h"
+        overrides = [
+            ("amount_px", ".hh-amount", "font-size"),
+            ("unit_px", ".hh-amount-unit", "font-size"),
+            ("card_h", ".hh-card", "height"),
+            ("tab_pad_x", ".tb-tab", "padding"),
+            ("omnibox_min_w", ".top-bar-omni", "min-width"),
+        ]
+        wanted = [(f, _css_decl(block, sel, prop)) for f, sel, prop in overrides]
+        wanted = [(f, v) for f, v in wanted if v is not None]
+        gutter = re.search(r"--hh-gutter:\s*([^;]+);", block)
+        if gutter:
+            wanted.append(("gutter", gutter.group(1)))
+        hides_kbd = ".tbo-kbd" in block and "display: none" in block
+        hides_tabs = 'data-tab="earn"' in block
+        if not (wanted or hides_kbd or hides_tabs):
+            continue
+        seen += 1
+        assert re.search(r"if %s <= %s\.0 \{" % (axis, bound), metrics), (
+            "scene.rs carries no %s <= %s branch for the block that sets %s"
+            % (axis, bound, [f for f, _ in wanted] or "the bar's shape"))
+        for field, value in wanted:
+            assert re.search(r"m\.%s = %s;" % (field, px(value)), metrics), (
+                "%s under %s:%s should be %s" % (field, axis_css, bound, value))
+        if hides_kbd:
+            assert "m.show_kbd = false;" in metrics, (
+                "the shortcut hint is hidden at %s but the scene still draws it" % bound)
+        if hides_tabs:
+            assert "m.nav_tabs = NAV_TABS.len() - 2;" in metrics, (
+                "two tabs are hidden at %s but the scene still draws five" % bound)
+    assert seen == 4, "matched %d sizing media blocks, expected 4" % seen
+
+
 def test_the_native_card_art_is_the_shells_own_brand_gradient():
     """THE SAME DRIFT CLASS, across the same language boundary, one layer in.
 

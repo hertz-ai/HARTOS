@@ -774,8 +774,12 @@ pub const CARD_HOVER_LIFT: f32 = 0.08;
 //    native scene reserves exactly what window placement already reserves. ──
 pub const TOP_BAR_H: f32 = 40.0;
 pub const TASKBAR_H: f32 = 44.0;
-const EDGE_PAD: f32 = 24.0;
-const OMNIBOX_W: f32 = 420.0;
+/// `.top-bar { padding: 0 12px }`: the BAR's own inset, which is not the content gutter
+/// and never was. One `EDGE_PAD` did both jobs at a value belonging to neither, which is
+/// how the bar ended up indented twice as far as the shell's and the content half as far.
+const BAR_PAD_X: f32 = 12.0;
+/// `.top-bar-omni { max-width: 360px }`: how wide the pill gets when there is room.
+const OMNIBOX_W: f32 = 360.0;
 const ORB_SM: f32 = 28.0;
 /// Wordmark type size. The shell sets it in the bar's own scale, not the hero's.
 const WORDMARK_PX: f32 = 15.0;
@@ -804,7 +808,8 @@ const AVATAR_PX: f32 = 13.0;
 /// than a guess at whose account it is.
 const AVATAR_INITIAL: &str = "H";
 const OMNIBOX_GLYPH: &str = "search";
-const OMNIBOX_PX: f32 = 14.0;
+/// `.top-bar-omni { font-size: 13px }`, which the prompt run inside it also takes.
+const OMNIBOX_PX: f32 = 13.0;
 /// The shortcut hint at the far end of the pill (the shell's `.tbo-kbd`).
 const OMNIBOX_KBD: &str = "Super K";
 const KBD_PX: f32 = 11.0;
@@ -814,30 +819,48 @@ const NAV_TABS: [&str; 5] = ["Home", "Agents", "Apps", "Hive", "Earn"];
 /// IS the active destination; this becomes state the moment a tab can navigate.
 const ACTIVE_TAB: usize = 0;
 const TAB_PX: f32 = 13.0;
-const TAB_PAD_X: f32 = 10.0;
 const TAB_GAP: f32 = 2.0;
 const HERO_H: f32 = 200.0;
-const HERO_EYEBROW_PX: f32 = 13.0;
-const HERO_AMOUNT_PX: f32 = 40.0;
-const HERO_UNIT_PX: f32 = 16.0;
+/// `.hh-eyebrow`.
+const HERO_EYEBROW_PX: f32 = 16.0;
 /// Both producers default the unit to this, so a payload that omits it still reads right.
 const HERO_UNIT_FALLBACK: &str = "Spark";
-const HERO_META_PX: f32 = 13.0;
-const HERO_BTN_PX: f32 = 13.0;
-const HERO_BTN_H: f32 = 30.0;
-const HERO_BTN_PAD_X: f32 = 14.0;
-const ROW_LABEL_H: f32 = 22.0;
-const ROW_LABEL_PX: f32 = 15.0;
-/// The note and the See-all are secondary to the label, so they sit a step smaller.
-const ROW_NOTE_PX: f32 = 13.0;
-const ROW_HEAD_GAP: f32 = 10.0;
+/// `.hh-hero-meta`.
+const HERO_META_PX: f32 = 15.0;
+/// `.hh-btn { font-size: 18px; padding: 15px 26px; border-radius: 14px }`. The height is
+/// the two paddings around one line of that type, which is what the box actually is.
+const HERO_BTN_PX: f32 = 18.0;
+const HERO_BTN_H: f32 = 15.0 * 2.0 + HERO_BTN_PX * 1.3;
+const HERO_BTN_PAD_X: f32 = 26.0;
+/// `.hh-row-title`, and the head's own `gap: 14px` / `margin-bottom: 12px`.
+const ROW_LABEL_PX: f32 = 23.0;
+const ROW_LABEL_H: f32 = ROW_LABEL_PX * 1.3 + 12.0;
+/// `.hh-row-note` and `.hh-see-all`, both 15px: secondary to the label, a step smaller.
+const ROW_NOTE_PX: f32 = 15.0;
+const ROW_HEAD_GAP: f32 = 14.0;
 /// The shell's own wording (hartHome.js `see.textContent`), not a paraphrase.
 const SEE_ALL: &str = "See all";
-const ROW_GAP: f32 = 14.0;
-const CARD_W: f32 = 210.0;
-const CARD_H: f32 = 128.0;
-const CARD_GAP: f32 = 14.0;
-const CARD_META_H: f32 = 16.0;
+/// `.hh-rows { gap: 18px }` between rows, `.hh-cards { gap: 18px }` between cards.
+const ROW_GAP: f32 = 18.0;
+/// `.hh-card { width: 258px }`. The height is responsive, so it lives in `HomeMetrics`.
+const CARD_W: f32 = 258.0;
+const CARD_GAP: f32 = 18.0;
+/// `.hh-card-title` / `.hh-card-meta`, and the line box each needs.
+const CARD_TITLE_PX: f32 = 18.0;
+const CARD_META_PX: f32 = 13.0;
+const CARD_TITLE_H: f32 = CARD_TITLE_PX * 1.3;
+const CARD_META_H: f32 = CARD_META_PX * 1.3;
+/// How far the title's baseline block sits above the card's bottom edge, leaving room for
+/// the meta line and the progress bar beneath it.
+const CARD_BODY_BOTTOM: f32 = 34.0;
+/// `.hh-card-body`'s own left inset, and `.hh-card-ic`'s.
+const CARD_PAD_X: f32 = 12.0;
+const CARD_ICON_INSET_X: f32 = 14.0;
+/// The small VERTICAL breathing room between the fixed strips and the content, which is
+/// not the gutter: `.hh-hero` pads `6px` on top, `.hh-rows` `18px` top and `4px` bottom.
+/// One value for both edges, because the native band has no scroller to absorb a
+/// mismatch, and it stays small so a short screen keeps its last row.
+const CONTENT_PAD_Y: f32 = 12.0;
 /// 5px, the shell's own `.hh-card-prog { height: 5px }`.
 const CARD_PROG_H: f32 = 5.0;
 const CARD_CHIP_PX: f32 = 12.0;
@@ -861,6 +884,74 @@ const RANK_INNER_W: f32 = 174.0;
 /// 16px, so 16 is the shape both draw when no theme preset overrides the variable.
 const CARD_RADIUS: f32 = 16.0;
 
+/// The four numbers hartHome.css makes RESPONSIVE, resolved for one output size.
+///
+/// Everything else on this desktop is a fixed literal, but the shell shrinks the hero
+/// figure and the cards on a small screen so the rows still fit without scrolling, and it
+/// pulls the gutter in on a narrow one. A compositor that ignored those rules would lay
+/// out a 1366x768 panel at desktop scale and push the last row off the bottom, which is
+/// the same "fits one screen" promise this layout is built on.
+struct HomeMetrics {
+    /// `--hh-gutter`: the CONTENT inset, left of the hero and the rows.
+    gutter: f32,
+    /// `.hh-amount` and `.hh-amount-unit`.
+    amount_px: f32,
+    unit_px: f32,
+    /// `.hh-card` height.
+    card_h: f32,
+    /// `.tb-tab` horizontal padding.
+    tab_pad_x: f32,
+    /// `.top-bar-omni` min-width: how far the pill may be squeezed before the tabs stop
+    /// getting the room instead.
+    omnibox_min_w: f32,
+    /// Whether the pill still shows `.tbo-kbd`, its shortcut hint.
+    show_kbd: bool,
+    /// How many of `NAV_TABS` are shown at all. The shell hides the last two on a narrow
+    /// bar, which is a different thing from the width check that drops a tab that would
+    /// collide with the pill: this one hides them even when they WOULD fit.
+    nav_tabs: usize,
+}
+
+impl HomeMetrics {
+    /// Resolve for an output, applying the shell's four media queries IN ITS ORDER, so a
+    /// screen matching several takes the later block's value exactly as the cascade does.
+    fn for_output(output_w: f32, output_h: f32) -> HomeMetrics {
+        let mut m = HomeMetrics {
+            gutter: 60.0,
+            amount_px: 88.0,
+            unit_px: 26.0,
+            card_h: 150.0,
+            tab_pad_x: 13.0,
+            omnibox_min_w: 220.0,
+            show_kbd: true,
+            nav_tabs: NAV_TABS.len(),
+        };
+        // @media (max-width: 1100px): the pill gives up its hint and most of its floor,
+        // and the tabs tighten, so the bar keeps all five destinations for longer.
+        if output_w <= 1100.0 {
+            m.omnibox_min_w = 120.0;
+            m.show_kbd = false;
+            m.tab_pad_x = 9.0;
+        }
+        // @media (max-width: 880px): Hive and Earn go, in that order from the right.
+        if output_w <= 880.0 {
+            m.nav_tabs = NAV_TABS.len() - 2;
+        }
+        // @media (max-width: 1400px)
+        if output_w <= 1400.0 {
+            m.amount_px = 70.0;
+            m.unit_px = 22.0;
+            m.gutter = 40.0;
+        }
+        // @media (max-height: 820px)
+        if output_h <= 820.0 {
+            m.amount_px = 58.0;
+            m.card_h = 132.0;
+        }
+        m
+    }
+}
+
 /// Build the home-desktop scene for an output of `output_w` x `output_h` LOGICAL px.
 /// The layout is the checklist's a2 canvas: a fixed 40px top bar, a hero with the orb
 /// floated to its right (c7), 2-3 card rows, and a fixed 44px taskbar. It never
@@ -878,6 +969,8 @@ pub fn layout_home(
     // and the answer cannot change within a single layout pass. Every icon on this
     // desktop is a ligature name, so this one bool decides whether ANY of them draw.
     let icons_available = measure.has_icon_face();
+    // The shell's two media queries, resolved ONCE for this output (see `HomeMetrics`).
+    let m = HomeMetrics::for_output(output_w, output_h);
 
     // ── Top bar (fixed, 40px): background, centre omnibox pill, right orb-sm. ──
     let bar = Rect::new(0.0, 0.0, output_w, TOP_BAR_H);
@@ -894,12 +987,11 @@ pub fn layout_home(
     // The omnibox pill is computed HERE, before the wordmark and tabs are placed, because
     // the tabs need to know where the pill starts in order to stop short of it. It is
     // still PUSHED in paint order below.
-    let pill = Rect::new(
-        (output_w - OMNIBOX_W) * 0.5,
-        6.0,
-        OMNIBOX_W,
-        TOP_BAR_H - 12.0,
-    );
+    // `.top-bar-omni { min-width: 220px; max-width: 360px }` in a flex row: it takes the
+    // max where there is room and is squeezed no further than the min. Centring it on the
+    // output is what the flex centre column resolves to on a bar this simple.
+    let pill_w = OMNIBOX_W.min(output_w).max(m.omnibox_min_w.min(output_w));
+    let pill = Rect::new((output_w - pill_w) * 0.5, 6.0, pill_w, TOP_BAR_H - 12.0);
     let mark_h = WORDMARK_PX * 1.3;
     let mark_y = (TOP_BAR_H - mark_h) * 0.5;
     let hart_w = measure.text_width("HART", WORDMARK_PX);
@@ -909,7 +1001,7 @@ pub fn layout_home(
     // box is the measured width rounded up with a pixel of slack rather than trusting an
     // exact float to survive the f32 -> i32 the lowering does.
     bar_children.push(SceneNode::Text {
-        rect: Rect::new(EDGE_PAD, mark_y, hart_w.ceil() + 2.0, mark_h),
+        rect: Rect::new(BAR_PAD_X, mark_y, hart_w.ceil() + 2.0, mark_h),
         text: "HART".to_string(),
         size_px: WORDMARK_PX,
         color: theme.accent,
@@ -917,7 +1009,7 @@ pub fn layout_home(
     });
     bar_children.push(SceneNode::Text {
         rect: Rect::new(
-            EDGE_PAD + hart_w + gap_w,
+            BAR_PAD_X + hart_w + gap_w,
             mark_y,
             os_w.ceil() + 2.0,
             mark_h,
@@ -939,10 +1031,10 @@ pub fn layout_home(
     let tab_y = (TOP_BAR_H - tab_h) * 0.5;
     let tab_ink_h = TAB_PX * 1.3;
     let tab_ink_y = (TOP_BAR_H - tab_ink_h) * 0.5;
-    let mut tab_x = EDGE_PAD + hart_w + gap_w + os_w + EDGE_PAD;
-    for (i, label) in NAV_TABS.iter().enumerate() {
+    let mut tab_x = BAR_PAD_X + hart_w + gap_w + os_w + BAR_PAD_X;
+    for (i, label) in NAV_TABS.iter().take(m.nav_tabs).enumerate() {
         let ink_w = measure.text_width(label, TAB_PX);
-        let slot = ink_w.ceil() + 2.0 * TAB_PAD_X;
+        let slot = ink_w.ceil() + 2.0 * m.tab_pad_x;
         if tab_x + slot > pill.x - TAB_GAP {
             break;
         }
@@ -956,7 +1048,7 @@ pub fn layout_home(
             });
         }
         bar_children.push(SceneNode::Text {
-            rect: Rect::new(tab_x + TAB_PAD_X, tab_ink_y, ink_w.ceil() + 2.0, tab_ink_h),
+            rect: Rect::new(tab_x + m.tab_pad_x, tab_ink_y, ink_w.ceil() + 2.0, tab_ink_h),
             text: label.to_string(),
             size_px: TAB_PX,
             color: if i == ACTIVE_TAB {
@@ -998,13 +1090,13 @@ pub fn layout_home(
             OMNIBOX_PX * 1.3,
         ),
         text: "Ask or search anything".to_string(),
-        size_px: 14.0,
+        size_px: OMNIBOX_PX,
         color: theme.omnibox_ink,
         stroke: 0.0,
     });
     let kbd_w = measure.text_width(OMNIBOX_KBD, KBD_PX);
     let kbd_x = pill.right() - 12.0 - kbd_w;
-    if kbd_x > pill_x {
+    if m.show_kbd && kbd_x > pill_x {
         bar_children.push(SceneNode::Text {
             rect: Rect::new(
                 kbd_x,
@@ -1024,7 +1116,7 @@ pub fn layout_home(
     //    shell's order read right to left. The clock sits outermost in the shell and is
     //    absent here: it needs a time source the scene has no input for, and reserving a
     //    slot for something that never draws would leave a hole in the cluster.
-    let mut right_x = output_w - EDGE_PAD;
+    let mut right_x = output_w - BAR_PAD_X;
     if icons_available {
         for glyph in TRAY_GLYPHS.iter().rev() {
             right_x -= TRAY_BTN;
@@ -1082,11 +1174,15 @@ pub fn layout_home(
     });
 
     // ── Content band, between the two fixed strips. ──
+    // `--hh-gutter` is a LEFT inset on both `.hh-hero` and `.hh-rows`; the rows carry
+    // `padding-right: 0` and their cards bleed to the viewport edge under an overflow
+    // scroller, so the band's right edge is the output's. Insetting both sides by the
+    // gutter would drop a card the shell shows.
     let content = Rect::new(
-        EDGE_PAD,
-        TOP_BAR_H + EDGE_PAD,
-        (output_w - 2.0 * EDGE_PAD).max(0.0),
-        (output_h - TOP_BAR_H - TASKBAR_H - 2.0 * EDGE_PAD).max(0.0),
+        m.gutter,
+        TOP_BAR_H + CONTENT_PAD_Y,
+        (output_w - m.gutter).max(0.0),
+        (output_h - TOP_BAR_H - TASKBAR_H - 2.0 * CONTENT_PAD_Y).max(0.0),
     );
 
     // ── Hero (P4, the EARNINGS hero): eyebrow, the big Spark figure with its unit, an
@@ -1094,7 +1190,7 @@ pub fn layout_home(
     //    Laid out top down from the content band, each part skipped when the payload has
     //    nothing for it, so a hero without an amount is short rather than gappy.
     let orb_home = HERO_H.min(content.h).max(0.0);
-    let hero_text_w = (content.w - orb_home - EDGE_PAD).max(0.0);
+    let hero_text_w = (content.w - orb_home - m.gutter).max(0.0);
     let mut hero_y = content.y;
     if !home.hero.eyebrow.is_empty() {
         root.push(SceneNode::Text {
@@ -1111,11 +1207,11 @@ pub fn layout_home(
         // the figure ends. That is the measure again: the figure's width is not known
         // until it is shaped, and it changes with the balance.
         let figure = amount.to_string();
-        let fw = measure.text_width(&figure, HERO_AMOUNT_PX);
+        let fw = measure.text_width(&figure, m.amount_px);
         root.push(SceneNode::Text {
-            rect: Rect::new(content.x, hero_y, fw.ceil() + 2.0, HERO_AMOUNT_PX * 1.3),
+            rect: Rect::new(content.x, hero_y, fw.ceil() + 2.0, m.amount_px * 1.3),
             text: figure,
-            size_px: HERO_AMOUNT_PX,
+            size_px: m.amount_px,
             color: theme.hero_title,
             stroke: 0.0,
         });
@@ -1124,22 +1220,22 @@ pub fn layout_home(
         } else {
             &home.hero.amount_unit
         };
-        let uw = measure.text_width(unit, HERO_UNIT_PX);
+        let uw = measure.text_width(unit, m.unit_px);
         root.push(SceneNode::Text {
             rect: Rect::new(
                 content.x + fw + 8.0,
                 // Sat on the figure's baseline rather than its box top, so the unit reads
                 // as part of the number instead of floating above it.
-                hero_y + (HERO_AMOUNT_PX - HERO_UNIT_PX) * 0.9,
+                hero_y + (m.amount_px - m.unit_px) * 0.9,
                 uw.ceil() + 2.0,
-                HERO_UNIT_PX * 1.3,
+                m.unit_px * 1.3,
             ),
             text: unit.to_string(),
-            size_px: HERO_UNIT_PX,
+            size_px: m.unit_px,
             color: theme.accent,
             stroke: 0.0,
         });
-        hero_y += HERO_AMOUNT_PX * 1.35;
+        hero_y += m.amount_px * 1.35;
     }
     // The meta strip: a payout pill, then the agents/tasks stat. Built as ONE run rather
     // than several, because the shell writes it as one sentence with separators and
@@ -1218,9 +1314,9 @@ pub fn layout_home(
 
     // ── Rows: cap at 3 (a2 "2-3 rows"), each a label + a strip of cards, emitted only
     //    while they fit inside the content band so the desktop never scrolls. ──
-    let mut cursor_y = content.y + HERO_H + EDGE_PAD;
+    let mut cursor_y = content.y + HERO_H + CONTENT_PAD_Y;
     for (row_index, row) in home.rows.iter().take(3).enumerate() {
-        let row_block_h = ROW_LABEL_H + CARD_H;
+        let row_block_h = ROW_LABEL_H + m.card_h;
         if cursor_y + row_block_h > content.bottom() {
             break;
         }
@@ -1275,7 +1371,7 @@ pub fn layout_home(
             if card_x + CARD_W > content.right() {
                 break;
             }
-            let cr = Rect::new(card_x, cards_y, CARD_W, CARD_H);
+            let cr = Rect::new(card_x, cards_y, CARD_W, m.card_h);
             // A ranked card has NO tile: `.hh-card.hh-ranked` is background:transparent,
             // border:none, so the numeral and the art ARE the whole card. It gets no
             // background node at all now that its art tile can anchor the hover.
@@ -1339,16 +1435,21 @@ pub fn layout_home(
             //    is what stops it rendering as the literal word when the face is absent.
             if let (Some(name), None, true) = (&card.icon, &card.photo, icons_available) {
                 card_children.push(SceneNode::Rect {
-                    rect: Rect::new(ab.x + 14.0, ab.y + 12.0, CARD_ICON_BOX, CARD_ICON_BOX),
+                    rect: Rect::new(
+                        ab.x + CARD_ICON_INSET_X,
+                        ab.y + CARD_CHIP_INSET,
+                        CARD_ICON_BOX,
+                        CARD_ICON_BOX,
+                    ),
                     color: theme.chip_bg,
                     radius: 10.0,
                 });
                 card_children.push(SceneNode::Text {
                     rect: centered_box(
                         measure.text_width(name, CARD_ICON_PX),
-                        ab.x + 14.0,
+                        ab.x + CARD_ICON_INSET_X,
                         CARD_ICON_BOX,
-                        ab.y + 12.0 + (CARD_ICON_BOX - CARD_ICON_PX * 1.3) * 0.5,
+                        ab.y + CARD_CHIP_INSET + (CARD_ICON_BOX - CARD_ICON_PX * 1.3) * 0.5,
                         CARD_ICON_PX * 1.3,
                     ),
                     text: name.clone(),
@@ -1422,22 +1523,32 @@ pub fn layout_home(
             // so the pair stays inside the box rather than the meta hanging off it.
             let has_meta = card.meta.is_some();
             let title_y = if has_meta {
-                ab.bottom() - 34.0 - CARD_META_H
+                ab.bottom() - CARD_BODY_BOTTOM - CARD_META_H
             } else {
-                ab.bottom() - 34.0
+                ab.bottom() - CARD_BODY_BOTTOM
             };
             card_children.push(SceneNode::Text {
-                rect: Rect::new(ab.x + 12.0, title_y, ab.w - 24.0, 22.0),
+                rect: Rect::new(
+                    ab.x + CARD_PAD_X,
+                    title_y,
+                    ab.w - 2.0 * CARD_PAD_X,
+                    CARD_TITLE_H,
+                ),
                 text: card.title.clone(),
-                size_px: 14.0,
+                size_px: CARD_TITLE_PX,
                 color: theme.card_ink,
                 stroke: 0.0,
             });
             if let Some(meta) = &card.meta {
                 card_children.push(SceneNode::Text {
-                    rect: Rect::new(ab.x + 12.0, title_y + 22.0, ab.w - 24.0, CARD_META_H),
+                    rect: Rect::new(
+                        ab.x + CARD_PAD_X,
+                        title_y + CARD_TITLE_H,
+                        ab.w - 2.0 * CARD_PAD_X,
+                        CARD_META_H,
+                    ),
                     text: meta.clone(),
-                    size_px: 12.0,
+                    size_px: CARD_META_PX,
                     color: theme.hero_copy,
                     stroke: 0.0,
                 });
@@ -2231,8 +2342,9 @@ mod tests {
         // row width, which is what it used to be.
         assert!(note.x > label.right(), "the note must follow the label");
         assert_eq!(note.y, label.y, "note and label share the header line");
-        // See-all is anchored to the right edge of the content band.
-        let content_right = w - EDGE_PAD;
+        // See-all is anchored to the right edge of the content band, which IS the
+        // output's: `.hh-rows` pads only on the left, by the gutter.
+        let content_right = w;
         assert!(
             (see.right() - content_right).abs() < 3.0,
             "see-all should sit at the right edge, ended at {} against {}",
@@ -2392,8 +2504,8 @@ mod tests {
         assert!(palette.x > notif.x, "then palette, then notifications");
         assert!(notif.x > avatar.x, "the avatar sits inside the tray");
         assert!(
-            shield.right() <= w - EDGE_PAD + 0.01,
-            "the cluster stays inside the edge pad"
+            shield.right() <= w - BAR_PAD_X + 0.01,
+            "the cluster stays inside the bar's own pad"
         );
 
         // The orb-sm is inboard of the avatar now, which is where the shell puts it.
@@ -2562,7 +2674,8 @@ mod tests {
             })
             .expect("a ranked card is made of its art");
         assert_eq!(art.w, RANK_INNER_W, "the rank art box is a fixed width");
-        assert_eq!(art.h, CARD_H, "and full card height");
+        let m = HomeMetrics::for_output(1600.0, 900.0);
+        assert_eq!(art.h, m.card_h, "and full card height");
         // An unranked card keeps its tile, and its art fills it.
         let plain = rows
             .iter()
@@ -2584,6 +2697,110 @@ mod tests {
             })
             .expect("every card has art");
         assert_eq!(plain_art.w, CARD_W, "an ordinary card's art is inset:0");
+    }
+
+    #[test]
+    fn the_shells_two_breakpoints_still_fit_every_row_on_a_real_panel() {
+        // The scale correction is only safe if the desktop still keeps its promise: rows
+        // are dropped, silently, the moment one does not fit the band, so laying out at
+        // the shell's real 88px figure and 150px cards could have cost a row on a small
+        // screen and nothing would have said so. Check the panel sizes that matter.
+        let theme = Theme::cosmic_default();
+        let hc = sample();
+        let rows_at = |w: f32, h: f32| {
+            let root = layout_home(w, h, &hc, &theme, &mut MonoMeasure);
+            let mut leaves: Vec<&SceneNode> = Vec::new();
+            root.flatten(&mut leaves);
+            hc.rows
+                .iter()
+                .filter(|r| {
+                    leaves.iter().any(
+                        |n| matches!(n, SceneNode::Text { text, size_px, .. }
+                                     if *text == r.title && *size_px == ROW_LABEL_PX),
+                    )
+                })
+                .count()
+        };
+        let want = hc.rows.len().min(3);
+        for (w, h) in [(1920.0, 1080.0), (1600.0, 900.0), (1366.0, 768.0), (1280.0, 800.0)] {
+            assert_eq!(rows_at(w, h), want, "a {w}x{h} panel lost a row");
+        }
+        // And the cards themselves must still fit ACROSS: a row that shows one card is
+        // not a row. 258px cards plus an 18px gap inside a 60px gutter is four on 1280.
+        let root = layout_home(1280.0, 800.0, &hc, &theme, &mut MonoMeasure);
+        let mut leaves: Vec<&SceneNode> = Vec::new();
+        root.flatten(&mut leaves);
+        let arts = leaves
+            .iter()
+            .filter(|n| matches!(n, SceneNode::Art { .. }))
+            .count();
+        assert!(arts >= 3, "a narrow panel still shows a strip of cards, got {arts}");
+    }
+
+    #[test]
+    fn the_metrics_apply_the_shells_media_queries_in_its_own_order() {
+        // hartHome.css declares max-width:1400 first and max-height:820 second, so on a
+        // screen matching BOTH the later block wins the figure size. Getting the order
+        // backwards is invisible except on exactly those screens, which is most laptops.
+        let big = HomeMetrics::for_output(1920.0, 1080.0);
+        assert_eq!((big.gutter, big.amount_px, big.unit_px, big.card_h), (60.0, 88.0, 26.0, 150.0));
+        let narrow = HomeMetrics::for_output(1366.0, 1000.0);
+        assert_eq!((narrow.gutter, narrow.amount_px, narrow.unit_px), (40.0, 70.0, 22.0));
+        assert_eq!(narrow.card_h, 150.0, "width alone does not shrink a card");
+        let short = HomeMetrics::for_output(1920.0, 800.0);
+        assert_eq!((short.gutter, short.amount_px, short.card_h), (60.0, 58.0, 132.0));
+        // Both: the max-height block is later in the cascade, so 58 not 70.
+        let both = HomeMetrics::for_output(1366.0, 768.0);
+        assert_eq!(both.amount_px, 58.0, "the later media block wins the figure");
+        assert_eq!((both.gutter, both.unit_px, both.card_h), (40.0, 22.0, 132.0));
+        // The breakpoints are inclusive, exactly as `max-width` / `max-height` are.
+        assert_eq!(HomeMetrics::for_output(1400.0, 1080.0).gutter, 40.0);
+        assert_eq!(HomeMetrics::for_output(1401.0, 1080.0).gutter, 60.0);
+        assert_eq!(HomeMetrics::for_output(1920.0, 820.0).card_h, 132.0);
+        assert_eq!(HomeMetrics::for_output(1920.0, 821.0).card_h, 150.0);
+        // The BAR's own two, which have nothing to do with the content scale: the pill
+        // drops its hint and its floor at 1100, and the last two destinations go at 880.
+        assert!(big.show_kbd && big.nav_tabs == NAV_TABS.len());
+        assert_eq!((big.tab_pad_x, big.omnibox_min_w), (13.0, 220.0));
+        let tight = HomeMetrics::for_output(1100.0, 1080.0);
+        assert!(!tight.show_kbd, "the shortcut hint goes first");
+        assert_eq!((tight.tab_pad_x, tight.omnibox_min_w), (9.0, 120.0));
+        assert_eq!(tight.nav_tabs, NAV_TABS.len(), "all five still fit at 1100");
+        assert_eq!(HomeMetrics::for_output(1101.0, 1080.0).tab_pad_x, 13.0);
+        let narrowest = HomeMetrics::for_output(880.0, 1080.0);
+        assert_eq!(narrowest.nav_tabs, 3, "Hive and Earn go at 880");
+        assert_eq!(HomeMetrics::for_output(881.0, 1080.0).nav_tabs, NAV_TABS.len());
+    }
+
+    #[test]
+    fn a_narrow_bar_hides_the_last_two_tabs_and_the_shortcut_hint() {
+        // Not the same as the collision check the tab loop already does: at 880 the shell
+        // hides Hive and Earn even where they would fit, and at 1100 it hides the hint
+        // even where it clears the prompt. Drawing either anyway is a bar that does not
+        // match the shell's on exactly the panels most likely to be plugged in.
+        let theme = Theme::cosmic_default();
+        let hc = sample();
+        let texts = |w: f32| {
+            let root = layout_home(w, 1080.0, &hc, &theme, &mut MonoMeasure);
+            let mut leaves: Vec<&SceneNode> = Vec::new();
+            root.flatten(&mut leaves);
+            leaves
+                .iter()
+                .filter_map(|n| match n {
+                    SceneNode::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let wide = texts(1920.0);
+        assert!(wide.contains(&"Hive".to_string()) && wide.contains(&"Earn".to_string()));
+        assert!(wide.contains(&OMNIBOX_KBD.to_string()), "the hint shows on a wide bar");
+        let tight = texts(1100.0);
+        assert!(!tight.contains(&OMNIBOX_KBD.to_string()), "the hint is hidden at 1100");
+        let narrow = texts(880.0);
+        assert!(!narrow.contains(&"Hive".to_string()), "Hive is hidden at 880");
+        assert!(!narrow.contains(&"Earn".to_string()), "Earn is hidden at 880");
+        assert!(narrow.contains(&"Home".to_string()), "Home always stays");
     }
 
     #[test]
@@ -2927,7 +3144,10 @@ mod tests {
         // cursor resting on them lifts nothing.
         assert_eq!(root.hover_leaf(Some((w * 0.5, 4.0))), None);
         assert_eq!(
-            root.hover_leaf(Some((EDGE_PAD + 4.0, TOP_BAR_H + EDGE_PAD + 4.0))),
+            root.hover_leaf(Some((
+                HomeMetrics::for_output(w, h).gutter + 4.0,
+                TOP_BAR_H + CONTENT_PAD_Y + 4.0,
+            ))),
             None
         );
         // No pointer, no highlight (the default every frame before the cursor moves).
@@ -2971,7 +3191,10 @@ mod tests {
         );
         // A point in the hero-title column (left of the floated orb) is NOT the orb, so
         // it lifts nothing, hovered OR pressed: clicking elsewhere never flares the orb.
-        let hero_pt = (EDGE_PAD + 4.0, TOP_BAR_H + EDGE_PAD + 4.0);
+        let hero_pt = (
+            HomeMetrics::for_output(w, h).gutter + 4.0,
+            TOP_BAR_H + CONTENT_PAD_Y + 4.0,
+        );
         assert_eq!(root.pointer_orb_energy(Some(hero_pt), false), 0.0);
         assert_eq!(root.pointer_orb_energy(Some(hero_pt), true), 0.0);
         // No pointer contributes nothing: the flag-off / no-cursor default is unchanged.
