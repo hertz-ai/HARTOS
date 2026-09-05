@@ -3664,11 +3664,23 @@ def _reuse_seed_message(user_prompt, message):
     any problem reading the recipe returns the user's message unchanged, which
     is exactly today's behaviour.
     """
+    # Both outcomes log at INFO on purpose.  The first cut logged only the
+    # failure, at DEBUG — which this deployment does not emit, so "no skip
+    # line" could not distinguish "seeded" from "fell back silently".  A
+    # signal that cannot show its own failure is not a signal: live on
+    # 2026-09-05 the command reached the wire 6x for Trading and 0x for Auto
+    # Research on the SAME code path, and the log could not say why.
     try:
         current_action_id = user_tasks[user_prompt].current_action
-        return f"{message}\n\n{_build_reuse_action_message(user_prompt, current_action_id)}"
+        seeded = f"{message}\n\n{_build_reuse_action_message(user_prompt, current_action_id)}"
+        current_app.logger.info(
+            f"[REUSE-SEED] seeded action {current_action_id} "
+            f"(+{len(seeded) - len(message)} chars)")
+        return seeded
     except Exception as _seed_err:
-        current_app.logger.debug(f"[REUSE-SEED] skipped: {_seed_err}")
+        current_app.logger.info(
+            f"[REUSE-SEED] FELL BACK to the bare user message — the opening "
+            f"turn will NOT command an action: {_seed_err!r}")
         return message
 
 
