@@ -260,11 +260,35 @@ def _settle_dispatched_goal(db, goal, goal_key):
       noop                  — no new spark at all; unchanged 5-strike pause
     Continuous goals still never auto-complete.
     """
+    # FLUSH BEFORE REFRESH.  refresh() expires the instance and reloads it
+    # from the database, which silently discards every UN-FLUSHED pending
+    # change on it -- here, the last_dispatched_at stamp and the
+    # spark_at_dispatch snapshot the tick set moments earlier.
+    #
+    # Measured on central 2026-09-03 with a before_cursor_execute listener:
+    # the tick reached the stamp and emitted NO `UPDATE agent_goals` at all.
+    # The object showed up in session.dirty (the attribute HAD been set) but
+    # its net diff was empty, because refresh had already reverted it.  Goal
+    # rows sat frozen from 2026-09-02 12:32 -- the hour this gate shipped --
+    # while the daemon dispatched every 30 seconds for two days.
+    #
+    # Flushing writes our pending change inside the open transaction, so the
+    # reload below returns a row that already carries it, and the outer
+    # db.commit() still governs whether any of it survives.
+    try:
+        db.flush()
+    except Exception:
+        pass  # a flush failure must not stop the gate from judging
     try:
         db.refresh(goal)
     except Exception:
         pass  # refresh failure → fall through to attribute read
-    cfg = goal.config_json or {}
+    # COPY, never mutate-in-place.  config_json is a plain JSON column, not a
+    # MutableDict: mutating the dict the attribute already holds and assigning
+    # that same object back compares equal at flush time, so the column is
+    # never written.  Every marker this gate records -- completion_grounding,
+    # noop_dispatch_count, awaiting_verification -- was lost that way.
+    cfg = dict(goal.config_json or {})
     is_continuous = cfg.get('continuous', False)
     spark_spent = goal.spark_spent or 0
     # Per-dispatch, not lifetime.  Absent key (a goal dispatched before this
@@ -1507,7 +1531,10 @@ class AgentDaemon:
                 # subsequent tick without doing any new work.  Written to
                 # config_json (no schema change) and consumed by
                 # _settle_dispatched_goal below.
-                _cfg_pre = goal.config_json or {}
+                # dict(...) copies: config_json is a plain JSON column, so
+                # mutating the dict it already holds and assigning the SAME
+                # object back compares equal at flush time and never writes.
+                _cfg_pre = dict(goal.config_json or {})
                 _cfg_pre['spark_at_dispatch'] = goal.spark_spent or 0
                 goal.config_json = _cfg_pre
 
@@ -1597,7 +1624,7 @@ class AgentDaemon:
                     if failure_count >= 5:
                         # Auto-pause after 5 consecutive failures
                         goal.status = 'paused'
-                        cfg = goal.config_json or {}
+                        cfg = dict(goal.config_json or {})  # copy: see above
                         cfg['pause_reason'] = (
                             f'Auto-paused: {failure_count} consecutive '
                             f'dispatch failures')
