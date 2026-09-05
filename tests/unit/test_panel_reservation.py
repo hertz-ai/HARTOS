@@ -627,3 +627,50 @@ def test_every_shipped_theme_declares_a_rule_colour_the_compositor_can_read():
         "back to having no edge")
     assert "theme.chrome_border" in scene, (
         "the scene no longer draws with the rule colour it reads")
+
+def test_the_compositor_mirrors_the_shells_own_potato_verdict():
+    """The third of the ledger's motion kill-switches, and the key it hangs on.
+
+    liquid_ui_service computes `is_potato = perf.disable_blur or gpu_mode ==
+    'software'`, and that one flag strips its animation strings before they are
+    ever emitted. The GPU half was already mirrored natively; this pins the THEME
+    half to the same key, because reading its sibling would look identical in
+    every Rust test (both are booleans in the same block, and only potato.json
+    sets either) while mirroring a verdict the shell does not make.
+
+    `disable_animations` is asserted UNREAD on purpose: nothing in the tree reads
+    it, so it is a dead key rather than a contract, and honouring it natively
+    would invent a behaviour the shell has never had.
+    """
+    service = open(SERVICE_SRC, encoding="utf-8").read()
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+
+    m = re.search(r"is_potato = perf\.get\('(\w+)'", service)
+    assert m, "liquid_ui_service no longer derives is_potato from a perf key"
+    key = m.group(1)
+    assert 'flag("%s")' % key in comp, (
+        "the shell's potato tier hangs on perf.%s and the compositor does not "
+        "read it, so a theme asking for reduced effects reaches one renderer "
+        "only" % key)
+    assert 'flag("disable_animations")' not in comp, (
+        "disable_animations is read by nothing in the tree; honouring it "
+        "natively would invent a behaviour the shell does not have")
+    assert "theme_potato" in comp, (
+        "the motion gate no longer takes the theme tier into account")
+
+    # And the key it hangs on is a real boolean in the shipped set, not a typo
+    # that would silently read as "not asking".
+    import glob
+    declared = 0
+    for path in glob.glob(os.path.join(
+            REPO, "nixos", "assets", "conky-themes", "*.json")):
+        perf = json.load(open(path, encoding="utf-8")).get("performance", {})
+        if key in perf:
+            assert isinstance(perf[key], bool), (
+                "%s sets %s to %r, which the compositor's flag reader only "
+                "accepts as a JSON bool" % (os.path.basename(path), key, perf[key]))
+            declared += 1
+    assert declared >= 1, (
+        "no shipped theme declares perf.%s any more, so the tier is unreachable "
+        "and the mirror is guarding nothing" % key)

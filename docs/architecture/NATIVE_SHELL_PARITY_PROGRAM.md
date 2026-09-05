@@ -890,11 +890,26 @@ compositor at the next start, which is the same documented gap the theme and the
 backdrop palette already carry rather than a new one; whoever lands the
 theme-change signal should carry this with it.
 
-The other two switches stay unbuilt and are now stated rather than merely absent:
-`prefers-reduced-motion` is an OS/browser preference with no native equivalent the
-compositor can read today, and the potato tier is Python-side, stripping animation
-strings before they are emitted, so it has nothing to mirror until the native
-scene has an equivalent tier notion.
+The other two switches: `prefers-reduced-motion` stays unbuilt and stated, being
+an OS/browser preference with no native equivalent the compositor can read today.
+
+The POTATO tier turned out to be much closer than that sentence originally
+claimed, and the correction is worth keeping. liquid_ui_service computes it as
+`is_potato = perf.disable_blur or gpu_mode == 'software'`. The GPU half was
+ALREADY mirrored (that is the hardware motion gate), and the theme half is one
+boolean in a file the compositor already reads. Calling it "Python-side, nothing
+to mirror" was reading the description rather than the expression.
+
+It sheds exactly what the hardware floor sheds and no more, per rule 5's "degrade
+gracefully, never gut": the perpetual breath goes, the brief transients stay, and
+only a stated preference stops those.
+
+Its sibling `performance.disable_animations` is deliberately NOT read: nothing in
+the tree reads it, so it is a dead key rather than a contract, and honouring it
+natively would invent a behaviour the shell has never had. The guard asserts that
+too, because reading it instead would look identical in every Rust test (both are
+booleans in the same block, and only potato.json sets either) while mirroring a
+verdict the shell does not make.
 
 ### The accessibility font scale, and how small its real reach is
 The ledger maps `a11y_fontscale` to a **Text** metric override. Following it to
@@ -984,3 +999,19 @@ CI. It found zero themes and said so, which is the right failure but the wrong
 home. The rule now sits with the other cross-language pins, asserting that every
 shipped theme declares a border in the shape the reader accepts, that its alpha is
 visible, and that the compositor both reads the key and draws with it.
+
+### Sweeping the theme file for other keys the readers cannot see
+The chrome rule was invisible because `--hart-glass-border` is `rgba(...)` and the
+reader only knew hex: a value in the wrong SHAPE fails exactly like a value that is
+not there. That is a class, not an incident, so the whole file was swept: every key
+in every shipped theme, its value shape, and whether the compositor reads it with a
+reader that accepts that shape.
+
+Result: no remaining mismatches among the keys the compositor consumes. The sweep
+also surfaced `performance.disable_blur`, which is half the shell's potato verdict
+and is now mirrored, and `performance.disable_animations`, which is read by
+nothing anywhere and is left alone.
+
+Worth doing again after any new reader lands. The whole audit is a dozen lines of
+Python over the shipped JSONs, and it is the only thing that can tell a key the
+compositor ignores from a key the compositor cannot parse.

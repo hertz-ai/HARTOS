@@ -2140,6 +2140,7 @@ pub fn effects_animating<S: CompState>(state: &S) -> bool {
     scene_animates(
         native_scene_drawn(state.native_shell_on(), state.capture_blocked()),
         state.motion_hardware(),
+        theme_potato(),
         motion_reduced(),
         ws_fading,
         map_animating,
@@ -2177,6 +2178,7 @@ pub fn native_scene_drawn(native_shell_on: bool, capture_blocked: bool) -> bool 
 pub fn scene_animates(
     native_scene_drawn: bool,
     motion_hardware: bool,
+    theme_potato: bool,
     motion_reduced: bool,
     ws_fading: bool,
     map_animating: bool,
@@ -2200,7 +2202,17 @@ pub fn scene_animates(
     // The workspace fade and the map animation are unconditional because they are
     // TRANSIENT: a few hundred milliseconds once, not a permanent 60fps hold, and both
     // are motion the user just asked for by switching or opening something.
-    (native_scene_drawn && motion_hardware) || ws_fading || map_animating
+    // `theme_potato` is the OTHER half of the shell's own reduced-effects verdict.
+    // liquid_ui_service computes `is_potato = perf.disable_blur or gpu_mode == 'software'`
+    // and that one flag strips its animation strings before they are ever emitted. The
+    // GPU half was already mirrored by `motion_hardware`; this is the theme half, and it
+    // is one key in a file the compositor already reads, so the third of the ledger's
+    // motion kill-switches was never as far away as it looked.
+    //
+    // It sheds the same thing the hardware floor sheds and no more, which is rule 5's
+    // "degrade gracefully, never gut": the PERPETUAL breath goes, the brief transients
+    // stay. Only a stated preference stops those.
+    (native_scene_drawn && motion_hardware && !theme_potato) || ws_fading || map_animating
 }
 
 /// Build the software-cursor render element(s) at the pointer location, PREPENDED so the
@@ -2418,7 +2430,7 @@ where
     // Read BEFORE `native_scene_caches` takes its `&mut` borrow of state, and it is the
     // SAME bool `effects_animating` gates the frame budget on, so the orb's motion and
     // the frame rate that carries it can never disagree.
-    let animate = state.motion_hardware() && !motion_reduced();
+    let animate = state.motion_hardware() && !theme_potato() && !motion_reduced();
     // The home now rides OUT of the accessor as a shared borrow beside the `&mut`
     // caches, so the frame no longer clones a HomeCompose just to release the state
     // borrow. `demo_ref` is the allocation-free fallback until `shell.compose` lands.
@@ -2438,6 +2450,24 @@ where
 }
 
 /// Lower a `HomeCompose` to render elements against the concrete caches — the
+/// Does the active THEME ask for the reduced-effects tier? Resolved once, beside the
+/// others, and carrying the same restart-to-change gap.
+///
+/// `performance.disable_blur` is half of the shell's `is_potato`; the other half is the
+/// software floor, which the compositor knows directly. Only `potato.json` sets it today.
+///
+/// Its sibling `performance.disable_animations` is NOT read here, deliberately: nothing
+/// in the tree reads it either, so it is a dead key rather than a contract, and honouring
+/// it natively would invent a behaviour the shell does not have.
+fn theme_potato() -> bool {
+    static POTATO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *POTATO.get_or_init(|| {
+        crate::bloom::SettingsFile::active()
+            .flag("disable_blur")
+            .unwrap_or(false)
+    })
+}
+
 /// Has the user declared reduced motion? Resolved ONCE, like the theme beside it, and
 /// carrying the same documented gap: a runtime PUT to /api/shell/accessibility lives in
 /// the shell process's memory and reaches this at the next start.
@@ -2926,7 +2956,7 @@ where
         let short = size.w.min(size.h);
         let side = (short as f32 * 0.30) as i32;
         let energy = state.orb_energy();
-        let animate = state.motion_hardware() && !motion_reduced();
+        let animate = state.motion_hardware() && !theme_potato() && !motion_reduced();
         if let Some((buffer, motion)) = state.orb_mut().current(side, energy, animate) {
             // Breathing scales about the CENTRE, so the top-left moves by half
             // the growth. Computed from the motion rather than stored, so there
@@ -4391,15 +4421,15 @@ mod native_render_tests {
         // so without this the flip to the native shell would quietly render that breath
         // at 5 Hz: a stutter, not a breath, and against the 60fps NFR.
         assert!(
-            scene_animates(true, true, false, false, false),
+            scene_animates(true, true, false, false, false, false),
             "a drawn native scene animates by construction, its orb never stops breathing"
         );
         // Flag OFF is untouched, which is what keeps the shipped WebView desktop's idle
         // saving: the orb still breathes down there, but occluded, so it costs nothing.
-        assert!(!scene_animates(false, true, false, false, false));
+        assert!(!scene_animates(false, true, false, false, false, false));
         // The two effects that already forced a paint still do, with the flag off.
-        assert!(scene_animates(false, true, false, true, false), "a workspace fade must play out");
-        assert!(scene_animates(false, true, false, false, true), "a map animation must play out");
+        assert!(scene_animates(false, true, false, false, true, false), "a workspace fade must play out");
+        assert!(scene_animates(false, true, false, false, false, true), "a map animation must play out");
     }
 
     #[test]
@@ -4479,11 +4509,11 @@ mod native_render_tests {
         assert!(!native_scene_drawn(false, false), "flag off: never drawn");
         assert!(!native_scene_drawn(false, true));
         // And the gate agrees, because both decisions read the same predicate.
-        assert!(!scene_animates(native_scene_drawn(true, true), true, false, false, false));
-        assert!(scene_animates(native_scene_drawn(true, false), true, false, false, false));
+        assert!(!scene_animates(native_scene_drawn(true, true), true, false, false, false, false));
+        assert!(scene_animates(native_scene_drawn(true, false), true, false, false, false, false));
         // A real animation still plays out under the killswitch: correctness first, the
         // saving is only ever about the native scene.
-        assert!(scene_animates(native_scene_drawn(true, true), true, false, true, false));
+        assert!(scene_animates(native_scene_drawn(true, true), true, false, false, true, false));
     }
 
     #[test]
@@ -4497,21 +4527,77 @@ mod native_render_tests {
         // nothing else, and liquid_ui_service records why (real-HW 2026-07-12, GPU-only
         // effects on a CPU renderer hung the whole shell).
         assert!(
-            scene_animates(true, true, false, false, false),
+            scene_animates(true, true, false, false, false, false),
             "GPU-composited with the scene drawn: the orb breathes"
         );
         assert!(
-            !scene_animates(true, false, false, false, false),
+            !scene_animates(true, false, false, false, false, false),
             "on the software floor a still native desktop must let the gate close"
         );
         // Transients are unconditional: a workspace fade and a map animation are a few
         // hundred milliseconds of motion the user just asked for, not a permanent hold,
         // and they must play out on the floor too.
-        assert!(scene_animates(true, false, false, true, false), "a ws fade plays on the floor");
-        assert!(scene_animates(true, false, false, false, true), "so does a map animation");
+        assert!(scene_animates(true, false, false, false, true, false), "a ws fade plays on the floor");
+        assert!(scene_animates(true, false, false, false, false, true), "so does a map animation");
         assert!(
-            !scene_animates(false, false, false, false, false),
+            !scene_animates(false, false, false, false, false, false),
             "nothing drawn, nothing animating, nothing to hold the gate open"
+        );
+    }
+
+    #[test]
+    fn the_themes_reduced_effects_tier_sheds_the_breath_and_keeps_the_transients() {
+        // liquid_ui_service computes `is_potato = perf.disable_blur or gpu_mode ==
+        // 'software'` and that one flag strips its animation strings before they are
+        // emitted. The GPU half was already mirrored; this is the THEME half, which is a
+        // single key in a file the compositor already reads, so the third of the ledger's
+        // motion kill-switches was never as far away as it looked.
+        assert!(
+            scene_animates(true, true, false, false, false, false),
+            "a capable GPU on an ordinary theme: the orb breathes"
+        );
+        assert!(
+            !scene_animates(true, true, true, false, false, false),
+            "the theme asked for the reduced-effects tier"
+        );
+        // It sheds exactly what the hardware floor sheds and no more, which is rule 5's
+        // "degrade gracefully, never gut": the perpetual breath goes, the brief
+        // transients stay. Only a stated preference stops those.
+        assert!(
+            scene_animates(true, true, true, false, true, false),
+            "a workspace fade still plays on the potato tier"
+        );
+        assert!(
+            !scene_animates(true, true, true, true, true, true),
+            "but reduced motion still outranks everything"
+        );
+        // The two halves are independent: either one alone is enough.
+        assert!(!scene_animates(true, false, false, false, false, false));
+        assert!(!scene_animates(true, false, true, false, false, false));
+    }
+
+    #[test]
+    fn the_potato_flag_is_the_key_the_shell_actually_reads() {
+        // `disable_blur`, not its sibling `disable_animations`. Only potato.json sets
+        // either, and NOTHING in the tree reads disable_animations, so honouring that one
+        // natively would invent a behaviour the shell does not have.
+        let dir = std::env::temp_dir().join("hart_potato_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let spud = dir.join("potato.json");
+        std::fs::write(
+            &spud,
+            r#"{"performance":{"disable_blur":true,"disable_animations":true}}"#,
+        )
+        .unwrap();
+        let f = crate::bloom::SettingsFile::load(&spud);
+        assert_eq!(f.flag("disable_blur"), Some(true));
+
+        let rich = dir.join("aura.json");
+        std::fs::write(&rich, r#"{"performance":{"lazy_load_iframes":true}}"#).unwrap();
+        assert_eq!(
+            crate::bloom::SettingsFile::load(&rich).flag("disable_blur"),
+            None,
+            "a theme that says nothing is not asking for the tier"
         );
     }
 
@@ -4525,20 +4611,20 @@ mod native_render_tests {
         // It is not a performance floor and is not overridden by one. On the fastest GPU
         // in the fleet, with the scene drawn, reduced motion still means still.
         assert!(
-            scene_animates(true, true, false, false, false),
+            scene_animates(true, true, false, false, false, false),
             "GPU, not reduced: the orb breathes"
         );
         assert!(
-            !scene_animates(true, true, true, false, false),
+            !scene_animates(true, true, false, true, false, false),
             "reduced motion wins over a perfectly capable GPU"
         );
         // And it wins over the TRANSIENTS too, which is the difference between this and
         // the hardware floor: a workspace fade the user asked not to see is exactly what
         // the preference exists to stop, where a slow CPU is a reason to skip the breath
         // and still show the fade.
-        assert!(scene_animates(true, false, false, true, false), "ws fade on the CPU floor");
+        assert!(scene_animates(true, false, false, false, true, false), "ws fade on the CPU floor");
         assert!(
-            !scene_animates(true, true, true, true, true),
+            !scene_animates(true, true, false, true, true, true),
             "nothing animates when the user said stop"
         );
     }
