@@ -1317,18 +1317,6 @@ class LiquidUIService:
                 _rspec['template'] = _entry['template']
             component['_spec'] = _rspec
 
-        # Provable audit trail — every accepted push is recorded exactly like
-        # a goal dispatch (dispatch.py:680).  Best-effort: an audit hiccup
-        # must not drop a user's card.  Type + agent only (no user payload).
-        try:
-            from security.immutable_audit_log import get_audit_log
-            get_audit_log().log_event(
-                'a2ui_push', actor_id=str(agent_id),
-                action=f'push {comp_type} component',
-                detail={'type': comp_type}, target_id=str(agent_id))
-        except Exception:
-            logger.exception("agent_ui_update: swallowed Exception")
-
         # 1. Store for the SSE stream (Nunba web LiquidUI)
         with self._lock:
             if agent_id not in self._agent_components:
@@ -1343,6 +1331,32 @@ class LiquidUIService:
         # stream; a missed wake still self-heals on the producer's safety timeout.
         with self._ui_event_cv:
             self._ui_event_cv.notify_all()
+
+        # Provable audit trail: every accepted push is recorded exactly like
+        # a goal dispatch (dispatch.py:858).  Best-effort: an audit hiccup
+        # must not drop a user's card.  Type + agent only (no user payload).
+        #
+        # AFTER the store and the wake, not before. log_event does a synchronous
+        # SQLAlchemy commit and connection close, and it sat directly on the A2UI
+        # push path: every card, every notification, every desktop compose waited
+        # for a durable write before the SSE producer was even told there was
+        # something to send. Measured on a dev box: 5.8s, 11.5s and 8.3s for three
+        # consecutive pushes, of which the commit and the connection teardown were
+        # effectively all of it, against a 0.5s budget. That is the whole reason
+        # the event-driven producer stopped measuring as event-driven.
+        #
+        # Ordering is all that changed. The call, its data and its best-effort
+        # contract are identical, the function cannot return between the two, and
+        # the audit's own subject is an ACCEPTED push, which is what storing it
+        # makes it. What it stops doing is deciding how fast the UI is.
+        try:
+            from security.immutable_audit_log import get_audit_log
+            get_audit_log().log_event(
+                'a2ui_push', actor_id=str(agent_id),
+                action=f'push {comp_type} component',
+                detail={'type': comp_type}, target_id=str(agent_id))
+        except Exception:
+            logger.exception("agent_ui_update: swallowed Exception")
 
         # 2. Push to EventBus → WAMP → Android/iOS/Desktop
         # The WAMP bridge (core/platform/events.py) auto-publishes to

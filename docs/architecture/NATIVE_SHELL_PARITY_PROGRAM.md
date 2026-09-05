@@ -1506,3 +1506,39 @@ DELTA since the last window, not the running total, so the line says "this windo
 went wrong" instead of "something went wrong since boot"; `dropped()` still answers
 the totals. `None` when nothing was refused, so a healthy box logs nothing extra
 and the line stays rare enough to be worth reading.
+
+### One line in the shell head that the desktop's own claim argues against
+Rendering the served document locally (`render_desktop_shell()`, 315KB, 29
+same-origin asset refs and all of them present on disk) turned up exactly one
+off-origin load, and it is deliberate and documented:
+
+```
+<script>if(navigator.onLine){ ...link rel=stylesheet
+  href='https://fonts.googleapis.com/icon?family=Material+Icons+Round' ... }</script>
+<style>/* ...the BUNDLED MaterialSymbolsRounded.woff2 below is authoritative
+  (every glyph, fully offline). This CDN <link> is progressive-enhancement ONLY. */</style>
+```
+
+The comment is accurate about the cascade: the icon stack lists
+`'Material Symbols Rounded'` (bundled, 451KB) first, so the bundled face wins every
+glyph it has. Not a regression, and NOT changed here, because it is someone's
+documented decision on a surface this program does not own.
+
+Recorded because two things argue against keeping it, and both are checkable rather
+than matters of taste:
+
+1. **It can only ever mask an offline bug.** The ISO boots offline by design, and
+   bundling the face was the fix for a real incident where a fresh offline boot
+   rendered "lock" and "notifications" as literal words. So any glyph the CDN link
+   would supply is a glyph that is ALREADY broken offline. The link does not fix
+   that case, it hides it whenever the box happens to be online, which makes icon
+   rendering depend on network state.
+2. **It is a third-party render-blocking stylesheet on the first-paint path.** On a
+   slow or captive network the desktop's first paint waits on Google. That is the
+   one path the latency work exists to protect.
+
+And the product claim: the hero paints "fully local" in teal on the same screen.
+
+Deciding this needs the shell's owner. What can be settled without them is whether
+the bundled face genuinely covers the shell's ligature set, which would make the
+link provably dead weight; that needs a font parser this box does not have.
