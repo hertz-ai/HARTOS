@@ -469,45 +469,52 @@ def _emit_llm_url_change_toast(new_url: str) -> None:
 def get_local_draft_url() -> str:
     """Single source of truth for the local DRAFT LLM endpoint URL.
 
-    The draft model is the Qwen3.5-0.8B instance that answers
-    dispatch_draft_first calls and generates continuous video captions.
-
-    On ≥8GB VRAM, draft runs on a SEPARATE port (8081) from the main
-    model (8080) so both stay resident simultaneously.
-
-    On ≤6GB VRAM (no separate draft server), the draft URL points to
-    the MAIN model's port so the same model serves both roles — draft
-    classification AND agentic responses. This avoids the "draft offline
-    → fall through → slow main" latency penalty by letting the speculative
-    dispatcher talk to whatever model IS running.
+    A draft is a SEPARATE, deliberately configured endpoint
+    (``HEVOLVE_DRAFT_LLM_URL``).  With none configured the MAIN model
+    serves the draft role and this returns ``get_local_llm_url()``.
 
     Resolution order:
-      1. HEVOLVE_DRAFT_LLM_URL    — full URL override
-      2. HEVOLVE_VLM_CAPTION_PORT — port override (separate draft server)
-      3. If draft server is running on default port → use it
-      4. Otherwise → fall back to main LLM URL (same model, dual role)
+      1. HEVOLVE_DRAFT_LLM_URL — full URL override
+      2. Otherwise → main LLM URL (same model serves both roles)
+
+    This used to fall back to the VLM caption port
+    (HEVOLVE_VLM_CAPTION_PORT / get_port('vlm_caption')) and then accept
+    whatever was listening there, which made the 0.8B caption server
+    double as the chat draft.  Two measurements on 2026-09-05, 8 GB box:
+
+      * the draft gate had already decided ``main_only`` (draft_decision
+        .jsonl, 18:11:42) — yet casual chat still answered from the 0.8B,
+        because an ORPHANED caption server (pid 30472, started 01:50, its
+        parent long dead) was listening on 8081 and this resolver took it;
+      * that 0.8B, handed a role-labelled transcript, replied
+        ``"User: I am Nunba. Gotcha…"`` (17:45:39) and later echoed the
+        user's own sentence back verbatim (18:44:40) — both read aloud by
+        TTS, and the leaked prefix was then persisted as an AIMessage so
+        it re-entered every later prompt.
+
+    Captioning and chat-drafting are different roles.  A live socket on
+    the caption port is not a declaration that the model behind it should
+    answer chat, so the caption port is no longer consulted here.  The
+    caption server keeps its own port and its own spawn path.
 
     Returns full URL with /v1 suffix (OpenAI-compatible).
     """
     url = os.environ.get('HEVOLVE_DRAFT_LLM_URL', '').strip()
     if not url:
-        port = os.environ.get('HEVOLVE_VLM_CAPTION_PORT', '').strip()
-        if not port:
-            port = str(get_port('vlm_caption'))
-        url = f'http://127.0.0.1:{port}/v1'
+        # No dedicated draft endpoint configured → main model serves the role.
+        return get_local_llm_url()
 
     url = url.rstrip('/')
     if not url.endswith('/v1'):
         url += '/v1'
 
-    # If draft port has no server, use the main LLM instead (single-model mode).
-    # This makes the main model serve BOTH draft and agentic roles on low VRAM.
+    # An explicitly configured draft that is not listening yields to the main
+    # model rather than handing callers a dead endpoint.
     try:
         _body = url.split('://', 1)[-1].split('/', 1)[0]
         host, _, port_s = _body.partition(':')
         # Shared connect-probe primitive (one socket idiom for the whole module).
         if not _is_port_listening(int(port_s or 8081), host or '127.0.0.1', 0.3):
-            # Draft port not listening → use main model as draft
             return get_local_llm_url()
     except Exception:
         pass
