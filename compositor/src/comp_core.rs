@@ -2465,9 +2465,47 @@ fn active_theme() -> &'static crate::scene::Theme {
     })
 }
 
+/// The accessibility FONT SCALE applied to a theme metric, exactly as the shell applies
+/// it: clamp to 0.8..=2.0, ignore anything within 0.01 of 1.0, and ROUND, because
+/// liquid_ui_service emits `str(round(icon_size * fs))` and a half-pixel difference here
+/// would be a different glyph size on the two renderers.
+///
+/// Only `--hart-icon-size` matters to the native scene today, and that is worth being
+/// exact about rather than sweeping: the a11y override rewrites three tokens, and the
+/// only two consumers in the whole served shell are `html,body{font-size:...}` (the root
+/// size, which the home surface does not inherit because hartHome.css sizes everything in
+/// absolute px) and `.tray-btn .mi{font-size:var(--hart-icon-size)}`, which IS a thing the
+/// native scene draws. So a user at font_scale 1.5 got 30px tray glyphs in the shell and
+/// 20px natively.
+///
+/// `None` scale, or a scale that rounds to no change, returns the metric untouched.
+fn a11y_scaled(metric: Option<f32>, font_scale: Option<f32>) -> Option<f32> {
+    let m = metric?;
+    let s = match font_scale {
+        Some(s) if s.is_finite() => s.clamp(0.8, 2.0),
+        _ => return Some(m),
+    };
+    if (s - 1.0).abs() <= 0.01 {
+        return Some(m);
+    }
+    Some((m * s).round())
+}
+
 /// Fold a loaded theme file's colours into the shipped defaults. Split out so it is
 /// testable against a real file with no environment and no OnceLock in the way.
 fn theme_from_file(file: &crate::bloom::SettingsFile) -> crate::scene::Theme {
+    theme_from_files(file, &crate::bloom::SettingsFile::load(std::path::Path::new(
+        crate::bloom::A11Y_SETTINGS_PATH,
+    )))
+}
+
+/// The same fold with the accessibility file passed in, so a test can drive both without
+/// touching /etc. The two files are separate on purpose: one is the look the user picked,
+/// the other is what they need to be able to see it.
+fn theme_from_files(
+    file: &crate::bloom::SettingsFile,
+    a11y: &crate::bloom::SettingsFile,
+) -> crate::scene::Theme {
     let hue = |key: &str| {
         file.hex(key)
             .map(|[r, g, b]| {
@@ -2493,7 +2531,9 @@ fn theme_from_file(file: &crate::bloom::SettingsFile) -> crate::scene::Theme {
         // sized by one number each rather than two that happen to agree today.
         .with_shell_metrics(
             file.num("topbar_height"),
-            file.num("icon_size"),
+            // The ONE theme metric the accessibility font scale rewrites, applied with
+            // the shell's own arithmetic so both renderers land on the same integer.
+            a11y_scaled(file.num("icon_size"), a11y.num("font_scale")),
             file.num("border_radius"),
         )
 }
@@ -3976,6 +4016,58 @@ mod tests {
             })
             .expect("the top bar strip");
         assert_eq!(bar.h, 36.0, "the bar the scene DRAWS is the theme's height");
+    }
+
+    #[test]
+    fn a_declared_font_scale_grows_the_tray_glyph_the_way_the_shell_does() {
+        // liquid_ui_service emits `--hart-icon-size: round(icon_size * fs)px` when the
+        // scale is set, and `.tray-btn .mi` reads it. The native scene draws that glyph
+        // and ignored the scale, so a user at 1.5 got 30px in the shell and 20 natively.
+        let dir = std::env::temp_dir().join("hart_fontscale_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let theme = dir.join("t.json");
+        std::fs::write(&theme, r#"{"shell":{"icon_size":20,"topbar_height":40}}"#).unwrap();
+        let big = dir.join("big.json");
+        std::fs::write(&big, r#"{"font_scale":1.5,"reduced_motion":false}"#).unwrap();
+
+        let t = theme_from_files(
+            &crate::bloom::SettingsFile::load(&theme),
+            &crate::bloom::SettingsFile::load(&big),
+        );
+        assert_eq!(t.icon_px, 30.0, "20 * 1.5, the shell's own arithmetic");
+        assert_eq!(t.top_bar_h, 40.0, "the bar is NOT font-scaled, and the shell agrees");
+
+        // The rounding is the shell's too: `str(round(...))`, so 20 * 1.15 is 23, not
+        // 23.0000004 and not 22. A half-pixel difference is a different glyph.
+        let odd = dir.join("odd.json");
+        std::fs::write(&odd, r#"{"font_scale":1.15}"#).unwrap();
+        assert_eq!(
+            theme_from_files(
+                &crate::bloom::SettingsFile::load(&theme),
+                &crate::bloom::SettingsFile::load(&odd),
+            )
+            .icon_px,
+            23.0
+        );
+    }
+
+    #[test]
+    fn the_font_scale_rule_matches_the_shells_clamp_and_deadband() {
+        // Pure, so the edges are checkable without files. The shell clamps 0.8..2.0 and
+        // ignores anything within 0.01 of 1.0; both matter, because a hostile or
+        // fat-fingered setting reaches this from a file and "no change" must mean the
+        // metric is untouched rather than multiplied by something near one and rounded.
+        assert_eq!(a11y_scaled(Some(20.0), None), Some(20.0), "no scale, no change");
+        assert_eq!(a11y_scaled(Some(20.0), Some(1.0)), Some(20.0), "exactly one");
+        assert_eq!(a11y_scaled(Some(20.0), Some(1.005)), Some(20.0), "inside the deadband");
+        assert_eq!(a11y_scaled(Some(20.0), Some(0.1)), Some(16.0), "clamped up to 0.8");
+        assert_eq!(a11y_scaled(Some(20.0), Some(99.0)), Some(40.0), "clamped down to 2.0");
+        assert_eq!(a11y_scaled(Some(20.0), Some(f32::NAN)), Some(20.0), "NaN is not a scale");
+        assert_eq!(a11y_scaled(None, Some(1.5)), None, "nothing to scale");
+        // ROUNDING, on a value where it plainly matters: the shell emits an integer
+        // pixel string, so 20 * 1.13 is a 23px glyph on both renderers, not 22.6 on one.
+        assert_eq!(a11y_scaled(Some(20.0), Some(1.13)), Some(23.0));
+        assert_eq!(a11y_scaled(Some(20.0), Some(1.12)), Some(22.0), "and rounds DOWN too");
     }
 
     #[test]

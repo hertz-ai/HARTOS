@@ -895,3 +895,32 @@ The other two switches stay unbuilt and are now stated rather than merely absent
 compositor can read today, and the potato tier is Python-side, stripping animation
 strings before they are emitted, so it has nothing to mirror until the native
 scene has an equivalent tier notion.
+
+### The accessibility font scale, and how small its real reach is
+The ledger maps `a11y_fontscale` to a **Text** metric override. Following it to
+what actually consumes the tokens is worth recording, because the answer is much
+narrower than the row suggests and being exact stopped this from being a sweeping
+change that would have made the two renderers differ MORE.
+
+The override rewrites three tokens (`--hart-font-size`, `--hart-heading-size`,
+`--hart-icon-size`) and the entire served shell has exactly TWO consumers of them:
+`html,body{font-size:var(--hart-font-size)}`, the root size, and
+`.top-bar-right .tray-btn .mi{font-size:var(--hart-icon-size)}`, the tray glyphs.
+`--hart-heading-size` has no consumer at all.
+
+The native scene draws those tray glyphs and ignored the scale, so a user at
+font_scale 1.5 got 30px glyphs in the shell and 20px natively. Fixed, with the
+shell's own arithmetic including its rounding: it emits `str(round(icon_size *
+fs))`, so both renderers land on the same integer and a 20px glyph at 1.13 is 23px
+on each rather than 23 on one and 22.6 on the other.
+
+The clamp (0.8..2.0) and the deadband (ignore within 0.01 of 1.0) are the shell's
+too. Both matter because the value arrives from a file: "no change" has to mean
+the metric is untouched, not multiplied by something near one and rounded.
+
+**Recorded, not fixed, because it is a SHELL gap rather than a parity gap:** the
+home surface does not scale in EITHER renderer. hartHome.css sizes everything in
+absolute px, so it inherits nothing from the root font-size, and a user who has
+asked for larger text gets a scaled tray and an unscaled desktop today. Making the
+native scene scale its own type would not fix that; it would make the two
+renderers disagree. The fix belongs where the sizes are declared.
