@@ -1542,3 +1542,38 @@ And the product claim: the hero paints "fully local" in teal on the same screen.
 Deciding this needs the shell's owner. What can be settled without them is whether
 the bundled face genuinely covers the shell's ligature set, which would make the
 link provably dead weight; that needs a font parser this box does not have.
+
+### What the fleet cache proves about OTA without a box
+The HART node has been physically down all session, and "OTA is blocked on
+hardware" was being asserted rather than tested. It is worth writing down what
+that assertion missed, because the same mistake is available next time.
+
+Deepbox, the machine the compositor check loop already ships to, is a live Linux
+host on the same LAN, and one of its containers is `hart-nix-cache`, the fleet
+binary cache the OTA apply path substitutes from. Probing from THERE rather than
+from Windows settled the blocker properly: `ping` and both TCP ports to the node
+return "no route to host", and a sweep of all 254 LAN addresses for port 5000
+found exactly one responder, which turned out to be the hevolve.ai SPA. The node
+is genuinely off the network. But the same access proved four OTA claims that had
+been sitting as "code-complete, unproven".
+
+The cache holds 5,575 signed store paths, 12G, last written 2026-09-04, including
+57 `nixos-system-hart-node` toplevels. Walking a toplevel's `References` to its
+`-etc`, then to `-etc-fstab`, and zstd-decompressing each nar (`zstandard` on the
+dev box, so nothing on deepbox was modified) reads the fstab a node would boot
+with. 28 of the 57 mount `/` by `hart-root` and `/boot` by `HART-ESP`. None carry
+per-rev labels, which is the defect the whole labels cutover exists to fix.
+
+They arrive in pairs a minute or two apart, which is `nix-build-matrix.yml`'s
+`cfgs="hart-desktop hart-desktop-raw"` loop doing what plan item 6 specified. And
+the raw toplevel's `systemd-boot` builder carries `bootctl install/update` with
+`--graceful --no-variables`, which is plan item 5 in the built artifact rather
+than in the source that was supposed to produce it.
+
+So the build-and-distribute half of OTA is live-proven, and what is left needs the
+box: the reflash, then apply, reboot, and rollback. `configurationLimit` is in the
+source but was NOT confirmed in the artifact here; it is passed into the builder
+rather than baked into the file that was read, so it stays unproven.
+
+The reusable part: "blocked on hardware" is a claim like any other, and the
+machine you are already using for something else may be able to test it.

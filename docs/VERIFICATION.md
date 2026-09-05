@@ -40,6 +40,10 @@ makes this worth more than another feature.
 | Screen recording produces a real mp4 at the rate it captured | `hart desktop record`, measured -0.6% timeline drift over 4s | 2026-07-27 |
 | Constitutional rules are enumerable without running anything | `security/hive_guardrails.py`, `CONSTITUTIONAL_RULES` frozen tuple, 13 guardrail classes | 2026-07-27 |
 | The hive weights a Pi and a GPU rack equally at equal participation | `federated_aggregator.py:642`, `log1p(interactions)`, no tier multiplier | 2026-07-27 |
+| The fleet binary cache serves signed HART system closures | `hart-nix-cache` on deepbox:8093, 5,575 signed paths / 12G, 57 `nixos-system-hart-node` toplevels, newest 11:37 | 2026-09-05, live |
+| An OTA-applied generation would mount a raw-flashed disk | 28 of those 57 toplevels mount `/` by `hart-root` and `/boot` by `HART-ESP`; 0 carry per-rev labels. Read out of the cache: toplevel -> `-etc` -> `-etc-fstab`, zstd-decompressed | 2026-09-05, live |
+| Both the ISO and the raw config reach the cache each run | The 57 arrive in 28 raw + 29 other pairs 1-2 min apart, which is `nix-build-matrix.yml`'s `cfgs="hart-desktop hart-desktop-raw"` loop | 2026-09-05, live |
+| The raw generation registers its own boot entry | its `systemd-boot` builder carries `bootctl install/update` with `--graceful --no-variables` | 2026-09-05, live |
 
 ## Unverified
 
