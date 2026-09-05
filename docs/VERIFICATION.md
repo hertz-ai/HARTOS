@@ -44,6 +44,13 @@ makes this worth more than another feature.
 | An OTA-applied generation would mount a raw-flashed disk | 28 of those 57 toplevels mount `/` by `hart-root` and `/boot` by `HART-ESP`; 0 carry per-rev labels. Read out of the cache: toplevel -> `-etc` -> `-etc-fstab`, zstd-decompressed | 2026-09-05, live |
 | Both the ISO and the raw config reach the cache each run | The 57 arrive in 28 raw + 29 other pairs 1-2 min apart, which is `nix-build-matrix.yml`'s `cfgs="hart-desktop hart-desktop-raw"` loop | 2026-09-05, live |
 | The raw generation registers its own boot entry | its `systemd-boot` builder carries `bootctl install/update` with `--graceful --no-variables` | 2026-09-05, live |
+| Two nodes form an ENCRYPTED PeerLink and messages cross it | `tests/standalone/peer_link_proof.py`, 11/11: upgrade in 1.92s, `encrypted=True`, server `active_links=1`, a gossip message reaches a handler on the far side | 2026-09-05, pass |
+| A second node makes shard fan-out stop running single-node | same run, step 6: `hive_benchmark_prover._discover_nodes()` returns 2 nodes, 1 `type=peer_link` | 2026-09-05, pass |
+| SAME_USER trust is grantable, so skill broadcast has a path | same run, steps 9 to 11: both sides grant `same_user`, and `federation.recipe_delta` (what `skill_exporter` publishes) arrives on the peer | 2026-09-05, pass |
+| A node ACCEPTS a peer's signed announce and counts it | `tests/standalone/two_node_collaboration.py`: `accepted=True is_new=True`, B's own census reports 2 nodes with one `local=False` | 2026-09-05, pass |
+| A learning delta produced on A is merged and counted by B | same run, step 4: delta accepted, read back FROM B rather than inferred from A's 200 | 2026-09-05, pass |
+| A hive node bootstraps a newcomer better than a solo node | `tests/standalone/network_beats_solo_proof.py`: joiner inherits 2 community-validated heuristics pooled from 3 peers; the solo node hands over `{}` | 2026-09-05, pass |
+| The experiment lifecycle advances on its own schedule without inventing outcomes | `tests/standalone/experiment_lifecycle_proof.py` 9/9, `decided` rows stay 0 | 2026-09-05, pass |
 
 ## Unverified
 

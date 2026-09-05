@@ -217,6 +217,12 @@ waitress==2.1.2
 # singletons (EventBus, ResourceGovernor, agent_daemon, watchdog) are
 # sharded for fork-safety.  Waitress kept above as a fallback path.
 hypercorn==0.17.3
+# A DEV BOX needs this too, not only the image. Without it
+# tests/standalone/peer_link_proof.py cannot start its second node at all
+# (`No module named 'hypercorn'`), so the one harness that proves an inbound
+# PeerLink forms looks like an environment failure rather than a result.
+# Verified 2026-09-05: with the pinned subtree below installed, that proof
+# passes 11/11 on Windows.
 # hypercorn's own dependency subtree, listed EXPLICITLY because the root
 # ./Dockerfile installs with `pip install --no-deps -r requirements.txt`
 # (Dockerfile:56).  Under --no-deps pip resolves nothing, so anything not named
