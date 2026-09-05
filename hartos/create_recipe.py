@@ -3935,7 +3935,17 @@ def create_action_with_ledger(actions: List[Dict], user_id: int, prompt_id: int,
     if user_prompt not in user_ledgers:
         current_app.logger.info(f"Creating new Smart Ledger for {user_prompt}")
         backend = get_production_backend()  # Tries Redis, falls back to JSON (already imported from agent_ledger)
-        ledger = create_ledger_from_actions(user_id, prompt_id, actions,
+        # BY KEYWORD — see the matching comment in
+        # reuse_recipe.create_agents_for_user.  Positionally this bound
+        # user_id -> agent_id and prompt_id -> session_id, which pinned the
+        # ledger identity to SmartLedger(user_id, prompt_id) for CREATE and
+        # REUSE alike (one shared, ever-growing ledger) and made the session
+        # resolution block at core.py:3884 unreachable.  Keywords restore
+        # agent_id == str(prompt_id) and let the default
+        # resume_if_unfinished=True resume a real in-flight build
+        # ("[RESUME] Resumed at Flow 3, Action 6") or mint a fresh session.
+        ledger = create_ledger_from_actions(user_id=user_id, prompt_id=prompt_id,
+                                            actions=actions,
                                             backend=backend, flow_id=flow_id)
         user_ledgers[user_prompt] = ledger
 

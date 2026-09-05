@@ -1090,33 +1090,42 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         #   prompt_id → session_id → flow_id → action_id.
         # Recipe filename ``{prompt_id}_{role_number}_recipe.json``
         # carries the same number; the two stay in lockstep.
-        # ``resume_if_unfinished=False``: a REUSE run gets its OWN session.
-        # The default (True) scans agent_data/ and attaches to any session for
-        # this (user_id, prompt_id) still holding a non-terminal task, which
-        # for reuse means attaching to the session CREATE just built — and
-        # inheriting its terminal action states.  The ledger then refuses every
-        # transition ("Cannot transition from terminal state COMPLETED",
-        # core.py:624 — correct: terminal means terminal) and the action can
-        # never advance.  Measured live 2026-09-05 on Scout2 (77712340019, a
-        # 2-action recipe): the "new" reuse ledger came back holding 77 tasks
-        # with action 1 already COMPLETED, its requires_breakdown subtasks were
-        # persisted but the parent could not be BLOCKED, and the run wedged.
-        # Daemon agent 43104584497 showed the same wall — current_action_id 1
-        # read 52 times across an hour, action 2 never reached.
+        # Pass user_id/prompt_id BY KEYWORD.  The signature is
+        # ``create_ledger_from_actions(agent_id, session_id, actions, ...)``,
+        # so the positional form this used to use bound user_id -> agent_id
+        # and prompt_id -> SESSION_ID.  Two consequences, both measured live
+        # 2026-09-05 on Scout2 (77712340019, a 2-action recipe):
         #
-        # This is the ledger half of the same defect clear_action_states fixes
-        # for the in-memory half (see L1079 and lifecycle_hooks): CREATE leaves
-        # BOTH stores terminal, so resetting only one is vacuous.  CREATE keeps
-        # the default — resuming its own in-flight build is a real feature
-        # there ("[RESUME] Resumed at Flow 3, Action 6").
-        ledger = create_ledger_from_actions(user_id, prompt_id, role_actions,
-                                            backend=backend, flow_id=role_number,
-                                            resume_if_unfinished=False)
+        #   * session_id was never None, so the whole session-resolution block
+        #     (core.py:3884 — resume an in-flight session, else mint a fresh
+        #     f"{user_id}_{prompt_id}_{ts_ms}") was unreachable, and with it
+        #     ``resume_if_unfinished`` in either direction.  Dead code in
+        #     production; it only ever ran from tests, which pass keywords.
+        #   * create_recipe used the identical positional form, so CREATE and
+        #     REUSE both constructed SmartLedger(user_id, prompt_id) — the SAME
+        #     ledger — which then accumulated every run's tasks forever.  The
+        #     marker below read "session=77712340019 tasks=77 actions=2": the
+        #     raw prompt_id as the session, holding 75 inherited tasks whose
+        #     terminal statuses blocked every transition ("Cannot transition
+        #     from terminal state COMPLETED", core.py:624 — correct: terminal
+        #     means terminal), so the action never advanced.  Daemon 43104584497
+        #     hit the same wall: current_action_id 1 read 52 times in an hour.
+        #
+        # With keywords, agent_id becomes str(prompt_id) (the documented
+        # ``agent_id == prompt_id`` convention the dashboard's
+        # prompt -> session -> flow -> action grouping depends on) and the
+        # default resume_if_unfinished=True does the right thing for both
+        # callers: resume a genuinely in-flight session, otherwise mint a fresh
+        # timestamped one.  Explicitly passing False would instead pin the
+        # legacy deterministic f"{user_id}_{prompt_id}" — i.e. re-create the
+        # accumulate-forever bug — so it is deliberately NOT passed here.
+        ledger = create_ledger_from_actions(user_id=user_id, prompt_id=prompt_id,
+                                            actions=role_actions,
+                                            backend=backend, flow_id=role_number)
         user_ledgers[user_prompt] = ledger
-        # Measures the line above: a fresh session holds one task per recipe
-        # action.  When reuse was attaching to CREATE's session this read
-        # "tasks=77 actions=2" (Scout2, 2026-09-05 18:47) — the inherited
-        # backlog whose COMPLETED action 1 blocked every transition.
+        # Measures the line above: a fresh session carries one task per recipe
+        # action, and its id is NOT the bare prompt_id.  Pre-fix this read
+        # "session=77712340019 tasks=77 actions=2".
         current_app.logger.info(
             f"[REUSE-LEDGER] session={ledger.session_id} "
             f"tasks={len(getattr(ledger, 'tasks', None) or {})} "
