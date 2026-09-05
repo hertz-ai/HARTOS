@@ -229,14 +229,31 @@ class TestCreationToReuseTransition:
         assert recipe_file.exists()
 
         # 3. Update database
-        with patch('hartos.create_recipe.requests.patch') as mock_patch:
+        # `pooled_patch`, not `requests.patch`: create_recipe moved to the pooled
+        # HTTP helpers (core.http_pool) and has no module-level `requests` any
+        # more, so the old target raised AttributeError inside patch() before the
+        # body ever ran. Patch fails loudly, which is why this surfaced as a red
+        # file rather than as a silent no-op.
+        with patch('hartos.create_recipe.pooled_patch') as mock_patch:
             mock_patch.return_value.status_code = 200
 
             from hartos.create_recipe import update_agent_creation_to_db
+            # The cloud push after the PATCH is best-effort and may raise on a
+            # box with no sync configured; the DB update itself is what this
+            # step is about.
             try:
                 update_agent_creation_to_db(test_prompt_id)
             except Exception:
                 pass
+
+        # Assert it actually happened. The old form swallowed everything and
+        # checked nothing, so it would have passed even with the PATCH never
+        # issued -- which is exactly what it had been doing.
+        assert mock_patch.called, (
+            'update_agent_creation_to_db issued no PATCH')
+        assert str(test_prompt_id) in mock_patch.call_args[0][0], (
+            'the PATCH did not carry the prompt_id: %r'
+            % (mock_patch.call_args[0][0],))
 
     def test_recipe_persistence_across_modes(self, test_user_id, test_prompt_id, tmp_path):
         """Test recipe persists from creation to reuse mode"""
