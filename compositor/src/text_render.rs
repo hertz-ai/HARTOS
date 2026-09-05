@@ -33,6 +33,9 @@ struct RunKey {
     w: u32,
     h: u32,
     color: u32,
+    /// Outline width in px, as bits. Part of the identity because a stroked run and a
+    /// filled one are different pictures of the same string.
+    stroke_bits: u32,
 }
 
 /// The most runs kept alive at once.
@@ -46,6 +49,42 @@ struct RunKey {
 ///
 /// A live desktop shows a few dozen runs, so this is a wide margin around normal use.
 const MAX_CACHED_RUNS: usize = 256;
+
+/// Grow an alpha mask by `r` px, as a separable max filter: horizontal then vertical.
+///
+/// Separable because a square max is the composition of two line maxes, which turns the
+/// cost from r squared per pixel into 2r. The mask is small (one run's box) and this runs
+/// only on a cache miss, but a 116px numeral with a 3px stroke is still a quarter of a
+/// million comparisons the naive form would do four times over.
+fn dilate(mask: &[u8], w: u32, h: u32, r: u32) -> Vec<u8> {
+    let (wi, hi) = (w as usize, h as usize);
+    let r = r as usize;
+    let mut horizontal = vec![0u8; wi * hi];
+    for y in 0..hi {
+        for x in 0..wi {
+            let lo = x.saturating_sub(r);
+            let hi_x = (x + r).min(wi.saturating_sub(1));
+            let mut m = 0u8;
+            for k in lo..=hi_x {
+                m = m.max(mask[y * wi + k]);
+            }
+            horizontal[y * wi + x] = m;
+        }
+    }
+    let mut out = vec![0u8; wi * hi];
+    for y in 0..hi {
+        let lo = y.saturating_sub(r);
+        let hi_y = (y + r).min(hi.saturating_sub(1));
+        for x in 0..wi {
+            let mut m = 0u8;
+            for k in lo..=hi_y {
+                m = m.max(horizontal[k * wi + x]);
+            }
+            out[y * wi + x] = m;
+        }
+    }
+    out
+}
 
 fn pack_color(c: [f32; 4]) -> u32 {
     let b = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u32;
@@ -131,6 +170,7 @@ impl TextRasterizer {
         w: i32,
         h: i32,
         color: [f32; 4],
+        stroke_px: f32,
     ) -> &MemoryRenderBuffer {
         let wi = w.max(1) as u32;
         let hi = h.max(1) as u32;
@@ -140,6 +180,7 @@ impl TextRasterizer {
             w: wi,
             h: hi,
             color: pack_color(color),
+            stroke_bits: stroke_px.max(0.0).to_bits(),
         };
         if !self.cache.contains_key(&key) {
             // Dropped wholesale rather than evicted one at a time. A run that has fallen
@@ -150,7 +191,7 @@ impl TextRasterizer {
             if self.cache.len() >= MAX_CACHED_RUNS {
                 self.cache.clear();
             }
-            let buf = self.compose(text, size_px, wi, hi, color);
+            let buf = self.compose(text, size_px, wi, hi, color, stroke_px);
             self.cache.insert(key.clone(), buf);
             self.composes += 1;
         }
@@ -161,7 +202,7 @@ impl TextRasterizer {
     /// The actual compose: shape the run, draw its glyph coverage into a
     /// premultiplied-ARGB byte buffer (B,G,R,A little-endian, matching bloom.rs), and
     /// wrap it as a `MemoryRenderBuffer`.
-    fn compose(&mut self, text: &str, size_px: f32, wi: u32, hi: u32, color: [f32; 4]) -> MemoryRenderBuffer {
+    fn compose(&mut self, text: &str, size_px: f32, wi: u32, hi: u32, color: [f32; 4], stroke_px: f32) -> MemoryRenderBuffer {
         let mut rgba = vec![0u8; (wi * hi * 4) as usize];
 
         // cosmic-text's shaper PANICS when the font database is empty (no face to fall
@@ -195,6 +236,62 @@ impl TextRasterizer {
             (color[2].clamp(0.0, 1.0) * 255.0) as u8,
             (color[3].clamp(0.0, 1.0) * 255.0) as u8,
         );
+
+        // A STROKED run is a different picture, so it takes a different pass: gather the
+        // glyph's coverage into a mask, grow it, and subtract the original so the middle
+        // stays hollow. That is what an outline IS. Filling the glyph at low alpha would
+        // look like a faded numeral, not a hollow one, which is the difference between
+        // parity and a lookalike.
+        if stroke_px > 0.0 {
+            let mut mask = vec![0u8; (wi * hi) as usize];
+            buffer.draw(
+                &mut self.font_system,
+                &mut self.swash_cache,
+                ct_color,
+                |gx, gy, gw, gh, gc| {
+                    let a = gc.a();
+                    if a == 0 {
+                        return;
+                    }
+                    for row in 0..gh as i32 {
+                        let py = gy + row;
+                        if py < 0 || py >= hi as i32 {
+                            continue;
+                        }
+                        for col in 0..gw as i32 {
+                            let px = gx + col;
+                            if px < 0 || px >= wi as i32 {
+                                continue;
+                            }
+                            let i = (py as u32 * wi + px as u32) as usize;
+                            mask[i] = mask[i].max(a);
+                        }
+                    }
+                },
+            );
+            let grown = dilate(&mask, wi, hi, stroke_px.round().max(1.0) as u32);
+            for i in 0..(wi * hi) as usize {
+                // Outside the glyph only: grown minus original leaves the band.
+                let a = grown[i].saturating_sub(mask[i]) as u32;
+                if a == 0 {
+                    continue;
+                }
+                let a = a * (color[3].clamp(0.0, 1.0) * 255.0) as u32 / 255;
+                let idx = i * 4;
+                rgba[idx] = ((color[2].clamp(0.0, 1.0) * 255.0) as u32 * a / 255) as u8;
+                rgba[idx + 1] = ((color[1].clamp(0.0, 1.0) * 255.0) as u32 * a / 255) as u8;
+                rgba[idx + 2] = ((color[0].clamp(0.0, 1.0) * 255.0) as u32 * a / 255) as u8;
+                rgba[idx + 3] = a as u8;
+            }
+            return MemoryRenderBuffer::from_slice(
+                &rgba,
+                Fourcc::Argb8888,
+                (wi as i32, hi as i32),
+                1,
+                Transform::Normal,
+                None,
+            );
+        }
 
         buffer.draw(
             &mut self.font_system,
@@ -290,10 +387,44 @@ mod tests {
             w,
             h,
             color: 0,
+            stroke_bits: 0,
         };
         assert_eq!(mk("hi", 14.0, 10, 10), mk("hi", 14.0, 10, 10));
         assert_ne!(mk("hi", 14.0, 10, 10), mk("hi", 15.0, 10, 10));
         assert_ne!(mk("hi", 14.0, 10, 10), mk("hi", 14.0, 20, 10));
+    }
+
+    #[test]
+    fn dilate_grows_a_mark_by_the_radius_and_leaves_empty_masks_empty() {
+        // 5x5, one lit pixel in the middle. Growing by 1 must light the 3x3 around it and
+        // nothing further, which is the property the outline width depends on.
+        let mut mask = vec![0u8; 25];
+        mask[12] = 200;
+        let g = dilate(&mask, 5, 5, 1);
+        for y in 0..5usize {
+            for x in 0..5usize {
+                let near = y.abs_diff(2) <= 1 && x.abs_diff(2) <= 1;
+                assert_eq!(g[y * 5 + x] > 0, near, "pixel {x},{y} grew wrong");
+            }
+        }
+        // Radius 2 reaches the corners of a 5x5; an empty mask stays empty at any radius.
+        assert!(dilate(&mask, 5, 5, 2).iter().all(|v| *v > 0));
+        assert!(dilate(&vec![0u8; 25], 5, 5, 3).iter().all(|v| *v == 0));
+    }
+
+    #[test]
+    fn a_stroked_run_is_a_different_cached_picture_from_a_filled_one() {
+        // The stroke is part of the run's identity. Without that, asking for an outline
+        // after a fill of the same string would hand back the fill.
+        let mut r = TextRasterizer::new();
+        let white = [1.0, 1.0, 1.0, 1.0];
+        let before = r.composes();
+        let _ = r.rasterize("7", 40.0, 60, 60, white, 0.0);
+        let _ = r.rasterize("7", 40.0, 60, 60, white, 3.0);
+        assert_eq!(r.composes(), before + 2, "fill and outline compose separately");
+        // And each is still cached in its own right.
+        let _ = r.rasterize("7", 40.0, 60, 60, white, 3.0);
+        assert_eq!(r.composes(), before + 2, "the outline is cached like any run");
     }
 
     #[test]
@@ -304,7 +435,7 @@ mod tests {
         let mut r = TextRasterizer::new();
         let white = [1.0, 1.0, 1.0, 1.0];
         for i in 0..(MAX_CACHED_RUNS * 3) {
-            let _ = r.rasterize(&format!("earned ${i} overnight"), 12.0, 24, 14, white);
+            let _ = r.rasterize(&format!("earned ${i} overnight"), 12.0, 24, 14, white, 0.0);
         }
         assert!(
             r.cached_runs() <= MAX_CACHED_RUNS,
@@ -315,9 +446,9 @@ mod tests {
 
         // And it is still a cache after a sweep: a run asked for twice composes once.
         let before = r.composes();
-        let _ = r.rasterize("steady", 12.0, 24, 14, white);
+        let _ = r.rasterize("steady", 12.0, 24, 14, white, 0.0);
         let after_first = r.composes();
-        let _ = r.rasterize("steady", 12.0, 24, 14, white);
+        let _ = r.rasterize("steady", 12.0, 24, 14, white, 0.0);
         assert_eq!(after_first, before + 1, "the first ask composes");
         assert_eq!(r.composes(), after_first, "the second ask must hit the cache");
     }

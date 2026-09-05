@@ -165,14 +165,6 @@ impl TextMeasure for MonoMeasure {
     }
 }
 
-/// Horizontal text alignment inside a `Text` node's rect.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum TextAlign {
-    Left,
-    Center,
-    Right,
-}
-
 /// The resolved shell palette for one compose. Colours are handed IN (resolved from
 /// the `mood`/HART_PALETTES id by the same owner the HTML shell uses), so this struct
 /// is a parameter, never a second palette table. Field names are roles, not hues, so
@@ -199,6 +191,9 @@ pub struct Theme {
     pub live_dot: Color,
     /// The translucent ground a live tag sits on, dark enough to read over card art.
     pub chip_bg: Color,
+    /// The leaderboard rank numeral's outline. Faint on purpose: it sits BEHIND the card's
+    /// own content and must read as a watermark, not compete with it.
+    pub rank_ink: Color,
     /// The brand SPECTRUM, in the shell's own order (teal, cyan, blue, violet, magenta,
     /// amber). A row names one of these and its note and its cards' progress bars take
     /// that hue, which is what stops a stack of rows reading flat. The names stay wire
@@ -270,6 +265,8 @@ impl Theme {
             on_accent_ink: palette("#04140F", Color::rgba(0.0, 0.0, 0.0, 1.0)),
             live_dot: palette("#FF2E9A", Color::rgba(0.5, 0.5, 0.5, 1.0)),
             chip_bg: Color::rgba(0.031, 0.047, 0.078, 0.72),
+            // rgba(255,255,255,0.30), the shell's own -webkit-text-stroke colour.
+            rank_ink: Color::rgba(1.0, 1.0, 1.0, 0.30),
             // hartBrandArt's SPECTRUM_HEX, in its order.
             spectrum: [
                 teal,
@@ -320,6 +317,7 @@ impl HomeCompose {
             rows: vec![
                 Row {
                     title: "Continue".to_string(),
+                    ranked: false,
                     accent: Some("cyan".to_string()),
                     note: Some("picked up where you left off".to_string()),
                     see_all: Some("panel:continue".to_string()),
@@ -355,6 +353,7 @@ impl HomeCompose {
                 },
                 Row {
                     title: "For you".to_string(),
+                    ranked: true,
                     accent: Some("amber".to_string()),
                     note: None,
                     see_all: None,
@@ -422,6 +421,9 @@ pub struct Row {
     pub title: String,
     /// A short qualifier the shell draws beside the label (`row.note`).
     pub note: Option<String>,
+    /// The hive leaderboard treatment (`row.ranked`): cards drop their tile and carry a
+    /// big outlined rank numeral instead.
+    pub ranked: bool,
     /// The row's spectrum accent NAME (`row.accent`), kept as the wire string and
     /// resolved by the theme, the same way `mood` is. Absent means rotate by position.
     pub accent: Option<String>,
@@ -485,7 +487,19 @@ pub enum SceneNode {
         text: String,
         size_px: f32,
         color: Color,
-        align: TextAlign,
+        /// Outline width in px; 0.0 fills the glyph, which is every run but one.
+        ///
+        /// The shell draws the hive leaderboard's rank numeral as OUTLINED text
+        /// (`color: transparent` plus a 3px `-webkit-text-stroke`), and coverage
+        /// compositing cannot express that: a filled glyph at low alpha is a different
+        /// thing, not a cheaper one. So the scene says what it wants and the rasterizer
+        /// renders it, rather than the layout approximating.
+        ///
+        /// This field replaced `align`, which was written at every construction and read
+        /// nowhere: neither the lowering nor the rasterizer ever looked at it, because
+        /// layout aligns by computing x now that it can measure. A field written twenty
+        /// times and read zero is not a contract, it is weight.
+        stroke: f32,
     },
     Image {
         rect: Rect,
@@ -733,6 +747,9 @@ const CARD_LIVE_GAP: f32 = 6.0;
 /// The shell's `.hh-card-ic`: a 34px rounded tile holding a 20px glyph.
 const CARD_ICON_BOX: f32 = 34.0;
 const CARD_ICON_PX: f32 = 20.0;
+/// `.hh-rank-num`: a 116px numeral with a 3px stroke, overhanging its card.
+const RANK_PX: f32 = 116.0;
+const RANK_STROKE: f32 = 3.0;
 
 /// Build the home-desktop scene for an output of `output_w` x `output_h` LOGICAL px.
 /// The layout is the checklist's a2 canvas: a fixed 40px top bar, a hero with the orb
@@ -786,7 +803,7 @@ pub fn layout_home(
         text: "HART".to_string(),
         size_px: WORDMARK_PX,
         color: theme.accent,
-        align: TextAlign::Left,
+        stroke: 0.0,
     });
     bar_children.push(SceneNode::Text {
         rect: Rect::new(
@@ -798,7 +815,7 @@ pub fn layout_home(
         text: "OS".to_string(),
         size_px: WORDMARK_PX,
         color: theme.accent2,
-        align: TextAlign::Left,
+        stroke: 0.0,
     });
 
     // ── Nav tabs (P5): the shell's five primary destinations, each sized to its own
@@ -837,7 +854,7 @@ pub fn layout_home(
             } else {
                 theme.omnibox_ink
             },
-            align: TextAlign::Left,
+            stroke: 0.0,
         });
         tab_x += slot + TAB_GAP;
     }
@@ -859,7 +876,7 @@ pub fn layout_home(
             text: OMNIBOX_GLYPH.to_string(),
             size_px: OMNIBOX_PX,
             color: theme.omnibox_ink,
-            align: TextAlign::Left,
+            stroke: 0.0,
         });
         pill_x += gw + 8.0;
     }
@@ -873,7 +890,7 @@ pub fn layout_home(
         text: "Ask or search anything".to_string(),
         size_px: 14.0,
         color: theme.omnibox_ink,
-        align: TextAlign::Left,
+        stroke: 0.0,
     });
     let kbd_w = measure.text_width(OMNIBOX_KBD, KBD_PX);
     let kbd_x = pill.right() - 12.0 - kbd_w;
@@ -888,7 +905,7 @@ pub fn layout_home(
             text: OMNIBOX_KBD.to_string(),
             size_px: KBD_PX,
             color: theme.omnibox_ink,
-            align: TextAlign::Left,
+            stroke: 0.0,
         });
     }
 
@@ -913,7 +930,7 @@ pub fn layout_home(
                 text: (*glyph).to_string(),
                 size_px: TRAY_PX,
                 color: theme.omnibox_ink,
-                align: TextAlign::Left,
+                stroke: 0.0,
             });
             right_x -= TRAY_GAP;
         }
@@ -938,7 +955,7 @@ pub fn layout_home(
         text: AVATAR_INITIAL.to_string(),
         size_px: AVATAR_PX,
         color: theme.bar_ink,
-        align: TextAlign::Left,
+        stroke: 0.0,
     });
     right_x -= TRAY_GAP;
 
@@ -975,7 +992,7 @@ pub fn layout_home(
             text: home.hero.eyebrow.clone(),
             size_px: HERO_EYEBROW_PX,
             color: theme.hero_copy,
-            align: TextAlign::Left,
+            stroke: 0.0,
         });
         hero_y += HERO_EYEBROW_PX * 1.6;
     }
@@ -990,7 +1007,7 @@ pub fn layout_home(
             text: figure,
             size_px: HERO_AMOUNT_PX,
             color: theme.hero_title,
-            align: TextAlign::Left,
+            stroke: 0.0,
         });
         let unit = if home.hero.amount_unit.is_empty() {
             HERO_UNIT_FALLBACK
@@ -1010,7 +1027,7 @@ pub fn layout_home(
             text: unit.to_string(),
             size_px: HERO_UNIT_PX,
             color: theme.accent,
-            align: TextAlign::Left,
+            stroke: 0.0,
         });
         hero_y += HERO_AMOUNT_PX * 1.35;
     }
@@ -1046,7 +1063,7 @@ pub fn layout_home(
             text: strip.join(" · "),
             size_px: HERO_META_PX,
             color: theme.hero_copy,
-            align: TextAlign::Left,
+            stroke: 0.0,
         });
         hero_y += HERO_META_PX * 1.9;
     }
@@ -1080,7 +1097,7 @@ pub fn layout_home(
             } else {
                 theme.card_ink
             },
-            align: TextAlign::Left,
+            stroke: 0.0,
         });
         cta_x += bw + 10.0;
     }
@@ -1112,7 +1129,7 @@ pub fn layout_home(
             text: row.title.clone(),
             size_px: ROW_LABEL_PX,
             color: theme.card_ink,
-            align: TextAlign::Left,
+            stroke: 0.0,
         });
         if let Some(note) = &row.note {
             let note_w = measure.text_width(note, ROW_NOTE_PX);
@@ -1123,7 +1140,7 @@ pub fn layout_home(
                     text: note.clone(),
                     size_px: ROW_NOTE_PX,
                     color: row_accent,
-                    align: TextAlign::Left,
+                    stroke: 0.0,
                 });
             }
         }
@@ -1138,22 +1155,50 @@ pub fn layout_home(
                     text: SEE_ALL.to_string(),
                     size_px: ROW_NOTE_PX,
                     color: theme.accent,
-                    align: TextAlign::Left,
+                    stroke: 0.0,
                 });
             }
         }
         let cards_y = cursor_y + ROW_LABEL_H;
         let mut card_x = content.x;
-        for card in row.cards.iter() {
+        for (card_index, card) in row.cards.iter().enumerate() {
             if card_x + CARD_W > content.right() {
                 break;
             }
             let cr = Rect::new(card_x, cards_y, CARD_W, CARD_H);
+            // A ranked card has NO tile: `.hh-card.hh-ranked` is background:transparent,
+            // border:none, so the numeral and the art are the whole card. It still needs a
+            // first-child Rect to be a hover target (see `hover_leaf`), so it gets a fully
+            // transparent one rather than a special case in the hit test.
             let mut card_children = vec![SceneNode::Rect {
                 rect: cr,
-                color: theme.card_bg,
+                color: if row.ranked {
+                    Color::TRANSPARENT
+                } else {
+                    theme.card_bg
+                },
                 radius: 12.0,
             }];
+            if row.ranked {
+                // The rank numeral, overhanging the card's bottom-left exactly as the
+                // shell places it, drawn as an OUTLINE because that is what the shell
+                // draws: transparent fill, 3px stroke. Its own box, not the card's, so a
+                // two-digit rank is not clipped at ten.
+                let label = (card_index + 1).to_string();
+                let nw = measure.text_width(&label, RANK_PX);
+                card_children.push(SceneNode::Text {
+                    rect: Rect::new(
+                        cr.x - 6.0,
+                        cr.bottom() + 14.0 - RANK_PX * 1.3,
+                        nw.ceil() + 2.0,
+                        RANK_PX * 1.3,
+                    ),
+                    text: label,
+                    size_px: RANK_PX,
+                    color: theme.rank_ink,
+                    stroke: RANK_STROKE,
+                });
+            }
             if let Some(src) = &card.image {
                 card_children.push(SceneNode::Image {
                     rect: cr,
@@ -1183,7 +1228,7 @@ pub fn layout_home(
                     text: name.clone(),
                     size_px: CARD_ICON_PX,
                     color: theme.card_ink,
-                    align: TextAlign::Left,
+                    stroke: 0.0,
                 });
             }
 
@@ -1241,7 +1286,7 @@ pub fn layout_home(
                     } else {
                         theme.on_accent_ink
                     },
-                    align: TextAlign::Left,
+                    stroke: 0.0,
                 });
             }
 
@@ -1260,7 +1305,7 @@ pub fn layout_home(
                 text: card.title.clone(),
                 size_px: 14.0,
                 color: theme.card_ink,
-                align: TextAlign::Left,
+                stroke: 0.0,
             });
             if let Some(meta) = &card.meta {
                 card_children.push(SceneNode::Text {
@@ -1268,7 +1313,7 @@ pub fn layout_home(
                     text: meta.clone(),
                     size_px: 12.0,
                     color: theme.hero_copy,
-                    align: TextAlign::Left,
+                    stroke: 0.0,
                 });
             }
             if let Some(p) = card.progress {
@@ -1472,6 +1517,7 @@ pub fn decode_home_compose(v: &serde_json::Value) -> HomeCompose {
                 // row.note / row.see_all); the native scene was simply dropping them.
                 // An empty string is treated as absent, so a blank field cannot produce
                 // a See-all that opens nothing.
+                ranked: r.get("ranked").and_then(Value::as_bool).unwrap_or(false),
                 accent: r
                     .get("accent")
                     .and_then(Value::as_str)
@@ -1519,6 +1565,7 @@ mod tests {
             rows: vec![
                 Row {
                     title: "Continue".into(),
+                    ranked: false,
                     accent: Some("magenta".into()),
                     note: Some("3 in progress".into()),
                     see_all: Some("panel:continue".into()),
@@ -1545,6 +1592,7 @@ mod tests {
                 },
                 Row {
                     title: "For you".into(),
+                    ranked: true,
                     accent: None,
                     note: None,
                     see_all: None,
@@ -2305,6 +2353,70 @@ mod tests {
             }
         });
         assert_eq!(seen, 0, "art supersedes the icon");
+    }
+
+    #[test]
+    fn a_ranked_row_drops_the_tile_and_numbers_its_cards() {
+        let theme = Theme::cosmic_default();
+        let root = layout_home(1600.0, 900.0, &sample(), &theme, &mut MonoMeasure);
+        // The sample's SECOND row is the ranked one.
+        let mut rows: Vec<Vec<SceneNode>> = Vec::new();
+        if let SceneNode::Container { children, .. } = &root {
+            for c in children {
+                if let SceneNode::Container {
+                    interactive: true,
+                    children,
+                    ..
+                } = c
+                {
+                    rows.push(children.clone());
+                }
+            }
+        }
+        // Ranked cards carry a numeral; unranked ones do not.
+        let numerals: Vec<(String, Rect, f32)> = rows
+            .iter()
+            .flatten()
+            .filter_map(|n| match n {
+                SceneNode::Text {
+                    rect, text, stroke, ..
+                } if *stroke > 0.0 => Some((text.clone(), *rect, *stroke)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(numerals.len(), 1, "one ranked card in the sample, so one numeral");
+        assert_eq!(numerals[0].0, "1", "ranks are 1-based");
+        assert_eq!(numerals[0].2, RANK_STROKE, "drawn as an outline, not a fill");
+
+        // The ranked card's tile is transparent: the numeral and the art ARE the card.
+        // It still has a background rect so it stays a hover target.
+        let ranked_bg = rows
+            .iter()
+            .find(|leaves| {
+                leaves
+                    .iter()
+                    .any(|n| matches!(n, SceneNode::Text { stroke, .. } if *stroke > 0.0))
+            })
+            .and_then(|leaves| leaves.first())
+            .expect("the ranked card");
+        match ranked_bg {
+            SceneNode::Rect { color, .. } => assert_eq!(*color, Color::TRANSPARENT),
+            other => panic!("a card must lead with its background rect, got {other:?}"),
+        }
+        // An unranked card keeps its tile.
+        let plain_bg = rows
+            .iter()
+            .find(|leaves| {
+                !leaves
+                    .iter()
+                    .any(|n| matches!(n, SceneNode::Text { stroke, .. } if *stroke > 0.0))
+            })
+            .and_then(|leaves| leaves.first())
+            .expect("an unranked card");
+        match plain_bg {
+            SceneNode::Rect { color, .. } => assert_eq!(*color, theme.card_bg),
+            other => panic!("expected a tile, got {other:?}"),
+        }
     }
 
     #[test]

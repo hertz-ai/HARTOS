@@ -2389,7 +2389,7 @@ where
                 text,
                 size_px,
                 color,
-                ..
+                stroke,
             } => {
                 if rect.w < 1.0 || rect.h < 1.0 || text.is_empty() {
                     return;
@@ -2400,6 +2400,7 @@ where
                     rect.w as i32,
                     rect.h as i32,
                     [color.r, color.g, color.b, color.a],
+                    *stroke,
                 );
                 let origin: Point<f64, Physical> = Point::from((rect.x as f64, rect.y as f64));
                 match MemoryRenderBufferRenderElement::from_buffer(
