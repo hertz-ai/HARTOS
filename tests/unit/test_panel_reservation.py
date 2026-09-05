@@ -674,3 +674,42 @@ def test_the_compositor_mirrors_the_shells_own_potato_verdict():
     assert declared >= 1, (
         "no shipped theme declares perf.%s any more, so the tier is unreachable "
         "and the mirror is guarding nothing" % key)
+
+def test_the_large_cursor_toggle_reaches_the_arrow_the_compositor_draws():
+    """A setting the product OFFERS, stores, and wires through NixOS, which had
+    no effect on the one thing it names.
+
+    hart-accessibility.nix sets `XCURSOR_SIZE` when largeCursor is on, which is
+    the standard every CLIENT already speaks. The compositor draws the DESKTOP's
+    cursor from a polygon authored in a fixed 24-unit space, so turning Large
+    Cursor on grew every cursor except the one the user looks at most.
+
+    Pinned across the three files it spans, because agreeing in two of them is
+    what it did before: the shell offers the toggle, nix exports the variable,
+    the compositor reads it.
+    """
+    nix = open(os.path.join(REPO, "nixos", "modules", "hart-accessibility.nix"),
+               encoding="utf-8").read()
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+    service = open(SERVICE_SRC, encoding="utf-8").read()
+
+    assert "'large_cursor'" in service, (
+        "the shell no longer offers the Large Cursor toggle")
+    m = re.search(r"largeCursor \{[^}]*?XCURSOR_SIZE = \"(\d+)\"", nix, re.S)
+    assert m, (
+        "hart-accessibility.nix no longer exports XCURSOR_SIZE for largeCursor, "
+        "so the setting reaches nothing at all")
+    assert 'var("XCURSOR_SIZE")' in comp, (
+        "the compositor no longer reads XCURSOR_SIZE, so its own arrow ignores "
+        "the toggle while every client honours it")
+
+    # The exported size must survive the compositor's clamp, or the toggle would
+    # be silently reduced to a size the user did not ask for.
+    c = re.search(r"n\.clamp\((\d+), (\d+)\)", comp)
+    assert c, "the compositor no longer clamps the cursor side"
+    lo, hi = int(c.group(1)), int(c.group(2))
+    size = int(m.group(1))
+    assert lo <= size <= hi, (
+        "nix exports XCURSOR_SIZE=%d but the compositor clamps to [%d, %d], so "
+        "the large cursor would be silently resized" % (size, lo, hi))

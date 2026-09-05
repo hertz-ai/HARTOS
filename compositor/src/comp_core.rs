@@ -3124,16 +3124,52 @@ pub fn process_keyboard_shortcut(
 /// visible cursor renders on llvmpipe with no xcursor theme load. Returns (rgba, width,
 /// height, hotspot). The hotspot is the arrow TIP (top-left).
 pub fn bake_default_cursor() -> (Vec<u8>, i32, i32, Point<i32, Logical>) {
-    const W: i32 = 24;
-    const H: i32 = 24;
+    bake_default_cursor_at(cursor_side())
+}
+
+/// The conventional default cursor size, and the size this arrow's polygon is drawn in.
+const CURSOR_SIDE_DEFAULT: i32 = 24;
+
+/// The cursor side from `XCURSOR_SIZE`, the standard the rest of the desktop already
+/// speaks.
+///
+/// hart-accessibility.nix sets `XCURSOR_SIZE = "48"` when `largeCursor` is on, so a user
+/// who turns Large Cursor on in the shell's own accessibility panel gets a 48px cursor
+/// from every CLIENT that draws its own, and got a 24px one from the compositor, which is
+/// the one that draws the desktop's. The toggle was offered, stored, wired through NixOS,
+/// and had no effect on the arrow the user actually sees on the desktop.
+///
+/// Clamped, because it arrives from the environment: a zero or negative side has no
+/// cursor at all and an enormous one is a full-screen arrow. Anything unparseable keeps
+/// the conventional 24.
+fn cursor_side() -> i32 {
+    std::env::var("XCURSOR_SIZE")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .map(|n| n.clamp(12, 256))
+        .unwrap_or(CURSOR_SIDE_DEFAULT)
+}
+
+/// The arrow baked at an explicit side, so the scaling is testable without touching
+/// process-global environment (cargo runs tests as threads in one process, and an
+/// env-mutating test would race every other test in this module).
+pub fn bake_default_cursor_at(side: i32) -> (Vec<u8>, i32, i32, Point<i32, Logical>) {
+    let side = side.clamp(12, 256);
+    let scale = side as f32 / CURSOR_SIDE_DEFAULT as f32;
+    let (w, h) = (side, side);
+    #[allow(non_snake_case)]
+    let (W, H) = (w, h);
+    // The polygon is authored in the 24-unit space this arrow was drawn in; every vertex
+    // scales with the side so the SHAPE is identical at any size rather than an arrow
+    // sitting in the corner of a bigger buffer.
     let poly: [(f32, f32); 7] = [
         (0.0, 0.0),
-        (0.0, 17.0),
-        (4.0, 13.0),
-        (7.0, 19.0),
-        (10.0, 18.0),
-        (7.0, 12.0),
-        (12.0, 12.0),
+        (0.0, 17.0 * scale),
+        (4.0 * scale, 13.0 * scale),
+        (7.0 * scale, 19.0 * scale),
+        (10.0 * scale, 18.0 * scale),
+        (7.0 * scale, 12.0 * scale),
+        (12.0 * scale, 12.0 * scale),
     ];
     let inside = |px: f32, py: f32| -> bool {
         let mut c = false;
@@ -3894,6 +3930,44 @@ mod tests {
         assert!(a0 <= a_mid && a_mid <= a_end, "fade alpha is monotonic: {a0} {a_mid} {a_end}");
         assert!(a_mid > 0.0 && a_mid < 1.0, "midpoint is strictly mid-ramp: {a_mid}");
         assert_eq!(a_end, 1.0, "at FADE_IN_MS the ramp has reached full opacity");
+    }
+
+    #[test]
+    fn a_large_cursor_setting_actually_grows_the_arrow_the_desktop_draws() {
+        // hart-accessibility.nix sets XCURSOR_SIZE=48 when largeCursor is on, so every
+        // CLIENT that draws its own cursor gets a 48px one. The compositor draws the
+        // desktop's, from a polygon authored in a fixed 24-unit space, so the toggle was
+        // offered in the shell's accessibility panel, stored, wired through NixOS, and
+        // had no effect on the arrow the user actually sees.
+        let (small, sw, sh, s_hot) = bake_default_cursor_at(24);
+        let (big, bw, bh, b_hot) = bake_default_cursor_at(48);
+        assert_eq!((sw, sh), (24, 24));
+        assert_eq!((bw, bh), (48, 48));
+        assert_eq!(big.len(), (bw * bh * 4) as usize);
+        assert_eq!(s_hot, b_hot, "the tip is the hotspot at any size");
+
+        // The SHAPE scales, rather than the same small arrow sitting in a bigger buffer.
+        // Count opaque pixels: at twice the side the arrow covers about four times the
+        // area, so a fixed-size arrow in a 48px buffer would be nowhere near.
+        let opaque = |px: &[u8]| px.chunks_exact(4).filter(|p| p[3] == 255).count();
+        let (a, b) = (opaque(&small), opaque(&big));
+        assert!(a > 0 && b > 0, "both sizes draw something");
+        let ratio = b as f32 / a as f32;
+        assert!(
+            (3.0..5.0).contains(&ratio),
+            "doubling the side should roughly quadruple the ink, got {ratio:.2}x"
+        );
+
+        // The far corner of the big buffer is still empty: an arrow, not a filled square.
+        let last = (bw * bh - 1) as usize * 4;
+        assert_eq!(big[last + 3], 0, "the opposite corner stays transparent");
+
+        // Absurd sides are clamped rather than trusted: this comes from the environment,
+        // and a zero side is no cursor while a huge one is a full-screen arrow.
+        let (_, tiny_w, _, _) = bake_default_cursor_at(0);
+        let (_, huge_w, _, _) = bake_default_cursor_at(100_000);
+        assert!(tiny_w >= 12, "a zero side is clamped up, not drawn");
+        assert!(huge_w <= 256, "an enormous side is clamped down");
     }
 
     #[test]

@@ -1015,3 +1015,35 @@ nothing anywhere and is left alone.
 Worth doing again after any new reader lands. The whole audit is a dozen lines of
 Python over the shipped JSONs, and it is the only thing that can tell a key the
 compositor ignores from a key the compositor cannot parse.
+
+### Large Cursor: a setting the product offered that changed nothing it named
+Sweeping the accessibility file the same way the theme file was swept turned this
+up. `/etc/hart/accessibility.json` carries five settings; the shell acts on two
+(`high_contrast` via a class, `reduced_motion` via a class), `font_scale` reaches
+three CSS tokens, and `large_cursor` reaches NO CSS at all.
+
+It is not dead, though, which is the part that made it worth following:
+hart-accessibility.nix exports `XCURSOR_SIZE = "48"` when it is on. That is the
+standard every CLIENT already speaks, so a user who turned Large Cursor on got a
+48px cursor from every application and a 24px one from the compositor, which draws
+the desktop's own arrow from a polygon authored in a fixed 24-unit space.
+
+So the toggle was offered in the accessibility panel, stored, wired through NixOS,
+honoured by every client, and had no effect on the arrow the user looks at most.
+
+The arrow now bakes at the exported size with its polygon scaled, so the SHAPE is
+identical at any size rather than a small arrow sitting in the corner of a bigger
+buffer, and the hotspot stays the tip. The side is clamped because it arrives from
+the environment: zero is no cursor and an enormous one is a full-screen arrow.
+
+Pinned across all three files it spans, since agreeing in two of them is exactly
+what it did before: the shell offers the toggle, nix exports the variable, the
+compositor reads it. The guard also checks the exported 48 survives the
+compositor's clamp, so the setting cannot be silently reduced to a size the user
+did not ask for.
+
+**Still not mirrored, and now stated: `high_contrast`.** The shell's
+`html.a11y-contrast` overrides four tokens and thickens the glass border to 2px.
+The native scene reads its colours from the theme file rather than from that
+class, so a high-contrast desktop would go native at ordinary contrast. It is the
+same shape as the two settings already mirrored and belongs next.
