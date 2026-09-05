@@ -1334,3 +1334,29 @@ literals, and a struct field declaration stood in for its initialiser.
 All three are the same mistake: prose that DESCRIBES a value is not the value.
 There is now a `_css_strip_comments` used by the shared reader, so the CSS half of
 that class is closed rather than dodged three times.
+
+### The scrim, and the third stop paying for itself
+`.hh-card-scrim`'s comment is one line and it is the entire argument: "Scrim so
+text-over-art always reads. Static gradient, no blur (software-safe)." The native
+scene drew the title, the meta and the chips straight onto the art, so a pale
+photo or a bright brand hue took the text with it. On a desktop whose cards are
+brand-coloured gradients by default, that is not an edge case.
+
+It is `linear-gradient(transparent 32%, rgba(4,7,13,0.78) 100%)`, and the
+three-stop tile added for the chrome floor expresses it EXACTLY rather than
+approximately: `from` and `mid` both fully transparent with `mid_at` at the 32%
+stop, then a ramp to the wash. A flat clear run followed by a ramp is what the CSS
+says, and a two-stop fade from the top would have washed the art it exists to
+protect. The stop that was added for one caller turned out to be the natural
+shape for the next.
+
+**The BASE rule is what is mirrored, not the `body.gpu-hardware` variant.** That
+class means "the WebView composites", which the native path never does, so it gets
+neither class and the base is its value. The guard asserts the negative too: if
+the native scene ever carries the GPU variant's numbers it fails, because agreeing
+with the wrong rule is the same kind of silent wrong as agreeing with none.
+
+The test distinguishes the scrim from the art by what a scrim IS, a wash that
+starts transparent, rather than by its position among a card's children. Two card
+tests had been counting fills to count cards, which stopped meaning that the
+moment a card had two.

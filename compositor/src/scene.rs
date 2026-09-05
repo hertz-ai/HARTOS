@@ -272,6 +272,17 @@ pub struct Theme {
     pub cta_glow: Color,
     pub cta_glow_dy: f32,
     pub cta_glow_blur: f32,
+    /// `.hh-card-scrim`'s `linear-gradient(transparent 32%, rgba(4,7,13,0.78) 100%)`, the
+    /// legibility wash between a card's art and its own text. Its comment is one line and
+    /// the whole reason it exists: "Scrim so text-over-art always reads. Static gradient,
+    /// no blur (software-safe)."
+    ///
+    /// The native scene drew the title, the meta and the chips straight onto the art, so
+    /// a pale photo or a bright brand hue took the text with it. The `body.gpu-hardware`
+    /// variant is slightly gentler; the base is what a renderer with neither class gets,
+    /// and the native path is never the WebView.
+    pub card_scrim: Color,
+    pub card_scrim_at: f32,
 }
 
 /// The spectrum names, positionally matched to `Theme::spectrum`.
@@ -440,6 +451,8 @@ impl Theme {
             cta_glow: Color::rgba(0.0, 230.0 / 255.0, 195.0 / 255.0, 0.30),
             cta_glow_dy: 12.0,
             cta_glow_blur: 30.0,
+            card_scrim: Color::rgba(4.0 / 255.0, 7.0 / 255.0, 13.0 / 255.0, 0.78),
+            card_scrim_at: 0.32,
         }
     }
 
@@ -2030,6 +2043,22 @@ pub fn layout_home(
                 radius: theme.card_radius,
                 photo: card.photo.clone(),
             });
+            // `.hh-card-scrim`, inset 0 over the art: transparent down to its stop, then
+            // ramping to a near-black wash at the bottom where the title sits. Expressed
+            // with the SAME three-stop tile the chrome floor uses: a flat transparent run
+            // to `card_scrim_at`, then the ramp, which is exactly what the CSS says.
+            card_children.push(SceneNode::Fill {
+                rect: ab,
+                from: Color::rgba(theme.card_scrim.r, theme.card_scrim.g, theme.card_scrim.b, 0.0),
+                mid: Color::rgba(theme.card_scrim.r, theme.card_scrim.g, theme.card_scrim.b, 0.0),
+                mid_at: theme.card_scrim_at,
+                to: theme.card_scrim,
+                // 180deg is straight DOWN, which is the CSS default direction and the
+                // only one that puts the wash under the text.
+                angle_deg: 180.0,
+                radius: theme.card_radius,
+                photo: None,
+            });
             // `.hh-card { border: 1px solid var(--hh-bord) }`, and `--hh-bord` resolves to
             // `--hart-glass-border`: the SAME colour the chrome strips rule with. Drawn
             // AFTER the art, because the art is `inset: 0` and would otherwise cover it,
@@ -3575,7 +3604,7 @@ mod tests {
         let arts: Vec<&SceneNode> = card_leaves
             .iter()
             .copied()
-            .filter(|n| matches!(n, SceneNode::Fill { .. }))
+            .filter(|n| matches!(n, SceneNode::Fill { from, .. } if from.a > 0.0))
             .collect();
         let cards: usize = home.rows.iter().map(|r| r.cards.len()).sum();
         assert_eq!(arts.len(), cards, "every card has an art tile, ranked or not");
@@ -3841,6 +3870,55 @@ mod tests {
                                  if (rect.h - HERO_BTN_H).abs() < 0.01))
             .count();
         assert_eq!(pills, 1, "only the primary is a lit ramp");
+    }
+
+    #[test]
+    fn the_scrim_is_clear_at_the_top_and_dark_where_the_title_sits() {
+        // `.hh-card-scrim`'s whole job, in its own words: "Scrim so text-over-art always
+        // reads." The native scene drew the title, the meta and the chips straight onto
+        // the art, so a pale photo or a bright brand hue took the text with it.
+        let theme = Theme::cosmic_default();
+        let root = layout_home(1600.0, 900.0, &sample(), &theme, &RowScroll::default(), &mut MonoMeasure);
+        let mut card_leaves: Vec<&SceneNode> = Vec::new();
+        leaves_of(&root, Component::HomeCard, &mut card_leaves);
+
+        let (from, mid, mid_at, to, angle, srect) = card_leaves
+            .iter()
+            .find_map(|n| match n {
+                SceneNode::Fill { from, mid, mid_at, to, angle_deg, rect, .. }
+                    if from.a == 0.0 =>
+                {
+                    Some((*from, *mid, *mid_at, *to, *angle_deg, *rect))
+                }
+                _ => None,
+            })
+            .expect("a card draws its scrim");
+
+        // CLEAR for the top third: the art has to read as art, not as a tinted panel.
+        assert_eq!(from.a, 0.0, "it starts fully transparent");
+        assert_eq!(mid.a, 0.0, "and stays clear all the way to its stop");
+        assert_eq!(mid_at, theme.card_scrim_at);
+        assert!(mid_at > 0.2 && mid_at < 0.5, "the clear run is a third, not a half");
+        // DARK where the body sits, and its own colour rather than plain black.
+        assert_eq!(to, theme.card_scrim);
+        assert!(to.a > 0.7, "the bottom is a real wash, not a tint");
+        assert!(to.r < 0.1 && to.b > to.r, "a cool near-black, the shell's #04070D");
+        assert_eq!(angle, 180.0, "straight down, or the wash misses the text entirely");
+
+        // It covers the whole art box, and the TITLE sits inside its dark end.
+        let title = card_leaves
+            .iter()
+            .find_map(|n| match n {
+                SceneNode::Text { rect, size_px, .. } if *size_px == CARD_TITLE_PX => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .expect("a card draws its title");
+        assert!(
+            title.y >= srect.y + srect.h * mid_at,
+            "the title must sit past the scrim's clear run: title {title:?} scrim {srect:?}"
+        );
     }
 
     #[test]
@@ -4351,8 +4429,11 @@ mod tests {
         let tree = layout_home(1280.0, 800.0, &hc, &theme, &RowScroll::default(), &mut MonoMeasure);
         let mut leaves: Vec<&SceneNode> = Vec::new();
         leaves_of(&tree, Component::HomeCard, &mut leaves);
+        // A card has TWO fills now: its art, and the legibility scrim over it. A scrim
+        // is the one that STARTS transparent, which is what a scrim is rather than a
+        // position this test would have to keep in step with the layout.
         let arts: Vec<(Option<String>, Color, Color, f32)> = leaves
-            .into_iter()
+            .iter()
             .filter_map(|n| match n {
                 SceneNode::Fill {
                     photo,
@@ -4360,10 +4441,15 @@ mod tests {
                     to,
                     angle_deg,
                     ..
-                } => Some((photo.clone(), *from, *to, *angle_deg)),
+                } if from.a > 0.0 => Some((photo.clone(), *from, *to, *angle_deg)),
                 _ => None,
             })
             .collect();
+        let scrims = leaves
+            .iter()
+            .filter(|n| matches!(n, SceneNode::Fill { from, .. } if from.a == 0.0))
+            .count();
+        assert_eq!(scrims, arts.len(), "every card's art carries its scrim");
         let cards: usize = hc.rows.iter().map(|r| r.cards.len()).sum();
         assert_eq!(arts.len(), cards, "one art tile per card, photo or not");
         assert!(arts[0].0.is_none(), "the first card named no picture");

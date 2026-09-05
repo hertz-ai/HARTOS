@@ -914,3 +914,49 @@ def test_the_lit_cta_and_the_card_hairline_match_the_shells_own_rules():
         "border and the chrome rule are no longer the same value")
     assert "color: theme.chrome_border," in scene, (
         "the cards no longer draw their hairline in that colour")
+
+def test_the_card_scrim_reaches_the_native_cards_with_the_shells_own_stops():
+    """The wash that makes text-over-art readable.
+
+    `.hh-card-scrim`'s comment is one line and it is the whole argument: "Scrim so
+    text-over-art always reads. Static gradient, no blur (software-safe)." The
+    native scene drew the title, the meta and the chips straight onto the art, so
+    a pale photo or a bright brand hue took the text with it.
+
+    The BASE rule is the one pinned. `body.gpu-hardware` carries a gentler variant,
+    and the native path is never the WebView, so it gets neither class.
+    """
+    css = _css_strip_comments(open(os.path.join(
+        REPO, "integrations", "agent_engine", "static", "hartHome.css"),
+        encoding="utf-8").read())
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    rule = re.search(r"(?m)^\.hh-card-scrim \{(.*?)^\}", css, re.S)
+    assert rule, "hartHome.css no longer has a base .hh-card-scrim rule"
+    m = re.search(r"linear-gradient\(\s*transparent\s+(\d+)%,\s*"
+                  r"rgba\((\d+),\s*(\d+),\s*(\d+),\s*([\d.]+)\)\s*100%\s*\)",
+                  rule.group(1))
+    assert m, (
+        "the scrim is no longer `transparent N%, rgba(...) 100%`; the native "
+        "three-stop mirror can only follow that shape")
+    at, r, g, b, a = m.groups()
+
+    assert "card_scrim_at: %s," % (int(at) / 100.0) in scene, (
+        "the scrim stays clear for %s%% in the shell" % at)
+    lit = re.search(r"card_scrim: Color::rgba\(([^)]*)\),", scene)
+    assert lit, "scene.rs no longer declares a card_scrim colour"
+    got = [eval(p.strip(), {"__builtins__": {}}) for p in lit.group(1).split(",")]
+    want = [int(r) / 255.0, int(g) / 255.0, int(b) / 255.0, float(a)]
+    assert all(abs(x - y) < 1e-6 for x, y in zip(got, want)), (
+        "the scrim colour is %s and the shell's is rgba(%s,%s,%s,%s)"
+        % (got, r, g, b, a))
+
+    # And the base rule is what is mirrored, not the GPU variant, which would be
+    # the wrong one for a renderer that is never the WebView.
+    gpu = re.search(r"body\.gpu-hardware \.hh-card-scrim \{(.*?)\}", css, re.S)
+    if gpu:
+        g_at = re.search(r"transparent\s+(\d+)%", gpu.group(1))
+        if g_at and g_at.group(1) != at:
+            assert "card_scrim_at: %s," % (int(g_at.group(1)) / 100.0) not in scene, (
+                "the native scene took the body.gpu-hardware scrim, which applies "
+                "only when the WebView composites")
