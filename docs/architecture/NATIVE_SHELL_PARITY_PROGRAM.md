@@ -641,3 +641,45 @@ existing IPC. That is a contract question with a shell side, so it is recorded
 here rather than settled. Note also its own internal rule, which any resolution
 must keep: the six Aura moods pin the functional accent to teal and let their quad
 drive ONLY the ambient field, while the ten classic palettes set the accent itself.
+
+### The native shell was the one thing that could defeat the frame-budget gate
+The #137 frame-budget gate exists so a still desktop stops re-importing textures,
+re-running the damage pass and attempting a page-flip on every 16ms tick. A drawn
+native scene held it open unconditionally, because the orb breathes. That was
+right as far as it went and wrong where it mattered: on the pixman software floor
+it meant a still native desktop CPU-compositing at 60fps forever, on the weakest
+hardware in the fleet, which is exactly the case the gate was built for.
+
+The HTML shell has never done this. Its breathing is `body.gpu-hardware
+#hart-voice-orb` and nothing else, and liquid_ui_service records why in its own
+words (real-HW 2026-07-12): GPU-only effects armed on a CPU renderer
+"re-rasterised a 60fps canvas + an animated software blur on the ONE WebKit thread
+and HUNG the whole shell". So the native rule is the same rule, sourced the same
+way: the scene animates only while the compositor is GPU-compositing.
+
+The signal is truthful rather than a boot-time guess. `render_all` publishes
+`gles.is_some()` onto State every tick before the gate reads it, so all three ways
+the floor is reached are covered together: the probe never authorised GLES, GLES
+init failed, or a runtime fault demoted it mid-session. A demotion stands the
+animation down on the very next frame.
+
+Two details worth keeping:
+
+**The transients stay unconditional.** A workspace fade and a window-map animation
+are a few hundred milliseconds of motion the user just asked for, not a permanent
+hold, and they must play out on the floor as well. Only the perpetual one is gated.
+
+**With motion off the orb RESTS, it does not freeze.** `animation: none` is not
+`animation-play-state: paused`. The shell's software floor never starts the
+breathing, so the orb sits at its resting scale; freezing it wherever the last
+painted frame caught it would leave a randomly half-inflated orb on screen for the
+session. Passing a zero elapsed to the same `motion_at` gives exactly that resting
+state, so there is no second resting-state constant to drift. Energy still reads
+through, because the canvas viz reacts on both floors in the shell too; only the
+CSS float and breathe are GPU-gated.
+
+The orb's motion and the gate now read ONE bool, passed into the state-free
+lowering rather than fetched twice. If they could disagree, the failure is a
+stuttering orb (animating while the gate holds the rate down) or a gate held open
+for an orb standing still, and both are the kind of thing that only shows up on
+hardware.

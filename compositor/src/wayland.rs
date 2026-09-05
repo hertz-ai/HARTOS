@@ -246,6 +246,13 @@ pub struct State {
     /// session. Set from the HART_NATIVE_SHELL env at State construction (default OFF,
     /// so the WebView shell is unchanged). No nix option until M6 flips the default.
     pub native_shell_on: bool,
+    /// Is the live renderer the GPU one? The native mirror of the shell's
+    /// `body.gpu-hardware`, refreshed by the DRM render tick from whether its
+    /// `GlesRenderer` still exists, so a mid-session demotion to the pixman floor stands
+    /// the orb's breathing (and the frame-budget hold it implies) down on the next frame.
+    /// Starts FALSE: the floor is the safe assumption until a GPU has actually proven
+    /// itself, and it is what the never-fail software path is.
+    pub motion_hardware: bool,
     /// NATIVE SHELL M3: the latest home_compose scene from the shell.compose IPC verb.
     pub native_home: Option<crate::scene::HomeCompose>,
     /// NATIVE SHELL M3 text: cosmic-text rasterizer (FontSystem enumerated once).
@@ -398,6 +405,12 @@ impl CompState for State {
     }
     fn native_shell_on(&self) -> bool {
         self.native_shell_on
+    }
+    fn motion_hardware(&self) -> bool {
+        self.motion_hardware
+    }
+    fn set_motion_hardware(&mut self, on: bool) {
+        self.motion_hardware = on;
     }
     fn native_home(&self) -> Option<&crate::scene::HomeCompose> {
         self.native_home.as_ref()

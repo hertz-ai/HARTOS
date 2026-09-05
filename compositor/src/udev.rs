@@ -510,6 +510,10 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         capture_blocked: false,
         // NATIVE SHELL M3: opt in per session via the env, default OFF (no regression).
         native_shell_on: std::env::var_os("HART_NATIVE_SHELL").is_some(),
+        // Set truthfully by the render tick below from whether GLES is live. Starting on
+        // the floor means the very first frame cannot claim hardware motion before a GPU
+        // has proven itself.
+        motion_hardware: false,
         native_home: None,
         text_rasterizer: crate::text_render::TextRasterizer::new(),
         black_buffer,
@@ -1772,6 +1776,12 @@ fn render_all(
     if devices.values().any(|d| !d.master) {
         state.repaint.mark_damaged();
     }
+    // Publish whether we are GPU-compositing RIGHT NOW, before the gate reads it. This
+    // is the one place that knows: `gles` is None when the probe never authorised it, when
+    // init failed, and when a runtime fault demoted it mid-session, and the pixman floor
+    // is what paints in all three. The native scene's orb breathes only under this, the
+    // same way `body.gpu-hardware #hart-voice-orb` is the shell's only breathing rule.
+    comp_core::CompState::set_motion_hardware(state, gles.is_some());
     let effects_animating = comp_core::effects_animating(state);
     if !state.repaint.should_paint(now, effects_animating) {
         // Nothing changed, nothing animating, still within the heartbeat: skip this tick's

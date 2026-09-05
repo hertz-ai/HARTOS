@@ -354,17 +354,29 @@ impl OrbCache {
     ///
     /// `None` for a degenerate size, matching BloomCache: the caller then emits
     /// no orb and the frame is the desktop without it, never a panic.
+    /// `animate` is the same hardware condition `scene_animates` gates on. With motion
+    /// off the elapsed time handed to `motion_at` is ZERO, which is its resting scale and
+    /// alpha, so the orb sits still rather than freezing wherever the last painted frame
+    /// happened to catch it. That matches `animation: none`, which is what the shell
+    /// applies on the software floor, and it does it through the SAME motion function
+    /// rather than a second resting-state constant.
     pub fn current(
         &mut self,
         side: i32,
         energy: f32,
+        animate: bool,
     ) -> Option<(&MemoryRenderBuffer, crate::orb::OrbMotion)> {
         if side <= 0 {
             return None;
         }
         let now = Instant::now();
         let epoch = *self.epoch.get_or_insert(now);
-        let motion = crate::orb::motion_at(now.saturating_duration_since(epoch), energy);
+        let elapsed = if animate {
+            now.saturating_duration_since(epoch)
+        } else {
+            std::time::Duration::ZERO
+        };
+        let motion = crate::orb::motion_at(elapsed, energy);
 
         let pal = crate::orb::OrbPalette::default();
         if self.key != Some((side, pal)) {
@@ -688,6 +700,28 @@ pub trait CompState:
     fn native_shell_on(&self) -> bool {
         false
     }
+
+    /// Is the compositor GPU-compositing RIGHT NOW (a live GLES renderer), as opposed to
+    /// painting through the pixman software floor?
+    ///
+    /// This is the native mirror of the shell's `body.gpu-hardware` class, and it exists
+    /// for the same reason that class does: the HTML shell runs its breathing orb, its
+    /// hover transforms and its live dots ONLY under `body.gpu-hardware`, because on a
+    /// software renderer those re-rasterise on the CPU every frame. That is not
+    /// hypothetical here either. liquid_ui_service records the real-HW consequence
+    /// (2026-07-12): GPU-only effects armed on a CPU renderer "re-rasterised a 60fps
+    /// canvas + an animated software blur on the ONE WebKit thread and HUNG the whole
+    /// shell".
+    ///
+    /// Defaults to FALSE, the floor, so a backend that does not track its renderer never
+    /// claims hardware motion it cannot afford.
+    fn motion_hardware(&self) -> bool {
+        false
+    }
+    /// Record whether the live renderer is the GPU one. The DRM backend sets this each
+    /// tick from whether its `GlesRenderer` is still present, so a mid-session demotion
+    /// to the pixman floor stands the animation down on the very next frame.
+    fn set_motion_hardware(&mut self, _on: bool) {}
 
     /// NATIVE SHELL M2 press half: how many pointer buttons the seat currently holds
     /// down, maintained by the shared `on_pointer_button` via `note_pointer_button`.
@@ -2092,6 +2126,7 @@ pub fn effects_animating<S: CompState>(state: &S) -> bool {
         .any(|w| w.user_data().get::<MapAnim>().map(|a| a.animating()).unwrap_or(false));
     scene_animates(
         native_scene_drawn(state.native_shell_on(), state.capture_blocked()),
+        state.motion_hardware(),
         ws_fading,
         map_animating,
     )
@@ -2125,8 +2160,23 @@ pub fn native_scene_drawn(native_shell_on: bool, capture_blocked: bool) -> bool 
 /// It is gated on the flag, not on the orb's existence, because the orb is drawn beneath
 /// the WebView shell today and OCCLUDED by it: invisible breathing must not cost the
 /// shipped desktop its idle saving. So flag off, behaviour is exactly what it was.
-pub fn scene_animates(native_shell_on: bool, ws_fading: bool, map_animating: bool) -> bool {
-    native_shell_on || ws_fading || map_animating
+pub fn scene_animates(
+    native_scene_drawn: bool,
+    motion_hardware: bool,
+    ws_fading: bool,
+    map_animating: bool,
+) -> bool {
+    // The native scene animates because its ORB breathes, and the orb breathes only on
+    // hardware, exactly as `body.gpu-hardware #hart-voice-orb` does. Without the second
+    // condition a drawn native scene held this gate open forever, so the pixman software
+    // floor would have CPU-composited a still desktop at 60fps: the frame-budget gate
+    // (#137) exists precisely to stop that, and the native shell was the one thing that
+    // could defeat it, on the weakest hardware in the fleet.
+    //
+    // The workspace fade and the map animation are unconditional because they are
+    // TRANSIENT: a few hundred milliseconds once, not a permanent 60fps hold, and both
+    // are motion the user just asked for by switching or opening something.
+    (native_scene_drawn && motion_hardware) || ws_fading || map_animating
 }
 
 /// Build the software-cursor render element(s) at the pointer location, PREPENDED so the
@@ -2313,6 +2363,10 @@ where
     let orb_energy = state.orb_energy();
     let pointer = native_pointer_scene_pos(state, size);
     let pressed = state.pointer_pressed();
+    // Read BEFORE `native_scene_caches` takes its `&mut` borrow of state, and it is the
+    // SAME bool `effects_animating` gates the frame budget on, so the orb's motion and
+    // the frame rate that carries it can never disagree.
+    let animate = state.motion_hardware();
     // The home now rides OUT of the accessor as a shared borrow beside the `&mut`
     // caches, so the frame no longer clones a HomeCompose just to release the state
     // borrow. `demo_ref` is the allocation-free fallback until `shell.compose` lands.
@@ -2327,7 +2381,7 @@ where
     };
     lower_scene(
         home, size, renderer, rasterizer, orb_cache, rect_cache, scene_cache, orb_energy,
-        pointer, pressed, elements,
+        pointer, pressed, animate, elements,
     )
 }
 
@@ -2387,6 +2441,11 @@ pub fn lower_scene<R>(
     orb_energy: f32,
     pointer: Option<(f32, f32)>,
     pressed: bool,
+    // `animate`: whether the orb breathes, the SAME hardware condition `scene_animates`
+    // gates the frame budget on. Passed in rather than read here because this fn is
+    // state-free. The two must agree, or the orb animates while the gate holds the frame
+    // rate down (a stuttering orb) or the gate stays open for an orb standing still.
+    animate: bool,
     elements: &mut Vec<HartRenderElement<R>>,
 ) -> u8
 where
@@ -2585,7 +2644,7 @@ where
                     return;
                 }
                 let side = (size.w.min(size.h) as f32 * 0.30) as i32;
-                if let Some((buffer, motion)) = orb_cache.current(side, orb_energy) {
+                if let Some((buffer, motion)) = orb_cache.current(side, orb_energy, animate) {
                     let dst = (rect.w.min(rect.h) * motion.scale) as i32;
                     if dst < 1 {
                         return;
@@ -2752,7 +2811,8 @@ where
         let short = size.w.min(size.h);
         let side = (short as f32 * 0.30) as i32;
         let energy = state.orb_energy();
-        if let Some((buffer, motion)) = state.orb_mut().current(side, energy) {
+        let animate = state.motion_hardware();
+        if let Some((buffer, motion)) = state.orb_mut().current(side, energy, animate) {
             // Breathing scales about the CENTRE, so the top-left moves by half
             // the growth. Computed from the motion rather than stored, so there
             // is no second source of truth for where the orb is.
@@ -3887,6 +3947,7 @@ mod native_render_tests {
             0.5,
             None,
             false,
+            true,
             &mut elements,
         );
 
@@ -3957,7 +4018,8 @@ mod native_render_tests {
                 0.5,
                 None,
                 false,
-                &mut elements,
+                true,
+            &mut elements,
             );
             if frame == 0 {
                 first = elements.len();
@@ -4034,15 +4096,15 @@ mod native_render_tests {
         // so without this the flip to the native shell would quietly render that breath
         // at 5 Hz: a stutter, not a breath, and against the 60fps NFR.
         assert!(
-            scene_animates(true, false, false),
+            scene_animates(true, true, false, false),
             "a drawn native scene animates by construction, its orb never stops breathing"
         );
         // Flag OFF is untouched, which is what keeps the shipped WebView desktop's idle
         // saving: the orb still breathes down there, but occluded, so it costs nothing.
-        assert!(!scene_animates(false, false, false));
+        assert!(!scene_animates(false, true, false, false));
         // The two effects that already forced a paint still do, with the flag off.
-        assert!(scene_animates(false, true, false), "a workspace fade must play out");
-        assert!(scene_animates(false, false, true), "a map animation must play out");
+        assert!(scene_animates(false, true, true, false), "a workspace fade must play out");
+        assert!(scene_animates(false, true, false, true), "a map animation must play out");
     }
 
     #[test]
@@ -4063,7 +4125,8 @@ mod native_render_tests {
             let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
             lower_scene(
                 &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
-                0.5, Some((10.0, 10.0)), true, &mut elements,
+                0.5, Some((10.0, 10.0)), true, true,
+            &mut elements,
             );
             // Whatever survived must still have a real footprint: the <1px skips exist so
             // nothing reaches the renderer with an empty or inverted box.
@@ -4095,7 +4158,7 @@ mod native_render_tests {
 
         let emitted = lower_scene(
             &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
-            0.5, None, false, &mut elements,
+            0.5, None, false, true, &mut elements,
         );
         assert_eq!(
             emitted & NATIVE_CHROME_ORB,
@@ -4121,11 +4184,61 @@ mod native_render_tests {
         assert!(!native_scene_drawn(false, false), "flag off: never drawn");
         assert!(!native_scene_drawn(false, true));
         // And the gate agrees, because both decisions read the same predicate.
-        assert!(!scene_animates(native_scene_drawn(true, true), false, false));
-        assert!(scene_animates(native_scene_drawn(true, false), false, false));
+        assert!(!scene_animates(native_scene_drawn(true, true), true, false, false));
+        assert!(scene_animates(native_scene_drawn(true, false), true, false, false));
         // A real animation still plays out under the killswitch: correctness first, the
         // saving is only ever about the native scene.
-        assert!(scene_animates(native_scene_drawn(true, true), true, false));
+        assert!(scene_animates(native_scene_drawn(true, true), true, true, false));
+    }
+
+    #[test]
+    fn the_software_floor_stops_the_native_desktop_compositing_at_full_rate() {
+        // The frame-budget gate (#137) exists so a still desktop stops re-importing
+        // textures and attempting a page-flip every 16ms. A drawn native scene held it
+        // open unconditionally, because its orb breathes, so the native shell was the one
+        // thing in the compositor that could defeat that gate entirely, on the pixman
+        // software floor, where the CPU pays for every composite. The HTML shell has
+        // never done this: its breathing is `body.gpu-hardware #hart-voice-orb` and
+        // nothing else, and liquid_ui_service records why (real-HW 2026-07-12, GPU-only
+        // effects on a CPU renderer hung the whole shell).
+        assert!(
+            scene_animates(true, true, false, false),
+            "GPU-composited with the scene drawn: the orb breathes"
+        );
+        assert!(
+            !scene_animates(true, false, false, false),
+            "on the software floor a still native desktop must let the gate close"
+        );
+        // Transients are unconditional: a workspace fade and a map animation are a few
+        // hundred milliseconds of motion the user just asked for, not a permanent hold,
+        // and they must play out on the floor too.
+        assert!(scene_animates(true, false, true, false), "a ws fade plays on the floor");
+        assert!(scene_animates(true, false, false, true), "so does a map animation");
+        assert!(
+            !scene_animates(false, false, false, false),
+            "nothing drawn, nothing animating, nothing to hold the gate open"
+        );
+    }
+
+    #[test]
+    fn an_orb_with_motion_off_rests_rather_than_freezing_mid_breath() {
+        // `animation: none` is not `animation-play-state: paused`. The shell's software
+        // floor never STARTS the breathing, so the orb sits at its resting scale; freezing
+        // it wherever the last painted frame caught it would leave a random half-inflated
+        // orb on screen for the whole session. Same motion function either way, so there
+        // is no second resting-state constant to drift.
+        let mut cache = OrbCache::default();
+        let rest = cache
+            .current(64, 0.0, false)
+            .map(|(_, m)| m)
+            .expect("a real size composes");
+        assert_eq!(rest.scale, crate::orb::motion_at(std::time::Duration::ZERO, 0.0).scale);
+        // Energy still reads through with motion off: a speaking orb is brighter even
+        // when it does not breathe, which is the shell's behaviour too (the canvas viz
+        // reacts on both floors; only the CSS float/breathe is GPU-gated).
+        let hot = cache.current(64, 1.0, false).map(|(_, m)| m).expect("composed");
+        assert!(hot.alpha > rest.alpha, "energy lifts the orb without motion");
+        assert_eq!(hot.scale, rest.scale, "but it does not inflate it");
     }
 
     #[test]
@@ -4155,7 +4268,7 @@ mod native_render_tests {
         let mut first: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
         lower_scene(
             &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
-            0.5, None, false, &mut first,
+            0.5, None, false, true, &mut first,
         );
         let a = idents(&first);
         assert!(!a.is_empty(), "the demo scene lowered to nothing");
@@ -4164,7 +4277,7 @@ mod native_render_tests {
         let mut second: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
         lower_scene(
             &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
-            0.5, None, false, &mut second,
+            0.5, None, false, true, &mut second,
         );
         assert_eq!(
             idents(&second),
@@ -4243,6 +4356,7 @@ mod native_render_tests {
             0.5,
             None,
             false,
+            true,
             &mut plain,
         );
         let plain_geo = geo(&plain);
@@ -4265,6 +4379,7 @@ mod native_render_tests {
             0.5,
             Some(centre),
             false,
+            true,
             &mut hovered,
         );
 
@@ -4319,6 +4434,7 @@ mod native_render_tests {
             0.5,
             None,
             false,
+            true,
             &mut elements,
         );
 
