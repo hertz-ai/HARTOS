@@ -66,17 +66,59 @@ fn hex3(s: &str) -> Option<[u8; 3]> {
     Some([h(0)?, h(2)?, h(4)?])
 }
 
-/// Read the palette from a theme JSON without pulling a JSON dependency into the
-/// compositor: the file is a flat `"key": "VALUE"` map for the fields we need, so
-/// a scan for each key is enough and cannot panic on malformed input. Any field
-/// that does not parse keeps its aura default (fail-to-shipped-look, never void).
-pub fn palette_from_theme_file(path: &Path) -> BloomPalette {
-    let mut p = BloomPalette::default();
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(_) => return p,
-    };
-    let find = |key: &str| -> Option<[u8; 3]> {
+/// One loaded theme JSON, and the ONE reader for it in this process.
+///
+/// The backdrop and the native scene both need colours out of the same file, and the
+/// scene's `Theme` was a hardcoded copy of what this file already carries, which is a
+/// parallel theme table inside a single binary: exactly what Gate 4 forbids and exactly
+/// what a user changing their theme would have discovered, the backdrop restyling under
+/// a desktop that did not. So the file is loaded once and both read it through here.
+///
+/// No JSON dependency is pulled in for it even though the crate has one: the file is a
+/// flat `"key": "VALUE"` map for every field either consumer needs, so a scan per key is
+/// enough, cannot panic on malformed input, and cannot be made to allocate by a hostile
+/// file. Any key that does not parse leaves the caller's default in place.
+pub struct ThemeFile {
+    text: Option<String>,
+}
+
+impl ThemeFile {
+    /// Load the theme JSON at `path`. A missing or unreadable file is not an error: it
+    /// yields a file that answers None to everything, so every caller keeps its shipped
+    /// default. This is the desktop's own colours; an unreadable theme must degrade to
+    /// the shipped look, never to a void.
+    pub fn load(path: &Path) -> ThemeFile {
+        ThemeFile {
+            text: std::fs::read_to_string(path).ok(),
+        }
+    }
+
+    /// Resolve the active theme file from the environment, degrading at every step.
+    ///
+    /// `HART_THEME_DIR` / `HART_THEME` follow the convention the conky + liquid-ui
+    /// modules already export, so this reads the same file the HTML shell is handed.
+    pub fn active() -> ThemeFile {
+        let dir = std::env::var("HART_THEME_DIR").unwrap_or_else(|_| THEME_DIR_DEFAULT.to_string());
+        let id = std::env::var("HART_THEME").unwrap_or_else(|_| "aura".to_string());
+        ThemeFile::for_id(&dir, &id)
+    }
+
+    /// The resolution rule with the environment read out of the way, so it is testable
+    /// without mutating process-global state (cargo runs tests as threads in one
+    /// process, and an env-mutating test would race every other test here).
+    pub fn for_id(dir: &str, id: &str) -> ThemeFile {
+        // Reject an id that could escape the theme directory. It reaches us from the
+        // environment, and a path separator would let it name any file on disk; a bad id
+        // falls back to the shipped look rather than reading around.
+        if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+            return ThemeFile { text: None };
+        }
+        ThemeFile::load(&Path::new(dir).join(format!("{}.json", id)))
+    }
+
+    /// The `#RRGGBB` value of `key`, or None when the key is absent or malformed.
+    pub fn hex(&self, key: &str) -> Option<[u8; 3]> {
+        let text = self.text.as_ref()?;
         let k = format!("\"{}\"", key);
         let i = text.find(&k)?;
         let rest = &text[i + k.len()..];
@@ -86,12 +128,23 @@ pub fn palette_from_theme_file(path: &Path) -> BloomPalette {
         let rest2 = &rest[q1 + 1..];
         let q2 = rest2.find('"')?;
         hex3(&rest2[..q2])
-    };
-    if let Some(v) = find("background") {
+    }
+}
+
+/// The backdrop palette out of a theme JSON. A thin consumer of `ThemeFile` now, so the
+/// scan lives in one place rather than once per thing that needs a colour.
+pub fn palette_from_theme_file(path: &Path) -> BloomPalette {
+    palette_from(&ThemeFile::load(path))
+}
+
+/// The backdrop palette from an already-loaded file.
+pub fn palette_from(file: &ThemeFile) -> BloomPalette {
+    let mut p = BloomPalette::default();
+    if let Some(v) = file.hex("background") {
         p.base = v;
     }
     for (i, key) in ["ambient_1", "ambient_2", "ambient_3", "ambient_4"].iter().enumerate() {
-        if let Some(v) = find(key) {
+        if let Some(v) = file.hex(key) {
             p.amb[i] = v;
         }
     }
@@ -110,24 +163,14 @@ const THEME_DIR_DEFAULT: &str = "/run/current-system/sw/share/hart/conky-themes"
 /// rather than a void, because this is the DESKTOP BACKDROP: an unreadable theme
 /// file must never produce a black screen the user cannot explain.
 pub fn theme_palette() -> BloomPalette {
-    let dir = std::env::var("HART_THEME_DIR").unwrap_or_else(|_| THEME_DIR_DEFAULT.to_string());
-    let id = std::env::var("HART_THEME").unwrap_or_else(|_| "aura".to_string());
-    theme_palette_from(&dir, &id)
+    palette_from(&ThemeFile::active())
 }
 
-/// The resolution rule itself, with the environment read out of the way.
-///
-/// Split from `theme_palette` so it is testable WITHOUT mutating process-global
-/// environment: cargo runs tests as parallel threads in one process, so an
-/// env-mutating test would race every other test in this module.
+/// The resolution rule itself, with the environment read out of the way. Kept as its own
+/// entry point because the tests drive it directly; the id-safety and the fallback both
+/// live in `ThemeFile::for_id` now, so this is the same rule, not a second one.
 pub fn theme_palette_from(dir: &str, id: &str) -> BloomPalette {
-    // Reject a theme id that could escape the theme directory. The id reaches us
-    // from the environment, and a path separator would let it name any file on
-    // disk; a bad id falls back to the shipped look rather than reading around.
-    if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
-        return BloomPalette::default();
-    }
-    palette_from_theme_file(&Path::new(dir).join(format!("{}.json", id)))
+    palette_from(&ThemeFile::for_id(dir, id))
 }
 
 /// One additive radial blob: centre as a fraction of the output, radius as a

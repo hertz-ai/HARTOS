@@ -348,6 +348,64 @@ impl Theme {
             taskbar_bg: Color::rgba(0.043, 0.047, 0.063, 0.85),
         }
     }
+
+    /// This theme with the ACTIVE theme file's colours folded in, each one optional.
+    ///
+    /// The compositor already reads `conky-themes/<id>.json` for the desktop backdrop
+    /// (bloom.rs, whose own header calls it "one palette source for both renderers, Gate
+    /// 4: no parallel theme table"). The scene's colours were a hardcoded copy of what
+    /// that same file carries, which made the compositor its OWN counter-example: change
+    /// the theme and the backdrop restyled under a desktop that did not move.
+    ///
+    /// Every argument is `None`-tolerant and falls back to the value already in `self`,
+    /// so a missing file, a missing key or a malformed hex costs exactly one colour and
+    /// an absent theme file is byte-identical to before this existed. That is the same
+    /// posture the backdrop takes, for the same reason: this runs in the process that
+    /// owns scanout.
+    ///
+    /// Alpha comes from `self`, never from the file. The theme names HUES; how opaque a
+    /// bar or a card is belongs to the surface treatment, and letting a palette change it
+    /// would let a theme make the top bar transparent or the cards solid.
+    pub fn with_theme_colors(
+        mut self,
+        background: Option<Color>,
+        accent: Option<Color>,
+        secondary: Option<Color>,
+        text: Option<Color>,
+        muted: Option<Color>,
+        surface: Option<Color>,
+    ) -> Theme {
+        let keep_alpha = |base: Color, hue: Option<Color>| match hue {
+            Some(c) => Color::rgba(c.r, c.g, c.b, base.a),
+            None => base,
+        };
+        // `background` is the ground both strips sit on, at their own opacities.
+        //
+        // `chip_bg` deliberately does NOT follow it. The shell's `.hh-card-live` is a
+        // fixed `rgba(8,12,20,0.72)` scrim, not a theme colour, because it exists to keep
+        // a live tag readable over whatever art is behind it. A pale theme background
+        // would turn that guarantee into pale-on-pale.
+        self.bar_bg = keep_alpha(self.bar_bg, background);
+        self.taskbar_bg = keep_alpha(self.taskbar_bg, background);
+        // `accent` is the functional signifier: the orb hue, the active tab, a badge.
+        // It also leads the spectrum, whose first entry IS teal in the shipped theme.
+        if let Some(a) = accent {
+            self.accent = a;
+            self.spectrum[0] = a;
+        }
+        if let Some(s) = secondary {
+            self.accent2 = s;
+        }
+        self.bar_ink = keep_alpha(self.bar_ink, text);
+        self.hero_title = keep_alpha(self.hero_title, text);
+        self.card_ink = keep_alpha(self.card_ink, text);
+        self.omnibox_ink = keep_alpha(self.omnibox_ink, muted);
+        self.hero_copy = keep_alpha(self.hero_copy, muted);
+        // `surface` is the raised material: cards and the omnibox pill.
+        self.card_bg = keep_alpha(self.card_bg, surface);
+        self.omnibox_bg = keep_alpha(self.omnibox_bg, surface);
+        self
+    }
 }
 
 /// The decoded `home_compose` A2UI payload. Mirrors the props allowlisted in

@@ -597,3 +597,47 @@ hero's content actually ends, which changes what overlaps what on screen. That i
 a visual call, so it waits for the box rather than being guessed at. The
 conflation is recorded at the constant itself so the next reader does not have to
 rediscover it.
+
+### The compositor was its own counter-example to Gate 4
+bloom.rs's header states the rule plainly: the backdrop reads
+`nixos/assets/conky-themes/<id>.json`, "one palette source for both renderers, Gate
+4: no parallel theme table". The scene's `Theme` was a hardcoded Rust copy of
+colours that same file already carries, in the same binary, ten lines away. So
+changing the theme restyled the wallpaper under a desktop that did not move, and
+neither renderer was wrong on its own.
+
+Both now read one file through one reader. `bloom::ThemeFile` is the scanner (a
+key scan, not a JSON parse, so a malformed or hostile file cannot panic or be made
+to allocate), `palette_from` is the backdrop's consumer, and
+`Theme::with_theme_colors` is the scene's. The scene's constructor stays pure: the
+file reading happens in comp_core, resolved once behind a OnceLock for the same
+reason BloomCache resolves its palette once, and carrying the same documented gap,
+that a runtime theme change does not restyle either until restart. They are now
+wrong in the same direction, which is the point.
+
+Two boundaries were drawn deliberately rather than folded in:
+
+**Alpha is the surface treatment's, never the palette's.** A theme names hues. How
+opaque a bar or a card is belongs to the material, and letting a palette set it
+would let a theme make the top bar transparent or the cards solid. Every folded
+colour keeps the alpha it replaced.
+
+**The live-tag scrim does not follow the theme.** The shell's `.hh-card-live` is a
+fixed `rgba(8,12,20,0.72)`, not a theme colour, because it exists to keep the tag
+readable over whatever art is behind it. A pale theme background would turn that
+guarantee into pale-on-pale.
+
+An absent or unreadable theme file is byte-identical to before this existed, which
+is the safety property that matters: this runs in the process that owns scanout.
+
+**Still open: `mood` is decoded and dropped.** `HomeCompose.mood` carries the
+palette id the agent picked per compose (§6a, the `HART_PALETTES` vocabulary in
+hartPersonalize.js), and nothing reads it, so at M6 every agent-composed mood would
+render identically. That is NOT the same vocabulary as the conky theme ids just
+wired up: HART_PALETTES is 16 entries the shell calls its authoritative client
+list, and resolving it natively means either a second copy of that table in Rust
+(guarded like the spectrum copy is) or the shell sending resolved colours over the
+existing IPC. That is a contract question with a shell side, so it is recorded
+here rather than settled. Note also its own internal rule, which any resolution
+must keep: the six Aura moods pin the functional accent to teal and let their quad
+drive ONLY the ambient field, while the ten classic palettes set the accent itself.

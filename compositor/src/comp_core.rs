@@ -2332,6 +2332,46 @@ where
 }
 
 /// Lower a `HomeCompose` to render elements against the concrete caches — the
+/// The scene's colours, resolved ONCE from the same theme file the backdrop reads.
+///
+/// A `OnceLock` rather than a per-frame call because resolving it touches the disk, and
+/// the frame path must not. This carries the SAME known gap `BloomCache` documents beside
+/// it: resolved once and never re-read, so a theme change at runtime does not restyle the
+/// native desktop until the compositor restarts. Whoever lands the theme-change signal
+/// invalidates both together, and they are wrong in the same direction meanwhile, which
+/// is the point of them reading one file.
+fn active_theme() -> &'static crate::scene::Theme {
+    static ACTIVE: std::sync::OnceLock<crate::scene::Theme> = std::sync::OnceLock::new();
+    ACTIVE.get_or_init(|| {
+        let file = crate::bloom::ThemeFile::active();
+        theme_from_file(&file)
+    })
+}
+
+/// Fold a loaded theme file's colours into the shipped defaults. Split out so it is
+/// testable against a real file with no environment and no OnceLock in the way.
+fn theme_from_file(file: &crate::bloom::ThemeFile) -> crate::scene::Theme {
+    let hue = |key: &str| {
+        file.hex(key)
+            .map(|[r, g, b]| {
+                crate::scene::Color::rgba(
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                    1.0,
+                )
+            })
+    };
+    crate::scene::Theme::cosmic_default().with_theme_colors(
+        hue("background"),
+        hue("accent"),
+        hue("secondary"),
+        hue("text"),
+        hue("muted"),
+        hue("surface"),
+    )
+}
+
 /// State-free core of `render_native_scene`, so it is unit-testable with a
 /// `PixmanRenderer` + freshly-constructed caches (no compositor State needed). The
 /// leaf list interleaves Text (needs `rasterizer`) and OrbSlot (needs `orb_cache`),
@@ -2366,7 +2406,7 @@ where
     // it already owns instead of allocating a fresh one every frame. The pointer is NOT a
     // key, so hover costs no rebuild. `scene_cache` is a disjoint field borrow, so holding
     // the tree across the loop does not conflict with the buffer caches below.
-    let theme = crate::scene::Theme::cosmic_default();
+    let theme = *active_theme();
     // The rasterizer doubles as the layout's text measure (it already shapes), so the bar
     // can butt one run against another. It is a disjoint borrow from `scene_cache`, and
     // the reborrow ends when `tree_for` returns, leaving it free for the lowering below.
@@ -3708,6 +3748,70 @@ mod tests {
         // A zero radius is a plain filled rect: the corner is now covered too.
         let sharp = rounded_rect_rgba(w, h, 0.0, white, white, 0.0);
         assert!(sharp[3] > 250, "radius 0 fills the corner");
+    }
+
+    #[test]
+    fn the_scene_takes_its_colours_from_the_same_theme_file_the_backdrop_does() {
+        // The compositor was its own counter-example to Gate 4: bloom.rs reads
+        // conky-themes/<id>.json for the backdrop while the scene carried a hardcoded
+        // copy of the same colours, so changing the theme restyled the wallpaper under a
+        // desktop that did not move. One file, both consumers.
+        let dir = std::env::temp_dir().join("hart_scene_theme_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("sunset.json");
+        std::fs::write(
+            &f,
+            r#"{"id":"sunset","colors":{"background":"160910","accent":"FF8A4C",
+               "secondary":"FF2E9A","text":"FFF3EC","muted":"C9A79B",
+               "surface":"241118","ambient_1":"FF8A4C"}}"#,
+        )
+        .unwrap();
+        let file = crate::bloom::ThemeFile::load(&f);
+        let themed = theme_from_file(&file);
+        let shipped = crate::scene::Theme::cosmic_default();
+        assert_ne!(themed.accent, shipped.accent, "the theme's accent must win");
+        assert_eq!(themed.accent, crate::scene::Color::rgba(1.0, 138.0 / 255.0, 76.0 / 255.0, 1.0));
+        assert_eq!(themed.accent2.r, 1.0, "and its secondary");
+        assert_eq!(
+            themed.spectrum[0], themed.accent,
+            "the spectrum leads with the functional accent, as the shipped one does"
+        );
+        // ALPHA is the surface treatment's, never the palette's: a theme names hues, and
+        // letting it set opacity would let one make the top bar transparent.
+        assert_eq!(themed.bar_bg.a, shipped.bar_bg.a, "bar opacity is not the theme's");
+        assert_eq!(themed.card_bg.a, shipped.card_bg.a, "nor a card's");
+        assert_ne!(themed.bar_bg.r, shipped.bar_bg.r, "but its hue is");
+
+        // The live-tag scrim stays FIXED: it is a legibility guarantee over card art,
+        // not a palette slot, so a pale theme cannot turn it pale-on-pale.
+        assert_eq!(themed.chip_bg, shipped.chip_bg, "the live scrim is not the theme's");
+
+        // The SAME file drives the backdrop, which is the whole point.
+        let pal = crate::bloom::palette_from(&file);
+        assert_eq!(pal.base, [0x16, 0x09, 0x10]);
+        assert_eq!(
+            (themed.bar_bg.r * 255.0).round() as u8,
+            pal.base[0],
+            "the bar and the backdrop must ground on one colour"
+        );
+    }
+
+    #[test]
+    fn an_absent_theme_file_leaves_the_shipped_desktop_exactly_as_it_was() {
+        // The fallback is the safety property: this runs in the process that owns
+        // scanout, so an unreadable theme must cost nothing at all rather than a colour
+        // the user cannot explain. Byte-identical to before the file was ever read.
+        let missing = crate::bloom::ThemeFile::load(std::path::Path::new("/definitely/not/here.json"));
+        assert_eq!(theme_from_file(&missing), crate::scene::Theme::cosmic_default());
+        // A file that parses but names nothing we use is the same case.
+        let dir = std::env::temp_dir().join("hart_scene_theme_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("bare.json");
+        std::fs::write(&f, r#"{"id":"bare","font":{"size":14}}"#).unwrap();
+        assert_eq!(
+            theme_from_file(&crate::bloom::ThemeFile::load(&f)),
+            crate::scene::Theme::cosmic_default()
+        );
     }
 
     #[test]
