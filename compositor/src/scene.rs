@@ -375,8 +375,12 @@ impl Theme {
             // The theme_service fallbacks, which are what the shell renders with when a
             // theme omits the key. Overridden per theme by `with_shell_metrics`.
             top_bar_h: TOP_BAR_H,
-            icon_px: 20.0,
-            card_radius: 16.0,
+            // The named constants, not bare literals: these ARE the fallbacks, and the
+            // cross-language guard pins the constants. Duplicating their values here left
+            // the constants orphaned and the guard pinning something the layout no longer
+            // read, which is a guard that cannot fail for the reason it exists.
+            icon_px: TRAY_PX,
+            card_radius: CARD_RADIUS,
             // The built-in css_vars fallback (liquid_ui_service l.1764), which is what
             // the shell renders with when ThemeService cannot be consulted. An unreadable
             // theme file here is the same situation, so it takes the same value.
@@ -706,8 +710,11 @@ pub struct Card {
 /// EXISTS and hit-tests ... what is missing is carrying a node identity from the input
 /// that produced a sample through to the frame that presented it."
 ///
-/// This is that identity. The names are the budget file's own keys, not a parallel
-/// vocabulary, and a Python guard asserts every one of them exists there.
+/// This is that identity. It carries NO names of its own: `surface()` maps each variant
+/// into `latency::Surface`, whose `label()` is the single source for the budget file's
+/// keys. An earlier cut had a `key()` here saying the same words, which is two spellings
+/// of one vocabulary and exactly the drift the guards exist to stop; the guard now reads
+/// the mapping and follows it to the label.
 ///
 /// Only the surfaces the NATIVE scene actually owns appear here. The rest of the budget
 /// table (start-menu, panel, chat-input, marketplace, onboarding) belongs to the WebView
@@ -738,18 +745,6 @@ impl Component {
             Component::Omnibox => crate::latency::Surface::Omnibox,
             Component::Taskbar => crate::latency::Surface::Taskbar,
             Component::HomeCard => crate::latency::Surface::HomeCard,
-        }
-    }
-
-    /// The budget file's key for this component. Byte-identical to
-    /// latency_budgets.json's `components` map, which a guard test pins.
-    pub fn key(self) -> &'static str {
-        match self {
-            Component::Orb => "orb",
-            Component::TopBar => "top-bar",
-            Component::Omnibox => "omnibox",
-            Component::Taskbar => "taskbar",
-            Component::HomeCard => "home-card",
         }
     }
 }
@@ -3310,12 +3305,27 @@ mod tests {
     }
 
     #[test]
-    fn the_component_keys_are_the_budget_files_own_names() {
-        // The keys cross a language boundary into docs/architecture/latency_budgets.json,
-        // which Rust cannot read (it is outside the crate, and the crane source filter
-        // ships `*.rs` only), so the pin lives in Python beside the other cross-language
-        // guards. This half asserts what that one greps for: the exact literals, all
-        // distinct, none of them a made-up vocabulary.
+    fn the_shipped_fallbacks_are_the_constants_the_guards_pin() {
+        // The cross-language guard pins TRAY_PX and CARD_RADIUS against the CSS. That
+        // only means anything if the value the scene actually falls back to IS those
+        // constants. When their values were duplicated as bare literals here the
+        // constants went dead, the compiler said so, and the guard carried on passing
+        // while pinning something the layout no longer read: a guard that cannot fail
+        // for the reason it exists.
+        let t = Theme::cosmic_default();
+        assert_eq!(t.icon_px, TRAY_PX, "the tray fallback IS the pinned constant");
+        assert_eq!(t.card_radius, CARD_RADIUS, "and so is the corner");
+        assert_eq!(t.top_bar_h, TOP_BAR_H, "as the bar already was");
+        assert_eq!(t.chrome_rule_px, CHROME_RULE, "and the rule's own width");
+    }
+
+    #[test]
+    fn every_component_maps_to_its_own_instrument_surface() {
+        // The names live ONCE, on `latency::Surface`. This half asserts the mapping into
+        // it: total, and injective, so two components cannot quietly share a budget row.
+        // The names themselves are pinned to latency_budgets.json in Python, which is
+        // where both files are readable (the budget file is outside the crate and crane's
+        // source filter ships `*.rs` only).
         let all = [
             Component::Orb,
             Component::TopBar,
@@ -3323,14 +3333,19 @@ mod tests {
             Component::Taskbar,
             Component::HomeCard,
         ];
-        let keys: Vec<&str> = all.iter().map(|c| c.key()).collect();
-        assert_eq!(keys, ["orb", "top-bar", "omnibox", "taskbar", "home-card"]);
-        for (i, a) in keys.iter().enumerate() {
-            for b in keys.iter().skip(i + 1) {
+        let labels: Vec<&str> = all.iter().map(|c| c.surface().label()).collect();
+        assert_eq!(labels, ["orb", "top-bar", "omnibox", "taskbar", "home-card"]);
+        for (i, a) in labels.iter().enumerate() {
+            for b in labels.iter().skip(i + 1) {
                 assert_ne!(a, b, "two components share a budget row");
             }
             assert!(!a.is_empty() && !a.contains(' '), "a key must be a bare slug");
         }
+        assert_ne!(
+            all[0].surface(),
+            crate::latency::Surface::Shell,
+            "a named component must never map to the unattributed surface"
+        );
     }
 
     #[test]

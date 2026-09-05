@@ -199,16 +199,35 @@ def test_the_sanitizer_still_drops_what_it_promises_to_drop():
 
 SCENE_SRC = os.path.join(REPO, "compositor", "src", "scene.rs")
 BUDGETS = os.path.join(REPO, "docs", "architecture", "latency_budgets.json")
-_KEY_RE = re.compile(r'Component::\w+ => "([^"]+)"')
-
-
 def _component_keys():
-    """Every budget key scene.rs can attribute a latency sample to."""
+    """Every budget key scene.rs can attribute a latency sample to.
+
+    Read by FOLLOWING the mapping rather than from a second list. An earlier cut
+    had a `Component::key()` naming these directly, which is two spellings of one
+    vocabulary and exactly the drift these guards exist to stop: the runtime used
+    `Surface::label` and NOTHING used `key`, so a change to one would have left
+    the other pinning a name the instrument never emits. `surface()` maps each
+    component into latency::Surface, and that label is the single source.
+    """
     scene = open(SCENE_SRC, encoding="utf-8").read()
-    block = re.search(r"impl Component \{(.*?)\n\}", scene, re.S)
-    assert block, "scene.rs no longer has a Component impl to read keys from"
-    keys = _KEY_RE.findall(block.group(1))
-    assert keys, "Component::key names no components at all"
+    block = re.search(
+        r"pub fn surface\(self\) -> crate::latency::Surface \{(.*?)\n    \}",
+        scene, re.S)
+    assert block, "scene.rs no longer maps Component into latency::Surface"
+    variants = re.findall(r"Component::\w+ => crate::latency::Surface::(\w+)",
+                          block.group(1))
+    assert variants, "the Component-to-Surface mapping names nothing"
+
+    latency = open(os.path.join(REPO, "compositor", "src", "latency.rs"),
+                   encoding="utf-8").read()
+    lab = re.search(r"impl Surface \{(.*?)\n    const ALL", latency, re.S)
+    assert lab, "latency.rs no longer has a Surface::label to read"
+    labels = dict(re.findall(r'Surface::(\w+) => "([^"]+)"', lab.group(1)))
+    keys = []
+    for v in variants:
+        assert v in labels, (
+            "Component maps to Surface::%s, which latency.rs does not label" % v)
+        keys.append(labels[v])
     return keys
 
 

@@ -1111,3 +1111,36 @@ It is left wired rather than removed, because the no-phantom-window correctness 
 already proven and the trigger is the only absent part. The state field carries
 the same note at its declaration, so it cannot be found by reading the code alone
 and misread as live.
+
+### Reading the dead-code warnings instead of filtering them
+The summon finding came from asking "what is built and unreachable". The compiler
+answers that question every build, and this session had been filtering it out of
+every check with `grep -v "never used"`. Reading the list properly:
+
+Most of it is accounted for and correct. The NFR proof hooks (`solid_allocs`,
+`rounded_composes`, `flatten`, `rebuilds`, `composes`, `cached_runs`) are used only
+by tests, which is what they are for. `clamp_region` / `transform_region` /
+`now_secs_nsecs` are called from screencopy.rs, which is `#![cfg(feature =
+"winit")]` and so is not compiled in the smithay build at all; they were moved into
+comp_core precisely so the smithay `doCheck` exercises their unit floor, and the
+file says so.
+
+Two entries were mine, from earlier today, and both were the same mistake.
+`TRAY_PX` and `CARD_RADIUS` went dead when their values moved into the `Theme`,
+because the fallbacks were written as bare literals rather than as the constants.
+The values still agreed, so nothing looked wrong. But the cross-language guard pins
+the CONSTANTS, and the layout no longer read them, so the guard was pinning
+something that could not affect a pixel: a guard that cannot fail for the reason it
+exists. The fallbacks use the constants again, and a test asserts that chain, so
+the CSS, the constant, the fallback and the guard are one line rather than four
+values that happen to match.
+
+The third was a genuine parallel path. `Component::key()` named the budget keys,
+and so did `Surface::label()`. The runtime used the label; nothing used `key`; the
+Python guard read `key`. A change to either would have left the guard pinning a
+name the instrument never emits. `key` is gone, `Component::surface()` is the
+mapping, `Surface::label` is the single source, and the guard follows the mapping
+to reach it.
+
+Worth doing at the end of any run of changes. Dead code is where the compiler
+tells you a contract has come loose, and it costs one `cargo check` to read.
