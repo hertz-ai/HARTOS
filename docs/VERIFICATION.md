@@ -87,6 +87,15 @@ Ordered by how much a contributor with modest hardware can settle in an evening.
 | 14 | **Intelligence compounds between two robots** | Robot A learns a skill by doing. Robot B performs it without having done it. Measure B before and after | 2 Reachy Minis |
 | 15 | A co-pilot's work on one node improves another | Seed a goal on node A only. Show node B starting ahead of where it was | 2 nodes |
 | 16 | Three nodes beat one node | Same benchmark, one node then three, same models. A floor test: error minimisation, not a capability claim | 3 machines |
+| 17 | **OTA applies, boots, and rolls back** | `docs/OTA_ON_HARDWARE_RUNBOOK.md`, written for this row. Everything upstream is in the Verified table; what is open is whether a node BOOTS what it fetched and can go back | 1 reflashed node |
+| 18 | An OS app installs from the store and launches | Drive `app_installer.py` against a real nix/flatpak on a node, then launch what it installed. The 176 passing installer tests all fake the package manager | installed node |
+| 19 | Input-to-photon meets the per-surface budgets | `latency.rs` emits `hart-latency component=... verdict=PASS/FAIL` per 10s window. Boot the native shell, interact, paste the journal lines. The SCENE side is measured (219us p99, 1.3% of a frame); this is the renderer and DRM side | node with a GPU |
+| 20 | A drop line never appears on a healthy box | Same journal. `hart-latency dropped ... verdict=SUSPECT` means vblanks stopped being reaped or frames stopped being queued, and the numbers beside it cannot be trusted | node with a GPU |
+| 21 | A recipe replays on a node | `replay_layout` dispatches through the same verb gate a live agent passes, and returns `available=False` with no compositor rather than pretending. Needs a running compositor to say anything else | node with a compositor |
+| 22 | A copilot task writes real files | `hart-copilot-daemon` runs `claude -p` in a repo clone. Dispatch one task, confirm the file exists on disk and the quality is not the fixed 0.50 the in-backend path returns | installed node |
+
+Row 7's first half is now settled: two nodes DO find each other, see the PeerLink
+and announce rows above. What is still open there is the compute borrow itself.
 
 ### What "the hive learns" means today, precisely
 
