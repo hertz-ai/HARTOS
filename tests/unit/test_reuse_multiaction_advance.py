@@ -39,12 +39,37 @@ class ReuseMultiActionAdvance(unittest.TestCase):
         self.assertIn('_reuse_advanced_actions', self.body,
                       "must guard one-advance-per-action so a stale verdict "
                       "cannot double-advance")
-        self.assertIn("_rc_vj.get('action_id'", self.body,
-                      "must match the verdict action_id to the current action")
+        # Re-pointed 2026-09-06.  This asserted the literal "_rc_vj.get('action_id'",
+        # a local that no longer exists: _advance_or_steer's consolidation replaced
+        # five inlined copies (_rc_next/_next/_next2/_w2_next/_w2_next2 and their
+        # _rc_vj twins) with one function taking claimed_action_id=, which owns the
+        # [HALLUCINATION?] comparison.  The INTENT is unchanged — the verdict's
+        # action_id must still be carried to the advance — so pin the surviving
+        # expression instead of the deleted variable name.
+        self.assertIn('claimed_action_id=', self.body,
+                      "the verdict's action_id must be carried into the advance "
+                      "so a verdict naming a different action is flagged")
+        self.assertIn('"action_id"', self.body,
+                      "claimed_action_id must be READ from the verdict json")
 
     def test_reuses_canonical_advance(self):
-        self.assertIn('_advance_reuse_action(', self.body,
-                      "must reuse the canonical advance fn, not a parallel path")
+        # Also re-pointed: get_agent_response no longer calls _advance_reuse_action
+        # directly — it goes through _advance_or_steer, the single home for the
+        # advance-or-re-steer rule.  Pin the whole chain so a parallel path still
+        # fails this guard: the body must call _advance_or_steer, and
+        # _advance_or_steer must be the thing that calls _advance_reuse_action.
+        self.assertIn('_advance_or_steer(', self.body,
+                      "must reuse the canonical advance/steer fn, not a parallel path")
+        src = open(SRC, encoding='utf-8').read()
+        tree = ast.parse(src)
+        fn = next((n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == '_advance_or_steer'), None)
+        self.assertIsNotNone(fn, '_advance_or_steer not found')
+        called = {c.func.id for c in ast.walk(fn)
+                  if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+        self.assertIn('_advance_reuse_action', called,
+                      "_advance_or_steer must delegate to the canonical "
+                      "_advance_reuse_action rather than reimplementing the advance")
 
 
 if __name__ == '__main__':

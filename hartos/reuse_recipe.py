@@ -3054,6 +3054,26 @@ _REUSE_FAB_STEER_MAX = 3
 _reuse_pending_counts = {}
 _REUSE_PENDING_STEER_MAX = 2
 
+# The StatusVerifier's not-done verdicts.  'pending' was the only one this
+# branch knew; 'requires_breakdown' strands an action exactly the same way and
+# was measured doing it live 2026-09-06 on agent 89555447799 (24-action
+# recipe): action 1 is autonomous, its google_search really executed ("INSIDE
+# google search"), and the verifier answered {'status': 'requires_breakdown',
+# 'action_id': 1} 35 times.  The turn ran 107 rounds / 40 minutes and never
+# left action 1 — `Retrieved current_action_id: 1 for session:
+# cf125371-..._89555447799` 175x, and zero [REUSE]/advance markers.
+#
+# Speaker routing already handles all four statuses (:2635 persists
+# requires_breakdown's subtasks, :2646 routes error/pending to the helper), so
+# the gap was only here, on the ADVANCE side.  The consequence is worse than
+# one slow action: the sole bound was the WHOLE-TURN round budget
+# (max(4, n_actions*4+4) = 100 for this recipe), so one wedged action consumed
+# the entire turn and the remaining 23 actions never ran.
+#
+# 'error' is deliberately NOT here.  It reports a failure, not an
+# under-reported success — advancing past it would bury the failure.
+_REUSE_UNDERREPORT_STATUSES = ('pending', 'requires_breakdown')
+
 
 def _reuse_turn_round_budget(user_prompt):
     """Iteration budget for ONE reuse turn, derived from the recipe it runs.
@@ -3403,17 +3423,19 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 current_app.logger.debug(f"robust completion-advance skipped: {_rc_err}")
 
             # UNDER-REPORTED COMPLETION (mirror of the fabrication gate above).
-            # 'pending' from an autonomous action whose tools have EVIDENTLY run
-            # is a reporting failure, not unfinished work — see the
-            # _REUSE_PENDING_STEER_MAX comment for the Scout2 measurement.
+            # A not-done verdict from an autonomous action whose tools have
+            # EVIDENTLY run is a reporting failure, not unfinished work — see
+            # the _REUSE_UNDERREPORT_STATUSES comment for the Scout2 ('pending')
+            # and 89555447799 ('requires_breakdown') measurements.
             # Steer first (bounded), then let the normal advance path decide;
             # that path re-runs the fabrication gate, so nothing advances whose
             # tool did not actually execute.
             try:
                 _pend = group_chat.messages[-1] if group_chat.messages else None
                 _pend_vj = retrieve_json((_pend or {}).get('content') or '') if _pend else None
+                _pend_st = str((_pend_vj or {}).get('status', '')).lower()
                 if (isinstance(_pend_vj, dict)
-                        and str(_pend_vj.get('status', '')).lower() == 'pending'
+                        and _pend_st in _REUSE_UNDERREPORT_STATUSES
                         and _reuse_current_action not in _reuse_advanced_actions
                         and _reuse_action_is_autonomous(user_prompt, _reuse_current_action)
                         and not _reuse_outstanding_tools(user_prompt, _reuse_current_action,
@@ -3424,7 +3446,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         _reuse_pending_counts[_pk] = _pn + 1
                         current_app.logger.info(
                             f"[UNDER-REPORTED] action {_reuse_current_action} says "
-                            f"'pending' but its tools already executed — steering for a "
+                            f"{_pend_st!r} but its tools already executed — steering for a "
                             f"truthful verdict (attempt {_pn + 1}/{_REUSE_PENDING_STEER_MAX})")
                         chat_instructor.initiate_chat(
                             recipient=manager,
@@ -3438,7 +3460,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     _reuse_advanced_actions.add(_reuse_current_action)
                     current_app.logger.warning(
                         f"[UNDER-REPORTED] action {_reuse_current_action} still reports "
-                        f"'pending' after {_REUSE_PENDING_STEER_MAX} steers while its tools "
+                        f"{_pend_st!r} after {_REUSE_PENDING_STEER_MAX} steers while its tools "
                         f"are evidenced as executed — advancing on the tool evidence")
                     if not _advance_or_steer(
                             user_prompt, _reuse_current_action,

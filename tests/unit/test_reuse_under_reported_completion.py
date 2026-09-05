@@ -25,6 +25,7 @@ notion of "did the tool run".
 """
 import ast
 import os
+import re
 
 import pytest
 
@@ -69,6 +70,62 @@ class TestBranchIsEvidenceGated:
         assert rr._REUSE_PENDING_STEER_MAX <= rr._REUSE_FAB_STEER_MAX, (
             'under-reported steering should not outlast the fabrication gate’s '
             'own allowance, or a stuck action burns the whole round budget')
+
+
+class TestRequiresBreakdownIsAlsoUnderReporting:
+    """'requires_breakdown' strands an action exactly like 'pending' did.
+
+    Measured live 2026-09-06 on agent 89555447799 (24-action recipe, driven as
+    its own owner cf125371-...).  The turn ran 107 rounds over 40 minutes and
+    never left action 1:
+
+      * action 1 is autonomous (can_perform_without_user_input='yes')
+      * its named tool really executed - `INSIDE google search` at 02:2x, so
+        _reuse_outstanding_tools is empty
+      * the StatusVerifier reported {'status': 'requires_breakdown',
+        'action_id': 1} 35 times
+
+    The StatusVerifier emits four statuses.  Speaker routing handles all four
+    (reuse_recipe.py:2635 persists requires_breakdown's subtasks, :2646 routes
+    error/pending), but the ADVANCE branch recognised only 'pending', so
+    requires_breakdown could never advance and had no per-action bound.  The
+    only bound was the whole-turn budget - max(4, n_actions*4+4) = 100 rounds
+    for this recipe - so ONE wedged action consumed the entire turn and the
+    remaining 23 actions never ran.  `Retrieved current_action_id: 1 for
+    session: cf125371-..._89555447799` appears 175x; [REUSE]/advance markers
+    appear 0x.
+
+    Fix reuses the machinery already here - same counter, same bound, same
+    evidence gate, same _advance_or_steer - so nothing advances whose tool did
+    not actually execute.  It must NOT become a second notion of the statuses:
+    one constant, read at the branch.
+    """
+
+    def test_constant_names_both_under_reporting_statuses(self):
+        rr = pytest.importorskip('hartos.reuse_recipe')
+        statuses = getattr(rr, '_REUSE_UNDERREPORT_STATUSES', None)
+        assert statuses is not None, (
+            '_REUSE_UNDERREPORT_STATUSES missing — the branch must read ONE '
+            'named constant, not inline a second status list')
+        assert 'pending' in statuses, 'pending must stay under-reporting'
+        assert 'requires_breakdown' in statuses, (
+            "requires_breakdown must be treated as under-reporting: live "
+            "2026-09-06 it stranded agent 89555447799 at action 1 for 107 "
+            "rounds while its google_search had already executed")
+
+    def test_advance_branch_reads_the_constant_not_a_bare_pending(self):
+        src = _source()
+        m = re.search(
+            r"_pend_vj = retrieve_json\(.*?\n(?P<block>.*?)\):", src, re.DOTALL)
+        assert m, 'under-reported advance branch not found'
+        block = m.group('block')
+        assert "== 'pending'" not in block, (
+            "the advance branch still compares status == 'pending' exactly, so "
+            "a 'requires_breakdown' verdict cannot advance — that is the "
+            'measured 107-round wedge')
+        assert '_REUSE_UNDERREPORT_STATUSES' in block, (
+            'the branch must test membership in the shared constant so the '
+            'status vocabulary has one home')
 
 
 class TestAutonomyPredicate:
