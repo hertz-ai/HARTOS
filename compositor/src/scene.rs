@@ -622,6 +622,23 @@ pub enum Component {
 }
 
 impl Component {
+    /// The latency instrument's own surface for this component.
+    ///
+    /// Two enums rather than one because latency.rs is deliberately free of every other
+    /// module (no Smithay, no scene, no clock), which is what lets its state machine run
+    /// under `cargo test` on the default no-feature build where `scene` is not even
+    /// compiled. This is the one bridge, and the key strings on both sides are pinned to
+    /// latency_budgets.json by the same guard.
+    pub fn surface(self) -> crate::latency::Surface {
+        match self {
+            Component::Orb => crate::latency::Surface::Orb,
+            Component::TopBar => crate::latency::Surface::TopBar,
+            Component::Omnibox => crate::latency::Surface::Omnibox,
+            Component::Taskbar => crate::latency::Surface::Taskbar,
+            Component::HomeCard => crate::latency::Surface::HomeCard,
+        }
+    }
+
     /// The budget file's key for this component. Byte-identical to
     /// latency_budgets.json's `components` map, which a guard test pins.
     pub fn key(self) -> &'static str {
@@ -1855,6 +1872,14 @@ impl SceneCache {
         self.tree
             .as_ref()
             .expect("the tree was just built when it was stale")
+    }
+
+    /// The retained tree, if one has been built. Read-only and borrow-free of the
+    /// caches, so the INPUT path can ask what a point is over without touching the
+    /// buffers the render path owns. None before the first frame, which is the honest
+    /// answer: nothing has been laid out, so nothing can be named.
+    pub fn tree(&self) -> Option<&SceneNode> {
+        self.tree.as_ref()
     }
 
     /// How many times the tree was actually rebuilt. This is the retention PROOF: a

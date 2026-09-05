@@ -768,3 +768,44 @@ buckets by kind alone. `note_input` has to take the component, the aggregator ha
 to bucket by (component, kind), the budget lookup has to join, and the journal
 line has to stop hardcoding `component=shell`. That is the next slice; the
 identity it needed now exists and is tested.
+
+### Per-component latency attribution is now LIVE
+The identity landed above is threaded through the instrument. Samples bucket by
+(surface, kind) rather than kind alone, so a window closes into one summary per
+surface, and a slow card can no longer hide behind a fast orb. The resolution
+happens once per input event against the retained tree; the render path pays
+nothing.
+
+Findings worth keeping:
+
+**No component actually overrides its default budget.** The 23-row table looked
+like it needed mirroring into Rust beside the `_defaults`. Every value in it
+equals the default for its kind, so what the table really declares is WHICH
+interactions each surface is expected to support, at the standard budget. That is
+now asserted rather than assumed: a Python guard fails the moment someone lands a
+genuinely different number, because the instrument would otherwise keep checking
+against the default and the override would silently do nothing.
+
+**`Surface::Shell` is not a failure case, and its line is byte-identical.** Bare
+desktop, WebView chrome, and every sample taken while the native scene is not on
+screen belong to it. The harness wants the web shell measured by this same
+instrument so "native is faster" is a demonstrated delta rather than a claim, and
+a format change would have broken every historical number. A test pins the exact
+string.
+
+**Two enums, one bridge, both pinned.** latency.rs knows nothing about scene.rs on
+purpose: no Smithay, no scene, no clock, which is what lets its state machine run
+under `cargo test` on the default no-feature build where `scene` is not even
+compiled. So the surface names exist twice, and a Python guard asserts the two
+sets agree and that both match latency_budgets.json's keys.
+
+**One honest limitation, stated in the module doc rather than hidden.** A relative
+motion sample is attributed to the surface the pointer is LEAVING, because T_input
+is captured before the event is applied and moving that capture would bias the
+clock estimator toward busy periods. It differs only at a boundary, and only for
+the one sample that crosses it.
+
+What the box will now print, per 10s window, is a line per surface per interaction
+kind with its own verdict. That is the difference between "the desktop is slow"
+and "the cards are slow and the orb is fine", which is the whole reason the budget
+file was written with 23 rows.

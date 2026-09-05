@@ -251,3 +251,55 @@ def test_the_attributable_components_are_the_ones_the_native_shell_draws():
         "the set of attributable native surfaces changed: %s. That is allowed, "
         "but a new one must be a surface the native scene actually DRAWS and "
         "must have a row in latency_budgets.json." % sorted(keys))
+
+def test_no_component_overrides_the_default_budget_for_its_kind():
+    """WHY THE RUST MIRROR CAN STAY PER-KIND.
+
+    latency.rs mirrors latency_budgets.json's `_defaults` as consts, because the
+    file lives outside the crate and crane's source filter would drop it anyway.
+    The per-component table looks like it needs mirroring too, and today it does
+    not: every value in it equals the default for that kind. The components map
+    declares WHICH interactions each surface is expected to support, at the
+    standard budget, rather than different numbers.
+
+    That is a load-bearing fact, so it is asserted rather than assumed. The
+    moment someone gives a component a genuinely different budget, the instrument
+    would silently keep checking it against the default and the override would do
+    nothing. This test fails first and says where to put it.
+    """
+    budgets = json.load(open(BUDGETS, encoding="utf-8"))
+    defaults = budgets["_defaults"]
+    for name, rows in budgets.get("components", {}).items():
+        for kind, value in rows.items():
+            if kind.startswith("_"):
+                continue
+            assert kind in defaults, (
+                "component %r budgets the kind %r, which has no default; "
+                "latency.rs::Kind has no bucket for it either" % (name, kind))
+            assert value == defaults[kind], (
+                "component %r sets %s=%s against a default of %s. That is a real "
+                "override, and latency.rs still looks its budget up per KIND only, "
+                "so the override would do nothing. Teach Kind::budget_ms about the "
+                "surface before landing it." % (name, kind, value, defaults[kind]))
+
+
+def test_the_instrument_and_the_scene_agree_on_the_surface_names():
+    """The bridge between the two enums.
+
+    latency.rs deliberately knows nothing about scene.rs (no Smithay, no scene,
+    no clock) so its state machine runs under `cargo test` on the default
+    no-feature build where `scene` is not even compiled. That means the surface
+    names exist TWICE, and a drift between them would attribute samples to a
+    component whose budget row is spelled differently.
+    """
+    latency = open(os.path.join(REPO, "compositor", "src", "latency.rs"),
+                   encoding="utf-8").read()
+    block = re.search(r"impl Surface \{(.*?)\n    const ALL", latency, re.S)
+    assert block, "latency.rs no longer has a Surface::label to read"
+    labels = set(re.findall(r'Surface::\w+ => "([^"]+)"', block.group(1)))
+    assert "shell" in labels, (
+        "the unattributed surface must stay `shell`, or every historical number "
+        "changes format")
+    assert labels - {"shell"} == set(_component_keys()), (
+        "latency.rs and scene.rs disagree on the attributable surfaces: %s "
+        "against %s" % (sorted(labels - {"shell"}), sorted(_component_keys())))

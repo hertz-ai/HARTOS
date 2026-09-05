@@ -737,6 +737,13 @@ pub trait CompState:
         false
     }
 
+    /// The retained native scene tree, for asking what a point is over. None for a
+    /// backend that keeps no scene, which is also the honest answer for the WebView
+    /// desktop: nothing native is laid out, so nothing native can be named.
+    fn native_tree(&self) -> Option<&crate::scene::SceneNode> {
+        None
+    }
+
     /// NATIVE SHELL M3: the latest home_compose scene pushed over the `shell.compose`
     /// IPC verb, or None to fall back to the demo scene. Default None / no-op setter,
     /// so only the DRM backend stores it (winit dev build uses the demo).
@@ -1199,28 +1206,34 @@ pub fn process_input_event<S: CompState, B: InputBackend>(state: &mut S, event: 
     // bias the estimator toward busy periods. `Event::time()` is libinput's
     // CLOCK_MONOTONIC microseconds — the kernel stamp, taken before any of
     // our code ran, which is the entire point of the instrument.
+    // WHICH surface this input touched, resolved once for the whole match against the
+    // retained scene tree. Before this every sample was reported as `component=shell`,
+    // so latency_budgets.json's 23 per-component rows were dead and a slow orb was
+    // indistinguishable from a slow marketplace.
+    let surface = pointer_surface(state);
     match &event {
         InputEvent::Keyboard { event } => {
-            crate::latency::on_input(crate::latency::Kind::Key, event.time());
+            crate::latency::on_input(surface, crate::latency::Kind::Key, event.time());
             note_input_alive();
         }
         InputEvent::PointerMotion { event } => {
-            crate::latency::on_motion(event.time());
+            crate::latency::on_motion(surface, event.time());
             note_input_alive();
         }
         InputEvent::PointerMotionAbsolute { event } => {
-            crate::latency::on_motion(event.time());
+            crate::latency::on_motion(surface, event.time());
             note_input_alive();
         }
         InputEvent::PointerButton { event } => {
             crate::latency::on_button(
+                surface,
                 event.state() == ButtonState::Pressed,
                 event.time(),
             );
             note_input_alive();
         }
         InputEvent::PointerAxis { event } => {
-            crate::latency::on_input(crate::latency::Kind::Scroll, event.time());
+            crate::latency::on_input(surface, crate::latency::Kind::Scroll, event.time());
             note_input_alive();
         }
         _ => {}
@@ -2317,6 +2330,34 @@ fn native_pointer_scene_pos<S: CompState>(
     let sx = size.w as f64 / geo.size.w as f64;
     let sy = size.h as f64 / geo.size.h as f64;
     Some(((lx * sx) as f32, (ly * sy) as f32))
+}
+
+/// Which surface the pointer is over RIGHT NOW, for latency attribution.
+///
+/// `Shell` whenever the native scene is not what is on screen (the flag is off, the
+/// killswitch is up, or nothing has been laid out yet), which is exactly right: those
+/// samples belong to the WebView shell, and the harness wants it measured by this same
+/// instrument so "native is faster" is a demonstrated delta rather than a claim.
+///
+/// KNOWN AND ACCEPTED, stated rather than hidden: this reads the pointer BEFORE the event
+/// is applied, because that is where T_input is captured and moving the capture would
+/// bias the clock estimator toward busy periods. So a relative-motion sample is
+/// attributed to the surface the pointer is LEAVING. It differs only at a component
+/// boundary, and only for the one sample that crosses it; a drag stays inside its
+/// component for hundreds of samples, which is where the headline numbers come from.
+fn pointer_surface<S: CompState>(state: &S) -> crate::latency::Surface {
+    if !native_scene_drawn(state.native_shell_on(), state.capture_blocked()) {
+        return crate::latency::Surface::Shell;
+    }
+    let size = output_physical_size(state);
+    let Some((px, py)) = native_pointer_scene_pos(state, size) else {
+        return crate::latency::Surface::Shell;
+    };
+    state
+        .native_tree()
+        .and_then(|t| t.component_at(px, py))
+        .map(|c| c.surface())
+        .unwrap_or(crate::latency::Surface::Shell)
 }
 
 /// NATIVE SHELL M3 GL LOWERING: lower the native shell scene to render elements.

@@ -433,6 +433,9 @@ impl CompState for State {
     fn orb_mut(&mut self) -> &mut crate::comp_core::OrbCache {
         &mut self.orb
     }
+    fn native_tree(&self) -> Option<&crate::scene::SceneNode> {
+        self.scene_cache.tree()
+    }
     fn native_scene_caches(&mut self) -> crate::comp_core::NativeSceneCaches<'_> {
         // Disjoint fields, so the shared home borrow and the &mut caches coexist.
         (

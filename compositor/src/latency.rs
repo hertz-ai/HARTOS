@@ -8,19 +8,33 @@
 //! path, compositor queue and scanout included. App- and browser-level numbers
 //! are proxies by construction; ours is not, because hart-comp owns both ends.
 //!
-//! WHAT THIS M0 SLICE IS, HONESTLY:
-//!   * attribution is `shell` for every sample. The scene graph now EXISTS and
-//!     hit-tests (scene.rs `hit_test` / `hover_leaf`, both already on the live
-//!     pointer path for the orb and card hover), so the blocker has moved: what
-//!     is missing is carrying a node identity from the input that produced a
-//!     sample through to the frame that presented it. The harness also wants the
-//!     WEB shell measured by the same instrument ("'native is faster' is a
-//!     demonstrated delta, not a claim"), so a single `shell` attribution stays
-//!     correct for the baseline the M6 flip is judged against. Per-component
-//!     attribution arrives with SceneNode ids.
+//! ATTRIBUTION IS LIVE. Samples bucket by (surface, kind), where the surface is
+//! resolved from the retained scene tree at the moment the input arrives
+//! (`scene::SceneNode::component_at`, deepest-wins, the same rule `hit_test` and
+//! `hover_leaf` follow). A window therefore closes into one summary per surface
+//! per kind, so a slow card cannot hide behind a fast orb.
+//!
+//! `Surface::Shell` is not a failure case: it is bare desktop, WebView chrome,
+//! and every sample taken while the native scene is not on screen. The harness
+//! wants the WEB shell measured by this same instrument ("'native is faster' is a
+//! demonstrated delta, not a claim"), and the `shell` journal line is byte
+//! identical to the one this instrument emitted before attribution existed.
+//!
+//! WHAT THIS M0 SLICE STILL IS, HONESTLY:
+//!   * budgets are looked up per KIND, not per (surface, kind). That is not a
+//!     shortcut today: every value in latency_budgets.json's `components` table
+//!     equals the `_defaults` entry for its kind, so the table declares WHICH
+//!     interactions a surface is expected to support rather than different
+//!     numbers. A Python guard asserts exactly that and fails the moment someone
+//!     lands a real override, because the override would otherwise do nothing.
+//!   * the surface for a RELATIVE motion event is the one the pointer is
+//!     LEAVING. T_input is captured before the event is applied (moving that
+//!     capture would bias the clock estimator toward busy periods), so a boundary
+//!     crossing attributes one sample to the wrong side. A drag stays inside its
+//!     surface for hundreds of samples, which is where the headline numbers come
+//!     from.
 //!   * one frame stream, not per-CRTC: the appliance is single-display; on a
 //!     multi-head box samples from two CRTCs would interleave into one stream.
-//!     Refined together with attribution.
 //!   * the winit dev backend is not wired — numbers from a nested session would
 //!     be lies about the hardware path (they'd include the HOST compositor).
 //!
@@ -102,10 +116,65 @@ impl Kind {
     }
 }
 
-/// One aggregated window per kind, ready to be logged. Pure data so the io
+/// Which surface a sample is attributed to, as the aggregator buckets it.
+///
+/// `Shell` is not a failure case. The harness wants the WEB shell measured by this same
+/// instrument, so "native is faster" is a demonstrated delta rather than a claim, and a
+/// sample over WebView chrome or bare desktop belongs to it. It is also what every sample
+/// was before the scene could name anything, so the journal line for it is byte-identical
+/// to the one this instrument has always emitted.
+///
+/// The five named ones mirror `scene::Component`. They are not the same type because
+/// this module is deliberately free of every other module (no Smithay, no scene, no
+/// clock), which is what lets its state machine run under `cargo test` on any dev box
+/// including the default no-feature build. The mapping is one `From` at the wiring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    Shell,
+    Orb,
+    TopBar,
+    Omnibox,
+    Taskbar,
+    HomeCard,
+}
+
+impl Surface {
+    /// The budget file's key, and the journal line's `component=`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Surface::Shell => "shell",
+            Surface::Orb => "orb",
+            Surface::TopBar => "top-bar",
+            Surface::Omnibox => "omnibox",
+            Surface::Taskbar => "taskbar",
+            Surface::HomeCard => "home-card",
+        }
+    }
+    const ALL: [Surface; 6] = [
+        Surface::Shell,
+        Surface::Orb,
+        Surface::TopBar,
+        Surface::Omnibox,
+        Surface::Taskbar,
+        Surface::HomeCard,
+    ];
+    fn idx(self) -> usize {
+        match self {
+            Surface::Shell => 0,
+            Surface::Orb => 1,
+            Surface::TopBar => 2,
+            Surface::Omnibox => 3,
+            Surface::Taskbar => 4,
+            Surface::HomeCard => 5,
+        }
+    }
+}
+
+/// One aggregated window per (surface, kind), ready to be logged. Pure data so the io
 /// stays at the caller and the aggregation is testable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary {
+    pub surface: Surface,
     pub kind: Kind,
     pub n: usize,
     pub p50_us: u64,
@@ -119,7 +188,8 @@ impl Summary {
     /// The harness §3 journal line, byte-stable so tests can pin it.
     pub fn journal_line(&self) -> String {
         format!(
-            "hart-latency component=shell kind={} n={} p50={:.1}ms p99={:.1}ms max={:.1}ms budget={}ms verdict={}",
+            "hart-latency component={} kind={} n={} p50={:.1}ms p99={:.1}ms max={:.1}ms budget={}ms verdict={}",
+            self.surface.label(),
             self.kind.label(),
             self.n,
             self.p50_us as f64 / 1000.0,
@@ -157,15 +227,18 @@ const OFFSET_WINDOW: usize = 64;
 pub struct LatencyCore {
     /// Rolling one-sided offset observations (instant_us - event_us).
     offset_obs: VecDeque<u64>,
-    /// Inputs seen since the last queued frame.
-    pending: Vec<(Kind, u64)>,
+    /// Inputs seen since the last queued frame, each with the surface it touched.
+    pending: Vec<(Surface, Kind, u64)>,
     pending_dropped: u64,
     /// Batches riding queued-but-not-yet-presented frames (FIFO by seq).
-    inflight: VecDeque<Vec<(Kind, u64)>>,
+    inflight: VecDeque<Vec<(Surface, Kind, u64)>>,
     inflight_dropped: u64,
     button_down: bool,
     window_start_us: Option<u64>,
-    window: [Vec<u64>; 5],
+    /// [surface][kind]. Thirty fixed buckets, allocated once and reused: an input rate
+    /// this cannot cover does not exist, and a map would put an allocation on the input
+    /// path for no benefit.
+    window: [[Vec<u64>; 5]; 6],
 }
 
 impl LatencyCore {
@@ -190,17 +263,17 @@ impl LatencyCore {
         self.offset_obs.iter().copied().min()
     }
 
-    pub fn note_button(&mut self, down: bool, event_us: u64, instant_us: u64) {
+    pub fn note_button(&mut self, surface: Surface, down: bool, event_us: u64, instant_us: u64) {
         self.button_down = down;
-        self.note_input(Kind::Press, event_us, instant_us);
+        self.note_input(surface, Kind::Press, event_us, instant_us);
     }
 
-    pub fn note_motion(&mut self, event_us: u64, instant_us: u64) {
+    pub fn note_motion(&mut self, surface: Surface, event_us: u64, instant_us: u64) {
         let kind = if self.button_down { Kind::Drag } else { Kind::Hover };
-        self.note_input(kind, event_us, instant_us);
+        self.note_input(surface, kind, event_us, instant_us);
     }
 
-    pub fn note_input(&mut self, kind: Kind, event_us: u64, instant_us: u64) {
+    pub fn note_input(&mut self, surface: Surface, kind: Kind, event_us: u64, instant_us: u64) {
         // Feed the offset estimator first — even inputs later dropped for
         // capacity still carry a valid clock observation.
         if instant_us >= event_us {
@@ -213,7 +286,7 @@ impl LatencyCore {
             self.pending.remove(0);
             self.pending_dropped += 1;
         }
-        self.pending.push((kind, event_us));
+        self.pending.push((surface, kind, event_us));
     }
 
     /// A frame carrying current damage was handed to DRM (`queue_frame` Ok).
@@ -239,12 +312,12 @@ impl LatencyCore {
         if let Some(off) = self.offset_us() {
             // Refuse to fabricate: no offset means no anchored photon time.
             let photon_event_us = instant_us.saturating_sub(off);
-            for (kind, t_in) in batch {
+            for (surface, kind, t_in) in batch {
                 let lat = photon_event_us.saturating_sub(t_in);
                 if lat == 0 || lat > MAX_SANE_LATENCY_US {
-                    continue; // unanchored or wedge artifact — not a report
+                    continue; // unanchored or wedge artifact, not a report
                 }
-                let w = &mut self.window[kind.idx()];
+                let w = &mut self.window[surface.idx()][kind.idx()];
                 if w.len() < MAX_WINDOW_SAMPLES {
                     w.push(lat);
                 }
@@ -263,8 +336,12 @@ impl LatencyCore {
 
     fn close_window(&mut self, now_us: u64) -> Vec<Summary> {
         let mut out = Vec::new();
+        // Surface-major, so a window's lines read as one block per component rather than
+        // interleaved by kind: that is how a reader sees "the orb is fine, the cards are
+        // not" at a glance instead of reconstructing it from ten lines.
+        for surface in Surface::ALL {
         for kind in Kind::ALL {
-            let w = &mut self.window[kind.idx()];
+            let w = &mut self.window[surface.idx()][kind.idx()];
             if w.is_empty() {
                 continue;
             }
@@ -275,6 +352,7 @@ impl LatencyCore {
             let max = *w.last().unwrap();
             let budget = kind.budget_ms();
             out.push(Summary {
+                surface,
                 kind,
                 n,
                 p50_us: p50,
@@ -286,6 +364,7 @@ impl LatencyCore {
                 pass: p99 <= budget * 1000,
             });
             w.clear();
+        }
         }
         self.window_start_us = Some(now_us);
         out
@@ -325,24 +404,24 @@ fn instant_us() -> u64 {
     global().base.elapsed().as_micros() as u64
 }
 
-pub fn on_motion(event_us: u64) {
+pub fn on_motion(surface: Surface, event_us: u64) {
     let g = global();
     if let Ok(mut c) = g.core.lock() {
-        c.note_motion(event_us, instant_us());
+        c.note_motion(surface, event_us, instant_us());
     }
 }
 
-pub fn on_button(down: bool, event_us: u64) {
+pub fn on_button(surface: Surface, down: bool, event_us: u64) {
     let g = global();
     if let Ok(mut c) = g.core.lock() {
-        c.note_button(down, event_us, instant_us());
+        c.note_button(surface, down, event_us, instant_us());
     }
 }
 
-pub fn on_input(kind: Kind, event_us: u64) {
+pub fn on_input(surface: Surface, kind: Kind, event_us: u64) {
     let g = global();
     if let Ok(mut c) = g.core.lock() {
-        c.note_input(kind, event_us, instant_us());
+        c.note_input(surface, kind, event_us, instant_us());
     }
 }
 
@@ -376,8 +455,8 @@ pub fn on_frame_presented() -> Vec<Summary> {
                 {
                     let _ = writeln!(
                         f,
-                        "{{\"component\":\"shell\",\"kind\":\"{}\",\"n\":{},\"p50_us\":{},\"p99_us\":{},\"max_us\":{},\"budget_ms\":{},\"pass\":{}}}",
-                        s.kind.label(), s.n, s.p50_us, s.p99_us, s.max_us,
+                        "{{\"component\":\"{}\",\"kind\":\"{}\",\"n\":{},\"p50_us\":{},\"p99_us\":{},\"max_us\":{},\"budget_ms\":{},\"pass\":{}}}",
+                        s.surface.label(), s.kind.label(), s.n, s.p50_us, s.p99_us, s.max_us,
                         s.budget_ms, s.pass
                     );
                 }
@@ -399,7 +478,7 @@ mod tests {
         let mut c = LatencyCore::new();
         for (i, delay) in [900u64, 40, 300, 15, 700, 90].iter().enumerate() {
             let ev = (i as u64) * 16_000;
-            c.note_input(Kind::Hover, ev, ev + 1_000_000 + delay);
+            c.note_input(Surface::Shell, Kind::Hover, ev, ev + 1_000_000 + delay);
         }
         // min picks the fastest delivery: error == 15µs against 16ms budgets.
         assert_eq!(c.offset_us(), Some(1_000_015));
@@ -413,7 +492,7 @@ mod tests {
         c.frame_queued();
         assert!(c.frame_presented(5_000_000).is_empty());
         // and nothing was smuggled into the window either
-        assert!(c.window.iter().all(|w| w.is_empty()));
+        assert!(c.window.iter().all(|per_kind| per_kind.iter().all(|w| w.is_empty())));
     }
 
     // ── the sample pipeline ─────────────────────────────────────────────────
@@ -422,10 +501,10 @@ mod tests {
     /// latency, using a zero-delay clock pairing so numbers are exact.
     fn one_sample(kind: Kind, t_in: u64, t_photon: u64) -> Option<u64> {
         let mut c = LatencyCore::new();
-        c.note_input(kind, t_in, t_in); // offset = 0 exactly
+        c.note_input(Surface::Shell, kind, t_in, t_in); // offset = 0 exactly
         c.frame_queued();
         c.frame_presented(t_photon);
-        c.window[kind.idx()].first().copied()
+        c.window[Surface::Shell.idx()][kind.idx()].first().copied()
     }
 
     #[test]
@@ -442,12 +521,12 @@ mod tests {
     #[test]
     fn motion_is_drag_with_a_button_held_and_hover_without() {
         let mut c = LatencyCore::new();
-        c.note_motion(10, 10);
-        c.note_button(true, 20, 20);
-        c.note_motion(30, 30);
-        c.note_button(false, 40, 40);
-        c.note_motion(50, 50);
-        let kinds: Vec<Kind> = c.pending.iter().map(|(k, _)| *k).collect();
+        c.note_motion(Surface::Shell, 10, 10);
+        c.note_button(Surface::Shell, true, 20, 20);
+        c.note_motion(Surface::Shell, 30, 30);
+        c.note_button(Surface::Shell, false, 40, 40);
+        c.note_motion(Surface::Shell, 50, 50);
+        let kinds: Vec<Kind> = c.pending.iter().map(|(_, k, _)| *k).collect();
         assert_eq!(
             kinds,
             vec![Kind::Hover, Kind::Press, Kind::Drag, Kind::Press, Kind::Hover],
@@ -458,22 +537,22 @@ mod tests {
     #[test]
     fn inputs_bind_to_the_frame_queued_after_them() {
         let mut c = LatencyCore::new();
-        c.note_input(Kind::Key, 1_000, 1_000);
+        c.note_input(Surface::Shell, Kind::Key, 1_000, 1_000);
         c.frame_queued();
-        c.note_input(Kind::Key, 2_000, 2_000); // after the queue — next frame
+        c.note_input(Surface::Shell, Kind::Key, 2_000, 2_000); // after the queue, so the next frame
         c.frame_presented(10_000);
-        assert_eq!(c.window[Kind::Key.idx()], vec![9_000]);
+        assert_eq!(c.window[Surface::Shell.idx()][Kind::Key.idx()], vec![9_000]);
         c.frame_queued();
         c.frame_presented(20_000);
-        assert_eq!(c.window[Kind::Key.idx()], vec![9_000, 18_000]);
+        assert_eq!(c.window[Surface::Shell.idx()][Kind::Key.idx()], vec![9_000, 18_000]);
     }
 
     #[test]
     fn a_presented_frame_with_no_bound_input_is_silent() {
         let mut c = LatencyCore::new();
-        c.note_input(Kind::Key, 1_000, 1_000); // pending, NOT queued
+        c.note_input(Surface::Shell, Kind::Key, 1_000, 1_000); // pending, NOT queued
         assert!(c.frame_presented(5_000).is_empty());
-        assert!(c.window[Kind::Key.idx()].is_empty());
+        assert!(c.window[Surface::Shell.idx()][Kind::Key.idx()].is_empty());
         assert_eq!(c.pending.len(), 1, "unqueued input must stay pending");
     }
 
@@ -481,11 +560,11 @@ mod tests {
     fn overflow_drops_are_counted_never_silent() {
         let mut c = LatencyCore::new();
         for i in 0..(MAX_PENDING_INPUTS + 10) {
-            c.note_input(Kind::Hover, i as u64, i as u64);
+            c.note_input(Surface::Shell, Kind::Hover, i as u64, i as u64);
         }
         assert_eq!(c.dropped().0, 10);
         for _ in 0..(MAX_INFLIGHT_FRAMES + 3) {
-            c.note_input(Kind::Hover, 1, 1);
+            c.note_input(Surface::Shell, Kind::Hover, 1, 1);
             c.frame_queued();
         }
         assert_eq!(c.dropped().1, 3);
@@ -497,13 +576,13 @@ mod tests {
         let mut c = LatencyCore::new();
         let mut t = 0u64;
         for &l in latencies_us {
-            c.note_input(Kind::Drag, t, t);
+            c.note_input(Surface::Shell, Kind::Drag, t, t);
             c.frame_queued();
             c.frame_presented(t + l);
             t += 20_000;
         }
         // force the window shut with one more presented frame far in the future
-        c.note_input(Kind::Drag, t + WINDOW_US, t + WINDOW_US);
+        c.note_input(Surface::Shell, Kind::Drag, t + WINDOW_US, t + WINDOW_US);
         c.frame_queued();
         c.frame_presented(t + WINDOW_US + 1_000)
     }
@@ -528,8 +607,97 @@ mod tests {
     }
 
     #[test]
+    fn two_surfaces_are_two_verdicts_not_one_blended_number() {
+        // The whole point of attribution. Before it, a fast orb and a slow card averaged
+        // into one `component=shell` line, so a p99 violation told you the desktop was
+        // slow and nothing else. Drive the same kind through two surfaces, one inside its
+        // budget and one far outside, and the window must produce two summaries with
+        // opposite verdicts rather than one blurred pass.
+        let mut c = LatencyCore::new();
+        let mut t = 1_000u64;
+        // 40 comfortable hovers over the orb (8ms), 40 terrible ones over a card (40ms).
+        for _ in 0..40 {
+            c.note_input(Surface::Orb, Kind::Hover, t, t);
+            c.frame_queued();
+            c.frame_presented(t + 8_000);
+            t += 16_000;
+            c.note_input(Surface::HomeCard, Kind::Hover, t, t);
+            c.frame_queued();
+            c.frame_presented(t + 40_000);
+            t += 16_000;
+        }
+        // Close the window with one more presented frame past the boundary.
+        c.note_input(Surface::Orb, Kind::Hover, t, t);
+        c.frame_queued();
+        let out = c.frame_presented(t + WINDOW_US + 8_000);
+        assert!(!out.is_empty(), "the window closed and produced summaries");
+
+        let orb = out
+            .iter()
+            .find(|s| s.surface == Surface::Orb && s.kind == Kind::Hover)
+            .expect("the orb got its own line");
+        let card = out
+            .iter()
+            .find(|s| s.surface == Surface::HomeCard && s.kind == Kind::Hover)
+            .expect("the card got its own line");
+        assert!(orb.pass, "8ms hovers are inside the 16ms budget");
+        assert!(!card.pass, "40ms hovers are not, and must not hide behind the orb");
+        assert!(card.p99_us > orb.p99_us * 3, "the two are nowhere near each other");
+        assert_eq!(orb.n + card.n, 80, "every sample landed in exactly one bucket");
+    }
+
+    #[test]
+    fn an_unattributed_sample_reports_exactly_what_it_always_did() {
+        // `Shell` is not a failure case: the harness wants the WEB shell measured by this
+        // same instrument so "native is faster" is a demonstrated delta. Its line must be
+        // byte-identical to the one this instrument emitted before attribution existed,
+        // or every historical number silently changes format.
+        let s = Summary {
+            surface: Surface::Shell,
+            kind: Kind::Drag,
+            n: 142,
+            p50_us: 8_100,
+            p99_us: 14_700,
+            max_us: 19_200,
+            budget_ms: 16,
+            pass: true,
+        };
+        assert_eq!(
+            s.journal_line(),
+            "hart-latency component=shell kind=drag n=142 p50=8.1ms p99=14.7ms max=19.2ms budget=16ms verdict=PASS"
+        );
+    }
+
+    #[test]
+    fn every_surface_label_is_a_bare_slug_and_they_are_all_distinct() {
+        // The labels are the keys of latency_budgets.json's `components` map, joined to
+        // it by a Python guard. A duplicate here would silently merge two components'
+        // samples into one row; a label with a space would break the journal line's
+        // key=value shape that the harness greps.
+        let labels: Vec<&str> = Surface::ALL.iter().map(|s| s.label()).collect();
+        assert_eq!(
+            labels,
+            ["shell", "orb", "top-bar", "omnibox", "taskbar", "home-card"]
+        );
+        for (i, a) in labels.iter().enumerate() {
+            assert!(!a.is_empty() && !a.contains(' '), "{a:?} is not a bare slug");
+            for b in labels.iter().skip(i + 1) {
+                assert_ne!(a, b, "two surfaces share a budget row");
+            }
+        }
+        // The index each one buckets under must be unique and in range, since the window
+        // is a fixed array rather than a map.
+        let mut seen = [false; 6];
+        for s in Surface::ALL {
+            assert!(!seen[s.idx()], "two surfaces share bucket {}", s.idx());
+            seen[s.idx()] = true;
+        }
+    }
+
+    #[test]
     fn the_journal_line_matches_the_harness_contract() {
         let s = Summary {
+            surface: Surface::Shell,
             kind: Kind::Drag,
             n: 142,
             p50_us: 8_100,
