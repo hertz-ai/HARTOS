@@ -937,12 +937,16 @@ def create_agents_for_role(user_id: str, prompt_id):
 def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]":
     """Create new assistant & user proxy agents for a user with basic configuration."""
     user_prompt = f'{user_id}_{prompt_id}'
-    # New session: the fabrication gate's one-shot budget is keyed
+    # New session: the fabrication gate's re-steer budget is keyed
     # (user_prompt, action_id); clear this session's entries so a re-run of
     # the same agent gets the budget back instead of one spent for the
-    # process lifetime.
+    # process lifetime.  The pending-refusal record is keyed the same way and
+    # must not survive the session either, or a stale entry would steer the
+    # next run about a tool it already ran.
     for _k in [k for k in _reuse_resteer_counts if k[0] == user_prompt]:
         _reuse_resteer_counts.pop(_k, None)
+    for _k in [k for k in _reuse_fab_pending if k[0] == user_prompt]:
+        _reuse_fab_pending.pop(_k, None)
     # Create a basic function calling config.
     # Per-dispatch model routing — see create_agents_for_role above for why the
     # thread-local override must win over the import-time module config_list.
@@ -3032,10 +3036,37 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
     return assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group
 
 
-# One-shot budget per (user_prompt, action_id) for the fabrication gate in
-# _advance_reuse_action: one refusal, then it fails open and advances, so it
-# can never loop or permanently stall an action.
+# Re-steer budget per (user_prompt, action_id) for the fabrication gate in
+# _advance_reuse_action.  Each refusal steers the agent to actually call the
+# unrun tool; after _REUSE_FAB_STEER_MAX the gate advances anyway (loudly), so
+# it can never loop or permanently stall an action.
 _reuse_resteer_counts = {}
+_REUSE_FAB_STEER_MAX = 3
+
+# Unrun tool names recorded by the fabrication gate for the refusal it just
+# returned, keyed the same way, and consumed by _reuse_fab_steer_message.
+_reuse_fab_pending = {}
+
+
+def _reuse_fab_steer_message(user_prompt, current_action_id):
+    """Re-steer text for a fabrication refusal, or None if it was not one.
+
+    _advance_reuse_action returns (None, False) for BOTH "this action's tool
+    never ran" and "all actions done / state error", so every caller treated a
+    refusal as done and ended the turn with an empty reply (review 2026-09-03
+    #1).  Popping the pending refusal here tells the two cases apart and gives
+    the caller a message that names the tool the agent must actually call.
+    """
+    tools = _reuse_fab_pending.pop((user_prompt, current_action_id), None)
+    if not tools:
+        return None
+    names = ', '.join(str(t) for t in tools)
+    return (
+        f"Action {current_action_id} is NOT complete: the tool(s) {names} were "
+        f"never actually called, so any result reported for them is not real. "
+        f"Do not report this action as completed. @Helper call {names} now with "
+        f"real arguments and report the actual returned result."
+    )
 
 
 def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
@@ -3225,6 +3256,17 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     _rc_next, _rc_ok = _advance_reuse_action(
                         user_prompt, _reuse_current_action, "reuse-w1-completed", prompt_id)
                     if not _rc_ok:
+                        # A fabrication refusal is not "all actions done": steer
+                        # the agent to actually run the tool and let the action
+                        # be re-verified (drop the once-per-action latch so the
+                        # next real 'completed' verdict can advance it).
+                        _rc_steer = _reuse_fab_steer_message(user_prompt, _reuse_current_action)
+                        if _rc_steer:
+                            _reuse_advanced_actions.discard(_reuse_current_action)
+                            chat_instructor.initiate_chat(
+                                recipient=manager, message=_rc_steer,
+                                clear_history=False, silent=False)
+                            continue
                         return ''
                     _rc_msg = _build_reuse_action_message(user_prompt, _rc_next)
                     chat_instructor.initiate_chat(
@@ -3260,6 +3302,11 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                                 f"but pipeline assigned {_reuse_current_action}")
                         _next, _ok = _advance_reuse_action(user_prompt, _reuse_current_action, "reuse-w1", prompt_id)
                         if not _ok:
+                            _steer = _reuse_fab_steer_message(user_prompt, _reuse_current_action)
+                            if _steer:
+                                chat_instructor.initiate_chat(recipient=manager, message=_steer,
+                                                              clear_history=False, silent=False)
+                                continue
                             return ''
                         user_message = _build_reuse_action_message(user_prompt, _next)
                         chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,
@@ -3282,6 +3329,11 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                                         f"but pipeline has {_known}")
                                 _next2, _ok2 = _advance_reuse_action(user_prompt, _known, "reuse-w1-regex", prompt_id)
                                 if not _ok2:
+                                    _steer2 = _reuse_fab_steer_message(user_prompt, _known)
+                                    if _steer2:
+                                        chat_instructor.initiate_chat(recipient=manager, message=_steer2,
+                                                                      clear_history=False, silent=False)
+                                        continue
                                     return ''
                                 user_message = _build_reuse_action_message(user_prompt, _next2)
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
@@ -3542,9 +3594,19 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
     # executed in the group chat.  The StatusVerifier LLM self-attests
     # "completed"/"done" and the model fabricates the tool's output (live
     # 2026-09-03: revenue agent "92% verified", zero get_api_revenue_stats
-    # execution).  Bounded to ONE refusal per action then fails open (advances)
-    # so it can never permanently stall.  Reaches the group chat + agents via the
-    # session registry, so it works no matter which loop (w1/w2/main) advanced.
+    # execution).  Reaches the group chat + agents via the session registry, so
+    # it works no matter which loop (w1/w2/main) advanced.
+    #
+    # The refusal RE-STEERS (bounded), it does not silently fail open after one
+    # hold.  Live 2026-09-05 (Trading 33204307184): the StatusVerifier claimed
+    # action 1 "completed" BEFORE its google_search ever ran; the old one-shot
+    # budget was spent on that first claim and the very next claim advanced an
+    # action whose tool had still not executed — exactly the "force-completed by
+    # a nudge" the verification contract forbids.  Now each refusal records the
+    # unrun tools so the caller can steer the agent to actually call them
+    # (_reuse_fab_steer_message); only after _REUSE_FAB_STEER_MAX real re-steers
+    # do we advance anyway — and then LOUDLY, so a non-tool-backed action is
+    # never reported as verified.
     try:
         from hartos.lifecycle_hooks import get_registered_groupchat
         _gc = get_registered_groupchat(user_prompt)
@@ -3552,13 +3614,22 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             _agents = list(getattr(_gc, 'agents', None) or [])
             _fab = _reuse_fabricated_tools(user_prompt, current_action_id, _gc, _agents)
             _rk = (user_prompt, current_action_id)
-            if _fab and _reuse_resteer_counts.get(_rk, 0) < 1:
-                _reuse_resteer_counts[_rk] = _reuse_resteer_counts.get(_rk, 0) + 1
-                current_app.logger.warning(
-                    f"[FABRICATED-COMPLETE] refusing to advance action "
-                    f"{current_action_id}: its tool(s) {_fab} produced NO result "
-                    f"in the group chat (fabricated completion) — holding for one retry")
-                return None, False
+            if _fab:
+                _n = _reuse_resteer_counts.get(_rk, 0)
+                if _n < _REUSE_FAB_STEER_MAX:
+                    _reuse_resteer_counts[_rk] = _n + 1
+                    _reuse_fab_pending[_rk] = list(_fab)
+                    current_app.logger.warning(
+                        f"[FABRICATED-COMPLETE] refusing to advance action "
+                        f"{current_action_id}: its tool(s) {_fab} never executed "
+                        f"(fabricated completion) — re-steering the agent to run "
+                        f"them (attempt {_n + 1}/{_REUSE_FAB_STEER_MAX})")
+                    return None, False
+                current_app.logger.error(
+                    f"[FABRICATED-COMPLETE] action {current_action_id} still claims "
+                    f"completion with tool(s) {_fab} never executed after "
+                    f"{_REUSE_FAB_STEER_MAX} re-steers — advancing to avoid a "
+                    f"permanent stall; this action's output is NOT tool-backed")
     except Exception as _fg_err:
         current_app.logger.debug(f"[FAB-GUARD] advance-gate skipped: {_fg_err}")
     # Mark current action done
@@ -3889,6 +3960,11 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                         f"but pipeline has {_w2_current}")
                                 _w2_next, _w2_ok = _advance_reuse_action(user_prompt, _w2_current, "reuse-w2", prompt_id)
                                 if not _w2_ok:
+                                    _w2_steer = _reuse_fab_steer_message(user_prompt, _w2_current)
+                                    if _w2_steer:
+                                        chat_instructor.initiate_chat(recipient=manager, message=_w2_steer,
+                                                                      clear_history=False, silent=False)
+                                        continue
                                     return ''
                                 user_message = _build_reuse_action_message(user_prompt, _w2_next)
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
@@ -3907,6 +3983,11 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                                 f"but pipeline has {_w2_current}")
                                         _w2_next2, _w2_ok2 = _advance_reuse_action(user_prompt, _w2_current, "reuse-w2-regex", prompt_id)
                                         if not _w2_ok2:
+                                            _w2_steer2 = _reuse_fab_steer_message(user_prompt, _w2_current)
+                                            if _w2_steer2:
+                                                chat_instructor.initiate_chat(recipient=manager, message=_w2_steer2,
+                                                                              clear_history=False, silent=False)
+                                                continue
                                             return ''
                                         user_message = _build_reuse_action_message(user_prompt, _w2_next2)
                                         chat_instructor.initiate_chat(recipient=manager, message=user_message,
