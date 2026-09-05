@@ -3689,8 +3689,17 @@ def _build_reuse_action_message(user_prompt, action_id):
     action_message = user_tasks[user_prompt].get_action(action_id - 1)['action']
     recipe_actions = recipes[user_prompt].get('actions', [])
     if action_id - 1 < len(recipe_actions):
-        steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
-                               'code': x.get('generalized_functions', None)}} for x in
+        # str() because `steps` is model-authored and its type is not fixed:
+        # in prompts/18088688973_0_recipe.json action 1 carries a LIST of
+        # {description, tool_name} dicts while actions 2..6 carry a str.  Used
+        # raw as a dict key that raised TypeError("unhashable type: 'list'"),
+        # which killed the builder for exactly the action the opening turn
+        # seeds — measured live 2026-09-05 14:06:38.  Trading 33204307184,
+        # whose action 1 is a str, was unaffected and got its command 6x on
+        # the wire from this same code.  Where the key is already a str,
+        # str(s) is s, so the rendered message is byte-identical.
+        steps = [{str(x['steps']): {'tool_name': x.get('tool_name', None),
+                                    'code': x.get('generalized_functions', None)}} for x in
                  recipe_actions[action_id - 1].get('recipe', [])]
     else:
         steps = []
