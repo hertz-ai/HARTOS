@@ -780,9 +780,11 @@ pub const TASKBAR_H: f32 = 44.0;
 const BAR_PAD_X: f32 = 12.0;
 /// `.top-bar-omni { max-width: 360px }`: how wide the pill gets when there is room.
 const OMNIBOX_W: f32 = 360.0;
-const ORB_SM: f32 = 28.0;
-/// Wordmark type size. The shell sets it in the bar's own scale, not the hero's.
-const WORDMARK_PX: f32 = 15.0;
+/// `.top-bar-orb { width: 30px; height: 30px }`: the brand orb docked in the bar.
+const ORB_SM: f32 = 30.0;
+/// `.top-bar .start-btn { font-size: 13px }`. The shell sets the wordmark in the BAR's
+/// own scale, not the hero's, which is the whole reason it has its own constant.
+const WORDMARK_PX: f32 = 13.0;
 /// A text box of `ink_w` centred inside a slot at `slot_x` of width `slot_w`, CLAMPED so
 /// it can never exceed the slot.
 ///
@@ -799,10 +801,14 @@ fn centered_box(ink_w: f32, slot_x: f32, slot_w: f32, y: f32, h: f32) -> Rect {
 /// The tray glyphs (`.top-bar-right .tray-btn`), in the shell's left-to-right order.
 /// Ligature names, so they ride the ordinary text path like every other icon.
 const TRAY_GLYPHS: [&str; 3] = ["notifications", "palette", "shield"];
+/// `.tray-btn { width: 32px; height: 32px }`, and `.top-bar-right { gap: 8px }`.
 const TRAY_BTN: f32 = 32.0;
-const TRAY_PX: f32 = 18.0;
+/// `.top-bar-right .tray-btn .mi { font-size: var(--hart-icon-size) }`, which the theme
+/// service and the built-in css_vars both default to 20px.
+const TRAY_PX: f32 = 20.0;
 const TRAY_GAP: f32 = 8.0;
-const AVATAR_D: f32 = 28.0;
+/// `.top-bar-avatar { width: 30px; height: 30px; font-size: 13px }`.
+const AVATAR_D: f32 = 30.0;
 const AVATAR_PX: f32 = 13.0;
 /// The shell hardcodes this letter in its own markup, so it is the same letter rather
 /// than a guess at whose account it is.
@@ -812,14 +818,31 @@ const OMNIBOX_GLYPH: &str = "search";
 const OMNIBOX_PX: f32 = 13.0;
 /// The shortcut hint at the far end of the pill (the shell's `.tbo-kbd`).
 const OMNIBOX_KBD: &str = "Super K";
+/// `.tbo-kbd { font-size: 11px }`.
 const KBD_PX: f32 = 11.0;
 /// The shell's five primary destinations (`.top-bar-nav .tb-tab`), in its order.
 const NAV_TABS: [&str; 5] = ["Home", "Agents", "Apps", "Hive", "Earn"];
 /// Which tab reads as current. The native scene only lays out the HOME canvas, so home
 /// IS the active destination; this becomes state the moment a tab can navigate.
 const ACTIVE_TAB: usize = 0;
+/// `.tb-tab { font-size: 13px }`, and `.top-bar-nav { gap: 2px }` between them.
 const TAB_PX: f32 = 13.0;
 const TAB_GAP: f32 = 2.0;
+/// TWO measurements under one name, which is the `EDGE_PAD` shape again and is NOT fixed
+/// here because unpicking it is a visual call the box has to settle.
+///
+/// It is (a) the home orb's slot, which the shell sizes at `.hart-hero-orbwrap`'s 300px,
+/// and (b) the vertical budget the hero takes before the rows start, which the shell does
+/// not have as a number at all: `.hh-hero` is `flex: 0 0 auto` so its height is whatever
+/// its content comes to, `.hh-rows` is `flex: 1 1 auto` taking the rest, and the ORB is
+/// not in that flow (it floats above the home at z 1450). Here the orb slot is subtracted
+/// from the hero's text width AND the same number is what the rows start below, so the
+/// orb pays for itself twice.
+///
+/// Setting this to the shell's 300 in place would therefore cost 100px of row budget that
+/// the shell never spends, and a row that does not fit is dropped silently. The correct
+/// shape is a separate `HERO_ORB_D = 300` that floats, with the band's height coming from
+/// where the hero's own content actually ends, and that changes what overlaps what.
 const HERO_H: f32 = 200.0;
 /// `.hh-eyebrow`.
 const HERO_EYEBROW_PX: f32 = 16.0;
@@ -863,6 +886,8 @@ const CARD_ICON_INSET_X: f32 = 14.0;
 const CONTENT_PAD_Y: f32 = 12.0;
 /// 5px, the shell's own `.hh-card-prog { height: 5px }`.
 const CARD_PROG_H: f32 = 5.0;
+/// `.hh-card-badge` / `.hh-card-live`, both 12px on an 8px horizontal pad, and the live
+/// tag's own `gap: 6px` before an 8px `.hh-dot`.
 const CARD_CHIP_PX: f32 = 12.0;
 const CARD_CHIP_H: f32 = 20.0;
 const CARD_CHIP_PAD_X: f32 = 8.0;
@@ -872,9 +897,11 @@ const CARD_LIVE_DOT: f32 = 8.0;
 const CARD_LIVE_GAP: f32 = 6.0;
 /// The shell's `.hh-card-ic`: a 34px rounded tile holding a 20px glyph.
 const CARD_ICON_BOX: f32 = 34.0;
+/// `.hh-card-ic .mi { font-size: 20px }`.
 const CARD_ICON_PX: f32 = 20.0;
 /// `.hh-rank-num`: a 116px numeral with a 3px stroke, overhanging its card.
 const RANK_PX: f32 = 116.0;
+/// `.hh-rank-num { -webkit-text-stroke: 3px }`.
 const RANK_STROKE: f32 = 3.0;
 /// `.hh-card.hh-ranked .hh-rank-inner`: the art box of a leaderboard card is a fixed
 /// 174px wide, pinned to the card's right edge and full height, leaving the numeral the

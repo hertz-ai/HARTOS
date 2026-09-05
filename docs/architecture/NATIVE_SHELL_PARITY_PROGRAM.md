@@ -569,3 +569,31 @@ compositor has not implemented fails the build instead of quietly rendering a
 different desktop. That guard is the same shape as the bar-height one above, and
 for the same reason: the drift is across a language boundary, so it has to be
 checked somewhere that can read both.
+
+### Finishing the constant audit, and the one left open
+Having found that a CSS citation in the comment was a reliable marker of a correct
+constant, the rest of scene.rs was audited the same way. Four more in the top-bar
+cluster were wrong and nothing could see them: the docked orb 28 against
+`.top-bar-orb`'s 30, the avatar 28 against `.top-bar-avatar`'s 30, the wordmark
+15px against `.top-bar .start-btn`'s 13, and the tray glyph 18 against
+`--hart-icon-size`'s 20. All four now carry their source and are pinned across the
+language boundary with the rest.
+
+Two of those sources are NOT in hartHome.css; they are in the service's own inline
+sheet, which is why they had drifted furthest. The bar's CSS is split across two
+files and the audit has to read both.
+
+**HERO_H is left open, deliberately.** It is `EDGE_PAD`'s shape again: one name
+doing two measurements. It is both the home orb's slot and the vertical budget the
+hero takes before the rows begin. The shell sizes the orb at
+`.hart-hero-orbwrap`'s 300px, but it has no number at all for the second: `.hh-hero`
+is `flex: 0 0 auto` so its height is its content's, `.hh-rows` takes the rest, and
+the orb is not in that flow (it floats above the home at z 1450).
+
+So setting HERO_H to 300 in place would spend 100px of row budget the shell never
+spends, and a row that does not fit is dropped silently. The correct shape is a
+separate floating `HERO_ORB_D = 300` with the band's height coming from where the
+hero's content actually ends, which changes what overlaps what on screen. That is
+a visual call, so it waits for the box rather than being guessed at. The
+conflation is recorded at the constant itself so the next reader does not have to
+rediscover it.

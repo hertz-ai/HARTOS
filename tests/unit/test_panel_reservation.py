@@ -204,6 +204,45 @@ def test_the_native_home_is_laid_out_at_the_shells_own_scale():
             "%s is %s but %s { %s } is %s"
             % (const, rust_const(const), selector, prop, want))
 
+    # ── the TOP BAR's cluster, whose CSS lives in the service's inline sheet
+    #    rather than hartHome.css: the wordmark rides `.start-btn`'s size, the
+    #    tray glyph rides the theme's icon-size variable. All four of these were
+    #    wrong (28/15/18/28 against 30/13/20/30) and nothing could see it.
+    service = open(SERVICE_SRC, encoding="utf-8").read()
+    for const, want in [
+        ("ORB_SM", _css_decl(base, ".top-bar-orb", "width")),
+        ("AVATAR_D", _css_decl(base, ".top-bar-avatar", "width")),
+        ("AVATAR_PX", _css_decl(base, ".top-bar-avatar", "font-size")),
+        ("TAB_PX", _css_decl(base, ".tb-tab", "font-size")),
+        ("KBD_PX", _css_decl(base, ".top-bar-omni .tbo-kbd", "font-size")),
+        ("CARD_ICON_PX", _css_decl(base, ".hh-card-ic .mi", "font-size")),
+        ("CARD_CHIP_PX", _css_decl(base, ".hh-card-badge", "font-size")),
+    ]:
+        assert want, "the home CSS no longer declares the source of %s" % const
+        assert rust_const(const) == px(want), (
+            "%s is %s but the shell's is %s" % (const, rust_const(const), want))
+
+    # The wordmark takes the bar's own start-btn size, not the hero's.
+    startbtn = re.search(r"\.top-bar \.start-btn\{\{[^}]*?font-size:(\d+)px", service, re.S)
+    assert startbtn, "the service no longer sizes .top-bar .start-btn"
+    assert rust_const("WORDMARK_PX") == float(startbtn.group(1)), (
+        "the native wordmark is %s but .start-btn is %spx"
+        % (rust_const("WORDMARK_PX"), startbtn.group(1)))
+
+    # The tray button, its gap, and the glyph inside it (a theme variable with a
+    # default the service and theme_service must agree on, so read the default).
+    traybtn = re.search(r"\.tray-btn\{\{width:(\d+)px", service)
+    assert traybtn and rust_const("TRAY_BTN") == float(traybtn.group(1)), (
+        "the native tray button drifted from .tray-btn")
+    traygap = re.search(r"\.top-bar-right\{\{[^}]*?gap:(\d+)px", service, re.S)
+    assert traygap and rust_const("TRAY_GAP") == float(traygap.group(1)), (
+        "the native tray gap drifted from .top-bar-right")
+    iconsize = re.search(r"--hart-icon-size:\s*(\d+)px", service)
+    assert iconsize, "the service no longer defaults --hart-icon-size"
+    assert rust_const("TRAY_PX") == float(iconsize.group(1)), (
+        "the native tray glyph is %s but --hart-icon-size defaults to %s"
+        % (rust_const("TRAY_PX"), iconsize.group(1)))
+
     # ── the RESPONSIVE four, pinned as the literals HomeMetrics carries ──
     metrics = re.search(r"fn for_output\(.*?\n    \}", scene, re.S)
     assert metrics, "HomeMetrics::for_output is no longer a readable block"
