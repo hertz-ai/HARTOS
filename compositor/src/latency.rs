@@ -231,6 +231,38 @@ impl Summary {
     }
 }
 
+/// What the instrument REFUSED during one window, and therefore what the numbers
+/// beside it are missing.
+///
+/// Both counters existed and were tested; `dropped()`'s own comment calls them "the
+/// no silent caps discipline", and nothing outside this module ever read them. A
+/// discipline nobody reads is a silent cap with extra steps.
+///
+/// They are not bookkeeping. `inflight` rises only when vblanks stop being reaped,
+/// which IS the #50 freeze, and `pending` rises only when frames stop being queued at
+/// all. So the two conditions under which the reported p50 stops meaning anything are
+/// exactly the two the journal never mentioned. A window that reports
+/// `p99=6.2ms verdict=PASS` while silently discarding 900 samples is worse than no
+/// instrument, because it reads as evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Drops {
+    /// Un-bound inputs dropped past `MAX_PENDING_INPUTS`: frames are not being queued.
+    pub pending: u64,
+    /// Whole batches dropped past `MAX_INFLIGHT_FRAMES`: vblanks are not being reaped.
+    pub inflight: u64,
+}
+
+impl Drops {
+    /// Same shape as `Summary::journal_line`, and greppable by the same `hart-latency`
+    /// prefix, so one filter catches both the numbers and the reason to distrust them.
+    pub fn journal_line(&self) -> String {
+        format!(
+            "hart-latency dropped pending={} inflight={} verdict=SUSPECT",
+            self.pending, self.inflight
+        )
+    }
+}
+
 /// Inputs bound to one queued frame await its vblank. More than a few in
 /// flight means vblanks stopped being reaped (the #50 freeze class) — binding
 /// newer frames would then attribute stale input to the wrong photon, so the
@@ -260,9 +292,14 @@ pub struct LatencyCore {
     /// Inputs seen since the last queued frame, each with the surface it touched.
     pending: Vec<(Surface, Kind, u64)>,
     pending_dropped: u64,
+    /// How much of `pending_dropped` has already been reported, so a window says
+    /// "this window went wrong" rather than "something went wrong since boot", which
+    /// is the difference between a signal and a stain.
+    pending_reported: u64,
     /// Batches riding queued-but-not-yet-presented frames (FIFO by seq).
     inflight: VecDeque<Vec<(Surface, Kind, u64)>>,
     inflight_dropped: u64,
+    inflight_reported: u64,
     button_down: bool,
     window_start_us: Option<u64>,
     /// [surface][kind]. Forty-two fixed buckets, allocated once and reused: an input
@@ -277,8 +314,10 @@ impl LatencyCore {
             offset_obs: VecDeque::new(),
             pending: Vec::new(),
             pending_dropped: 0,
+            pending_reported: 0,
             inflight: VecDeque::new(),
             inflight_dropped: 0,
+            inflight_reported: 0,
             button_down: false,
             window_start_us: None,
             window: Default::default(),
@@ -422,9 +461,27 @@ impl LatencyCore {
         out
     }
 
-    /// Diagnostics for the drop counters (the "no silent caps" discipline).
+    /// Diagnostics for the drop counters (the "no silent caps" discipline). Running
+    /// totals since construction; `take_drops` is what the journal reports.
     pub fn dropped(&self) -> (u64, u64) {
         (self.pending_dropped, self.inflight_dropped)
+    }
+
+    /// What was dropped since the last call, or `None` when nothing was.
+    ///
+    /// `None` rather than a zeroed record so a healthy box logs nothing extra: the
+    /// line has to be rare to be worth reading.
+    pub fn take_drops(&mut self) -> Option<Drops> {
+        let d = Drops {
+            pending: self.pending_dropped - self.pending_reported,
+            inflight: self.inflight_dropped - self.inflight_reported,
+        };
+        if d.pending == 0 && d.inflight == 0 {
+            return None;
+        }
+        self.pending_reported = self.pending_dropped;
+        self.inflight_reported = self.inflight_dropped;
+        Some(d)
     }
 }
 
@@ -494,11 +551,18 @@ pub fn on_frame_queued() {
 
 /// Called from the vblank reaper. Emits the journal lines and (opt-in) the
 /// jsonl sink here so udev.rs stays one line.
-pub fn on_frame_presented() -> Vec<Summary> {
+pub fn on_frame_presented() -> (Vec<Summary>, Option<Drops>) {
     let g = global();
-    let summaries = match g.core.lock() {
-        Ok(mut c) => c.frame_presented(instant_us()),
-        Err(_) => Vec::new(),
+    // Both under ONE lock: the drops belong to the window the summaries describe, and
+    // taking them separately would let a drop land between the two and be attributed
+    // to the next window, which is the one place this record must not lie.
+    let (summaries, drops) = match g.core.lock() {
+        Ok(mut c) => {
+            let s = c.frame_presented(instant_us());
+            let d = c.take_drops();
+            (s, d)
+        }
+        Err(_) => (Vec::new(), None),
     };
     if !summaries.is_empty() {
         let jsonl = std::env::var("HART_LATENCY_JSONL").ok().as_deref() == Some("1");
@@ -523,12 +587,92 @@ pub fn on_frame_presented() -> Vec<Summary> {
             }
         }
     }
-    summaries
+    // The drop record rides the SAME opt-in sink, because a run whose jsonl says
+    // PASS and whose journal says SUSPECT is a run whose two halves disagree.
+    if let Some(d) = drops {
+        if std::env::var("HART_LATENCY_JSONL").ok().as_deref() == Some("1") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/run/hart/latency.jsonl")
+            {
+                let _ = writeln!(
+                    f,
+                    "{{\"dropped\":true,\"pending\":{},\"inflight\":{}}}",
+                    d.pending, d.inflight
+                );
+            }
+        }
+    }
+    (summaries, drops)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── the drop record: the instrument saying its own numbers are suspect ──
+
+    #[test]
+    fn a_window_that_refused_samples_says_so_instead_of_reporting_a_clean_pass() {
+        // Both counters existed and were tested; nothing outside this module read
+        // them. So a window could discard hundreds of samples and still print
+        // `verdict=PASS`, which is worse than no instrument because it reads as
+        // evidence. The two conditions that trip them are the two that make the
+        // numbers meaningless: `inflight` rises only when vblanks stop being reaped
+        // (the #50 freeze), `pending` only when frames stop being queued at all.
+        let mut c = LatencyCore::new();
+        assert_eq!(c.take_drops(), None, "a healthy window says nothing");
+
+        // Overrun the un-bound input cap: no frame is ever queued, so nothing binds.
+        for i in 0..(MAX_PENDING_INPUTS as u64 + 10) {
+            c.note_motion(Surface::Shell, 1_000 + i, 1_000 + i);
+        }
+        let d = c.take_drops().expect("the refusal is reported");
+        assert_eq!(d.pending, 10, "exactly the samples past the cap");
+        assert_eq!(d.inflight, 0);
+        assert!(
+            d.journal_line().starts_with("hart-latency "),
+            "one grep catches the numbers and the reason to distrust them: {}",
+            d.journal_line()
+        );
+        assert!(d.journal_line().contains("verdict=SUSPECT"));
+
+        // Drained, not restated: the next window is about the next window.
+        assert_eq!(c.take_drops(), None, "a quiet window after a loud one is quiet");
+        // ...while the running total is still the running total.
+        assert_eq!(c.dropped().0, 10, "take_drops reports a delta, not a reset");
+
+        // And the freeze counter reports on its own terms.
+        for _ in 0..(MAX_INFLIGHT_FRAMES + 3) {
+            c.note_motion(Surface::Shell, 2_000, 2_000);
+            c.frame_queued();
+        }
+        let d = c.take_drops().expect("dropped batches are reported");
+        assert_eq!(d.inflight, 3, "vblanks stopped being reaped, and it is said");
+    }
+
+    #[test]
+    fn the_drop_record_belongs_to_the_window_it_is_reported_with() {
+        // A drop taken outside the flush would be attributed to the NEXT window,
+        // which is the one place this record must not lie: it exists to qualify the
+        // numbers printed beside it.
+        let mut c = LatencyCore::new();
+        let t = 1_000_000;
+        // A real, well-formed sample, so the window has something to report.
+        c.note_motion(Surface::Shell, t, t + 500);
+        c.frame_queued();
+        c.frame_presented(t + 8_000);
+        // Then a burst that overruns the cap before the window closes.
+        for i in 0..(MAX_PENDING_INPUTS as u64 + 5) {
+            c.note_motion(Surface::Shell, t + 10_000 + i, t + 10_000 + i);
+        }
+        let out = c.frame_presented(t + WINDOW_US + 8_000);
+        let d = c.take_drops().expect("the same window carries both");
+        assert!(!out.is_empty(), "the window still reports its summary");
+        assert_eq!(d.pending, 5, "and says what it had to throw away to get it");
+    }
 
     // ── the offset estimator ────────────────────────────────────────────────
 

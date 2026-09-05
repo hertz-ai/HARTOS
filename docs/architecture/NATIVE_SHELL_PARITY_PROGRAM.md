@@ -1483,3 +1483,26 @@ incident was about. Making it real means moving the earnings-window read to the 
 server producer so both clients get it from the same place, which is a contract
 change to the wire on an incident-scarred surface, so it is written down here rather
 than decided alone.
+
+### The latency instrument was hiding the one thing that invalidates it
+`LatencyCore` counts two kinds of refused sample and `dropped()`'s own comment
+calls them "the no silent caps discipline". Both counters were tested. Nothing
+outside the module ever read them, so a discipline nobody reads was a silent cap
+with extra steps.
+
+They are not bookkeeping. `inflight_dropped` rises only when vblanks stop being
+reaped, which IS the #50 freeze class, and `pending_dropped` rises only when frames
+stop being queued at all. Those are precisely the two conditions under which the
+reported p50 and p99 stop meaning anything, and they were the two the journal never
+mentioned. A window printing `p99=6.2ms verdict=PASS` while discarding 900 samples
+is worse than no instrument, because it reads as evidence.
+
+`on_frame_presented` now returns the window's drops alongside its summaries, taken
+under the SAME lock, because a drop taken separately could land between the two
+calls and be attributed to the next window. `Drops::journal_line` carries the same
+`hart-latency` prefix, so one grep catches both the numbers and the reason to
+distrust them, and udev logs it at `warn!` rather than `info!`. It reports the
+DELTA since the last window, not the running total, so the line says "this window
+went wrong" instead of "something went wrong since boot"; `dropped()` still answers
+the totals. `None` when nothing was refused, so a healthy box logs nothing extra
+and the line stays rare enough to be worth reading.

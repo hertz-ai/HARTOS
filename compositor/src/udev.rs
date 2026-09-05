@@ -1211,8 +1211,17 @@ fn reap_completed_vblanks(state: &mut State, devices: &mut HashMap<DrmNode, Devi
                 // photon side of every input bound to the frame it completes.
                 // Summaries surface once per 10s window; the journal line is
                 // the harness §3 contract, greppable as `hart-latency`.
-                for s in crate::latency::on_frame_presented() {
+                let (summaries, drops) = crate::latency::on_frame_presented();
+                for s in summaries {
                     info!("{}", s.journal_line());
+                }
+                // Rare by construction: the instrument only refuses samples when
+                // vblanks stop being reaped or frames stop being queued, which are
+                // the two conditions that make the numbers above untrustworthy.
+                // `warn!` rather than `info!` because a window that reports a PASS
+                // while discarding samples reads as evidence when it is not.
+                if let Some(d) = drops {
+                    warn!("{}", d.journal_line());
                 }
             }
         }
