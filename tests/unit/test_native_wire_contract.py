@@ -30,6 +30,7 @@ Run:
 
 import json
 import os
+import re
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -193,3 +194,60 @@ def test_the_sanitizer_still_drops_what_it_promises_to_drop():
     assert "image_url" not in card, "a data: URL is dropped"
     assert "progress" not in card, "an out-of-range progress is dropped"
     assert card["action"] == "open", "an unknown action falls back, never passes"
+
+# -- LATENCY ATTRIBUTION ------------------------------------------------------
+
+SCENE_SRC = os.path.join(REPO, "compositor", "src", "scene.rs")
+BUDGETS = os.path.join(REPO, "docs", "architecture", "latency_budgets.json")
+_KEY_RE = re.compile(r'Component::\w+ => "([^"]+)"')
+
+
+def _component_keys():
+    """Every budget key scene.rs can attribute a latency sample to."""
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+    block = re.search(r"impl Component \{(.*?)\n\}", scene, re.S)
+    assert block, "scene.rs no longer has a Component impl to read keys from"
+    keys = _KEY_RE.findall(block.group(1))
+    assert keys, "Component::key names no components at all"
+    return keys
+
+
+def test_every_component_the_scene_names_has_a_real_latency_budget():
+    """The attribution contract, across the same language boundary as the rest.
+
+    docs/architecture/latency_budgets.json carries 23 per-component budgets and
+    the instrument has never consulted one: latency.rs reports `component=shell`
+    for every sample, so a slow orb and a slow marketplace are the same number.
+    Its own header says the blocker moved once the scene graph could hit-test.
+
+    scene.rs now names the surfaces the native shell owns, and those names are
+    the budget file's OWN keys rather than a parallel vocabulary. Rust cannot
+    check that: the budget file is outside the crate, and the crane source filter
+    ships `*.rs` only. So the pin lives here, where both files are readable.
+    """
+    budgets = json.load(open(BUDGETS, encoding="utf-8"))
+    known = budgets.get("components", {})
+    for key in _component_keys():
+        assert key in known, (
+            "scene.rs attributes latency to %r, which latency_budgets.json has "
+            "no row for, so its samples would be checked against the _defaults "
+            "and that component's budget would stay dead" % key)
+        rows = [k for k in known[key] if not k.startswith("_")]
+        assert rows, "%r is in the budget file with no actual budgets" % key
+
+
+def test_the_attributable_components_are_the_ones_the_native_shell_draws():
+    """Guard the guard, again.
+
+    A Component enum that quietly shrank to one entry would still pass the pin
+    above while attributing almost nothing. These five are exactly the surfaces
+    the native scene paints today. The rest of the budget table (start-menu,
+    panel, chat-input, marketplace, onboarding) belongs to the WebView shell and
+    is measured as `shell` on purpose, so that "native is faster" stays a
+    demonstrated delta rather than a claim.
+    """
+    keys = set(_component_keys())
+    assert keys == {"orb", "top-bar", "omnibox", "taskbar", "home-card"}, (
+        "the set of attributable native surfaces changed: %s. That is allowed, "
+        "but a new one must be a surface the native scene actually DRAWS and "
+        "must have a row in latency_budgets.json." % sorted(keys))

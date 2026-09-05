@@ -594,6 +594,47 @@ pub struct Card {
     pub photo: Option<String>,
 }
 
+/// Which named surface of the desktop a point belongs to, for LATENCY ATTRIBUTION.
+///
+/// docs/architecture/latency_budgets.json carries a per-component budget table with 23
+/// entries, and not one of them has ever been consulted: the instrument reports
+/// `component=shell` for every sample, so every measurement is checked against the
+/// `_defaults` and a slow orb is indistinguishable from a slow marketplace. latency.rs
+/// says why in its own header, and says the blocker has MOVED: "the scene graph now
+/// EXISTS and hit-tests ... what is missing is carrying a node identity from the input
+/// that produced a sample through to the frame that presented it."
+///
+/// This is that identity. The names are the budget file's own keys, not a parallel
+/// vocabulary, and a Python guard asserts every one of them exists there.
+///
+/// Only the surfaces the NATIVE scene actually owns appear here. The rest of the budget
+/// table (start-menu, panel, chat-input, marketplace, onboarding) belongs to the WebView
+/// shell, which the same instrument measures as `shell`; that is deliberate, because the
+/// harness wants the web baseline measured by the same instrument, so "native is faster"
+/// is a demonstrated delta rather than a claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Component {
+    Orb,
+    TopBar,
+    Omnibox,
+    Taskbar,
+    HomeCard,
+}
+
+impl Component {
+    /// The budget file's key for this component. Byte-identical to
+    /// latency_budgets.json's `components` map, which a guard test pins.
+    pub fn key(self) -> &'static str {
+        match self {
+            Component::Orb => "orb",
+            Component::TopBar => "top-bar",
+            Component::Omnibox => "omnibox",
+            Component::Taskbar => "taskbar",
+            Component::HomeCard => "home-card",
+        }
+    }
+}
+
 /// The scene tree the compositor renders. Wayland-FREE and GL-FREE: `comp_core`
 /// lowers each variant to a `HartRenderElement` (Rect -> SolidColorBuffer or a cached
 /// rounded tile, Text -> glyph-atlas Memory texture, Art -> a cached gradient tile,
@@ -610,6 +651,11 @@ pub enum SceneNode {
         /// the group that already exists rather than a new node kind, because reacting to
         /// a cursor is a property of a group, not a thing that paints.
         interactive: bool,
+        /// Which named surface this group IS, for latency attribution, or None for a
+        /// group that is only structure (the root). Set where the group is BUILT, so
+        /// the layout that decides what a thing is also names it, rather than a second
+        /// table elsewhere re-deriving it from geometry.
+        component: Option<Component>,
         children: Vec<SceneNode>,
     },
     Rect {
@@ -771,6 +817,51 @@ impl SceneNode {
         }
     }
 
+    /// Which named component a point belongs to, for latency attribution, or None over
+    /// bare desktop.
+    ///
+    /// The rule is DEEPEST WINS, matching `hit_test` and `hover_leaf`, so a card inside
+    /// the content band names the card and the pill inside the top bar names the omnibox
+    /// rather than the bar it sits in. The orb is the one component that is a LEAF rather
+    /// than a group: `OrbSlot` already is the orb, so tagging a container around it would
+    /// be a second way of saying the same thing.
+    ///
+    /// Pure, allocation-free and off the frame path: the caller runs it once per INPUT
+    /// event against the retained tree, which is how a sample learns what it touched
+    /// without the render loop paying for anything.
+    pub fn component_at(&self, px: f32, py: f32) -> Option<Component> {
+        let mut found = None;
+        self.component_walk(px, py, &mut found);
+        found
+    }
+
+    fn component_walk(&self, px: f32, py: f32, found: &mut Option<Component>) {
+        match self {
+            SceneNode::Container {
+                rect,
+                component,
+                children,
+                ..
+            } => {
+                if !rect.contains(px, py) {
+                    return;
+                }
+                if let Some(c) = component {
+                    *found = Some(*c);
+                }
+                for child in children {
+                    child.component_walk(px, py, found);
+                }
+            }
+            SceneNode::OrbSlot { rect, .. } if rect.contains(px, py) => {
+                *found = Some(Component::Orb);
+            }
+            // A leaf inside a tagged group is that group; a leaf outside every group is
+            // bare desktop, which has no budget row and must not borrow one.
+            _ => {}
+        }
+    }
+
     /// The index, in `flatten` paint order, of the leaf that must paint its HOVER state
     /// this frame, or None when the pointer is absent or over nothing interactive. That
     /// leaf is the SURFACE of the top-most interactive `Container` under the cursor: its
@@ -799,6 +890,7 @@ impl SceneNode {
                 rect,
                 interactive,
                 children,
+                ..
             } => {
                 // Claim the group's SURFACE: the first child that paints a ground. For an
                 // ordinary card that is child zero, its background Rect. For a RANKED card
@@ -1146,11 +1238,15 @@ pub fn layout_home(
         tab_x += slot + TAB_GAP;
     }
 
-    bar_children.push(SceneNode::Rect {
+    // The pill and the three runs inside it are ONE surface (`.top-bar-omni`), so they
+    // are one group. They used to be four siblings of the bar's other children, which is
+    // why the omnibox could not be named even though the latency budget table has a row
+    // for it; collecting them here costs one node and makes the pill addressable.
+    let mut pill_children = vec![SceneNode::Rect {
         rect: pill,
         color: theme.omnibox_bg,
         radius: (TOP_BAR_H - 12.0) * 0.5,
-    });
+    }];
     // Inside the pill, the shell's own three parts: a search glyph, the prompt, and the
     // shortcut hint pushed to the far end. The hint is right-anchored, which is the
     // measure again; before it there was nowhere to put it.
@@ -1158,7 +1254,7 @@ pub fn layout_home(
     let mut pill_x = pill.x + 12.0;
     if icons_available {
         let gw = measure.text_width(OMNIBOX_GLYPH, OMNIBOX_PX);
-        bar_children.push(SceneNode::Text {
+        pill_children.push(SceneNode::Text {
             rect: Rect::new(pill_x, pill_ink_y, gw.ceil() + 2.0, OMNIBOX_PX * 1.3),
             text: OMNIBOX_GLYPH.to_string(),
             size_px: OMNIBOX_PX,
@@ -1167,7 +1263,7 @@ pub fn layout_home(
         });
         pill_x += gw + 8.0;
     }
-    bar_children.push(SceneNode::Text {
+    pill_children.push(SceneNode::Text {
         rect: Rect::new(
             pill_x,
             pill_ink_y,
@@ -1182,7 +1278,7 @@ pub fn layout_home(
     let kbd_w = measure.text_width(OMNIBOX_KBD, KBD_PX);
     let kbd_x = pill.right() - 12.0 - kbd_w;
     if m.show_kbd && kbd_x > pill_x {
-        bar_children.push(SceneNode::Text {
+        pill_children.push(SceneNode::Text {
             rect: Rect::new(
                 kbd_x,
                 (TOP_BAR_H - KBD_PX * 1.3) * 0.5,
@@ -1195,6 +1291,15 @@ pub fn layout_home(
             stroke: 0.0,
         });
     }
+    bar_children.push(SceneNode::Container {
+        rect: pill,
+        // Not a hover target: nothing routes an omnibox activation yet, and an
+        // affordance that reacts but does nothing is a lie (the same rule the nav tabs
+        // follow). It is a named SURFACE either way, which is what attribution needs.
+        interactive: false,
+        component: Some(Component::Omnibox),
+        children: pill_children,
+    });
 
     // ── The bar's right cluster, laid out from the RIGHT EDGE inward so it stays put as
     //    the output widens: tray glyphs, then the avatar, then the orb-sm, which is the
@@ -1255,6 +1360,7 @@ pub fn layout_home(
     root.push(SceneNode::Container {
         rect: bar,
         interactive: false,
+        component: Some(Component::TopBar),
         children: bar_children,
     });
 
@@ -1661,6 +1767,7 @@ pub fn layout_home(
                 // A card is the one thing on this desktop the cursor reacts to, and the
                 // background rect pushed FIRST above is what the hover lifts.
                 interactive: true,
+                component: Some(Component::HomeCard),
                 children: card_children,
             });
             card_x += CARD_W + CARD_GAP;
@@ -1670,15 +1777,21 @@ pub fn layout_home(
 
     // ── Taskbar (fixed, 44px, bottom). ──
     let taskbar = Rect::new(0.0, output_h - TASKBAR_H, output_w, TASKBAR_H);
-    root.push(SceneNode::Rect {
+    root.push(SceneNode::Container {
         rect: taskbar,
-        color: theme.taskbar_bg,
-        radius: 0.0,
+        interactive: false,
+        component: Some(Component::Taskbar),
+        children: vec![SceneNode::Rect {
+            rect: taskbar,
+            color: theme.taskbar_bg,
+            radius: 0.0,
+        }],
     });
 
     SceneNode::Container {
         rect: Rect::new(0.0, 0.0, output_w, output_h),
         interactive: false,
+        component: None,
         children: root,
     }
 }
@@ -2331,11 +2444,17 @@ mod tests {
         let mut out = Vec::new();
         if let SceneNode::Container { children, .. } = root {
             for c in children {
-                if let SceneNode::Container { rect, children, .. } = c {
+                if let SceneNode::Container { rect, .. } = c {
                     if rect.y != 0.0 || rect.h != TOP_BAR_H {
                         continue;
                     }
-                    for n in children {
+                    // The bar's runs are no longer all direct children: the omnibox is
+                    // its own group now, so walk the bar's LEAVES rather than its
+                    // children. Depth is a layout decision, and a test that pins it
+                    // fails on every regrouping without anything being wrong.
+                    let mut leaves: Vec<&SceneNode> = Vec::new();
+                    c.flatten(&mut leaves);
+                    for n in leaves {
                         if let SceneNode::Text { rect, text, .. } = n {
                             out.push((text.clone(), *rect));
                         }
@@ -2958,6 +3077,99 @@ mod tests {
                 leaves.len() > 4,
                 "a malformed payload must leave the chrome standing: {bad}"
             );
+        }
+    }
+
+    #[test]
+    fn every_surface_the_native_shell_owns_names_itself_for_latency_attribution() {
+        // latency_budgets.json carries 23 per-component budgets and the instrument has
+        // never consulted one of them: every sample is reported as `component=shell`, so
+        // a slow orb and a slow marketplace are the same number. latency.rs says the
+        // blocker moved once the scene graph could hit-test; this is the identity it
+        // named as missing.
+        let theme = Theme::cosmic_default();
+        let root = layout_home(1600.0, 900.0, &sample(), &theme, &mut MonoMeasure);
+
+        // The top bar, and the omnibox INSIDE it, because deepest wins: a pill that
+        // reported `top-bar` would hide the omnibox's own budget behind the bar's.
+        assert_eq!(root.component_at(4.0, 4.0), Some(Component::TopBar));
+        let pill_x = 1600.0 * 0.5;
+        assert_eq!(root.component_at(pill_x, TOP_BAR_H * 0.5), Some(Component::Omnibox));
+
+        // The taskbar strip.
+        assert_eq!(
+            root.component_at(800.0, 900.0 - TASKBAR_H * 0.5),
+            Some(Component::Taskbar)
+        );
+
+        // A card, found through the tree rather than by guessing at its geometry.
+        let card = match &root {
+            SceneNode::Container { children, .. } => children
+                .iter()
+                .find(|c| matches!(c, SceneNode::Container { interactive: true, .. }))
+                .map(|c| c.rect())
+                .expect("a card was laid out"),
+            _ => unreachable!("the root is a container"),
+        };
+        assert_eq!(
+            root.component_at(card.x + card.w * 0.5, card.y + card.h * 0.5),
+            Some(Component::HomeCard)
+        );
+
+        // The orb is a LEAF, not a group: OrbSlot already is the orb, so it names itself
+        // without a container wrapped around it saying the same thing twice.
+        let mut leaves: Vec<&SceneNode> = Vec::new();
+        root.flatten(&mut leaves);
+        let orb = leaves
+            .iter()
+            .find_map(|n| match n {
+                SceneNode::OrbSlot { rect, compact } if !*compact => Some(*rect),
+                _ => None,
+            })
+            .expect("the home orb has a slot");
+        assert_eq!(
+            root.component_at(orb.x + orb.w * 0.5, orb.y + orb.h * 0.5),
+            Some(Component::Orb)
+        );
+        // The COMPACT orb docked in the bar is still the orb, not the bar it sits in.
+        let orb_sm = leaves
+            .iter()
+            .find_map(|n| match n {
+                SceneNode::OrbSlot { rect, compact } if *compact => Some(*rect),
+                _ => None,
+            })
+            .expect("the bar has an orb-sm");
+        assert_eq!(
+            root.component_at(orb_sm.x + orb_sm.w * 0.5, orb_sm.y + orb_sm.h * 0.5),
+            Some(Component::Orb)
+        );
+
+        // Bare desktop has no budget row and must not borrow one. A sample attributed to
+        // a component it did not touch is worse than an unattributed sample.
+        assert_eq!(root.component_at(-5.0, -5.0), None, "outside the output entirely");
+    }
+
+    #[test]
+    fn the_component_keys_are_the_budget_files_own_names() {
+        // The keys cross a language boundary into docs/architecture/latency_budgets.json,
+        // which Rust cannot read (it is outside the crate, and the crane source filter
+        // ships `*.rs` only), so the pin lives in Python beside the other cross-language
+        // guards. This half asserts what that one greps for: the exact literals, all
+        // distinct, none of them a made-up vocabulary.
+        let all = [
+            Component::Orb,
+            Component::TopBar,
+            Component::Omnibox,
+            Component::Taskbar,
+            Component::HomeCard,
+        ];
+        let keys: Vec<&str> = all.iter().map(|c| c.key()).collect();
+        assert_eq!(keys, ["orb", "top-bar", "omnibox", "taskbar", "home-card"]);
+        for (i, a) in keys.iter().enumerate() {
+            for b in keys.iter().skip(i + 1) {
+                assert_ne!(a, b, "two components share a budget row");
+            }
+            assert!(!a.is_empty() && !a.contains(' '), "a key must be a bare slug");
         }
     }
 

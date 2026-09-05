@@ -725,3 +725,46 @@ ranked row, two different accents, a progress bar, a live tag, a badge, a See-al
 prevent.** The test's own message says so and carries the command. A wire change is
 allowed; a wire change the decoder has not been taught is what put four phantom
 keys in the tree.
+
+### The scene can now say WHICH component an input touched
+latency_budgets.json carries 23 per-component budgets and not one of them has
+ever been consulted. The instrument reports `component=shell` for every sample,
+so every measurement is checked against the `_defaults` and a slow orb is
+indistinguishable from a slow marketplace. latency.rs says why in its own header,
+and says the blocker has MOVED: "the scene graph now EXISTS and hit-tests ... what
+is missing is carrying a node identity from the input that produced a sample
+through to the frame that presented it."
+
+`SceneNode::component_at(x, y)` is that identity. Deepest wins, matching hit_test
+and hover_leaf, so a pill inside the top bar names the omnibox rather than the bar
+it sits in. The names are the budget file's OWN keys, pinned to it by a Python
+guard, because a second vocabulary here would mean the budgets stay dead in a new
+way.
+
+Three design points:
+
+**The layout names its own groups.** `Container` carries the component, set where
+the group is built, rather than a lookup elsewhere re-deriving it from geometry.
+Deriving it would be a second copy of everything layout already decides, and it is
+exactly what put `EDGE_PAD` at a value belonging to neither of its two jobs.
+
+**The orb is a leaf, not a group.** `OrbSlot` already IS the orb, so wrapping a
+tagged container around it would be two ways of saying one thing. Both slots (the
+home orb and the compact one docked in the bar) name the orb, which is right: they
+are the same control and the shell treats them so.
+
+**Bare desktop names nothing.** A point over no component returns None rather than
+falling back to the nearest group. A sample attributed to something it did not
+touch is worse than an unattributed one.
+
+The omnibox became a real group in the process. Its pill and its three runs were
+four siblings of the bar's other children, which is why it could not be named even
+though the budget table has a row for it; collecting them costs one node and makes
+the surface addressable. The taskbar strip is likewise a group now rather than a
+bare rect, which is also where its content will hang when it gets any.
+
+**What remains for per-component attribution to be LIVE:** the instrument still
+buckets by kind alone. `note_input` has to take the component, the aggregator has
+to bucket by (component, kind), the budget lookup has to join, and the journal
+line has to stop hardcoding `component=shell`. That is the next slice; the
+identity it needed now exists and is tested.
