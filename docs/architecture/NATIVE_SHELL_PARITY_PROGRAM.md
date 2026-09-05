@@ -1438,3 +1438,48 @@ Two remainders, named rather than hidden. The `<b>` inside `.hh-stat` is 800 aga
 the line's own 400, which needs the stat split into four measured runs; and
 `.hh-pill` / `.hh-local-mini` are an amber badge and a teal shield-dot that the
 native still folds into one grey sentence. Both are now expressible; neither is done.
+
+### The meta strip, and the honesty badge that read as prose
+The hero's meta line was ONE grey run of joined fragments, and its comment said
+splitting it would need per-fragment spacing the scene had no reason to own. The
+scene owns it now: `text_width` answers per run, so the strip can be the flex row
+`.hh-hero-meta` actually is.
+
+The item that matters is the pill. `payout_pending` is the home's statement that the
+money is not real yet, and the shell says it in an amber badge with a leading dot,
+`--hh-amber` ink on a `rgba(255,200,61,.12)` wash inside a `rgba(255,200,61,.30)`
+hairline. Folded into a grey sentence beside the agent count it read as prose, on the
+one surface where the user is looking at a number they believe they earned. That is
+the same class of failure as the 2026-07-24 fabrication incident, one step milder:
+not a false figure, a true qualifier that no longer looks like one.
+
+`.hh-stat` is `<b>N</b> agents · <b>M</b> tasks`, so the counts are `--hh-ink` at 800
+against the line's own `#C3CDD9` at 400. Two colours and two weights in one line,
+which is exactly what a single joined string cannot say. The counts are the only part
+of that line anyone reads at a glance and they had no emphasis at all. The pin asserts
+`meta_ink != card_ink`, so the test cannot pass by the two colours quietly becoming
+one.
+
+`.hh-local-mini` closes the line in teal behind an 8px shield dot. It sits INSIDE the
+stat after a separator, because hartHome.js appends it to the same element, so it
+trails that sequence rather than starting a new flex item.
+
+**One component, not two.** The shell has three chips and they are the same thing with
+different colours: `.hh-card-live` (dot and label on a dark ground), `.hh-card-badge`
+(a filled accent block, no dot) and `.hh-pill`. The card's two were built inline here.
+Writing the hero's a second time is how two copies of a component drift, so all three
+now go through one `Chip` and `push_chip`. That immediately paid: `.hh-card-live`
+carries `1px solid var(--hh-bord)`, the same hairline as the card, and the inline
+version had never drawn it.
+
+A rounded border is drawn as the border-coloured rounded rect with the fill inset by
+the rule width, because a pill's corners are round and the four-hairline idiom the
+square card border uses cannot say that.
+
+`.hh-usd` belongs in this row too and is deliberately NOT drawn. `usd_equiv` is
+computed client-side from two live endpoints and never appears on the wire, so the
+native path has no figure for it. Drawing a zero there would be the fabrication the
+incident was about. Making it real means moving the earnings-window read to the ONE
+server producer so both clients get it from the same place, which is a contract
+change to the wire on an incident-scarred surface, so it is written down here rather
+than decided alone.

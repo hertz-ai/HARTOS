@@ -298,6 +298,21 @@ pub struct Theme {
     /// a pale photo or a bright brand hue took the text with it. The `body.gpu-hardware`
     /// variant is slightly gentler; the base is what a renderer with neither class gets,
     /// and the native path is never the WebView.
+    /// `.hh-pill`'s amber: `--hh-amber: #FFC83D` ink on a `rgba(255,200,61,.12)` wash
+    /// inside a `rgba(255,200,61,.30)` hairline.
+    ///
+    /// The payout pill is the home's HONESTY signal. `payout_pending` means the money is
+    /// not real yet, and the shell says so in an amber badge; the native folded the same
+    /// words into a grey sentence beside the agent count, where it reads as prose rather
+    /// than as a status. On the surface that shows the user a number they think they have
+    /// earned, that is the one line that must not read as decoration.
+    pub pill_ink: Color,
+    pub pill_bg: Color,
+    pub pill_border: Color,
+    /// `.hh-hero-meta` / `.hh-stat`'s own `#C3CDD9`, which is neither the body ink nor the
+    /// muted hero copy. The numbers inside it are `--hh-ink` at 800 (`.hh-stat b`), so the
+    /// line is deliberately two colours and two weights, not one grey run.
+    pub meta_ink: Color,
     pub card_scrim: Color,
     pub card_scrim_at: f32,
 }
@@ -468,6 +483,10 @@ impl Theme {
             cta_glow: Color::rgba(0.0, 230.0 / 255.0, 195.0 / 255.0, 0.30),
             cta_glow_dy: 12.0,
             cta_glow_blur: 30.0,
+            pill_ink: palette("#FFC83D", Color::rgba(0.5, 0.5, 0.5, 1.0)),
+            pill_bg: Color::rgba(1.0, 200.0 / 255.0, 61.0 / 255.0, 0.12),
+            pill_border: Color::rgba(1.0, 200.0 / 255.0, 61.0 / 255.0, 0.30),
+            meta_ink: palette("#C3CDD9", Color::rgba(0.5, 0.5, 0.5, 1.0)),
             card_scrim: Color::rgba(4.0 / 255.0, 7.0 / 255.0, 13.0 / 255.0, 0.78),
             card_scrim_at: 0.32,
         }
@@ -1498,6 +1517,112 @@ pub fn row_extents(home: &HomeCompose, output_w: f32, output_h: f32) -> Vec<(f32
         .collect()
 }
 
+/// `.hh-pill { padding: 5px 12px; font-size: 13px }` over the shell's `line-height: 1.5`,
+/// so the box is 5 + 19.5 + 5.
+const HERO_PILL_H: f32 = 29.5;
+const HERO_PILL_PX: f32 = 13.0;
+const HERO_PILL_PAD_X: f32 = 12.0;
+/// `.hh-pill-dot { width: 7px }` and `.hh-pill { gap: 7px }`.
+const HERO_PILL_DOT: f32 = 7.0;
+const HERO_PILL_GAP: f32 = 7.0;
+/// `.hh-hero-meta { gap: 10px 16px }`: the COLUMN gap, between the strip's items.
+const HERO_META_GAP: f32 = 16.0;
+/// `.hh-local-mini`'s own words, which the shell hardcodes in its markup.
+const HERO_LOCAL: &str = "fully local";
+/// `.hh-local-mini .hh-shield { width: 8px }` and `.hh-local-mini { gap: 6px }`.
+const HERO_SHIELD: f32 = 8.0;
+const HERO_SHIELD_GAP: f32 = 6.0;
+
+/// One CHIP: a rounded box with an optional leading dot and a label.
+///
+/// The shell has three of these and they are the same component with different colours:
+/// `.hh-card-live` (a dot and a label on a dark ground), `.hh-card-badge` (a filled accent
+/// block, no dot) and `.hh-pill` (a dot and a label on an amber wash). The card's two were
+/// already built inline here; writing the hero's a second time is how two copies of a
+/// component drift, so both go through this.
+struct Chip<'a> {
+    label: &'a str,
+    px: f32,
+    weight: u16,
+    /// Box height and corner. A pill passes `h * 0.5`; the badge is an 8px block.
+    h: f32,
+    radius: f32,
+    pad_x: f32,
+    bg: Color,
+    ink: Color,
+    /// `1px solid` in the shell. Drawn as a rounded rect BEHIND the fill, inset by the
+    /// rule width, because a rounded border cannot be four hairlines the way a square one
+    /// can and the scene has one fill primitive to say it with.
+    border: Option<Color>,
+    /// (diameter, gap after it, colour), when the chip leads with a dot.
+    dot: Option<(f32, f32, Color)>,
+}
+
+/// How wide `chip` will be. Separate from drawing it so a caller can lay out a row.
+fn chip_width(chip: &Chip, measure: &mut dyn TextMeasure) -> f32 {
+    let ink = measure.text_width(chip.label, chip.px, chip.weight, 0.0);
+    let dot = chip.dot.map(|(d, g, _)| d + g).unwrap_or(0.0);
+    ink.ceil() + 2.0 * chip.pad_x + dot
+}
+
+/// Draw `chip` with its left edge at `x` and its top at `y`, and answer its width.
+fn push_chip(
+    out: &mut Vec<SceneNode>,
+    x: f32,
+    y: f32,
+    chip: &Chip,
+    rule_px: f32,
+    measure: &mut dyn TextMeasure,
+) -> f32 {
+    let w = chip_width(chip, measure);
+    let mut fill = Rect::new(x, y, w, chip.h);
+    let mut radius = chip.radius;
+    if let Some(c) = chip.border {
+        out.push(SceneNode::Rect {
+            rect: fill,
+            color: c,
+            radius,
+        });
+        fill = Rect::new(
+            x + rule_px,
+            y + rule_px,
+            (w - 2.0 * rule_px).max(0.0),
+            (chip.h - 2.0 * rule_px).max(0.0),
+        );
+        radius = (radius - rule_px).max(0.0);
+    }
+    out.push(SceneNode::Rect {
+        rect: fill,
+        color: chip.bg,
+        radius,
+    });
+    let mut ink_x = x + chip.pad_x;
+    if let Some((d, gap, color)) = chip.dot {
+        out.push(SceneNode::Rect {
+            rect: Rect::new(ink_x, y + (chip.h - d) * 0.5, d, d),
+            color,
+            radius: d * 0.5,
+        });
+        ink_x += d + gap;
+    }
+    let ink_w = measure.text_width(chip.label, chip.px, chip.weight, 0.0);
+    out.push(SceneNode::Text {
+        rect: Rect::new(
+            ink_x,
+            y + (chip.h - chip.px * 1.3) * 0.5,
+            ink_w.ceil() + 2.0,
+            chip.px * 1.3,
+        ),
+        text: chip.label.to_string(),
+        size_px: chip.px,
+        color: chip.ink,
+        stroke: 0.0,
+        weight: chip.weight,
+        letter_spacing: 0.0,
+    });
+    w
+}
+
 /// The fill for a chrome strip: the shell's no-blur floor gradient, as an `Art` tile.
 ///
 /// An `Art` node rather than a `Rect` because the fill is a RAMP, and the tile path
@@ -1880,13 +2005,41 @@ pub fn layout_home(
         });
         hero_y += m.amount_px * 1.35;
     }
-    // The meta strip: a payout pill, then the agents/tasks stat. Built as ONE run rather
-    // than several, because the shell writes it as one sentence with separators and
-    // splitting it would need per-fragment spacing the scene has no reason to own.
-    let mut strip: Vec<String> = Vec::new();
-    if home.hero.payout_pending {
-        strip.push("Payout pending".to_string());
-    }
+    // ── The meta strip (`.hh-hero-meta`): a flex ROW of an amber payout pill and a
+    //    stat line, centred on a common baseline with the rule's own 16px column gap.
+    //
+    //    It was one grey run of joined fragments, and the comment said splitting it would
+    //    need per-fragment spacing the scene had no reason to own. The scene owns it now:
+    //    `text_width` answers per run, so the strip can be what the shell actually draws.
+    //    That matters most for the pill. `payout_pending` means the money is not real
+    //    yet, and the shell says so in an amber badge with a dot; folded into a grey
+    //    sentence beside the agent count it read as prose, on the one surface where the
+    //    user is looking at a number they believe they earned.
+    //
+    //    `.hh-usd` ("~ $X at the hive rate") belongs in this row too and is NOT drawn:
+    //    `usd_equiv` is computed CLIENT-side from two live endpoints and never appears on
+    //    the wire, so the native path has no figure to show. Drawing a zero there would be
+    //    the fabrication the 2026-07-24 incident was about.
+    let pill = home.hero.payout_pending.then(|| Chip {
+        label: "Payout pending",
+        px: HERO_PILL_PX,
+        // .hh-pill
+        weight: 700,
+        h: HERO_PILL_H,
+        radius: HERO_PILL_H * 0.5,
+        pad_x: HERO_PILL_PAD_X,
+        bg: theme.pill_bg,
+        ink: theme.pill_ink,
+        border: Some(theme.pill_border),
+        dot: Some((HERO_PILL_DOT, HERO_PILL_GAP, theme.pill_ink)),
+    });
+    // `.hh-stat` is `<b>N</b> agents · <b>M</b> tasks`, so the numbers are `--hh-ink` at
+    // 800 against the line's own #C3CDD9 at 400: two colours and two weights in one line,
+    // which is why it is a sequence of runs and not a string. `.hh-local-mini` sits INSIDE
+    // the stat after a separator (hartHome.js appends it to the same element), teal and
+    // 700 behind an 8px shield dot, so it trails the same sequence rather than starting a
+    // new flex item.
+    let mut stat: Vec<(String, u16, Color)> = Vec::new();
     if home.hero.agents != 0 || home.hero.tasks != 0 {
         fn plural<'a>(n: i64, one: &'a str, many: &'a str) -> &'a str {
             if n == 1 {
@@ -1895,29 +2048,86 @@ pub fn layout_home(
                 many
             }
         }
-        strip.push(format!(
-            "{} {} · {} {}",
-            home.hero.agents,
-            plural(home.hero.agents, "agent", "agents"),
-            home.hero.tasks,
-            plural(home.hero.tasks, "task", "tasks"),
+        stat.push((home.hero.agents.to_string(), 800, theme.card_ink));
+        stat.push((
+            format!(" {} · ", plural(home.hero.agents, "agent", "agents")),
+            400,
+            theme.meta_ink,
+        ));
+        stat.push((home.hero.tasks.to_string(), 800, theme.card_ink));
+        stat.push((
+            format!(" {}", plural(home.hero.tasks, "task", "tasks")),
+            400,
+            theme.meta_ink,
         ));
         if home.hero.local {
-            strip.push("fully local".to_string());
+            stat.push((" · ".to_string(), 400, theme.meta_ink));
         }
     }
-    if !strip.is_empty() {
-        root.push(SceneNode::Text {
-            rect: Rect::new(content.x, hero_y, hero_text_w, HERO_META_PX * 1.4),
-            text: strip.join(" · "),
-            size_px: HERO_META_PX,
-            color: theme.hero_copy,
-            stroke: 0.0,
-            // .hh-hero-meta inherits the home body weight
-            weight: 400,
-            letter_spacing: 0.0,
-        });
-        hero_y += HERO_META_PX * 1.9;
+    let shield = home.hero.local && !stat.is_empty();
+    if pill.is_some() || !stat.is_empty() {
+        // `align-items: center`: the row is as tall as its tallest item and everything
+        // sits centred in it, so the pill does not drag the stat off the line.
+        let text_h = HERO_META_PX * 1.4;
+        let row_h = if pill.is_some() {
+            HERO_PILL_H.max(text_h)
+        } else {
+            text_h
+        };
+        let text_y = hero_y + (row_h - text_h) * 0.5;
+        let mut mx = content.x;
+        if let Some(spec) = &pill {
+            let w = push_chip(
+                &mut root,
+                mx,
+                hero_y + (row_h - HERO_PILL_H) * 0.5,
+                spec,
+                theme.chrome_rule_px,
+                measure,
+            );
+            mx += w + HERO_META_GAP;
+        }
+        for (frag, weight, color) in &stat {
+            let fw = measure.text_width(frag, HERO_META_PX, *weight, 0.0);
+            root.push(SceneNode::Text {
+                rect: Rect::new(mx, text_y, fw.ceil() + 2.0, text_h),
+                text: frag.clone(),
+                size_px: HERO_META_PX,
+                color: *color,
+                stroke: 0.0,
+                weight: *weight,
+                letter_spacing: 0.0,
+            });
+            mx += fw;
+        }
+        if shield {
+            root.push(SceneNode::Rect {
+                rect: Rect::new(
+                    mx,
+                    hero_y + (row_h - HERO_SHIELD) * 0.5,
+                    HERO_SHIELD,
+                    HERO_SHIELD,
+                ),
+                color: theme.accent,
+                radius: HERO_SHIELD * 0.5,
+            });
+            mx += HERO_SHIELD + HERO_SHIELD_GAP;
+            let lw = measure.text_width(HERO_LOCAL, HERO_META_PX, 700, 0.0);
+            root.push(SceneNode::Text {
+                rect: Rect::new(mx, text_y, lw.ceil() + 2.0, text_h),
+                text: HERO_LOCAL.to_string(),
+                size_px: HERO_META_PX,
+                // `.hh-local-mini { color: var(--hh-teal) }`: the same accent the figure
+                // and the eyebrow take, which is what makes "fully local" read as a claim
+                // the desktop is making rather than as more of the stat line.
+                color: theme.accent,
+                stroke: 0.0,
+                // .hh-local-mini
+                weight: 700,
+                letter_spacing: 0.0,
+            });
+        }
+        hero_y += row_h + HERO_META_PX * 0.5;
     }
     // Calls to action. Labels only: nothing routes a hero action natively yet, so these
     // draw as the shell's two buttons but are not hover targets, the same call made for
@@ -2225,55 +2435,44 @@ pub fn layout_home(
                 .map(|t| (t, true))
                 .or_else(|| card.badge.as_ref().map(|t| (t, false)));
             if let Some((label, is_live)) = chip {
-                let ink_w = measure.text_width(label, CARD_CHIP_PX, if is_live { 600 } else { 700 }, 0.0);
-                let dot_w = if is_live {
-                    CARD_LIVE_DOT + CARD_LIVE_GAP
-                } else {
-                    0.0
-                };
-                let chip_w = ink_w.ceil() + 2.0 * CARD_CHIP_PAD_X + dot_w;
-                let chip_x = ab.right() - CARD_CHIP_INSET - chip_w;
-                let chip_y = ab.y + CARD_CHIP_INSET;
-                // A live tag is a pill on a dark ground; a badge is a filled accent
-                // block with dark ink on it.
-                card_children.push(SceneNode::Rect {
-                    rect: Rect::new(chip_x, chip_y, chip_w, CARD_CHIP_H),
-                    color: if is_live { theme.chip_bg } else { theme.accent },
+                // A live tag is a bordered pill on a dark ground; a badge is a filled
+                // accent block with dark ink and no border. `.hh-card-live` carries
+                // `1px solid var(--hh-bord)`, the same hairline as the card itself, which
+                // this drew without until the chip became one component.
+                let spec = Chip {
+                    label,
+                    px: CARD_CHIP_PX,
+                    // .hh-card-live 600 / .hh-card-badge 700
+                    weight: if is_live { 600 } else { 700 },
+                    h: CARD_CHIP_H,
                     radius: if is_live { CARD_CHIP_H * 0.5 } else { 8.0 },
-                });
-                let mut ink_x = chip_x + CARD_CHIP_PAD_X;
-                if is_live {
-                    card_children.push(SceneNode::Rect {
-                        rect: Rect::new(
-                            ink_x,
-                            chip_y + (CARD_CHIP_H - CARD_LIVE_DOT) * 0.5,
-                            CARD_LIVE_DOT,
-                            CARD_LIVE_DOT,
-                        ),
-                        color: theme.live_dot,
-                        radius: CARD_LIVE_DOT * 0.5,
-                    });
-                    ink_x += CARD_LIVE_DOT + CARD_LIVE_GAP;
-                }
-                card_children.push(SceneNode::Text {
-                    rect: Rect::new(
-                        ink_x,
-                        chip_y + (CARD_CHIP_H - CARD_CHIP_PX * 1.3) * 0.5,
-                        ink_w.ceil() + 2.0,
-                        CARD_CHIP_PX * 1.3,
-                    ),
-                    text: label.clone(),
-                    size_px: CARD_CHIP_PX,
-                    color: if is_live {
+                    pad_x: CARD_CHIP_PAD_X,
+                    bg: if is_live { theme.chip_bg } else { theme.accent },
+                    ink: if is_live {
                         theme.card_ink
                     } else {
                         theme.on_accent_ink
                     },
-                    stroke: 0.0,
-                    // .hh-card-live 600 / .hh-card-badge 700
-                    weight: if is_live { 600 } else { 700 },
-                    letter_spacing: 0.0,
-                });
+                    border: if is_live {
+                        Some(theme.chrome_border)
+                    } else {
+                        None
+                    },
+                    dot: if is_live {
+                        Some((CARD_LIVE_DOT, CARD_LIVE_GAP, theme.live_dot))
+                    } else {
+                        None
+                    },
+                };
+                let chip_w = chip_width(&spec, measure);
+                push_chip(
+                    &mut card_children,
+                    ab.right() - CARD_CHIP_INSET - chip_w,
+                    ab.y + CARD_CHIP_INSET,
+                    &spec,
+                    theme.chrome_rule_px,
+                    measure,
+                );
             }
 
             // Title, then the meta line under it, then the progress bar pinned to the art
@@ -2890,14 +3089,37 @@ mod tests {
             "the unit sits on the figure's baseline, not its box top"
         );
 
-        // The stat line is ONE run reading as a sentence, with the pill folded in.
-        let stat = runs
-            .iter()
-            .find(|(s, _)| s.contains("3 agents") && s.contains("41 tasks"))
-            .expect("the agents/tasks stat");
-        assert!(stat.0.contains("Payout pending"), "the payout pill leads the strip");
-        assert!(stat.0.contains("fully local"), "and the local claim closes it");
-        assert!(stat.1.y > amount.y, "the strip is under the number");
+        // The strip is a flex ROW, not a sentence: the pill leads it, the stat's
+        // numbers are their own runs so they can be bold against the words, and the
+        // local claim closes it in the accent. Read left to right, they must be in the
+        // shell's order and on one line.
+        let pill = find("Payout pending").expect("the payout pill leads the strip");
+        let n_agents = find("3").expect("the agent count is its own run");
+        let agents_word = find(" agents · ").expect("the words the count is set against");
+        let n_tasks = find("41").expect("the task count is its own run");
+        let local = find(HERO_LOCAL).expect("and the local claim closes it");
+        assert!(pill.y > amount.y, "the strip is under the number");
+        assert!(n_agents.x > pill.right() - 1.0, "the stat follows the pill");
+        for (a, b) in [(n_agents, agents_word), (agents_word, n_tasks), (n_tasks, local)] {
+            assert!(
+                b.x > a.x && b.x >= a.right() - 3.0,
+                "the strip reads left to right; {:?} does not follow {:?}",
+                (b.x, b.w),
+                (a.x, a.w)
+            );
+        }
+        // `align-items: center`. `pill` here is the LABEL inside the chip, and the stat
+        // is set 2px larger, so the two boxes are different heights: what must agree is
+        // their CENTRE, which is what centring a flex row means and what a top-aligned
+        // row would visibly fail.
+        let mid = |r: Rect| r.y + r.h * 0.5;
+        assert!(
+            (mid(pill) - mid(n_agents)).abs() < 1.5,
+            "the strip's items are not centred on a common line: pill {:?} stat {:?}",
+            (pill.y, pill.h),
+            (n_agents.y, n_agents.h)
+        );
+        let stat = ("", n_agents);
 
         // Both actions draw, primary first.
         let p = find("Resume").expect("the primary action");
@@ -3630,9 +3852,9 @@ mod tests {
         decode_home_compose(&v)
     }
 
-    /// Every drawn run as (text, weight, letter_spacing), so a test can say what a run is
-    /// SET IN rather than only what it says.
-    fn drawn_runs(root: &SceneNode) -> Vec<(String, u16, f32)> {
+    /// Every drawn run as (text, weight, letter_spacing, colour), so a test can say what
+    /// a run is SET IN rather than only what it says.
+    fn drawn_runs(root: &SceneNode) -> Vec<(String, u16, f32, Color)> {
         let mut leaves: Vec<&SceneNode> = Vec::new();
         root.flatten(&mut leaves);
         leaves
@@ -3642,11 +3864,178 @@ mod tests {
                     text,
                     weight,
                     letter_spacing,
+                    color,
                     ..
-                } => Some((text.clone(), *weight, *letter_spacing)),
+                } => Some((text.clone(), *weight, *letter_spacing, *color)),
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn the_payout_pill_is_an_amber_badge_and_not_another_grey_sentence() {
+        // `payout_pending` is the home's statement that the money is NOT real yet. The
+        // shell says it in an amber badge with a dot: `.hh-pill` is amber ink on a
+        // `rgba(255,200,61,.12)` wash inside a `rgba(255,200,61,.30)` hairline. The native
+        // folded the same two words into the grey stat sentence, where a status reads as
+        // prose, on the one surface where the user is looking at a figure they believe
+        // they earned.
+        let theme = Theme::cosmic_default();
+        let mut home = sample();
+        home.hero.payout_pending = true;
+        let root = layout_home(
+            1920.0,
+            1080.0,
+            &home,
+            &theme,
+            &RowScroll::default(),
+            &mut MonoMeasure,
+        );
+        let mut leaves: Vec<&SceneNode> = Vec::new();
+        root.flatten(&mut leaves);
+
+        let label = leaves
+            .iter()
+            .find_map(|n| match n {
+                SceneNode::Text { text, rect, color, .. } if text == "Payout pending" => {
+                    Some((*rect, *color))
+                }
+                _ => None,
+            })
+            .expect("the payout pill");
+        assert_eq!(label.1, theme.pill_ink, "the words are amber, not body grey");
+
+        // The three shapes behind it: the border ring, the wash inset inside it, and the
+        // dot. Found by geometry against the label, so this cannot pass on some other
+        // rounded rect elsewhere in the hero.
+        let boxes: Vec<(Rect, Color, f32)> = leaves
+            .iter()
+            .filter_map(|n| match n {
+                SceneNode::Rect { rect, color, radius }
+                    if rect.y < label.0.y && rect.bottom() > label.0.bottom() =>
+                {
+                    Some((*rect, *color, *radius))
+                }
+                _ => None,
+            })
+            .collect();
+        let ring = boxes
+            .iter()
+            .find(|(_, c, _)| *c == theme.pill_border)
+            .expect("the pill's 1px hairline");
+        let wash = boxes
+            .iter()
+            .find(|(_, c, _)| *c == theme.pill_bg)
+            .expect("the pill's amber wash");
+        // The dot is SHORTER than the label box, so it is found on its own terms:
+        // amber, 7px square, and sitting inside the ring the two shapes above defined.
+        let dot = leaves
+            .iter()
+            .find_map(|n| match n {
+                SceneNode::Rect { rect, color, radius }
+                    if *color == theme.pill_ink
+                        && rect.w == HERO_PILL_DOT
+                        && rect.x >= ring.0.x
+                        && rect.right() <= ring.0.right() =>
+                {
+                    Some((*rect, *color, *radius))
+                }
+                _ => None,
+            })
+            .expect("the pill's amber dot");
+
+        assert!(
+            wash.0.x > ring.0.x && wash.0.right() < ring.0.right(),
+            "the wash sits INSIDE the hairline, which is what a 1px border is"
+        );
+        assert!(
+            (ring.0.h - HERO_PILL_H).abs() < 0.01,
+            "the pill is `padding: 5px 12px` around a 13px line"
+        );
+        assert!(
+            (ring.2 - HERO_PILL_H * 0.5).abs() < 0.01,
+            "`border-radius: 30px` on a 29.5px box is a full round end"
+        );
+        assert!(dot.0.x < label.0.x, "the dot LEADS the words");
+        assert_eq!(dot.2, HERO_PILL_DOT * 0.5, "and it is round");
+        assert!(
+            label.0.x > ring.0.x + HERO_PILL_PAD_X,
+            "the words clear the pill's left padding and its dot"
+        );
+
+        // And with nothing pending there is no pill at all, rather than an empty badge.
+        home.hero.payout_pending = false;
+        let root = layout_home(
+            1920.0,
+            1080.0,
+            &home,
+            &theme,
+            &RowScroll::default(),
+            &mut MonoMeasure,
+        );
+        assert!(
+            !drawn_texts(&root).iter().any(|t| t == "Payout pending"),
+            "the pill is the payload's claim, not furniture"
+        );
+    }
+
+    #[test]
+    fn the_stat_sets_its_numbers_against_its_words(
+    ) {
+        // `.hh-stat` is `<b>N</b> agents · <b>M</b> tasks`: the counts are `--hh-ink` at
+        // 800 and the words are #C3CDD9 at 400, so the line is deliberately two colours
+        // and two weights. Drawn as one joined string it was one grey run and the counts,
+        // which are the only part anyone reads at a glance, had no emphasis at all.
+        let theme = Theme::cosmic_default();
+        let mut home = sample();
+        home.hero.agents = 3;
+        home.hero.tasks = 41;
+        home.hero.local = true;
+        let root = layout_home(
+            1920.0,
+            1080.0,
+            &home,
+            &theme,
+            &RowScroll::default(),
+            &mut MonoMeasure,
+        );
+        let runs = drawn_runs(&root);
+        let of = |t: &str| {
+            runs.iter()
+                .find(|(s, _, _, _)| s == t)
+                .unwrap_or_else(|| panic!("no run drew {t:?}"))
+        };
+        assert_eq!((of("3").1, of("3").3), (800, theme.card_ink), ".hh-stat b");
+        assert_eq!((of("41").1, of("41").3), (800, theme.card_ink), ".hh-stat b");
+        assert_eq!(
+            (of(" agents · ").1, of(" agents · ").3),
+            (400, theme.meta_ink),
+            ".hh-stat's own colour, which is neither the ink nor the muted copy"
+        );
+        assert_ne!(
+            theme.meta_ink, theme.card_ink,
+            "if these were the same colour this test would be pinning nothing"
+        );
+        // The local claim is the accent, and it is a claim rather than more stat.
+        assert_eq!(
+            (of(HERO_LOCAL).1, of(HERO_LOCAL).3),
+            (700, theme.accent),
+            ".hh-local-mini"
+        );
+        // Singulars, because the shell writes them.
+        home.hero.agents = 1;
+        home.hero.tasks = 1;
+        let root = layout_home(
+            1920.0,
+            1080.0,
+            &home,
+            &theme,
+            &RowScroll::default(),
+            &mut MonoMeasure,
+        );
+        let texts = drawn_texts(&root);
+        assert!(texts.iter().any(|t| t == " agent · "), "one agent, not agents");
+        assert!(texts.iter().any(|t| t == " task"), "one task, not tasks");
     }
 
     #[test]
@@ -3665,9 +4054,10 @@ mod tests {
             &mut IconMeasure,
         );
         let runs = drawn_runs(&root);
+        let theme = Theme::cosmic_default();
         let of = |t: &str| {
             runs.iter()
-                .find(|(s, _, _)| s == t)
+                .find(|(s, _, _, _)| s == t)
                 .unwrap_or_else(|| panic!("no run drew {t:?}"))
         };
 
@@ -3677,7 +4067,11 @@ mod tests {
         assert_eq!(of("Spark").1, 700, ".hh-amount-unit");
         assert_eq!(
             runs.iter()
-                .find(|(t, _, _)| t.chars().all(|c| c.is_ascii_digit()) && t.len() > 1)
+                .find(|(t, _, _, c)| {
+                    t.chars().all(|c| c.is_ascii_digit())
+                        && t.len() > 1
+                        && *c == theme.hero_title
+                })
                 .expect("the Spark figure")
                 .1,
             800,
@@ -3697,16 +4091,14 @@ mod tests {
         // And the negative: NOTHING is left at the shaper's default except the runs whose
         // rule genuinely says so. A new construction site that forgets its weight lands
         // here rather than shipping a flat surface.
-        let plain: Vec<&String> = runs
-            .iter()
-            .filter(|(_, w, _)| *w == 400)
-            .map(|(t, _, _)| t)
-            .collect();
-        for t in &plain {
-            let is_icon = t.chars().all(|c| c.is_ascii_lowercase() || c == '_');
-            let is_meta = t.contains('·') || home.rows.iter().any(|r| {
-                r.cards.iter().any(|c| c.meta.as_deref() == Some(t.as_str()))
-            });
+        for (t, _, _, c) in runs.iter().filter(|(_, w, _, _)| *w == 400) {
+            // A ligature glyph is a bare lowercase icon NAME, with no spaces.
+            let is_icon = !t.is_empty()
+                && t.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_');
+            // The two surfaces that legitimately inherit 400, identified by the colour
+            // they are painted in rather than by what they happen to say: the hero strip's
+            // words (its NUMBERS are 800 in the body ink) and a card's own meta line.
+            let is_meta = *c == theme.meta_ink || *c == theme.hero_copy;
             assert!(
                 is_icon || is_meta,
                 "{t:?} is drawn at the default weight but is not a ligature glyph or an                  inheriting meta line, so its shell rule was never read"

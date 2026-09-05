@@ -1051,3 +1051,89 @@ def test_the_eyebrow_is_the_brand_label_the_shell_paints():
     assert "letter_spacing: %s," % float(ls.group(1)) in scene, (
         "the native eyebrow does not carry the shell's %spx letter-spacing"
         % ls.group(1))
+
+def test_the_payout_pill_and_the_stat_carry_the_shells_own_literals():
+    """The honesty badge and the two-tone stat, pinned to hartHome.css.
+
+    `payout_pending` is the home's statement that the money is not real yet, and
+    `.hh-pill` says it in amber: `--hh-amber` ink on a `rgba(255,200,61,.12)` wash
+    inside a `rgba(255,200,61,.30)` hairline, led by a 7px dot. `.hh-stat` sets its
+    COUNTS in `--hh-ink` at 800 against its own `#C3CDD9` at 400, and
+    `.hh-local-mini` closes the line in teal behind an 8px shield.
+
+    The native drew all of it as one grey run, so this pins the numbers that make
+    the difference between a status and a sentence.
+    """
+    css = _css_strip_comments(open(os.path.join(
+        REPO, "integrations", "agent_engine", "static", "hartHome.css"),
+        encoding="utf-8").read())
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    def rule(sel):
+        m = re.search(r"(?m)^%s \{(.*?)^\}" % re.escape(sel), css, re.S)
+        assert m, "hartHome.css no longer has a %s rule" % sel
+        return m.group(1)
+
+    def rgba_of(body, prop):
+        m = re.search(prop + r":[^;]*?rgba\((\d+),\s*(\d+),\s*(\d+),\s*([\d.]+)\)",
+                      body)
+        assert m, "%s has no rgba %s" % (prop, body[:60])
+        r, g, b, a = m.groups()
+        return (int(r) / 255.0, int(g) / 255.0, int(b) / 255.0, float(a))
+
+    def scene_rgba(field):
+        m = re.search(r"%s: Color::rgba\(([^)]*)\)," % field, scene)
+        assert m, "scene.rs no longer declares %s" % field
+        return [eval(p.strip(), {"__builtins__": {}}) for p in m.group(1).split(",")]
+
+    pill = rule(".hh-pill")
+
+    # --hh-amber is the ink, and the wash and hairline are the same hue at .12/.30.
+    amber = re.search(r"--hh-amber:\s*(#[0-9A-Fa-f]{6})", css)
+    assert amber, "the shell no longer defines --hh-amber"
+    assert 'pill_ink: palette("%s"' % amber.group(1) in scene, (
+        "the native pill ink is not --hh-amber")
+    for prop, field in (("background", "pill_bg"), ("border", "pill_border")):
+        want = rgba_of(pill, prop)
+        got = scene_rgba(field)
+        assert all(abs(x - y) < 1e-6 for x, y in zip(got, want)), (
+            "%s is %s and .hh-pill's %s is %s" % (field, got, prop, list(want)))
+
+    # Geometry: `padding: 5px 12px` over a 13px line at the shell's line-height 1.5.
+    pad_y, pad_x = re.search(r"padding:\s*(\d+)px\s+(\d+)px", pill).groups()
+    px = re.search(r"font-size:\s*(\d+)px", pill).group(1)
+    assert "HERO_PILL_PAD_X: f32 = %s.0;" % pad_x in scene
+    assert "HERO_PILL_PX: f32 = %s.0;" % px in scene
+    want_h = 2 * int(pad_y) + int(px) * 1.5
+    assert "HERO_PILL_H: f32 = %s;" % want_h in scene, (
+        "the pill box should be %s (2 x %spx padding + %spx at line-height 1.5)"
+        % (want_h, pad_y, px))
+    gap = re.search(r"gap:\s*(\d+)px", pill).group(1)
+    assert "HERO_PILL_GAP: f32 = %s.0;" % gap in scene
+    dot = re.search(r"width:\s*(\d+)px", rule(".hh-pill-dot")).group(1)
+    assert "HERO_PILL_DOT: f32 = %s.0;" % dot in scene
+
+    # `.hh-hero-meta { gap: 10px 16px }`: the COLUMN gap is the one between items.
+    meta = rule(".hh-hero-meta")
+    col = re.search(r"gap:\s*\d+px\s+(\d+)px", meta).group(1)
+    assert "HERO_META_GAP: f32 = %s.0;" % col in scene, (
+        "the strip's items are not spaced by the rule's column gap")
+    ink = re.search(r"color:\s*(#[0-9A-Fa-f]{6})", meta).group(1)
+    assert 'meta_ink: palette("%s"' % ink in scene, (
+        "the strip is not painted in .hh-hero-meta's own colour")
+    # `.hh-stat` is that same colour and its <b> is heavier, which is the whole
+    # reason the native draws the counts as separate runs.
+    assert re.search(r"\.hh-stat\s*\{[^}]*color:\s*%s" % ink, css), (
+        ".hh-stat drifted from .hh-hero-meta's colour")
+    b_weight = re.search(r"\.hh-stat b\s*\{[^}]*font-weight:\s*(\d+)", css).group(1)
+    assert "stat.push((home.hero.agents.to_string(), %s," % b_weight in scene, (
+        "the agent count is not set at .hh-stat b's %s" % b_weight)
+
+    # `.hh-local-mini`: teal, 700, behind an 8px shield with a 6px gap.
+    mini = rule(".hh-local-mini")
+    assert "var(--hh-teal)" in mini, "the local claim stopped being teal in the shell"
+    assert re.search(r"font-weight:\s*700", mini)
+    shield = re.search(r"width:\s*(\d+)px", rule(".hh-local-mini .hh-shield")).group(1)
+    assert "HERO_SHIELD: f32 = %s.0;" % shield in scene
+    assert "HERO_SHIELD_GAP: f32 = %s.0;" % re.search(
+        r"gap:\s*(\d+)px", mini).group(1) in scene
