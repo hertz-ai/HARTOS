@@ -195,6 +195,18 @@ def test_no_shipped_theme_is_clamped_by_the_native_scene():
                 "different one" % (os.path.basename(path), key, v, lo, hi))
 
 
+def _css_strip_comments(css):
+    """CSS with `/* ... */` removed.
+
+    THREE guards in this file have now matched a value out of a COMMENT rather
+    than a declaration: a Rust doc comment quoting the CSS rule it implements, a
+    struct field declaration standing in for its initialiser, and `.hh-btn-primary`
+    whose comment quotes the MOCKUP's `0 12px 36px` right above the rule's own
+    `0 12px 30px`. Prose that describes the value is not the value.
+    """
+    return re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+
+
 def _css_decl(css, selector, prop):
     """The value of `prop` in the LAST rule matching `selector` (cascade order)."""
     found = None
@@ -849,3 +861,56 @@ def test_the_card_depth_the_shell_keeps_on_every_tier_reaches_the_native_cards()
     assert "color: theme.card_shadow," in scene, (
         "the card no longer casts the theme's shadow, so the numbers above are "
         "pinning something that never reaches a pixel")
+
+def test_the_lit_cta_and_the_card_hairline_match_the_shells_own_rules():
+    """Two more one-time rasters the shell keeps on every tier.
+
+    `.hh-btn-primary` is a gradient plus a static teal glow, kept on the software
+    floor by the same argument as the card depth: "A one-time raster, so software
+    keeps the lit 'Resume' button". And every card carries a 1px border whose
+    colour resolves through `--hh-bord` to `--hart-glass-border`, the same value
+    the chrome strips rule with. The native CTA was a flat accent block and the
+    native cards had no edge at all.
+    """
+    css = open(os.path.join(REPO, "integrations", "agent_engine", "static",
+                            "hartHome.css"), encoding="utf-8").read()
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+
+    btn = re.search(r"(?m)^\.hh-btn-primary \{(.*?)^\}",
+                    _css_strip_comments(css), re.S)
+    assert btn, "hartHome.css no longer has a .hh-btn-primary rule"
+
+    grad = re.search(r"linear-gradient\((\d+)deg,\s*(#[0-9A-Fa-f]{6})", btn.group(1))
+    assert grad, "the primary CTA is no longer a linear-gradient the native scene can mirror"
+    # Case-insensitive on the HEX only: upper-casing the whole file also
+    # upper-cases the field name, so the needle never matches itself.
+    assert re.search(r'cta_from: palette\("%s"' % grad.group(2), scene, re.I), (
+        "the CTA's bright stop is %s in the shell and the native scene does not "
+        "carry it" % grad.group(2))
+    assert "angle_deg: %s.0," % grad.group(1) in scene, (
+        "the CTA ramp runs at %sdeg in the shell" % grad.group(1))
+
+    glow = re.search(r"box-shadow:\s*0\s+(\d+)px\s+(\d+)px\s+"
+                     r"rgba\((\d+),\s*(\d+),\s*(\d+),\s*([\d.]+)\)", btn.group(1))
+    assert glow, "the primary CTA no longer carries its static glow"
+    dy, blur, r, g, b, a = glow.groups()
+    assert "cta_glow_dy: %s.0," % dy in scene
+    assert "cta_glow_blur: %s.0," % blur in scene
+    # Read the three channels back out of the Rust rather than reconstructing the
+    # literal's exact spelling, which is how the first cut of this compared a
+    # string against a differently-formatted equal value.
+    lit = re.search(r"cta_glow: Color::rgba\(([^)]*)\),", scene)
+    assert lit, "scene.rs no longer declares a cta_glow colour"
+    got = [eval(p.strip(), {"__builtins__": {}}) for p in lit.group(1).split(",")]
+    want = [int(r) / 255.0, int(g) / 255.0, int(b) / 255.0, float(a)]
+    assert all(abs(x - y) < 1e-6 for x, y in zip(got, want)), (
+        "the CTA glow is %s and the shell's is rgba(%s,%s,%s,%s)" % (got, r, g, b, a))
+
+    # `--hh-bord` IS `--hart-glass-border`, so the card border and the chrome rule
+    # are one colour rather than two that happen to match.
+    bord = re.search(r"--hh-bord:\s*var\(--([\w-]+)", css)
+    assert bord and bord.group(1) == "hart-glass-border", (
+        "--hh-bord no longer resolves to --hart-glass-border, so the native card "
+        "border and the chrome rule are no longer the same value")
+    assert "color: theme.chrome_border," in scene, (
+        "the cards no longer draw their hairline in that colour")

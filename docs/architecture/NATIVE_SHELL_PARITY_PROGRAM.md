@@ -1303,3 +1303,34 @@ border, so there is no box to cast one, and its art tile carries the depth.
 opaque literal in the shell and the native value was white at 6%. It is the
 backstop under the art rather than a visible surface, but a pale wash shows
 through as a ghost anywhere the art does not reach.
+
+### The lit CTA and the card hairline, and a third way prose fooled a guard
+Two more one-time rasters the shell keeps on every tier, both found by following
+`.hh-card`'s neighbours in the same stylesheet.
+
+`.hh-btn-primary` is a `linear-gradient(135deg, #5CFFD9, var(--hh-teal))` plus a
+static teal `box-shadow`, kept on the software floor by the same argument as the
+card depth: "A one-time raster, so software keeps the lit 'Resume' button". The
+native CTA was a flat accent block with neither. The shell's comment also says
+what the ramp is NOT and why: "NOT teal->cyan: cyan #29C5FF dominated the small
+button and read 'blue'", which is worth carrying because a plausible-looking
+brand ramp would have been wrong in a way nobody could have argued with later.
+
+Every card also carries `border: 1px solid var(--hh-bord)`, and `--hh-bord`
+resolves to `--hart-glass-border`: the SAME value the chrome strips rule with, so
+the card edge and the chrome edge are one colour rather than two that agree. The
+native cards had no edge at all. Four hairlines rather than a stroked outline,
+because the scene has one fill primitive and four rects is the honest way to say a
+border with it.
+
+**The guard read the comment instead of the rule, and this is the third time that
+class has appeared.** `.hh-btn-primary`'s comment quotes the MOCKUP's
+`0 12px 36px rgba(0,230,184,.35)` directly above the rule's own
+`0 12px 30px rgba(0,230,195,0.30)`, so a regex over the block matched the
+description rather than the declaration and failed against correct code. Before
+that, a Rust doc comment quoting a CSS rule satisfied a check for that rule's
+literals, and a struct field declaration stood in for its initialiser.
+
+All three are the same mistake: prose that DESCRIBES a value is not the value.
+There is now a `_css_strip_comments` used by the shared reader, so the CSS half of
+that class is closed rather than dodged three times.

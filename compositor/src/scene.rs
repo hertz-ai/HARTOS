@@ -261,6 +261,17 @@ pub struct Theme {
     pub card_shadow: Color,
     pub card_shadow_dy: f32,
     pub card_shadow_blur: f32,
+    /// `.hh-btn-primary`'s `linear-gradient(135deg, #5CFFD9, var(--hh-teal))`: a BRIGHT
+    /// teal falling to the brand teal. The shell's own comment says what it is not, and
+    /// why: "NOT teal->cyan: cyan #29C5FF dominated the small button and read 'blue'".
+    /// The native CTA was a flat accent fill, which is the third thing it is not.
+    pub cta_from: Color,
+    /// `box-shadow: 0 12px 30px rgba(0,230,195,0.30)`, the static teal glow. Kept on the
+    /// software floor by the same rule as the card's depth: "A one-time raster, so
+    /// software keeps the lit 'Resume' button".
+    pub cta_glow: Color,
+    pub cta_glow_dy: f32,
+    pub cta_glow_blur: f32,
 }
 
 /// The spectrum names, positionally matched to `Theme::spectrum`.
@@ -425,6 +436,10 @@ impl Theme {
             card_shadow: Color::rgba(0.0, 0.0, 0.0, 0.46),
             card_shadow_dy: 16.0,
             card_shadow_blur: 38.0,
+            cta_from: palette("#5CFFD9", Color::rgba(0.5, 0.5, 0.5, 1.0)),
+            cta_glow: Color::rgba(0.0, 230.0 / 255.0, 195.0 / 255.0, 0.30),
+            cta_glow_dy: 12.0,
+            cta_glow_blur: 30.0,
         }
     }
 
@@ -1812,11 +1827,35 @@ pub fn layout_home(
         if cta_x + bw > content.x + hero_text_w {
             break;
         }
-        root.push(SceneNode::Rect {
-            rect: Rect::new(cta_x, hero_y, bw, HERO_BTN_H),
-            color: if primary { theme.accent } else { theme.omnibox_bg },
-            radius: HERO_BTN_H * 0.5,
-        });
+        let btn = Rect::new(cta_x, hero_y, bw, HERO_BTN_H);
+        if primary {
+            // The lit Resume button: a static teal glow UNDER it, then the bright-to-brand
+            // teal ramp, not the flat accent fill this used to be. Both are one-time
+            // rasters, which is why the shell keeps both on the software floor.
+            root.push(SceneNode::Shadow {
+                rect: btn,
+                radius: HERO_BTN_H * 0.5,
+                blur: theme.cta_glow_blur,
+                offset_y: theme.cta_glow_dy,
+                color: theme.cta_glow,
+            });
+            root.push(SceneNode::Fill {
+                rect: btn,
+                from: theme.cta_from,
+                mid: theme.cta_from.mix(theme.accent, 0.5),
+                mid_at: 0.5,
+                to: theme.accent,
+                angle_deg: 135.0,
+                radius: HERO_BTN_H * 0.5,
+                photo: None,
+            });
+        } else {
+            root.push(SceneNode::Rect {
+                rect: btn,
+                color: theme.omnibox_bg,
+                radius: HERO_BTN_H * 0.5,
+            });
+        }
         root.push(SceneNode::Text {
             rect: Rect::new(
                 cta_x + HERO_BTN_PAD_X,
@@ -1991,6 +2030,23 @@ pub fn layout_home(
                 radius: theme.card_radius,
                 photo: card.photo.clone(),
             });
+            // `.hh-card { border: 1px solid var(--hh-bord) }`, and `--hh-bord` resolves to
+            // `--hart-glass-border`: the SAME colour the chrome strips rule with. Drawn
+            // AFTER the art, because the art is `inset: 0` and would otherwise cover it,
+            // and as four hairlines rather than a stroked outline because the scene has
+            // one fill primitive and four rects is the honest way to say a border with it.
+            for edge in [
+                Rect::new(ab.x, ab.y, ab.w, theme.chrome_rule_px),
+                Rect::new(ab.x, ab.bottom() - theme.chrome_rule_px, ab.w, theme.chrome_rule_px),
+                Rect::new(ab.x, ab.y, theme.chrome_rule_px, ab.h),
+                Rect::new(ab.right() - theme.chrome_rule_px, ab.y, theme.chrome_rule_px, ab.h),
+            ] {
+                card_children.push(SceneNode::Rect {
+                    rect: edge,
+                    color: theme.chrome_border,
+                    radius: 0.0,
+                });
+            }
             // ── Icon glyph, top left, and ONLY when the card has no photo: the shell draws
             //    it as `card.icon && !hasImage`, because the glyph is the stand-in FOR the
             //    missing picture, not a decoration beside one. It is a ligature name in a
@@ -3734,6 +3790,89 @@ mod tests {
     }
 
     #[test]
+    fn the_primary_cta_is_a_lit_teal_ramp_and_not_a_flat_accent_block() {
+        // `.hh-btn-primary` is a gradient plus a static glow, and the shell keeps both on
+        // the software floor for the same reason it keeps the card depth: "A one-time
+        // raster, so software keeps the lit 'Resume' button". The native CTA was a flat
+        // accent fill with neither, which is the button the mockup was contrasted against.
+        let theme = Theme::cosmic_default();
+        let root = layout_home(1600.0, 900.0, &sample(), &theme, &RowScroll::default(), &mut MonoMeasure);
+        let mut leaves: Vec<&SceneNode> = Vec::new();
+        root.flatten(&mut leaves);
+
+        // The pill: a ramp from the BRIGHT teal down to the brand accent.
+        let pill = leaves
+            .iter()
+            .find_map(|n| match n {
+                SceneNode::Fill { from, to, rect, radius, .. }
+                    if (rect.h - HERO_BTN_H).abs() < 0.01 =>
+                {
+                    Some((*from, *to, *radius, *rect))
+                }
+                _ => None,
+            })
+            .expect("the primary CTA draws a gradient pill");
+        assert_eq!(pill.0, theme.cta_from, "it starts at the bright teal");
+        assert_eq!(pill.1, theme.accent, "and lands on the brand accent");
+        assert_ne!(pill.0, pill.1, "a ramp, not the flat fill it used to be");
+        assert!(pill.0.g > pill.0.b, "the bright end is TEAL, not the cyan the shell warns off");
+        assert!((pill.2 - HERO_BTN_H * 0.5).abs() < 0.01, "a pill, fully rounded");
+
+        // The glow: teal, under the pill, offset down like the card's depth.
+        let glow = leaves
+            .iter()
+            .find_map(|n| match n {
+                SceneNode::Shadow { color, rect, offset_y, blur, .. }
+                    if (rect.h - HERO_BTN_H).abs() < 0.01 =>
+                {
+                    Some((*color, *offset_y, *blur))
+                }
+                _ => None,
+            })
+            .expect("the primary CTA casts its glow");
+        assert_eq!(glow.0, theme.cta_glow);
+        assert!(glow.0.g > glow.0.r, "the glow is TEAL, not the card's black");
+        assert_eq!((glow.1, glow.2), (theme.cta_glow_dy, theme.cta_glow_blur));
+
+        // The SECONDARY button gets neither: the shell lights one call to action.
+        let pills = leaves
+            .iter()
+            .filter(|n| matches!(n, SceneNode::Fill { rect, .. }
+                                 if (rect.h - HERO_BTN_H).abs() < 0.01))
+            .count();
+        assert_eq!(pills, 1, "only the primary is a lit ramp");
+    }
+
+    #[test]
+    fn every_card_carries_the_hairline_border_the_shell_draws() {
+        // `.hh-card { border: 1px solid var(--hh-bord) }`, and `--hh-bord` resolves to
+        // `--hart-glass-border`: the same colour the chrome strips rule with, so a card
+        // without it loses its edge against the desktop exactly as the strips did.
+        let theme = Theme::cosmic_default();
+        let root = layout_home(1600.0, 900.0, &sample(), &theme, &RowScroll::default(), &mut MonoMeasure);
+        let mut card_leaves: Vec<&SceneNode> = Vec::new();
+        leaves_of(&root, Component::HomeCard, &mut card_leaves);
+        let edges: Vec<Rect> = card_leaves
+            .iter()
+            .filter_map(|n| match n {
+                SceneNode::Rect { rect, color, .. } if *color == theme.chrome_border => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .collect();
+        let cards: usize = sample().rows.iter().map(|r| r.cards.len()).sum();
+        assert_eq!(edges.len(), cards * 4, "four hairlines per card");
+        for e in &edges {
+            assert!(
+                (e.w - theme.chrome_rule_px).abs() < 0.01
+                    || (e.h - theme.chrome_rule_px).abs() < 0.01,
+                "an edge is one pixel in one direction: {e:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_chrome_strips_take_the_shells_no_blur_floor_not_its_blurred_glass() {
         // `.glass` is a translucent white over a `backdrop-filter: blur`. The native path
         // has NO blur, so copying that alpha would put unreadable chrome over the aurora.
@@ -3798,10 +3937,15 @@ mod tests {
         let root = layout_home(w, h, &sample(), &theme, &RowScroll::default(), &mut MonoMeasure);
         let mut leaves: Vec<&SceneNode> = Vec::new();
         root.flatten(&mut leaves);
+        // FULL-WIDTH rules only: `--hart-glass-border` is also the card border's colour
+        // (`--hh-bord` resolves to it), so filtering on colour alone counts four hairlines
+        // per card as chrome. A strip's rule is the one that spans the output.
         let rules: Vec<Rect> = leaves
             .iter()
             .filter_map(|n| match n {
-                SceneNode::Rect { rect, color, .. } if *color == theme.chrome_border => {
+                SceneNode::Rect { rect, color, .. }
+                    if *color == theme.chrome_border && rect.w == w =>
+                {
                     Some(*rect)
                 }
                 _ => None,
