@@ -73,10 +73,19 @@ class ReuseCompletionTerminates(unittest.TestCase):
                          "the KNOWN pipeline action instead")
 
     def test_robust_advance_still_uses_canonical_advance_fn(self):
-        # No parallel advance path — same _advance_reuse_action as the TERMINATE gate.
-        self.assertIn('_advance_reuse_action(\n                        user_prompt, _reuse_current_action, "reuse-w1-completed"',
-                      self.src,
-                      "advancement must go through the canonical _advance_reuse_action")
+        # No parallel advance path.  The five advance-and-steer sites now go
+        # through ONE helper, _advance_or_steer, which is the only caller of
+        # _advance_reuse_action — so this site must reach the canonical
+        # advance through that helper, not by re-inlining the block.
+        self.assertIn('"reuse-w1-completed"', self.src,
+                      "the robust completion-advance site must still exist")
+        self.assertIn('_advance_or_steer(', self.src,
+                      "advancement must go through the canonical helper")
+        self.assertNotIn(
+            '_advance_reuse_action(\n                        user_prompt, _reuse_current_action, "reuse-w1-completed"',
+            self.src,
+            "the inline copy at this site was collapsed into _advance_or_steer; "
+            "re-inlining it would restore the five-way drift")
 
 
 if __name__ == '__main__':

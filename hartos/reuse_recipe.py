@@ -3002,6 +3002,63 @@ def _reuse_fab_steer_message(user_prompt, current_action_id):
     )
 
 
+def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
+                      manager, chat_instructor,
+                      claimed_action_id=None, advanced_latch=None):
+    """Move the reuse pipeline past `action_id` — or, when the action only
+    CLAIMED completion, steer the agent to actually run its tools.
+
+    One rule, one home.  Five call sites used to inline this same block
+    (w1-completed / w1 / w1-regex / w2 / w2-regex), each with locals named
+    after the loop they sat in — _rc_next, _next, _next2, _w2_next,
+    _w2_next2 and their _ok/_steer twins.  A name that says WHERE the code
+    is tells a reader nothing about WHAT the value holds, and five copies of
+    one rule drift apart: the 2026-09-05 fabricated-completion fix had to be
+    applied five times, and the [HALLUCINATION?] check four.
+
+    Args:
+        action_id: the action the PIPELINE believes is current.
+        claimed_action_id: the action id the LLM asserted, when it named one.
+            Logged when it disagrees with `action_id` — an agent claiming a
+            different action than the one assigned is a hallucination signal.
+        advanced_latch: the caller's once-per-action set, when it keeps one
+            (only get_agent_response does).  A refusal drops the latch so the
+            action can be re-verified once the agent really runs the tool.
+
+    Returns:
+        True  — the next action's message, or a re-steer, was posted; the
+                caller should keep looping.
+        False — no next action and nothing to steer; the caller should end
+                the turn.
+    """
+    if claimed_action_id is not None and claimed_action_id != action_id:
+        current_app.logger.warning(
+            f"[HALLUCINATION?] LLM claims action_id={claimed_action_id} "
+            f"but pipeline has {action_id}")
+
+    next_action_id, advanced = _advance_reuse_action(
+        user_prompt, action_id, reason, prompt_id)
+
+    if not advanced:
+        # A fabrication refusal is NOT "all actions done" — it wants the
+        # tool actually run, so steer instead of ending the turn.
+        steer_message = _reuse_fab_steer_message(user_prompt, action_id)
+        if not steer_message:
+            return False
+        if advanced_latch is not None:
+            advanced_latch.discard(action_id)
+        chat_instructor.initiate_chat(
+            recipient=manager, message=steer_message,
+            clear_history=False, silent=False)
+        return True
+
+    chat_instructor.initiate_chat(
+        recipient=manager,
+        message=_build_reuse_action_message(user_prompt, next_action_id),
+        clear_history=False, silent=False)
+    return True
+
+
 def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
     """Registered tool names the current action NAMES but that produced ZERO
     tool results anywhere in the group chat — i.e. a fabricated 'completed'.
@@ -3186,25 +3243,13 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     current_app.logger.info(
                         f"reuse-w1-completed: terminal 'completed' verdict for action "
                         f"{_reuse_current_action} — advancing (manager terminated on verdict)")
-                    _rc_next, _rc_ok = _advance_reuse_action(
-                        user_prompt, _reuse_current_action, "reuse-w1-completed", prompt_id)
-                    if not _rc_ok:
-                        # A fabrication refusal is not "all actions done": steer
-                        # the agent to actually run the tool and let the action
-                        # be re-verified (drop the once-per-action latch so the
-                        # next real 'completed' verdict can advance it).
-                        _rc_steer = _reuse_fab_steer_message(user_prompt, _reuse_current_action)
-                        if _rc_steer:
-                            _reuse_advanced_actions.discard(_reuse_current_action)
-                            chat_instructor.initiate_chat(
-                                recipient=manager, message=_rc_steer,
-                                clear_history=False, silent=False)
-                            continue
+                    if not _advance_or_steer(
+                            user_prompt, _reuse_current_action,
+                            "reuse-w1-completed", prompt_id,
+                            manager, chat_instructor,
+                            advanced_latch=_reuse_advanced_actions):
                         return ''
-                    _rc_msg = _build_reuse_action_message(user_prompt, _rc_next)
-                    chat_instructor.initiate_chat(
-                        recipient=manager, message=_rc_msg,
-                        clear_history=False, silent=False)
+                    continue
             except Exception as _rc_err:
                 current_app.logger.debug(f"robust completion-advance skipped: {_rc_err}")
             if _reuse_current_action in _reuse_advanced_actions:
@@ -3228,22 +3273,13 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                     current_app.logger.info(f'got json object {json_obj}')
                     if json_obj['status'].lower() == 'completed':
-                        _llm_action_id = int(json_obj.get("action_id", _reuse_current_action))
-                        if _llm_action_id != _reuse_current_action:
-                            current_app.logger.warning(
-                                f"[HALLUCINATION?] LLM claims action_id={_llm_action_id} "
-                                f"but pipeline assigned {_reuse_current_action}")
-                        _next, _ok = _advance_reuse_action(user_prompt, _reuse_current_action, "reuse-w1", prompt_id)
-                        if not _ok:
-                            _steer = _reuse_fab_steer_message(user_prompt, _reuse_current_action)
-                            if _steer:
-                                chat_instructor.initiate_chat(recipient=manager, message=_steer,
-                                                              clear_history=False, silent=False)
-                                continue
+                        if not _advance_or_steer(
+                                user_prompt, _reuse_current_action, "reuse-w1",
+                                prompt_id, manager, chat_instructor,
+                                claimed_action_id=int(json_obj.get(
+                                    "action_id", _reuse_current_action)),
+                                advanced_latch=_reuse_advanced_actions):
                             return ''
-                        user_message = _build_reuse_action_message(user_prompt, _next)
-                        chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,
-                                                      silent=False)
                         continue
                 except IndexError:
                     current_app.logger.info("Completed ALL ACTIONS")
@@ -3254,23 +3290,15 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         if json_obj:
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
-                                _known = user_tasks[user_prompt].current_action
-                                _llm_claimed = int(json_obj.get("action_id", _known))
-                                if _llm_claimed != _known:
-                                    current_app.logger.warning(
-                                        f"[HALLUCINATION?] LLM claims action_id={_llm_claimed} "
-                                        f"but pipeline has {_known}")
-                                _next2, _ok2 = _advance_reuse_action(user_prompt, _known, "reuse-w1-regex", prompt_id)
-                                if not _ok2:
-                                    _steer2 = _reuse_fab_steer_message(user_prompt, _known)
-                                    if _steer2:
-                                        chat_instructor.initiate_chat(recipient=manager, message=_steer2,
-                                                                      clear_history=False, silent=False)
-                                        continue
+                                pipeline_action_id = user_tasks[user_prompt].current_action
+                                if not _advance_or_steer(
+                                        user_prompt, pipeline_action_id,
+                                        "reuse-w1-regex", prompt_id,
+                                        manager, chat_instructor,
+                                        claimed_action_id=int(json_obj.get(
+                                            "action_id", pipeline_action_id)),
+                                        advanced_latch=_reuse_advanced_actions):
                                     return ''
-                                user_message = _build_reuse_action_message(user_prompt, _next2)
-                                chat_instructor.initiate_chat(recipient=manager, message=user_message,
-                                                              clear_history=False, silent=False)
                                 continue
                         else:
                             raise ValueError('No json found')
@@ -3863,17 +3891,18 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                     current_app.logger.info('inside while2')
 
                     # === LEDGER v2.0: Heartbeat + Budget/SLA ===
-                    _w2_current = user_tasks[user_prompt].current_action
-                    _w2_ledger = user_ledgers.get(user_prompt)
-                    if _w2_ledger:
-                        _w2_task = _w2_ledger.tasks.get(f"action_{_w2_current}")
-                        if _w2_task:
-                            _w2_task.heartbeat()
-                            if _w2_task.is_budget_exhausted():
-                                current_app.logger.warning(f"[BUDGET] action_{_w2_current} budget exhausted in while2")
+                    current_action_id = user_tasks[user_prompt].current_action
+                    ledger = user_ledgers.get(user_prompt)
+                    if ledger:
+                        action_task = ledger.tasks.get(f"action_{current_action_id}")
+                        if action_task:
+                            action_task.heartbeat()
+                            if action_task.is_budget_exhausted():
+                                current_app.logger.warning(
+                                    f"[BUDGET] action_{current_action_id} budget exhausted in while2")
                                 break
-                            if _w2_task.is_sla_breached() and not _w2_task.sla_breached:
-                                _w2_task.mark_sla_breached()
+                            if action_task.is_sla_breached() and not action_task.sla_breached:
+                                action_task.mark_sla_breached()
 
                     # Same empty-history hazard as the while1 loop above.
                     if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
@@ -3886,22 +3915,13 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
-                                _llm_aid = int(json_obj.get("action_id", _w2_current))
-                                if _llm_aid != _w2_current:
-                                    current_app.logger.warning(
-                                        f"[HALLUCINATION?] LLM claims action_id={_llm_aid} "
-                                        f"but pipeline has {_w2_current}")
-                                _w2_next, _w2_ok = _advance_reuse_action(user_prompt, _w2_current, "reuse-w2", prompt_id)
-                                if not _w2_ok:
-                                    _w2_steer = _reuse_fab_steer_message(user_prompt, _w2_current)
-                                    if _w2_steer:
-                                        chat_instructor.initiate_chat(recipient=manager, message=_w2_steer,
-                                                                      clear_history=False, silent=False)
-                                        continue
+                                if not _advance_or_steer(
+                                        user_prompt, current_action_id,
+                                        "reuse-w2", prompt_id,
+                                        manager, chat_instructor,
+                                        claimed_action_id=int(json_obj.get(
+                                            "action_id", current_action_id))):
                                     return ''
-                                user_message = _build_reuse_action_message(user_prompt, _w2_next)
-                                chat_instructor.initiate_chat(recipient=manager, message=user_message,
-                                                              clear_history=False, silent=False)
                                 continue
                         except Exception:
                             try:
@@ -3909,22 +3929,13 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 if json_obj:
                                     current_app.logger.info(f'got json object {json_obj}')
                                     if json_obj['status'].lower() == 'completed':
-                                        _llm_aid2 = int(json_obj.get("action_id", _w2_current))
-                                        if _llm_aid2 != _w2_current:
-                                            current_app.logger.warning(
-                                                f"[HALLUCINATION?] LLM claims action_id={_llm_aid2} "
-                                                f"but pipeline has {_w2_current}")
-                                        _w2_next2, _w2_ok2 = _advance_reuse_action(user_prompt, _w2_current, "reuse-w2-regex", prompt_id)
-                                        if not _w2_ok2:
-                                            _w2_steer2 = _reuse_fab_steer_message(user_prompt, _w2_current)
-                                            if _w2_steer2:
-                                                chat_instructor.initiate_chat(recipient=manager, message=_w2_steer2,
-                                                                              clear_history=False, silent=False)
-                                                continue
+                                        if not _advance_or_steer(
+                                                user_prompt, current_action_id,
+                                                "reuse-w2-regex", prompt_id,
+                                                manager, chat_instructor,
+                                                claimed_action_id=int(json_obj.get(
+                                                    "action_id", current_action_id))):
                                             return ''
-                                        user_message = _build_reuse_action_message(user_prompt, _w2_next2)
-                                        chat_instructor.initiate_chat(recipient=manager, message=user_message,
-                                                                      clear_history=False, silent=False)
                                         continue
 
                                 else:
