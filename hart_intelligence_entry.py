@@ -9450,7 +9450,20 @@ def chat():
     # For system agents (is_system_agent=True), custom_prompt is already
     # populated with the persona and is forwarded so the standby reply
     # comes back in character.
-    _is_agentic_orchestration = bool(create_agent) or bool(autonomous)
+    #
+    # prompt_id is in the predicate because it is the SESSION-SHAPE flag —
+    # the same one casual_conv uses at chatbot_routes:486, `not bool(
+    # prompt_id or create_agent)`: no prompt_id = casual companion
+    # session, prompt_id = agent-bound session.  create_agent alone is a
+    # PHASE flag: set_flags_to_enter_reuse_mode returns False because
+    # reuse is not creation, so gating on it alone sent every REUSE turn
+    # into draft-first.  Live 2026-09-05 agent 18088688973 answered "Hi!
+    # How can I help you today?" in 2.4s carrying Agent_status=
+    # 'Draft-First Mode' while its saved recipe never ran; the same
+    # request 8 minutes earlier had executed google_search over 100s.
+    # System agents still get draft-first — they null their own
+    # prompt_id at ~9387 above, before this gate.
+    _is_agentic_orchestration = bool(prompt_id or create_agent) or bool(autonomous)
     # Skip draft-first for non-Latin-script languages — the 0.8B can't produce
     # correct native script (outputs garbled Kannada for Tamil, etc.). Going
     # straight to the 4B avoids wasted compute on a useless standby reply.
