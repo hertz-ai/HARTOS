@@ -96,3 +96,32 @@ The `journalctl -u hart-ota-apply -b` block, `bootctl status`, the generation li
 before and after, and whether the rollback returned a working desktop. Pass or
 fail both settle a row in `VERIFICATION.md`; a failure is worth as much as a pass
 and moves up as a verified negative.
+
+## Step 1 is DONE (2026-09-05)
+
+The stick was reflashed from the 2026-09-04 nightly and verified three ways:
+
+- the flasher's stream sha256 equals the published `.raw.sha256`
+  (`ae718e6f4bfe...`), so the bytes decompressed were the published image;
+- its full device read-back equals that stream, taken while it held the drive
+  exclusively, which is the only moment a read of that disk is trustworthy;
+- the UKI now on the ESP names
+  `jzhhbf4d9hb2pdnis12cqlaz1myryyhj-nixos-system-hart-node-...` in its
+  `.cmdline`, which is the SAME toplevel already verified in the fleet cache as
+  mounting `/` by `hart-root` and `/boot` by `HART-ESP`.
+
+Before: `ESP` / `nixos` labels and a UKI naming
+`di98dhvpx7cx9q6lf9qb2v8jyl0z31q7`, a generation not present in the cache at all
+and predating both label changes (62de882 per-build, c918a18 stable).
+
+**A warning for whoever verifies this next.** Ad-hoc raw reads of
+`\.\PhysicalDrive2` were STALE and disagreed with reality in both directions
+during this work: before the flash Windows reported a cached `HART-ESP` on a stick
+that raw bytes showed as `ESP`; after the flash the raw reader still showed the old
+partition names while the filesystem showed the new ones. Neither is reliable on a
+removable device that something else has had open. What settled it was reading the
+ESP through the filesystem after `Update-Disk`, where the UKI is a different size
+(76,337,664 vs 76,287,488) and `loader/random-seed` is gone.
+
+So the remaining steps are 2 onward: boot it at the box, then apply, reboot,
+rollback.
