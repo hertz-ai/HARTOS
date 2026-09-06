@@ -1109,3 +1109,32 @@ VERDICT_COMPLETION_STATUSES = frozenset({VERDICT_COMPLETED, VERDICT_SUCCESS})
 # (lines 181-182) and never called either, so the decomposition it persisted
 # was never executed.  Fixed by wiring the loop, not by widening this set.
 VERDICT_UNDERREPORT_STATUSES = frozenset({VERDICT_PENDING})
+
+# Verdicts that END an action's group-chat round, handing control back to the
+# outer pipeline loop.  Consumed by reuse_recipe._reuse_group_terminate as the
+# manager's is_termination_msg.
+#
+# "Round-terminal" is a DIFFERENT question from "action finished".  It asks:
+# has this action's group conversation produced its answer, so that the OUTER
+# loop is now the thing that must act?  Two verdicts qualify:
+#
+#   'completed'          — the action is done; the loop advances.
+#   'requires_breakdown' — the action needs decomposing and the subtasks are
+#                          supplied; the loop must EXECUTE the decomposition.
+#
+# Both were found the same way, a year apart in the same function:
+#   2026-09-05  'completed' was missing.  The group ran to max_round=10 and
+#               get_agent_response never regained control — verdict at
+#               03:29:12, current_action_id still 1.
+#   2026-09-06  'requires_breakdown' was missing, for identical reasons.
+#               Agent 89555447799: 17 requires_breakdown verdicts, 0 breakdown
+#               executions, 0 advances, action 1 throughout.  The breakdown
+#               execution block had shipped and was PROVEN loaded (py-spy
+#               line-number match against the patched copy) — it simply sits
+#               in the loop that never regained control.
+#
+# 'pending' is deliberately absent: it means the action is still working, and
+# ending the round on it would cut off work that legitimately has more to do.
+# 'error' is absent too — unmeasured here; do not add it without a measurement.
+VERDICT_ROUND_TERMINAL_STATUSES = frozenset({
+    VERDICT_COMPLETED, VERDICT_REQUIRES_BREAKDOWN})

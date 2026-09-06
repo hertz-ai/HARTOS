@@ -2892,30 +2892,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         ]
     )
 
-    def _reuse_group_terminate(msg):
-        """End an action's group chat on its real completion signal.
-
-        The manager previously carried NO is_termination_msg, so it fell back to
-        the default (content == 'TERMINATE') and ran to max_round.  A completed
-        action is signalled by the StatusVerifier verdict {'status':'completed'},
-        which does not contain 'TERMINATE'; state_transition treats it as
-        action-terminal (returns chat_instructor expecting a 'TERMINATE' that a
-        human_input_mode='NEVER' UserProxy does not reliably emit), so the group
-        spun to max_round=10 and get_agent_response never regained control to
-        advance.  Measured live 2026-09-05: action 1 verdict 'completed' at
-        03:29:12 yet current_action_id stayed 1 (send_message_to_user looped to
-        the cap).  Terminating on the verdict lets initiate_chat return so the
-        w1/w2 loop advances via the SAME _advance_reuse_action path — no parallel
-        path, reuses _is_terminate_msg + retrieve_json.
-        """
-        if _is_terminate_msg(msg):
-            return True
-        try:
-            _vj = retrieve_json((msg or {}).get('content') or '')
-            return isinstance(_vj, dict) and str(_vj.get('status', '')).lower() == 'completed'
-        except Exception:
-            return False
-
+    # _reuse_group_terminate is module-level (see its docstring) — the three
+    # managers below share that ONE predicate.
     group_chat = autogen.GroupChat(
         agents=[assistant, helper, user_proxy, multi_role_agent, executor, chat_instructor, verify],
         messages=[],
@@ -3091,10 +3069,63 @@ _REUSE_PENDING_STEER_MAX = 2
 # The tokens live in core.constants, not here: this file spells the same
 # StatusVerifier vocabulary at 11 other sites and create_recipe.py spells it
 # at 5 more, so a set defined locally would be a 17th private copy of a
-# shared vocabulary.  Only the GROUPING is local — see the constant's own
-# comment for why :2646 (error+pending, routing) and this set
-# (pending+requires_breakdown, advancing) must stay different.
-from core.constants import VERDICT_UNDERREPORT_STATUSES as _REUSE_UNDERREPORT_STATUSES
+# shared vocabulary.  Only the GROUPING is local — see each constant's own
+# comment for why the three groupings must stay different:
+#   :2646                            error+pending          — speaker routing
+#   _REUSE_UNDERREPORT_STATUSES      pending                — advancing
+#   VERDICT_ROUND_TERMINAL_STATUSES  completed+breakdown    — ending the round
+from core.constants import (
+    VERDICT_ROUND_TERMINAL_STATUSES,
+    VERDICT_UNDERREPORT_STATUSES as _REUSE_UNDERREPORT_STATUSES,
+)
+
+
+def _reuse_group_terminate(msg):
+    """End an action's group-chat round on a verdict the OUTER loop must act on.
+
+    Module-level, not a closure, for two reasons: it needs nothing from the
+    enclosing scope, and as a closure its contract could only ever be guarded
+    by string-matching the source — which is exactly how the
+    requires_breakdown gap below survived a guard test that already existed.
+
+    Each reuse action runs as an autogen group chat.  ``initiate_chat``
+    returns only when this predicate says the round is over; until then the
+    group talks to itself up to ``max_round``.  Everything the w1/w2 loop does
+    between actions — advancing, executing a decomposition, steering — is
+    therefore unreachable for any verdict this predicate does not recognise.
+
+    Two live measurements, both the same defect in this one function:
+
+      2026-09-05  'completed' was not recognised.  The manager fell back to
+                  the default (content == 'TERMINATE'), which a
+                  human_input_mode='NEVER' UserProxy does not reliably emit,
+                  so the group spun to max_round=10.  Auto Research
+                  18088688973: verdict at 03:29:12, current_action_id still 1,
+                  actions 2-6 never ran.
+
+      2026-09-06  'requires_breakdown' was not recognised, identically.
+                  Agent 89555447799 (24 actions): 17 requires_breakdown
+                  verdicts for action 1, 0 breakdown executions, 0 advances.
+                  The breakdown-execution block had already shipped and was
+                  PROVEN loaded on the running process (py-spy frame
+                  `get_agent_response (hartos\\reuse_recipe.py:3662)` matches
+                  the patched copy's line numbering; the unpatched copies put
+                  that def at 3280) — it sits in the loop that never regained
+                  control, so it could not run.
+
+    The membership set is canonical (core.constants), so adding a third
+    round-terminal verdict is a one-line change there, not a fourth private
+    spelling here.  Fails closed: anything unparseable is NOT terminal.
+    """
+    if _is_terminate_msg(msg):
+        return True
+    try:
+        _vj = retrieve_json((msg or {}).get('content') or '')
+        return (isinstance(_vj, dict)
+                and str(_vj.get('status', '')).lower()
+                in VERDICT_ROUND_TERMINAL_STATUSES)
+    except Exception:
+        return False
 
 
 def _reuse_turn_round_budget(user_prompt):

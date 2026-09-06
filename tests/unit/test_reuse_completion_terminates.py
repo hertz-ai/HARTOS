@@ -51,11 +51,23 @@ class ReuseCompletionTerminates(unittest.TestCase):
             "never regains control to advance")
 
     def test_terminator_recognises_completed_verdict(self):
-        # The terminator must fall through _is_terminate_msg to a completed-status
-        # check parsed with the canonical retrieve_json.
+        # The terminator must fall through _is_terminate_msg to a status check
+        # parsed with the canonical retrieve_json.
+        #
+        # 2026-09-06: this assertion used to pin the literal
+        # `== 'completed'`.  That exact-equality form was itself the next bug —
+        # 'requires_breakdown' is equally action-terminal (the outer loop must
+        # regain control to EXECUTE the decomposition) and could never match,
+        # so 17 breakdown verdicts on agent 89555447799 produced 0 executions.
+        # The contract is now membership in the canonical round-terminal set;
+        # the behavioural coverage lives in
+        # tests/unit/test_reuse_group_terminates_on_breakdown.py, which calls
+        # the predicate for real rather than matching its source text.
         self.assertIn('_is_terminate_msg(msg)', self.src)
-        self.assertIn("str(_vj.get('status', '')).lower() == 'completed'", self.src,
-                      "the terminator must end the chat on a 'completed' verdict")
+        self.assertIn('in VERDICT_ROUND_TERMINAL_STATUSES', self.src,
+                      "the terminator must end the round on any canonical "
+                      "round-terminal verdict, not just an equality test "
+                      "against one hardcoded status")
         self.assertIn('retrieve_json((msg or {}).get', self.src,
                       "the verdict must be parsed with the canonical retrieve_json")
 
