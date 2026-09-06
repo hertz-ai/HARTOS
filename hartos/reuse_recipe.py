@@ -4128,15 +4128,22 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                 if _n < _REUSE_FAB_STEER_MAX:
                     _reuse_resteer_counts[_rk] = _n + 1
                     _reuse_fab_pending[_rk] = list(_fab)
+                    # "no real result" not "never executed": since a6fd615e5
+                    # this also holds a tool that RAN and returned one of
+                    # TOOL_FAILURE_RESULTS.  Live 2026-09-07 03:03:12 the
+                    # refusal that fired here was exactly that case, and a log
+                    # line reading "never executed" sends the next reader
+                    # hunting a registration bug that is not there.
                     current_app.logger.warning(
                         f"[FABRICATED-COMPLETE] refusing to advance action "
-                        f"{current_action_id}: its tool(s) {_fab} never executed "
-                        f"(fabricated completion) — re-steering the agent to run "
+                        f"{current_action_id}: its tool(s) {_fab} produced no real "
+                        f"result (never called, or ran and returned a failure) "
+                        f"— re-steering the agent to run "
                         f"them (attempt {_n + 1}/{_REUSE_FAB_STEER_MAX})")
                     return None, False
                 current_app.logger.error(
                     f"[FABRICATED-COMPLETE] action {current_action_id} still claims "
-                    f"completion with tool(s) {_fab} never executed after "
+                    f"completion with tool(s) {_fab} producing no real result after "
                     f"{_REUSE_FAB_STEER_MAX} re-steers — advancing to avoid a "
                     f"permanent stall; this action's output is NOT tool-backed")
     except Exception as _fg_err:
