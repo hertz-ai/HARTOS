@@ -286,6 +286,60 @@ def attach_for_tags(cap_tags, helper, executor, registry, attached_names):
     return n
 
 
+def attach_for_names(names, helper, executor, registry, attached_names):
+    """Attach the registry tools a turn NAMES outright.
+
+    Name-keyed sibling of ``attach_for_tags`` — same primitives
+    (``create_endpoint_function`` + ``register_dual``), same idempotent
+    ``attached_names`` set, same return contract.  Not a second attachment
+    mechanism: only the SELECTOR differs, and this one is authoritative
+    where the other infers.
+
+    Why it exists.  ``attach_for_tags`` matches on capability tags derived
+    from a keyword scan of the turn's prose.  That is a good fallback for
+    families nothing mentions, and a bad way to honour an action that says
+    which tool it needs.  Measured live 2026-09-06 on agent 89555447799:
+    recipe action 1 declares ``tool_name: google_search`` and the seeded
+    message carries it verbatim, yet ``detect_goal_tags`` read the words
+    "developer"/"platforms" as the tag ``coding`` and the attach logged
+
+        Tier-1 turn attach: +['coding'] -> 0 tools
+
+    google_search never reached the wire (1 of 96 autogen.reuse calls in a
+    26-minute drive carried any tools[] block; ``INSIDE google search`` fired
+    0 times), so the model could not call the one tool its own recipe named.
+
+    The same gap at population scale: 8,799 ``Error: Function <X> not found``
+    across the log rotations — send_message_to_user x1618 (the path that
+    hands the agent's result to the user), get_user_details x908,
+    execute_windows_or_android_command x418.  Those tools are defined and
+    registerable; they were simply not attached for that turn.  It also
+    explains why one tool both works and fails: same tool, different turn,
+    different tag scan.
+
+    Unknown names are ignored rather than raising — a recipe may name a tool
+    this deployment does not ship, and a turn that mentions one absent tool
+    must still get the others.
+    """
+    want = {str(n) for n in (names or []) if n}
+    if not want:
+        return 0
+    n = 0
+    for tool_name, tool in registry._tools.items():
+        for ep_name, ep in tool.endpoints.items():
+            fn = tool_name if ep_name == tool_name else f"{tool_name}_{ep_name}"
+            if fn not in want or fn in attached_names:
+                continue
+            func = registry.create_endpoint_function(tool_name, ep_name)
+            if func is None:
+                continue
+            register_dual(helper, executor, func, fn,
+                          ep.get('description', f'{tool_name} {ep_name}'))
+            attached_names.add(fn)
+            n += 1
+    return n
+
+
 # ---------------------------------------------------------------------------
 # Core tool closure factory
 # ---------------------------------------------------------------------------

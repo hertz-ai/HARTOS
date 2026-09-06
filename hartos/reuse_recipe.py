@@ -3343,12 +3343,43 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             _unlocked = getattr(assistant, '_hart_unlocked_tags', None)
             if _unlocked is not None:
                 from integrations.agent_engine.marketing_tools import detect_goal_tags
+                from integrations.service_tools import service_tool_registry
+
+                # (a) NAMED — the tools this action's own recipe declares.
+                # Authoritative: the authoring pipeline recorded exactly which
+                # tool the action needs, so honour it before inferring anything.
+                # Live 2026-09-06, agent 89555447799: action 1 declares
+                # tool_name google_search, yet the tag scan below read the
+                # words "developer"/"platforms" as ['coding'] and logged
+                # "Tier-1 turn attach: +['coding'] -> 0 tools".  google_search
+                # never reached the wire (1 of 96 autogen.reuse calls carried
+                # any tools[]; INSIDE google search fired 0x), so the model
+                # could not call the one tool its recipe named.  Population
+                # scale: 8,799 "Error: Function <X> not found" across the log
+                # rotations — send_message_to_user x1618 (the path that returns
+                # the agent's result to the user), get_user_details x908.
+                try:
+                    _aid = user_tasks[user_prompt].current_action
+                except Exception:
+                    _aid = None
+                _named = _reuse_action_tool_names(user_prompt, _aid) if _aid else []
+                if _named:
+                    from core.agent_tools import attach_for_names
+                    _nn = attach_for_names(_named, helper, assistant,
+                                           service_tool_registry,
+                                           assistant._hart_attached_tools)
+                    if _nn:
+                        current_app.logger.info(
+                            f"Tier-1 named attach: action {_aid} names "
+                            f"{_named} -> {_nn} tools")
+
+                # (b) TAGS — unchanged fallback for capability families the
+                # recipe never mentions but the conversation drifted into.
                 _new = [t for t in detect_goal_tags(message or '')
                         if t not in _unlocked]
                 if _new:
                     from core.agent_tools import attach_for_tags
                     from integrations.agent_engine.goal_manager import get_tool_tags
-                    from integrations.service_tools import service_tool_registry
                     _cap = set()
                     for _t in _new:
                         _cap.update(get_tool_tags(_t))
@@ -3949,6 +3980,39 @@ def _build_reuse_action_message(user_prompt, action_id):
         steps = []
         current_app.logger.warning(f"[REUSE] No recipe for action {action_id} — executing without steps")
     return f"Perform this action -> Action #{action_id}:{action_message}\n follow these steps: {steps}"
+
+
+def _reuse_action_tool_names(user_prompt, action_id):
+    """The tool names the given action's recipe steps declare.
+
+    Reads the same ``recipes[user_prompt]['actions'][n]['recipe']`` list that
+    ``_build_reuse_action_message`` renders into the turn message, and returns
+    the ``tool_name`` each step names.  One reader, one shape — the authoring
+    pipeline records the needed tool there, so that is the authoritative
+    answer to "which tool does this action need".
+
+    Used by the Tier-1 per-turn attach.  Before this, the attach chose tools
+    only from ``detect_goal_tags(message)`` — a prose keyword scan — and so
+    could miss the tool the action names outright: measured live 2026-09-06 on
+    agent 89555447799, whose action 1 declares ``tool_name: google_search``
+    while the scan inferred ``['coding']`` and attached 0 tools.
+
+    Returns [] for a prose action that names no tool, an out-of-range id, or
+    an unknown session — never raises, because the attach hook runs on every
+    round and must not be able to kill a turn.
+    """
+    try:
+        actions = (recipes[user_prompt] or {}).get('actions') or []
+        if not 1 <= action_id <= len(actions):
+            return []
+        out = []
+        for step in (actions[action_id - 1].get('recipe') or []):
+            name = (step or {}).get('tool_name')
+            if name and name not in out:
+                out.append(name)
+        return out
+    except Exception:
+        return []
 
 
 # =============================================================================
