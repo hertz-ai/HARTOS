@@ -1251,12 +1251,15 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             import json
 
             # Load and check for existing VLM agent files
-            prompts_dir = "prompts"
-            tool_logger.info(f"Checking for VLM files in directory: {os.path.abspath(prompts_dir)}")
+            # Canonical store (hartos.helper, module scope) — see the sibling
+            # site in reuse_recipe.  The old CWD-relative "prompts" never
+            # existed in the frozen install, so this scan silently found ZERO
+            # vlm_agent files instead of raising: same defect, quieter face.
+            tool_logger.info(f"Checking for VLM files in directory: {PROMPTS_DIR}")
 
             existing_vlm_files = []
-            if os.path.exists(prompts_dir):
-                for file in os.listdir(prompts_dir):
+            if os.path.exists(PROMPTS_DIR):
+                for file in os.listdir(PROMPTS_DIR):
                     if file.startswith(f"{prompt_id}_{role_number}_") and file.endswith("_vlm_agent.json"):
                         existing_vlm_files.append(file)
 

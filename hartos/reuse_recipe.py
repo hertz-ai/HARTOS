@@ -1619,14 +1619,19 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             import re
             import json
 
-            prompts_dir = "prompts"
-            current_app.logger.info(f"Checking for VLM files in directory: {os.path.abspath(prompts_dir)}")
+            # PROMPTS_DIR (module scope, from hartos.helper) is the canonical
+            # deployment-aware recipe store, and helper creates it at import so
+            # listdir cannot ENOENT.  A CWD-relative "prompts" resolved against
+            # the frozen install's CWD (Program Files), which has no such dir:
+            # every one of 38 live calls on 2026-09-06 raised FileNotFoundError
+            # here before any real work ran.
+            current_app.logger.info(f"Checking for VLM files in directory: {PROMPTS_DIR}")
             pattern = f"{prompt_id}_{role_number}_*_vlm_agent.json"
             current_app.logger.info(f"Looking for files matching pattern: {pattern}")
 
 
             existing_vlm_files = []
-            for file in os.listdir(prompts_dir):
+            for file in os.listdir(PROMPTS_DIR):
                 if file.startswith(f"{prompt_id}_{role_number}_") and file.endswith("_vlm_agent.json"):
                     existing_vlm_files.append(file)
 
