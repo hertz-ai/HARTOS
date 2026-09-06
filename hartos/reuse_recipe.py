@@ -2665,15 +2665,25 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                     # ends the turn honestly instead of looping.
                     _st = str(last_json.get('status', '')).lower()
                     if _cp_yes and _st == 'requires_breakdown':
-                        _subs = last_json.get('subtasks') or []
-                        try:
-                            if _subs and user_prompt in user_ledgers:
-                                user_ledgers[user_prompt].add_subtasks(_known_aid, _subs)
-                                current_app.logger.info(
-                                    f'reuse: requires_breakdown -> persisted {len(_subs)} subtasks '
-                                    f'to ledger for action {_known_aid}; routing to helper to execute')
-                        except Exception as _bd_e:
-                            current_app.logger.warning(f'reuse: requires_breakdown add_subtasks failed: {_bd_e}')
+                        # ROUTING ONLY.  The subtask WRITE that used to sit here
+                        # has moved to the [BREAKDOWN] block in get_agent_response,
+                        # which is the scope that also reads the ledger back.
+                        #
+                        # It never fired from here and could not: this function is
+                        # autogen's speaker-selection callback, so it runs to pick
+                        # who speaks NEXT and is therefore never invoked on a
+                        # round's terminal message — which is precisely what a
+                        # requires_breakdown verdict is.  Measured live 2026-09-06
+                        # 18:07-18:33: this JSON branch was entered 11 times, all
+                        # error/pending, 0 requires_breakdown, while the consumer
+                        # saw requires_breakdown 27 times on an empty ledger.
+                        # Keeping a second writer here would just be a parallel
+                        # path that drifts (Gate 4) — one writer, and it lives
+                        # where the data actually arrives.
+                        current_app.logger.info(
+                            f'reuse: requires_breakdown for action {_known_aid} '
+                            f'-> routing to helper (subtasks persisted by the '
+                            f'breakdown executor) for session: {user_prompt}')
                         return helper
                     if _cp_yes and _st in ('error', 'pending'):
                         current_app.logger.info(
@@ -3587,6 +3597,40 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 _bd_vj = retrieve_json((_bd or {}).get('content') or '') if _bd else None
                 if (isinstance(_bd_vj, dict)
                         and str(_bd_vj.get('status', '')).lower() == 'requires_breakdown'):
+                    # PERSIST HERE, not in state_transition.  The only
+                    # add_subtasks call used to live in state_transition — which
+                    # is autogen's SPEAKER SELECTOR.  Selection picks who talks
+                    # NEXT, so it is never invoked on a round's final message,
+                    # and the requires_breakdown verdict carrying the subtasks
+                    # IS that final message.  Measured live 2026-09-06
+                    # 18:07-18:33 (agent 89555447799): 27 [BREAKDOWN] entries
+                    # here, 0 subtasks persisted, and across the last 24
+                    # consecutive iterations ZERO state_transition events of any
+                    # kind — action 9 span every ~6s on an empty ledger until
+                    # the turn died, returning raw control JSON to the user.
+                    #
+                    # This block already parses the verdict and already reads
+                    # the ledger back, so writing here makes producer and
+                    # consumer the same scope — exactly the shape
+                    # create_recipe.py:4506-4523 has always had.  Same
+                    # canonical helper it uses (add_subtasks_to_ledger, already
+                    # imported at :181 and until now never called), so this is
+                    # one writer relocated, not a second one added.
+                    _bd_subs = _bd_vj.get('subtasks') or []
+                    if _bd_subs:
+                        try:
+                            _bd_ok = add_subtasks_to_ledger(
+                                user_prompt, _reuse_current_action,
+                                _bd_subs, user_ledgers)
+                            current_app.logger.info(
+                                f"[BREAKDOWN] action {_reuse_current_action} "
+                                f"persisted {len(_bd_subs)} subtask(s) "
+                                f"(ok={_bd_ok}) for session: {user_prompt}")
+                        except Exception as _bd_add_e:
+                            current_app.logger.warning(
+                                f"[BREAKDOWN] add_subtasks_to_ledger failed for "
+                                f"action {_reuse_current_action}, session "
+                                f"{user_prompt}: {_bd_add_e}")
                     _pending = get_pending_subtasks(
                         user_prompt, _reuse_current_action, user_ledgers)
                     if _pending:
