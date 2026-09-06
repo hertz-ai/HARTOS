@@ -42,44 +42,82 @@ HARTOS = os.path.join(os.path.dirname(__file__), '..', '..')
 TARGETS = {
     'reuse_recipe': os.path.join(HARTOS, 'hartos', 'reuse_recipe.py'),
     'create_recipe': os.path.join(HARTOS, 'hartos', 'create_recipe.py'),
+    # helper.py owns load_vlm_agent_files -- the function reuse/create call on
+    # the line AFTER their own scan -- and carried the SAME literal twice.
+    'helper': os.path.join(HARTOS, 'hartos', 'helper.py'),
 }
 
+# Calls whose FIRST argument is a filesystem path, plus os.path.join, which is
+# how the second helper.py site built its path.
+_PATH_CALLS = {'listdir', 'exists', 'isdir', 'isfile', 'open', 'makedirs',
+               'remove', 'walk', 'glob', 'scandir', 'rmtree', 'unlink', 'join'}
+_MODES = {'r', 'w', 'a', 'rb', 'wb', 'ab', 'r+', 'w+', 'utf-8', 'utf8'}
 
-def _relative_prompts_dir_assignments(path):
-    """Every `*prompt*dir* = "<relative literal>"` in the file, as (line, value)."""
+
+def _call_name(node):
+    f = node.func
+    if isinstance(f, ast.Attribute):
+        return f.attr
+    if isinstance(f, ast.Name):
+        return f.id
+    return ''
+
+
+def _defines_the_resolver(call):
+    """True when the call is the PROMPTS_DIR fallback itself.
+
+    The three legitimate `'prompts'` literals are the code-relative fallbacks
+    inside the PROMPTS_DIR definitions, which anchor on __file__.  Those are the
+    resolver; everything else must consume PROMPTS_DIR.
+    """
+    return any(isinstance(n, ast.Name) and n.id == '__file__'
+               for n in ast.walk(call))
+
+
+def _relative_path_literals(path):
+    """Every bare relative string literal handed to a path call, as (line, fn, value)."""
     tree = ast.parse(open(path, encoding='utf-8').read())
-    out = []
+    out = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
+        if not isinstance(node, ast.Call):
             continue
-        if not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, str):
+        fn = _call_name(node)
+        if fn not in _PATH_CALLS or not node.args:
             continue
-        for tgt in node.targets:
-            name = getattr(tgt, 'id', '')
-            low = name.lower()
-            if 'prompt' in low and 'dir' in low:
-                if not os.path.isabs(node.value.value):
-                    out.append((node.lineno, name, node.value.value))
-    return out
+        if _defines_the_resolver(node):
+            continue
+        arg = node.args[0]
+        if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
+            continue
+        v = arg.value
+        if not v or os.path.isabs(v) or v in _MODES or v.startswith(('http', '~')):
+            continue
+        out.add((arg.lineno, fn, v))
+    return sorted(out)
 
 
 class VlmPromptsDirCanonical(unittest.TestCase):
-    def test_no_cwd_relative_prompts_dir_literal(self):
-        """A relative prompts-dir literal resolves against the process CWD.
+    def test_no_cwd_relative_path_literal(self):
+        """A relative path literal resolves against the process CWD.
 
         In the frozen install that CWD is Program Files, so the path does not
-        exist and every VLM scan either raises (reuse) or silently finds
-        nothing (create).
+        exist and the VLM scan either raises (reuse), silently finds nothing
+        (create), or is swallowed by a broad except and returns [] (helper's
+        load_vlm_agent_files -- measured: 45 swallowed errors, and ZERO
+        'Found VLM agent recipe' lines, ever).
+
+        Checks the whole call surface, not just assignments: the helper.py
+        pair was an inline literal in os.listdir(...) and os.path.join(...),
+        which an assignment-only guard would have missed.
         """
         for label, path in TARGETS.items():
             with self.subTest(module=label):
-                bad = _relative_prompts_dir_assignments(path)
+                bad = _relative_path_literals(path)
                 self.assertEqual(
                     bad, [],
-                    f"{label}: prompts dir bound to a CWD-relative literal at "
-                    f"{bad} — use the module-level canonical PROMPTS_DIR "
-                    f"(hartos.helper, via core.platform_paths."
-                    f"get_recipe_prompts_dir) instead")
+                    f"{label}: CWD-relative path literal(s) at {bad} — use the "
+                    f"module-level canonical PROMPTS_DIR (hartos.helper, via "
+                    f"core.platform_paths.get_recipe_prompts_dir) instead")
 
     def test_vlm_scan_uses_canonical_constant(self):
         """The scan must name PROMPTS_DIR, so there is ONE prompts-dir authority."""

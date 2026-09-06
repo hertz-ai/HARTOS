@@ -3332,11 +3332,17 @@ def load_vlm_agent_files(prompt_id, role_number):
     """Loads any VLM agent JSON files for the given prompt_id and role_number and integrates them with existing recipes."""
     vlm_actions = []
 
-    # Look for existing VLM agent files
+    # Look for existing VLM agent files.  PROMPTS_DIR (module scope, above) is
+    # the canonical store and is created at import; the CWD-relative "prompts"
+    # this used to read resolved to Program Files in the frozen install, so the
+    # listdir raised and the broad except below SWALLOWED it — measured live
+    # 2026-09-06: 45 "Error listing files in prompts directory" and ZERO
+    # "Found VLM agent recipe", i.e. this function had never once returned a
+    # loaded agent on an installed build.
     try:
-        for file in os.listdir("prompts"):
+        for file in os.listdir(PROMPTS_DIR):
             if file.startswith(f"{prompt_id}_{role_number}_") and file.endswith("_vlm_agent.json"):
-                file_path = os.path.join("prompts", file)
+                file_path = os.path.join(PROMPTS_DIR, file)
                 try:
                     with open(file_path, 'r') as f:
                         recipe_data = json.load(f)
