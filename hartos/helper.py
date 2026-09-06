@@ -1392,7 +1392,30 @@ class ToolMessageHandler:
         return f"{truncated}... [truncated from {len(words)} words]"
 
     def create_log_safe_message(self, msg, max_words=10):
-        """Create a log-safe version of message with truncated content."""
+        """Create a log-safe version of message with truncated content.
+
+        ``msg.copy()`` is SHALLOW, so ``log_msg['tool_calls']`` is the caller's
+        own list object.  Assigning into it (``log_msg['tool_calls'][i] = ...``)
+        is ``list.__setitem__`` on that shared list and writes the truncated
+        copy straight back into the live message — the per-entry ``.copy()``
+        calls below protect the dicts but not the list holding them.
+
+        Measured cost of that, live 2026-09-06 17:08-17:55 (agent 89555447799):
+        every tool_call with arguments over 200 chars reached the executor cut
+        to ``[:1000] + "... [truncated]"``, i.e. no longer valid JSON, so
+        ``ensure_tool_call_arguments_json`` repaired it into a wrong dict or
+        ``'{}'``.  The turn ended with the agent telling the user "the previous
+        attempts to open LinkedIn failed because I didn't have the correct
+        parameters", and one executor error was literally
+        ``send_message_to_user() got an unexpected keyword argument 'remains'``
+        — 'remains' being a word from inside the article draft the model had
+        correctly placed in ``text``.  Short arguments were unaffected, which
+        is why execute_windows_or_android_command survived 14/15 and
+        send_message_to_user 0/17.
+
+        Owning each list before writing into it keeps the truncation (the log
+        line stays small) while confining it to the copy.
+        """
         log_msg = msg.copy()
 
         # Truncate main content
@@ -1401,6 +1424,7 @@ class ToolMessageHandler:
 
         # Truncate tool_responses content if present
         if 'tool_responses' in log_msg and isinstance(log_msg['tool_responses'], list):
+            log_msg['tool_responses'] = list(log_msg['tool_responses'])
             for i, response in enumerate(log_msg['tool_responses']):
                 if 'content' in response and response['content']:
                     log_msg['tool_responses'][i] = response.copy()
@@ -1410,6 +1434,7 @@ class ToolMessageHandler:
 
         # Truncate tool_calls arguments if they're very large
         if 'tool_calls' in log_msg and isinstance(log_msg['tool_calls'], list):
+            log_msg['tool_calls'] = list(log_msg['tool_calls'])
             for i, tool_call in enumerate(log_msg['tool_calls']):
                 if ('function' in tool_call and
                         'arguments' in tool_call['function'] and
