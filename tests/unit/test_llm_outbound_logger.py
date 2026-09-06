@@ -64,11 +64,47 @@ class _FakeClient:
     pass
 
 
-def _build_fake_httpx_module():
+class _FakeResponse:
+    """A response whose body is ALREADY buffered — what httpx hands back
+    from a non-streaming ``Client.send`` (it calls ``.read()`` internally).
+
+    Deliberately NOT a MagicMock: a MagicMock auto-creates ``_content`` as
+    another MagicMock, so a test using one cannot tell "no body to read"
+    apart from "read it and found nothing".
+    """
+
+    def __init__(self, payload=None, status_code=200, buffered=True):
+        self.status_code = status_code
+        if buffered:
+            self._content = json.dumps(payload or {}).encode('utf-8')
+
+    @property
+    def content(self):
+        # Mirrors httpx: touching .content on an unread stream raises.
+        if not hasattr(self, '_content'):
+            raise RuntimeError(
+                'Attempted to access .content on a streaming response before '
+                'read() — reading it here would CONSUME the stream and starve '
+                'the real caller')
+        return self._content
+
+
+def _build_fake_httpx_module(response_factory=None):
     """Build a minimal stand-in for the ``httpx`` module so the patch
-    can be installed without polluting the real one."""
+    can be installed without polluting the real one.
+
+    ``response_factory`` (optional) supplies the object the fake send
+    returns, so a test can exercise the response-side extraction with a
+    realistic completion payload instead of the default MagicMock."""
     mod = types.ModuleType('httpx')
     captured = {'send_calls': []}
+
+    def _mk_response():
+        if response_factory is not None:
+            return response_factory()
+        resp = MagicMock()
+        resp.status_code = 200
+        return resp
 
     def _send(self, request, **kwargs):
         captured['send_calls'].append({
@@ -76,9 +112,7 @@ def _build_fake_httpx_module():
             'content_length': request.headers.get('content-length'),
             'url': str(request.url),
         })
-        resp = MagicMock()
-        resp.status_code = 200
-        return resp
+        return _mk_response()
 
     class Client:
         send = _send
@@ -484,3 +518,168 @@ def test_target_ports_follows_dynamic_port_reassignment(monkeypatch):
         assert 8091 in mod._target_ports()
     finally:
         mod._target_ports_cache = None
+
+
+# ─── Response-side tool-call capture (#787 / D21) ─────────────────────
+#
+# Why this exists.  On 2026-09-06 a live drive measured that 29 of 55 distinct
+# tool_calls reaching the wire carried EMPTY arguments ``{}``, and 16 of the
+# resulting real tool results were ``TypeError: ... missing 1 required
+# positional argument``.  The schema branch was eliminated — all four tools
+# correctly advertise ``required`` — which leaves exactly two candidates:
+#
+#   (a) the model GENERATED ``{}``, or
+#   (b) arguments were STRIPPED somewhere between generation and what autogen
+#       replays back into the next request body.
+#
+# Those two demand opposite fixes, and NOTHING on this box could tell them
+# apart: llm_outbound.jsonl records request bodies only, llama_server_8080.log
+# carries slot/timing metrics with no content, and server.log dumps the
+# request side.  The ``tool_calls`` visible in a request body are autogen's
+# RE-SERIALISATION of an earlier response — post-parse — so they are evidence
+# about (b) contaminated by (a).
+#
+# This module is already the response chokepoint (it records response_status
+# per call), so the raw completion is recorded HERE rather than in a second
+# logger.  Extend, don't fork — see the module docstring's "why this lives at
+# the httpx layer" argument, which applies identically to the response.
+
+
+def _completion(tool_calls, finish_reason='tool_calls'):
+    return {'choices': [{'finish_reason': finish_reason,
+                         'message': {'role': 'assistant',
+                                     'tool_calls': tool_calls}}]}
+
+
+def _last_record(log_path):
+    lines = [ln for ln in log_path.read_text(encoding='utf-8').splitlines() if ln]
+    assert lines, 'no JSONL record was written at all'
+    return json.loads(lines[-1])
+
+
+def _drive_one_send(tmp_path, monkeypatch, response_factory):
+    """Install the patch against a fake httpx and fire ONE target POST."""
+    _reset_module(monkeypatch, tmp_path)
+    fake_httpx = _build_fake_httpx_module(response_factory=response_factory)
+    monkeypatch.setitem(sys.modules, 'httpx', fake_httpx)
+    import core.llm_outbound_logger as mod
+    mod.install()
+    request = _FakeRequest(body=b'{"messages": [{"role": "user", "content": "go"}]}')
+    fake_httpx.Client.send(_FakeClient(), request)
+    mod._close_handle()
+    return _last_record(tmp_path / 'llm_outbound.jsonl')
+
+
+def test_response_tool_call_arguments_are_recorded_verbatim(
+        tmp_path, monkeypatch):
+    """The RAW ``arguments`` string as the model returned it.
+
+    Verbatim matters more than parsed: ``{}``, ``''`` and absent are three
+    different generation outcomes with three different fixes, and any
+    normalisation here would erase exactly the distinction #787 needs.
+    """
+    payload = _completion([
+        {'id': 'c1', 'type': 'function',
+         'function': {'name': 'execute_windows_or_android_command',
+                      'arguments': '{"instructions":"open LinkedIn",'
+                                   '"os_to_control":"windows"}'}},
+    ])
+    rec = _drive_one_send(tmp_path, monkeypatch,
+                          lambda: _FakeResponse(payload))
+    calls = rec.get('response_tool_calls')
+    assert calls, (
+        'the JSONL record must carry the response tool calls — without them '
+        'there is no record anywhere of what the model actually generated, '
+        'which is the whole of #787')
+    assert calls[0]['name'] == 'execute_windows_or_android_command'
+    assert calls[0]['arguments'] == ('{"instructions":"open LinkedIn",'
+                                     '"os_to_control":"windows"}')
+
+
+def test_empty_arguments_are_recorded_as_emitted_not_normalised(
+        tmp_path, monkeypatch):
+    """THE decisive case: an empty-argument call must survive to the log.
+
+    If this is what the model emits, #787's fix belongs in generation
+    (prompt / schema / grammar).  If the model emits real arguments and the
+    request body still shows ``{}``, the fix belongs in the parse-and-replay
+    path.  The log must be able to say which — so an empty ``{}`` has to be
+    recorded, never dropped as "nothing interesting".
+    """
+    payload = _completion([
+        {'id': 'c2', 'type': 'function',
+         'function': {'name': 'save_data_in_memory', 'arguments': '{}'}},
+    ])
+    rec = _drive_one_send(tmp_path, monkeypatch,
+                          lambda: _FakeResponse(payload))
+    calls = rec.get('response_tool_calls')
+    assert calls and len(calls) == 1
+    assert calls[0]['arguments'] == '{}', (
+        'an empty arguments object is the SIGNAL, not noise — it must be '
+        'recorded exactly as emitted')
+    assert calls[0]['finish_reason'] == 'tool_calls', (
+        'finish_reason distinguishes a deliberate tool call from a "length" '
+        'truncation that merely looks like one')
+
+
+def test_response_without_tool_calls_records_an_empty_list(
+        tmp_path, monkeypatch):
+    """Readable-but-none must be distinguishable from not-readable.
+
+    A plain prose completion records ``[]``; a response whose body was never
+    buffered records no key at all.  Collapsing those two into one value is
+    how a measurement quietly becomes a guess.
+    """
+    payload = {'choices': [{'finish_reason': 'stop',
+                            'message': {'role': 'assistant',
+                                        'content': 'done'}}]}
+    rec = _drive_one_send(tmp_path, monkeypatch,
+                          lambda: _FakeResponse(payload))
+    assert rec.get('response_tool_calls') == []
+
+
+def test_streaming_response_is_never_consumed_by_the_logger(
+        tmp_path, monkeypatch):
+    """A logging hook may not eat the caller's stream.
+
+    ``_FakeResponse(buffered=False)`` raises on ``.content`` exactly as httpx
+    does before ``read()``.  The extraction must not touch it: the send must
+    still return normally, and the record must simply omit the key.
+    """
+    rec = _drive_one_send(tmp_path, monkeypatch,
+                          lambda: _FakeResponse(buffered=False))
+    assert 'response_tool_calls' not in rec, (
+        'an unread streaming body must yield NO response_tool_calls key — '
+        'reading it here would consume the stream the real caller needs')
+    assert rec['response_status'] == 200, (
+        'the send itself must be unaffected')
+
+
+def test_extraction_failure_never_breaks_the_send(tmp_path, monkeypatch):
+    """Fail-open: a malformed body is logged without tool calls, not raised."""
+
+    class _Garbage(_FakeResponse):
+        def __init__(self):
+            self.status_code = 200
+            self._content = b'<html>llama-server said no</html>'
+
+    rec = _drive_one_send(tmp_path, monkeypatch, _Garbage)
+    assert rec['response_status'] == 200
+    assert rec.get('response_tool_calls') in (None, [])
+
+
+def test_argument_string_is_capped_so_the_log_stays_bounded(
+        tmp_path, monkeypatch):
+    """PERF-2 discipline: this file is already capped by size; one runaway
+    arguments blob must not eat that budget."""
+    huge = '{"content":"' + ('x' * 5000) + '"}'
+    payload = _completion([
+        {'id': 'c3', 'type': 'function',
+         'function': {'name': 'create_social_post', 'arguments': huge}},
+    ])
+    rec = _drive_one_send(tmp_path, monkeypatch,
+                          lambda: _FakeResponse(payload))
+    got = rec['response_tool_calls'][0]['arguments']
+    import core.llm_outbound_logger as mod
+    assert len(got) <= mod._RESP_ARG_CAP + 32
+    assert got.startswith('{"content":"xxx')

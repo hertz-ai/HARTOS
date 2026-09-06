@@ -852,17 +852,81 @@ def _ts() -> str:
             + f',{int((t % 1)*1000):03d}')
 
 
+# Per-argument-string cap.  Long enough to carry a real tool call whole
+# (the longest observed live was ~380 chars), short enough that one
+# runaway blob cannot eat the file's size budget (PERF-2).
+_RESP_ARG_CAP = 600
+
+
+def _response_tool_calls(response) -> Optional[list]:
+    """Tool-call names + RAW ``arguments`` strings from an ALREADY-BUFFERED
+    response body.  ``None`` when there is nothing safely readable.
+
+    Why the response and not just the request (#787).  The ``tool_calls``
+    that appear in a later request body are autogen's re-serialisation of an
+    earlier completion, so a ``{}`` there could equally mean the model
+    generated ``{}`` or that the arguments were dropped in between.  Those
+    have opposite fixes.  Recording the completion as it arrived is the only
+    way to tell them apart, and this function is already on every LLM
+    response, so it is the one place that can.
+
+    Never consumes a stream.  Only ``_content`` is read — httpx sets it when
+    a non-streaming ``send`` has already buffered the body, and leaves it
+    absent for ``stream=True``.  Touching ``.content`` instead would raise on
+    an unread response and, worse, drain the bytes the real caller is waiting
+    for.  urllib's ``HTTPResponse`` has no ``_content`` at all, so that
+    transport simply reports nothing rather than being read behind the
+    caller's back.
+
+    Returns ``[]`` for a readable completion that made no tool call — a
+    distinct fact from ``None`` ("could not read"), and collapsing the two
+    would turn an absent measurement into a false zero.
+    """
+    try:
+        raw = getattr(response, '_content', None)
+        if raw is None:
+            return None
+        data = json.loads(bytes(raw).decode('utf-8', 'replace'))
+        if not isinstance(data, dict):
+            return None
+        out = []
+        for choice in (data.get('choices') or []):
+            if not isinstance(choice, dict):
+                continue
+            msg = choice.get('message') or choice.get('delta') or {}
+            for tc in (msg.get('tool_calls') or []):
+                fn = (tc or {}).get('function') or {}
+                args = fn.get('arguments')
+                args = args if isinstance(args, str) else json.dumps(
+                    args, default=str)
+                if len(args) > _RESP_ARG_CAP:
+                    args = args[:_RESP_ARG_CAP] + '...[cut]'
+                out.append({'name': fn.get('name'),
+                            'arguments': args,
+                            'finish_reason': choice.get('finish_reason')})
+        return out
+    except Exception:
+        # A logging hook may never fail an LLM call, and an unparseable body
+        # is itself a legitimate outcome (an HTML error page, a 500).
+        return None
+
+
 def log_outbound(body: dict, *,
                  response_status: Any = None,
                  latency_ms: Optional[float] = None,
-                 source: Optional[str] = None) -> None:
+                 source: Optional[str] = None,
+                 response_tools: Optional[list] = None) -> None:
     """Public hook for non-httpx callers (dispatcher's raw
     ``requests.post`` draft path).  Writes one JSONL record; never
     raises.
 
     ``source`` overrides whatever ``set_source`` / ``source_context``
     set on the thread-local context; pass it when the caller wants to
-    label the call explicitly (e.g. ``dispatcher.draft``)."""
+    label the call explicitly (e.g. ``dispatcher.draft``).
+
+    ``response_tools`` is ``_response_tool_calls``' output; the key is
+    omitted entirely when it is ``None`` so "not readable" stays visibly
+    different from "read it, no tool calls" (``[]``)."""
     try:
         record = {
             'ts': _ts(),
@@ -872,6 +936,8 @@ def log_outbound(body: dict, *,
             'response_status': response_status,
             'latency_ms': latency_ms,
         }
+        if response_tools is not None:
+            record['response_tool_calls'] = response_tools
         line = json.dumps(record, default=str, ensure_ascii=False) + '\n'
         with _file_lock:
             fh = _open_log_handle()
@@ -1039,7 +1105,8 @@ def _install_sync_patch(httpx_module) -> None:
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
                          response_status=getattr(response, 'status_code', None),
-                         latency_ms=round(elapsed, 1))
+                         latency_ms=round(elapsed, 1),
+                         response_tools=_response_tool_calls(response))
             return response
         except Exception as e:
             elapsed = (time.time() - start) * 1000
@@ -1076,7 +1143,8 @@ def _install_async_patch(httpx_module) -> None:
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
                          response_status=getattr(response, 'status_code', None),
-                         latency_ms=round(elapsed, 1))
+                         latency_ms=round(elapsed, 1),
+                         response_tools=_response_tool_calls(response))
             return response
         except Exception as e:
             elapsed = (time.time() - start) * 1000
@@ -1168,10 +1236,16 @@ def _install_urllib_patch(urllib_request_module) -> None:
             with _slot_cm:
                 response = _orig_urlopen(url, data, *args, **kwargs)
             elapsed = (time.time() - start) * 1000
+            # Same extractor as the httpx sites — one notion of "what did the
+            # response say", not a per-transport reimplementation.  A urllib
+            # HTTPResponse carries no buffered `_content`, so it reports None
+            # and the key is omitted; the alternative (read it here) would
+            # drain the body the caller has not read yet.
             log_outbound(body or {},
                          source=(_get_source() or 'urllib'),
                          response_status=getattr(response, 'status', None),
-                         latency_ms=round(elapsed, 1))
+                         latency_ms=round(elapsed, 1),
+                         response_tools=_response_tool_calls(response))
             return response
         except Exception as e:
             elapsed = (time.time() - start) * 1000
