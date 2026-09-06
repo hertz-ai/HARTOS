@@ -36,19 +36,54 @@ class ReuseHistorySync(unittest.TestCase):
                       "the empty-history sync must read the manager's own "
                       "conversation buffer (autogen's store), not a new one")
 
-    def test_sync_extends_group_messages(self):
-        self.assertIn('group_chat.messages.extend(_conv)', self.src,
-                      "the sync must populate the SAME group_chat.messages the "
-                      "loop reads — not a parallel list")
-
     def test_sync_picks_richest_conversation(self):
         self.assertIn('max(_mgr_msgs.values(), key=len', self.src,
                       "the sync must pick the longest pairwise buffer (the full "
                       "conversation as the manager saw it)")
 
-    def test_sync_guarded_on_empty_only(self):
-        # The sync must be gated so it cannot double-populate a healthy loop.
-        self.assertIn('if not group_chat.messages:', self.src)
+    def test_sync_fires_on_STALE_not_only_on_EMPTY(self):
+        """The empty-only guard was vacuous after its first fire.
+
+        Measured live 2026-09-06 (agent 89555447799, 13:06-13:19): [725-SYNC]
+        fired ONCE at 13:08:02 with 10 msgs.  From then on group_chat.messages
+        was non-empty — so `if not group_chat.messages` could never fire again —
+        but it still received no appends, so it FROZE.  state_transition's own
+        messages[-1] log proves it: of 193 calls over ~12 minutes, 191 saw the
+        same ChatInstructor nudge ("You should "), and a StatusVerifier verdict
+        never once reached [-1].
+
+        Every advance path reads group_chat.messages[-1] (state_transition:2612,
+        the w1 loop's completed/breakdown/under-report branches), so a frozen
+        list makes all of them unreachable: GOT COMPLETED 0, FAB-GUARD 0,
+        advancing 0, 101 loop iterations, current_action_id stuck at 1.
+
+        The guard cured EMPTINESS but the defect is STALENESS — a guard that
+        cannot fire for its own defect after the first time (feedback_vacuous_
+        guards).  Gate on "shorter than the manager's conversation" instead.
+        """
+        self.assertIn('len(_conv) > len(group_chat.messages)', self.src,
+                      "the sync must fire whenever the group log is SHORTER "
+                      "than the manager's conversation, not only when it is "
+                      "empty — an empty-only guard is vacuous after its first "
+                      "fire and the list then freezes")
+
+    def test_sync_replaces_in_place_never_appends_a_duplicate_prefix(self):
+        """Blind extend() on a non-empty list would duplicate the prefix.
+
+        That is the trap in the obvious version of this fix.  Slice-assignment
+        replaces the contents while keeping the SAME list object, which matters
+        because autogen/graph wrappers hold a reference to it — rebinding
+        `group_chat.messages = [...]` would detach them.
+        """
+        self.assertIn('group_chat.messages[:] = list(_conv)', self.src,
+                      "resync must replace IN PLACE (slice-assign), so it "
+                      "neither duplicates the already-synced prefix nor "
+                      "rebinds the list object autogen holds")
+        self.assertNotIn('group_chat.messages.extend(_conv)', self.src,
+                         "blind extend() on a now-non-empty list appends a "
+                         "second copy of the whole conversation")
+
+    def test_sync_marker_kept(self):
         self.assertIn('[725-SYNC]', self.src,
                       "keep the 725-SYNC log marker so the fix is observable live")
 

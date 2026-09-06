@@ -3453,17 +3453,37 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             # the turn bailed "empty mid-loop" — the general reuse blocker.  Sync the
             # group log from the manager's richest conversation buffer (autogen's own
             # store — no parallel path) so the existing reads work unchanged.  Cheap:
-            # only runs when the group log is empty.
+            # only runs when the group log has fallen behind.
+            #
+            # The gate was `if not group_chat.messages` and that was VACUOUS after
+            # its first fire: it cures EMPTINESS, but the list still receives no
+            # appends, so once seeded it FREEZES and a non-empty-but-stale log can
+            # never re-enter the branch.  Measured live 2026-09-06 (agent
+            # 89555447799, 13:06-13:19): [725-SYNC] fired ONCE at 13:08:02 with 10
+            # msgs, and state_transition's own messages[-1] log then shows 191 of
+            # 193 calls over ~12 minutes seeing the SAME ChatInstructor nudge
+            # ("You should ") — a StatusVerifier verdict never once reached [-1].
+            # Since every advance path reads group_chat.messages[-1]
+            # (state_transition's verdict parse, and this loop's completed /
+            # breakdown / under-report branches), all of them were unreachable:
+            # GOT COMPLETED 0, FAB-GUARD 0, advancing 0, 101 iterations, action
+            # stuck at 1, and the user got "you haven't specified what task".
+            #
+            # Gate on SHORTER-THAN instead, and replace by slice-assignment: a
+            # blind extend() onto a now-non-empty list would append a SECOND copy
+            # of the whole conversation, and rebinding `group_chat.messages = [...]`
+            # would detach the wrapper autogen holds a reference to.  Same source,
+            # same shape, same single mechanism — no parallel path.
             try:
-                if not group_chat.messages:
-                    _mgr_msgs = getattr(manager, '_oai_messages', None)
-                    if _mgr_msgs:
-                        _conv = max(_mgr_msgs.values(), key=len, default=None)
-                        if _conv:
-                            group_chat.messages.extend(_conv)
-                            current_app.logger.info(
-                                f"[725-SYNC] group_chat.messages empty — synced "
-                                f"{len(_conv)} msgs from manager._oai_messages")
+                _mgr_msgs = getattr(manager, '_oai_messages', None)
+                if _mgr_msgs:
+                    _conv = max(_mgr_msgs.values(), key=len, default=None)
+                    if _conv and len(_conv) > len(group_chat.messages):
+                        _was = len(group_chat.messages)
+                        group_chat.messages[:] = list(_conv)
+                        current_app.logger.info(
+                            f"[725-SYNC] group_chat.messages stale ({_was} < "
+                            f"{len(_conv)}) — resynced from manager._oai_messages")
             except Exception as _sync_err:
                 current_app.logger.debug(f"[725-SYNC] skipped: {_sync_err}")
 
