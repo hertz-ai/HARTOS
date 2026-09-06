@@ -3369,21 +3369,68 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         # is still scanned (group log + each agent's pairwise buffer), which is
         # what the 2026-09-05 Trading widening actually needed — that tool had
         # a REAL result, just in a buffer the old scan missed.
+        # A tool result's own top-level `name` is the EXECUTING AGENT's name,
+        # never the function's, so it cannot identify the tool.  Measured live
+        # 2026-09-06 19:22-19:43 (agent 89555447799): this gate logged
+        # `executed=['Assistant']; unrun=['google_search']` while
+        # agent_system.log recorded google_search 10 START / 10 SUCCESS / 0
+        # ERROR and execute_windows_or_android_command 28/28/0 in the SAME
+        # window — 50 real executions, every one called unrun, so each action
+        # burned its 3 re-steers and force-advanced "NOT tool-backed".
+        #
+        # The function name lives on the PROPOSING assistant message's
+        # tool_calls[].function.name and is joined to the result by
+        # tool_call_id.  helper.py:1898-1907 already resolves it exactly this
+        # way when it builds the outgoing body — which is why the live wire
+        # bodies carried 12 properly-named google_search tool messages in the
+        # very window this gate saw none.  Same mapping here: one rule for
+        # "which tool ran", no second vocabulary.
         executed = set()
         _msg_lists = [getattr(group_chat, 'messages', None) or []]
         for ag in agents:
             conv = getattr(ag, '_oai_messages', None)
             if isinstance(conv, dict):
                 _msg_lists.extend(conv.values())
+        _call_fn = {}
         for _ml in _msg_lists:
             for m in (_ml or []):
                 if not isinstance(m, dict):
                     continue
-                if m.get('role') != 'tool' or not m.get('name'):
+                for tc in (m.get('tool_calls') or []):
+                    _cid = (tc or {}).get('id')
+                    _fn = ((tc or {}).get('function') or {}).get('name')
+                    if _cid and _fn:
+                        _call_fn[_cid] = _fn
+
+        def _record_result(call_id, content, fallback_name=None):
+            """Count one tool RESULT, resolved to its function name."""
+            if HISTORICAL_TOOL_PLACEHOLDER in str(content or ''):
+                return  # the stand-in minted BECAUSE nothing executed
+            fn = _call_fn.get(call_id) or fallback_name
+            # Only a REGISTERED tool name counts.  An agent name satisfies
+            # nothing and only pollutes the set — that pollution is what
+            # `executed=['Assistant']` was.
+            if fn in names:
+                executed.add(fn)
+
+        for _ml in _msg_lists:
+            for m in (_ml or []):
+                if not isinstance(m, dict) or m.get('role') != 'tool':
                     continue
-                if HISTORICAL_TOOL_PLACEHOLDER in str(m.get('content') or ''):
-                    continue
-                executed.add(m.get('name'))
+                # Two shapes, both live: the aggregate envelope autogen puts
+                # in the buffers (per-call entries under `tool_responses`),
+                # and the flat per-call message (22 of 80 in the measured
+                # window carried a tool_call_id and NO name at all — the old
+                # `not m.get('name')` skip discarded every one of them).
+                responses = m.get('tool_responses')
+                if isinstance(responses, list) and responses:
+                    for r in responses:
+                        if isinstance(r, dict):
+                            _record_result(r.get('tool_call_id'),
+                                           r.get('content'), r.get('name'))
+                else:
+                    _record_result(m.get('tool_call_id'), m.get('content'),
+                                   m.get('name'))
         unrun = [n for n in referenced if n not in executed]
         try:
             current_app.logger.info(
