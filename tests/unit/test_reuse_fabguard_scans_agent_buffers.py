@@ -43,10 +43,41 @@ class ReuseFabGuardScansAgentBuffers(unittest.TestCase):
                       "replacement)")
 
     def test_still_keyed_on_specific_function_name(self):
-        # Must key on the tool_call's function name, never "any tool ran".
-        self.assertIn("((tc or {}).get('function') or {}).get('name')", self.src,
+        """Never "any tool ran" — the executed set is keyed by tool NAME.
+
+        Re-pointed 2026-09-06.  This used to pin the tool_calls expression
+        `((tc or {}).get('function') or {}).get('name')`, but that line was
+        never what enforced this property, and it has been REMOVED: counting a
+        bare `tool_calls` entry meant counting the model's PROPOSAL as an
+        execution (1,200 proposals for one tool against 1 real body entry),
+        which is what made the gate unable to fail at all.  See
+        test_fab_guard_counts_real_execution.py.
+
+        The property itself — an unrelated tool cannot clear a named one —
+        lives in the name-keyed membership test below, which the new code
+        keeps and in fact tightens (fewer things can enter `executed`).
+        Behavioural proof of the revwarm5407 case is in
+        FabGuardCountsRealExecution.test_unrelated_tool_does_not_clear.
+        """
+        self.assertIn("unrun = [n for n in referenced if n not in executed]",
+                      self.src,
                       "executed detection must key on the SPECIFIC function "
                       "name so an unrelated tool cannot mark a named tool run")
+        self.assertIn("executed.add(m.get('name'))", self.src,
+                      "the executed set must be populated from the tool "
+                      "message's own name, not from a generic 'something ran'")
+
+    def test_proposals_are_not_counted_as_execution(self):
+        """The removed line must stay removed.
+
+        A `tool_calls` entry is the model asking for a call.  Counting it as
+        execution is what let nine fabricated 'completed' verdicts advance on
+        2026-09-06 (agent 89555447799, actions 16..24).
+        """
+        self.assertNotIn("((tc or {}).get('function') or {}).get('name')",
+                         self.src,
+                         "a proposed tool_call must NOT re-enter the executed "
+                         "set — that is the model asking, not the tool running")
 
     def test_detector_defined_once(self):
         self.assertEqual(self.src.count('def _reuse_fabricated_tools('), 1,

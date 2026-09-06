@@ -140,6 +140,25 @@ class FabGuardCountsRealExecution(unittest.TestCase):
                          "a real result in an agent's pairwise _oai_messages "
                          "buffer must still count as executed")
 
+    def test_unrelated_tool_does_not_clear(self):
+        """revwarm5407: a DIFFERENT tool running must not clear a named one.
+
+        This is the property test_reuse_fabguard_scans_agent_buffers used to
+        pin by text against the tool_calls expression.  Pinned behaviourally
+        here instead, so removing that expression cannot silently lose it.
+        """
+        other = 'search_long_term_memory'
+        msgs = [
+            {'role': 'tool', 'name': other, 'tool_call_id': 'c9',
+             'content': 'a real result, but for a DIFFERENT tool'},
+        ]
+        unrun = self.rr._reuse_fabricated_tools(
+            self.key, 1, _GroupChat(msgs), [_Agent([self.TOOL, other])])
+        self.assertEqual(
+            unrun, [self.TOOL],
+            "an unrelated tool's real result must not mark the action's own "
+            "named tool as executed")
+
     def test_sentinel_has_one_home(self):
         """The minter and the reader must share ONE sentinel definition."""
         import inspect
