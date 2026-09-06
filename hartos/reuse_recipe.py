@@ -3210,11 +3210,22 @@ def _reuse_fab_steer_message(user_prompt, current_action_id):
     if not tools:
         return None
     names = ', '.join(str(t) for t in tools)
+    # The guard now holds an action for TWO causes -- the tool was never
+    # called, and the tool ran but returned one of TOOL_FAILURE_RESULTS -- so
+    # this text may no longer assert non-invocation.  It said "were never
+    # actually called", which for the second cause tells the model something
+    # false and prescribes the wrong remedy: call it again, unchanged, and it
+    # fails again the same way (live 2026-09-07: the VLM computer-use loop
+    # exhausted max_iterations trying to focus a window that is not open).
+    # State the property the guard actually established -- no real result --
+    # and require the failure to be reported rather than dressed as success.
     return (
-        f"Action {current_action_id} is NOT complete: the tool(s) {names} were "
-        f"never actually called, so any result reported for them is not real. "
-        f"Do not report this action as completed. @Helper call {names} now with "
-        f"real arguments and report the actual returned result."
+        f"Action {current_action_id} is NOT complete: the tool(s) {names} did "
+        f"not produce a real result — either they were never called, or they "
+        f"ran and returned a failure. Do not report this action as completed. "
+        f"@Helper call {names} now with real arguments and report the actual "
+        f"returned result verbatim. If the tool reports a failure, say so "
+        f"plainly and do not claim the action succeeded."
     )
 
 

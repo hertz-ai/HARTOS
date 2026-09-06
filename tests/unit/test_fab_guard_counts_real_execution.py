@@ -225,6 +225,50 @@ class FabGuardCountsRealExecution(unittest.TestCase):
             "'companion app is not running' means nothing ran on the user's "
             "machine — it must not clear the action's named tool")
 
+    def test_steer_message_does_not_assert_non_invocation(self):
+        """The re-steer text must be true for BOTH causes the guard holds on.
+
+        The guard used to fire only for "never called", so its steer text said
+        so.  It now also fires when the tool RAN and returned a failure -- and
+        for that cause the old wording told the model something false and
+        prescribed the wrong remedy (call it again, unchanged; it fails again
+        the same way).  Drives the real _reuse_fab_steer_message.
+        """
+        key = (self.key, 1)
+        self.rr._reuse_fab_pending[key] = [self.TOOL]
+        try:
+            msg = self.rr._reuse_fab_steer_message(*key)
+        finally:
+            self.rr._reuse_fab_pending.pop(key, None)
+
+        self.assertIsNotNone(msg, "a pending refusal must yield a steer message")
+        self.assertNotIn(
+            "were never actually called", msg,
+            "the guard also holds tools that RAN and failed, so the steer text "
+            "must not assert they were never called")
+        self.assertIn(self.TOOL, msg, "the steer must name the tool to call")
+        low = msg.lower()
+        self.assertIn(
+            "not complete", low,
+            "the steer must state the action is not complete")
+        self.assertTrue(
+            "do not claim" in low or "not claim the action succeeded" in low,
+            "the steer must forbid dressing a tool failure as success — that "
+            "is the outcome this whole gate exists to prevent")
+
+    def test_steer_message_is_none_without_a_pending_refusal(self):
+        """Non-regression: 'all actions done' must stay distinguishable.
+
+        _advance_reuse_action returns (None, False) for a refusal AND for
+        'all actions done'; this helper is what tells them apart, so it must
+        keep returning None when nothing is pending.
+        """
+        self.rr._reuse_fab_pending.pop((self.key, 99), None)
+        self.assertIsNone(
+            self.rr._reuse_fab_steer_message(self.key, 99),
+            "no pending refusal must return None so the caller can still end "
+            "the turn normally when the actions really are done")
+
     def test_sentinel_has_one_home(self):
         """The minter and the reader must share ONE sentinel definition."""
         import inspect
