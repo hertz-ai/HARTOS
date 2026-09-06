@@ -2601,10 +2601,25 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                 last_json = retrieve_json(messages[-1]["content"])
 
                 if isinstance(last_json, dict) and last_json:
-                    current_app.logger.info(f'last json as {last_json}')
+                    # Session-qualified, like the sibling "Retrieved
+                    # current_action_id: N for session: X" line.  Without the
+                    # qualifier this verdict cannot be attributed: measured
+                    # 2026-09-06 08:41-08:57, THREE sessions were emitting
+                    # verdicts at once (cf125371-..._89555447799 x84,
+                    # 219b8c80-..._65708210992 x68, 219b8c80-..._88663405573 x6
+                    # — the last two driven by background daemons, not by any
+                    # operator), and 0 of 41 'last json as' lines named their
+                    # session.  Reading them as one agent's produced two wrong
+                    # conclusions in one day: an "action 6" that belonged to
+                    # another agent, and a "cross-agent contamination" defect
+                    # that was simply a concurrent agent's own action text.
+                    # A log line that cannot say whose it is is not evidence.
+                    current_app.logger.info(
+                        f'last json as {last_json} for session: {user_prompt}')
 
                     if 'status' in last_json.keys() and str(last_json.get('status', '')).lower() == 'completed':
-                        current_app.logger.info('GOT COMPLETED FOR ACTION in state_transition')
+                        current_app.logger.info(
+                            f'GOT COMPLETED FOR ACTION in state_transition for session: {user_prompt}')
                         # Don't trust LLM's action_id — use known pipeline state
                         # The actual advancement happens in get_agent_response/chat_agent loops
                         return chat_instructor
