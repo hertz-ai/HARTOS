@@ -1084,9 +1084,28 @@ VERDICT_REQUIRES_BREAKDOWN = 'requires_breakdown'
 # An action the model reports as finished.  Both pipelines must agree.
 VERDICT_COMPLETION_STATUSES = frozenset({VERDICT_COMPLETED, VERDICT_SUCCESS})
 
-# The model says "not done".  When the action is autonomous AND its named
-# tools are evidenced as executed, that is an under-report, not unfinished
-# work — see reuse_recipe._REUSE_UNDERREPORT_STATUSES' call site.  'error'
-# is deliberately EXCLUDED: it reports a failure, not an under-reported
-# success, and advancing past it would bury the failure.
-VERDICT_UNDERREPORT_STATUSES = frozenset({VERDICT_PENDING, VERDICT_REQUIRES_BREAKDOWN})
+# The model says "not done" AND has nothing further to do about it.  When the
+# action is autonomous and its named tools are evidenced as executed, that is
+# an under-report, not unfinished work.
+#
+# ONLY 'pending' belongs here.  Two statuses are deliberately excluded because
+# each has its own execution path, and treating them as under-reports would
+# force-advance past work that has not run:
+#
+#   'error'              — reports a failure.  Advancing buries it.
+#   'requires_breakdown' — the model is NOT under-reporting; it is correctly
+#                          saying the action needs decomposing, and it SUPPLIES
+#                          the subtasks.  The designed flow is
+#                          add_subtasks() -> get_pending_subtasks() -> execute
+#                          each -> check_and_unblock_parent() -> parent
+#                          completes.  create_recipe.py:4503-4520 wires exactly
+#                          that.  Advancing on tool evidence instead would mark
+#                          the parent done while its own subtasks sit unrun —
+#                          the "force-completed by a nudge" failure.
+#
+# I had requires_breakdown in this set on 2026-09-06 and it was wrong: it
+# treated a missing execution path as a reporting bug.  The real defect was
+# that reuse_recipe imported get_pending_subtasks/check_and_unblock_parent
+# (lines 181-182) and never called either, so the decomposition it persisted
+# was never executed.  Fixed by wiring the loop, not by widening this set.
+VERDICT_UNDERREPORT_STATUSES = frozenset({VERDICT_PENDING})

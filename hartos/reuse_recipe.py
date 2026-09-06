@@ -3475,6 +3475,52 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             except Exception as _rc_err:
                 current_app.logger.debug(f"robust completion-advance skipped: {_rc_err}")
 
+            # BREAKDOWN EXECUTION.  'requires_breakdown' is not a failure and not
+            # an under-report: the model is saying the action needs decomposing,
+            # and it supplies the subtasks.  The designed flow is
+            #   add_subtasks() -> get_pending_subtasks() -> work each -> parent
+            # and create_recipe.py:4503-4520 wires exactly that.
+            #
+            # Reuse did not.  state_transition:2635 persisted the subtasks and
+            # returned a speaker; get_pending_subtasks and check_and_unblock_parent
+            # were imported at :181-182 and NEVER CALLED, so the children went into
+            # a ledger nobody read and the parent could never complete.  Measured
+            # live 2026-09-06 on agent 89555447799: 35 requires_breakdown verdicts
+            # for action 1, subtasks re-persisted each time (3 then 4), 107 rounds,
+            # 0 advances, nothing executed.
+            #
+            # Same helpers, same message shape, same `continue` as create — the
+            # loop that was missing, not a second mechanism.  Do NOT "fix" this by
+            # treating requires_breakdown as an under-report and advancing on tool
+            # evidence: that marks the parent done while its own subtasks sit
+            # unrun, which is the force-completion the verification contract
+            # forbids (I made that mistake first; see VERDICT_UNDERREPORT_STATUSES).
+            try:
+                _bd = group_chat.messages[-1] if group_chat.messages else None
+                _bd_vj = retrieve_json((_bd or {}).get('content') or '') if _bd else None
+                if (isinstance(_bd_vj, dict)
+                        and str(_bd_vj.get('status', '')).lower() == 'requires_breakdown'):
+                    _pending = get_pending_subtasks(
+                        user_prompt, _reuse_current_action, user_ledgers)
+                    if _pending:
+                        _next_sub = _pending[0]
+                        current_app.logger.info(
+                            f"[BREAKDOWN] action {_reuse_current_action} has "
+                            f"{len(_pending)} pending subtask(s) for session: "
+                            f"{user_prompt} — working '{_next_sub.description[:60]}'")
+                        chat_instructor.initiate_chat(
+                            recipient=manager,
+                            message=f"Work on subtask: {_next_sub.description}",
+                            clear_history=False, silent=False)
+                        continue
+                    current_app.logger.info(
+                        f"[BREAKDOWN] action {_reuse_current_action} reported "
+                        f"requires_breakdown but the ledger holds no pending "
+                        f"subtask for session: {user_prompt} — letting the normal "
+                        f"paths decide")
+            except Exception as _bd_err:
+                current_app.logger.debug(f"breakdown execution skipped: {_bd_err}")
+
             # UNDER-REPORTED COMPLETION (mirror of the fabrication gate above).
             # A not-done verdict from an autonomous action whose tools have
             # EVIDENTLY run is a reporting failure, not unfinished work — see

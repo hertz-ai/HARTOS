@@ -72,46 +72,67 @@ class TestBranchIsEvidenceGated:
             'own allowance, or a stuck action burns the whole round budget')
 
 
-class TestRequiresBreakdownIsAlsoUnderReporting:
-    """'requires_breakdown' strands an action exactly like 'pending' did.
+class TestRequiresBreakdownIsNotAnUnderReport:
+    """'requires_breakdown' must NOT be force-advanced on tool evidence.
 
-    Measured live 2026-09-06 on agent 89555447799 (24-action recipe, driven as
-    its own owner cf125371-...).  The turn ran 107 rounds over 40 minutes and
-    never left action 1:
+    I got this wrong on 2026-09-06 and this class pins the correction.
 
-      * action 1 is autonomous (can_perform_without_user_input='yes')
-      * its named tool really executed - `INSIDE google search` at 02:2x, so
-        _reuse_outstanding_tools is empty
-      * the StatusVerifier reported {'status': 'requires_breakdown',
-        'action_id': 1} 35 times
+    Agent 89555447799 wedged: 35 requires_breakdown verdicts for action 1, 107
+    rounds, 0 advances.  My first fix added 'requires_breakdown' to the
+    under-report set so the action would advance once its named tool was
+    evidenced.  That was wrong twice over:
 
-    The StatusVerifier emits four statuses.  Speaker routing handles all four
-    (reuse_recipe.py:2635 persists requires_breakdown's subtasks, :2646 routes
-    error/pending), but the ADVANCE branch recognised only 'pending', so
-    requires_breakdown could never advance and had no per-action bound.  The
-    only bound was the whole-turn budget - max(4, n_actions*4+4) = 100 rounds
-    for this recipe - so ONE wedged action consumed the entire turn and the
-    remaining 23 actions never ran.  `Retrieved current_action_id: 1 for
-    session: cf125371-..._89555447799` appears 175x; [REUSE]/advance markers
-    appear 0x.
+      * SEMANTICS — the model is not under-reporting a completion.  It is
+        correctly saying the action needs decomposing, and it SUPPLIES the
+        subtasks in the same verdict.
+      * BEHAVIOUR — advancing marks the parent done while its own subtasks sit
+        unrun, on evidence from a DIFFERENT tool.  That is exactly the
+        "force-completed by a stuck-loop guard or a nudge" the verification
+        contract excludes.
 
-    Fix reuses the machinery already here - same counter, same bound, same
-    evidence gate, same _advance_or_steer - so nothing advances whose tool did
-    not actually execute.  It must NOT become a second notion of the statuses:
-    one constant, read at the branch.
+    The real defect was a missing execution path.  create_recipe.py:4503-4520
+    wires the designed flow —
+        add_subtasks() -> get_pending_subtasks() -> "Work on subtask: X"
+        -> check_and_unblock_parent() -> parent completes
+    — while reuse_recipe did step one only (state_transition:2635 persists,
+    then returns a speaker) and imported get_pending_subtasks /
+    check_and_unblock_parent at :181-182 without ever calling either.  The
+    children went into a ledger nobody read.
+
+    Fix = wire the loop, not widen the status set.
     """
 
-    def test_constant_names_both_under_reporting_statuses(self):
+    def test_requires_breakdown_is_excluded_from_the_underreport_set(self):
         rr = pytest.importorskip('hartos.reuse_recipe')
         statuses = getattr(rr, '_REUSE_UNDERREPORT_STATUSES', None)
-        assert statuses is not None, (
-            '_REUSE_UNDERREPORT_STATUSES missing — the branch must read ONE '
-            'named constant, not inline a second status list')
-        assert 'pending' in statuses, 'pending must stay under-reporting'
-        assert 'requires_breakdown' in statuses, (
-            "requires_breakdown must be treated as under-reporting: live "
-            "2026-09-06 it stranded agent 89555447799 at action 1 for 107 "
-            "rounds while its google_search had already executed")
+        assert statuses is not None, '_REUSE_UNDERREPORT_STATUSES missing'
+        assert 'pending' in statuses, 'pending stays — it is a real under-report'
+        assert 'requires_breakdown' not in statuses, (
+            "requires_breakdown must NOT be treated as an under-reported "
+            'completion: it has its own execution path (subtasks), and '
+            'advancing on tool evidence would complete the parent while its '
+            'subtasks are unrun')
+        assert 'error' not in statuses, 'error reports a failure; advancing buries it'
+
+    def test_reuse_executes_the_breakdown_instead_of_advancing_past_it(self):
+        """The loop create has and reuse was missing."""
+        src = _source()
+        assert 'get_pending_subtasks(' in src, (
+            'reuse imports get_pending_subtasks at :181-182 — it must CALL it. '
+            'Persisting subtasks into a ledger nothing reads is why action 1 of '
+            'agent 89555447799 could never complete')
+        m = re.search(r'BREAKDOWN EXECUTION(.*?)except Exception as _bd_err',
+                      src, re.DOTALL)
+        assert m, 'breakdown-execution block not found in the reuse loop'
+        block = m.group(1)
+        assert "== 'requires_breakdown'" in block, 'must key on the verdict'
+        assert 'get_pending_subtasks(' in block, 'must read the persisted subtasks back'
+        assert 'Work on subtask:' in block, (
+            'must post the same work message create_recipe.py:4518 posts — one '
+            'shape, not a second protocol')
+        assert '_advance_or_steer' not in block, (
+            'the breakdown path must EXECUTE the decomposition, never advance '
+            'past it')
 
     def test_advance_branch_reads_the_constant_not_a_bare_pending(self):
         src = _source()
