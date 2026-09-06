@@ -1744,7 +1744,8 @@ def _resolve_llm_endpoint(registry_fn_name: str, env_var: str) -> str:
 # chat/completions POST in this module goes to GPT_API or DRAFT_GPT_API with
 # LLM_MODEL_NAME in the body, and _pooled_post_with_refusal_check adds
 # LLM_AUTH_HEADERS on the way out; no site picks a model or a port of its own.
-from core.autogen_config import resolve_llm_backend, llm_http_target
+from core.autogen_config import (
+    resolve_llm_backend, llm_http_target, with_local_fallback)
 LLM_KIND, _llm_entry = resolve_llm_backend()
 LLM_MODEL_NAME = _llm_entry['model']
 if LLM_KIND == 'api':
@@ -9243,9 +9244,22 @@ def chat():
         if not re.fullmatch(r'[a-zA-Z0-9_-]+', prompt_id):
             return jsonify({'error': 'Invalid prompt_id format', 'response': None}), 400
 
-    # Per-request model config override (speculative execution)
+    # Per-request model config override (speculative execution).
+    #
+    # The dispatcher sends ONE entry — the tier it selected
+    # (ModelBackend.to_config_list returns [entry]).  Stored raw, every autogen
+    # agent built from this override runs with a single client, so autogen has
+    # nothing to fall to when that tier fails and the exception ends the turn
+    # (measured 2026-09-06: claude-code 503 'at capacity' / 'not on PATH', 6x
+    # per drive, swallowed by reuse_recipe.get_agent_response).  Composing this
+    # node's own backend on as the TERMINAL entry gives the engine's own ladder
+    # somewhere to land; the selected tier is still entry 0 and still tried
+    # first.  This is the ONE consumer of the payload key, so both producers
+    # (speculative_dispatcher, dispatch.py) and all five override readers
+    # inherit it from here.
     if model_config:
-        thread_local_data.set_model_config_override(model_config)
+        thread_local_data.set_model_config_override(
+            with_local_fallback(model_config))
     else:
         thread_local_data.clear_model_config_override()
 

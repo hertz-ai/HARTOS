@@ -155,6 +155,53 @@ def llm_http_target(draft=False):
     return base.rstrip('/') + '/chat/completions', headers, entry['model']
 
 
+def _same_endpoint(a: dict, b: dict) -> bool:
+    """Two config entries that would dial the same model at the same place."""
+    def _norm(e):
+        return ((e or {}).get('base_url') or '').rstrip('/'), (e or {}).get('model')
+    return _norm(a) == _norm(b)
+
+
+def with_local_fallback(config_list) -> list:
+    """``config_list`` plus this node's own backend as the TERMINAL entry.
+
+    autogen's ``OpenAIWrapper.create`` walks config_list IN ORDER and re-raises
+    only when the LAST client fails (autogen/oai/client.py:687 ``last =
+    len(self._clients) - 1``; :783 ``except APIError ... if i == last: raise``).
+    A second entry therefore IS the engine's own fallback ladder, and it fires
+    on exactly the exception a failing tier raises — no second dispatch path is
+    needed to degrade one.
+
+    The dispatcher hands the inner /chat a ONE-entry list naming the tier it
+    selected (``ModelBackend.to_config_list`` returns ``[entry]``;
+    speculative_dispatcher:1721, dispatch.py:904), and chat() stores it as the
+    per-request override every autogen agent then runs on.  With one entry
+    there is nothing to fall to.  Measured live 2026-09-06: the claude-code
+    EXPERT endpoint answered 503 — both "claude-code at capacity" (its own
+    BoundedSemaphore, i.e. ordinary concurrency) and "claude not on PATH" — and
+    every reuse turn died on openai.InternalServerError, which
+    reuse_recipe.get_agent_response swallows.  claude_code_endpoint's
+    ``_FAIL_STATUS`` states the intended contract verbatim ("a lapsed
+    subscription must not error the OS; it degrades to local", "caller falls
+    back to local"); nothing implemented it for the inner group chat.  This is
+    that fallback, built from the engine's existing mechanism.
+
+    Routing still belongs to the dispatcher: the selected tier stays FIRST and
+    is always tried first, so this never hardwires a tier — it only gives the
+    chosen one somewhere to land.  An override that already ends at this node's
+    backend gets no duplicate: re-dialling the endpoint that just failed is a
+    retry, not a fallback.  A falsy override stays falsy, because every consumer
+    spells its default as ``override or config_list``.
+    """
+    if not config_list:
+        return config_list
+    entries = list(config_list)
+    for own in get_autogen_config_list():
+        if not any(_same_endpoint(own, e) for e in entries):
+            entries.append(own)
+    return entries
+
+
 def get_autogen_config_list() -> list:
     """The autogen ``config_list``: one entry, the configured backend."""
     _kind, entry = resolve_llm_backend()
