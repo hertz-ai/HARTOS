@@ -5229,7 +5229,12 @@ def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, j
     flow = get_current_flow(user_prompt)
     set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
     group_chat.messages[-1]['content'] = f'{individual_recipe}'
-    assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
+    # The dependency instruction is carried by `message` below (byte-identical
+    # text), which is what actually reaches the model.  Assigning to
+    # `update_system_message` did NOT set a system message: on autogen's
+    # ConversableAgent it is a method that writes
+    # _oai_system_message[0]['content'], so the assignment only shadowed the
+    # bound method with a str and left it non-callable for that agent's life.
     flow = get_current_flow(user_prompt)
     for num, action in enumerate(user_tasks[user_prompt].actions, 1):
         try:
@@ -5289,7 +5294,8 @@ def after_all_actions_terminated_from_exception(assistant_agent, chat_instructor
     individual_recipe = []
     set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
     group_chat.messages[-1]['content'] = f'{individual_recipe}'
-    assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
+    # Same dead assignment as the sibling above: the instruction is delivered
+    # by `message` inside the loop, not by a system message.
     for num, action in enumerate(user_tasks[user_prompt].actions, 1):
         message = f'''Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.\n current_action: {action}'''
         result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
@@ -5391,8 +5397,7 @@ def get_execute_next_action_message( prompt_id, user_prompt):
 def begin_agent_convo_to_get_schedulers_not_last(assistant_agent, chat_instructor,  manager, prompt_id,  updated_actions, user_prompt):
 
     final_recipe[prompt_id] = {"status": "completed", "actions": updated_actions}
-    assistant_agent.update_system_message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
-                        { "status": "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
+    # Dead assignment removed: same scheduler schema is sent as `message`.
     message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
                         { "status": "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
     chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
@@ -5410,8 +5415,7 @@ def begin_agent_convo_to_get_schedulers(assistant_agent, chat_instructor, manage
     message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
                             { "status": "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
     final_recipe[prompt_id] = {"status": "completed", "actions": updated_actions}
-    assistant_agent.update_system_message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
-                        { "status": "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
+    # Dead assignment removed: same scheduler schema is sent as `message` above.
     current_app.logger.info(
         f'user_tasks[user_prompt].current_action:{user_tasks[user_prompt].current_action} == len(user_tasks[user_prompt].actions)')
     chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
