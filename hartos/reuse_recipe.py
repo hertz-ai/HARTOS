@@ -3833,7 +3833,22 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         f"Cannot access recipe for current action {user_tasks[user_prompt].current_action}")
                     continue
 
-                if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action - 1]['can_perform_without_user_input'] == 'yes':
+                # Canonical reader (:3214), not a raw subscript.  A recipe
+                # action that omits `can_perform_without_user_input` raised
+                # KeyError here, and the blanket except below swallowed it as
+                # "WE have some indexx error here: 'can_perform_without_user_
+                # input'" — 20 times in ONE live turn (agent 74769894436,
+                # 2026-09-07 00:12).  The cost is not the log line: the raise
+                # happens BEFORE initiate_chat, so the "complete this task
+                # independently" steering never reaches the group for that
+                # round, and the action cannot advance on its own.  Every
+                # sibling read of this field is already guarded (:2650, :2808)
+                # or goes through the helper (:3719); this was the one site
+                # left, and the helper's docstring already fixes the semantics
+                # for an absent field ("-> False, so an unknown action is
+                # never auto-advanced").
+                if _reuse_action_is_autonomous(
+                        user_prompt, user_tasks[user_prompt].current_action):
                     current_app.logger.info('GOT can_perform_without_user_input as true')
                     message = 'You should complete this task independently. Feel free to make reasonable assumptions where necessary'
                     # chat_instructor, not helper — same reason as the
