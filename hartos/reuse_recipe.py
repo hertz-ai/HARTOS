@@ -1432,6 +1432,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             For pending tasks or ongoing actions, respond to helper to complete the task.
             Verify the action performed by assistant and make sure the action is performed correctly as per instructions. if action performed was not as per instructions give the pending actions to the helper agent.
             Report status only—do not perform actions yourself and do not try calling any functions/tools.
+            Judge ONLY from evidence already present in this conversation. A tool result carrying the tool's real output is proof that step RAN: mark it completed even though you yourself cannot call tools.
+            NEVER answer "pending" with the reason that you cannot perform or cannot call the tool. Your own inability to call a tool says nothing about whether the Assistant already called it. "pending" means the conversation shows the work has not been done yet.
             Use "requires_breakdown" when an action is too complex and needs to be split into smaller subtasks. Each subtask should have a unique subtask_id (e.g., "1.1", "1.2").
 
         """,
