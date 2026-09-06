@@ -3072,7 +3072,14 @@ _REUSE_PENDING_STEER_MAX = 2
 #
 # 'error' is deliberately NOT here.  It reports a failure, not an
 # under-reported success — advancing past it would bury the failure.
-_REUSE_UNDERREPORT_STATUSES = ('pending', 'requires_breakdown')
+#
+# The tokens live in core.constants, not here: this file spells the same
+# StatusVerifier vocabulary at 11 other sites and create_recipe.py spells it
+# at 5 more, so a set defined locally would be a 17th private copy of a
+# shared vocabulary.  Only the GROUPING is local — see the constant's own
+# comment for why :2646 (error+pending, routing) and this set
+# (pending+requires_breakdown, advancing) must stay different.
+from core.constants import VERDICT_UNDERREPORT_STATUSES as _REUSE_UNDERREPORT_STATUSES
 
 
 def _reuse_turn_round_budget(user_prompt):

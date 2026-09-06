@@ -1046,3 +1046,47 @@ MACHINE_GOAL_AUTHORS = frozenset({
 # while the app-level policy said 2 MB was fine.
 import os as _os
 MAX_PAYLOAD_BYTES = int(_os.environ.get('HEVOLVE_MAX_PAYLOAD_BYTES', 2 * 1024 * 1024))
+
+
+# ── StatusVerifier verdict vocabulary (ONE source, two pipelines) ────────
+# The StatusVerifier prompt tells the model to answer with one of a fixed
+# set of statuses (create_recipe.py:3114, reuse_recipe.py:1428/1434).  Every
+# consumer then re-spelled those tokens as bare literals, and the two
+# pipelines drifted apart:
+#
+#   create_recipe.py:641,2480  status == 'completed'
+#   create_recipe.py:2475      status == 'completed' OR 'success'   <-- only create
+#   create_recipe.py:2516      status == 'pending'
+#   create_recipe.py:2548      status == 'requires_breakdown'
+#   reuse_recipe.py:2606,2756,2900,3409,3495,3512,4202,4216
+#                              status == 'completed'                <-- 'success' absent
+#   reuse_recipe.py:2635       status == 'requires_breakdown'  (routing)
+#   reuse_recipe.py:2646       status in ('error','pending')   (routing)
+#   reuse_recipe.py:3438       under-reported advance set
+#
+# Measured 2026-09-06: create accepts 'success' as a completion, reuse does
+# not.  Same model, same prompt family — a model that answers "success"
+# completes its action in CREATE and stalls forever in REUSE.  That is the
+# same shape as the requires_breakdown wedge (agent 89555447799: 107 rounds,
+# 0 advances), with a different token.
+#
+# The TOKENS belong here.  The GROUPINGS deliberately differ per call site
+# and are NOT unified: :2646 groups error+pending to route work back to the
+# helper, while :3438 groups pending+requires_breakdown to advance on tool
+# evidence.  Collapsing those would change behaviour — only the spellings
+# are shared.
+VERDICT_COMPLETED = 'completed'
+VERDICT_SUCCESS = 'success'
+VERDICT_PENDING = 'pending'
+VERDICT_ERROR = 'error'
+VERDICT_REQUIRES_BREAKDOWN = 'requires_breakdown'
+
+# An action the model reports as finished.  Both pipelines must agree.
+VERDICT_COMPLETION_STATUSES = frozenset({VERDICT_COMPLETED, VERDICT_SUCCESS})
+
+# The model says "not done".  When the action is autonomous AND its named
+# tools are evidenced as executed, that is an under-report, not unfinished
+# work — see reuse_recipe._REUSE_UNDERREPORT_STATUSES' call site.  'error'
+# is deliberately EXCLUDED: it reports a failure, not an under-reported
+# success, and advancing past it would bury the failure.
+VERDICT_UNDERREPORT_STATUSES = frozenset({VERDICT_PENDING, VERDICT_REQUIRES_BREAKDOWN})
