@@ -1158,3 +1158,28 @@ VERDICT_ROUND_TERMINAL_STATUSES = frozenset({
 # minter would write text the reader no longer recognises, and every
 # placeholder would read as a real result again.
 HISTORICAL_TOOL_PLACEHOLDER: str = "Placeholder response for historical tool call"
+
+# Results a tool returns when it RAN and could not do the work.
+#
+# Sibling of HISTORICAL_TOOL_PLACEHOLDER above, and read by the same gate for
+# the same reason: neither is the action's work being done.  The placeholder
+# means "the call produced nothing"; these mean "the call produced a refusal".
+#
+# reuse_recipe.py RETURNS them (execute_windows_or_android_command's failure
+# branches) and READS them (the fabrication gate), so they live here rather
+# than as literals at either end — a drifted copy would silently re-open the
+# hole, exactly as it would for the placeholder.
+#
+# Measured 2026-09-07, agent 60834540771 driven as its real owner, action 1
+# "Bring the HART Finance Dashboard window to foreground": the tool really ran
+# (the VLM computer-use loop clicked the taskbar, opened a Notepad error
+# dialog, exited max_iterations/incomplete), returned the first string below at
+# 02:11:34, and 25s later the action advanced on a 'completed' verdict with
+# [FAB-GUARD] unrun=[].  The gate asked "did a result come back", never "did
+# the tool do the work", so the one thing it exists to prevent happened with
+# the gate green.
+TOOL_FAILURE_RESULTS: tuple = (
+    "Not able to perform this action now please try later",
+    "I'm unable to perform this action since the Hevolve A I Companion App is "
+    "not running in your computer, Open the companion app & try again",
+)

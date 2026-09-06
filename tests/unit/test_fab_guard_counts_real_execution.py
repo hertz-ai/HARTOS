@@ -159,6 +159,72 @@ class FabGuardCountsRealExecution(unittest.TestCase):
             "an unrelated tool's real result must not mark the action's own "
             "named tool as executed")
 
+    def test_tool_reported_failure_is_not_execution(self):
+        """A tool that RAN and reported failure has not done the action's work.
+
+        Live 2026-09-07, agent 60834540771 driven as its real owner
+        (c23d388c-...), action 1 "Bring the HART Finance Dashboard window to
+        foreground".  execute_windows_or_android_command really did run: the
+        VLM computer-use loop clicked the taskbar at (2206,1373), opened a
+        Notepad error dialog, spent its remaining iterations dismissing it and
+        exited `max_iterations` / status=incomplete.  The tool then returned
+        its failure branch (reuse_recipe.py:1929) VERBATIM as the string
+        below, and 25s later the action advanced:
+
+            02:11:34  "content": "Not able to perform this action now please try later"
+            02:11:59  reuse-w1-completed: terminal 'completed' verdict for action 1
+            02:11:59  [FAB-GUARD] ... executed=[...]; unrun=[]
+
+        The guard passed because it asked "did a result come back", never "did
+        the tool do the work".  So the one thing it exists to prevent -- an
+        action reported complete without its tool's work behind it -- happened
+        with the guard green, which is the vacuous-guard shape
+        (feedback_vacuous_guards): it could not fail for its own defect.
+
+        Reporting UNRUN routes this into the machinery that already exists for
+        it: _advance_reuse_action re-steers (bounded), and only after
+        _REUSE_FAB_STEER_MAX real re-steers advances anyway and LOUDLY, so a
+        non-tool-backed action is never silently reported as verified.
+        """
+        msgs = [
+            {'role': 'assistant',
+             'tool_calls': [{'id': 'c5', 'type': 'function',
+                             'function': {'name': self.TOOL}}]},
+            {'role': 'tool', 'name': self.TOOL, 'tool_call_id': 'c5',
+             'content': 'Not able to perform this action now please try later'},
+        ]
+        unrun = self.rr._reuse_fabricated_tools(
+            self.key, 1, _GroupChat(msgs), [_Agent([self.TOOL])])
+        self.assertEqual(
+            unrun, [self.TOOL],
+            "a tool whose own result says it could NOT perform the action "
+            "must be reported UNRUN — counting it as executed lets the action "
+            "advance on work that never happened")
+
+    def test_companion_app_missing_is_not_execution(self):
+        """The sibling failure return of the same tool (reuse_recipe.py:1927).
+
+        Same branch, different cause: the companion app is not running, so
+        nothing was done on the user's machine.  Pinned alongside its sibling
+        so a fix keyed to only one observed string cannot leave the other
+        counting as success.
+        """
+        msgs = [
+            {'role': 'assistant',
+             'tool_calls': [{'id': 'c6', 'type': 'function',
+                             'function': {'name': self.TOOL}}]},
+            {'role': 'tool', 'name': self.TOOL, 'tool_call_id': 'c6',
+             'content': "I'm unable to perform this action since the Hevolve "
+                        "A I Companion App is not running in your computer, "
+                        "Open the companion app & try again"},
+        ]
+        unrun = self.rr._reuse_fabricated_tools(
+            self.key, 1, _GroupChat(msgs), [_Agent([self.TOOL])])
+        self.assertEqual(
+            unrun, [self.TOOL],
+            "'companion app is not running' means nothing ran on the user's "
+            "machine — it must not clear the action's named tool")
+
     def test_sentinel_has_one_home(self):
         """The minter and the reader must share ONE sentinel definition."""
         import inspect

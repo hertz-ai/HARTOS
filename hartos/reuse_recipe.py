@@ -20,6 +20,7 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
     DEFAULT_SINGLE_ROLE,
     HISTORICAL_TOOL_PLACEHOLDER,
     NUNBA_WEB_FETCH_POLICY,
+    TOOL_FAILURE_RESULTS,
 )
 
 from enum import Enum
@@ -1923,10 +1924,15 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             if response and response['status'] == 'success':
                 return 'Successfully ran the command in user\'s computer.'
             else:
+                # Returned from core.constants, not restated here: the
+                # fabrication gate keys on these exact strings to tell "the
+                # tool ran and refused" from "the tool did the work".  A
+                # literal at this end could drift from the reader's copy and
+                # a failed action would silently count as completed again.
                 if 'message' in response and 'Failed to capture screenshot' in response['message']:
-                    return 'I\'m unable to perform this action since the Hevolve A I Companion App is not running in your computer, Open the companion app & try again'
+                    return TOOL_FAILURE_RESULTS[1]
                 else:
-                    return 'Not able to perform this action now please try later'
+                    return TOOL_FAILURE_RESULTS[0]
         except Exception as e:
             error_message = traceback.format_exc()  # Capture full traceback
             current_app.logger.error(f"Error executing command:\n{error_message}")
@@ -3407,8 +3413,20 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
 
         def _record_result(call_id, content, fallback_name=None):
             """Count one tool RESULT, resolved to its function name."""
-            if HISTORICAL_TOOL_PLACEHOLDER in str(content or ''):
+            _body = str(content or '')
+            if HISTORICAL_TOOL_PLACEHOLDER in _body:
                 return  # the stand-in minted BECAUSE nothing executed
+            # The tool RAN and reported it could not do the work.  Running is
+            # not the property this gate protects — the action's work getting
+            # done is.  Live 2026-09-07 (agent 60834540771 as its real owner)
+            # action 1's execute_windows_or_android_command drove the VLM loop
+            # into a Notepad error dialog, exited max_iterations, returned
+            # "Not able to perform this action now please try later" — and the
+            # action advanced 25s later with unrun=[].  Treated like the
+            # placeholder above: report UNRUN so _advance_reuse_action
+            # re-steers (bounded) instead of silently marking it verified.
+            if any(f in _body for f in TOOL_FAILURE_RESULTS):
+                return
             fn = _call_fn.get(call_id) or fallback_name
             # Only a REGISTERED tool name counts.  An agent name satisfies
             # nothing and only pollutes the set — that pollution is what
