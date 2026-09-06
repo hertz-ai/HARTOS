@@ -622,6 +622,41 @@ def test_empty_arguments_are_recorded_as_emitted_not_normalised(
         'truncation that merely looks like one')
 
 
+def test_tool_call_id_is_recorded_so_a_call_can_be_matched_to_its_replay(
+        tmp_path, monkeypatch):
+    """The join key between a generation and its later replays.
+
+    Measured 2026-09-06 17:08-17:40 on the live reuse drive: the model
+    generated 17 distinct ``send_message_to_user`` argument sets and NONE of
+    them appear in any later request body, which carries only 2 distinct
+    shapes (47 of 89 occurrences are ``{}``).  ``save_data_in_memory``: 12
+    distinct generations, 1 survives, 175 of 276 replays ``{}``.  Meanwhile
+    ``execute_windows_or_android_command`` survives 14 of 15.
+
+    Name-level counts can show THAT arguments go missing but not WHICH call
+    lost them, and the two candidate mechanisms need opposite fixes:
+
+      * same id, arguments now ``{}``  -> the call object is rebuilt or
+        mutated on the replay path.
+      * different id                   -> these are other call instances
+        generated on a leg with no captured response, and nothing was lost.
+
+    ``id`` is what separates them, so it has to be in the record.
+    """
+    payload = _completion([
+        {'id': 'call_abc123', 'type': 'function',
+         'function': {'name': 'save_data_in_memory',
+                      'arguments': '{"key":"k","value":"v"}'}},
+    ])
+    rec = _drive_one_send(tmp_path, monkeypatch,
+                          lambda: _FakeResponse(payload))
+    call = rec['response_tool_calls'][0]
+    assert call.get('id') == 'call_abc123', (
+        "the tool_call id must be recorded — without it a generated call "
+        "cannot be matched to its own replay, and 'arguments went missing' "
+        "stays a name-level inference instead of a per-call fact")
+
+
 def test_response_without_tool_calls_records_an_empty_list(
         tmp_path, monkeypatch):
     """Readable-but-none must be distinguishable from not-readable.

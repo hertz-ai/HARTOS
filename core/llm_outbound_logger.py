@@ -901,7 +901,14 @@ def _response_tool_calls(response) -> Optional[list]:
                     args, default=str)
                 if len(args) > _RESP_ARG_CAP:
                     args = args[:_RESP_ARG_CAP] + '...[cut]'
-                out.append({'name': fn.get('name'),
+                # `id` is the join key back to the same call's replays in later
+                # request bodies.  Without it, "these arguments went missing"
+                # is a name-level inference; with it, the two mechanisms
+                # separate — same id with '{}' means the call object was
+                # rebuilt, a different id means it is simply another call
+                # instance whose generation was never captured.
+                out.append({'id': tc.get('id'),
+                            'name': fn.get('name'),
                             'arguments': args,
                             'finish_reason': choice.get('finish_reason')})
         return out
