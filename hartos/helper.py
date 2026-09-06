@@ -1551,47 +1551,14 @@ class ToolMessageHandler:
 
         processed_messages = messages.copy()
 
-        # STEP 1: Handle first message if it's a tool message (special case).
-        #
-        # A LEADING role=tool is an orphan: nothing precedes it to answer, so
-        # it is invalid in the OpenAI schema.  It becomes one when the wire
-        # left-trim eats the conversation from the front and splits a
-        # tool_call/tool-response pair.  Measured live 2026-09-06 (agent
-        # 89555447799, action 1 of 24) — the response starts correctly paired
-        # and migrates as the trim advances:
-        #
-        #   10:58:33  [3] assistant Helper tool_calls=[Tqon4dDj]
-        #             [4] role=tool  name=Assistant      <- paired, valid
-        #   10:58:57  index 1
-        #   10:59:16  index 0   <- orphan; its tool_call has been trimmed away
-        #   10:59:35  index 0
-        #   10:59:40  index 0
-        #
-        # The three lines below are the right repair: demote to user text,
-        # rename, drop the now-dangling tool_call_id.  They were followed by
-        # `processed_messages = processed_messages[1:]`, which discarded the
-        # message they had just made valid — so the repair was dead code and
-        # the tool's OUTPUT was destroyed.
-        #
-        # google_search really ran (INSIDE google search 10:58:28,044, then
-        # five HTTP 200s via primp).  The model never saw the result, replied
-        # "I apologize for the error in my previous response...", re-issued the
-        # same call, and the unanswered tool_call accumulated to 7 byte-identical
-        # copies ("Detected 7 active tool calls").  Action 1 never completed.
-        # 3 STEP-1 firings in that window == the 3 snapshots with role=tool at
-        # index 0.
-        #
-        # Keeping the repaired message preserves the tool result as ordinary
-        # user-visible context.  It deliberately does NOT try to re-pair the
-        # orphan (the assistant tool_call is gone — there is nothing to pair
-        # with) and does NOT touch the trimmer; that split is a separate
-        # upstream concern.
+        # STEP 1: Handle first message if it's a tool message (special case)
         if processed_messages and processed_messages[0].get('role') == 'tool':
             current_app.logger.info('GOT TOOL AS FIRST MESSAGE CHANGING IT')
             processed_messages[0]['role'] = 'user'
             processed_messages[0]['name'] = 'Helper'
             if 'tool_call_id' in processed_messages[0]:
                 del processed_messages[0]['tool_call_id']
+            processed_messages = processed_messages[1:]
 
         # STEP 2: Pre-identify consolidated responses and assistants with tool calls
         final_messages = []
