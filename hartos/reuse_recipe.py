@@ -18,6 +18,7 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
     AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
     AUTOGEN_HISTORY_LIMIT,
     DEFAULT_SINGLE_ROLE,
+    HISTORICAL_TOOL_PLACEHOLDER,
     NUNBA_WEB_FETCH_POLICY,
 )
 
@@ -3338,6 +3339,26 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         # keyed on the SPECIFIC function name (never "any tool ran"), so the
         # revwarm5407 defeat — an unrelated MemoryGraph tool marking a
         # never-run get_api_revenue_stats as executed — cannot recur.
+        # A tool counts as executed ONLY on a real role=='tool' RESULT.
+        #
+        # Two things that look like execution and are not — both were being
+        # counted, which made this guard unable to fail for its own defect
+        # (measured 2026-09-06, agent 89555447799, actions 16..24):
+        #   * the HISTORICAL_TOOL_PLACEHOLDER stand-in, which helper.py mints
+        #     precisely BECAUSE a tool_call produced no result.  On 625 wire
+        #     bodies every named tool-role message was one of these (real=0),
+        #     so the set filled with proof of NON-execution.
+        #   * a bare `tool_calls` entry, which is the model PROPOSING a call —
+        #     1,200 proposals for execute_windows_or_android_command alone,
+        #     against ONE actual tool-body entry in 21 minutes.
+        # With clear_history=False the set also accumulates all session, so it
+        # saturated to the whole 25-name roster and unrun=[] became
+        # unreachable; nine fabricated 'completed' verdicts advanced.
+        #
+        # Fail-open is preserved by SCOPE, not by leniency: every message list
+        # is still scanned (group log + each agent's pairwise buffer), which is
+        # what the 2026-09-05 Trading widening actually needed — that tool had
+        # a REAL result, just in a buffer the old scan missed.
         executed = set()
         _msg_lists = [getattr(group_chat, 'messages', None) or []]
         for ag in agents:
@@ -3348,12 +3369,11 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
             for m in (_ml or []):
                 if not isinstance(m, dict):
                     continue
-                if m.get('role') == 'tool' and m.get('name'):
-                    executed.add(m.get('name'))
-                for tc in (m.get('tool_calls') or []):
-                    fn = ((tc or {}).get('function') or {}).get('name')
-                    if fn:
-                        executed.add(fn)
+                if m.get('role') != 'tool' or not m.get('name'):
+                    continue
+                if HISTORICAL_TOOL_PLACEHOLDER in str(m.get('content') or ''):
+                    continue
+                executed.add(m.get('name'))
         unrun = [n for n in referenced if n not in executed]
         try:
             current_app.logger.info(

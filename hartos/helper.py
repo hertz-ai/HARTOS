@@ -24,6 +24,9 @@ import ast
 # here is what actually keeps it out of the boot.  Same proxy + test as
 # create_recipe.py.  See tests/unit/test_lazy_autogen_import.py.
 from core.optional_import import lazy_module
+# The fabrication gate in reuse_recipe keys on this EXACT string to tell a
+# back-filled stand-in from a real tool result — one definition, no drift.
+from core.constants import HISTORICAL_TOOL_PLACEHOLDER
 autogen = lazy_module("autogen")
 transform_messages = lazy_module(
     "autogen.agentchat.contrib.capabilities.transform_messages")
@@ -1878,7 +1881,7 @@ class ToolMessageHandler:
                                 'role': 'tool',
                                 'name': function_name or assistant_msg.get('name', 'Assistant'),
                                 'tool_call_id': tool_call_id,
-                                'content': "Placeholder response for historical tool call"
+                                'content': HISTORICAL_TOOL_PLACEHOLDER
                             }
 
                             # Insert the placeholder right after the assistant message

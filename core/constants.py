@@ -1138,3 +1138,23 @@ VERDICT_UNDERREPORT_STATUSES = frozenset({VERDICT_PENDING})
 # 'error' is absent too — unmeasured here; do not add it without a measurement.
 VERDICT_ROUND_TERMINAL_STATUSES = frozenset({
     VERDICT_COMPLETED, VERDICT_REQUIRES_BREAKDOWN})
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Synthetic stand-in for a tool_call that never produced a result.
+#
+# helper.py MINTS it: llama.cpp rejects a history whose assistant tool_call
+# has no matching role='tool' answer, so any pending call left behind by an
+# earlier round is back-filled with this content to keep the wire valid.
+#
+# reuse_recipe.py READS it: the fabrication gate must NOT count a placeholder
+# as execution — a placeholder exists precisely BECAUSE the call returned
+# nothing.  Measured 2026-09-06 on 625 wire bodies: every named tool-role
+# message was a placeholder (real=0), so an executed-set that accepted them
+# saturated and unrun=[] became unreachable; nine fabricated 'completed'
+# verdicts advanced unchallenged.
+#
+# ONE definition, because a drifted copy silently re-opens that hole: the
+# minter would write text the reader no longer recognises, and every
+# placeholder would read as a real result again.
+HISTORICAL_TOOL_PLACEHOLDER: str = "Placeholder response for historical tool call"
