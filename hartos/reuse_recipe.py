@@ -2124,7 +2124,18 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
     # factory that builds the closures) so create_recipe's identical
     # helper/assistant leg applies the SAME filter — it had none, and shipped
     # all 72 tools / 10,544 schema tokens into a 12,288-token slot.
-    register_core_tools(main_leg_core_tools(core_tools), helper, assistant)
+    # executor_proposes: the Assistant carries the tool SCHEMA, not execution
+    # alone.  The recipes name IT as the actor
+    # ('agent_to_perform_this_action': 'Assistant'), but the helper=schema /
+    # assistant=execution split meant its outbound bodies carried no tools[] —
+    # measured 2026-09-06 on agent 89555447799: 11 of 1,182 autogen.reuse
+    # bodies had a tools block, and the tools-less execution-persona ones drove
+    # 26x "tool 'google_search' is not available" + 2,657+ "Function <X> not
+    # found".  second_executor keeps the Assistant's own structured calls from
+    # stranding under autogen's repeat-speaker rule — same reason
+    # register_news_tools/register_revenue_tools below are passed executor=.
+    register_core_tools(main_leg_core_tools(core_tools), helper, assistant,
+                        executor_proposes=True, second_executor=executor)
 
     # Channel tools: send to channels, register channels, list status, get context
     try:

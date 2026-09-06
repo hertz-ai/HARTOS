@@ -118,16 +118,57 @@ def main_leg_core_tools(tools):
     return [t for t in tools if t[0] in MAIN_LEG_CORE_TOOLS]
 
 
-def register_core_tools(tools, helper, executor):
+def register_core_tools(tools, helper, executor, *,
+                        executor_proposes=False, second_executor=None):
     """Register (name, desc, func) tuples on an AutoGen helper/executor pair.
 
     Args:
         tools: list of (name, description, func) tuples from build_core_tool_closures()
         helper: AutoGen agent that suggests tool use (register_for_llm)
         executor: AutoGen agent that executes tools (register_for_execution)
+        executor_proposes: ALSO give ``executor`` the LLM schema, so it can
+            propose these tools instead of being told they do not exist.
+        second_executor: a distinct agent that can execute them, so
+            ``executor``'s own structured tool_calls are not stranded.
+
+    ``executor_proposes`` exists because the helper=schema / executor=execution
+    split silently disarms whichever agent the recipe actually assigns the work
+    to.  Measured live 2026-09-06, agent 89555447799: the main leg registered
+    with ``(helper, assistant)``, so the Assistant held execution only and its
+    outbound bodies carried NO ``tools[]`` at all — while ~591 execution-persona
+    bodies in the same window named it as the actor
+    (``'agent_to_perform_this_action': 'Assistant'``).  Downstream that produced
+    26x "The requested tool 'google_search' is not available" and 2,657+
+    "Error: Function <X> not found" (send_message_to_user x1052 — the path that
+    returns the agent's result to the user; request_tools x101 — the
+    never-say-unavailable escape hatch, itself unreachable).
+
+    ``second_executor`` is the other half, for the same reason news_tools.py
+    takes an ``executor=``: once the proposer emits a STRUCTURED tool_call,
+    autogen's repeat-speaker rule will not let that same agent speak again to
+    run it, so a sole-executor proposer strands its own call with no role=tool
+    answer.
+
+    This is the canonical home for the pattern that news_tools.py:421-442 and
+    revenue_tools.py:224-225 currently inline ("Deliberately dual here ... do
+    not 'simplify' it back"); per review follow-up #755 item 2 those two should
+    migrate here rather than a third copy being written.
+
+    Cost, measured before landing: the 18 MAIN_LEG_CORE_TOOLS serialise to
+    ~1,859 tokens.  Against the live geometry (n_ctx 12,288, 1 slot, max_tokens
+    2,048, safety margin 2,816) that leaves 5,565 tokens for messages — well
+    clear of the degrade branch.  Re-measure before widening this to the full
+    service registry, which is ~6,758 tokens and would not fit.
+
+    Defaults are a strict no-op: the time and visual legs keep
+    helper=schema / executor=execution exactly as before.
     """
     for name, desc, func in tools:
         register_dual(helper, executor, func, name, desc)
+        if executor_proposes:
+            executor.register_for_llm(name=name, description=desc)(func)
+        if second_executor is not None:
+            second_executor.register_for_execution(name=name)(func)
 
 
 def filter_service_tools(goal_tags, svc_tools, svc_defs, registry):
