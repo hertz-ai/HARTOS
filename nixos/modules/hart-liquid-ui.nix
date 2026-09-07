@@ -718,7 +718,37 @@ in
           ++ lib.optional (pkgs ? bluez)         pkgs.bluez         # bluetoothctl - bluetooth
           ++ lib.optional (pkgs ? cups)          pkgs.cups          # lpstat/lpadmin/lp - printers
           ++ lib.optional (pkgs ? smartmontools) pkgs.smartmontools # smartctl     - SMART disk health
-          ++ lib.optional (pkgs ? sane-backends) pkgs.sane-backends; # scanimage   - scanners
+          ++ lib.optional (pkgs ? sane-backends) pkgs.sane-backends  # scanimage   - scanners
+          # ── THE FLOOR, so there is no fourth wave ───────────────────────────
+          # Everything above is a capability someone found MISSING on a booted
+          # box and added by hand: gtk-launch on 2026-09-01, six more on
+          # 2026-08-26, flatpak and nix inside app_installer's own PATH helper.
+          # Same defect every time, and the list can only ever be as complete as
+          # the last sweep.
+          #
+          # Swept all 77 binaries the shell layer shells, against this unit's
+          # real PATH on the box 2026-09-07: 33 were INSTALLED and invisible
+          # here. notify-send (so a desktop notification never reaches D-Bus),
+          # xdg-open, xdg-mime, xdg-settings, wl-copy, wl-paste, xclip,
+          # gsettings, wlr-randr (the documented display fallback),
+          # powerprofilesctl, git, gh, hart-self-build, sudo, useradd, pgrep,
+          # pkill, and every nix binary. Each one degrades SILENTLY, because the
+          # canonical probe (core/subprocess_safe.run_probe, 139 call sites)
+          # reads FileNotFoundError as "optional tooling absent on this build".
+          # So the OS reports its own working features as unavailable.
+          #
+          # These two entries are the system profile and the setuid wrappers,
+          # i.e. exactly what a login shell on this node sees. makeBinPath
+          # appends /bin, so the strings carry no /bin themselves (verified on
+          # the box: -> /run/current-system/sw/bin:/run/wrappers/bin).
+          #
+          # They go LAST on purpose. Every pinned entry above still wins, so the
+          # rustdesk guard shim keeps its first-on-PATH contract and nothing
+          # already working changes; this only catches what would otherwise be
+          # invisible. It is a floor, NOT a replacement: an explicit pkgs entry
+          # is still the right way to add a tool, because it pins a version and
+          # makes the dependency real, where this resolves at runtime.
+          ++ [ "/run/current-system/sw" "/run/wrappers" ];
 
         environment = {
           HEVOLVE_DATA_DIR = cfg.dataDir;

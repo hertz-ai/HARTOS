@@ -4526,3 +4526,55 @@ class TestTheNativeTierHasAnIpcRelayToo:
         The client must require a real answer before claiming the transport."""
         client = self._read('integrations/agent_engine/hart_wm_client.py')
         assert "_call_on(path, 'window.list')" in client
+class TestTheServiceCanSeeTheSystemProfile:
+    """The shell must not report its own working features as missing.
+
+    THE RECURRING DEFECT. hart-liquid-ui.service gets a curated PATH, and a
+    tool the curation missed is indistinguishable from a tool that is not
+    installed: core/subprocess_safe.run_probe (the canonical probe behind 139
+    call sites) reads FileNotFoundError as "optional tooling absent on this
+    build" and returns None, so every caller degrades silently.
+
+    It has been found and hand-patched at least three times: gtk-launch on
+    2026-09-01 (typed-name app launch was dead on the appliance), six more
+    capabilities on 2026-08-26, and flatpak/nix inside app_installer's own PATH
+    helper. A curated list is only ever as complete as the last sweep.
+
+    Swept all 77 binaries the shell layer shells against the unit's real PATH
+    on the box 2026-09-07: 33 were installed and invisible, including
+    notify-send, xdg-open, the clipboard tools, gsettings, wlr-randr, git and
+    every nix binary.
+    """
+
+    @staticmethod
+    def _read(rel):
+        with open(os.path.join(REPO_ROOT, rel), encoding='utf8') as fh:
+            return fh.read()
+
+    def _ui(self):
+        return self._read('nixos/modules/hart-liquid-ui.nix')
+
+    def test_the_system_profile_is_on_the_units_path(self):
+        src = self._ui()
+        assert '"/run/current-system/sw"' in src
+        assert '"/run/wrappers"' in src
+
+    def test_the_floor_entries_carry_no_bin_suffix(self):
+        """makeBinPath APPENDS /bin, so a '/bin' here would produce
+        '/run/current-system/sw/bin/bin' and silently fix nothing. Verified on
+        the box: makeBinPath ["/run/current-system/sw" "/run/wrappers"]
+        -> /run/current-system/sw/bin:/run/wrappers/bin."""
+        src = self._ui()
+        assert '"/run/current-system/sw/bin"' not in src
+        assert '"/run/wrappers/bin"' not in src
+
+    def test_the_floor_goes_last_so_pinned_entries_still_win(self):
+        """The rustdesk guard shim has a first-on-PATH contract, and every
+        explicit pkgs entry pins a version. The floor must only catch what
+        would otherwise be invisible, never shadow them."""
+        src = self._ui()
+        floor = src.index('++ [ "/run/current-system/sw" "/run/wrappers" ];')
+        rustdesk = src.index('lib.optional (pkgs ? rustdesk)')
+        last_pinned = src.rindex('lib.optional (pkgs ? sane-backends)')
+        assert rustdesk < floor
+        assert last_pinned < floor
