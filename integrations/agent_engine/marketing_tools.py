@@ -644,16 +644,33 @@ def detect_goal_tags(prompt) -> list:
     # 'sustainab' (107, 12.1% -- generic), and bare 'revenue' (146, 16.5%),
     # which is an owner call because it grants adjust_pricing, a MUTATING
     # tool, to one agent in six.
+    # THE UNDERSCORE FORMS ARE LOAD-BEARING, not decoration.  The first cut
+    # of this block used only the space forms and was HALF VACUOUS: the real
+    # seed (goal_seeding.py:263 bootstrap_finance_agent) writes its tools as
+    # get_financial_health / track_revenue_split / assess_sustainability /
+    # manage_invite_participation, and _mentions matches VERBATIM -- so the
+    # seed's own description scored NO finance tag.  Only its title
+    # ('Finance Agent Vijai') matched, making the fix work or not depending
+    # on whether a caller happens to pass the title.  Measured before and
+    # after: description-only -> [] then ['finance'].
+    #
+    # 'financial_health' also covers the get_ prefix: the lookbehind is
+    # (?<![a-z0-9]) and '_' is not in that class, so it matches inside
+    # get_financial_health.  Exact tool names are the most precise keyword
+    # available -- 4 of 884 real goals (0.45%) each, vs 20.4% for 'budget'.
     finance_keywords = [
-        'financial health', 'revenue split', 'finance agent', 'expense',
-        'accounting', 'cash flow', 'runway', 'profit and loss', 'invoice',
+        'financial health', 'financial_health',
+        'revenue split', 'revenue_split',
+        'assess_sustainability', 'manage_invite_participation',
+        'finance agent', 'expense', 'accounting',
+        'cash flow', 'runway', 'profit and loss', 'invoice',
     ]
     if _mentions(lower, finance_keywords):
         tags.append('finance')
 
     revenue_keywords = [
-        'api revenue', 'revenue split', 'pricing', 'monetiz', 'subscription',
-        'billing',
+        'api revenue', 'api_revenue', 'revenue split', 'revenue_split',
+        'adjust_pricing', 'pricing', 'monetiz', 'subscription', 'billing',
     ]
     if _mentions(lower, revenue_keywords):
         tags.append('revenue')

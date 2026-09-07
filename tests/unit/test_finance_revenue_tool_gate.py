@@ -100,6 +100,38 @@ class TestTagsAreProducible:
         tags = d("Write a short bedtime story about a sleepy fox")
         assert 'finance' not in tags and 'revenue' not in tags, tags
 
+    def test_the_real_seeded_goal_description_alone_tags_finance(self):
+        """The ACTUAL seed text, description only -- not the title.
+
+        This caught a half-vacuous first fix.  goal_seeding.py:263
+        'bootstrap_finance_agent' names its four tools with UNDERSCORES
+        (get_financial_health, track_revenue_split, ...), while the first
+        keyword set used the space forms ('financial health').  _mentions
+        matches verbatim, so the description scored NO finance tag at all;
+        only the title 'Finance Agent Vijai' happened to match, meaning the
+        fix worked or not depending on whether a caller passes the title.
+
+        goal_manager.py:930-934 tells this agent "YOUR TOOLS: 1.
+        get_financial_health ... 4. manage_invite_participation" -- it is
+        promised four tools by name and, before this fix, given none.
+
+        Exact tool names are also the most precise keyword available:
+        measured 4 of 884 real goals (0.45%) each.
+        """
+        d = _detect()
+        desc = (
+            'Make the business self-sustaining with Vijai personality: '
+            '1) Use get_financial_health to monitor platform revenue and costs, '
+            '2) Use track_revenue_split to verify 90/9/1 compliance every period, '
+            '3) Use assess_sustainability to determine if revenue covers '
+            'infrastructure, '
+            '4) Use manage_invite_participation to review private core access '
+            'agreements.')
+        assert 'finance' in d(desc), (
+            "the seeded bootstrap_finance_agent description names all four "
+            "finance tools and still produces no 'finance' tag -- the "
+            "underscore forms are not matched by the space-form keywords")
+
 
 class TestBroadKeywordsStayOut:
     """The three measured-too-broad terms must never be re-introduced.
