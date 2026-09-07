@@ -1101,7 +1101,20 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # (measured live 2026-09-05, agent 88601674818 action 6).  The other
     # families below (channels, media, memory-graph, service registry) are
     # unchanged; only the unbounded core set is brought in line.
-    register_core_tools(main_leg_core_tools(core_tools), helper, assistant)
+    # executor_proposes / second_executor: the SAME arguments reuse's identical
+    # helper/assistant leg passes (reuse_recipe.py:2167).  Without them the
+    # Assistant holds execution only, so its outbound bodies carry no tools[]
+    # while the recipes name IT as the actor
+    # ('agent_to_perform_this_action': 'Assistant') — the wiring
+    # register_core_tools' own docstring documents as producing
+    # "Error: Function <X> not found", send_message_to_user worst-hit (the path
+    # that returns the agent's result to the user).  The remedy was written for
+    # that measurement and applied to reuse; create kept the disarmed wiring
+    # even though the factory exists so the two legs "can never drift apart
+    # again" (core/agent_tools.py:115).  `executor` is already bound at :1016,
+    # so this introduces no new object — only the missing symmetry.
+    register_core_tools(main_leg_core_tools(core_tools), helper, assistant,
+                        executor_proposes=True, second_executor=executor)
     register_memory_graph_tools(memory_graph, helper, assistant, user_id, user_prompt)
 
     # Channel tools: send to channels, register channels, list status, get context
