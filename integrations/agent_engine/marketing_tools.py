@@ -622,6 +622,42 @@ def detect_goal_tags(prompt) -> list:
     if _mentions(lower, news_keywords):
         tags.append('news')
 
+    # Finance + revenue.  These two tags were CONSUMED but never PRODUCED:
+    # reuse_recipe.py:2533 / create_recipe.py:2079 dispatch on 'revenue',
+    # and nothing in this detector emitted it, so the branch was
+    # unreachable; 'finance' was neither emitted nor dispatched, leaving
+    # register_finance_tools with zero production callers.  Measured
+    # 2026-09-07 on the live install: a Finance agent's action reported
+    # 'error' twelve times because manage_invite_participation never
+    # attached.
+    #
+    # The stored-tag arm cannot cover this: 1 of 2,296 saved agents carries
+    # any goal_tags, and the repo's only writer emits 'research', which no
+    # consumer tests for.  So the lexical detector is the ONLY live path.
+    #
+    # Keyword precision measured against the 884 real goals that carry text
+    # (the discipline _mentions' docstring exists to enforce):
+    #   'financial health' 8 (0.9%) | 'api revenue' 7 | 'finance agent' 4
+    #   'expense' 4 | 'accounting' 3 | 'revenue split' 37 (4.2%)
+    #   'pricing' 33 (3.7%)
+    # DELIBERATELY EXCLUDED: 'budget' (180 goals, 20.4% -- "token budget"),
+    # 'sustainab' (107, 12.1% -- generic), and bare 'revenue' (146, 16.5%),
+    # which is an owner call because it grants adjust_pricing, a MUTATING
+    # tool, to one agent in six.
+    finance_keywords = [
+        'financial health', 'revenue split', 'finance agent', 'expense',
+        'accounting', 'cash flow', 'runway', 'profit and loss', 'invoice',
+    ]
+    if _mentions(lower, finance_keywords):
+        tags.append('finance')
+
+    revenue_keywords = [
+        'api revenue', 'revenue split', 'pricing', 'monetiz', 'subscription',
+        'billing',
+    ]
+    if _mentions(lower, revenue_keywords):
+        tags.append('revenue')
+
     media_keywords = [
         'song', 'music', 'compose', 'melody', 'sing', 'vocals',
         'voice clone', 'clone my voice', 'text to speech', 'tts',

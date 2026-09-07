@@ -2084,6 +2084,21 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             from integrations.agent_engine.revenue_tools import register_revenue_tools
             register_revenue_tools(helper, assistant, user_id)
             tool_logger.info("Revenue tools loaded (Tier 2) based on prompt content")
+        if 'finance' in goal_tags:
+            # Finance tools: get_financial_health / track_revenue_split /
+            # assess_sustainability / manage_invite_participation.  EXACTLY
+            # the same defect the news branch below records ("defined, never
+            # wired"): register_finance_tools had zero production callers,
+            # its only caller being tests/e2e/test_e2e_pipelines.py:615.
+            # Measured live 2026-09-07 — a Finance agent's action reported
+            # 'error' on twelve consecutive nudges because the tool it names
+            # could never attach.  NOTE: this block's convention omits
+            # executor= (reuse_recipe.py:2540 passes it); that asymmetry is
+            # pre-existing across revenue/news here and is not widened by
+            # this change.
+            from integrations.agent_engine.finance_tools import register_finance_tools
+            register_finance_tools(helper, assistant, user_id)
+            tool_logger.info("Finance tools loaded (Tier 2) based on prompt content")
         if 'news' in goal_tags:
             # News tools: fetch_news_feeds / subscribe_news_feed /
             # mark_news_for_web etc.  Required by the seeded

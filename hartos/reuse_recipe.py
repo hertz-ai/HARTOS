@@ -2539,6 +2539,16 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             from integrations.agent_engine.revenue_tools import register_revenue_tools
             register_revenue_tools(helper, assistant, user_id, executor=executor)
             current_app.logger.info("Revenue tools loaded (Tier 2) for reuse agent")
+        if 'finance' in goal_tags:
+            # Finance tools: get_financial_health + track_revenue_split +
+            # assess_sustainability + manage_invite_participation.  This
+            # branch did not exist, so register_finance_tools had ZERO
+            # production callers (only tests/e2e/test_e2e_pipelines.py:615)
+            # and a Finance agent's action reported 'error' twelve
+            # consecutive nudges because the tool it names never attached.
+            from integrations.agent_engine.finance_tools import register_finance_tools
+            register_finance_tools(helper, assistant, user_id, executor=executor)
+            current_app.logger.info("Finance tools loaded (Tier 2) for reuse agent")
         if 'news' in goal_tags:
             # News tools parity with create_recipe.py — a Herald (news) recipe
             # authored under the 'news' tag must replay with its feed tools,

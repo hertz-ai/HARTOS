@@ -21,8 +21,21 @@ from integrations.agent_engine.revenue_aggregator import (
 logger = logging.getLogger('hevolve_social')
 
 
-def register_finance_tools(helper, assistant, user_id: str):
-    """Register finance tools with an AutoGen agent (Tier 2)."""
+def register_finance_tools(helper, assistant, user_id: str, executor=None):
+    """Register finance tools with an AutoGen agent (Tier 2).
+
+    Registration mirrors revenue_tools / news_tools (HARTOS 87fb8389 +
+    09afbcf3 + 30c03518) rather than inventing a third shape: the schema
+    goes on BOTH Helper and Assistant, so whichever agent speaker-selection
+    lets propose a tool emits a STRUCTURED tool_call instead of <tool_call>
+    text that autogen never executes; execution is registered on the
+    Assistant and, when supplied, on the distinct executor so the
+    Assistant's own proposals do not strand under the repeat-speaker rule.
+
+    This module previously used the two-line helper-schema/assistant-exec
+    form, which is the pattern documented in core/agent_tools.py:134-143 as
+    silently disarming whichever agent the recipe names as the actor.
+    """
 
     def get_financial_health() -> str:
         """Get platform financial health: revenue, costs, runway, split compliance."""
@@ -271,6 +284,9 @@ def register_finance_tools(helper, assistant, user_id: str):
 
     for name, desc, func in tools:
         helper.register_for_llm(name=name, description=desc)(func)
+        assistant.register_for_llm(name=name, description=desc)(func)
         assistant.register_for_execution(name=name)(func)
+        if executor is not None:
+            executor.register_for_execution(name=name)(func)
 
     logger.info(f"Registered {len(tools)} finance tools for user {user_id}")
