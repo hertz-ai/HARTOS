@@ -20,10 +20,14 @@ WALL-CLOCK, not just the return value. A version of this module that
 regressed to plain `subprocess.run` would still return None here — it would
 just take minutes to do it, and only the clock catches that.
 """
+import logging
 import os
 import subprocess
 import sys
 import time
+from unittest.mock import patch
+
+import core.subprocess_safe as subprocess_safe
 
 import pytest
 
@@ -345,3 +349,63 @@ class TestShellApiProbeContract:
             r = fn(_py("import sys; sys.exit(4)"), timeout=30)
             assert r is not None and r.returncode == 4, \
                 f"{name}._run collapsed a real failure into 'tool missing'"
+class TestAMissingToolIsSaidOutLoudOnce:
+    """A silent degrade is how the same defect survived four rounds.
+
+    run_probe cannot tell "not installed" from "installed, but not on THIS
+    process's PATH", and the second is a real bug: flatpak (2026-08-12), six
+    more capabilities (2026-08-26), gtk-launch (2026-09-01), and every nix
+    binary (2026-09-07, when a sweep found 33 of the 77 tools the shell shells
+    were installed on the box and invisible to the service). All of it hid
+    behind a debug line while callers degraded by design.
+
+    Per call it stays debug (139 call sites, hot path). Once per binary it is a
+    warning, which is what makes the class findable in a journal.
+    """
+
+    def setup_method(self):
+        subprocess_safe._missing_tools_seen.clear()
+
+    def test_the_first_miss_warns(self, caplog):
+        with caplog.at_level(logging.WARNING, logger=subprocess_safe.__name__):
+            with patch.object(subprocess_safe, 'run_bounded',
+                              side_effect=FileNotFoundError()):
+                assert subprocess_safe.run_probe(['definitely-not-a-tool']) is None
+        assert any('definitely-not-a-tool' in r.message for r in caplog.records)
+
+    def test_the_warning_names_the_ambiguity_not_a_conclusion(self, caplog):
+        """It must not assert the tool is absent. Saying so is what sent an
+        operator to debug a Flatpak install that was working fine."""
+        with caplog.at_level(logging.WARNING, logger=subprocess_safe.__name__):
+            with patch.object(subprocess_safe, 'run_bounded',
+                              side_effect=FileNotFoundError()):
+                subprocess_safe.run_probe(['some-tool'])
+        # getMessage() formats once; r.message is ALREADY formatted, so
+        # applying r.args to it again raises TypeError.
+        text = ' '.join(r.getMessage() for r in caplog.records)
+        assert 'PATH' in text
+
+    def test_it_stays_quiet_after_the_first(self, caplog):
+        """139 call sites on a hot path: one line per binary per process, not
+        one per call."""
+        with patch.object(subprocess_safe, 'run_bounded',
+                          side_effect=FileNotFoundError()):
+            with caplog.at_level(logging.WARNING, logger=subprocess_safe.__name__):
+                for _ in range(25):
+                    subprocess_safe.run_probe(['repeated-tool'])
+        hits = [r for r in caplog.records if 'repeated-tool' in r.message]
+        assert len(hits) == 1, 'expected exactly one warning, got %d' % len(hits)
+
+    def test_each_distinct_binary_gets_its_own_line(self, caplog):
+        with patch.object(subprocess_safe, 'run_bounded',
+                          side_effect=FileNotFoundError()):
+            with caplog.at_level(logging.WARNING, logger=subprocess_safe.__name__):
+                subprocess_safe.run_probe(['tool-a'])
+                subprocess_safe.run_probe(['tool-b'])
+        msgs = ' '.join(r.message for r in caplog.records)
+        assert 'tool-a' in msgs and 'tool-b' in msgs
+
+    def test_an_empty_argv_does_not_explode(self, caplog):
+        with patch.object(subprocess_safe, 'run_bounded',
+                          side_effect=FileNotFoundError()):
+            assert subprocess_safe.run_probe([]) is None
