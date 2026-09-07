@@ -4382,3 +4382,71 @@ class TestFirstPaintInferenceGate:
             "the gate must wait on the same shell-ready marker the supervisor's "
             "own paint watchdog uses (readyFlag), so it resolves for whichever "
             "tier paints — not a private path")
+
+
+class TestWaylandSocketWaitOutlastsTheCompositorsStartup:
+    """The Tier-1 wrapper must not give up before hart-comp binds its socket.
+
+    LIVE capture on the Samsung box, 2026-09-07: hart-comp took 14.6s to create
+    wayland-1 and the wrapper's wait expired at 10s, so it declared the tier dead
+    4.1s BEFORE the compositor succeeded. Everything after that line in the same
+    journal is the compositor working perfectly:
+
+        12:46:31.7  hart-comp did not create a wayland socket - exiting
+        12:46:35.9  Created new socket name=Some("wayland-1")
+        12:46:35.9  acquired DRM master via drmSetMaster; scanning out
+        12:46:36.1  first real scanout (page-flip vblank) completed - display LIVE
+
+    The session latched to sway with a healthy compositor still coming up. This is
+    the same shape as the 20 -> 120 shellPaintTimeoutSeconds raise on 2026-08-12;
+    that fix moved the paint budget and left this wait at its original 10s.
+    """
+
+    def _comp(self):
+        return read_nix(os.path.join(MODULES_DIR, "hart-comp.nix"))
+
+    def _iterations(self):
+        m = re.search(r"for _ in \$\(seq 1 (\d+)\); do", self._comp())
+        assert m, "the socket-wait loop is gone or reshaped; re-point this guard"
+        return int(m.group(1))
+
+    def _sleep_step(self):
+        src = self._comp()
+        i = src.index("for _ in $(seq 1 ")
+        m = re.search(r"sleep ([0-9.]+)", src[i:i + 1400])
+        assert m, "the socket-wait loop no longer sleeps; re-point this guard"
+        return float(m.group(1))
+
+    def test_the_wait_covers_the_measured_hardware_startup(self):
+        budget = self._iterations() * self._sleep_step()
+        assert budget >= 45.0, (
+            "the wayland-socket wait is %.1fs. Measured on real hardware, hart-comp "
+            "needs 14.6s on an Ivy Bridge iGPU, and this bound was 10s, which "
+            "dropped Tier-1 on a compositor that went on to scan out. Keep a wide "
+            "margin: a longer bound costs NOTHING on the failure path because the "
+            "loop breaks immediately when the compositor process dies." % budget)
+
+    def test_the_wait_still_fits_inside_the_paint_budget(self):
+        """It must not eat the whole paint watchdog, or a slow socket would leave
+        the shell no time to paint before the supervisor calls the tier HUNG."""
+        sup = read_nix(os.path.join(MODULES_DIR, "hart-session-supervisor.nix"))
+        # Anchored on the OPTION DECLARATION, not the first mention of the name:
+        # it is referenced in prose above its own definition.
+        m = re.search(r"shellPaintTimeoutSeconds = lib\.mkOption \{.*?default = (\d+);",
+                      sup, re.S)
+        assert m, "shellPaintTimeoutSeconds option declaration not found"
+        paint = int(m.group(1))
+        budget = self._iterations() * self._sleep_step()
+        assert budget < paint, (
+            "the socket wait (%.1fs) must stay under the paint budget (%ds), or a "
+            "slow socket leaves no headroom for the shell's first frame" % (budget, paint))
+
+    def test_a_dead_compositor_still_breaks_out_immediately(self):
+        """The reason a long bound is safe. Without this early break, raising the
+        wait would delay every genuine crash by the full budget."""
+        src = self._comp()
+        i = src.index("for _ in $(seq 1 ")
+        block = src[i:i + 1400]
+        assert 'kill -0 "$HART_COMP_PID"' in block and "break" in block, (
+            "the socket-wait loop no longer bails when the compositor dies, so the "
+            "raised bound now delays real crash detection")

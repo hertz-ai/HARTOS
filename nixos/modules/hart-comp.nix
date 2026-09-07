@@ -628,7 +628,32 @@ let
     # shell at it. The socket is the first wayland-N in XDG_RUNTIME_DIR that hart-comp
     # created (it logs the name; we discover it by polling the runtime dir).
     SHELL_SOCK=""
-    for _ in $(seq 1 50); do
+    # 300 x 0.2s = 60s, raised from 50 (10s) on 2026-09-07 after a LIVE capture on
+    # the Samsung box: hart-comp needed 14.6s to bind its socket and the loop gave
+    # up at 10s, so the wrapper declared it dead 4.1s BEFORE it succeeded. Its own
+    # journal for that boot, all AFTER the wrapper had already exited:
+    #   12:46:31.7  hart-comp did not create a wayland socket - exiting
+    #   12:46:35.9  Created new socket name=Some("wayland-1")
+    #   12:46:35.9  acquired DRM master via drmSetMaster; scanning out
+    #   12:46:36.0  bloom.composed width=1600 height=900 took_ms=70
+    #   12:46:36.1  first real scanout (page-flip vblank) completed - display LIVE
+    # Nothing was hung. The 11s sat between creating the wl_output and initialising
+    # libinput, i.e. DRM/EGL probe time on an Ivy Bridge iGPU, and the session was
+    # latched to sway with a perfectly healthy compositor still coming up behind it.
+    #
+    # This is the SAME bug shellPaintTimeoutSeconds already fixed once (20 -> 120 on
+    # 2026-08-12): "a watchdog tuned so tightly that I/O speed decides whether the
+    # desktop comes up is not detecting hangs, it is causing them". That raise moved
+    # the paint budget and left this socket wait at its original 10s, so slow
+    # hardware still lost the race one step earlier.
+    #
+    # A longer bound costs nothing on the failure path: the loop below already
+    # breaks IMMEDIATELY when the compositor process dies, so a genuine crash is
+    # still detected in ~0.2s. The bound only governs "alive but still starting",
+    # where being too short is strictly worse than being too long. 60s is 4x the
+    # measured need and still leaves the 120s paint budget most of its headroom for
+    # the shell's own first frame.
+    for _ in $(seq 1 300); do
       # Newest wayland-N socket in the runtime dir (hart-comp's auto socket).
       SHELL_SOCK=$(ls -t "$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null | grep -v '\.lock$' | head -1 || true)
       # -nt "$HART_SOCK_T0": it must have been bound AFTER we started the compositor.
