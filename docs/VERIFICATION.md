@@ -69,6 +69,7 @@ makes this worth more than another feature.
 | A steady desktop pays no layout at all | same run: a retained-tree hit is p50 and p99 both under 1us, and `rebuilds()` does not move on an unchanged key | 2026-09-05, measured |
 | Windows / macOS capability parity is COMPUTED, not asserted | `OS_PARITY_MATRIX.md`, 30 rows, gated by `test_nixos_configs.py::TestParityMatrix`: 30 pass. 28 present, 2 deliberately partial (remote-desktop control and firewall writes are steward-gated ingress on purpose), 0 gaps | 2026-09-05, pass |
 | The matrix cannot advertise a route that does not exist | same gate: every `/api/shell/...` the matrix cites is checked against the registered routes, and the honest-gap test parametrizes over the gap list, which is now EMPTY (hence its skip) | 2026-09-05, pass |
+| The desktop's event channel opens immediately, not on the next keep-alive | `/api/notifications/stream` on the Samsung box, same probe before and after a one-line overlay: OPEN 15.024s (first frame `: hb`) -> OPEN 0.012s (first frame `: ok`), heartbeats unchanged at 15.012s / 30.013s. Werkzeug withholds the head until the first yield and the producer opened with a 15s CV wait, so every page load and reconnect paid a full heartbeat before `EventSource.onopen`. Fixed ebc84c1 | 2026-09-07, measured on hardware |
 
 Read the sealed rows for what they are. `shell_surface/conftest.py` guarantees a
 poweroff/format/nmcli test can never touch the host, and chapter 00 asserts that
