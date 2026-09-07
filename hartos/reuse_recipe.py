@@ -3110,9 +3110,7 @@ _REUSE_PENDING_STEER_MAX = 2
 #   :2646                            error+pending          — speaker routing
 #   _REUSE_UNDERREPORT_STATUSES      pending                — advancing
 #   VERDICT_ROUND_TERMINAL_STATUSES  completed+breakdown    — ending the round
-#   VERDICT_COMPLETION_STATUSES      completed+success      — the action is done
 from core.constants import (
-    VERDICT_COMPLETION_STATUSES,
     VERDICT_ROUND_TERMINAL_STATUSES,
     VERDICT_UNDERREPORT_STATUSES as _REUSE_UNDERREPORT_STATUSES,
 )
@@ -3268,74 +3266,6 @@ def _reuse_outstanding_tools(user_prompt, action_id, group_chat):
         except Exception:
             pass
         return ['<unknown>']
-
-
-def _reuse_latest_verdict(group_chat, action_id, lookback=12):
-    """The newest StatusVerifier verdict for `action_id`, wherever it sits.
-
-    Both completion consumers used to read `group_chat.messages[-1]` and so
-    could only ever see a verdict that happened to be the LAST message.  It
-    almost never is: state_transition is autogen's speaker-selection callback,
-    so a steer ("You should complete this task independently", "Work on
-    subtask: ...", "Perform this action -> ...") lands after the verdict and
-    buries it.  The same structural property is already documented at the
-    requires_breakdown branch in state_transition.
-
-    Measured live 2026-09-07 09:13-09:19, agent 30611960713 (ONE action,
-    tool get_user_uploaded_file executed 2/2 OK, FAB-GUARD passed unrun=[]):
-    StatusVerifier emitted 6 'completed' verdicts, and across all 59
-    state_transition calls messages[-1] was a steer EVERY time — never a
-    verdict.  So `GOT COMPLETED FOR ACTION` fired 0 times and the action
-    looped on 1 for five minutes.
-
-    Bound to `action_id` on purpose.  A back-scan that accepted any verdict
-    would let a stale 'completed' for action N advance action N+1 — the
-    "force-completed by a nudge" failure a6fd615e5 exists to prevent.  A
-    verdict that names a DIFFERENT action is skipped; one that names none is
-    accepted, because the pipeline's own current_action is the authority
-    (same rule as the existing `_known_aid` / claimed_action_id handling).
-
-    A DOTTED action_id ('1.1', '2.3') is a SUBTASK verdict and is skipped, not
-    mapped onto its parent.  Measured over today's 401 real verdicts in
-    llm_outbound.jsonl: 400 name an action, 23 of the distinct ones are dotted,
-    and their `action` text is the subtask steer verbatim ("Work on subtask:
-    Check available disk space on drive C:...").  One session runs
-    completed 1.1 -> completed 1.2 -> completed 2.1, so subtask 1.1 finishing
-    does NOT mean action 1 is finished — mapping '1.1' to action 1 would
-    advance the action with 1.2 still outstanding, which is precisely a
-    force-completion.  Skipping is strictly conservative: it can only withhold
-    an advance, never manufacture one, and it leaves a decomposed action
-    exactly where it already was.  Whole-number verdicts are unaffected, which
-    is what the undecomposed majority (42 of 65 distinct) emit.
-
-    Returns the parsed dict, or None.  Read-only — it never advances anything;
-    callers route through _advance_or_steer so the fabrication gate inside
-    _advance_reuse_action still decides whether the work was really done.
-    """
-    try:
-        msgs = list(getattr(group_chat, 'messages', None) or [])
-    except Exception:
-        return None
-    for msg in reversed(msgs[-lookback:]):
-        try:
-            parsed = retrieve_json((msg or {}).get('content') or '')
-        except Exception:
-            continue
-        if not isinstance(parsed, dict) or 'status' not in parsed:
-            continue
-        claimed = parsed.get('action_id')
-        if claimed is not None:
-            claimed_s = str(claimed).strip()
-            if '.' in claimed_s:
-                # subtask verdict — keep scanning for one about the action
-                continue
-            try:
-                if int(claimed_s) != int(action_id):
-                    continue
-            except (TypeError, ValueError):
-                pass
-        return parsed
-    return None
 
 
 def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
@@ -3810,39 +3740,9 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             # that path re-runs the fabrication gate, so nothing advances whose
             # tool did not actually execute.
             try:
-                # Find the verdict wherever it sits, not only at [-1].  A steer
-                # normally lands after it (see _reuse_latest_verdict), which is
-                # why this block and the TERMINATE branch below both used to
-                # miss every verdict the agent actually produced.
-                _pend_vj = _reuse_latest_verdict(group_chat, _reuse_current_action)
+                _pend = group_chat.messages[-1] if group_chat.messages else None
+                _pend_vj = retrieve_json((_pend or {}).get('content') or '') if _pend else None
                 _pend_st = str((_pend_vj or {}).get('status', '')).lower()
-
-                # A truthful 'completed' must advance from HERE too.  The only
-                # other consumer (the TERMINATE branch below) fires solely when
-                # messages[-1] is ChatInstructor/'TERMINATE' and reads the
-                # verdict from messages[-2] — so while the loop keeps steering,
-                # TERMINATE never lands last and a real completion is dropped.
-                # Measured live 2026-09-07 on agent 30611960713: 6 'completed'
-                # verdicts, 0 advances, action looped on 1.
-                # NOT a new advance path: same _advance_or_steer, so the
-                # fabrication gate in _advance_reuse_action still refuses (and
-                # re-steers) any action whose tool produced no real result.
-                if (isinstance(_pend_vj, dict)
-                        and _pend_st in VERDICT_COMPLETION_STATUSES
-                        and _reuse_current_action not in _reuse_advanced_actions):
-                    current_app.logger.info(
-                        f"[VERDICT] action {_reuse_current_action} reports "
-                        f"completed (verdict found off the tail) — advancing "
-                        f"via the gated path for session: {user_prompt}")
-                    if not _advance_or_steer(
-                            user_prompt, _reuse_current_action,
-                            "reuse-verdict-completed", prompt_id,
-                            manager, chat_instructor,
-                            claimed_action_id=_reuse_current_action,
-                            advanced_latch=_reuse_advanced_actions):
-                        return ''
-                    continue
-
                 if (isinstance(_pend_vj, dict)
                         and _pend_st in _REUSE_UNDERREPORT_STATUSES
                         and _reuse_current_action not in _reuse_advanced_actions
