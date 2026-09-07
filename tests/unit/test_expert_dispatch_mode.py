@@ -113,6 +113,55 @@ def test_completed_agent_classifier_flags_conversation():
     assert hie.conversation_agent['val-user_val-prompt'] is True
 
 
+def test_agent_bound_turn_never_enters_draft_first():
+    """A prompt_id-bound turn must reach its agent, not the 0.8B draft.
+
+    Live 2026-09-05, Auto Research 18088688973 (a COMPLETED agent with a
+    saved recipe), driven twice with the SAME request 8 minutes apart:
+
+        13:39:40   100s   autogen reuse ran, google_search executed 2x
+        13:47:37   2.4s   answered "Hi! How can I help you today?"
+
+    The 2.4s response carried ``agent_status='Draft-First Mode'`` — the
+    literal from the draft-first block's final ``else``, which returns
+    the draft's reply and ends the turn.  The reuse pipeline never ran,
+    so the agent greeted the user instead of doing its job.
+
+    Root cause: the gate reads ``create_agent``, which is a PHASE flag.
+    ``set_flags_to_enter_reuse_mode`` returns False by design (reuse is
+    not creation — see the sibling test above), so EVERY reuse turn
+    tested False and fell into draft-first.  But the session-shape
+    contract already stated in this codebase — the one ``casual_conv``
+    uses at chatbot_routes:486, ``not bool(prompt_id or create_agent)``
+    — is: no prompt_id = casual companion session (draft-first),
+    prompt_id = agent-bound session.  The gate must speak that same
+    vocabulary instead of a second one.
+
+    Owner ruling 2026-09-05: draft-first "shd not be a problem for
+    prompt id bound requests ... even when create_agent=false".
+
+    System agents keep draft-first: they null their own ``prompt_id``
+    upstream (hart_intelligence_entry ~9387) before reaching this gate.
+    """
+    hie_src = (Path(__file__).resolve().parents[2] /
+               'hart_intelligence_entry.py').read_text(encoding='utf-8')
+    assigns = re.findall(r'^[ \t]*_is_agentic_orchestration\s*=\s*(.+)$',
+                         hie_src, re.MULTILINE)
+    assert assigns, '_is_agentic_orchestration assignment not found'
+    # One computed gate + the create-intent override (`= True`) inside
+    # the draft block.  A second computed assignment would be a parallel
+    # gate and must fail here rather than drift.
+    computed = [a.strip() for a in assigns if a.strip() != 'True']
+    assert len(computed) == 1, (
+        'expected exactly ONE computed _is_agentic_orchestration gate '
+        f'(plus the create-intent override); got {assigns!r}')
+    assert 'prompt_id' in computed[0], (
+        'the draft-first gate ignores session shape: an agent-bound '
+        'REUSE turn (create_agent=False) falls into draft-first and can '
+        'be answered by the 0.8B standby instead of reaching its agent '
+        f'— live 13:47:37 greeting. Predicate is: {computed[0]!r}')
+
+
 def test_review_phase_wraps_already_created():
     """Defense in depth at the Phase-2 recipe() handler: a genuine
     mid-creation resume that turns out already complete must be treated

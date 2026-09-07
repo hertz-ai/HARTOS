@@ -942,6 +942,46 @@ def get_action_state(user_prompt: str, action_id: int) -> ActionState:
         return action_states.get(user_prompt, {}).get(action_id, ActionState.ASSIGNED)
 
 
+def clear_action_states(user_prompt: str) -> int:
+    """Drop one session's action states so a NEW run starts from ASSIGNED.
+
+    `action_states` is keyed only by user_prompt ("{user_id}_{prompt_id}") — it
+    carries no phase dimension and no run id, so CREATE and REUSE for the same
+    agent address the SAME cells.  CREATE force-terminates every action at its
+    flow boundary (create_recipe.py "[FLOW-COMPLETE] Forcing action N ..."), so
+    a REUSE that follows IN THE SAME PROCESS reads TERMINATED for everything and
+    `[AUTO-ADVANCE]`s through the whole flow without executing a single tool.
+
+    Measured live 2026-09-05 on agent 90210554431 (4 actions) — same agent, same
+    recipe, same request, only a process restart between the two runs:
+
+        same process as CREATE -> 4x AUTO-ADVANCE, action 1 -> 5 in 14 ms,
+                                  0 tool calls
+        fresh process          -> 0x AUTO-ADVANCE, action stays 1,
+                                  google_search executed for real
+
+    Restarting is not a fix: the daemon flywheel runs CREATE and REUSE in one
+    long-lived process, which is precisely the failing case.  Clearing at the
+    start of a REUSE run is.
+
+    Scoped to the one session and idempotent (an unknown key is a no-op), so it
+    can never disturb another agent's in-flight run.  Lives here because
+    `set_action_state` is this dict's only writer and `get_action_state` its
+    only reader — a caller reaching into the dict itself would be a third
+    accessor and a parallel path.
+
+    Returns the number of action entries dropped (0 when there was no session).
+    """
+    with _state_lock:
+        dropped = len(action_states.pop(user_prompt, {}) or {})
+    if dropped:
+        logger.info(
+            "[STATE-RESET] cleared %d action state(s) for %s — this run starts "
+            "from ASSIGNED instead of inheriting the previous phase's terminals",
+            dropped, user_prompt)
+    return dropped
+
+
 def validate_state_transition(user_prompt: str, action_id: int, new_state: ActionState) -> bool:
     """Validate state transitions follow the exact sequence"""
     current_state = get_action_state(user_prompt, action_id)

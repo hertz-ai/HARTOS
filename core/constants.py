@@ -75,8 +75,26 @@ AUTOGEN_HISTORY_LIMIT: int = 50                  # message-count limit, unchange
 #                              across slots; default 1)
 LLAMA_CTX_SIZE_DEFAULT: int = 12288
 LLAMA_SLOTS_DEFAULT: int = 1
-WIRE_TRIM_SAFETY_MARGIN_TOKENS: int = 256       # headroom under the budget
+# headroom under the budget.  MUST cover the tokens llama-server ADDS when it
+# renders the Qwen chat template that count_tokens_for_messages never sees:
+# per-message <|im_start|>{role}\n ... <|im_end|>\n wrapping (~4-8 tok/msg over
+# ~40-msg reuse group chats) plus the tool/system block framing.  MEASURED LIVE
+# 2026-09-03: a reuse body the wire-trim passed as fitting its 9984 budget was
+# billed n_prompt_tokens=12567 by llama-server (400 exceed_context_size) — a
+# 2583-token gap the old 256 margin could not absorb, so the "zero-tolerance
+# overflow" guard let it through and the reuse turn died.  The body's raw
+# content tokenized to only 10421 (real /tokenize), so this is template-render
+# overhead, NOT a tokenizer under-count.  Reserve enough to cover it with head-
+# room; the cost is a slightly shorter trimmed history, which autogen tolerates.
+WIRE_TRIM_SAFETY_MARGIN_TOKENS: int = 2816       # 256 base + ~2560 template-render reserve
 WIRE_TRIM_MARKER: str = '...[truncated head]...\n'
+# Seed injected at the wire when an outbound body carries no role='user'
+# turn.  llama-server's Qwen3 chat template raises a hard 500 "No user
+# query found in messages." whenever the messages array reaches it without
+# a user turn (a role='tool' result does NOT satisfy it).  The text is a
+# neutral continuation directive so the model still advances the task.
+WIRE_USER_SEED_TEXT: str = (
+    'Please continue with the current task and produce the final result now.')
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -100,6 +118,37 @@ WIRE_TRIM_MARKER: str = '...[truncated head]...\n'
 # enumerates the same three tiers.
 # ──────────────────────────────────────────────────────────────────────
 HIVE_DEPTH: int = 3
+
+
+# ──────────────────────────────────────────────────────────────────────
+# HIVE_WORKER_CAPABILITIES — the complete vocabulary of capability names
+# a worker node can advertise.
+#
+# A distributed task carries context['capabilities_required']; a worker
+# claims it only when one of ITS capabilities appears in that list
+# (task_coordinator.claim_next_task).  So a requirement naming anything
+# outside this set can never be satisfied by any node in the fleet, and
+# the task sits PENDING forever.
+#
+# This is a DIFFERENT vocabulary from goal_type (marketing, hive_growth,
+# hive_training, autoresearch, robot, …).  The two overlap by accident on
+# five words, which is exactly why writing a goal_type into the capability
+# field looked correct for years: a 'marketing' goal matched, while a
+# 'hive_growth' goal produced an unclaimable task.  Measured on central
+# 2026-09-03 — three hive goals re-dispatched every 30s since 09-01 with
+# every one of their tasks unclaimable.
+#
+# Single source of truth — consumed by:
+#   - integrations.distributed_agent.worker_loop._detect_capabilities
+#     (what this node advertises)
+#   - integrations.agent_engine.dispatch._decompose_goal
+#     (what a task is allowed to demand)
+# ──────────────────────────────────────────────────────────────────────
+HIVE_WORKER_BASE_CAPABILITIES = ('marketing', 'news', 'finance', 'revenue')
+HIVE_WORKER_TIERED_CAPABILITIES = (
+    'coding', 'ip_protection', 'provision', 'vision')
+HIVE_WORKER_CAPABILITIES = frozenset(
+    HIVE_WORKER_BASE_CAPABILITIES + HIVE_WORKER_TIERED_CAPABILITIES)
 
 
 # ISO 639-1 → language name mapping.
@@ -997,3 +1046,95 @@ MACHINE_GOAL_AUTHORS = frozenset({
 # while the app-level policy said 2 MB was fine.
 import os as _os
 MAX_PAYLOAD_BYTES = int(_os.environ.get('HEVOLVE_MAX_PAYLOAD_BYTES', 2 * 1024 * 1024))
+
+
+# ── StatusVerifier verdict vocabulary (ONE source, two pipelines) ────────
+# The StatusVerifier prompt tells the model to answer with one of a fixed
+# set of statuses (create_recipe.py:3114, reuse_recipe.py:1428/1434).  Every
+# consumer then re-spelled those tokens as bare literals, and the two
+# pipelines drifted apart:
+#
+#   create_recipe.py:641,2480  status == 'completed'
+#   create_recipe.py:2475      status == 'completed' OR 'success'   <-- only create
+#   create_recipe.py:2516      status == 'pending'
+#   create_recipe.py:2548      status == 'requires_breakdown'
+#   reuse_recipe.py:2606,2756,2900,3409,3495,3512,4202,4216
+#                              status == 'completed'                <-- 'success' absent
+#   reuse_recipe.py:2635       status == 'requires_breakdown'  (routing)
+#   reuse_recipe.py:2646       status in ('error','pending')   (routing)
+#   reuse_recipe.py:3438       under-reported advance set
+#
+# Measured 2026-09-06: create accepts 'success' as a completion, reuse does
+# not.  Same model, same prompt family — a model that answers "success"
+# completes its action in CREATE and stalls forever in REUSE.  That is the
+# same shape as the requires_breakdown wedge (agent 89555447799: 107 rounds,
+# 0 advances), with a different token.
+#
+# The TOKENS belong here.  The GROUPINGS deliberately differ per call site
+# and are NOT unified: :2646 groups error+pending to route work back to the
+# helper, while :3438 groups pending+requires_breakdown to advance on tool
+# evidence.  Collapsing those would change behaviour — only the spellings
+# are shared.
+VERDICT_COMPLETED = 'completed'
+VERDICT_SUCCESS = 'success'
+VERDICT_PENDING = 'pending'
+VERDICT_ERROR = 'error'
+VERDICT_REQUIRES_BREAKDOWN = 'requires_breakdown'
+
+# An action the model reports as finished.  Both pipelines must agree.
+VERDICT_COMPLETION_STATUSES = frozenset({VERDICT_COMPLETED, VERDICT_SUCCESS})
+
+# The model says "not done" AND has nothing further to do about it.  When the
+# action is autonomous and its named tools are evidenced as executed, that is
+# an under-report, not unfinished work.
+#
+# ONLY 'pending' belongs here.  Two statuses are deliberately excluded because
+# each has its own execution path, and treating them as under-reports would
+# force-advance past work that has not run:
+#
+#   'error'              — reports a failure.  Advancing buries it.
+#   'requires_breakdown' — the model is NOT under-reporting; it is correctly
+#                          saying the action needs decomposing, and it SUPPLIES
+#                          the subtasks.  The designed flow is
+#                          add_subtasks() -> get_pending_subtasks() -> execute
+#                          each -> check_and_unblock_parent() -> parent
+#                          completes.  create_recipe.py:4503-4520 wires exactly
+#                          that.  Advancing on tool evidence instead would mark
+#                          the parent done while its own subtasks sit unrun —
+#                          the "force-completed by a nudge" failure.
+#
+# I had requires_breakdown in this set on 2026-09-06 and it was wrong: it
+# treated a missing execution path as a reporting bug.  The real defect was
+# that reuse_recipe imported get_pending_subtasks/check_and_unblock_parent
+# (lines 181-182) and never called either, so the decomposition it persisted
+# was never executed.  Fixed by wiring the loop, not by widening this set.
+VERDICT_UNDERREPORT_STATUSES = frozenset({VERDICT_PENDING})
+
+# Verdicts that END an action's group-chat round, handing control back to the
+# outer pipeline loop.  Consumed by reuse_recipe._reuse_group_terminate as the
+# manager's is_termination_msg.
+#
+# "Round-terminal" is a DIFFERENT question from "action finished".  It asks:
+# has this action's group conversation produced its answer, so that the OUTER
+# loop is now the thing that must act?  Two verdicts qualify:
+#
+#   'completed'          — the action is done; the loop advances.
+#   'requires_breakdown' — the action needs decomposing and the subtasks are
+#                          supplied; the loop must EXECUTE the decomposition.
+#
+# Both were found the same way, a year apart in the same function:
+#   2026-09-05  'completed' was missing.  The group ran to max_round=10 and
+#               get_agent_response never regained control — verdict at
+#               03:29:12, current_action_id still 1.
+#   2026-09-06  'requires_breakdown' was missing, for identical reasons.
+#               Agent 89555447799: 17 requires_breakdown verdicts, 0 breakdown
+#               executions, 0 advances, action 1 throughout.  The breakdown
+#               execution block had shipped and was PROVEN loaded (py-spy
+#               line-number match against the patched copy) — it simply sits
+#               in the loop that never regained control.
+#
+# 'pending' is deliberately absent: it means the action is still working, and
+# ending the round on it would cut off work that legitimately has more to do.
+# 'error' is absent too — unmeasured here; do not add it without a measurement.
+VERDICT_ROUND_TERMINAL_STATUSES = frozenset({
+    VERDICT_COMPLETED, VERDICT_REQUIRES_BREAKDOWN})

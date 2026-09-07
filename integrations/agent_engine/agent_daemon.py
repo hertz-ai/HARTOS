@@ -260,11 +260,35 @@ def _settle_dispatched_goal(db, goal, goal_key):
       noop                  — no new spark at all; unchanged 5-strike pause
     Continuous goals still never auto-complete.
     """
+    # FLUSH BEFORE REFRESH.  refresh() expires the instance and reloads it
+    # from the database, which silently discards every UN-FLUSHED pending
+    # change on it -- here, the last_dispatched_at stamp and the
+    # spark_at_dispatch snapshot the tick set moments earlier.
+    #
+    # Measured on central 2026-09-03 with a before_cursor_execute listener:
+    # the tick reached the stamp and emitted NO `UPDATE agent_goals` at all.
+    # The object showed up in session.dirty (the attribute HAD been set) but
+    # its net diff was empty, because refresh had already reverted it.  Goal
+    # rows sat frozen from 2026-09-02 12:32 -- the hour this gate shipped --
+    # while the daemon dispatched every 30 seconds for two days.
+    #
+    # Flushing writes our pending change inside the open transaction, so the
+    # reload below returns a row that already carries it, and the outer
+    # db.commit() still governs whether any of it survives.
+    try:
+        db.flush()
+    except Exception:
+        pass  # a flush failure must not stop the gate from judging
     try:
         db.refresh(goal)
     except Exception:
         pass  # refresh failure → fall through to attribute read
-    cfg = goal.config_json or {}
+    # COPY, never mutate-in-place.  config_json is a plain JSON column, not a
+    # MutableDict: mutating the dict the attribute already holds and assigning
+    # that same object back compares equal at flush time, so the column is
+    # never written.  Every marker this gate records -- completion_grounding,
+    # noop_dispatch_count, awaiting_verification -- was lost that way.
+    cfg = dict(goal.config_json or {})
     is_continuous = cfg.get('continuous', False)
     spark_spent = goal.spark_spent or 0
     # Per-dispatch, not lifetime.  Absent key (a goal dispatched before this
@@ -1367,24 +1391,38 @@ class AgentDaemon:
                             f"(cooldown={_CONTINUOUS_COOLDOWN_S}s), skipping")
                         continue
 
-                # ── PARALLEL DISPATCH: check for goals with parallel subtasks ──
-                parallel_dispatched = self._try_parallel_dispatch(
-                    goal, idle_agents, dispatched, max_concurrent)
-                if parallel_dispatched > 0:
-                    dispatched += parallel_dispatched
-                    continue
+                # PARALLEL DISPATCH is selected further down, next to the
+                # speculative and direct styles, so all three share ONE
+                # last_dispatched_at stamp, ONE spark snapshot and ONE
+                # completion gate.
+                #
+                # It used to run HERE and `continue`, which skipped all three
+                # — the exact defect (b) the speculative branch already had
+                # (see the note there).  Measured on central 2026-09-03: the
+                # three hive goals fanned out on every 30s tick while their
+                # rows still read last_dispatched_at=2026-09-01 21:05, spark
+                # frozen, and _settle_dispatched_goal never ran once — so the
+                # flywheel looked idle for two days while it was in fact
+                # dispatching continuously into a queue nothing could claim.
 
-                # Find next unused agent (don't skip goal if current agent is taken)
-                agent = None
-                while dispatched < len(idle_agents) and dispatched < max_concurrent:
-                    candidate = idle_agents[dispatched]
-                    if candidate['user_id'] not in used_agents:
-                        agent = candidate
-                        break
-                    dispatched += 1
+                # Find the next agent nobody has taken this tick.
+                #
+                # This used to walk `dispatched` as a CURSOR into idle_agents
+                # while that same variable is also the dispatch COUNT the loop
+                # compares against max_concurrent.  Stepping over an
+                # already-taken agent therefore burned a concurrency slot, so
+                # on central (max_concurrent == 1, the headroom ceiling) the
+                # first taken agent ended the entire tick.
+                #
+                # Line-traced live 2026-09-03: the loop examined 2 of 5 goals,
+                # dispatched none, and still logged "dispatched 1 goal(s)" --
+                # the 1 was this cursor, not a dispatch.
+                agent = next(
+                    (c for c in idle_agents
+                     if c['user_id'] not in used_agents),
+                    None)
                 if agent is None:
                     break  # No more available agents
-                used_agents.add(agent['user_id'])
 
                 # Load product if marketing goal
                 product_dict = None
@@ -1490,6 +1528,14 @@ class AgentDaemon:
                         f"resume in {backoff_info['skip_until'] - time.time():.0f}s)")
                     continue
 
+                # Reserve the agent only now that the goal has cleared every
+                # gate.  Reserving it at selection time meant a goal skipped
+                # afterwards -- above all by build_prompt returning None, which
+                # every robot goal does on a host with no robot hardware, and
+                # central has none -- permanently consumed an idle agent and
+                # starved every goal behind it in the rotation.
+                used_agents.add(agent['user_id'])
+
                 goal.last_dispatched_at = datetime.utcnow()
 
                 # Snapshot spark BEFORE the handoff so the completion gate can
@@ -1500,7 +1546,10 @@ class AgentDaemon:
                 # subsequent tick without doing any new work.  Written to
                 # config_json (no schema change) and consumed by
                 # _settle_dispatched_goal below.
-                _cfg_pre = goal.config_json or {}
+                # dict(...) copies: config_json is a plain JSON column, so
+                # mutating the dict it already holds and assigning the SAME
+                # object back compares equal at flush time and never writes.
+                _cfg_pre = dict(goal.config_json or {})
                 _cfg_pre['spark_at_dispatch'] = goal.spark_spent or 0
                 goal.config_json = _cfg_pre
 
@@ -1517,8 +1566,22 @@ class AgentDaemon:
                 # DB-backed and dispatch-style-independent, so the SAME gate,
                 # noop counter and auto-pause now judge speculative handoffs.
                 result = None
-                speculated = False
-                if speculative_enabled:
+                handed_off = False
+
+                # PARALLEL: the goal's ledger has independently-runnable
+                # subtasks, so fan them out across the idle agents instead of
+                # dispatching the goal prompt once.  Treated as a handoff
+                # exactly like speculation: truthy result, backoff cleared,
+                # and the completion gate below still judges it.
+                parallel_dispatched = self._try_parallel_dispatch(
+                    goal, idle_agents, dispatched, max_concurrent)
+                if parallel_dispatched > 0:
+                    dispatched += parallel_dispatched
+                    with _module_lock:
+                        _dispatch_backoff.pop(goal_key, None)
+                    handed_off = True
+                    result = 'parallel-handoff'
+                elif speculative_enabled:
                     try:
                         from .speculative_dispatcher import get_speculative_dispatcher
                         dispatcher = get_speculative_dispatcher()
@@ -1531,7 +1594,7 @@ class AgentDaemon:
                             # Success — clear backoff
                             with _module_lock:
                                 _dispatch_backoff.pop(goal_key, None)
-                            speculated = True
+                            handed_off = True
                             # Handed off — same truth as dispatch_goal's
                             # non-None. Truthy so the failure/backoff arm
                             # (synchronous failures only; speculation reports
@@ -1541,7 +1604,7 @@ class AgentDaemon:
                     except ImportError:
                         pass
 
-                if not speculated:
+                if not handed_off:
                     result = dispatch_goal(prompt, str(agent['user_id']), goal.id, goal.goal_type)
                     dispatched += 1
                     self._wd_heartbeat()
@@ -1576,7 +1639,7 @@ class AgentDaemon:
                     if failure_count >= 5:
                         # Auto-pause after 5 consecutive failures
                         goal.status = 'paused'
-                        cfg = goal.config_json or {}
+                        cfg = dict(goal.config_json or {})  # copy: see above
                         cfg['pause_reason'] = (
                             f'Auto-paused: {failure_count} consecutive '
                             f'dispatch failures')

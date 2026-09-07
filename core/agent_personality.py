@@ -635,7 +635,8 @@ def generate_personality(role: str, goal: str, agent_name: str = "") -> AgentPer
 
 def build_personality_prompt(personality: AgentPersonality,
                              resonance_profile=None,
-                             user_language: str = '') -> str:
+                             user_language: str = '',
+                             execution_mode: bool = False) -> str:
     """Build a ~200 token system_message block encoding the personality.
 
     Injected into agent system_messages so they embody the personality
@@ -645,6 +646,13 @@ def build_personality_prompt(personality: AgentPersonality,
         personality: The base agent personality.
         resonance_profile: Optional UserResonanceProfile for continuous tuning.
         user_language: User's preferred language for regional tone code-mixing.
+        execution_mode: True for REUSE execution turns, where the saved recipe
+            IS the plan.  Suppresses the "ask 1-2 clarifying questions before
+            executing" proactive behaviour, which is a CREATE-time behaviour:
+            in REUSE it made the model open with discovery questions instead
+            of running the saved recipe (measured live 2026-09-03, agent
+            18088688973: it asked "what deeper vision?").  The recipe's own
+            persona already declares autonomous execution.
     """
     from hartos.cultural_wisdom import get_trait_by_name, PROACTIVE_BEHAVIORS
 
@@ -661,7 +669,11 @@ def build_personality_prompt(personality: AgentPersonality,
 
     # Build proactive instructions
     proactive_lines = []
-    if personality.proactive_vision_check:
+    # execution_mode (REUSE): the recipe IS the plan, so NEVER inject the
+    # "ask clarifying questions before executing" behaviour — it makes the
+    # model stall with discovery questions / holding messages instead of
+    # running the saved recipe and synthesising from the real tool outputs.
+    if personality.proactive_vision_check and not execution_mode:
         proactive_lines.append(
             "1. Before executing any complex task, ask the user 1-2 clarifying questions "
             "to understand their deeper vision and intent."

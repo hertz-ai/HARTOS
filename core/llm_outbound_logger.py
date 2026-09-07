@@ -551,7 +551,8 @@ def _trim_to_budget(body: dict) -> tuple:
     Reuses ``core.token_utils`` for token counting (single source) and
     ``core.constants`` for the safety margin + marker (single source).
     """
-    from core.constants import WIRE_TRIM_SAFETY_MARGIN_TOKENS, WIRE_TRIM_MARKER
+    from core.constants import (WIRE_TRIM_SAFETY_MARGIN_TOKENS, WIRE_TRIM_MARKER,
+                                 WIRE_USER_SEED_TEXT)
     from core.token_utils import (
         count_tokens_for_messages, count_tokens_for_text, _content_to_text,
     )
@@ -559,6 +560,38 @@ def _trim_to_budget(body: dict) -> tuple:
     messages = list(body.get('messages') or [])
     if not messages:
         return body, 0, 0, 0, 0, 0
+
+    # ─── Guarantee at least one role='user' turn (before any budget math) ───
+    # llama-server's Qwen3 chat template raises a hard 500 "No user query
+    # found in messages." whenever the body reaches it with no user turn — a
+    # role='tool' result does NOT satisfy it.  Measured live 2026-09-03
+    # 03:40:07 (source autogen.reuse, roles [system, assistant, tool,
+    # assistant]): a reuse group-chat reply view lost its user anchor and the
+    # turn died with that 500.  The anchor logic further down only PRESERVES
+    # an existing user turn during trimming, and the whole trim path is
+    # skipped for under-budget bodies (this one was 4 short messages ~ far
+    # under budget), so a user-less small body sailed straight through the
+    # `est_before <= budget` early-return untouched.  The wire is the single
+    # chokepoint EVERY outbound body crosses (autogen + langchain + raw SDK),
+    # which is why the guard belongs here and not in a per-agent transform:
+    # ToolMessageHandler.validate_messages is registered per agent and was
+    # bypassed on this reply path (no seed line logged, body still user-less).
+    # Idempotent — strict no-op when a user turn already exists.
+    if not any(isinstance(m, dict) and (m.get('role') or '') == 'user'
+               for m in messages):
+        _seed_idx = 1 if (isinstance(messages[0], dict)
+                          and messages[0].get('role') == 'system') else 0
+        messages.insert(_seed_idx, {'role': 'user', 'name': 'User',
+                                    'content': WIRE_USER_SEED_TEXT})
+        # Rebuild body so BOTH the under-budget early-return and the trim
+        # path carry the seed (the early-return returns `body` as-is; a fresh
+        # dict also makes `_apply_trim_to_request`'s `trimmed is body` check
+        # re-serialize the wire bytes, exactly like the max_tokens pin below).
+        body = dict(body)
+        body['messages'] = messages
+        logger.info(
+            "wire-trim: seeded one user turn (body had no role='user' — would "
+            "trip llama-server's Qwen3 'No user query found in messages' 500).")
 
     model = body.get('model') or None
     max_tokens = int(body.get('max_tokens') or body.get('max_completion_tokens') or 2048)

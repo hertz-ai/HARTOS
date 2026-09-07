@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 53
+SCHEMA_VERSION = 54
 
 
 # Tables that hold tenant-scoped user content. v40 adds a nullable
@@ -1890,3 +1890,54 @@ def run_migrations():
                     logger.warning(
                         "v53 migration: %s failed: %s", label, e)
         set_schema_version(engine, 53)
+
+    if current < 54:
+        # v54 (2026-09-03): add comments.agent_id + comments.privacy.
+        #
+        # Both were added to the Comment model without a migration behind
+        # them, so every deployment created before that model change has a
+        # `comments` table without them.  SQLAlchemy selects every mapped
+        # column, so the omission did not degrade gracefully -- it took out
+        # the whole endpoint:
+        #
+        #   sqlite3.OperationalError: no such column: comments.agent_id
+        #     services.py:761 CommentService.get_by_post -> q.all()
+        #     api.py:1782 get_comments
+        #
+        # Measured on central 2026-09-03: 30 identical 500s in a 30-minute
+        # window, i.e. every attempt to read the comments on any post.
+        # A schema-drift sweep over Base.metadata found these two and
+        # nothing else, so this migration closes the drift completely.
+        #
+        # Both are index=True on the model, so the indexes are created here
+        # too; without them the column exists but the mapper's index is a
+        # lie and comment-by-agent lookups table-scan.
+        logger.info(
+            "HevolveSocial: migrating to v54 "
+            "(comments.agent_id + comments.privacy)")
+        _v54_stmts = [
+            ("ALTER TABLE comments ADD COLUMN agent_id VARCHAR(64)",
+             "ADD COLUMN comments.agent_id"),
+            ("ALTER TABLE comments ADD COLUMN privacy VARCHAR(16)",
+             "ADD COLUMN comments.privacy"),
+            ("CREATE INDEX IF NOT EXISTS ix_comments_agent_id "
+             "ON comments(agent_id)",
+             "INDEX comments(agent_id)"),
+            ("CREATE INDEX IF NOT EXISTS ix_comments_privacy "
+             "ON comments(privacy)",
+             "INDEX comments(privacy)"),
+        ]
+        for sql, label in _v54_stmts:
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text(sql))
+                    conn.commit()
+            except Exception as e:
+                if _is_already_exists_error(e):
+                    logger.info(
+                        "v54 migration: %s skipped (already exists)",
+                        label)
+                else:
+                    logger.warning(
+                        "v54 migration: %s failed: %s", label, e)
+        set_schema_version(engine, 54)

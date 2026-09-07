@@ -483,6 +483,82 @@ def _win_diskpart_clean(disk_number, log):
             pass
 
 
+def _win_dismount_disk_volumes(disk_number, log=None):
+    """FSCTL-dismount EVERY volume on the disk, INCLUDING the letterless FAT32 ESP
+    a raw GPT image creates -- which _dismount_windows (drive-letter only) misses
+    and whose kernel mount walls the write with ACCESS_DENIED (5) a few MB in,
+    unrecoverably by the drive-letter dismount+reopen re-arm. `diskpart offline`
+    cannot help (unsupported on removable media). This is the Rufus/Win32DiskImager
+    approach: enumerate volumes, keep those whose disk extents are on disk_number,
+    FSCTL_LOCK_VOLUME + FSCTL_DISMOUNT_VOLUME each. Best-effort; never raises.
+    Returns the count dismounted.
+
+    UNUSED (2026-09-03, do not wire into the per-chunk write re-arm): calling this
+    on every ACCESS_DENIED (5) HANGS/crawls the flash -- the ESP RE-MOUNTS after
+    each dismount, so dismount-per-chunk never converges. A working Windows raw
+    USB flash needs lock-and-HOLD (open each volume's FSCTL_LOCK_VOLUME handle and
+    keep it open for the WHOLE write, Rufus-style), not per-chunk dismount. Kept as
+    a reference for that future fix; balenaEtcher/Rufus are the reliable path now."""
+    log = log or (lambda m: None)
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+    except Exception as e:
+        log("  FSCTL dismount: ctypes/kernel32 unavailable (%s)" % e)
+        return 0
+    GENERIC_RW, SHARE_RW, OPEN_EXISTING = 0xC0000000, 0x3, 3
+    FSCTL_LOCK_VOLUME, FSCTL_DISMOUNT_VOLUME = 0x00090018, 0x00090020
+    IOCTL_GET_DISK_EXTENTS = 0x00560000
+    INVALID = wintypes.HANDLE(-1).value
+    k.CreateFileW.restype = wintypes.HANDLE
+    k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                              wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    k.FindFirstVolumeW.restype = wintypes.HANDLE
+    k.FindFirstVolumeW.argtypes = [wintypes.LPWSTR, wintypes.DWORD]
+    k.FindNextVolumeW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD]
+    k.FindVolumeClose.argtypes = [wintypes.HANDLE]
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    k.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID,
+                                  wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                                  ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+    buf = ctypes.create_unicode_buffer(260)
+    fh = k.FindFirstVolumeW(buf, 260)
+    if fh == INVALID:
+        return 0
+    count = 0
+    try:
+        while True:
+            devpath = buf.value.rstrip("\\")          # CreateFile needs no trailing '\'
+            vh = k.CreateFileW(devpath, GENERIC_RW, SHARE_RW, None, OPEN_EXISTING, 0, None)
+            if vh != INVALID:
+                try:
+                    out = ctypes.create_string_buffer(4096)
+                    ret = wintypes.DWORD()
+                    if k.DeviceIoControl(vh, IOCTL_GET_DISK_EXTENTS, None, 0, out, 4096,
+                                         ctypes.byref(ret), None):
+                        n = int.from_bytes(out.raw[0:4], "little")
+                        on_disk = any(
+                            int.from_bytes(out.raw[8 + i * 24: 8 + i * 24 + 4], "little")
+                            == disk_number for i in range(n))
+                        if on_disk:
+                            k.DeviceIoControl(vh, FSCTL_LOCK_VOLUME, None, 0, None, 0,
+                                              ctypes.byref(ret), None)
+                            if k.DeviceIoControl(vh, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0,
+                                                 ctypes.byref(ret), None):
+                                count += 1
+                finally:
+                    k.CloseHandle(vh)
+            if not k.FindNextVolumeW(fh, buf, 260):
+                break
+    finally:
+        k.FindVolumeClose(fh)
+    if count:
+        log("  FSCTL-dismounted %d volume(s) on disk %d (incl. any letterless ESP)"
+            % (count, disk_number))
+    return count
+
+
 def _prepare_windows_device(disk, dd, log, clean=True):
     """Release Windows' raw-write protection before flashing: disable automount
     (so the freshly-written ISO isn't re-mounted + re-protected mid-write), drop
@@ -569,9 +645,14 @@ class _WinExclusiveWriter:
         # (Verified: a bare exclusive open succeeds seconds after the flasher's
         # first attempt failed err 32 on a Cruzer Blade whose `clean` was
         # refused with "Incorrect function".)
-        _TRANSIENT = (32, 21, 5)        # SHARING_VIOLATION, NOT_READY, ACCESS_DENIED
+        # 433 (NO_SUCH_DEVICE): a flaky USB controller (SanDisk Cruzer Blade)
+        # drops off the bus mid-write; PhysicalDriveN briefly resolves to no
+        # device and the exclusive open returns 433. It re-appears within
+        # seconds at the SAME number, so retry-with-backoff reopens it (the
+        # write_at re-arm below relies on this to continue the flash).
+        _TRANSIENT = (32, 21, 5, 433)   # SHARING_VIOLATION, NOT_READY, ACCESS_DENIED, NO_SUCH_DEVICE
         last_err = 0
-        for attempt in range(6):
+        for attempt in range(8):
             h = k.CreateFileW(r"\\.\PhysicalDrive%d" % disk_number,
                               0xC0000000, 0, None, 3, 0, None)
             if h != self.invalid:
@@ -579,7 +660,7 @@ class _WinExclusiveWriter:
             last_err = ctypes.get_last_error()
             if last_err not in _TRANSIENT:
                 break
-            time.sleep(2 + attempt)     # 2,3,4,5,6s — let the volume manager release
+            time.sleep(2 + attempt)     # 2..9s — let the volume manager release / the stick re-appear
         raise RuntimeError("exclusive open of PhysicalDrive%d failed (err %d) — "
                            "is the disk still mounted? (a re-plug or reboot "
                            "resets a stick whose controller refuses writes)"
@@ -595,7 +676,7 @@ class _WinExclusiveWriter:
             pass
         _win_automount(False)
         try:
-            _dismount_windows(self._disk)
+            _dismount_windows(self._disk)          # drive-letter volumes
         except Exception:
             pass                        # best-effort: the reopen is the real test
         self.h = self._open()
@@ -616,17 +697,22 @@ class _WinExclusiveWriter:
                 break
             if len(buf) % SECTOR:                          # pad a final partial sector
                 buf += b"\x00" * (SECTOR - len(buf) % SECTOR)
-            # Re-arm + retry on the volume-manager claim (see the class docstring):
-            # a raw GPT+FAT32 image gets its ESP mounted the moment the table
-            # lands, and the next write into that span returns ACCESS_DENIED.
-            for attempt in range(5):
+            # Re-arm + retry on a transient device claim OR drop (see the class
+            # docstring): a raw GPT+FAT32 image gets its ESP mounted the moment
+            # the table lands and the next write into that span returns
+            # ACCESS_DENIED (5); a flaky USB controller (SanDisk Cruzer Blade)
+            # instead drops off the bus mid-write so the write returns
+            # NO_SUCH_DEVICE (433). Both recover within seconds — drop the handle,
+            # dismount, reopen (retrying the reappearing device), re-seek, and
+            # rewrite the IDENTICAL buffer at the IDENTICAL offset (idempotent).
+            for attempt in range(8):
                 if k.WriteFile(self.h, buf, len(buf), ctypes.byref(written), None):
                     break
                 err = ctypes.get_last_error()
-                if err != 5 or attempt == 4:               # ACCESS_DENIED only
+                if err not in (5, 433) or attempt == 7:    # claim (5) or bus drop (433)
                     raise RuntimeError("write at %d failed (err %d)"
                                        % (byte_offset + total, err))
-                time.sleep(1 + attempt)
+                time.sleep(2 + attempt)                    # 2..9s — release / re-appear
                 self._rearm()
                 _seek(byte_offset + total)                 # absolute — handle is new
             total += written.value
@@ -786,6 +872,14 @@ def _dd_bytes(stderr):
 
 # ───────────────────────── download / stream a part ─────────────────────────
 def download_part(gh, tag, name, tmp, want_size, log, tries=4):
+    # Namespace the cache dir by TAG. The raw parts are a FIXED 1900 MiB, so the
+    # size-only reuse check below would otherwise hand back a same-size part left
+    # from a DIFFERENT (older) tag and flash the WRONG image silently -- a real
+    # trap 2026-09-03: an August build's parts were reused for a September tag and
+    # only a manual sha256 of the reassembled image caught it. One subdir per tag
+    # keeps tags from colliding while still reusing a real partial download.
+    tmp = os.path.join(tmp, "".join(
+        c if (c.isalnum() or c in "._-") else "_" for c in str(tag)))
     os.makedirs(tmp, exist_ok=True)
     dest = os.path.join(tmp, name)
     if os.path.exists(dest) and os.path.getsize(dest) == want_size:

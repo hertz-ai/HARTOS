@@ -248,6 +248,8 @@ pub struct State {
     pub native_shell_on: bool,
     /// NATIVE SHELL M3: the latest home_compose scene from the shell.compose IPC verb.
     pub native_home: Option<crate::scene::HomeCompose>,
+    /// NATIVE SHELL M3 text: cosmic-text rasterizer (FontSystem enumerated once).
+    pub text_rasterizer: crate::text_render::TextRasterizer,
     pub black_buffer: smithay::backend::renderer::element::solid::SolidColorBuffer,
     /// NATIVE SHELL M1 — the composed aura backdrop, cached across frames so the
     /// per-pixel compose runs once per (mode, theme) rather than every frame.
@@ -255,6 +257,17 @@ pub struct State {
     /// NATIVE SHELL M2 — the voice orb, composed once and animated per frame by
     /// scale+alpha on the GPU.
     pub orb: crate::comp_core::OrbCache,
+    /// NATIVE SHELL M3 — rounded-rect buffers (cards, omnibox), composed once per
+    /// unique size/radius/colour so the corner radius the scene specifies is drawn.
+    pub rect_cache: crate::comp_core::RectCache,
+    /// NATIVE SHELL: the RETAINED scene tree. Rebuilt only when the output size, the
+    /// composed home payload or the theme changes, so a steady desktop stops rebuilding
+    /// its layout every frame (the zero-per-frame-alloc NFR).
+    pub scene_cache: crate::scene::SceneCache,
+    /// NATIVE SHELL M2 press half: pointer buttons currently held on the seat, kept
+    /// current by the shared `on_pointer_button`. The native orb reads it via
+    /// `pointer_pressed` to react to a click held over it.
+    pub pointer_buttons_down: u32,
     /// M8 — the com.hart.Compositor IPC server's per-compositor state (the event
     /// fan-out subscribers). The DRM backend serves the SAME framed-JSON socket the
     /// winit backend does, so an agent arranges real windows on real hardware too.
@@ -392,6 +405,9 @@ impl CompState for State {
     fn set_native_home(&mut self, home: crate::scene::HomeCompose) {
         self.native_home = Some(home);
     }
+    fn text_rasterizer_mut(&mut self) -> &mut crate::text_render::TextRasterizer {
+        &mut self.text_rasterizer
+    }
     fn set_capture_blocked_flag(&mut self, on: bool) {
         self.capture_blocked = on;
     }
@@ -403,6 +419,31 @@ impl CompState for State {
     }
     fn orb_mut(&mut self) -> &mut crate::comp_core::OrbCache {
         &mut self.orb
+    }
+    fn native_scene_caches(
+        &mut self,
+    ) -> (
+        &mut crate::text_render::TextRasterizer,
+        &mut crate::comp_core::OrbCache,
+        &mut crate::comp_core::RectCache,
+        &mut crate::scene::SceneCache,
+    ) {
+        (
+            &mut self.text_rasterizer,
+            &mut self.orb,
+            &mut self.rect_cache,
+            &mut self.scene_cache,
+        )
+    }
+    fn note_pointer_button(&mut self, down: bool) {
+        if down {
+            self.pointer_buttons_down = self.pointer_buttons_down.saturating_add(1);
+        } else {
+            self.pointer_buttons_down = self.pointer_buttons_down.saturating_sub(1);
+        }
+    }
+    fn pointer_pressed(&self) -> bool {
+        self.pointer_buttons_down > 0
     }
     fn emit_window_event(&mut self, event: &str, window: &Window, handle: &str) {
         // Fan the edge out over the SHARED framed-JSON IPC (the same socket the winit

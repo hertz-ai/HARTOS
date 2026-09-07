@@ -468,6 +468,59 @@ class TestDecomposeGoal:
 
         assert len(tasks) == 2
 
+    def test_a_goal_type_that_is_also_a_capability_is_still_demanded(self):
+        """The five words that live in both vocabularies must keep working —
+        a marketing task should still be routed to a marketing-capable node."""
+        from core.constants import HIVE_WORKER_CAPABILITIES
+        with patch.dict('sys.modules', {
+            'integrations.agent_engine.parallel_dispatch': None,
+        }):
+            tasks = dispatch_mod._decompose_goal('p', 'g1', 'marketing', 'u1')
+
+        assert tasks[0]['capabilities'] == ['marketing']
+        assert 'marketing' in HIVE_WORKER_CAPABILITIES
+
+    def test_a_goal_type_that_is_not_a_capability_demands_nothing(self):
+        """Measured on central 2026-09-03: hive_growth / hive_training goals
+        produced tasks requiring capability 'hive_growth', which NO node can
+        advertise (worker_loop._detect_capabilities emits only the shared
+        vocabulary). Those tasks sat PENDING forever and their goals never
+        grounded. A goal type is not a capability."""
+        from core.constants import HIVE_WORKER_CAPABILITIES
+        for goal_type in ('hive_growth', 'hive_training', 'autoresearch',
+                          'thought_experiment'):
+            with patch.dict('sys.modules', {
+                'integrations.agent_engine.parallel_dispatch': None,
+            }):
+                tasks = dispatch_mod._decompose_goal('p', 'g1', goal_type, 'u1')
+
+            assert goal_type not in HIVE_WORKER_CAPABILITIES
+            assert tasks[0]['capabilities'] == [], (
+                f'{goal_type} is demanded as a capability, so the task is '
+                f'unclaimable by every node in the fleet')
+
+    def test_every_demanded_capability_is_one_a_worker_can_advertise(self):
+        """The invariant behind both cases above, stated once: whatever
+        _decompose_goal demands, _detect_capabilities must be able to supply."""
+        from core.constants import HIVE_WORKER_CAPABILITIES
+        from integrations.distributed_agent.worker_loop import DistributedWorkerLoop
+
+        advertisable = set(DistributedWorkerLoop()._detect_capabilities())
+        assert advertisable <= HIVE_WORKER_CAPABILITIES, (
+            'a node advertises a capability outside the shared vocabulary: '
+            f'{advertisable - HIVE_WORKER_CAPABILITIES}')
+
+        for goal_type in ('marketing', 'news', 'finance', 'revenue', 'coding',
+                          'hive_growth', 'hive_training', 'robot', 'p2p'):
+            with patch.dict('sys.modules', {
+                'integrations.agent_engine.parallel_dispatch': None,
+            }):
+                tasks = dispatch_mod._decompose_goal('p', 'g1', goal_type, 'u1')
+            demanded = set(tasks[0]['capabilities'])
+            assert demanded <= HIVE_WORKER_CAPABILITIES, (
+                f'{goal_type} demands {demanded - HIVE_WORKER_CAPABILITIES}, '
+                f'which no worker can ever advertise')
+
 
 # ── _get_distributed_coordinator ──────────────────────────────────────────
 

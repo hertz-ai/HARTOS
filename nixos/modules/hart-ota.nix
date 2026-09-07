@@ -436,7 +436,7 @@ in
       defaultText = lib.literalExpression ''"hart-''${config.hart.variant}"'';
       description = ''
         The nixosConfigurations attribute this node switches to on apply
-        (`nixos-rebuild switch --flake <ref>#<flakeAttr>`). The config NAMES
+        (`nixos-rebuild boot --flake <ref>#<flakeAttr>`). The config NAMES
         ITSELF here, because the same variant exists in several image kinds
         and only the config knows which one it is: hart-<variant> is the
         ISO-kind closure, hart-<variant>-raw the dd-able raw image, and an
@@ -1072,7 +1072,7 @@ in
             journalctl -u hart-ota-check -n 20 --no-pager
             ;;
           apply)
-            echo "Applying staged update..."
+            echo "Staging update as the next-boot default (reboot activates it)..."
             # ONE apply path (task #22): the request writer resolves the
             # central-approved switch_flake from pending_update.json exactly
             # like autoApply does (closing the 2026-07-29 flakeRef-vs-
@@ -1112,7 +1112,7 @@ in
             echo "Commands:"
             echo "  hart-ota status       Show update status + current generation"
             echo "  hart-ota check        Poll CENTRAL for updates now (user trigger)"
-            echo "  hart-ota apply        Apply staged update (nixos-rebuild switch)"
+            echo "  hart-ota apply        Stage pending update as next-boot default (nixos-rebuild boot)"
             echo "  hart-ota rollback     Revert to previous generation"
             echo "  hart-ota self-build   Rebuild OS from current config (runtime.nix)"
             echo "  hart-ota dry-run      Test build without applying"

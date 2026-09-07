@@ -505,6 +505,7 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         // NATIVE SHELL M3: opt in per session via the env, default OFF (no regression).
         native_shell_on: std::env::var_os("HART_NATIVE_SHELL").is_some(),
         native_home: None,
+        text_rasterizer: crate::text_render::TextRasterizer::new(),
         black_buffer,
         // NATIVE SHELL M1 — empty until the first frame composes the backdrop at
         // the output's real mode (the 1920x1080 guess above is only the killswitch
@@ -512,6 +513,13 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         bloom: Default::default(),
         // NATIVE SHELL M2 — composed on the first frame at the real output size.
         orb: Default::default(),
+        // NATIVE SHELL M3 — rounded-rect buffers, composed on first use per card size.
+        rect_cache: Default::default(),
+        // NATIVE SHELL: retained scene tree, built on the first frame then reused until
+        // the size, the composed home or the theme changes.
+        scene_cache: Default::default(),
+        // NATIVE SHELL M2 press half: no buttons held at boot.
+        pointer_buttons_down: 0,
         ipc: crate::ipc::IpcState::default(),
         // F1 (#166) — no flips in flight at boot; the VBlank source populates this.
         vblank_completed: std::collections::HashSet::new(),

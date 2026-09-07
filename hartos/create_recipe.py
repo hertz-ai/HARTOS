@@ -892,8 +892,21 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 simplemem_store = SimpleMemStore(sm_config)
                 user_simplemem[user_prompt] = simplemem_store
                 tool_logger.info(f"[SIMPLEMEM] Initialized for {user_prompt}")
+            else:
+                # Twin of reuse_recipe.py's silent exit — same defect on the
+                # CREATE side, so recipes are authored by an agent that also
+                # lost the tools its own prompts name.
+                tool_logger.info(
+                    "[SIMPLEMEM] Not configured (enabled=%s, api_key=%s) — "
+                    "long-term memory runs on MemoryGraph for %s",
+                    bool(sm_config.enabled), bool(sm_config.api_key),
+                    user_prompt)
         except Exception as e:
             tool_logger.warning(f"[SIMPLEMEM] Init failed: {e}")
+    else:
+        tool_logger.info(
+            "[SIMPLEMEM] Package unavailable — long-term memory runs on "
+            "MemoryGraph for %s", user_prompt)
 
     # Initialize MemoryGraph for provenance-aware memory
     memory_graph = None
@@ -1065,7 +1078,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # --- Core tools (defined once in core/agent_tools.py) ---
     from core.agent_tools import (
         build_core_tool_closures, register_core_tools, register_memory_graph_tools,
-        register_dual,
+        register_dual, main_leg_core_tools,
     )
     _tool_ctx = {
         'user_id': user_id, 'prompt_id': prompt_id,
@@ -1081,7 +1094,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         'save_conversation_db': save_conversation_db,
     }
     core_tools = build_core_tool_closures(_tool_ctx)
-    register_core_tools(core_tools, helper, assistant)
+    # Same name filter the reuse pipeline's identical helper/assistant leg
+    # uses (core.agent_tools.MAIN_LEG_CORE_TOOLS).  This call registered ALL
+    # core closures — the asymmetry that put 72 tools / 10,544 schema tokens
+    # into a 12,288-token slot and 400'd every create turn once a flow grew
+    # (measured live 2026-09-05, agent 88601674818 action 6).  The other
+    # families below (channels, media, memory-graph, service registry) are
+    # unchanged; only the unbounded core set is brought in line.
+    register_core_tools(main_leg_core_tools(core_tools), helper, assistant)
     register_memory_graph_tools(memory_graph, helper, assistant, user_id, user_prompt)
 
     # Channel tools: send to channels, register channels, list status, get context
@@ -3917,7 +3937,17 @@ def create_action_with_ledger(actions: List[Dict], user_id: int, prompt_id: int,
     if user_prompt not in user_ledgers:
         current_app.logger.info(f"Creating new Smart Ledger for {user_prompt}")
         backend = get_production_backend()  # Tries Redis, falls back to JSON (already imported from agent_ledger)
-        ledger = create_ledger_from_actions(user_id, prompt_id, actions,
+        # BY KEYWORD — see the matching comment in
+        # reuse_recipe.create_agents_for_user.  Positionally this bound
+        # user_id -> agent_id and prompt_id -> session_id, which pinned the
+        # ledger identity to SmartLedger(user_id, prompt_id) for CREATE and
+        # REUSE alike (one shared, ever-growing ledger) and made the session
+        # resolution block at core.py:3884 unreachable.  Keywords restore
+        # agent_id == str(prompt_id) and let the default
+        # resume_if_unfinished=True resume a real in-flight build
+        # ("[RESUME] Resumed at Flow 3, Action 6") or mint a fresh session.
+        ledger = create_ledger_from_actions(user_id=user_id, prompt_id=prompt_id,
+                                            actions=actions,
                                             backend=backend, flow_id=flow_id)
         user_ledgers[user_prompt] = ledger
 
@@ -4326,13 +4356,32 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     user_tasks[user_prompt], '_needs_user_input_action_id', None,
                 )
                 if _blocked_action_id is not None and _blocked_action_id == current_action_id:
+                    # ASK, don't break.  `break` fell through to the tail-message
+                    # return at the bottom of this function, which hands the user
+                    # whatever the Assistant last said.  Measured live 2026-09-06
+                    # on agent 12165936867: this gate fired 8x, the loop broke at
+                    # iteration #6, and the user received "Successfully added
+                    # diverse local RSS feeds..." with success=True and NO recipe
+                    # written.  The question was never asked, so the user could
+                    # not answer and the build could never resume.  Same failure
+                    # the `_attempt > 3` escape below already fixed.
+                    try:
+                        _blocked_text = user_tasks[user_prompt].get_action(
+                            current_action_id - 1)
+                    except Exception:
+                        _blocked_text = ''
                     current_app.logger.info(
-                        f"[USER-INPUT-GATE] OUTER loop breaking at iteration "
+                        f"[USER-INPUT-GATE] OUTER loop returning at iteration "
                         f"#{while_loop_iterations}: Action {current_action_id} is "
-                        f"flagged as needing user input.  Returning control to user; "
-                        f"the agent's question is in the assistant's last message."
+                        f"flagged as needing user input.  Asking the user for it."
                     )
-                    break
+                    # The old `break` reached the tail write at the end of this
+                    # function; :4213 reads this list next turn to decide resume,
+                    # so returning early must still store it.  (The `_attempt > 3`
+                    # escape deliberately does NOT — it never did.  The two sites
+                    # differ on purpose; do not unify without measuring that.)
+                    messages[user_prompt] = group_chat.messages
+                    return _needs_input_reply(current_action_id, _blocked_text)
             except Exception as _gate_err:
                 current_app.logger.debug(
                     f"[USER-INPUT-GATE] outer-loop gate check failed (non-blocking): {_gate_err}"
@@ -5385,7 +5434,7 @@ def request_recipe_for_action_last(current_action_id, prompt_id, role, user_prom
     safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED, "recipe start")
     message = RECIPE_CREATE_PROMPT_PREFIX + ''' that includes only the necessary steps for this action from history, along with a suitable name. Provide the output in the following JSON format:
                         { "status": "done", "action": "''' + str(user_tasks[user_prompt].get_action(user_tasks[
-                                                                                                                      user_prompt].current_action - 1)) + '''","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
+                                                                                                                      user_prompt].current_action - 1)) + '''","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"If this step uses a tool, put the EXACT name of one of the tools provided to you in this request. Do not invent a name. If no provided tool fits, leave this empty string.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
                         Recipe Requirements:
                         1. Generalized Python Functions: Give the code which was created and executed successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
                         2. Avoid directly storing any specific information provided by the author in the recipe. Use placeholders for variables instead.
@@ -5401,8 +5450,20 @@ def request_recipe_for_action(current_action_id, prompt_id, role, user_prompt, p
     user_tasks[user_prompt].fallback = False
     safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED, "recipe start")
     metadata = strip_json_values(agent_data[prompt_id])
+    # Name the action the recipe is FOR, exactly as request_recipe_for_action_last
+    # already does.  This builder sent the literal placeholder "Describe the
+    # action performed here", so the only strong word in the whole prompt was
+    # "recipe" — and the model wrote a FOOD recipe.  Measured 2026-09-05 in
+    # agent 88601674818, a GitHub release monitor whose saved flow recipe
+    # contains "Generate a detailed recipe for preparing a classic chocolate
+    # cake using standard kitchen tools and ingredients" with steps about
+    # sifting flour and cocoa powder.  The census in
+    # memory/feedback_recipe_jargon_cooking_contamination.md put this at
+    # 25/123 saved recipes (20%); this is the producer.
+    _action_text = str(user_tasks[user_prompt].get_action(
+        user_tasks[user_prompt].current_action - 1))
     message = RECIPE_CREATE_PROMPT_PREFIX + ''' that includes only the necessary steps for this action, along with a suitable name. Provide the output in the following JSON format:
-                        { "status": "done", "action": "Describe the action performed here","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
+                        { "status": "done", "action": "''' + _action_text + '''","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"If this step uses a tool, put the EXACT name of one of the tools provided to you in this request. Do not invent a name. If no provided tool fits, leave this empty string.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
                         Recipe Requirements:
                         1. Generalized Python Functions: Give the code which was created and excuted successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
                         2. Avoid directly storing any specific information provided by the author in the recipe. Use placeholders for variables instead.
@@ -5443,6 +5504,15 @@ _RECIPE_PLACEHOLDER_STRINGS = frozenset({
     'steps here',
     'only include tool name here if used for this step.',
     'action here',
+    # Current tool_name instruction.  The template changed when the field was
+    # constrained to real tool names (the model was inventing "Baking Pan",
+    # "github_api_client", "nlp_parser_tool" — 20 invented names in agent
+    # 88601674818 alone, none of which resolve at REUSE).  Without this entry
+    # the guard would still be looking for the OLD wording and would pass an
+    # echo of the new one straight through — a vacuous guard.
+    'if this step uses a tool, put the exact name of one of the tools '
+    'provided to you in this request. do not invent a name. if no provided '
+    'tool fits, leave this empty string.',
 })
 
 

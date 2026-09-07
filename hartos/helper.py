@@ -96,15 +96,28 @@ except Exception as _search_err:
     search = None
 
 
+# The control token autogen agents emit to end a round — the same literal the
+# UserProxyAgents carry as ``default_auto_reply``.  Named here, next to the
+# predicate that consumes it, so the guard below and the check agree by
+# construction instead of by two copies of a string.
+_TERMINATE_TOKEN = "TERMINATE"
+
+
 def _is_terminate_msg(msg: dict) -> bool:
     """Null-safe AutoGen termination check.
 
     AutoGen tool-call messages can have content=None.
     Using ``"TERMINATE" in msg.get("content")`` crashes with TypeError
     when content is None.  This helper guards against that.
+
+    Deliberately a SUBSTRING match: autogen's own convention is that a model
+    ends its final answer with "… TERMINATE", so the token has to be honoured
+    mid-content.  That is exactly why a CONSUMED token must never be merged
+    into unrelated content — see the stale-terminate rule in
+    ``validate_messages``.
     """
     content = msg.get("content") if isinstance(msg, dict) else None
-    return content is not None and "TERMINATE" in content
+    return content is not None and _TERMINATE_TOKEN in content
 try:
     redis_client = redis.StrictRedis(
         host=os.environ.get('REDIS_HOST', 'localhost'),
@@ -905,6 +918,86 @@ def retrieve_json(json_message):
         return json_obj
 
 
+def ensure_tool_call_arguments_json(messages):
+    """Coerce every tool_call / function_call ``arguments`` field to a valid
+    JSON-object string, in place, and return the same list.
+
+    Why this exists (measured live 2026-09-05 02:16, Auto Research reuse on the
+    installed build): the local model emitted a tool_call whose ``arguments``
+    was a natural-language sentence, not JSON.  llama.cpp's OpenAI-compatible
+    server is lenient on tool-call OUTPUT (it returns whatever the model put in
+    the arguments position) but STRICT on INPUT — when a later request carries
+    an assistant message whose tool_call arguments string is not valid JSON, it
+    returns HTTP 500 "Failed to parse tool call arguments as JSON" and refuses
+    the whole generation.  A single malformed call therefore poisons EVERY
+    subsequent request in the group chat, and the reuse turn dies before any
+    action completes (a plain completion re-probe returned 200 in the same
+    window, proving the server was healthy and the fault was the args).
+
+    This is the tool-call sibling of ``validate_messages``' ROLE-ORDER-GUARD:
+    purely defensive, a no-op when the model emits valid JSON args, enforcing
+    the OpenAI/autogen contract ("arguments is a JSON string") rather than any
+    engine-specific error text — so it stays engine-neutral.
+
+    Coercion per malformed call: keep it if ``json.loads`` already succeeds;
+    else ``repair_json`` and keep the repaired text only if it parses to a
+    dict; else fall back to ``"{}"`` — a well-formed empty-args call.  The
+    executor then reports a missing argument and the model re-steers, which is
+    strictly better than a 500 that aborts the entire turn.
+    """
+    if not messages:
+        return messages
+    coerced = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        fns = []
+        for tc in (msg.get('tool_calls') or []):
+            if isinstance(tc, dict) and isinstance(tc.get('function'), dict):
+                fns.append(tc['function'])
+        if isinstance(msg.get('function_call'), dict):
+            fns.append(msg['function_call'])
+        for fn in fns:
+            args = fn.get('arguments')
+            if isinstance(args, dict):
+                # Some code paths store the arguments as an object already —
+                # the wire wants a string, so serialize (never a 500 risk).
+                fn['arguments'] = json.dumps(args)
+                continue
+            if args is None:
+                fn['arguments'] = '{}'
+                coerced += 1
+                continue
+            if not isinstance(args, str):
+                args = str(args)
+            try:
+                json.loads(args)
+                continue  # already valid JSON — leave untouched
+            except Exception:
+                pass
+            fixed = '{}'
+            try:
+                repaired = repair_json(args)
+                obj = (repaired if isinstance(repaired, (dict, list))
+                       else json.loads(repaired))
+                if isinstance(obj, dict):
+                    fixed = json.dumps(obj)
+            except Exception:
+                fixed = '{}'
+            fn['arguments'] = fixed
+            coerced += 1
+    if coerced:
+        try:
+            current_app.logger.info(
+                f"[TOOL-ARGS-GUARD] coerced {coerced} malformed tool_call "
+                f"argument(s) to valid JSON — would otherwise cause llama 500 "
+                f"'Failed to parse tool call arguments as JSON' on the next "
+                f"request and abort the turn.")
+        except Exception:
+            pass
+    return messages
+
+
 class ToolMessageHandler:
     """Handles tool messages in the conversation history to prevent tool_call_id errors.
 
@@ -943,6 +1036,12 @@ class ToolMessageHandler:
         return None
 
     def validate_messages(self, messages: List[Dict]) -> List[Dict]:
+        # TOOL-ARGS-GUARD: coerce any malformed tool_call arguments to valid
+        # JSON before anything downstream (or the model server) sees them.  A
+        # non-JSON arguments string makes llama.cpp 500 "Failed to parse tool
+        # call arguments as JSON" on EVERY subsequent request and aborts the
+        # turn — sibling of the ROLE-ORDER-GUARD below (see module function).
+        messages = ensure_tool_call_arguments_json(messages)
         for i, msg in enumerate(messages):
             if 'content' in msg and msg['content'] is None:
                 # Log detailed information about the problematic message
@@ -1010,6 +1109,8 @@ class ToolMessageHandler:
             # loudest, which is when you need it.
             _dropped: List[str] = []
             _coalesced: List[str] = []
+            _stale_terms: List[str] = []
+            _last_idx = len(messages) - 1
             for i, msg in enumerate(messages):
                 role = (msg.get('role') or '').lower()
                 content = msg.get('content')
@@ -1019,6 +1120,31 @@ class ToolMessageHandler:
                     if content is None or (isinstance(content, str) and content.strip() == ''):
                         _dropped.append(f"{i}({msg.get('name','unknown')})")
                         continue
+                # Drop a CONSUMED bare TERMINATE — same class of artifact as the
+                # empty placeholder above: a control token, already acted on,
+                # carrying no content for the turn being built.
+                #
+                # It matters because the coalescing below CONCATENATES contents.
+                # A stale token merged into a later message makes
+                # _is_terminate_msg (a substring match, by design) fire on that
+                # message, and autogen applies this transform BEFORE any reply
+                # function (conversable_agent.py:2059) — so
+                # check_termination_and_human_reply returns (True, None),
+                # generate_reply returns None, and run_chat breaks
+                # (groupchat.py:1190) without ever calling the model.
+                #
+                # Measured live 2026-09-05, agent 88601674818 action 3: three
+                # attempts in 137 ms, llama-server /slots byte-identical across
+                # the turn, retry budget spent, HITL question repeating forever.
+                #
+                # Only a token that is NOT the last message qualifies.  A live
+                # TERMINATE still terminates — dropping that would loop the
+                # group chat forever, the opposite failure.
+                if (not has_calls and i < _last_idx
+                        and isinstance(content, str)
+                        and content.strip() == _TERMINATE_TOKEN):
+                    _stale_terms.append(f"{i}({msg.get('name','unknown')})")
+                    continue
                 # Coalesce consecutive same-role messages
                 if cleaned:
                     prev = cleaned[-1]
@@ -1042,22 +1168,27 @@ class ToolMessageHandler:
             # One line per invocation, only when the guard actually acted.
             # Indices are capped so a pathological turn cannot reintroduce the
             # unbounded growth this replaced — the count stays exact either way.
-            if _dropped or _coalesced:
+            if _dropped or _coalesced or _stale_terms:
                 _cap = 12
                 _d = ', '.join(_dropped[:_cap]) + (
                     f" (+{len(_dropped) - _cap} more)" if len(_dropped) > _cap else '')
                 _c = ', '.join(_coalesced[:_cap]) + (
                     f" (+{len(_coalesced) - _cap} more)" if len(_coalesced) > _cap else '')
+                _s = ', '.join(_stale_terms[:_cap]) + (
+                    f" (+{len(_stale_terms) - _cap} more)" if len(_stale_terms) > _cap else '')
                 current_app.logger.info(
                     f"[ROLE-ORDER-GUARD] {len(messages)} msgs out of "
-                    f"{len(_dropped) + len(_coalesced) + len(messages)} in; "
+                    f"{len(_dropped) + len(_coalesced) + len(_stale_terms) + len(messages)} in; "
                     f"dropped {len(_dropped)} empty assistant placeholder(s)"
                     f"{' at ' + _d if _dropped else ''}; "
+                    f"dropped {len(_stale_terms)} consumed TERMINATE token(s)"
+                    f"{' at ' + _s if _stale_terms else ''}; "
                     f"coalesced {len(_coalesced)} consecutive same-role pair(s)"
                     f"{' at ' + _c if _coalesced else ''} "
                     f"— both would cause OpenAI 400 (2+ assistant messages / "
                     f"alternation rule)."
                 )
+
         except Exception as _guard_err:
             # Never break the upstream pipeline — if the guard itself
             # crashes, fall through with the original messages and let

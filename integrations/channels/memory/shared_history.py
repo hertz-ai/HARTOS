@@ -102,6 +102,7 @@ def seed_autogen_from_shared_history(
 def create_autogen_history_hook(
     user_id: int,
     simplemem_store=None,
+    simplemem_metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[Callable]:
     """Create a hook that writes autogen messages back to the shared buffer.
 
@@ -126,6 +127,26 @@ def create_autogen_history_hook(
             # Skip seeded messages (already in buffer)
             if isinstance(msg, dict) and msg.get('_from_shared'):
                 return
+
+            # SimpleMem ingest.  This function has ALWAYS taken
+            # simplemem_store and never used it, so every caller that passed
+            # a store got silent no-ingest — which is exactly why
+            # reuse_recipe hand-rolled its own hook instead of calling
+            # install_history_writeback, and that copy then grew the
+            # orphaned-append + loop-scoped-class defects.  Honour the
+            # parameter here so the canonical helper is a real superset.
+            if simplemem_store is not None:
+                try:
+                    content = msg.get('content', '') if isinstance(msg, dict) else str(msg)
+                    if content and len(content.strip()) > 5 and content != 'TERMINATE':
+                        from core.event_loop import get_or_create_event_loop
+                        speaker = msg.get('name', 'Agent') if isinstance(msg, dict) else 'Agent'
+                        _meta = {'sender_name': speaker, 'user_id': user_id}
+                        _meta.update(simplemem_metadata or {})
+                        loop = get_or_create_event_loop()
+                        loop.run_until_complete(simplemem_store.add(content, _meta))
+                except Exception:
+                    logger.debug("SimpleMem ingest skipped", exc_info=True)
 
             # Write new autogen messages to the shared buffer
             try:
@@ -181,22 +202,48 @@ class HookedMessageList(list):
             logger.debug("history write-back hook failed", exc_info=True)
 
 
-def install_history_writeback(group_chat, user_id, simplemem_store=None):
-    """Wrap group_chat.messages so every appended message is written back to
-    the shared PersistentChatHistory (dedup-aware, seeds skipped).
+def install_history_writeback(group_chat, user_id, simplemem_store=None,
+                              extra_sinks=None, simplemem_metadata=None):
+    """Wrap group_chat.messages so every appended message reaches every sink:
+    the shared PersistentChatHistory (dedup-aware, seeds skipped), SimpleMem
+    when a store is given, and any ``extra_sinks`` callables (e.g. MemoryGraph
+    ingest).
 
     This is the write half of the seed/write contract: a group seeded via
     seed_autogen_from_shared_history but never write-back-hooked loses its
     whole conversation (#686 — live 2026-08-23, the role group's BLUEFIN6
     exchange never reached the buffer the next turn read).
 
-    Returns True when the write-back is active, False when no history store
-    is available for the user."""
-    factory = create_autogen_history_hook(user_id, simplemem_store)
-    if factory is None:
+    ONE wrap, composed here.  Wrapping twice (a second subclass around the
+    first) silently kills the inner hook: the outer append calls plain
+    ``list.append``, never the inner subclass's ``append``.  reuse_recipe's
+    hand-rolled copy did exactly that — its ``isinstance`` re-check compared
+    against a class redefined inside a ``for`` loop, so it was False for two
+    of three group chats and their shared-history + SimpleMem write-back was
+    dead.  Extra sinks therefore compose into this single hook rather than
+    stacking another list subclass.
+
+    Returns True when at least one sink is active, False when there is
+    nothing to write to."""
+    factory = create_autogen_history_hook(user_id, simplemem_store,
+                                          simplemem_metadata)
+    sinks = []
+    if factory is not None:
+        # The factory wraps an append callable; the list subclass already did
+        # the append, so hand it a no-op and keep only the write-back side.
+        sinks.append(factory(lambda _msg: None))
+    for _s in (extra_sinks or []):
+        if callable(_s):
+            sinks.append(_s)
+    if not sinks:
         return False
-    # The factory wraps an append callable; the list subclass already did
-    # the append, so hand it a no-op and keep only the write-back side.
-    buffer_hook = factory(lambda _msg: None)
-    group_chat.messages = HookedMessageList(group_chat.messages, buffer_hook)
+
+    def _fanout(msg):
+        for _sink in sinks:
+            try:
+                _sink(msg)
+            except Exception:
+                logger.debug("history sink failed", exc_info=True)
+
+    group_chat.messages = HookedMessageList(group_chat.messages, _fanout)
     return True

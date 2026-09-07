@@ -91,10 +91,18 @@ class SensitiveFilter(logging.Filter):
                         "[audit_log] CANONICAL REDACTOR FAILED (%r) — audit-log "
                         "redaction has DEGRADED to the long-hex pattern only; "
                         "vendor API keys are NO LONGER being scrubbed.\n" % (exc,))
-                except Exception:
-                    # stderr itself is gone (closed/detached). The flag above is
-                    # still set, so canonical_redactor_status() remains truthful.
-                    pass
+                except (OSError, ValueError):
+                    # stderr is gone (closed/detached/redirected to a dead pipe):
+                    # OSError for a broken pipe or bad descriptor, ValueError for
+                    # "I/O operation on closed file". NARROW, not bare — an
+                    # unexpected exception class here should still surface rather
+                    # than be absorbed by the reporter of last resort.
+                    #
+                    # Nothing further can be logged: the logging system is what
+                    # failed (see the module header), and stderr was the fallback.
+                    # The state flag set above is what keeps this honest —
+                    # canonical_redactor_status() still reports the degradation.
+                    _redactor_failure = (_redactor_failure or '') + ' [stderr unavailable]'
         for pattern, replacement in _AUDIT_EXTRA_PATTERNS:
             text = pattern.sub(replacement, text)
         return text

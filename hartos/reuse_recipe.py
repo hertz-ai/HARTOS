@@ -187,6 +187,7 @@ from hartos.helper_ledger import (
 from hartos.lifecycle_hooks import (
     sync_action_state_to_ledger, register_ledger_for_session,
     ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
+    clear_action_states,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -1005,7 +1006,12 @@ def create_agents_for_role(user_id: str, prompt_id):
                 current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
                 # retrieve: action 1 -> action 2
                 return None
-            return "auto"
+            # Speaker order is pipeline state, never a model decision (same
+            # rule as the main reuse group): the Assistant asks the role
+            # question -> the user agent answers it; anything else (the
+            # Helper) hands back to the Assistant.  user_proxy was routed
+            # above.
+            return user_proxy if last_speaker is assistant else assistant
 
         # Seed autogen with recent messages from shared LangChain/autogen buffer
         try:
@@ -1111,6 +1117,16 @@ def create_agents_for_role(user_id: str, prompt_id):
 def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]":
     """Create new assistant & user proxy agents for a user with basic configuration."""
     user_prompt = f'{user_id}_{prompt_id}'
+    # New session: the fabrication gate's re-steer budget is keyed
+    # (user_prompt, action_id); clear this session's entries so a re-run of
+    # the same agent gets the budget back instead of one spent for the
+    # process lifetime.  The pending-refusal record is keyed the same way and
+    # must not survive the session either, or a stale entry would steer the
+    # next run about a tool it already ran.
+    for _k in [k for k in _reuse_resteer_counts if k[0] == user_prompt]:
+        _reuse_resteer_counts.pop(_k, None)
+    for _k in [k for k in _reuse_fab_pending if k[0] == user_prompt]:
+        _reuse_fab_pending.pop(_k, None)
     # Create a basic function calling config.
     # Per-dispatch model routing — see create_agents_for_role above for why the
     # thread-local override must win over the import-time module config_list.
@@ -1133,8 +1149,22 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                 simplemem_store = SimpleMemStore(sm_config)
                 user_simplemem[user_prompt] = simplemem_store
                 current_app.logger.info(f"SimpleMem initialized for {user_prompt}")
+            else:
+                # THE silent exit.  Measured 2026-09-05: the live log had
+                # "SimpleMem initialized" 0 times AND "SimpleMem init failed"
+                # 0 times — this branch left no trace at all, so a keyless
+                # desktop lost both long-term memory tools invisibly.  Say it.
+                current_app.logger.info(
+                    "SimpleMem not configured (enabled=%s, api_key=%s) — "
+                    "long-term memory runs on MemoryGraph for %s",
+                    bool(sm_config.enabled), bool(sm_config.api_key),
+                    user_prompt)
         except Exception as e:
             current_app.logger.warning(f"SimpleMem init failed: {e}")
+    else:
+        current_app.logger.info(
+            "SimpleMem package unavailable — long-term memory runs on "
+            "MemoryGraph for %s", user_prompt)
 
     # Initialize MemoryGraph for provenance-aware memory
     memory_graph = None
@@ -1214,7 +1244,18 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     # Perform topological sorting
     # sorted_actions = topological_sort(role_actions)
 
-    # Create Action with Smart Ledger integration for persistent task tracking
+    # Create Action with Smart Ledger integration for persistent task tracking.
+    #
+    # Clear this session's ActionStates FIRST.  They are process-global and keyed
+    # only by user_prompt, so a CREATE that ran earlier in this same process left
+    # every action TERMINATED (its flow-complete force-terminate).  Without the
+    # reset, the loop below reads those terminals and `[AUTO-ADVANCE]`s through
+    # the whole recipe without executing anything — measured live 2026-09-05 on
+    # agent 90210554431: 4 actions skipped in 14 ms, zero tool calls, while the
+    # identical run on a fresh process executed google_search for real.
+    # A new Action object IS a new run; its states must start where a new run
+    # starts.  See lifecycle_hooks.clear_action_states.
+    clear_action_states(user_prompt)
     user_tasks[user_prompt] = Action(role_actions)
 
     # Initialize or load Smart Ledger for this user with production backend (Redis with JSON fallback)
@@ -1228,9 +1269,46 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         #   prompt_id → session_id → flow_id → action_id.
         # Recipe filename ``{prompt_id}_{role_number}_recipe.json``
         # carries the same number; the two stay in lockstep.
-        ledger = create_ledger_from_actions(user_id, prompt_id, role_actions,
+        # Pass user_id/prompt_id BY KEYWORD.  The signature is
+        # ``create_ledger_from_actions(agent_id, session_id, actions, ...)``,
+        # so the positional form this used to use bound user_id -> agent_id
+        # and prompt_id -> SESSION_ID.  Two consequences, both measured live
+        # 2026-09-05 on Scout2 (77712340019, a 2-action recipe):
+        #
+        #   * session_id was never None, so the whole session-resolution block
+        #     (core.py:3884 — resume an in-flight session, else mint a fresh
+        #     f"{user_id}_{prompt_id}_{ts_ms}") was unreachable, and with it
+        #     ``resume_if_unfinished`` in either direction.  Dead code in
+        #     production; it only ever ran from tests, which pass keywords.
+        #   * create_recipe used the identical positional form, so CREATE and
+        #     REUSE both constructed SmartLedger(user_id, prompt_id) — the SAME
+        #     ledger — which then accumulated every run's tasks forever.  The
+        #     marker below read "session=77712340019 tasks=77 actions=2": the
+        #     raw prompt_id as the session, holding 75 inherited tasks whose
+        #     terminal statuses blocked every transition ("Cannot transition
+        #     from terminal state COMPLETED", core.py:624 — correct: terminal
+        #     means terminal), so the action never advanced.  Daemon 43104584497
+        #     hit the same wall: current_action_id 1 read 52 times in an hour.
+        #
+        # With keywords, agent_id becomes str(prompt_id) (the documented
+        # ``agent_id == prompt_id`` convention the dashboard's
+        # prompt -> session -> flow -> action grouping depends on) and the
+        # default resume_if_unfinished=True does the right thing for both
+        # callers: resume a genuinely in-flight session, otherwise mint a fresh
+        # timestamped one.  Explicitly passing False would instead pin the
+        # legacy deterministic f"{user_id}_{prompt_id}" — i.e. re-create the
+        # accumulate-forever bug — so it is deliberately NOT passed here.
+        ledger = create_ledger_from_actions(user_id=user_id, prompt_id=prompt_id,
+                                            actions=role_actions,
                                             backend=backend, flow_id=role_number)
         user_ledgers[user_prompt] = ledger
+        # Measures the line above: a fresh session carries one task per recipe
+        # action, and its id is NOT the bare prompt_id.  Pre-fix this read
+        # "session=77712340019 tasks=77 actions=2".
+        current_app.logger.info(
+            f"[REUSE-LEDGER] session={ledger.session_id} "
+            f"tasks={len(getattr(ledger, 'tasks', None) or {})} "
+            f"actions={len(role_actions)}")
 
         # Best-effort: when the Redis backend is live, enable ledger
         # pubsub + heartbeat so distributed_agent subscribers can
@@ -1315,13 +1393,37 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                 _resonance_profile = get_or_create_profile(str(user_id))
             except ImportError:
                 pass
-            _personality_block = build_personality_prompt(_saved_personality, resonance_profile=_resonance_profile)
-            _personality_block += build_proactive_vision_prompt(goal)
+            # REUSE = execution: the recipe IS the plan.  execution_mode=True
+            # suppresses the persona's "ask 1-2 clarifying questions before
+            # executing" behaviour, and we deliberately do NOT append
+            # build_proactive_vision_prompt(goal) here — its "understand the
+            # DEEPER VISION … ask 1-2 questions before executing the first
+            # action" block is a SECOND source of the same stall: it is what
+            # made the 4B open with discovery questions ("what deeper vision?")
+            # and send holding messages instead of running the saved recipe and
+            # synthesising from the real tool outputs (measured live 2026-09-03,
+            # agent 18088688973).  Both are CREATE-time behaviours; in REUSE the
+            # requirements are already gathered and banked in the recipe.
+            _personality_block = build_personality_prompt(
+                _saved_personality, resonance_profile=_resonance_profile,
+                execution_mode=True)
     except Exception:
         pass
 
     response_format = {"message2userfinal": "Your message here"}
-    agent_prompt = f'''You are a Helpful {role} Assistant. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
+    # DATE-CONTEXT: the local model's training cutoff makes it assume an earlier
+    # year — it refused "2026" research as "the future" and injected "2024" into
+    # its own search queries (measured live 2026-09-05, agent 18088688973).
+    # State today's date as ground truth so current/future-year work is treated
+    # as real and searchable.  Reused for the StatusVerifier below (one source).
+    _date_ctx = (
+        f"CURRENT DATE: today is {datetime.now().strftime('%A, %B %d, %Y')}. "
+        f"Treat this as the present; do NOT assume an earlier year or refuse a "
+        f"task as 'in the future'. Current-year information is real and searchable."
+    )
+    agent_prompt = f'''{_date_ctx}
+
+You are a Helpful {role} Assistant. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
 {get_cultural_prompt()}
 {_personality_block}
 
@@ -1513,6 +1615,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         """,
         is_termination_msg=_is_terminate_msg,
     )
+    # Give the StatusVerifier the same date ground-truth as the Assistant so it
+    # does not reject current/future-year work as impossible (see DATE-CONTEXT).
+    try:
+        verify.update_system_message(_date_ctx + "\n\n" + verify.system_message)
+    except Exception:
+        pass
 
     chat_instructor = autogen.UserProxyAgent(
         name="ChatInstructor",
@@ -2157,7 +2265,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     context_handling.add_to_agent(chat_instructor1)
 
     # --- Core tools for time_agent (defined once in core/agent_tools.py) ---
-    from core.agent_tools import build_core_tool_closures, register_core_tools, register_dual
+    from core.agent_tools import (
+        build_core_tool_closures, register_core_tools, register_dual,
+        main_leg_core_tools,
+    )
     # #509: reuse canonical log_tool_execution from core.tool_logging
     # (was passthrough no-op before — tools in reuse_recipe paths weren't
     # emitting publish_chat_stage UI status, weren't getting structured
@@ -2187,20 +2298,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     # Name-filtered to exactly the set the main leg registered before the
     # migration: zero schema growth, no new tools; per-tag gating at the
     # factory is the next step and depends on this consolidation.
-    _MAIN_LEG_CORE = {
-        'txt2img', 'img2txt', 'save_data_in_memory', 'get_saved_metadata',
-        'get_data_by_key', 'get_user_id', 'get_prompt_id', 'Generate_video',
-        'get_user_uploaded_file', 'get_user_camera_inp', 'get_chat_history',
-        'search_visual_history', 'search_long_term_memory',
-        'save_to_long_term_memory',
-        'send_message_to_user', 'send_presynthesized_video_to_user',
-        'send_message_in_seconds', 'google_search',
-    }
-    # create_scheduled_jobs is NOT in the filter: the factory's twin is a
-    # create-flow stub; the real live-scheduling version stays inline
-    # above (see the #511 name-collision note at its definition).
-    register_core_tools(
-        [t for t in core_tools if t[0] in _MAIN_LEG_CORE], helper, assistant)
+    #
+    # The name set moved to core.agent_tools.MAIN_LEG_CORE_TOOLS (beside the
+    # factory that builds the closures) so create_recipe's identical
+    # helper/assistant leg applies the SAME filter — it had none, and shipped
+    # all 72 tools / 10,544 schema tokens into a 12,288-token slot.
+    register_core_tools(main_leg_core_tools(core_tools), helper, assistant)
 
     # Channel tools: send to channels, register channels, list status, get context
     try:
@@ -2229,7 +2332,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         tool_logger.debug(f"Media tools registration skipped: {e}")
     try:
         from integrations.agent_engine.news_tools import register_news_tools
-        register_news_tools(helper1, time_agent, user_id)
+        register_news_tools(helper1, time_agent, user_id, executor=executor1)
     except Exception as e:
         tool_logger.debug(f"News tools registration skipped: {e}")
 
@@ -2574,7 +2677,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             # observe commercial-API revenue and the flywheel can't
             # close the marketing/revenue loop.
             from integrations.agent_engine.revenue_tools import register_revenue_tools
-            register_revenue_tools(helper, assistant, user_id)
+            register_revenue_tools(helper, assistant, user_id, executor=executor)
             current_app.logger.info("Revenue tools loaded (Tier 2) for reuse agent")
         if 'news' in goal_tags:
             # News tools parity with create_recipe.py — a Herald (news) recipe
@@ -2582,7 +2685,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             # else fetch_news_feeds / mark_news_for_web 404 and the daily
             # refresh step fails silently.
             from integrations.agent_engine.news_tools import register_news_tools
-            register_news_tools(helper, assistant, user_id)
+            register_news_tools(helper, assistant, user_id, executor=executor)
             current_app.logger.info("News tools loaded (Tier 2) for reuse agent")
     except Exception as e:
         # Same observability promotion as create_recipe.py — a failure
@@ -2640,39 +2743,75 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                     current_app.logger.info(f"Detected mention of {mention} - directing message to appropriate agent")
                     return agent
 
+            # A tool call routes to the agent whose function_map actually holds
+            # the function — autogen's own func_call_filter rule
+            # (groupchat.py _prepare_and_select_agents: agents that
+            # can_execute_function(funcs)).  A custom speaker_selection_method
+            # returns BEFORE that filter runs, so it must be applied here;
+            # hardcoding one executor sent google_search to an agent whose map
+            # lacked it -> "Function google_search not found", the tool never
+            # ran and the turn fell back to a knowledge-cutoff answer (live
+            # 2026-09-05 01:25).  register_dual puts service-tool execution on
+            # the executor and core-tool execution on the assistant, so which
+            # agent runs a call is per-tool; ask, don't assume.
+            _last = messages[-1]
+            _funcs = []
+            if isinstance(_last, dict):
+                if _last.get("function_call"):
+                    _funcs.append((_last["function_call"] or {}).get("name"))
+                for _tc in (_last.get("tool_calls") or []):
+                    if (_tc or {}).get("type") == "function":
+                        _funcs.append((_tc.get("function") or {}).get("name"))
+            _funcs = [f for f in _funcs if f]
+            # Return the first agent that can execute, exactly as autogen's
+            # func_call_filter does — an early return, so allow_repeat_speaker
+            # is not applied (a tool whose executor IS the proposer still runs).
+            if _funcs:
+                for _ag in groupchat.agents:
+                    try:
+                        if _ag.can_execute_function(_funcs):
+                            current_app.logger.info(
+                                f"reuse: tool_call {_funcs} -> {_ag.name} (holds the function)")
+                            return _ag
+                    except Exception:
+                        pass
+
             # Check for messages directed to the user
 
 
 
-            # Process JSON responses from StatusVerifier.
-            #
-            # This used to be `content.replace("'", '"')` followed by a
-            # non-greedy `\{.*?\}` scrape.  Both were wrong:
-            #   * the replace corrupted every reply containing an apostrophe --
-            #     `{"reply": "Hello! It's great..."}` became `... "It"s great`,
-            #     which fails with `Expecting ',' delimiter` at exactly the
-            #     apostrophe's column;
-            #   * the non-greedy pattern truncates nested JSON at the first '}'.
-            # Together they made this block throw on essentially every natural
-            # assistant reply (14 parse errors / 26 empty extractions in a
-            # single turn), so `status == 'completed'` could never be observed,
-            # chat_instructor was never selected, TERMINATE never fired, and the
-            # reuse loop spun to exhaustion and returned ''.
-            #
-            # retrieve_json (helper.py) is the shared, hardened extractor:
-            # unicode-quote normalisation, json_repair, ast.literal_eval and
-            # regex fallbacks, plus an empty-input guard.
+            # Process JSON responses from StatusVerifier.  Parse with the
+            # canonical retrieve_json (json / repair_json / ast / regex), NOT a
+            # naive single-to-double quote swap + non-greedy brace regex +
+            # json.loads: swapping every quote corrupts apostrophes in the
+            # verdict (developer's becomes developer"s), json.loads then dies on
+            # "Expecting ',' delimiter", the 'completed' status is never read,
+            # and the action loops until the count cap (measured live
+            # 2026-09-05: 21 parse-fails on one Auto Research turn, action never
+            # advanced).  Same fix the sibling parse site below carries (#95).
             try:
                 last_json = retrieve_json(messages[-1]["content"])
-                if not isinstance(last_json, dict):
-                    last_json = None
-                current_app.logger.info(f'Got Json as {1 if last_json else 0}')
 
-                if last_json:
-                    current_app.logger.info(f'last json as {last_json}')
+                if isinstance(last_json, dict) and last_json:
+                    # Session-qualified, like the sibling "Retrieved
+                    # current_action_id: N for session: X" line.  Without the
+                    # qualifier this verdict cannot be attributed: measured
+                    # 2026-09-06 08:41-08:57, THREE sessions were emitting
+                    # verdicts at once (cf125371-..._89555447799 x84,
+                    # 219b8c80-..._65708210992 x68, 219b8c80-..._88663405573 x6
+                    # — the last two driven by background daemons, not by any
+                    # operator), and 0 of 41 'last json as' lines named their
+                    # session.  Reading them as one agent's produced two wrong
+                    # conclusions in one day: an "action 6" that belonged to
+                    # another agent, and a "cross-agent contamination" defect
+                    # that was simply a concurrent agent's own action text.
+                    # A log line that cannot say whose it is is not evidence.
+                    current_app.logger.info(
+                        f'last json as {last_json} for session: {user_prompt}')
 
-                    if 'status' in last_json.keys() and str(last_json['status']).lower() == 'completed':
-                        current_app.logger.info('GOT COMPLETED FOR ACTION in state_transition')
+                    if 'status' in last_json.keys() and str(last_json.get('status', '')).lower() == 'completed':
+                        current_app.logger.info(
+                            f'GOT COMPLETED FOR ACTION in state_transition for session: {user_prompt}')
                         # Don't trust LLM's action_id — use known pipeline state
                         # The actual advancement happens in get_agent_response/chat_agent loops
                         return chat_instructor
@@ -2686,11 +2825,46 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
 
                     # Use known pipeline state, not LLM's claimed action_id
                     _known_aid = user_tasks[user_prompt].current_action
+                    _cp_yes = False
                     try:
-                        if individual_recipe[_known_aid - 1]['can_perform_without_user_input'] == 'yes':
-                            return assistant
+                        _cp_yes = individual_recipe[_known_aid - 1]['can_perform_without_user_input'] == 'yes'
                     except (IndexError, KeyError):
                         pass
+
+                    # DEAD-STATE HANDLING: StatusVerifier emits four states
+                    # (completed/error/pending/requires_breakdown) but only
+                    # 'completed' was handled — the other three fell through and
+                    # the action spun until the turn's round cap, never advancing
+                    # and (for requires_breakdown) silently discarding the subtasks.
+                    # Handle them per the StatusVerifier system_message: route
+                    # error/pending back to the helper to actually finish/fix the
+                    # work, and persist requires_breakdown's subtasks to the
+                    # ledger (the imported-but-unwired add_subtasks machinery).
+                    # Bounded by the loop's round budget (_reuse_turn_round_budget,
+                    # recipe-derived — it was a literal 4 when this was written);
+                    # NEVER fake-advances — only a
+                    # truthful 'completed' advances, a persistent error/pending
+                    # ends the turn honestly instead of looping.
+                    _st = str(last_json.get('status', '')).lower()
+                    if _cp_yes and _st == 'requires_breakdown':
+                        _subs = last_json.get('subtasks') or []
+                        try:
+                            if _subs and user_prompt in user_ledgers:
+                                user_ledgers[user_prompt].add_subtasks(_known_aid, _subs)
+                                current_app.logger.info(
+                                    f'reuse: requires_breakdown -> persisted {len(_subs)} subtasks '
+                                    f'to ledger for action {_known_aid}; routing to helper to execute')
+                        except Exception as _bd_e:
+                            current_app.logger.warning(f'reuse: requires_breakdown add_subtasks failed: {_bd_e}')
+                        return helper
+                    if _cp_yes and _st in ('error', 'pending'):
+                        current_app.logger.info(
+                            f'reuse: non-terminal status {_st!r} for action {_known_aid} '
+                            f'-> routing to helper to continue (bounded)')
+                        return helper
+
+                    if _cp_yes:
+                        return assistant
             except Exception as e:
                 current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
 
@@ -2758,11 +2932,26 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                 current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
                 return None
 
-            return "auto"
+            # Speaker order is pipeline state, never a model decision.  This
+            # group is a fixed loop (Assistant proposes -> Executor runs the
+            # tool -> Assistant synthesises -> StatusVerifier judges ->
+            # ChatInstructor advances) and every hop is already decided above
+            # from what just happened: @mention, tool call, verifier verdict,
+            # who spoke.  The only speakers that can reach this line are the
+            # Assistant with a plain turn (no tool call, no mention, no
+            # verdict: its work is done -> verify it) and the StatusVerifier
+            # or another agent with an unparseable turn (-> back to the
+            # Assistant); Helper, Executor, user_proxy and ChatInstructor were
+            # routed at the name check above.  Returning "auto" would spend an
+            # extra model call per hop to guess what this state already
+            # knows, and that call runs outside the AgentLightningWrapper, so
+            # any engine failure inside it ends the whole turn (measured
+            # 2026-09-03 23:26 on the installed build).
+            return verify if last_speaker is assistant else assistant
         except Exception as e:
             current_app.logger.error(f"Error in state_transition: {e}")
             current_app.logger.error(traceback.format_exc())
-            return "auto"
+            return assistant
 
     def state_transition1(last_speaker, groupchat):
         current_app.logger.info('INSIDE TIMER STATE TRANSITION')
@@ -2816,7 +3005,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                     send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
                 except Exception:
                     pass
-                return "auto"
+                return verify1 if last_speaker is time_agent else time_agent
 
         if messages[-1]["role"] == 'function':
             current_app.logger.info('The last speaker was function returning assistant')
@@ -2828,7 +3017,11 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
             # retrieve: action 1 -> action 2
             return None
-        return "auto"
+        # Speaker order is pipeline state, never a model decision (same rule
+        # as the main reuse group): the timer agent's plain turn -> verify1
+        # judges it; anything else -> back to the timer agent.  user_proxy,
+        # multi_role_agent, Helper and Executor were routed above.
+        return verify1 if last_speaker is time_agent else time_agent
 
     def state_transition2(last_speaker, groupchat):
         current_app.logger.info('INSIDE VISUAL STATE TRANSITION')
@@ -2878,7 +3071,9 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
             # retrieve: action 1 -> action 2
             return None
-        return "auto"
+        # Same rule as the main reuse group: the visual agent's plain turn ->
+        # verify2 judges it; anything else -> back to the visual agent.
+        return verify2 if last_speaker is visual_agent else visual_agent
 
     def publish_intermediate_thoughts_to_user(last_speaker, messages):
         # Delegates to the module-level publisher in create_recipe so
@@ -2904,11 +3099,21 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         ]
     )
 
+    # _reuse_group_terminate is module-level (see its docstring) — the three
+    # managers below share that ONE predicate.
     group_chat = autogen.GroupChat(
         agents=[assistant, helper, user_proxy, multi_role_agent, executor, chat_instructor, verify],
         messages=[],
         max_round=10,
-        select_speaker_prompt_template=f"Read the above conversation, select the next person from [Assistant, Helper, Executor, ChatInstructor, StatusVerifier, multi_role_agent & User] & only return the role as agent. Return User only if the previous message demands it",
+        # {agentlist} is filled by autogen's select_speaker_prompt() with the
+        # ELIGIBLE candidate set — i.e. the last speaker is dropped when it is
+        # barred from repeating (allow_repeat_speaker=False, groupchat.py:509).
+        # A hardcoded list here diverged from that eligible set: the 4B was
+        # SHOWN Assistant, picked it, but the validator (_mentioned_agents,
+        # groupchat.py:853) checked against the Assistant-excluded set → endless
+        # "You didn't choose a speaker" reprompt. Must be a plain str (not f"")
+        # so the {agentlist} token survives to autogen's .format(agentlist=...).
+        select_speaker_prompt_template="Read the above conversation, select the next person from {agentlist} & only return the role as agent. Return User only if the previous message demands it",
         select_speaker_transform_messages=select_speaker_transforms,
         speaker_selection_method=state_transition,  # using an LLM to decide
         allow_repeat_speaker=False,  # Prevent same agent speaking twice
@@ -2918,7 +3123,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
 
     manager = autogen.GroupChatManager(
         groupchat=group_chat,
-        llm_config={"cache_seed": None, "config_list": config_list}
+        llm_config={"cache_seed": None, "config_list": config_list},
+        is_termination_msg=_reuse_group_terminate,
     )
 
 
@@ -2935,7 +3141,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
 
     manager_1 = autogen.GroupChatManager(
         groupchat=group_chat_1,
-        llm_config={"cache_seed": None, "config_list": config_list}
+        llm_config={"cache_seed": None, "config_list": config_list},
+        is_termination_msg=_reuse_group_terminate,
     )
 
     group_chat_2 = autogen.GroupChat(
@@ -2951,7 +3158,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
 
     manager_2 = autogen.GroupChatManager(
         groupchat=group_chat_2,
-        llm_config={"cache_seed": None, "config_list": config_list}
+        llm_config={"cache_seed": None, "config_list": config_list},
+        is_termination_msg=_reuse_group_terminate,
     )
 
     visual_agent_group = {}
@@ -2965,107 +3173,40 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     visual_agent_group['group_chat_2'] = group_chat_2
     visual_agent_group['manager_2'] = manager_2
 
-    # Auto-ingest group_chat messages into SimpleMem + shared LangChain buffer
-    # This ensures autogen writes go to the SAME PersistentChatHistory that LangChain reads,
-    # eliminating redundant conversation storage and keeping both frameworks in sync.
-    _shared_hook_factory = None
+    # Group-chat write-back — shared PersistentChatHistory + SimpleMem +
+    # MemoryGraph — through the CANONICAL installer, the same one
+    # create_agents_for_role already uses (L871).
+    #
+    # This block used to hand-roll the wrapping and carried three defects the
+    # canonical installer does not have:
+    #   1. it captured `gc.messages.append` and called it from inside the hook,
+    #      so every message was appended a SECOND time into the pre-wrap list —
+    #      an orphan nothing reads.  The canonical installer documents this
+    #      exact hazard and hands the factory a no-op instead;
+    #   2. its list subclass was defined INSIDE the for-loop, so the
+    #      `isinstance(gc.messages, _HookedList)` re-check below compared
+    #      against the LAST iteration's class object and was False for
+    #      group_chat and group_chat_1;
+    #   3. those two therefore got DOUBLE-wrapped, which silently killed their
+    #      shared-history + SimpleMem write-back: an outer list subclass's
+    #      append calls plain list.append, never the inner subclass's append.
+    # One wrap, one sink fan-out, one place to fix.
+    def _graph_sink(msg, graph=memory_graph, session=user_prompt):
+        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+        speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
+        if content and len(content.strip()) > 5:
+            graph.register_conversation(speaker, content, session)
+
     try:
-        from integrations.channels.memory.shared_history import create_autogen_history_hook
-        _shared_hook_factory = create_autogen_history_hook(user_id, simplemem_store)
-    except Exception:
-        pass
-
-    for gc in [group_chat, group_chat_1, group_chat_2]:
-        _original_append = gc.messages.append
-
-        def _make_hook(orig_append, store=simplemem_store, shared_factory=_shared_hook_factory):
-            def _unified_ingest_hook(msg):
-                orig_append(msg)
-                # Skip seeded messages (already in buffer)
-                if isinstance(msg, dict) and msg.get('_from_shared'):
-                    return
-                content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-                if not content or len(content.strip()) <= 5 or content == 'TERMINATE':
-                    return
-                speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
-                # SimpleMem ingest
-                if store is not None:
-                    try:
-                        loop = get_or_create_event_loop()
-                        loop.run_until_complete(store.add(content, {
-                            "sender_name": speaker,
-                            "user_id": user_id,
-                            "prompt_id": prompt_id,
-                        }))
-                    except Exception:
-                        pass
-                # Shared PersistentChatHistory write-back (dedup-aware)
-                if shared_factory is not None:
-                    try:
-                        from langchain_core.messages import HumanMessage, AIMessage
-                        from integrations.channels.memory.shared_history import _get_persistent_history
-                        hist = _get_persistent_history(user_id)
-                        if hist:
-                            role = msg.get("role", "assistant") if isinstance(msg, dict) else "assistant"
-                            lc_msg = HumanMessage(content=content) if role == "user" else AIMessage(content=content)
-                            # Dedup: skip if last buffer message has same content
-                            last_msgs = hist.messages[-3:] if hist.messages else []
-                            if not any(m.content == content for m in last_msgs):
-                                from datetime import datetime
-                                hist.add_message(lc_msg, metadata={
-                                    'timestamp': datetime.now().isoformat(),
-                                    'source': 'autogen',
-                                })
-                    except Exception:
-                        pass
-            return _unified_ingest_hook
-
-        # Use wrapper list (plain list.append is read-only in Python)
-        class _HookedList(list):
-            def __init__(self, data, hook):
-                super().__init__(data)
-                self._hook = hook
-            def append(self, msg):
-                super().append(msg)
-                try:
-                    self._hook(msg)
-                except Exception:
-                    pass
-        gc.messages = _HookedList(gc.messages, _make_hook(_original_append))
-
-    # Auto-ingest group_chat messages into MemoryGraph (provenance tracking)
-    if memory_graph is not None:
+        from integrations.channels.memory.shared_history import install_history_writeback
         for gc in [group_chat, group_chat_1, group_chat_2]:
-            def _make_graph_hook(graph=memory_graph, session=user_prompt):
-                def _graph_ingest_hook(msg):
-                    try:
-                        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-                        speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
-                        if content and len(content.strip()) > 5:
-                            graph.register_conversation(speaker, content, session)
-                    except Exception:
-                        pass
-                return _graph_ingest_hook
-            if isinstance(gc.messages, _HookedList):
-                # Already hooked — chain the graph hook into the existing one
-                _existing_hook = gc.messages._hook
-                _graph_h = _make_graph_hook()
-                def _chained(msg, _eh=_existing_hook, _gh=_graph_h):
-                    _eh(msg)
-                    _gh(msg)
-                gc.messages._hook = _chained
-            else:
-                class _GraphHookedList(list):
-                    def __init__(self, data, hook):
-                        super().__init__(data)
-                        self._hook = hook
-                    def append(self, msg):
-                        super().append(msg)
-                        try:
-                            self._hook(msg)
-                        except Exception:
-                            pass
-                gc.messages = _GraphHookedList(gc.messages, _make_graph_hook())
+            install_history_writeback(
+                gc, user_id, simplemem_store,
+                extra_sinks=[_graph_sink] if memory_graph is not None else None,
+                simplemem_metadata={'prompt_id': prompt_id})
+    except Exception:
+        current_app.logger.debug(
+            'group-chat history write-back skipped', exc_info=True)
 
     # ── System Introspection Tools ─────────────────────────────────
     # Register self-awareness tools (GPU tier, active models, TTS
@@ -3394,6 +3535,340 @@ def _giveup_current_reuse_action(user_prompt: str, reason: str) -> None:
             current_app.logger.error(f"[GAVE-UP] failed to mark {user_prompt} action GAVE_UP: {e}")
         except Exception:
             pass
+# Re-steer budget per (user_prompt, action_id) for the fabrication gate in
+# _advance_reuse_action.  Each refusal steers the agent to actually call the
+# unrun tool; after _REUSE_FAB_STEER_MAX the gate advances anyway (loudly), so
+# it can never loop or permanently stall an action.
+_reuse_resteer_counts = {}
+_REUSE_FAB_STEER_MAX = 3
+
+# The MIRROR of the fabrication gate.  That gate catches an action CLAIMING
+# completion whose tool never ran.  This one catches the opposite, measured
+# live 2026-09-05 on Scout2 (77712340019): google_search really ran (three
+# HTTP 200s to brave/wikipedia/grokipedia at 19:45:24-25) and the agent wrote
+# the correct 2-bullet summary from the results — then reported
+# {'status': 'pending', 'action_id': 1}.  Every advance site gates on
+# status == 'completed', so none fired, the turn ended on '@user', and
+# current_action_id never left 1.  Five agents in the sweep sit at 1/N this way.
+#
+# An under-reporting model must not strand a finished action, but "pending"
+# is also the honest answer when an action genuinely needs another tool call.
+# So steer first, bounded, and only then proceed — and only ever when the
+# action's own tools are EVIDENCED to have executed (_reuse_fabricated_tools
+# returns nothing outstanding).  Advancing without that evidence would be the
+# "force-completed by a nudge" the verification contract forbids.
+_reuse_pending_counts = {}
+_REUSE_PENDING_STEER_MAX = 2
+
+# The StatusVerifier's not-done verdicts.  'pending' was the only one this
+# branch knew; 'requires_breakdown' strands an action exactly the same way and
+# was measured doing it live 2026-09-06 on agent 89555447799 (24-action
+# recipe): action 1 is autonomous, its google_search really executed ("INSIDE
+# google search"), and the verifier answered {'status': 'requires_breakdown',
+# 'action_id': 1} 35 times.  The turn ran 107 rounds / 40 minutes and never
+# left action 1 — `Retrieved current_action_id: 1 for session:
+# cf125371-..._89555447799` 175x, and zero [REUSE]/advance markers.
+#
+# Speaker routing already handles all four statuses (:2635 persists
+# requires_breakdown's subtasks, :2646 routes error/pending to the helper), so
+# the gap was only here, on the ADVANCE side.  The consequence is worse than
+# one slow action: the sole bound was the WHOLE-TURN round budget
+# (max(4, n_actions*4+4) = 100 for this recipe), so one wedged action consumed
+# the entire turn and the remaining 23 actions never ran.
+#
+# 'error' is deliberately NOT here.  It reports a failure, not an
+# under-reported success — advancing past it would bury the failure.
+#
+# The tokens live in core.constants, not here: this file spells the same
+# StatusVerifier vocabulary at 11 other sites and create_recipe.py spells it
+# at 5 more, so a set defined locally would be a 17th private copy of a
+# shared vocabulary.  Only the GROUPING is local — see each constant's own
+# comment for why the three groupings must stay different:
+#   :2646                            error+pending          — speaker routing
+#   _REUSE_UNDERREPORT_STATUSES      pending                — advancing
+#   VERDICT_ROUND_TERMINAL_STATUSES  completed+breakdown    — ending the round
+from core.constants import (
+    VERDICT_ROUND_TERMINAL_STATUSES,
+    VERDICT_UNDERREPORT_STATUSES as _REUSE_UNDERREPORT_STATUSES,
+)
+
+
+def _reuse_group_terminate(msg):
+    """End an action's group-chat round on a verdict the OUTER loop must act on.
+
+    Module-level, not a closure, for two reasons: it needs nothing from the
+    enclosing scope, and as a closure its contract could only ever be guarded
+    by string-matching the source — which is exactly how the
+    requires_breakdown gap below survived a guard test that already existed.
+
+    Each reuse action runs as an autogen group chat.  ``initiate_chat``
+    returns only when this predicate says the round is over; until then the
+    group talks to itself up to ``max_round``.  Everything the w1/w2 loop does
+    between actions — advancing, executing a decomposition, steering — is
+    therefore unreachable for any verdict this predicate does not recognise.
+
+    Two live measurements, both the same defect in this one function:
+
+      2026-09-05  'completed' was not recognised.  The manager fell back to
+                  the default (content == 'TERMINATE'), which a
+                  human_input_mode='NEVER' UserProxy does not reliably emit,
+                  so the group spun to max_round=10.  Auto Research
+                  18088688973: verdict at 03:29:12, current_action_id still 1,
+                  actions 2-6 never ran.
+
+      2026-09-06  'requires_breakdown' was not recognised, identically.
+                  Agent 89555447799 (24 actions): 17 requires_breakdown
+                  verdicts for action 1, 0 breakdown executions, 0 advances.
+                  The breakdown-execution block had already shipped and was
+                  PROVEN loaded on the running process (py-spy frame
+                  `get_agent_response (hartos\\reuse_recipe.py:3662)` matches
+                  the patched copy's line numbering; the unpatched copies put
+                  that def at 3280) — it sits in the loop that never regained
+                  control, so it could not run.
+
+    The membership set is canonical (core.constants), so adding a third
+    round-terminal verdict is a one-line change there, not a fourth private
+    spelling here.  Fails closed: anything unparseable is NOT terminal.
+    """
+    if _is_terminate_msg(msg):
+        return True
+    try:
+        _vj = retrieve_json((msg or {}).get('content') or '')
+        return (isinstance(_vj, dict)
+                and str(_vj.get('status', '')).lower()
+                in VERDICT_ROUND_TERMINAL_STATUSES)
+    except Exception:
+        return False
+
+
+def _reuse_turn_round_budget(user_prompt):
+    """Iteration budget for ONE reuse turn, derived from the recipe it runs.
+
+    Both reuse loops used a literal ``if count == 4: break``.  That budgets the
+    whole turn for what a SINGLE action may legitimately need: the fabrication
+    gate allows ``_REUSE_FAB_STEER_MAX`` (3) re-steers per action before it
+    advances anyway, so one action can honestly consume 4 rounds.
+
+    Measured live 2026-09-05 driving every saved agent through /chat: six
+    agents stopped at EXACTLY action 4 regardless of how long their recipe
+    was — 4/24, 4/15, 4/15, 4/6, 4/6, 4/6 — and the only two that "finished"
+    were the two whose recipes are SHORTER than the cap (4/3 and 4/2).  Their
+    logs carry `state_transition with action id 1..4`, so advancement was
+    working; the turn simply ran out of rounds.  75 of the 127 saved agents
+    have >= 2 actions and the largest has 24, so a fixed 4 truncates most of
+    the population.
+
+    Budget per action what one action may need, plus a small constant so a
+    single-action recipe keeps its previous headroom.  The loop's other exits
+    (budget exhausted, SLA breach, empty history, '@user') are unchanged —
+    this only stops the counter from ending a turn that is still progressing.
+    """
+    try:
+        n_actions = len(user_tasks[user_prompt].actions)
+    except Exception:
+        n_actions = 1
+    return max(4, n_actions * (_REUSE_FAB_STEER_MAX + 1) + 4)
+
+# Unrun tool names recorded by the fabrication gate for the refusal it just
+# returned, keyed the same way, and consumed by _reuse_fab_steer_message.
+_reuse_fab_pending = {}
+
+
+def _reuse_fab_steer_message(user_prompt, current_action_id):
+    """Re-steer text for a fabrication refusal, or None if it was not one.
+
+    _advance_reuse_action returns (None, False) for BOTH "this action's tool
+    never ran" and "all actions done / state error", so every caller treated a
+    refusal as done and ended the turn with an empty reply (review 2026-09-03
+    #1).  Popping the pending refusal here tells the two cases apart and gives
+    the caller a message that names the tool the agent must actually call.
+    """
+    tools = _reuse_fab_pending.pop((user_prompt, current_action_id), None)
+    if not tools:
+        return None
+    names = ', '.join(str(t) for t in tools)
+    return (
+        f"Action {current_action_id} is NOT complete: the tool(s) {names} were "
+        f"never actually called, so any result reported for them is not real. "
+        f"Do not report this action as completed. @Helper call {names} now with "
+        f"real arguments and report the actual returned result."
+    )
+
+
+def _reuse_action_is_autonomous(user_prompt, action_id):
+    """True when the recipe marks this action runnable without the user.
+
+    Reads the same ``can_perform_without_user_input`` field the recipe author
+    writes and the prompt at L1296 instructs the model to honour.  Absent or
+    unparseable -> False, so an unknown action is never auto-advanced.
+    """
+    try:
+        action = user_tasks[user_prompt].actions[action_id - 1]
+        return str(action.get('can_perform_without_user_input', '')).lower() == 'yes'
+    except Exception:
+        return False
+
+
+def _reuse_outstanding_tools(user_prompt, action_id, group_chat):
+    """The action's named tools that have NOT executed in this group chat.
+
+    Thin adapter over ``_reuse_fabricated_tools`` (the fabrication gate's own
+    predicate) so the under-reported-completion branch asks exactly the
+    question the gate asks, instead of growing a second notion of "did the
+    tool run".  Empty result == every tool this action names really executed.
+    On any error returns a non-empty sentinel, so uncertainty blocks the
+    advance rather than permitting it.
+    """
+    try:
+        agents = list(getattr(group_chat, 'agents', None) or [])
+        return _reuse_fabricated_tools(user_prompt, action_id, group_chat, agents)
+    except Exception as err:
+        # The log must never be able to fail the fail-closed path itself:
+        # current_app raises outside an app context, which would let the
+        # exception escape and hand the caller a green light instead of the
+        # blocking sentinel.  Caught by test_error_reports_outstanding_tools.
+        try:
+            current_app.logger.debug(f"_reuse_outstanding_tools: {err}")
+        except Exception:
+            pass
+        return ['<unknown>']
+
+
+def _advance_or_steer(user_prompt, action_id, reason, prompt_id, user_id,
+                      manager, chat_instructor, json_obj=None,
+                      claimed_action_id=None, advanced_latch=None):
+    """Move the reuse pipeline past `action_id` -- or, when the action only
+    CLAIMED completion, steer the agent to actually run its tools.
+
+    One rule, one home.  Five call sites used to inline this same block
+    (w1-completed / w1 / w1-regex / w2 / w2-regex), each with locals named
+    after the loop they sat in -- _rc_next, _next, _next2, _w2_next,
+    _w2_next2 and their _ok/_steer twins.  A name that says WHERE the code
+    is tells a reader nothing about WHAT the value holds, and five copies of
+    one rule drift apart: the 2026-09-05 fabricated-completion fix had to be
+    applied five times, and the [HALLUCINATION?] check four.
+
+    Args:
+        action_id: the action the PIPELINE believes is current.
+        json_obj: the verdict dict this advance is reacting to, if any --
+            forwarded to _finish_reuse_recipe when this turns out to be the
+            recipe's last action, so its 'message' still reaches the user
+            instead of being silently dropped.
+        claimed_action_id: the action id the LLM asserted, when it named one.
+            Logged when it disagrees with `action_id` -- an agent claiming a
+            different action than the one assigned is a hallucination signal.
+        advanced_latch: the caller's once-per-action set, when it keeps one
+            (only get_agent_response does).  A refusal drops the latch so the
+            action can be re-verified once the agent really runs the tool.
+
+    Returns:
+        True -- the next action's message, or a re-steer, was posted; the
+                caller should keep looping.
+        str  -- the turn is over; the caller should return this value as-is
+                ('' for a plain end, or _finish_reuse_recipe's message when
+                the whole recipe just completed).
+    """
+    if claimed_action_id is not None and claimed_action_id != action_id:
+        current_app.logger.warning(
+            f"[HALLUCINATION?] LLM claims action_id={claimed_action_id} "
+            f"but pipeline has {action_id}")
+
+    next_action_id, advanced, done = _advance_reuse_action(
+        user_prompt, action_id, reason, prompt_id)
+
+    if not advanced:
+        # A fabrication refusal is NOT "all actions done" -- it wants the
+        # tool actually run, so steer instead of ending the turn.
+        steer_message = _reuse_fab_steer_message(user_prompt, action_id)
+        if not steer_message:
+            # Either a real state error, or the recipe's last action just
+            # terminated (done=True) -- in that case _finish_reuse_recipe's
+            # message must still reach the user, not a bare ''.
+            return _finish_reuse_recipe(user_id, prompt_id, json_obj) if done else ''
+        if advanced_latch is not None:
+            advanced_latch.discard(action_id)
+        chat_instructor.initiate_chat(
+            recipient=manager, message=steer_message,
+            clear_history=False, silent=False)
+        return True
+
+    chat_instructor.initiate_chat(
+        recipient=manager,
+        message=_build_reuse_action_message(user_prompt, next_action_id),
+        clear_history=False, silent=False)
+    return True
+
+
+def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
+    """Registered tool names the current action NAMES but that produced ZERO
+    tool results anywhere in the group chat — i.e. a fabricated 'completed'.
+
+    Deliberately COARSE + fail-open (returns [] unless certain): only flags
+    when (a) the action text names a registered tool AND (b) the chat carries
+    no tool result or tool call for it.  This catches the pure-fabrication
+    case (live 2026-09-03: revenue agent claimed get_api_revenue_stats
+    returned 90% with zero tool_execution) while NEVER stalling an action
+    once its tool has run, and NEVER touching prose actions that name no tool.
+    """
+    try:
+        task = user_tasks.get(user_prompt)
+        text = str(task.get_action(current_action - 1) or '').lower() if task else ''
+        if not text:
+            return []
+        names = set()
+        for ag in agents:
+            try:
+                names.update((getattr(ag, '_function_map', None) or {}).keys())
+            except Exception:
+                pass
+            cfg = getattr(ag, 'llm_config', None)
+            if isinstance(cfg, dict):
+                for t in (cfg.get('tools') or []):
+                    fn = ((t or {}).get('function') or {}).get('name')
+                    if fn:
+                        names.add(fn)
+        referenced = [n for n in names if n and len(n) > 3 and n.lower() in text]
+        if not referenced:
+            return []
+        # Which of the referenced tools ACTUALLY executed?  A tool ran if a
+        # role=='tool' result named for it OR an assistant tool_call for it
+        # appears ANYWHERE the conversation is recorded — the group-chat log OR
+        # any agent's pairwise _oai_messages buffer.  Scanning only
+        # group_chat.messages was blind to tool activity autogen records in an
+        # agent buffer but not the (hooked) group log: live 2026-09-05 Trading
+        # 33204307184, google_search made a real HTTP 200 (primp) yet
+        # executed=[] because its assistant tool_call + role=tool result lived
+        # in the Helper<->Assistant buffer, not group_chat.messages — so the
+        # guard could not tell a real completion from a fabricated one.  Still
+        # keyed on the SPECIFIC function name (never "any tool ran"), so the
+        # revwarm5407 defeat — an unrelated MemoryGraph tool marking a
+        # never-run get_api_revenue_stats as executed — cannot recur.
+        executed = set()
+        _msg_lists = [getattr(group_chat, 'messages', None) or []]
+        for ag in agents:
+            conv = getattr(ag, '_oai_messages', None)
+            if isinstance(conv, dict):
+                _msg_lists.extend(conv.values())
+        for _ml in _msg_lists:
+            for m in (_ml or []):
+                if not isinstance(m, dict):
+                    continue
+                if m.get('role') == 'tool' and m.get('name'):
+                    executed.add(m.get('name'))
+                for tc in (m.get('tool_calls') or []):
+                    fn = ((tc or {}).get('function') or {}).get('name')
+                    if fn:
+                        executed.add(fn)
+        unrun = [n for n in referenced if n not in executed]
+        try:
+            current_app.logger.info(
+                f"[FAB-GUARD] action {current_action} names tool(s) {referenced}; "
+                f"executed={sorted(executed)}; unrun={unrun}")
+        except Exception:
+            pass
+        return unrun
+    except Exception:
+        return []
 
 
 def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "autogen.UserProxyAgent",
@@ -3414,6 +3889,15 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
     # reach get_agent_response without going through /chat.
     _owns_deadline = getattr(_turn_deadline_state, 'deadline', None) is None
     _begin_turn_deadline(user_prompt, only_if_unset=True)
+    # Register this session's group chat so the fabrication gate in
+    # _advance_reuse_action can reach it (via get_registered_groupchat) on
+    # EVERY advance path — w1/w2/regex.  Reuse never registered it before, so
+    # the gate silently no-op'd (get_registered_groupchat returned None).
+    try:
+        from hartos.lifecycle_hooks import register_groupchat_for_session
+        register_groupchat_for_session(user_prompt, group_chat)
+    except Exception:
+        pass
     try:
         # Tier-1 per-turn attach: deterministic keyword scan of THIS message
         # unlocks families the construction-time goal never mentioned — zero
@@ -3423,12 +3907,43 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             _unlocked = getattr(assistant, '_hart_unlocked_tags', None)
             if _unlocked is not None:
                 from integrations.agent_engine.marketing_tools import detect_goal_tags
+                from integrations.service_tools import service_tool_registry
+
+                # (a) NAMED — the tools this action's own recipe declares.
+                # Authoritative: the authoring pipeline recorded exactly which
+                # tool the action needs, so honour it before inferring anything.
+                # Live 2026-09-06, agent 89555447799: action 1 declares
+                # tool_name google_search, yet the tag scan below read the
+                # words "developer"/"platforms" as ['coding'] and logged
+                # "Tier-1 turn attach: +['coding'] -> 0 tools".  google_search
+                # never reached the wire (1 of 96 autogen.reuse calls carried
+                # any tools[]; INSIDE google search fired 0x), so the model
+                # could not call the one tool its recipe named.  Population
+                # scale: 8,799 "Error: Function <X> not found" across the log
+                # rotations — send_message_to_user x1618 (the path that returns
+                # the agent's result to the user), get_user_details x908.
+                try:
+                    _aid = user_tasks[user_prompt].current_action
+                except Exception:
+                    _aid = None
+                _named = _reuse_action_tool_names(user_prompt, _aid) if _aid else []
+                if _named:
+                    from core.agent_tools import attach_for_names
+                    _nn = attach_for_names(_named, helper, assistant,
+                                           service_tool_registry,
+                                           assistant._hart_attached_tools)
+                    if _nn:
+                        current_app.logger.info(
+                            f"Tier-1 named attach: action {_aid} names "
+                            f"{_named} -> {_nn} tools")
+
+                # (b) TAGS — unchanged fallback for capability families the
+                # recipe never mentions but the conversation drifted into.
                 _new = [t for t in detect_goal_tags(message or '')
                         if t not in _unlocked]
                 if _new:
                     from core.agent_tools import attach_for_tags
                     from integrations.agent_engine.goal_manager import get_tool_tags
-                    from integrations.service_tools import service_tool_registry
                     _cap = set()
                     for _t in _new:
                         _cap.update(get_tool_tags(_t))
@@ -3441,7 +3956,9 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         except Exception as _e:
             current_app.logger.debug(f"turn attach skipped: {_e}")
 
-        result = user_proxy.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
+        result = user_proxy.initiate_chat(manager,
+                                          message=_reuse_seed_message(user_prompt, message),
+                                          speaker_selection={"speaker": "assistant"},
                                           clear_history=False)
 
         # Conversational turns (greetings, small talk) are answered directly.
@@ -3476,9 +3993,32 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             os.environ.get('HEVOLVE_REUSE_LOOP_MAX_SECONDS', '300'))
 
         count = 0
+        _round_budget = _reuse_turn_round_budget(user_prompt)
+        _reuse_advanced_actions = set()  # one robust completion-advance per action id
         while True:
             current_app.logger.info('inside reuse while1')
 
+            # #725 ROOT-CAUSE FIX (proven live 2026-09-05: nappend=0, conversation in
+            # manager._oai_messages).  In this reuse flow autogen accumulates the
+            # exchange in the agents' pairwise _oai_messages, NOT in group_chat.messages
+            # (which the factory wrapped as a _GraphHookedList that never gets appended
+            # to).  Every group_chat.messages read below therefore saw an empty list and
+            # the turn bailed "empty mid-loop" — the general reuse blocker.  Sync the
+            # group log from the manager's richest conversation buffer (autogen's own
+            # store — no parallel path) so the existing reads work unchanged.  Cheap:
+            # only runs when the group log is empty.
+            try:
+                if not group_chat.messages:
+                    _mgr_msgs = getattr(manager, '_oai_messages', None)
+                    if _mgr_msgs:
+                        _conv = max(_mgr_msgs.values(), key=len, default=None)
+                        if _conv:
+                            group_chat.messages.extend(_conv)
+                            current_app.logger.info(
+                                f"[725-SYNC] group_chat.messages empty — synced "
+                                f"{len(_conv)} msgs from manager._oai_messages")
+            except Exception as _sync_err:
+                current_app.logger.debug(f"[725-SYNC] skipped: {_sync_err}")
             # The turn deadline is checked here too, not just in the speaker
             # selector.  Without it a turn bounded at HEVOLVE_TURN_MAX_SECONDS
             # inside initiate_chat would simply hand off to a fresh
@@ -3578,6 +4118,150 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     f'{id(_mgr_list) if _mgr_list is not None else "n/a"})')
                 break
 
+            # ROBUST COMPLETION-ADVANCE.  With the manager now terminating on the
+            # StatusVerifier 'completed' verdict (is_termination_msg=
+            # _reuse_group_terminate), initiate_chat RETURNS the moment an action
+            # completes and group_chat.messages[-1] IS that verdict.  The
+            # ChatInstructor-'TERMINATE'-at-[-1] gate below does NOT fire on this
+            # path (name=StatusVerifier, content=JSON), so advance here off the
+            # TERMINAL verdict, using the KNOWN pipeline action — do NOT require the
+            # LLM to echo action_id (the verdict shape is inconsistent: some carry
+            # 'action_id', some don't) and read only [-1] not a [-4:] tail (history
+            # accumulates across actions under clear_history=False, so a prior
+            # action's verdict lingers — [-1] is always the just-terminated action).
+            # One-advance-per-action guarded.  Measured live 2026-09-05: 'completed'
+            # fired at 03:29:12 yet current_action_id stayed 1 because the group ran
+            # to max_round without terminating and this loop never regained control.
+            # Same _advance_reuse_action the TERMINATE path uses — no parallel path.
+            try:
+                _term = group_chat.messages[-1] if group_chat.messages else None
+                _term_vj = retrieve_json((_term or {}).get('content') or '') if _term else None
+                if (isinstance(_term_vj, dict)
+                        and str(_term_vj.get('status', '')).lower() == 'completed'
+                        and _reuse_current_action not in _reuse_advanced_actions):
+                    _reuse_advanced_actions.add(_reuse_current_action)
+                    current_app.logger.info(
+                        f"reuse-w1-completed: terminal 'completed' verdict for action "
+                        f"{_reuse_current_action} — advancing (manager terminated on verdict)")
+                    _adv_result = _advance_or_steer(
+                        user_prompt, _reuse_current_action,
+                        "reuse-w1-completed", prompt_id, user_id,
+                        manager, chat_instructor, json_obj=_term_vj,
+                        advanced_latch=_reuse_advanced_actions)
+                    if _adv_result is not True:
+                        return _adv_result
+                    continue
+            except Exception as _rc_err:
+                current_app.logger.debug(f"robust completion-advance skipped: {_rc_err}")
+
+            # BREAKDOWN EXECUTION.  'requires_breakdown' is not a failure and not
+            # an under-report: the model is saying the action needs decomposing,
+            # and it supplies the subtasks.  The designed flow is
+            #   add_subtasks() -> get_pending_subtasks() -> work each -> parent
+            # and create_recipe.py:4503-4520 wires exactly that.
+            #
+            # Reuse did not.  state_transition:2635 persisted the subtasks and
+            # returned a speaker; get_pending_subtasks and check_and_unblock_parent
+            # were imported at :181-182 and NEVER CALLED, so the children went into
+            # a ledger nobody read and the parent could never complete.  Measured
+            # live 2026-09-06 on agent 89555447799: 35 requires_breakdown verdicts
+            # for action 1, subtasks re-persisted each time (3 then 4), 107 rounds,
+            # 0 advances, nothing executed.
+            #
+            # Same helpers, same message shape, same `continue` as create — the
+            # loop that was missing, not a second mechanism.  Do NOT "fix" this by
+            # treating requires_breakdown as an under-report and advancing on tool
+            # evidence: that marks the parent done while its own subtasks sit
+            # unrun, which is the force-completion the verification contract
+            # forbids (I made that mistake first; see VERDICT_UNDERREPORT_STATUSES).
+            try:
+                _bd = group_chat.messages[-1] if group_chat.messages else None
+                _bd_vj = retrieve_json((_bd or {}).get('content') or '') if _bd else None
+                if (isinstance(_bd_vj, dict)
+                        and str(_bd_vj.get('status', '')).lower() == 'requires_breakdown'):
+                    _pending = get_pending_subtasks(
+                        user_prompt, _reuse_current_action, user_ledgers)
+                    if _pending:
+                        _next_sub = _pending[0]
+                        current_app.logger.info(
+                            f"[BREAKDOWN] action {_reuse_current_action} has "
+                            f"{len(_pending)} pending subtask(s) for session: "
+                            f"{user_prompt} — working '{_next_sub.description[:60]}'")
+                        chat_instructor.initiate_chat(
+                            recipient=manager,
+                            message=f"Work on subtask: {_next_sub.description}",
+                            clear_history=False, silent=False)
+                        continue
+                    current_app.logger.info(
+                        f"[BREAKDOWN] action {_reuse_current_action} reported "
+                        f"requires_breakdown but the ledger holds no pending "
+                        f"subtask for session: {user_prompt} — letting the normal "
+                        f"paths decide")
+            except Exception as _bd_err:
+                current_app.logger.debug(f"breakdown execution skipped: {_bd_err}")
+
+            # UNDER-REPORTED COMPLETION (mirror of the fabrication gate above).
+            # A not-done verdict from an autonomous action whose tools have
+            # EVIDENTLY run is a reporting failure, not unfinished work — see
+            # the _REUSE_UNDERREPORT_STATUSES comment for the Scout2 ('pending')
+            # and 89555447799 ('requires_breakdown') measurements.
+            # Steer first (bounded), then let the normal advance path decide;
+            # that path re-runs the fabrication gate, so nothing advances whose
+            # tool did not actually execute.
+            try:
+                _pend = group_chat.messages[-1] if group_chat.messages else None
+                _pend_vj = retrieve_json((_pend or {}).get('content') or '') if _pend else None
+                _pend_st = str((_pend_vj or {}).get('status', '')).lower()
+                if (isinstance(_pend_vj, dict)
+                        and _pend_st in _REUSE_UNDERREPORT_STATUSES
+                        and _reuse_current_action not in _reuse_advanced_actions
+                        and _reuse_action_is_autonomous(user_prompt, _reuse_current_action)
+                        and not _reuse_outstanding_tools(user_prompt, _reuse_current_action,
+                                                        group_chat)):
+                    _pk = (user_prompt, _reuse_current_action)
+                    _pn = _reuse_pending_counts.get(_pk, 0)
+                    if _pn < _REUSE_PENDING_STEER_MAX:
+                        _reuse_pending_counts[_pk] = _pn + 1
+                        current_app.logger.info(
+                            f"[UNDER-REPORTED] action {_reuse_current_action} says "
+                            f"{_pend_st!r} but its tools already executed — steering for a "
+                            f"truthful verdict (attempt {_pn + 1}/{_REUSE_PENDING_STEER_MAX})")
+                        chat_instructor.initiate_chat(
+                            recipient=manager,
+                            message=(
+                                "Your tool for this action has already executed and returned "
+                                "its result. Do not re-run it. Either report this action "
+                                "completed, or state the exact remaining step that still "
+                                "needs a tool call."),
+                            clear_history=False, silent=False)
+                        continue
+                    _reuse_advanced_actions.add(_reuse_current_action)
+                    current_app.logger.warning(
+                        f"[UNDER-REPORTED] action {_reuse_current_action} still reports "
+                        f"{_pend_st!r} after {_REUSE_PENDING_STEER_MAX} steers while its tools "
+                        f"are evidenced as executed — advancing on the tool evidence")
+                    _adv_result = _advance_or_steer(
+                        user_prompt, _reuse_current_action,
+                        "reuse-under-reported", prompt_id, user_id,
+                        manager, chat_instructor, json_obj=_pend_vj,
+                        advanced_latch=_reuse_advanced_actions)
+                    if _adv_result is not True:
+                        return _adv_result
+                    continue
+            except Exception as _ur_err:
+                current_app.logger.debug(f"under-reported advance skipped: {_ur_err}")
+
+            if _reuse_current_action in _reuse_advanced_actions:
+                continue
+
+            # group_chat.messages can be empty here (live 2026-08-30).  CAUSE
+            # NOT ESTABLISHED -- see #725; transform_messages was my first
+            # guess and is ruled out (it logs "10 -> 1", never "-> 0", and
+            # helper.py:1786 only COMPARES pre/post, it does not mutate).
+            # What matters for this line: the subscript SELECTS the body, so
+            # the `except IndexError` below -- which opens on the next line --
+            # can never cover it; the turn died with "Error getting response:
+            # list index out of range".  Guard as create_recipe.py:4385 does.
             if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                 current_app.logger.info(
                     f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
@@ -3588,17 +4272,15 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                     current_app.logger.info(f'got json object {json_obj}')
                     if json_obj['status'].lower() == 'completed':
-                        _llm_action_id = int(json_obj.get("action_id", _reuse_current_action))
-                        if _llm_action_id != _reuse_current_action:
-                            current_app.logger.warning(
-                                f"[HALLUCINATION?] LLM claims action_id={_llm_action_id} "
-                                f"but pipeline assigned {_reuse_current_action}")
-                        _next, _ok, _done = _advance_reuse_action(user_prompt, _reuse_current_action, "reuse-w1", prompt_id)
-                        if not _ok:
-                            return _finish_reuse_recipe(user_id, prompt_id, json_obj) if _done else ''
-                        user_message = _build_reuse_action_message(user_prompt, _next)
-                        chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,
-                                                      silent=False)
+                        _adv_result = _advance_or_steer(
+                            user_prompt, _reuse_current_action, "reuse-w1",
+                            prompt_id, user_id, manager, chat_instructor,
+                            json_obj=json_obj,
+                            claimed_action_id=int(json_obj.get(
+                                "action_id", _reuse_current_action)),
+                            advanced_latch=_reuse_advanced_actions)
+                        if _adv_result is not True:
+                            return _adv_result
                         continue
                 except IndexError:
                     current_app.logger.info("Completed ALL ACTIONS")
@@ -3609,18 +4291,16 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         if json_obj:
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
-                                _known = user_tasks[user_prompt].current_action
-                                _llm_claimed = int(json_obj.get("action_id", _known))
-                                if _llm_claimed != _known:
-                                    current_app.logger.warning(
-                                        f"[HALLUCINATION?] LLM claims action_id={_llm_claimed} "
-                                        f"but pipeline has {_known}")
-                                _next2, _ok2, _done2 = _advance_reuse_action(user_prompt, _known, "reuse-w1-regex", prompt_id)
-                                if not _ok2:
-                                    return _finish_reuse_recipe(user_id, prompt_id, json_obj) if _done2 else ''
-                                user_message = _build_reuse_action_message(user_prompt, _next2)
-                                chat_instructor.initiate_chat(recipient=manager, message=user_message,
-                                                              clear_history=False, silent=False)
+                                pipeline_action_id = user_tasks[user_prompt].current_action
+                                _adv_result = _advance_or_steer(
+                                    user_prompt, pipeline_action_id,
+                                    "reuse-w1-regex", prompt_id, user_id,
+                                    manager, chat_instructor, json_obj=json_obj,
+                                    claimed_action_id=int(json_obj.get(
+                                        "action_id", pipeline_action_id)),
+                                    advanced_latch=_reuse_advanced_actions)
+                                if _adv_result is not True:
+                                    return _adv_result
                                 continue
                         else:
                             raise ValueError('No json found')
@@ -3642,7 +4322,11 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         continue
             try:
                 # Safely access recipes
-                if count == 4:
+                if count >= _round_budget:
+                    current_app.logger.warning(
+                        f"[REUSE-ROUNDS] while1 exhausted {_round_budget} rounds at "
+                        f"action {user_tasks[user_prompt].current_action}/"
+                        f"{len(user_tasks[user_prompt].actions)} — ending turn")
                     break
 
                 count += 1
@@ -3666,13 +4350,13 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 current_app.logger.error(f"Error in get_agent_response indexx:\n{error_message}")
 
             if not group_chat.messages:
-                # States the OBSERVATION only.  An earlier version of this line
-                # blamed transform_messages; that was never established -- the
-                # transform logs "N -> 1", never "-> 0", and it rewrites the
-                # per-reply view, not group_chat.messages.  Cause still open.
+                # Defensive: the loop-top #725 sync (extend from
+                # manager._oai_messages) normally keeps this populated once a
+                # conversation exists.  If it is still empty here, end the turn
+                # gracefully rather than raise IndexError on messages[-1].
                 current_app.logger.warning(
                     'reuse: group chat history is empty mid-loop - ending the '
-                    'turn instead of raising IndexError (cause not established)')
+                    'turn instead of raising IndexError')
                 break
             last_message = group_chat.messages[-1]
             content_lower = last_message['content'].lower()
@@ -3891,6 +4575,49 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
     (current_action_id itself terminated fine — callers should still deliver its message).
     Returns (None, False, False) if a state error prevented advancing at all.
     """
+    # FABRICATION GATE (canonical single point — EVERY advance path calls this):
+    # refuse to mark a tool-naming action COMPLETED when its specific tool never
+    # executed in the group chat.  The StatusVerifier LLM self-attests
+    # "completed"/"done" and the model fabricates the tool's output (live
+    # 2026-09-03: revenue agent "92% verified", zero get_api_revenue_stats
+    # execution).  Reaches the group chat + agents via the session registry, so
+    # it works no matter which loop (w1/w2/main) advanced.
+    #
+    # The refusal RE-STEERS (bounded), it does not silently fail open after one
+    # hold.  Live 2026-09-05 (Trading 33204307184): the StatusVerifier claimed
+    # action 1 "completed" BEFORE its google_search ever ran; the old one-shot
+    # budget was spent on that first claim and the very next claim advanced an
+    # action whose tool had still not executed — exactly the "force-completed by
+    # a nudge" the verification contract forbids.  Now each refusal records the
+    # unrun tools so the caller can steer the agent to actually call them
+    # (_reuse_fab_steer_message); only after _REUSE_FAB_STEER_MAX real re-steers
+    # do we advance anyway — and then LOUDLY, so a non-tool-backed action is
+    # never reported as verified.
+    try:
+        from hartos.lifecycle_hooks import get_registered_groupchat
+        _gc = get_registered_groupchat(user_prompt)
+        if _gc is not None:
+            _agents = list(getattr(_gc, 'agents', None) or [])
+            _fab = _reuse_fabricated_tools(user_prompt, current_action_id, _gc, _agents)
+            _rk = (user_prompt, current_action_id)
+            if _fab:
+                _n = _reuse_resteer_counts.get(_rk, 0)
+                if _n < _REUSE_FAB_STEER_MAX:
+                    _reuse_resteer_counts[_rk] = _n + 1
+                    _reuse_fab_pending[_rk] = list(_fab)
+                    current_app.logger.warning(
+                        f"[FABRICATED-COMPLETE] refusing to advance action "
+                        f"{current_action_id}: its tool(s) {_fab} never executed "
+                        f"(fabricated completion) — re-steering the agent to run "
+                        f"them (attempt {_n + 1}/{_REUSE_FAB_STEER_MAX})")
+                    return None, False, False
+                current_app.logger.error(
+                    f"[FABRICATED-COMPLETE] action {current_action_id} still claims "
+                    f"completion with tool(s) {_fab} never executed after "
+                    f"{_REUSE_FAB_STEER_MAX} re-steers — advancing to avoid a "
+                    f"permanent stall; this action's output is NOT tool-backed")
+    except Exception as _fg_err:
+        current_app.logger.debug(f"[FAB-GUARD] advance-gate skipped: {_fg_err}")
     # Mark current action done
     ok1 = force_state_through_valid_path(user_prompt, current_action_id,
                                          ActionState.COMPLETED, f"{reason}: confirmed")
@@ -3948,13 +4675,69 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
     return next_id, True, False
 
 
+def _reuse_seed_message(user_prompt, message):
+    """The opening turn's message: the user's words PLUS the current action's
+    execution command.
+
+    Actions 2..N are commanded explicitly — every advance posts
+    ``_build_reuse_action_message`` ("Perform this action -> Action #N: ...
+    follow these steps: [{... 'tool_name': 'google_search' ...}]").  Action 1
+    never was: the loop opened with the raw user text and nothing told the
+    group chat to execute anything.
+
+    Measured live 2026-09-05 (Trading 33204307184, 467s drive, from
+    llm_outbound.jsonl): of 39 autogen.reuse calls, 0 carried "Perform this
+    action ->" while 30 carried the recipe in their SYSTEM prompt.  So the
+    agents could SEE the recipe but were never told to run step 1 —
+    google_search executed 0x, `Retrieved current_action_id: 1` 44x, no
+    advance, no outcome.  A closed loop: no action-1 command -> nothing
+    executes -> nothing completes -> no advance -> the builder never runs.
+
+    It stayed hidden because agents whose request happens to imply action 1
+    (18088688973 "what is Tokyo's population" -> google_search) work off the
+    raw question alone; only meta requests ("run my recipe") stall.
+
+    ADDITIVE, never a replacement — the user's intent must reach the chat, and
+    the agents that already succeed on the raw text must not regress.  Fail-safe:
+    any problem reading the recipe returns the user's message unchanged, which
+    is exactly today's behaviour.
+    """
+    # Both outcomes log at INFO on purpose.  The first cut logged only the
+    # failure, at DEBUG — which this deployment does not emit, so "no skip
+    # line" could not distinguish "seeded" from "fell back silently".  A
+    # signal that cannot show its own failure is not a signal: live on
+    # 2026-09-05 the command reached the wire 6x for Trading and 0x for Auto
+    # Research on the SAME code path, and the log could not say why.
+    try:
+        current_action_id = user_tasks[user_prompt].current_action
+        seeded = f"{message}\n\n{_build_reuse_action_message(user_prompt, current_action_id)}"
+        current_app.logger.info(
+            f"[REUSE-SEED] seeded action {current_action_id} "
+            f"(+{len(seeded) - len(message)} chars)")
+        return seeded
+    except Exception as _seed_err:
+        current_app.logger.info(
+            f"[REUSE-SEED] FELL BACK to the bare user message — the opening "
+            f"turn will NOT command an action: {_seed_err!r}")
+        return message
+
+
 def _build_reuse_action_message(user_prompt, action_id):
     """Build the action execution message for REUSE mode."""
     action_message = user_tasks[user_prompt].get_action(action_id - 1)['action']
     recipe_actions = recipes[user_prompt].get('actions', [])
     if action_id - 1 < len(recipe_actions):
-        steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
-                               'code': x.get('generalized_functions', None)}} for x in
+        # str() because `steps` is model-authored and its type is not fixed:
+        # in prompts/18088688973_0_recipe.json action 1 carries a LIST of
+        # {description, tool_name} dicts while actions 2..6 carry a str.  Used
+        # raw as a dict key that raised TypeError("unhashable type: 'list'"),
+        # which killed the builder for exactly the action the opening turn
+        # seeds — measured live 2026-09-05 14:06:38.  Trading 33204307184,
+        # whose action 1 is a str, was unaffected and got its command 6x on
+        # the wire from this same code.  Where the key is already a str,
+        # str(s) is s, so the rendered message is byte-identical.
+        steps = [{str(x['steps']): {'tool_name': x.get('tool_name', None),
+                                    'code': x.get('generalized_functions', None)}} for x in
                  recipe_actions[action_id - 1].get('recipe', [])]
     else:
         steps = []
@@ -3975,6 +4758,37 @@ def _finish_reuse_recipe(user_id, prompt_id, json_obj):
     if message:
         send_message_to_user1(user_id, message, '', prompt_id)
     return message
+def _reuse_action_tool_names(user_prompt, action_id):
+    """The tool names the given action's recipe steps declare.
+
+    Reads the same ``recipes[user_prompt]['actions'][n]['recipe']`` list that
+    ``_build_reuse_action_message`` renders into the turn message, and returns
+    the ``tool_name`` each step names.  One reader, one shape — the authoring
+    pipeline records the needed tool there, so that is the authoritative
+    answer to "which tool does this action need".
+
+    Used by the Tier-1 per-turn attach.  Before this, the attach chose tools
+    only from ``detect_goal_tags(message)`` — a prose keyword scan — and so
+    could miss the tool the action names outright: measured live 2026-09-06 on
+    agent 89555447799, whose action 1 declares ``tool_name: google_search``
+    while the scan inferred ``['coding']`` and attached 0 tools.
+
+    Returns [] for a prose action that names no tool, an out-of-range id, or
+    an unknown session — never raises, because the attach hook runs on every
+    round and must not be able to kill a turn.
+    """
+    try:
+        actions = (recipes[user_prompt] or {}).get('actions') or []
+        if not 1 <= action_id <= len(actions):
+            return []
+        out = []
+        for step in (actions[action_id - 1].get('recipe') or []):
+            name = (step or {}).get('tool_name')
+            if name and name not in out:
+                out.append(name)
+        return out
+    except Exception:
+        return []
 
 
 # =============================================================================
@@ -4257,31 +5071,37 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
                 user_journey[user_prompt] = 'UseBot'
                 create_schedule(prompt_id, user_id)
-                action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
-                steps = [
-                    {x['steps']: {'tool_name': x.get('tool_name', None), 'code': x.get('generalized_functions', None)}}
-                    for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action - 1]['recipe']]
-                message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action}:{action_message}\n follow these steps: {steps}"
+                # ONE builder for the action command.  This was a verbatim
+                # inline copy — same get_action lookup, same steps
+                # comprehension, same template — so the str() coercion that
+                # fixed the builder left THIS copy still raising
+                # TypeError("unhashable type: 'list'") on a list-valued
+                # `steps`, and it never carried the builder's
+                # `action_id - 1 < len(recipe_actions)` bounds check either.
+                message = _build_reuse_action_message(
+                    user_prompt, user_tasks[user_prompt].current_action)
                 # message = "let's perform the actions availabe in sequence\nIMP instruction: keep track of action id you are working on."
                 result = chat_instructor.initiate_chat(manager, message=message,
                                                        speaker_selection={"speaker": "assistant"}, clear_history=False)
 
                 count = 0
+                _round_budget = _reuse_turn_round_budget(user_prompt)
                 while True:
                     current_app.logger.info('inside while2')
 
                     # === LEDGER v2.0: Heartbeat + Budget/SLA ===
-                    _w2_current = user_tasks[user_prompt].current_action
-                    _w2_ledger = user_ledgers.get(user_prompt)
-                    if _w2_ledger:
-                        _w2_task = _w2_ledger.tasks.get(f"action_{_w2_current}")
-                        if _w2_task:
-                            _w2_task.heartbeat()
-                            if _w2_task.is_budget_exhausted():
-                                current_app.logger.warning(f"[BUDGET] action_{_w2_current} budget exhausted in while2")
+                    current_action_id = user_tasks[user_prompt].current_action
+                    ledger = user_ledgers.get(user_prompt)
+                    if ledger:
+                        action_task = ledger.tasks.get(f"action_{current_action_id}")
+                        if action_task:
+                            action_task.heartbeat()
+                            if action_task.is_budget_exhausted():
+                                current_app.logger.warning(
+                                    f"[BUDGET] action_{current_action_id} budget exhausted in while2")
                                 break
-                            if _w2_task.is_sla_breached() and not _w2_task.sla_breached:
-                                _w2_task.mark_sla_breached()
+                            if action_task.is_sla_breached() and not action_task.sla_breached:
+                                action_task.mark_sla_breached()
 
                     # Same empty-history hazard as the while1 loop above.
                     if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
@@ -4294,17 +5114,14 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
-                                _llm_aid = int(json_obj.get("action_id", _w2_current))
-                                if _llm_aid != _w2_current:
-                                    current_app.logger.warning(
-                                        f"[HALLUCINATION?] LLM claims action_id={_llm_aid} "
-                                        f"but pipeline has {_w2_current}")
-                                _w2_next, _w2_ok, _w2_done = _advance_reuse_action(user_prompt, _w2_current, "reuse-w2", prompt_id)
-                                if not _w2_ok:
-                                    return _finish_reuse_recipe(user_id, prompt_id, json_obj) if _w2_done else ''
-                                user_message = _build_reuse_action_message(user_prompt, _w2_next)
-                                chat_instructor.initiate_chat(recipient=manager, message=user_message,
-                                                              clear_history=False, silent=False)
+                                _adv_result = _advance_or_steer(
+                                    user_prompt, current_action_id,
+                                    "reuse-w2", prompt_id, user_id,
+                                    manager, chat_instructor, json_obj=json_obj,
+                                    claimed_action_id=int(json_obj.get(
+                                        "action_id", current_action_id)))
+                                if _adv_result is not True:
+                                    return _adv_result
                                 continue
                         except Exception:
                             try:
@@ -4312,17 +5129,14 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 if json_obj:
                                     current_app.logger.info(f'got json object {json_obj}')
                                     if json_obj['status'].lower() == 'completed':
-                                        _llm_aid2 = int(json_obj.get("action_id", _w2_current))
-                                        if _llm_aid2 != _w2_current:
-                                            current_app.logger.warning(
-                                                f"[HALLUCINATION?] LLM claims action_id={_llm_aid2} "
-                                                f"but pipeline has {_w2_current}")
-                                        _w2_next2, _w2_ok2, _w2_done2 = _advance_reuse_action(user_prompt, _w2_current, "reuse-w2-regex", prompt_id)
-                                        if not _w2_ok2:
-                                            return _finish_reuse_recipe(user_id, prompt_id, json_obj) if _w2_done2 else ''
-                                        user_message = _build_reuse_action_message(user_prompt, _w2_next2)
-                                        chat_instructor.initiate_chat(recipient=manager, message=user_message,
-                                                                      clear_history=False, silent=False)
+                                        _adv_result = _advance_or_steer(
+                                            user_prompt, current_action_id,
+                                            "reuse-w2-regex", prompt_id, user_id,
+                                            manager, chat_instructor, json_obj=json_obj,
+                                            claimed_action_id=int(json_obj.get(
+                                                "action_id", current_action_id)))
+                                        if _adv_result is not True:
+                                            return _adv_result
                                         continue
 
                                 else:
@@ -4346,7 +5160,11 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                                               silent=False)
                                 continue
                     count += 1
-                    if count == 4:
+                    if count >= _round_budget:
+                        current_app.logger.warning(
+                            f"[REUSE-ROUNDS] while2 exhausted {_round_budget} rounds at "
+                            f"action {user_tasks[user_prompt].current_action}/"
+                            f"{len(user_tasks[user_prompt].actions)} — ending turn")
                         break
                     # role = get_role(user_id,prompt_id)
                     last_message = group_chat.messages[-1]

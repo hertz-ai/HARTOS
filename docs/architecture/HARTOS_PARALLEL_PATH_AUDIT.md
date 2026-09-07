@@ -10,7 +10,7 @@
 >
 > | # | finding | status 2026-08-17 | the check that proves it |
 > |---|---|---|---|
-> | 1 | theme-apply dual handler, palette dead | **FIXED** | `/api/social/theme/apply` no longer exists in `integrations/` |
+> | 1 | theme-apply dual handler, palette dead | **FIXED — but my 2026-08-17 PROOF WAS FALSE, see note below** | the two handlers now serve DIFFERENT URLs: `api.py:4101` `@social_bp.route('/theme/apply')` vs `api_theme.py:39` `@theme_bp.route('/api/appearance/apply')` |
 > | 2 | raw `/api/shell/launch` bypasses `launch_app` | **FIXED** | route delegates to `get_app_bridge().launch_app`, checks `ok`, returns a real 500 (the #133 anti-pattern is named in the code) |
 > | 3 | shell-auth 4 copies, `0.0.0.0` trusted | **FIXED** | canonical `integrations/agent_engine/shell_auth.py`; **0** hits for a trusted `'0.0.0.0'` across `shell_*.py` |
 > | 4 | consent written by two drifted writers | **FIXED** | `consent_api.py` carries 8 refs to `ConsentService` |
@@ -42,6 +42,31 @@
 >   fallback, so it is a product decision — but fail-open inverts the safe default
 >   on a privileged surface. Cheap fix: import from `shell_auth` directly (no shell
 >   dependencies), making the cited failure mode unreachable.
+>
+> ### ⚠ CORRECTION 2026-09-06 — row 1's evidence was wrong (the verdict survives)
+>
+> On 2026-08-17 I wrote that row 1 was fixed because *"`/api/social/theme/apply` no
+> longer exists in `integrations/`"*. **That proof is false.** The route exists at
+> `integrations/social/api.py:4101`. I had grepped the FULL path, but Flask
+> blueprints register only the SUFFIX — `@social_bp.route('/theme/apply')` — and the
+> `/api/social` prefix is added by `register_blueprint`. My pattern could not match,
+> and I read the empty result as absence.
+>
+> The VERDICT still holds, for a different reason: the two handlers no longer collide
+> because one MOVED NAMESPACE. `api_theme.py:39` now serves `/api/appearance/apply`
+> (with the #161 palette overlay), while `api.py:4101` keeps `/api/social/theme/apply`.
+> Different URLs, no shadowing.
+>
+> **Consequence nobody has ruled on:** `deploy/linux/hart-cli.py:275` still posts to
+> `/api/social/theme/apply`, i.e. the LEGACY handler — the one the original finding
+> described as dropping `secondary_accent`/`custom`. So `hart theme set` may not carry
+> palette overlays. I have NOT verified whether that is deliberate or drift; it needs
+> the CLI's intent checked against the /api/appearance contract.
+>
+> **The lesson, per RULE 0:** grep only LOCATES. A pattern that cannot match the
+> framework's registration form produces silence, and silence is not evidence. Route
+> existence must be checked by the SUFFIX plus the blueprint prefix, or by reading the
+> registered URL map — never by grepping the full path.
 >
 > **Method note for whoever refreshes this next:** re-verify before reading. The
 > standing rule (`feedback_check_review_queue_regularly`) exists because *one of

@@ -74,6 +74,50 @@ def register_dual(helper, executor, func, name: str, description: str):
     return func
 
 
+# The core closures the MAIN agent leg carries — the helper/assistant pair
+# that drives a user-facing turn, in BOTH the create and reuse pipelines.
+#
+# Canonical home is here, beside build_core_tool_closures() that produces the
+# closures, so the two legs agree by construction.  It was previously a local
+# `_MAIN_LEG_CORE` inside reuse_recipe only, which is why create's identical
+# helper/assistant pair silently carried EVERY core closure instead.
+#
+# Why it has to be a filter at all — measured live 2026-09-05, CREATE of agent
+# 88601674818 action 6:
+#
+#   wire-trim: the TOOL SCHEMA alone is 10544 tokens against an n_ctx of 12288
+#   (72 tool(s)) — no amount of message trimming can make this fit.
+#   -> 400 request (13378 tokens) exceeds the available context size (12288)
+#
+# The turn that 400'd was asking the Helper to WRITE A JSON RECIPE for one
+# step, while carrying payments, video, channel, camera, receipt, Instagram
+# and coding tools it cannot use.  filter_service_tools() already gates the
+# SERVICE registry, but says so explicitly of this set: "the always-on core
+# closures and Tier-2 families are unaffected" — so nothing bounded it.
+#
+# create_scheduled_jobs is deliberately absent: the factory's twin is a
+# create-flow stub and the real live-scheduling version stays inline in
+# reuse_recipe (see the #511 name-collision note at its definition).
+MAIN_LEG_CORE_TOOLS = frozenset({
+    'txt2img', 'img2txt', 'save_data_in_memory', 'get_saved_metadata',
+    'get_data_by_key', 'get_user_id', 'get_prompt_id', 'Generate_video',
+    'get_user_uploaded_file', 'get_user_camera_inp', 'get_chat_history',
+    'search_visual_history', 'search_long_term_memory',
+    'save_to_long_term_memory',
+    'send_message_to_user', 'send_presynthesized_video_to_user',
+    'send_message_in_seconds', 'google_search',
+})
+
+
+def main_leg_core_tools(tools):
+    """The subset of ``tools`` the main helper/assistant leg registers.
+
+    ONE filter for both pipelines — call this rather than re-deriving the
+    name set, so create and reuse can never drift apart again.
+    """
+    return [t for t in tools if t[0] in MAIN_LEG_CORE_TOOLS]
+
+
 def register_core_tools(tools, helper, executor):
     """Register (name, desc, func) tuples on an AutoGen helper/executor pair.
 
@@ -231,6 +275,60 @@ def attach_for_tags(cap_tags, helper, executor, registry, attached_names):
         for ep_name, ep in tool.endpoints.items():
             fn = tool_name if ep_name == tool_name else f"{tool_name}_{ep_name}"
             if fn in attached_names:
+                continue
+            func = registry.create_endpoint_function(tool_name, ep_name)
+            if func is None:
+                continue
+            register_dual(helper, executor, func, fn,
+                          ep.get('description', f'{tool_name} {ep_name}'))
+            attached_names.add(fn)
+            n += 1
+    return n
+
+
+def attach_for_names(names, helper, executor, registry, attached_names):
+    """Attach the registry tools a turn NAMES outright.
+
+    Name-keyed sibling of ``attach_for_tags`` — same primitives
+    (``create_endpoint_function`` + ``register_dual``), same idempotent
+    ``attached_names`` set, same return contract.  Not a second attachment
+    mechanism: only the SELECTOR differs, and this one is authoritative
+    where the other infers.
+
+    Why it exists.  ``attach_for_tags`` matches on capability tags derived
+    from a keyword scan of the turn's prose.  That is a good fallback for
+    families nothing mentions, and a bad way to honour an action that says
+    which tool it needs.  Measured live 2026-09-06 on agent 89555447799:
+    recipe action 1 declares ``tool_name: google_search`` and the seeded
+    message carries it verbatim, yet ``detect_goal_tags`` read the words
+    "developer"/"platforms" as the tag ``coding`` and the attach logged
+
+        Tier-1 turn attach: +['coding'] -> 0 tools
+
+    google_search never reached the wire (1 of 96 autogen.reuse calls in a
+    26-minute drive carried any tools[] block; ``INSIDE google search`` fired
+    0 times), so the model could not call the one tool its own recipe named.
+
+    The same gap at population scale: 8,799 ``Error: Function <X> not found``
+    across the log rotations — send_message_to_user x1618 (the path that
+    hands the agent's result to the user), get_user_details x908,
+    execute_windows_or_android_command x418.  Those tools are defined and
+    registerable; they were simply not attached for that turn.  It also
+    explains why one tool both works and fails: same tool, different turn,
+    different tag scan.
+
+    Unknown names are ignored rather than raising — a recipe may name a tool
+    this deployment does not ship, and a turn that mentions one absent tool
+    must still get the others.
+    """
+    want = {str(n) for n in (names or []) if n}
+    if not want:
+        return 0
+    n = 0
+    for tool_name, tool in registry._tools.items():
+        for ep_name, ep in tool.endpoints.items():
+            fn = tool_name if ep_name == tool_name else f"{tool_name}_{ep_name}"
+            if fn not in want or fn in attached_names:
                 continue
             func = registry.create_endpoint_function(tool_name, ep_name)
             if func is None:
@@ -1026,9 +1124,23 @@ def build_core_tool_closures(ctx):
     ))
 
     # ------------------------------------------------------------------
-    # Conditional: SimpleMem long-term memory
+    # Conditional: long-term memory — SimpleMem preferred, MemoryGraph fallback
     # ------------------------------------------------------------------
-    if simplemem_store is not None:
+    # Gated on EITHER store, not SimpleMem alone.  SimpleMem only constructs
+    # when `sm_config.enabled and sm_config.api_key` (reuse_recipe.py:963,
+    # create_recipe.py:886 — byte-identical twins), so a local desktop with no
+    # cloud key silently got neither tool, while nine prompt sites kept
+    # instructing the model to call save_to_long_term_memory by name.  Measured
+    # live 2026-09-05 (Auto Research 18088688973): of the 18 _MAIN_LEG_CORE
+    # tools, these two — and only these two, the only two gated here — were
+    # missing from all 6 wire bodies.  The model skipped the save step with no
+    # error, then read an empty store 24x and asserted completion on nothing.
+    #
+    # MemoryGraph needs no key, initialized 27x in that same log with 0
+    # failures (including for this agent), and was ALREADY the dual-write
+    # target below and the read-back path in get_data_by_key.  So it backs the
+    # tools when SimpleMem is absent rather than the capability disappearing.
+    if simplemem_store is not None or memory_graph is not None:
         from core.event_loop import get_or_create_event_loop
 
         @log_tool_execution
@@ -1036,14 +1148,24 @@ def build_core_tool_closures(ctx):
             query: Annotated[str, "Natural language query to search long-term memory"],
         ) -> str:
             """Search compressed long-term memory using semantic retrieval."""
+            if simplemem_store is not None:
+                try:
+                    loop = get_or_create_event_loop()
+                    results = loop.run_until_complete(simplemem_store.search(query))
+                    if results:
+                        return results[0].content
+                    return "No relevant memories found."
+                except Exception as e:
+                    tool_logger.info(f"SimpleMem search error: {e}")
+                    return "Memory search unavailable."
+            # MemoryGraph leg — same contract, local store, no API key.
             try:
-                loop = get_or_create_event_loop()
-                results = loop.run_until_complete(simplemem_store.search(query))
+                results = memory_graph.recall(query, mode='hybrid', top_k=5)
                 if results:
-                    return results[0].content
+                    return '\n'.join(r.content for r in results[:5])
                 return "No relevant memories found."
             except Exception as e:
-                tool_logger.info(f"SimpleMem search error: {e}")
+                tool_logger.info(f"MemoryGraph search error: {e}")
                 return "Memory search unavailable."
 
         tools.append((
@@ -1058,6 +1180,24 @@ def build_core_tool_closures(ctx):
             speaker: Annotated[str, "Who said this (e.g. 'User', 'Assistant', 'System')"] = "System",
         ) -> str:
             """Save important information to compressed long-term memory."""
+            if simplemem_store is None:
+                # MemoryGraph leg.  SYNCHRONOUS on purpose: the dual-write
+                # below can be fire-and-forget because SimpleMem already
+                # persisted, but when the graph is the ONLY store, a detached
+                # thread would let this return "Saved" for a write that never
+                # landed — the fabricated success this whole fix exists to
+                # remove.  Report what actually happened.
+                try:
+                    memory_graph.register(
+                        content, {'memory_type': 'fact',
+                                  'source_agent': speaker,
+                                  'session_id': user_prompt,
+                                  'source': 'memory_graph'},
+                    )
+                    return "Saved to long-term memory."
+                except Exception as e:
+                    tool_logger.info(f"MemoryGraph save error: {e}")
+                    return "Failed to save to long-term memory."
             try:
                 loop = get_or_create_event_loop()
                 loop.run_until_complete(simplemem_store.add(content, {

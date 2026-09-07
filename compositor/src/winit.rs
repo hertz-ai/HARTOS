@@ -276,6 +276,19 @@ pub struct State {
     /// NATIVE SHELL M2 — the voice orb, composed once and animated per frame by
     /// scale+alpha on the GPU.
     pub orb: crate::comp_core::OrbCache,
+    /// NATIVE SHELL M3 text: cosmic-text rasterizer. The dev build carries it too
+    /// (the trait method is required); native_shell_on is off by default here.
+    pub text_rasterizer: crate::text_render::TextRasterizer,
+    /// NATIVE SHELL M3 — rounded-rect buffer cache (cards, omnibox).
+    pub rect_cache: crate::comp_core::RectCache,
+    /// NATIVE SHELL: the RETAINED scene tree. Rebuilt only when the output size, the
+    /// composed home payload or the theme changes, so a steady desktop stops rebuilding
+    /// its layout every frame (the zero-per-frame-alloc NFR).
+    pub scene_cache: crate::scene::SceneCache,
+    /// NATIVE SHELL M2 press half: pointer buttons currently held on the seat, kept
+    /// current by the shared `on_pointer_button`. The native orb reads it via
+    /// `pointer_pressed` to react to a click held over it.
+    pub pointer_buttons_down: u32,
 }
 
 impl State {
@@ -378,6 +391,34 @@ impl CompState for State {
     }
     fn orb_mut(&mut self) -> &mut crate::comp_core::OrbCache {
         &mut self.orb
+    }
+    fn text_rasterizer_mut(&mut self) -> &mut crate::text_render::TextRasterizer {
+        &mut self.text_rasterizer
+    }
+    fn native_scene_caches(
+        &mut self,
+    ) -> (
+        &mut crate::text_render::TextRasterizer,
+        &mut crate::comp_core::OrbCache,
+        &mut crate::comp_core::RectCache,
+        &mut crate::scene::SceneCache,
+    ) {
+        (
+            &mut self.text_rasterizer,
+            &mut self.orb,
+            &mut self.rect_cache,
+            &mut self.scene_cache,
+        )
+    }
+    fn note_pointer_button(&mut self, down: bool) {
+        if down {
+            self.pointer_buttons_down = self.pointer_buttons_down.saturating_add(1);
+        } else {
+            self.pointer_buttons_down = self.pointer_buttons_down.saturating_sub(1);
+        }
+    }
+    fn pointer_pressed(&self) -> bool {
+        self.pointer_buttons_down > 0
     }
     /// winit OVERRIDE: the shared flag-flip/log PLUS fail any in-flight screencopy
     /// frames so no capture queued just-as-the-kill-engaged leaks a frame painted before
@@ -1125,6 +1166,10 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         bloom: Default::default(),
         // NATIVE SHELL M2 — the voice orb, same lazy-compose contract.
         orb: Default::default(),
+        text_rasterizer: crate::text_render::TextRasterizer::new(),
+        rect_cache: Default::default(),
+        scene_cache: Default::default(),
+        pointer_buttons_down: 0,
     };
 
     // 6. (No calloop Generic source for the Display â€” see step 1. The Display is

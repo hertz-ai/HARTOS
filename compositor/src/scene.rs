@@ -302,6 +302,32 @@ impl SceneNode {
         }
         Some(self)
     }
+
+    /// Extra orb energy contributed by the pointer at `pointer` (in the SAME logical
+    /// coords the scene was laid out in), so the native orb energises under the cursor
+    /// exactly as the WebView shell's orb does: a lift on hover, a stronger lift while a
+    /// button is held OVER the orb (the M2 press half). Returns 0.0 when the pointer is
+    /// absent or is not over an `OrbSlot`; a press anywhere else contributes nothing, so
+    /// clicking a card never makes the orb flare. The render path adds this scalar to the
+    /// ambient orb energy it already computes, so pointer reactivity rides the EXISTING
+    /// orb path (one orb, no easing) and `orb::motion_at` clamps the sum into 0..=1.
+    pub fn pointer_orb_energy(&self, pointer: Option<(f32, f32)>, pressed: bool) -> f32 {
+        const HOVER_LIFT: f32 = 0.35;
+        const PRESS_LIFT: f32 = 0.65;
+        match pointer {
+            Some((px, py)) => match self.hit_test(px, py) {
+                Some(SceneNode::OrbSlot { .. }) => {
+                    if pressed {
+                        PRESS_LIFT
+                    } else {
+                        HOVER_LIFT
+                    }
+                }
+                _ => 0.0,
+            },
+            None => 0.0,
+        }
+    }
 }
 
 // ── Layout constants. The 40/44 are the SAME strip dims the compositor publishes at
@@ -458,6 +484,55 @@ pub fn layout_home(output_w: f32, output_h: f32, home: &HomeCompose, theme: &The
     SceneNode::Container {
         rect: Rect::new(0.0, 0.0, output_w, output_h),
         children: root,
+    }
+}
+
+/// The RETAINED scene tree. `layout_home` allocates a fresh node tree and clones every
+/// label on each call, so calling it per frame violates the zero-per-frame-alloc NFR
+/// this module's header states. This is "step two" of the native render path: the tree is
+/// rebuilt ONLY when something that actually changes LAYOUT changes (the output size, the
+/// composed home payload, or the theme), so a steady desktop walks a tree it already owns.
+///
+/// The pointer is deliberately NOT part of the key: hover changes the orb's energy scalar,
+/// never the layout, so cursor motion must never invalidate the tree.
+#[derive(Default)]
+pub struct SceneCache {
+    tree: Option<SceneNode>,
+    key_w: f32,
+    key_h: f32,
+    key_home: HomeCompose,
+    /// `Theme` has no `Default`, so the key starts as None and the first call is a miss.
+    key_theme: Option<Theme>,
+    rebuilds: u64,
+}
+
+impl SceneCache {
+    /// The tree for this size/home/theme, rebuilding only when one of them changed.
+    /// The comparison walks a handful of short strings; the rebuild it avoids allocates
+    /// the whole node tree and re-clones every label, so the compare is the cheap side.
+    pub fn tree_for(&mut self, w: f32, h: f32, home: &HomeCompose, theme: &Theme) -> &SceneNode {
+        let stale = self.tree.is_none()
+            || self.key_w != w
+            || self.key_h != h
+            || self.key_theme != Some(*theme)
+            || self.key_home != *home;
+        if stale {
+            self.tree = Some(layout_home(w, h, home, theme));
+            self.key_w = w;
+            self.key_h = h;
+            self.key_theme = Some(*theme);
+            self.key_home = home.clone();
+            self.rebuilds += 1;
+        }
+        self.tree
+            .as_ref()
+            .expect("the tree was just built when it was stale")
+    }
+
+    /// How many times the tree was actually rebuilt. This is the retention PROOF: a
+    /// steady desktop must not grow this per frame.
+    pub fn rebuilds(&self) -> u64 {
+        self.rebuilds
     }
 }
 
@@ -631,5 +706,71 @@ mod tests {
         assert_eq!(hc.rows[0].label, "Continue");
         assert_eq!(hc.rows[0].cards[0].image.as_deref(), Some("a.png"));
         assert_eq!(hc.mood.as_deref(), Some("cosmic"));
+    }
+
+    #[test]
+    fn pointer_over_the_orb_lifts_its_energy_and_nowhere_else() {
+        let (w, h) = (1600.0, 900.0);
+        let root = layout_home(w, h, &sample(), &Theme::cosmic_default());
+        // The large home orb's centre must energise the orb.
+        let mut orb_centre = None;
+        if let SceneNode::Container { children, .. } = &root {
+            for c in children {
+                if let SceneNode::OrbSlot { rect, compact: false } = c {
+                    orb_centre = Some((rect.x + rect.w * 0.5, rect.y + rect.h * 0.5));
+                }
+            }
+        }
+        let (ox, oy) = orb_centre.expect("a home orb slot");
+        let hover = root.pointer_orb_energy(Some((ox, oy)), false);
+        let press = root.pointer_orb_energy(Some((ox, oy)), true);
+        assert!(hover > 0.0, "the orb must energise when the cursor is over it");
+        assert!(
+            press > hover,
+            "a held button over the orb must energise it beyond hover ({press} vs {hover})"
+        );
+        // A point in the hero-title column (left of the floated orb) is NOT the orb, so
+        // it lifts nothing, hovered OR pressed: clicking elsewhere never flares the orb.
+        let hero_pt = (EDGE_PAD + 4.0, TOP_BAR_H + EDGE_PAD + 4.0);
+        assert_eq!(root.pointer_orb_energy(Some(hero_pt), false), 0.0);
+        assert_eq!(root.pointer_orb_energy(Some(hero_pt), true), 0.0);
+        // No pointer contributes nothing: the flag-off / no-cursor default is unchanged.
+        assert_eq!(root.pointer_orb_energy(None, false), 0.0);
+        assert_eq!(root.pointer_orb_energy(None, true), 0.0);
+    }
+
+    #[test]
+    fn the_scene_tree_is_retained_and_rebuilt_only_when_layout_inputs_change() {
+        let theme = Theme::cosmic_default();
+        let home = sample();
+        let mut cache = SceneCache::default();
+
+        let _ = cache.tree_for(1600.0, 900.0, &home, &theme);
+        assert_eq!(cache.rebuilds(), 1, "the first frame builds the tree");
+
+        // A steady desktop: same size, same payload, same theme. However many frames run,
+        // the tree must NOT be rebuilt — this is the zero-per-frame-alloc NFR.
+        for _ in 0..10 {
+            let _ = cache.tree_for(1600.0, 900.0, &home, &theme);
+        }
+        assert_eq!(cache.rebuilds(), 1, "a steady desktop must not rebuild per frame");
+
+        // A resize changes layout, so it must rebuild.
+        let _ = cache.tree_for(1280.0, 800.0, &home, &theme);
+        assert_eq!(cache.rebuilds(), 2, "a resize must rebuild");
+
+        // A new compose changes layout, so it must rebuild.
+        let mut recomposed = home.clone();
+        recomposed.hero.title = "Your hive shipped a release".into();
+        let _ = cache.tree_for(1280.0, 800.0, &recomposed, &theme);
+        assert_eq!(cache.rebuilds(), 3, "a new compose must rebuild");
+
+        // And the retained tree is a REAL tree, not an empty placeholder: the cached nodes
+        // are what hover hit-tests against (the pointer is deliberately not part of the key).
+        let node_count = cache
+            .tree_for(1280.0, 800.0, &recomposed, &theme)
+            .node_count();
+        assert!(node_count > 1, "the retained tree must hold real nodes");
+        assert_eq!(cache.rebuilds(), 3, "re-reading the cached tree must not rebuild");
     }
 }

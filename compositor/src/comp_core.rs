@@ -367,6 +367,132 @@ impl OrbCache {
     }
 }
 
+/// Rasterize a rounded rectangle of `color` into a premultiplied [B,G,R,A] buffer,
+/// anti-aliased at the corners via a rounded-box signed-distance field. The scene
+/// carries a `radius` on the card / omnibox rects that a `SolidColorRenderElement`
+/// (always a hard quad) cannot express, so those rects lower through a cached
+/// MemoryRenderBuffer of THIS shape instead. Byte order + premultiply match
+/// text_render.rs and bloom.rs (Argb8888 little-endian = B,G,R,A, premultiplied).
+fn rounded_rect_rgba(w: u32, h: u32, radius: f32, color: [f32; 4]) -> Vec<u8> {
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    let hw = w as f32 / 2.0;
+    let hh = h as f32 / 2.0;
+    // A radius past half the short side is just a fuller pill / circle.
+    let r = radius.clamp(0.0, hw.min(hh));
+    let ca = color[3].clamp(0.0, 1.0);
+    let cr = color[0].clamp(0.0, 1.0);
+    let cg = color[1].clamp(0.0, 1.0);
+    let cb = color[2].clamp(0.0, 1.0);
+    for y in 0..h {
+        for x in 0..w {
+            // Pixel centre relative to the rect centre.
+            let px = x as f32 + 0.5 - hw;
+            let py = y as f32 + 0.5 - hh;
+            // Rounded-box SDF (<=0 inside): distance to the shape's edge.
+            let qx = px.abs() - (hw - r);
+            let qy = py.abs() - (hh - r);
+            let dist =
+                (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r;
+            // ~1px anti-aliased coverage across the edge.
+            let cov = (0.5 - dist).clamp(0.0, 1.0);
+            if cov <= 0.0 {
+                continue;
+            }
+            let a = ca * cov;
+            let idx = ((y * w + x) * 4) as usize;
+            rgba[idx] = (cb * a * 255.0) as u8;
+            rgba[idx + 1] = (cg * a * 255.0) as u8;
+            rgba[idx + 2] = (cr * a * 255.0) as u8;
+            rgba[idx + 3] = (a * 255.0) as u8;
+        }
+    }
+    rgba
+}
+
+/// Caches rounded-rect buffers keyed by (size, radius, colour) so the per-pixel SDF
+/// rasterization runs ONCE per unique rect (cards are a single size), never per
+/// frame. Mirrors OrbCache / TextRasterizer: compose once, reuse the buffer, so the
+/// per-frame cost of a rounded panel is a GPU blit, not a CPU rasterize.
+#[derive(Default)]
+pub struct RectCache {
+    cache: std::collections::HashMap<(u32, u32, u32, u32, u32, u32, u32), MemoryRenderBuffer>,
+    /// POOL for the sharp-rect path. The first cut built a `SolidColorBuffer` per rect per
+    /// frame, which is the other half of the zero-per-frame-alloc NFR (the retained tree in
+    /// `scene::SceneCache` was the first). Buffers are handed out in paint order and reused
+    /// next frame via `update`, so a steady desktop allocates none.
+    solids: Vec<SolidColorBuffer>,
+    /// How far into `solids` this frame has got. Reset by `begin_frame`.
+    solid_next: usize,
+    /// How many solid buffers were ever actually allocated. The pooling PROOF: a steady
+    /// desktop must not grow this per frame.
+    solid_allocs: u64,
+}
+
+impl RectCache {
+    /// Start a frame: hand out pooled solids from the top again. Paint order is
+    /// deterministic for a given tree, so frame N+1 reuses the same buffer for the same
+    /// rect. Must be called once per lowering, before any `solid` call.
+    pub fn begin_frame(&mut self) {
+        self.solid_next = 0;
+    }
+
+    /// The next pooled solid buffer, sized and coloured for this rect. Allocates only
+    /// while the pool is still shorter than the frame needs; afterwards it is `update` on
+    /// a buffer this cache already owns.
+    pub fn solid(&mut self, w: i32, h: i32, color: [f32; 4]) -> &mut SolidColorBuffer {
+        if self.solid_next == self.solids.len() {
+            self.solids.push(SolidColorBuffer::new((w, h), color));
+            self.solid_allocs += 1;
+        } else {
+            self.solids[self.solid_next].update((w, h), color);
+        }
+        let idx = self.solid_next;
+        self.solid_next += 1;
+        &mut self.solids[idx]
+    }
+
+    /// Total solid buffers ever allocated (test hook for the pooling proof).
+    pub fn solid_allocs(&self) -> u64 {
+        self.solid_allocs
+    }
+
+    /// The rounded-rect buffer for these dims / radius / colour, composed on first
+    /// use. `None` for a degenerate size (the caller then draws nothing for it).
+    pub fn rounded(
+        &mut self,
+        w: i32,
+        h: i32,
+        radius: f32,
+        color: [f32; 4],
+    ) -> Option<&MemoryRenderBuffer> {
+        if w < 1 || h < 1 {
+            return None;
+        }
+        let key = (
+            w as u32,
+            h as u32,
+            radius.to_bits(),
+            color[0].to_bits(),
+            color[1].to_bits(),
+            color[2].to_bits(),
+            color[3].to_bits(),
+        );
+        if !self.cache.contains_key(&key) {
+            let rgba = rounded_rect_rgba(w as u32, h as u32, radius, color);
+            let buf = MemoryRenderBuffer::from_slice(
+                &rgba,
+                Fourcc::Argb8888,
+                (w, h),
+                1,
+                Transform::Normal,
+                None,
+            );
+            self.cache.insert(key, buf);
+        }
+        self.cache.get(&key)
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // THE `CompState` trait — the backend-agnostic accessor surface the shared WM brain
 // drives. Each backend's concrete `State` impls it by handing back references to the
@@ -457,6 +583,20 @@ pub trait CompState:
         false
     }
 
+    /// NATIVE SHELL M2 press half: how many pointer buttons the seat currently holds
+    /// down, maintained by the shared `on_pointer_button` via `note_pointer_button`.
+    /// The native scene reads `pointer_pressed` so the orb reacts to a click held over
+    /// it. Defaults keep the press reaction OFF for any backend that does not store the
+    /// count, which is exactly today's behaviour (additive, no regression). A count
+    /// rather than a bool so two buttons held then one released stays pressed; the
+    /// release decrement saturates, so a stray release never underflows. Known edge,
+    /// accepted: a release swallowed by the capture killswitch can leave the count high
+    /// until the next click, which only over-energises the orb cosmetically.
+    fn note_pointer_button(&mut self, _down: bool) {}
+    fn pointer_pressed(&self) -> bool {
+        false
+    }
+
     /// NATIVE SHELL M3: the latest home_compose scene pushed over the `shell.compose`
     /// IPC verb, or None to fall back to the demo scene. Default None / no-op setter,
     /// so only the DRM backend stores it (winit dev build uses the demo).
@@ -464,6 +604,32 @@ pub trait CompState:
         None
     }
     fn set_native_home(&mut self, _home: crate::scene::HomeCompose) {}
+
+    /// NATIVE SHELL M3 text: the cosmic-text rasterizer, held on State so
+    /// FontSystem::new() (font enumeration) runs ONCE, not per frame. Required so
+    /// every backend that can render the native scene supplies one.
+    fn text_rasterizer_mut(&mut self) -> &mut crate::text_render::TextRasterizer;
+
+    /// ALL native-scene caches at once, as DISJOINT field borrows. `lower_scene`
+    /// walks one leaf list that interleaves Text runs (rasterizer) and OrbSlots
+    /// (orb cache), so it must hold BOTH `&mut` across the loop — which the separate
+    /// `text_rasterizer_mut`/`orb_mut` accessors cannot give (each borrows all of
+    /// `self`). One combined accessor split-borrows the fields, so the lowering
+    /// stays a SINGLE path shared by `render_native_scene` (via State) and its test
+    /// (via directly-constructed caches). Required so every native-capable backend
+    /// supplies all of them.
+    ///
+    /// The 4th is the RETAINED scene tree: it must come through this same accessor
+    /// rather than a separate method, because the lowering needs the tree borrowed at
+    /// the same time as the buffer caches, and two `&mut self` accessors cannot overlap.
+    fn native_scene_caches(
+        &mut self,
+    ) -> (
+        &mut crate::text_render::TextRasterizer,
+        &mut OrbCache,
+        &mut RectCache,
+        &mut crate::scene::SceneCache,
+    );
 
     // ── IPC event fan-out (window.opened/closed/focused…). The winit backend pushes
     //    framed JSON to its `IpcState` subscribers; the DRM backend logs the edge.
@@ -1425,6 +1591,10 @@ pub fn on_pointer_button<S: CompState, B: InputBackend>(state: &mut S, evt: B::P
     let serial = SERIAL_COUNTER.next_serial();
     let button = evt.button_code();
     let button_state = evt.state();
+    // M2 press half: keep the seat's held-button count current for the native scene
+    // (the orb's press reaction). One line on the SAME shared handler both backends
+    // route through, so there is no second button path.
+    state.note_pointer_button(button_state == ButtonState::Pressed);
     if button_state == ButtonState::Pressed {
         update_keyboard_focus(state, state.pointer().current_location(), serial);
     }
@@ -1935,18 +2105,47 @@ where
 /// windows (faded) → Bottom/Background layers.
 /// Generic over R so BOTH backends build the identical frame; the backend then binds its
 /// framebuffer + draws this slice. This is the single source of the desktop's z-order.
-/// NATIVE SHELL M3 GL LOWERING (first cut): lower the native shell scene to render
-/// elements. Only Rect leaves (top bar, taskbar, hero and card tiles) become
-/// SolidColorRenderElements for now; Text (glyph atlas), Image (texture) and OrbSlot
-/// (reuse the M2 orb element) are the M3 remainder. Gated by `native_shell_on` at the
-/// call site, so with the flag OFF this never runs.
-///
-/// FIRST-CUT alloc note: builds the scene and one SolidColorBuffer per rect PER FRAME.
-/// That violates the zero-per-frame-alloc NFR on purpose: step one is proving the
-/// native scene scans out; step two retains the tree (rebuild on compose/resize only)
-/// and pools the buffers. Not shipped past M3 as-is.
-pub fn render_native_scene<S, R>(
+/// NATIVE SHELL M2 input: the pointer position mapped into the native scene's own
+/// coordinate space (the physical `size` the scene is laid out in), or None when there
+/// is no output geometry yet (pre-mode) or the cursor is off this output. Used ONLY to
+/// energise the orb under the cursor, so returning None simply means no hover lift and
+/// today's flag-off behaviour stays byte-identical. The pointer lives in the GLOBAL
+/// logical space, so it is made output-local and scaled into physical coords, which keeps
+/// the hit-test aligned with the painted orb on a HiDPI output too.
+fn native_pointer_scene_pos<S: CompState>(
     state: &S,
+    size: Size<i32, Physical>,
+) -> Option<(f32, f32)> {
+    let loc = state.pointer().current_location();
+    let geo = state.space().output_geometry(state.output())?;
+    if geo.size.w <= 0 || geo.size.h <= 0 {
+        return None;
+    }
+    let lx = loc.x - geo.loc.x as f64;
+    let ly = loc.y - geo.loc.y as f64;
+    let sx = size.w as f64 / geo.size.w as f64;
+    let sy = size.h as f64 / geo.size.h as f64;
+    Some(((lx * sx) as f32, (ly * sy) as f32))
+}
+
+/// NATIVE SHELL M3 GL LOWERING: lower the native shell scene to render elements.
+/// Rect leaves (top bar, taskbar, hero and card tiles) become SolidColorRenderElements;
+/// Text runs are shaped + rasterized into cached MemoryRenderBuffers; OrbSlots reuse the
+/// M2 orb texture. Image (texture) is the remaining leaf kind. Gated by `native_shell_on`
+/// at the call site, so with the flag OFF this never runs. The actual lowering lives in
+/// `lower_scene` (State-free, so it is render-tested); this wrapper just pulls the scene
+/// and caches off `state`.
+///
+/// Alloc note: step two is now DONE both halves. The scene tree is retained
+/// (`scene::SceneCache`, rebuilt only on a real layout change) and the sharp-rect
+/// SolidColorBuffers are pooled (`RectCache::solid`, reused via `update`), so a steady
+/// desktop allocates neither per frame. What still allocates per frame: the `HomeCompose`
+/// clone below (it must, to drop the state borrow before taking the `&mut` caches, so
+/// removing it needs the accessor to split-borrow the home) and the per-frame `elements`
+/// and leaf vectors.
+pub fn render_native_scene<S, R>(
+    state: &mut S,
+    renderer: &mut R,
     size: Size<i32, Physical>,
     elements: &mut Vec<HartRenderElement<R>>,
 ) where
@@ -1954,32 +2153,187 @@ pub fn render_native_scene<S, R>(
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Send + Clone + 'static,
 {
+    // Pull the scene + caches OFF `state` here, then hand the concrete pieces to
+    // `lower_scene`. The demo scene is the fallback until a `shell.compose` IPC feed
+    // stores one. Energy is read before the cache borrow (a plain f32). This is the
+    // ONLY caller that goes through State; the render test calls `lower_scene`
+    // directly with constructed caches, so there is one lowering path, not two.
     let home = state
         .native_home()
         .cloned()
         .unwrap_or_else(crate::scene::HomeCompose::demo);
+    let orb_energy = state.orb_energy();
+    // Read the pointer + held-button state BEFORE the `&mut` cache borrow (all plain
+    // owned values), so hover AND press ride the same single lowering call. None on a
+    // pre-mode frame.
+    let pointer = native_pointer_scene_pos(state, size);
+    let pressed = state.pointer_pressed();
+    let (rasterizer, orb_cache, rect_cache, scene_cache) = state.native_scene_caches();
+    lower_scene(
+        &home, size, renderer, rasterizer, orb_cache, rect_cache, scene_cache, orb_energy,
+        pointer, pressed, elements,
+    );
+}
+
+/// Lower a `HomeCompose` to render elements against the concrete caches — the
+/// State-free core of `render_native_scene`, so it is unit-testable with a
+/// `PixmanRenderer` + freshly-constructed caches (no compositor State needed). The
+/// leaf list interleaves Text (needs `rasterizer`) and OrbSlot (needs `orb_cache`),
+/// which is why both `&mut` are passed together rather than fetched per-leaf.
+pub fn lower_scene<R>(
+    home: &crate::scene::HomeCompose,
+    size: Size<i32, Physical>,
+    renderer: &mut R,
+    rasterizer: &mut crate::text_render::TextRasterizer,
+    orb_cache: &mut OrbCache,
+    rect_cache: &mut RectCache,
+    scene_cache: &mut crate::scene::SceneCache,
+    orb_energy: f32,
+    pointer: Option<(f32, f32)>,
+    pressed: bool,
+    elements: &mut Vec<HartRenderElement<R>>,
+) where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Send + Clone + 'static,
+{
+    // RETAINED TREE (zero-per-frame-alloc, step two): the layout is rebuilt only when the
+    // size, the composed home, or the theme changes, so a steady desktop reuses the tree
+    // it already owns instead of allocating a fresh one every frame. The pointer is NOT a
+    // key, so hover costs no rebuild. `scene_cache` is a disjoint field borrow, so holding
+    // the tree across the loop does not conflict with the buffer caches below.
     let theme = crate::scene::Theme::cosmic_default();
-    let tree = crate::scene::layout_home(size.w as f32, size.h as f32, &home, &theme);
+    let tree = scene_cache.tree_for(size.w as f32, size.h as f32, home, &theme);
+
+    // Hand out pooled solid buffers from the top for this frame (see RectCache::solid).
+    rect_cache.begin_frame();
+
+    // M2 input half: the pointer energises the orb it sits over (more while a button is
+    // held). Fold the lift into the ambient energy ONCE here, against the SAME tree the
+    // leaves come from, so orb reactivity rides the existing orb path (orb::motion_at
+    // clamps the sum to 0..=1).
+    let orb_energy = orb_energy + tree.pointer_orb_energy(pointer, pressed);
 
     let mut leaves: Vec<&crate::scene::SceneNode> = Vec::new();
     tree.flatten(&mut leaves);
     for leaf in leaves {
-        if let crate::scene::SceneNode::Rect { rect, color, .. } = leaf {
-            if rect.w < 1.0 || rect.h < 1.0 {
-                continue;
+        match leaf {
+            crate::scene::SceneNode::Rect { rect, color, radius } => {
+                if rect.w < 1.0 || rect.h < 1.0 {
+                    continue;
+                }
+                if *radius > 0.5 {
+                    // Rounded (cards, omnibox): lower through a cached rounded-rect
+                    // buffer so the corner radius the scene specifies is actually
+                    // drawn. A SolidColorRenderElement is always a hard quad, so this
+                    // is the ONLY way the native chrome gets soft corners like the
+                    // shell has. Alpha is baked into the premultiplied buffer, so the
+                    // element alpha is 1.0.
+                    if let Some(buffer) = rect_cache.rounded(
+                        rect.w as i32,
+                        rect.h as i32,
+                        *radius,
+                        [color.r, color.g, color.b, color.a],
+                    ) {
+                        let origin: Point<f64, Physical> =
+                            Point::from((rect.x as f64, rect.y as f64));
+                        match MemoryRenderBufferRenderElement::from_buffer(
+                            renderer,
+                            origin,
+                            buffer,
+                            Some(1.0),
+                            None,
+                            Some((rect.w as i32, rect.h as i32).into()),
+                            Kind::Unspecified,
+                        ) {
+                            Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                            Err(err) => warn!(?err, "native scene: rounded rect import failed"),
+                        }
+                    }
+                } else {
+                    // Sharp (desktop ground, bars): the cheap solid quad, no per-pixel
+                    // rasterize. The buffer comes from the POOL, so a steady desktop
+                    // reuses the one it handed out last frame instead of allocating.
+                    let buf = rect_cache.solid(
+                        rect.w as i32,
+                        rect.h as i32,
+                        [color.r, color.g, color.b, color.a],
+                    );
+                    let el = SolidColorRenderElement::from_buffer(
+                        buf,
+                        (rect.x as i32, rect.y as i32),
+                        Scale::from(1.0),
+                        color.a,
+                        Kind::Unspecified,
+                    );
+                    elements.push(HartRenderElement::Solid(el));
+                }
             }
-            let mut buf = SolidColorBuffer::new(
-                (rect.w as i32, rect.h as i32),
-                [color.r, color.g, color.b, color.a],
-            );
-            let el = SolidColorRenderElement::from_buffer(
-                &mut buf,
-                (rect.x as i32, rect.y as i32),
-                Scale::from(1.0),
-                color.a,
-                Kind::Unspecified,
-            );
-            elements.push(HartRenderElement::Solid(el));
+            crate::scene::SceneNode::Text {
+                rect,
+                text,
+                size_px,
+                color,
+                ..
+            } => {
+                if rect.w < 1.0 || rect.h < 1.0 || text.is_empty() {
+                    continue;
+                }
+                let buffer = rasterizer.rasterize(
+                    text,
+                    *size_px,
+                    rect.w as i32,
+                    rect.h as i32,
+                    [color.r, color.g, color.b, color.a],
+                );
+                let origin: Point<f64, Physical> = Point::from((rect.x as f64, rect.y as f64));
+                match MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    origin,
+                    buffer,
+                    Some(1.0),
+                    None,
+                    Some((rect.w as i32, rect.h as i32).into()),
+                    Kind::Unspecified,
+                ) {
+                    Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                    Err(err) => warn!(?err, "native scene: text run import failed"),
+                }
+            }
+            crate::scene::SceneNode::OrbSlot { rect, .. } => {
+                // The scene OWNS the orb (the hardcoded M2 draw is gated off when
+                // native_shell_on), so ONE orb path. Both the large home orb and the
+                // compact top-bar orb-sm share ONE cached texture composed at a fixed
+                // size and render at their own slot size via GPU scale, so two slots in
+                // one frame never thrash the single-buffer OrbCache.
+                if rect.w < 1.0 || rect.h < 1.0 {
+                    continue;
+                }
+                let side = (size.w.min(size.h) as f32 * 0.30) as i32;
+                if let Some((buffer, motion)) = orb_cache.current(side, orb_energy) {
+                    let dst = (rect.w.min(rect.h) * motion.scale) as i32;
+                    if dst < 1 {
+                        continue;
+                    }
+                    let origin: Point<f64, Physical> = Point::from((
+                        (rect.x + (rect.w - dst as f32) / 2.0) as f64,
+                        (rect.y + (rect.h - dst as f32) / 2.0) as f64,
+                    ));
+                    match MemoryRenderBufferRenderElement::from_buffer(
+                        renderer,
+                        origin,
+                        buffer,
+                        Some(motion.alpha),
+                        None,
+                        Some((dst, dst).into()),
+                        Kind::Unspecified,
+                    ) {
+                        Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                        Err(err) => warn!(?err, "native scene: orb import failed"),
+                    }
+                }
+            }
+            // Image lowering is the M3 remainder; Container only groups.
+            _ => {}
         }
     }
 }
@@ -2020,7 +2374,7 @@ where
     //    here so native chrome sits above the app windows and below the cursor. A pure
     //    additive path: flag off = no-op, the WebView shell is untouched. ──
     if state.native_shell_on() {
-        render_native_scene(state, size, &mut elements);
+        render_native_scene(state, renderer, size, &mut elements);
     }
 
     let ws_alpha = workspace_fade_alpha(state);
@@ -2087,7 +2441,7 @@ where
     // composed once. No pixel is touched by the CPU per frame, which is the
     // difference between this and the ~5.4s/6s of userspace rasterisation
     // measured in WebKit while it breathed the same orb.
-    if !state.capture_blocked() {
+    if !state.capture_blocked() && !state.native_shell_on() {
         // Placement per checklist rule c7: "Home mode: orb floats to the RIGHT
         // of the hero copy". An earlier draft centred it, which contradicts a
         // binding rule — the checklist is the instruction record, not a
@@ -3078,5 +3432,235 @@ mod tests {
     fn workspace_fade_constant_is_short_and_positive() {
         assert!(WS_FADE_MS > 0 && WS_FADE_MS <= 500, "ws fade should be a short ramp");
         assert!(FADE_IN_MS > 0 && FADE_IN_MS <= 500, "map fade should be a short ramp");
+    }
+
+    #[test]
+    fn rounded_rect_cuts_corners_and_fills_the_centre() {
+        // A 12px radius on a 40x40 box: the exact corner pixel is outside the arc and
+        // must be fully transparent, while the centre and the straight top edge are
+        // fully covered. This is precisely what a hard SolidColorRenderElement cannot
+        // express, so it is the reason rounded rects lower through a buffer.
+        let (w, h) = (40u32, 40u32);
+        let rgba = rounded_rect_rgba(w, h, 12.0, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
+        let alpha_at = |x: u32, y: u32| rgba[((y * w + x) * 4 + 3) as usize];
+        assert_eq!(alpha_at(0, 0), 0, "top-left corner must be cut away");
+        assert!(alpha_at(w / 2, h / 2) > 250, "centre must be opaque");
+        assert!(alpha_at(w / 2, 0) > 250, "the straight top edge must be covered");
+        // A zero radius is a plain filled rect: the corner is now covered too.
+        let sharp = rounded_rect_rgba(w, h, 0.0, [1.0, 1.0, 1.0, 1.0]);
+        assert!(sharp[3] > 250, "radius 0 fills the corner");
+    }
+}
+
+// NATIVE SHELL PARITY PROGRAM, M3 render proof. Gated on `smithay` because it uses
+// the real `PixmanRenderer` (the never-fail software floor, no GPU) to exercise the
+// SAME `lower_scene` the DRM/pixman frame path runs. This closes the gap the other
+// tests leave: scene.rs proves LAYOUT, text_render.rs proves colour packing, and the
+// build proves the API TYPE-checks — but only actually lowering a scene against a
+// live renderer proves the buffers IMPORT and the elements are produced. Runs headless
+// in CI (pixman is pure CPU), so the native chrome is validated without the box.
+#[cfg(all(test, feature = "smithay"))]
+mod native_render_tests {
+    use super::*;
+    use smithay::backend::renderer::element::Element;
+    use smithay::backend::renderer::pixman::PixmanRenderer;
+
+    #[test]
+    fn demo_scene_lowers_and_imports_buffers_on_pixman() {
+        // The never-fail software renderer of record — allocates with no GPU, so this
+        // holds in any CI sandbox.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (1280, 800).into();
+
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        lower_scene(
+            &home,
+            size,
+            &mut renderer,
+            &mut rasterizer,
+            &mut orb,
+            &mut rects,
+            &mut scenes,
+            0.5,
+            None,
+            false,
+            &mut elements,
+        );
+
+        // The demo home is a full desktop (top bar + hero + rows + taskbar), so it
+        // lowers to a non-trivial element set, not one stray rect.
+        assert!(
+            elements.len() >= 3,
+            "demo scene lowered to only {} elements",
+            elements.len()
+        );
+
+        // The orb slots, the rounded card/omnibox rects, and (with a font) the text
+        // runs all lower to Memory elements — each exists ONLY when
+        // `MemoryRenderBufferRenderElement::from_buffer` returned Ok, so their presence
+        // is evidence the MemoryRenderBuffer -> PixmanRenderer ImportMem path actually
+        // works. The demo always carries orb slots, so this never depends on fonts
+        // being installed in the sandbox.
+        let memory = elements
+            .iter()
+            .filter(|e| matches!(e, HartRenderElement::Memory(_)))
+            .count();
+        assert!(
+            memory >= 1,
+            "orb/rounded-rect/text buffers must import as Memory elements, got {memory}"
+        );
+
+        // Every lowered element has a positive on-screen footprint — nothing collapsed
+        // to zero area (the <1px skip) or lowered with an empty box.
+        for e in &elements {
+            let g = e.geometry(Scale::from(1.0));
+            assert!(
+                g.size.w > 0 && g.size.h > 0,
+                "element lowered with empty geometry: {g:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_steady_desktop_reuses_its_buffers_instead_of_allocating_each_frame() {
+        // The zero-per-frame-alloc NFR, proven the way a frame loop actually runs: same
+        // caches, same scene, repeated lowerings, with the element vector rebuilt each
+        // time exactly as build_frame_elements does.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (1280, 800).into();
+
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+
+        let mut first = 0usize;
+        let mut solids_after_first_frame = 0u64;
+        for frame in 0..6 {
+            // A fresh element vector each pass, exactly as build_frame_elements does, so
+            // the previous frame's elements are dropped before the buffers are reused.
+            let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+            lower_scene(
+                &home,
+                size,
+                &mut renderer,
+                &mut rasterizer,
+                &mut orb,
+                &mut rects,
+                &mut scenes,
+                0.5,
+                None,
+                false,
+                &mut elements,
+            );
+            if frame == 0 {
+                first = elements.len();
+                solids_after_first_frame = rects.solid_allocs();
+                assert!(first > 0, "the demo scene lowered to nothing");
+                assert_eq!(scenes.rebuilds(), 1, "the first frame builds the tree once");
+                assert!(
+                    solids_after_first_frame > 0,
+                    "the demo scene has sharp rects, so the first frame allocates solids"
+                );
+            } else {
+                assert_eq!(
+                    elements.len(),
+                    first,
+                    "a steady desktop must lower the same element set every frame"
+                );
+            }
+        }
+
+        assert_eq!(
+            scenes.rebuilds(),
+            1,
+            "a steady desktop must not rebuild the scene tree per frame"
+        );
+        assert_eq!(
+            rects.solid_allocs(),
+            solids_after_first_frame,
+            "five further frames must reuse the pooled solids, not allocate new ones"
+        );
+    }
+
+    #[test]
+    fn demo_scene_composites_visible_pixels_on_pixman() {
+        // Color32F / Frame / draw_render_elements are cfg-gated to the winit path in
+        // this module's own imports, so bring them in directly for the smithay test.
+        use smithay::backend::renderer::utils::draw_render_elements;
+        use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen};
+
+        // Compose the lowered scene into an offscreen pixman image OVER a magenta
+        // sentinel the scene never paints, then read the pixels back. This is the
+        // on-screen COMPOSITE proof the import test does not give: the elements must
+        // actually PAINT onto a framebuffer, with the right byte order and premultiply,
+        // not merely be produced. Pure CPU (pixman), so it runs headless in CI without
+        // a GPU or the thermal-blocked box.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (640, 400).into();
+        let buf_size: Size<i32, BufferCoord> = (640, 400).into();
+
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        lower_scene(
+            &home,
+            size,
+            &mut renderer,
+            &mut rasterizer,
+            &mut orb,
+            &mut rects,
+            &mut scenes,
+            0.5,
+            None,
+            false,
+            &mut elements,
+        );
+
+        let mut image = renderer
+            .create_buffer(Fourcc::Argb8888, buf_size)
+            .expect("offscreen image");
+        let mut target = renderer.bind(&mut image).expect("bind offscreen");
+        let full: Rectangle<i32, Physical> = Rectangle::from_size(size);
+        {
+            let mut frame = renderer
+                .render(&mut target, size, Transform::Normal)
+                .expect("begin frame");
+            frame
+                .clear(Color32F::new(1.0, 0.0, 1.0, 1.0), &[full])
+                .expect("clear to sentinel");
+            draw_render_elements(&mut frame, 1.0, &elements, &[full]).expect("draw scene");
+            let _ = frame.finish().expect("finish frame");
+        }
+
+        let region: Rectangle<i32, BufferCoord> = Rectangle::from_size(buf_size);
+        let mapping = renderer
+            .copy_framebuffer(&target, region, Fourcc::Argb8888)
+            .expect("copy_framebuffer");
+        let bytes = renderer.map_texture(&mapping).expect("map_texture");
+
+        // Argb8888 little-endian = [B,G,R,A]; the opaque magenta clear reads
+        // B=255,G=0,R=255. Count pixels the scene painted over it: the chrome (top bar,
+        // taskbar, hero, orb, text) must cover a real fraction of the frame.
+        let total = (size.w * size.h) as usize;
+        let painted = bytes
+            .chunks_exact(4)
+            .filter(|px| !(px[0] > 250 && px[1] < 5 && px[2] > 250))
+            .count();
+        assert!(
+            painted > total / 20,
+            "native scene painted only {painted}/{total} px over the clear sentinel"
+        );
     }
 }

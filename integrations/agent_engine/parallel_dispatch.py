@@ -171,6 +171,20 @@ def decompose_goal_to_ledger(prompt: str, goal_id: str, goal_type: str,
         (task_list, ledger) — task_list for coordinator compatibility,
         ledger for parallel dispatch. ledger is None for single-task goals.
     """
+    # capabilities are NOT goal types.  A worker claims a task only when one of
+    # its OWN advertised capability names appears in capabilities_required, and
+    # worker_loop._detect_capabilities can only ever emit the names in
+    # HIVE_WORKER_CAPABILITIES.  Demanding a goal_type outside that set --
+    # hive_growth, hive_training, autoresearch, thought_experiment, ... --
+    # produces a task no node in the fleet can claim.  Measured on central
+    # 2026-09-03: three hive goals, every task PENDING and unclaimable.
+    #
+    # Computed once, before the try, so all THREE exits below agree, including
+    # the ImportError fallback.  The two vocabularies overlap on five words, so
+    # a per-exit copy of this rule would silently drift.
+    from core.constants import HIVE_WORKER_CAPABILITIES
+    caps = [goal_type] if goal_type in HIVE_WORKER_CAPABILITIES else []
+
     try:
         from agent_ledger import SmartLedger, Task, TaskType, ExecutionMode
 
@@ -232,7 +246,7 @@ def decompose_goal_to_ledger(prompt: str, goal_id: str, goal_type: str,
                 result.append({
                     'task_id': tid,
                     'description': task.description[:500],
-                    'capabilities': [goal_type],
+                    'capabilities': caps,
                     'execution_mode': task.execution_mode.value
                     if hasattr(task.execution_mode, 'value')
                     else str(task.execution_mode),
@@ -244,7 +258,7 @@ def decompose_goal_to_ledger(prompt: str, goal_id: str, goal_type: str,
         return [{
             'task_id': f'{goal_id}_task_0',
             'description': prompt[:500],
-            'capabilities': [goal_type],
+            'capabilities': caps,
         }], None
 
     except ImportError:
@@ -252,7 +266,7 @@ def decompose_goal_to_ledger(prompt: str, goal_id: str, goal_type: str,
         return [{
             'task_id': f'{goal_id}_task_0',
             'description': prompt[:500],
-            'capabilities': [goal_type],
+            'capabilities': caps,
         }], None
 
 

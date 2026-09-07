@@ -96,3 +96,88 @@ def test_schema_version_still_stamps(db_path):
 
     run_migrations()
     assert get_schema_version(get_engine()) >= 1
+
+
+def test_a_column_added_to_a_model_reaches_an_already_stamped_db(db_path):
+    """Central, 2026-09-03: `comments.agent_id` and `comments.privacy` were
+    added to the Comment model with no migration behind them, so every DB
+    created before that change lacked both. SQLAlchemy selects every mapped
+    column, so this did not degrade -- it 500'd the whole endpoint:
+
+        sqlite3.OperationalError: no such column: comments.agent_id
+          services.py:761 CommentService.get_by_post -> q.all()
+
+    30 identical failures in a 30-minute window, i.e. every attempt to read the
+    comments on any post. Same shape as the missing-table regression above:
+    a model changed, the ladder did not.
+
+    Behavioural — drives the REAL run_migrations() against a REAL sqlite file
+    whose `comments` table is missing the columns, and asserts the ORM query
+    that was failing now runs."""
+    from integrations.social.migrations import run_migrations, set_schema_version
+    from integrations.social.models import get_engine
+
+    run_migrations()
+    engine = get_engine()
+
+    # Rebuild `comments` as it existed before the model gained the two
+    # columns, and roll the stamp back so the ladder has to do the work.
+    with engine.connect() as conn:
+        conn.execute(text("DROP TABLE comments"))
+        conn.execute(text(
+            "CREATE TABLE comments ("
+            " id VARCHAR(64) PRIMARY KEY,"
+            " post_id VARCHAR(64) NOT NULL,"
+            " author_id VARCHAR(64) NOT NULL,"
+            " parent_id VARCHAR(64),"
+            " content TEXT NOT NULL,"
+            " upvotes INTEGER DEFAULT 0,"
+            " downvotes INTEGER DEFAULT 0,"
+            " score INTEGER DEFAULT 0,"
+            " depth INTEGER DEFAULT 0,"
+            " is_deleted BOOLEAN DEFAULT 0,"
+            " is_hidden BOOLEAN DEFAULT 0,"
+            " created_at DATETIME,"
+            " updated_at DATETIME)"))
+        conn.commit()
+    # The stamp lives in social_meta, not a table of its own — go through the
+    # canonical setter so this test cannot drift from the ladder's storage.
+    set_schema_version(engine, 53)
+
+    live = {c["name"] for c in inspect(engine).get_columns("comments")}
+    assert "agent_id" not in live and "privacy" not in live, \
+        "precondition: the table must start without the drifted columns"
+
+    run_migrations()
+
+    live = {c["name"] for c in inspect(engine).get_columns("comments")}
+    for col in ("agent_id", "privacy"):
+        assert col in live, (
+            f"comments.{col} is in the model but no migration adds it, so any "
+            f"DB created before the model change 500s on every comment read")
+
+
+def test_the_model_and_a_migrated_db_agree_on_every_column(db_path):
+    """The general invariant the case above is one instance of: after
+    run_migrations(), no mapped column may be missing from its live table.
+
+    A drift sweep over Base.metadata is what found the comments pair on
+    central, and it found exactly those two -- so this assertion is the cheap
+    standing version of that sweep."""
+    from integrations.social.migrations import run_migrations
+    from integrations.social.models import get_engine, Base
+
+    run_migrations()
+    engine = get_engine()
+    insp = inspect(engine)
+
+    drift = {}
+    for name, table in Base.metadata.tables.items():
+        if not insp.has_table(name):
+            continue
+        live = {c["name"] for c in insp.get_columns(name)}
+        missing = [c.name for c in table.columns if c.name not in live]
+        if missing:
+            drift[name] = missing
+
+    assert not drift, f"model columns with no table column behind them: {drift}"
