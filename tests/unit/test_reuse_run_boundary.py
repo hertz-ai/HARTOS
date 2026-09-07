@@ -28,7 +28,7 @@ TOUCH-ON-READ (core/session_cache.py:84), so an agent used at least once every
 2h NEVER expires, never takes the cache-miss branch, and never resets. The more
 an agent is used, the less likely its run state ever resets.
 
-WHY THIS PREDICATE IS SAFE: `current_action > len(actions)` is NEVER a valid
+WHY THE PREDICATE IS SAFE: `current_action > len(actions)` is NEVER a valid
 continuation state. A genuine mid-recipe continuation always has
 `current_action <= len(actions)`. So resetting here cannot truncate a run in
 flight — it can only clear a run that already finished.
@@ -37,12 +37,18 @@ WHAT IT DELIBERATELY DOES NOT FIX: a run abandoned at action 3 of 10 followed by
 a genuinely NEW user request still resumes at 3. Distinguishing those needs a
 real run-id from the caller; this predicate does not invent one.
 
+THESE ASSERT ON OBSERVED STATE, NOT ON A RETURN CODE.  Each case reads
+`user_tasks[key].current_action` back after the call — the value the reuse loop
+actually consumes via `helper.get_current_action_id()` — so the guard survives
+any change to what the function returns.
+
     python -m pytest tests/unit/test_reuse_run_boundary.py -q
 """
 import unittest
 
 from hartos.helper import Action
-from hartos.reuse_recipe import _reset_pointer_if_run_finished, user_tasks
+from hartos.lifecycle_hooks import clear_action_states, get_action_state, set_action_state, ActionState
+from hartos.reuse_recipe import user_tasks
 
 
 def _seed(user_prompt, n_actions, current_action):
@@ -57,7 +63,7 @@ def _seed(user_prompt, n_actions, current_action):
 class RunBoundary(unittest.TestCase):
 
     def tearDown(self):
-        for k in ('u_finished', 'u_midrun', 'u_fresh', 'u_empty', 'u_deep'):
+        for k in ('u_finished', 'u_midrun', 'u_fresh', 'u_empty', 'u_deep', 'u_junk'):
             try:
                 del user_tasks[k]
             except Exception:
@@ -68,48 +74,70 @@ class RunBoundary(unittest.TestCase):
         a = _seed('u_finished', n_actions=1, current_action=2)
         self.assertGreater(a.current_action, len(a.actions),
                            'precondition: the pointer must be past the end')
-        fired = _reset_pointer_if_run_finished('u_finished')
-        self.assertTrue(fired, 'a finished run must be detected')
-        self.assertEqual(user_tasks['u_finished'].current_action, 1)
+        clear_action_states('u_finished', user_tasks)
+        self.assertEqual(user_tasks['u_finished'].current_action, 1,
+                         'a finished run must restart at action 1')
 
     def test_mid_recipe_continuation_is_NOT_reset(self):
         """Action 3 of 10 is a run in flight — truncating it would be the bug."""
         _seed('u_midrun', n_actions=10, current_action=3)
-        fired = _reset_pointer_if_run_finished('u_midrun')
-        self.assertFalse(fired)
+        clear_action_states('u_midrun', user_tasks)
         self.assertEqual(user_tasks['u_midrun'].current_action, 3,
                          'a continuation must keep its place')
 
     def test_last_action_in_flight_is_NOT_reset(self):
         """current_action == len(actions) is the FINAL action, still running."""
         _seed('u_deep', n_actions=4, current_action=4)
-        self.assertFalse(_reset_pointer_if_run_finished('u_deep'))
+        clear_action_states('u_deep', user_tasks)
         self.assertEqual(user_tasks['u_deep'].current_action, 4)
 
     def test_fresh_run_is_a_no_op(self):
         _seed('u_fresh', n_actions=1, current_action=1)
-        self.assertFalse(_reset_pointer_if_run_finished('u_fresh'))
+        clear_action_states('u_fresh', user_tasks)
         self.assertEqual(user_tasks['u_fresh'].current_action, 1)
-
-    def test_unknown_session_is_safe(self):
-        """First-ever turn: nothing cached. Must not raise into the hot path."""
-        self.assertFalse(_reset_pointer_if_run_finished('never_seen_before'))
 
     def test_empty_action_list_is_safe(self):
         """len(actions) == 0 must not be read as 'past the end' and reset."""
         _seed('u_empty', n_actions=0, current_action=1)
-        self.assertFalse(_reset_pointer_if_run_finished('u_empty'))
+        clear_action_states('u_empty', user_tasks)
+        self.assertEqual(user_tasks['u_empty'].current_action, 1)
+
+    def test_unknown_session_is_safe(self):
+        """First-ever turn: nothing cached. Must not raise into the hot path."""
+        clear_action_states('never_seen_before', user_tasks)  # must not raise
 
     def test_malformed_entry_never_raises(self):
         """A junk cache entry must not kill the turn."""
         user_tasks['u_junk'] = object()
-        try:
-            self.assertFalse(_reset_pointer_if_run_finished('u_junk'))
-        finally:
-            try:
-                del user_tasks['u_junk']
-            except Exception:
-                pass
+        clear_action_states('u_junk', user_tasks)  # must not raise
+
+    def test_action_states_still_cleared_without_user_tasks(self):
+        """The pre-existing one-arg contract is unchanged.
+
+        `reuse_recipe.py:1081` and the 3 call sites in
+        test_reuse_action_state_isolation.py all call this with ONE argument;
+        extending the signature must not alter what they get.
+        """
+        set_action_state('u_states_only', 1, ActionState.IN_PROGRESS)
+        self.assertEqual(get_action_state('u_states_only', 1), ActionState.IN_PROGRESS)
+        dropped = clear_action_states('u_states_only')
+        self.assertEqual(dropped, 1, 'must still return the dropped count')
+        self.assertEqual(get_action_state('u_states_only', 1), ActionState.ASSIGNED,
+                         'a cleared session reads back as ASSIGNED')
+
+    def test_pointer_reset_also_clears_action_states(self):
+        """Both stores reset together, or the reset is vacuous.
+
+        Resetting the pointer alone leaves every action TERMINATED from the
+        previous run, and the loop `[AUTO-ADVANCE]`s straight through — the
+        90210554431 failure this module's own docstring records.
+        """
+        _seed('u_finished', n_actions=1, current_action=2)
+        set_action_state('u_finished', 1, ActionState.IN_PROGRESS)
+        clear_action_states('u_finished', user_tasks)
+        self.assertEqual(user_tasks['u_finished'].current_action, 1)
+        self.assertEqual(get_action_state('u_finished', 1), ActionState.ASSIGNED,
+                         'states must reset with the pointer, not after it')
 
 
 if __name__ == '__main__':

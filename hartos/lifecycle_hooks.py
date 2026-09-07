@@ -942,8 +942,8 @@ def get_action_state(user_prompt: str, action_id: int) -> ActionState:
         return action_states.get(user_prompt, {}).get(action_id, ActionState.ASSIGNED)
 
 
-def clear_action_states(user_prompt: str) -> int:
-    """Drop one session's action states so a NEW run starts from ASSIGNED.
+def clear_action_states(user_prompt: str, user_tasks=None) -> int:
+    """Drop one session's run state so a NEW run starts from the beginning.
 
     `action_states` is keyed only by user_prompt ("{user_id}_{prompt_id}") — it
     carries no phase dimension and no run id, so CREATE and REUSE for the same
@@ -970,8 +970,43 @@ def clear_action_states(user_prompt: str) -> int:
     only reader — a caller reaching into the dict itself would be a third
     accessor and a parallel path.
 
+    RUN STATE IS TWO STORES, AND BOTH RESET HERE.  `action_states` (this module)
+    says what PHASE each action is in; the session's `Action.current_action` (an
+    entry in the caller's `user_tasks` cache) says WHICH action is current.
+    Clearing only one is vacuous — [[feedback_mirrored_state_reset]], and
+    measured twice:
+
+      • states without pointer — agent 33323830039, 2026-09-07: a 1-action
+        recipe driven twice in one process kept `current_action = 2`, so the
+        second drive terminated a phantom "Action 2" in 35 ms, ran no tool, and
+        answered with a self-introduction.
+      • pointer without states — the 90210554431 case above: every action still
+        reads TERMINATED and the loop `[AUTO-ADVANCE]`s through the recipe.
+
+    Pass `user_tasks` (the mapping, or the session's own `Action`) and this
+    resets both.  Callers that only hold the states — `reuse_recipe.py:1081`,
+    which rebuilds the `Action` itself on the next line — keep the one-argument
+    form unchanged.
+
+    THE TWO STORES RESET ON DIFFERENT TERMS, because they carry different risk.
+    Dropping `action_states` mid-run is safe: the actions re-read as ASSIGNED and
+    the run continues where its pointer says.  Resetting the POINTER mid-run
+    would truncate the run, so it happens only when the pointer is past the end
+    of the recipe — `current_action > len(actions)`, which is never a valid
+    continuation state (a run in flight always has `current_action <=
+    len(actions)`, including on its FINAL action, which is why the comparison is
+    `<=` and not `<`).  That asymmetry is what makes this function safe to call
+    at ANY run entry point without knowing whether a run is already in flight.
+
+    DELIBERATELY NOT HANDLED: a run abandoned at action 3 of 10, followed by a
+    genuinely NEW request, still resumes at 3.  Separating those needs a real
+    run-id from the caller; this does not invent one.
+
     Returns the number of action entries dropped (0 when there was no session).
     """
+    if user_tasks is not None:
+        _reset_finished_pointer(user_prompt, user_tasks)
+
     with _state_lock:
         dropped = len(action_states.pop(user_prompt, {}) or {})
     if dropped:
@@ -980,6 +1015,45 @@ def clear_action_states(user_prompt: str) -> int:
             "from ASSIGNED instead of inheriting the previous phase's terminals",
             dropped, user_prompt)
     return dropped
+
+
+def _reset_finished_pointer(user_prompt: str, user_tasks) -> bool:
+    """Rewind `current_action` to 1 iff the previous run ran off the end.
+
+    Split out of `clear_action_states` for SRP: that function owns the states,
+    this owns the pointer, and the caller-facing contract stays one call.  The
+    predicate and its safety argument are documented there.
+
+    Accepts the same shapes the sibling `lifecycle_hook_*` functions accept — a
+    mapping of sessions, or the session's `Action` itself — so there is one
+    accessor idiom in this module rather than a second one here.
+    """
+    try:
+        if hasattr(user_tasks, 'get'):
+            task = user_tasks.get(user_prompt)
+        elif hasattr(user_tasks, 'current_action'):
+            task = user_tasks
+        else:
+            return False
+        if task is None:
+            return False
+
+        n = len(getattr(task, 'actions', None) or [])
+        current = getattr(task, 'current_action', 1)
+        # `not n` guards a recipe with zero actions: 1 > 0 would otherwise read
+        # as "past the end" and rewind on every single turn.
+        if not n or not isinstance(current, int) or current <= n:
+            return False
+        task.current_action = 1
+    except Exception:
+        # Never raise into the reuse hot path — a failed reset must degrade to
+        # the previous behaviour, not kill the turn.
+        return False
+
+    logger.info(
+        "[RUN-BOUNDARY] %s: previous run finished (current_action=%s > %s "
+        "action(s)) — reset to action 1", user_prompt, current, n)
+    return True
 
 
 def validate_state_transition(user_prompt: str, action_id: int, new_state: ActionState) -> bool:
