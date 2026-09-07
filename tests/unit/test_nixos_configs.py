@@ -4450,3 +4450,79 @@ class TestWaylandSocketWaitOutlastsTheCompositorsStartup:
         assert 'kill -0 "$HART_COMP_PID"' in block and "break" in block, (
             "the socket-wait loop no longer bails when the compositor dies, so the "
             "raised bound now delays real crash detection")
+
+
+class TestTheNativeTierHasAnIpcRelayToo:
+    """The brain must have a route to HART-comp, not only to sway.
+
+    THE GAP, measured on the Samsung box 2026-09-07 while Tier-1 was healthy.
+    compositor/src/ipc.rs serves the whole com.hart.Compositor verb surface
+    against the real Space<Window>, and it was answering correctly the entire
+    time (window.list -> ok=true, an unknown method -> code=unsupported). But
+    the ONLY relay resolved /run/user/*/sway-ipc.*.sock, which the native tier
+    never has, so it exited 1 on every connection. A banked window-layout
+    recipe therefore replayed as:
+
+        available: true, replayed 0 of 3, three anonymous ok=false
+
+    Both compositors bind under /run/user/<session uid> as the session user and
+    the brain runs as `hart`, so a relay is the route for either tier.
+    HART-comp's socket is 0600 ON PURPOSE (IPC_PROTOCOL.md 6.5 makes that
+    permission the server-side half of the boundary), which is exactly why the
+    grant belongs in one root unit and not in a looser mode on the socket.
+    """
+
+    @staticmethod
+    def _read(rel):
+        with open(os.path.join(REPO_ROOT, rel), encoding='utf8') as fh:
+            return fh.read()
+
+    def _host(self):
+        return self._read('nixos/modules/hart-layer-shell-host.nix')
+
+    def test_a_relay_socket_exists_for_hart_comp(self):
+        src = self._host()
+        assert 'systemd.sockets.hart-comp-ipc' in src
+        assert '"/run/hart/hart-comp.sock"' in src
+
+    def test_both_relays_share_one_implementation(self):
+        """Byte forwarding is protocol-agnostic, so a second copy of it would be
+        a parallel path maintained twice and drifting once."""
+        src = self._host()
+        assert 'wmIpcRelay' in src
+        # Exactly one relay script is defined, and both units exec it.
+        assert src.count('pkgs.writeScript "hart-wm-ipc-relay"') == 1
+        assert src.count('${wmIpcRelay} /run/user/*/sway-ipc.*.sock') == 1
+        assert src.count('${wmIpcRelay} /run/user/*/hart-comp.sock') == 1
+
+    def test_the_relay_takes_its_upstream_from_argv(self):
+        """One implementation only works if the upstream is a parameter. A
+        hardcoded glob is what limited it to sway in the first place."""
+        src = self._host()
+        assert "pattern = sys.argv[1] if len(sys.argv) > 1" in src
+        assert "glob.glob(pattern)" in src
+
+    def test_the_hart_comp_relay_is_reachable_by_the_brains_group(self):
+        """0660 root:hart, same as the sway relay: the backend runs as `hart`
+        and connect(2) needs WRITE on the socket inode. Not world-accessible."""
+        src = self._host()
+        block = src[src.index('systemd.sockets.hart-comp-ipc'):]
+        block = block[:block.index('systemd.services."hart-comp-ipc@"')]
+        assert 'SocketMode = "0660"' in block
+        assert 'SocketGroup = "hart"' in block
+        # Accept=true gives one relay per connection, so the upstream is
+        # re-resolved every time and a session restart cannot pin a stale one.
+        assert 'Accept = true' in block
+
+    def test_the_service_is_pointed_at_the_relay(self):
+        ui = self._read('nixos/modules/hart-liquid-ui.nix')
+        assert 'HART_COMP_SOCK = "/run/hart/hart-comp.sock"' in ui
+
+    def test_the_client_does_not_trust_that_variable_on_its_own(self):
+        """The env var CANNOT be the proof, and this is the whole lesson of the
+        bug being fixed. systemd socket activation means connect(2) always
+        succeeds on the relay path whether or not a compositor is behind it,
+        precisely as SWAYSOCK is always set whether or not sway is running.
+        The client must require a real answer before claiming the transport."""
+        client = self._read('integrations/agent_engine/hart_wm_client.py')
+        assert "_call_on(path, 'window.list')" in client

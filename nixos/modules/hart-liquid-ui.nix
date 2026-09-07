@@ -760,6 +760,16 @@ in
           # serves its synthetic "Main" placeholder -- a desktop reporting no
           # display while driving a 1600x900 panel.
           SWAYSOCK = "/run/hart/sway-ipc.sock";
+          # The Tier-1 twin of the line above: HartWmClient speaks HART-comp's
+          # framed-JSON socket through this relay, which is how native window
+          # verbs and banked layout recipes work on the native tier at all.
+          # Note it is deliberately safe to set UNCONDITIONALLY, exactly as
+          # SWAYSOCK is, because the client does not trust the variable: it
+          # requires a real window.list answer before claiming the transport.
+          # That matters here more than usual, since systemd socket activation
+          # means connect(2) ALWAYS succeeds on this path whether or not a
+          # compositor is behind it.
+          HART_COMP_SOCK = "/run/hart/hart-comp.sock";
           # NEVER let pactl autospawn a PulseAudio daemon. PipeWire owns the
           # devices, so an autospawned pulseaudio dies instantly with "Daemon
           # startup without any loaded modules" -- and because the UI polls audio
