@@ -147,6 +147,52 @@ class TestMergeRecoversRealAnswers:
             f'its answer must be recovered, got {out}')
         assert 'OTHER SEAT' in tools[0]['content']
 
+    def test_consolidated_reply_ids_live_in_tool_responses(self):
+        """THE REAL AUTOGEN SHAPE — and why two live fixes still spliced 0.
+
+        Read from autogen's own generate_tool_calls_reply
+        (agentchat/conversable_agent.py): when tools run it returns
+
+            {"role": "tool",
+             "tool_responses": [ {"tool_call_id": ..., "role": "tool",
+                                  "content": ...}, ... ],
+             "content": "\\n\\n".join(...)}
+
+        There is NO top-level tool_call_id on that message — the ids are
+        NESTED inside tool_responses.  Both earlier versions of the merge did
+        `tid = m.get('tool_call_id')`, which is None for every such reply, so
+        `tid in missing` was never true and nothing was ever spliced.  That is
+        exactly the measured signature: 38 sync events, answers visible in a
+        sibling buffer, 0 spliced, on a byte-verified deploy.
+
+        helper.py already models this shape — is_consolidated_response()
+        (helper.py:1276) keys on 'tool_responses' — so the reader must too.
+        """
+        base = [_assistant('a'), _assistant('b')]
+        consolidated = [{
+            'role': 'tool',
+            'content': 'A-RESULT\n\nB-RESULT',
+            'tool_responses': [
+                {'tool_call_id': 'a', 'role': 'tool', 'content': 'A-RESULT'},
+                {'tool_call_id': 'b', 'role': 'tool', 'content': 'B-RESULT'},
+            ],
+        }]
+        out = _call(base, [base, consolidated])
+        tools = [m for m in out if m.get('role') == 'tool']
+        assert tools, f'a consolidated reply answers real calls — splice it: {out}'
+        blob = ' '.join(str(m.get('content', '')) for m in tools)
+        assert 'A-RESULT' in blob and 'B-RESULT' in blob, (
+            f'both nested answers must survive, got {tools}')
+
+    def test_consolidated_reply_answering_nothing_is_not_spliced(self):
+        """Must not drag in a reply whose ids the base never announced."""
+        base = [_assistant('a')]
+        other = [{'role': 'tool', 'content': 'X',
+                  'tool_responses': [{'tool_call_id': 'zzz', 'role': 'tool',
+                                      'content': 'X'}]}]
+        out = _call(base, [base, other])
+        assert [m for m in out if m.get('role') == 'tool'] == []
+
     def test_malformed_input_never_raises(self):
         """Runs on every sync of a live turn — it must not be able to kill one."""
         assert _call([], []) == []

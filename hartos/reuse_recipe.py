@@ -4374,6 +4374,41 @@ def _tool_name_candidates(raw):
 _merge_last_stats: dict = {}
 
 
+def _answered_call_ids(m):
+    """Every tool_call_id a single message answers.
+
+    autogen returns tool results in TWO shapes, and a reader that knows only
+    the first sees nothing on real data.  From its own
+    ``generate_tool_calls_reply`` (agentchat/conversable_agent.py): each
+    executed call becomes ``{"tool_call_id": ..., "role": "tool", "content":
+    ...}``, and when the turn finishes those are wrapped and returned as ONE
+    message —
+
+        {"role": "tool", "tool_responses": [ ...those... ],
+         "content": "\\n\\n".join(...)}
+
+    — whose OUTER dict has no ``tool_call_id`` at all.  The ids live inside
+    ``tool_responses``.  Both earlier versions of the merge read only
+    ``m.get('tool_call_id')``, which is None for every such reply, so no id
+    ever matched and both deploys spliced 0 while a sibling buffer visibly
+    held the answers (38 sync events, byte-verified pyc — the gap was here,
+    not in the deploy).
+
+    helper.py already models this shape: ``is_consolidated_response``
+    (:1276) keys on ``'tool_responses'`` for exactly the same reason.  This is
+    that knowledge as one function, so the two sides cannot drift again.
+    """
+    ids = set()
+    if not isinstance(m, dict) or m.get('role') != 'tool':
+        return ids
+    if m.get('tool_call_id'):
+        ids.add(m['tool_call_id'])
+    for r in (m.get('tool_responses') if isinstance(m.get('tool_responses'), list) else []):
+        if isinstance(r, dict) and r.get('tool_call_id'):
+            ids.add(r['tool_call_id'])
+    return ids
+
+
 def _merge_tool_answers(base, buffers):
     """Splice the REAL tool answers from sibling buffers into `base`.
 
@@ -4427,22 +4462,29 @@ def _merge_tool_answers(base, buffers):
                     announced.append(tc['id'])
         if not announced:
             return out
-        answered = {m.get('tool_call_id') for m in out
-                    if isinstance(m, dict) and m.get('role') == 'tool'}
+        answered = set()
+        for m in out:
+            answered |= _answered_call_ids(m)
         missing = [i for i in announced if i not in answered]
         if not missing:
             return out
 
-        found = {}
+        # (anchor_id, message) pairs — anchor is the call the message is
+        # positioned after.  A consolidated reply answers several ids but is
+        # spliced ONCE, so `claimed` stops it being inserted per id.
+        found = []
+        claimed = set()
         answers_seen = 0
         for buf in (buffers or []):
             for m in (buf or []):
                 if not isinstance(m, dict) or m.get('role') != 'tool':
                     continue
                 answers_seen += 1
-                tid = m.get('tool_call_id')
-                if tid in missing and tid not in found:
-                    found[tid] = m
+                ids = _answered_call_ids(m)
+                hits = [i for i in missing if i in ids and i not in claimed]
+                if hits:
+                    claimed.update(hits)
+                    found.append((hits[0], m))
         # DIAGNOSTIC.  Two live runs spliced 0 while a sibling buffer visibly
         # held answers, and the deployed pyc was byte-verified against source,
         # so the gap is in the SET RELATION, not the deploy.  These three
@@ -4452,16 +4494,19 @@ def _merge_tool_answers(base, buffers):
         #        tool_call_ids the picked buffer never announced (different
         #        conversations, not one conversation from two seats)
         #   found>0 -> the merge should splice; anything else is a bug here
+        # The live answer was the middle case: answers_seen>0 with found=0,
+        # because the ids sat inside tool_responses (see _answered_call_ids).
         try:
             _merge_last_stats.clear()
             _merge_last_stats.update(announced=len(announced), missing=len(missing),
-                                     answers_seen=answers_seen, found=len(found))
+                                     answers_seen=answers_seen, found=len(claimed),
+                                     msgs=len(found))
         except Exception:
             pass
         if not found:
             return out
 
-        for tid, msg in found.items():
+        for tid, msg in found:
             pos = None
             for i, m in enumerate(out):
                 # Role-agnostic for the same reason as the announce scan above.
