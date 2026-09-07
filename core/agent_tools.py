@@ -462,7 +462,12 @@ def build_core_tool_closures(ctx):
     def get_user_camera_inp(
         inp: Annotated[str, "The Question to check from visual context"],
     ) -> str:
-        return helper_fun.get_user_camera_inp(inp, int(user_id), request_id_list[user_prompt])
+        # No int() — user_id is a UUID on desktop installs and int() raised
+        # on every call (152/152 failures across three log rotations,
+        # 10/10 on 2026-09-07).  The callee never needs an int: helper.py:2163
+        # does get_frame(str(user_id)) and :2165 interpolates it into a
+        # filename.  An integer id still passes through unchanged.
+        return helper_fun.get_user_camera_inp(inp, user_id, request_id_list[user_prompt])
 
     tools.append((
         "get_user_camera_inp",
@@ -961,8 +966,13 @@ def build_core_tool_closures(ctx):
     @log_tool_execution
     def get_user_uploaded_file() -> str:
         tool_logger.info('INSIDE get_user_uploaded_file')
-        if recent_file_id[user_id]:
-            return f'Got user uploaded file the file_id is {recent_file_id[user_id]}'
+        # .get(), not [] — recent_file_id is a TTLCache written only when a
+        # file is actually uploaded, so a user who uploaded nothing has no
+        # key and [] raised KeyError (44/44 failures, 4/4 on 2026-09-07).
+        # That case is exactly the answer below, which was unreachable.
+        file_id = recent_file_id.get(user_id)
+        if file_id:
+            return f'Got user uploaded file the file_id is {file_id}'
         return 'No file uploaded from user'
 
     tools.append((
