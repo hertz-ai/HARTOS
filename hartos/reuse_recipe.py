@@ -4260,6 +4260,54 @@ def _build_reuse_action_message(user_prompt, action_id):
     return f"Perform this action -> Action #{action_id}:{action_message}\n follow these steps: {steps}"
 
 
+# A registry tool name as `attach_for_names` compares it: the registry key, or
+# `{tool}_{endpoint}`.  Dots are legal (`tts.package_installer` is real, 5 uses
+# in the banked corpus).  The >=3-char floor is what stops a Windows drive
+# letter surviving as the candidate `C` when a path is split on ':'.
+_TOOL_IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_.]{2,}$')
+
+
+def _tool_name_candidates(raw):
+    """The registry-shaped identifiers inside one authored ``tool_name``.
+
+    ``attach_for_names`` compares EXACTLY (core/agent_tools.py:372,
+    ``if fn not in want``), which is right for a matcher.  The authoring model,
+    however, routinely writes the tool AND its argument into the single field,
+    so an exact comparison rejects a tool that is registered and working.
+
+    Measured 2026-09-07 across all 165 banked recipes in
+    ~/Documents/Nunba/data/prompts — 1,473 steps, 978 naming a tool:
+
+        identifier-shaped   848
+        prose-shaped        130      37 of 165 files (22.4%) carry >=1
+
+    Splitting the 130 on ':' / ',' recovers a real name for 34, and 28 of those
+    are ``execute_windows_or_android_command`` — registered at :1589 and
+    measured firing 38x live.  A working tool was being withheld from the very
+    turn whose action asked for it:
+
+        execute_windows_or_android_command: click the 'Search' button
+        google_search, crawl4ai, retry_logic
+
+    The other 96 are not tool names at all — the model pasting Python source
+    line by line (``ENGINE_REGISTRY = router.ENGINE_REGISTRY``,
+    ``for eid in engine_ids``) or the literal ``N/A``.  The identifier shape
+    drops every one of them, so they yield nothing instead of a plausible
+    candidate.
+
+    Deliberately NOT a fuzzy or semantic match: a candidate still has to match
+    a registry entry exactly downstream.  This only recovers a name the author
+    actually wrote; it never guesses which tool an action "probably meant".
+    An unknown candidate is free — the matcher already ignores it.
+    """
+    out = []
+    for tok in re.split(r'[:,]', str(raw or '')):
+        tok = tok.strip().strip('\'"`')
+        if _TOOL_IDENT_RE.match(tok) and tok not in out:
+            out.append(tok)
+    return out
+
+
 def _reuse_action_tool_names(user_prompt, action_id):
     """The tool names the given action's recipe steps declare.
 
@@ -4285,9 +4333,12 @@ def _reuse_action_tool_names(user_prompt, action_id):
             return []
         out = []
         for step in (actions[action_id - 1].get('recipe') or []):
-            name = (step or {}).get('tool_name')
-            if name and name not in out:
-                out.append(name)
+            # _tool_name_candidates, not the raw field: the authored value is
+            # frequently `<real tool>: <its argument>`, which no exact match
+            # can ever resolve.  Junk (pasted source, 'N/A') yields nothing.
+            for name in _tool_name_candidates((step or {}).get('tool_name')):
+                if name not in out:
+                    out.append(name)
         return out
     except Exception:
         return []
