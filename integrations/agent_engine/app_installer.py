@@ -909,12 +909,22 @@ class AppInstaller:
         never raises."""
         try:
             os.makedirs(self._flatpak_dir, exist_ok=True)
-            subprocess.run(
+            r = subprocess.run(
                 ['flatpak', '--user', 'remote-add', '--if-not-exists', 'flathub',
                  'https://dl.flathub.org/repo/flathub.flatpakrepo'],
                 capture_output=True, text=True, timeout=30, env=self._flatpak_env(), **no_window_kwargs())
-        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-            pass
+            if r.returncode != 0:
+                # Best-effort still, but not SILENT. Without this the only
+                # symptom is a later install failing with "Remote flathub not
+                # found", which names the consequence and hides the cause.
+                # Measured while probing the node 2026-09-07: the real reason
+                # was "Creating repo: mkdirat: Permission denied" on
+                # FLATPAK_USER_DIR, invisible until the command was rerun by
+                # hand.
+                logger.warning("flatpak remote-add failed (rc=%s): %s",
+                               r.returncode, (r.stderr or '').strip()[:200])
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+            logger.warning("flatpak remote-add could not run: %s", e)
 
     def _install_flatpak(self, req: InstallRequest) -> InstallResult:
         """Install a Flatpak package (--user scope + writable dir; see __init__).
