@@ -47,7 +47,10 @@ any change to what the function returns.
 import unittest
 
 from hartos.helper import Action
-from hartos.lifecycle_hooks import clear_action_states, get_action_state, set_action_state, ActionState
+from hartos.lifecycle_hooks import (
+    ActionState, clear_action_states, force_state_through_valid_path,
+    get_action_state, is_terminal_state, set_action_state,
+)
 from hartos.reuse_recipe import user_tasks
 
 
@@ -63,7 +66,8 @@ def _seed(user_prompt, n_actions, current_action):
 class RunBoundary(unittest.TestCase):
 
     def tearDown(self):
-        for k in ('u_finished', 'u_midrun', 'u_fresh', 'u_empty', 'u_deep', 'u_junk'):
+        for k in ('u_finished', 'u_midrun', 'u_fresh', 'u_empty', 'u_deep',
+                  'u_junk', 'u_parked'):
             try:
                 del user_tasks[k]
             except Exception:
@@ -86,10 +90,40 @@ class RunBoundary(unittest.TestCase):
                          'a continuation must keep its place')
 
     def test_last_action_in_flight_is_NOT_reset(self):
-        """current_action == len(actions) is the FINAL action, still running."""
+        """The FINAL action, still working — truncating it would be the bug.
+
+        `current_action == len(actions)` alone is ambiguous; what makes this one
+        a continuation is that the action is NOT terminal.
+        """
         _seed('u_deep', n_actions=4, current_action=4)
+        set_action_state('u_deep', 4, ActionState.IN_PROGRESS)
         clear_action_states('u_deep', user_tasks)
         self.assertEqual(user_tasks['u_deep'].current_action, 4)
+
+    def test_final_action_TERMINAL_is_reset(self):
+        """THE 88764372848 REGRESSION — CREATE parks the pointer ON the last action.
+
+        Measured live 2026-09-07 13:00-13:02 on "Nunba Guardian" (5 actions:
+        Read file / Parse / Filter ERROR / Select newest / Return text).  CREATE
+        finished with `current_action = 5` and action 5 TERMINATED.  The REUSE
+        drive then read `Retrieved current_action_id: 5` seven times, churned
+        into `[STATE-TRANSITION-LOOP-BREAK] STUCK LOOP DETECTED` and
+        `[ASSISTANT-STREAK-ESCALATE] streak=3`, and actions 1-4 NEVER RAN — so
+        the log was never read and the agent could not reach its goal.
+
+        `current_action > len(actions)` (the original predicate) cannot see this:
+        5 == 5 is not > 5.  A run parked ON its final action and a run still
+        working ON its final action are the same integer; only the action's own
+        STATE separates them.  Terminal ⇒ the previous run ended ⇒ reset.
+        """
+        _seed('u_parked', n_actions=5, current_action=5)
+        force_state_through_valid_path('u_parked', 5, ActionState.TERMINATED,
+                                       'create flow-complete force')
+        self.assertTrue(is_terminal_state(get_action_state('u_parked', 5)),
+                        'precondition: the final action must be terminal')
+        clear_action_states('u_parked', user_tasks)
+        self.assertEqual(user_tasks['u_parked'].current_action, 1,
+                         'a run parked on a finished final action must restart at 1')
 
     def test_fresh_run_is_a_no_op(self):
         _seed('u_fresh', n_actions=1, current_action=1)

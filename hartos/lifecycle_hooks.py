@@ -1008,16 +1008,23 @@ def clear_action_states(user_prompt: str, user_tasks=None) -> int:
     THE TWO STORES RESET ON DIFFERENT TERMS, because they carry different risk.
     Dropping `action_states` mid-run is safe: the actions re-read as ASSIGNED and
     the run continues where its pointer says.  Resetting the POINTER mid-run
-    would truncate the run, so it happens only when the pointer is past the end
-    of the recipe — `current_action > len(actions)`, which is never a valid
-    continuation state (a run in flight always has `current_action <=
-    len(actions)`, including on its FINAL action, which is why the comparison is
-    `<=` and not `<`).  That asymmetry is what makes this function safe to call
-    at ANY run entry point without knowing whether a run is already in flight.
+    would truncate the run, so it happens only on the two states that cannot be
+    a live continuation:
 
-    DELIBERATELY NOT HANDLED: a run abandoned at action 3 of 10, followed by a
-    genuinely NEW request, still resumes at 3.  Separating those needs a real
-    run-id from the caller; this does not invent one.
+      * `current_action > len(actions)` — past the end.
+      * `current_action == len(actions)` AND that action is TERMINAL — parked on
+        a finished final action.  The integer alone is ambiguous here (a run
+        still working on its last action looks identical), so the action's own
+        state is what separates them; agent 88764372848 is the measured case.
+
+    Anything else is a live continuation and is left alone.  That is what makes
+    this function safe to call at ANY run entry point without knowing whether a
+    run is already in flight.
+
+    DELIBERATELY NOT HANDLED: a run abandoned MID-recipe — action 3 of 10, not
+    terminal — followed by a genuinely NEW request, still resumes at 3.  That one
+    is genuinely ambiguous without a run-id from the caller, and this does not
+    invent one.
 
     Returns the number of action entries dropped (0 when there was no session).
     """
@@ -1059,17 +1066,35 @@ def _reset_finished_pointer(user_prompt: str, user_tasks) -> bool:
         current = getattr(task, 'current_action', 1)
         # `not n` guards a recipe with zero actions: 1 > 0 would otherwise read
         # as "past the end" and rewind on every single turn.
-        if not n or not isinstance(current, int) or current <= n:
+        if not n or not isinstance(current, int) or current < 1:
             return False
+
+        if current > n:
+            why = f"pointer {current} is past the end of {n} action(s)"
+        elif current == n and is_terminal_state(get_action_state(user_prompt, current)):
+            # A run PARKED on its final action and a run still WORKING on its
+            # final action are the same integer; only the action's own state
+            # separates them.  Measured live 2026-09-07 on agent 88764372848
+            # ("Nunba Guardian", 5 actions): CREATE ended with current_action=5
+            # and action 5 TERMINATED, so the next REUSE drive resumed AT 5 —
+            # `Retrieved current_action_id: 5` x7, then STUCK LOOP DETECTED and
+            # ASSISTANT-STREAK-ESCALATE — and actions 1-4 (read the log, filter
+            # ERROR, pick the newest) never ran.  The agent could not reach its
+            # goal because the work was skipped, not because it failed.
+            why = (f"final action {current}/{n} is "
+                   f"{get_action_state(user_prompt, current).value} — the "
+                   f"previous run ended on it")
+        else:
+            return False
+
         task.current_action = 1
     except Exception:
         # Never raise into the reuse hot path — a failed reset must degrade to
         # the previous behaviour, not kill the turn.
         return False
 
-    logger.info(
-        "[RUN-BOUNDARY] %s: previous run finished (current_action=%s > %s "
-        "action(s)) — reset to action 1", user_prompt, current, n)
+    logger.info("[RUN-BOUNDARY] %s: previous run finished (%s) — reset to "
+                "action 1", user_prompt, why)
     return True
 
 
