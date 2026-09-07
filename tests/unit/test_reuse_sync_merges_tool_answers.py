@@ -115,6 +115,38 @@ class TestMergeRecoversRealAnswers:
         for m in base:
             assert m in out, f'merge must be additive, lost {m}'
 
+    def test_tool_calls_on_a_role_user_message_still_count(self):
+        """THE LIVE SHAPE — and the bug my first implementation shipped.
+
+        `manager._oai_messages[agent]` stores the conversation FROM THAT
+        AGENT'S SEAT: the agent's own turns are role='assistant', everyone
+        else's are role='user'.  The buffer the sync picks is keyed "User", so
+        the Helper/Assistant tool calls inside it arrive as role='user'.
+
+        My first version collected announced ids only from role=='assistant',
+        so on the real data `announced` was empty, the function returned at its
+        early exit, and it spliced NOTHING.  Measured live 2026-09-07 after
+        deploying 50e4df7ae: 15 sync events, "spliced 0 real tool answer(s)"
+        every time, while the composition line showed the picked buffer at
+        calls=35/answers=0 beside a sibling at calls=19/answers=10.
+
+        The unit tests passed because the `_assistant()` helper in this file
+        hard-codes role='assistant' — they tested a shape the live system does
+        not produce.  A tool_calls key is what makes a message a call; the role
+        it happens to be stored under is a function of whose buffer you are in.
+        """
+        base = [{'role': 'user', 'name': 'Helper',
+                 'tool_calls': [{'id': 'call_u', 'type': 'function',
+                                 'function': {'name': 'google_search',
+                                              'arguments': '{}'}}]}]
+        sibling = [_answer('call_u', 'RESULT FROM THE OTHER SEAT')]
+        out = _call(base, [base, sibling])
+        tools = [m for m in out if m.get('role') == 'tool']
+        assert len(tools) == 1, (
+            'a tool_calls message stored as role=user is still a call — '
+            f'its answer must be recovered, got {out}')
+        assert 'OTHER SEAT' in tools[0]['content']
+
     def test_malformed_input_never_raises(self):
         """Runs on every sync of a live turn — it must not be able to kill one."""
         assert _call([], []) == []

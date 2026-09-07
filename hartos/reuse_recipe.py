@@ -4406,7 +4406,15 @@ def _merge_tool_answers(base, buffers):
         out = list(base or [])
         announced = []
         for m in out:
-            if not isinstance(m, dict) or m.get('role') != 'assistant':
+            # A `tool_calls` key is what makes a message a CALL.  Do NOT also
+            # require role=='assistant': _oai_messages[agent] stores the
+            # conversation from THAT AGENT'S SEAT, so in the buffer the sync
+            # picks (keyed "User") every other agent's call arrives as
+            # role='user'.  The first version of this function gated on
+            # 'assistant' and therefore found ZERO announced ids on real data
+            # — 15 sync events, "spliced 0", while a sibling buffer sat on 10
+            # answers (measured 2026-09-07 after deploying 50e4df7ae).
+            if not isinstance(m, dict):
                 continue
             for tc in (m.get('tool_calls') if isinstance(m.get('tool_calls'), list) else []):
                 if isinstance(tc, dict) and tc.get('id'):
@@ -4433,7 +4441,8 @@ def _merge_tool_answers(base, buffers):
         for tid, msg in found.items():
             pos = None
             for i, m in enumerate(out):
-                if not isinstance(m, dict) or m.get('role') != 'assistant':
+                # Role-agnostic for the same reason as the announce scan above.
+                if not isinstance(m, dict):
                     continue
                 tcs = m.get('tool_calls') if isinstance(m.get('tool_calls'), list) else []
                 if any(isinstance(tc, dict) and tc.get('id') == tid for tc in tcs):
