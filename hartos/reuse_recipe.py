@@ -21,6 +21,7 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
     HISTORICAL_TOOL_PLACEHOLDER,
     NUNBA_WEB_FETCH_POLICY,
     TOOL_FAILURE_RESULTS,
+    VERDICT_COMPLETION_STATUSES,
 )
 
 from enum import Enum
@@ -2818,7 +2819,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             if json_objects:
                 last_json = json_objects[-1]
                 current_app.logger.info(f'last json as {last_json}')
-                if 'status' in last_json.keys() and last_json['status'].lower() == 'completed':
+                if ('status' in last_json.keys()
+                        and last_json['status'].lower() in VERDICT_COMPLETION_STATUSES):
                     current_app.logger.info('GOT COMPLETED FOR ACTION in timer state_transition1')
                     time_actions[user_prompt].current_action += 1
                     return chat_instructor1
@@ -3120,10 +3122,18 @@ _REUSE_PENDING_STEER_MAX = 2
 # StatusVerifier vocabulary at 11 other sites and create_recipe.py spells it
 # at 5 more, so a set defined locally would be a 17th private copy of a
 # shared vocabulary.  Only the GROUPING is local — see each constant's own
-# comment for why the three groupings must stay different:
+# comment for why these groupings must stay different:
 #   :2646                            error+pending          — speaker routing
 #   _REUSE_UNDERREPORT_STATUSES      pending                — advancing
 #   VERDICT_ROUND_TERMINAL_STATUSES  completed+breakdown    — ending the round
+#   VERDICT_COMPLETION_STATUSES      completed+success+done — action finished
+#
+# The last one was the 2026-09-07 migration of five of those "11 other
+# sites" (the completion readers at :2821, :3865, :3882, :4841, :4855).
+# Each asked the pure "is this action finished" question and advanced the
+# action pointer, so they were the sites a shared token set fits without
+# changing any grouping — and they were dropping the model's 'done'
+# spelling, 6 verdicts of 22 measured live.
 from core.constants import (
     VERDICT_ROUND_TERMINAL_STATUSES,
     VERDICT_UNDERREPORT_STATUSES as _REUSE_UNDERREPORT_STATUSES,
@@ -3862,7 +3872,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     except (json.JSONDecodeError, ValueError):
                         json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                     current_app.logger.info(f'got json object {json_obj}')
-                    if json_obj['status'].lower() == 'completed':
+                    if json_obj['status'].lower() in VERDICT_COMPLETION_STATUSES:
                         if not _advance_or_steer(
                                 user_prompt, _reuse_current_action, "reuse-w1",
                                 prompt_id, manager, chat_instructor,
@@ -3879,7 +3889,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         json_obj = retrieve_json(group_chat.messages[-2]["content"])  # canonical parse (#95)
                         if json_obj:
                             current_app.logger.info(f'got json object {json_obj}')
-                            if json_obj['status'].lower() == 'completed':
+                            if json_obj['status'].lower() in VERDICT_COMPLETION_STATUSES:
                                 pipeline_action_id = user_tasks[user_prompt].current_action
                                 if not _advance_or_steer(
                                         user_prompt, pipeline_action_id,
@@ -4838,7 +4848,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                             except (json.JSONDecodeError, ValueError):
                                 json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                             current_app.logger.info(f'got json object {json_obj}')
-                            if json_obj['status'].lower() == 'completed':
+                            if json_obj['status'].lower() in VERDICT_COMPLETION_STATUSES:
                                 if not _advance_or_steer(
                                         user_prompt, current_action_id,
                                         "reuse-w2", prompt_id,
@@ -4852,7 +4862,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 json_obj = retrieve_json(group_chat.messages[-2]["content"])  # canonical parse (#95)
                                 if json_obj:
                                     current_app.logger.info(f'got json object {json_obj}')
-                                    if json_obj['status'].lower() == 'completed':
+                                    if json_obj['status'].lower() in VERDICT_COMPLETION_STATUSES:
                                         if not _advance_or_steer(
                                                 user_prompt, current_action_id,
                                                 "reuse-w2-regex", prompt_id,

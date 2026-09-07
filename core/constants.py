@@ -1058,8 +1058,16 @@ MAX_PAYLOAD_BYTES = int(_os.environ.get('HEVOLVE_MAX_PAYLOAD_BYTES', 2 * 1024 * 
 #   create_recipe.py:2475      status == 'completed' OR 'success'   <-- only create
 #   create_recipe.py:2516      status == 'pending'
 #   create_recipe.py:2548      status == 'requires_breakdown'
-#   reuse_recipe.py:2606,2756,2900,3409,3495,3512,4202,4216
-#                              status == 'completed'                <-- 'success' absent
+#   reuse_recipe.py            status == 'completed'                <-- 'success' absent
+#                              RESOLVED 2026-09-07: all five completion
+#                              readers (:2821 timer, :3865/:3882 reuse-w1,
+#                              :4841/:4855 reuse-w2) now consult
+#                              VERDICT_COMPLETION_STATUSES.  Each asked the
+#                              pure "is this action finished" question and
+#                              advanced the action pointer, so adopting the
+#                              shared token set changed no grouping.  Guarded
+#                              by tests/unit/test_completion_verdict_vocabulary.py,
+#                              which fails if the literal is re-introduced.
 #   reuse_recipe.py:2635       status == 'requires_breakdown'  (routing)
 #   reuse_recipe.py:2646       status in ('error','pending')   (routing)
 #   reuse_recipe.py:3438       under-reported advance set
@@ -1077,12 +1085,32 @@ MAX_PAYLOAD_BYTES = int(_os.environ.get('HEVOLVE_MAX_PAYLOAD_BYTES', 2 * 1024 * 
 # are shared.
 VERDICT_COMPLETED = 'completed'
 VERDICT_SUCCESS = 'success'
+VERDICT_DONE = 'done'
 VERDICT_PENDING = 'pending'
 VERDICT_ERROR = 'error'
 VERDICT_REQUIRES_BREAKDOWN = 'requires_breakdown'
 
 # An action the model reports as finished.  Both pipelines must agree.
-VERDICT_COMPLETION_STATUSES = frozenset({VERDICT_COMPLETED, VERDICT_SUCCESS})
+#
+# 'done' was added 2026-09-07 from a live measurement, not from reading the
+# prompt.  Of 22 StatusVerifier verdicts emitted on the installed build,
+# 6 were spelled 'done' and 6 'completed' — the prompt names four statuses
+# and the model answers with a fifth roughly as often as the first:
+#
+#   {"status": "done", "action": "Use fetch_news_feeds to pull the latest
+#    articles from all configured RSS/Atom feeds ...", "action_id": 1}
+#
+# Every reuse reader tested == 'completed', so those six verdicts were
+# discarded and their actions never advanced.  This is the 'success' drift
+# above with a third spelling, found the same way.
+#
+# 'updated' was measured in the same window (2 of 22) and is deliberately
+# NOT here: it carries "message": "The fallback strategy for Action 3
+# requires specific user input" — a revision that is still pending.  It maps
+# to VERDICT_PENDING, and advancing on it would force-completion past the
+# USER-INPUT GATE (create_recipe.py:3123).
+VERDICT_COMPLETION_STATUSES = frozenset({
+    VERDICT_COMPLETED, VERDICT_SUCCESS, VERDICT_DONE})
 
 # The model says "not done" AND has nothing further to do about it.  When the
 # action is autonomous and its named tools are evidenced as executed, that is
