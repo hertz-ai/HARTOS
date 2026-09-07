@@ -3592,12 +3592,31 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 _mgr_msgs = getattr(manager, '_oai_messages', None)
                 if _mgr_msgs:
                     _conv = max(_mgr_msgs.values(), key=len, default=None)
-                    if _conv and len(_conv) > len(group_chat.messages):
+                    # Gate on the BASE length last synced, NOT on
+                    # len(group_chat.messages).  The merge below splices answers
+                    # in, so the group log is legitimately LONGER than its own
+                    # source; comparing against it would stop this branch ever
+                    # firing again — precisely the freeze the comment above
+                    # records for the original `if not group_chat.messages`.
+                    _base_n = getattr(group_chat, '_hart_sync_base_n',
+                                      len(group_chat.messages))
+                    if _conv and len(_conv) > _base_n:
                         _was = len(group_chat.messages)
-                        group_chat.messages[:] = list(_conv)
+                        # The longest buffer is the right SKELETON but carries
+                        # zero tool answers (measured 16/16, see
+                        # _merge_tool_answers).  Fill its unanswered calls from
+                        # the sibling buffers before handing it over, or
+                        # helper.py:1940 mints a placeholder over each one.
+                        _merged = _merge_tool_answers(_conv, list(_mgr_msgs.values()))
+                        group_chat.messages[:] = list(_merged)
+                        try:
+                            group_chat._hart_sync_base_n = len(_conv)
+                        except Exception:
+                            pass
                         current_app.logger.info(
                             f"[725-SYNC] group_chat.messages stale ({_was} < "
-                            f"{len(_conv)}) — resynced from manager._oai_messages")
+                            f"{len(_conv)}) — resynced from manager._oai_messages"
+                            f"; spliced {len(_merged) - len(_conv)} real tool answer(s)")
                         # DIAGNOSTIC ONLY (no behaviour change).  _oai_messages is
                         # keyed PER AGENT and each value is a pairwise broadcast log,
                         # so "longest" is a LENGTH proxy for "most complete" — it is
@@ -4347,6 +4366,91 @@ def _tool_name_candidates(raw):
         if _TOOL_IDENT_RE.match(tok) and tok not in out:
             out.append(tok)
     return out
+
+
+def _merge_tool_answers(base, buffers):
+    """Splice the REAL tool answers from sibling buffers into `base`.
+
+    ``manager._oai_messages`` is keyed PER AGENT, so each value is one seat's
+    view of the group conversation.  The #725 sync picks the LONGEST as the
+    transcript, and measured live 2026-09-07 (agent 18088688973, 16 of 16
+    samples) that buffer holds ZERO tool answers:
+
+        User*:n=30,calls=9,answers=0   ... StatusVerifier:n=30,calls=9,answers=0
+        Assistant:n=14,calls=10,answers=4      <-- only buffer with answers
+
+    Six buffers are identical-length broadcast copies (the manager relays every
+    message to every member); the EXECUTING agent's buffer carries the results
+    and is SHORTER, so `max(key=len)` can never reach it.  Length is not a weak
+    proxy for completeness here — it is anti-correlated with it.
+
+    Downstream that is #786 in full: helper.py:1897 sees a tool_call_id with no
+    answer, calls it "historical pending", and mints HISTORICAL_TOOL_PLACEHOLDER
+    (:1940) to satisfy an API that rejects an unanswered tool_call — 83
+    placeholders over 30 repair events in one drive.  The model then had a
+    45-character string where a page of search results should have been, and
+    produced a brief with no citations from a search that really ran.
+
+    MERGE, don't re-pick: the long buffer is the right SKELETON (it has every
+    agent's turns); the short one only has answers the skeleton lacks.  Choosing
+    the answer-bearing buffer instead would drop the other agents' messages.  So
+    keep the base and fill exactly the slots helper.py would otherwise
+    placeholder — the same operation already in the codebase, with the real
+    result instead of a manufactured one.
+
+    Never invents content: a call no buffer answers is left missing, so
+    helper.py still fills it and the fabrication gate still sees the truth.
+    Never raises — it runs on every sync of a live turn.
+    """
+    try:
+        out = list(base or [])
+        announced = []
+        for m in out:
+            if not isinstance(m, dict) or m.get('role') != 'assistant':
+                continue
+            for tc in (m.get('tool_calls') if isinstance(m.get('tool_calls'), list) else []):
+                if isinstance(tc, dict) and tc.get('id'):
+                    announced.append(tc['id'])
+        if not announced:
+            return out
+        answered = {m.get('tool_call_id') for m in out
+                    if isinstance(m, dict) and m.get('role') == 'tool'}
+        missing = [i for i in announced if i not in answered]
+        if not missing:
+            return out
+
+        found = {}
+        for buf in (buffers or []):
+            for m in (buf or []):
+                if not isinstance(m, dict) or m.get('role') != 'tool':
+                    continue
+                tid = m.get('tool_call_id')
+                if tid in missing and tid not in found:
+                    found[tid] = m
+        if not found:
+            return out
+
+        for tid, msg in found.items():
+            pos = None
+            for i, m in enumerate(out):
+                if not isinstance(m, dict) or m.get('role') != 'assistant':
+                    continue
+                tcs = m.get('tool_calls') if isinstance(m.get('tool_calls'), list) else []
+                if any(isinstance(tc, dict) and tc.get('id') == tid for tc in tcs):
+                    pos = i
+                    break
+            if pos is None:
+                continue
+            # After the assistant's existing run of answers, so a parallel
+            # tool_calls block keeps one answer per call in order — the same
+            # placement rule helper.py:1946-1951 uses.
+            j = pos + 1
+            while j < len(out) and isinstance(out[j], dict) and out[j].get('role') == 'tool':
+                j += 1
+            out.insert(j, msg)
+        return out
+    except Exception:
+        return list(base or [])
 
 
 def _reuse_action_tool_names(user_prompt, action_id):
