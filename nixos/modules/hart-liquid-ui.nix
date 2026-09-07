@@ -770,6 +770,16 @@ in
           # means connect(2) ALWAYS succeeds on this path whether or not a
           # compositor is behind it.
           HART_COMP_SOCK = "/run/hart/hart-comp.sock";
+          # The App Store shells `nix-env -f '<nixpkgs>' -iA <pkg>`, and
+          # `<nixpkgs>` resolves through NIX_PATH. A unit does NOT get one:
+          # /etc/set-environment exports it, and that file is sourced by a
+          # LOGIN shell only. Measured on the box 2026-09-07 inside this very
+          # service: PATH had no /run/current-system/sw/bin (so nix-env was
+          # unfindable) and NIX_PATH was unset (so the attribute could not
+          # resolve even once it was). app_installer defaults to this same
+          # value when the variable is missing, so an older node still works;
+          # this line is the authority, that default is the floor.
+          NIX_PATH = "nixpkgs=flake:nixpkgs";
           # NEVER let pactl autospawn a PulseAudio daemon. PipeWire owns the
           # devices, so an autospawned pulseaudio dies instantly with "Daemon
           # startup without any loaded modules" -- and because the UI polls audio

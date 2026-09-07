@@ -130,6 +130,50 @@ class TestNixIsReal(_InstallerCase):
         self.assertFalse(res.success)
         self.assertIn('not available', res.error)
 
+    def test_nix_calls_get_a_usable_environment(self):
+        """A systemd unit inherits neither of the two things nix needs.
+
+        Measured inside hart-liquid-ui.service on the box 2026-09-07: PATH had
+        46 entries and none of them was /run/current-system/sw/bin (where
+        nix-env lives), and NIX_PATH was unset because /etc/set-environment is
+        a LOGIN-shell file. Either alone makes every nix install fail on a real
+        node while the faked-boundary tests stay green. flatpak got this fix in
+        2026-08-12; nix never did.
+        """
+        # tool_path() only APPENDS a dir that exists, so assert the contract
+        # with the node's dirs faked present. Asserting the bare result would
+        # make this a test of the dev host, green or red by accident.
+        with patch('integrations.agent_engine.app_installer.os.path.isdir',
+                   return_value=True):
+            env = self.installer._tool_env()
+        self.assertIn('/run/current-system/sw/bin', env['PATH'])
+        self.assertTrue(env.get('NIX_PATH'), 'nix cannot resolve <nixpkgs> without it')
+
+    def test_an_inherited_nix_path_wins_over_the_default(self):
+        """The unit is the authority; the built-in value is only a floor."""
+        with patch.dict(os.environ, {'NIX_PATH': 'nixpkgs=/somewhere/else'}):
+            self.assertEqual(
+                self.installer._tool_env()['NIX_PATH'], 'nixpkgs=/somewhere/else')
+
+    def test_flatpak_env_still_carries_its_own_dir_and_the_shared_path(self):
+        """Refactoring flatpak onto the shared builder must not drop what only
+        flatpak needs."""
+        with patch('integrations.agent_engine.app_installer.os.path.isdir',
+                   return_value=True):
+            env = self.installer._flatpak_env()
+        self.assertEqual(env['FLATPAK_USER_DIR'], self.installer._flatpak_dir)
+        self.assertIn('/run/current-system/sw/bin', env['PATH'])
+
+    @patch('integrations.agent_engine.app_installer.subprocess.run',
+           side_effect=NotADirectoryError(20, 'Not a directory'))
+    def test_a_malformed_path_is_reported_not_raised(self, _):
+        """A bad PATH entry raises NotADirectoryError, not FileNotFoundError,
+        out of the same exec. Letting it escape turns a bad environment into a
+        500 instead of an honest failure."""
+        res = self.installer._install_nix(InstallRequest(source='nixpkgs.htop'))
+        self.assertFalse(res.success)
+        self.assertIn('not available', res.error)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # REAL — flatpak: invokes flatpak install, PROPAGATES failure

@@ -490,7 +490,8 @@ class AppInstaller:
         try:
             result = subprocess.run(
                 ['nix-env', '-q', '--json'],
-                capture_output=True, text=True, timeout=10, **no_window_kwargs())
+                capture_output=True, text=True, timeout=10,
+                env=self._tool_env(), **no_window_kwargs())
             if result.returncode == 0:
                 pkgs = json.loads(result.stdout) if result.stdout.strip() else {}
                 for name, info in pkgs.items():
@@ -551,7 +552,8 @@ class AppInstaller:
             try:
                 result = subprocess.run(
                     ['nix', 'search', 'nixpkgs', query, '--json'],
-                    capture_output=True, text=True, timeout=30, **no_window_kwargs())
+                    capture_output=True, text=True, timeout=30,
+                    env=self._tool_env(), **no_window_kwargs())
                 if result.returncode == 0:
                     pkgs = json.loads(result.stdout) if result.stdout.strip() else {}
                     for attr, info in list(pkgs.items())[:20]:
@@ -743,7 +745,7 @@ class AppInstaller:
     # ─── Platform Handlers ──────────────────────────────────
 
     @staticmethod
-    def _nix_out_path(pkg: str) -> str:
+    def _nix_out_path(pkg: str, _env: Optional[dict] = None) -> str:
         """The REAL store path of a package, or '' if it cannot be resolved.
 
         This used to be reported as the literal ``/nix/store/.../<pkg>``,
@@ -759,7 +761,8 @@ class AppInstaller:
             r = subprocess.run(
                 ['nix-env', '-f', '<nixpkgs>', '-qaA', pkg,
                  '--out-path', '--no-name'],
-                capture_output=True, text=True, timeout=60, **no_window_kwargs())
+                capture_output=True, text=True, timeout=60,
+                env=_env, **no_window_kwargs())
             if r.returncode == 0:
                 first = (r.stdout or '').strip().split('\n')[0].strip()
                 if first.startswith('/nix/store/'):
@@ -794,41 +797,76 @@ class AppInstaller:
         try:
             result = subprocess.run(
                 ['nix-env', '-f', '<nixpkgs>', '-iA', pkg],
-                capture_output=True, text=True, timeout=300, **no_window_kwargs())
+                capture_output=True, text=True, timeout=300,
+                env=self._tool_env(), **no_window_kwargs())
             if result.returncode == 0:
                 return InstallResult(
                     success=True, platform='nix', name=name,
-                    app_id=pkg, install_path=self._nix_out_path(pkg))
+                    app_id=pkg, install_path=self._nix_out_path(pkg, self._tool_env()))
             return InstallResult(
                 success=False, platform='nix', name=name,
                 error=result.stderr.strip()[:500])
-        except FileNotFoundError:
+        except OSError as e:
+            # FileNotFoundError is the ordinary case (the tool is not on PATH),
+            # but a MALFORMED PATH entry raises NotADirectoryError out of the
+            # same exec, and letting that escape turns a bad environment into a
+            # 500 instead of an honest "cannot run it". Both are OSError; both
+            # mean the same thing to the caller. Hit while reproducing the
+            # unit's environment on the box 2026-09-07.
             return InstallResult(
                 success=False, platform='nix', name=name,
-                error='nix-env not available')
+                error='nix-env not available (%s)' % type(e).__name__)
         except subprocess.TimeoutExpired:
             return InstallResult(
                 success=False, platform='nix', name=name,
                 error='Installation timed out')
 
+    # What /etc/set-environment exports on this OS. That file is sourced by a
+    # LOGIN shell, never by a systemd unit, so the service does not inherit it.
+    _NIX_PATH_DEFAULT = 'nixpkgs=flake:nixpkgs'
+
+    def _tool_env(self) -> dict:
+        """The env in which packaging tools are findable AND usable.
+
+        Split out of ``_flatpak_env`` because nix needs exactly the same
+        treatment and never got it. Measured inside hart-liquid-ui.service on
+        the box 2026-09-07, both of these were true at once:
+
+          - PATH carries no ``/run/current-system/sw/bin``, which is where
+            ``nix-env`` lives, so every nix call raised FileNotFoundError and
+            got reported as "nix-env not available". That blames the system for
+            a PATH gap in this one process, which is precisely the 2026-08-12
+            flatpak bug the comment below describes, left unfixed for nix.
+          - NIX_PATH is unset, so even the corrected ``-f '<nixpkgs>'`` form
+            cannot resolve.
+
+        Either one alone is enough to make every nix install fail on a node
+        while the faked-boundary tests stay green.
+        """
+        env = dict(os.environ)
+        env['PATH'] = self.tool_path()
+        # hart-liquid-ui.nix sets this explicitly; the default is the floor for
+        # a node where it is missing, and matches what the OS itself exports.
+        if not env.get('NIX_PATH'):
+            env['NIX_PATH'] = self._NIX_PATH_DEFAULT
+        return env
+
     def _flatpak_env(self) -> dict:
         """Env pinning flatpak to the --user installation dir this service can write."""
-        env = dict(os.environ)
-        env['FLATPAK_USER_DIR'] = self._flatpak_dir
         # ── Make `flatpak` FINDABLE from a systemd service ──────────────────────
-        # Real-HW bug this fixes (2026-08-12): clicking "install Firefox" answered
-        # "flatpak not available" INSTANTLY on a box where flatpak was fully working
-        # -- /run/current-system/sw/bin/flatpak present, the `flathub` remote already
-        # configured, DNS fine, and `flatpak remote-add` returning rc=0 from a shell.
-        # The installer runs inside a systemd unit whose PATH does NOT include
-        # /run/current-system/sw/bin, so `subprocess.run(['flatpak', ...])` raised
-        # FileNotFoundError -- which the caller reports verbatim as "flatpak not
-        # available". The message blamed the SYSTEM for what was purely a PATH gap in
-        # this process, sending the operator to debug a Flatpak install that was fine.
-        # Append (never replace) the standard NixOS command dirs so an inherited PATH
-        # still wins, and every flatpak call site gets this because they all route
-        # through this one env builder.
-        env['PATH'] = self.tool_path()
+        # Real-HW bug the PATH in _tool_env fixes (2026-08-12): clicking "install
+        # Firefox" answered "flatpak not available" INSTANTLY on a box where flatpak
+        # was fully working -- /run/current-system/sw/bin/flatpak present, the
+        # `flathub` remote already configured, DNS fine, and `flatpak remote-add`
+        # returning rc=0 from a shell. The installer runs inside a systemd unit whose
+        # PATH does NOT include /run/current-system/sw/bin, so
+        # `subprocess.run(['flatpak', ...])` raised FileNotFoundError -- which the
+        # caller reports verbatim as "flatpak not available". The message blamed the
+        # SYSTEM for what was purely a PATH gap in this process, sending the operator
+        # to debug a Flatpak install that was fine. Every flatpak call site gets the
+        # fix because they all route through this one env builder; nix now shares it.
+        env = self._tool_env()
+        env['FLATPAK_USER_DIR'] = self._flatpak_dir
         return env
 
     @staticmethod
@@ -1477,7 +1515,8 @@ class AppInstaller:
         try:
             result = subprocess.run(
                 ['nix-env', '-e', pkg],
-                capture_output=True, text=True, timeout=60, **no_window_kwargs())
+                capture_output=True, text=True, timeout=60,
+                env=self._tool_env(), **no_window_kwargs())
             return InstallResult(
                 success=result.returncode == 0, platform='nix',
                 name=pkg, error=result.stderr.strip()[:500])
