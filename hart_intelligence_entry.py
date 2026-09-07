@@ -7153,21 +7153,41 @@ def top5_results(query):
     if search is None:
         app.logger.warning(
             "top5_results: GoogleSearchAPIWrapper unavailable "
-            "(missing GOOGLE_API_KEY / GOOGLE_CSE_ID).  Returning empty.")
-        return []
+            "(missing GOOGLE_API_KEY / GOOGLE_CSE_ID).")
+        return ("Web search is not configured on this machine "
+                "(GOOGLE_API_KEY / GOOGLE_CSE_ID are not set), so no results "
+                "could be fetched.  This is a setup gap, not an empty web.")
 
     try:
         top_2_search_res = search.results(query, 2) or []
     except Exception as e:
         app.logger.warning(f"top5_results: search.results() failed: {e}")
-        return []
+        return (f"The web search call failed and returned no results: {e}.  "
+                f"Treat this as a failed step, not as 'nothing was found'.")
 
     top_2_search_res_link = [
         res['link'] for res in top_2_search_res
         if isinstance(res, dict) and 'link' in res
     ]
     if not top_2_search_res_link:
-        return []
+        # THE EXIT THAT ACTUALLY FIRES, and it used to be silent.  Measured
+        # 2026-09-07: 79 of 158 google_search payloads reaching StatusVerifier
+        # were the two characters '[]', while the two logged exits above
+        # produced ZERO warnings across 47 live invocations -- so every one of
+        # those empties came through here, with no diagnostic at all.
+        #
+        # The raw payload is logged because the CAUSE lives in it: the CSE can
+        # answer 200-OK with an entry that carries no 'link' (e.g. langchain's
+        # "No good Google Search Result was found" sentinel), which is a very
+        # different thing from a quota error, and neither is distinguishable
+        # once this returns a bare [].
+        app.logger.warning(
+            "top5_results: search.results() returned %d entr(y/ies) but none "
+            "carried a 'link' -- returning no-results. raw=%.400r",
+            len(top_2_search_res), top_2_search_res)
+        return ("The web search ran but returned no usable results for this "
+                "query (no result carried a link).  Do NOT cite sources for "
+                "this step -- none were retrieved.")
 
     try:
         text = asyncio.run(async_main(top_2_search_res_link))
@@ -7184,12 +7204,20 @@ def top5_results(query):
     final_res.append({'text': cleaned_text, 'source': top_2_search_res_link})
     app.logger.info(f"res:-->{final_res}")
 
-    if len(final_res) == 0:
+    # UNREACHABLE / vacuous guard, left in place and marked rather than
+    # silently deleted: final_res.append(...) two lines above runs on every
+    # path that gets here, so len(final_res) is always 1 and this branch --
+    # including its search.results(query, 4) retry -- can never execute.
+    # Recorded here so the next reader does not mistake it for live error
+    # handling.  Removing it is a separate change with its own commit; this
+    # one is scoped to making the EMPTY-RESULT failure diagnosable.
+    if len(final_res) == 0:  # dead: see comment above
         try:
             return search.results(query, 4)
         except Exception as e:
             app.logger.warning(f"top5_results: fallback search failed: {e}")
-            return []
+            return ("The web search fallback also failed, so no results were "
+                    f"retrieved: {e}")
 
     return final_res
 
