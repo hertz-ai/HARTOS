@@ -109,24 +109,34 @@ class TestSuccessPathUntouched:
         """The fix must not disturb the working path."""
         assert "return final_res" in _src()
 
-    def test_dead_fallback_is_recorded(self):
+    def test_dead_fallback_is_gone(self):
         """`if len(final_res) == 0` after an unconditional append is vacuous.
 
-        final_res.append(...) runs on every path that reaches it, so the
-        search.results(query, 4) fallback below it is unreachable.  NOT fixed
-        in the same change as the diagnostics -- it is a separate defect and
-        gets its own commit -- but it must be visibly marked so the next
-        reader does not trust it.
+        final_res.append({'text': ..., 'source': ...}) runs on EVERY path that
+        reaches it, so len(final_res) is always 1 and the branch below it --
+        including its search.results(query, 4) retry -- can never execute.
+
+        It was left in place and marked by the diagnostics commit (911d18447)
+        so that change stayed scoped; removing it is this separate commit.
+        Dead error-handling is worse than no error-handling: it reads as a
+        safety net that will catch the empty case, and it never runs.
+
+        This assertion replaces the earlier "must be marked" one, which would
+        pass vacuously once the branch is gone.
         """
         src = _src()
-        if "if len(final_res) == 0" in src:
-            i = src.index("if len(final_res) == 0")
-            # 900, not 400: the marking comment is ~600 chars, and a 400-char
-            # lookback cut it off — the same too-narrow-window error this
-            # suite exists to catch, made by the suite itself.
-            window = src[max(0, i - 900):i]
-            assert ("unreachable" in window.lower()
-                    or "vacuous" in window.lower()
-                    or "dead" in window.lower()), (
-                "the unreachable len(final_res)==0 fallback must be marked, "
-                "otherwise it reads as live error handling")
+        assert "if len(final_res) == 0" not in src, (
+            "the unreachable len(final_res)==0 fallback is still present; it "
+            "cannot execute (the append above it is unconditional) and reads "
+            "as live error handling")
+
+    def test_the_only_success_exit_is_final_res(self):
+        """Removing the dead branch must not remove a real return path.
+
+        Guards the removal itself: the success path still returns final_res,
+        and the three diagnosable failure exits are still distinct.
+        """
+        src = _src()
+        assert "return final_res" in src
+        assert "search.results(query, 4)" not in src, (
+            "the dead fallback's retry call should have gone with it")

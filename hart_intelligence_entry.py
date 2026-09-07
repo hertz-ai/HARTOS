@@ -7204,21 +7204,6 @@ def top5_results(query):
     final_res.append({'text': cleaned_text, 'source': top_2_search_res_link})
     app.logger.info(f"res:-->{final_res}")
 
-    # UNREACHABLE / vacuous guard, left in place and marked rather than
-    # silently deleted: final_res.append(...) two lines above runs on every
-    # path that gets here, so len(final_res) is always 1 and this branch --
-    # including its search.results(query, 4) retry -- can never execute.
-    # Recorded here so the next reader does not mistake it for live error
-    # handling.  Removing it is a separate change with its own commit; this
-    # one is scoped to making the EMPTY-RESULT failure diagnosable.
-    if len(final_res) == 0:  # dead: see comment above
-        try:
-            return search.results(query, 4)
-        except Exception as e:
-            app.logger.warning(f"top5_results: fallback search failed: {e}")
-            return ("The web search fallback also failed, so no results were "
-                    f"retrieved: {e}")
-
     return final_res
 
 
