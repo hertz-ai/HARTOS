@@ -409,3 +409,66 @@ class TestAMissingToolIsSaidOutLoudOnce:
         with patch.object(subprocess_safe, 'run_bounded',
                           side_effect=FileNotFoundError()):
             assert subprocess_safe.run_probe([]) is None
+class TestTheProbeLooksWhereALoginShellWould:
+    """A unit's PATH lists only its own dependencies, so a working system tool
+    reads as absent from inside a service. Audited on the box 2026-09-07: 33 of
+    the 77 binaries the shell layer shells were installed and invisible to
+    hart-liquid-ui, and all 29 OTHER hart-* units had the same blindness. One
+    shared helper is the fix, not 29 nix modules.
+    """
+
+    def test_existing_system_dirs_are_appended(self):
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=True):
+            out = subprocess_safe.system_search_path('/only/this')
+        parts = out.split(os.pathsep)
+        assert parts[0] == '/only/this', 'the caller PATH must stay first'
+        assert '/run/current-system/sw/bin' in parts
+        assert '/run/wrappers/bin' in parts
+
+    def test_it_appends_never_prepends(self):
+        """A pinned or shimmed tool keeps its precedence. The rustdesk guard in
+        hart-liquid-ui.nix depends on being first on PATH."""
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=True):
+            out = subprocess_safe.system_search_path('/a')
+        assert out.startswith('/a' + os.pathsep)
+
+    def test_absent_dirs_are_not_invented(self):
+        """On a dev host or in a container these do not exist, and claiming
+        them would put a lie in PATH."""
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=False):
+            assert subprocess_safe.system_search_path('/a:/b') == '/a:/b'
+
+    def test_no_duplicates_when_already_present(self):
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=True):
+            out = subprocess_safe.system_search_path('/run/current-system/sw/bin')
+        assert out.split(os.pathsep).count('/run/current-system/sw/bin') == 1
+
+    def test_run_probe_passes_the_augmented_path_down(self):
+        captured = {}
+
+        def fake(cmd, timeout=5.0, **kw):
+            captured.update(kw)
+            return subprocess_safe.BoundedResult(0, '', '', False)
+
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=True):
+            with patch.object(subprocess_safe, 'run_bounded', side_effect=fake):
+                subprocess_safe.run_probe(['anything'])
+        assert '/run/current-system/sw/bin' in captured['env']['PATH']
+
+    def test_a_callers_own_env_is_kept_and_augmented(self):
+        """Passing env must not lose the caller's variables, and must not lose
+        the augmentation either."""
+        captured = {}
+
+        def fake(cmd, timeout=5.0, **kw):
+            captured.update(kw)
+            return subprocess_safe.BoundedResult(0, '', '', False)
+
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=True):
+            with patch.object(subprocess_safe, 'run_bounded', side_effect=fake):
+                subprocess_safe.run_probe(
+                    ['anything'], env={'PATH': '/mine', 'MARKER': 'kept'})
+        env = captured['env']
+        assert env['MARKER'] == 'kept'
+        assert env['PATH'].startswith('/mine')
+        assert '/run/current-system/sw/bin' in env['PATH']

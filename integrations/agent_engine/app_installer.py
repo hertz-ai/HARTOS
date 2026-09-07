@@ -885,13 +885,20 @@ class AppInstaller:
         That is the same class of bug the comment above documents (a short unit
         PATH misreported as a missing system tool); the installer was fixed for
         execution in 2026-08-12 and the availability probe was left behind.
+
+        The system dirs come from ``core.subprocess_safe.system_search_path``,
+        the ONE definition of where a node keeps its tools, shared with the
+        run_probe path so the installer and the 139 shell probes cannot drift
+        into disagreeing about it again. The nix user profile is appended here
+        because it is specific to this class: it is where ``nix-env -i`` puts
+        what the App Store just installed, so a freshly installed binary is
+        launchable without a re-login.
         """
-        _extra = ['/run/current-system/sw/bin', '/run/wrappers/bin',
-                  os.path.expanduser('~/.nix-profile/bin')]
-        _path = [p for p in os.environ.get('PATH', '').split(os.pathsep) if p]
-        for _d in _extra:
-            if _d not in _path and os.path.isdir(_d):
-                _path.append(_d)
+        from core.subprocess_safe import system_search_path
+        _path = [p for p in system_search_path().split(os.pathsep) if p]
+        _profile = os.path.expanduser('~/.nix-profile/bin')
+        if _profile not in _path and os.path.isdir(_profile):
+            _path.append(_profile)
         return os.pathsep.join(_path)
 
     def _ensure_flathub(self) -> None:
