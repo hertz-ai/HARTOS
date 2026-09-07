@@ -250,7 +250,7 @@ from hartos.lifecycle_hooks import (
     lifecycle_hook_track_user_fallback,
     debug_lifecycle_status,
     ActionState,
-    get_action_state, safe_set_state, force_state_through_valid_path,
+    get_action_state, safe_set_state, force_state_through_valid_path, is_terminal_state,
     lifecycle_hook_track_status_verification_request,
     lifecycle_hook_track_fallback_request,
     lifecycle_hook_track_recipe_request,
@@ -2535,13 +2535,26 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             # hallucinating user confirmation).
                             try:
                                 _gate_value = (json_obj.get('can_perform_without_user_input') or '').strip().lower()
-                                if _gate_value.startswith('no'):
+                                # `safe_set_state(..., PENDING)` above is REFUSED on a
+                                # terminal action, so the verdict can arrive for an
+                                # action that is already over.  Flagging that one asks
+                                # the user a question no answer can resolve — see
+                                # _should_block_on_user_input for the 20-minute live
+                                # stall this closes.
+                                if _should_block_on_user_input(user_prompt, current_action_id, _gate_value):
                                     user_tasks[user_prompt]._needs_user_input_action_id = current_action_id
                                     current_app.logger.info(
                                         f"[USER-INPUT-GATE] Action {current_action_id} flagged "
                                         f"as blocked on user input "
                                         f"(can_perform_without_user_input={_gate_value!r}); "
                                         f"OUTER loop will break and return control to user."
+                                    )
+                                elif _gate_value.startswith('no'):
+                                    current_app.logger.info(
+                                        f"[USER-INPUT-GATE] NOT flagging action {current_action_id}: "
+                                        f"verdict said {_gate_value!r} but the action is already "
+                                        f"{get_action_state(user_prompt, current_action_id).value} — "
+                                        f"a finished action cannot be waiting for the user."
                                     )
                             except Exception as _gate_err:
                                 current_app.logger.debug(
@@ -4144,6 +4157,59 @@ def _is_terminate(content):
     # positive SKIPS a legitimate user-bound reply, so only a message that IS
     # the terminate token (after removing the skeleton suffix) qualifies.
     return _strip_memory_skeleton(content).upper().startswith('TERMINATE')
+
+
+def _should_block_on_user_input(user_prompt, action_id, gate_value) -> bool:
+    """Should the StatusVerifier's `can_perform_without_user_input` block this action?
+
+    Only an action that still has work left can be waiting on the USER.  A
+    TERMINAL action is over — nothing the user types can change its outcome — so
+    flagging one blocks the build on a question that can never resolve.
+
+    MEASURED LIVE 2026-09-07, agent 88761328396: all five action files were on
+    disk by 11:40:05 (action 5 = 'Output the extracted line verbatim',
+    status='done', can_perform_without_user_input='yes'), and the state machine
+    agreed — 11:41:40 `Action 5: terminated`, plus repeated `[LOCKED] Action 5 in
+    terminated - skipping assignment hook`.  From 11:43:32 the gate nonetheless
+    flagged action 5 eight times and the loop returned the "Step 5 ... isn't
+    coming together" question at 11:46:15 and again at 11:59:52 — 20.4 minutes of
+    user-visible wall clock spent asking about a step finished 6 minutes before
+    the first ask.  The user answered; the build could not advance, because the
+    answer addressed an action that was already over.
+
+    WHY IT HAPPENED: the caller's `pending` branch runs
+    `safe_set_state(..., PENDING)` and then sets the sticky flag.  The state
+    change is correctly REFUSED on a terminal action — verified against the real
+    state machine, not inferred:
+
+        validate_state_transition(TERMINATED -> PENDING)   -> False
+        [ERROR] Invalid transition: Action 5 cannot go from terminated to pending
+        state after safe_set_state(PENDING)                -> terminated
+
+    but nothing checked whether it took, so the flag was set anyway.
+
+    DELIBERATELY NARROW.  Terminal is the only state with evidence, so terminal
+    is the only case this refuses.  The stronger-looking predicate — require the
+    state to read back as PENDING — would also stop blocking for ASSIGNED and
+    IN_PROGRESS (ASSIGNED->PENDING is refused by the same table), changing a
+    second behaviour on a hunch.  The gate's real job is untouched: a live action
+    whose verifier says 'no' still blocks, which is what stops the 2026-05-08
+    drift-to-'yes' that hallucinated a user confirmation.
+
+    Terminality is asked of `lifecycle_hooks.is_terminal_state` rather than
+    re-listed here — a fourth copy of that tuple is the drift this codebase keeps
+    paying for.
+    """
+    if not (gate_value or '').strip().lower().startswith('no'):
+        return False
+    try:
+        if is_terminal_state(get_action_state(user_prompt, action_id)):
+            return False
+    except Exception:
+        # Never raise into the create loop; an unreadable state degrades to the
+        # previous behaviour (block), which is the safe side of this gate.
+        return True
+    return True
 
 
 def _needs_input_reply(action_id, action_text):

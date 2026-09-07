@@ -445,6 +445,23 @@ _STALL_STATES = (ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_REQUESTED)
 _TERMINAL_STATES = (ActionState.COMPLETED, ActionState.TERMINATED, ActionState.ERROR, ActionState.GAVE_UP)
 
 
+def is_terminal_state(state) -> bool:
+    """Is this action state one the action can never leave?
+
+    The public reader for `_TERMINAL_STATES`, so callers in other modules ask
+    this question instead of re-listing the states.  That tuple is already
+    spelled out inline in `validate_state_transition` (the GAVE_UP guard) and
+    twice more around the give-up paths; every extra copy is a place the set can
+    drift, and drift here means a consumer disagreeing with the state machine
+    about whether an action is finished.
+
+    Added for the CREATE user-input gate (agent 88761328396, 2026-09-07), which
+    kept asking the user about action 5 for 20 minutes after that action reached
+    TERMINATED — see `create_recipe._should_block_on_user_input`.
+    """
+    return state in _TERMINAL_STATES
+
+
 # #139 observability counter — bumped each time the FAILED→COMPLETED recovery
 # reconcile fires via the TERMINATED (forced) terminal (a possible masked
 # failure). Module-level so diag can quantify it without log-scraping; the
