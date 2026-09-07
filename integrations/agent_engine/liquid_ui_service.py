@@ -1963,6 +1963,12 @@ class LiquidUIService:
                 '.hart-hero-orbwrap>canvas,#hart-voice-orb,'
                 '.hart-orb-orbit,.hart-orb-orbit2{visibility:hidden;animation:none}'
             )
+        # The SAME verdict, handed to script as well as to CSS. The CSS above
+        # stops the canvas painting; only this can stop the canvas being DRAWN
+        # INTO. See the window.HART_NATIVE_CHROME comment below for the measured
+        # cost of leaving that loop running (a full core, zero page flips).
+        # Sorted so the emitted page is byte-stable across renders.
+        native_chrome_js = json.dumps(sorted(native_chrome))
 
         # Living-Glass: emit the active accent as a comma-triple so every glow /
         # ring / selection re-tints when the theme accent changes. Parsed from the
@@ -3692,6 +3698,22 @@ window.HART_PERF = PERF;
 // Which product the user installed (HART OS vs the Nunba desktop companion) — the
 // right-click "Ask <Product>" menu (hartAskMenu.js) brands to it.
 window.HART_PRODUCT = '{hart_product}';
+
+// Which chrome the COMPOSITOR is drawing itself. Same verdict the CSS above
+// already acts on (native_orb_css / the transparent wallpaper), reaching a
+// second consumer that CSS cannot serve: one publisher, several consumers, the
+// pattern read_native_chrome already established.
+//
+// CSS can stop an element PAINTING. It cannot stop a script. voiceOrbViz.js
+// drives its canvas from a self-perpetuating requestAnimationFrame loop, and
+// rAF throttling keys off DOCUMENT visibility, not element visibility -- so
+// `visibility:hidden` on the canvas left the loop running at full rate,
+// computing trig and stroking paths into a surface nobody would ever see.
+// Measured on the box 2026-09-07: WebKitWebProcess at 1188 CPU ticks in 12s,
+// a full core, while the compositor reported ZERO page flips. That is exactly
+// the per-frame cost M2 exists to remove, and hiding the canvas never removed
+// it. The orb module reads this to stand its loop down.
+window.HART_NATIVE_CHROME = {native_chrome_js};
 
 // ═══ State ═══
 let panels = {{}};
