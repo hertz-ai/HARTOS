@@ -998,6 +998,38 @@ def ensure_tool_call_arguments_json(messages):
     return messages
 
 
+def answered_call_ids(m):
+    """Every tool_call_id a single message answers.
+
+    autogen returns tool results in TWO shapes and a reader that knows only the
+    first sees nothing on real data.  From ``generate_tool_calls_reply``
+    (autogen/agentchat/conversable_agent.py): each executed call becomes
+    ``{"tool_call_id": ..., "role": "tool", "content": ...}``, and when the turn
+    finishes those are wrapped and returned as ONE message —
+
+        {"role": "tool", "tool_responses": [ ...those... ],
+         "content": "\\n\\n".join(...)}
+
+    — whose OUTER dict has no ``tool_call_id`` at all.  ``is_consolidated_response``
+    below keys on ``'tool_responses'`` for exactly this reason (it additionally
+    requires len > 1; this reader deliberately does not, because a single-entry
+    reply hides its id in the same place).
+
+    CANONICAL: reuse_recipe imports this rather than keeping its own copy —
+    the two sides must not drift, since one finds answers and the other
+    decides whether a slot gets a real result or a manufactured one.
+    """
+    ids = set()
+    if not isinstance(m, dict) or m.get('role') != 'tool':
+        return ids
+    if m.get('tool_call_id'):
+        ids.add(m['tool_call_id'])
+    for r in (m.get('tool_responses') if isinstance(m.get('tool_responses'), list) else []):
+        if isinstance(r, dict) and r.get('tool_call_id'):
+            ids.add(r['tool_call_id'])
+    return ids
+
+
 class ToolMessageHandler:
     """Handles tool messages in the conversation history to prevent tool_call_id errors.
 
@@ -1008,16 +1040,70 @@ class ToolMessageHandler:
     It also handles the "only messages with role 'assistant' can have a function call" error.
     """
 
-    def __init__(self, user_tasks=None, user_prompt=None):
+    def __init__(self, user_tasks=None, user_prompt=None, peer_agents=None):
         """
         Initialize the ToolMessageHandler.
 
         Args:
             user_tasks: Global user_tasks dictionary containing session data
             user_prompt: Current session identifier (e.g., "10077_123")
+            peer_agents: The other agents in THIS conversation.  Tools execute
+                in a pairwise Assistant<->Executor exchange, so the seat whose
+                request we are building often never saw the result and the
+                repair below would mint a placeholder over a real answer.
+                Given the peers, we can read the answer they already hold.
+                A live list of agent objects (their _oai_messages fill in
+                later); omit it and behaviour is exactly as before.
         """
         self.user_tasks = user_tasks
         self.user_prompt = user_prompt
+        self._peer_agents = list(peer_agents or [])
+
+    def real_tool_answer(self, tool_call_id):
+        """The REAL content answering this call, from a peer agent's buffer.
+
+        WHY THIS EXISTS.  Measured live 2026-09-07 (agent 18088688973):
+        google_search really ran and really fetched five engines, yet the brief
+        cited nothing.  On the wire the median tool result was 45 chars —
+        exactly HISTORICAL_TOOL_PLACEHOLDER — 116/119 under 120 chars, 1/119
+        carrying a URL.  The model cannot cite what it never received.
+
+        The answers are not lost: they sit in the executing seat's own
+        ``_oai_messages`` buffer (measured: Assistant n=14 calls=10 answers=4
+        beside six broadcast copies at answers=0).  Same process, same turn,
+        same conversation — so this reads them directly rather than caching or
+        reconstructing anything.
+
+        Returns None when no peer holds a real answer, so the caller keeps the
+        placeholder and the fabrication gate still sees the truth.  Never
+        returns the placeholder itself as if it were real, and never raises —
+        it runs inside the transform on every LLM call.
+        """
+        try:
+            for agent in self._peer_agents:
+                buffers = getattr(agent, '_oai_messages', None)
+                if not buffers:
+                    continue
+                for conv in list(buffers.values()):
+                    for m in (conv or []):
+                        if tool_call_id not in answered_call_ids(m):
+                            continue
+                        # Consolidated reply: take THIS call's own entry, not
+                        # the joined blob of every call in the batch.
+                        for r in (m.get('tool_responses') or []):
+                            if isinstance(r, dict) and r.get('tool_call_id') == tool_call_id:
+                                c = r.get('content')
+                                if c and c != HISTORICAL_TOOL_PLACEHOLDER:
+                                    return c
+                        c = m.get('content')
+                        if c and c != HISTORICAL_TOOL_PLACEHOLDER:
+                            return c
+        except Exception as e:
+            try:
+                current_app.logger.debug(f"real_tool_answer lookup skipped: {e}")
+            except Exception:
+                pass
+        return None
 
     def get_current_action_id(self):
         """Get current action ID from user_tasks."""
@@ -1933,11 +2019,19 @@ class ToolMessageHandler:
                                     function_name = tc.get('function', {}).get('name')
                                     break
 
+                            # Fill the slot with the REAL result when a peer
+                            # agent already holds it.  This is the same "fill
+                            # the answer slot" repair as before — only the
+                            # content changes, from a manufactured string to
+                            # what the tool actually returned.  Falls back to
+                            # the placeholder when nothing real exists, so a
+                            # genuinely unanswered call still looks unanswered.
+                            _real = self.real_tool_answer(tool_call_id)
                             placeholder = {
                                 'role': 'tool',
                                 'name': function_name or assistant_msg.get('name', 'Assistant'),
                                 'tool_call_id': tool_call_id,
-                                'content': HISTORICAL_TOOL_PLACEHOLDER
+                                'content': _real or HISTORICAL_TOOL_PLACEHOLDER
                             }
 
                             # Insert the placeholder right after the assistant message
@@ -1952,7 +2046,8 @@ class ToolMessageHandler:
 
                             final_messages.insert(insert_position, placeholder)
                             current_app.logger.info(
-                                f"Added placeholder for historical tool_call_id {tool_call_id}"
+                                f"[TOOL-ANSWER-FILL] {tool_call_id} <- "
+                                f"{'REAL result %d chars' % len(_real) if _real else 'placeholder (no peer holds it)'}"
                             )
 
 

@@ -57,7 +57,7 @@ from PIL import Image
 
 
 from flask import current_app
-from hartos.helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files, _is_terminate_msg
+from hartos.helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files, _is_terminate_msg, answered_call_ids
 
 
 def _normalize_flow_recipe(config):
@@ -1461,7 +1461,17 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
-            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
+            # peer_agents: the seat that RAN a tool is not usually the seat
+            # whose next request is being built (tools execute in a pairwise
+            # Assistant<->Executor exchange — see the note at :3363).  Handing
+            # the handler the peers lets it fill an unanswered tool slot with
+            # the result they already hold instead of a placeholder.  Live
+            # 2026-09-07: 88 placeholders minted in one drive, median wire tool
+            # result 45 chars = the placeholder, so the brief could not cite a
+            # search that really ran.  Same list the transform is attached to.
+            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt,
+                               peer_agents=[assistant, helper, executor, verify,
+                                            chat_instructor]),
         ]
     )
 
@@ -2087,7 +2097,11 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
-            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
+            # Same peer wiring as the recipe path above (see rationale there).
+            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt,
+                               peer_agents=[time_agent, helper1, executor1,
+                                            multi_role_agent1, verify1,
+                                            chat_instructor1]),
         ]
     )
     context_handling.add_to_agent(time_agent)
@@ -4374,39 +4388,12 @@ def _tool_name_candidates(raw):
 _merge_last_stats: dict = {}
 
 
-def _answered_call_ids(m):
-    """Every tool_call_id a single message answers.
-
-    autogen returns tool results in TWO shapes, and a reader that knows only
-    the first sees nothing on real data.  From its own
-    ``generate_tool_calls_reply`` (agentchat/conversable_agent.py): each
-    executed call becomes ``{"tool_call_id": ..., "role": "tool", "content":
-    ...}``, and when the turn finishes those are wrapped and returned as ONE
-    message —
-
-        {"role": "tool", "tool_responses": [ ...those... ],
-         "content": "\\n\\n".join(...)}
-
-    — whose OUTER dict has no ``tool_call_id`` at all.  The ids live inside
-    ``tool_responses``.  Both earlier versions of the merge read only
-    ``m.get('tool_call_id')``, which is None for every such reply, so no id
-    ever matched and both deploys spliced 0 while a sibling buffer visibly
-    held the answers (38 sync events, byte-verified pyc — the gap was here,
-    not in the deploy).
-
-    helper.py already models this shape: ``is_consolidated_response``
-    (:1276) keys on ``'tool_responses'`` for exactly the same reason.  This is
-    that knowledge as one function, so the two sides cannot drift again.
-    """
-    ids = set()
-    if not isinstance(m, dict) or m.get('role') != 'tool':
-        return ids
-    if m.get('tool_call_id'):
-        ids.add(m['tool_call_id'])
-    for r in (m.get('tool_responses') if isinstance(m.get('tool_responses'), list) else []):
-        if isinstance(r, dict) and r.get('tool_call_id'):
-            ids.add(r['tool_call_id'])
-    return ids
+# `answered_call_ids` (imported from hartos.helper) is the ONE reader of
+# "which tool calls does this message answer".  It lived here briefly as a
+# private copy; that duplicated knowledge helper.py already owns
+# (is_consolidated_response keys on the same 'tool_responses' shape), and
+# helper.py is where the placeholder-vs-real decision is made.  One reader
+# on both sides, so a shape autogen changes cannot be half-learned.
 
 
 def _merge_tool_answers(base, buffers):
@@ -4464,7 +4451,7 @@ def _merge_tool_answers(base, buffers):
             return out
         answered = set()
         for m in out:
-            answered |= _answered_call_ids(m)
+            answered |= answered_call_ids(m)
         missing = [i for i in announced if i not in answered]
         if not missing:
             return out
@@ -4480,7 +4467,7 @@ def _merge_tool_answers(base, buffers):
                 if not isinstance(m, dict) or m.get('role') != 'tool':
                     continue
                 answers_seen += 1
-                ids = _answered_call_ids(m)
+                ids = answered_call_ids(m)
                 hits = [i for i in missing if i in ids and i not in claimed]
                 if hits:
                     claimed.update(hits)
@@ -4495,7 +4482,7 @@ def _merge_tool_answers(base, buffers):
         #        conversations, not one conversation from two seats)
         #   found>0 -> the merge should splice; anything else is a bug here
         # The live answer was the middle case: answers_seen>0 with found=0,
-        # because the ids sat inside tool_responses (see _answered_call_ids).
+        # because the ids sat inside tool_responses (see answered_call_ids in helper.py).
         try:
             _merge_last_stats.clear()
             _merge_last_stats.update(announced=len(announced), missing=len(missing),
