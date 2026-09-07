@@ -4578,3 +4578,38 @@ class TestTheServiceCanSeeTheSystemProfile:
         last_pinned = src.rindex('lib.optional (pkgs ? sane-backends)')
         assert rustdesk < floor
         assert last_pinned < floor
+class TestTheBackendDoesNotFabricateTheCopilotsWork:
+    """The in-backend auto-run must stand down where a real executor exists.
+
+    REPRODUCED LIVE on the box 2026-09-07, which is the proof 7dc4da3 said it
+    was waiting for. Dispatching the 6 queued tasks moved all 6 from pending to
+    COMPLETED in under a second, quality_score 0.5 and spark_reward 15 apiece,
+    while hart-copilot-daemon went on logging "no task assigned by the hive".
+    The real executor never saw one.
+
+    _dispatch_to_pipeline asks the LLM for a diff, parses it, applies NOTHING,
+    and reports success. On a node running the claude-code daemon it is also a
+    race the fabricator wins, so the honest executor starves.
+    """
+
+    @staticmethod
+    def _read(rel):
+        with open(os.path.join(REPO_ROOT, rel), encoding='utf8') as fh:
+            return fh.read()
+
+    def test_the_backend_unit_stands_the_fabricator_down(self):
+        """Set only where the real daemon runs. Nodes without it keep the
+        historical behaviour, and the library default is untouched -- moving
+        that is the seam owner's call."""
+        src = self._read('nixos/modules/hart-backend.nix')
+        assert 'HEVOLVE_HIVE_INPROCESS_EXEC' in src
+        block = src[src.index('HEVOLVE_HIVE_INPROCESS_EXEC'):][:300]
+        assert 'hart.copilot.daemon.enable' in block, (
+            'the stand-down must be conditional on the real executor existing')
+        assert '"0"' in block and '"1"' in block, (
+            'both arms must be explicit: 0 with the daemon, 1 without it')
+
+    def test_the_gate_is_read_from_the_environment_not_hardcoded(self):
+        src = self._read('integrations/coding_agent/claude_hive_session.py')
+        assert "os.environ.get(\n            'HEVOLVE_HIVE_INPROCESS_EXEC', '1')" in src \
+            or "'HEVOLVE_HIVE_INPROCESS_EXEC', '1'" in src

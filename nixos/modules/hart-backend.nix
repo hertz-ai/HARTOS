@@ -61,6 +61,28 @@ in
         # OS-mode posture (port_registry.is_os_mode is already true via os-release).
         HEVOLVE_LOCAL_LLM_URL = "http://127.0.0.1:${toString cfg.ports.llm}/v1";
 
+        # ── Do not let the backend FABRICATE the co-pilot's work ──────────────
+        # claude_hive_session's in-backend auto-run asks the LLM for a diff,
+        # parses it, applies NOTHING, and reports the task completed at a fixed
+        # quality of 0.50. Worse, it CONSUMES the task before the external
+        # claude-code daemon (the real executor, `claude -p` in a repo clone,
+        # polling /api/hive/session/tasks) can claim it.
+        #
+        # Reproduced live on the box 2026-09-07, which is the proof 7dc4da3 said
+        # it needed: dispatching 6 queued tasks moved all 6 from pending to
+        # COMPLETED in under a second, quality_score 0.5 and spark_reward 15
+        # apiece, while hart-copilot-daemon went on logging "no task assigned by
+        # the hive". It never saw one.
+        #
+        # The seam's own comment names this exact remedy: "A node that runs the
+        # claude-code daemon sets it to 0 so the task stays PENDING and the
+        # daemon executes it for real." So it is set here ONLY when that daemon
+        # is actually enabled. Nodes without it keep the historical behaviour,
+        # and the library DEFAULT is untouched -- moving that is agent-3's call,
+        # and this does not move it.
+        HEVOLVE_HIVE_INPROCESS_EXEC =
+          if config.hart.copilot.daemon.enable or false then "0" else "1";
+
         # ── Realtime origin (P0a: SSE/WAMP reaches the Nunba UI) ──
         # This backend is the ORIGIN of HARTOS realtime: it serves REST /api/social
         # + root /chat and emits push events via core.platform.events
