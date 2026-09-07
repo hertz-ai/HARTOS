@@ -3616,7 +3616,8 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         current_app.logger.info(
                             f"[725-SYNC] group_chat.messages stale ({_was} < "
                             f"{len(_conv)}) — resynced from manager._oai_messages"
-                            f"; spliced {len(_merged) - len(_conv)} real tool answer(s)")
+                            f"; spliced {len(_merged) - len(_conv)} real tool answer(s)"
+                            f" {dict(_merge_last_stats)}")
                         # DIAGNOSTIC ONLY (no behaviour change).  _oai_messages is
                         # keyed PER AGENT and each value is a pairwise broadcast log,
                         # so "longest" is a LENGTH proxy for "most complete" — it is
@@ -4368,6 +4369,11 @@ def _tool_name_candidates(raw):
     return out
 
 
+# Filled by the last _merge_tool_answers call; read by the sync log line
+# below so the numbers travel without changing the function's return.
+_merge_last_stats: dict = {}
+
+
 def _merge_tool_answers(base, buffers):
     """Splice the REAL tool answers from sibling buffers into `base`.
 
@@ -4428,13 +4434,30 @@ def _merge_tool_answers(base, buffers):
             return out
 
         found = {}
+        answers_seen = 0
         for buf in (buffers or []):
             for m in (buf or []):
                 if not isinstance(m, dict) or m.get('role') != 'tool':
                     continue
+                answers_seen += 1
                 tid = m.get('tool_call_id')
                 if tid in missing and tid not in found:
                     found[tid] = m
+        # DIAGNOSTIC.  Two live runs spliced 0 while a sibling buffer visibly
+        # held answers, and the deployed pyc was byte-verified against source,
+        # so the gap is in the SET RELATION, not the deploy.  These three
+        # numbers separate the remaining possibilities without another guess:
+        #   missing>0, answers_seen=0  -> no buffer holds any answer at all
+        #   missing>0, answers_seen>0, found=0 -> answers exist but under
+        #        tool_call_ids the picked buffer never announced (different
+        #        conversations, not one conversation from two seats)
+        #   found>0 -> the merge should splice; anything else is a bug here
+        try:
+            _merge_last_stats.clear()
+            _merge_last_stats.update(announced=len(announced), missing=len(missing),
+                                     answers_seen=answers_seen, found=len(found))
+        except Exception:
+            pass
         if not found:
             return out
 
