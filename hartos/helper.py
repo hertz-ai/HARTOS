@@ -1619,6 +1619,72 @@ class ToolMessageHandler:
                 del processed_messages[0]['tool_call_id']
             processed_messages = processed_messages[1:]
 
+        # STEP 1b: normalise autogen's tool-reply shape into the wire shape.
+        #
+        # autogen's generate_tool_calls_reply returns
+        #     {'role': 'tool',
+        #      'tool_responses': [{'tool_call_id': .., 'role': .., 'content': ..}, ..],
+        #      'content': '\n\n'.join(...)}
+        # with NO top-level tool_call_id — proven from the shipped
+        # lib/autogen/agentchat/conversable_agent.pyc, whose dict-key tuple
+        # consts are ('tool_call_id','role','content') for each per-call
+        # return and ('role','tool_responses','content') for the outer
+        # message.
+        #
+        # Everything downstream matches on a TOP-LEVEL tool_call_id.  Without
+        # this normalisation the id is invisible, so the repair branch below
+        # guesses from the most recent assistant's pending calls: the real
+        # output is bound to the wrong call and the rightful call is left
+        # unanswered, which is what :1889 then stamps
+        # HISTORICAL_TOOL_PLACEHOLDER over.  For parallel returns the joined
+        # blob is copied to every pending id, so one tool's output is served
+        # as several tools' answers.
+        #
+        # Measured live 2026-09-07 (agent 19794274829, 358 s): 60x "Adding
+        # missing tool_call_id", 83x placeholder mints, against 5 real tool
+        # executions.
+        #
+        # One tool message per tool_call_id is what the OpenAI API requires
+        # anyway, so this produces the shape the rest of the function — and
+        # the server — already expect.  A message whose responses carry no
+        # ids at all is passed through untouched for the existing branches
+        # to handle; nothing is dropped here.
+        _normalised = []
+        _expanded_count = 0
+        for _m in processed_messages:
+            if not isinstance(_m, dict):
+                _normalised.append(_m)
+                continue
+            _responses = _m.get('tool_responses')
+            if (_m.get('role') != 'tool' or 'tool_call_id' in _m
+                    or not isinstance(_responses, list) or not _responses):
+                _normalised.append(_m)
+                continue
+
+            _per_call = []
+            for _r in _responses:
+                if not isinstance(_r, dict) or not _r.get('tool_call_id'):
+                    continue
+                _one = {'role': 'tool',
+                        'tool_call_id': _r['tool_call_id'],
+                        'content': _r.get('content', '')}
+                if _r.get('name'):
+                    _one['name'] = _r['name']
+                elif _m.get('name'):
+                    _one['name'] = _m['name']
+                _per_call.append(_one)
+
+            if _per_call:
+                _normalised.extend(_per_call)
+                _expanded_count += len(_per_call)
+            else:
+                _normalised.append(_m)
+        if _expanded_count:
+            current_app.logger.info(
+                f"[TOOL-RESPONSES] expanded {_expanded_count} autogen tool "
+                f"response(s) to their own tool_call_id — no guessing needed")
+        processed_messages = _normalised
+
         # STEP 2: Pre-identify consolidated responses and assistants with tool calls
         final_messages = []
         tool_call_mapping = {}  # Maps tool_call_id -> assistant_idx
