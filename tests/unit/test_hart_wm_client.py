@@ -440,18 +440,55 @@ def test_a_reply_split_across_reads_still_reassembles(tmp_path, monkeypatch):
 
 
 @needs_af_unix
-def test_a_peer_that_closes_without_answering_is_reported_not_hung(tmp_path, monkeypatch):
-    """Exactly what the sway relay does under Tier-1: accept, then exit without
-    a reply. The client must say so rather than return a bare False."""
+def test_a_socket_that_accepts_but_never_answers_is_not_a_backend(tmp_path, monkeypatch):
+    """THE TRAP THIS TRANSPORT MUST NOT FALL INTO.
+
+    HART_COMP_SOCK points at a systemd socket-activated relay, and systemd
+    ALWAYS accepts the connection, spawning a relay that then exits 1 when it
+    cannot find an upstream compositor. So connect(2) succeeding proves
+    nothing at all: it is the same worthless signal as SWAYSOCK being set,
+    which is what made the client claim a working window manager on a tier
+    that had none. Detection therefore requires a real answer, and a peer that
+    accepts and hangs up must leave the backend unclaimed.
+    """
     srv = _FakeCompositor(tmp_path, lambda req: None)   # accepts, never answers
     try:
         monkeypatch.setenv('HART_COMP_SOCK', srv.path)
-        c = HartWmClient()
-        r = c.switch_workspace(1)
+        monkeypatch.setenv('XDG_RUNTIME_DIR', str(tmp_path / 'no-such-runtime'))
+        with patch('integrations.agent_engine.shell_desktop_apis._is_wayland',
+                   return_value=False):
+            c = HartWmClient()
+        assert c._backend is None, 'a silent peer must not count as a compositor'
+        assert c.available is False
+        # And the low-level call says WHY, flagged as a transport failure so a
+        # refusal is never confused with a dead pipe.
+        r = HartWmClient._call_on(srv.path, 'window.list')
+        assert r['ok'] is False and r['_transport'] is True
+        assert 'no response frame' in r['error'] or 'failed' in r['error']
     finally:
         srv.close()
-    assert r['ok'] is False
-    assert 'no response frame' in r['error'] or 'failed' in r['error']
+
+
+@needs_af_unix
+def test_a_refusal_is_not_retried_as_a_transport_failure(tmp_path, monkeypatch):
+    """not_found is the compositor answering correctly. Retrying it would
+    dispatch a destructive verb twice, so only _transport failures re-probe."""
+    def responder(req):
+        return {'v': 1, 'id': req.get('id'), 'ok': False, 'result': None,
+                'error': {'code': 'not_found', 'message': 'no mapped window'}}
+    srv = _FakeCompositor(tmp_path, responder)
+    try:
+        monkeypatch.setenv('HART_COMP_SOCK', srv.path)
+        c = HartWmClient()
+        c._backend = 'hart-comp'          # detection saw window.list refuse too
+        c._hc_path = srv.path
+        before = len(srv.requests)
+        r = c.focus_window(4)
+    finally:
+        srv.close()
+    assert r['ok'] is False and r['error'] == 'not_found'
+    assert '_transport' not in r
+    assert len(srv.requests) - before == 1, 'a refusal must be dispatched ONCE'
 
 
 def test_a_failed_swaymsg_run_reports_why():

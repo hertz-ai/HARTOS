@@ -73,11 +73,15 @@ class HartWmClient:
     """Brain-side WM client. Tier-1 = the HART-comp socket, Tier-2 = swaymsg."""
 
     def __init__(self):
+        # Resolved once: the probe below costs a round trip, and this client is
+        # a singleton (get_wm_client). _hc re-probes if the cached path dies,
+        # so a compositor restart recovers without a new client.
+        self._hc_path = self._hart_comp_socket()
         self._backend = self._detect_backend()
 
     # ── transport discovery ──
-    @staticmethod
-    def _hart_comp_socket() -> Optional[str]:
+    @classmethod
+    def _hart_comp_socket(cls) -> Optional[str]:
         """The live ``com.hart.Compositor`` socket, or None.
 
         Resolution order, first CONNECTABLE candidate wins:
@@ -90,10 +94,14 @@ class HartWmClient:
           2. ``$XDG_RUNTIME_DIR/hart-comp.sock`` — the compositor's own bind
              path, reachable when the caller IS the session user.
 
-        A candidate counts only if ``connect(2)`` SUCCEEDS. Existence is not
-        enough: a socket file outlives the process that bound it, and claiming
-        a transport we cannot actually open is the precise dishonesty this
-        module exists to avoid.
+        A candidate counts only if it ANSWERS a real ``window.list``. Neither
+        existence nor a successful connect is enough, for two different
+        reasons: a socket file outlives the process that bound it, and a
+        systemd socket-activated relay ALWAYS accepts, then exits 1 when it
+        cannot find an upstream. Accepting either signal would recreate the
+        exact bug this replaces, where SWAYSOCK being set was read as proof of
+        a working window manager on a tier that had none. Only a well-formed
+        reply proves a compositor is behind the socket.
         """
         # No AF_UNIX (Windows Python) means no HART-comp transport at all, and
         # saying so here keeps the AttributeError out of the connect loop below,
@@ -109,18 +117,8 @@ class HartWmClient:
         if xdg:
             cands.append(os.path.join(xdg, 'hart-comp.sock'))
         for path in cands:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            try:
-                s.settimeout(_HC_TIMEOUT)
-                s.connect(path)
+            if cls._call_on(path, 'window.list').get('ok'):
                 return path
-            except OSError:
-                continue
-            finally:
-                try:
-                    s.close()
-                except OSError:
-                    pass
         return None
 
     @classmethod
@@ -167,9 +165,34 @@ class HartWmClient:
         (the compositor has no such method); it keeps its honest ``unsupported``
         in ``summon_app``.
         """
-        path = self._hart_comp_socket()
-        if not path:
-            return {'ok': False, 'error': 'hart-comp socket went away'}
+        if not self._hc_path:
+            return {'ok': False, 'error': 'no hart-comp socket', '_transport': True}
+        reply = self._call_on(self._hc_path, method, args)
+        if reply.get('_transport'):
+            # A TRANSPORT failure, not a refusal. The compositor may have
+            # restarted under us, which invalidates the cached path without
+            # anything being wrong with the request. Re-probe ONCE and retry so
+            # a session restart does not leave the brain permanently blind. A
+            # real ``not_found`` never lands here, so a legitimate refusal is
+            # never retried into a second dispatch.
+            self._hc_path = self._hart_comp_socket()
+            if self._hc_path:
+                return self._call_on(self._hc_path, method, args)
+        return reply
+
+    @classmethod
+    def _call_on(cls, path: str, method: str,
+                 args: Optional[dict] = None) -> Dict[str, Any]:
+        """One framed request/response on an EXPLICIT socket path.
+
+        Detection and dispatch share this, so the probe proves the transport
+        with exactly the machinery the real calls use. Nothing here is allowed
+        to raise: every caller treats a failure as "no window manager", which
+        is the honest reading.
+        """
+        if not hasattr(socket, 'AF_UNIX'):
+            return {'ok': False, 'error': 'no AF_UNIX on this platform',
+                    '_transport': True}
         body = json.dumps({'id': 'brain', 'method': method,
                            'args': args or {}}).encode('utf-8')
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -177,19 +200,24 @@ class HartWmClient:
             s.settimeout(_HC_TIMEOUT)
             s.connect(path)
             s.sendall(struct.pack('>I', len(body)) + body)
-            head = self._recv_exactly(s, 4)
+            head = cls._recv_exactly(s, 4)
             if head is None:
-                return {'ok': False, 'error': 'no response frame from hart-comp'}
+                # Exactly what a socket-activated relay does when it cannot find
+                # an upstream: accept, then exit without answering.
+                return {'ok': False, 'error': 'no response frame from hart-comp',
+                        '_transport': True}
             (length,) = struct.unpack('>I', head)
             if length > _HC_MAX_FRAME:
-                return {'ok': False,
+                return {'ok': False, '_transport': True,
                         'error': 'hart-comp frame too large: %d' % length}
-            payload = self._recv_exactly(s, length)
+            payload = cls._recv_exactly(s, length)
             if payload is None:
-                return {'ok': False, 'error': 'truncated hart-comp frame'}
+                return {'ok': False, 'error': 'truncated hart-comp frame',
+                        '_transport': True}
             reply = json.loads(payload.decode('utf-8'))
         except (OSError, ValueError) as e:
-            return {'ok': False, 'error': 'hart-comp call failed: %s' % e}
+            return {'ok': False, 'error': 'hart-comp call failed: %s' % e,
+                    '_transport': True}
         finally:
             try:
                 s.close()
