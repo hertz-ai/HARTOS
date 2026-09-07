@@ -79,6 +79,29 @@ def get_node_health():
     except Exception:
         data['world_model'] = {'healthy': False}
 
+    # ── The governor's own view of itself ────────────────────────────────
+    # Its mode decides whether ANY background work runs: _proactive_check_
+    # tasks returns immediately unless MODE_IDLE, and the dispatch yield gate
+    # closes below a 0.3 throttle (ACTIVE is 0.05). So when the node quietly
+    # does nothing, the mode is the first thing worth reading -- and until now
+    # nothing served it. get_stats() already assembles exactly this for
+    # dashboards, including the cpu_total/own/external attribution that
+    # EXPLAINS the mode rather than just stating it.
+    #
+    # Measured on the box 2026-09-07: the agent daemon logged "yield gate has
+    # blocked on 'governor_throttle' for 12204s" every 30s, i.e. the entire
+    # boot, and establishing why took ten passes of inference from outside the
+    # process because the value itself was not exposed anywhere. One call now.
+    #
+    # Same shape as the two blocks above: best-effort, never raises, and a
+    # governor that has not started reports that rather than vanishing.
+    try:
+        from core.resource_governor import get_governor
+        gov = get_governor()
+        data['governor'] = gov.get_stats() if gov else {'mode': 'not_started'}
+    except Exception as exc:
+        data['governor'] = {'mode': 'unavailable', 'error': str(exc)[:160]}
+
     return jsonify({'success': True, 'data': data}), 200
 
 
