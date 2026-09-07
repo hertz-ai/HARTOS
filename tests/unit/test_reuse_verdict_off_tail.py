@@ -87,9 +87,25 @@ class VerdictFoundOffTheTail(unittest.TestCase):
         gc = _GC([_verdict('completed', 1), _steer('You should ...')])
         self.assertIsNone(_reuse_latest_verdict(gc, 2))
 
-    def test_subtask_id_matches_its_parent_action(self):
-        """'1.1' is action 1's subtask — same action, not a different one."""
+    def test_subtask_completion_does_NOT_complete_its_parent_action(self):
+        """'1.1' finishing is not action 1 finishing.
+
+        Measured over 401 real verdicts (llm_outbound.jsonl, 2026-09-07): a
+        dotted action_id is a SUBTASK — its `action` text is the subtask steer
+        verbatim ("Work on subtask: Check available disk space on drive C:").
+        One session runs completed 1.1 -> completed 1.2 -> completed 2.1, so
+        accepting '1.1' for action 1 would advance the action while subtask 1.2
+        is still outstanding: a force-completion, which the verification
+        contract forbids.  Withholding is safe; it leaves the action where it
+        already was.
+        """
         gc = _GC([_verdict('completed', '1.1'), _steer('You should ...')])
+        self.assertIsNone(_reuse_latest_verdict(gc, 1))
+
+    def test_a_subtask_verdict_does_not_hide_the_action_verdict_behind_it(self):
+        """Skipping a subtask keeps scanning — it must not blind the reader."""
+        gc = _GC([_verdict('completed', 1), _steer('...'),
+                  _verdict('pending', '1.2'), _steer('...')])
         found = _reuse_latest_verdict(gc, 1)
         self.assertIsInstance(found, dict)
         self.assertEqual(found.get('status'), 'completed')

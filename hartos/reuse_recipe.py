@@ -3295,6 +3295,19 @@ def _reuse_latest_verdict(group_chat, action_id, lookback=12):
     accepted, because the pipeline's own current_action is the authority
     (same rule as the existing `_known_aid` / claimed_action_id handling).
 
+    A DOTTED action_id ('1.1', '2.3') is a SUBTASK verdict and is skipped, not
+    mapped onto its parent.  Measured over today's 401 real verdicts in
+    llm_outbound.jsonl: 400 name an action, 23 of the distinct ones are dotted,
+    and their `action` text is the subtask steer verbatim ("Work on subtask:
+    Check available disk space on drive C:...").  One session runs
+    completed 1.1 -> completed 1.2 -> completed 2.1, so subtask 1.1 finishing
+    does NOT mean action 1 is finished — mapping '1.1' to action 1 would
+    advance the action with 1.2 still outstanding, which is precisely a
+    force-completion.  Skipping is strictly conservative: it can only withhold
+    an advance, never manufacture one, and it leaves a decomposed action
+    exactly where it already was.  Whole-number verdicts are unaffected, which
+    is what the undecomposed majority (42 of 65 distinct) emit.
+
     Returns the parsed dict, or None.  Read-only — it never advances anything;
     callers route through _advance_or_steer so the fabrication gate inside
     _advance_reuse_action still decides whether the work was really done.
@@ -3312,8 +3325,12 @@ def _reuse_latest_verdict(group_chat, action_id, lookback=12):
             continue
         claimed = parsed.get('action_id')
         if claimed is not None:
+            claimed_s = str(claimed).strip()
+            if '.' in claimed_s:
+                # subtask verdict — keep scanning for one about the action
+                continue
             try:
-                if int(str(claimed).split('.')[0]) != int(action_id):
+                if int(claimed_s) != int(action_id):
                     continue
             except (TypeError, ValueError):
                 pass
