@@ -4471,6 +4471,84 @@ def get_ledger_status_for_logging(user_prompt: str) -> str:
 from core.llm_outbound_logger import with_llm_context as _with_llm_context
 
 
+def _reset_pointer_if_run_finished(user_prompt) -> bool:
+    """Reset a session whose PREVIOUS run ran off the end of its recipe.
+
+    `user_tasks` is a process-global TTLCache (:4078, ttl 7200s), and the only
+    run-state reset — `clear_action_states` + `Action(role_actions)` at
+    :1081-1082 — lives inside `create_agents_for_user`, which `chat_agent` calls
+    only under `if user_prompt not in user_agents` below.  `user_agents` is
+    itself a 2h TTLCache whose `__getitem__` does TOUCH-ON-READ
+    (core/session_cache.py:84, added for the 2026-05-08 "TTS without text"
+    incident and correct for that purpose).  So an agent used at least once
+    every 2h never expires, never takes the cache-miss branch, and never resets:
+    the more an agent is used, the less likely its run state ever resets.
+
+    Measured live 2026-09-07 on agent 33323830039 — a ONE-action recipe
+    (`execute_windows_or_android_command: open file ...tts_chatterbox...`)
+    driven twice in one process with no restart between:
+
+        10:05:42  Retrieved current_action_id: 1   <- fresh, after a restart
+        10:26:54  Retrieved current_action_id: 2   <- SAME process, inherited
+        10:27:43  Action 2: in_progress -> ... -> terminated   (35 ms)
+        10:27:43  [REUSE] All 1 actions completed
+
+    `[FAB-GUARD]` logged nothing, the action's own tool never executed, and the
+    user got a self-introduction instead of the file status.  Cross-checked
+    across today's restarts: sessions carried pointers of 3 and 5 into new
+    drives and were reset ONLY by a process restart.
+
+    WHY THIS PREDICATE IS SAFE: `current_action > len(actions)` is NEVER a valid
+    continuation state.  A run still in flight always has
+    `current_action <= len(actions)` — including on its FINAL action, which is
+    why the comparison is `<=` and not `<`.  So this can only clear a run that
+    already finished; it cannot truncate one in progress.
+
+    DELIBERATELY NOT FIXED HERE: a run abandoned at action 3 of 10 followed by a
+    genuinely NEW user request still resumes at 3.  Separating those needs a
+    real run-id from the caller; this predicate does not invent one.
+
+    Returns True iff a finished run was detected and reset.
+    """
+    try:
+        prev = user_tasks.get(user_prompt)
+        if prev is None:
+            return False
+        n = len(getattr(prev, 'actions', None) or [])
+        current = getattr(prev, 'current_action', 1)
+        # `not n` guards a recipe with zero actions: 1 > 0 would otherwise read
+        # as "past the end" and reset every turn for an empty recipe.
+        if not n or not isinstance(current, int) or current <= n:
+            return False
+        prev.current_action = 1
+    except Exception:
+        # Never raise into the reuse hot path — a failed reset must degrade to
+        # today's behaviour, not kill the turn.
+        return False
+
+    try:
+        current_app.logger.info(
+            f"[RUN-BOUNDARY] {user_prompt}: previous run finished "
+            f"(current_action={current} > {n} action(s)) — reset to action 1")
+    except Exception:
+        pass
+    # The pointer and the action states are ONE concern (where is this run?), so
+    # they reset together.  Clearing states alone was measured insufficient
+    # (this defect); resetting the pointer alone would leave every action
+    # TERMINATED from the previous run and `[AUTO-ADVANCE]` straight through —
+    # the 90210554431 failure clear_action_states' own docstring records.
+    try:
+        clear_action_states(user_prompt)
+    except Exception as exc:
+        try:
+            current_app.logger.warning(
+                f"[RUN-BOUNDARY] pointer reset but clear_action_states failed "
+                f"for {user_prompt}: {exc}")
+        except Exception:
+            pass
+    return True
+
+
 @_with_llm_context('autogen.reuse')
 def chat_agent(user_id, text, prompt_id, file_id, request_id):
     current_app.logger.info('--' * 100)
@@ -4481,6 +4559,14 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
     try:
         if file_id:
             recent_file_id[user_id] = file_id
+
+        # RUN BOUNDARY — deliberately OUTSIDE the cache guard below.
+        # `chat_agent` is where a reuse RUN starts; `user_agents` is where AGENT
+        # OBJECTS are cached, and the two have opposite lifetimes (agents want
+        # to stay warm, run state wants to reset per run).  Binding the reset to
+        # the cache miss is the defect this line exists to close — see
+        # _reset_pointer_if_run_finished.
+        _reset_pointer_if_run_finished(user_prompt)
 
         # Get or create agents for this user
         if user_prompt not in user_agents:
