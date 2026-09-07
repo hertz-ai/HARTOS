@@ -1140,17 +1140,48 @@ class ToolMessageHandler:
                 # Only a token that is NOT the last message qualifies.  A live
                 # TERMINATE still terminates — dropping that would loop the
                 # group chat forever, the opposite failure.
+                #
+                # role='tool' is excluded here for the same reason it is
+                # excluded from the coalescing below: a tool message is an
+                # answer slot keyed by tool_call_id, so dropping one always
+                # orphans its call and mints a placeholder over the real
+                # output.  A result that happens to read TERMINATE is a
+                # RESULT, never a control token.  Unlike the coalescing case
+                # this one has not been observed in production — it is the
+                # same invariant applied at the sibling site, pinned by test.
                 if (not has_calls and i < _last_idx
+                        and role != 'tool'
                         and isinstance(content, str)
                         and content.strip() == _TERMINATE_TOKEN):
                     _stale_terms.append(f"{i}({msg.get('name','unknown')})")
                     continue
-                # Coalesce consecutive same-role messages
+                # Coalesce consecutive same-role messages.
+                #
+                # NOT role='tool'.  A tool message is an ANSWER SLOT addressed
+                # by tool_call_id, not prose: merging two of them keeps only
+                # the first id, so every other call is left unanswered and
+                # :1889 stamps HISTORICAL_TOOL_PLACEHOLDER over output that
+                # really was produced.  The guard already refuses to merge a
+                # message that CARRIES tool_calls for exactly this reason
+                # ("would silently drop the call") — that protected the
+                # question and never the answer, because a tool message has
+                # no 'tool_calls' key and so has_calls is False here.
+                #
+                # Measured live 2026-09-07 on the installed build: 104
+                # occurrences across two log rotations, e.g. 03:47:27 merged
+                # indices 10..16 — seven results into one message, six answers
+                # destroyed in a single call.
+                #
+                # Nothing is lost by excluding them.  The 400 this guard
+                # exists to prevent is the user/assistant alternation rule;
+                # consecutive tool messages are REQUIRED by that same API,
+                # one per tool_call in a parallel-call assistant message.
                 if cleaned:
                     prev = cleaned[-1]
                     prev_role = (prev.get('role') or '').lower()
                     prev_has_calls = bool(prev.get('tool_calls') or prev.get('function_call'))
                     if (prev_role == role
+                            and role != 'tool'
                             and not prev_has_calls
                             and not has_calls
                             and isinstance(prev.get('content'), str)
