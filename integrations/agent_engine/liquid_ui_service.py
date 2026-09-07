@@ -8579,6 +8579,17 @@ function renderAgentOverlay(ev) {{
                 return out
 
             def generate():
+                # FLUSH THE RESPONSE HEAD IMMEDIATELY. Werkzeug does not send the
+                # headers until the generator yields its first chunk, and the loop
+                # below OPENS with a 15s CV wait, so on a quiet fleet the client sat
+                # there unconnected for a full heartbeat before EventSource fired
+                # onopen. Measured on the box 2026-09-07: urlopen returned in
+                # 15.011s, exactly the first ": hb". Every page load and every
+                # reconnect paid it, on the same "Liquid UI is the heart" channel
+                # whose wake latency we had just fixed upstream. An SSE comment is
+                # the canonical fix: 6 bytes, ignored by every conforming client
+                # (it carries no "event:"/"data:" field, so no handler ever sees it).
+                yield ": ok\n\n"
                 last_check = _time.time()
                 # EVENT-DRIVEN (was a 2s server-side poll that capped the latency of
                 # every A2UI card / notification / desktop compose — the "Liquid UI

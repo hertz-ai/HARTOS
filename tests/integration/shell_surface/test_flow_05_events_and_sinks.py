@@ -17,12 +17,15 @@ and every event drains through one of a small set of sinks:
     free-form intent --> /api/agent/ask + /api/assistant/chat --> the brain
     context --> /api/context --> /api/ui --> rendered HTML --> the human
 
-SSE DRIVING RULE (learned from a wedged run): both stream generators can
-block/spin BEFORE their first yield when no event is pending, and the test
-client pulls the first chunk, so a cold open can hang forever. Every stream
-here is therefore (1) SEEDED so the first yield is immediate and (2) opened
-inside a guarded worker thread with a join timeout; a wedge is narrated and
-xfailed instead of hanging the suite.
+SSE DRIVING RULE (learned from a wedged run): a generator that does its
+collect-then-wait BEFORE any yield leaves the client with no response head, so
+a cold open hangs until the keep-alive finally fires. /api/notifications/stream
+no longer has that shape: it primes with a ': ok' comment the instant the
+generator starts (fixed 2026-09-07, after the box measured 15.011s just to
+OPEN the stream). The journal follow still blocks on real output. Every stream
+here is therefore (1) SEEDED so the first frame is immediate and (2) opened
+inside a guarded worker thread with a join timeout, and _drive_stream skips
+comment lines exactly the way a conforming client does.
 """
 import json
 import logging
@@ -45,11 +48,21 @@ def _calls_for(fake_os, binary):
 
 
 def _drive_stream(client, url, timeout=15.0):
-    """Open an SSE route with buffered=False, read exactly ONE chunk, close.
+    """Open an SSE route with buffered=False, read one FRAME, close.
+
+    A frame is not a chunk. SSE comment lines carry no event:/data: field, so
+    no conforming client ever surfaces them, and neither does this helper:
+    /api/notifications/stream primes its response head with ': ok' (so the
+    browser's EventSource fires onopen immediately instead of waiting out the
+    15s keep-alive) and emits ': hb' as that keep-alive. Comments are recorded
+    under 'comments' for tests that want to assert the head primed, then
+    skipped, bounded so a stream that ONLY comments still returns rather than
+    looping.
 
     Runs the whole open/read/close inside a daemon worker so a generator that
     blocks pre-yield can never wedge the suite; the caller decides what a
-    timeout means. Returns {'status', 'mimetype', 'chunk'} or None on wedge.
+    timeout means. Returns {'status', 'mimetype', 'chunk', 'comments'} or None
+    on wedge.
     """
     out = {}
 
@@ -57,12 +70,17 @@ def _drive_stream(client, url, timeout=15.0):
         resp = client.open(url, buffered=False)
         out['status'] = resp.status_code
         out['mimetype'] = resp.mimetype
+        out['comments'] = []
         try:
-            chunk = next(iter(resp.response))
-            out['chunk'] = (chunk.decode('utf-8', 'replace')
-                            if isinstance(chunk, bytes) else str(chunk))
-        except StopIteration:
             out['chunk'] = ''
+            for n, raw in enumerate(resp.response):
+                text = (raw.decode('utf-8', 'replace')
+                        if isinstance(raw, bytes) else str(raw))
+                if text.startswith(':') and n < 4:
+                    out['comments'].append(text.strip())
+                    continue
+                out['chunk'] = text
+                break
         finally:
             resp.close()                 # never iterate further into infinity
 
@@ -171,11 +189,19 @@ def test_ch05_scene2_agent_event_stream_delivers_a2ui_pushes(
         got = _drive_stream(client, '/api/notifications/stream')
 
     if got is None:
-        pytest.xfail('DEFECT-ADJACENT: /api/notifications/stream blocks '
-                     'pre-yield with no keepalive frame; cannot be driven '
-                     'cold even with a seeded queue')
+        pytest.fail('/api/notifications/stream delivered no frame in 15s. It '
+                    'primes its head the instant the generator starts, so a '
+                    'wedge here is a regression of that flush, not the old '
+                    'cold-open defect this scene was first written around.')
     assert got['status'] == 200
     assert got['mimetype'] == 'text/event-stream'
+    # THE HEAD PRIMES BEFORE ANY EVENT. Werkzeug sends no headers until the
+    # generator yields, and the producer's first act is a 15s CV wait, so
+    # without this comment the browser could not fire onopen (nor start its
+    # reconnect accounting) for a full heartbeat after connecting.
+    assert ': ok' in got['comments'], (
+        'the stream head did not prime, so every page load and reconnect pays '
+        'a full keep-alive before onopen. comments=%r' % got['comments'])
     # The first frame is a JSON list of events; ours rides in it, stamped
     # with the pushing agent's id by the generator.
     assert got['chunk'].startswith('data: ')

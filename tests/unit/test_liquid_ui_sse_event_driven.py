@@ -146,3 +146,47 @@ def test_the_audit_write_cannot_hold_the_ui_wake_behind_it(svc):
     assert seen['event'] == 'a2ui_push'
     assert seen['kw'].get('actor_id') == 'agent-3'
     assert seen['kw'].get('detail') == {'type': 'notification'}
+
+
+def test_the_stream_head_flushes_without_waiting_for_a_heartbeat(svc):
+    """Opening the stream must not cost a full heartbeat.
+
+    THE BUG, measured on the box 2026-09-07 with a plain urllib client:
+
+        stream open: http=200 content-type=text/event-stream in 15.011s
+           15.01s  : hb
+           30.01s  : hb
+
+    urlopen returns as soon as the response HEAD arrives, so 15.011s says the
+    head did not arrive until the first heartbeat did. Werkzeug does not send
+    headers until the generator yields, and the producer loop OPENS with the
+    15s CV wait, so on a quiet fleet every page load and every reconnect sat
+    unconnected for a full heartbeat before EventSource fired onopen. Same
+    channel as the wake latency fixed above, one layer earlier.
+
+    Behavioural: pulls the FIRST chunk out of the REAL route's REAL generator
+    with no push pending, which is exactly the quiet-fleet case. If the head
+    flush is ever removed this blocks on the CV and the elapsed assertion
+    fails rather than the test hanging.
+    """
+    app = svc._create_flask_app()
+    with app.test_request_context('/api/notifications/stream'):
+        resp = app.view_functions['notification_stream']()
+        stream = iter(resp.response)
+        t0 = time.time()
+        try:
+            first = next(stream)
+        finally:
+            elapsed = time.time() - t0
+            resp.response.close()
+
+    assert elapsed < 2.0, (
+        "the SSE head waited %.3fs for the first chunk; the client cannot "
+        "know it is connected until then" % elapsed)
+
+    if isinstance(first, bytes):
+        first = first.decode('utf-8')
+    # An SSE comment: no "event:"/"data:" field, so no browser handler sees it.
+    assert first.startswith(':'), (
+        "the priming chunk must be an SSE comment, got %r" % first[:40])
+    assert first.endswith('\n\n'), "SSE frames terminate on a blank line"

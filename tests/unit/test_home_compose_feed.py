@@ -177,9 +177,20 @@ def test_sse_stream_delivers_a_pushed_component_to_the_client(svc, client):
     svc._agent_components['agent_x'][-1]['_ts'] = time.time() + 3600
     with client.get('/api/notifications/stream',
                     headers={'Accept': 'text/event-stream'}, buffered=False) as r:
-        first = next(iter(r.response), b'')
-    if isinstance(first, str):
-        first = first.encode()
+        # Drain SSE COMMENTS before asserting. Two are legitimate on this stream:
+        # the ": ok" that primes the response head (so EventSource fires onopen
+        # immediately instead of waiting out a heartbeat) and the ": hb" keep-alive.
+        # Neither carries an event:/data: field, so a real client never surfaces
+        # them, and neither does this test. Bounded so a stream that only ever
+        # comments fails the assertion instead of hanging the suite.
+        first = b''
+        for n, chunk in enumerate(r.response):
+            if isinstance(chunk, str):
+                chunk = chunk.encode()
+            if chunk.startswith(b':') and n < 4:
+                continue
+            first = chunk
+            break
     assert first.startswith(b'data: '), 'stream did not emit an SSE data frame: %r' % first
     assert b'Hello G4' in first, 'the pushed component never reached the SSE client leg'
     assert b'"type": "card"' in first or b'"type":"card"' in first
