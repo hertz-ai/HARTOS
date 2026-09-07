@@ -61,6 +61,9 @@ makes this worth more than another feature.
 | The earnings, health and delegation paths hold end to end | `test_compute_earnings_e2e.py`, `test_health_endpoints.py`, `test_task_delegation_bridge.py`, 22 pass | 2026-09-05, pass |
 | An A2UI push wakes the SSE stream without waiting on a durable write | `test_liquid_ui_sse_event_driven.py` 4/4; the audit commit sat ahead of the wake and cost 5.8s to 11.5s per push, now 0.000s | 2026-09-05, pass |
 | The native scene layer is not the frame-rate bottleneck | `scene_cost_fits_the_frame_budget` on an i7-7700K, release: a full relayout WITH real cosmic-text shaping is p99 219us, 1.3% of a 16.667ms frame; geometry alone is 2us | 2026-09-05, measured |
+| The native compositor HOLDS as the live desktop | Cold boot on the Samsung box with the socket-wait fix: socket bound at 19.4s, first scanout 0.7s later, glass shell mapped as a Background layer surface, `layer.composited layers_painted=1`, and `current-tier=hart-comp` with `tier-degraded` absent | 2026-09-07, pass |
+| The Tier-1 socket wait was what dropped the native tier | Three cold boots measured hart-comp binding at 14.6s / 22.5s / 19.4s against a 10s wrapper bound. The wrapper EXITS on timeout, so the glass shell was never launched at all and nothing could paint; the 120s watchdog then dropped a compositor that scans out 0.6s after binding | 2026-09-07, pass |
+| hart-comp composites its own chrome on real hardware | Same boot: `orb.composed took_ms=2`, `bloom.composed width=1600 height=900 took_ms=66`, `native-chrome published chrome=bloom,orb` on GLES / Intel HD 4000 | 2026-09-07, measured |
 | A steady desktop pays no layout at all | same run: a retained-tree hit is p50 and p99 both under 1us, and `rebuilds()` does not move on an unchanged key | 2026-09-05, measured |
 | Windows / macOS capability parity is COMPUTED, not asserted | `OS_PARITY_MATRIX.md`, 30 rows, gated by `test_nixos_configs.py::TestParityMatrix`: 30 pass. 28 present, 2 deliberately partial (remote-desktop control and firewall writes are steward-gated ingress on purpose), 0 gaps | 2026-09-05, pass |
 | The matrix cannot advertise a route that does not exist | same gate: every `/api/shell/...` the matrix cites is checked against the registered routes, and the honest-gap test parametrizes over the gap list, which is now EMPTY (hence its skip) | 2026-09-05, pass |
@@ -98,7 +101,9 @@ Ordered by how much a contributor with modest hardware can settle in an evening.
 | 19 | Input-to-photon meets the per-surface budgets | `latency.rs` emits `hart-latency component=... verdict=PASS/FAIL` per 10s window. Boot the native shell, interact, paste the journal lines. The SCENE side is measured (219us p99, 1.3% of a frame); this is the renderer and DRM side | node with a GPU |
 | 20 | A drop line never appears on a healthy box | Same journal. `hart-latency dropped ... verdict=SUSPECT` means vblanks stopped being reaped or frames stopped being queued, and the numbers beside it cannot be trusted | node with a GPU |
 | 21 | A recipe replays on a node | `replay_layout` dispatches through the same verb gate a live agent passes, and returns `available=False` with no compositor rather than pretending. Needs a running compositor to say anything else | node with a compositor |
+
 | 22 | A copilot task writes real files | `hart-copilot-daemon` runs `claude -p` in a repo clone. Dispatch one task, confirm the file exists on disk and the quality is not the fixed 0.50 the in-backend path returns | installed node |
+| 23 | Screen capture works under Tier-1 | hart-comp does NOT implement `wlr-screencopy-unstable-v1`: `grim` refuses and `/api/shell/screenshot` returns 403 while the native tier is live. The parity matrix's screen-capture row is green for the sway/cage tiers only | node with a GPU |
 
 Row 7's first half is now settled: two nodes DO find each other, see the PeerLink
 and announce rows above. What is still open there is the compute borrow itself.
