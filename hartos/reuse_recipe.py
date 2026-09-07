@@ -3598,6 +3598,33 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         current_app.logger.info(
                             f"[725-SYNC] group_chat.messages stale ({_was} < "
                             f"{len(_conv)}) — resynced from manager._oai_messages")
+                        # DIAGNOSTIC ONLY (no behaviour change).  _oai_messages is
+                        # keyed PER AGENT and each value is a pairwise broadcast log,
+                        # so "longest" is a LENGTH proxy for "most complete" — it is
+                        # not the same thing.  Measured live 2026-09-07 on agent
+                        # 18088688973: the synced history carried 418 announced
+                        # tool_call ids against 106 role=tool answers (312 unanswered,
+                        # 74.6%), and one snapshot repeated a single id seven times.
+                        # Slice-assignment above cannot create duplicates, so they are
+                        # in the SOURCE.  This line records, per buffer, whether the
+                        # answers live somewhere other than the buffer we picked —
+                        # the fact needed before changing the selector (see task #789).
+                        try:
+                            _picked = id(_conv)
+                            _parts = []
+                            for _k, _v in _mgr_msgs.items():
+                                _calls = sum(len(m.get('tool_calls') or [])
+                                             for m in _v if isinstance(m, dict))
+                                _answers = sum(1 for m in _v
+                                               if isinstance(m, dict) and m.get('role') == 'tool')
+                                _parts.append(
+                                    f"{getattr(_k, 'name', str(_k))[:18]}"
+                                    f"{'*' if id(_v) == _picked else ''}"
+                                    f":n={len(_v)},calls={_calls},answers={_answers}")
+                            current_app.logger.info(
+                                "[725-SYNC-COMPOSITION] (*=picked) " + " | ".join(_parts))
+                        except Exception:
+                            pass
             except Exception as _sync_err:
                 current_app.logger.debug(f"[725-SYNC] skipped: {_sync_err}")
 
