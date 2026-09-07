@@ -63,15 +63,57 @@ class TestNixIsReal(_InstallerCase):
     """nix is REAL: real command, real exit-code check."""
 
     @patch('integrations.agent_engine.app_installer.subprocess.run')
-    def test_invokes_nix_env_with_package(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stderr='')
+    def test_invokes_nix_env_against_the_nix_path_not_a_channel(self, mock_run):
+        """The attribute must NOT be prefixed with the channel name.
+
+        This test used to assert 'nixpkgs.htop' was in the command, which is
+        what a channel-based nix-env wants. A flake-built HART OS node has no
+        channels (no nix-channel on PATH, NIX_PATH=nixpkgs=flake:nixpkgs), so
+        that form failed on every node with "attribute 'nixpkgs' in selection
+        path 'nixpkgs.htop' not found" while this test stayed green, because it
+        fakes the package manager. Measured on the box 2026-09-07.
+        """
+        mock_run.return_value = MagicMock(returncode=0, stderr='', stdout='')
         res = self.installer._install_nix(InstallRequest(source='nixpkgs.htop'))
         self.assertTrue(res.success)
-        mock_run.assert_called_once()
-        cmd = mock_run.call_args[0][0]
+        cmd = mock_run.call_args_list[0][0][0]      # the INSTALL call
         self.assertEqual(cmd[0], 'nix-env')
         self.assertIn('-iA', cmd)
-        self.assertIn('nixpkgs.htop', cmd)
+        # Resolved through NIX_PATH, so the attribute is bare.
+        self.assertIn('-f', cmd)
+        self.assertIn('<nixpkgs>', cmd)
+        self.assertIn('htop', cmd)
+        self.assertNotIn('nixpkgs.htop', cmd)
+
+    @patch('integrations.agent_engine.app_installer.subprocess.run')
+    def test_reports_a_real_store_path_or_none_at_all(self, mock_run):
+        """A fabricated path is worse than an empty one.
+
+        The success result used to carry the literal string
+        '/nix/store/.../<pkg>' with the ellipsis in it, so anything that opened
+        install_path or showed it to a person got a fiction. '' is the honest
+        answer when the query cannot resolve it, and every consumer already
+        guards on the field being empty.
+        """
+        real = '/nix/store/hwz2l7ihv2skq7gr5l3paavs3rr9il7z-hello-2.12.1'
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stderr='', stdout=''),        # install
+            MagicMock(returncode=0, stderr='', stdout=real + '\n'),  # out-path
+        ]
+        res = self.installer._install_nix(InstallRequest(source='nixpkgs.hello'))
+        self.assertTrue(res.success)
+        self.assertEqual(res.install_path, real)
+        self.assertNotIn('...', res.install_path)
+
+    @patch('integrations.agent_engine.app_installer.subprocess.run')
+    def test_an_unresolvable_path_is_empty_not_invented(self, mock_run):
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stderr='', stdout=''),   # install OK
+            MagicMock(returncode=1, stderr='boom', stdout=''),  # query fails
+        ]
+        res = self.installer._install_nix(InstallRequest(source='nixpkgs.hello'))
+        self.assertTrue(res.success, 'a failed path QUERY must not fail the install')
+        self.assertEqual(res.install_path, '')
 
     @patch('integrations.agent_engine.app_installer.subprocess.run')
     def test_propagates_failure(self, mock_run):

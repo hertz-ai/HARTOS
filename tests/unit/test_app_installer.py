@@ -296,12 +296,14 @@ class TestNixHandler(unittest.TestCase):
 
     @patch('subprocess.run')
     def test_nix_success(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0)
+        mock_run.return_value = MagicMock(returncode=0, stdout='', stderr='')
         result = self.installer._install_nix(InstallRequest(source='nixpkgs.htop'))
         self.assertTrue(result.success)
         self.assertEqual(result.platform, 'nix')
-        mock_run.assert_called_once()
-        cmd = mock_run.call_args[0][0]
+        # TWO calls now: the install, then a query for the REAL store path. The
+        # success result used to carry the literal '/nix/store/.../htop',
+        # ellipsis included, which was never a path on any machine.
+        cmd = mock_run.call_args_list[0][0][0]
         self.assertIn('nix-env', cmd)
 
     @patch('subprocess.run')

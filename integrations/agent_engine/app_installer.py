@@ -742,18 +742,63 @@ class AppInstaller:
 
     # ─── Platform Handlers ──────────────────────────────────
 
+    @staticmethod
+    def _nix_out_path(pkg: str) -> str:
+        """The REAL store path of a package, or '' if it cannot be resolved.
+
+        This used to be reported as the literal ``/nix/store/.../<pkg>``,
+        ellipsis and all: a path that has never existed on any machine.
+        Anything downstream that opened it, or showed it to a person, was
+        handed a fiction. '' is the honest answer when we do not know, and
+        every consumer already guards on the field being empty.
+
+        Costs ~1.3s measured on the box, and only runs after a SUCCESSFUL
+        install, when the evaluation it needs is already warm.
+        """
+        try:
+            r = subprocess.run(
+                ['nix-env', '-f', '<nixpkgs>', '-qaA', pkg,
+                 '--out-path', '--no-name'],
+                capture_output=True, text=True, timeout=60, **no_window_kwargs())
+            if r.returncode == 0:
+                first = (r.stdout or '').strip().split('\n')[0].strip()
+                if first.startswith('/nix/store/'):
+                    return first
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+        return ''
+
     def _install_nix(self, req: InstallRequest) -> InstallResult:
-        """Install a Nix package."""
+        """Install a Nix package.
+
+        THE INVOCATION WAS WRONG AND NOTHING COULD SEE IT. ``nix-env -iA
+        nixpkgs.<pkg>`` resolves that attribute through ``~/.nix-defexpr``,
+        which is the CHANNEL mechanism, and a flake-built HART OS node has no
+        channels at all: ``nix-channel`` is not even on PATH and NIX_PATH is
+        ``nixpkgs=flake:nixpkgs``. So EVERY nix install failed on EVERY node
+        with
+
+            error: attribute 'nixpkgs' in selection path 'nixpkgs.hello' not found
+
+        and none of the installer's tests noticed, because all of them fake the
+        package manager. Measured on the box 2026-09-07, where the corrected
+        form below then fetched and ran a real package.
+
+        ``-f '<nixpkgs>'`` resolves through NIX_PATH, and therefore through the
+        flake-registry indirection this OS actually sets. That is also why the
+        attribute becomes a bare ``hello`` rather than ``nixpkgs.hello``: the
+        prefix was naming the channel, and there is no channel.
+        """
         pkg = req.source.replace('nixpkgs.', '').replace('nix:', '')
         name = req.name or pkg
         try:
             result = subprocess.run(
-                ['nix-env', '-iA', f'nixpkgs.{pkg}'],
+                ['nix-env', '-f', '<nixpkgs>', '-iA', pkg],
                 capture_output=True, text=True, timeout=300, **no_window_kwargs())
             if result.returncode == 0:
                 return InstallResult(
                     success=True, platform='nix', name=name,
-                    app_id=pkg, install_path=f'/nix/store/.../{pkg}')
+                    app_id=pkg, install_path=self._nix_out_path(pkg))
             return InstallResult(
                 success=False, platform='nix', name=name,
                 error=result.stderr.strip()[:500])
