@@ -4281,13 +4281,27 @@ def _tool_name_candidates(raw):
         identifier-shaped   848
         prose-shaped        130      37 of 165 files (22.4%) carry >=1
 
-    Splitting the 130 on ':' / ',' recovers a real name for 34, and 28 of those
-    are ``execute_windows_or_android_command`` — registered at :1589 and
-    measured firing 38x live.  A working tool was being withheld from the very
-    turn whose action asked for it:
+    Splitting the 130 on ':' / ',' recovers an identifier for 34 of them:
 
         execute_windows_or_android_command: click the 'Search' button
         google_search, crawl4ai, retry_logic
+
+    HOW MUCH THAT ACTUALLY BUYS — measured, after an earlier version of this
+    docstring overstated it.  ``attach_for_names`` iterates
+    ``service_tool_registry._tools`` ONLY, and the live app registers just 13
+    names into it (payments x3, seo_audit_score, gh_pr_open, crawl4ai,
+    crawl4ai_crawl, pocket_tts x3, acestep x3 — counted from its own
+    "Registered service tool:" log lines).  ``execute_windows_or_android_command``
+    and ``google_search`` are NOT there: they are core tools registered by the
+    decorators at :1483-1948, a different path this matcher never reads.  So of
+    the 34 recovered names exactly ONE (crawl4ai) is one the matcher can act
+    on; the 30 execute_windows_or_android_command and 3 google_search
+    occurrences stay unattachable by this route no matter how they are spelled.
+
+    This function is therefore CORRECTNESS, not throughput: it stops the reader
+    handing the matcher strings that are not names, and it stops 90 junk fields
+    (pasted Python, 'N/A') from being offered at all.  Do not cite it as the
+    reason a tool started working.
 
     The other 96 are not tool names at all — the model pasting Python source
     line by line (``ENGINE_REGISTRY = router.ENGINE_REGISTRY``,

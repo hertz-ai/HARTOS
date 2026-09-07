@@ -180,14 +180,28 @@ class TestAuthoredToolNameNormalisation(TestNamedToolExtraction):
         prose-shaped        130   <- can never match by exact comparison
         files with >=1      37 of 165  (22.4%)
 
-    Splitting those 130 on ':' / ',' recovers a real name for 34 of them, and
-    28 of those 34 are ``execute_windows_or_android_command`` — registered at
-    reuse_recipe.py:1589 and measured firing 38x live, i.e. a tool that
-    demonstrably works was being withheld from the turn that asked for it:
+    Splitting those 130 on ':' / ',' recovers an identifier for 34 of them:
 
         execute_windows_or_android_command: click the 'Search' button
         execute_windows_or_android_command: type 'vegan pasta' into the search field
         google_search, crawl4ai, retry_logic
+
+    SCOPE OF THE WIN — measured after an earlier version of this docstring
+    (and commit 5dd2b406d's message) overstated it.  ``attach_for_names``
+    iterates ``service_tool_registry._tools`` ONLY, and the live app registers
+    just 13 names there (payments x3, seo_audit_score, gh_pr_open, crawl4ai,
+    crawl4ai_crawl, pocket_tts x3, acestep x3 — counted from its own
+    "Registered service tool:" log lines).  ``execute_windows_or_android_command``
+    and ``google_search`` are core tools registered by the decorators at
+    reuse_recipe.py:1483-1948 and are NOT in that registry, so this matcher
+    could never attach them however they are spelled.  Exactly ONE of the 34
+    (crawl4ai) is actionable by this route.
+
+    That does not make the normalisation pointless — it makes it a CORRECTNESS
+    fix, not a throughput one.  The reader's job is to answer "which tool does
+    this action name"; returning a 60-character sentence was answering wrongly,
+    and 90 of the 130 fields are not tool names at all.  Do NOT cite these
+    tests as evidence that a tool started working.
 
     The remaining 96 are not tools at all — the model pasting Python source
     line by line into the field (``ENGINE_REGISTRY = router.ENGINE_REGISTRY``,
