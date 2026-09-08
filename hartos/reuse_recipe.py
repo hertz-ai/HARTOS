@@ -3353,6 +3353,13 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
     next_action_id, advanced = _advance_reuse_action(
         user_prompt, action_id, reason, prompt_id)
 
+    # Both branches below post a command into the SAME group chat the
+    # assistant is already in, so its cached system prompt must name the
+    # ledger's action before either goes out.  Placed after the advance (it
+    # is what moves current_action) and above the branch, so the advance and
+    # the re-steer are covered by one call rather than two that can drift.
+    _narrow_assistant_to_current_action(user_prompt)
+
     if not advanced:
         # A fabrication refusal is NOT "all actions done" — it wants the
         # tool actually run, so steer instead of ending the turn.
@@ -3572,21 +3579,9 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 # recipes and the wire-trim left-trims the early ones away —
                 # measured 2026-09-08: body carried action_id [13..24] while
                 # the turn asked for #2, and the agent correctly told the user
-                # it could not see the action.  update_system_message is the
-                # CALL form (never assignment: create_recipe.py:5328 records
-                # that assigning to it shadows the bound method).
-                try:
-                    _narrowed = _recipe_section_for_action(
-                        assistant.system_message,
-                        getattr(assistant, '_hart_individual_recipe', None), _aid)
-                    if _narrowed and _narrowed != assistant.system_message:
-                        _was = len(assistant.system_message or '')
-                        assistant.update_system_message(_narrowed)
-                        current_app.logger.info(
-                            f"Tier-1 prompt narrow: action {_aid} -> system "
-                            f"{_was} to {len(_narrowed)} chars")
-                except Exception as _e:
-                    current_app.logger.debug(f"prompt narrow skipped: {_e}")
+                # it could not see the action.  ONE implementation, shared
+                # with the advance path: see _narrow_assistant_to_current_action.
+                _narrow_assistant_to_current_action(user_prompt)
 
                 _named = _reuse_action_tool_names(user_prompt, _aid) if _aid else []
                 if _named:
@@ -4147,17 +4142,31 @@ def get_flow_number(user_id, prompt_id):
     return role_number, role
 
 
-def _sched_log(level, msg):
-    """Log for create_schedule — works with or without Flask app context."""
+def _ctx_safe_log(level, msg):
+    """Log from anywhere in this module — with or without a Flask app context.
+
+    Was ``_sched_log``, named for its first caller.  The name promised the
+    helper belonged to create_schedule, so the prompt-narrow path was about
+    to grow a second identical copy; renamed to say what it DOES, and both
+    now share it.
+
+    ``except Exception`` rather than ``except RuntimeError``: callers sit on
+    fail-safe paths where an escaping logging error turns a cosmetic problem
+    into a dead turn.  The fallback still EMITS to a module logger — a
+    swallowed log is how a silent failure stays silent.
+    """
     try:
         getattr(current_app.logger, level)(msg)
-    except RuntimeError:
-        import logging
-        getattr(logging.getLogger('reuse_recipe.scheduler'), level)(msg)
+    except Exception:
+        try:
+            import logging
+            getattr(logging.getLogger('reuse_recipe'), level)(msg)
+        except Exception:
+            pass
 
 
 def create_schedule(prompt_id, user_id):
-    _sched_log('info', 'INSIDE Create Schedule')
+    _ctx_safe_log('info', 'INSIDE Create Schedule')
     user_prompt = f'{user_id}_{prompt_id}'
     role_number, role = get_flow_number(user_id, prompt_id)
     with open(helper_fun.safe_prompt_path(prompt_id, role_number, 'recipe'), 'r') as f:
@@ -4166,28 +4175,28 @@ def create_schedule(prompt_id, user_id):
         recipes[user_prompt] = config
     try:
         if 'scheduled_tasks' in config and len(config['scheduled_tasks']) > 0:
-            _sched_log('info', 'Creating scheduled tasks')
+            _ctx_safe_log('info', 'Creating scheduled tasks')
             for i in config['scheduled_tasks']:
                 if role and i['persona'].lower() == role.lower():
                     trigger = CronTrigger.from_crontab(i['cron_expression'])
                     job_id = f"job_{int(time.time())}"
                     scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,
                                       args=[i['job_description'], user_id, prompt_id, i['action_entry_point']])
-                    _sched_log('info', f'Successfully created scheduler job {i["persona"]}')
+                    _ctx_safe_log('info', f'Successfully created scheduler job {i["persona"]}')
 
         # Only schedule the 2s visual-poll job when the action API it depends
         # on is actually configured.  With ACTION_API='' (unset in config.json)
         # this job can't work and would error every 2s forever (see the
         # call_visual_task guard) — don't create it at all on such boxes.
         if ACTION_API:
-            _sched_log('info', 'Creating Visual scheduled tasks')
+            _ctx_safe_log('info', 'Creating Visual scheduled tasks')
             trigger = IntervalTrigger(seconds=int(2))
             job_id = f"job_{int(time.time())}"
             scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
                               args=['get past 1 mins visual information', user_id, prompt_id])
-            _sched_log('info', 'Successfully created scheduler job')
+            _ctx_safe_log('info', 'Successfully created scheduler job')
         else:
-            _sched_log('info', 'Skipping 2s visual-poll job — ACTION_API not configured')
+            _ctx_safe_log('info', 'Skipping 2s visual-poll job — ACTION_API not configured')
         if 'visual_scheduled_tasks' in config and len(config['visual_scheduled_tasks']) > 0:
             for i in config['visual_scheduled_tasks']:
                 if role and i['persona'].lower() == role.lower():
@@ -4195,9 +4204,9 @@ def create_schedule(prompt_id, user_id):
                     job_id = f"job_{int(time.time())}"
                     scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
                                       args=[i['job_description'], user_id, prompt_id])
-                    _sched_log('info', f'Successfully created scheduler job {i["persona"]}')
+                    _ctx_safe_log('info', f'Successfully created scheduler job {i["persona"]}')
     except Exception as e:
-        _sched_log('error', f'Some Error in creating scheduled tasks error:{e}')
+        _ctx_safe_log('error', f'Some Error in creating scheduled tasks error:{e}')
 
 
 recent_file_id = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_recent_file_id')
@@ -4642,6 +4651,57 @@ def _recipe_section_for_action(system_message, individual_recipe, action_id):
         return system_message
 
 
+def _narrow_assistant_to_current_action(user_prompt):
+    """Re-pin the assistant's system prompt to the action the LEDGER commands.
+
+    Takes no action id on purpose.  ``user_tasks[user_prompt].current_action``
+    is the single field ``_advance_reuse_action`` writes (:4297) and every
+    dispatch site already reads, so keying off it here makes prompt and
+    command agree by construction — an id passed in could be the caller's
+    stale copy, which is the exact failure this fixes.
+
+    WHY A SECOND CALL SITE EXISTS.  The narrow in ``get_agent_response`` runs
+    once per entry into that function.  The group chat then advances INSIDE a
+    single autogen loop, and those rounds never re-enter it.  Measured live
+    2026-09-08 20:21-20:27 on agent 89555447799:
+
+        20:22:19  [REUSE] Action 1 TERMINATED, advancing
+        20:24:07  [FAB-GUARD] action 2 names ['execute_windows_or_android_command']
+
+    yet of 37 recipe-bearing calls on the wire, the 32 that came AFTER the
+    advance all still carried ``'action_id': 1``.  Same defect as the
+    [13..24] slice the narrowing replaced — the prompt describes an action
+    the pipeline has left — so the fix is to follow the ledger, not the turn.
+
+    Returns True when the prompt actually changed, False otherwise (already
+    narrowed to this action, no agents cached, no recipe stashed).  Never
+    raises: it runs on the dispatch path and must not be able to kill a turn.
+    """
+    try:
+        agents = user_agents.get(user_prompt)
+        if not agents:
+            return False
+        assistant = agents[0]
+        narrowed = _recipe_section_for_action(
+            assistant.system_message,
+            getattr(assistant, '_hart_individual_recipe', None),
+            user_tasks[user_prompt].current_action)
+        if not narrowed or narrowed == assistant.system_message:
+            return False
+        was = len(assistant.system_message or '')
+        # CALL, never assignment — create_recipe.py:5328 records that
+        # assigning to update_system_message shadows the bound method.
+        assistant.update_system_message(narrowed)
+        _ctx_safe_log('info',
+                      f"Tier-1 prompt narrow: action "
+                      f"{user_tasks[user_prompt].current_action} -> system "
+                      f"{was} to {len(narrowed)} chars")
+        return True
+    except Exception as err:
+        _ctx_safe_log('debug', f"prompt narrow skipped: {err}")
+        return False
+
+
 def _reuse_action_tool_names(user_prompt, action_id):
     """The tool names the given action's recipe steps declare.
 
@@ -4930,6 +4990,11 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 # `action_id - 1 < len(recipe_actions)` bounds check either.
                 message = _build_reuse_action_message(
                     user_prompt, user_tasks[user_prompt].current_action)
+                # Same invariant as the advance path: the prompt must name the
+                # action this message commands.  create_agents_for_user was
+                # just called above, so the assistant here is freshly built
+                # with ALL N recipes — exactly the body the wire-trim eats.
+                _narrow_assistant_to_current_action(user_prompt)
                 # message = "let's perform the actions availabe in sequence\nIMP instruction: keep track of action id you are working on."
                 result = chat_instructor.initiate_chat(manager, message=message,
                                                        speaker_selection={"speaker": "assistant"}, clear_history=False)

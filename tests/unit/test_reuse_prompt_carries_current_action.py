@@ -118,3 +118,133 @@ class TestNeverRaisesOnTheHotPath:
 
     def test_none_system_message_returns_it_unchanged(self):
         assert _recipe_section_for_action(None, RECIPES, 2) is None
+
+
+# ── the narrow must FOLLOW the ledger, not the turn ───────────────────
+# MEASURED 2026-09-08 20:21-20:27, same agent, on the build that already
+# carried the narrowing above.  The turn entered on action 1, narrowed
+# correctly (57,817 -> 16,744 chars), then the group chat advanced INSIDE
+# the same autogen loop:
+#
+#     20:22:19  [REUSE] Action 1 TERMINATED, advancing
+#     20:24:07  [FAB-GUARD] action 2 names ['execute_windows_or_android_command']
+#
+# but the narrow is applied once per get_agent_response entry, and the
+# group chat's rounds never re-enter it.  Of 37 recipe-bearing calls on
+# the wire, 32 were AFTER the advance and every one of them still carried
+# 'action_id': 1.  Same class of defect as the [13..24] slice it replaced:
+# the prompt names an action the pipeline is no longer on.
+#
+# The fix hangs the narrow off the ledger field itself
+# (user_tasks[user_prompt].current_action) — the same single authority the
+# scheduler writes at _advance_reuse_action, so the two cannot disagree.
+
+
+class _FakeAssistant:
+    """Enough of ConversableAgent to observe the effect.
+
+    update_system_message is a real METHOD here on purpose: assigning to it
+    (rather than calling it) shadows the bound method — create_recipe.py:5328
+    records that trap — and this stand-in turns that mistake into a failure
+    instead of a silent no-op.
+    """
+
+    def __init__(self, system_message, individual_recipe):
+        self.system_message = system_message
+        self._hart_individual_recipe = individual_recipe
+
+    def update_system_message(self, msg):
+        self.system_message = msg
+
+
+class _FakeTask:
+    def __init__(self, current_action):
+        self.current_action = current_action
+
+
+class TestNarrowFollowsTheLedger:
+
+    def _wire(self, monkeypatch, current_action, recipes=RECIPES):
+        from hartos import reuse_recipe as rr
+        a = _FakeAssistant(_sysmsg(recipes), recipes)
+        monkeypatch.setitem(rr.user_agents, 'u1', (a,) + (None,) * 11)
+        monkeypatch.setitem(rr.user_tasks, 'u1', _FakeTask(current_action))
+        return rr, a
+
+    def test_narrows_to_the_action_the_ledger_holds(self, monkeypatch):
+        rr, a = self._wire(monkeypatch, 2)
+        assert rr._narrow_assistant_to_current_action('u1') is True
+        assert "'action_id': 2" in a.system_message
+        assert "'action_id': 1," not in a.system_message
+
+    def test_renarrows_after_an_advance(self, monkeypatch):
+        """The live sequence: narrow to 1, ledger advances, narrow to 2.
+
+        The second call starts from an ALREADY-narrowed prompt — if the
+        surgery could only run once (e.g. keyed on the full recipe list
+        being present) the agent would stay pinned to action 1 exactly as
+        measured on the wire.
+        """
+        rr, a = self._wire(monkeypatch, 1)
+        assert rr._narrow_assistant_to_current_action('u1') is True
+        assert "'action_id': 1" in a.system_message
+        rr.user_tasks['u1'].current_action = 2          # _advance_reuse_action
+        assert rr._narrow_assistant_to_current_action('u1') is True
+        assert "'action_id': 2" in a.system_message, (
+            "re-narrow must track the advance; pinning at the entry action is "
+            "the 32-of-37 defect this guard exists for")
+
+    def test_second_call_on_the_same_action_is_a_no_op(self, monkeypatch):
+        rr, a = self._wire(monkeypatch, 2)
+        assert rr._narrow_assistant_to_current_action('u1') is True
+        before = a.system_message
+        assert rr._narrow_assistant_to_current_action('u1') is False
+        assert a.system_message == before
+
+    @pytest.mark.parametrize("prompt", ['unknown-user', None])
+    def test_unknown_user_returns_false_without_raising(self, monkeypatch, prompt):
+        rr, _ = self._wire(monkeypatch, 1)
+        assert rr._narrow_assistant_to_current_action(prompt) is False
+
+    def test_no_recipe_stashed_returns_false_without_raising(self, monkeypatch):
+        rr, a = self._wire(monkeypatch, 1)
+        del a._hart_individual_recipe
+        assert rr._narrow_assistant_to_current_action('u1') is False
+        assert a.system_message == _sysmsg(RECIPES)
+
+
+class TestEveryDispatchSiteNarrows:
+    """Structure guard: source structure IS the subject here.
+
+    A dispatch that commands action N while the prompt still describes
+    action N-1 is the whole defect, so every site that posts an action
+    command must re-pin the prompt first.  Behavioural coverage lives
+    above; this catches a NEW dispatch site added without the narrow.
+    """
+
+    def _fn(self, name):
+        import ast
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[2]
+               / 'hartos' / 'reuse_recipe.py').read_text(encoding='utf-8')
+        tree = ast.parse(src)
+        return next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == name), ast
+
+    def test_advance_or_steer_repins_the_prompt(self):
+        fn, ast = self._fn('_advance_or_steer')
+        called = [n.func.id for n in ast.walk(fn)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+        assert '_narrow_assistant_to_current_action' in called, (
+            "_advance_or_steer posts the NEXT action's command; without a "
+            "re-pin the agent reads the previous action's recipe")
+
+    def test_one_narrow_implementation_not_two(self):
+        """get_agent_response must call the helper, not re-inline it."""
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[2]
+               / 'hartos' / 'reuse_recipe.py').read_text(encoding='utf-8')
+        assert src.count('.update_system_message(') <= 2, (
+            "update_system_message should be called from the narrow helper "
+            "(plus the pre-existing verify site) — a second inline copy is "
+            "the parallel path this consolidation removed")
