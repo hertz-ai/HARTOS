@@ -377,8 +377,49 @@ def run_local_agentic_loop(
                             combined_prompt += (
                                 f"Previous action: {last.get('action', '?')} — "
                                 f"{last.get('reasoning', '')[:80]}.\n"
-                                f"Check the screenshot: did it succeed?\n\n"
                             )
+                            # Feed back the action's OWN OUTPUT, not just the
+                            # screenshot.  A DETERMINISTIC action (shell,
+                            # read_file_and_understand, list_folders_and_files)
+                            # writes to stdout and changes NOTHING on screen, so
+                            # "check the screenshot" is unanswerable for it and
+                            # the model concludes the step failed.
+                            #
+                            # Measured live 2026-09-09 03:47:19-39, agent
+                            # 33323830039 whose single action is
+                            # `Get-Content ...\tts_chatterbox_turbo.err -Head 50`:
+                            #   iter 1/3  Action: shell  -> ran, output captured
+                            #   iter 2/3  Action: type   value='Get-Content C:\...'
+                            #   iter 3/3  Action: type   value='Get-Content C:\...'
+                            #   exit_reason=max_iterations, status=incomplete
+                            # i.e. it re-TYPED the command it had already run.
+                            # incomplete -> TOOL_FAILURE_RESULTS -> FAB-GUARD
+                            # unrun -> verifier 'error' -> the user was told
+                            # "All tool execution attempts have consistently
+                            # failed" about work that had already succeeded.
+                            #
+                            # The value was ALWAYS captured — see the
+                            # extracted_responses append below, which stores
+                            # result.get('output') — it was simply never shown
+                            # to the model.  This reads that existing field; it
+                            # adds no new state and no second feedback channel.
+                            _prev_out = str(last.get('result', '') or '')
+                            if _prev_out.strip():
+                                combined_prompt += (
+                                    "Output of that action (this is the REAL "
+                                    "result — trust it over the screenshot, "
+                                    "which will not show it):\n"
+                                    f"{_prev_out[:1500]}\n"
+                                    "If this output already satisfies the task, "
+                                    'reply "Next Action": "None", '
+                                    '"Status": "DONE" and put the answer in '
+                                    '"Reasoning". Do NOT re-run or re-type it.'
+                                    "\n\n"
+                                )
+                            else:
+                                combined_prompt += (
+                                    "Check the screenshot: did it succeed?\n\n"
+                                )
                     combined_prompt += (
                         _VLM_ACTION_LIST +
                         "\n"
