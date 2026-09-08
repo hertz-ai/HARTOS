@@ -44,7 +44,11 @@ MAX_BARE_SWALLOWS = 1521        # `except ...: pass` (was 1533 -> 1528 -> 1521;
 #: Note 4 of the remainder are in hive_guardrails.py, which CLAUDE.md forbids
 #: modifying (circuit breaker / structural immutability) — they need the steward,
 #: not a refactor.
-MAX_SECURITY_SWALLOWS = 63      # was 68
+MAX_SECURITY_SWALLOWS = 62      # was 68 -> 63 -> 62. Lowered 2026-09-08 on this
+                                # guard's OWN staleness check: the tree had
+                                # already reached 62 under both interpreters
+                                # (CI run 34201055211 and a local 3.12 run), and
+                                # a budget above reality is a comment, not a gate.
 MAX_GOD_MODULES = 9             # SOURCE files > 3000 lines (tests excluded —
                                 # the first draft said 11 by counting
                                 # test_nixos_configs.py and test_agent_engine.py,
