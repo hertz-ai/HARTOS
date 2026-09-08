@@ -3411,6 +3411,117 @@ def _reuse_latest_verdict(group_chat):
     return None
 
 
+def _reuse_needs_synthesis(group_chat):
+    """True when the turn is about to answer the user with CONTROL JSON.
+
+    ``_reuse_group_terminate`` ends the round ON the StatusVerifier verdict, so
+    ``messages[-1]`` is STRUCTURALLY that verdict whenever an action completes.
+    The post-loop extractor only unwraps ``message2userfinal`` / ``message2``;
+    anything else falls through to ``return last_message['content']`` — i.e. the
+    raw verdict is handed to the user.
+
+    Measured live 2026-09-09 04:14:22 (agent 33323830039), the whole reply:
+
+        {"status": "completed", "action": "Action #1: cd C:\\\\Users\\\\sathi\\\\
+         Documents && dir Nunba", "action_id": 1, "message": "Action completed
+         successfully. The directory listing ... was retrieved."}
+
+    The `response_format` at L1315 asks for ``message2userfinal`` and the agent
+    prompt instructs it, but nobody is ever given a turn to produce it once the
+    verdict has ended the round — producer contract and consumer both ship, and
+    the step between them does not exist (#799/D33).
+
+    NOT fixable by walking back to an earlier message: measured on the same
+    turn, the closing history is tool traffic only —
+    ``[725-SYNC-COMPOSITION] User*:n=10,calls=7,answers=0 |
+    Assistant:n=3,calls=1`` — the assistant entries are ``name=unknown`` with
+    ``tool_calls`` and no prose, and the only non-tool entries are a
+    ChatInstructor nudge and a bare user-role line.  There is no synthesis to
+    recover; it has to be asked for.
+    """
+    try:
+        messages = list(getattr(group_chat, 'messages', None) or [])
+        if not messages:
+            return False
+        content = (messages[-1] or {}).get('content')
+        if not isinstance(content, str) or not content.strip():
+            return False
+        low = content.lower()
+        if 'message2userfinal' in low or 'message2' in low:
+            return False          # the answer is already there
+        parsed = retrieve_json(content)
+        # A control verdict is a dict carrying 'status'.  Prose is not.
+        return isinstance(parsed, dict) and 'status' in parsed
+    except Exception:
+        return False
+
+
+# Asks for the ONE thing the round never produced.  Deliberately names the
+# response_format key the prompt already defines, so the existing extractor
+# unwraps it with no new parsing rule.
+_REUSE_SYNTHESIS_STEER = (
+    "The actions are finished and their tools have already run — do NOT run "
+    "any tool again and do NOT emit another status object. Write the ANSWER "
+    "for the user now, in your own words, using the real tool results from "
+    "this conversation. Reply to @user with exactly: "
+    '{"message2userfinal": "<your answer here>"}'
+)
+
+
+def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
+    """Give the synthesis the one turn the pipeline never gives it.
+
+    Posts through ``chat_instructor.initiate_chat(recipient=manager, ...)`` —
+    the same initiator, recipient and kwargs every other steer in this file
+    uses (see ``_advance_or_steer`` and the two StatusVerifier recovery
+    sites), so the reply lands in ``group_chat.messages`` where the extractor
+    already reads it.  No new publisher, no second delivery path.
+
+    Bounded by the group's own ``max_round=10``; at the measured closing pace
+    (~1-3 s per speaker turn on 2026-09-09 04:14:10-19) that is ~10-30 s.
+    Deliberately does NOT pass ``max_turns``: no sibling call does, and the
+    installed autogen's support for it could not be verified from the shipped
+    bundle (no loose conversable_agent.py, no library.zip member).
+
+    Called from the post-loop extractor ONLY, which runs exactly once per
+    turn — so no latch is needed to keep it from firing twice.
+
+    Returns True when a steer was posted.  Never raises: this is the last step
+    before the user gets an answer, and an exception here would turn a bad
+    reply into no reply.
+    """
+    if not _reuse_needs_synthesis(group_chat):
+        return False
+    _before = len(getattr(group_chat, 'messages', None) or [])
+
+    def _say(level, msg):
+        # Logging is NEVER on the path that can skip the steer.  The first cut
+        # put current_app.logger inside the same try as initiate_chat, and
+        # current_app RAISES outside an app context — so a logging error would
+        # have been swallowed by the except and the user would have silently
+        # got the control JSON back.  _ctx_safe_log already cannot raise; this
+        # keeps that true even if someone swaps it for a logger that can.
+        try:
+            _ctx_safe_log(level, msg)
+        except Exception:
+            pass
+
+    _say('info', f"[SYNTHESIS] reply would be raw control JSON — asking for "
+                 f"the user-facing answer (session: {user_prompt}, "
+                 f"{_before} msgs)")
+    try:
+        chat_instructor.initiate_chat(
+            recipient=manager, message=_REUSE_SYNTHESIS_STEER,
+            clear_history=False, silent=False)
+    except Exception as err:
+        _say('warning', f"[SYNTHESIS] steer failed: {err}")
+        return False
+    _after = len(getattr(group_chat, 'messages', None) or [])
+    _say('info', f"[SYNTHESIS] round returned ({_before} -> {_after} msgs); "
+                 f"still control JSON: {_reuse_needs_synthesis(group_chat)}")
+    return True
+
+
 def _reuse_outstanding_tools(user_prompt, action_id, group_chat):
     """The action's named tools that have NOT executed in this group chat.
 
@@ -4304,6 +4415,11 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             current_app.logger.warning(
                 'reuse: no messages to extract a reply from after trimming')
             return ''
+        # The round ended ON the StatusVerifier verdict (_reuse_group_terminate),
+        # so messages[-1] is control JSON and the extractor below would hand it
+        # to the user verbatim.  Ask for the answer first — once, here, where
+        # the turn is finalised exactly once (#799/D33).
+        _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor)
         last_message = group_chat.messages[-1]
         # len>1 matters: a lone TERMINATE would send [-2] off the front.
         if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
