@@ -3464,6 +3464,19 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
                 caller should keep looping.
         False — no next action and nothing to steer; the caller should end
                 the turn.
+
+    False is what a SUCCESSFULLY FINISHED recipe looks like: the last action
+    advanced, so there is no next action, and it was not fabricated, so
+    _reuse_fab_steer_message has nothing to say.  End the turn by `break`ing
+    to the extractor that already sits after each loop
+    (get_agent_response :4258-4304, chat_agent :5288-5310) — never by
+    `return ''`.  All six call sites used to return '', which threw away the
+    answer of an agent that had done its whole job; in Nunba that empty string
+    trips the empty-reply check and silently reroutes the user to the
+    tool-less Tier-2 fallback, so they were told something that contradicted
+    the work the machine had just done and saved (#797/#798, measured live
+    2026-09-09 on agent 90210554431).  Guarded by
+    tests/unit/test_completion_is_not_an_empty_reply.py.
     """
     if claimed_action_id is not None and claimed_action_id != action_id:
         current_app.logger.warning(
@@ -3960,7 +3973,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                             "reuse-w1-completed", prompt_id,
                             manager, chat_instructor,
                             advanced_latch=_reuse_advanced_actions):
-                        return ''
+                        break  # finished recipe -> post-loop extractor (#798)
                     continue
             except Exception as _rc_err:
                 current_app.logger.debug(f"robust completion-advance skipped: {_rc_err}")
@@ -4092,7 +4105,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                             "reuse-under-reported", prompt_id,
                             manager, chat_instructor,
                             advanced_latch=_reuse_advanced_actions):
-                        return ''
+                        break  # finished recipe -> post-loop extractor (#798)
                     continue
             except Exception as _ur_err:
                 current_app.logger.debug(f"under-reported advance skipped: {_ur_err}")
@@ -4124,7 +4137,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                                 claimed_action_id=int(json_obj.get(
                                     "action_id", _reuse_current_action)),
                                 advanced_latch=_reuse_advanced_actions):
-                            return ''
+                            break  # finished recipe -> post-loop extractor (#798)
                         continue
                 except IndexError:
                     current_app.logger.info("Completed ALL ACTIONS")
@@ -4143,7 +4156,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                                         claimed_action_id=int(json_obj.get(
                                             "action_id", pipeline_action_id)),
                                         advanced_latch=_reuse_advanced_actions):
-                                    return ''
+                                    break  # finished recipe -> post-loop extractor (#798)
                                 continue
                         else:
                             raise ValueError('No json found')
@@ -5232,7 +5245,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                         manager, chat_instructor,
                                         claimed_action_id=int(json_obj.get(
                                             "action_id", current_action_id))):
-                                    return ''
+                                    break  # finished recipe -> post-loop extractor (#798)
                                 continue
                         except Exception:
                             try:
@@ -5246,7 +5259,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                                 manager, chat_instructor,
                                                 claimed_action_id=int(json_obj.get(
                                                     "action_id", current_action_id))):
-                                            return ''
+                                            break  # finished recipe -> post-loop extractor (#798)
                                         continue
 
                                 else:
