@@ -93,6 +93,67 @@ def _normalize_flow_recipe(config):
     out = dict(config)
     out['actions'] = []
     return out
+
+
+def _vlm_merged_actions(existing_actions, vlm_actions, flow_persona=None):
+    """``existing_actions`` with each VLM re-authoring applied, OWNER kept.
+
+    A ``*_vlm_agent.json`` file re-authors the STEPS of an action; it does not
+    reassign whose action it is.  But its ``persona`` field carries a USER id
+    (``usercf125371-...``), while a flow recipe's carries a ROLE name
+    (``Executor``) — two producers, one field, different vocabularies.  Three
+    verbatim copies of the merge replaced the flow action wholesale
+    (``recipes[user_prompt]['actions'][i] = vlm_action``), so the role filter
+    at L1057 stopped matching every overridden action.
+
+    MEASURED 2026-09-08 20:44 on the installed build, agent 89555447799:
+    24 flow actions all persona 'Executor', 22 VLM files carrying user ids ->
+    in memory 19 + 3 user-id personas and only 2 'Executor'.  role_actions
+    became 2, ``Action(role_actions)`` made 2 the ledger's whole world, and
+    the run ended '[REUSE] All 2 actions completed' having silently skipped
+    22.  The ``len(role_actions) == 0`` fallback could not help: 2 is not 0,
+    so a PARTIAL match reads as a successful narrow instead of a failure.
+
+    Reconciling at LOAD rather than rewriting the 22 files on disk follows
+    the precedent ``_normalize_flow_recipe`` set directly above.
+
+    Returns a NEW list — the three call sites all merge into the shared
+    ``recipes[user_prompt]`` and one of them re-runs on reload, so mutating
+    in place let a second pass compound onto an already-merged list.
+    Never raises: this runs while the agent is being built.
+    """
+    try:
+        out = [dict(a) for a in (existing_actions or []) if isinstance(a, dict)]
+    except Exception:
+        return list(existing_actions or [])
+    if not isinstance(vlm_actions, list):
+        return out
+    for vlm_action in vlm_actions:
+        if not isinstance(vlm_action, dict):
+            continue
+        action_id = vlm_action.get('action_id')
+        if action_id is None:
+            continue          # unplaceable: no id to match or append against
+        merged = dict(vlm_action)
+        replaced = False
+        for i, action in enumerate(out):
+            if action.get('action_id') == action_id:
+                # Keep the REPLACED action's owner, not the session role — a
+                # multi-persona flow must not have its work silently
+                # reassigned by a VLM pass.
+                if action.get('persona') is not None:
+                    merged['persona'] = action['persona']
+                out[i] = merged
+                replaced = True
+                break
+        if not replaced:
+            # An appended action has no predecessor to inherit from; the flow's
+            # persona is the only correct owner.  Without one, leave the file's
+            # own value alone rather than invent an owner.
+            if flow_persona:
+                merged['persona'] = flow_persona
+            out.append(merged)
+    return out
 try:
     from hartos.helper import PROMPTS_DIR
 except Exception:
@@ -1033,24 +1094,20 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     # Load any VLM agent files
     vlm_actions = load_vlm_agent_files(prompt_id, role_number)
 
-    # Integrate VLM agent actions with existing recipe actions
+    # Integrate VLM agent actions with existing recipe actions.  ONE merge —
+    # this block was inlined verbatim at three sites, and all three dropped the
+    # flow action's persona, which is what reduced this agent's ledger from 24
+    # actions to 2.  See _vlm_merged_actions.
     if vlm_actions:
-        for vlm_action in vlm_actions:
-            # Check if this action should replace an existing one or be added
-            action_id = vlm_action.get("action_id")
-            action_exists = False
-
-            for i, action in enumerate(recipes[user_prompt]['actions']):
-                if action.get("action_id") == action_id:
-                    recipes[user_prompt]["actions"][i] = vlm_action
-                    action_exists = True
-                    break
-
-            if not action_exists:
-                recipes[user_prompt]['actions'].append(vlm_action)
-
-        # Update the recipes dictionary
+        _before = len(recipes[user_prompt]['actions'])
+        recipes[user_prompt]['actions'] = _vlm_merged_actions(
+            recipes[user_prompt]['actions'], vlm_actions, role)
         final_recipe[prompt_id] = recipes[user_prompt]
+        current_app.logger.info(
+            f"[VLM-MERGE] {len(vlm_actions)} override(s); actions "
+            f"{_before} -> {len(recipes[user_prompt]['actions'])}, "
+            f"persona-matching role {role!r}: "
+            f"{sum(1 for a in recipes[user_prompt]['actions'] if str(a.get('persona','')).lower() == str(role or '').lower())}")
 
     current_app.logger.info(f'Getting role actions')
     for i in recipes[user_prompt]['actions']:
@@ -1659,20 +1716,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             if vlm_actions:
                 current_app.logger.info(f"Loaded {len(vlm_actions)} VLM agents")
                 if user_prompt in recipes:
-                    for vlm_action in vlm_actions:
-                        action_id = vlm_action.get("action_id")
-                        action_exists = False
-
-                        for i, action in enumerate(recipes[user_prompt]['actions']):
-                            if action.get("action_id") == action_id:
-                                recipes[user_prompt]['actions'][i] = vlm_action
-                                action_exists = True
-                                break
-
-                        if not action_exists:
-                            recipes[user_prompt]['actions'].append(vlm_action)
-
-                    # Update the recipes dictionary
+                    recipes[user_prompt]['actions'] = _vlm_merged_actions(
+                        recipes[user_prompt]['actions'], vlm_actions)
                     final_recipe[prompt_id] = recipes[user_prompt]
 
 
@@ -1908,19 +1953,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
                             vlm_actions = load_vlm_agent_files(prompt_id, role_number)
                             if vlm_actions and user_prompt in recipes:
-                                for vlm_action in vlm_actions:
-                                    action_id = vlm_action.get("action_id")
-                                    action_exists = False
-
-                                    for i, action in enumerate(recipes[user_prompt]['actions']):
-                                        if action.get("action_id") == action_id:
-                                            recipes[user_prompt]['actions'][i] = vlm_action
-                                            action_exists = True
-                                            break
-                                    if not action_exists:
-                                        recipes[user_prompt]['actions'].append(vlm_action)
-
-                                # Update the recipes dictionary
+                                recipes[user_prompt]['actions'] = _vlm_merged_actions(
+                                    recipes[user_prompt]['actions'], vlm_actions)
                                 final_recipe[prompt_id] = recipes[user_prompt]
                             return f'Successfully ran the command in user\'s computer and created the VLM agent data at {vlm_agent_path}.'
                         else:
