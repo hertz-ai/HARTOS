@@ -3346,6 +3346,71 @@ def _reuse_action_is_autonomous(user_prompt, action_id):
         return False
 
 
+# How far back to look for the StatusVerifier's verdict.  Bounded because
+# clear_history=False makes these lists thousands of entries long, and an
+# unbounded scan would resurrect an ancient verdict.
+_REUSE_VERDICT_TAIL_SCAN = 12
+
+
+def _reuse_latest_verdict(group_chat):
+    """The most recent StatusVerifier verdict in the group log, or None.
+
+    The under-report escape below used to read ONLY ``messages[-1]``, and that
+    position is structurally never the verdict.  Measured live 2026-09-08
+    22:18-22:43 (agent 89555447799, action 4): of 128 state_transition calls in
+    the wedge, 120 saw "You should" there -- the ChatInstructor nudge.  The
+    #725 sync explains why it cannot be anything else:
+
+        [725-SYNC-COMPOSITION] (*=picked)
+          User*:n=240,calls=100,answers=0 | Assistant:n=120,answers=0 |
+          Helper:n=240,answers=0 | ... | Assistant:n=120,calls=42,answers=30
+
+    the sync picks the LONGEST buffer (User), whose tail is the steering nudge;
+    the only buffer holding tool answers is half its length and never picked
+    (#789/D22).  So the escape's precondition could not be satisfied, and it
+    fired 0 times in this drive and 0 times across every retained log -- while
+    40 real verdicts for that one action went by.  Cost: a 23-minute wedge, the
+    round budget drained (rounds 4 -> 85), the user's /chat timing out with no
+    reply for work the machine had actually completed, and ~8 browser windows
+    opened by the retry loop.
+
+    Deliberately does NOT filter on the verdict's ``action_id``.  Measured over
+    the same 72 verdicts: 25 of 65 for action 4 carried ``action_id: 24`` -- the
+    recipe's TOTAL action count -- while their own text read "Action #4".
+    Filtering on that integer would discard 38% of genuine verdicts and could
+    credit them to action 24.  This file already treats the model's id as
+    advisory (``_advance_or_steer``'s ``claimed_action_id`` and its
+    [HALLUCINATION?] log); the caller keys on the PIPELINE's current_action.
+
+    Scoping to the current action is likewise NOT done here, because it is
+    already done downstream: the caller's tool-evidence check
+    (``_reuse_outstanding_tools``) asks whether THIS action's tools ran since
+    THIS action was dispatched, which 209478af5 made per-action correct.  A
+    stale verdict from an earlier action therefore cannot advance the current
+    one -- that check blocks it -- so no second scoping scheme is needed.
+
+    Uses ``retrieve_json``, the canonical parse (#95), like every sibling
+    verdict reader.  Never raises: this runs inside the live turn loop.
+    """
+    try:
+        messages = list(getattr(group_chat, 'messages', None) or [])
+    except Exception:
+        return None
+    for msg in reversed(messages[-_REUSE_VERDICT_TAIL_SCAN:]):
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get('content')
+        if not isinstance(content, str) or not content.strip():
+            continue
+        try:
+            parsed = retrieve_json(content)
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and 'status' in parsed:
+            return parsed
+    return None
+
+
 def _reuse_outstanding_tools(user_prompt, action_id, group_chat):
     """The action's named tools that have NOT executed in this group chat.
 
@@ -3989,8 +4054,10 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             # that path re-runs the fabrication gate, so nothing advances whose
             # tool did not actually execute.
             try:
-                _pend = group_chat.messages[-1] if group_chat.messages else None
-                _pend_vj = retrieve_json((_pend or {}).get('content') or '') if _pend else None
+                # Was `group_chat.messages[-1]`, which is the ChatInstructor
+                # nudge 120 times in 128 (see _reuse_latest_verdict) -- that one
+                # read is why this whole escape had never fired.
+                _pend_vj = _reuse_latest_verdict(group_chat)
                 _pend_st = str((_pend_vj or {}).get('status', '')).lower()
                 if (isinstance(_pend_vj, dict)
                         and _pend_st in _REUSE_UNDERREPORT_STATUSES
