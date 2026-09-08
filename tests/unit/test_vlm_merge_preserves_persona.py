@@ -53,7 +53,72 @@ def _flow(n, persona='Executor'):
 
 def _vlm(action_id, persona='usercf125371-5b6a-4e00-beae-f42513cf47ab'):
     return {'action_id': action_id, 'action': 'vlm step %d' % action_id,
-            'persona': persona, 'recipe': [{'steps': 'click'}]}
+            'persona': persona, 'recipe': [{'steps': 'click'}],
+            'can_perform_without_user_input': 'no'}
+
+
+class TestAutonomyIsAlsoAContractField:
+    """The SECOND constant the same merge clobbers.
+
+    MEASURED 2026-09-08 21:34-21:35, agent 89555447799, on the build that
+    already carried the persona fix.  Action 2 was finally in the ledger, and
+    the turn then burned 99 rounds on it making NO progress:
+
+        rounds (inside reuse while1)      99
+        LLM calls in the same window       7
+        GOT can_perform_without_user_input 0   <- the steer never fired
+        every other branch                 0
+        [REUSE-ROUNDS] while1 exhausted 100 rounds at action 2/24
+
+    `_reuse_action_is_autonomous` returned False, so the "complete this task
+    independently" steering never reached the group; with no steer, no LLM
+    call and nothing appended, each round re-read an identical last_message
+    and fell off the end of the loop body.
+
+    WHY IT WAS False: the flow recipe marks all 24 actions 'yes'; the VLM
+    override for action 2 says 'no'.  And that 'no' is not a judgement —
+    it is a constant:
+
+        this agent's 22 vlm files : {'no': 22}
+        ALL vlm files on the box   : {'no': 47}   (47 of 47, zero variance)
+
+    A field with no variance carries no information.  Same shape as persona:
+    a VLM file re-authors an action's STEPS, it does not renegotiate the
+    action's contract with the user.  So the replaced action's contract
+    fields survive; only its content is replaced.
+    """
+
+    def test_autonomy_survives_a_vlm_override(self):
+        flow = [{'action_id': 1, 'action': 'a', 'persona': 'Executor',
+                 'can_perform_without_user_input': 'yes'}]
+        out = _vlm_merged_actions(flow, [_vlm(1)], 'Executor')
+        assert out[0]['can_perform_without_user_input'] == 'yes', (
+            "the flow author said this action is autonomous; a VLM re-authoring "
+            "must not silently make it need a human — that is the 99-round spin")
+        assert out[0]['action'] == 'vlm step 1', "content must still be replaced"
+
+    def test_a_genuinely_non_autonomous_flow_action_stays_non_autonomous(self):
+        """Preserve the FLOW's value, not a hardcoded 'yes'."""
+        flow = [{'action_id': 1, 'action': 'a', 'persona': 'Executor',
+                 'can_perform_without_user_input': 'no'}]
+        out = _vlm_merged_actions(flow, [_vlm(1)], 'Executor')
+        assert out[0]['can_perform_without_user_input'] == 'no'
+
+    def test_absent_on_the_flow_action_leaves_the_vlm_value(self):
+        """No flow value to preserve -> do not invent one."""
+        flow = [{'action_id': 1, 'action': 'a', 'persona': 'Executor'}]
+        out = _vlm_merged_actions(flow, [_vlm(1)], 'Executor')
+        assert out[0]['can_perform_without_user_input'] == 'no'
+
+    def test_the_live_shape_keeps_all_24_autonomous(self):
+        flow = [{'action_id': i, 'action': 'step %d' % i, 'persona': 'Executor',
+                 'can_perform_without_user_input': 'yes'} for i in range(1, 25)]
+        out = _vlm_merged_actions(flow, [_vlm(i) for i in range(2, 24)], 'Executor')
+        auto = [a for a in out
+                if str(a.get('can_perform_without_user_input')).lower() == 'yes']
+        assert len(auto) == 24, (
+            "22 VLM overrides must not strip autonomy from 22 of 24 actions; "
+            "got %d autonomous" % len(auto))
 
 
 class TestReplacementKeepsTheOwner:

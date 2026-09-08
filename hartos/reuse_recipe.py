@@ -95,6 +95,14 @@ def _normalize_flow_recipe(config):
     return out
 
 
+# Fields a VLM re-authoring must NOT overwrite: they are the action's contract
+# (who owns it, whether it may run unattended), not its content.  Both are
+# emitted as constants by the VLM writer — persona is always a user id, and
+# can_perform_without_user_input was 'no' in 47 of 47 files measured on this
+# box — so letting them through replaces an authored decision with noise.
+_VLM_PRESERVED_CONTRACT_FIELDS = ('persona', 'can_perform_without_user_input')
+
+
 def _vlm_merged_actions(existing_actions, vlm_actions, flow_persona=None):
     """``existing_actions`` with each VLM re-authoring applied, OWNER kept.
 
@@ -138,11 +146,19 @@ def _vlm_merged_actions(existing_actions, vlm_actions, flow_persona=None):
         replaced = False
         for i, action in enumerate(out):
             if action.get('action_id') == action_id:
-                # Keep the REPLACED action's owner, not the session role — a
-                # multi-persona flow must not have its work silently
-                # reassigned by a VLM pass.
-                if action.get('persona') is not None:
-                    merged['persona'] = action['persona']
+                # CONTRACT fields survive; only CONTENT is replaced.  Both of
+                # these are constants in the VLM writer's output, so taking
+                # them would overwrite the flow author's decision with noise:
+                #   persona                       -> a user id, never a role
+                #   can_perform_without_user_input-> 'no' in 47 of 47 files on
+                #                                    this box (zero variance)
+                # The autonomy one cost 99 rounds on action 2/24 live at
+                # 21:34: _reuse_action_is_autonomous went False, the "complete
+                # this task independently" steer never fired, and every round
+                # re-read an identical message and made no progress.
+                for _keep in _VLM_PRESERVED_CONTRACT_FIELDS:
+                    if action.get(_keep) is not None:
+                        merged[_keep] = action[_keep]
                 out[i] = merged
                 replaced = True
                 break
