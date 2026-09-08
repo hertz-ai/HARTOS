@@ -11,6 +11,7 @@ exceeded rejections in one boot).
 
     python -m pytest tests/unit/test_hierarchical_tool_gate.py --noconftest -q
 """
+import ast
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -189,13 +190,23 @@ class HierarchicalToolGate(unittest.TestCase):
         for fname, n_expected in expected_detect.items():
             src = (_ROOT / 'hartos' / fname).read_text(encoding='utf-8',
                                                        errors='replace')
-            # count CODE lines only — reuse_recipe:2691 names the function
-            # inside a #510 history comment
-            code = [ln for ln in src.splitlines()
-                    if not ln.lstrip().startswith('#')]
-            n_detect = sum(('detect_goal_tags(' in ln)
-                           or ('resolve_goal_tags(' in ln) for ln in code)
-            n_filter = sum('filter_service_tools(' in ln for ln in code)
+            # Count REAL CALLS via AST, not text.  Stripping '#' lines was not
+            # enough: a DOCSTRING that names the function was counted as a call
+            # site, and that is a guard reporting a defect that does not exist.
+            # Measured 2026-09-08 — reuse_recipe.py scored 3 against a budget of
+            # 2, and the third "call" was this line of prose inside
+            # _reuse_action_tool_names' docstring:
+            #     only from ``detect_goal_tags(message)`` -- a prose keyword scan
+            # HEAD and the working tree both scored 3, so it was never a
+            # regression; the guard had simply been counting documentation.
+            # ast.walk sees Call nodes only, so comments, docstrings and any
+            # future prose mentioning these names are all inert.
+            tree = ast.parse(src)
+            _called = [n.func.id for n in ast.walk(tree)
+                       if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+            n_detect = sum(name in ('detect_goal_tags', 'resolve_goal_tags')
+                           for name in _called)
+            n_filter = sum(name == 'filter_service_tools' for name in _called)
             self.assertEqual(
                 n_detect, n_expected,
                 f'{fname}: expected exactly {n_expected} goal-tag '

@@ -14,7 +14,6 @@ filter drifts from the factory's names.
 """
 import ast
 from pathlib import Path
-import re
 from types import SimpleNamespace
 import unittest
 
@@ -74,12 +73,24 @@ class ReuseMainCoreFactory(unittest.TestCase):
         self.assertFalse(missing, f"reuse-specific tools vanished: {missing}")
 
     def test_main_leg_registers_filtered_factory_set(self):
+        # RE-POINTED 2026-09-08.  This guard searched reuse_recipe.py for a
+        # local `_MAIN_LEG_CORE = {...}`, but that set was deliberately MOVED to
+        # core/agent_tools.py as MAIN_LEG_CORE_TOOLS, "beside
+        # build_core_tool_closures() that produces the closures, so the two legs
+        # agree by construction" (its own comment).  reuse_recipe.py has ZERO
+        # mentions of _MAIN_LEG_CORE at HEAD and in the working tree, so the
+        # guard could only ever fail — it was watching a symbol that no longer
+        # exists, not detecting drift.  Assert the invariant at its real home,
+        # and that the main leg still registers the FILTERED slice.
+        from core.agent_tools import MAIN_LEG_CORE_TOOLS
+        self.assertEqual(set(MAIN_LEG_CORE_TOOLS), MIGRATED,
+                         "MAIN_LEG_CORE_TOOLS drifted from the migrated set")
         src = _REUSE.read_text(encoding='utf-8')
-        m = re.search(r'_MAIN_LEG_CORE\s*=\s*\{([^}]*)\}', src)
-        self.assertIsNotNone(m, "_MAIN_LEG_CORE filter set missing")
-        names = set(re.findall(r"'([^']+)'", m.group(1)))
-        self.assertEqual(names, MIGRATED)
-        self.assertIn("in _MAIN_LEG_CORE], helper, assistant)", src)
+        self.assertIn("register_core_tools(main_leg_core_tools(core_tools), "
+                      "helper, assistant", src,
+                      "main leg must register the FILTERED factory slice — "
+                      "registering the full list would put every closure, "
+                      "including ones no action asked for, on every agent")
 
     # ── behavioral effect guards ──────────────────────────────────────
     # These CALL the factory closures and observe the effect; a source
