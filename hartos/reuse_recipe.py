@@ -4140,8 +4140,15 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                             break  # finished recipe -> post-loop extractor (#798)
                         continue
                 except IndexError:
+                    # BREAK to the post-loop extractor, never `return ''`.
+                    # #798 converted the six advance-path empty returns for
+                    # exactly this reason and missed this one, whose own log
+                    # line claims the recipe COMPLETED — the worst case to
+                    # answer with nothing (see _advance_or_steer's docstring
+                    # and #803/D37).  The extractor below already handles a
+                    # genuinely empty history.
                     current_app.logger.info("Completed ALL ACTIONS")
-                    return ''
+                    break
                 except Exception:
                     try:
                         json_obj = retrieve_json(group_chat.messages[-2]["content"])  # canonical parse (#95)
@@ -4239,7 +4246,29 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     json_obj = retrieve_json(last_message['content'])
                     if json_obj and 'message2userfinal' in json_obj:
                         send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
-                        return ''
+                        # RETURN the answer, do not drop it.  This return value IS
+                        # the reply: hart_intelligence_entry:10165 assigns it and
+                        # hands it to _chat_reply (see the note at :2023, "the
+                        # /chat handler checks after chat_agent() returns").
+                        # send_message_to_user1 is a SECOND, off-box leg whose
+                        # URL is pointed at the wrong address (:524).  Measured
+                        # 2026-09-09: it POSTs to aws_rasa.hertzai.com:9890
+                        # (-> 106.51.181.24), which refuses; the service is
+                        # REAL and RUNNING on the LAN box — sathish-linux-deep
+                        # container `chatbot_pipeline` publishes
+                        # 0.0.0.0:8001->9890/tcp, and POST
+                        # http://192.168.0.9:8001/autogen_response answers in
+                        # 35 ms.  9890 is the CONTAINER-INTERNAL port, never
+                        # the published one.  So this leg delivers nothing on
+                        # this deployment, and its failure comes back as a
+                        # string nobody reads.  Address fix tracked in #803;
+                        # it does not change the rule below.
+                        # Returning '' here therefore lost the finished answer
+                        # entirely: Nunba's empty-reply check then rerouted the
+                        # user to the tool-less Tier-2 fallback, which answered
+                        # from training data and contradicted the work this
+                        # agent had just done and saved (#797/D31, #803/D37).
+                        return json_obj['message2userfinal']
                 except Exception as e:
                     current_app.logger.error(f"Error extracting JSON: {e}")
             elif f'message2'.lower() in content_lower:
@@ -4248,7 +4277,9 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     json_obj = retrieve_json(last_message['content'])
                     if json_obj and 'message2' in json_obj:
                         send_message_to_user1(user_id, json_obj['message2'], '', prompt_id)
-                        return ''
+                        # Same as the message2userfinal branch above — the
+                        # return value is the reply, the POST is a dead leg.
+                        return json_obj['message2']
                 except Exception as e:
                     current_app.logger.error(f"Error extracting JSON: {e}")
             elif f'@user'.lower() not in content_lower:
@@ -5265,8 +5296,12 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 else:
                                     raise ValueError('No json found')
                             except IndexError:
+                                # BREAK, not `return ''` — same reason as the
+                                # while1 twin above (#798 / #803 D37).  The
+                                # extractor after this loop is what turns the
+                                # finished conversation into the reply.
                                 current_app.logger.info("Completed ALL ACTIONS")
-                                return ''
+                                break
                             except Exception as e:
                                 current_app.logger.warning(f'it is not a json object the error is: {e}')
                                 current_app.logger.info(
@@ -5297,9 +5332,20 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                         current_app.logger.info(f'@user in last message')
                         break
 
+                # Guard the subscript, exactly as the while1 extractor does
+                # (:4272).  while2 never had it, so an empty history raised
+                # IndexError here instead of ending the turn — and the
+                # "Completed ALL ACTIONS" break above now reaches this line
+                # on precisely the short-history case that raised it.
+                if not group_chat.messages:
+                    current_app.logger.warning(
+                        'reuse while2: no messages to extract a reply from')
+                    return ''
                 last_message = group_chat.messages[-1]
 
-                if last_message['content'] == 'TERMINATE':
+                # len>1 matters: a lone TERMINATE would send [-2] off the
+                # front — same reason the while1 twin carries this check.
+                if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
                     last_message = group_chat.messages[-2]
 
                 llm_call_track[user_prompt]['count'] = 0
