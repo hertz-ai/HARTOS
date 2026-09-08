@@ -405,6 +405,11 @@ class Action:
         self.new_json = []
         self.recipe = False
         self.ledger = None  # Smart Ledger for persistent task tracking
+        # tool_call ids that already existed when the CURRENT action was
+        # dispatched.  The fabrication gate ignores their results, so an
+        # action cannot inherit credit for an earlier action's tool run.
+        # Empty for action 1 — nothing has run yet, so nothing to discount.
+        self.evidence_seen_call_ids = set()
 
     def get_action(self, current_action):
         try:
@@ -3430,6 +3435,63 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
     return True
 
 
+def _reuse_present_call_ids(msg_lists):
+    """Every tool_call id currently visible in ``msg_lists``.
+
+    Stamped when an action is dispatched so the fabrication gate can tell
+    THIS action's tool runs from an earlier action's.  Ids (not indices)
+    because the lists are mutated in place and spliced by the #725 sync, so
+    a position is not stable; a tool_call id is.
+    """
+    out = set()
+    for ml in (msg_lists or []):
+        for m in (ml or []):
+            if not isinstance(m, dict):
+                continue
+            for tc in (m.get('tool_calls') or []):
+                cid = (tc or {}).get('id')
+                if cid:
+                    out.add(cid)
+    return out
+
+
+def _reuse_evidence_msg_lists(group_chat, agents):
+    """The message lists the gate treats as evidence — ONE definition.
+
+    Both the watermark stamp and the gate must look at the same places, or
+    the stamp would miss a buffer the gate later credits.
+    """
+    lists = [getattr(group_chat, 'messages', None) or []]
+    for ag in (agents or []):
+        conv = getattr(ag, '_oai_messages', None)
+        if isinstance(conv, dict):
+            lists.extend(conv.values())
+    return lists
+
+
+def _stamp_action_evidence_watermark(user_prompt):
+    """Record which tool runs already existed when this action was dispatched.
+
+    Called from the ONE site that writes ``current_action`` so the watermark
+    and the action id can never disagree.  Reaches the group chat the same
+    way the gate does (get_registered_groupchat), so no new plumbing.
+    """
+    try:
+        from hartos.lifecycle_hooks import get_registered_groupchat
+        gc = get_registered_groupchat(user_prompt)
+        if gc is None:
+            return
+        seen = _reuse_present_call_ids(
+            _reuse_evidence_msg_lists(gc, getattr(gc, 'agents', None) or []))
+        user_tasks[user_prompt].evidence_seen_call_ids = seen
+        _ctx_safe_log('info',
+                      f"[FAB-GUARD] watermark for action "
+                      f"{user_tasks[user_prompt].current_action}: "
+                      f"{len(seen)} pre-existing tool call(s)")
+    except Exception as err:
+        _ctx_safe_log('debug', f"evidence watermark skipped: {err}")
+
+
 def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
     """Registered tool names the current action NAMES but that produced ZERO
     tool results anywhere in the group chat — i.e. a fabricated 'completed'.
@@ -3511,11 +3573,21 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         # very window this gate saw none.  Same mapping here: one rule for
         # "which tool ran", no second vocabulary.
         executed = set()
-        _msg_lists = [getattr(group_chat, 'messages', None) or []]
-        for ag in agents:
-            conv = getattr(ag, '_oai_messages', None)
-            if isinstance(conv, dict):
-                _msg_lists.extend(conv.values())
+        _msg_lists = _reuse_evidence_msg_lists(group_chat, agents)
+        # Tool runs that already existed when THIS action was dispatched are
+        # someone else's work.  Without this window the set accumulates for
+        # the whole session (clear_history=False), so one real result makes
+        # the gate unable to fail for every later action naming that tool —
+        # measured live 2026-09-08: execute_windows_or_android_command
+        # DISPATCHED 2, named by 17 advanced actions; actions 4..18 all
+        # advanced after the last dispatch with unrun=[].  The docstring
+        # above already records this failure once; the remedy then widened
+        # WHERE the gate looks, never WHEN.
+        try:
+            _seen = getattr(user_tasks.get(user_prompt), 'evidence_seen_call_ids', None)
+        except Exception:
+            _seen = None
+        _seen = _seen if isinstance(_seen, (set, frozenset)) else set()
         _call_fn = {}
         for _ml in _msg_lists:
             for m in (_ml or []):
@@ -3529,6 +3601,11 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
 
         def _record_result(call_id, content, fallback_name=None):
             """Count one tool RESULT, resolved to its function name."""
+            # This result belongs to an EARLIER action — its call id was
+            # already on the wire when the current action was dispatched.
+            # Crediting it is what let 15 actions advance on 0 dispatches.
+            if call_id and call_id in _seen:
+                return
             _body = str(content or '')
             if HISTORICAL_TOOL_PLACEHOLDER in _body:
                 return  # the stand-in minted BECAUSE nothing executed
@@ -4354,6 +4431,9 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
     current_app.logger.info(f'[REUSE] Action {current_action_id} TERMINATED, advancing')
     next_id = current_action_id + 1
     user_tasks[user_prompt].current_action = next_id
+    # Stamp the evidence watermark HERE — the one site that writes
+    # current_action — so the window and the action id cannot disagree.
+    _stamp_action_evidence_watermark(user_prompt)
 
     if next_id > len(user_tasks[user_prompt].actions):
         current_app.logger.info(f'[REUSE] All {len(user_tasks[user_prompt].actions)} actions completed')
