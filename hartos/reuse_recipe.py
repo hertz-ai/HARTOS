@@ -3516,6 +3516,15 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
     except Exception as err:
         _say('warning', f"[SYNTHESIS] steer failed: {err}")
         return False
+    # The answer the group just wrote lives in manager._oai_messages, NOT in
+    # group_chat.messages — autogen appends to the former and the #725 sync
+    # copies it to the latter.  That sync only ran inside the while1 loop,
+    # which has already exited here, so without this call the synthesis
+    # answer is invisible to the extractor: measured 2026-09-09 04:38:48,
+    # "round returned (23 -> 23 msgs); still control JSON: True" while the
+    # real message2userfinal sat in the buffer (04:38:12).  Same function the
+    # loop calls — one sync, two callers.
+    _reuse_sync_group_log(group_chat, manager)
     _after = len(getattr(group_chat, 'messages', None) or [])
     _say('info', f"[SYNTHESIS] round returned ({_before} -> {_after} msgs); "
                  f"still control JSON: {_reuse_needs_synthesis(group_chat)}")
@@ -3846,6 +3855,90 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         return []
 
 
+def _reuse_sync_group_log(group_chat, manager):
+    """Bring ``group_chat.messages`` up to date from ``manager._oai_messages``.
+
+    The body is the #725 sync, lifted OUT of the while1 loop so it has more
+    than one caller.  While it was inline, the only moment the group log could
+    catch up was inside that loop — and the post-loop synthesis steer
+    (#799/D33) runs after the loop has exited.
+
+    Measured live 2026-09-09 04:37:58-04:38:48: the synthesis round DID produce
+    the answer —
+
+        04:38:12  last json as {'message2userfinal': "The chatterbox_turbo
+                  worker startup failure has been diagnosed..."}
+
+    — but the group log never moved:
+
+        04:38:48  [SYNTHESIS] round returned (23 -> 23 msgs);
+                  still control JSON: True
+
+    The answer was in _oai_messages and the extractor could not see it, so the
+    user still got the verdict.  One implementation, two callers; NOT a second
+    sync.
+
+    Never raises: both callers sit on the path that produces the user's reply.
+    """
+    try:
+        _mgr_msgs = getattr(manager, '_oai_messages', None)
+        if not _mgr_msgs:
+            return False
+        _conv = max(_mgr_msgs.values(), key=len, default=None)
+        # Gate on the BASE length last synced, NOT on len(group_chat.messages).
+        # The merge splices answers in, so the group log is legitimately LONGER
+        # than its own source; comparing against it would stop this ever firing
+        # again — the freeze the original `if not group_chat.messages` had.
+        _base_n = getattr(group_chat, '_hart_sync_base_n',
+                          len(group_chat.messages))
+        if not _conv or len(_conv) <= _base_n:
+            return False
+        _was = len(group_chat.messages)
+        # The longest buffer is the right SKELETON but carries zero tool
+        # answers (measured 16/16, see _merge_tool_answers).  Fill its
+        # unanswered calls from the sibling buffers before handing it over,
+        # or helper.py:1940 mints a placeholder over each one.
+        _merged = _merge_tool_answers(_conv, list(_mgr_msgs.values()))
+        group_chat.messages[:] = list(_merged)
+        try:
+            group_chat._hart_sync_base_n = len(_conv)
+        except Exception:
+            pass
+        _ctx_safe_log('info',
+                      f"[725-SYNC] group_chat.messages stale ({_was} < "
+                      f"{len(_conv)}) — resynced from manager._oai_messages"
+                      f"; spliced {len(_merged) - len(_conv)} real tool "
+                      f"answer(s) {dict(_merge_last_stats)}")
+        # DIAGNOSTIC ONLY (no behaviour change).  _oai_messages is keyed PER
+        # AGENT and each value is a pairwise broadcast log, so "longest" is a
+        # LENGTH proxy for "most complete" — not the same thing.  Measured live
+        # 2026-09-07 on agent 18088688973: 418 announced tool_call ids against
+        # 106 role=tool answers (312 unanswered, 74.6%).  Slice-assignment
+        # cannot create duplicates, so they are in the SOURCE.  Records, per
+        # buffer, whether the answers live somewhere other than the buffer we
+        # picked — the fact needed before changing the selector (task #789).
+        try:
+            _picked = id(_conv)
+            _parts = []
+            for _k, _v in _mgr_msgs.items():
+                _calls = sum(len(m.get('tool_calls') or [])
+                             for m in _v if isinstance(m, dict))
+                _answers = sum(1 for m in _v
+                               if isinstance(m, dict) and m.get('role') == 'tool')
+                _parts.append(
+                    f"{getattr(_k, 'name', str(_k))[:18]}"
+                    f"{'*' if id(_v) == _picked else ''}"
+                    f":n={len(_v)},calls={_calls},answers={_answers}")
+            _ctx_safe_log('info',
+                          "[725-SYNC-COMPOSITION] (*=picked) " + " | ".join(_parts))
+        except Exception:
+            pass
+        return True
+    except Exception as _sync_err:
+        _ctx_safe_log('debug', f"[725-SYNC] skipped: {_sync_err}")
+        return False
+
+
 def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "autogen.UserProxyAgent",
                        helper: "autogen.AssistantAgent", user_proxy: "autogen.UserProxyAgent",
                        manager: "autogen.GroupChatManager", group_chat: "autogen.GroupChat", message: str, role: str,
@@ -3979,65 +4072,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             # of the whole conversation, and rebinding `group_chat.messages = [...]`
             # would detach the wrapper autogen holds a reference to.  Same source,
             # same shape, same single mechanism — no parallel path.
-            try:
-                _mgr_msgs = getattr(manager, '_oai_messages', None)
-                if _mgr_msgs:
-                    _conv = max(_mgr_msgs.values(), key=len, default=None)
-                    # Gate on the BASE length last synced, NOT on
-                    # len(group_chat.messages).  The merge below splices answers
-                    # in, so the group log is legitimately LONGER than its own
-                    # source; comparing against it would stop this branch ever
-                    # firing again — precisely the freeze the comment above
-                    # records for the original `if not group_chat.messages`.
-                    _base_n = getattr(group_chat, '_hart_sync_base_n',
-                                      len(group_chat.messages))
-                    if _conv and len(_conv) > _base_n:
-                        _was = len(group_chat.messages)
-                        # The longest buffer is the right SKELETON but carries
-                        # zero tool answers (measured 16/16, see
-                        # _merge_tool_answers).  Fill its unanswered calls from
-                        # the sibling buffers before handing it over, or
-                        # helper.py:1940 mints a placeholder over each one.
-                        _merged = _merge_tool_answers(_conv, list(_mgr_msgs.values()))
-                        group_chat.messages[:] = list(_merged)
-                        try:
-                            group_chat._hart_sync_base_n = len(_conv)
-                        except Exception:
-                            pass
-                        current_app.logger.info(
-                            f"[725-SYNC] group_chat.messages stale ({_was} < "
-                            f"{len(_conv)}) — resynced from manager._oai_messages"
-                            f"; spliced {len(_merged) - len(_conv)} real tool answer(s)"
-                            f" {dict(_merge_last_stats)}")
-                        # DIAGNOSTIC ONLY (no behaviour change).  _oai_messages is
-                        # keyed PER AGENT and each value is a pairwise broadcast log,
-                        # so "longest" is a LENGTH proxy for "most complete" — it is
-                        # not the same thing.  Measured live 2026-09-07 on agent
-                        # 18088688973: the synced history carried 418 announced
-                        # tool_call ids against 106 role=tool answers (312 unanswered,
-                        # 74.6%), and one snapshot repeated a single id seven times.
-                        # Slice-assignment above cannot create duplicates, so they are
-                        # in the SOURCE.  This line records, per buffer, whether the
-                        # answers live somewhere other than the buffer we picked —
-                        # the fact needed before changing the selector (see task #789).
-                        try:
-                            _picked = id(_conv)
-                            _parts = []
-                            for _k, _v in _mgr_msgs.items():
-                                _calls = sum(len(m.get('tool_calls') or [])
-                                             for m in _v if isinstance(m, dict))
-                                _answers = sum(1 for m in _v
-                                               if isinstance(m, dict) and m.get('role') == 'tool')
-                                _parts.append(
-                                    f"{getattr(_k, 'name', str(_k))[:18]}"
-                                    f"{'*' if id(_v) == _picked else ''}"
-                                    f":n={len(_v)},calls={_calls},answers={_answers}")
-                            current_app.logger.info(
-                                "[725-SYNC-COMPOSITION] (*=picked) " + " | ".join(_parts))
-                        except Exception:
-                            pass
-            except Exception as _sync_err:
-                current_app.logger.debug(f"[725-SYNC] skipped: {_sync_err}")
+            _reuse_sync_group_log(group_chat, manager)
 
             # === LEDGER v2.0: Heartbeat + Budget/SLA using KNOWN state ===
             _reuse_current_action = user_tasks[user_prompt].current_action
