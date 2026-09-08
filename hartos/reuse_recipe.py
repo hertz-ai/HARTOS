@@ -2329,6 +2329,13 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         # whole point is to reach a closure the main leg was NOT given, only
         # for an action whose own recipe names it (see attach_for_names).
         assistant._hart_core_tools = core_tools
+        # The FULL recipe list, so the per-turn hook in get_agent_response can
+        # narrow the system prompt to the action actually being dispatched
+        # (see _recipe_section_for_action).  Same scope problem as above: the
+        # list is built at L1189 inside THIS function, the hook runs in
+        # another.  Stored by reference and never mutated — L2682 indexes the
+        # same list for can_perform_without_user_input.
+        assistant._hart_individual_recipe = individual_recipe
 
         def request_tools(need: str) -> str:
             from core.agent_tools import discover_and_attach
@@ -3559,6 +3566,28 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     _aid = user_tasks[user_prompt].current_action
                 except Exception:
                     _aid = None
+                # Narrow the system prompt to the action being dispatched.
+                # The prompt is built ONCE at construction (L1328) and cached
+                # in user_agents, so without this every turn ships all N
+                # recipes and the wire-trim left-trims the early ones away —
+                # measured 2026-09-08: body carried action_id [13..24] while
+                # the turn asked for #2, and the agent correctly told the user
+                # it could not see the action.  update_system_message is the
+                # CALL form (never assignment: create_recipe.py:5328 records
+                # that assigning to it shadows the bound method).
+                try:
+                    _narrowed = _recipe_section_for_action(
+                        assistant.system_message,
+                        getattr(assistant, '_hart_individual_recipe', None), _aid)
+                    if _narrowed and _narrowed != assistant.system_message:
+                        _was = len(assistant.system_message or '')
+                        assistant.update_system_message(_narrowed)
+                        current_app.logger.info(
+                            f"Tier-1 prompt narrow: action {_aid} -> system "
+                            f"{_was} to {len(_narrowed)} chars")
+                except Exception as _e:
+                    current_app.logger.debug(f"prompt narrow skipped: {_e}")
+
                 _named = _reuse_action_tool_names(user_prompt, _aid) if _aid else []
                 if _named:
                     from core.agent_tools import attach_for_names
@@ -4552,6 +4581,65 @@ def _merge_tool_answers(base, buffers):
         return out
     except Exception:
         return list(base or [])
+
+
+def _recipe_section_for_action(system_message, individual_recipe, action_id):
+    """``system_message`` with the recipe block narrowed to ONE action.
+
+    The reuse system prompt (built at L1310) interpolates the WHOLE recipe
+    list between ``<recipeStart><generalized_functionsStart>`` and
+    ``<generalized_functionsEnd><recipeEnd>``.  For a 24-action agent that is
+    ~15,879 estimated tokens, and the turn only ever asks for one action.
+
+    WHY THIS EXISTS — measured at the wire 2026-09-08 19:44 on the installed
+    build, agent 89555447799 (growth.local.executor, 24 actions):
+
+        wire-trim: the TOOL SCHEMA alone is 8487 tokens against an n_ctx of
+        12288 (66 tool(s)) -- no amount of message trimming can make this fit
+
+        [TRIM] left-trimmed 13 msg(s) + 39363 char(s)
+               est tokens 15879 -> 4308, budget 5484
+
+    66 tools take 69% of the window; the recipe prompt does not fit in what
+    is left; the trim removes from the FRONT.  The body that actually reached
+    the model carried action_id [13..24] ONLY, while the user message said
+    "Perform this action -> Action #2".  The agent then told the user
+    "those actions do not exist in my immediate view ... please paste the
+    list of specific actions" -- which was TRUE of its context.
+
+    Sending the dispatched action instead of all 24 is both smaller and
+    strictly more correct.  The action-title list (``role_actions``, a
+    separate interpolation) still carries the overall plan, so the model does
+    not lose sight of the sequence.
+
+    NOT the loader: 24 load attempts, 0 errors, indices 1..24, all files
+    present and json.load()-clean.  ``individual_recipe`` is built whole at
+    L1189 and is INDEXED ELSEWHERE (e.g. L2682
+    ``individual_recipe[_known_aid - 1]['can_perform_without_user_input']``),
+    so this returns a NEW STRING and never mutates that list.
+
+    Returns ``system_message`` unchanged for an out-of-range or non-integer
+    action_id, a missing recipe block, an empty recipe list, or any
+    exception: this runs on every reuse turn and must not be able to kill
+    one.
+    """
+    OPEN, CLOSE = '<generalized_functionsStart>', '<generalized_functionsEnd>'
+    try:
+        if not system_message or not individual_recipe:
+            return system_message
+        if not isinstance(action_id, int) or isinstance(action_id, bool):
+            return system_message
+        if not 1 <= action_id <= len(individual_recipe):
+            return system_message
+        i0 = system_message.find(OPEN)
+        i1 = system_message.find(CLOSE, i0 + 1) if i0 >= 0 else -1
+        if i0 < 0 or i1 <= i0:
+            return system_message
+        return (system_message[:i0 + len(OPEN)]
+                + str([individual_recipe[action_id - 1]])
+                + system_message[i1:])
+    except Exception:
+        return system_message
 
 
 def _reuse_action_tool_names(user_prompt, action_id):
