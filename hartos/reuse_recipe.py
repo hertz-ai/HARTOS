@@ -3219,6 +3219,15 @@ from core.constants import (
 )
 
 
+# The harness's own voice inside the group.  All three reuse stacks name their
+# steering UserProxy "ChatInstructor" (reuse_recipe :1531 main, :2144 timer,
+# helper.py :2854 visual), and every steering site in this file initiates
+# through it — the three `chat_instructor.initiate_chat(recipient=manager...)`
+# calls say so explicitly.  Its messages are instructions TO the group, so they
+# can never be the group's answer, however they are worded.
+_REUSE_STEER_INITIATOR_NAMES = ("ChatInstructor",)
+
+
 def _reuse_group_terminate(msg):
     """End an action's group-chat round on a verdict the OUTER loop must act on.
 
@@ -3255,14 +3264,55 @@ def _reuse_group_terminate(msg):
     The membership set is canonical (core.constants), so adding a third
     round-terminal verdict is a one-line change there, not a fourth private
     spelling here.  Fails closed: anything unparseable is NOT terminal.
+
+    THIRD MEASUREMENT, 2026-09-09, agent 33323830039 — the ANSWER is terminal
+    too, and for the identical reason.  The synthesis steer (#799/D33) asked
+    the group for the user-facing reply and got it:
+
+        04:38:12  last json as {'message2userfinal': "The chatterbox_turbo
+                  worker startup failure has been diagnosed... The directory
+                  check confirmed the existence of the 'Nunba' folder..."}
+
+    grounded in the `dir` output its own tool had returned.  Nothing ended the
+    round, so the group talked for four more turns and closed on a verdict:
+
+        04:38:48  [SYNTHESIS] round returned (23 -> 23 msgs);
+                  still control JSON: True
+
+    and the user got the verdict.  The answer was TALKED OVER.  get_agent_
+    response ALREADY treats message2userfinal as turn-ending — its in-loop
+    branch unwraps it and returns it as the reply — but it only ever SEES it
+    when the answer happens to be messages[-1] at the moment initiate_chat
+    returns.  So this is the existing rule applied where it decides anything,
+    not a new one.
+
+    Two guards keep it from firing on the ASK instead of the answer, both from
+    the same window:
+      * the steer carries the example `{"message2userfinal": "<your answer
+        here>"}`, and the pipeline's own parser read it as such at 04:37:58 —
+        so a placeholder or empty value is not an answer;
+      * ChatInstructor is this file's canonical steering initiator (its three
+        initiate_chat sites say so), so its messages are instructions to the
+        group and can never be the group's answer.
     """
     if _is_terminate_msg(msg):
         return True
     try:
         _vj = retrieve_json((msg or {}).get('content') or '')
-        return (isinstance(_vj, dict)
-                and str(_vj.get('status', '')).lower()
-                in VERDICT_ROUND_TERMINAL_STATUSES)
+        if not isinstance(_vj, dict):
+            return False
+        if (str(_vj.get('status', '')).lower()
+                in VERDICT_ROUND_TERMINAL_STATUSES):
+            return True
+        if str((msg or {}).get('name') or '') in _REUSE_STEER_INITIATOR_NAMES:
+            return False
+        for _k, _v in _vj.items():
+            if str(_k).lower() != 'message2userfinal':
+                continue
+            _v = str(_v or '').strip()
+            # '<your answer here>' is the steer's own template, not an answer.
+            return bool(_v) and not (_v.startswith('<') and _v.endswith('>'))
+        return False
     except Exception:
         return False
 
@@ -3411,8 +3461,44 @@ def _reuse_latest_verdict(group_chat):
     return None
 
 
+# Prefixes that mean a message is addressed to ANOTHER AGENT, not the user.
+# Lifted out of get_agent_response's inline `agent_mentions` list so the
+# synthesis gate asks the same question the loop already asks, instead of
+# growing a second notion of "who is this message for".
+_REUSE_AGENT_MENTIONS = (
+    "@statusverifier", "@status verifier", "@verification",
+    "@helper", "@executor",
+)
+
+
 def _reuse_needs_synthesis(group_chat):
-    """True when the turn is about to answer the user with CONTROL JSON.
+    """True when the turn is about to answer the user with something that is
+    NOT AN ANSWER.
+
+    WIDENED after the 2026-09-09 04:48-04:51 drive.  The first cut asked "is
+    messages[-1] control JSON?", which is only ONE of the ways the tail fails
+    to be an answer.  That drive ended on
+    `[REUSE-ROUNDS] while1 exhausted 12 rounds at action 2/2`, the tail was
+    NOT control JSON, the gate returned False, `[SYNTHESIS]` logged 0 times —
+    and the user received a 5,078-char essay that diagnosed the agent from its
+    NAME ("chatterbox_turbo ... implies a high-velocity worker") and prescribed
+    docker/kubectl remediation on a Windows desktop, ignoring the `dir` output
+    its own tool had just produced.
+
+    So the predicate is now the property that actually matters: the tail is not
+    a reply TO THE USER.  Each branch is a shape measured on this pipeline:
+      * empty / whitespace           — nothing to say
+      * 'TERMINATE'                  — the control token
+      * role == 'tool'               — a tool RESULT, not a reply
+      * @Helper / @StatusVerifier /… — addressed to another agent (same list
+                                       the loop's own routing uses)
+      * dict carrying 'status'       — a StatusVerifier verdict (the original
+                                       case, measured 04:14:22)
+    Prose with none of those is a real answer and is left alone — anti-vacuity
+    matters here, because a false positive burns a group round on every good
+    turn.
+
+    WHY THE TAIL IS STRUCTURALLY NOT AN ANSWER (#799/D33, the original case):
 
     ``_reuse_group_terminate`` ends the round ON the StatusVerifier verdict, so
     ``messages[-1]`` is STRUCTURALLY that verdict whenever an action completes.
@@ -3442,16 +3528,26 @@ def _reuse_needs_synthesis(group_chat):
     try:
         messages = list(getattr(group_chat, 'messages', None) or [])
         if not messages:
+            # Nothing to synthesise FROM.  The extractor's own empty-history
+            # guard handles this; asking the group would only add a round.
             return False
-        content = (messages[-1] or {}).get('content')
+        last = messages[-1] or {}
+        content = last.get('content')
         if not isinstance(content, str) or not content.strip():
-            return False
+            return True                      # empty tail is not an answer
         low = content.lower()
         if 'message2userfinal' in low or 'message2' in low:
-            return False          # the answer is already there
+            return False                     # the answer is already there
+        if content.strip() == 'TERMINATE':
+            return True                      # control token
+        if last.get('role') == 'tool':
+            return True                      # a tool RESULT, not a reply
+        if any(m in low for m in _REUSE_AGENT_MENTIONS):
+            return True                      # addressed to another agent
         parsed = retrieve_json(content)
-        # A control verdict is a dict carrying 'status'.  Prose is not.
-        return isinstance(parsed, dict) and 'status' in parsed
+        if isinstance(parsed, dict) and 'status' in parsed:
+            return True                      # StatusVerifier verdict
+        return False                         # prose for the user — leave it
     except Exception:
         return False
 
@@ -4429,10 +4525,14 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 except Exception as e:
                     current_app.logger.error(f"Error extracting JSON: {e}")
             elif f'@user'.lower() not in content_lower:
-                agent_mentions = [
-                    "@statusverifier", "@status verifier", "@verification",
-                    "@helper", "@executor", "@StatusVerifier", "@Helper", "@Executor"
-                ]
+                # _REUSE_AGENT_MENTIONS (module scope) — ONE list, shared with
+                # the synthesis gate so "who is this message for" has a single
+                # answer.  The four CamelCase entries this list used to carry
+                # ("@StatusVerifier", "@Helper", "@Executor") were DEAD: the
+                # subject here is `content_lower`, so an uppercase needle can
+                # never match.  The five lowercase forms are the whole
+                # effective set and are what the constant holds.
+                agent_mentions = _REUSE_AGENT_MENTIONS
 
                 if any(mention in content_lower for mention in agent_mentions):
                     agent_found = next((mention for mention in agent_mentions if mention in content_lower), None)
