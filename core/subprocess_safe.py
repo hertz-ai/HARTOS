@@ -22,9 +22,25 @@ fires but the reader-thread cleanup still hangs.
 
 THE FIX
 ───────
-Drive Popen directly.  On TimeoutExpired, kill() then **explicitly
-close** the parent-side pipe handles so any still-running reader
-thread unblocks and exits; finally `wait()` briefly to reap.
+Drive Popen directly.  On TimeoutExpired, kill the process TREE — the
+child AND any descendants that inherited the pipe handles — then
+`wait()` briefly to reap.  The parent-side pipes are deliberately NOT
+closed here.
+
+CORRECTED 2026-09-09 (D36).  This module used to close them, and said
+so: "Closing the parent FD causes the read() to return EOF -> thread
+exits cleanly."  That is FALSE once a reader is already inside read().
+`fh.read()` holds the file object's lock for its whole duration and
+`fh.close()` must take the same lock, so closing from the timeout path
+blocks for as long as the reader is parked — reintroducing, one frame
+lower, the exact wedge this module exists to prevent.  Measured live:
+a chat turn stuck in `_safe_kill_and_close` -> `fh.close()` across
+three thread dumps 85+ s apart, with two `_readerthread`s stopped at
+`subprocess.py:1599  buffer.append(fh.read())`.
+
+Why the old tests did not catch it: they kill children whose pipes then
+DO reach EOF, so the close was always uncontended.
+`TestKillReachesDescendants` builds the contended case on purpose.
 
 Always returns a `BoundedResult` — never raises TimeoutExpired.
 `FileNotFoundError` propagates (caller decides "tool missing" vs
@@ -229,33 +245,100 @@ def run_probe(
     return result
 
 
+def _kill_descendants_then_self(proc: "subprocess.Popen[str]") -> int:
+    """Kill `proc`'s descendants, then `proc`.  Returns descendants killed.
+
+    kill() reaches only the DIRECT child.  A grandchild that inherited the
+    stdout/stderr write handles keeps them open, so the parent-side read()
+    never sees EOF — which is what leaves the reader threads parked forever
+    (D36).  Reaping the tree is what actually lets those pipes close.
+
+    Descendants are enumerated BEFORE the kill, because once the direct child
+    is reaped its pid can no longer be walked.
+
+    psutil is used rather than `taskkill /T` or `os.killpg`:
+      * it is already this repo's process-walking tool (core/resource_governor
+        uses .children(recursive=True)), so this adds no new dependency and no
+        second way of doing the same thing;
+      * `taskkill` would mean spawning a subprocess from inside the subprocess
+        cleanup path;
+      * `os.killpg(os.getpgid(pid))` is actively DANGEROUS here — Popen does
+        not put the child in its own process group unless asked, so that pgid
+        is OUR group and the call would kill the host process.
+
+    Best-effort by contract: this runs on the timeout path, where the caller
+    is already degraded, so every failure is swallowed.  If psutil is missing
+    the tree is simply not reaped — the caller still returns promptly, because
+    correctness rests on NOT blocking (see `_safe_kill_and_close`), not on
+    this reclamation succeeding.
+    """
+    descendants = []
+    pid = getattr(proc, "pid", None)
+    if pid:
+        try:
+            import psutil
+            descendants = psutil.Process(pid).children(recursive=True)
+        except Exception:
+            descendants = []
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    killed = 0
+    for child in descendants:
+        try:
+            child.kill()
+            killed += 1
+        except Exception:
+            pass
+    return killed
+
+
 def _safe_kill_and_close(
     proc: "subprocess.Popen[str]",
     cmd_name: str,
     *,
     wait_after_kill: float,
 ) -> None:
-    """Kill proc, close pipes, bounded wait — no exception escapes.
+    """Kill the process TREE, bounded wait — and never touch the pipes.
 
-    Without the explicit close() on stdout/stderr, Python's
-    _readerthread daemons stay blocked in fh.read() after the child
-    dies, and join() wedges.  Closing the parent FD causes the read()
-    to return EOF → thread exits cleanly.
+    THIS FUNCTION USED TO CLOSE THE PIPES, AND THAT IS WHAT HUNG (D36).
+    The old contract read: "Closing the parent FD causes the read() to return
+    EOF -> thread exits cleanly."  That is false once a reader is ALREADY
+    inside read().  `fh.read()` holds the file object's lock for its whole
+    duration and `fh.close()` must acquire the same lock, so the parent blocks
+    for exactly as long as the reader stays parked — i.e. forever, which is
+    the failure this module exists to prevent.
+
+    Measured live 2026-09-09 (agent 33323830039): a reuse turn sat in
+    `_safe_kill_and_close` -> `fh.close()` across three thread dumps 85+
+    seconds apart, while the same dumps held two `_readerthread`s stopped at
+    `subprocess.py:1599  buffer.append(fh.read())`.  Reproduced deterministically
+    by tests/unit/test_subprocess_safe.py::TestKillReachesDescendants.
+
+    So the pipes are LEFT ALONE.  The reader threads are daemons: once the
+    tree kill lets the pipe reach EOF they return and close the handles
+    themselves (CPython's `_readerthread` ends with `fh.close()`).  In the
+    pathological case where EOF never arrives they simply stay parked — a
+    leaked thread per timeout, which costs a little memory and blocks nobody.
+    That trade is the whole point: this path runs when something has ALREADY
+    gone wrong, and its one duty is to return.
+
+    No exception escapes: a cleanup that threw would surface as an exception
+    from run_probe instead of the documented None, bypassing every caller's
+    "tool missing or hung" branch.
     """
     logger.warning(
-        "subprocess %s exceeded timeout; killing + closing pipes "
-        "to unblock reader threads", cmd_name,
+        "subprocess %s exceeded timeout; killing the process tree "
+        "(pipes are left to their reader threads — closing them here "
+        "deadlocks against an in-progress read, D36)", cmd_name,
     )
-    try:
-        proc.kill()
-    except Exception:
-        pass
-    for fh in (proc.stdout, proc.stderr):
-        try:
-            if fh is not None and not fh.closed:
-                fh.close()
-        except Exception:
-            pass
+    killed = _kill_descendants_then_self(proc)
+    if killed:
+        logger.warning(
+            "subprocess %s: also killed %d descendant(s) that were holding "
+            "the inherited pipe handles open", cmd_name, killed,
+        )
     try:
         proc.wait(timeout=wait_after_kill)
     except subprocess.TimeoutExpired:
