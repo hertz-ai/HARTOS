@@ -327,8 +327,9 @@ def attach_for_tags(cap_tags, helper, executor, registry, attached_names):
     return n
 
 
-def attach_for_names(names, helper, executor, registry, attached_names):
-    """Attach the registry tools a turn NAMES outright.
+def attach_for_names(names, helper, executor, registry, attached_names,
+                     core_tools=None):
+    """Attach the tools a turn NAMES outright — registry AND core closures.
 
     Name-keyed sibling of ``attach_for_tags`` — same primitives
     (``create_endpoint_function`` + ``register_dual``), same idempotent
@@ -361,6 +362,43 @@ def attach_for_names(names, helper, executor, registry, attached_names):
     Unknown names are ignored rather than raising — a recipe may name a tool
     this deployment does not ship, and a turn that mentions one absent tool
     must still get the others.
+
+    ``core_tools`` — WHY THIS FUNCTION NEEDED A SECOND SOURCE.  Searching only
+    ``registry._tools`` made the whole mechanism inert, because the recipes
+    name CORE closures and the registry holds SERVICE tools.  Measured live
+    2026-09-07/08 across 23 agents driven through /chat (672,846 server.log
+    lines): ``Tier-1 named attach`` logged ZERO times, with ``turn attach
+    skipped`` also zero — the block ran every round and resolved nothing.
+    The registry holds 13 names on this deployment (payments x3,
+    seo_audit_score, gh_pr_open, crawl4ai, crawl4ai_crawl, pocket_tts x3,
+    acestep x3); of the tool names the recipes actually use, exactly ONE
+    (crawl4ai) is among them.
+
+    What the actions name instead, and how often FAB-GUARD saw it unrun:
+
+        execute_windows_or_android_command   35 named, 27 unrun (77%)
+        google_search                        13 named,  0 unrun ( 0%)
+        send_message_to_user                  5 named,  2 unrun (40%)
+        save_to_long_term_memory              5 named,  2 unrun (40%)
+
+    The 0% entry is the control: ``google_search`` is in MAIN_LEG_CORE_TOOLS
+    and therefore always-on, so it never needs attaching.  The 77% entry is
+    not in that frozenset, so on the MAIN leg it could not be called at all —
+    reuse_recipe.py hands the time and visual legs the FULL closure list
+    (:2142, :2250) but the main leg only ``main_leg_core_tools(...)`` (:2167).
+    That asymmetry is what stalled agent 89555447799 on action 3 for 21
+    minutes: the tool never ran, so StatusVerifier honestly kept returning
+    'pending' and the turn burned its whole round budget (tasks #770, #790).
+
+    Passing the core closures here fixes that WITHOUT widening
+    MAIN_LEG_CORE_TOOLS, which is deliberate: that frozenset is the always-on
+    set for every agent, and execute_windows_or_android_command runs arbitrary
+    OS commands.  Attaching it only for an action whose own recipe names it
+    keeps the blast radius at the action that asked for it.
+
+    Accepts the ``(name, description, func)`` tuples ``build_core_tool_closures``
+    already returns, so callers pass what they built — no second builder.
+    Omitted or empty is a strict no-op, leaving the registry path unchanged.
     """
     want = {str(n) for n in (names or []) if n}
     if not want:
@@ -378,6 +416,16 @@ def attach_for_names(names, helper, executor, registry, attached_names):
                           ep.get('description', f'{tool_name} {ep_name}'))
             attached_names.add(fn)
             n += 1
+
+    # Core closures: same selector, same idempotent set — only the SOURCE
+    # differs.  Kept inside this function rather than a sibling so there is one
+    # answer to "attach the tools this turn names", not two that can drift.
+    for core_name, core_desc, core_func in (core_tools or []):
+        if core_name not in want or core_name in attached_names:
+            continue
+        register_dual(helper, executor, core_func, core_name, core_desc)
+        attached_names.add(core_name)
+        n += 1
     return n
 
 

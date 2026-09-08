@@ -2322,6 +2322,13 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         # both layers see one attach ledger.
         assistant._hart_attached_tools = _attached_names
         assistant._hart_unlocked_tags = set(goal_tags)
+        # The FULL core closure list, for the per-turn named attach in
+        # get_agent_response — that runs in a different function, so the list
+        # built at L2141 is out of scope there and has to ride the agent like
+        # its two siblings above.  Full, not main_leg_core_tools(...): the
+        # whole point is to reach a closure the main leg was NOT given, only
+        # for an action whose own recipe names it (see attach_for_names).
+        assistant._hart_core_tools = core_tools
 
         def request_tools(need: str) -> str:
             from core.agent_tools import discover_and_attach
@@ -3557,11 +3564,21 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     from core.agent_tools import attach_for_names
                     _nn = attach_for_names(_named, helper, assistant,
                                            service_tool_registry,
-                                           assistant._hart_attached_tools)
-                    if _nn:
-                        current_app.logger.info(
-                            f"Tier-1 named attach: action {_aid} names "
-                            f"{_named} -> {_nn} tools")
+                                           assistant._hart_attached_tools,
+                                           core_tools=getattr(
+                                               assistant, '_hart_core_tools', None))
+                    # Log BOTH outcomes, not just the non-zero one.  The old
+                    # `if _nn:` made a resolved-nothing round indistinguishable
+                    # from a round that never ran, and that is exactly how this
+                    # hook read as healthy while doing nothing: measured live
+                    # 2026-09-07/08 over 23 driven agents, "Tier-1 named attach"
+                    # appeared ZERO times and no line said why.
+                    current_app.logger.info(
+                        f"Tier-1 named attach: action {_aid} names {_named} "
+                        f"-> {_nn} tools")
+                elif _aid:
+                    current_app.logger.debug(
+                        f"Tier-1 named attach: action {_aid} names no tool")
 
                 # (b) TAGS — unchanged fallback for capability families the
                 # recipe never mentions but the conversation drifted into.
