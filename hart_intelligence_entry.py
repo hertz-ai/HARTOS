@@ -10,7 +10,7 @@ import sys
 if sys.platform == 'win32':
     import asyncio as _asyncio_boot
     _asyncio_boot.set_event_loop_policy(_asyncio_boot.WindowsSelectorEventLoopPolicy())
-from core.subprocess_safe import no_window_kwargs
+from core.subprocess_safe import run_bounded
 import io
 if sys.platform == 'win32' and 'pytest' not in sys.modules:
     # Force UTF-8 encoding for stdout/stderr to prevent crashes with non-ASCII characters
@@ -360,7 +360,6 @@ import json
 import os
 import re
 import secrets
-import subprocess
 import logging
 import threading
 import atexit
@@ -3178,25 +3177,40 @@ def _handle_shell_command_tool(input_text: str) -> str:
         else:
             argv = ['/bin/sh', '-c', text]
 
+    # Bounded through core.subprocess_safe — a plain subprocess.run(timeout=30)
+    # CANNOT enforce that 30s on Windows.  When the deadline fires, run() kills
+    # the direct child and then calls process.communicate() a SECOND time with
+    # NO timeout (CPython subprocess.py:559) to drain the pipes.  kill() does
+    # not reach a grandchild, and a surviving grandchild holds the inherited
+    # stdout/stderr WRITE handles open, so the reader threads never see EOF and
+    # that drain blocks forever — the `except TimeoutExpired` below could never
+    # be reached.  Measured live 2026-09-09: agent 33323830039's reuse turn sat
+    # in exactly this frame for 21 minutes while llama-server was idle,
+    # wedging that user's whole chat turn (thread dump, D35).
+    #
+    # run_bounded kills AND explicitly closes the parent-side handles, which is
+    # what actually releases the readers; its boundedness is already proven by
+    # tests/unit/test_subprocess_safe.py::TestRunProbeBoundedness.  It also
+    # pins stdin=DEVNULL, so a command that unexpectedly reads stdin gets EOF
+    # instead of hanging — a second way this could freeze, also closed.
+    #
+    # argv still routes through the chosen shell, and run_bounded never passes
+    # shell=True, so the string is not double-parsed.  no_window_kwargs() is
+    # applied INSIDE run_bounded; repeating it here would be a second copy of
+    # that decision.
     try:
-        proc = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            # Do NOT pass shell=True — argv already routes through the
-            # chosen shell and shell=True would double-parse the string.
-            shell=False,
-         **no_window_kwargs())
-    except subprocess.TimeoutExpired:
-        return (
-            "Shell_Command timed out after 30s. For long-running work use "
-            "Execute_Coding_Task instead, which has a longer budget."
-        )
+        proc = run_bounded(argv, timeout=30)
     except FileNotFoundError as e:
         return f"Shell_Command: interpreter not found — {e}"
     except Exception as e:
         return f"Shell_Command error: {type(e).__name__}: {str(e)[:200]}"
+
+    # run_bounded never raises TimeoutExpired — it reports the kill this way.
+    if proc.timed_out:
+        return (
+            "Shell_Command timed out after 30s. For long-running work use "
+            "Execute_Coding_Task instead, which has a longer budget."
+        )
 
     out = (proc.stdout or '').strip()
     err = (proc.stderr or '').strip()

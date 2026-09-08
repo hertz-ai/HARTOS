@@ -9,11 +9,12 @@ Covers the three responsibilities:
   6. Handles missing interpreters and unexpected errors gracefully.
 """
 
-import subprocess
 import sys
 
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
+
+from core.subprocess_safe import BoundedResult
 
 # Import the handler directly — no need to spin up the full LangChain
 # tool wrapper for unit coverage.
@@ -31,6 +32,34 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _ran(returncode=0, stdout='', stderr=''):
+    """A run_bounded success — the child exited on its own, no kill.
+
+    The handler executes through core.subprocess_safe.run_bounded (D35: a
+    plain subprocess.run cannot enforce its own timeout on Windows, see
+    tests/unit/test_shell_tool_is_bounded.py).  These fakes therefore return
+    the REAL BoundedResult rather than a MagicMock, for two reasons:
+
+      * MagicMock auto-creates `.timed_out` as a truthy Mock, so every one
+        of these tests would silently take the timeout branch and assert
+        against the wrong string.
+      * The real class pins the shape, so a future change to BoundedResult
+        breaks these tests instead of letting the handler drift.
+    """
+    return BoundedResult(returncode=returncode, stdout=stdout,
+                         stderr=stderr, timed_out=False)
+
+
+def _timed_out():
+    """What run_bounded returns after killing a child that blew its budget.
+
+    run_bounded NEVER raises TimeoutExpired — it kills, closes the
+    parent-side pipes so the reader threads unblock, and reports the kill
+    through this flag with empty output.
+    """
+    return BoundedResult(returncode=-1, stdout='', stderr='', timed_out=True)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Happy path: echo + exit code
 # ═══════════════════════════════════════════════════════════════════════════
@@ -45,25 +74,23 @@ class TestShellCommandHappyPath:
         result = _handle_shell_command_tool(None)
         assert 'empty input' in result.lower()
 
-    @patch('hart_intelligence_entry.subprocess.run')
+    @patch('hart_intelligence_entry.run_bounded')
     def test_simple_echo_returns_stdout_and_exit_code(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout='hello world\n', stderr=''
-        )
+        mock_run.return_value = _ran(returncode=0, stdout='hello world\n')
         result = _handle_shell_command_tool('echo hello world')
         assert 'Exit code: 0' in result
         assert 'hello world' in result
 
-    @patch('hart_intelligence_entry.subprocess.run')
+    @patch('hart_intelligence_entry.run_bounded')
     def test_nonzero_exit_surfaces_returncode(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=1, stdout='', stderr='nope')
+        mock_run.return_value = _ran(returncode=1, stderr='nope')
         result = _handle_shell_command_tool('false')
         assert 'Exit code: 1' in result
         assert 'nope' in result
 
-    @patch('hart_intelligence_entry.subprocess.run')
+    @patch('hart_intelligence_entry.run_bounded')
     def test_empty_output_reports_no_output(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout='', stderr='')
+        mock_run.return_value = _ran(returncode=0)
         result = _handle_shell_command_tool('true')
         assert '(no output)' in result
 
@@ -74,18 +101,16 @@ class TestShellCommandHappyPath:
 
 
 class TestShellCommandShellSelector:
-    # Faking sys.platform = 'win32' on a Linux host also drags
-    # core.subprocess_safe.no_window_kwargs() down its Windows branch, where it
-    # calls subprocess.STARTUPINFO() -- a name that does not exist on Linux. The
-    # kwargs are splatted INTO the subprocess.run(...) call, so the AttributeError
-    # fires before run() is ever entered and the handler's `except Exception`
-    # swallows it: mock_run.call_args stayed None and the failure read as
-    # "'NoneType' object has no attribute 'args'". These two tests are about
-    # shell SELECTION, not about Windows console flags, so stub that helper out.
-    @patch('hart_intelligence_entry.no_window_kwargs', return_value={})
-    @patch('hart_intelligence_entry.subprocess.run')
-    def test_default_on_windows_uses_cmd(self, mock_run, _no_window):
-        mock_run.return_value = MagicMock(returncode=0, stdout='x', stderr='')
+    # These two used to need `no_window_kwargs` stubbed out: faking
+    # sys.platform='win32' on a Linux host dragged that helper down its Windows
+    # branch, where subprocess.STARTUPINFO() does not exist, and the resulting
+    # AttributeError was swallowed by the handler's `except Exception` (the
+    # failure read as "'NoneType' object has no attribute 'args'").
+    # Since D35 the console flags are applied INSIDE run_bounded, which is
+    # mocked here, so that whole hazard is gone with no stub needed.
+    @patch('hart_intelligence_entry.run_bounded')
+    def test_default_on_windows_uses_cmd(self, mock_run):
+        mock_run.return_value = _ran(returncode=0, stdout='x')
         with patch.object(sys, 'platform', 'win32'):
             _handle_shell_command_tool('dir')
         argv = mock_run.call_args.args[0]
@@ -93,9 +118,9 @@ class TestShellCommandShellSelector:
         assert argv[1] == '/c'
         assert argv[2] == 'dir'
 
-    @patch('hart_intelligence_entry.subprocess.run')
+    @patch('hart_intelligence_entry.run_bounded')
     def test_default_on_linux_uses_sh(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout='x', stderr='')
+        mock_run.return_value = _ran(returncode=0, stdout='x')
         with patch.object(sys, 'platform', 'linux'):
             _handle_shell_command_tool('ls')
         argv = mock_run.call_args.args[0]
@@ -103,10 +128,9 @@ class TestShellCommandShellSelector:
         assert argv[1] == '-c'
         assert argv[2] == 'ls'
 
-    @patch('hart_intelligence_entry.no_window_kwargs', return_value={})
-    @patch('hart_intelligence_entry.subprocess.run')
-    def test_powershell_selector_forces_powershell(self, mock_run, _no_window):
-        mock_run.return_value = MagicMock(returncode=0, stdout='x', stderr='')
+    @patch('hart_intelligence_entry.run_bounded')
+    def test_powershell_selector_forces_powershell(self, mock_run):
+        mock_run.return_value = _ran(returncode=0, stdout='x')
         with patch.object(sys, 'platform', 'win32'):
             _handle_shell_command_tool('powershell: Get-Process')
         argv = mock_run.call_args.args[0]
@@ -115,9 +139,9 @@ class TestShellCommandShellSelector:
         assert 'Get-Process' in argv[-1]
         assert 'powershell:' not in argv[-1]
 
-    @patch('hart_intelligence_entry.subprocess.run')
+    @patch('hart_intelligence_entry.run_bounded')
     def test_bash_selector_forces_bash(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout='x', stderr='')
+        mock_run.return_value = _ran(returncode=0, stdout='x')
         with patch.object(sys, 'platform', 'linux'):
             _handle_shell_command_tool('bash: ls -la ~')
         argv = mock_run.call_args.args[0]
@@ -147,7 +171,7 @@ class TestShellCommandDenylist:
         'Format-Volume -DriveLetter C',
         'Remove-Item -Recurse -Force C:\\Windows',
     ])
-    @patch('hart_intelligence_entry.subprocess.run')
+    @patch('hart_intelligence_entry.run_bounded')
     def test_destructive_denied(self, mock_run, cmd):
         result = _handle_shell_command_tool(cmd)
         assert 'refused' in result.lower()
@@ -164,9 +188,9 @@ class TestShellCommandDenylist:
         'python script.py',
         'ls -la /tmp',
     ])
-    @patch('hart_intelligence_entry.subprocess.run')
+    @patch('hart_intelligence_entry.run_bounded')
     def test_benign_allowed(self, mock_run, cmd):
-        mock_run.return_value = MagicMock(returncode=0, stdout='ok', stderr='')
+        mock_run.return_value = _ran(returncode=0, stdout='ok')
         result = _handle_shell_command_tool(cmd)
         assert 'refused' not in result.lower()
         mock_run.assert_called_once()
@@ -202,7 +226,7 @@ class TestShellCommandHomoglyphBypass:
         # Full-width del /s /q
         'ｄｅｌ /s /q Ｃ:\\Users',
     ])
-    @patch('hart_intelligence_entry.subprocess.run')
+    @patch('hart_intelligence_entry.run_bounded')
     def test_homoglyph_bypass_blocked(self, mock_run, cmd):
         result = _handle_shell_command_tool(cmd)
         assert 'refused' in result.lower(), f'bypass slipped through: {cmd!r}'
@@ -221,20 +245,20 @@ class TestShellCommandHomoglyphBypass:
         # Emoji in echo
         'echo 🚀 deploy',
     ])
-    @patch('hart_intelligence_entry.subprocess.run')
+    @patch('hart_intelligence_entry.run_bounded')
     def test_legitimate_unicode_still_allowed(self, mock_run, cmd):
-        mock_run.return_value = MagicMock(returncode=0, stdout='ok', stderr='')
+        mock_run.return_value = _ran(returncode=0, stdout='ok')
         result = _handle_shell_command_tool(cmd)
         assert 'refused' not in result.lower()
         mock_run.assert_called_once()
 
-    @patch('hart_intelligence_entry.subprocess.run')
+    @patch('hart_intelligence_entry.run_bounded')
     def test_raw_text_is_executed_not_normalized(self, mock_run):
         """If the raw command contains legitimate unicode filename chars,
         subprocess must receive the RAW bytes, not the NFKC-normalized
         version. Otherwise 'cat ﬁle.txt' (U+FB01) would execute as
         'cat file.txt' and fail to find the real ligature file."""
-        mock_run.return_value = MagicMock(returncode=0, stdout='ok', stderr='')
+        mock_run.return_value = _ran(returncode=0, stdout='ok')
         cmd = 'cat ﬁle.txt'
         _handle_shell_command_tool(cmd)
         call_args = mock_run.call_args
@@ -246,7 +270,7 @@ class TestShellCommandHomoglyphBypass:
             f'expected ligature ﬁ in {executed!r}'
         )
 
-    @patch('hart_intelligence_entry.subprocess.run')
+    @patch('hart_intelligence_entry.run_bounded')
     def test_denylist_check_is_case_insensitive_after_normalize(self, mock_run):
         """Mixed-case full-width should still hit the denylist."""
         result = _handle_shell_command_tool('Ｒm -RF ~')
@@ -260,16 +284,32 @@ class TestShellCommandHomoglyphBypass:
 
 
 class TestShellCommandTimeout:
-    @patch('hart_intelligence_entry.subprocess.run',
-           side_effect=subprocess.TimeoutExpired(cmd='sleep', timeout=30))
+    @patch('hart_intelligence_entry.run_bounded')
     def test_timeout_returns_explanation(self, mock_run):
+        # run_bounded reports a killed child via the flag, never by raising:
+        # it has to survive the kill to close the pipes (D35).
+        mock_run.return_value = _timed_out()
         result = _handle_shell_command_tool('sleep 60')
         assert 'timed out' in result.lower()
         assert '30s' in result
 
-    @patch('hart_intelligence_entry.subprocess.run')
+    @patch('hart_intelligence_entry.run_bounded')
+    def test_timeout_is_not_reported_as_a_failed_exit(self, mock_run):
+        """The kill must not be laundered into an ordinary non-zero exit.
+
+        BoundedResult carries returncode=-1 on timeout.  A handler that
+        checked only the return code would tell the agent "Exit code: -1"
+        with no output — indistinguishable from a command that genuinely
+        failed, and it would lose the "use Execute_Coding_Task" steer.
+        """
+        mock_run.return_value = _timed_out()
+        result = _handle_shell_command_tool('sleep 60')
+        assert 'Exit code' not in result
+        assert 'Execute_Coding_Task' in result
+
+    @patch('hart_intelligence_entry.run_bounded')
     def test_timeout_arg_is_30_seconds(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout='', stderr='')
+        mock_run.return_value = _ran(returncode=0)
         _handle_shell_command_tool('echo x')
         assert mock_run.call_args.kwargs.get('timeout') == 30
 
@@ -280,21 +320,18 @@ class TestShellCommandTimeout:
 
 
 class TestShellCommandTruncation:
-    @patch('hart_intelligence_entry.subprocess.run')
+    @patch('hart_intelligence_entry.run_bounded')
     def test_long_stdout_truncated_to_2000_chars(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout='A' * 5000, stderr=''
-        )
+        mock_run.return_value = _ran(returncode=0, stdout='A' * 5000)
         result = _handle_shell_command_tool('cat huge.log')
         # The 2000-char cap per stream means body ≤ 2000 chars of 'A's
         a_count = result.count('A')
         assert a_count <= 2000
 
-    @patch('hart_intelligence_entry.subprocess.run')
+    @patch('hart_intelligence_entry.run_bounded')
     def test_stderr_surfaces_alongside_stdout(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=1, stdout='out data', stderr='error data'
-        )
+        mock_run.return_value = _ran(returncode=1, stdout='out data',
+                                     stderr='error data')
         result = _handle_shell_command_tool('mixed')
         assert 'out data' in result
         assert '[stderr]' in result
@@ -307,13 +344,16 @@ class TestShellCommandTruncation:
 
 
 class TestShellCommandErrorHandling:
-    @patch('hart_intelligence_entry.subprocess.run',
+    # run_bounded documents that FileNotFoundError and other OSErrors from
+    # Popen PROPAGATE — the caller decides "tool missing" vs "tool failed" —
+    # so both handlers below are still reached unchanged after the migration.
+    @patch('hart_intelligence_entry.run_bounded',
            side_effect=FileNotFoundError('pwsh not found'))
     def test_missing_interpreter_returns_explanation(self, mock_run):
         result = _handle_shell_command_tool('powershell: Get-Process')
         assert 'interpreter not found' in result.lower()
 
-    @patch('hart_intelligence_entry.subprocess.run',
+    @patch('hart_intelligence_entry.run_bounded',
            side_effect=OSError('permission denied'))
     def test_unexpected_oserror_is_wrapped(self, mock_run):
         result = _handle_shell_command_tool('some-cmd')
