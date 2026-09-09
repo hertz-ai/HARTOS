@@ -515,7 +515,26 @@ def init_social(app):
             "HevolveSocial: boot verification did not pass, so gossip, LAN "
             "auto-discovery and the integrity round are ALL disabled on this "
             "node. Peering, federation and challenge retention will not run.")
-    if _boot_verified:
+
+    # SECOND, independent question: may this PROCESS start daemons at all?
+    # init_social runs from hart_intelligence_entry's module body, so anything
+    # that imports the chat entry point boots a node — gossip, a UDP socket, a
+    # tree-walking integrity thread, an outbound registry call.  A process that
+    # only reads or exercises the code must be able to opt out; the unit suite
+    # could not complete until it did (see should_start_background_services).
+    # Same warn-loudly rule as the boot-verification branch above: silence here
+    # is what made "gossip fine" and "gossip never started" indistinguishable.
+    from core.config_cache import should_start_background_services
+    _start_services = should_start_background_services()
+    if not _start_services:
+        logger.warning(
+            "HevolveSocial: HEVOLVE_START_BACKGROUND_SERVICES is off, so "
+            "gossip, LAN auto-discovery, the runtime integrity monitor, the "
+            "sync drain, the coding agent, registry registration and the node "
+            "watchdog are ALL skipped in this process. Blueprints and routes "
+            "are still registered. Unset the flag for a real node.")
+
+    if _boot_verified and _start_services:
         try:
             from .peer_discovery import gossip
             gossip.start()
@@ -574,7 +593,7 @@ def init_social(app):
     # nothing else.  With parent_tier_url now resolving to a live genesis
     # central on flat nodes (task #629), the loop must exist for the resolver
     # to matter.
-    if _boot_verified:
+    if _boot_verified and _start_services:
         try:
             from .sync_engine import sync_engine
             sync_engine.start_background_sync()
@@ -591,7 +610,9 @@ def init_social(app):
     # the daemon itself (no idle agents → early return; budget gate;
     # 30s poll cadence).  Servers that don't want it set explicitly.
     import os as _os2
-    if _os2.environ.get('HEVOLVE_CODING_AGENT_ENABLED', 'true').lower() == 'true':
+    if (_start_services
+            and _os2.environ.get('HEVOLVE_CODING_AGENT_ENABLED',
+                                 'true').lower() == 'true'):
         try:
             from integrations.coding_agent import init_coding_agent
             init_coding_agent(app)
@@ -618,7 +639,7 @@ def init_social(app):
     # Register with central registry if configured
     import os
     registry_url = os.environ.get('HEVOLVE_REGISTRY_URL', '')
-    if registry_url and _boot_verified:
+    if registry_url and _boot_verified and _start_services:
         try:
             from .integrity_service import IntegrityService
             from .peer_discovery import gossip as _gossip
@@ -630,155 +651,156 @@ def init_social(app):
             logger.debug(f"HevolveSocial registry registration skipped: {e}")
 
     # ── NodeWatchdog - start LAST, monitors all daemon threads ──
-    try:
-        from security.node_watchdog import start_watchdog
-        watchdog = start_watchdog()
+    if _start_services:
+        try:
+            from security.node_watchdog import start_watchdog
+            watchdog = start_watchdog()
 
-        # Register gossip — interval must exceed worst-case gossip round
-        # (3 peers × 10s timeout = 30s max) to avoid false FROZEN alerts.
-        if _boot_verified:
+            # Register gossip — interval must exceed worst-case gossip round
+            # (3 peers × 10s timeout = 30s max) to avoid false FROZEN alerts.
+            if _boot_verified:
+                try:
+                    from .peer_discovery import gossip as _g
+                    if _g._running:
+                        watchdog.register('gossip', expected_interval=120,
+                                          restart_fn=_g.start, stop_fn=_g.stop)
+                except Exception:
+                    pass
+
+            # Register auto-discovery
             try:
-                from .peer_discovery import gossip as _g
-                if _g._running:
-                    watchdog.register('gossip', expected_interval=120,
-                                      restart_fn=_g.start, stop_fn=_g.stop)
+                from .peer_discovery import auto_discovery as _ad
+                if _ad._running:
+                    watchdog.register('auto_discovery',
+                                      expected_interval=_ad._beacon_interval,
+                                      restart_fn=_ad.start, stop_fn=_ad.stop)
             except Exception:
                 pass
 
-        # Register auto-discovery
-        try:
-            from .peer_discovery import auto_discovery as _ad
-            if _ad._running:
-                watchdog.register('auto_discovery',
-                                  expected_interval=_ad._beacon_interval,
-                                  restart_fn=_ad.start, stop_fn=_ad.stop)
-        except Exception:
-            pass
+            # Register runtime monitor.  Gated on the monitor actually running,
+            # not on `_boot_manifest` — the monitor now also arms in
+            # boot-baseline mode on nodes with no manifest, and those heartbeats
+            # need watching just the same.
+            try:
+                from security.runtime_monitor import get_monitor
+                mon = get_monitor()
+                if mon and mon._running:
+                    watchdog.register('runtime_monitor',
+                                      expected_interval=mon._check_interval,
+                                      restart_fn=mon.start, stop_fn=mon.stop)
+            except Exception:
+                pass
 
-        # Register runtime monitor.  Gated on the monitor actually running,
-        # not on `_boot_manifest` — the monitor now also arms in
-        # boot-baseline mode on nodes with no manifest, and those heartbeats
-        # need watching just the same.
-        try:
-            from security.runtime_monitor import get_monitor
-            mon = get_monitor()
-            if mon and mon._running:
-                watchdog.register('runtime_monitor',
-                                  expected_interval=mon._check_interval,
-                                  restart_fn=mon.start, stop_fn=mon.stop)
-        except Exception:
-            pass
+            # Register sync engine
+            try:
+                from .sync_engine import sync_engine as _se
+                if _se._running:
+                    watchdog.register('sync_engine',
+                                      expected_interval=_se._interval,
+                                      restart_fn=_se.start_background_sync,
+                                      stop_fn=_se.stop_background_sync)
+            except Exception:
+                pass
 
-        # Register sync engine
-        try:
-            from .sync_engine import sync_engine as _se
-            if _se._running:
-                watchdog.register('sync_engine',
-                                  expected_interval=_se._interval,
-                                  restart_fn=_se.start_background_sync,
-                                  stop_fn=_se.stop_background_sync)
-        except Exception:
-            pass
+            # Register agent daemon
+            try:
+                from integrations.agent_engine.agent_daemon import agent_daemon as _agent_d
+                if _agent_d._running:
+                    watchdog.register('agent_daemon',
+                                      expected_interval=_agent_d._interval,
+                                      restart_fn=_agent_d.start, stop_fn=_agent_d.stop)
+            except Exception:
+                pass
 
-        # Register agent daemon
-        try:
-            from integrations.agent_engine.agent_daemon import agent_daemon as _agent_d
-            if _agent_d._running:
-                watchdog.register('agent_daemon',
-                                  expected_interval=_agent_d._interval,
-                                  restart_fn=_agent_d.start, stop_fn=_agent_d.stop)
-        except Exception:
-            pass
+            # Register coding daemon
+            try:
+                from integrations.coding_agent.coding_daemon import coding_daemon as _coding_d
+                if _coding_d._running:
+                    watchdog.register('coding_daemon',
+                                      expected_interval=_coding_d._interval,
+                                      restart_fn=_coding_d.start, stop_fn=_coding_d.stop)
+            except Exception:
+                pass
 
-        # Register coding daemon
-        try:
-            from integrations.coding_agent.coding_daemon import coding_daemon as _coding_d
-            if _coding_d._running:
-                watchdog.register('coding_daemon',
-                                  expected_interval=_coding_d._interval,
-                                  restart_fn=_coding_d.start, stop_fn=_coding_d.stop)
-        except Exception:
-            pass
+            # Register model lifecycle manager — interval must exceed worst-case
+            # tick duration (nvidia-smi 5s + pressure checks + federation report).
+            try:
+                from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+                _lifecycle = get_model_lifecycle_manager()
+                _lifecycle.start()
+                if _lifecycle._running:
+                    watchdog.register('model_lifecycle',
+                                      expected_interval=max(_lifecycle._interval * 3, 60),
+                                      restart_fn=_lifecycle.start,
+                                      stop_fn=_lifecycle.stop)
+                    logger.info("Model lifecycle manager started")
+            except Exception as e:
+                logger.debug(f"Model lifecycle manager start skipped: {e}")
 
-        # Register model lifecycle manager — interval must exceed worst-case
-        # tick duration (nvidia-smi 5s + pressure checks + federation report).
-        try:
-            from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
-            _lifecycle = get_model_lifecycle_manager()
-            _lifecycle.start()
-            if _lifecycle._running:
-                watchdog.register('model_lifecycle',
-                                  expected_interval=max(_lifecycle._interval * 3, 60),
-                                  restart_fn=_lifecycle.start,
-                                  stop_fn=_lifecycle.stop)
-                logger.info("Model lifecycle manager started")
+            # Distributed worker loop — claims tasks from shared Redis queue.
+            # Self-gates: start() is a no-op when Redis is unreachable.
+            try:
+                from integrations.distributed_agent.worker_loop import worker_loop as _wl
+                _wl.start()
+                if _wl._running:
+                    watchdog.register('distributed_worker',
+                                      expected_interval=_wl._interval * 4,
+                                      restart_fn=_wl.start,
+                                      stop_fn=_wl.stop)
+                    logger.info("Distributed worker loop started")
+            except Exception as e:
+                logger.debug(f"Distributed worker loop start skipped: {e}")
+
+            # Hive benchmark prover — rotates model benchmarks every 6 hours
+            # and publishes baseline+score deltas into the ledger.
+            try:
+                from integrations.agent_engine.hive_benchmark_prover import (
+                    get_benchmark_prover, _LOOP_INTERVAL_SECONDS as _hbp_interval,
+                )
+                _hbp = get_benchmark_prover()
+                _hbp.start_continuous_loop()
+                if _hbp._loop_running:
+                    watchdog.register('hive_benchmark_prover',
+                                      expected_interval=_hbp_interval * 2,
+                                      restart_fn=_hbp.start_continuous_loop,
+                                      stop_fn=_hbp.stop)
+                    logger.info("Hive benchmark prover started")
+            except Exception as e:
+                logger.debug(f"Hive benchmark prover start skipped: {e}")
+
+            # Outbound announcement broadcaster — listens for
+            # hive.benchmark.published events and pushes the proof to
+            # externally-configured channel destinations (Discord /
+            # Telegram / Slack / etc.) so the flywheel's self-advertising
+            # leg escapes the HARTOS-only feed.  Idempotent; safe to call
+            # before the events registry exists (returns False and the
+            # next run-loop tick can retry).
+            try:
+                from integrations.channels.announcement_broadcaster import (
+                    register_announcement_subscriber)
+                register_announcement_subscriber()
+            except Exception as e:
+                logger.debug(f"Announcement broadcaster wire-up skipped: {e}")
+
+            # On-platform content distribution.  announce_new_content pushes
+            # pages OFF platform and is consent-gated; it also had no caller,
+            # so no page was ever distributed anywhere.  This publishes new
+            # pages to our OWN feed, from which FederationManager pushes them
+            # to every instance that follows this one -- the research corpus
+            # reaches the node network instead of stopping at the website.
+            # Idempotent; the thread is a daemon so it never blocks shutdown.
+            try:
+                from integrations.channels.announcement_broadcaster import (
+                    start_content_distribution)
+                start_content_distribution()
+            except Exception as e:
+                logger.debug(f"Content distribution wire-up skipped: {e}")
+
+            watchdog.start()
+            logger.info(f"NodeWatchdog started: monitoring "
+                        f"{len(watchdog._threads)} threads")
         except Exception as e:
-            logger.debug(f"Model lifecycle manager start skipped: {e}")
-
-        # Distributed worker loop — claims tasks from shared Redis queue.
-        # Self-gates: start() is a no-op when Redis is unreachable.
-        try:
-            from integrations.distributed_agent.worker_loop import worker_loop as _wl
-            _wl.start()
-            if _wl._running:
-                watchdog.register('distributed_worker',
-                                  expected_interval=_wl._interval * 4,
-                                  restart_fn=_wl.start,
-                                  stop_fn=_wl.stop)
-                logger.info("Distributed worker loop started")
-        except Exception as e:
-            logger.debug(f"Distributed worker loop start skipped: {e}")
-
-        # Hive benchmark prover — rotates model benchmarks every 6 hours
-        # and publishes baseline+score deltas into the ledger.
-        try:
-            from integrations.agent_engine.hive_benchmark_prover import (
-                get_benchmark_prover, _LOOP_INTERVAL_SECONDS as _hbp_interval,
-            )
-            _hbp = get_benchmark_prover()
-            _hbp.start_continuous_loop()
-            if _hbp._loop_running:
-                watchdog.register('hive_benchmark_prover',
-                                  expected_interval=_hbp_interval * 2,
-                                  restart_fn=_hbp.start_continuous_loop,
-                                  stop_fn=_hbp.stop)
-                logger.info("Hive benchmark prover started")
-        except Exception as e:
-            logger.debug(f"Hive benchmark prover start skipped: {e}")
-
-        # Outbound announcement broadcaster — listens for
-        # hive.benchmark.published events and pushes the proof to
-        # externally-configured channel destinations (Discord /
-        # Telegram / Slack / etc.) so the flywheel's self-advertising
-        # leg escapes the HARTOS-only feed.  Idempotent; safe to call
-        # before the events registry exists (returns False and the
-        # next run-loop tick can retry).
-        try:
-            from integrations.channels.announcement_broadcaster import (
-                register_announcement_subscriber)
-            register_announcement_subscriber()
-        except Exception as e:
-            logger.debug(f"Announcement broadcaster wire-up skipped: {e}")
-
-        # On-platform content distribution.  announce_new_content pushes
-        # pages OFF platform and is consent-gated; it also had no caller,
-        # so no page was ever distributed anywhere.  This publishes new
-        # pages to our OWN feed, from which FederationManager pushes them
-        # to every instance that follows this one -- the research corpus
-        # reaches the node network instead of stopping at the website.
-        # Idempotent; the thread is a daemon so it never blocks shutdown.
-        try:
-            from integrations.channels.announcement_broadcaster import (
-                start_content_distribution)
-            start_content_distribution()
-        except Exception as e:
-            logger.debug(f"Content distribution wire-up skipped: {e}")
-
-        watchdog.start()
-        logger.info(f"NodeWatchdog started: monitoring "
-                    f"{len(watchdog._threads)} threads")
-    except Exception as e:
-        logger.debug(f"NodeWatchdog start skipped: {e}")
+            logger.debug(f"NodeWatchdog start skipped: {e}")
 
     # Sync trained agents as social users on first request
     @app.before_request
