@@ -5118,61 +5118,7 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             f"[REUSE] Action {current_action_id} already TERMINATED (idempotent)")
 
     current_app.logger.info(f'[REUSE] Action {current_action_id} TERMINATED, advancing')
-    # CANONICAL SCHEDULER (#779).  The session's SmartLedger task graph decides
-    # what runs next — not `current_action + 1`.  That ledger is already built
-    # for this session at L1203 (create_ledger_from_actions) and was, until
-    # now, never asked anything: 118 `current_action` references against 6
-    # ledger references, measured 2026-09-09.  A hand-rolled LINEAR scheduler
-    # beside a task GRAPH is the parallel system this removes.
-    #
-    # Behaviour-preserving: priority = 100 - action_id, so for an ordinary
-    # linear recipe get_next_task() yields 1,2,3… exactly as the counter did.
-    # It additionally honours prerequisites and can express parallelism, which
-    # a counter cannot.  Pinned by
-    # tests/unit/test_reuse_advances_via_ledger_graph.py.
-    #
-    # PENDING -> COMPLETED is ILLEGAL (agent_ledger core.py:628): complete_task
-    # on a PENDING task logs "Invalid transition" and returns False, leaving it
-    # PENDING — so get_next_task() would hand back action 1 forever, for every
-    # agent.  Hence IN_PROGRESS first here, and again on the task we hand out.
-    # No `+1` fallback: the ledger is constructed unconditionally upstream, so
-    # a missing one is a real defect that must be loud, not silently degraded
-    # onto the very path this replaces.
-    _led = user_ledgers.get(user_prompt)
-    if _led is None:
-        current_app.logger.error(
-            f'[REUSE-LEDGER] no ledger for {user_prompt} — cannot advance '
-            f'action {current_action_id}; refusing rather than guessing +1')
-        return None, False
-    try:
-        _cur_task = _led.get_task(f'action_{current_action_id}')
-        if _cur_task is not None:
-            if _cur_task.status == LedgerTaskStatus.PENDING:
-                _led.update_task_status(f'action_{current_action_id}',
-                                        LedgerTaskStatus.IN_PROGRESS)
-            _led.complete_task(f'action_{current_action_id}')
-        _nxt = _led.get_next_task()
-    except Exception as _led_err:
-        current_app.logger.error(
-            f'[REUSE-LEDGER] advance failed for action {current_action_id}: '
-            f'{_led_err}')
-        return None, False
-
-    if _nxt is None:
-        # Graph says nothing is ready: every task terminal == all actions done.
-        next_id = len(user_tasks[user_prompt].actions) + 1
-    else:
-        next_id = getattr(_nxt, 'recipe_action_id', None)
-        if next_id is None:
-            current_app.logger.error(
-                f'[REUSE-LEDGER] task {_nxt.task_id} carries no '
-                f'recipe_action_id — cannot map it to a recipe action')
-            return None, False
-        if _nxt.status == LedgerTaskStatus.PENDING:
-            _led.update_task_status(_nxt.task_id, LedgerTaskStatus.IN_PROGRESS)
-    current_app.logger.info(
-        f'[REUSE-LEDGER] graph selected action {next_id} after '
-        f'{current_action_id} for session {user_prompt}')
+    next_id = current_action_id + 1
     user_tasks[user_prompt].current_action = next_id
     # Stamp the evidence watermark HERE — the one site that writes
     # current_action — so the window and the action id cannot disagree.
