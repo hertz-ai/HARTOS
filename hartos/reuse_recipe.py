@@ -1676,9 +1676,15 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             visual_context = 'User\'s camera is not on. no visual data'
         return visual_context
 
+    # ONE description string.  The named-attach hand-over at L2392 builds this
+    # closure's (name, desc, func) triple from the same constant, so the schema
+    # the per-turn attach shows the model can never drift from the one
+    # register_for_llm shows it.
+    _EXEC_CMD_DESC = ("Processes user-defined commands on a personal Windows "
+                      "or Android system.")
+
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="tool",
-                             description="Processes user-defined commands on a personal Windows or Android system.")
+    @helper.register_for_llm(api_style="tool", description=_EXEC_CMD_DESC)
     @log_tool_execution
     async def execute_windows_or_android_command(
             instructions: Annotated[str, "Command in plain English to execute on the user's computer or mobile device"],
@@ -2389,7 +2395,27 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         # its two siblings above.  Full, not main_leg_core_tools(...): the
         # whole point is to reach a closure the main leg was NOT given, only
         # for an action whose own recipe names it (see attach_for_names).
-        assistant._hart_core_tools = core_tools
+        # ...plus the one named tool the builder cannot hold.
+        # execute_windows_or_android_command is a nested def in THIS function
+        # (L1683) closing over 33 locals — assistant, helper, final_recipe,
+        # recipes, user_tasks, prompt_id — so build_core_tool_closures(ctx),
+        # which only gets a ctx dict, cannot construct it.  It was therefore in
+        # neither list attach_for_names searches, and 28 saved recipes name it:
+        # measured live 2026-09-09, "named attach ... -> 0 tools" 5/5 for this
+        # name (google_search and send_message_to_user, which ARE in the
+        # builder, resolved 1/1).  The action then wedges honestly — 15:14:31
+        # FAB-GUARD unrun=['execute_windows_or_android_command'], and the agent
+        # itself said "I don't have the execute_windows_or_android_command tool
+        # available".  Handed over here, in the (name, desc, func) shape
+        # attach_for_names already unpacks (core/agent_tools.py:423), because
+        # here is the only scope where the closure exists.
+        # Still named-attach ONLY: this runs arbitrary OS commands, and
+        # attach_for_names' own docstring keeps the blast radius at the action
+        # whose recipe asked for it.  Nothing is added to the main leg.
+        assistant._hart_core_tools = core_tools + [
+            ('execute_windows_or_android_command', _EXEC_CMD_DESC,
+             execute_windows_or_android_command),
+        ]
         # The FULL recipe list, so the per-turn hook in get_agent_response can
         # narrow the system prompt to the action actually being dispatched
         # (see _recipe_section_for_action).  Same scope problem as above: the
