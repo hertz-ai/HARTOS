@@ -167,10 +167,12 @@ class TestBudgetIsSpentPerAction:
 
     def test_both_loops_reset_the_counter_when_the_action_advances(self):
         src = _source()
-        assert src.count('_action_rounds = 0') == 4, (
-            'each loop needs its initialisation AND its reset-on-advance '
-            '(2 sites x 2 loops); a loop missing the reset spends the '
-            "successor action's allowance on its predecessor")
+        assert src.count('_action_rounds = 0') == 6, (
+            'each loop needs three: initialisation, reset-on-advance, and '
+            'reset-on-progress (3 sites x 2 loops).  A loop missing the '
+            "advance reset spends the successor action's allowance on its "
+            'predecessor; one missing the progress reset caps an action whose '
+            'tools are running (measured 05:55:50, 0.445 s after the tool ran)')
         assert src.count('_action_rounds >= _REUSE_ROUNDS_PER_ACTION') == 2, (
             'both reuse loops must bound the CURRENT action, not only the turn')
 
@@ -178,3 +180,108 @@ class TestBudgetIsSpentPerAction:
         """The budget path must not raise on a missing session."""
         rr = pytest.importorskip('hartos.reuse_recipe')
         assert rr._reuse_current_action_id('no_such_prompt') is None
+
+
+class TestProgressResetsTheAllowance:
+    """A cap that stops STALLS must not stop WORK.
+
+    Measured 2026-09-09 on agent 33323830039, the drive after the per-action
+    split landed.  Action 2 got its own allowance (`turn spend 12/24`, which
+    is the split working), used it, and the cap fired:
+
+        05:55:49,887  VLM loop finished: 2 actions in 9.2s (exit_reason=done)
+        05:55:50,122  [725-SYNC] ... spliced 2 real tool answer(s)
+        05:55:50,332  [REUSE-ROUNDS] while1 action 2/2 used its 12 rounds
+                      without completing — ending turn (turn spend 12/24)
+
+    The tool had executed 0.445 s earlier and its answers were already in the
+    group log.  The action was moving; the budget ended it anyway.  New tool
+    evidence now earns a fresh window, bounded by the unchanged turn ceiling.
+    """
+
+    def test_counts_results_not_proposals(self):
+        """A tool_call is the model ASKING; only a RESULT is progress.
+
+        Counting proposals would make the budget unable to end the exact
+        stall it exists for — a model that keeps proposing and never runs
+        anything would extend its own allowance forever.  Same distinction
+        the fabrication gate draws.
+        """
+        rr = pytest.importorskip('hartos.reuse_recipe')
+
+        class _Chat:
+            agents = []
+
+            def __init__(self, messages):
+                self.messages = messages
+
+        proposals_only = _Chat([
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'a1', 'function': {'name': 'execute_windows_or_android_command'}}]},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'a2', 'function': {'name': 'execute_windows_or_android_command'}}]},
+        ])
+        assert rr._reuse_evidence_count(proposals_only) == 0, (
+            'two unexecuted proposals counted as progress — that is the '
+            'stall the budget must be able to end')
+
+        with_result = _Chat(list(proposals_only.messages) + [
+            {'role': 'tool', 'name': 'execute_windows_or_android_command',
+             'content': 'Directory of C:\\Users\\sathi\\Documents ...'},
+        ])
+        assert rr._reuse_evidence_count(with_result) == 1
+
+    def test_placeholder_result_is_not_progress(self):
+        """The stand-in is minted BECAUSE nothing executed."""
+        rr = pytest.importorskip('hartos.reuse_recipe')
+        c = pytest.importorskip('core.constants')
+
+        class _Chat:
+            agents = []
+            messages = [{'role': 'tool', 'name': 'x',
+                         'content': c.HISTORICAL_TOOL_PLACEHOLDER}]
+
+        assert rr._reuse_evidence_count(_Chat()) == 0
+
+    def test_empty_chat_counts_zero_and_does_not_raise(self):
+        rr = pytest.importorskip('hartos.reuse_recipe')
+
+        class _Empty:
+            messages = []
+            agents = []
+
+        assert rr._reuse_evidence_count(_Empty()) == 0
+
+    def test_unmeasurable_evidence_cannot_extend_the_allowance(self):
+        """Fail-closed: an object that raises must never read as progress."""
+        rr = pytest.importorskip('hartos.reuse_recipe')
+
+        class _Hostile:
+            agents = []
+
+            @property
+            def messages(self):
+                raise RuntimeError('buffer gone')
+
+        assert rr._reuse_evidence_count(_Hostile()) == -1
+        for previous in (0, 1, 7):
+            assert not (rr._reuse_evidence_count(_Hostile()) > previous), (
+                'an unmeasurable chat must not satisfy `> previous`, or the '
+                'allowance is extended forever on uncertainty')
+
+    def test_both_loops_reset_on_new_evidence(self):
+        src = _source()
+        assert src.count('_evidence_now > _action_evidence') == 2, (
+            'both reuse loops must extend the CURRENT action when its tools '
+            'produce new results; a loop without it caps working actions')
+        assert src.count('_action_evidence = _reuse_evidence_count(') == 4, (
+            'each loop needs the initial mark AND the re-mark on advance '
+            '(2 sites x 2 loops), or the successor action inherits the '
+            "predecessor's evidence count and never registers progress")
+
+    def test_the_turn_ceiling_still_bounds_it(self):
+        """Anti-vacuity: progress may consume the turn, not exceed it."""
+        src = _source()
+        assert src.count('count >= _round_budget') == 2, (
+            'the turn ceiling is what keeps the progress reset from running '
+            'forever; it must remain in both loops')

@@ -3317,6 +3317,38 @@ def _reuse_group_terminate(msg):
         return False
 
 
+def _reuse_evidence_count(group_chat):
+    """How many tool RESULTS are visible in this group chat's evidence.
+
+    The round budget exists to stop stalls, and this is how a loop tells a
+    stall from work.  It counts RESULTS — ``role == 'tool'`` messages — not
+    tool_call entries: a tool_call is the model ASKING, and a model that
+    keeps asking without ever running anything is precisely the stall the
+    budget is there to end.  That is the same distinction the fabrication
+    gate draws (see `_record_result`), and it reads the same message lists
+    via `_reuse_evidence_msg_lists`, so there is no second notion of
+    evidence.  Placeholders are excluded for the gate's reason: the stand-in
+    is minted BECAUSE nothing executed.
+
+    Returns -1 when it cannot be measured, which callers compare with `>` so
+    an unmeasurable state can never be read as progress and extend a budget
+    forever.  Never raises: it runs inside the loop that produces the reply.
+    """
+    try:
+        n = 0
+        for _ml in _reuse_evidence_msg_lists(
+                group_chat, getattr(group_chat, 'agents', None) or []):
+            for m in (_ml or []):
+                if not isinstance(m, dict) or m.get('role') != 'tool':
+                    continue
+                if HISTORICAL_TOOL_PLACEHOLDER in str(m.get('content') or ''):
+                    continue
+                n += 1
+        return n
+    except Exception:
+        return -1
+
+
 def _reuse_current_action_id(user_prompt):
     """The action the pipeline believes it is on, or None if unreadable.
 
@@ -4196,6 +4228,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         # recipe is unreachable no matter how well it would have run.
         _action_rounds = 0                # spent on the CURRENT action
         count = 0                         # spent on the whole turn
+        _action_evidence = _reuse_evidence_count(group_chat)  # progress mark
         _budget_action = _reuse_current_action_id(user_prompt)
         _round_budget = _reuse_turn_round_budget(user_prompt)
         _reuse_advanced_actions = set()  # one robust completion-advance per action id
@@ -4495,6 +4528,25 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     # The action advanced: its successor starts with a full
                     # allowance instead of inheriting a spent counter.
                     _budget_action = _now_action
+                    _action_rounds = 0
+                    _action_evidence = _reuse_evidence_count(group_chat)
+                # PROGRESS RESETS THE ALLOWANCE.  Measured 2026-09-09:
+                # action 2's tool executed at 05:55:49,887 and the per-action
+                # cap ended the turn at 05:55:50,332 — 0.445 s later, with
+                # the tool answers already spliced in by the sync at
+                # 05:55:50,122.  A cap meant to stop STALLS ended an action
+                # that was moving.  New tool evidence means the action is
+                # working, so it earns a fresh window; the TURN ceiling above
+                # still bounds the whole thing, and an unmeasurable evidence
+                # count (-1) can never satisfy `>`.
+                _evidence_now = _reuse_evidence_count(group_chat)
+                if _evidence_now > _action_evidence:
+                    current_app.logger.info(
+                        f"[REUSE-ROUNDS] action {_now_action} produced new tool "
+                        f"evidence ({_action_evidence} -> {_evidence_now}) — "
+                        f"resetting its round allowance (turn spend "
+                        f"{count}/{_round_budget})")
+                    _action_evidence = _evidence_now
                     _action_rounds = 0
                 if count >= _round_budget:
                     current_app.logger.warning(
@@ -5571,6 +5623,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
 
                 count = 0                  # spent on the whole turn
                 _action_rounds = 0         # spent on the CURRENT action
+                _action_evidence = _reuse_evidence_count(group_chat)
                 _budget_action = _reuse_current_action_id(user_prompt)
                 _round_budget = _reuse_turn_round_budget(user_prompt)
                 while True:
@@ -5649,10 +5702,22 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                                               silent=False)
                                 continue
                     # Same per-action/per-turn split as while1 (#790/D23) —
-                    # one semantics for both loops, from one constant.
+                    # one semantics for both loops, from one constant — and
+                    # the same progress reset, so a working action is not
+                    # capped in either loop.
                     _now_action = _reuse_current_action_id(user_prompt)
                     if _now_action != _budget_action:
                         _budget_action = _now_action
+                        _action_rounds = 0
+                        _action_evidence = _reuse_evidence_count(group_chat)
+                    _evidence_now = _reuse_evidence_count(group_chat)
+                    if _evidence_now > _action_evidence:
+                        current_app.logger.info(
+                            f"[REUSE-ROUNDS] action {_now_action} produced new tool "
+                            f"evidence ({_action_evidence} -> {_evidence_now}) — "
+                            f"resetting its round allowance (turn spend "
+                            f"{count}/{_round_budget})")
+                        _action_evidence = _evidence_now
                         _action_rounds = 0
                     count += 1
                     _action_rounds += 1
