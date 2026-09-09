@@ -92,6 +92,62 @@ def test_empty_history_does_not_trigger(rr):
     assert rr._reuse_needs_synthesis(_FakeGroupChat([])) is False
 
 
+# The whole reply the user received at 05:31:01 on the drive after the
+# terminate-on-answer fix — raw, unexecuted tool-call markup, verbatim.
+LIVE_RAW_TOOL_CALL = (
+    "<tool_call>\n"
+    "<function=execute_windows_or_android_command>\n"
+    "<parameter=instructions>\n"
+    "cd C:\\Users\\sathi\\Documents\n"
+    "</parameter>\n"
+    "<parameter=os_to_control>\n"
+    "windows\n"
+    "</parameter>\n"
+    "</function>\n"
+    "</tool_call>"
+)
+
+
+def test_raw_tool_call_markup_is_not_an_answer(rr):
+    """MEASURED 2026-09-09 05:31:01, agent 33323830039, installed build.
+
+    That drive was a real improvement — action 1 executed its tool for real
+    (`[FAB-GUARD] ... executed=['execute_windows_or_android_command',
+    'send_message_to_user']; unrun=[]`), the under-report escape corrected a
+    'pending' verdict, and the action advanced through the full lifecycle.
+    The turn then ran out of rounds at action 2/2 and the extractor handed the
+    user the tail, which was the markup above: an unexecuted tool call, in the
+    model's own call syntax, with the user's home path in it.
+
+    `[SYNTHESIS]` logged 0 times, because the widened gate still read this as
+    "prose for the user".  It is the same class as the empty tail it already
+    catches: a message that is not addressed to the user at all.
+    """
+    gc = _FakeGroupChat([{'name': 'Assistant', 'content': LIVE_RAW_TOOL_CALL}])
+    assert rr._reuse_needs_synthesis(gc) is True, (
+        "raw tool-call markup was not flagged; the user is shown internal "
+        "call syntax instead of an answer")
+
+
+def test_tool_call_markup_mid_prose_is_still_not_an_answer(rr):
+    """A sentence wrapped around the markup does not make it a reply."""
+    gc = _FakeGroupChat([{'name': 'Assistant', 'content':
+                          "I'll run this now.\n" + LIVE_RAW_TOOL_CALL}])
+    assert rr._reuse_needs_synthesis(gc) is True
+
+
+def test_prose_that_merely_names_a_tool_is_left_alone(rr):
+    """Anti-vacuity: talking ABOUT a tool is a legitimate answer.
+
+    Without this, the gate would burn a round on every honest report of what
+    the agent did — which is most good replies this pipeline produces.
+    """
+    gc = _FakeGroupChat([{'name': 'Assistant', 'content':
+                          'I ran execute_windows_or_android_command and the '
+                          'Nunba folder has 12 entries.'}])
+    assert rr._reuse_needs_synthesis(gc) is False
+
+
 def test_synthesis_asks_the_group_for_the_answer(rr):
     """The fix: one steer, through the canonical initiator, naming the key
     the existing extractor already unwraps."""

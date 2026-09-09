@@ -3317,6 +3317,28 @@ def _reuse_group_terminate(msg):
         return False
 
 
+def _reuse_current_action_id(user_prompt):
+    """The action the pipeline believes it is on, or None if unreadable.
+
+    Both loops read ``user_tasks[user_prompt].current_action`` in a dozen
+    places behind bare subscripts; this is the guarded read the round-budget
+    counters use, so a missing session cannot raise on the budget path (the
+    same failure mode the canonical `_reuse_action_is_autonomous` reader was
+    added for: a KeyError there skipped the steering for that whole round).
+    """
+    try:
+        return user_tasks[user_prompt].current_action
+    except Exception:
+        return None
+
+
+# Rounds ONE action may spend before the turn ends.  Measured, not chosen —
+# see _reuse_turn_round_budget's docstring for the 05:29:49-05:30:49 count.
+# Both loops check it per action AND derive the turn ceiling from it, so the
+# per-action allowance and the turn total can never drift apart.
+_REUSE_ROUNDS_PER_ACTION = 12
+
+
 def _reuse_turn_round_budget(user_prompt):
     """Iteration budget for ONE reuse turn, derived from the recipe it runs.
 
@@ -3338,12 +3360,32 @@ def _reuse_turn_round_budget(user_prompt):
     single-action recipe keeps its previous headroom.  The loop's other exits
     (budget exhausted, SLA breach, empty history, '@user') are unchanged —
     this only stops the counter from ending a turn that is still progressing.
+
+    SIZED FROM A LIVE ACTION, 2026-09-09 05:29:49-05:30:49 (agent
+    33323830039).  Action 1 did its real work and needed, counted from the
+    log: the ordinary group rounds, ONE fabrication refusal
+    (`[FAB-GUARD] ... unrun=[...]` at 05:30:01) and ONE under-report re-steer
+    (`[UNDER-REPORTED] ... attempt 1/2` at 05:30:43) before it advanced
+    honestly at 05:30:49 — 16 while1 iterations, 12 counted rounds.  The old
+    per-action term was 4.  So an action that WORKS legitimately needs about
+    three times what the formula allowed it, which is why both drives that
+    day ended on `exhausted 12 rounds at action 2/2`: the turn total and one
+    action's honest need were the same number.
+
+    _REUSE_ROUNDS_PER_ACTION is that measured need, and the turn ceiling is
+    n_actions of them — one constant, used by the per-action check in both
+    loops and by this ceiling, so the two cannot drift.
+
+    COST, stated plainly: a turn may now run n_actions times longer than
+    before in the worst case (that drive: 141s at 12 rounds, so ~12s/round).
+    The trade is deliberate — an agent whose later actions can never be
+    reached does not do its job at all.
     """
     try:
         n_actions = len(user_tasks[user_prompt].actions)
     except Exception:
         n_actions = 1
-    return max(4, n_actions * (_REUSE_FAB_STEER_MAX + 1) + 4)
+    return max(1, n_actions) * _REUSE_ROUNDS_PER_ACTION
 
 # Unrun tool names recorded by the fabrication gate for the refusal it just
 # returned, keyed the same way, and consumed by _reuse_fab_steer_message.
@@ -3490,6 +3532,9 @@ def _reuse_needs_synthesis(group_chat):
       * empty / whitespace           — nothing to say
       * 'TERMINATE'                  — the control token
       * role == 'tool'               — a tool RESULT, not a reply
+      * <tool_call> / <function=…>   — an UNEXECUTED call in the model's own
+                                       syntax; measured 05:31:01 as the WHOLE
+                                       reply, the user's home path in it
       * @Helper / @StatusVerifier /… — addressed to another agent (same list
                                        the loop's own routing uses)
       * dict carrying 'status'       — a StatusVerifier verdict (the original
@@ -3542,6 +3587,14 @@ def _reuse_needs_synthesis(group_chat):
             return True                      # control token
         if last.get('role') == 'tool':
             return True                      # a tool RESULT, not a reply
+        if '<tool_call>' in low or '<function=' in low:
+            # An unexecuted tool call in the model's own call syntax.  The
+            # WHOLE reply at 05:31:01 was this, user's home path included:
+            #   <tool_call>\n<function=execute_windows_or_android_command>
+            #   \n<parameter=instructions>\ncd C:\\Users\\sathi\\Documents...
+            # Markup, not a sentence — matching the SYNTAX, never prose that
+            # merely names a tool, which stays a legitimate answer.
+            return True
         if any(m in low for m in _REUSE_AGENT_MENTIONS):
             return True                      # addressed to another agent
         parsed = retrieve_json(content)
@@ -4133,7 +4186,17 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                                           speaker_selection={"speaker": "assistant"},
                                           clear_history=False)
 
-        count = 0
+        # TWO counters, because the budget is PER ACTION but was spent per
+        # TURN (#790/D23).  Measured 2026-09-09 on agent 33323830039, twice in
+        # one hour: 04:50:52 the turn died with action 1 having used 2 loop
+        # iterations and action 2 fourteen; 05:31:01 it died the other way
+        # round, action 1 having used almost all of them doing REAL work.
+        # Both ended `exhausted 12 rounds at action 2/2` — whichever action
+        # goes first spends the whole turn's allowance, and the rest of the
+        # recipe is unreachable no matter how well it would have run.
+        _action_rounds = 0                # spent on the CURRENT action
+        count = 0                         # spent on the whole turn
+        _budget_action = _reuse_current_action_id(user_prompt)
         _round_budget = _reuse_turn_round_budget(user_prompt)
         _reuse_advanced_actions = set()  # one robust completion-advance per action id
         while True:
@@ -4427,14 +4490,29 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         continue
             try:
                 # Safely access recipes
+                _now_action = _reuse_current_action_id(user_prompt)
+                if _now_action != _budget_action:
+                    # The action advanced: its successor starts with a full
+                    # allowance instead of inheriting a spent counter.
+                    _budget_action = _now_action
+                    _action_rounds = 0
                 if count >= _round_budget:
                     current_app.logger.warning(
-                        f"[REUSE-ROUNDS] while1 exhausted {_round_budget} rounds at "
+                        f"[REUSE-ROUNDS] while1 exhausted {_round_budget} TURN rounds at "
                         f"action {user_tasks[user_prompt].current_action}/"
                         f"{len(user_tasks[user_prompt].actions)} — ending turn")
                     break
+                if _action_rounds >= _REUSE_ROUNDS_PER_ACTION:
+                    current_app.logger.warning(
+                        f"[REUSE-ROUNDS] while1 action "
+                        f"{user_tasks[user_prompt].current_action}/"
+                        f"{len(user_tasks[user_prompt].actions)} used its "
+                        f"{_REUSE_ROUNDS_PER_ACTION} rounds without completing "
+                        f"— ending turn (turn spend {count}/{_round_budget})")
+                    break
 
                 count += 1
+                _action_rounds += 1
 
                 if user_prompt not in recipes or user_tasks[user_prompt].current_action > len(user_tasks[user_prompt].actions):
                     current_app.logger.error(
@@ -5491,7 +5569,9 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 result = chat_instructor.initiate_chat(manager, message=message,
                                                        speaker_selection={"speaker": "assistant"}, clear_history=False)
 
-                count = 0
+                count = 0                  # spent on the whole turn
+                _action_rounds = 0         # spent on the CURRENT action
+                _budget_action = _reuse_current_action_id(user_prompt)
                 _round_budget = _reuse_turn_round_budget(user_prompt)
                 while True:
                     current_app.logger.info('inside while2')
@@ -5568,12 +5648,27 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,
                                                               silent=False)
                                 continue
+                    # Same per-action/per-turn split as while1 (#790/D23) —
+                    # one semantics for both loops, from one constant.
+                    _now_action = _reuse_current_action_id(user_prompt)
+                    if _now_action != _budget_action:
+                        _budget_action = _now_action
+                        _action_rounds = 0
                     count += 1
+                    _action_rounds += 1
                     if count >= _round_budget:
                         current_app.logger.warning(
-                            f"[REUSE-ROUNDS] while2 exhausted {_round_budget} rounds at "
+                            f"[REUSE-ROUNDS] while2 exhausted {_round_budget} TURN rounds at "
                             f"action {user_tasks[user_prompt].current_action}/"
                             f"{len(user_tasks[user_prompt].actions)} — ending turn")
+                        break
+                    if _action_rounds >= _REUSE_ROUNDS_PER_ACTION:
+                        current_app.logger.warning(
+                            f"[REUSE-ROUNDS] while2 action "
+                            f"{user_tasks[user_prompt].current_action}/"
+                            f"{len(user_tasks[user_prompt].actions)} used its "
+                            f"{_REUSE_ROUNDS_PER_ACTION} rounds without completing "
+                            f"— ending turn (turn spend {count}/{_round_budget})")
                         break
                     # role = get_role(user_id,prompt_id)
                     last_message = group_chat.messages[-1]

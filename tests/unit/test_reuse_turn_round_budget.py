@@ -110,3 +110,71 @@ class TestBudgetScalesWithTheRecipe:
         """Budget is read on a hot path; an absent session must not crash it."""
         rr = pytest.importorskip('hartos.reuse_recipe')
         assert rr._reuse_turn_round_budget('no_such_prompt') >= 4
+
+
+class TestBudgetIsSpentPerAction:
+    """#790/D23 — the allowance is PER ACTION, so whichever action runs first
+    cannot spend the whole turn.
+
+    Measured on agent 33323830039, twice within one hour, both ending
+    `exhausted 12 rounds at action 2/2`:
+
+      04:48 drive   action 1 used 2 while1 iterations, action 2 used 14
+      05:31 drive   the other way round — action 1 did the REAL work
+                    (tool executed, one fabrication refusal at 05:30:01, one
+                    under-report re-steer at 05:30:43, honest advance at
+                    05:30:49) and action 2 got what was left, ~12 seconds
+
+    Whichever action goes first spends the turn.  The old formula made that
+    inevitable: for a 2-action recipe the turn total (n*4+4 = 12) equalled one
+    action's measured honest need (12).
+    """
+
+    def _budget(self, n_actions):
+        rr = pytest.importorskip('hartos.reuse_recipe')
+
+        class _Task:
+            actions = [{'action_id': i + 1} for i in range(n_actions)]
+
+        rr.user_tasks['probe_prompt'] = _Task()
+        try:
+            return rr._reuse_turn_round_budget('probe_prompt')
+        finally:
+            rr.user_tasks.pop('probe_prompt', None)
+
+    def test_per_action_allowance_covers_the_measured_need(self):
+        rr = pytest.importorskip('hartos.reuse_recipe')
+        assert rr._REUSE_ROUNDS_PER_ACTION >= 12, (
+            'an action that executed its tool, was refused once by the '
+            'fabrication gate and re-steered once by the under-report escape '
+            'used 12 counted rounds live; a smaller allowance cuts off work '
+            'that is going right')
+
+    def test_turn_ceiling_is_n_actions_of_that_allowance(self):
+        """One constant feeds both, so per-action and per-turn cannot drift."""
+        rr = pytest.importorskip('hartos.reuse_recipe')
+        for n in (1, 2, 6, 24):
+            assert self._budget(n) == n * rr._REUSE_ROUNDS_PER_ACTION
+
+    def test_a_second_action_can_still_do_a_full_actions_work(self):
+        """The property the live drives lacked, stated as arithmetic."""
+        rr = pytest.importorskip('hartos.reuse_recipe')
+        spent_by_first = rr._REUSE_ROUNDS_PER_ACTION
+        assert self._budget(2) - spent_by_first >= rr._REUSE_ROUNDS_PER_ACTION, (
+            'after action 1 spends its full allowance there must still be a '
+            "full allowance for action 2 — otherwise the recipe's later "
+            'actions are unreachable however well they would have run')
+
+    def test_both_loops_reset_the_counter_when_the_action_advances(self):
+        src = _source()
+        assert src.count('_action_rounds = 0') == 4, (
+            'each loop needs its initialisation AND its reset-on-advance '
+            '(2 sites x 2 loops); a loop missing the reset spends the '
+            "successor action's allowance on its predecessor")
+        assert src.count('_action_rounds >= _REUSE_ROUNDS_PER_ACTION') == 2, (
+            'both reuse loops must bound the CURRENT action, not only the turn')
+
+    def test_current_action_read_is_guarded(self):
+        """The budget path must not raise on a missing session."""
+        rr = pytest.importorskip('hartos.reuse_recipe')
+        assert rr._reuse_current_action_id('no_such_prompt') is None

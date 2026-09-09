@@ -135,10 +135,21 @@ class TestRequiresBreakdownIsNotAnUnderReport:
             'past it')
 
     def test_advance_branch_reads_the_constant_not_a_bare_pending(self):
+        # ANCHOR NOTE.  This used to key on `_pend_vj = retrieve_json(`, and
+        # went stale the moment that read moved to the canonical
+        # `_reuse_latest_verdict(group_chat)` helper — after which the regex
+        # matched nothing and the assertion below could never run.  Measured
+        # 2026-09-09: the pattern finds no block at HEAD either, so the
+        # property has been UNGUARDED since that refactor, not broken by it
+        # (the branch itself still tests the constant).  Anchor on the
+        # condition variable the branch actually reads, so a rename of the
+        # verdict SOURCE cannot silently disarm a check about the STATUS.
         src = _source()
         m = re.search(
-            r"_pend_vj = retrieve_json\(.*?\n(?P<block>.*?)\):", src, re.DOTALL)
-        assert m, 'under-reported advance branch not found'
+            r"_pend_st = str\(.*?\n(?P<block>.*?)\):", src, re.DOTALL)
+        assert m, (
+            'under-reported advance branch not found — if `_pend_st` was '
+            'renamed, re-point this anchor rather than deleting the check')
         block = m.group('block')
         assert "== 'pending'" not in block, (
             "the advance branch still compares status == 'pending' exactly, so "
