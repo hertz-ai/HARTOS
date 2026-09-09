@@ -253,6 +253,99 @@ class TestRecoveryNeverReplacesTheSteer:
         assert rec.messages, 'control JSON was treated as a written answer'
 
 
+class TestThePipelinesOwnTextIsNeverTheAnswer:
+    """MEASURED live 2026-09-10 04:42:04 — the first fix's own regression.
+
+    The recovery fired and delivered THIS to the user, verbatim:
+
+        [SYNTHESIS] the action already wrote the answer — recovered 391 chars
+        LangChain local response: Perform this action -> Action #4:Return the
+        summarized text to the user.
+
+    The walk-back was bounded on `name in _REUSE_STEER_INITIATOR_NAMES`, and
+    in `group_chat.messages` after the #725 sync that dispatch does NOT carry
+    name='ChatInstructor' — the sync slice-assigns the longest per-agent
+    buffer from `manager._oai_messages`, whose `name` fields are that pair's
+    view.  The 04:42:02 structure dump shows the pattern the bound assumed
+    (`[9] role=user, name=ChatInstructor`), but the list actually walked was
+    the 12-entry buffer resynced two seconds later, and there the same text
+    passed the shape test as ordinary prose.
+
+    So the bound has to be keyed on the PRODUCER, not on a seat name that the
+    buffer may not preserve: `_build_reuse_action_message` always emits
+    `_REUSE_ACTION_MESSAGE_PREFIX`.  One constant, used by the producer and
+    the recogniser, so rewording the steer moves both at once — which is what
+    the seat-name comment asked for and the name field could not deliver.
+
+    This also closes the same hole in the PRE-EXISTING gate: the
+    2026-09-09 08:53:22 defect (a dispatch delivered verbatim as the answer)
+    was only caught when the name survived.
+    """
+
+    LIVE_DISPATCH_UNNAMED = {
+        'role': 'user', 'name': 'Assistant',
+        'content': ("Perform this action -> Action #4:Return the summarized "
+                    "text to the user.\n follow these steps: [{'Retrieve the "
+                    "final formatted string': {'tool_name': '', 'code': ''}}]"),
+    }
+
+    def test_an_action_dispatch_is_not_an_answer_whatever_its_name(self, rr):
+        """THE REGRESSION.  RED before the second fix."""
+        assert rr._reuse_message_is_user_answer(
+            dict(self.LIVE_DISPATCH_UNNAMED)) is False, (
+            "the pipeline's own action dispatch was classified as prose for "
+            "the user — this is the 391-char reply the user received at "
+            "04:42:04")
+
+    def test_recovery_does_not_deliver_the_dispatch(self, rr, monkeypatch):
+        """End to end over the live shape: nothing recoverable, so steer."""
+        messages = [
+            dict(self.LIVE_DISPATCH_UNNAMED),
+            {'role': 'user', 'name': 'StatusVerifier',
+             'content': LIVE_ACTION_VERDICT},
+        ]
+        _posted, chat, rec = _run(rr, monkeypatch, messages)
+        tail = chat.messages[-1].get('content') or ''
+        assert 'Perform this action ->' not in tail, (
+            'the action dispatch reached the extractor as the reply')
+        assert rec.messages, (
+            'nothing was recoverable, so the synthesis steer had to fire')
+
+    def test_the_prefix_has_one_definition_shared_with_its_producer(self, rr):
+        """DRY: the recogniser must read the constant the producer emits."""
+        import inspect
+        assert rr._REUSE_ACTION_MESSAGE_PREFIX in (
+            'Perform this action -> Action #',)
+        assert '_REUSE_ACTION_MESSAGE_PREFIX' in inspect.getsource(
+            rr._build_reuse_action_message), (
+            'the action-message producer must emit the shared constant, not '
+            'its own copy of the wording')
+        assert '_REUSE_ACTION_MESSAGE_PREFIX' in inspect.getsource(
+            rr._reuse_message_is_user_answer), (
+            'the recogniser must read the same constant the producer emits')
+
+    def test_the_producers_real_output_is_rejected(self, rr, monkeypatch):
+        """Not a hand-written lookalike — build the string the way the
+        pipeline builds it, so a reworded producer fails this test."""
+        class _Task:
+            current_action = 4
+
+            def get_action(self, i):
+                return {'action': 'Return the summarized text to the user.'}
+
+        monkeypatch.setitem(rr.user_tasks, 'sess_x', _Task())
+        # Four action slots so the builder takes its normal branch — the
+        # short-recipe branch logs through current_app and would fail here
+        # for want of a Flask context, not for want of the fix.
+        monkeypatch.setitem(rr.recipes, 'sess_x', {'actions': [
+            {'recipe': [{'steps': 'step %d' % i, 'tool_name': ''}]}
+            for i in range(4)]})
+        built = rr._build_reuse_action_message('sess_x', 4)
+        assert built.startswith(rr._REUSE_ACTION_MESSAGE_PREFIX)
+        assert rr._reuse_message_is_user_answer(
+            {'role': 'user', 'name': 'Assistant', 'content': built}) is False
+
+
 class TestOneNotionOfWhatAnAnswerIs:
 
     def test_the_gate_and_the_recovery_share_a_predicate(self, rr):

@@ -130,14 +130,23 @@ class ReuseActionMessageSteps(unittest.TestCase):
         bounds check.  A duplicate like that is exactly how the two diverge
         again next time, so pin the count.
         """
-        # Count only EXECUTABLE f-strings.  A raw src.count() also catches
-        # this module's own docstrings and a commented-out line, which are
-        # references, not implementations — counting those would make the
-        # guard fire on prose.
+        # RE-POINTED 2026-09-10, and STRENGTHENED.  The prefix moved into
+        # `_REUSE_ACTION_MESSAGE_PREFIX` so `_reuse_message_is_user_answer`
+        # can refuse the pipeline's own dispatch without re-spelling it (the
+        # 04:42:04 regression: the dispatch was delivered to the user as the
+        # answer).  The old check counted f-strings carrying the literal and
+        # required exactly one; with the literal in a constant that count is
+        # now 0, which the old assertion read as "the builder vanished".
+        #
+        # The invariant is unchanged — ONE place builds the dispatch — so the
+        # guard now pins the stronger form: the literal has exactly one
+        # ASSIGNMENT, no f-string inlines it at all, and the builder reads
+        # the constant.
         import ast
         import inspect as _i
-        tree = ast.parse(_i.getsource(rr))
-        sites = [
+        src = _i.getsource(rr)
+        tree = ast.parse(src)
+        inlined = [
             node for node in ast.walk(tree)
             if isinstance(node, ast.JoinedStr)
             and any(isinstance(v, ast.Constant)
@@ -146,11 +155,26 @@ class ReuseActionMessageSteps(unittest.TestCase):
                     for v in node.values)
         ]
         self.assertEqual(
-            1, len(sites),
-            'the action-message template must be BUILT in exactly ONE place '
-            f'(the canonical builder); found {len(sites)} f-strings at lines '
-            f'{[n.lineno for n in sites]}. Call _build_reuse_action_message '
-            'instead of inlining it.')
+            0, len(inlined),
+            'the action-message template must never be inlined in an '
+            f'f-string; found {len(inlined)} at lines '
+            f'{[n.lineno for n in inlined]}. Use '
+            '_REUSE_ACTION_MESSAGE_PREFIX / _build_reuse_action_message.')
+
+        homes = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+            and node.value.value == 'Perform this action -> Action #'
+        ]
+        self.assertEqual(
+            1, len(homes),
+            'the dispatch prefix must have exactly ONE definition; found '
+            f'{len(homes)} at lines {[n.lineno for n in homes]}')
+        self.assertIn('_REUSE_ACTION_MESSAGE_PREFIX',
+                      _i.getsource(rr._build_reuse_action_message),
+                      'the canonical builder must emit the shared constant')
 
     def test_builder_does_not_key_a_dict_on_raw_step_content(self):
         # Root-cause pin: using model-authored content as a dict key is what

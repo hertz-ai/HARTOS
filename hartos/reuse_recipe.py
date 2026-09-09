@@ -3264,6 +3264,24 @@ from core.constants import (
 # can never be the group's answer, however they are worded.
 _REUSE_STEER_INITIATOR_NAMES = ("ChatInstructor",)
 
+# How every action dispatch this module posts begins.  ONE definition:
+# `_build_reuse_action_message` emits it and `_reuse_message_is_user_answer`
+# refuses it, so rewording the dispatch moves both at once.
+#
+# WHY A PREFIX AND NOT JUST THE SEAT NAME.  The seat check above reads
+# `msg['name']`, which is right for the wire body but NOT for
+# `group_chat.messages`: the #725 sync slice-assigns the longest per-agent
+# buffer out of `manager._oai_messages`, and in that buffer the same dispatch
+# can arrive under another agent's name.  Measured live 2026-09-10 04:42:04 —
+# the answer-recovery walked the resynced 12-entry buffer, the dispatch there
+# was NOT name='ChatInstructor', it passed the shape test as ordinary prose,
+# and the user's whole reply was
+#   "Perform this action -> Action #4:Return the summarized text to the user."
+# Keying on the producer's own literal is what the seat-name comment asked
+# for ("keyed on WHO, not on the wording") and what the name field could not
+# deliver across the sync.
+_REUSE_ACTION_MESSAGE_PREFIX = 'Perform this action -> Action #'
+
 
 def _reuse_group_terminate(msg):
     """End an action's group-chat round on a verdict the OUTER loop must act on.
@@ -3701,6 +3719,11 @@ def _reuse_message_is_user_answer(message):
                     if _ak in _ans:
                         return _reuse_is_written_answer(_ans[_ak])
             return True                      # the answer is already there
+        if content.lstrip().startswith(_REUSE_ACTION_MESSAGE_PREFIX):
+            # THIS MODULE POSTED IT.  Checked BEFORE the seat name because
+            # the seat name does not survive the #725 sync — see the
+            # constant's comment for the 2026-09-10 04:42:04 measurement.
+            return False
         if str(last.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES:
             # THE LOOP'S OWN STEER.  This seat exists to steer; it never
             # speaks TO the user, so whatever it said is plumbing.  Measured
@@ -3929,11 +3952,18 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
                 _say('warning', f"[SYNTHESIS] recovery append failed: "
                                 f"{_app_err!r} — steering instead")
             else:
+                # NAME AND HEAD, not just a length.  The first cut logged
+                # "recovered 391 chars" and that number was equally true of
+                # the finished answer and of the action dispatch it actually
+                # delivered on 2026-09-10 04:42:04 — a count that cannot tell
+                # a right answer from a wrong one is not a measurement.
+                _txt = _written.get('content') or ''
                 _say('info',
                      f"[SYNTHESIS] the action already wrote the answer — "
-                     f"recovered {len(_written.get('content') or '')} chars "
-                     f"from the group log, no steer posted (session: "
-                     f"{user_prompt}, {_before} msgs)")
+                     f"recovered {len(_txt)} chars from the group log, no "
+                     f"steer posted (session: {user_prompt}, {_before} msgs, "
+                     f"from={_written.get('name') or '?'}, "
+                     f"head={_txt[:120]!r})")
                 return False
         _steer = _REUSE_SYNTHESIS_STEER
     _say('info', f"[SYNTHESIS] reply would be raw control JSON — asking for "
@@ -5305,7 +5335,8 @@ def _build_reuse_action_message(user_prompt, action_id):
     else:
         steps = []
         current_app.logger.warning(f"[REUSE] No recipe for action {action_id} — executing without steps")
-    return f"Perform this action -> Action #{action_id}:{action_message}\n follow these steps: {steps}"
+    return (f"{_REUSE_ACTION_MESSAGE_PREFIX}{action_id}:{action_message}"
+            f"\n follow these steps: {steps}")
 
 
 # A registry tool name as `attach_for_names` compares it: the registry key, or
