@@ -3615,6 +3615,29 @@ def _reuse_needs_synthesis(group_chat):
         low = content.lower()
         if 'message2userfinal' in low or 'message2' in low:
             return False                     # the answer is already there
+        if str(last.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES:
+            # THE LOOP'S OWN STEER.  This seat exists to steer; it never
+            # speaks TO the user, so whatever it said is plumbing.  Measured
+            # live 2026-09-09 08:53:22, delivered verbatim as the answer:
+            #   "Perform this action -> Action #2:cd C:\\Users\\sathi\\Documents
+            #    |  follow these steps: [{'cd C:\\\\Users\\\\sathi\\\\Documents':
+            #    {'tool_name': 'execute_windows_or_android_command',
+            #    'code': None}}]"
+            # (tail confirmed as `Message[14]: role=user, name=ChatInstructor`,
+            # `last_speaker ChatInstructor`).  It matched none of the shapes
+            # below — prose, role='user', no '@' mention, and retrieve_json of
+            # its trailing "[{...}]" yields a LIST not a status dict — so the
+            # gate fell through to "prose for the user" and the extractor
+            # handed it over.
+            #
+            # Keyed on WHO, not on the wording: matching the sentence would
+            # break the moment a steer is reworded, and there are several.
+            # Same constant _reuse_group_terminate:3307 already reads for the
+            # same semantic ("the steer's own voice is not a terminal
+            # answer") — one notion of it, not two.  Deliberately BELOW the
+            # message2userfinal check: if a steer-seat message ever does carry
+            # the answer key, it IS the answer.
+            return True
         if content.strip() == 'TERMINATE':
             return True                      # control token
         if last.get('role') == 'tool':
