@@ -3650,6 +3650,14 @@ def _reuse_needs_synthesis(group_chat):
     ``tool_calls`` and no prose, and the only non-tool entries are a
     ChatInstructor nudge and a bare user-role line.  There is no synthesis to
     recover; it has to be asked for.
+
+    CORRECTION 2026-09-10 — "not fixable by walking back" was true of THAT
+    turn, not of the pipeline.  Agent 88094979291 closed with its finished
+    answer at ``messages[-2]``; see ``_reuse_written_answer``, which recovers
+    it and is bounded so the 33323830039 shape still reaches the steer.
+
+    The per-message shape test now lives in ``_reuse_message_is_user_answer``
+    so the recovery asks exactly the question this gate asks.
     """
     try:
         messages = list(getattr(group_chat, 'messages', None) or [])
@@ -3657,22 +3665,42 @@ def _reuse_needs_synthesis(group_chat):
             # Nothing to synthesise FROM.  The extractor's own empty-history
             # guard handles this; asking the group would only add a round.
             return False
-        last = messages[-1] or {}
+        return not _reuse_message_is_user_answer(messages[-1])
+    except Exception:
+        return False
+
+
+def _reuse_message_is_user_answer(message):
+    """True when *message* is a reply the USER can read.
+
+    The shape list is the one documented on ``_reuse_needs_synthesis`` above,
+    in positive form, factored out so the gate ("is the tail an answer?") and
+    the recovery ("did this action already write one?") cannot grow two
+    different notions of it.  Every shape was measured on this pipeline one
+    live failure at a time; a second copy would miss the next one.
+
+    Fails CLOSED — a message this cannot judge is not an answer.  For the gate
+    that still means "leave the tail alone" (its caller's except returns
+    False); for the recovery it means "never deliver what we cannot read".
+    """
+    try:
+        last = message or {}
         content = last.get('content')
         if not isinstance(content, str) or not content.strip():
-            return True                      # empty tail is not an answer
+            return False                     # empty is not an answer
         low = content.lower()
         if 'message2userfinal' in low or 'message2' in low:
             # The KEY present is not the ANSWER present: live 18:25:22 the
             # model returned the steer's template and this branch called it
-            # "already there".  Unparseable / key-absent keeps the old False,
-            # so this narrows the gate, it does not re-open synthesis.
+            # "already there".  Unparseable / key-absent keeps the old
+            # "answer", so this narrows the gate, it does not re-open
+            # synthesis.
             _ans = retrieve_json(content)
             if isinstance(_ans, dict):
                 for _ak in ('message2userfinal', 'message2'):
                     if _ak in _ans:
-                        return not _reuse_is_written_answer(_ans[_ak])
-            return False                     # the answer is already there
+                        return _reuse_is_written_answer(_ans[_ak])
+            return True                      # the answer is already there
         if str(last.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES:
             # THE LOOP'S OWN STEER.  This seat exists to steer; it never
             # speaks TO the user, so whatever it said is plumbing.  Measured
@@ -3695,11 +3723,11 @@ def _reuse_needs_synthesis(group_chat):
             # answer") — one notion of it, not two.  Deliberately BELOW the
             # message2userfinal check: if a steer-seat message ever does carry
             # the answer key, it IS the answer.
-            return True
+            return False
         if content.strip() == 'TERMINATE':
-            return True                      # control token
+            return False                     # control token
         if last.get('role') == 'tool':
-            return True                      # a tool RESULT, not a reply
+            return False                     # a tool RESULT, not a reply
         if '<tool_call>' in low or '<function=' in low:
             # An unexecuted tool call in the model's own call syntax.  The
             # WHOLE reply at 05:31:01 was this, user's home path included:
@@ -3707,15 +3735,56 @@ def _reuse_needs_synthesis(group_chat):
             #   \n<parameter=instructions>\ncd C:\\Users\\sathi\\Documents...
             # Markup, not a sentence — matching the SYNTAX, never prose that
             # merely names a tool, which stays a legitimate answer.
-            return True
+            return False
         if any(m in low for m in _REUSE_AGENT_MENTIONS):
-            return True                      # addressed to another agent
+            return False                     # addressed to another agent
         parsed = retrieve_json(content)
         if isinstance(parsed, dict) and 'status' in parsed:
-            return True                      # StatusVerifier verdict
-        return False                         # prose for the user — leave it
+            return False                     # StatusVerifier verdict
+        return True                          # prose for the user
     except Exception:
         return False
+
+
+def _reuse_written_answer(group_chat):
+    """The answer THIS action already wrote, or None.
+
+    MEASURED live 2026-09-10 03:37:33 (agent 88094979291, "summarize into
+    exactly three bullet points").  The closing history was:
+
+        Message[10]  user      ChatInstructor   "Perform this action ->
+                                                 Action #4: Return the
+                                                 summarized text ..."
+        Message[11]  assistant Assistant        "... into exactly three bullet
+                                                 points for you: • ... • ... •"
+        Message[12]  user      StatusVerifier   {"status": "completed", ...}
+
+    The deliverable was at ``messages[-2]`` and the synthesis round replaced
+    it with 426 characters of prose carrying zero bullets (rowid 206313, what
+    the user actually read).  ``_REUSE_SYNTHESIS_STEER`` says "in your own
+    words" — for an agent whose whole goal IS the format, being asked again is
+    what destroys the answer.
+
+    BOUNDED AT THIS ACTION'S OWN DISPATCH.  The walk stops at the first
+    ``_REUSE_STEER_INITIATOR_NAMES`` seat going backwards, which is the
+    "Perform this action -> Action #N" that opened the action.  Anything
+    before it belongs to an earlier action — or to an earlier TURN, since
+    every steer runs with ``clear_history=False`` — and delivering that would
+    answer a question the user did not ask.
+
+    Not a replacement for the steer: on the 2026-09-09 33323830039 shape the
+    span holds only tool traffic, nothing matches, and the caller steers
+    exactly as before.
+    """
+    try:
+        for msg in reversed(list(getattr(group_chat, 'messages', None) or [])):
+            if str((msg or {}).get('name') or '') in _REUSE_STEER_INITIATOR_NAMES:
+                return None                  # reached this action's dispatch
+            if _reuse_message_is_user_answer(msg):
+                return msg
+        return None
+    except Exception:
+        return None
 
 
 # Asks for the ONE thing the round never produced.  Deliberately names the
@@ -3842,6 +3911,30 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
         _steer = _REUSE_SYNTHESIS_STEER_INCOMPLETE.format(
             unrun=', '.join(str(t) for t in _unrun))
     else:
+        # THE ACTION MAY HAVE ALREADY WRITTEN THE ANSWER.  Only asked once
+        # everything really ran — a recovered message asserts whatever the
+        # model asserted, and over an unrun tool that is exactly the
+        # "successfully completed" the honest-report fix removed (#808).
+        # Deliberately BELOW the _unrun branch for that reason.
+        _written = _reuse_written_answer(group_chat)
+        if _written is not None:
+            # A COPY: the extractor edits last_message['content'] in place
+            # (strips '@user '), and that must not rewrite the history it
+            # came from.  Appending rather than reordering keeps the record
+            # honest, and the next #725 sync slice-assigns the whole list, so
+            # this cannot accumulate.
+            try:
+                group_chat.messages.append(dict(_written))
+            except Exception as _app_err:
+                _say('warning', f"[SYNTHESIS] recovery append failed: "
+                                f"{_app_err!r} — steering instead")
+            else:
+                _say('info',
+                     f"[SYNTHESIS] the action already wrote the answer — "
+                     f"recovered {len(_written.get('content') or '')} chars "
+                     f"from the group log, no steer posted (session: "
+                     f"{user_prompt}, {_before} msgs)")
+                return False
         _steer = _REUSE_SYNTHESIS_STEER
     _say('info', f"[SYNTHESIS] reply would be raw control JSON — asking for "
                  f"the user-facing answer (session: {user_prompt}, "

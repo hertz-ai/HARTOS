@@ -122,7 +122,16 @@ class TestSteerTextIsNotAnAnswer:
         assert src.count('_REUSE_STEER_INITIATOR_NAMES = ') == 1, (
             'the steer-seat names must have exactly one definition; a second '
             'copy drifts from the terminate predicate that also reads it')
+        # RE-POINTED 2026-09-10.  The shape tests moved out of
+        # _reuse_needs_synthesis into _reuse_message_is_user_answer so the
+        # answer-recovery could ask the same question; the invariant is
+        # unchanged, it just lives one function deeper.  Both readers are
+        # named, so the guard fails again if either re-spells the seats.
         assert '_REUSE_STEER_INITIATOR_NAMES' in inspect.getsource(
-            rr._reuse_needs_synthesis), (
+            rr._reuse_message_is_user_answer), (
             'the synthesis gate must read the SHARED constant, not re-spell '
             'the seat names')
+        assert '_REUSE_STEER_INITIATOR_NAMES' in inspect.getsource(
+            rr._reuse_written_answer), (
+            'the answer-recovery bound must read the SHARED constant, not '
+            're-spell the seat names')
