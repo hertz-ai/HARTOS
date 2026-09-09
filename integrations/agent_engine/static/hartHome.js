@@ -829,11 +829,11 @@
     }).catch(function (e) { console.debug('hartHome: recipes fetch failed (keeping sample)', e); });
   }
 
-  // A row marked `flagship: true` is CURATED, and this is the one place that
+  // A row marked 'flagship: true' is CURATED, and this is the one place that
   // reads the flag. The curator can set it: the home prompt offers
-  // `"emphasis": <flagship|ranked|normal>`, _home_curate maps flagship onto the
+  // 'emphasis: flagship|ranked|normal', _home_curate maps flagship onto the
   // row and _sanitize_home_payload forwards it, so the value travelled the whole
-  // way to the client and then meant nothing. Its sibling `ranked` restyles every
+  // way to the client and then meant nothing. Its sibling 'ranked' restyles every
   // card in its row, so one of the three emphases the curator is offered was a
   // no-op. The protection that DID hold was accidental: _replaceRow matches on a
   // display title, so 'Flagship agents' survived only by never colliding with a
