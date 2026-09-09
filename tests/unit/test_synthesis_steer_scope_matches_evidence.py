@@ -26,6 +26,8 @@ been told do not exist.
 """
 import re
 
+import pytest
+
 REPO = __file__.rsplit("tests", 1)[0]
 
 
@@ -34,19 +36,22 @@ def _src():
                 errors="replace").read()
 
 
-def _steer_text(src):
-    """The ASSEMBLED steer, not its source form.
+def _steer_text(_src_unused=None):
+    """The ASSEMBLED steer — read from the module, not reconstructed.
 
-    The constant is built from implicitly-concatenated literals, so
+    This helper used to slice the constant's source block and re-join the
+    implicit-concatenation seams with a regex, because
     "Do not describe unexecuted " + "work as done" never appears contiguously
-    in the file. Asserting on raw source therefore fails on wording that IS
-    present — my first version of this test did exactly that. Join the
-    adjacent literals the way Python does before asserting on prose.
+    in the file. That worked, but it is a parser of Python written in regex,
+    and it only stayed correct while the constant's shape did: the answer-shape
+    sentence has since moved into _REUSE_SYNTHESIS_ANSWER_SHAPE and is
+    concatenated in, which the slice cannot see at all.
+
+    The module imports fine under --noconftest, so ask it. The value under
+    test is then the value the pipeline actually sends.
     """
-    i = src.index("_REUSE_SYNTHESIS_STEER_INCOMPLETE = (")
-    block = src[i:src.index("\n)\n", i)]
-    # drop the `" <newline+indent> "` seams between adjacent string literals
-    return re.sub(r'"\s*\n\s*[\'"]', "", block)
+    rr = pytest.importorskip("hartos.reuse_recipe")
+    return rr._REUSE_SYNTHESIS_STEER_INCOMPLETE
 
 
 class TestScopeMatchesEvidence:

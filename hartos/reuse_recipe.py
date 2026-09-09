@@ -3346,12 +3346,24 @@ def _reuse_group_terminate(msg):
         for _k, _v in _vj.items():
             if str(_k).lower() != 'message2userfinal':
                 continue
-            _v = str(_v or '').strip()
-            # '<your answer here>' is the steer's own template, not an answer.
-            return bool(_v) and not (_v.startswith('<') and _v.endswith('>'))
+            return _reuse_is_written_answer(_v)
         return False
     except Exception:
         return False
+
+
+def _reuse_is_written_answer(value):
+    """True when a message2userfinal VALUE is text a user can read.
+
+    Was inline in _reuse_group_terminate only, so _reuse_needs_synthesis --
+    asking the same question -- checked the KEY instead of the VALUE.  Live
+    2026-09-09 18:25:22 (agent 33323830039) that gap sent the steer's own
+    template as a whole 313-second turn's reply: `REPLY: <your answer here>`,
+    len=18, logged as "still control JSON: False".  One function, both
+    callers.  Matches `<...>` as a shape, not a specific sentence.
+    """
+    _v = str(value or '').strip()
+    return bool(_v) and not (_v.startswith('<') and _v.endswith('>'))
 
 
 def _reuse_evidence_count(group_chat):
@@ -3651,6 +3663,15 @@ def _reuse_needs_synthesis(group_chat):
             return True                      # empty tail is not an answer
         low = content.lower()
         if 'message2userfinal' in low or 'message2' in low:
+            # The KEY present is not the ANSWER present: live 18:25:22 the
+            # model returned the steer's template and this branch called it
+            # "already there".  Unparseable / key-absent keeps the old False,
+            # so this narrows the gate, it does not re-open synthesis.
+            _ans = retrieve_json(content)
+            if isinstance(_ans, dict):
+                for _ak in ('message2userfinal', 'message2'):
+                    if _ak in _ans:
+                        return not _reuse_is_written_answer(_ans[_ak])
             return False                     # the answer is already there
         if str(last.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES:
             # THE LOOP'S OWN STEER.  This seat exists to steer; it never
@@ -3709,12 +3730,33 @@ def _reuse_needs_synthesis(group_chat):
 # 0 advances) and this steer still told the model its tools had already run,
 # so the user was told "The directory change ... has been successfully
 # completed."  The model was obeying an instruction, not hallucinating.
+# HOW to reply, in ONE place, appended to both steers below.
+#
+# Both used to end "Reply to @user with exactly: {"message2userfinal":
+# "<your answer here>"}".  Live 2026-09-09 18:25:22 (agent 33323830039) the
+# model reproduced that literal as the whole reply of a 313-second turn.
+# "with exactly" is an instruction to copy; same finding as the false-premise
+# wording above -- obeying an instruction, not hallucinating.  So no copyable
+# literal ships: the slot is described, not shown.
+#
+# ONE constant because that session logged `unrun=none`, i.e. the COMPLETE
+# steer fired -- a fix applied to one copy would have missed the failing path,
+# which is exactly what happened to the D44 scope fix the same evening.
+#
+# Keeps the message2userfinal name (get_agent_response unwraps it, #797/D31)
+# and carries no braces, so .format(unrun=...) below stays safe.
+_REUSE_SYNTHESIS_ANSWER_SHAPE = (
+    "Address your reply to @user, and send one JSON object whose only key is "
+    "message2userfinal and whose value is the answer itself, written out as "
+    "sentences the user will read. Substitute the real text — a placeholder, "
+    "an empty value, or anything in angle brackets is not an answer."
+)
+
 _REUSE_SYNTHESIS_STEER = (
     "The actions are finished and their tools have already run — do NOT run "
     "any tool again and do NOT emit another status object. Write the ANSWER "
     "for the user now, in your own words, using the real tool results from "
-    "this conversation. Reply to @user with exactly: "
-    '{"message2userfinal": "<your answer here>"}'
+    "this conversation. " + _REUSE_SYNTHESIS_ANSWER_SHAPE
 )
 
 # The same request, minus the false premise, for the case the gate says some
@@ -3740,8 +3782,7 @@ _REUSE_SYNTHESIS_STEER_INCOMPLETE = (
     "for the user now, in your own words: report what WAS actually done, "
     "using only the real tool results present in this conversation, and say "
     "plainly which part could not be completed. Do not describe unexecuted "
-    "work as done. Reply to @user with exactly: "
-    '{{"message2userfinal": "<your answer here>"}}'
+    "work as done. " + _REUSE_SYNTHESIS_ANSWER_SHAPE
 )
 
 
