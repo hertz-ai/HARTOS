@@ -20,6 +20,50 @@ logger = logging.getLogger('hevolve.vlm.local_loop')
 # Max iterations to prevent infinite loops (same safeguard as OmniParser)
 MAX_ITERATIONS = 30
 
+# What the route the safety denylist FORCES actually costs, in iterations.
+# The denylist refuses interpreter one-liners (python -c, perl -e, ...) and
+# _VLM_ACTION_LIST tells the model the sanctioned alternative is write_file
+# the script, then shell it.  Walked perfectly that is:
+#     1 refused one-liner, 2 write_file, 3 shell, 4 done
+# `done` costs an iteration of its own (it yields a `completion`, not an
+# action) — pinned by test_loop_exits_on_done / test_loop_3_iterations.
+_DENYLIST_RECOVERY_ITERATIONS = 4
+
+# Slack the original clamp already granted, in its own words: "gives one
+# nudge-retry + one followup if the click misses".  For a click (route length
+# 1) that produced the historical 3.  Applying the SAME policy to a route of
+# length 4 is what makes 6 a consequence of the existing rule rather than a
+# tuning knob — see test_the_margin_is_the_original_authors_not_mine.
+_SINGLE_SHOT_RECOVERY_MARGIN = 2
+
+
+def _route_iteration_budget(route, requested):
+    """Iterations to allow for *route*, given the caller's *requested* budget.
+
+    Routing may LOWER a caller's ceiling, never raise it — the functional
+    tests drive this loop with max_iterations=1 and 5 to pin specific control
+    flow, and raising those would silently invalidate them.
+
+    Only a POSITIVELY-matched route is clamped.  `single_shot` is
+    route_task's default fall-through, not a verdict that the task is one
+    click, so it gets the floor the forced route needs rather than a
+    click-sized budget.  Live 2026-09-10 (agent 18088688973, action 2) both
+    "Execute the following sequence of commands:" and "Run the following
+    Python script ... and report ..." fell through to single_shot, were
+    capped at 3, and exited exit_reason=max_iterations — the tool then
+    returned a TOOL_FAILURE_RESULTS string and the fabrication gate
+    correctly refused the action.  Iteration 2 of the second run DID
+    write_file correctly; the budget died one step later.
+    """
+    if route == 'enumerate':
+        # parse_and_reason snapshot — no follow-up iteration needed.
+        return min(requested, 1)
+    if route == 'single_shot':
+        return min(requested,
+                   _DENYLIST_RECOVERY_ITERATIONS + _SINGLE_SHOT_RECOVERY_MARGIN)
+    # multi_step, and any verdict route_task gains later: never over-cap.
+    return requested
+
 # Action list — single source of truth for both the legacy SYSTEM_PROMPT
 # and the unified-mode combined_prompt. Keeping one string means the
 # legacy OmniParser path and the unified Qwen3-VL path can never drift
@@ -247,15 +291,11 @@ def run_local_agentic_loop(
     try:
         if qwen3vl is not None:
             _route = qwen3vl.route_task(instruction or enhanced)
-            logger.info(f"VLM loop route_task: '{instruction[:60]}' → {_route}")
-            if _route == 'single_shot' and max_iterations > 3:
-                # Cap at 3 — gives one nudge-retry + one followup
-                # if the click misses without burning the full budget.
-                max_iterations = 3
-            elif _route == 'enumerate' and max_iterations > 1:
-                # Enumerate = parse_and_reason snapshot, no follow-up
-                # iter needed.
-                max_iterations = 1
+            _budget = _route_iteration_budget(_route, max_iterations)
+            logger.info(
+                f"VLM loop route_task: '{instruction[:60]}' → {_route} "
+                f"(iterations {max_iterations} → {_budget})")
+            max_iterations = _budget
     except Exception as e:
         logger.debug(f'route_task wire-up skipped: {e}')
 
