@@ -3640,12 +3640,37 @@ def _reuse_needs_synthesis(group_chat):
 # Asks for the ONE thing the round never produced.  Deliberately names the
 # response_format key the prompt already defines, so the existing extractor
 # unwraps it with no new parsing rule.
+#
+# USED ONLY WHEN THE TOOLS REALLY RAN.  This text asserts completion, and for
+# a long time it was the ONLY steer — posted whenever the tail was control
+# JSON, with no reference to whether anything had executed.  Measured live
+# 2026-09-09 08:14:20 (agent 33323830039): the fabrication gate had just
+# refused action 2 ("executed=[]; unrun=['execute_windows_or_android_command']",
+# 0 advances) and this steer still told the model its tools had already run,
+# so the user was told "The directory change ... has been successfully
+# completed."  The model was obeying an instruction, not hallucinating.
 _REUSE_SYNTHESIS_STEER = (
     "The actions are finished and their tools have already run — do NOT run "
     "any tool again and do NOT emit another status object. Write the ANSWER "
     "for the user now, in your own words, using the real tool results from "
     "this conversation. Reply to @user with exactly: "
     '{"message2userfinal": "<your answer here>"}'
+)
+
+# The same request, minus the false premise, for the case the gate says some
+# tool did NOT execute.  Names the tools so the answer can be specific: a
+# model told only "something failed" writes a vaguer report than the user
+# deserves.  Asks for the SAME message2userfinal key, so the existing
+# extractor unwraps it unchanged (a different shape would produce an answer
+# nobody reads — #797/D31).
+_REUSE_SYNTHESIS_STEER_INCOMPLETE = (
+    "Do NOT run any tool again and do NOT emit another status object. These "
+    "tools did NOT execute in this conversation: {unrun}. Write the ANSWER "
+    "for the user now, in your own words: report what WAS actually done, "
+    "using only the real tool results present in this conversation, and say "
+    "plainly which part could not be completed. Do not describe unexecuted "
+    "work as done. Reply to @user with exactly: "
+    '{{"message2userfinal": "<your answer here>"}}'
 )
 
 
@@ -3687,12 +3712,31 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
         except Exception:
             pass
 
+    # WHAT ACTUALLY RAN decides what we are allowed to assert.  Asked of
+    # _reuse_outstanding_tools — the fabrication gate's own predicate, one
+    # function below — so the sentence the user reads is bound to the same
+    # evidence the gate uses to refuse an advance.  Without this the two
+    # disagreed: the gate refused action 2 and the reply still claimed
+    # success (measured 2026-09-09 08:13:41 vs 08:14:20).  Its error path
+    # returns ['<unknown>'], so an unmeasurable state is treated as
+    # outstanding — asserting success on what we cannot measure is the same
+    # defect wearing a different hat.
+    try:
+        _unrun = _reuse_outstanding_tools(
+            user_prompt, _reuse_current_action_id(user_prompt), group_chat)
+    except Exception:
+        _unrun = ['<unknown>']
+    if _unrun:
+        _steer = _REUSE_SYNTHESIS_STEER_INCOMPLETE.format(
+            unrun=', '.join(str(t) for t in _unrun))
+    else:
+        _steer = _REUSE_SYNTHESIS_STEER
     _say('info', f"[SYNTHESIS] reply would be raw control JSON — asking for "
                  f"the user-facing answer (session: {user_prompt}, "
-                 f"{_before} msgs)")
+                 f"{_before} msgs, unrun={_unrun or 'none'})")
     try:
         chat_instructor.initiate_chat(
-            recipient=manager, message=_REUSE_SYNTHESIS_STEER,
+            recipient=manager, message=_steer,
             clear_history=False, silent=False)
     except Exception as err:
         _say('warning', f"[SYNTHESIS] steer failed: {err}")
