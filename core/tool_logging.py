@@ -94,6 +94,45 @@ def _emit_tool_call_stage(tool_name: str) -> None:
         )
 
 
+def _session_suffix() -> str:
+    """`" for session: <user_id>_<prompt_id>"`, or '' when there is no context.
+
+    WHY (measured live 2026-09-09 22:06:08).  A tool execution line named only
+    the tool: `TOOL EXECUTION SUCCESS: execute_windows_or_android_command`.
+    One server.log carries every agent AND every daemon, and four reuse
+    sessions were interleaved in that one window, so it was impossible to say
+    WHOSE tool ran -- while the session-qualified [FAB-GUARD] snapshot taken
+    17s earlier still read `unrun`.  The strongest "the tool truly ran" signal
+    in the system was therefore unattributable, which is the same defect
+    HARTOS 2eaec2be4 fixed at FAB-GUARD; this is the identical remedy at the
+    identical layer -- the PRODUCER.
+
+    Deliberately the same `for session: {user}_{prompt_id}` spelling as
+    `Retrieved current_action_id: N for session: ...` and `[FAB-GUARD]`, so
+    ONE grep attributes every marker instead of three vocabularies for one
+    fact.
+
+    Never raises and never blocks the tool: a daemon tick has no chat context
+    and must still execute.  `hartos.threadlocal` is imported inside the
+    function for the same reason `_emit_tool_call_stage` does it -- core must
+    not take a module-level dependency on hartos.
+    """
+    try:
+        from hartos.threadlocal import thread_local_data
+
+        user_id = thread_local_data.get_user_id()
+        prompt_id = thread_local_data.get_prompt_id()
+        if user_id and prompt_id:
+            return f" for session: {user_id}_{prompt_id}"
+    except Exception:
+        # Attribution is evidence, not behaviour: a failure to resolve it must
+        # never surface as a tool failure.  Debug, not warning -- the no-context
+        # case is normal (daemons) and a warning per tool call would be noise.
+        _emit_logger.debug("[tool_logging] session suffix unavailable",
+                           exc_info=True)
+    return ""
+
+
 def _error_envelope(func_name: str, exc: BaseException) -> str:
     """Structured JSON error returned to the LLM on tool failure.
 
@@ -186,7 +225,9 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
 
     def _on_error(e, _t0=None):
         _took = '' if _t0 is None else f" latency_ms={round((time.perf_counter() - _t0) * 1000, 1)}"
-        tool_logger.error(f"TOOL EXECUTION ERROR: {tool_name} - {e}{_took}")
+        tool_logger.error(
+            f"TOOL EXECUTION ERROR: {tool_name} - {e}{_took}"
+            f"{_session_suffix()}")
         tool_logger.exception("Exception details:")
         if plain_errors:
             return f"Tool '{tool_name}' encountered an error: {str(e)[:200]}"
@@ -212,7 +253,8 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
                     result = str(result)
                 tool_logger.info(
                     f"TOOL EXECUTION SUCCESS: {tool_name} "
-                    f"latency_ms={round((time.perf_counter() - _t0) * 1000, 1)}")
+                    f"latency_ms={round((time.perf_counter() - _t0) * 1000, 1)}"
+                    f"{_session_suffix()}")
                 tool_logger.info(
                     f"Result: {result[:100]}..."
                     if len(result) > 100 else f"Result: {result}"
@@ -250,7 +292,8 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
                 result = str(result)
             tool_logger.info(
                 f"TOOL EXECUTION SUCCESS: {tool_name} "
-                f"latency_ms={round((time.perf_counter() - _t0) * 1000, 1)}")
+                f"latency_ms={round((time.perf_counter() - _t0) * 1000, 1)}"
+                f"{_session_suffix()}")
             tool_logger.info(
                 f"Result: {result[:100]}..."
                 if len(result) > 100 else f"Result: {result}"
