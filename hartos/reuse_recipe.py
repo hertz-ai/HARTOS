@@ -4670,6 +4670,41 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     current_app.logger.info(f'continuing since @user not in last message')
                     continue
 
+                # NOTHING CAN DRIVE THIS ACTION — end the turn, don't re-loop.
+                # Falling through here re-enters the loop with the conversation
+                # unchanged.  For an AUTONOMOUS action that is fine: the next
+                # pass calls initiate_chat above and the group really moves.
+                # For a NON-autonomous one that call is gated off, and so is
+                # every advance path (completion / breakdown / under-report all
+                # test the same predicate), so the next pass is byte-identical
+                # to this one and the loop spins at CPU speed until the round
+                # cap stops it.
+                #
+                # Measured live 2026-09-09 (agent 33323830039, action 2 of 4,
+                # 'cd C:\\Users\\sathi\\Documents', can_perform_without_user_input
+                # = 'no'): all 13 `inside reuse while1` passes inside ONE 10 ms
+                # window 07:27:31,833 -> ,843, 2 outbound LLM calls in the whole
+                # phase, allowance gone, `[REUSE-ROUNDS] ... used its 12 rounds`.
+                # Every other branch's log marker is absent from that window,
+                # which is what identifies this path.
+                #
+                # Break to the post-loop extractor — the same exit the
+                # TERMINATE/IndexError path takes (#798).  It already
+                # synthesises the user-facing reply, observed one line after
+                # the cap fired ('[SYNTHESIS] reply would be raw control JSON
+                # — asking for the user-facing answer'), so this reaches the
+                # identical outcome deterministically instead of after 11
+                # wasted rounds.  Never `return ''` here (#797/D31).
+                if not _reuse_action_is_autonomous(
+                        user_prompt, user_tasks[user_prompt].current_action):
+                    current_app.logger.warning(
+                        f"[REUSE-NODRIVER] action "
+                        f"{user_tasks[user_prompt].current_action} is not "
+                        f"autonomous and the last message is addressed to no "
+                        f"one — nothing would change on the next pass, so "
+                        f"ending the turn instead of spinning")
+                    break
+
             else:
                 current_app.logger.info(f'@user in last message')
                 break
