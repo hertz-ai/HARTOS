@@ -6372,10 +6372,45 @@ def get_total_actions_for_current_flow_and_reset_actions(prompt_id, user_prompt)
     return config, total_actions
 
 
+def _drop_non_flow_entries(config, prompt_id):
+    """Remove anything in config['flows'] that is not a flow.
+
+    A flow is a dict carrying 'actions'.  Every other entry is malformed model
+    JSON that a lenient repair let through, and indexing it crashes the whole
+    /chat request: live 2026-09-09 agent 28160128202 died 5/5 turns on
+    `config['flows'][flow_idx]['actions']` -> KeyError, so recipe() never
+    reached the authoring loop and a tool-less fallback answered instead.
+
+    Measured over all 720 on-disk configs (1151 flow entries): exactly two are
+    affected -- 28160128202 has the TOP-LEVEL keys extra_information /
+    review_required misplaced into flows[], and 79991757345 has a bare '}'.
+    For the other 718 this is a no-op, so flow indices (which name the
+    <id>_<flow>_<action>.json files) do not move.
+    """
+    if not isinstance(config, dict):
+        return config
+    flows = config.get('flows')
+    if not isinstance(flows, list):
+        return config
+    kept = [f for f in flows if isinstance(f, dict) and 'actions' in f]
+    if len(kept) != len(flows):
+        # getLogger, not current_app.logger: this loader has 16 call sites and
+        # not all are inside a Flask request (daemon ticks read configs too).
+        # Logging through current_app raised "needed the current application"
+        # in 3/9 of this fix's own tests -- i.e. the guard would itself have
+        # crashed the very config read it exists to protect.
+        logging.getLogger(__name__).error(
+            f"[CONFIG] prompt_id={prompt_id}: dropped {len(flows) - len(kept)} "
+            f"non-flow entrie(s) from flows[] (no 'actions' key) -- malformed "
+            f"saved config, keeping {len(kept)} real flow(s)")
+        config['flows'] = kept
+    return config
+
+
 def get_prompt_config_json(prompt_id):
     with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
         config = json.load(f)
-    return config
+    return _drop_non_flow_entries(config, prompt_id)
 
 
 def acknowledgment(user_id,prompt_id,request_id):
