@@ -229,7 +229,11 @@ class TestCreationToReuseTransition:
         assert recipe_file.exists()
 
         # 3. Update database
-        with patch('hartos.create_recipe.requests.patch') as mock_patch:
+        # update_agent_creation_to_db uses the shared connection-pooled
+        # client (core.http_pool.pooled_patch), not a bare requests.patch
+        # call -- create_recipe.py doesn't import `requests` at module
+        # level at all any more.
+        with patch('hartos.create_recipe.pooled_patch') as mock_patch:
             mock_patch.return_value.status_code = 200
 
             from hartos.create_recipe import update_agent_creation_to_db

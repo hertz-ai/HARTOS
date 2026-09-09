@@ -289,6 +289,41 @@ class TestLocalDispatch:
                 local, 'tell me a story', 'u', 'pid', 'general', None)
         assert out == 'collapsed answer'
         post.assert_called_once()
+
+    def test_local_non_bundled_honors_channel_agent_timeout_env_var(
+            self, monkeypatch):
+        """Found live 2026-08-31: this re-entrant /chat call hardcoded
+        timeout=60, but it runs the SAME full multi-agent turn as any
+        other channel's /chat call, which routinely takes well over 60s
+        locally — the future completed "cleanly" (no exception, no log)
+        exactly 60.0s after starting, silently discarding a real answer
+        that was still generating. Must honor the same
+        HEVOLVE_CHANNEL_AGENT_TIMEOUT every other channel already does."""
+        monkeypatch.delenv('NUNBA_BUNDLED', raising=False)
+        monkeypatch.setattr(sys, 'frozen', False, raising=False)
+        monkeypatch.setenv('HEVOLVE_CHANNEL_AGENT_TIMEOUT', '300')
+
+        from integrations.agent_engine.speculative_dispatcher import (
+            SpeculativeDispatcher,
+        )
+        from integrations.agent_engine.model_registry import (
+            ModelRegistry, ModelBackend, ModelTier,
+        )
+        d = SpeculativeDispatcher(model_registry=ModelRegistry())
+        local = ModelBackend(
+            model_id='qwen-4b-local', display_name='4B', tier=ModelTier.FAST,
+            config_list_entry={
+                'model': 'qwen-4b', 'api_key': 'k',
+                'base_url': 'http://127.0.0.1:8080/v1',
+            },
+            is_local=True,
+        )
+        fake_resp = MagicMock(status_code=200)
+        fake_resp.json.return_value = {'response': 'collapsed answer'}
+        with patch('requests.post', return_value=fake_resp) as post:
+            d._dispatch_expert_langchain(
+                local, 'tell me a story', 'u', 'pid', 'general', None)
+        assert post.call_args.kwargs['timeout'] == 300
         body = post.call_args.kwargs['json']
         # Re-entry guard: inner /chat reads these and skips dispatcher
         assert body['speculative'] is False
@@ -470,3 +505,92 @@ class TestCollapsedPathDelivery:
                 'spec-r', 'p', 'r', expert,
                 'u', 'pid', None, 'general')
         assert rec.call_args.kwargs['escalation_reason'] == 'refusal_override'
+
+
+# ─────────────────────────────────────────────────────────────────────
+# _deliver_expert_response — a failed expert turn must not leak its raw
+# internal error string to the user (2026-08-31: found live on Signal —
+# a malformed tool-call from the local model 500'd, and the literal
+# "Error getting response: Error code: 500 - {...}" was delivered to the
+# channel as if it were the real answer, landing right after the standby
+# and reading as a second, broken reply).
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _run_deliver(dispatcher, monkeypatch, response, speculation_id='spec-x'):
+    """Drive _deliver_expert_response's channel leg to completion and
+    return whatever text actually reached ChannelRegistry.send_to_channel
+    (or None if the leg didn't fire)."""
+    import asyncio
+    import core.safe_hartos_attr as sha
+    import core.peer_link.message_bus as mb
+    import integrations.channels.registry as reg
+    import integrations.channels.flask_integration as fi
+
+    monkeypatch.setattr(sha, 'safe_hartos_attr', lambda name: None)
+    monkeypatch.setattr(mb, 'chat_topic_for', lambda uid: f'chat.{uid}')
+
+    captured = {}
+
+    class FakeRegistry:
+        async def send_to_channel(self, channel, chat_id, text):
+            captured['channel_text'] = text
+
+            class R:
+                success = True
+            return R()
+
+    monkeypatch.setattr(reg, 'get_registry', lambda: FakeRegistry())
+
+    class FakeLoop:
+        def is_running(self):
+            return True
+
+    monkeypatch.setattr(
+        fi, 'get_channel_integration',
+        lambda: type('X', (), {'_loop': FakeLoop()})(),
+    )
+    monkeypatch.setattr(
+        asyncio, 'run_coroutine_threadsafe',
+        lambda coro, loop: asyncio.ensure_future(coro),
+    )
+
+    with dispatcher._lock:
+        dispatcher._active[speculation_id] = {
+            'channel_context': {'channel': 'signal', 'chat_id': '+1'},
+        }
+
+    async def _run():
+        dispatcher._deliver_expert_response(
+            'u', 'pid', speculation_id, response)
+        await asyncio.sleep(0.05)
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+    return captured.get('channel_text')
+
+
+class TestErrorLeakGuard:
+
+    def test_error_shaped_response_not_delivered_verbatim(
+            self, dispatcher, monkeypatch):
+        raw_error = (
+            "Error getting response: Error code: 500 - {'error': "
+            "{'code': 500, 'message': 'Failed to parse tool call "
+            "arguments as JSON'}}"
+        )
+        delivered = _run_deliver(dispatcher, monkeypatch, raw_error)
+        assert delivered != raw_error
+        assert delivered == (
+            "I ran into a problem working on that — could you try again?"
+        )
+
+    def test_successful_response_still_delivered_unchanged(
+            self, dispatcher, monkeypatch):
+        delivered = _run_deliver(
+            dispatcher, monkeypatch,
+            "Sure! Here's the answer you asked for: 42.")
+        assert delivered == "Sure! Here's the answer you asked for: 42."

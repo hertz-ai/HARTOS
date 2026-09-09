@@ -130,6 +130,17 @@ def resolve_llm_backend():
         # it lands on the client, not on .create(). The api kind keeps the
         # default retries: a real cloud 429/5xx genuinely is transient.
         "max_retries": 0,
+        # A local model that never emits a stop token will generate until it
+        # exhausts the context while the caller blocks forever: the shared
+        # http_client's timeout is deliberately loose (must not cut off a
+        # long real generation), so nothing else bounds this. Observed live
+        # -- llama-server logged n_decoded=3448 and climbing on a one-word
+        # "hello" until the client gave up. Bound both ends so a runaway
+        # generation degrades to a truncated reply instead of an unbounded
+        # hang. Cloud configs are left alone; those providers enforce their
+        # own limits.
+        "max_tokens": int(os.environ.get('HEVOLVE_LOCAL_LLM_MAX_TOKENS', '1024')),
+        "timeout": int(os.environ.get('HEVOLVE_LOCAL_LLM_TIMEOUT', '180')),
     }
 
 

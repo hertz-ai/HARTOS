@@ -110,6 +110,65 @@ def _error_envelope(func_name: str, exc: BaseException) -> str:
     return f"Tool execution failed: {json.dumps(payload)}"
 
 
+def _rebind_annotations(wrapper, func):
+    """Re-resolve the wrapped function's annotations in ITS own namespace.
+
+    @wraps copies func.__annotations__ onto the wrapper verbatim, but the
+    wrapper's __globals__ is THIS module's.  The tool modules
+    (reuse_recipe.py, create_recipe.py, ...) use `from __future__ import
+    annotations`, so those copied annotations are plain STRINGS like
+    "Annotated[str, 'Target persona/role name']".  Anything that later
+    resolves them — autogen's register_for_llm → pydantic — evaluates
+    them against the wrapper's globals, where `Annotated` was never
+    imported, giving:
+
+        PydanticUndefinedAnnotation: name 'Annotated' is not defined
+
+    That propagates out of create_agents_for_user and 500s the entire
+    /chat turn, so every channel replies "Sorry, I encountered an error"
+    no matter what the user said.
+
+    Resolving eagerly here — in func.__globals__, where the names DO
+    exist — leaves the wrapper carrying real objects that need no further
+    resolution.  include_extras=True is required: it preserves the
+    Annotated[...] metadata autogen reads for parameter descriptions.
+
+    Setting __annotations__ alone is NOT enough: @wraps also sets
+    __wrapped__, and inspect.signature() follows that back to the original
+    function and reads its raw string annotations, bypassing anything we
+    put on the wrapper.  inspect.signature stops unwrapping as soon as it
+    finds __signature__, so the resolved signature must be pinned there
+    too — that is what autogen's register_for_llm actually reads.
+
+    Best-effort: a tool whose annotations genuinely can't resolve keeps
+    the copied strings rather than failing to register at all.
+    """
+    try:
+        hints = get_type_hints(func, include_extras=True)
+    except Exception as e:
+        tool_logger.debug(
+            "could not resolve annotations for %s: %s",
+            getattr(func, '__name__', func), e,
+        )
+        return
+
+    wrapper.__annotations__ = hints
+    try:
+        sig = inspect.signature(func, follow_wrapped=False)
+        wrapper.__signature__ = sig.replace(
+            parameters=[
+                p.replace(annotation=hints.get(p.name, p.annotation))
+                for p in sig.parameters.values()
+            ],
+            return_annotation=hints.get('return', sig.return_annotation),
+        )
+    except Exception as e:
+        tool_logger.debug(
+            "could not pin resolved signature for %s: %s",
+            getattr(func, '__name__', func), e,
+        )
+
+
 def log_tool_execution(func=None, *, name=None, plain_errors=False):
     """Decorator wrapping a tool function with logging + UI emit.
 
@@ -223,6 +282,14 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
 
         if _resolved_hints:
             async_wrapper.__annotations__ = _resolved_hints
+        # _rebind_annotations additionally pins __signature__, which
+        # inspect.signature() (what autogen's register_for_llm actually
+        # calls) follows via __wrapped__ regardless of __annotations__ —
+        # see its own docstring. Layered with the _resolved_hints repair
+        # above for the same reason reuse_recipe.py keeps its own
+        # annotation-quoting fix alongside this one (comment above):
+        # two fixes for one defect family, neither sufficient alone.
+        _rebind_annotations(async_wrapper, func)
         return async_wrapper
 
     @wraps(func)
@@ -261,6 +328,7 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
 
     if _resolved_hints:
         sync_wrapper.__annotations__ = _resolved_hints
+    _rebind_annotations(sync_wrapper, func)
     return sync_wrapper
 
 

@@ -284,6 +284,185 @@ llm_call_track = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_llm_call_t
 _active_tools = {}
 _active_tools_lock = threading.Lock()
 
+# ── Re-entrancy guard for concurrent turns on the SAME user+prompt ──────────
+#
+# user_agents[user_prompt] caches ONE autogen GroupChat per user+prompt, and
+# every agent in it is mutable shared state.  Two turns running concurrently
+# for the same key therefore drive the same GroupChat, and they corrupt each
+# other -- observed live as group_chat.messages being EMPTY the instant
+# initiate_chat() returned, which then raised IndexError out of
+# get_agent_response and delivered the literal text "Error getting response:
+# list index out of range" to the user on Discord/WhatsApp/Telegram.
+#
+# The concurrency is not hypothetical and not the caller's fault: a real user
+# turn causes the speculative dispatcher to POST *back* to /chat on localhost
+# (integrations/agent_engine/speculative_dispatcher.py -- the non-bundled
+# branch), landing a second, identical turn on the same key ~6ms later.
+# speculative_dispatcher.py already warns that re-entering /chat "causes
+# re-entrancy" and avoids it in bundled mode; the HTTP path had no such guard.
+#
+# A speculative turn is a pure optimisation whose callers all tolerate an
+# empty result, so the duplicate is dropped rather than queued -- queueing it
+# behind the real turn would deadlock, because the real turn is what is
+# blocked waiting on it.
+_inflight_turns = set()
+_inflight_turns_lock = threading.Lock()
+
+# Module logger for the GroupChat tracer below.  Deliberately NOT current_app:
+# the tracer must be able to report from any thread, with or without a Flask
+# app context.  Self-contained import so the careful io_guard-first ordering at
+# the top of this file is left alone.
+import logging as _logging  # noqa: E402  (intentional, see comment above)
+_LOG = _logging.getLogger(__name__)
+
+
+# ── Wall-clock bound on a single turn's GroupChat round-robin ──────────────
+#
+# The reuse loop in get_agent_response already has iteration/second bounds,
+# but they guard the WRONG loop: get_agent_response calls
+# user_proxy.initiate_chat(...) FIRST, and the bounded `while True` runs only
+# after it returns.  The runaway lives inside autogen's own round-robin, which
+# those bounds never observe.
+#
+# Measured 2026-08-12: a plain "hello" ran 1408s (23m28s).  max_round=10 did
+# fire -- the tally was Assistant x10 -- but ten rounds of a local 4B at
+# ~90-140s each is 23 minutes, and the caller had long since timed out.  A
+# round cap cannot bound wall-clock when each round is unboundedly slow.
+#
+# autogen's contract: a custom speaker_selection_method returning None raises
+# NoEligibleSpeaker, which run_chat catches with a plain `break` (groupchat.py
+# ~1186).  So returning None ends the chat *gracefully* -- messages already
+# appended survive, and the existing conversational-reply extraction and
+# post-loop fallback still run.  That makes the selector the correct place to
+# enforce a deadline: it is called once per round, inside the loop that is
+# actually spinning.
+# Scope is the THREAD, not the session.  A session-keyed dict looks right and
+# is wrong: the speculative/expert-dispatch re-entry means two turns run
+# concurrently under the SAME user_prompt (observed 2026-08-12 --
+# "[REENTRANCY] concurrent non-speculative turn ... shared GroupChat may
+# interleave").  With one shared entry, whichever turn finished first ran its
+# finally: and disarmed the other, silently restoring unbounded behaviour for
+# the turn still running.  Caught by watching a real run, not by the tests.
+#
+# A thread is the right unit: autogen's initiate_chat, the speaker selectors
+# it calls, and the reuse loop afterwards all execute synchronously on the
+# thread that started the turn.
+_turn_deadline_state = threading.local()
+
+
+def _begin_turn_deadline(user_prompt: str, only_if_unset: bool = False) -> float:
+    """Arm the wall-clock deadline for this thread's turn.  Returns it.
+
+    ``only_if_unset`` keeps an already-running clock rather than restarting
+    it.  /chat arms the deadline at the request entry so the bound covers the
+    time a *user* actually waits; get_agent_response then arms with
+    only_if_unset=True so it extends nothing -- re-arming there would reset
+    the clock partway through and hand back the very overshoot the entry-point
+    arming exists to remove.  Measured 2026-08-12: ~84s elapses between a
+    Discord message arriving and initiate_chat starting, so a 150s bound armed
+    at initiate_chat let a real turn run 234s.
+    """
+    if only_if_unset and getattr(_turn_deadline_state, 'deadline', None) is not None:
+        return _turn_deadline_state.deadline
+    _seconds = float(os.environ.get('HEVOLVE_TURN_MAX_SECONDS', '150'))
+    _deadline = time.time() + _seconds
+    _turn_deadline_state.deadline = _deadline
+    _turn_deadline_state.user_prompt = user_prompt
+    return _deadline
+
+
+def _clear_turn_deadline(user_prompt: str) -> None:
+    """Disarm — only ever affects the calling thread's own turn."""
+    _turn_deadline_state.deadline = None
+    _turn_deadline_state.user_prompt = None
+
+
+def _turn_deadline_exceeded(user_prompt: str) -> bool:
+    """True once this thread's turn has outlived HEVOLVE_TURN_MAX_SECONDS.
+
+    Nothing armed => no deadline => never expired.  A turn that somehow
+    reaches a selector without going through _begin_turn_deadline keeps the
+    old unbounded behaviour rather than being killed by a stale entry.
+
+    ``user_prompt`` is still taken (and checked) so a selector belonging to a
+    different session than the armed turn can never be terminated by it --
+    cached agents are shared, and their closures capture their own
+    user_prompt.
+    """
+    _deadline = getattr(_turn_deadline_state, 'deadline', None)
+    if _deadline is None:
+        return False
+    _armed_for = getattr(_turn_deadline_state, 'user_prompt', None)
+    if _armed_for is not None and _armed_for != user_prompt:
+        return False
+    return time.time() > _deadline
+
+
+def _resync_manager_reply_config(manager, group_chat) -> int:
+    """Re-point a GroupChatManager's registered run_chat config at the LIVE
+    ``group_chat.messages`` list.  Returns the number of configs re-pointed.
+
+    Why this is needed
+    ------------------
+    autogen's ``ConversableAgent.register_reply`` stores ``copy.copy(config)``,
+    so ``GroupChatManager.__init__`` registers ``run_chat`` against a *shallow
+    copy* of the GroupChat -- a different object that merely shares the same
+    ``.messages`` list at construction time.
+
+    ``run_chat`` appends to that bound copy, never to ``manager.groupchat``.
+    So the moment anything REASSIGNS ``group_chat.messages`` after the manager
+    is built -- which the MemoryGraph/provenance hooks below do -- the copy
+    keeps pointing at the original list while every reader here uses the new
+    one.  Result: autogen writes a full conversation into a list nobody reads,
+    ``group_chat.messages`` stays empty forever, and every channel gets the
+    "I wasn't able to put a response together" fallback even though the model
+    produced a perfectly good reply.
+
+    That was the empty-GroupChat defect (2026-08-04..08-10).  It is
+    deterministic, not a race, which is why restarting never helped.
+
+    Keep this call AFTER the last ``.messages`` reassignment.  Better still, do
+    not reassign ``.messages`` after manager construction at all -- this
+    function exists because the hooks below have to.
+    """
+    _n = 0
+    try:
+        import autogen as _ag
+        for _entry in getattr(manager, '_reply_func_list', []) or []:
+            _cfg = _entry.get('config')
+            if isinstance(_cfg, _ag.GroupChat) and _cfg is not group_chat:
+                if _cfg.messages is not group_chat.messages:
+                    _cfg.messages = group_chat.messages
+                    _n += 1
+    except Exception as _e:
+        try:
+            _LOG.error(f'[GC-RESYNC-FAILED] {_e}')
+        except Exception:
+            pass
+    return _n
+
+
+def _is_expert_dispatch_reentry() -> bool:
+    """True when this /chat request is the dispatcher calling back into itself.
+
+    Detected by the SHAPE of the payload, not by a truthy flag: the dispatcher
+    deliberately sends ``'speculative': False`` / ``'draft_first': False`` (its
+    own "hard no-reentry" markers, telling the inner /chat not to speculate
+    again), so testing those values always reports False.  What actually
+    identifies the caller is that it explicitly sends ``model_config`` together
+    with those markers -- a combination no external client (curl, the RN app,
+    a channel adapter) ever produces.
+    """
+    try:
+        from flask import request as _rq
+        body = _rq.get_json(silent=True) or {}
+    except Exception:
+        return False
+    if not isinstance(body, dict):
+        return False
+    return 'model_config' in body and (
+        'speculative' in body or 'draft_first' in body)
+
 # (removed dead module-level redis_client — never referenced; the only
 # `redis_client` uses here are getattr(backend, 'redis_client') on ledger
 # backends, unrelated. The one live recipe-pipeline client is helper.py. #93)
@@ -2249,12 +2428,14 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
     try:
         from integrations.service_tools import (
             service_tool_registry, Crawl4AITool, AceStepTool,
-            SeoAuditTool, GhPrTool)
+            SeoAuditTool, GhPrTool, TimeTool, CalculatorTool)
 
         Crawl4AITool.register()   # port 11235
         AceStepTool.register()    # port 8001
         SeoAuditTool.register()   # native in-process (no port)
         GhPrTool.register()       # native in-process (no port)
+        TimeTool.register()       # native in-process (no port)
+        CalculatorTool.register() # native in-process (no port)
         service_tool_registry.load_config()  # load any user-added tools from service_tools.json
 
         svc_tools = service_tool_registry.get_all_tool_functions()
@@ -2531,6 +2712,17 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
     def state_transition(last_speaker, groupchat):
         messages = groupchat.messages
+        # Wall-clock bound.  See _turn_deadline_exceeded: max_round alone
+        # cannot bound a turn when each round is an unboundedly slow local
+        # LLM call.  None => NoEligibleSpeaker => run_chat breaks cleanly.
+        if _turn_deadline_exceeded(user_prompt):
+            current_app.logger.error(
+                f'[TURN-DEADLINE] ending group chat for {user_prompt} after '
+                f'{os.environ.get("HEVOLVE_TURN_MAX_SECONDS", "150")}s — '
+                f'{len(messages)} message(s) so far, last speaker '
+                f'{getattr(last_speaker, "name", last_speaker)}. Terminating '
+                f'so the caller gets an answer instead of waiting forever.')
+            return None
         try:
             request_id = f'{request_id_list[user_prompt]}'
             # Check for specific agent mentions FIRST - this should take precedence
@@ -2624,6 +2816,13 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                         # The actual advancement happens in get_agent_response/chat_agent loops
                         return chat_instructor
 
+                    # See should_delegate_route_to_helper for why this exists.
+                    if should_delegate_route_to_helper(last_json, last_speaker.name):
+                        current_app.logger.info(
+                            f"[DELEGATE-ROUTE] delegate={last_json.get('delegate')!r} -> "
+                            f"Helper (hive not yet peer-dispatched; using the local path)")
+                        return helper
+
                     # Use known pipeline state, not LLM's claimed action_id
                     _known_aid = user_tasks[user_prompt].current_action
                     _cp_yes = False
@@ -2690,7 +2889,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
             if (last_speaker.name == f"user_proxy_{user_id}" or
                     last_speaker.name == "multi_role_agent" or
-                    last_speaker.name == "helper" or
+                    last_speaker.name == "Helper" or
                     last_speaker.name == "Executor" or
                     last_speaker.name == "ChatInstructor"):
                 return assistant
@@ -2757,6 +2956,10 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
     def state_transition1(last_speaker, groupchat):
         current_app.logger.info('INSIDE TIMER STATE TRANSITION')
         messages = groupchat.messages
+        if _turn_deadline_exceeded(user_prompt):
+            current_app.logger.error(
+                f'[TURN-DEADLINE] ending timer group chat for {user_prompt}')
+            return None
         # visual_context = helper_fun.get_visual_context(user_id)
         # if visual_context:
         #     groupchat.messages.insert(-1,{'content':visual_context,'role':'user','name':'helper'})
@@ -2823,6 +3026,10 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
     def state_transition2(last_speaker, groupchat):
         current_app.logger.info('INSIDE VISUAL STATE TRANSITION')
         messages = groupchat.messages
+        if _turn_deadline_exceeded(user_prompt):
+            current_app.logger.error(
+                f'[TURN-DEADLINE] ending visual group chat for {user_prompt}')
+            return None
         # visual_context = helper_fun.get_visual_context(user_id)
         # if visual_context:
         #     groupchat.messages.insert(-1,{'content':visual_context,'role':'user','name':'helper'})
@@ -2919,6 +3126,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         llm_config={"cache_seed": None, "config_list": config_list},
         is_termination_msg=_reuse_group_terminate,
     )
+
 
     group_chat_1 = autogen.GroupChat(
         agents=[time_agent, helper1, time_user, multi_role_agent1, executor1, chat_instructor1, verify1],
@@ -3019,9 +3227,314 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             f"system_introspect autogen registration failed: {_ie}",
         )
 
+    # THE FIX for the empty-GroupChat defect.  Must run AFTER every
+    # `.messages` reassignment above (the MemoryGraph/provenance hooks),
+    # because each one orphans the list autogen's registered run_chat config
+    # still points at.  See _resync_manager_reply_config for the full
+    # mechanism.
+    try:
+        _resynced = 0
+        for _mgr, _gc in ((manager, group_chat),
+                          (manager_1, group_chat_1),
+                          (manager_2, group_chat_2)):
+            _resynced += _resync_manager_reply_config(_mgr, _gc)
+        current_app.logger.info(
+            f'[GC-RESYNC] re-pointed {_resynced} reply-config(s) at the live '
+            f'group-chat message list(s)')
+    except Exception as _rs_err:
+        current_app.logger.error(f'[GC-RESYNC] failed: {_rs_err}')
+
     return assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group
 
 
+# The dispatcher prompt (speculative_dispatcher.py ~1107) shows the model the
+# exact JSON shape to emit, using angle-bracketed placeholders --
+# "<your short reply to the user, 1-3 sentences>".  A 4B model sometimes
+# parrots that skeleton back instead of filling it in.  Observed live on
+# 2026-08-12, on the first turn after a cold start.
+#
+# An echo is well-formed JSON with is_casual set, so it sails through every
+# check in _extract_conversational_reply and gets delivered to the user
+# verbatim.  On 08-12 it was caught only by luck: the echoed `delegate`
+# parsed to the garbage string 'none" OR "local" OR "hive', which happened
+# to fail the delegate check.  A cleaner echo would have shipped.
+_TEMPLATE_PLACEHOLDER_RE = re.compile(r'^<[^<>]{2,}>$')
+
+
+def _is_template_echo(reply: str) -> bool:
+    """True when ``reply`` is the prompt's own placeholder, not a real answer.
+
+    Deliberately narrow: only a reply that is *wholly* one angle-bracketed
+    placeholder counts.  A genuine reply that merely contains angle brackets
+    (code, math, markup) is untouched.
+    """
+    return bool(_TEMPLATE_PLACEHOLDER_RE.match((reply or '').strip()))
+
+
+def _salvage_assistant_reply(messages) -> Optional[str]:
+    """Return the assistant's own latest reply, whatever kind of turn this was.
+
+    Used ONLY on the failure path, where the alternative is the generic
+    "I couldn't complete that request just now." apology.
+
+    Why this exists
+    ---------------
+    Observed on a real Discord channel 2026-08-12: a user asked for help with
+    coding.  The model classified it correctly and confidently --
+    ``is_casual: true, delegate: 'local', confidence: 0.9`` -- and wrote a real
+    reply.  But ``delegate: 'local'`` is read by nothing for routing, so
+    StatusVerifier never spoke, TERMINATE never fired, the turn hit the wall
+    clock bound, and the user got the apology while the model's actual answer
+    sat unused in group_chat.messages.
+
+    That makes EVERY substantive request fail -- coding, research, anything
+    needing tools -- while only pure chit-chat (delegate 'none') works.
+
+    This does not fix routing: a request that genuinely needs a tool still does
+    not get the tool run, so the answer is the model's direct response rather
+    than a tool-backed one.  It is strictly better than an apology, and it
+    touches ONLY the path that was already returning failure -- a turn that
+    completes normally never reaches here.
+
+    Unlike _extract_conversational_reply this ignores is_casual/delegate/
+    is_create_agent (we are past the point where routing could have helped) but
+    keeps the template-echo guard, so the prompt skeleton is never surfaced.
+
+    Two message shapes reach this function, and both are salvageable:
+    structured JSON (``{"reply": ..., "delegate": ...}``, the draft/
+    classifier-style format) and plain prose (the recipe/task-execution
+    GroupChat's own persona replies, e.g. "auto.agent8888").  Only the JSON
+    shape was handled until 2026-08-19 -- confirmed live on a real REUSE-loop
+    abort (agent 8888, "what is the weather in chennai today"): the model
+    produced a good, honestly-hedged answer twice in plain prose
+    ("I can't access real-time data right now... likely warm and humid...")
+    and the loop still discarded it for the generic apology, because
+    retrieve_json() cannot parse prose and the function silently skipped
+    every candidate. Plain prose is tried as a fallback ONLY after the JSON
+    shape fails for a given message, so a message that legitimately contains
+    a JSON envelope is still read from its 'reply' field, never its raw
+    (JSON-shaped) text.
+
+    Unverified-claim caveat (2026-08-19): confirmed live on a second
+    REUSE-loop abort, same agent, "what is the latest news in chennai
+    politics today" -- the Assistant stated a specific, wrong headline
+    ("CM E. Vaiko's health scare") BEFORE any tool had run at all. A
+    subtask then dispatched a real tool (crawl4ai_crawl, a genuine fetch of
+    timesofindia.indiatimes.com that succeeded) trying to verify/replace it,
+    but the turn deadline hit before the Assistant got another turn to
+    synthesize an answer from that real data -- so the premature, unverified
+    guess is what survived to be salvaged. If a tool call happened AFTER the
+    candidate reply with no later Assistant message answering from its
+    result, that reply was never confirmed -- say so, rather than presenting
+    a guess as settled fact. This is strictly a phrasing safeguard: it does
+    not change WHICH reply is chosen, only whether it is honestly labelled.
+    """
+    try:
+        _msgs = list(messages or [])
+        for _idx in range(len(_msgs) - 1, -1, -1):
+            _msg = _msgs[_idx]
+            if not isinstance(_msg, dict):
+                continue
+            if _msg.get('name') not in ('Assistant', 'assistant'):
+                continue
+            # A tool's OWN response is attributed name="Assistant" too (the
+            # tool call was Assistant's), role="tool" -- confirmed live in a
+            # real transcript. That's tool output, never an Assistant reply;
+            # without this check a raw scraped-page dump could be salvaged
+            # as if the model had said it.
+            if _msg.get('role') == 'tool':
+                continue
+            _content = _msg.get('content') or ''
+            _obj = retrieve_json(_content)
+            if isinstance(_obj, dict):
+                _reply = _obj.get('reply')
+            elif isinstance(_content, str):
+                _reply = _content
+            else:
+                continue
+            if not isinstance(_reply, str) or not _reply.strip():
+                continue
+            if _is_template_echo(_reply):
+                continue      # keep scanning: an echo is not an answer
+            _reply = _reply.strip()
+            if _tool_activity_after(_msgs, _idx):
+                _reply += (
+                    "\n\n(Note: I couldn't fully verify this before running "
+                    "out of time -- treat it as a best guess, not a "
+                    "confirmed fact.)")
+            return _reply
+    except Exception:
+        return None
+    return None
+
+
+def _tool_activity_after(messages: list, index: int) -> bool:
+    """True if any tool call/response appears strictly after ``index`` in
+    ``messages`` -- evidence a verification attempt started but the
+    candidate reply at ``index`` predates (and was never updated by) it."""
+    for _later in messages[index + 1:]:
+        if not isinstance(_later, dict):
+            continue
+        if _later.get('role') == 'tool' or _later.get('tool_calls') or \
+                _later.get('tool_responses'):
+            return True
+    return False
+
+
+def should_delegate_route_to_helper(last_json, last_speaker_name: str) -> bool:
+    """True if state_transition should hand this turn to Helper.
+
+    `delegate` routing (2026-08-24): the assistant sets is_casual/delegate on
+    every response (see _extract_conversational_reply), but until this change
+    nothing read `delegate` in state_transition, so a substantive request
+    classified 'local'/'hive' had nowhere to go and spun to the turn
+    deadline. Helper already has the registered tools
+    (delegate_to_specialist, service-tool registry) and the existing
+    "last_speaker == helper -> assistant" edge already hands control back to
+    Assistant afterwards, so this is the one missing edge, not new machinery.
+
+    'hive' has no peer/federation dispatch wired yet -- routed through the
+    same local Helper path for now rather than left unroutable; this is a
+    deliberate interim scoping choice, not a claim that local and hive should
+    stay identical long-term.
+
+    A pure predicate (no autogen agent objects) so it can be unit-tested
+    directly -- state_transition itself is a closure that needs a live
+    autogen/LLM setup to construct, same reasoning as
+    lifecycle_hooks.is_recipe_creation_request for create_recipe's
+    state_transition.
+    """
+    if not isinstance(last_json, dict):
+        return False
+    delegate = str(last_json.get('delegate') or '').strip().lower()
+    if delegate not in ('local', 'hive'):
+        return False
+    return last_speaker_name not in ('Helper', 'Executor', 'ChatInstructor')
+
+
+def _extract_conversational_reply(messages) -> Optional[str]:
+    """Return the assistant's reply for a purely conversational turn, else None.
+
+    The reuse loop is built for TASK execution: it only returns an answer once
+    StatusVerifier emits ``status: "completed"``, which makes state_transition
+    pick ChatInstructor, which finally emits TERMINATE.  A greeting never goes
+    near that machinery -- StatusVerifier never speaks -- so the loop spun to
+    exhaustion and leaked an internal instruction string
+    ("You should complete this task independently...") as the user-facing
+    answer, even though the model had already produced a perfectly good reply.
+
+    The assistant already tells us which kind of turn this is: it sets
+    ``is_casual`` and ``delegate`` on every response.  Nothing read those flags
+    (zero references to is_casual in this module before this change).
+
+    Deliberately conservative -- a turn is only short-circuited when the
+    assistant itself marked it casual, delegated to nobody, is not creating an
+    agent, and supplied a non-empty reply.  Anything task-shaped falls through
+    to the normal loop untouched.
+    """
+    try:
+        for _msg in reversed(list(messages or [])):
+            if not isinstance(_msg, dict):
+                continue
+            if _msg.get('name') not in ('Assistant', 'assistant'):
+                continue
+            _obj = retrieve_json(_msg.get('content') or '')
+            if not isinstance(_obj, dict):
+                continue
+            _reply = _obj.get('reply')
+            if not isinstance(_reply, str) or not _reply.strip():
+                continue
+            if _is_template_echo(_reply):
+                # This turn's assistant message is the prompt skeleton, not an
+                # answer.  Do NOT keep scanning backwards -- an older message
+                # belongs to a previous turn, and returning it would answer the
+                # user's new question with a stale reply.  Fall through to the
+                # task loop, which is the conservative path.
+                try:
+                    current_app.logger.warning(
+                        f'[TEMPLATE-ECHO] assistant parroted the prompt '
+                        f'placeholder instead of answering '
+                        f'({_reply.strip()[:80]!r}); not returning it')
+                except Exception:
+                    pass
+                return None
+            _delegate = str(_obj.get('delegate') or 'none').strip().lower()
+            if not _obj.get('is_casual'):
+                return None          # task-shaped: let the normal loop run
+            if _obj.get('is_create_agent'):
+                return None          # creation needs its own flow, not this
+            if _delegate in ('', 'none', 'null'):
+                return _reply.strip()
+
+            # delegate is 'local' or 'hive' -- the model asked for a specialist.
+            #
+            # There is nowhere to send it.  state_transition routes only on a
+            # literal "@statusverifier"-style mention in the message text;
+            # `delegate` is read by NOTHING for routing.  So a turn that reaches
+            # here cannot ever complete: StatusVerifier never speaks, no
+            # status:"completed" appears, TERMINATE never fires, and the turn
+            # burns the full HEVOLVE_TURN_MAX_SECONDS before returning the
+            # generic apology -- with the model's own good answer sitting
+            # unused in group_chat.messages the whole time.
+            #
+            # Measured on a real Discord channel 2026-08-12: "i need a help in
+            # coding" was classified is_casual=true, delegate='local',
+            # confidence=0.9, and the user waited ~238s for
+            # "I couldn't complete that request just now."  Every substantive
+            # request behaves that way; only chit-chat (delegate 'none') works.
+            #
+            # Until delegate routing exists, entering the loop is strictly
+            # worse than answering: same information, 150s later, phrased as a
+            # failure.  So answer directly.  This is a DELIBERATE interim
+            # choice, not a claim that routing is unnecessary -- flip
+            # HEVOLVE_DELEGATE_ROUTING=1 the moment real routing lands and this
+            # falls back to the loop untouched.
+            if os.environ.get('HEVOLVE_DELEGATE_ROUTING', '0') == '1':
+                return None          # real routing exists: let it run
+            try:
+                current_app.logger.warning(
+                    f'[UNROUTABLE-DELEGATE] delegate={_delegate!r} has no '
+                    f'destination (delegate routing not implemented); '
+                    f'returning the assistant\'s own reply instead of spinning '
+                    f'to the turn deadline and apologising')
+            except Exception:
+                pass
+            return _reply.strip()
+    except Exception:
+        return None
+    return None
+
+
+def _giveup_current_reuse_action(user_prompt: str, reason: str) -> None:
+    """Mark the in-flight ledger action GAVE_UP (-> ledger FAILED, #139) when
+    the reuse loop abandons a turn without ever reaching TERMINATE.
+
+    Without this, the action's ledger task stays PENDING/IN_PROGRESS forever
+    -- create_ledger_from_actions' _find_resumable_session() has no age/TTL
+    check, so it treats ANY non-terminal task as "in-flight" no matter how
+    stale, and silently reattaches the next unrelated message for this
+    (user, prompt) pair to the abandoned session's stale goal/description
+    instead of starting fresh. This is the mechanism behind the
+    weeks-long "agent 8888 has weird pre-existing state" pattern -- create_
+    recipe.py's flow-complete path already force-abandons stalled actions
+    via ActionState.GAVE_UP, but the reuse loop's own give-up paths
+    (turn/loop-deadline abort, budget exhaustion, empty groupchat) never
+    called it. GAVE_UP is deliberately re-openable (-> ASSIGNED) so a later
+    real retry is not blocked by this.
+
+    Best-effort: must never raise into a give-up path that is already
+    trying to return an honest reply to the user.
+    """
+    try:
+        if user_prompt not in user_tasks:
+            return
+        action_id = user_tasks[user_prompt].current_action
+        safe_set_state(user_prompt, action_id, ActionState.GAVE_UP, reason)
+    except Exception as e:
+        try:
+            current_app.logger.error(f"[GAVE-UP] failed to mark {user_prompt} action GAVE_UP: {e}")
+        except Exception:
+            pass
 # Re-steer budget per (user_prompt, action_id) for the fabrication gate in
 # _advance_reuse_action.  Each refusal steers the agent to actually call the
 # unrun tool; after _REUSE_FAB_STEER_MAX the gate advances anyway (loudly), so
@@ -3221,15 +3734,15 @@ def _reuse_outstanding_tools(user_prompt, action_id, group_chat):
         return ['<unknown>']
 
 
-def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
-                      manager, chat_instructor,
+def _advance_or_steer(user_prompt, action_id, reason, prompt_id, user_id,
+                      manager, chat_instructor, json_obj=None,
                       claimed_action_id=None, advanced_latch=None):
-    """Move the reuse pipeline past `action_id` — or, when the action only
+    """Move the reuse pipeline past `action_id` -- or, when the action only
     CLAIMED completion, steer the agent to actually run its tools.
 
     One rule, one home.  Five call sites used to inline this same block
     (w1-completed / w1 / w1-regex / w2 / w2-regex), each with locals named
-    after the loop they sat in — _rc_next, _next, _next2, _w2_next,
+    after the loop they sat in -- _rc_next, _next, _next2, _w2_next,
     _w2_next2 and their _ok/_steer twins.  A name that says WHERE the code
     is tells a reader nothing about WHAT the value holds, and five copies of
     one rule drift apart: the 2026-09-05 fabricated-completion fix had to be
@@ -3237,33 +3750,41 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
 
     Args:
         action_id: the action the PIPELINE believes is current.
+        json_obj: the verdict dict this advance is reacting to, if any --
+            forwarded to _finish_reuse_recipe when this turns out to be the
+            recipe's last action, so its 'message' still reaches the user
+            instead of being silently dropped.
         claimed_action_id: the action id the LLM asserted, when it named one.
-            Logged when it disagrees with `action_id` — an agent claiming a
+            Logged when it disagrees with `action_id` -- an agent claiming a
             different action than the one assigned is a hallucination signal.
         advanced_latch: the caller's once-per-action set, when it keeps one
             (only get_agent_response does).  A refusal drops the latch so the
             action can be re-verified once the agent really runs the tool.
 
     Returns:
-        True  — the next action's message, or a re-steer, was posted; the
+        True -- the next action's message, or a re-steer, was posted; the
                 caller should keep looping.
-        False — no next action and nothing to steer; the caller should end
-                the turn.
+        str  -- the turn is over; the caller should return this value as-is
+                ('' for a plain end, or _finish_reuse_recipe's message when
+                the whole recipe just completed).
     """
     if claimed_action_id is not None and claimed_action_id != action_id:
         current_app.logger.warning(
             f"[HALLUCINATION?] LLM claims action_id={claimed_action_id} "
             f"but pipeline has {action_id}")
 
-    next_action_id, advanced = _advance_reuse_action(
+    next_action_id, advanced, done = _advance_reuse_action(
         user_prompt, action_id, reason, prompt_id)
 
     if not advanced:
-        # A fabrication refusal is NOT "all actions done" — it wants the
+        # A fabrication refusal is NOT "all actions done" -- it wants the
         # tool actually run, so steer instead of ending the turn.
         steer_message = _reuse_fab_steer_message(user_prompt, action_id)
         if not steer_message:
-            return False
+            # Either a real state error, or the recipe's last action just
+            # terminated (done=True) -- in that case _finish_reuse_recipe's
+            # message must still reach the user, not a bare ''.
+            return _finish_reuse_recipe(user_id, prompt_id, json_obj) if done else ''
         if advanced_latch is not None:
             advanced_latch.discard(action_id)
         chat_instructor.initiate_chat(
@@ -3356,6 +3877,18 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                        user_id: int, prompt_id: int, request_id: str) -> str:
     """Get a single response from the agent for the given message."""
     user_prompt = f'{user_id}_{prompt_id}'
+    # Arm the wall-clock bound BEFORE initiate_chat -- that call is where the
+    # runaway lives, and the reuse loop's own bounds below only start counting
+    # once it has already returned.  Cleared in the finally so a cached agent's
+    # selector can never inherit a stale deadline from a previous turn.
+    #
+    # only_if_unset: /chat already armed this thread at the request entry, and
+    # that clock is the one that matches what the user waits.  Re-arming here
+    # would restart it and give back the ~84s of pre-turn routing the entry
+    # point arming exists to cover.  This call still matters for callers that
+    # reach get_agent_response without going through /chat.
+    _owns_deadline = getattr(_turn_deadline_state, 'deadline', None) is None
+    _begin_turn_deadline(user_prompt, only_if_unset=True)
     # Register this session's group chat so the fabrication gate in
     # _advance_reuse_action can reach it (via get_registered_groupchat) on
     # EVERY advance path — w1/w2/regex.  Reuse never registered it before, so
@@ -3428,6 +3961,37 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                                           speaker_selection={"speaker": "assistant"},
                                           clear_history=False)
 
+        # Conversational turns (greetings, small talk) are answered directly.
+        # They have no action to verify, so the task loop below can never
+        # terminate for them.  See _extract_conversational_reply.
+        _conv_reply = _extract_conversational_reply(group_chat.messages)
+        if _conv_reply:
+            current_app.logger.info(
+                f'[CONVERSATIONAL] returning assistant reply directly for '
+                f'{user_prompt} ({len(_conv_reply)} chars)')
+            return _conv_reply
+
+        # Hard bounds on the task loop.
+        #
+        # The loop's only text-returning exit needs ChatInstructor to emit
+        # TERMINATE, which needs state_transition to see status="completed",
+        # which only StatusVerifier produces -- and StatusVerifier is selected
+        # only by a literal "@statusverifier" in the previous message.  The
+        # assistant emits structured JSON with a `delegate` field instead, which
+        # nothing reads, so that handshake never happens for task-shaped turns.
+        #
+        # Unbounded, such a turn does not merely fail to answer: it spins
+        # forever, holding a channel-agent worker and hammering the LLM.
+        # Observed live 2026-08-10 -- two task requests left 3 of 4 workers
+        # permanently occupied and every later message on the channel timed out.
+        # One bad request took the whole channel down until restart.
+        #
+        # These bounds do not fix task execution; they stop one request
+        # poisoning the channel.  Remove/raise once the delegate routing lands.
+        _loop_max_iters = int(os.environ.get('HEVOLVE_REUSE_LOOP_MAX_ITERS', '25'))
+        _loop_deadline = time.time() + float(
+            os.environ.get('HEVOLVE_REUSE_LOOP_MAX_SECONDS', '300'))
+
         count = 0
         _round_budget = _reuse_turn_round_budget(user_prompt)
         _reuse_advanced_actions = set()  # one robust completion-advance per action id
@@ -3455,6 +4019,53 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                                 f"{len(_conv)} msgs from manager._oai_messages")
             except Exception as _sync_err:
                 current_app.logger.debug(f"[725-SYNC] skipped: {_sync_err}")
+            # The turn deadline is checked here too, not just in the speaker
+            # selector.  Without it a turn bounded at HEVOLVE_TURN_MAX_SECONDS
+            # inside initiate_chat would simply hand off to a fresh
+            # HEVOLVE_REUSE_LOOP_MAX_SECONDS budget here -- 150s + 300s = 450s,
+            # which is not a bound anyone asked for.  One deadline covers the
+            # whole turn; the loop's own counters remain as a backstop.
+            _hit_iters = count >= _loop_max_iters
+            _hit_loop_clock = time.time() > _loop_deadline
+            _hit_turn_clock = _turn_deadline_exceeded(user_prompt)
+            if _hit_iters or _hit_loop_clock or _hit_turn_clock:
+                # Name the bound that actually fired.  The original message
+                # reported only the reuse loop's own elapsed, so a turn killed
+                # by the turn deadline logged "after 0 iteration(s) / 0s" --
+                # true of this loop, and completely misleading about where the
+                # time went (observed 2026-08-12).  A diagnostic that misreports
+                # which limit tripped is how the earlier defects stayed hidden.
+                _which = ('turn-deadline' if _hit_turn_clock
+                          else 'loop-seconds' if _hit_loop_clock
+                          else 'loop-iterations')
+                _loop_elapsed = int(time.time() - (_loop_deadline - float(
+                    os.environ.get('HEVOLVE_REUSE_LOOP_MAX_SECONDS', '300'))))
+                current_app.logger.error(
+                    f'[REUSE-LOOP-ABORT] giving up for {user_prompt} — bound '
+                    f'hit: {_which}. {count} loop iteration(s), {_loop_elapsed}s '
+                    f'in this loop (turn deadline = '
+                    f'{os.environ.get("HEVOLVE_TURN_MAX_SECONDS", "150")}s, '
+                    f'measured from before initiate_chat, so most of a '
+                    f'turn-deadline abort was spent inside autogen, not here). '
+                    f'TERMINATE never fired (StatusVerifier never spoke). '
+                    f'Returning an honest failure instead of spinning.')
+                # Before apologising, check whether the model already answered.
+                # It usually has: the turn fails for lack of ROUTING, not for
+                # lack of an answer, and that answer is sitting in
+                # group_chat.messages.  Sending the apology on top of a real
+                # reply is the worst of both -- the user waits the full bound
+                # AND is told nothing could be done.
+                _giveup_current_reuse_action(user_prompt, f'[REUSE-LOOP-ABORT] bound hit: {_which}')
+                _salvaged = _salvage_assistant_reply(group_chat.messages)
+                if _salvaged:
+                    current_app.logger.warning(
+                        f'[SALVAGED-REPLY] returning the assistant\'s own '
+                        f'answer for {user_prompt} ({len(_salvaged)} chars) '
+                        f'instead of the generic failure — the turn could not '
+                        f'complete, but the model did produce a reply')
+                    return _salvaged
+                return ("I couldn't complete that request just now. "
+                        "Could you try rephrasing it?")
 
             # === LEDGER v2.0: Heartbeat + Budget/SLA using KNOWN state ===
             _reuse_current_action = user_tasks[user_prompt].current_action
@@ -3466,10 +4077,46 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     _reuse_task.heartbeat()
                     if _reuse_task.is_budget_exhausted():
                         current_app.logger.warning(f"[BUDGET] Task {_reuse_task_id} budget exhausted in reuse loop")
+                        _giveup_current_reuse_action(user_prompt, f'[BUDGET] {_reuse_task_id} budget exhausted')
                         break
                     if _reuse_task.is_sla_breached() and not _reuse_task.sla_breached:
                         _reuse_task.mark_sla_breached()
                         current_app.logger.warning(f"[SLA] Task {_reuse_task_id} SLA breached in reuse loop")
+
+            # An empty group chat here used to raise IndexError straight out of
+            # the loop, so the whole turn was answered with the raw exception
+            # text ("Error getting response: list index out of range") on every
+            # channel.  Break instead and let the post-loop fallback answer.
+            # The diagnostic is deliberately loud: it records whether the
+            # manager is even holding the same GroupChat object we were handed,
+            # which is the one thing the traceback alone could never tell us.
+            # (main independently added an `and group_chat.messages` guard on
+            # the line below this block for the same symptom, #725 "cause not
+            # established" — NOT moot: live-reproduced 2026-08-30 reaching that
+            # line with an empty groupchat despite this break, so the guard
+            # below stays.)
+            if not group_chat.messages:
+                try:
+                    _mgr_chat = getattr(manager, 'groupchat', None)
+                    _same = _mgr_chat is group_chat
+                    _mgr_len = len(_mgr_chat.messages) if _mgr_chat is not None else -1
+                except Exception:
+                    _same, _mgr_len = 'unknown', -1
+                _gcm = group_chat.messages
+                _mgr_list = getattr(_mgr_chat, 'messages', None)
+                current_app.logger.error(
+                    f'[EMPTY-GROUPCHAT] group_chat.messages empty in reuse loop '
+                    f'(user_prompt={user_prompt}, iteration={count}, '
+                    f'manager_holds_same_object={_same}, '
+                    f'len(manager.groupchat.messages)={_mgr_len}, '
+                    f'id(list)={id(_gcm)}, id(group_chat)={id(group_chat)}, '
+                    # If these two ids ever differ again, the run_chat reply
+                    # config has been orphaned from the live list -- i.e. the
+                    # defect _resync_manager_reply_config exists to prevent has
+                    # regressed.  That comparison is the one worth keeping.
+                    f'id(manager.groupchat.messages)='
+                    f'{id(_mgr_list) if _mgr_list is not None else "n/a"})')
+                break
 
             # ROBUST COMPLETION-ADVANCE.  With the manager now terminating on the
             # StatusVerifier 'completed' verdict (is_termination_msg=
@@ -3496,12 +4143,13 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     current_app.logger.info(
                         f"reuse-w1-completed: terminal 'completed' verdict for action "
                         f"{_reuse_current_action} — advancing (manager terminated on verdict)")
-                    if not _advance_or_steer(
-                            user_prompt, _reuse_current_action,
-                            "reuse-w1-completed", prompt_id,
-                            manager, chat_instructor,
-                            advanced_latch=_reuse_advanced_actions):
-                        return ''
+                    _adv_result = _advance_or_steer(
+                        user_prompt, _reuse_current_action,
+                        "reuse-w1-completed", prompt_id, user_id,
+                        manager, chat_instructor, json_obj=_term_vj,
+                        advanced_latch=_reuse_advanced_actions)
+                    if _adv_result is not True:
+                        return _adv_result
                     continue
             except Exception as _rc_err:
                 current_app.logger.debug(f"robust completion-advance skipped: {_rc_err}")
@@ -3592,12 +4240,13 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         f"[UNDER-REPORTED] action {_reuse_current_action} still reports "
                         f"{_pend_st!r} after {_REUSE_PENDING_STEER_MAX} steers while its tools "
                         f"are evidenced as executed — advancing on the tool evidence")
-                    if not _advance_or_steer(
-                            user_prompt, _reuse_current_action,
-                            "reuse-under-reported", prompt_id,
-                            manager, chat_instructor,
-                            advanced_latch=_reuse_advanced_actions):
-                        return ''
+                    _adv_result = _advance_or_steer(
+                        user_prompt, _reuse_current_action,
+                        "reuse-under-reported", prompt_id, user_id,
+                        manager, chat_instructor, json_obj=_pend_vj,
+                        advanced_latch=_reuse_advanced_actions)
+                    if _adv_result is not True:
+                        return _adv_result
                     continue
             except Exception as _ur_err:
                 current_app.logger.debug(f"under-reported advance skipped: {_ur_err}")
@@ -3623,13 +4272,15 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                     current_app.logger.info(f'got json object {json_obj}')
                     if json_obj['status'].lower() == 'completed':
-                        if not _advance_or_steer(
-                                user_prompt, _reuse_current_action, "reuse-w1",
-                                prompt_id, manager, chat_instructor,
-                                claimed_action_id=int(json_obj.get(
-                                    "action_id", _reuse_current_action)),
-                                advanced_latch=_reuse_advanced_actions):
-                            return ''
+                        _adv_result = _advance_or_steer(
+                            user_prompt, _reuse_current_action, "reuse-w1",
+                            prompt_id, user_id, manager, chat_instructor,
+                            json_obj=json_obj,
+                            claimed_action_id=int(json_obj.get(
+                                "action_id", _reuse_current_action)),
+                            advanced_latch=_reuse_advanced_actions)
+                        if _adv_result is not True:
+                            return _adv_result
                         continue
                 except IndexError:
                     current_app.logger.info("Completed ALL ACTIONS")
@@ -3641,14 +4292,15 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
                                 pipeline_action_id = user_tasks[user_prompt].current_action
-                                if not _advance_or_steer(
-                                        user_prompt, pipeline_action_id,
-                                        "reuse-w1-regex", prompt_id,
-                                        manager, chat_instructor,
-                                        claimed_action_id=int(json_obj.get(
-                                            "action_id", pipeline_action_id)),
-                                        advanced_latch=_reuse_advanced_actions):
-                                    return ''
+                                _adv_result = _advance_or_steer(
+                                    user_prompt, pipeline_action_id,
+                                    "reuse-w1-regex", prompt_id, user_id,
+                                    manager, chat_instructor, json_obj=json_obj,
+                                    claimed_action_id=int(json_obj.get(
+                                        "action_id", pipeline_action_id)),
+                                    advanced_latch=_reuse_advanced_actions)
+                                if _adv_result is not True:
+                                    return _adv_result
                                 continue
                         else:
                             raise ValueError('No json found')
@@ -3746,16 +4398,25 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
 
         # if individual_recipe[currentaction_id-1]['can_perform_without_user_input'] == 'yes':
         #     return assistant
+        # Same emptiness hazard as the loop head — reached when the group chat
+        # produced nothing at all.  Return a plain sentence (and mark the
+        # ledger action given-up, see _giveup_current_reuse_action) rather
+        # than the '' silent-failure main independently used here — an
+        # empty response looks identical to "handler declined intentionally"
+        # downstream and delivers total silence to the channel.
         if not group_chat.messages:
-            current_app.logger.warning(
-                'reuse: no messages to extract a reply from after trimming')
-            return ''
+            current_app.logger.error(
+                f'[EMPTY-GROUPCHAT] group_chat.messages empty after reuse loop '
+                f'(user_prompt={user_prompt}) — returning fallback reply')
+            _giveup_current_reuse_action(user_prompt, '[EMPTY-GROUPCHAT] no messages after reuse loop')
+            return "I wasn't able to put a response together just then. Could you try asking again?"
+
         last_message = group_chat.messages[-1]
         # len>1 matters: a lone TERMINATE would send [-2] off the front.
         if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
             last_message = group_chat.messages[-2]
 
-        content_lower = last_message['content'].lower()
+        content_lower = (last_message.get('content') or '').lower()
 
         if f'message2userfinal'.lower() in content_lower:
             try:
@@ -3803,6 +4464,13 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         # aloud to the user, observed live 2026-08-31)
         from core.agent_tools import user_facing_error
         return user_facing_error(e)
+    finally:
+        # Only disarm what this call armed.  When /chat owns the clock it must
+        # survive until the request ends (cleared in teardown_request) --
+        # clearing it here would leave the rest of the request unbounded, which
+        # is the same class of hole as the concurrent-disarm bug.
+        if _owns_deadline:
+            _clear_turn_deadline(user_prompt)
 
 
 def get_flow_number(user_id, prompt_id):
@@ -3902,7 +4570,10 @@ creation_signals = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_creation
 def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt_id=None):
     """
     Mark action COMPLETED → TERMINATED, advance to next action, set ASSIGNED → IN_PROGRESS.
-    Returns (next_action_id, True) if advanced, or (None, False) if all actions done or state error.
+    Returns (next_action_id, True, False) if advanced.
+    Returns (None, False, True) if that was the last action and all actions are now complete
+    (current_action_id itself terminated fine — callers should still deliver its message).
+    Returns (None, False, False) if a state error prevented advancing at all.
     """
     # FABRICATION GATE (canonical single point — EVERY advance path calls this):
     # refuse to mark a tool-naming action COMPLETED when its specific tool never
@@ -3939,7 +4610,7 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                         f"{current_action_id}: its tool(s) {_fab} never executed "
                         f"(fabricated completion) — re-steering the agent to run "
                         f"them (attempt {_n + 1}/{_REUSE_FAB_STEER_MAX})")
-                    return None, False
+                    return None, False, False
                 current_app.logger.error(
                     f"[FABRICATED-COMPLETE] action {current_action_id} still claims "
                     f"completion with tool(s) {_fab} never executed after "
@@ -3960,7 +4631,7 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             current_app.logger.error(
                 f"[REUSE] Cannot advance action {current_action_id}: "
                 f"state is {actual.value}, not TERMINATED — aborting advance")
-            return None, False
+            return None, False, False
         current_app.logger.info(
             f"[REUSE] Action {current_action_id} already TERMINATED (idempotent)")
 
@@ -3970,6 +4641,21 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
 
     if next_id > len(user_tasks[user_prompt].actions):
         current_app.logger.info(f'[REUSE] All {len(user_tasks[user_prompt].actions)} actions completed')
+        # Reset for the NEXT incoming message from this same user_prompt.
+        # user_tasks[user_prompt] is a persistent, per-identity object —
+        # create_agents_for_user() (which builds a fresh Action(), current_action=1)
+        # only runs on this identity's FIRST-ever turn (guarded by
+        # `user_prompt not in user_agents`); every later turn reuses this
+        # SAME object and SAME actions list (reuse mode intentionally
+        # re-runs the same recipe per message). Leaving current_action at
+        # next_id here left it permanently out of range after the first
+        # completed turn — found live 2026-08-31: every subsequent message
+        # from the same self-chat identity immediately hit "Cannot access
+        # recipe for current action N" (the `current_action > len(actions)`
+        # guard a few hundred lines up), burned its bounded 4 retries doing
+        # nothing, and fell through to echoing the user's own prompt back
+        # as if it were the agent's reply.
+        user_tasks[user_prompt].current_action = 1
         # Meter the COMPLETED replay into the owning goal's spark ledger —
         # the daemon's completion gate closes goals on transacted spark only
         # (charged on finished work, never at dispatch). Mirrors the CREATE
@@ -3982,11 +4668,11 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             except Exception as _spark_err:
                 current_app.logger.debug(
                     f'[REUSE] completed-work spark charge skipped: {_spark_err}')
-        return None, False
+        return None, False, True
 
     safe_set_state(user_prompt, next_id, ActionState.ASSIGNED, f"{reason}: next assigned")
     safe_set_state(user_prompt, next_id, ActionState.IN_PROGRESS, f"{reason}: starting")
-    return next_id, True
+    return next_id, True, False
 
 
 def _reuse_seed_message(user_prompt, message):
@@ -4059,6 +4745,19 @@ def _build_reuse_action_message(user_prompt, action_id):
     return f"Perform this action -> Action #{action_id}:{action_message}\n follow these steps: {steps}"
 
 
+def _finish_reuse_recipe(user_id, prompt_id, json_obj):
+    """
+    All actions in a recipe just completed (_advance_reuse_action returned
+    all_done=True). Extract the StatusVerifier's completion message and
+    deliver it — previously the caller returned '' here unconditionally,
+    discarding a correct, verified answer (e.g. a completed arithmetic
+    task shipped an empty response despite StatusVerifier confirming the
+    right result).
+    """
+    message = json_obj.get('message', '') if isinstance(json_obj, dict) else ''
+    if message:
+        send_message_to_user1(user_id, message, '', prompt_id)
+    return message
 def _reuse_action_tool_names(user_prompt, action_id):
     """The tool names the given action's recipe steps declare.
 
@@ -4276,6 +4975,58 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
     user_message = text
     user_prompt = f'{user_id}_{prompt_id}'
 
+    # Drop a speculative re-entry that would race the real turn already
+    # running on this key.  See _inflight_turns above for why.
+    with _inflight_turns_lock:
+        already_running = user_prompt in _inflight_turns
+        if not already_running:
+            _inflight_turns.add(user_prompt)
+    # Only the turn that actually claimed the key may release it, or a
+    # duplicate would clear the real turn's flag on its way out.
+    owns_inflight = not already_running
+    if already_running:
+        if _is_expert_dispatch_reentry():
+            current_app.logger.warning(
+                f'[REENTRANCY] dropped expert-dispatch /chat re-entry for '
+                f'{user_prompt} — a real turn is already in flight')
+            return ''
+        # Identify the caller that got past _is_expert_dispatch_reentry.
+        # The detector matches on payload SHAPE, so a re-entry that omits
+        # model_config/speculative/draft_first is invisible to it and runs a
+        # full duplicate turn against the same cached GroupChat.  Logging the
+        # shape here is the only way to name that caller -- inferring it from
+        # the source was ambiguous (several /chat posters share the pattern).
+        try:
+            from flask import request as _rq_dbg
+            _body_dbg = _rq_dbg.get_json(silent=True) or {}
+            _keys_dbg = sorted(_body_dbg.keys()) if isinstance(_body_dbg, dict) else []
+            _src_dbg = (_body_dbg.get('task_source'),
+                        _body_dbg.get('autonomous'),
+                        _body_dbg.get('request_id'))
+            _ua_dbg = _rq_dbg.headers.get('User-Agent', '')
+        except Exception:
+            _keys_dbg, _src_dbg, _ua_dbg = ['<no request ctx>'], (None, None, None), ''
+        current_app.logger.warning(
+            f'[REENTRANCY] concurrent non-speculative turn for {user_prompt} '
+            f'— proceeding, shared GroupChat may interleave. '
+            f'CALLER-SHAPE keys={_keys_dbg} '
+            f'task_source/autonomous/request_id={_src_dbg} ua={_ua_dbg!r}')
+        # TEMP DIAGNOSTIC (2026-08-14) -- name the duplicate caller.
+        # CALLER-SHAPE cannot: the duplicate replays the original request
+        # body verbatim, so payload shape is identical for both turns and
+        # _is_expert_dispatch_reentry() is blind to it.  The in-process
+        # call stack is the one thing that differs, and knowing which
+        # caller this is decides the fix: the duplicate cannot simply be
+        # queued behind the owner (see _inflight_turns above -- that
+        # deadlocks when the owner is what is blocked waiting on it), and
+        # dropping the wrong one returns silence to the user.
+        # Gated off by default; remove once the caller is identified.
+        if os.environ.get('HEVOLVE_REENTRANCY_STACK', '').lower() in ('1', 'true', 'yes'):
+            import traceback as _tb_dbg
+            current_app.logger.warning(
+                '[REENTRANCY-STACK] %s duplicate caller:\n%s',
+                user_prompt, ''.join(_tb_dbg.format_stack()[-25:]))
+
     request_id_list[user_prompt] = request_id
     try:
         if file_id:
@@ -4363,13 +5114,14 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
-                                if not _advance_or_steer(
-                                        user_prompt, current_action_id,
-                                        "reuse-w2", prompt_id,
-                                        manager, chat_instructor,
-                                        claimed_action_id=int(json_obj.get(
-                                            "action_id", current_action_id))):
-                                    return ''
+                                _adv_result = _advance_or_steer(
+                                    user_prompt, current_action_id,
+                                    "reuse-w2", prompt_id, user_id,
+                                    manager, chat_instructor, json_obj=json_obj,
+                                    claimed_action_id=int(json_obj.get(
+                                        "action_id", current_action_id)))
+                                if _adv_result is not True:
+                                    return _adv_result
                                 continue
                         except Exception:
                             try:
@@ -4377,13 +5129,14 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 if json_obj:
                                     current_app.logger.info(f'got json object {json_obj}')
                                     if json_obj['status'].lower() == 'completed':
-                                        if not _advance_or_steer(
-                                                user_prompt, current_action_id,
-                                                "reuse-w2-regex", prompt_id,
-                                                manager, chat_instructor,
-                                                claimed_action_id=int(json_obj.get(
-                                                    "action_id", current_action_id))):
-                                            return ''
+                                        _adv_result = _advance_or_steer(
+                                            user_prompt, current_action_id,
+                                            "reuse-w2-regex", prompt_id, user_id,
+                                            manager, chat_instructor, json_obj=json_obj,
+                                            claimed_action_id=int(json_obj.get(
+                                                "action_id", current_action_id)))
+                                        if _adv_result is not True:
+                                            return _adv_result
                                         continue
 
                                 else:
@@ -4460,6 +5213,10 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
     except Exception as e:
         current_app.logger.info(f'Some ERROR IN REUSE RECIPE {e}')
         raise
+    finally:
+        if owns_inflight:
+            with _inflight_turns_lock:
+                _inflight_turns.discard(user_prompt)
 
 
 def crossbar_multiagent(msg):

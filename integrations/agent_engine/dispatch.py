@@ -80,7 +80,8 @@ def _local_dispatch_base_url() -> str:
     return get_local_backend_url()
 
 
-def _internal_auth_headers() -> Optional[Dict[str, str]]:
+def _internal_auth_headers(user_id: str = 'system_daemon',
+                            username: str = None) -> Optional[Dict[str, str]]:
     """Build auth headers for internal /chat dispatch.
 
     Why: on central/regional tiers, security/middleware.py Gate 2 rejects
@@ -89,9 +90,34 @@ def _internal_auth_headers() -> Optional[Dict[str, str]]:
     autonomous outreach flywheel silently 401'd from 2026-03-14 onward.
 
     Prefers HEVOLVE_API_KEY (X-API-Key) if set; otherwise mints a
-    short-lived system_daemon JWT via integrations.social.auth.
-    Returns None on flat-tier deployments where auth is unneeded
-    (caller passes None to pooled_post → no header attached).
+    short-lived JWT via integrations.social.auth. Returns None on
+    flat-tier deployments where auth is unneeded (caller passes None to
+    pooled_post → no header attached).
+
+    Args:
+        user_id: identity the minted JWT represents. Defaults to the
+            generic 'system_daemon' admin identity for genuinely
+            autonomous callers in this module (outreach flywheel,
+            coding/agent daemon dispatch — no real end-user behind the
+            call). Real channel-message relays (flask_integration.py's
+            _handle_message) MUST pass the actual resolved end-user
+            user_id here instead of accepting this default.
+
+            2026-08-06 fix: /chat's JWT-vs-body user_id check (Layer 1
+            auth, hart_intelligence_entry.py) always trusts the JWT
+            over the request body — correct security behavior, prevents
+            a caller from spoofing a different user_id in the body. But
+            every channel message (Discord/Telegram/WhatsApp/...) was
+            relayed through this SAME function with the hardcoded
+            'system_daemon' default, so the JWT silently overrode each
+            real user's resolved identity with 'system_daemon' —
+            collapsing every channel user, across every channel, into
+            one shared, cross-contaminated cached agent session. This
+            is what caused replies to go missing/empty: concurrent
+            unrelated turns (real users' messages AND genuine autonomous
+            daemon calls) all corrupting the same autogen GroupChat.
+        username: display name for the minted token. Defaults to
+            ``user_id`` when not given.
     """
     headers: Dict[str, str] = {}
     try:
@@ -101,8 +127,8 @@ def _internal_auth_headers() -> Optional[Dict[str, str]]:
         else:
             from integrations.social.auth import generate_jwt as _mint_jwt
             jwt = _mint_jwt(
-                user_id='system_daemon',
-                username='system_daemon',
+                user_id=user_id,
+                username=username or user_id,
                 role='admin',
             )
             if jwt:

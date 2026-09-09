@@ -271,6 +271,7 @@ class TestActiveEntryReason:
              patch.object(dispatcher._expert_pool, 'submit'):
             result = dispatcher.dispatch_draft_first(
                 'do x', user_id='u', prompt_id='p')
+            dispatcher.schedule_expert_for_draft(result)
 
         speculation_id = result['speculation_id']
         assert speculation_id in dispatcher._active
