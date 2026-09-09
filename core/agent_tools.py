@@ -209,7 +209,8 @@ def filter_service_tools(goal_tags, svc_tools, svc_defs, registry):
     return kept
 
 
-def discover_and_attach(need, helper, executor, registry, attached_names):
+def discover_and_attach(need, helper, executor, registry, attached_names,
+                        core_tools=None):
     """On-demand tool discovery: the never-say-unavailable half of the gate.
 
     Owner requirement 2026-08-31: the hierarchy must be LAZY, not
@@ -230,6 +231,20 @@ def discover_and_attach(need, helper, executor, registry, attached_names):
         registry: ServiceToolRegistry
         attached_names: set of func names already on the agents —
             updated in place with everything newly attached
+        core_tools: the ``(name, description, func)`` triples
+            ``build_core_tool_closures`` returns.  SAME reason
+            ``attach_for_names`` needed them (D25/#788): the registry holds
+            SERVICE tools, while the capability an agent asks for at runtime
+            is usually a CORE closure.  Owner requirement 2026-09-09 — an
+            agent whose recipe names no tool must still identify the need at
+            RUNTIME and get it — and this is that path, so searching the
+            registry alone made the requirement unmeetable for core
+            capabilities.  Measured live 2026-09-09, agent 33323830039: the
+            model called ``request_tools`` at 17:55:35 precisely because it
+            could not see execute_windows_or_android_command, and discovery
+            attached nothing — that tool is a core closure and the registry
+            holds 13 service names, of which exactly one (crawl4ai) is a name
+            any recipe uses.  Omitted or empty is a strict no-op.
     Returns a human/model-readable summary string.
     """
     # Stopwords would over-attach: 'the' passes len>2 AND is a substring of
@@ -268,6 +283,25 @@ def discover_and_attach(need, helper, executor, registry, attached_names):
                           ep.get('description', f'{tool_name} {ep_name}'))
             attached_names.add(fn)
             attached.append(fn)
+    # Core closures: SAME selector (the keyword/stem matcher above), same
+    # idempotent `attached_names`, same register_dual primitive — only the
+    # SOURCE differs.  Kept in this function rather than a sibling so there is
+    # one answer to "attach the tool this need describes", not two that drift
+    # (the reason attach_for_names holds its core loop inline too).
+    for _c_name, _c_desc, _c_func in (core_tools or []):
+        if _c_name in attached_names:
+            continue
+        hay_core = (str(_c_name) + ' ' + str(_c_desc or '')).lower()
+        core_words = {hw for hw in _re.split(r'[^a-z0-9]+', hay_core)
+                      if len(hw) >= 4}
+        core_stems = {hw[:4] for hw in core_words}
+        if not any(w in hay_core or (len(w) >= 4 and w[:4] in core_stems)
+                   for w in words):
+            continue
+        register_dual(helper, executor, _c_func, _c_name, _c_desc)
+        attached_names.add(_c_name)
+        attached.append(_c_name)
+
     parts = []
     if attached:
         # Imperative on purpose: hop-2 probe 2026-08-31 showed the model

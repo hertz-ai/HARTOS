@@ -1115,6 +1115,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # so this introduces no new object — only the missing symmetry.
     register_core_tools(main_leg_core_tools(core_tools), helper, assistant,
                         executor_proposes=True, second_executor=executor)
+    # The FULL closure list for the runtime discovery path.  request_tools is
+    # defined in another function, so the local built above is out of scope
+    # there — ride it on the agent exactly as the reuse leg does
+    # (reuse_recipe.py:2415).  Registration above is unchanged: still only
+    # main_leg_core_tools(...), so nothing is added to the always-on set.
+    assistant._hart_core_tools = core_tools
     register_memory_graph_tools(memory_graph, helper, assistant, user_id, user_prompt)
 
     # Channel tools: send to channels, register channels, list status, get context
@@ -1879,7 +1885,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         def request_tools(need: str) -> str:
             from core.agent_tools import discover_and_attach
             return discover_and_attach(need, helper, assistant,
-                                       service_tool_registry, _attached_names)
+                                       service_tool_registry, _attached_names,
+                                       core_tools=getattr(
+                                           assistant, '_hart_core_tools', None))
         register_dual(helper, assistant, request_tools, 'request_tools',
                       "Discover and attach additional tools by describing the "
                       "capability you need, e.g. 'text to speech' or 'crawl a "

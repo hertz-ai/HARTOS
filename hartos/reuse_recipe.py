@@ -2426,8 +2426,13 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
         def request_tools(need: str) -> str:
             from core.agent_tools import discover_and_attach
+            # _hart_core_tools is the FULL closure list stashed at L2415 —
+            # the same source attach_for_names reads.  Without it the runtime
+            # discovery path can only see the 13 service tools.
             return discover_and_attach(need, helper, assistant,
-                                       service_tool_registry, _attached_names)
+                                       service_tool_registry, _attached_names,
+                                       core_tools=getattr(
+                                           assistant, '_hart_core_tools', None))
         register_dual(helper, assistant, request_tools, 'request_tools',
                       "Discover and attach additional tools by describing the "
                       "capability you need, e.g. 'text to speech' or 'crawl a "
