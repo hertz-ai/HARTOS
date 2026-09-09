@@ -1660,6 +1660,112 @@ class ToolMessageHandler:
 
         return re.sub(pattern, replace_if_older, content, flags=re.IGNORECASE)
 
+    def stale_phantom_call_ids(self, messages):
+        """Tool calls announced by a FINISHED action that never produced a result.
+
+        MEASURED LIVE 2026-09-09 06:46:23-06:46:34 (agent 33323830039, action
+        2 of 2, installed build).  Action 1 had completed honestly.  Action 2
+        then had its own full round allowance and still reported
+        ``{'status': 'pending', ...}``.  In its 10.4-second window every one of
+        4 LLM calls was over budget and left-trimmed (est 6291 -> 6519 tokens
+        against a 5484 budget — the body GREW), and the model was shown 7
+        placeholder tool answers against 3 real ones.  It said `pending`
+        because 70% of the results in its view were
+        HISTORICAL_TOOL_PLACEHOLDER: it could not see its own work.
+
+        Those 7 were not action 2's calls.  STEP 4 below treats EVERY
+        unanswered tool_call id anywhere in the accumulated conversation as
+        "historical pending" and answers it with a manufactured string, and
+        under ``clear_history=False`` nothing ever ages one out.  So a call the
+        model announced during action 1 but never executed is re-answered with
+        a placeholder on every later request, forever — costing budget and
+        reporting "your tools produced nothing" at the same time.
+
+        WHOSE CALL IS IT.  ``evidence_seen_call_ids`` already answers exactly
+        that: ``_stamp_action_evidence_watermark`` records, at each dispatch,
+        the tool calls that already existed when THIS action started — someone
+        else's work.  The fabrication gate reads the same set to refuse
+        crediting an earlier action's result.  Reusing it keeps ONE notion of
+        ownership; a second rule here would be free to drift from the gate's.
+
+        Deliberately conservative, in this order:
+          - no watermark recorded -> nothing is stale (behaviour unchanged);
+          - answered anywhere in this list -> real work, keep it;
+          - a peer agent holds the answer -> keep it, so the fill below can
+            put the REAL result in the slot (the 2026-09-07 repair);
+          - only then is it a phantom.
+
+        Never raises: this runs inside the transform on every LLM call.
+        """
+        try:
+            session = (self.user_tasks or {}).get(self.user_prompt)
+            seen = getattr(session, 'evidence_seen_call_ids', None)
+        except Exception:
+            seen = None
+        if not isinstance(seen, (set, frozenset)) or not seen:
+            return set()
+
+        answered = set()
+        announced = set()
+        for m in messages or []:
+            if not isinstance(m, dict):
+                continue
+            answered |= answered_call_ids(m)
+            for tc in (m.get('tool_calls') or []):
+                if isinstance(tc, dict) and tc.get('id'):
+                    announced.add(tc['id'])
+
+        stale = set()
+        for call_id in (announced & set(seen)):
+            if call_id in answered:
+                continue
+            if self.real_tool_answer(call_id):
+                continue
+            stale.add(call_id)
+        return stale
+
+    def drop_stale_phantom_tool_calls(self, messages):
+        """Remove the announcements identified by stale_phantom_call_ids.
+
+        Done BEFORE the pending-call bookkeeping so the phantom never enters
+        ``pending_tool_calls`` and no placeholder is minted for it — rather
+        than deleting a placeholder after the fact, which would leave the
+        assistant announcement behind for the next transform to re-answer.
+
+        Copies any message it edits.  These dicts are the agents' own
+        ``_oai_messages`` entries; mutating one would rewrite the
+        conversation's real history, not just this request body.
+        """
+        stale = self.stale_phantom_call_ids(messages)
+        if not stale:
+            return messages
+
+        out = []
+        for m in messages:
+            if not isinstance(m, dict) or not m.get('tool_calls'):
+                out.append(m)
+                continue
+            kept = [tc for tc in m['tool_calls']
+                    if not (isinstance(tc, dict) and tc.get('id') in stale)]
+            if len(kept) == len(m['tool_calls']):
+                out.append(m)
+                continue
+            m = dict(m)
+            if kept:
+                m['tool_calls'] = kept
+            else:
+                m.pop('tool_calls', None)
+                if not str(m.get('content') or '').strip():
+                    continue  # the announcement was all the message carried
+            out.append(m)
+
+        current_app.logger.info(
+            f"[PHANTOM-DROP] {len(stale)} tool call(s) announced by a finished "
+            f"action produced no result and were dropped instead of being "
+            f"answered with a placeholder: {sorted(stale)} "
+            f"({len(messages)} msgs -> {len(out)})")
+        return out
+
     def apply_transform(self, messages: List[Dict]) -> List[Dict]:
         """Applies the tool message handling transformation to ensure valid tool call/response pairings."""
         if not messages:
@@ -1673,6 +1779,10 @@ class ToolMessageHandler:
 
         """Removes the word Execute for historical actions and not for current action"""
         messages = self.compress_action_messages(messages, current_action_id)
+
+        # Drop announcements left behind by actions that are already finished,
+        # before anything downstream counts them as needing an answer.
+        messages = self.drop_stale_phantom_tool_calls(messages)
 
         current_app.logger.info(f"ToolMessageHandler: Processing {len(messages)} messages")
         # DEBUGGING: Print the entire conversation structure with full message details
