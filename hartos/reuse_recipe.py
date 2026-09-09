@@ -1863,19 +1863,25 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
                         # Determine file path with the action_id
                         role_number, role = get_flow_number(user_id, prompt_id)
-                        action_id_to_use = action_id
-                        base_path = helper_fun.safe_prompt_path(prompt_id, role_number, ext='')
 
                         # Import os here to ensure it's available
                         import os
                         import re
                         import json
 
-                        # Check if a file with the current action_id exists, and increment if needed
-                        while os.path.exists(f"{base_path}_{action_id_to_use}_vlm_agent.json"):
-                            action_id_to_use += 1
-
-                        vlm_agent_path = f"{base_path}_{action_id_to_use}_vlm_agent.json"
+                        # Same builder the read site above uses, so writer and reader
+                        # agree by construction.  The number in this filename is NOT a
+                        # uniquifier: helper.load_vlm_agent_files parses it back as the
+                        # action's identity (parts[2]), and _vlm_merged_actions appends
+                        # any id no existing action carries.  A counter that walked to
+                        # the next free slot therefore filed each re-learned command as
+                        # a NEW action.  Measured on agent 33323830039: a 1-action
+                        # recipe grew to 4 actions over two drives, and the 3 appended
+                        # ones each carry can_perform_without_user_input 'no' below,
+                        # which disarms every driver.  Re-learning an action overwrites
+                        # that action's file.
+                        vlm_agent_path = helper_fun.safe_prompt_path(
+                            prompt_id, role_number, action_id, 'vlm_agent')
 
                         # Create directory if it doesn't exist
                         os.makedirs(os.path.dirname(vlm_agent_path), exist_ok=True)
@@ -1943,7 +1949,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                                 "action": instructions,
                                 "fallback_action": "Perform a Google search using Internet Explorer",
                                 "persona": persona,
-                                "action_id": action_id_to_use,
+                                "action_id": action_id,
                                 "recipe": recipe_steps,
                                 "can_perform_without_user_input": "no",
                                 "scheduled_tasks": [],
