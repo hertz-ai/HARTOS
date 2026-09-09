@@ -3713,14 +3713,25 @@ _REUSE_SYNTHESIS_STEER = (
 )
 
 # The same request, minus the false premise, for the case the gate says some
-# tool did NOT execute.  Names the tools so the answer can be specific: a
+# tool did NOT execute.  SCOPED TO THE ACTION, because that is all the
+# evidence covers: the caller computes `unrun` from
+# _reuse_outstanding_tools(user_prompt, _reuse_current_action_id(...), ...)
+# i.e. outstanding for the CURRENT action.  Saying "in this conversation"
+# generalised that per-action fact and was FALSE whenever an earlier action
+# had run the same tool -- measured live 2026-09-09 on agent 33323830039:
+# execute_windows_or_android_command ran at 18:10:07 and FAB-GUARD recorded
+# unrun=[] for action 1 at 18:10:19, yet the 18:10:32 steer told the model
+# it had never executed, while the SAME steer orders it to "use only the
+# real tool results present in this conversation".  Two contradictory
+# instructions in one message.  Names the tools so the answer can be specific: a
 # model told only "something failed" writes a vaguer report than the user
 # deserves.  Asks for the SAME message2userfinal key, so the existing
 # extractor unwraps it unchanged (a different shape would produce an answer
 # nobody reads — #797/D31).
 _REUSE_SYNTHESIS_STEER_INCOMPLETE = (
     "Do NOT run any tool again and do NOT emit another status object. These "
-    "tools did NOT execute in this conversation: {unrun}. Write the ANSWER "
+    "tools did not run for the action just attempted: {unrun}. Write the "
+    "ANSWER "
     "for the user now, in your own words: report what WAS actually done, "
     "using only the real tool results present in this conversation, and say "
     "plainly which part could not be completed. Do not describe unexecuted "
