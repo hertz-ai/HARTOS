@@ -9176,6 +9176,30 @@ def chat():
     req_tool = data.get('tools', None)
     file_id = data.get('file_id', None)
     prompt_id = data.get('prompt_id', None)
+
+    # Stamp the thread-local HERE, the first line at which both values exist.
+    #
+    # WHY (measured live 2026-09-09 on agent 18088688973): the canonical stamp
+    # is ~1,100 lines below, and 25 of chat()'s returns fire in between --
+    # including all four exits of the agent-bound REUSE branch.  So a reuse
+    # turn finished without ever writing the thread-local, and everything
+    # downstream that reads it saw None:
+    #   * core/tool_logging.py could not name the session on any of 136 tool
+    #     executions, leaving "did THIS agent's tool run?" unanswerable while
+    #     four sessions interleaved in one log;
+    #   * _emit_tool_call_stage publishes the per-tool UI status only when
+    #     user_id is truthy -- 0 chat.stage events, i.e. task #509's feature
+    #     is dead on this path, not merely unmeasured.
+    #
+    # The later stamp is deliberately LEFT IN PLACE and remains authoritative:
+    # the probe / intermediate / else arms below reset `prompt_id = 0`, and
+    # only that stamp records the 0.  Hoisting instead of adding would put the
+    # real agent id into those paths' thread-local -- a regression.
+    # Guarded by tests/unit/test_chat_seeds_threadlocal_before_returning.py,
+    # which pins both the ordering and the survival of the later stamp.
+    thread_local_data.set_user_id(user_id=user_id)
+    thread_local_data.set_prompt_id(prompt_id)
+
     create_agent = data.get('create_agent', None)
     casual_conv = data.get('casual_conv', False)
     autonomous = data.get('autonomous', False)
