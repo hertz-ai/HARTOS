@@ -1105,6 +1105,37 @@ except ImportError:
 except Exception as e:
     app.logger.warning(f"Claude Code endpoint init skipped: {e}")
 
+# Agent-engine API — the ledger surface the MCP daemon probe already depends on.
+#
+# WHY THIS WAS MISSING AND WHY IT MATTERS. integrations/mcp/_tool_impls.py
+# documents a known false negative: `probe_agent_daemon()` reads `_running` /
+# `_tick_count` off an imported module, and when Python (or, on HART OS, a
+# SECOND PROCESS) resolves a different agent_daemon instance than the live one,
+# it reports `daemon_enabled=false, _tick_count=0` while the daemon is happily
+# ticking. Its defence is to ALSO fetch canonical ledger stats over Flask
+# loopback, "shadow-immune" because the request lands on whichever singleton
+# Flask actually resolved.
+#
+# That defence has never been able to run here: agent_engine_bp was registered
+# nowhere. Measured on the box 2026-09-09 -- `list_routes` on this backend
+# returns 829 routes and ZERO agent-engine, and /api/agent-engine/ledger/stats
+# 404s on :6777 AND on the nunba socket. So the corrective probe 404'd, the
+# module-attr view was the only view, and the agent engine was structurally
+# unobservable from outside the process.
+#
+# The ledger is DB-backed (HEVOLVE_DB_PATH, shared by both processes), so
+# serving it here answers for the node rather than for this process. Registered
+# in its own try/except like every neighbour: a route-drop must never take the
+# app down.
+try:
+    from integrations.agent_engine import get_engine_blueprint as _get_agent_engine_bp
+    app.register_blueprint(_get_agent_engine_bp())
+    app.logger.info("Agent-engine API registered at /api/agent-engine/")
+except ImportError:
+    app.logger.info("Agent-engine API not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Agent-engine API init skipped: {e}")
+
 # MCP HTTP Bridge — exposes local MCP tools via REST for Nunba/external clients
 try:
     from integrations.mcp.mcp_http_bridge import mcp_local_bp, auto_register_local_mcp
