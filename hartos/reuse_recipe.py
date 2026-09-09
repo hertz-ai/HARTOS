@@ -4022,7 +4022,8 @@ def _stamp_action_evidence_watermark(user_prompt):
         _ctx_safe_log('info',
                       f"[FAB-GUARD] watermark for action "
                       f"{user_tasks[user_prompt].current_action}: "
-                      f"{len(seen)} pre-existing tool call(s)")
+                      f"{len(seen)} pre-existing tool call(s) "
+                      f"for session: {user_prompt}")
     except Exception as err:
         _ctx_safe_log('debug', f"evidence watermark skipped: {err}")
 
@@ -4182,9 +4183,14 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
                                    m.get('name'))
         unrun = [n for n in referenced if n not in executed]
         try:
+            # 'for session:' suffix, same as "Retrieved current_action_id": one
+            # server.log carries every agent's and daemon's lines, so unqualified
+            # this scored 88764372848 "reached=[1] tools-ran=[4]" on 2026-09-09 --
+            # action 4's tool cannot run without action 4 being reached.
             current_app.logger.info(
                 f"[FAB-GUARD] action {current_action} names tool(s) {referenced}; "
-                f"executed={sorted(executed)}; unrun={unrun}")
+                f"executed={sorted(executed)}; unrun={unrun} "
+                f"for session: {user_prompt}")
         except Exception:
             pass
         return unrun
