@@ -71,8 +71,13 @@ def _src() -> str:
 _KEEP = {
     # State-driven: these run for seconds during a real interaction and are what
     # tells the user HART is doing something. The gate's own note keeps them.
+    #
+    # `lg-pulse` USED TO BE HERE, justified as "runs only while a sense is
+    # active". Reading hartSenses.js showed that is false: the eye is lit
+    # whenever senses are merely UNCUT, which is the default, so it animated
+    # forever. It is gated now. A keep-list entry is a claim about behaviour,
+    # and this one was never checked against the code that sets the class.
     "lg-breathe-ring": "listening ring -- runs only while actually listening",
-    "lg-pulse": "is-sensing -- runs only while a sense is active",
     "pulse": "mic recording -- runs only while recording, and is_potato-gated too",
     "lg-comet": "streaming comet -- runs only while a reply streams",
     # Cheap, and carrying real meaning at idle.

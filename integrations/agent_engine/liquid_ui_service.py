@@ -3028,6 +3028,13 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
         #     state the user needs to notice. That is state-driven signalling,
         #     which the paragraph above keeps by policy. Cheap, and it earns it.
         #
+        #     NOT kept, and it is worth saying why the first judgement was
+        #     wrong: `.hart-senses-btn.is-sensing .mi` looked state-driven by
+        #     the same argument, and is not. hartSenses.js lights it whenever
+        #     senses are merely UNCUT, which is the default, so it animates
+        #     forever rather than during an interaction. Its colour is kept and
+        #     only its animation dropped, so the eye still reports the state.
+        #
         #     test_liquid_ui_idle_motion_gate.py enumerates every `infinite`
         #     animation in this stylesheet and fails on any that is neither
         #     gated here nor in its documented keep-list, so the next one cannot
@@ -3078,6 +3085,28 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
                 # of 500 jiffies (97.4% of a core) continuously from boot while
                 # hart-comp idled at 2.2%: the cost was re-rasterising two large
                 # blurs per frame in software, not compositing them.
+                # The SENSES eye, added 2026-09-10 after reading how it is lit.
+                # I had kept this out of the gate on the grounds that it is
+                # "state-driven -- runs only while a sense is active". That
+                # reasoning was wrong, and hartSenses.js says so plainly:
+                #
+                #   anySensing = (d.mic !== true) || (d.screen !== true)
+                #                || (p.camera_service_running === true)
+                #
+                # On a box where nothing has been explicitly disabled `d.mic` is
+                # undefined, so `undefined !== true` is TRUE and the eye is lit
+                # permanently. It is not a transient interaction signal at all;
+                # it is an always-on animation, which is precisely the class
+                # this rule exists to stop. Measured cost on the software rung:
+                # removing it alongside the two orbs took the shell from 55% of
+                # a core to 22%, against 21% for all-animations-off.
+                #
+                # The SIGNAL SURVIVES. `.is-sensing` sets `color` as well as
+                # `animation`, and only the animation is dropped here, so the
+                # eye still lights in the vision colour and still says the AI
+                # can hear. What goes is the 2.4s pulse re-rasterising it
+                # forever on a box that paints in software.
+                'body.webkit-flat .hart-senses-btn.is-sensing .mi,'
                 'body.webkit-flat .hart-onboarding .hob-orb,'
                 'body.webkit-flat .ds-skeleton{animation:none!important}'
             )
