@@ -1118,11 +1118,76 @@ pub fn work_area(
     (ox, oy + top, ow, oh - top - bottom)
 }
 
+/// The chrome the NATIVE scene paints, expressed as a reservation.
+///
+/// THE CONTRACT INVERTS AT M6, and this is the half that inverts it. While the
+/// WebView draws the bars, the shell is the only thing that knows their size and it
+/// publishes `PANEL_RESERVATION_PATH`. Once the compositor paints them, the
+/// compositor is what knows -- and the file's only publisher is exactly the process
+/// M6 demotes. Nothing would write it, `panel_reservation` would fail safe to zero,
+/// and a maximized window would cover the native bars: the 2026-08-29 "taskbar
+/// unreachable" report arriving through the new renderer.
+///
+/// Both numbers come from the SAME sources the scene lays out from, so the
+/// reservation cannot disagree with the pixels. `top_bar_h` is off the active theme,
+/// because four of the ten shipped themes move it (36/38/40/44). `TASKBAR_H` is the
+/// scene constant that tests/unit/test_panel_reservation.py already pins to the
+/// shell's Python constant. Neither is a new number.
+pub fn native_chrome_reservation() -> PanelReservation {
+    let theme = active_theme();
+    PanelReservation {
+        top: theme.top_bar_h.round().max(0.0) as i32,
+        bottom: crate::scene::TASKBAR_H.round().max(0.0) as i32,
+    }
+}
+
+/// What placement must avoid, given what the shell published and what the scene
+/// draws. PURE, so the merge rule is testable with no output and no theme file.
+///
+/// `None` -- the flag off -- returns the published value UNCHANGED. Every existing
+/// placement path is then byte-identical to before, which is what lets this ship
+/// ahead of the flip with zero risk to the desktop that is actually running.
+///
+/// With the scene on, the edges merge BY MAXIMUM rather than the native value
+/// replacing the published one. That is deliberate, and it is the honest reading of
+/// every state this can be in:
+///
+///   * Transition, which is where the box is today: `shell.native {on}` draws the
+///     scene WITHOUT standing the WebView down, since that hand-off is a separate M6
+///     obligation. Both sets of bars are genuinely on screen, so reserving the larger
+///     of each edge is the only value that covers what is drawn.
+///   * After the demotion: the file is absent, `panel_reservation` fails safe to
+///     zero, and the maximum is the native value. Which is the whole point.
+///   * A STALE file left behind by the demoted shell can then only ever
+///     OVER-reserve. That asymmetry is the reason for the maximum: over-reserving
+///     costs a band of unused desktop, under-reserving costs a bar the user cannot
+///     reach, and `work_area` already caps the absurd case at half the output.
+pub fn effective_reservation(
+    published: PanelReservation,
+    native: Option<PanelReservation>,
+) -> PanelReservation {
+    match native {
+        None => published,
+        Some(n) => PanelReservation {
+            top: published.top.max(n.top),
+            bottom: published.bottom.max(n.bottom),
+        },
+    }
+}
+
 /// The live work area. THE single place window placement learns where it may lay
 /// things out; `output_geometry` must not be read directly for that purpose again.
 pub fn work_area_for<S: CompState>(state: &S) -> Option<(i32, i32, i32, i32)> {
     let g = state.space().output_geometry(state.output())?;
-    Some(work_area(g.loc.x, g.loc.y, g.size.w, g.size.h, panel_reservation()))
+    // `native_shell_on`, NOT `native_scene_drawn`. The killswitch blacks the screen
+    // out and skips the scene for that frame, but the bars have not stopped existing
+    // and window placement must not shuffle every window because the display went
+    // dark for a moment.
+    let reserved = effective_reservation(
+        panel_reservation(),
+        state.native_shell_on().then(native_chrome_reservation),
+    );
+    Some(work_area(g.loc.x, g.loc.y, g.size.w, g.size.h, reserved))
 }
 
 /// The current output size in PHYSICAL (framebuffer) pixels. Screencopy reports this
@@ -3882,6 +3947,67 @@ mod tests {
         // has not published anything yet. Either way the answer is "no
         // reservation", so the compositor half ships inert ahead of the shell half.
         assert_eq!(panel_reservation(), PanelReservation::default());
+    }
+
+    // ── The M6 inversion: who OWNS the reservation once the compositor paints ──
+
+    #[test]
+    fn with_the_scene_off_the_reservation_is_exactly_what_the_shell_published() {
+        // The zero-regression claim, stated as a test. Nothing about the shipped
+        // WebView desktop may move because this code exists.
+        let published = PanelReservation { top: 40, bottom: 44 };
+        assert_eq!(effective_reservation(published, None), published);
+        assert_eq!(
+            effective_reservation(PanelReservation::default(), None),
+            PanelReservation::default()
+        );
+    }
+
+    #[test]
+    fn the_demoted_webview_publishes_nothing_and_the_native_bars_are_still_reserved() {
+        // The failure this whole inversion exists to prevent: M6 stands the shell
+        // down, the file stops being written, panel_reservation fails safe to zero,
+        // and a maximized window swallows bars the compositor is still painting.
+        let native = PanelReservation { top: 36, bottom: 44 };
+        assert_eq!(
+            effective_reservation(PanelReservation::default(), Some(native)),
+            native
+        );
+    }
+
+    #[test]
+    fn while_both_renderers_draw_bars_each_edge_takes_the_larger() {
+        // Today's transition state: shell.native turns the scene on without standing
+        // the WebView down, so both sets of bars are really on screen. Per edge,
+        // independently, because the top can come from one and the bottom the other.
+        let published = PanelReservation { top: 44, bottom: 44 };
+        let native = PanelReservation { top: 36, bottom: 52 };
+        assert_eq!(
+            effective_reservation(published, Some(native)),
+            PanelReservation { top: 44, bottom: 52 }
+        );
+    }
+
+    #[test]
+    fn the_native_reservation_reads_its_two_numbers_rather_than_restating_them() {
+        // Guards the "no third source" property. Restating 40 and 44 here would let
+        // a theme change or a TASKBAR_H change pass while the bars and the area they
+        // reserve silently disagreed, which is the drift the cross-language guard in
+        // test_panel_reservation.py exists to stop on the Python side.
+        let r = native_chrome_reservation();
+        assert_eq!(r.top, active_theme().top_bar_h.round() as i32);
+        assert_eq!(r.bottom, crate::scene::TASKBAR_H.round() as i32);
+    }
+
+    #[test]
+    fn an_absurd_native_reservation_still_cannot_squeeze_the_desktop_to_nothing() {
+        // The maximum merge can only push the reservation UP, so the half-height cap
+        // in work_area is what stops it becoming a desktop with no room for windows.
+        let huge = PanelReservation { top: 4000, bottom: 4000 };
+        let merged = effective_reservation(PanelReservation { top: 40, bottom: 44 }, Some(huge));
+        let (_, y, _, h) = work_area(0, 0, 1600, 900, merged);
+        assert!(h > 0, "the work area must never collapse: got h={h}");
+        assert!(y <= 900 / 2, "the top reservation must stay inside the cap");
     }
 
     // ════════════════════════════════════════════════════════════════════════

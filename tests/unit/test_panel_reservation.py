@@ -1137,3 +1137,60 @@ def test_the_payout_pill_and_the_stat_carry_the_shells_own_literals():
     assert "HERO_SHIELD: f32 = %s.0;" % shield in scene
     assert "HERO_SHIELD_GAP: f32 = %s.0;" % re.search(
         r"gap:\s*(\d+)px", mini).group(1) in scene
+
+
+def _rust_fn_body(src, decl):
+    """A Rust fn's text, from its declaration to the first bare closing brace.
+
+    Deliberately not a regex: this file is edited from a Windows shell where a
+    heredoc silently eats backslashes, and a mangled pattern here would fail open.
+    """
+    i = src.index(decl)
+    out = []
+    for line in src[i:].splitlines():
+        out.append(line)
+        if line == "}":
+            break
+    return chr(10).join(out)
+
+
+def test_the_native_scene_owns_the_reservation_once_it_paints_the_bars():
+    """The M6 inversion, pinned from the side that can see both processes.
+
+    While the WebView draws the bars it publishes the reservation and the
+    compositor reads the file. Once the compositor paints them, the file's only
+    publisher is the process M6 demotes: nothing writes it, the parse fails safe to
+    zero, and a maximized window covers the native bars. That is the 2026-08-29
+    "taskbar unreachable" report arriving again through the new renderer.
+
+    The merge rule is unit-tested in Rust. What no Rust test can reach is the
+    WIRING, because work_area_for needs a mapped output and a real State, so a
+    correct merge function that nothing calls would pass every Rust test. Reading a
+    value nothing acts on is the same dead-contract shape as a budget row nothing
+    measures, so the wiring is pinned here.
+    """
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+
+    body = _rust_fn_body(comp, "pub fn work_area_for<S: CompState>")
+    assert "native_shell_on()" in body, (
+        "work_area_for no longer consults native_shell_on, so once the WebView is "
+        "demoted nothing reserves the bars the compositor itself paints")
+    assert "effective_reservation" in body, (
+        "work_area_for no longer merges the published and the native reservation")
+    assert "panel_reservation()" in body, (
+        "work_area_for stopped reading what the shell publishes, which regresses "
+        "the WebView desktop that is still the one shipping")
+
+    # And the two numbers stay READ rather than restated. A literal here would be a
+    # third source for a value this file already pins in two places.
+    native = _rust_fn_body(comp, "pub fn native_chrome_reservation()")
+    assert "top_bar_h" in native, (
+        "the native top reservation stopped coming from the theme, so a 36px theme "
+        "would reserve a hardcoded 40 again")
+    assert "TASKBAR_H" in native, (
+        "the native bottom reservation stopped coming from scene.rs TASKBAR_H, the "
+        "constant this file already ties to the shell's own")
+    assert "40" not in native and "44" not in native, (
+        "native_chrome_reservation restates a bar height as a literal instead of "
+        "reading it, which is the drift every other pin in this file exists to stop")
