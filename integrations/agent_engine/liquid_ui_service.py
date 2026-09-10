@@ -3021,6 +3021,17 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
         #     is-sensing, mic recording) stay, because they run for seconds during a
         #     real interaction and they are what tells the user HART is doing
         #     something. lg-comet likewise. A vulkan rung keeps everything as authored.
+        #
+        #     DELIBERATELY KEPT, having been looked at: `.lg-empty-offline
+        #     .lg-empty-disc .mi` breathes forever too, but it is a 28px glyph
+        #     with NO blur, and it is the signal that the box is OFFLINE -- a
+        #     state the user needs to notice. That is state-driven signalling,
+        #     which the paragraph above keeps by policy. Cheap, and it earns it.
+        #
+        #     test_liquid_ui_idle_motion_gate.py enumerates every `infinite`
+        #     animation in this stylesheet and fails on any that is neither
+        #     gated here nor in its documented keep-list, so the next one cannot
+        #     be missed the way `.hob-orb` was.
         if not blur_composites:
             _CSS_LIVING_GLASS += (
                 '/* sw-paint: idle motion stopped (see the note in liquid_ui_service.py) */'
@@ -3040,6 +3051,18 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
                 'body.webkit-flat .hart-hero-hevolve .dot,'
                 'body.webkit-flat .top-bar-orb,'
                 'body.webkit-flat .hart-hero-go,'
+                # The ONBOARDING orb, added 2026-09-10 after finding it on the
+                # live node. `.hob-orb` is 150px carrying `0 0 70px` AND
+                # `0 0 150px` box-shadows and scaling to 1.08 forever -- the
+                # exact shape this rule was written for, and it is strictly
+                # worse than `.hart-hero-orb` because it is the FIRST screen a
+                # new user sees and it stays up for the whole of onboarding.
+                # On the Samsung, sitting on "Light Your HART" with no
+                # onboarding state written, WebKit's main thread measured 487
+                # of 500 jiffies (97.4% of a core) continuously from boot while
+                # hart-comp idled at 2.2%: the cost was re-rasterising two large
+                # blurs per frame in software, not compositing them.
+                'body.webkit-flat .hart-onboarding .hob-orb,'
                 'body.webkit-flat .ds-skeleton{animation:none}'
             )
 
