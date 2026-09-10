@@ -5492,7 +5492,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     _evidence_now = _reuse_evidence_count(group_chat)
                 if _evidence_now > _action_evidence:
                     current_app.logger.info(
-                        f"[REUSE-ROUNDS] action {_now_action} produced new tool "
+                        f"[REUSE-ROUNDS] action {_now_action} produced new evidence for "
                         f"its own tool(s) ({_action_evidence} -> {_evidence_now}) — "
                         f"resetting its round allowance (turn spend "
                         f"{count}/{_round_budget})")
@@ -6805,7 +6805,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                         _evidence_now = _reuse_evidence_count(group_chat)
                     if _evidence_now > _action_evidence:
                         current_app.logger.info(
-                            f"[REUSE-ROUNDS] action {_now_action} produced new tool "
+                            f"[REUSE-ROUNDS] action {_now_action} produced new evidence for "
                             f"its own tool(s) ({_action_evidence} -> {_evidence_now}) — "
                             f"resetting its round allowance (turn spend "
                             f"{count}/{_round_budget})")
