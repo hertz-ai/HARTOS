@@ -2596,19 +2596,110 @@ fn native_pointer_scene_pos<S: CompState>(
 /// attributed to the surface the pointer is LEAVING. It differs only at a component
 /// boundary, and only for the one sample that crosses it; a drag stays inside its
 /// component for hundreds of samples, which is where the headline numbers come from.
+/// Why an input could not be attributed to a named component. Each reason is
+/// reported ONCE per boot, the first time it is taken.
+///
+/// `Shell` is the answer to two completely different questions: "the pointer was
+/// over the WebView shell" and "I could not work out where the pointer was". The
+/// function returned the same value for both, so on hardware 2026-09-10 a sweep
+/// of ~4,200 hover samples across the entire output, including a dwell on the
+/// top bar where ORB_SM sits, came back 100% `component=shell` and looked like
+/// clean data. It was not clean data. It was the attribution failing silently,
+/// which left every one of latency_budgets.json's per-component rows dead and
+/// made the native-versus-shell delta (the whole case for native chrome, and by
+/// its own doc comment "a demonstrated delta rather than a claim") impossible to
+/// measure.
+///
+/// The returned Surface is deliberately UNCHANGED: `Shell` stays the fallback, so
+/// the journal contract and the budget file keep their meaning and no consumer
+/// has to learn a new component name. What changes is that the fallback stops
+/// being silent about which branch produced it.
+static ATTRIB_REPORTED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn report_attrib_gap(bit: u8, reason: &str) {
+    use std::sync::atomic::Ordering;
+    let prev = ATTRIB_REPORTED.fetch_or(bit, Ordering::Relaxed);
+    if prev & bit == 0 {
+        info!(
+            reason,
+            "hart-latency attribution: falling back to component=shell. Samples from              here on carry the shell's budget row, and every per-component row stays              empty until this reason is resolved."
+        );
+    }
+}
+
+/// The ambiguous branch also carries WHERE the pointer was, in the same scene
+/// space the tree was laid out in. That is the one number that separates "the
+/// desktop really is bare here" from "the two coordinate spaces do not line up",
+/// and without it the reason line asks the reader to guess between them.
+fn report_attrib_gap_at(
+    bit: u8,
+    reason: &str,
+    px: f32,
+    py: f32,
+    size: Size<i32, Physical>,
+) {
+    use std::sync::atomic::Ordering;
+    let prev = ATTRIB_REPORTED.fetch_or(bit, Ordering::Relaxed);
+    if prev & bit == 0 {
+        info!(
+            reason,
+            scene_x = px,
+            scene_y = py,
+            scene_w = size.w,
+            scene_h = size.h,
+            "hart-latency attribution: falling back to component=shell. Compare these              coordinates against the layout: a point inside the output but over no              component means the tree has no tagged container there."
+        );
+    }
+}
+
 fn pointer_surface<S: CompState>(state: &S) -> crate::latency::Surface {
     if !native_scene_drawn(state.native_shell_on(), state.capture_blocked()) {
+        report_attrib_gap(
+            1 << 0,
+            if state.capture_blocked() {
+                "capture blocked (killswitch up), so the native scene is not on screen"
+            } else {
+                "native_shell_on is false, so there is no native scene to attribute to"
+            },
+        );
         return crate::latency::Surface::Shell;
     }
     let size = output_physical_size(state);
     let Some((px, py)) = native_pointer_scene_pos(state, size) else {
+        report_attrib_gap(
+            1 << 1,
+            "no pointer position in scene space (output geometry absent or zero-sized)",
+        );
         return crate::latency::Surface::Shell;
     };
-    state
-        .native_tree()
-        .and_then(|t| t.component_at(px, py))
-        .map(|c| c.surface())
-        .unwrap_or(crate::latency::Surface::Shell)
+    let Some(tree) = state.native_tree() else {
+        // Distinct from "nothing under the pointer": the tree is built by
+        // lower_scene, so its absence means the native scene has not been
+        // lowered even once, and NO position could ever attribute.
+        report_attrib_gap(
+            1 << 2,
+            "native_tree() is None, so the scene has never been lowered and no              position can attribute",
+        );
+        return crate::latency::Surface::Shell;
+    };
+    match tree.component_at(px, py).map(|c| c.surface()) {
+        Some(surface) => surface,
+        None => {
+            // The one genuinely ambiguous branch: the tree EXISTS and the pointer
+            // has a position in its space, but that point lies over no tagged
+            // component. Over bare desktop that is correct and expected. Covering
+            // the whole output without ever hitting one is not, so the reported
+            // coordinates are the thing to compare against the layout.
+            report_attrib_gap_at(
+                1 << 3,
+                "pointer is over no tagged component (bare desktop, or the tree's                  geometry does not line up with the pointer's scene space)",
+                px,
+                py,
+                size,
+            );
+            crate::latency::Surface::Shell
+        }
+    }
 }
 
 /// NATIVE SHELL M3 GL LOWERING: lower the native shell scene to render elements.
