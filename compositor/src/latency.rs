@@ -298,10 +298,18 @@ impl Drops {
 pub struct Stall {
     /// Vblanks reaped since the last report.
     pub presented: u64,
-    /// Frames queued in the same span. Zero is the diagnosis.
+    /// Frames queued in the same span. Zero means `frame_queued` is not being
+    /// reached, so nothing can bind.
     pub queued: u64,
-    /// Inputs sitting unbound because nothing ever queued.
+    /// Inputs waiting to be bound to a frame.
     pub pending: usize,
+    /// Samples that actually resolved. Zero WITH a non-zero `queued` means
+    /// binding happened but the sample was refused -- an unanchored clock or a
+    /// latency outside the sane window.
+    pub samples: u64,
+    /// Whether the clock offset has been established at all. `false` means no
+    /// input observation was ever accepted, which is its own distinct fault.
+    pub anchored: bool,
 }
 
 impl Stall {
@@ -310,8 +318,9 @@ impl Stall {
     /// no reading at all.
     pub fn journal_line(&self) -> String {
         format!(
-            "hart-latency stalled presented={} queued={} pending={} verdict=NO-SAMPLES",
-            self.presented, self.queued, self.pending
+            "hart-latency stalled presented={} queued={} pending={} samples={} \
+             anchored={} verdict=NO-SAMPLES",
+            self.presented, self.queued, self.pending, self.samples, self.anchored
         )
     }
 }
@@ -333,10 +342,17 @@ const WINDOW_US: u64 = 10_000_000;
 /// not an interaction; refuse it (anti-gaming: report nothing over almost).
 const MAX_SANE_LATENCY_US: u64 = 5_000_000;
 
-/// Vblanks between stall reports. At 60Hz this is about ten seconds, matching
-/// the summary window, so a stalled box speaks at the same cadence a healthy
-/// one does and neither floods the journal.
-const STALL_REPORT_EVERY: u64 = 600;
+/// Vblanks between stall reports.
+///
+/// Was 600, chosen as "ten seconds at 60Hz". That reasoning assumed a desktop
+/// that flips 60 times a second, and the desktop this runs on is DAMAGE-TRACKED:
+/// when nothing moves it flips a handful of times a minute. 600 vblanks is then
+/// tens of minutes away, so the diagnostic that exists to explain silence was
+/// itself silent through a two-minute probe on real hardware 2026-09-10.
+///
+/// 60 is reachable on a quiet box within a probe, and still rare enough on a
+/// busy one (one line per second at full rate) to stay readable.
+const STALL_REPORT_EVERY: u64 = 60;
 /// Offset observations kept for the rolling-min estimator.
 const OFFSET_WINDOW: usize = 64;
 
@@ -364,6 +380,7 @@ pub struct LatencyCore {
     /// Their DIVERGENCE is the stall signal (see `Stall`).
     frames_queued: u64,
     frames_presented: u64,
+    samples_recorded: u64,
     stall_reported_at: u64,
     /// [surface][kind]. Forty-two fixed buckets, allocated once and reused: an input
     /// rate this cannot cover does not exist, and a map would put an allocation on the
@@ -385,6 +402,7 @@ impl LatencyCore {
             window_start_us: None,
             frames_queued: 0,
             frames_presented: 0,
+            samples_recorded: 0,
             stall_reported_at: 0,
             window: Default::default(),
         }
@@ -486,6 +504,7 @@ impl LatencyCore {
                 if lat == 0 || lat > MAX_SANE_LATENCY_US {
                     continue; // unanchored or wedge artifact, not a report
                 }
+                self.samples_recorded += 1;
                 let w = &mut self.window[surface.idx()][kind.idx()];
                 if w.len() < MAX_WINDOW_SAMPLES {
                     w.push(lat);
@@ -556,22 +575,30 @@ impl LatencyCore {
         if since < STALL_REPORT_EVERY {
             return None;
         }
-        // Nothing waiting means nobody touched the box, which is not a stall.
-        if self.pending.is_empty() {
-            self.stall_reported_at = self.frames_presented;
-            return None;
-        }
-        // Frames ARE binding, so the instrument is working; silence would then
-        // be a real absence of interaction, and this must not cry wolf.
-        if self.frames_queued > 0 {
-            self.stall_reported_at = self.frames_presented;
-            return None;
-        }
         self.stall_reported_at = self.frames_presented;
+
+        // Nothing waiting AND nothing ever anchored means nobody has touched the
+        // box. That is not a stall, and saying so at an idle desk is how a
+        // diagnostic becomes noise and then gets ignored.
+        if self.pending.is_empty() && self.offset_obs.is_empty() {
+            return None;
+        }
+        // Samples ARE resolving, so the instrument works end to end. Any silence
+        // after this is a genuine absence of interaction.
+        if self.samples_recorded > 0 {
+            return None;
+        }
+        // Input has been seen and frames have been presented, yet nothing
+        // resolved. Report the counters rather than a guess: `queued == 0` says
+        // frame_queued is never reached, `anchored == false` says no clock
+        // observation was accepted, and both non-zero with samples == 0 says the
+        // sample was computed and refused.
         Some(Stall {
             presented: since,
-            queued: 0,
+            queued: self.frames_queued,
             pending: self.pending.len(),
+            samples: self.samples_recorded,
+            anchored: !self.offset_obs.is_empty(),
         })
     }
 
@@ -1155,18 +1182,27 @@ mod tests {
 
     #[test]
     fn no_stall_is_reported_when_frames_are_binding() {
-        // Frames queue, so the instrument works; any silence after this is a
-        // real absence of interaction and must not be blamed on the pipeline.
+        // Frames queue AND samples resolve, so the instrument works end to end;
+        // any silence after this is a real absence of interaction and must not
+        // be blamed on the pipeline. Clocks paired the way a booted node pairs
+        // them (kernel stamps since BOOT, Instant readings since COMPOSITOR
+        // START) -- the old same-origin pairing recorded no offset at all, so
+        // this test passed for the wrong reason.
+        const GAP: u64 = 1_000_000;
         let mut c = LatencyCore::new();
-        c.note_input(Surface::Shell, Kind::Hover, 1_000, 1_100);
+        let t = 2_000_000; // kernel stamp, since boot
+        c.note_input(Surface::Shell, Kind::Hover, t, t - GAP);
         c.frame_queued();
-        c.note_input(Surface::Shell, Kind::Hover, 3_000, 3_100);
+        // The flip that carried it, 8ms later, expressed in the Instant domain.
+        let out = c.frame_presented(t - GAP + 8_000);
+        assert!(!out.is_empty() || c.samples_recorded > 0,
+                "the pairing must actually resolve a sample");
         for i in 0..STALL_REPORT_EVERY {
-            let _ = c.frame_presented(4_000 + i);
+            let _ = c.frame_presented(t - GAP + 20_000 + i);
         }
         assert!(
             c.take_stall().is_none(),
-            "a pipeline that binds must never be reported as stalled"
+            "a pipeline that binds and resolves must never be reported as stalled"
         );
     }
 
