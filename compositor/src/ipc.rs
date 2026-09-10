@@ -514,6 +514,32 @@ fn dispatch_request<S: CompState>(
             Response::ok(id, json!({ "blocked": blocked }))
         }
 
+        // ── shell.native(on): turn the NATIVE SCENE render path on or off for the
+        //    running session (IPC_PROTOCOL.md §4.12). Its purpose is measurement: the
+        //    latency instrument attributes an input to a component only while the scene
+        //    is drawn, so the native-versus-shell delta needs both halves of the
+        //    comparison in one session, and until now the flag could only be read from
+        //    the environment at session start. The M6 DEFAULT is untouched: this
+        //    changes only what the current session is doing, and a reboot forgets it. ──
+        "shell.native" | "ShellNative" => {
+            let on = args.get("on").and_then(Value::as_bool).unwrap_or(true);
+            let native = state.set_native_shell(on);
+            if flip_took(on, native) {
+                Response::ok(id, json!({ "native": native }))
+            } else {
+                // The `window.resize` lesson, applied at the moment it would repeat: a
+                // verb that answers `ok` for something that did not happen costs the
+                // caller more than an error does.
+                Response::err(
+                    id,
+                    "unsupported",
+                    format!(
+                        "this backend has no native scene path; native_shell_on is still {native}"
+                    ),
+                )
+            }
+        }
+
         // â”€â”€ Â§4.10 events.subscribe â€” register this stream for unsolicited events â”€â”€
         "events.subscribe" | "Subscribe" => {
             let events = args.get("events").cloned().unwrap_or_else(|| json!([
@@ -525,6 +551,17 @@ fn dispatch_request<S: CompState>(
 
         other => Response::err(id, "unsupported", format!("unknown method: {other}")),
     }
+}
+
+/// PURE: did a flag flip actually happen? The rule is the whole honesty of
+/// `shell.native`, and it is one line so it can be tested without a compositor.
+///
+/// It compares the request against what the flag reads AFTERWARDS, never against
+/// whether a setter was called. That distinction is the entire point: on a backend
+/// whose `set_native_shell_flag` is the default no-op, the setter runs happily and the
+/// flag does not move.
+fn flip_took(requested: bool, actual_after: bool) -> bool {
+    requested == actual_after
 }
 
 // â”€â”€ argument extractors â”€â”€
@@ -831,6 +868,27 @@ mod tests {
         assert_eq!(arg_workspace(&json!({"workspace": 0})), None, "0 is below the 1-based floor");
         assert_eq!(arg_workspace(&json!({"workspace": -3})), None, "negative is rejected");
         assert_eq!(arg_workspace(&json!({})), None, "missing workspace → None");
+    }
+
+    // ── shell.native's honesty rule (§4.12) ──
+
+    #[test]
+    fn flip_took_compares_the_request_against_the_flag_afterwards() {
+        // Both directions succeed when the flag ends up where it was asked to be,
+        // INCLUDING the no-change case: asking a backend to turn the scene off when it
+        // is already off is honoured, not refused.
+        assert!(flip_took(true, true), "asked on, reads on");
+        assert!(flip_took(false, false), "asked off, reads off");
+    }
+
+    #[test]
+    fn flip_took_is_false_when_the_flag_did_not_move() {
+        // The case that exists because of the default no-op setter: a backend with no
+        // native scene field accepts the call, changes nothing, and must NOT be reported
+        // as having obeyed. `window.resize` answering ok for a resize the client declined
+        // is the same bug, found on hardware 2026-09-10.
+        assert!(!flip_took(true, false), "asked on, still off → refused, not ok");
+        assert!(!flip_took(false, true), "asked off, still on → refused, not ok");
     }
 
     // ── response envelope (IPC_PROTOCOL.md §3) ──

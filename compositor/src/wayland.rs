@@ -427,6 +427,14 @@ impl CompState for State {
     fn native_shell_on(&self) -> bool {
         self.native_shell_on
     }
+    /// The DRM backend is the one that HAS the field, so it is the one where
+    /// `shell.native` can actually do something. Nothing else needs invalidating: the
+    /// render tick reads the flag every frame, `lower_scene` builds the retained tree on
+    /// the first frame that finds it on, and the idle heartbeat guarantees such a frame
+    /// arrives without waiting for damage.
+    fn set_native_shell_flag(&mut self, on: bool) {
+        self.native_shell_on = on;
+    }
     fn row_scroll(&self) -> crate::scene::RowScroll {
         self.row_scroll
     }

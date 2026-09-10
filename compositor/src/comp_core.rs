@@ -852,6 +852,33 @@ pub trait CompState:
         false
     }
 
+    /// Store the native-scene flag. Default = a NO-OP, and deliberately so: a backend
+    /// with no such field has no native scene to turn on, and pretending otherwise is
+    /// the failure mode `window.resize` was caught in on 2026-09-10 (it answered `ok`
+    /// for a resize the client had declined). The caller reads `native_shell_on` back
+    /// and reports what the flag ACTUALLY says, so a backend that cannot honour the
+    /// request says so rather than appearing to obey.
+    fn set_native_shell_flag(&mut self, _on: bool) {}
+
+    /// Toggle the native scene render path at RUNTIME (the `shell.native` IPC verb's
+    /// executor), mirroring `set_capture_blocked` next door. Returns the new state,
+    /// which is what the flag reads AFTER the attempt, never what was asked for.
+    ///
+    /// Why a runtime toggle exists at all, when M6 will flip the default: the one
+    /// measurement this program has never taken is its own headline claim.
+    /// `pointer_surface` can attribute an input to TOPBAR/CARD/ORB only while the
+    /// native scene is drawn, so with the flag off every latency sample is
+    /// `component=shell` by construction, which is exactly what the box reported on
+    /// 2026-09-10, ~4,200 samples with one distinct component. Turning the scene on
+    /// meant an env var read once at session start: a new generation, a reboot, and no
+    /// way back except another reboot. Over this socket it is one call with an instant
+    /// undo, so the native-versus-shell delta can be measured in one session on one
+    /// machine minutes apart, and a surprise is reverted in the time it takes to send
+    /// `{"on": false}`.
+    fn set_native_shell(&mut self, on: bool) -> bool {
+        set_native_shell_shared(self, on)
+    }
+
     /// Is the compositor GPU-compositing RIGHT NOW (a live GLES renderer), as opposed to
     /// painting through the pixman software floor?
     ///
@@ -1188,6 +1215,25 @@ pub fn set_capture_blocked_shared<S: CompState>(state: &mut S, on: bool) -> bool
         info!(blocked = on, "screen.kill — capture/input/screencopy gate toggled");
     }
     state.capture_blocked()
+}
+
+/// The native-scene toggle (the `CompState::set_native_shell` default body). Named
+/// distinctly from the trait method for the same reason as its neighbour above: a
+/// default body that called the trait method would recurse into itself.
+///
+/// It logs the OUTCOME, not the request. `set_native_shell_flag` is a no-op on any
+/// backend without the field, so `took` can be false, and a log line saying the scene
+/// was turned on when it was not is worse than no line at all.
+pub fn set_native_shell_shared<S: CompState>(state: &mut S, on: bool) -> bool {
+    if state.native_shell_on() != on {
+        state.set_native_shell_flag(on);
+        info!(
+            native = on,
+            took = state.native_shell_on() == on,
+            "shell.native: the native scene render path toggled at runtime"
+        );
+    }
+    state.native_shell_on()
 }
 
 // ── input routing (keyboard focus + pointer hit-test + click-to-focus) ──
