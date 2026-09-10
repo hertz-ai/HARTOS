@@ -709,11 +709,20 @@ pub fn on_animation_started(surface: Surface) {
 
 /// Called once per render pass with the compositor's own "nothing changed"
 /// verdict, so the instrument can tell a static desktop from a dead render loop.
-pub fn on_render(unchanged: bool) {
+///
+/// Returns the stall record when the span has earned one, and THIS is the only
+/// place it is taken. It used to be taken inside `on_frame_presented`, which
+/// meant the diagnostic whose entire job is to report "frames are not reaching
+/// the screen" could only speak from the code path that runs when a frame
+/// reaches the screen. Moving the GATE onto render attempts earlier the same day
+/// fixed which counter it watched and left that reachability untouched, so it
+/// stayed silent on hardware for another day. A diagnostic has to be reachable
+/// on the path that is still alive during the fault it describes.
+pub fn on_render(unchanged: bool) -> Option<Stall> {
     let g = global();
-    if let Ok(mut c) = g.core.lock() {
-        c.note_render(unchanged);
-    }
+    let mut c = g.core.lock().ok()?;
+    c.note_render(unchanged);
+    c.take_stall()
 }
 
 pub fn on_frame_queued() {
@@ -725,19 +734,18 @@ pub fn on_frame_queued() {
 
 /// Called from the vblank reaper. Emits the journal lines and (opt-in) the
 /// jsonl sink here so udev.rs stays one line.
-pub fn on_frame_presented() -> (Vec<Summary>, Option<Drops>, Option<Stall>) {
+pub fn on_frame_presented() -> (Vec<Summary>, Option<Drops>) {
     let g = global();
     // Both under ONE lock: the drops belong to the window the summaries describe, and
     // taking them separately would let a drop land between the two and be attributed
     // to the next window, which is the one place this record must not lie.
-    let (summaries, drops, stall) = match g.core.lock() {
+    let (summaries, drops) = match g.core.lock() {
         Ok(mut c) => {
             let s = c.frame_presented(instant_us());
             let d = c.take_drops();
-            let st = c.take_stall();
-            (s, d, st)
+            (s, d)
         }
-        Err(_) => (Vec::new(), None, None),
+        Err(_) => (Vec::new(), None),
     };
     if !summaries.is_empty() {
         let jsonl = std::env::var("HART_LATENCY_JSONL").ok().as_deref() == Some("1");
@@ -780,7 +788,7 @@ pub fn on_frame_presented() -> (Vec<Summary>, Option<Drops>, Option<Stall>) {
             }
         }
     }
-    (summaries, drops, stall)
+    (summaries, drops)
 }
 
 #[cfg(test)]
@@ -1286,5 +1294,48 @@ mod tests {
             let _ = c.frame_presented(t - GAP + 10_000 + i);
         }
         assert!(c.take_stall().is_some(), "the next span reports again");
+    }
+
+    #[test]
+    fn the_stall_is_reachable_with_nothing_ever_presented() {
+        // THE REACHABILITY GUARD. Every other stall test drives take_stall()
+        // directly, so all of them passed while the only production caller sat
+        // inside the vblank handler: on hardware the line could not be reached
+        // unless frames were being presented, which is the opposite of the
+        // condition it reports. This test uses the shape of a box that renders
+        // and never presents -- frames_presented stays 0 throughout.
+        let mut c = LatencyCore::new();
+        c.note_input(Surface::Shell, Kind::Press, 1_000_000, 0);
+        for _ in 0..STALL_REPORT_EVERY {
+            c.note_render(true);
+        }
+        let st = c
+            .take_stall()
+            .expect("a render loop that never presents must be able to say so");
+        assert_eq!(st.presented, 0, "nothing was ever presented");
+        assert_eq!(st.attempted, STALL_REPORT_EVERY, "the renders are what counted");
+        assert_eq!(st.unchanged, STALL_REPORT_EVERY, "and all of them were no-ops");
+        assert_eq!(st.samples, 0, "so no sample could resolve");
+
+        // The structural half of the guard: `on_frame_presented` no longer
+        // returns a Stall at all, so the presented path CANNOT be the emitter
+        // again by accident. `on_render` is the only source, and it is called
+        // from every arm of the render match including the failure arms.
+    }
+
+    #[test]
+    fn a_render_loop_that_fails_every_tick_still_reports() {
+        // udev.rs:1006's shape: render_frame refuses on every tick. The loop is
+        // running at full speed, nothing reaches the screen, and before the
+        // error arms started counting, `attempted` stayed 0 and the instrument
+        // read this as an idle desk.
+        let mut c = LatencyCore::new();
+        c.note_input(Surface::Shell, Kind::Press, 1_000_000, 0);
+        for _ in 0..STALL_REPORT_EVERY {
+            c.note_render(false); // a failed attempt is not "unchanged"
+        }
+        let st = c.take_stall().expect("a failing render loop must report");
+        assert_eq!(st.unchanged, 0, "nothing claimed the screen was static");
+        assert_eq!(st.queued, 0, "and nothing ever reached queue_frame");
     }
 }

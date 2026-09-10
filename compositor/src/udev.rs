@@ -1138,6 +1138,20 @@ fn should_recover_frozen(since_last_present: Option<Duration>) -> bool {
     since_last_present.map(|d| d >= SILENT_FREEZE_AFTER).unwrap_or(false)
 }
 
+/// One render pass finished; tell the latency instrument and emit the stall line
+/// if it decides this span has earned one.
+///
+/// Every arm of the render match calls this, INCLUDING the two error arms. A
+/// box whose `render_frame` fails on every tick is running its render loop at
+/// full speed and presenting nothing, which is exactly the shape the stall line
+/// exists to name, so those arms have to count as attempts or the counter
+/// describes a loop that is not the one running.
+fn note_render_pass(unchanged: bool) {
+    if let Some(st) = crate::latency::on_render(unchanged) {
+        warn!("{}", st.journal_line());
+    }
+}
+
 fn resync_flip_state(crtc: &crtc::Handle, surface: &mut SurfaceData, reason: &str) {
     match surface.compositor.frame_submitted() {
         Ok(_) => {}
@@ -1211,7 +1225,7 @@ fn reap_completed_vblanks(state: &mut State, devices: &mut HashMap<DrmNode, Devi
                 // photon side of every input bound to the frame it completes.
                 // Summaries surface once per 10s window; the journal line is
                 // the harness §3 contract, greppable as `hart-latency`.
-                let (summaries, drops, stall) = crate::latency::on_frame_presented();
+                let (summaries, drops) = crate::latency::on_frame_presented();
                 for s in summaries {
                     info!("{}", s.journal_line());
                 }
@@ -1223,13 +1237,10 @@ fn reap_completed_vblanks(state: &mut State, devices: &mut HashMap<DrmNode, Devi
                 if let Some(d) = drops {
                     warn!("{}", d.journal_line());
                 }
-                // The dual case: vblanks reaped and input waiting, but nothing
-                // ever queued, so no sample can be MADE and the journal would
-                // otherwise be silent — indistinguishable from a box nobody
-                // touched. Says so at the same cadence a healthy window reports.
-                if let Some(st) = stall {
-                    warn!("{}", st.journal_line());
-                }
+                // The stall line USED TO BE EMITTED HERE and has moved to
+                // `note_render_pass`, on the render path. Reaching it required a
+                // vblank, so the one condition it exists to report -- vblanks not
+                // arriving -- was also the condition that made it unreachable.
             }
         }
     }
@@ -1710,7 +1721,7 @@ where
                     // queues, so no input can bind to it; the instrument needs to
                     // know how often we land here to tell "static desktop" from
                     // "render loop not running".
-                    crate::latency::on_render(true);
+                    note_render_pass(true);
                     continue;
                 }
                 Ok(false) => match surface.compositor.queue_frame(()) {
@@ -1723,7 +1734,7 @@ where
                         // even though presentation is proven only at the
                         // vblank: the batch rides FIFO and is measured against
                         // the flip that actually completes (harness M0).
-                        crate::latency::on_render(false);
+                        note_render_pass(false);
                         crate::latency::on_frame_queued();
                         // `last_flip_at` and `publish_native_chrome()` USED TO BE HERE
                         // and have moved to `reap_completed_vblanks`, because this Ok
@@ -1738,6 +1749,8 @@ where
                         // scanout, and that is where both now live.
                     }
                     Err(err) => {
+                        // Rendered, then the flip was refused. An attempt either way.
+                        note_render_pass(false);
                         // A flip/commit ioctl error (the real-HW EACCES/EBUSY/ENODEV/
                         // EINVAL): classify → log → leave `awaiting_vblank` false so the
                         // NEXT tick re-renders + retries. The compositor stays ALIVE.
@@ -1761,6 +1774,10 @@ where
                 // is a DRM/swapchain/master hiccup that would hit pixman too → NOT a renderer
                 // fault, just retried next tick. EITHER way the compositor stays ALIVE (#186).
                 Err(err) => {
+                    // render_frame itself failed. The loop is running at full
+                    // speed and nothing will ever reach the screen: the exact
+                    // case #1006 describes, and the one worth counting.
+                    note_render_pass(false);
                     if gles_should_demote(matches!(err, RenderFrameError::RenderFrame(_))) {
                         renderer_fault = true;
                         warn!(?err, ?crtc, "HART-comp DRM: render_frame RENDERER fault (RenderFrame) — degrading; caller may demote to the pixman floor");
