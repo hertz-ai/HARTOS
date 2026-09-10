@@ -130,6 +130,11 @@ class TestResolvedNothingIsVisibleInProduction(unittest.TestCase):
         and not a nicety.
         """
         block = _empty_branch(_reuse_src())
+        # FORMAT NOTE 2026-09-11: the suffix is `for session: {user_prompt}`,
+        # matching the convention FAB-GUARD already uses in this same module
+        # ('...; unrun=[...] for session: <key>').  The first cut invented a
+        # second phrasing '(session <key>)' -- two formats for one concept in
+        # one file is the drift this project's rules exist to prevent.
         # Assert on the LOG MESSAGE, not the block.  A bare
         # ``assertIn('user_prompt', block)`` passes vacuously: the block
         # already reads ``recipes.get(user_prompt)`` to compute the count, so
@@ -137,7 +142,7 @@ class TestResolvedNothingIsVisibleInProduction(unittest.TestCase):
         # A/B on 2026-09-11 -- that assertion passed against the reverted,
         # session-less line too.  Match the interpolation inside the f-string.
         self.assertTrue(
-            re.search(r'session \{user_prompt\}', block),
+            re.search(r'for session: \{user_prompt\}', block),
             'the resolved-nothing line reports a count without naming the '
             'session it measured; on a box with daemon agents and a second '
             'user driving reuse concurrently, that number cannot be attributed '

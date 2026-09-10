@@ -5138,9 +5138,19 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     # hook read as healthy while doing nothing: measured live
                     # 2026-09-07/08 over 23 driven agents, "Tier-1 named attach"
                     # appeared ZERO times and no line said why.
+                    # The SESSION KEY belongs on this half too.  These two
+                    # branches are one diagnostic pair -- the whole point is
+                    # telling a resolved-nothing round from a real one -- so
+                    # identifying only the empty half leaves the other half
+                    # exactly as unattributable as before.  MEASURED 2026-09-11
+                    # 01:47:46, minutes after the empty branch gained its key:
+                    # "action 1 names ['google_search'] -> 1 tools" arrived
+                    # with a reuse walk in flight AND daemon traffic AND a
+                    # second user's agents on the box, and there was no way to
+                    # say whose it was.
                     current_app.logger.info(
                         f"Tier-1 named attach: action {_aid} names {_named} "
-                        f"-> {_nn} tools")
+                        f"-> {_nn} tools for session: {user_prompt}")
                 elif _aid:
                     # INFO, not debug.  gui_app.log captured ZERO "- DEBUG -"
                     # lines across the whole 2026-09-11 drive, so at debug this
@@ -5177,8 +5187,8 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     _store = (recipes.get(user_prompt) or {}).get('actions') or []
                     current_app.logger.info(
                         f"Tier-1 named attach: action {_aid} names no tool "
-                        f"(session {user_prompt}, recipes store holds "
-                        f"{len(_store)} action(s))")
+                        f"(recipes store holds {len(_store)} action(s)) "
+                        f"for session: {user_prompt}")
 
                 # (b) TAGS — unchanged fallback for capability families the
                 # recipe never mentions but the conversation drifted into.
