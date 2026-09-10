@@ -167,6 +167,70 @@ def is_window_blocked(window_meta: Optional[dict],
     return None
 
 
+# ─── Fabricated-credential guard ──────────────────────────────────────
+
+# RFC 2606 / RFC 6761 reserve these for documentation and testing, so an
+# address inside one can never be a real account.  Typing it into a live
+# login form is therefore always a fabrication, never a user credential.
+RESERVED_CREDENTIAL_DOMAINS: Tuple[str, ...] = (
+    'example.com', 'example.org', 'example.net', 'example.edu',
+)
+RESERVED_CREDENTIAL_TLDS: Tuple[str, ...] = (
+    '.example', '.invalid', '.test', '.localhost',
+)
+
+# Local-parts a model writes when standing in for a value it does not have.
+# Deliberately limited to the unambiguous "your*" family plus an explicit
+# placeholder marker.  'user', 'admin', 'test' and 'email' are NOT here on
+# purpose: user@realcompany.com and admin@realcompany.com are perfectly real
+# addresses, and blocking them would break legitimate typing (the observed
+# user@example.com is already caught by its reserved DOMAIN, which is the
+# unambiguous half of the signal).
+PLACEHOLDER_LOCAL_PARTS: Tuple[str, ...] = (
+    'youremail', 'your_email', 'your-email', 'yourname', 'your_name',
+    'your-name', 'yourusername', 'your_username', 'placeholder',
+)
+
+# A bare credential-shaped token: no whitespace, exactly one '@', dotted
+# domain.  Anchored on purpose -- prose that merely mentions example.com
+# contains spaces and so cannot match, which keeps ordinary typing working.
+_CREDENTIAL_TOKEN = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
+
+
+def is_placeholder_credential(action: Optional[dict]) -> Optional[str]:
+    """Return a block-reason when a 'type' action would enter a FABRICATED
+    credential, None otherwise.  Same contract as :func:`is_window_blocked`.
+
+    Measured live 2026-09-10: the VLM loop reached x.com's login form with no
+    credential, invented one, typed it, and reported ok:True --
+    'Typed: user@example.com...' then 'Typed: your_email@example.com...'.
+    Repeated bad logins against a real account trip rate-limiting and
+    security locks, so the refusal has to happen before pyautogui runs.
+
+    Scope is intentionally narrow (see PLACEHOLDER_LOCAL_PARTS): only a
+    'type' action whose ENTIRE trimmed text is one credential-shaped token.
+    """
+    if not action or action.get('action') != 'type':
+        return None
+    text = (action.get('text') or action.get('value') or '').strip()
+    if not text or not _CREDENTIAL_TOKEN.match(text):
+        return None
+
+    local, _, domain = text.rpartition('@')
+    domain_l = domain.lower()
+    if domain_l in RESERVED_CREDENTIAL_DOMAINS:
+        return (f'placeholder_credential: "{text}" uses reserved '
+                f'documentation domain "{domain_l}" (RFC 2606)')
+    for tld in RESERVED_CREDENTIAL_TLDS:
+        if domain_l.endswith(tld):
+            return (f'placeholder_credential: "{text}" uses reserved '
+                    f'TLD "{tld}" (RFC 6761)')
+    if local.lower() in PLACEHOLDER_LOCAL_PARTS:
+        return (f'placeholder_credential: "{text}" has placeholder '
+                f'local-part "{local}"')
+    return None
+
+
 # ─── Audit logger ─────────────────────────────────────────────────────
 
 class AuditLogger:

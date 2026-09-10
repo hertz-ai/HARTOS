@@ -270,7 +270,7 @@ def execute_action(action: dict, tier: str, *,
     # rate cap is cheapest, run first; window blocklist needs window
     # metadata so runs second.
     if safety:
-        _block = _check_safety(_window_meta)
+        _block = _check_safety(_window_meta, action)
         if _block is not None:
             _result = {
                 'output': '', 'status': 'safety_blocked',
@@ -326,19 +326,29 @@ def execute_action(action: dict, tier: str, *,
 
 # ─── Phase 6 helper plumbing ──────────────────────────────────────────
 
-def _check_safety(window_meta):
-    """Run rate guard + window blocklist.  Returns block-reason
-    string when refusing, None when OK."""
+def _check_safety(window_meta, action=None):
+    """Run rate guard + window blocklist + fabricated-credential guard.
+    Returns block-reason string when refusing, None when OK.
+
+    ``action`` is optional so the window/rate checks keep working for any
+    caller that has no action in hand; the credential guard simply does not
+    fire in that case.
+    """
     try:
         from integrations.vlm.safety import (
-            get_session_guard, is_window_blocked)
+            get_session_guard, is_placeholder_credential, is_window_blocked)
     except Exception as e:
         logger.debug(f"safety module unavailable: {e}")
         return None
     reason = get_session_guard().check()
     if reason is not None:
         return reason
-    return is_window_blocked(window_meta)
+    blocked = is_window_blocked(window_meta)
+    if blocked is not None:
+        return blocked
+    # Runs last so every pre-existing block keeps reporting its own reason
+    # unchanged; this only catches what used to fall through and get typed.
+    return is_placeholder_credential(action)
 
 
 def _emit_audit(action, result, window_meta, screenshot_b64,
