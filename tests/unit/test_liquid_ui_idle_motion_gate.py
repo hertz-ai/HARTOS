@@ -11,18 +11,32 @@ carries a measured gate for this: on `body.webkit-flat` it flips the
 animations that have no such var.
 
 That gate was written from a survey of the stylesheet, and a survey is a thing
-you do once. `.hart-onboarding .hob-orb` was added later and missed it. Found on
-the live node 2026-09-10, sitting on the "Light Your HART" onboarding screen with
-no onboarding state written:
+you do once. `.hart-onboarding .hob-orb` was added later and missed it: a 150px
+orb carrying `0 0 70px` AND `0 0 150px` box-shadows, scaling to 1.08 and back
+forever, on the "Light Your HART" screen that a node with no onboarding state
+sits on from boot. That is precisely the shape the gate's own note calls out for
+`.hart-hero-orb` ("each breathe frame re-rasterises two big blurs in software"),
+and it is worse, because it is the FIRST screen a new user ever meets.
 
-    WebKitWebProcess main thread   487 of 500 jiffies  (97.4% of one core)
-    hart-comp                      2.2%
+So it belongs in the gate on the gate's own stated criterion, and that is the
+whole justification for the one-line fix. It is NOT justified by the CPU burn
+measured on the node the same day, and the difference matters:
 
-Continuously, from boot. The compositor was nearly idle, so the cost was not
-compositing the frames -- it was WebKit re-rasterising, in software, a 150px orb
-carrying `0 0 70px` AND `0 0 150px` box-shadows while it scaled to 1.08 and back,
-forever. The same shape the gate's own note calls out for `.hart-hero-orb`, on
-the FIRST screen a new user ever sees.
+A CORRECTION, recorded because the first version of this file got it wrong.
+The live node showed WebKit's main thread at 487 of 500 jiffies (97.4% of a
+core) continuously from boot while hart-comp idled at 2.2%, and this file
+originally named the orb as the cause. It is not. Measuring the thread's
+context switches settled it:
+
+    webkit  cpu=99%   voluntary=+37   nonvoluntary=+173   (over 10s)
+
+A rAF or CSS-animation loop yields to the event loop about 60 times a second,
+so voluntary switches would dominate. Three per second, against seventeen
+preemptions, is a SYNCHRONOUS BUSY LOOP that almost never yields -- not an
+animation. hart-comp idling at 2.2% says the same thing from the other end: a
+60fps animation would have produced frames for it to composite, and there were
+none. The busy loop is a separate, still-unidentified defect. Do not let this
+fix be mistaken for having addressed it.
 
 So this test replaces the survey with an invariant: enumerate every `infinite`
 animation in the stylesheet and require each one to be either GATED on the
@@ -128,8 +142,11 @@ def test_the_onboarding_orb_is_gated():
     """The specific regression, pinned by name.
 
     `.hob-orb` is 150px with `0 0 70px` and `0 0 150px` box-shadows, scaling
-    forever, on the first screen a new user sees. Measured on the live node at
-    97.4% of a core with hart-comp idle at 2.2%.
+    forever, on the first screen a new user sees. It is gated because it matches
+    the gate's own criterion, not because it was shown to cause the 97.4% burn
+    measured on the node that day -- context-switch counts later showed that
+    burn to be a synchronous busy loop, not an animation. See the correction in
+    this file's module docstring.
     """
     gate = _gate_rule()
     assert "body.webkit-flat .hart-onboarding .hob-orb" in gate, (
