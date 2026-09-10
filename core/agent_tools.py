@@ -108,6 +108,20 @@ MAIN_LEG_CORE_TOOLS = frozenset({
     'send_message_in_seconds', 'google_search',
 })
 
+# The closures the CREATE leg registers always-on, on top of
+# MAIN_LEG_CORE_TOOLS.  All of them live in build_core_tool_closures so the
+# REUSE leg can attach them BY NAME for an action whose recipe names one;
+# create_recipe registers them eagerly because the recipe-AUTHORING model has
+# to be able to call them while it builds, and its prompts advertise them.
+# Named here rather than in create_recipe so the two legs read one list.
+CREATE_LEG_EXTRA_TOOLS = frozenset({
+    'execute_coding_task', 'get_repository_map',
+    'create_code_shard', 'get_coding_benchmarks',
+    # create_recipe.py:3084 and :3102 tell the model to "always use the
+    # validate_json_response tool"; a recipe naming it must be runnable.
+    'validate_json_response',
+})
+
 
 def _join_tool_menu(names, extra=()):
     """One join for every prose tool menu: sorted, comma-separated, no quotes."""
@@ -2088,6 +2102,212 @@ def build_core_tool_closures(ctx):
         # commits C4+ EXTENDS web_crawler.py with cookie injection + B2 CDP
         # attach, instead of building a parallel driver.  See
         # memory/project_browser_research_subsystem.md for the corrected plan.
+
+    @log_tool_execution
+    def validate_json_response(response: Annotated[str, "The response from a tool that should be JSON"]) -> str:
+        """
+        Validates and repairs JSON response from tools.
+
+        Args:
+            response: string responses from a tool that should be JSON formatted
+        Returns:
+            Valid JSON string or the original string if not repairable
+        """
+        tool_logger.info("INSIDE validate json response")
+        try:
+            # First try to parse as is
+            json_obj = json.loads(response)
+            return json.dumps(json_obj)
+        except json.JSONDecodeError:
+            try:
+
+                # If parsing fails, try to repair
+                repaired_json = repair_json(response)
+                # Verify the repaired JSON is valid
+                json_obj = json.loads(repaired_json)
+                return json.dumps(json_obj)
+            except Exception as e:
+                # If repair filas, return the original with a warning
+                tool_logger.info("JSON repair has failed")
+                return f"{response}"
+
+    tools.append((
+        "validate_json_response",
+        "Checks and corrects if the tool response is not JSON but expected to be.",
+        validate_json_response,
+    ))
+
+    # ------------------------------------------------------------------
+    # Coding-agent leg
+    #
+    # These four were inline closures in create_recipe.create_agents
+    # (register_dual, L1674-1816) until 2026-09-10.  CREATE advertised them
+    # to the recipe-authoring LLM while REUSE — which builds its tools from
+    # THIS factory (reuse_recipe.py:2238) — held no copy.  Two consequences,
+    # and the second is the one that hid the first:
+    #   * a saved action naming one could never execute; and
+    #   * _reuse_fabricated_tools could not see the name as `referenced`
+    #     (that helper intersects the action text with names REGISTERED ON
+    #     THE AGENTS), so it returned [] at its second early-return, before
+    #     its log line.  A tool the leg cannot run was indistinguishable
+    #     from an action naming no tool, and the action advanced silently.
+    # Measured live 2026-09-10, agent 88719487304 action 4: FAB-GUARD
+    # watermark 23 in, 23 out — zero tool calls in the whole window — no
+    # verdict line at all, both subtasks closed, parent terminated in 14s.
+    # 36 of the 185 saved recipes on that box name such a tool; 87 actions
+    # name execute_coding_task alone.
+    #
+    # Deliberately NOT added to MAIN_LEG_CORE_TOOLS: reuse reaches them via
+    # attach_for_names, for the action whose own recipe names one, so the
+    # always-on schema stays 18 tools / ~1,859 tokens against the 12,288
+    # slot (#730).  Same rule reuse_recipe.py:2429-2442 already states for
+    # execute_windows_or_android_command — that closure captures 33 locals
+    # of its defining function so ctx cannot build it and it is handed over
+    # inline; these four capture nothing but user_id, which ctx supplies.
+    # ------------------------------------------------------------------
+    async def execute_coding_task(
+        task: Annotated[str, "The coding task to execute (e.g., 'review this function for bugs', 'implement a login form')"],
+        task_type: Annotated[str, "Task type: code_review, feature, bug_fix, refactor, app_build, debugging, multi_session"] = "feature",
+        preferred_tool: Annotated[str, "Optional tool override: kilocode, claude_code, opencode, aider_native, or claw_native (empty = auto-select best)"] = "",
+        working_dir: Annotated[str, "Working directory / repo path for the coding task (empty = use HEVOLVE_CODING_WORKDIR env or cwd)"] = "",
+    ) -> str:
+        """Execute a coding task using the best available coding agent tool (KiloCode, Claude Code, OpenCode, or AiderNative).
+
+        Routes to the best tool based on benchmarks and task type.
+        This is for writing, reviewing, refactoring, or debugging code —
+        NOT for GUI automation (use execute_windows_or_android_command for that).
+        """
+        try:
+            from integrations.coding_agent.orchestrator import get_coding_orchestrator
+            orchestrator = get_coding_orchestrator()
+            result = orchestrator.execute(
+                task=task,
+                task_type=task_type,
+                preferred_tool=preferred_tool,
+                user_id=user_id,
+                model=os.environ.get('HEVOLVE_CODING_MODEL', ''),
+                working_dir=working_dir or os.environ.get('HEVOLVE_CODING_WORKDIR', ''),
+            )
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return f"Coding task execution error: {e}"
+
+    tools.append((
+        "execute_coding_task",
+        "Execute a coding task (write, review, refactor, debug code) using the best available coding agent tool. Routes to KiloCode, Claude Code, OpenCode, AiderNative, or ClawNative (Rust) based on benchmarks. Pass working_dir for the target repo path.",
+        execute_coding_task,
+    ))
+
+    # Repository map tool — tree-sitter based code understanding.
+    # Import-gated exactly as create_recipe had it: absent, not broken,
+    # when aider_core is not installed.
+    try:
+        from integrations.coding_agent.recipe_bridge import CodingRecipeBridge
+
+        async def get_repository_map(
+            working_dir: Annotated[str, "Directory to map (default: current directory)"] = ".",
+            max_tokens: Annotated[int, "Maximum tokens for the map output"] = 2048,
+        ) -> str:
+            """Generate a tree-sitter based repository map showing key functions, classes, and their relationships.
+
+            Use this to understand a codebase's structure before making changes.
+            Returns a ranked summary of the most important code symbols.
+            """
+            return CodingRecipeBridge.get_repository_map(working_dir, max_tokens)
+
+        tools.append((
+            "get_repository_map",
+            "Generate a tree-sitter repository map showing key functions, classes, and structure. Use before coding tasks to understand the codebase.",
+            get_repository_map,
+        ))
+    except ImportError:
+        tool_logger.debug("Repository map tool not available (aider_core not installed)")
+
+    # Shard Engine: Call-chain context for coding tasks.
+    # Target function + upstream callers + downstream callees = FULL source.
+    # Everything else = interfaces only. Exposure proportional to task.
+    # Call graph from Trueflow MCP (IDE) or AST fallback (headless).
+    try:
+        async def create_code_shard(
+            task: Annotated[str, "Description of the coding task"],
+            target_file: Annotated[str, "Relative path to the file containing the target function"],
+            target_function: Annotated[str, "Name of the function to modify"],
+            repo_path: Annotated[str, "Path to the repository (default: HART OS install dir)"] = "",
+        ) -> str:
+            """Create a code shard with call-chain context for a coding task.
+
+            Returns:
+            - Target function: FULL source (what you're modifying)
+            - Upstream callers: FULL source (who calls it, input contracts)
+            - Downstream callees: FULL source (what it calls, output contracts)
+            - Everything else: Interfaces only (signatures + types)
+
+            Call graph sourced from Trueflow MCP (when IDE running) or AST fallback.
+            Security: exposure proportional to the task. E2E encrypted for peer offload.
+            Use execute_coding_task with working_dir to actually apply edits.
+            """
+            from integrations.agent_engine.shard_engine import ShardEngine
+            engine = ShardEngine(code_root=repo_path) if repo_path else ShardEngine()
+            shard = engine.create_call_chain_shard(
+                task=task, target_file=target_file,
+                target_function=target_function)
+            return json.dumps({
+                'shard_id': shard.shard_id,
+                'task': shard.task_description,
+                'scope': shard.scope.value,
+                'target_files': shard.target_files,
+                'call_chain_source': shard.full_content,
+                'interfaces': [{'file': s.file_path, 'functions': s.functions,
+                               'classes': s.classes} for s in shard.interface_specs],
+            }, indent=2, default=str)
+
+        tools.append((
+            "create_code_shard",
+            "Create a code shard with call-chain context: target function + upstream callers + downstream callees (FULL source), everything else interfaces only.",
+            create_code_shard,
+        ))
+    except Exception:
+        tool_logger.debug("Shard engine tool not available")
+
+    # Benchmark Tracker: Query which coding tool performs best for each task type
+    try:
+        async def get_coding_benchmarks(
+            task_type: Annotated[str, "Task type to check (code_review, feature, bug_fix, refactor, app_build, debugging, multi_session, or 'all')"] = "all",
+        ) -> str:
+            """Get coding tool benchmarks — which tool (KiloCode, Claude Code, OpenCode, AiderNative) performs best.
+
+            Returns success rates, average times, and sample counts per tool per task type.
+            Includes both local benchmarks and hive-aggregated intelligence from peers.
+            """
+            from integrations.coding_agent.benchmark_tracker import get_benchmark_tracker
+            tracker = get_benchmark_tracker()
+            result = {'local': {}, 'hive': {}}
+
+            if task_type == 'all':
+                delta = tracker.export_learning_delta()
+                result['local'] = delta.get('coding_benchmarks', {})
+            else:
+                best = tracker.get_best_tool(task_type)
+                if best:
+                    result['local'][task_type] = {
+                        'best_tool': best[0], 'success_rate': best[1],
+                        'avg_time_s': best[2],
+                    }
+                hive_best = tracker.get_hive_best_tool(task_type)
+                if hive_best:
+                    result['hive'][task_type] = {
+                        'best_tool': hive_best[0], 'success_rate': hive_best[1],
+                        'avg_time_s': hive_best[2],
+                    }
+            return json.dumps(result, indent=2, default=str)
+
+        tools.append((
+            "get_coding_benchmarks",
+            "Query coding tool benchmarks — which tool performs best per task type. Includes local and hive-aggregated data.",
+            get_coding_benchmarks,
+        ))
+    except Exception:
+        tool_logger.debug("Benchmark tracker tool not available")
 
     return tools
 
