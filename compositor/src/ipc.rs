@@ -92,9 +92,15 @@ impl IpcState {
     /// Push an event frame (IPC_PROTOCOL.md Â§5) to every live subscriber. Drops a
     /// subscriber whose socket has gone away. Pure fan-out; the caller built the
     /// `window` payload from the SAME `WindowRegistry`/`Space` source of truth.
-    pub fn emit_event(&mut self, event: &str, window: Value) {
+    /// Returns whether the event reached at least one live subscriber.
+    ///
+    /// The answer matters to the input path: a click on the native scene is CONSUMED only
+    /// when its activation actually went somewhere. With nobody listening the click falls
+    /// through to the surface underneath exactly as it does today, so wiring the emit
+    /// ahead of its consumer cannot swallow a click into silence.
+    pub fn emit_event(&mut self, event: &str, window: Value) -> bool {
         if self.subscribers.is_empty() {
-            return;
+            return false;
         }
         let frame = json!({
             "v": PROTOCOL_VERSION,
@@ -105,16 +111,21 @@ impl IpcState {
             Ok(b) => b,
             Err(err) => {
                 warn!(?err, "IPC: failed to serialize an event frame; dropping it");
-                return;
+                return false;
             }
         };
+        let mut delivered = false;
         self.subscribers.retain_mut(|s| match write_frame(s, &bytes) {
-            Ok(()) => true,
+            Ok(()) => {
+                delivered = true;
+                true
+            }
             Err(err) => {
                 debug!(?err, "IPC: dropping a subscriber whose event write failed (peer likely gone)");
                 false
             }
         });
+        delivered
     }
 }
 
@@ -941,7 +952,11 @@ mod tests {
     fn emit_event_to_no_subscribers_is_a_no_op() {
         let mut ipc = IpcState::default();
         // No panic, no allocation path taken — the empty-subscriber early return.
-        ipc.emit_event("window.opened", json!({"handle": "win_1"}));
+        // The RETURN is what the input path acts on: with nobody listening a native card
+        // press must NOT be consumed, or the click is swallowed into silence while the
+        // surface underneath never sees it either.
+        let delivered = ipc.emit_event("window.opened", json!({"handle": "win_1"}));
+        assert!(!delivered, "no subscribers means the event went nowhere");
         assert!(ipc.subscribers.is_empty());
     }
 
@@ -954,7 +969,9 @@ mod tests {
         let mut ipc = IpcState::default();
         ipc.subscribers.push(server_side);
 
-        ipc.emit_event("window.focused", json!({"handle": "win_42", "app_id": "foot"}));
+        let delivered =
+            ipc.emit_event("window.focused", json!({"handle": "win_42", "app_id": "foot"}));
+        assert!(delivered, "a live subscriber took the frame");
 
         // Read the framed event off the client end. The server end stays open (the live
         // subscriber), so the reader MUST be non-blocking — otherwise `fill()` would
@@ -970,6 +987,21 @@ mod tests {
         assert_eq!(frame["window"]["handle"], "win_42");
         assert_eq!(frame["window"]["app_id"], "foot");
         assert_eq!(ipc.subscribers.len(), 1, "a live subscriber is retained");
+    }
+
+    #[test]
+    fn a_dead_subscriber_is_not_a_delivery() {
+        // The peer is gone, so the write fails and the subscriber is dropped. Reporting
+        // that as delivered would consume a native card press on behalf of a listener
+        // that no longer exists.
+        let (server_side, client_side) = UnixStream::pair().expect("socketpair");
+        drop(client_side);
+        let mut ipc = IpcState::default();
+        ipc.subscribers.push(server_side);
+
+        let delivered = ipc.emit_event("shell.activate", json!({"row": 0, "card": 2}));
+        assert!(!delivered, "a write to a dead peer is not a delivery");
+        assert!(ipc.subscribers.is_empty(), "and the dead subscriber is dropped");
     }
 
     #[test]

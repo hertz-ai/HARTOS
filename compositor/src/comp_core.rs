@@ -2051,6 +2051,13 @@ pub fn on_pointer_button<S: CompState, B: InputBackend>(state: &mut S, evt: B::P
     // route through, so there is no second button path.
     state.note_pointer_button(button_state == ButtonState::Pressed);
     if button_state == ButtonState::Pressed {
+        // The native scene gets first refusal on a press, and ONLY when it can actually
+        // do something with it (see `activate_native_card_under_pointer`). Before the
+        // focus update and before the seat, because a consumed click must not also move
+        // keyboard focus to whatever surface happens to sit under the native pixels.
+        if activate_native_card_under_pointer(state) {
+            return;
+        }
         update_keyboard_focus(state, state.pointer().current_location(), serial);
     }
     let pointer = state.pointer().clone();
@@ -2134,6 +2141,49 @@ fn row_scroll_delta(vertical: f32, horizontal: f32) -> f32 {
 /// `overflow-x` element with nothing to scroll vertically, and so what this desktop's
 /// users already expect from the shell. A horizontal wheel or a two-finger sideways swipe
 /// scrolls it too, and the two are summed rather than fought over.
+/// A press on a native card: tell whoever is listening WHICH card, and consume the click.
+///
+/// Returns whether the click was consumed, which is true ONLY when every one of these
+/// holds: the native scene is actually drawn, the press landed on a card, and the
+/// activation reached at least one live subscriber.
+///
+/// THAT LAST CONDITION IS THE POINT. `events.subscribe` has no subscriber in the tree
+/// today, so without it this would swallow clicks into silence the moment the native
+/// shell came on: the scene cannot act on them and the shell underneath would never see
+/// them. With it, an unheard activation leaves the click to fall through exactly as it
+/// does now, so this can ship ahead of its consumer with no way to make the desktop worse.
+///
+/// It sends IDENTITY, not intent: (row, card) into the composed payload. The listener
+/// holds the same composition and already knows that "ask" focuses the command bar and
+/// "open" opens a panel, so the compositor never learns the action vocabulary and there
+/// is no second executor. Both indices are already server-sanitized before they are
+/// composed, so nothing here can widen what a card is allowed to do.
+fn activate_native_card_under_pointer<S: CompState>(state: &mut S) -> bool {
+    if !native_scene_drawn(state.native_shell_on(), state.capture_blocked()) {
+        return false;
+    }
+    let size = output_physical_size(state);
+    let Some((px, py)) = native_pointer_scene_pos(state, size) else {
+        return false;
+    };
+    let Some((row, card)) = state.native_tree().and_then(|t| t.card_at(px, py)) else {
+        return false;
+    };
+    let delivered = state.ipc_state_mut().emit_event(
+        "shell.activate",
+        serde_json::json!({ "row": row, "card": card }),
+    );
+    if delivered {
+        info!(row, card, "shell.activate (native card press handed to the shell)");
+    } else {
+        debug!(
+            row,
+            card, "native card press NOT consumed: no subscriber to act on it"
+        );
+    }
+    delivered
+}
+
 fn scroll_row_under_pointer<S: CompState>(state: &mut S, vertical: f32, horizontal: f32) {
     if !native_scene_drawn(state.native_shell_on(), state.capture_blocked()) {
         return;
