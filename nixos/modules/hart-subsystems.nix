@@ -723,7 +723,10 @@ in
     # mostly CLI + some GUI macOS binaries; maturity is well below Wine, so this
     # stays default-OFF and never touches the default desktop build. The
     # `pkgs ? darling` guard keeps evaluation safe on a nixpkgs rev/arch where
-    # darling is absent or unbuildable.
+    # darling is absent or unbuildable. That guard is about EVAL, not about
+    # whether macOS apps actually run: see the assertion message below for
+    # the measured reason they currently do not (the darling-mach kernel
+    # module is not in nixpkgs, so /dev/mach never exists and darling hangs).
     (lib.mkIf sub.macos.enable {
       # Eval-LOUD prerequisite (only when macos is explicitly enabled — it is
       # default-OFF, so the common case never hits this). Darling is absent /
@@ -741,6 +744,19 @@ in
             pin a rev/arch where darling builds, or leave hart.subsystems.macos
             disabled (the default). GUI / .dmg / .pkg remain unsupported regardless
             (the installer refuses them honestly via `darling shell`).
+
+            AND NOTE, measured on real hardware 2026-09-10: pkgs.darling being
+            PRESENT is not sufficient, so this assertion passing does not mean
+            macOS apps will run. Darling needs its `darling-mach` KERNEL MODULE,
+            which provides /dev/mach; nixpkgs on this pin ships no such module
+            (`linuxPackages ? darling` evaluates FALSE), and without it
+            `darling shell echo HARTOK` hangs at "Setting up a new Darling
+            prefix" until it is killed (rc=124 after 180s on kernel 6.15.3, no
+            module loaded, /dev/mach absent). Enabling this option therefore
+            ships a 451 MiB runtime that cannot execute a Darwin command. Fixing
+            it needs the kernel module packaged and added to
+            boot.extraModulePackages, which is a real piece of work and not a
+            flag flip.
           '';
         }
       ];
