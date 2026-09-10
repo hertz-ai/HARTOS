@@ -1945,8 +1945,28 @@ class LiquidUIService:
         # native side proves itself — and the shell keeps its own opaque
         # backdrop, which is the safe direction.
         native_chrome = read_native_chrome()
+        native_bloom_css = ''
         if 'bloom' in native_chrome:
             wp_css = 'transparent'
+            # ...and the shell's OWN bloom canvas goes with it. Making the
+            # wallpaper transparent only removes the opaque gradient ABOVE the
+            # native field; hartBloom.js was still composing its own aura into
+            # #hart-bloom-canvas and painting it over the top, so the compositor
+            # drew a bloom and the browser drew a second one on top of it.
+            #
+            # The orb half of this block already argues the case exactly:
+            # "there would be TWO orbs, the native one breathing under an HTML
+            # one breathing on top of it". Same argument, same fix, and it was
+            # simply never applied to the bloom. Found 2026-09-10 auditing for
+            # duplicate render paths after an owner report of the screen
+            # alternating between the compositor's scene and the shell's.
+            #
+            # visibility rather than display, matching the orb: the canvas keeps
+            # its box, so nothing reflows and any geometry read against it stays
+            # valid while the compositor owns the pixels.
+            native_bloom_css = (
+                '#hart-bloom-canvas,.hart-bloom-canvas{visibility:hidden}'
+            )
         # The orb half. Without this there would be TWO orbs, the native one
         # breathing under an HTML one breathing on top of it — and the browser
         # would still be paying the per-frame cost M2 exists to remove, so the
@@ -3179,7 +3199,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 
 /* ── Wallpaper ── */
 .wallpaper{{position:fixed;inset:0;z-index:0;background:{wp_css}}}
-{native_orb_css}
+{native_bloom_css}{native_orb_css}
 
 /* ── Glass mixin (perf-aware) ── */
 .glass{{background:var(--hart-glass-bg);

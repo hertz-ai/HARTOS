@@ -31,6 +31,20 @@
   var CANVAS_ID = 'hart-bloom-canvas';
   var _raf = 0;
 
+  // The compositor draws bloom.rs natively when it has claimed 'bloom', and the
+  // shell is told which chrome it owns through window.HART_NATIVE_CHROME. There
+  // is no point composing a second aura underneath a native one that already
+  // covers the output: the CSS hides the canvas, and this stops us paying to
+  // fill it. Mirrors voiceOrbViz.js's nativeOwnsOrb() stand-down exactly.
+  function nativeOwnsBloom() {
+    try {
+      var claimed = global.HART_NATIVE_CHROME;
+      return !!(claimed && claimed.indexOf && claimed.indexOf('bloom') !== -1);
+    } catch (e) {
+      return false;
+    }
+  }
+
   // Read a --hart-amb-N-rgb custom property (an "r,g,b" triple) with a fallback so a
   // theme that has not set it (or a pre-compose first paint) still gets the aura hue.
   function amb(cs, n, fallback) {
@@ -46,6 +60,8 @@
   // Compose the bloom ONCE. Idempotent: safe to call on load, resize, and every mood
   // re-compose. Never throws out (a backdrop must never take the shell down).
   function composeHartBloom() {
+    // Nothing to compose when the compositor owns the field.
+    if (nativeOwnsBloom()) { return; }
     try {
       var c = (typeof document !== 'undefined') && document.getElementById(CANVAS_ID);
       if (!c || !c.getContext) return;

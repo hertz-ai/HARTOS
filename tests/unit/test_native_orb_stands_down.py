@@ -90,3 +90,50 @@ def test_no_claim_emits_an_empty_array_not_a_missing_global():
     """The orb module reads the global defensively, but an undefined global on
     a page that HAS a compositor would be an ambiguity worth avoiding."""
     assert _claim_js(_render(set())) == '[]'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The BLOOM half of the same contract, added 2026-09-10.
+#
+# The orb stand-down was built and argued carefully; the bloom's was half done.
+# `if 'bloom' in native_chrome` made the WALLPAPER transparent, which only
+# removes the opaque gradient ABOVE the native field -- hartBloom.js kept
+# composing its own aura into #hart-bloom-canvas and painting it over the top.
+# So the compositor drew a bloom and the browser drew a second one on it, which
+# is the duplicate-render-path class the orb block's own comment warns about:
+# "there would be TWO orbs, the native one breathing under an HTML one".
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_shell_bloom_canvas_is_hidden_when_the_compositor_owns_bloom():
+    src = _read(_SVC) if '_read' in dir() else __import__('pathlib').Path(
+        'integrations/agent_engine/liquid_ui_service.py').read_text(encoding='utf-8')
+    assert "native_bloom_css" in src, (
+        "claiming 'bloom' must also stand the shell's own bloom canvas down, "
+        "not just make the wallpaper transparent")
+    assert "hart-bloom-canvas" in src and "visibility:hidden" in src, (
+        "#hart-bloom-canvas must be hidden when the compositor owns the bloom")
+
+
+def test_the_bloom_rule_is_actually_emitted_into_the_page():
+    src = __import__('pathlib').Path(
+        'integrations/agent_engine/liquid_ui_service.py').read_text(encoding='utf-8')
+    assert "{native_bloom_css}" in src, (
+        "native_bloom_css must be interpolated into the served CSS, or the "
+        "variable is computed and thrown away -- which is indistinguishable "
+        "from not having written it")
+
+
+def test_hartbloom_js_stands_down_too():
+    """CSS stops the canvas being SEEN; only this stops it being FILLED."""
+    js = __import__('pathlib').Path(
+        'integrations/agent_engine/static/hartBloom.js').read_text(encoding='utf-8')
+    assert "nativeOwnsBloom" in js, (
+        "hartBloom.js must check window.HART_NATIVE_CHROME and skip composing "
+        "when the compositor owns the bloom, mirroring voiceOrbViz.js")
+    assert "HART_NATIVE_CHROME" in js, (
+        "the stand-down must read the SAME claim the compositor publishes, not "
+        "a second source of truth")
+    i = js.index("function composeHartBloom")
+    assert "nativeOwnsBloom()" in js[i:i + 400], (
+        "the guard must be INSIDE composeHartBloom, so every caller (load, "
+        "resize, mood re-compose) is covered rather than just the first")
