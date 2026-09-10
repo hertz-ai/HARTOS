@@ -74,11 +74,69 @@ let
   # Fallback to `pkgs.rustPlatform` if the input is somehow absent (e.g. a consumer
   # that imports this module without the flake specialArgs) so eval never crashes;
   # that path only matters off the flake, where the package is not actually built.
+  # ── The crates.io DOWNLOAD HOST, swapped at the fetcher ──
+  # importCargoLock's default download URL is
+  #   https://crates.io/api/v1/crates/<name>/<version>/download
+  # and since ~2026-09-03 that endpoint answers 403 to curl-style user agents (bot
+  # protection). Nix's crate fetcher IS curl, so every crate fetch failed and
+  # `Build hart-rust-precedent` was red on every Nix Build Matrix run. Measured
+  # against the endpoint directly: no User-Agent 403, `curl/8.12.1` 403, `Mozilla`
+  # 200, and serde 1.0.228 behaves the same, so it is the AGENT being rejected and
+  # not any particular crate.
+  #
+  # The first fix (f27f0ce) passed `extraRegistries` keyed on the crates.io index so
+  # the download URL was replaced. It fixed the fetch and broke the build one step
+  # later, which is why this is the second attempt and why the mechanism is written
+  # down: import-cargo-lock.nix ALWAYS writes `[source.crates-io]` into the vendor
+  # config.toml, and then writes a `[source."<url>"] registry = "<url>"` block for
+  # every extraRegistries key. Naming the crates.io index there produces two sources
+  # for one registry, and cargo refuses:
+  #   error: source `https://github.com/rust-lang/crates.io-index` defines source
+  #   registry `crates-io`, but that source is already defined by `crates-io`
+  # (measured in CI on 2a4dea9, after the crates had downloaded fine). The registry
+  # map is a `let` binding inside that file, so extraRegistries is the only public
+  # way to reach it and there is no way to reach it without also emitting the block.
+  #
+  # So swap the host one layer lower, at fetchurl, where no config.toml is written.
+  # Crate tarballs are fixed-output derivations keyed on the Cargo.lock checksum, so
+  # the store path does not depend on where the bytes came from, and a URL rewrite
+  # that yields the same bytes is invisible downstream. static.crates.io is what the
+  # crates.io index advertises as its own `dl`, and it is already proven here:
+  # hart-comp's crane path fetches all 139 of its crates from
+  # static.crates.io/crates/<name>/<version>/download and succeeds in the same CI run
+  # where the precedent 403s.
+  #
+  # Scope: the overlay is applied to the 25.05 Rust instance ONLY, never to the 24.11
+  # `pkgs` the rest of the flake uses, and it rewrites nothing but URLs under the
+  # crates.io API prefix. Every other fetch in that instance keeps its arguments and
+  # therefore its derivation, so nothing else rebuilds.
+  #
+  # Kept BYTE-FOR-BYTE in sync between hart-comp.nix and hart-rust-precedent.nix, the
+  # same way the rust-platform block below is.
+  staticCratesUrl =
+    url:
+    let
+      api = "https://crates.io/api/v1/crates/";
+    in
+    if lib.hasPrefix api url
+    then "https://static.crates.io/crates/" + lib.removePrefix api url
+    else url;
+  crateHostOverlay = _final: prev: {
+    fetchurl =
+      args:
+      prev.fetchurl (
+        args
+        // lib.optionalAttrs (args ? url) { url = staticCratesUrl args.url; }
+        // lib.optionalAttrs (args ? urls) { urls = map staticCratesUrl args.urls; }
+      );
+  };
+
   rustNixpkgs =
     if hartRustNixpkgs != null
     then import hartRustNixpkgs {
       inherit (pkgs.stdenv.hostPlatform) system;
       config = pkgs.config;
+      overlays = [ crateHostOverlay ];
     }
     else pkgs;
   # rust_1_88 = rustc 1.88.0 + matching cargo (≥1.85 → edition2024 OK). We use 25.05's
@@ -219,18 +277,12 @@ let
         "smithay-0.7.0" = smithayGitHash;
       };
 
-      # Same crates.io 403 fix as hart-rust-precedent.nix — see the long rationale
-      # there. Short form: importCargoLock's default download host
-      # (crates.io/api/v1/crates) now rejects curl-style agents, and Nix's fetcher is
-      # curl; static.crates.io serves the identical tarballs, which is exactly why
-      # THIS module's crane path (vendorCargoDeps, above) has never hit the problem.
-      # Registry crates only — the git Smithay dep above is fetched by fetchgit and
-      # is unaffected. This fallback is selected only off-flake (hartCrane == null),
-      # so CI does not exercise it; fixing it here keeps the two call sites honest
-      # instead of leaving a known-broken path behind for the next consumer.
-      extraRegistries = {
-        "https://github.com/rust-lang/crates.io-index" = "https://static.crates.io/crates";
-      };
+      # The crates.io 403 is fixed at fetchurl, not here: see the crateHostOverlay
+      # block in the `let` above (kept byte-for-byte in sync with
+      # hart-rust-precedent.nix). Registry crates only; the git Smithay dep above is
+      # fetched by fetchgit and is unaffected. This buildRustPackage path is selected
+      # only off-flake (hartCrane == null), so CI does not exercise it, but it is
+      # fixed alongside the one CI does so a known-broken path is not left behind.
     };
 
     # Smithay's build needs the Wayland/DRM/input/render C libraries on Linux.

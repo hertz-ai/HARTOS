@@ -4630,6 +4630,18 @@ class TestCargoRegistryPinnedOffThe403Endpoint:
     What this guards is NOT the fix regressing -- it is a THIRD call site
     landing later on the default host and going red the same silent way. So it
     DISCOVERS the call sites instead of listing them.
+
+    RE-POINTED 2026-09-10, at the mechanism rather than at one spelling of it.
+    The first fix passed `extraRegistries` keyed on the crates.io index, which
+    replaced the download URL and then broke the build one step further on:
+    import-cargo-lock.nix emits `[source.crates-io]` unconditionally AND a
+    `[source."<url>"]` block per extraRegistries key, so naming the crates.io
+    index there defines one registry twice and cargo refuses the vendor config
+    ("defines source registry `crates-io`, but that source is already defined
+    by `crates-io`"). The host is therefore swapped one layer lower, at
+    fetchurl, where nothing is written into config.toml. This guard follows it:
+    what must hold is that a call site's module rewrites crate downloads to
+    static.crates.io, not that it does so through any particular attribute.
     """
 
     API_HOST = "crates.io/api/v1/crates"
@@ -4682,22 +4694,43 @@ class TestCargoRegistryPinnedOffThe403Endpoint:
             "found %d -- if the idiom moved, re-point this guard rather than "
             "deleting it" % len(sites))
 
-    def test_every_call_site_overrides_the_download_registry(self):
-        for rel, block in self._call_sites():
-            assert "extraRegistries" in block, (
-                "%s: a cargoLock without extraRegistries falls back to %s, which "
-                "403s Nix's curl fetcher" % (rel, self.API_HOST))
-            assert self.INDEX_KEY in block, (
-                "%s: extraRegistries must re-use the crates.io-index key so it "
-                "REPLACES the default download URL instead of adding a second "
-                "registry that nothing in the lock refers to" % rel)
-            assert self.WANT in block, (
+    def test_every_call_site_rewrites_crate_downloads_to_the_working_host(self):
+        """The module that owns a cargoLock must also own the host rewrite.
+
+        Asserted per FILE, not per block, because the rewrite now lives in the
+        module's `let` (it wraps fetchurl for the whole Rust instance) while the
+        cargoLock sits further down. A third call site landing in a new module
+        still fails here, which is what this guard is for.
+        """
+        for rel, _block in self._call_sites():
+            code = self._uncommented(read_nix(os.path.join(REPO_ROOT, rel)))
+            assert "crateHostOverlay" in code, (
+                "%s has a cargoLock but no crateHostOverlay, so its crates come "
+                "from %s, which 403s Nix's curl fetcher" % (rel, self.API_HOST))
+            assert "overlays = [ crateHostOverlay ]" in code, (
+                "%s defines the overlay but never applies it to the Rust "
+                "instance it builds with, which is a no-op" % rel)
+            assert self.WANT in code, (
                 "%s: expected the download host %s" % (rel, self.WANT))
 
-    def test_no_module_pins_the_403_host_in_code(self):
-        """Comments may name the bad host; code may not."""
+    def test_the_403_host_appears_only_as_the_thing_being_rewritten(self):
+        """Comments may name the bad host. Code may name it only to replace it.
+
+        The rewrite has to match the URL importCargoLock builds, so the string
+        cannot be banned outright any more. What can be banned is the shape that
+        matters: the bad host reached by a `url =`/`urls =` assignment, i.e. a
+        module that FETCHES from it rather than one that rewrites it away.
+        """
         for path in glob.glob(os.path.join(NIXOS_DIR, "**", "*.nix"), recursive=True):
+            rel = os.path.relpath(path, REPO_ROOT)
             code = self._uncommented(read_nix(path))
-            assert self.API_HOST not in code, (
-                "%s pins the 403 download host outside a comment"
-                % os.path.relpath(path, REPO_ROOT))
+            for line in code.splitlines():
+                if self.API_HOST not in line:
+                    continue
+                assert "url" not in line.split("=")[0], (
+                    "%s assigns the 403 download host to a url attribute: %s"
+                    % (rel, line.strip()))
+                assert ("hasPrefix" in line or "removePrefix" in line
+                        or line.strip().startswith("api =")), (
+                    "%s names the 403 host outside the rewrite: %s"
+                    % (rel, line.strip()))
