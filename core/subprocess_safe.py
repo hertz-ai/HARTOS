@@ -61,8 +61,10 @@ sites — they reintroduce the reader-thread orphan.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
+import threading
 from typing import Optional, Sequence
 
 logger = logging.getLogger(__name__)
@@ -194,6 +196,58 @@ def run_bounded(
         )
 
 
+# Where a NixOS node keeps the tools a login shell can see. A systemd unit's
+# PATH is built from its own declared dependencies and contains NEITHER of
+# these, which is the whole problem below.
+_SYSTEM_TOOL_DIRS = ("/run/current-system/sw/bin", "/run/wrappers/bin")
+
+
+def system_search_path(base: Optional[str] = None) -> str:
+    """``base`` PATH with the node's system tool dirs APPENDED if they exist.
+
+    THE ONE DEFINITION of "where the system tools are". A systemd unit does not
+    inherit a login shell's PATH, so a tool that is installed and working is
+    indistinguishable, from inside a service, from one that was never there.
+    Audited on the box 2026-09-07: 33 of the 77 binaries the shell layer shells
+    were installed and invisible to hart-liquid-ui, and ALL 29 other hart-*
+    units had the same blindness.
+
+    Appended, never prepended, so a caller's own PATH always wins and a pinned
+    or shimmed tool keeps its precedence. Only existing dirs are added, so this
+    is a no-op on a dev host or in a container, and returns ``base`` unchanged
+    there.
+    """
+    path = base if base is not None else os.environ.get("PATH", "")
+    entries = [p for p in path.split(os.pathsep) if p]
+    for d in _SYSTEM_TOOL_DIRS:
+        if d not in entries and os.path.isdir(d):
+            entries.append(d)
+    return os.pathsep.join(entries)
+
+
+_missing_tools_seen: set = set()
+_missing_tools_lock = threading.Lock()
+
+
+def _warn_missing_tool_once(name: str) -> None:
+    """Warn the FIRST time a binary is found missing, then stay quiet.
+
+    See the FileNotFoundError branch of ``run_probe`` for why this exists. The
+    wording deliberately names the ambiguity rather than asserting the tool is
+    absent, because this function cannot tell the two cases apart and guessing
+    wrong is what sent an operator off to debug a working Flatpak install.
+    """
+    with _missing_tools_lock:
+        if name in _missing_tools_seen:
+            return
+        _missing_tools_seen.add(name)
+    logger.warning(
+        "run_probe: %r is not on this process's PATH, so every feature that "
+        "shells it degrades silently from here on. If it IS installed on this "
+        "machine, the gap is this process's PATH, not a missing system tool.",
+        name)
+
+
 def run_probe(
     cmd: Sequence[str],
     timeout: float = 10.0,
@@ -230,14 +284,38 @@ def run_probe(
     propagate, exactly as before — they are real faults, not a missing
     optional tool, and swallowing them here would hide a broken install.
     """
+    # Look for the tool where a login shell would. Every caller of this probe
+    # runs inside a systemd unit whose PATH lists only its own dependencies, so
+    # without this a working system tool reads as absent. A caller that passes
+    # its own env keeps it, augmented the same way; nothing is ever shadowed,
+    # because the additions go on the END.
+    _env = popen_kwargs.get("env")
+    _base = _env.get("PATH") if _env is not None else None
+    _search = system_search_path(_base)
+    if _search:
+        popen_kwargs["env"] = dict(_env if _env is not None else os.environ,
+                                   PATH=_search)
+
     try:
         result = run_bounded(cmd, timeout=timeout, **popen_kwargs)
     except FileNotFoundError:
-        # Expected: optional tooling absent on this build (no lspci in a
-        # container, no nmcli on a headless server). Debug, not warning —
-        # callers degrade by design and this is a hot path.
-        logger.debug("run_probe: %s not present on PATH",
-                     cmd[0] if cmd else "<empty>")
+        # Expected in general: optional tooling absent on this build (no lspci
+        # in a container, no nmcli on a headless server). PER CALL this stays
+        # debug, because callers degrade by design and this is a hot path.
+        #
+        # ONCE per binary it is a warning, because from here "not installed"
+        # and "installed, but not on THIS process's PATH" are the same
+        # exception, and the second is a real defect that hid behind this line
+        # four separate times: flatpak (2026-08-12), six more capabilities
+        # (2026-08-26), gtk-launch (2026-09-01), and every nix binary
+        # (2026-09-07, when a sweep found 33 of the 77 tools the shell shells
+        # were installed on the box and invisible to the service). Each one
+        # degraded silently, so the OS reported its own working features as
+        # unavailable. One line per binary per process costs nothing on the hot
+        # path and makes the whole class findable in a journal.
+        name = cmd[0] if cmd else "<empty>"
+        logger.debug("run_probe: %s not present on PATH", name)
+        _warn_missing_tool_once(name)
         return None
     if result.timed_out:
         # run_bounded already logged a warning with the command name.

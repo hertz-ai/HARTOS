@@ -854,5 +854,69 @@ class TestInternalScoring(unittest.TestCase):
         self.assertLessEqual(score, 10)
 
 
+
+class TestInProcessExecutorStandsDownForTheRealDaemon(unittest.TestCase):
+    """The backend must not consume a task the real executor should run.
+
+    REPRODUCED LIVE on the box 2026-09-07, the proof 7dc4da3 was blocked on.
+    Dispatching the 6 queued tasks moved all 6 from pending to COMPLETED in
+    under a second, quality_score 0.5 and spark_reward 15 apiece, while
+    hart-copilot-daemon went on logging "no task assigned by the hive". It
+    never saw one.
+
+    _dispatch_to_pipeline asks the LLM for a diff, parses it, applies NOTHING,
+    and reports the task complete. So on a node running the claude-code daemon
+    the in-backend auto-run is a race the FABRICATOR wins.
+
+    These drive the real receive_task and count whether the auto-run fired.
+    The origin-signature check is satisfied rather than bypassed wholesale, so
+    the path under test is the real one.
+    """
+
+    def _probe(self, env_value):
+        fired = {'n': 0}
+        s = mod.ClaudeHiveSession()
+        s.session_id = 'chs_test'
+        s.status = mod.STATUS_IDLE
+        s.current_task = None
+        envp = dict(os.environ)
+        envp.pop('HEVOLVE_HIVE_INPROCESS_EXEC', None)
+        if env_value is not None:
+            envp['HEVOLVE_HIVE_INPROCESS_EXEC'] = env_value
+        with patch.dict(os.environ, envp, clear=True), \
+             patch.object(mod.ClaudeHiveSession, '_verify_task_origin',
+                          lambda self, t: True), \
+             patch.object(mod.ClaudeHiveSession, '_execute_next_task',
+                          lambda self: fired.__setitem__('n', fired['n'] + 1)):
+            accepted = s.receive_task({
+                'task_id': 't1', 'title': 'x', 'description': 'y',
+                'task_type': 'benchmark', 'priority': 70})
+        return accepted, fired['n']
+
+    def test_zero_leaves_the_task_pending_for_the_real_executor(self):
+        accepted, fired = self._probe('0')
+        self.assertTrue(accepted, 'the task must still be ACCEPTED and queued')
+        self.assertEqual(fired, 0,
+                         'the backend must not execute it; the daemon will')
+
+    def test_one_keeps_the_historical_in_backend_run(self):
+        """Nodes without a real executor are unchanged by the node-level fix."""
+        _, fired = self._probe('1')
+        self.assertEqual(fired, 1)
+
+    def test_the_library_default_is_still_the_historical_behaviour(self):
+        """Moving this default belongs to the seam's owner. The node-level
+        setting in hart-backend.nix is what changes behaviour on HART OS, and
+        it must not depend on this default having moved."""
+        _, fired = self._probe(None)
+        self.assertEqual(fired, 1)
+
+    def test_the_off_spellings_all_stand_down(self):
+        for val in ('0', 'false', 'no', 'off', 'OFF', ' 0 '):
+            with self.subTest(val=val):
+                _, fired = self._probe(val)
+                self.assertEqual(fired, 0, 'value %r must disable it' % val)
+
+
 if __name__ == '__main__':
     unittest.main()

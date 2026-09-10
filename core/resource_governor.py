@@ -1282,17 +1282,69 @@ class ResourceGovernor:
         # Fallback: assume moderate
         return 0.4
 
+    @staticmethod
+    def _ac_online_from_sysfs():
+        """True/False if the KERNEL knows mains state, else None.
+
+        psutil reports ``power_plugged=None`` when it cannot tell, but the
+        kernel usually can: every mains adapter exports ``type=Mains`` and an
+        ``online`` flag under /sys/class/power_supply. Reading it directly is
+        how a node recovers the fact psutil lost.
+        """
+        try:
+            base = '/sys/class/power_supply'
+            for name in os.listdir(base):
+                d = os.path.join(base, name)
+                try:
+                    with open(os.path.join(d, 'type')) as fh:
+                        if fh.read().strip().lower() != 'mains':
+                            continue
+                    with open(os.path.join(d, 'online')) as fh:
+                        return fh.read().strip() == '1'
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return None
+
     def _get_battery_status(self) -> tuple:
         """Return (battery_level: float 0-1, on_battery: bool).
 
         Returns (1.0, False) if no battery detected (desktop).
+
+        UNKNOWN IS NOT "ON BATTERY". psutil sets ``power_plugged=None`` when it
+        cannot determine mains state, and ``not None`` is True — so the old
+        expression silently reported a plugged-in machine as running on
+        battery. Combined with a WORN battery that reads a low percent, that
+        drives _target_mode_for straight to MODE_SLEEP, whose throttle is 0.0:
+        the dispatch yield gate closes, _proactive_check_tasks returns early,
+        gpu_allowed goes False and cpu_limit 0.0. Every piece of background
+        work on the node stops.
+
+        Measured on the Samsung box 2026-09-09, mains plugged in the whole
+        time:
+
+            /sys/.../ADP1/online   1          <- the kernel KNOWS
+            /sys/.../BAT1/status   Not charging
+            /sys/.../BAT1/capacity 1
+            psutil.sensors_battery() -> power_plugged=None, percent=1.0
+            governor mode          sleep, throttle 0.0
+
+        So: trust a definite psutil answer; when it says None, ask the kernel;
+        and if even that is unavailable, assume MAINS. Guessing "on battery"
+        suspends the whole node, and guessing "plugged" merely lets background
+        work run — the asymmetry decides the default.
         """
         psutil = _try_import_psutil()
         if psutil is not None:
             try:
                 battery = psutil.sensors_battery()
                 if battery is not None:
-                    return (battery.percent / 100.0, not battery.power_plugged)
+                    plugged = battery.power_plugged
+                    if plugged is None:
+                        ac = self._ac_online_from_sysfs()
+                        plugged = True if ac is None else ac
+                    return (battery.percent / 100.0, not plugged)
             except Exception:
                 pass
 

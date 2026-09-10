@@ -4382,3 +4382,355 @@ class TestFirstPaintInferenceGate:
             "the gate must wait on the same shell-ready marker the supervisor's "
             "own paint watchdog uses (readyFlag), so it resolves for whichever "
             "tier paints — not a private path")
+
+
+class TestWaylandSocketWaitOutlastsTheCompositorsStartup:
+    """The Tier-1 wrapper must not give up before hart-comp binds its socket.
+
+    LIVE capture on the Samsung box, 2026-09-07: hart-comp took 14.6s to create
+    wayland-1 and the wrapper's wait expired at 10s, so it declared the tier dead
+    4.1s BEFORE the compositor succeeded. Everything after that line in the same
+    journal is the compositor working perfectly:
+
+        12:46:31.7  hart-comp did not create a wayland socket - exiting
+        12:46:35.9  Created new socket name=Some("wayland-1")
+        12:46:35.9  acquired DRM master via drmSetMaster; scanning out
+        12:46:36.1  first real scanout (page-flip vblank) completed - display LIVE
+
+    The session latched to sway with a healthy compositor still coming up. This is
+    the same shape as the 20 -> 120 shellPaintTimeoutSeconds raise on 2026-08-12;
+    that fix moved the paint budget and left this wait at its original 10s.
+    """
+
+    def _comp(self):
+        return read_nix(os.path.join(MODULES_DIR, "hart-comp.nix"))
+
+    def _iterations(self):
+        m = re.search(r"for _ in \$\(seq 1 (\d+)\); do", self._comp())
+        assert m, "the socket-wait loop is gone or reshaped; re-point this guard"
+        return int(m.group(1))
+
+    def _sleep_step(self):
+        src = self._comp()
+        i = src.index("for _ in $(seq 1 ")
+        m = re.search(r"sleep ([0-9.]+)", src[i:i + 1400])
+        assert m, "the socket-wait loop no longer sleeps; re-point this guard"
+        return float(m.group(1))
+
+    def test_the_wait_covers_the_measured_hardware_startup(self):
+        budget = self._iterations() * self._sleep_step()
+        assert budget >= 45.0, (
+            "the wayland-socket wait is %.1fs. Measured on real hardware, hart-comp "
+            "needs 14.6s on an Ivy Bridge iGPU, and this bound was 10s, which "
+            "dropped Tier-1 on a compositor that went on to scan out. Keep a wide "
+            "margin: a longer bound costs NOTHING on the failure path because the "
+            "loop breaks immediately when the compositor process dies." % budget)
+
+    def test_the_wait_still_fits_inside_the_paint_budget(self):
+        """It must not eat the whole paint watchdog, or a slow socket would leave
+        the shell no time to paint before the supervisor calls the tier HUNG."""
+        sup = read_nix(os.path.join(MODULES_DIR, "hart-session-supervisor.nix"))
+        # Anchored on the OPTION DECLARATION, not the first mention of the name:
+        # it is referenced in prose above its own definition.
+        m = re.search(r"shellPaintTimeoutSeconds = lib\.mkOption \{.*?default = (\d+);",
+                      sup, re.S)
+        assert m, "shellPaintTimeoutSeconds option declaration not found"
+        paint = int(m.group(1))
+        budget = self._iterations() * self._sleep_step()
+        assert budget < paint, (
+            "the socket wait (%.1fs) must stay under the paint budget (%ds), or a "
+            "slow socket leaves no headroom for the shell's first frame" % (budget, paint))
+
+    def test_a_dead_compositor_still_breaks_out_immediately(self):
+        """The reason a long bound is safe. Without this early break, raising the
+        wait would delay every genuine crash by the full budget."""
+        src = self._comp()
+        i = src.index("for _ in $(seq 1 ")
+        block = src[i:i + 1400]
+        assert 'kill -0 "$HART_COMP_PID"' in block and "break" in block, (
+            "the socket-wait loop no longer bails when the compositor dies, so the "
+            "raised bound now delays real crash detection")
+
+
+class TestTheNativeTierHasAnIpcRelayToo:
+    """The brain must have a route to HART-comp, not only to sway.
+
+    THE GAP, measured on the Samsung box 2026-09-07 while Tier-1 was healthy.
+    compositor/src/ipc.rs serves the whole com.hart.Compositor verb surface
+    against the real Space<Window>, and it was answering correctly the entire
+    time (window.list -> ok=true, an unknown method -> code=unsupported). But
+    the ONLY relay resolved /run/user/*/sway-ipc.*.sock, which the native tier
+    never has, so it exited 1 on every connection. A banked window-layout
+    recipe therefore replayed as:
+
+        available: true, replayed 0 of 3, three anonymous ok=false
+
+    Both compositors bind under /run/user/<session uid> as the session user and
+    the brain runs as `hart`, so a relay is the route for either tier.
+    HART-comp's socket is 0600 ON PURPOSE (IPC_PROTOCOL.md 6.5 makes that
+    permission the server-side half of the boundary), which is exactly why the
+    grant belongs in one root unit and not in a looser mode on the socket.
+    """
+
+    @staticmethod
+    def _read(rel):
+        with open(os.path.join(REPO_ROOT, rel), encoding='utf8') as fh:
+            return fh.read()
+
+    def _host(self):
+        return self._read('nixos/modules/hart-layer-shell-host.nix')
+
+    def test_a_relay_socket_exists_for_hart_comp(self):
+        src = self._host()
+        assert 'systemd.sockets.hart-comp-ipc' in src
+        assert '"/run/hart/hart-comp.sock"' in src
+
+    def test_both_relays_share_one_implementation(self):
+        """Byte forwarding is protocol-agnostic, so a second copy of it would be
+        a parallel path maintained twice and drifting once."""
+        src = self._host()
+        assert 'wmIpcRelay' in src
+        # Exactly one relay script is defined, and both units exec it.
+        assert src.count('pkgs.writeScript "hart-wm-ipc-relay"') == 1
+        assert src.count('${wmIpcRelay} /run/user/*/sway-ipc.*.sock') == 1
+        assert src.count('${wmIpcRelay} /run/user/*/hart-comp.sock') == 1
+
+    def test_the_relay_takes_its_upstream_from_argv(self):
+        """One implementation only works if the upstream is a parameter. A
+        hardcoded glob is what limited it to sway in the first place."""
+        src = self._host()
+        assert "pattern = sys.argv[1] if len(sys.argv) > 1" in src
+        assert "glob.glob(pattern)" in src
+
+    def test_the_hart_comp_relay_is_reachable_by_the_brains_group(self):
+        """0660 root:hart, same as the sway relay: the backend runs as `hart`
+        and connect(2) needs WRITE on the socket inode. Not world-accessible."""
+        src = self._host()
+        block = src[src.index('systemd.sockets.hart-comp-ipc'):]
+        block = block[:block.index('systemd.services."hart-comp-ipc@"')]
+        assert 'SocketMode = "0660"' in block
+        assert 'SocketGroup = "hart"' in block
+        # Accept=true gives one relay per connection, so the upstream is
+        # re-resolved every time and a session restart cannot pin a stale one.
+        assert 'Accept = true' in block
+
+    def test_the_service_is_pointed_at_the_relay(self):
+        ui = self._read('nixos/modules/hart-liquid-ui.nix')
+        assert 'HART_COMP_SOCK = "/run/hart/hart-comp.sock"' in ui
+
+    def test_the_client_does_not_trust_that_variable_on_its_own(self):
+        """The env var CANNOT be the proof, and this is the whole lesson of the
+        bug being fixed. systemd socket activation means connect(2) always
+        succeeds on the relay path whether or not a compositor is behind it,
+        precisely as SWAYSOCK is always set whether or not sway is running.
+        The client must require a real answer before claiming the transport."""
+        client = self._read('integrations/agent_engine/hart_wm_client.py')
+        assert "_call_on(path, 'window.list')" in client
+class TestTheServiceCanSeeTheSystemProfile:
+    """The shell must not report its own working features as missing.
+
+    THE RECURRING DEFECT. hart-liquid-ui.service gets a curated PATH, and a
+    tool the curation missed is indistinguishable from a tool that is not
+    installed: core/subprocess_safe.run_probe (the canonical probe behind 139
+    call sites) reads FileNotFoundError as "optional tooling absent on this
+    build" and returns None, so every caller degrades silently.
+
+    It has been found and hand-patched at least three times: gtk-launch on
+    2026-09-01 (typed-name app launch was dead on the appliance), six more
+    capabilities on 2026-08-26, and flatpak/nix inside app_installer's own PATH
+    helper. A curated list is only ever as complete as the last sweep.
+
+    Swept all 77 binaries the shell layer shells against the unit's real PATH
+    on the box 2026-09-07: 33 were installed and invisible, including
+    notify-send, xdg-open, the clipboard tools, gsettings, wlr-randr, git and
+    every nix binary.
+    """
+
+    @staticmethod
+    def _read(rel):
+        with open(os.path.join(REPO_ROOT, rel), encoding='utf8') as fh:
+            return fh.read()
+
+    def _ui(self):
+        return self._read('nixos/modules/hart-liquid-ui.nix')
+
+    def test_the_system_profile_is_on_the_units_path(self):
+        src = self._ui()
+        assert '"/run/current-system/sw"' in src
+        assert '"/run/wrappers"' in src
+
+    def test_the_floor_entries_carry_no_bin_suffix(self):
+        """makeBinPath APPENDS /bin, so a '/bin' here would produce
+        '/run/current-system/sw/bin/bin' and silently fix nothing. Verified on
+        the box: makeBinPath ["/run/current-system/sw" "/run/wrappers"]
+        -> /run/current-system/sw/bin:/run/wrappers/bin."""
+        src = self._ui()
+        assert '"/run/current-system/sw/bin"' not in src
+        assert '"/run/wrappers/bin"' not in src
+
+    def test_the_floor_goes_last_so_pinned_entries_still_win(self):
+        """The rustdesk guard shim has a first-on-PATH contract, and every
+        explicit pkgs entry pins a version. The floor must only catch what
+        would otherwise be invisible, never shadow them."""
+        src = self._ui()
+        floor = src.index('++ [ "/run/current-system/sw" "/run/wrappers" ];')
+        rustdesk = src.index('lib.optional (pkgs ? rustdesk)')
+        last_pinned = src.rindex('lib.optional (pkgs ? sane-backends)')
+        assert rustdesk < floor
+        assert last_pinned < floor
+class TestTheBackendDoesNotFabricateTheCopilotsWork:
+    """The in-backend auto-run must stand down where a real executor exists.
+
+    REPRODUCED LIVE on the box 2026-09-07, which is the proof 7dc4da3 said it
+    was waiting for. Dispatching the 6 queued tasks moved all 6 from pending to
+    COMPLETED in under a second, quality_score 0.5 and spark_reward 15 apiece,
+    while hart-copilot-daemon went on logging "no task assigned by the hive".
+    The real executor never saw one.
+
+    _dispatch_to_pipeline asks the LLM for a diff, parses it, applies NOTHING,
+    and reports success. On a node running the claude-code daemon it is also a
+    race the fabricator wins, so the honest executor starves.
+    """
+
+    @staticmethod
+    def _read(rel):
+        with open(os.path.join(REPO_ROOT, rel), encoding='utf8') as fh:
+            return fh.read()
+
+    def test_the_backend_unit_stands_the_fabricator_down(self):
+        """Set only where the real daemon runs. Nodes without it keep the
+        historical behaviour, and the library default is untouched -- moving
+        that is the seam owner's call."""
+        src = self._read('nixos/modules/hart-backend.nix')
+        assert 'HEVOLVE_HIVE_INPROCESS_EXEC' in src
+        block = src[src.index('HEVOLVE_HIVE_INPROCESS_EXEC'):][:300]
+        assert 'hart.copilot.daemon.enable' in block, (
+            'the stand-down must be conditional on the real executor existing')
+        assert '"0"' in block and '"1"' in block, (
+            'both arms must be explicit: 0 with the daemon, 1 without it')
+
+    def test_the_gate_is_read_from_the_environment_not_hardcoded(self):
+        src = self._read('integrations/coding_agent/claude_hive_session.py')
+        assert "os.environ.get(\n            'HEVOLVE_HIVE_INPROCESS_EXEC', '1')" in src \
+            or "'HEVOLVE_HIVE_INPROCESS_EXEC', '1'" in src
+
+
+class TestCargoRegistryPinnedOffThe403Endpoint:
+    """Every buildRustPackage call site must fetch crates from static.crates.io.
+
+    importCargoLock's default download host, crates.io/api/v1/crates, began
+    answering 403 to curl-style user agents around 2026-09-03, and Nix's crate
+    fetcher IS curl. `Build hart-rust-precedent` went red on every Nix Build
+    Matrix run and stayed red for a week, because a permanently-red gate reads
+    as background noise. hart-comp's crane path was unaffected only because
+    crane fetches from static.crates.io, which serves byte-identical tarballs
+    (verified: the sha256 of each crate the failing log named equals its
+    Cargo.lock checksum, so the fixed-output store path is unchanged).
+
+    What this guards is NOT the fix regressing -- it is a THIRD call site
+    landing later on the default host and going red the same silent way. So it
+    DISCOVERS the call sites instead of listing them.
+
+    RE-POINTED 2026-09-10, at the mechanism rather than at one spelling of it.
+    The first fix passed `extraRegistries` keyed on the crates.io index, which
+    replaced the download URL and then broke the build one step further on:
+    import-cargo-lock.nix emits `[source.crates-io]` unconditionally AND a
+    `[source."<url>"]` block per extraRegistries key, so naming the crates.io
+    index there defines one registry twice and cargo refuses the vendor config
+    ("defines source registry `crates-io`, but that source is already defined
+    by `crates-io`"). The host is therefore swapped one layer lower, at
+    fetchurl, where nothing is written into config.toml. This guard follows it:
+    what must hold is that a call site's module rewrites crate downloads to
+    static.crates.io, not that it does so through any particular attribute.
+    """
+
+    API_HOST = "crates.io/api/v1/crates"
+    WANT = "https://static.crates.io/crates"
+    INDEX_KEY = '"https://github.com/rust-lang/crates.io-index"'
+
+    @staticmethod
+    def _uncommented(text):
+        """Nix source with whole-line `#` comments dropped.
+
+        The comments deliberately NAME the bad host to explain it, so any scan
+        for that host -- and the brace matching below -- must not see them.
+        """
+        return "\n".join(
+            line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+    @classmethod
+    def _blocks(cls, text, opener="cargoLock = {"):
+        """Every brace-balanced `cargoLock = { ... }` body in a nix source."""
+        text = cls._uncommented(text)
+        out, i = [], text.find(opener)
+        while i != -1:
+            j = text.index("{", i)
+            depth, k = 0, j
+            while k < len(text):
+                if text[k] == "{":
+                    depth += 1
+                elif text[k] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            out.append(text[j:k + 1])
+            i = text.find(opener, k)
+        return out
+
+    @classmethod
+    def _call_sites(cls):
+        sites = []
+        for path in glob.glob(os.path.join(NIXOS_DIR, "**", "*.nix"), recursive=True):
+            for block in cls._blocks(read_nix(path)):
+                sites.append((os.path.relpath(path, REPO_ROOT), block))
+        return sites
+
+    def test_there_is_something_to_check(self):
+        """A guard that can pass by finding nothing is not a guard."""
+        sites = self._call_sites()
+        assert len(sites) >= 2, (
+            "expected the hart-comp + hart-rust-precedent cargoLock call sites, "
+            "found %d -- if the idiom moved, re-point this guard rather than "
+            "deleting it" % len(sites))
+
+    def test_every_call_site_rewrites_crate_downloads_to_the_working_host(self):
+        """The module that owns a cargoLock must also own the host rewrite.
+
+        Asserted per FILE, not per block, because the rewrite now lives in the
+        module's `let` (it wraps fetchurl for the whole Rust instance) while the
+        cargoLock sits further down. A third call site landing in a new module
+        still fails here, which is what this guard is for.
+        """
+        for rel, _block in self._call_sites():
+            code = self._uncommented(read_nix(os.path.join(REPO_ROOT, rel)))
+            assert "crateHostOverlay" in code, (
+                "%s has a cargoLock but no crateHostOverlay, so its crates come "
+                "from %s, which 403s Nix's curl fetcher" % (rel, self.API_HOST))
+            assert "overlays = [ crateHostOverlay ]" in code, (
+                "%s defines the overlay but never applies it to the Rust "
+                "instance it builds with, which is a no-op" % rel)
+            assert self.WANT in code, (
+                "%s: expected the download host %s" % (rel, self.WANT))
+
+    def test_the_403_host_appears_only_as_the_thing_being_rewritten(self):
+        """Comments may name the bad host. Code may name it only to replace it.
+
+        The rewrite has to match the URL importCargoLock builds, so the string
+        cannot be banned outright any more. What can be banned is the shape that
+        matters: the bad host reached by a `url =`/`urls =` assignment, i.e. a
+        module that FETCHES from it rather than one that rewrites it away.
+        """
+        for path in glob.glob(os.path.join(NIXOS_DIR, "**", "*.nix"), recursive=True):
+            rel = os.path.relpath(path, REPO_ROOT)
+            code = self._uncommented(read_nix(path))
+            for line in code.splitlines():
+                if self.API_HOST not in line:
+                    continue
+                assert "url" not in line.split("=")[0], (
+                    "%s assigns the 403 download host to a url attribute: %s"
+                    % (rel, line.strip()))
+                assert ("hasPrefix" in line or "removePrefix" in line
+                        or line.strip().startswith("api =")), (
+                    "%s names the 403 host outside the rewrite: %s"
+                    % (rel, line.strip()))

@@ -48,6 +48,12 @@
 #     (or its skip/no-image state) and the script CONTINUES — one bad runtime
 #     never aborts the others, and the unit ALWAYS `exit 0` (oneshot +
 #     RemainAfterExit + bounded TimeoutStartSec) so it can never fail the boot.
+#   * Every probe runs through `probe`, which captures to a FILE rather than a
+#     command substitution, so its time bound is actually enforced (Wine's
+#     detached daemons inherit a pipe's write end and hold the substitution
+#     open long past the kill — see the helper), and the unit's outer
+#     TimeoutStartSec is DERIVED from the sum of those bounds so it can never
+#     again be smaller than the work it contains.
 #   * `command -v <tool>` gates every probe, so the script auto-adapts to which
 #     hart.subsystems.* are enabled: an absent tool records `skip` (the runtime
 #     simply isn't installed on this build), never a false `failed`.
@@ -61,6 +67,50 @@ let
   # the runtime/image/network state it measured.
   statusFile = "/run/hart/compat-status";
 
+  # ── Probe time budgets, in seconds ──────────────────────────────────────────
+  # Every runtime probe runs under its own bound, and the unit's outer
+  # TimeoutStartSec is DERIVED from their sum below so the two can never drift
+  # apart again.
+  #
+  # They had drifted, and it cost the entire measurement. The outer bound was
+  # hand-written as 360 while the inner bounds summed to 390 (120 wine + 30
+  # waydroid-status + 60 waydroid-shell + 120 darling + 30 flatpak + 30
+  # fsprobe). A run in which every probe merely reached its OWN limit could not
+  # possibly finish inside the unit's limit, so systemd SIGKILLed the unit and
+  # /run/hart/compat-status stayed EMPTY: no verdicts at all, which is the one
+  # outcome this module exists to prevent. Real HW, 2026-09-10, twice in a row:
+  # `Failed with result timeout`, and not a single [hart-compat-smoketest]
+  # verdict line in the journal.
+  budget = {
+    # 180, not 90. Measured on real hardware 2026-09-10, AFTER this module's own
+    # fix shipped and the unit finally completed: the very first honest run said
+    #
+    #   [hart-compat-smoketest] probe exceeded its bound of 90 s: wine cmd /c echo HARTOK
+    #   [hart-compat-smoketest] windows = failed
+    #
+    # and that verdict was an artifact of the budget, not of Wine. A separate
+    # clean-prefix run on the same box needed up to 240s for `wineboot --init`
+    # alone, and a cold prefix is exactly what a freshly-booted node has. 90s
+    # could never cover it, so the probe was reporting the timer rather than the
+    # runtime. Raising it is only safe because TimeoutStartSec is DERIVED from
+    # this attrset now; before that, a bigger budget here would have silently
+    # pushed the total past a hand-written ceiling, which is the original bug.
+    wine = 180;
+    waydroidStatus = 20;
+    waydroidShell = 40;
+    darling = 90;
+    flatpak = 20;
+    fsprobe = 30;
+  };
+  probeBudget = lib.foldl' (a: b: a + b) 0 (lib.attrValues budget);
+
+  # Headroom over the probe sum for the script's own plumbing: the prefix
+  # mkdir, the post-probe wineserver teardown, and the SIGTERM-then-SIGKILL
+  # grace each bound allows. Deliberately generous. The unit is off the boot
+  # path (a timer fires it ten minutes in), so a ceiling that is too high costs
+  # nothing at all, while one that is too low costs every verdict.
+  startTimeout = probeBudget + 150;
+
   # Tools referenced for the script's OWN plumbing (truncate / grep / echo). The
   # per-runtime RUNTIME tools (wine/waydroid/darling/flatpak/appimage-run) live in
   # the SYSTEM path (/run/current-system/sw/bin) ONLY when their subsystem is
@@ -71,10 +121,11 @@ let
   # ── The cross-OS runtime smoke-test ─────────────────────────────────────────
   # `set -uo pipefail` (NOT -e): a single probe failing must NEVER abort the run —
   # it must RECORD its honest status (failed / skip / no-image / ready) and move
-  # on. Every runtime tool is run under `timeout` + `|| true` so a HANG or non-zero
-  # exit cannot fail the unit; the classification is made purely from the captured
-  # text. `command -v` gates each probe so an absent (disabled) subsystem records
-  # `skip`, never a false `failed`. The unit always exits 0.
+  # on. Every runtime tool is run through the `probe` helper, which bounds it and
+  # swallows its exit status, so a HANG or non-zero exit cannot fail the unit; the
+  # classification is made purely from the captured text. `command -v` gates each
+  # probe so an absent (disabled) subsystem records `skip`, never a false
+  # `failed`. The unit always exits 0.
   smokeScript = pkgs.writeShellScript "hart-compat-smoketest" ''
     set -uo pipefail
     # System path FIRST so the per-subsystem runtime tools (wine/waydroid/darling/
@@ -96,6 +147,42 @@ let
       echo "[hart-compat-smoketest] $1 = $2" >&2
     }
 
+    # probe <seconds> <command...> -- run one runtime probe under a REAL time
+    # bound, leaving its combined output in $PROBE_OUT and its exit status in
+    # $PROBE_RC.
+    #
+    # WHY A FILE AND NOT "$(...)": a command substitution reads the pipe until
+    # EOF, and EOF only arrives once EVERY holder of the write end has closed
+    # it. Wine forks wineserver and winedevice.exe, which INHERIT that write
+    # end and deliberately outlive the `wine` process. So `timeout` killed wine
+    # exactly on schedule and the substitution went on blocking on the
+    # surviving daemons: the inner bound quietly stopped bounding anything.
+    # Measured on real HW 2026-09-10, same prefix, same command, back to back:
+    # `timeout 20 wine cmd /c "echo HARTOK"` returned from a substitution after
+    # 41s, and from this file redirect after exactly 20s. A file needs no such
+    # handshake, so the bound written here is the bound that is enforced.
+    #
+    # stdin is /dev/null so a probe that decides to prompt cannot sit waiting
+    # for an answer, and -k turns an ignored SIGTERM into a SIGKILL instead of
+    # letting the probe run on past its bound.
+    PROBE_OUT=""
+    PROBE_RC=0
+    PROBE_TMP="$(mktemp 2>/dev/null || echo /tmp/hart-compat-probe.$$)"
+    trap 'rm -f "$PROBE_TMP" 2>/dev/null || true' EXIT
+    probe() {
+      local secs="$1"; shift
+      : > "$PROBE_TMP" 2>/dev/null || true
+      timeout -k 5 "$secs" "$@" >"$PROBE_TMP" 2>&1 </dev/null
+      PROBE_RC=$?
+      PROBE_OUT="$(cat "$PROBE_TMP" 2>/dev/null || true)"
+      # 124 = the bound expired; 137 = it had to be SIGKILLed after that. Say so
+      # in the journal: a runtime that HANGS and one that fails cleanly are both
+      # recorded `failed`, and only this line tells the operator which happened.
+      if [ "$PROBE_RC" = 124 ] || [ "$PROBE_RC" = 137 ]; then
+        echo "[hart-compat-smoketest] probe exceeded its bound of $secs s: $*" >&2
+      fi
+    }
+
     # ── Windows / Wine ─────────────────────────────────────────────────────────
     # REAL exec: run `cmd /c echo HARTOK` through Wine; HARTOK back => the Win32
     # translation layer loaded + executed a Windows command. WINEDLLOVERRIDES skips
@@ -104,13 +191,22 @@ let
     # the user's prefix. timeout caps a cold-prefix init so it can't hang the unit.
     if command -v wine >/dev/null 2>&1; then
       mkdir -p /var/lib/hart/wine/smoke 2>/dev/null || true
-      WIN_OUT="$(WINEPREFIX=/var/lib/hart/wine/smoke WINEDLLOVERRIDES="mscoree,mshtml=" \
-        timeout 120 wine cmd /c "echo HARTOK" 2>&1 || true)"
+      export WINEPREFIX=/var/lib/hart/wine/smoke
+      export WINEDLLOVERRIDES="mscoree,mshtml="
+      probe ${toString budget.wine} wine cmd /c "echo HARTOK"
+      WIN_OUT="$PROBE_OUT"
       if printf '%s' "$WIN_OUT" | grep -q 'HARTOK'; then
         record windows ok
       else
         record windows failed
       fi
+      # Wine's daemons (wineserver, winedevice.exe) outlive the `wine` process
+      # by design, and a lingering wineserver keeps this unit's cgroup
+      # populated, so systemd has to SIGKILL it at exit -- which is precisely
+      # what the 2026-09-10 journal showed, seven processes at a time. Ask them
+      # to leave, under a bound of their own, rather than being shot.
+      timeout -k 5 20 wineserver -k >/dev/null 2>&1 </dev/null || true
+      unset WINEPREFIX WINEDLLOVERRIDES
     else
       record windows skip
     fi
@@ -125,9 +221,11 @@ let
     #                                  a smoke test)
     if command -v waydroid >/dev/null 2>&1; then
       if [ -f /var/lib/waydroid/images/system.img ]; then
-        WD_STATUS="$(timeout 30 waydroid status 2>&1 || true)"
+        probe ${toString budget.waydroidStatus} waydroid status
+        WD_STATUS="$PROBE_OUT"
         if printf '%s' "$WD_STATUS" | grep -qi 'RUNNING'; then
-          WD_OUT="$(timeout 60 waydroid shell echo HARTOK 2>&1 || true)"
+          probe ${toString budget.waydroidShell} waydroid shell echo HARTOK
+          WD_OUT="$PROBE_OUT"
           if printf '%s' "$WD_OUT" | grep -q 'HARTOK'; then
             record android ok
           else
@@ -148,7 +246,8 @@ let
     # layer executed a macOS-side command. Experimental + heavy, so capped with a
     # timeout; absent tool (default — macos is opt-in) => skip.
     if command -v darling >/dev/null 2>&1; then
-      MAC_OUT="$(timeout 120 darling shell echo HARTOK 2>&1 || true)"
+      probe ${toString budget.darling} darling shell echo HARTOK
+      MAC_OUT="$PROBE_OUT"
       if printf '%s' "$MAC_OUT" | grep -q 'HARTOK'; then
         record macos ok
       else
@@ -167,7 +266,8 @@ let
     # `flatpak run` needs an installed app + a session bus; --version is the honest
     # "the runtime is here" signal that matches the subsystem-enabled gate.)
     if command -v flatpak >/dev/null 2>&1; then
-      if timeout 30 flatpak --version >/dev/null 2>&1; then
+      probe ${toString budget.flatpak} flatpak --version
+      if [ "$PROBE_RC" = 0 ]; then
         record flatpak ok
       else
         record flatpak skip
@@ -198,7 +298,7 @@ let
     # hart.storage.filesystems set (single source of truth). Bounded + best-effort:
     # `timeout` + `|| true` so it can never delay or fail this oneshot.
     if command -v hart-storage-fsprobe >/dev/null 2>&1; then
-      timeout 30 hart-storage-fsprobe "$STATUS" ${lib.concatStringsSep " " config.hart.storage.filesystems} || true
+      timeout -k 5 ${toString budget.fsprobe} hart-storage-fsprobe "$STATUS" ${lib.concatStringsSep " " config.hart.storage.filesystems} || true
     fi
 
     # Always succeed — this is a measurement, never a gate.
@@ -281,11 +381,13 @@ in
         RemainAfterExit = true;
         User = "hart";
         ExecStart = "${smokeScript}";
-        # The script bounds each runtime probe itself (wine 120s, darling 120s,
-        # waydroid 30+60s); this outer belt caps the whole run so a pathological hang
-        # OUTSIDE a `timeout` still can't wedge boot. 360s comfortably covers a cold
-        # Wine prefix init + a Darling first-run + the Waydroid status/shell probes.
-        TimeoutStartSec = "360";
+        # DERIVED from the per-probe budgets, never hand-written: see the
+        # `budget` attrset for what a hand-written 360 against an inner sum of
+        # 390 did to this measurement. The outer belt still exists for the same
+        # reason it always did, to cap a pathological hang OUTSIDE any single
+        # probe's bound, but it can no longer be smaller than the work it is
+        # meant to contain.
+        TimeoutStartSec = toString startTimeout;
       };
     };
   };

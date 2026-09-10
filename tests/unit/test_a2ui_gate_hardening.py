@@ -29,15 +29,36 @@ def _not_halted():
         yield
 
 
-def test_rate_cap_blocks_a_flood(svc):
+@pytest.fixture
+def frozen_clock():
+    """Stop the token bucket refilling for the duration of a flood.
+
+    The bucket is 20 tokens refilling at 2/s, so whether a flood is capped
+    depends on how long the flood TAKES. That is not a property of the guardrail
+    and it made this test unfalsifiable on a slow machine: measured here, one
+    `agent_ui_update` costs ~440ms, 396ms of which is the synchronous durable
+    SQLite commit the immutable audit log makes for every accepted push. Thirty
+    pushes therefore span 13 seconds and refill 26 tokens, so the cap NEVER
+    engaged and the test failed while the guardrail was working correctly.
+
+    Freezing the clock is the fix rather than pushing harder: a cap that only
+    shows up when you outrun a refill is not what this test is for, and adding
+    pushes would add seconds of real audit-log commits to every run.
+    """
+    with patch.object(m.time, 'monotonic', return_value=1_000.0):
+        yield
+
+
+def test_rate_cap_blocks_a_flood(svc, frozen_clock):
+    # 20 burst tokens, so 25 pushes with no refill must refuse the last five.
     results = [svc.agent_ui_update('flooder', {'type': 'card'})
-               for _ in range(30)]
+               for _ in range(25)]
     assert results[0] is True            # burst is allowed
     assert results[-1] is False          # a flood is eventually capped
     assert results.count(False) >= 5
 
 
-def test_rate_cap_is_per_agent(svc):
+def test_rate_cap_is_per_agent(svc, frozen_clock):
     for _ in range(25):
         svc.agent_ui_update('noisy', {'type': 'card'})
     assert svc.agent_ui_update('quiet', {'type': 'card'}) is True

@@ -20,10 +20,14 @@ WALL-CLOCK, not just the return value. A version of this module that
 regressed to plain `subprocess.run` would still return None here — it would
 just take minutes to do it, and only the clock catches that.
 """
+import logging
 import os
 import subprocess
 import sys
 import time
+from unittest.mock import patch
+
+import core.subprocess_safe as subprocess_safe
 
 import pytest
 
@@ -468,3 +472,134 @@ class TestKillReachesDescendants:
                 subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
                                stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, timeout=10)
+
+
+# MERGE NOTE 2026-09-11: two lanes each appended a test class here. They
+# guard different invariants of the same module -- one that kill() must be
+# bounded even when a grandchild holds the pipe open (D36), one that a
+# missing tool is reported rather than silently degraded -- so both are
+# kept. Neither was dropped to make the merge tidy.
+
+class TestAMissingToolIsSaidOutLoudOnce:
+    """A silent degrade is how the same defect survived four rounds.
+
+    run_probe cannot tell "not installed" from "installed, but not on THIS
+    process's PATH", and the second is a real bug: flatpak (2026-08-12), six
+    more capabilities (2026-08-26), gtk-launch (2026-09-01), and every nix
+    binary (2026-09-07, when a sweep found 33 of the 77 tools the shell shells
+    were installed on the box and invisible to the service). All of it hid
+    behind a debug line while callers degraded by design.
+
+    Per call it stays debug (139 call sites, hot path). Once per binary it is a
+    warning, which is what makes the class findable in a journal.
+    """
+
+    def setup_method(self):
+        subprocess_safe._missing_tools_seen.clear()
+
+    def test_the_first_miss_warns(self, caplog):
+        with caplog.at_level(logging.WARNING, logger=subprocess_safe.__name__):
+            with patch.object(subprocess_safe, 'run_bounded',
+                              side_effect=FileNotFoundError()):
+                assert subprocess_safe.run_probe(['definitely-not-a-tool']) is None
+        assert any('definitely-not-a-tool' in r.message for r in caplog.records)
+
+    def test_the_warning_names_the_ambiguity_not_a_conclusion(self, caplog):
+        """It must not assert the tool is absent. Saying so is what sent an
+        operator to debug a Flatpak install that was working fine."""
+        with caplog.at_level(logging.WARNING, logger=subprocess_safe.__name__):
+            with patch.object(subprocess_safe, 'run_bounded',
+                              side_effect=FileNotFoundError()):
+                subprocess_safe.run_probe(['some-tool'])
+        # getMessage() formats once; r.message is ALREADY formatted, so
+        # applying r.args to it again raises TypeError.
+        text = ' '.join(r.getMessage() for r in caplog.records)
+        assert 'PATH' in text
+
+    def test_it_stays_quiet_after_the_first(self, caplog):
+        """139 call sites on a hot path: one line per binary per process, not
+        one per call."""
+        with patch.object(subprocess_safe, 'run_bounded',
+                          side_effect=FileNotFoundError()):
+            with caplog.at_level(logging.WARNING, logger=subprocess_safe.__name__):
+                for _ in range(25):
+                    subprocess_safe.run_probe(['repeated-tool'])
+        hits = [r for r in caplog.records if 'repeated-tool' in r.message]
+        assert len(hits) == 1, 'expected exactly one warning, got %d' % len(hits)
+
+    def test_each_distinct_binary_gets_its_own_line(self, caplog):
+        with patch.object(subprocess_safe, 'run_bounded',
+                          side_effect=FileNotFoundError()):
+            with caplog.at_level(logging.WARNING, logger=subprocess_safe.__name__):
+                subprocess_safe.run_probe(['tool-a'])
+                subprocess_safe.run_probe(['tool-b'])
+        msgs = ' '.join(r.message for r in caplog.records)
+        assert 'tool-a' in msgs and 'tool-b' in msgs
+
+    def test_an_empty_argv_does_not_explode(self, caplog):
+        with patch.object(subprocess_safe, 'run_bounded',
+                          side_effect=FileNotFoundError()):
+            assert subprocess_safe.run_probe([]) is None
+class TestTheProbeLooksWhereALoginShellWould:
+    """A unit's PATH lists only its own dependencies, so a working system tool
+    reads as absent from inside a service. Audited on the box 2026-09-07: 33 of
+    the 77 binaries the shell layer shells were installed and invisible to
+    hart-liquid-ui, and all 29 OTHER hart-* units had the same blindness. One
+    shared helper is the fix, not 29 nix modules.
+    """
+
+    def test_existing_system_dirs_are_appended(self):
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=True):
+            out = subprocess_safe.system_search_path('/only/this')
+        parts = out.split(os.pathsep)
+        assert parts[0] == '/only/this', 'the caller PATH must stay first'
+        assert '/run/current-system/sw/bin' in parts
+        assert '/run/wrappers/bin' in parts
+
+    def test_it_appends_never_prepends(self):
+        """A pinned or shimmed tool keeps its precedence. The rustdesk guard in
+        hart-liquid-ui.nix depends on being first on PATH."""
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=True):
+            out = subprocess_safe.system_search_path('/a')
+        assert out.startswith('/a' + os.pathsep)
+
+    def test_absent_dirs_are_not_invented(self):
+        """On a dev host or in a container these do not exist, and claiming
+        them would put a lie in PATH."""
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=False):
+            assert subprocess_safe.system_search_path('/a:/b') == '/a:/b'
+
+    def test_no_duplicates_when_already_present(self):
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=True):
+            out = subprocess_safe.system_search_path('/run/current-system/sw/bin')
+        assert out.split(os.pathsep).count('/run/current-system/sw/bin') == 1
+
+    def test_run_probe_passes_the_augmented_path_down(self):
+        captured = {}
+
+        def fake(cmd, timeout=5.0, **kw):
+            captured.update(kw)
+            return subprocess_safe.BoundedResult(0, '', '', False)
+
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=True):
+            with patch.object(subprocess_safe, 'run_bounded', side_effect=fake):
+                subprocess_safe.run_probe(['anything'])
+        assert '/run/current-system/sw/bin' in captured['env']['PATH']
+
+    def test_a_callers_own_env_is_kept_and_augmented(self):
+        """Passing env must not lose the caller's variables, and must not lose
+        the augmentation either."""
+        captured = {}
+
+        def fake(cmd, timeout=5.0, **kw):
+            captured.update(kw)
+            return subprocess_safe.BoundedResult(0, '', '', False)
+
+        with patch.object(subprocess_safe.os.path, 'isdir', return_value=True):
+            with patch.object(subprocess_safe, 'run_bounded', side_effect=fake):
+                subprocess_safe.run_probe(
+                    ['anything'], env={'PATH': '/mine', 'MARKER': 'kept'})
+        env = captured['env']
+        assert env['MARKER'] == 'kept'
+        assert env['PATH'].startswith('/mine')
+        assert '/run/current-system/sw/bin' in env['PATH']

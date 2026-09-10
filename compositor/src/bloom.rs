@@ -66,17 +66,150 @@ fn hex3(s: &str) -> Option<[u8; 3]> {
     Some([h(0)?, h(2)?, h(4)?])
 }
 
-/// Read the palette from a theme JSON without pulling a JSON dependency into the
-/// compositor: the file is a flat `"key": "VALUE"` map for the fields we need, so
-/// a scan for each key is enough and cannot panic on malformed input. Any field
-/// that does not parse keeps its aura default (fail-to-shipped-look, never void).
-pub fn palette_from_theme_file(path: &Path) -> BloomPalette {
-    let mut p = BloomPalette::default();
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(_) => return p,
-    };
-    let find = |key: &str| -> Option<[u8; 3]> {
+/// One loaded settings JSON, and the ONE reader for that shape in this process.
+///
+/// Born as the theme reader: the backdrop and the native scene both need colours out of
+/// `conky-themes/<id>.json`, and the scene's `Theme` was a hardcoded copy of what that
+/// file already carries, which is a parallel theme table inside a single binary, exactly
+/// what Gate 4 forbids and exactly what a user changing their theme would have
+/// discovered, the backdrop restyling under a desktop that did not.
+///
+/// It reads `/etc/hart/accessibility.json` too, which is the same shape and the same
+/// posture, so the name is the shape rather than the subject. Two files, one scanner:
+/// a second copy of this is how the drift it was written to end would start again.
+///
+/// No JSON dependency is pulled in for it even though the crate has one: the file is a
+/// flat `"key": "VALUE"` map for every field either consumer needs, so a scan per key is
+/// enough, cannot panic on malformed input, and cannot be made to allocate by a hostile
+/// file. Any key that does not parse leaves the caller's default in place.
+pub struct SettingsFile {
+    text: Option<String>,
+}
+
+impl SettingsFile {
+    /// Load the theme JSON at `path`. A missing or unreadable file is not an error: it
+    /// yields a file that answers None to everything, so every caller keeps its shipped
+    /// default. This is the desktop's own colours; an unreadable theme must degrade to
+    /// the shipped look, never to a void.
+    pub fn load(path: &Path) -> SettingsFile {
+        SettingsFile {
+            text: std::fs::read_to_string(path).ok(),
+        }
+    }
+
+    /// Resolve the active theme file from the environment, degrading at every step.
+    ///
+    /// `HART_THEME_DIR` / `HART_THEME` follow the convention the conky + liquid-ui
+    /// modules already export, so this reads the same file the HTML shell is handed.
+    pub fn active() -> SettingsFile {
+        let dir = std::env::var("HART_THEME_DIR").unwrap_or_else(|_| THEME_DIR_DEFAULT.to_string());
+        let id = std::env::var("HART_THEME").unwrap_or_else(|_| "aura".to_string());
+        SettingsFile::for_id(&dir, &id)
+    }
+
+    /// The resolution rule with the environment read out of the way, so it is testable
+    /// without mutating process-global state (cargo runs tests as threads in one
+    /// process, and an env-mutating test would race every other test here).
+    pub fn for_id(dir: &str, id: &str) -> SettingsFile {
+        // Reject an id that could escape the theme directory. It reaches us from the
+        // environment, and a path separator would let it name any file on disk; a bad id
+        // falls back to the shipped look rather than reading around.
+        if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+            return SettingsFile { text: None };
+        }
+        SettingsFile::load(&Path::new(dir).join(format!("{}.json", id)))
+    }
+
+    /// The NUMERIC value of `key`, or None when it is absent or not a number.
+    ///
+    /// The shell's three shell-metric variables (`--hart-topbar-height`,
+    /// `--hart-icon-size`, `--hart-radius`) come straight from this file's `shell` block,
+    /// and the native scene hardcoded all three. Four of the ten shipped themes move the
+    /// bar height and every one of them moves the corner radius, so that was not a
+    /// theoretical drift: on `potato` the native bar would draw 40px over a 36px
+    /// reservation, which is the 2026-08-29 "taskbar unreachable" report through a new
+    /// renderer.
+    ///
+    /// Unquoted, unlike `hex`: JSON numbers carry no quotes, so this scans to the value
+    /// separator and parses what follows up to the next delimiter. A malformed value
+    /// yields None and the caller keeps its shipped default, the same posture every other
+    /// read here takes.
+    pub fn num(&self, key: &str) -> Option<f32> {
+        let text = self.text.as_ref()?;
+        let k = format!("\"{}\"", key);
+        let i = text.find(&k)?;
+        let rest = &text[i + k.len()..];
+        let c = rest.find(':')?;
+        let v = rest[c + 1..]
+            .trim_start()
+            .split([',', '}', '\n'])
+            .next()?
+            .trim();
+        v.parse::<f32>().ok().filter(|n| n.is_finite())
+    }
+
+    /// The BOOLEAN value of `key`, or None when it is absent or not a JSON bool.
+    ///
+    /// `/etc/hart/accessibility.json` carries `reduced_motion`, and the CSS parity ledger
+    /// is explicit that the shell's three motion kill-switches must all exist natively.
+    /// The native scene honoured only the GPU floor, so a user who had declared reduced
+    /// motion still got a breathing orb the moment the shell went native.
+    ///
+    /// Only the DECLARATIVE file is visible from here. A runtime PUT to
+    /// /api/shell/accessibility lives in the shell process's memory, so it reaches the
+    /// compositor at the next start, which is the same documented gap the theme and the
+    /// backdrop palette already carry rather than a new one.
+    pub fn flag(&self, key: &str) -> Option<bool> {
+        let text = self.text.as_ref()?;
+        let k = format!("\"{}\"", key);
+        let i = text.find(&k)?;
+        let rest = &text[i + k.len()..];
+        let c = rest.find(':')?;
+        match rest[c + 1..].trim_start() {
+            v if v.starts_with("true") => Some(true),
+            v if v.starts_with("false") => Some(false),
+            _ => None,
+        }
+    }
+
+    /// An `rgba(r, g, b, a)` value: three 0..255 channels and a 0..1 alpha.
+    ///
+    /// The theme writes its translucent colours this way rather than as hex, which is why
+    /// `glass_border` could not be read before: `hex` finds no `#RRGGBB` and returns None,
+    /// so the chrome strips had no separator and the shell's own 1px rule between the bars
+    /// and the desktop simply did not exist natively. Spacing varies across the shipped
+    /// themes (`rgba(255,255,255,0.10)` and `rgba(2, 136, 209, 0.15)` are both in the
+    /// tree), so every field is trimmed.
+    pub fn rgba(&self, key: &str) -> Option<([u8; 3], f32)> {
+        let text = self.text.as_ref()?;
+        let k = format!("\"{}\"", key);
+        let i = text.find(&k)?;
+        let rest = &text[i + k.len()..];
+        let c = rest.find(':')?;
+        let v = rest[c + 1..].trim_start();
+        let open = v.find("rgba(")?;
+        // Only accept it as the value itself, not something further down the file.
+        if v[..open].trim_matches(['"', ' ']).len() > 1 {
+            return None;
+        }
+        let body = &v[open + 5..];
+        let close = body.find(')')?;
+        let mut parts = body[..close].split(',');
+        let ch = |p: Option<&str>| -> Option<u8> {
+            let n = p?.trim().parse::<f32>().ok()?;
+            Some(n.clamp(0.0, 255.0) as u8)
+        };
+        let rgb = [ch(parts.next())?, ch(parts.next())?, ch(parts.next())?];
+        let a = parts.next()?.trim().parse::<f32>().ok()?;
+        if !a.is_finite() {
+            return None;
+        }
+        Some((rgb, a.clamp(0.0, 1.0)))
+    }
+
+    /// The `#RRGGBB` value of `key`, or None when the key is absent or malformed.
+    pub fn hex(&self, key: &str) -> Option<[u8; 3]> {
+        let text = self.text.as_ref()?;
         let k = format!("\"{}\"", key);
         let i = text.find(&k)?;
         let rest = &text[i + k.len()..];
@@ -86,12 +219,23 @@ pub fn palette_from_theme_file(path: &Path) -> BloomPalette {
         let rest2 = &rest[q1 + 1..];
         let q2 = rest2.find('"')?;
         hex3(&rest2[..q2])
-    };
-    if let Some(v) = find("background") {
+    }
+}
+
+/// The backdrop palette out of a theme JSON. A thin consumer of `SettingsFile` now, so the
+/// scan lives in one place rather than once per thing that needs a colour.
+pub fn palette_from_theme_file(path: &Path) -> BloomPalette {
+    palette_from(&SettingsFile::load(path))
+}
+
+/// The backdrop palette from an already-loaded file.
+pub fn palette_from(file: &SettingsFile) -> BloomPalette {
+    let mut p = BloomPalette::default();
+    if let Some(v) = file.hex("background") {
         p.base = v;
     }
     for (i, key) in ["ambient_1", "ambient_2", "ambient_3", "ambient_4"].iter().enumerate() {
-        if let Some(v) = find(key) {
+        if let Some(v) = file.hex(key) {
             p.amb[i] = v;
         }
     }
@@ -103,6 +247,19 @@ pub fn palette_from_theme_file(path: &Path) -> BloomPalette {
 /// renderers read one palette source (Gate 4: no parallel theme table).
 const THEME_DIR_DEFAULT: &str = "/run/current-system/sw/share/hart/conky-themes";
 
+/// Where the shell reads its declarative accessibility state
+/// (shell_os_apis.py seeds `_A11Y_SETTINGS` from this exact path at import).
+pub const A11Y_SETTINGS_PATH: &str = "/etc/hart/accessibility.json";
+
+/// Does the user want motion stood down? Reads the same declarative file the shell does.
+/// FALSE when the file is absent or the key is missing, which is the shipped default and
+/// what `_A11Y_SETTINGS` seeds `reduced_motion` to.
+pub fn reduced_motion() -> bool {
+    SettingsFile::load(Path::new(A11Y_SETTINGS_PATH))
+        .flag("reduced_motion")
+        .unwrap_or(false)
+}
+
 /// Resolve the active palette from the environment, degrading at every step.
 ///
 /// `HART_THEME_DIR` / `HART_THEME` follow the convention the conky + liquid-ui
@@ -110,24 +267,53 @@ const THEME_DIR_DEFAULT: &str = "/run/current-system/sw/share/hart/conky-themes"
 /// rather than a void, because this is the DESKTOP BACKDROP: an unreadable theme
 /// file must never produce a black screen the user cannot explain.
 pub fn theme_palette() -> BloomPalette {
-    let dir = std::env::var("HART_THEME_DIR").unwrap_or_else(|_| THEME_DIR_DEFAULT.to_string());
-    let id = std::env::var("HART_THEME").unwrap_or_else(|_| "aura".to_string());
-    theme_palette_from(&dir, &id)
+    palette_from(&SettingsFile::active())
 }
 
-/// The resolution rule itself, with the environment read out of the way.
-///
-/// Split from `theme_palette` so it is testable WITHOUT mutating process-global
-/// environment: cargo runs tests as parallel threads in one process, so an
-/// env-mutating test would race every other test in this module.
+/// The resolution rule itself, with the environment read out of the way. Kept as its own
+/// entry point because the tests drive it directly; the id-safety and the fallback both
+/// live in `SettingsFile::for_id` now, so this is the same rule, not a second one.
 pub fn theme_palette_from(dir: &str, id: &str) -> BloomPalette {
-    // Reject a theme id that could escape the theme directory. The id reaches us
-    // from the environment, and a path separator would let it name any file on
-    // disk; a bad id falls back to the shipped look rather than reading around.
-    if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
-        return BloomPalette::default();
+    palette_from(&SettingsFile::for_id(dir, id))
+}
+
+// `.hart-vignette` (liquid_ui_service l.2430), which the shell emits UNCONDITIONALLY
+// (no potato gate, no GPU gate): `radial-gradient(120% 120% at 50% 38%, transparent 56%,
+// rgba(0,0,0,0.30) 100%)`. It is the framing that keeps the desktop from reading flat at
+// the corners, the ledger files it under Field/M1, and the native scene had nothing like
+// it, so standing the WebView down at M6 would have taken the framing with it.
+//
+// Folded into the bloom's own buffer rather than pushed as a second element: it is
+// deterministic given the output size, so it recomposes exactly when the backdrop does,
+// costs no extra per-frame blit, and lands in the right place in the stack for free. In
+// the shell it sits at z-index 2 with nothing but the grain between it and the bloom
+// canvas at z 1, and every piece of chrome is above it; here the native scene is pushed
+// after the backdrop, so the same thing is true.
+/// Ellipse radii as a fraction of the box, the CSS `120% 120%`.
+const VIGNETTE_R: (f32, f32) = (1.2, 1.2);
+/// Centre, the CSS `at 50% 38%`.
+const VIGNETTE_C: (f32, f32) = (0.5, 0.38);
+/// Where the darkening starts along the gradient ray (`transparent 56%`).
+const VIGNETTE_INNER: f32 = 0.56;
+/// Peak darkening at the ellipse edge (`rgba(0,0,0,0.30)`).
+const VIGNETTE_ALPHA: f32 = 0.30;
+
+/// The vignette's darkening factor at a pixel: 1.0 = untouched, 0.70 at full strength.
+///
+/// PURE, so the gradient's shape is testable without composing a buffer. `t` is the
+/// normalised elliptical distance from the centre; CSS holds the last stop's colour
+/// beyond the ending shape, so past `t = 1` the factor stays at its darkest rather than
+/// continuing to fall, which matters because the corners of a 16:9 output are outside a
+/// 120%/120% ellipse.
+fn vignette_factor(x: f32, y: f32, w: f32, h: f32) -> f32 {
+    let dx = (x - VIGNETTE_C.0 * w) / (VIGNETTE_R.0 * w).max(1.0);
+    let dy = (y - VIGNETTE_C.1 * h) / (VIGNETTE_R.1 * h).max(1.0);
+    let t = (dx * dx + dy * dy).sqrt();
+    if t <= VIGNETTE_INNER {
+        return 1.0;
     }
-    palette_from_theme_file(&Path::new(dir).join(format!("{}.json", id)))
+    let ramp = ((t - VIGNETTE_INNER) / (1.0 - VIGNETTE_INNER)).min(1.0);
+    1.0 - VIGNETTE_ALPHA * ramp
 }
 
 /// One additive radial blob: centre as a fraction of the output, radius as a
@@ -199,6 +385,13 @@ pub fn compose(width: i32, height: i32, pal: &BloomPalette) -> Vec<u8> {
                 g += hue[1] as f32 * f;
                 b += hue[2] as f32 * f;
             }
+            // The vignette darkens what the blobs just built. Multiplying is exact
+            // here because the backdrop is OPAQUE: black at alpha `a` over an opaque
+            // ground is that ground scaled by `1 - a`, with no alpha term left over.
+            let vg = vignette_factor(fx, fy, w as f32, h as f32);
+            r *= vg;
+            g *= vg;
+            b *= vg;
             let i = row + x * 4;
             // Argb8888 little-endian => bytes are B, G, R, A. Opaque alpha, and the
             // colour is already "premultiplied" because alpha is 255.
@@ -246,6 +439,102 @@ mod tests {
             "violet lead ({:?}) is not brighter than the far corner ({:?}) -- the bloom is flat",
             lead,
             corner
+        );
+    }
+
+    #[test]
+    fn the_vignette_frames_the_desktop_the_way_the_shell_does() {
+        // `.hart-vignette` is emitted unconditionally by the shell, so standing the
+        // WebView down at M6 would have taken the framing with it and left the corners
+        // reading flat. Check the SHAPE, not just that something changed: untouched
+        // inside the transparent stop, darkening beyond it, darkest at the edge.
+        let (w, h) = (1920.0, 1080.0);
+        let c = (VIGNETTE_C.0 * w, VIGNETTE_C.1 * h);
+        assert_eq!(vignette_factor(c.0, c.1, w, h), 1.0, "the centre is untouched");
+
+        // Just inside the transparent stop: still untouched. Just outside: darkening.
+        let inner_x = c.0 + VIGNETTE_INNER * VIGNETTE_R.0 * w * 0.99;
+        let outer_x = c.0 + VIGNETTE_INNER * VIGNETTE_R.0 * w * 1.01;
+        assert_eq!(vignette_factor(inner_x, c.1, w, h), 1.0, "inside the clear stop");
+        assert!(
+            vignette_factor(outer_x, c.1, w, h) < 1.0,
+            "past the clear stop it starts to darken"
+        );
+
+        // HOW SUBTLE IT ACTUALLY IS, which is the part worth pinning. The ellipse is
+        // 120% of the box in EACH axis, so on a 16:9 output the far corner is only
+        // t = 0.66 along the ray: about a 7% darkening, not the 30% the last stop names.
+        // Anyone reimplementing this by eye would make it several times too strong.
+        let corner = vignette_factor(0.0, h, w, h);
+        assert!(
+            (corner - 0.929).abs() < 0.01,
+            "the 16:9 corner should sit at ~0.93, got {corner}"
+        );
+        assert!(corner > 1.0 - VIGNETTE_ALPHA, "the box never reaches the last stop");
+
+        // Past the ending shape CSS holds the last stop rather than continuing to fall.
+        // No pixel of a real output gets there, but the clamp is what stops a wider
+        // aspect from going black in the corners.
+        let far = vignette_factor(c.0 + 10.0 * w, c.1, w, h);
+        assert!(
+            (far - (1.0 - VIGNETTE_ALPHA)).abs() < 1e-6,
+            "beyond the ellipse it holds at the last stop: {far}"
+        );
+        assert!(far > 0.0, "it is a darkening, never a blackout");
+
+        // Monotonic outward along the ray: a vignette that brightened anywhere would be
+        // a banding artifact rather than framing.
+        let mut prev = 1.0;
+        for i in 0..=20 {
+            let x = c.0 + (i as f32 / 20.0) * VIGNETTE_R.0 * w;
+            let f = vignette_factor(x, c.1, w, h);
+            assert!(f <= prev + 1e-6, "brightened at step {i}: {f} after {prev}");
+            prev = f;
+        }
+    }
+
+    #[test]
+    fn the_compose_applies_the_vignette_to_every_channel() {
+        // The factor is one thing; that the COMPOSE applies it is another, and the two
+        // have to be checked separately or a correct gradient can sit unused.
+        //
+        // ISOLATED from the blob field, with ambient hues that add nothing, so every
+        // pixel is exactly `base * vignette_factor`. This measures the vignette rather
+        // than the bloom's own centre-bright falloff, which matters: a "corner darker
+        // than centre" check against the real palette passes with NO vignette at all,
+        // and passes with only two of the three channels darkened. Both were written
+        // that way first and both mutations sailed through.
+        let (w, h) = (320, 180);
+        let flat = BloomPalette {
+            base: [200, 150, 100],
+            amb: [[0, 0, 0]; 4],
+        };
+        let px = compose(w, h, &flat);
+        for (x, y) in [
+            (0usize, 0usize),
+            (w as usize - 1, h as usize - 1),
+            (w as usize / 2, (h as f32 * VIGNETTE_C.1) as usize),
+        ] {
+            let i = (y * w as usize + x) * 4;
+            let vg = vignette_factor(x as f32, y as f32, w as f32, h as f32);
+            // B, G, R in memory order, against the palette's R, G, B.
+            for (byte, base) in [
+                (px[i], flat.base[2]),
+                (px[i + 1], flat.base[1]),
+                (px[i + 2], flat.base[0]),
+            ] {
+                let want = (base as f32 * vg) as u8;
+                assert_eq!(
+                    byte, want,
+                    "at ({x},{y}) the vignette must scale every channel: {byte} vs {want}"
+                );
+            }
+        }
+        // Every pixel stays opaque: the vignette darkens the ground, it does not punch a
+        // hole in it, and a transparent backdrop would show the clear colour through.
+        assert!(
+            (0..(w as usize * h as usize)).all(|i| px[i * 4 + 3] == 255),
+            "the backdrop must stay opaque"
         );
     }
 

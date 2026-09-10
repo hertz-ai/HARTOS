@@ -233,6 +233,35 @@ capture path and honours this same gate. The brain-side caller is
 `integrations/agent_engine/hart_wm_client.py` (the same singleton that drives every other
 verb); it maps a `screen` cut/restore from `core.ai_sensing` to `screen.kill {on}`.
 
+### 4.12 `shell.native` · `ShellNative(on)` *(the native scene render path, for THIS session)*
+**args:** `{ "on": true }` (omit → defaults `true`)
+**result:** `{ "native": true }`, or an `unsupported` error when the flag did not move.
+
+Turns the native scene (top bar, hero, rows, taskbar, orb) on or off in the running
+session. It changes **only this session**: the M6 default is untouched and a reboot
+forgets the call.
+
+It exists for **measurement**. `latency.rs` attributes an input to a component
+(`TOPBAR`, `CARD`, `ORB`…) by hit-testing the native scene tree, so while the scene is
+not drawn every sample is `component=shell` **by construction**. That is what the box
+reported on 2026-09-10: ~4,200 samples swept across the whole output, one distinct
+component, and every per-component row in `latency_budgets.json` therefore dead. Before
+this verb, turning the scene on meant an env var read once at session start: build a
+generation, reboot, and reboot again to get back. Over this socket both halves of the
+native-versus-shell comparison can be measured on one machine minutes apart.
+
+**The error case is the point.** `set_native_shell_flag` is a no-op on any backend
+without the field, so the verb reads the flag back and compares it with the request. If
+it did not move, the answer is an `unsupported` error naming the state the flag is still
+in, never an `ok` for something that did not happen. (`window.resize` was caught doing
+exactly that on 2026-09-10: it answered `ok: true` for a resize the client had declined.)
+
+**What it does NOT do:** tell the WebView shell to stand down. The shell keeps painting
+its own home while the native scene draws above it, so with `on: true` the desktop shows
+both. That hand-off is one of M6's four named obligations
+(`docs/architecture/NATIVE_SHELL_PARITY_PROGRAM.md`) and is a contract decision, not a
+toggle. For a latency sweep the doubling is cosmetic; for anything else, expect it.
+
 ---
 
 ## 5. Events

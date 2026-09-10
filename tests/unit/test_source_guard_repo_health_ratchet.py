@@ -44,11 +44,25 @@ MAX_BARE_SWALLOWS = 1521        # `except ...: pass` (was 1533 -> 1528 -> 1521;
 #: Note 4 of the remainder are in hive_guardrails.py, which CLAUDE.md forbids
 #: modifying (circuit breaker / structural immutability) — they need the steward,
 #: not a refactor.
-MAX_SECURITY_SWALLOWS = 62      # was 68 -> 63 -> 62. Lowered 2026-09-08 on this
-                                # guard's OWN staleness check: the tree had
-                                # already reached 62 under both interpreters
-                                # (CI run 34201055211 and a local 3.12 run), and
-                                # a budget above reality is a comment, not a gate.
+MAX_SECURITY_SWALLOWS = 62      # was 68 -> 63 -> 62.
+                                # MERGE NOTE 2026-09-11: two lanes lowered this
+                                # to 62 independently and each recorded a
+                                # different cause, so BOTH are kept -- the number
+                                # agrees, the attribution does not, and dropping
+                                # either would leave the next reader with half
+                                # the history.
+                                #   2026-09-05 (origin/main): security/audit_log.py
+                                #     gave up its last one, and this guard's own
+                                #     staleness check asked for the tightening.
+                                #   2026-09-08 (this lane): the same staleness
+                                #     check measured the tree already AT 62 under
+                                #     both interpreters (CI run 34201055211 and a
+                                #     local 3.12 run); a budget above reality is a
+                                #     comment, not a gate.
+                                # If those were two DIFFERENT swallows, the merged
+                                # tree is at 61 and the staleness check below will
+                                # say so on the next run -- which is the correct
+                                # way to find out, not a guess made here.
 MAX_GOD_MODULES = 9             # SOURCE files > 3000 lines (tests excluded —
                                 # the first draft said 11 by counting
                                 # test_nixos_configs.py and test_agent_engine.py,

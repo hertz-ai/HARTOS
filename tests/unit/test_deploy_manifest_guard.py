@@ -86,9 +86,42 @@ class ScriptGuardTest(unittest.TestCase):
                         'the guard must run before docker run can create a dir')
 
     def test_script_still_parses(self):
+        """`bash -n` the script, feeding it on STDIN rather than by path.
+
+        Passing _SCRIPT as an argument fails on a Windows dev host: git-bash
+        eats the backslashes as escapes, so the path arrives as
+        `C:Userssathihartos-reflashdeploydeepbox_deploy.sh` and bash reports
+        `No such file or directory` (exit 127). That reads exactly like a
+        missing deploy script, which is alarming and untrue. `bash -n` with no
+        file argument reads the script from stdin, so the syntax check is the
+        same and no path crosses the shell boundary at all.
+        """
+        import shutil
         import subprocess
-        r = subprocess.run(['bash', '-n', _SCRIPT], capture_output=True, text=True)
-        self.assertEqual(r.returncode, 0, r.stderr[:400])
+        if not shutil.which('bash'):
+            self.skipTest('no bash on this host to syntax-check with')
+        # BYTES, not text. Two separate traps live in text mode here, and both
+        # produce failures that look like a broken deploy script when the
+        # script is perfectly fine (`bash -n` on the file passes):
+        #   * the locale codec, cp1252 on this box, cannot encode the
+        #     box-drawing characters in the script's comments;
+        #   * Windows newline translation rewrites \n as \r\n, so `}` arrives
+        #     as `}\r`, stops terminating its block, and bash reports
+        #     "syntax error near unexpected token `}'".
+        # Reading and writing raw bytes sidesteps both, on every platform.
+        with open(_SCRIPT, 'rb') as fh:
+            script_bytes = fh.read()
+        # CR stripped. git checks this file out with CRLF on a Windows working
+        # tree, and bash then sees `}\r`, which no longer terminates its block:
+        # "syntax error near unexpected token `}'" for a script that is
+        # perfectly valid (bash -n on the file passes under git-bash, and CI
+        # checks it out with LF, so this never fires there). Shell syntax does
+        # not depend on carriage returns, so removing them tests the script
+        # rather than the checkout.
+        r = subprocess.run(['bash', '-n'], input=script_bytes.replace(b'\r\n', b'\n'),
+                           capture_output=True, timeout=60)
+        self.assertEqual(r.returncode, 0,
+                         r.stderr.decode('utf-8', 'replace')[:400])
 
 
 if __name__ == '__main__':

@@ -706,19 +706,39 @@ class AgentDaemon:
             except Exception as e:
                 logger.debug(f"Proactive hive: task protocol check failed: {e}")
 
-            # If idle and tasks exist, auto-dispatch to local Claude hive session
+            # OBSERVE the backlog. Do NOT claim to dispatch it.
+            #
+            # This block used to import `get_blueprint` -- a Flask blueprint
+            # factory, the wrong symbol entirely -- never call it, and then log
+            # "auto-dispatching task to local hive session" once per task.
+            # Nothing was dispatched by it, ever. The log asserted an action
+            # that did not happen, which is worse than silence: it made the
+            # queue look serviced while every task sat at `pending`, and it is
+            # the same fabrication shape as the copilot two-executor problem.
+            #
+            # Dispatch has exactly ONE driver, and it is not here:
+            # ResourceGovernor._proactive_check_tasks calls
+            # HiveTaskDispatcher.dispatch_pending() on its own timer
+            # (TASK_CHECK_INTERVAL, 600s +/-50%, so a 300s floor, re-armed on
+            # every non-IDLE iteration). Calling dispatch_pending() from here as
+            # well would make the daemon a SECOND scheduler for the same queue.
+            # How responsive hive dispatch should be is a scheduling decision
+            # about the hive, so it belongs to whoever owns that lane, not to a
+            # log line that was pretending the problem was already solved.
+            #
+            # What this block is for now is telling the truth about the backlog,
+            # which is what makes a stuck queue visible at all.
             if pending_tasks:
+                oldest = ''
                 try:
-                    from integrations.coding_agent.claude_hive_session import get_blueprint
-                    for task in pending_tasks[:3]:  # Max 3 tasks per exploration
-                        task_desc = getattr(task, 'description', '') or str(task)
-                        logger.info(
-                            f"Proactive hive: auto-dispatching task to local "
-                            f"hive session: {task_desc[:100]}")
-                except ImportError:
-                    logger.debug("Proactive hive: claude_hive_session not available")
-                except Exception as e:
-                    logger.debug(f"Proactive hive: hive session dispatch failed: {e}")
+                    oldest = getattr(pending_tasks[0], 'description', '') or ''
+                except Exception:
+                    oldest = ''
+                logger.info(
+                    "Proactive hive: %d task(s) waiting in the dispatcher queue; "
+                    "dispatch is driven by ResourceGovernor._proactive_check_tasks, "
+                    "not by this daemon. Oldest: %s",
+                    len(pending_tasks), oldest[:100] or '(no description)')
 
         # ── 2. Self-promotion on benchmark results ──
         try:

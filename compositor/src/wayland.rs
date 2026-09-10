@@ -150,6 +150,23 @@ pub struct State {
     /// manifest ↔ toplevel map (the "AppRegistry window-handle field").
     pub windows: WindowRegistry,
     /// SummonApps awaiting a real map, keyed by manifest id.
+    /// UNREACHABLE IN THE LIVE COMPOSITOR, stated here rather than discovered at M6.
+    ///
+    /// Nothing ever pushes to this. `udev.rs` initialises it to `Vec::new()`, the render
+    /// tick drains it through `expire_summons` every frame, and `resolve_summon` reads it
+    /// on every real map, but there is no IPC verb that begins a summon and no live caller
+    /// of `SummonResolver::begin` (its only callers are main.rs's own tests). So the
+    /// expiry walks an always-empty vec forever and a summon can never resolve.
+    ///
+    /// The machinery is correct and unit-tested; what is missing is the trigger, and that
+    /// is app-launch, which the owner has DROPPED. Both sides currently describe Tier-1 as
+    /// where SummonApp awaits a real map: hart_wm_client returns an honest `unsupported`
+    /// at Tier-2 and points here, and HART_OS_NATIVE_ARCHITECTURE §5.4 makes real-map
+    /// success a release gate. Neither is wrong about the DESIGN; both are wrong about it
+    /// being reachable today.
+    ///
+    /// Left wired rather than removed: deleting it would throw away the no-phantom-window
+    /// correctness that is already proven, and the trigger is the only missing piece.
     pub pending: Vec<PendingSummon>,
 
     // ── Smithay protocol state ──
@@ -246,6 +263,17 @@ pub struct State {
     /// session. Set from the HART_NATIVE_SHELL env at State construction (default OFF,
     /// so the WebView shell is unchanged). No nix option until M6 flips the default.
     pub native_shell_on: bool,
+    /// How far each card row is scrolled sideways (a2: "Netflix rows scroll
+    /// HORIZONTALLY"). Lives on State rather than in the scene cache because it survives
+    /// a relayout: a resize must not throw away where the user had scrolled to.
+    pub row_scroll: crate::scene::RowScroll,
+    /// Is the live renderer the GPU one? The native mirror of the shell's
+    /// `body.gpu-hardware`, refreshed by the DRM render tick from whether its
+    /// `GlesRenderer` still exists, so a mid-session demotion to the pixman floor stands
+    /// the orb's breathing (and the frame-budget hold it implies) down on the next frame.
+    /// Starts FALSE: the floor is the safe assumption until a GPU has actually proven
+    /// itself, and it is what the never-fail software path is.
+    pub motion_hardware: bool,
     /// NATIVE SHELL M3: the latest home_compose scene from the shell.compose IPC verb.
     pub native_home: Option<crate::scene::HomeCompose>,
     /// NATIVE SHELL M3 text: cosmic-text rasterizer (FontSystem enumerated once).
@@ -399,6 +427,26 @@ impl CompState for State {
     fn native_shell_on(&self) -> bool {
         self.native_shell_on
     }
+    /// The DRM backend is the one that HAS the field, so it is the one where
+    /// `shell.native` can actually do something. Nothing else needs invalidating: the
+    /// render tick reads the flag every frame, `lower_scene` builds the retained tree on
+    /// the first frame that finds it on, and the idle heartbeat guarantees such a frame
+    /// arrives without waiting for damage.
+    fn set_native_shell_flag(&mut self, on: bool) {
+        self.native_shell_on = on;
+    }
+    fn row_scroll(&self) -> crate::scene::RowScroll {
+        self.row_scroll
+    }
+    fn set_row_scroll(&mut self, s: crate::scene::RowScroll) {
+        self.row_scroll = s;
+    }
+    fn motion_hardware(&self) -> bool {
+        self.motion_hardware
+    }
+    fn set_motion_hardware(&mut self, on: bool) {
+        self.motion_hardware = on;
+    }
     fn native_home(&self) -> Option<&crate::scene::HomeCompose> {
         self.native_home.as_ref()
     }
@@ -420,15 +468,13 @@ impl CompState for State {
     fn orb_mut(&mut self) -> &mut crate::comp_core::OrbCache {
         &mut self.orb
     }
-    fn native_scene_caches(
-        &mut self,
-    ) -> (
-        &mut crate::text_render::TextRasterizer,
-        &mut crate::comp_core::OrbCache,
-        &mut crate::comp_core::RectCache,
-        &mut crate::scene::SceneCache,
-    ) {
+    fn native_tree(&self) -> Option<&crate::scene::SceneNode> {
+        self.scene_cache.tree()
+    }
+    fn native_scene_caches(&mut self) -> crate::comp_core::NativeSceneCaches<'_> {
+        // Disjoint fields, so the shared home borrow and the &mut caches coexist.
         (
+            self.native_home.as_ref(),
             &mut self.text_rasterizer,
             &mut self.orb,
             &mut self.rect_cache,

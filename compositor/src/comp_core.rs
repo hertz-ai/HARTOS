@@ -149,8 +149,61 @@ pub static LAYERS_PAINTED: std::sync::atomic::AtomicUsize =
 /// detail into the backend-agnostic accessor surface for no gain.
 pub static NATIVE_CHROME_EMITTED: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
+/// Set once the native scene has actually put elements into a frame. Read by the
+/// compositor's shell-ready writer, which must mean "the scene really painted" rather than
+/// "the flag was set": a marker that fires off configuration instead of pixels is the
+/// false-healthy this whole marker family exists to avoid.
+pub static NATIVE_SCENE_PAINTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Everything one lowering needs off the backend `State`, handed back together.
+///
+/// One accessor rather than five because these are DISJOINT fields and two `&mut self`
+/// accessors cannot overlap: the tree has to be borrowed alongside the buffer caches for
+/// the whole walk. The composed home rides along as a SHARED borrow, which is what let the
+/// per-frame clone go. Named because the tuple is wide enough that spelling it at every
+/// implementor was its own kind of noise.
+pub type NativeSceneCaches<'a> = (
+    Option<&'a crate::scene::HomeCompose>,
+    &'a mut crate::text_render::TextRasterizer,
+    &'a mut OrbCache,
+    &'a mut RectCache,
+    &'a mut crate::scene::SceneCache,
+);
+
 pub const NATIVE_CHROME_BLOOM: u8 = 1 << 0;
 pub const NATIVE_CHROME_ORB: u8 = 1 << 1;
+/// The HOME SURFACE: the desktop between the two bars (hero, card rows, the big orb).
+///
+/// Claimed so the shell can stand `#hart-home` down while KEEPING its own top bar and
+/// taskbar. That split is what lets the native scene become the renderer without first
+/// carrying the taskbar chips, the agent cluster and the clock, none of which the scene
+/// can see: they are DOM inside the shell's one surface, an HTTP poll, and local time
+/// that a `unsafe_code = "deny"` crate cannot format. So the compositor takes the half it
+/// can draw correctly and the shell keeps the half it alone knows.
+///
+/// There is deliberately no TOPBAR or TASKBAR bit yet. The native bars draw, but the
+/// native taskbar is an empty strip, so claiming it would take the user's window and panel
+/// switching away. A bit nothing can honestly claim is worse than no bit.
+pub const NATIVE_CHROME_HOME: u8 = 1 << 2;
+
+/// Whether a lowered leaf lies WHOLLY inside the home band. PURE, so the rule is testable
+/// without a renderer.
+///
+/// The evidence question for the HOME claim, and it has to be geometric because the
+/// lowering walk cannot tell a card's background from the top bar's fill: both are a Rect
+/// under a Container, and `walk_leaves` hands the callback a leaf with no ancestry.
+/// Geometry is not a workaround here, it is the actual property: what the shell hides is
+/// the band, so what the compositor must prove it painted is the band.
+///
+/// WHOLLY inside, not overlapping. A leaf straddling either boundary claims nothing, so a
+/// frame that drew only chrome can never tell the shell to hide its home. Under-claiming
+/// costs a duplicated home for one frame; over-claiming costs an EMPTY DESKTOP, which the
+/// paint watchdog does not catch because it watches for hangs and not for wrong-looking
+/// desktops.
+pub fn in_home_band(rect: crate::scene::Rect, top_h: f32, taskbar_y: f32) -> bool {
+    rect.h > 0.0 && rect.w > 0.0 && rect.y >= top_h && rect.y + rect.h <= taskbar_y
+}
 
 /// The action a compositor keyboard shortcut resolves to (anvil's `KeyAction`
 /// analogue). `process_keyboard_shortcut` maps a `(ModifiersState, Keysym)` to one of
@@ -332,17 +385,29 @@ impl OrbCache {
     ///
     /// `None` for a degenerate size, matching BloomCache: the caller then emits
     /// no orb and the frame is the desktop without it, never a panic.
+    /// `animate` is the same hardware condition `scene_animates` gates on. With motion
+    /// off the elapsed time handed to `motion_at` is ZERO, which is its resting scale and
+    /// alpha, so the orb sits still rather than freezing wherever the last painted frame
+    /// happened to catch it. That matches `animation: none`, which is what the shell
+    /// applies on the software floor, and it does it through the SAME motion function
+    /// rather than a second resting-state constant.
     pub fn current(
         &mut self,
         side: i32,
         energy: f32,
+        animate: bool,
     ) -> Option<(&MemoryRenderBuffer, crate::orb::OrbMotion)> {
         if side <= 0 {
             return None;
         }
         let now = Instant::now();
         let epoch = *self.epoch.get_or_insert(now);
-        let motion = crate::orb::motion_at(now.saturating_duration_since(epoch), energy);
+        let elapsed = if animate {
+            now.saturating_duration_since(epoch)
+        } else {
+            std::time::Duration::ZERO
+        };
+        let motion = crate::orb::motion_at(elapsed, energy);
 
         let pal = crate::orb::OrbPalette::default();
         if self.key != Some((side, pal)) {
@@ -367,22 +432,44 @@ impl OrbCache {
     }
 }
 
-/// Rasterize a rounded rectangle of `color` into a premultiplied [B,G,R,A] buffer,
-/// anti-aliased at the corners via a rounded-box signed-distance field. The scene
-/// carries a `radius` on the card / omnibox rects that a `SolidColorRenderElement`
-/// (always a hard quad) cannot express, so those rects lower through a cached
-/// MemoryRenderBuffer of THIS shape instead. Byte order + premultiply match
+/// Rasterize a rounded rectangle into a premultiplied [B,G,R,A] buffer, anti-aliased at
+/// the corners via a rounded-box signed-distance field, filled with a linear gradient from
+/// `from` to `to` along `angle_deg`. A SOLID tile is this with `from == to`, which is why
+/// there is one rasterizer and not two: the scene's card art and its card background are
+/// the same shape with a different fill, and a second copy of the SDF is exactly the drift
+/// the shell's own brand-art module was written to end.
+///
+/// The scene carries a `radius` on the card / omnibox / art rects that a
+/// `SolidColorRenderElement` (always a hard quad) cannot express, so those lower through a
+/// cached MemoryRenderBuffer of THIS shape instead. Byte order + premultiply match
 /// text_render.rs and bloom.rs (Argb8888 little-endian = B,G,R,A, premultiplied).
-fn rounded_rect_rgba(w: u32, h: u32, radius: f32, color: [f32; 4]) -> Vec<u8> {
+///
+/// `angle_deg` follows CSS `linear-gradient`: 0 points UP the tile and the angle increases
+/// clockwise, so 135 runs top-left to bottom-right. The gradient line is centred on the
+/// tile and its length is `|w*sin| + |h*cos|`, which is what makes the last stop land
+/// exactly on the far corner rather than short of it.
+fn rounded_rect_rgba(
+    w: u32,
+    h: u32,
+    radius: f32,
+    from: [f32; 4],
+    mid: [f32; 4],
+    mid_at: f32,
+    to: [f32; 4],
+    angle_deg: f32,
+) -> Vec<u8> {
     let mut rgba = vec![0u8; (w * h * 4) as usize];
     let hw = w as f32 / 2.0;
     let hh = h as f32 / 2.0;
     // A radius past half the short side is just a fuller pill / circle.
     let r = radius.clamp(0.0, hw.min(hh));
-    let ca = color[3].clamp(0.0, 1.0);
-    let cr = color[0].clamp(0.0, 1.0);
-    let cg = color[1].clamp(0.0, 1.0);
-    let cb = color[2].clamp(0.0, 1.0);
+    let solid = from == to;
+    // Screen space has y DOWN, so the CSS "up" axis is -y: the unit vector along the
+    // gradient line is (sin, -cos).
+    let rad = angle_deg.to_radians();
+    let (dx, dy) = (rad.sin(), -rad.cos());
+    let len = (w as f32 * dx).abs() + (h as f32 * dy).abs();
+    let inv_len = if len > 0.0 { 1.0 / len } else { 0.0 };
     for y in 0..h {
         for x in 0..w {
             // Pixel centre relative to the rect centre.
@@ -398,12 +485,80 @@ fn rounded_rect_rgba(w: u32, h: u32, radius: f32, color: [f32; 4]) -> Vec<u8> {
             if cov <= 0.0 {
                 continue;
             }
-            let a = ca * cov;
+            // Position along the gradient line, 0 at the first stop's end. The projection
+            // is centred, so shifting by half the length puts 0 at the start edge.
+            let t = if solid {
+                0.0
+            } else {
+                ((px * dx + py * dy) * inv_len + 0.5).clamp(0.0, 1.0)
+            };
+            // Three stops, because the shell's own no-blur floor is a three-stop ramp
+            // (teal leads, violet accents) and a two-stop copy of it loses the accent.
+            // A TWO-stop gradient is this with `mid` on the line between the ends, so
+            // there is one ramp here and not a second code path for the simpler case.
+            let ch = |i: usize| {
+                let v = if t <= mid_at {
+                    let k = if mid_at > 0.0 { t / mid_at } else { 0.0 };
+                    from[i] + (mid[i] - from[i]) * k
+                } else {
+                    let span = (1.0 - mid_at).max(f32::EPSILON);
+                    let k = (t - mid_at) / span;
+                    mid[i] + (to[i] - mid[i]) * k
+                };
+                v.clamp(0.0, 1.0)
+            };
+            let a = ch(3) * cov;
             let idx = ((y * w + x) * 4) as usize;
-            rgba[idx] = (cb * a * 255.0) as u8;
-            rgba[idx + 1] = (cg * a * 255.0) as u8;
-            rgba[idx + 2] = (cr * a * 255.0) as u8;
+            rgba[idx] = (ch(2) * a * 255.0) as u8;
+            rgba[idx + 1] = (ch(1) * a * 255.0) as u8;
+            rgba[idx + 2] = (ch(0) * a * 255.0) as u8;
             rgba[idx + 3] = (a * 255.0) as u8;
+        }
+    }
+    rgba
+}
+
+/// Rasterize a DROP SHADOW: the rounded box, blurred, into a premultiplied buffer.
+///
+/// The buffer is the caster grown by `blur` on every side, so the caller draws it at
+/// `(rect.x - blur, rect.y + offset_y - blur)` and the shape lands where the box is.
+///
+/// APPROXIMATED, and worth saying which way. A CSS box-shadow is the shape convolved with
+/// a Gaussian of about `blur/2`; this ramps the alpha across `blur` centred on the edge
+/// with a smoothstep instead. The difference is a fraction of a pixel of softness at the
+/// extremes and no convolution at all, which matters because this is the software floor's
+/// depth: the shell keeps this shadow on every tier precisely because it "rasters ONCE and
+/// composites cheaply forever", and a real blur here would make it the opposite.
+fn shadow_rgba(w: u32, h: u32, radius: f32, blur: f32, color: [f32; 4]) -> Vec<u8> {
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    // The CASTER sits inset by `blur` inside this buffer.
+    let bw = w as f32 - 2.0 * blur;
+    let bh = h as f32 - 2.0 * blur;
+    let (hw, hh) = (bw / 2.0, bh / 2.0);
+    let r = radius.clamp(0.0, hw.min(hh).max(0.0));
+    let cx = w as f32 / 2.0;
+    let cy = h as f32 / 2.0;
+    let ramp = blur.max(f32::EPSILON);
+    for y in 0..h {
+        for x in 0..w {
+            let px = x as f32 + 0.5 - cx;
+            let py = y as f32 + 0.5 - cy;
+            let qx = px.abs() - (hw - r);
+            let qy = py.abs() - (hh - r);
+            let dist =
+                (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r;
+            // 1 well inside, 0 a blur-radius outside, smooth across the edge.
+            let t = (0.5 - dist / ramp).clamp(0.0, 1.0);
+            let cov = t * t * (3.0 - 2.0 * t);
+            if cov <= 0.0 {
+                continue;
+            }
+            let a = color[3].clamp(0.0, 1.0) * cov;
+            let i = ((y * w + x) * 4) as usize;
+            rgba[i] = (color[2] * a * 255.0) as u8;
+            rgba[i + 1] = (color[1] * a * 255.0) as u8;
+            rgba[i + 2] = (color[0] * a * 255.0) as u8;
+            rgba[i + 3] = (a * 255.0) as u8;
         }
     }
     rgba
@@ -415,7 +570,16 @@ fn rounded_rect_rgba(w: u32, h: u32, radius: f32, color: [f32; 4]) -> Vec<u8> {
 /// per-frame cost of a rounded panel is a GPU blit, not a CPU rasterize.
 #[derive(Default)]
 pub struct RectCache {
-    cache: std::collections::HashMap<(u32, u32, u32, u32, u32, u32, u32), MemoryRenderBuffer>,
+    /// Unbounded on purpose, unlike the text cache which had to gain a cap: every part of
+    /// this key comes from LAYOUT, never from the feed. Sizes are the layout constants
+    /// plus a handful that track the output width, radii are constants, and colours are
+    /// the theme's plus one hover lift per card. That is a few dozen combinations for a
+    /// given output, not a set that grows with what the agent writes.
+    #[allow(clippy::type_complexity)]
+    cache: std::collections::HashMap<
+        (u32, u32, u32, [u32; 4], [u32; 4], u32, [u32; 4], u32),
+        MemoryRenderBuffer,
+    >,
     /// POOL for the sharp-rect path. The first cut built a `SolidColorBuffer` per rect per
     /// frame, which is the other half of the zero-per-frame-alloc NFR (the retained tree in
     /// `scene::SceneCache` was the first). Buffers are handed out in paint order and reused
@@ -426,6 +590,10 @@ pub struct RectCache {
     /// How many solid buffers were ever actually allocated. The pooling PROOF: a steady
     /// desktop must not grow this per frame.
     solid_allocs: u64,
+    /// How many rounded-rect buffers were ever composed. The other half of the same
+    /// proof: a rounded rect is a per-pixel SDF rasterize, so recomposing one per frame
+    /// would be far more expensive than the solid pool it sits beside.
+    rounded_composes: u64,
 }
 
 impl RectCache {
@@ -465,31 +633,163 @@ impl RectCache {
         radius: f32,
         color: [f32; 4],
     ) -> Option<&MemoryRenderBuffer> {
+        // A flat fill is the degenerate gradient, so it goes through the same tile: one
+        // rasterizer, one cache, one compose-once counter.
+        self.tile(w, h, radius, color, color, 0.5, color, 0.0)
+    }
+
+    /// The card-art buffer: the same rounded tile, filled with the scene's two-stop
+    /// gradient. Keyed on both stops and the angle, so the whole desktop's art is a
+    /// handful of buffers (six hues by three angles at one card size), each composed once.
+    pub fn gradient(
+        &mut self,
+        w: i32,
+        h: i32,
+        radius: f32,
+        from: [f32; 4],
+        to: [f32; 4],
+        angle_deg: f32,
+    ) -> Option<&MemoryRenderBuffer> {
+        // Two stops is three with the middle ON the line between the ends, which is
+        // exactly the ramp it already was: same pixels, no second path.
+        let mid = [
+            (from[0] + to[0]) * 0.5,
+            (from[1] + to[1]) * 0.5,
+            (from[2] + to[2]) * 0.5,
+            (from[3] + to[3]) * 0.5,
+        ];
+        self.tile(w, h, radius, from, mid, 0.5, to, angle_deg)
+    }
+
+    /// The blurred shadow buffer for a caster of these dims. Same cache, same
+    /// compose-once counter: a desktop of identical cards composes exactly one.
+    ///
+    /// Keyed through the tile map by putting the blur where the angle goes and a sentinel
+    /// radius, so a shadow and a tile of the same size can never collide.
+    pub fn shadow(
+        &mut self,
+        w: i32,
+        h: i32,
+        radius: f32,
+        blur: f32,
+        color: [f32; 4],
+    ) -> Option<&MemoryRenderBuffer> {
+        let (bw, bh) = (w + 2.0_f32.mul_add(blur, 0.0) as i32, h + (2.0 * blur) as i32);
+        if bw < 1 || bh < 1 {
+            return None;
+        }
+        let bits = |c: [f32; 4]| [c[0].to_bits(), c[1].to_bits(), c[2].to_bits(), c[3].to_bits()];
+        // `SHADOW` in the mid slot: a marker no colour can produce, so the key space is
+        // shared with the tiles without either being able to answer for the other.
+        const SHADOW: [u32; 4] = [u32::MAX, u32::MAX, u32::MAX, u32::MAX];
+        let key = (
+            bw as u32,
+            bh as u32,
+            radius.to_bits(),
+            bits(color),
+            SHADOW,
+            blur.to_bits(),
+            bits(color),
+            0u32,
+        );
+        let Self {
+            cache,
+            rounded_composes,
+            ..
+        } = self;
+        match cache.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let rgba = shadow_rgba(bw as u32, bh as u32, radius, blur, color);
+                *rounded_composes += 1;
+                Some(e.insert(MemoryRenderBuffer::from_slice(
+                    &rgba,
+                    Fourcc::Argb8888,
+                    (bw, bh),
+                    1,
+                    Transform::Normal,
+                    None,
+                )))
+            }
+        }
+    }
+
+    /// A THREE-stop tile, for the one place the shell uses one: its no-blur chrome floor.
+    pub fn gradient3(
+        &mut self,
+        w: i32,
+        h: i32,
+        radius: f32,
+        from: [f32; 4],
+        mid: [f32; 4],
+        mid_at: f32,
+        to: [f32; 4],
+        angle_deg: f32,
+    ) -> Option<&MemoryRenderBuffer> {
+        self.tile(w, h, radius, from, mid, mid_at, to, angle_deg)
+    }
+
+    /// The one composed-tile path behind `rounded` and `gradient`.
+    #[allow(clippy::too_many_arguments)]
+    fn tile(
+        &mut self,
+        w: i32,
+        h: i32,
+        radius: f32,
+        from: [f32; 4],
+        mid: [f32; 4],
+        mid_at: f32,
+        to: [f32; 4],
+        angle_deg: f32,
+    ) -> Option<&MemoryRenderBuffer> {
         if w < 1 || h < 1 {
             return None;
         }
+        let bits = |c: [f32; 4]| [c[0].to_bits(), c[1].to_bits(), c[2].to_bits(), c[3].to_bits()];
+        // A solid tile keys its angle as zero whatever was passed, so the same colour at
+        // two angles is one buffer rather than two identical ones.
+        let angle_key = if from == to && mid == to { 0.0f32 } else { angle_deg };
         let key = (
             w as u32,
             h as u32,
             radius.to_bits(),
-            color[0].to_bits(),
-            color[1].to_bits(),
-            color[2].to_bits(),
-            color[3].to_bits(),
+            bits(from),
+            bits(mid),
+            mid_at.to_bits(),
+            bits(to),
+            angle_key.to_bits(),
         );
-        if !self.cache.contains_key(&key) {
-            let rgba = rounded_rect_rgba(w as u32, h as u32, radius, color);
-            let buf = MemoryRenderBuffer::from_slice(
-                &rgba,
-                Fourcc::Argb8888,
-                (w, h),
-                1,
-                Transform::Normal,
-                None,
-            );
-            self.cache.insert(key, buf);
+        // Destructured so the counter and the map are DISJOINT borrows: that is what lets
+        // the vacant arm bump `rounded_composes` while still holding the entry, and so
+        // lets one `entry` lookup replace the contains_key/insert/get triple this used to
+        // hash the key three times for.
+        let Self {
+            cache,
+            rounded_composes,
+            ..
+        } = self;
+        match cache.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let rgba =
+                rounded_rect_rgba(w as u32, h as u32, radius, from, mid, mid_at, to, angle_deg);
+                *rounded_composes += 1;
+                Some(e.insert(MemoryRenderBuffer::from_slice(
+                    &rgba,
+                    Fourcc::Argb8888,
+                    (w, h),
+                    1,
+                    Transform::Normal,
+                    None,
+                )))
+            }
         }
-        self.cache.get(&key)
+    }
+
+    /// Total composed tiles ever rasterized, solid and gradient alike (test hook for the
+    /// compose-once proof).
+    pub fn rounded_composes(&self) -> u64 {
+        self.rounded_composes
     }
 }
 
@@ -583,6 +883,55 @@ pub trait CompState:
         false
     }
 
+    /// Store the native-scene flag. Default = a NO-OP, and deliberately so: a backend
+    /// with no such field has no native scene to turn on, and pretending otherwise is
+    /// the failure mode `window.resize` was caught in on 2026-09-10 (it answered `ok`
+    /// for a resize the client had declined). The caller reads `native_shell_on` back
+    /// and reports what the flag ACTUALLY says, so a backend that cannot honour the
+    /// request says so rather than appearing to obey.
+    fn set_native_shell_flag(&mut self, _on: bool) {}
+
+    /// Toggle the native scene render path at RUNTIME (the `shell.native` IPC verb's
+    /// executor), mirroring `set_capture_blocked` next door. Returns the new state,
+    /// which is what the flag reads AFTER the attempt, never what was asked for.
+    ///
+    /// Why a runtime toggle exists at all, when M6 will flip the default: the one
+    /// measurement this program has never taken is its own headline claim.
+    /// `pointer_surface` can attribute an input to TOPBAR/CARD/ORB only while the
+    /// native scene is drawn, so with the flag off every latency sample is
+    /// `component=shell` by construction, which is exactly what the box reported on
+    /// 2026-09-10, ~4,200 samples with one distinct component. Turning the scene on
+    /// meant an env var read once at session start: a new generation, a reboot, and no
+    /// way back except another reboot. Over this socket it is one call with an instant
+    /// undo, so the native-versus-shell delta can be measured in one session on one
+    /// machine minutes apart, and a surprise is reverted in the time it takes to send
+    /// `{"on": false}`.
+    fn set_native_shell(&mut self, on: bool) -> bool {
+        set_native_shell_shared(self, on)
+    }
+
+    /// Is the compositor GPU-compositing RIGHT NOW (a live GLES renderer), as opposed to
+    /// painting through the pixman software floor?
+    ///
+    /// This is the native mirror of the shell's `body.gpu-hardware` class, and it exists
+    /// for the same reason that class does: the HTML shell runs its breathing orb, its
+    /// hover transforms and its live dots ONLY under `body.gpu-hardware`, because on a
+    /// software renderer those re-rasterise on the CPU every frame. That is not
+    /// hypothetical here either. liquid_ui_service records the real-HW consequence
+    /// (2026-07-12): GPU-only effects armed on a CPU renderer "re-rasterised a 60fps
+    /// canvas + an animated software blur on the ONE WebKit thread and HUNG the whole
+    /// shell".
+    ///
+    /// Defaults to FALSE, the floor, so a backend that does not track its renderer never
+    /// claims hardware motion it cannot afford.
+    fn motion_hardware(&self) -> bool {
+        false
+    }
+    /// Record whether the live renderer is the GPU one. The DRM backend sets this each
+    /// tick from whether its `GlesRenderer` is still present, so a mid-session demotion
+    /// to the pixman floor stands the animation down on the very next frame.
+    fn set_motion_hardware(&mut self, _on: bool) {}
+
     /// NATIVE SHELL M2 press half: how many pointer buttons the seat currently holds
     /// down, maintained by the shared `on_pointer_button` via `note_pointer_button`.
     /// The native scene reads `pointer_pressed` so the orb reacts to a click held over
@@ -595,6 +944,22 @@ pub trait CompState:
     fn note_pointer_button(&mut self, _down: bool) {}
     fn pointer_pressed(&self) -> bool {
         false
+    }
+
+    /// How far each card row is scrolled sideways. Default-empty for a backend that
+    /// keeps no scroll state, which is also the honest answer for the WebView desktop:
+    /// its rows scroll themselves.
+    fn row_scroll(&self) -> crate::scene::RowScroll {
+        crate::scene::RowScroll::default()
+    }
+    /// Record a new scroll state. A no-op for a backend that keeps none.
+    fn set_row_scroll(&mut self, _s: crate::scene::RowScroll) {}
+
+    /// The retained native scene tree, for asking what a point is over. None for a
+    /// backend that keeps no scene, which is also the honest answer for the WebView
+    /// desktop: nothing native is laid out, so nothing native can be named.
+    fn native_tree(&self) -> Option<&crate::scene::SceneNode> {
+        None
     }
 
     /// NATIVE SHELL M3: the latest home_compose scene pushed over the `shell.compose`
@@ -622,14 +987,14 @@ pub trait CompState:
     /// The 4th is the RETAINED scene tree: it must come through this same accessor
     /// rather than a separate method, because the lowering needs the tree borrowed at
     /// the same time as the buffer caches, and two `&mut self` accessors cannot overlap.
-    fn native_scene_caches(
-        &mut self,
-    ) -> (
-        &mut crate::text_render::TextRasterizer,
-        &mut OrbCache,
-        &mut RectCache,
-        &mut crate::scene::SceneCache,
-    );
+    ///
+    /// The 1st is the composed home as a SHARED borrow riding alongside those `&mut`s
+    /// (disjoint fields, so this is one split borrow, not a conflict). It is here purely
+    /// to kill an allocation: `render_native_scene` used to CLONE the HomeCompose every
+    /// frame just to end the state borrow before taking the caches, which is the last
+    /// per-frame heap traffic the zero-alloc NFR named. None means no `shell.compose`
+    /// has landed and the caller falls back to `scene::demo_ref()`.
+    fn native_scene_caches(&mut self) -> NativeSceneCaches<'_>;
 
     // ── IPC event fan-out (window.opened/closed/focused…). The winit backend pushes
     //    framed JSON to its `IpcState` subscribers; the DRM backend logs the edge.
@@ -784,11 +1149,76 @@ pub fn work_area(
     (ox, oy + top, ow, oh - top - bottom)
 }
 
+/// The chrome the NATIVE scene paints, expressed as a reservation.
+///
+/// THE CONTRACT INVERTS AT M6, and this is the half that inverts it. While the
+/// WebView draws the bars, the shell is the only thing that knows their size and it
+/// publishes `PANEL_RESERVATION_PATH`. Once the compositor paints them, the
+/// compositor is what knows -- and the file's only publisher is exactly the process
+/// M6 demotes. Nothing would write it, `panel_reservation` would fail safe to zero,
+/// and a maximized window would cover the native bars: the 2026-08-29 "taskbar
+/// unreachable" report arriving through the new renderer.
+///
+/// Both numbers come from the SAME sources the scene lays out from, so the
+/// reservation cannot disagree with the pixels. `top_bar_h` is off the active theme,
+/// because four of the ten shipped themes move it (36/38/40/44). `TASKBAR_H` is the
+/// scene constant that tests/unit/test_panel_reservation.py already pins to the
+/// shell's Python constant. Neither is a new number.
+pub fn native_chrome_reservation() -> PanelReservation {
+    let theme = active_theme();
+    PanelReservation {
+        top: theme.top_bar_h.round().max(0.0) as i32,
+        bottom: crate::scene::TASKBAR_H.round().max(0.0) as i32,
+    }
+}
+
+/// What placement must avoid, given what the shell published and what the scene
+/// draws. PURE, so the merge rule is testable with no output and no theme file.
+///
+/// `None` -- the flag off -- returns the published value UNCHANGED. Every existing
+/// placement path is then byte-identical to before, which is what lets this ship
+/// ahead of the flip with zero risk to the desktop that is actually running.
+///
+/// With the scene on, the edges merge BY MAXIMUM rather than the native value
+/// replacing the published one. That is deliberate, and it is the honest reading of
+/// every state this can be in:
+///
+///   * Transition, which is where the box is today: `shell.native {on}` draws the
+///     scene WITHOUT standing the WebView down, since that hand-off is a separate M6
+///     obligation. Both sets of bars are genuinely on screen, so reserving the larger
+///     of each edge is the only value that covers what is drawn.
+///   * After the demotion: the file is absent, `panel_reservation` fails safe to
+///     zero, and the maximum is the native value. Which is the whole point.
+///   * A STALE file left behind by the demoted shell can then only ever
+///     OVER-reserve. That asymmetry is the reason for the maximum: over-reserving
+///     costs a band of unused desktop, under-reserving costs a bar the user cannot
+///     reach, and `work_area` already caps the absurd case at half the output.
+pub fn effective_reservation(
+    published: PanelReservation,
+    native: Option<PanelReservation>,
+) -> PanelReservation {
+    match native {
+        None => published,
+        Some(n) => PanelReservation {
+            top: published.top.max(n.top),
+            bottom: published.bottom.max(n.bottom),
+        },
+    }
+}
+
 /// The live work area. THE single place window placement learns where it may lay
 /// things out; `output_geometry` must not be read directly for that purpose again.
 pub fn work_area_for<S: CompState>(state: &S) -> Option<(i32, i32, i32, i32)> {
     let g = state.space().output_geometry(state.output())?;
-    Some(work_area(g.loc.x, g.loc.y, g.size.w, g.size.h, panel_reservation()))
+    // `native_shell_on`, NOT `native_scene_drawn`. The killswitch blacks the screen
+    // out and skips the scene for that frame, but the bars have not stopped existing
+    // and window placement must not shuffle every window because the display went
+    // dark for a moment.
+    let reserved = effective_reservation(
+        panel_reservation(),
+        state.native_shell_on().then(native_chrome_reservation),
+    );
+    Some(work_area(g.loc.x, g.loc.y, g.size.w, g.size.h, reserved))
 }
 
 /// The current output size in PHYSICAL (framebuffer) pixels. Screencopy reports this
@@ -881,6 +1311,25 @@ pub fn set_capture_blocked_shared<S: CompState>(state: &mut S, on: bool) -> bool
         info!(blocked = on, "screen.kill — capture/input/screencopy gate toggled");
     }
     state.capture_blocked()
+}
+
+/// The native-scene toggle (the `CompState::set_native_shell` default body). Named
+/// distinctly from the trait method for the same reason as its neighbour above: a
+/// default body that called the trait method would recurse into itself.
+///
+/// It logs the OUTCOME, not the request. `set_native_shell_flag` is a no-op on any
+/// backend without the field, so `took` can be false, and a log line saying the scene
+/// was turned on when it was not is worse than no line at all.
+pub fn set_native_shell_shared<S: CompState>(state: &mut S, on: bool) -> bool {
+    if state.native_shell_on() != on {
+        state.set_native_shell_flag(on);
+        info!(
+            native = on,
+            took = state.native_shell_on() == on,
+            "shell.native: the native scene render path toggled at runtime"
+        );
+    }
+    state.native_shell_on()
 }
 
 // ── input routing (keyboard focus + pointer hit-test + click-to-focus) ──
@@ -1059,28 +1508,34 @@ pub fn process_input_event<S: CompState, B: InputBackend>(state: &mut S, event: 
     // bias the estimator toward busy periods. `Event::time()` is libinput's
     // CLOCK_MONOTONIC microseconds — the kernel stamp, taken before any of
     // our code ran, which is the entire point of the instrument.
+    // WHICH surface this input touched, resolved once for the whole match against the
+    // retained scene tree. Before this every sample was reported as `component=shell`,
+    // so latency_budgets.json's 23 per-component rows were dead and a slow orb was
+    // indistinguishable from a slow marketplace.
+    let surface = pointer_surface(state);
     match &event {
         InputEvent::Keyboard { event } => {
-            crate::latency::on_input(crate::latency::Kind::Key, event.time());
+            crate::latency::on_input(surface, crate::latency::Kind::Key, event.time());
             note_input_alive();
         }
         InputEvent::PointerMotion { event } => {
-            crate::latency::on_motion(event.time());
+            crate::latency::on_motion(surface, event.time());
             note_input_alive();
         }
         InputEvent::PointerMotionAbsolute { event } => {
-            crate::latency::on_motion(event.time());
+            crate::latency::on_motion(surface, event.time());
             note_input_alive();
         }
         InputEvent::PointerButton { event } => {
             crate::latency::on_button(
+                surface,
                 event.state() == ButtonState::Pressed,
                 event.time(),
             );
             note_input_alive();
         }
         InputEvent::PointerAxis { event } => {
-            crate::latency::on_input(crate::latency::Kind::Scroll, event.time());
+            crate::latency::on_input(surface, crate::latency::Kind::Scroll, event.time());
             note_input_alive();
         }
         _ => {}
@@ -1596,6 +2051,13 @@ pub fn on_pointer_button<S: CompState, B: InputBackend>(state: &mut S, evt: B::P
     // route through, so there is no second button path.
     state.note_pointer_button(button_state == ButtonState::Pressed);
     if button_state == ButtonState::Pressed {
+        // The native scene gets first refusal on a press, and ONLY when it can actually
+        // do something with it (see `activate_native_card_under_pointer`). Before the
+        // focus update and before the seat, because a consumed click must not also move
+        // keyboard focus to whatever surface happens to sit under the native pixels.
+        if activate_native_card_under_pointer(state) {
+            return;
+        }
         update_keyboard_focus(state, state.pointer().current_location(), serial);
     }
     let pointer = state.pointer().clone();
@@ -1635,9 +2097,120 @@ pub fn on_pointer_axis<S: CompState, B: InputBackend>(state: &mut S, evt: B::Poi
             frame = frame.stop(Axis::Vertical);
         }
     }
+    // A2's card rails, before the frame goes to the client: a wheel over a row scrolls
+    // THAT row sideways. Handled here rather than as a client event because the rows are
+    // ours, painted by the compositor; a client under the pointer still gets its frame
+    // below, exactly as it did.
+    // libinput reports axis amounts as f64; the scene works in f32 logical px.
+    scroll_row_under_pointer(state, vertical as f32, horizontal as f32);
+
     let pointer = state.pointer().clone();
     pointer.axis(state, frame);
     pointer.frame(state);
+}
+
+/// One wheel notch, in logical px of row travel.
+///
+/// libinput reports a mouse notch as 15 units (or 120 in the v120 axis, normalised to 15
+/// above), and a touchpad reports continuous units. Eight px per unit puts a notch at
+/// 120px, which is the browser's own wheel step and so what the shell's `overflow-x`
+/// rails already move by: the same gesture travels the same distance on both renderers.
+const SCROLL_PX_PER_UNIT: f32 = 8.0;
+
+/// PURE: how far one axis event moves a row, in logical px.
+///
+/// Extracted like `gles_should_demote` / `flip_action` / `master_step`, and for the same
+/// reason: the decision is unit-testable on any dev box while the state-touching glue
+/// around it is not. A vertical wheel scrolls a horizontal rail, which is what a browser
+/// does over an `overflow-x` element with nothing to scroll vertically, and so what this
+/// desktop's users already get from the shell. A sideways swipe scrolls it too, and the
+/// two are SUMMED rather than one winning: a diagonal touchpad gesture should move the
+/// row by what the finger actually travelled.
+fn row_scroll_delta(vertical: f32, horizontal: f32) -> f32 {
+    let d = (vertical + horizontal) * SCROLL_PX_PER_UNIT;
+    if d.is_finite() {
+        d
+    } else {
+        0.0
+    }
+}
+
+/// Scroll the card row under the pointer, if a card row is under the pointer.
+///
+/// A vertical wheel scrolls a horizontal rail, which is what a browser does over an
+/// `overflow-x` element with nothing to scroll vertically, and so what this desktop's
+/// users already expect from the shell. A horizontal wheel or a two-finger sideways swipe
+/// scrolls it too, and the two are summed rather than fought over.
+/// A press on a native card: tell whoever is listening WHICH card, and consume the click.
+///
+/// Returns whether the click was consumed, which is true ONLY when every one of these
+/// holds: the native scene is actually drawn, the press landed on a card, and the
+/// activation reached at least one live subscriber.
+///
+/// THAT LAST CONDITION IS THE POINT. `events.subscribe` has no subscriber in the tree
+/// today, so without it this would swallow clicks into silence the moment the native
+/// shell came on: the scene cannot act on them and the shell underneath would never see
+/// them. With it, an unheard activation leaves the click to fall through exactly as it
+/// does now, so this can ship ahead of its consumer with no way to make the desktop worse.
+///
+/// It sends IDENTITY, not intent: (row, card) into the composed payload. The listener
+/// holds the same composition and already knows that "ask" focuses the command bar and
+/// "open" opens a panel, so the compositor never learns the action vocabulary and there
+/// is no second executor. Both indices are already server-sanitized before they are
+/// composed, so nothing here can widen what a card is allowed to do.
+fn activate_native_card_under_pointer<S: CompState>(state: &mut S) -> bool {
+    if !native_scene_drawn(state.native_shell_on(), state.capture_blocked()) {
+        return false;
+    }
+    let size = output_physical_size(state);
+    let Some((px, py)) = native_pointer_scene_pos(state, size) else {
+        return false;
+    };
+    let Some((row, card)) = state.native_tree().and_then(|t| t.card_at(px, py)) else {
+        return false;
+    };
+    let delivered = state.ipc_state_mut().emit_event(
+        "shell.activate",
+        serde_json::json!({ "row": row, "card": card }),
+    );
+    if delivered {
+        info!(row, card, "shell.activate (native card press handed to the shell)");
+    } else {
+        debug!(
+            row,
+            card, "native card press NOT consumed: no subscriber to act on it"
+        );
+    }
+    delivered
+}
+
+fn scroll_row_under_pointer<S: CompState>(state: &mut S, vertical: f32, horizontal: f32) {
+    if !native_scene_drawn(state.native_shell_on(), state.capture_blocked()) {
+        return;
+    }
+    let delta = row_scroll_delta(vertical, horizontal);
+    if delta == 0.0 {
+        return;
+    }
+    let size = output_physical_size(state);
+    let Some((px, py)) = native_pointer_scene_pos(state, size) else {
+        return;
+    };
+    let Some(row) = state.native_tree().and_then(|t| t.row_at(px, py)) else {
+        return;
+    };
+    // The row's own extents, from the payload that laid it out. A row with fewer cards
+    // than fit has nothing to scroll and the clamp pins it, which is what stops a stray
+    // wheel sliding a two-card row off its gutter.
+    let cards = state
+        .native_home()
+        .map(|h| h.rows.get(row).map(|r| r.cards.len()).unwrap_or(0))
+        .unwrap_or(0);
+    let content_w = crate::scene::RowScroll::content_width(cards);
+    let view_w = crate::scene::row_view_width(size.w as f32, size.h as f32);
+    let mut sc = state.row_scroll();
+    sc.scroll(row, delta, content_w, view_w);
+    state.set_row_scroll(sc);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1977,15 +2550,110 @@ pub fn workspace_fade_alpha<S: CompState>(state: &S) -> f32 {
 /// Is any effect still animating (a window mid-fade, or a workspace crossfade in
 /// flight)? The loop forces a redraw next iteration while true.
 pub fn effects_animating<S: CompState>(state: &S) -> bool {
-    if let Some(t) = state.ws_switch_at() {
-        if t.elapsed().as_millis() < WS_FADE_MS {
-            return true;
-        }
-    }
-    state
+    let ws_fading = state
+        .ws_switch_at()
+        .is_some_and(|t| t.elapsed().as_millis() < WS_FADE_MS);
+    let map_animating = state
         .space()
         .elements()
-        .any(|w| w.user_data().get::<MapAnim>().map(|a| a.animating()).unwrap_or(false))
+        .any(|w| w.user_data().get::<MapAnim>().map(|a| a.animating()).unwrap_or(false));
+    scene_animates(
+        native_scene_drawn(state.native_shell_on(), state.capture_blocked()),
+        state.motion_hardware(),
+        theme_potato(),
+        motion_reduced(),
+        ws_fading,
+        map_animating,
+    )
+}
+
+/// PURE: is the native scene actually drawn this frame? The flag alone is not the answer.
+/// Under the privacy killswitch an opaque full-output black solid is pushed above
+/// everything, so the scene beneath it is invisible: lowering it is wasted work, and
+/// because a drawn native scene holds the frame-budget gate open (see `scene_animates`),
+/// counting it would composite at full rate behind a blacked-out screen.
+///
+/// ONE predicate for both decisions, so "we draw it" and "it animates" can never drift
+/// Whether `HART_NATIVE_SHELL` asks for the native scene. PURE, so the parse is testable
+/// without an environment.
+///
+/// This was `env::var_os(..).is_some()`, which reads the PRESENCE of the variable and not
+/// its value, so `HART_NATIVE_SHELL=0` turned the native shell ON. That is the wrong
+/// answer to the most likely way anyone would try to turn it off, and it is the shape of
+/// footgun that only ever fires on a box, in front of someone, at the moment they are
+/// trying to get back to a working desktop.
+///
+/// Truthy is the small explicit set rather than "anything but 0", so a typo reads as OFF.
+/// OFF is the safe direction here: it is the shipped desktop.
+pub fn native_shell_env_on(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+    }
+}
+
+/// apart. The bloom backdrop and the M2 orb already carry the same `!capture_blocked`
+/// condition inline; this is the M3 scene joining them rather than a new policy.
+pub fn native_scene_drawn(native_shell_on: bool, capture_blocked: bool) -> bool {
+    native_shell_on && !capture_blocked
+}
+
+/// PURE: does the scene animate CONTINUOUSLY, so the tick must composite rather than
+/// coast on the idle heartbeat? Split out for the same reason `wants_paint` is split from
+/// `should_paint`: the rule is then unit-testable without building a compositor State.
+///
+/// The native shell counts because its orb BREATHES. `orb::motion_at` is a function of
+/// the clock, so while the native scene is drawn the desktop is animating by
+/// construction, and the 200ms idle heartbeat would render that breath as a 5 Hz stutter,
+/// against the program's 60fps NFR. What makes this affordable rather than the
+/// "catastrophic at 60Hz" full repaint is damage tracking: the tick composites, but only
+/// the orb's own region actually changed, which is exactly the case damage tracking
+/// exists for (and which the element-identity test pins down).
+///
+/// It is gated on the flag, not on the orb's existence, because the orb is drawn beneath
+/// the WebView shell today and OCCLUDED by it: invisible breathing must not cost the
+/// shipped desktop its idle saving. So flag off, behaviour is exactly what it was.
+pub fn scene_animates(
+    native_scene_drawn: bool,
+    motion_hardware: bool,
+    theme_potato: bool,
+    motion_reduced: bool,
+    ws_fading: bool,
+    map_animating: bool,
+) -> bool {
+    // REDUCED MOTION is not a performance floor and is not overridable by one: it is the
+    // user saying stop. The shell has three independent motion kill-switches and the CSS
+    // parity ledger is explicit that all three must exist natively; this is the one that
+    // is a stated preference rather than a hardware verdict, so it wins over everything,
+    // including the transients below. A workspace fade the user asked not to see is
+    // exactly what `prefers-reduced-motion` exists to stop.
+    if motion_reduced {
+        return false;
+    }
+    // The native scene animates because its ORB breathes, and the orb breathes only on
+    // hardware, exactly as `body.gpu-hardware #hart-voice-orb` does. Without the second
+    // condition a drawn native scene held this gate open forever, so the pixman software
+    // floor would have CPU-composited a still desktop at 60fps: the frame-budget gate
+    // (#137) exists precisely to stop that, and the native shell was the one thing that
+    // could defeat it, on the weakest hardware in the fleet.
+    //
+    // The workspace fade and the map animation are unconditional because they are
+    // TRANSIENT: a few hundred milliseconds once, not a permanent 60fps hold, and both
+    // are motion the user just asked for by switching or opening something.
+    // `theme_potato` is the OTHER half of the shell's own reduced-effects verdict.
+    // liquid_ui_service computes `is_potato = perf.disable_blur or gpu_mode == 'software'`
+    // and that one flag strips its animation strings before they are ever emitted. The
+    // GPU half was already mirrored by `motion_hardware`; this is the theme half, and it
+    // is one key in a file the compositor already reads, so the third of the ledger's
+    // motion kill-switches was never as far away as it looked.
+    //
+    // It sheds the same thing the hardware floor sheds and no more, which is rule 5's
+    // "degrade gracefully, never gut": the PERPETUAL breath goes, the brief transients
+    // stay. Only a stated preference stops those.
+    (native_scene_drawn && motion_hardware && !theme_potato) || ws_fading || map_animating
 }
 
 /// Build the software-cursor render element(s) at the pointer location, PREPENDED so the
@@ -2128,54 +2796,341 @@ fn native_pointer_scene_pos<S: CompState>(
     Some(((lx * sx) as f32, (ly * sy) as f32))
 }
 
+/// Which surface the pointer is over RIGHT NOW, for latency attribution.
+///
+/// `Shell` whenever the native scene is not what is on screen (the flag is off, the
+/// killswitch is up, or nothing has been laid out yet), which is exactly right: those
+/// samples belong to the WebView shell, and the harness wants it measured by this same
+/// instrument so "native is faster" is a demonstrated delta rather than a claim.
+///
+/// KNOWN AND ACCEPTED, stated rather than hidden: this reads the pointer BEFORE the event
+/// is applied, because that is where T_input is captured and moving the capture would
+/// bias the clock estimator toward busy periods. So a relative-motion sample is
+/// attributed to the surface the pointer is LEAVING. It differs only at a component
+/// boundary, and only for the one sample that crosses it; a drag stays inside its
+/// component for hundreds of samples, which is where the headline numbers come from.
+/// Why an input could not be attributed to a named component. Each reason is
+/// reported ONCE per boot, the first time it is taken.
+///
+/// `Shell` is the answer to two completely different questions: "the pointer was
+/// over the WebView shell" and "I could not work out where the pointer was". The
+/// function returned the same value for both, so on hardware 2026-09-10 a sweep
+/// of ~4,200 hover samples across the entire output, including a dwell on the
+/// top bar where ORB_SM sits, came back 100% `component=shell` and looked like
+/// clean data. It was not clean data. It was the attribution failing silently,
+/// which left every one of latency_budgets.json's per-component rows dead and
+/// made the native-versus-shell delta (the whole case for native chrome, and by
+/// its own doc comment "a demonstrated delta rather than a claim") impossible to
+/// measure.
+///
+/// The returned Surface is deliberately UNCHANGED: `Shell` stays the fallback, so
+/// the journal contract and the budget file keep their meaning and no consumer
+/// has to learn a new component name. What changes is that the fallback stops
+/// being silent about which branch produced it.
+static ATTRIB_REPORTED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn report_attrib_gap(bit: u8, reason: &str) {
+    use std::sync::atomic::Ordering;
+    let prev = ATTRIB_REPORTED.fetch_or(bit, Ordering::Relaxed);
+    if prev & bit == 0 {
+        info!(
+            reason,
+            "hart-latency attribution: falling back to component=shell. Samples from              here on carry the shell's budget row, and every per-component row stays              empty until this reason is resolved."
+        );
+    }
+}
+
+/// The ambiguous branch also carries WHERE the pointer was, in the same scene
+/// space the tree was laid out in. That is the one number that separates "the
+/// desktop really is bare here" from "the two coordinate spaces do not line up",
+/// and without it the reason line asks the reader to guess between them.
+fn report_attrib_gap_at(
+    bit: u8,
+    reason: &str,
+    px: f32,
+    py: f32,
+    size: Size<i32, Physical>,
+) {
+    use std::sync::atomic::Ordering;
+    let prev = ATTRIB_REPORTED.fetch_or(bit, Ordering::Relaxed);
+    if prev & bit == 0 {
+        info!(
+            reason,
+            scene_x = px,
+            scene_y = py,
+            scene_w = size.w,
+            scene_h = size.h,
+            "hart-latency attribution: falling back to component=shell. Compare these              coordinates against the layout: a point inside the output but over no              component means the tree has no tagged container there."
+        );
+    }
+}
+
+fn pointer_surface<S: CompState>(state: &S) -> crate::latency::Surface {
+    if !native_scene_drawn(state.native_shell_on(), state.capture_blocked()) {
+        report_attrib_gap(
+            1 << 0,
+            if state.capture_blocked() {
+                "capture blocked (killswitch up), so the native scene is not on screen"
+            } else {
+                "native_shell_on is false, so there is no native scene to attribute to"
+            },
+        );
+        return crate::latency::Surface::Shell;
+    }
+    let size = output_physical_size(state);
+    let Some((px, py)) = native_pointer_scene_pos(state, size) else {
+        report_attrib_gap(
+            1 << 1,
+            "no pointer position in scene space (output geometry absent or zero-sized)",
+        );
+        return crate::latency::Surface::Shell;
+    };
+    let Some(tree) = state.native_tree() else {
+        // Distinct from "nothing under the pointer": the tree is built by
+        // lower_scene, so its absence means the native scene has not been
+        // lowered even once, and NO position could ever attribute.
+        report_attrib_gap(
+            1 << 2,
+            "native_tree() is None, so the scene has never been lowered and no              position can attribute",
+        );
+        return crate::latency::Surface::Shell;
+    };
+    match tree.component_at(px, py).map(|c| c.surface()) {
+        Some(surface) => surface,
+        None => {
+            // The one genuinely ambiguous branch: the tree EXISTS and the pointer
+            // has a position in its space, but that point lies over no tagged
+            // component. Over bare desktop that is correct and expected. Covering
+            // the whole output without ever hitting one is not, so the reported
+            // coordinates are the thing to compare against the layout.
+            report_attrib_gap_at(
+                1 << 3,
+                "pointer is over no tagged component (bare desktop, or the tree's                  geometry does not line up with the pointer's scene space)",
+                px,
+                py,
+                size,
+            );
+            crate::latency::Surface::Shell
+        }
+    }
+}
+
 /// NATIVE SHELL M3 GL LOWERING: lower the native shell scene to render elements.
 /// Rect leaves (top bar, taskbar, hero and card tiles) become SolidColorRenderElements;
 /// Text runs are shaped + rasterized into cached MemoryRenderBuffers; OrbSlots reuse the
 /// M2 orb texture. Image (texture) is the remaining leaf kind. Gated by `native_shell_on`
-/// at the call site, so with the flag OFF this never runs. The actual lowering lives in
-/// `lower_scene` (State-free, so it is render-tested); this wrapper just pulls the scene
-/// and caches off `state`.
+/// and the killswitch at the call site (`native_scene_drawn`), so with the flag OFF, or
+/// while capture is blocked, this never runs. The actual lowering lives in `lower_scene`
+/// (State-free, so it is render-tested); this wrapper just pulls the scene and caches off
+/// `state`.
 ///
-/// Alloc note: step two is now DONE both halves. The scene tree is retained
-/// (`scene::SceneCache`, rebuilt only on a real layout change) and the sharp-rect
-/// SolidColorBuffers are pooled (`RectCache::solid`, reused via `update`), so a steady
-/// desktop allocates neither per frame. What still allocates per frame: the `HomeCompose`
-/// clone below (it must, to drop the state borrow before taking the `&mut` caches, so
-/// removing it needs the accessor to split-borrow the home) and the per-frame `elements`
-/// and leaf vectors.
+/// Alloc note: the zero-per-frame-alloc NFR is MET, in four parts. The scene tree is
+/// retained (`scene::SceneCache`, rebuilt only on a real layout change); the sharp-rect
+/// SolidColorBuffers are pooled (`RectCache::solid`, reused via `update`); the composed
+/// home rides out of the accessor as a borrow rather than a clone; and the leaves are
+/// walked by callback (`SceneNode::for_each_leaf`) rather than collected, which is what a
+/// list of leaf references needs, since it borrows the tree the cache owns and so could
+/// never be retained the way the tree and the pools are.
+///
+/// The one allocation left per frame is the caller's own `elements` vector, which is
+/// architectural: smithay's render path takes a slice of elements, so the frame has to
+/// build one. It is not counted against the NFR here for that reason. The claim is
+/// structural rather than measured: no counting allocator is installed, so what the tests
+/// pin is that the tree-rebuild, solid-allocation, text-compose and rounded-compose counts
+/// all stay flat across a steady desktop's frames.
+/// Returns the NATIVE_CHROME_* mask this frame actually emitted, so the shell bridge can
+/// stand down the HTML chrome the compositor has taken over. See `lower_scene`.
 pub fn render_native_scene<S, R>(
     state: &mut S,
     renderer: &mut R,
     size: Size<i32, Physical>,
     elements: &mut Vec<HartRenderElement<R>>,
-) where
+) -> u8
+where
     S: CompState,
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Send + Clone + 'static,
 {
     // Pull the scene + caches OFF `state` here, then hand the concrete pieces to
-    // `lower_scene`. The demo scene is the fallback until a `shell.compose` IPC feed
-    // stores one. Energy is read before the cache borrow (a plain f32). This is the
-    // ONLY caller that goes through State; the render test calls `lower_scene`
-    // directly with constructed caches, so there is one lowering path, not two.
-    let home = state
-        .native_home()
-        .cloned()
-        .unwrap_or_else(crate::scene::HomeCompose::demo);
+    // `lower_scene`. Energy, pointer and button state are read FIRST because they are
+    // plain owned values and the accessor below takes `&mut state`. This is the ONLY
+    // caller that goes through State; the render test calls `lower_scene` directly with
+    // constructed caches, so there is one lowering path, not two.
     let orb_energy = state.orb_energy();
-    // Read the pointer + held-button state BEFORE the `&mut` cache borrow (all plain
-    // owned values), so hover AND press ride the same single lowering call. None on a
-    // pre-mode frame.
     let pointer = native_pointer_scene_pos(state, size);
     let pressed = state.pointer_pressed();
-    let (rasterizer, orb_cache, rect_cache, scene_cache) = state.native_scene_caches();
+    // Read BEFORE `native_scene_caches` takes its `&mut` borrow of state, and it is the
+    // SAME bool `effects_animating` gates the frame budget on, so the orb's motion and
+    // the frame rate that carries it can never disagree.
+    let animate = state.motion_hardware() && !theme_potato() && !motion_reduced();
+    // Read here too, for the same reason: `lower_scene` is state-free so the layout can
+    // be render-tested with constructed caches, and the offset is state.
+    //
+    // RE-CLAMPED against the live extents first. A row scrolled to its end and then given
+    // fewer cards, or shown on a narrower output, would otherwise keep an offset past its
+    // own content and render EMPTY, with every card off the left edge. Clamping an
+    // in-range value changes nothing, so a steady desktop writes back the same struct and
+    // the cache key does not move: this costs a handful of float compares, not a rebuild.
+    let mut scroll = state.row_scroll();
+    {
+        let extents = state
+            .native_home()
+            .map(|h| crate::scene::row_extents(h, size.w as f32, size.h as f32))
+            .unwrap_or_default();
+        let before = scroll;
+        scroll.reclamp(&extents);
+        if scroll != before {
+            state.set_row_scroll(scroll);
+        }
+    }
+    // The home now rides OUT of the accessor as a shared borrow beside the `&mut`
+    // caches, so the frame no longer clones a HomeCompose just to release the state
+    // borrow. `demo_ref` is the allocation-free fallback until `shell.compose` lands.
+    let (home, rasterizer, orb_cache, rect_cache, scene_cache) = state.native_scene_caches();
+    // A `match`, not `unwrap_or_else`: passing a `fn() -> &'static HomeCompose` makes the
+    // compiler unify the Option's item type WITH 'static, which would demand that the
+    // borrow of `state` outlive the program. The arms of a match unify at the shorter
+    // lifetime instead, and the 'static demo simply coerces down to it.
+    let home = match home {
+        Some(h) => h,
+        None => crate::scene::demo_ref(),
+    };
     lower_scene(
-        &home, size, renderer, rasterizer, orb_cache, rect_cache, scene_cache, orb_energy,
-        pointer, pressed, elements,
-    );
+        home, size, renderer, rasterizer, orb_cache, rect_cache, scene_cache, orb_energy,
+        pointer, pressed, animate, &scroll, elements,
+    )
 }
 
 /// Lower a `HomeCompose` to render elements against the concrete caches — the
+/// Does the active THEME ask for the reduced-effects tier? Resolved once, beside the
+/// others, and carrying the same restart-to-change gap.
+///
+/// `performance.disable_blur` is half of the shell's `is_potato`; the other half is the
+/// software floor, which the compositor knows directly. Only `potato.json` sets it today.
+///
+/// Its sibling `performance.disable_animations` is NOT read here, deliberately: nothing
+/// in the tree reads it either, so it is a dead key rather than a contract, and honouring
+/// it natively would invent a behaviour the shell does not have.
+fn theme_potato() -> bool {
+    static POTATO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *POTATO.get_or_init(|| {
+        crate::bloom::SettingsFile::active()
+            .flag("disable_blur")
+            .unwrap_or(false)
+    })
+}
+
+/// Has the user declared reduced motion? Resolved ONCE, like the theme beside it, and
+/// carrying the same documented gap: a runtime PUT to /api/shell/accessibility lives in
+/// the shell process's memory and reaches this at the next start.
+///
+/// A `OnceLock` because the frame path must not touch the disk, and the answer is a
+/// declarative setting rather than something that changes under us.
+fn motion_reduced() -> bool {
+    static REDUCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REDUCED.get_or_init(crate::bloom::reduced_motion)
+}
+
+/// The scene's colours, resolved ONCE from the same theme file the backdrop reads.
+///
+/// A `OnceLock` rather than a per-frame call because resolving it touches the disk, and
+/// the frame path must not. This carries the SAME known gap `BloomCache` documents beside
+/// it: resolved once and never re-read, so a theme change at runtime does not restyle the
+/// native desktop until the compositor restarts. Whoever lands the theme-change signal
+/// invalidates both together, and they are wrong in the same direction meanwhile, which
+/// is the point of them reading one file.
+fn active_theme() -> &'static crate::scene::Theme {
+    static ACTIVE: std::sync::OnceLock<crate::scene::Theme> = std::sync::OnceLock::new();
+    ACTIVE.get_or_init(|| {
+        let file = crate::bloom::SettingsFile::active();
+        theme_from_file(&file)
+    })
+}
+
+/// The accessibility FONT SCALE applied to a theme metric, exactly as the shell applies
+/// it: clamp to 0.8..=2.0, ignore anything within 0.01 of 1.0, and ROUND, because
+/// liquid_ui_service emits `str(round(icon_size * fs))` and a half-pixel difference here
+/// would be a different glyph size on the two renderers.
+///
+/// Only `--hart-icon-size` matters to the native scene today, and that is worth being
+/// exact about rather than sweeping: the a11y override rewrites three tokens, and the
+/// only two consumers in the whole served shell are `html,body{font-size:...}` (the root
+/// size, which the home surface does not inherit because hartHome.css sizes everything in
+/// absolute px) and `.tray-btn .mi{font-size:var(--hart-icon-size)}`, which IS a thing the
+/// native scene draws. So a user at font_scale 1.5 got 30px tray glyphs in the shell and
+/// 20px natively.
+///
+/// `None` scale, or a scale that rounds to no change, returns the metric untouched.
+fn a11y_scaled(metric: Option<f32>, font_scale: Option<f32>) -> Option<f32> {
+    let m = metric?;
+    let s = match font_scale {
+        Some(s) if s.is_finite() => s.clamp(0.8, 2.0),
+        _ => return Some(m),
+    };
+    if (s - 1.0).abs() <= 0.01 {
+        return Some(m);
+    }
+    Some((m * s).round())
+}
+
+/// Fold a loaded theme file's colours into the shipped defaults. Split out so it is
+/// testable against a real file with no environment and no OnceLock in the way.
+fn theme_from_file(file: &crate::bloom::SettingsFile) -> crate::scene::Theme {
+    theme_from_files(file, &crate::bloom::SettingsFile::load(std::path::Path::new(
+        crate::bloom::A11Y_SETTINGS_PATH,
+    )))
+}
+
+/// The same fold with the accessibility file passed in, so a test can drive both without
+/// touching /etc. The two files are separate on purpose: one is the look the user picked,
+/// the other is what they need to be able to see it.
+fn theme_from_files(
+    file: &crate::bloom::SettingsFile,
+    a11y: &crate::bloom::SettingsFile,
+) -> crate::scene::Theme {
+    // Applied LAST, after the theme's own colours and metrics, because that is what the
+    // cascade does: `html.a11y-contrast` is a later source than `css_vars`, so it wins
+    // over whatever the theme chose. A theme cannot opt out of high contrast.
+    let contrast = a11y.flag("high_contrast").unwrap_or(false);
+    let hue = |key: &str| {
+        file.hex(key)
+            .map(|[r, g, b]| {
+                crate::scene::Color::rgba(
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                    1.0,
+                )
+            })
+    };
+    let themed = crate::scene::Theme::cosmic_default()
+        .with_theme_colors(
+            hue("background"),
+            hue("accent"),
+            hue("secondary"),
+            hue("text"),
+            hue("muted"),
+            hue("surface"),
+        )
+        // The same three keys theme_service emits as --hart-topbar-height,
+        // --hart-icon-size and --hart-radius, so the native scene and the browser are
+        // sized by one number each rather than two that happen to agree today.
+        .with_shell_metrics(
+            file.num("topbar_height"),
+            // The ONE theme metric the accessibility font scale rewrites, applied with
+            // the shell's own arithmetic so both renderers land on the same integer.
+            a11y_scaled(file.num("icon_size"), a11y.num("font_scale")),
+            file.num("border_radius"),
+            file.rgba("glass_border").map(|([r, g, b], a)| {
+                crate::scene::Color::rgba(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a)
+            }),
+        );
+    if contrast {
+        return themed.with_high_contrast();
+    }
+    themed
+}
+
 /// State-free core of `render_native_scene`, so it is unit-testable with a
 /// `PixmanRenderer` + freshly-constructed caches (no compositor State needed). The
 /// leaf list interleaves Text (needs `rasterizer`) and OrbSlot (needs `orb_cache`),
@@ -2191,18 +3146,45 @@ pub fn lower_scene<R>(
     orb_energy: f32,
     pointer: Option<(f32, f32)>,
     pressed: bool,
+    // `animate`: whether the orb breathes, the SAME hardware condition `scene_animates`
+    // gates the frame budget on. Passed in rather than read here because this fn is
+    // state-free. The two must agree, or the orb animates while the gate holds the frame
+    // rate down (a stuttering orb) or the gate stays open for an orb standing still.
+    animate: bool,
+    // `scroll`: how far each card row is pushed sideways. A parameter, not a read, so the
+    // lowering stays state-free and the render test can drive a scrolled desktop.
+    scroll: &crate::scene::RowScroll,
     elements: &mut Vec<HartRenderElement<R>>,
-) where
+) -> u8
+where
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Send + Clone + 'static,
 {
+    // What native chrome this lowering ACTUALLY emitted, accumulated only on a successful
+    // push exactly as the M2 orb and bloom blocks do. The shell bridge stands its own HTML
+    // chrome down on the strength of this (liquid_ui_service.read_native_chrome), so a
+    // claim that is not backed by real pixels would blank the orb on both sides, and a
+    // claim that is missing leaves TWO orbs breathing on top of each other with the
+    // WebView still paying the per-frame cost the native orb exists to remove.
+    let mut emitted: u8 = 0;
+
     // RETAINED TREE (zero-per-frame-alloc, step two): the layout is rebuilt only when the
     // size, the composed home, or the theme changes, so a steady desktop reuses the tree
     // it already owns instead of allocating a fresh one every frame. The pointer is NOT a
     // key, so hover costs no rebuild. `scene_cache` is a disjoint field borrow, so holding
     // the tree across the loop does not conflict with the buffer caches below.
-    let theme = crate::scene::Theme::cosmic_default();
-    let tree = scene_cache.tree_for(size.w as f32, size.h as f32, home, &theme);
+    let theme = *active_theme();
+    // The rasterizer doubles as the layout's text measure (it already shapes), so the bar
+    // can butt one run against another. It is a disjoint borrow from `scene_cache`, and
+    // the reborrow ends when `tree_for` returns, leaving it free for the lowering below.
+    let tree = scene_cache.tree_for(
+        size.w as f32,
+        size.h as f32,
+        home,
+        &theme,
+        scroll,
+        rasterizer,
+    );
 
     // Hand out pooled solid buffers from the top for this frame (see RectCache::solid).
     rect_cache.begin_frame();
@@ -2213,14 +3195,38 @@ pub fn lower_scene<R>(
     // clamps the sum to 0..=1).
     let orb_energy = orb_energy + tree.pointer_orb_energy(pointer, pressed);
 
-    let mut leaves: Vec<&crate::scene::SceneNode> = Vec::new();
-    tree.flatten(&mut leaves);
-    for leaf in leaves {
+    // M2 input half, card slice: which leaf paints its hover state this frame (the
+    // background of the interactive group under the cursor), or None. Resolved ONCE here
+    // against the SAME tree the leaves come from, so the card highlight and the orb lift
+    // above read one consistent pointer position.
+    let hover_leaf = tree.hover_leaf(pointer);
+
+    // Walked by CALLBACK, not collected into a Vec: a list of leaf references borrows the
+    // tree the cache owns and so cannot be retained across frames, which made collecting
+    // one the last per-frame allocation the NFR named. `return` inside the closure skips
+    // this leaf, exactly where the loop said `continue`.
+    // Which band this leaf is in, resolved ONCE before the arms so every push below can
+    // claim it without re-deriving the rule. The taskbar line comes from the same
+    // TASKBAR_H the layout reserves and the panel reservation publishes, so the claim and
+    // the pixels cannot disagree.
+    let home_top = theme.top_bar_h;
+    let home_bottom = size.h as f32 - crate::scene::TASKBAR_H;
+    tree.for_each_leaf(&mut |idx, leaf| {
+        let home_leaf = in_home_band(leaf.rect(), home_top, home_bottom);
         match leaf {
             crate::scene::SceneNode::Rect { rect, color, radius } => {
                 if rect.w < 1.0 || rect.h < 1.0 {
-                    continue;
+                    return;
                 }
+                // The hover lift: the SAME rect, one brighter colour, so hovering changes
+                // no geometry and no element count. The rounded cache keys on colour, so a
+                // hovered card composes ONE extra buffer on the first frame of the hover
+                // and reuses it for every frame after, never per frame.
+                let color = if hover_leaf == Some(idx) {
+                    color.lift(crate::scene::CARD_HOVER_LIFT)
+                } else {
+                    *color
+                };
                 if *radius > 0.5 {
                     // Rounded (cards, omnibox): lower through a cached rounded-rect
                     // buffer so the corner radius the scene specifies is actually
@@ -2245,7 +3251,7 @@ pub fn lower_scene<R>(
                             Some((rect.w as i32, rect.h as i32).into()),
                             Kind::Unspecified,
                         ) {
-                            Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                            Ok(e) => { elements.push(HartRenderElement::Memory(e)); if home_leaf { emitted |= NATIVE_CHROME_HOME; } }
                             Err(err) => warn!(?err, "native scene: rounded rect import failed"),
                         }
                     }
@@ -2266,6 +3272,7 @@ pub fn lower_scene<R>(
                         Kind::Unspecified,
                     );
                     elements.push(HartRenderElement::Solid(el));
+                    if home_leaf { emitted |= NATIVE_CHROME_HOME; }
                 }
             }
             crate::scene::SceneNode::Text {
@@ -2273,10 +3280,13 @@ pub fn lower_scene<R>(
                 text,
                 size_px,
                 color,
-                ..
+                stroke,
+                weight,
+                letter_spacing,
+                icon,
             } => {
                 if rect.w < 1.0 || rect.h < 1.0 || text.is_empty() {
-                    continue;
+                    return;
                 }
                 let buffer = rasterizer.rasterize(
                     text,
@@ -2284,6 +3294,10 @@ pub fn lower_scene<R>(
                     rect.w as i32,
                     rect.h as i32,
                     [color.r, color.g, color.b, color.a],
+                    *stroke,
+                    *weight,
+                    *letter_spacing,
+                    *icon,
                 );
                 let origin: Point<f64, Physical> = Point::from((rect.x as f64, rect.y as f64));
                 match MemoryRenderBufferRenderElement::from_buffer(
@@ -2295,8 +3309,104 @@ pub fn lower_scene<R>(
                     Some((rect.w as i32, rect.h as i32).into()),
                     Kind::Unspecified,
                 ) {
-                    Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                    Ok(e) => { elements.push(HartRenderElement::Memory(e)); if home_leaf { emitted |= NATIVE_CHROME_HOME; } }
                     Err(err) => warn!(?err, "native scene: text run import failed"),
+                }
+            }
+            crate::scene::SceneNode::Fill {
+                rect,
+                from,
+                mid,
+                mid_at,
+                to,
+                angle_deg,
+                radius,
+                // The photo is not lowered yet (M3 remainder). The gradient beneath it is
+                // what the shell paints first and never removes, so the card is a card
+                // with or without one; before this, a card the feed gave a picture drew
+                // its picture's ABSENCE, and a ranked card drew nothing whatsoever.
+                photo: _,
+            } => {
+                if rect.w < 1.0 || rect.h < 1.0 {
+                    return;
+                }
+                // Hovering an art tile lifts BOTH stops, so the whole tile brightens by the
+                // same amount and the gradient keeps its shape. This is the ranked card's
+                // only hover state, its background being transparent by design.
+                let (from, mid, to) = if hover_leaf == Some(idx) {
+                    (
+                        from.lift(crate::scene::CARD_HOVER_LIFT),
+                        mid.lift(crate::scene::CARD_HOVER_LIFT),
+                        to.lift(crate::scene::CARD_HOVER_LIFT),
+                    )
+                } else {
+                    (*from, *mid, *to)
+                };
+                if let Some(buffer) = rect_cache.gradient3(
+                    rect.w as i32,
+                    rect.h as i32,
+                    *radius,
+                    [from.r, from.g, from.b, from.a],
+                    [mid.r, mid.g, mid.b, mid.a],
+                    *mid_at,
+                    [to.r, to.g, to.b, to.a],
+                    *angle_deg,
+                ) {
+                    let origin: Point<f64, Physical> =
+                        Point::from((rect.x as f64, rect.y as f64));
+                    match MemoryRenderBufferRenderElement::from_buffer(
+                        renderer,
+                        origin,
+                        buffer,
+                        Some(1.0),
+                        None,
+                        Some((rect.w as i32, rect.h as i32).into()),
+                        Kind::Unspecified,
+                    ) {
+                        Ok(e) => { elements.push(HartRenderElement::Memory(e)); if home_leaf { emitted |= NATIVE_CHROME_HOME; } }
+                        Err(err) => warn!(?err, "native scene: card art import failed"),
+                    }
+                }
+            }
+            crate::scene::SceneNode::Shadow {
+                rect,
+                radius,
+                blur,
+                offset_y,
+                color,
+            } => {
+                if rect.w < 1.0 || rect.h < 1.0 || *blur <= 0.0 {
+                    return;
+                }
+                if let Some(buffer) = rect_cache.shadow(
+                    rect.w as i32,
+                    rect.h as i32,
+                    *radius,
+                    *blur,
+                    [color.r, color.g, color.b, color.a],
+                ) {
+                    // The buffer is the caster grown by `blur` on every side, so it is
+                    // drawn back by that much and down by the CSS offset.
+                    let origin: Point<f64, Physical> = Point::from((
+                        (rect.x - blur) as f64,
+                        (rect.y + offset_y - blur) as f64,
+                    ));
+                    let side = (
+                        rect.w as i32 + (2.0 * blur) as i32,
+                        rect.h as i32 + (2.0 * blur) as i32,
+                    );
+                    match MemoryRenderBufferRenderElement::from_buffer(
+                        renderer,
+                        origin,
+                        buffer,
+                        Some(1.0),
+                        None,
+                        Some(side.into()),
+                        Kind::Unspecified,
+                    ) {
+                        Ok(e) => { elements.push(HartRenderElement::Memory(e)); if home_leaf { emitted |= NATIVE_CHROME_HOME; } }
+                        Err(err) => warn!(?err, "native scene: card shadow import failed"),
+                    }
                 }
             }
             crate::scene::SceneNode::OrbSlot { rect, .. } => {
@@ -2306,13 +3416,13 @@ pub fn lower_scene<R>(
                 // size and render at their own slot size via GPU scale, so two slots in
                 // one frame never thrash the single-buffer OrbCache.
                 if rect.w < 1.0 || rect.h < 1.0 {
-                    continue;
+                    return;
                 }
                 let side = (size.w.min(size.h) as f32 * 0.30) as i32;
-                if let Some((buffer, motion)) = orb_cache.current(side, orb_energy) {
+                if let Some((buffer, motion)) = orb_cache.current(side, orb_energy, animate) {
                     let dst = (rect.w.min(rect.h) * motion.scale) as i32;
                     if dst < 1 {
-                        continue;
+                        return;
                     }
                     let origin: Point<f64, Physical> = Point::from((
                         (rect.x + (rect.w - dst as f32) / 2.0) as f64,
@@ -2327,15 +3437,20 @@ pub fn lower_scene<R>(
                         Some((dst, dst).into()),
                         Kind::Unspecified,
                     ) {
-                        Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                        Ok(e) => {
+                            elements.push(HartRenderElement::Memory(e));
+                            if home_leaf { emitted |= NATIVE_CHROME_HOME; }
+                            emitted |= NATIVE_CHROME_ORB;
+                        }
                         Err(err) => warn!(?err, "native scene: orb import failed"),
                     }
                 }
             }
-            // Image lowering is the M3 remainder; Container only groups.
+            // Container only groups; it paints nothing of its own.
             _ => {}
         }
-    }
+    });
+    emitted
 }
 
 pub fn build_frame_elements<S, R>(
@@ -2370,12 +3485,6 @@ where
         build_cursor_elements(state, renderer, &mut elements);
     }
 
-    // ── 1b. NATIVE SHELL M3 scene (gated OFF by default via native_shell_on). Pushed
-    //    here so native chrome sits above the app windows and below the cursor. A pure
-    //    additive path: flag off = no-op, the WebView shell is untouched. ──
-    if state.native_shell_on() {
-        render_native_scene(state, renderer, size, &mut elements);
-    }
 
     let ws_alpha = workspace_fade_alpha(state);
     let output = state.output().clone();
@@ -2417,6 +3526,67 @@ where
         elements.extend(win_elems.into_iter().map(HartRenderElement::Surface));
     }
 
+    // ── 3c. NATIVE SHELL M3 scene: the DESKTOP PLANE, below windows, above the shell. ──
+    //
+    // Z-ORDER IS THE WHOLE POINT OF THIS POSITION, and it used to be step 1b, above the
+    // toplevels and above the Top/Overlay layers. That made the home desktop paint over
+    // every application window: a maximized Firefox got hero copy and card rows drawn on
+    // top of it, while `surface_under` still routed the clicks to Firefox, because hit
+    // testing walks Overlay, then Top, then windows. Pixels saying one thing and input
+    // another is exactly what the layer-ordering work below was written to end.
+    //
+    // Here instead it sits where the shell it replaces already sits: ABOVE the
+    // Bottom/Background layer that carries the WebView glass shell, and BELOW the
+    // toplevels and the Top/Overlay layers. Both halves are load-bearing.
+    //
+    //   Below windows, because the scene is the desktop. Windows must cover it, and the
+    //   bars stay reachable through the panel RESERVATION (`work_area_for`), which is the
+    //   same mechanism that keeps the WebView shell's bars reachable today. That is the
+    //   2026-08-29 "taskbar unreachable" fix, not a second copy of it.
+    //
+    //   Above the Background layer, because during the transition `shell.native {on}`
+    //   leaves the WebView running underneath and its surface is opaque. Below it the
+    //   native scene would be invisible, and the A/B the latency program needs could not
+    //   be taken at all.
+    //
+    // Skipped under the killswitch for the SAME reason the bloom and the M2 orb are: the
+    // black solid above already hides it, so lowering it is pure waste, and a drawn native
+    // scene holds the frame-budget gate open, so it would otherwise composite at full rate
+    // behind a blacked-out screen. Flag off = no-op, the WebView shell untouched. ──
+    if native_scene_drawn(state.native_shell_on(), state.capture_blocked()) {
+        // The scene CLAIMS the chrome it draws. Without this the flag would silently
+        // un-claim the orb, because the M2 block below that used to set the bit is
+        // skipped precisely when the native shell is on, and the shell would then keep
+        // its own HTML orb: two orbs breathing over each other, the browser still paying
+        // the per-frame cost, and the entire point of the native orb lost.
+        let before = elements.len();
+        let scene_mask = render_native_scene(state, renderer, size, &mut elements);
+        native_mask |= scene_mask;
+        if elements.len() > before {
+            // Evidence for the compositor's shell-ready writer: elements the SCENE itself
+            // put into this frame. Deliberately measured by growth of the element list
+            // rather than by `scene_mask != 0`, which is what this used to test.
+            //
+            // The mask is not that evidence. `lower_scene` sets exactly ONE bit, and only
+            // where the ORB's buffer imports; Rect, Text and Art all push elements and set
+            // nothing. So `scene_mask != 0` means "the orb drew", and a frame that painted
+            // the hero, the rows, the cards and both bars while the orb was skipped (a
+            // sub-pixel slot, a cache miss, a failed import) claimed nothing had painted.
+            // shell-ready would then never be written, the paint watchdog would stop seeing
+            // HEALTHY, and the ladder would demote off the native shell on its own, which
+            // is the exact failure the writer beside it in udev.rs was added to prevent.
+            //
+            // Growth of the list is also what this static's own doc says it means: "set
+            // once the native scene has actually put elements into a frame".
+            //
+            // Still the SCENE's own contribution, not the accumulated mask: the bloom below
+            // pushes an element whether or not the native shell drew anything, and it is
+            // measured after this point, so the backdrop alone can never claim a painted
+            // native shell.
+            NATIVE_SCENE_PAINTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     // ── 4. BOTTOM / BACKGROUND layer surfaces — BELOW the toplevels. ──
     // This is the desktop plane: the HART glass shell anchors here, which is what
     // makes it the desktop rather than an app.
@@ -2455,7 +3625,8 @@ where
         let short = size.w.min(size.h);
         let side = (short as f32 * 0.30) as i32;
         let energy = state.orb_energy();
-        if let Some((buffer, motion)) = state.orb_mut().current(side, energy) {
+        let animate = state.motion_hardware() && !theme_potato() && !motion_reduced();
+        if let Some((buffer, motion)) = state.orb_mut().current(side, energy, animate) {
             // Breathing scales about the CENTRE, so the top-left moves by half
             // the growth. Computed from the motion rather than stored, so there
             // is no second source of truth for where the orb is.
@@ -2622,16 +3793,52 @@ pub fn process_keyboard_shortcut(
 /// visible cursor renders on llvmpipe with no xcursor theme load. Returns (rgba, width,
 /// height, hotspot). The hotspot is the arrow TIP (top-left).
 pub fn bake_default_cursor() -> (Vec<u8>, i32, i32, Point<i32, Logical>) {
-    const W: i32 = 24;
-    const H: i32 = 24;
+    bake_default_cursor_at(cursor_side())
+}
+
+/// The conventional default cursor size, and the size this arrow's polygon is drawn in.
+const CURSOR_SIDE_DEFAULT: i32 = 24;
+
+/// The cursor side from `XCURSOR_SIZE`, the standard the rest of the desktop already
+/// speaks.
+///
+/// hart-accessibility.nix sets `XCURSOR_SIZE = "48"` when `largeCursor` is on, so a user
+/// who turns Large Cursor on in the shell's own accessibility panel gets a 48px cursor
+/// from every CLIENT that draws its own, and got a 24px one from the compositor, which is
+/// the one that draws the desktop's. The toggle was offered, stored, wired through NixOS,
+/// and had no effect on the arrow the user actually sees on the desktop.
+///
+/// Clamped, because it arrives from the environment: a zero or negative side has no
+/// cursor at all and an enormous one is a full-screen arrow. Anything unparseable keeps
+/// the conventional 24.
+fn cursor_side() -> i32 {
+    std::env::var("XCURSOR_SIZE")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .map(|n| n.clamp(12, 256))
+        .unwrap_or(CURSOR_SIDE_DEFAULT)
+}
+
+/// The arrow baked at an explicit side, so the scaling is testable without touching
+/// process-global environment (cargo runs tests as threads in one process, and an
+/// env-mutating test would race every other test in this module).
+pub fn bake_default_cursor_at(side: i32) -> (Vec<u8>, i32, i32, Point<i32, Logical>) {
+    let side = side.clamp(12, 256);
+    let scale = side as f32 / CURSOR_SIDE_DEFAULT as f32;
+    let (w, h) = (side, side);
+    #[allow(non_snake_case)]
+    let (W, H) = (w, h);
+    // The polygon is authored in the 24-unit space this arrow was drawn in; every vertex
+    // scales with the side so the SHAPE is identical at any size rather than an arrow
+    // sitting in the corner of a bigger buffer.
     let poly: [(f32, f32); 7] = [
         (0.0, 0.0),
-        (0.0, 17.0),
-        (4.0, 13.0),
-        (7.0, 19.0),
-        (10.0, 18.0),
-        (7.0, 12.0),
-        (12.0, 12.0),
+        (0.0, 17.0 * scale),
+        (4.0 * scale, 13.0 * scale),
+        (7.0 * scale, 19.0 * scale),
+        (10.0 * scale, 18.0 * scale),
+        (7.0 * scale, 12.0 * scale),
+        (12.0 * scale, 12.0 * scale),
     ];
     let inside = |px: f32, py: f32| -> bool {
         let mut c = false;
@@ -2891,6 +4098,108 @@ mod tests {
         // has not published anything yet. Either way the answer is "no
         // reservation", so the compositor half ships inert ahead of the shell half.
         assert_eq!(panel_reservation(), PanelReservation::default());
+    }
+
+    // ── The M6 inversion: who OWNS the reservation once the compositor paints ──
+
+    #[test]
+    fn only_a_leaf_wholly_inside_the_band_claims_the_home_surface() {
+        use crate::scene::Rect;
+        let (top, bottom) = (40.0f32, 856.0f32); // 900 output, 44px taskbar
+        // Inside: a card.
+        assert!(in_home_band(Rect::new(60.0, 200.0, 258.0, 150.0), top, bottom));
+        // Flush against each boundary is still inside.
+        assert!(in_home_band(Rect::new(0.0, 40.0, 100.0, 10.0), top, bottom));
+        assert!(in_home_band(Rect::new(0.0, 800.0, 100.0, 56.0), top, bottom));
+        // The top bar's own fill.
+        assert!(!in_home_band(Rect::new(0.0, 0.0, 1600.0, 40.0), top, bottom));
+        // The taskbar.
+        assert!(!in_home_band(Rect::new(0.0, 856.0, 1600.0, 44.0), top, bottom));
+        // STRADDLING claims nothing, in either direction. Under-claiming costs a
+        // duplicated home for a frame; over-claiming costs an empty desktop.
+        assert!(!in_home_band(Rect::new(0.0, 30.0, 100.0, 40.0), top, bottom));
+        assert!(!in_home_band(Rect::new(0.0, 840.0, 100.0, 40.0), top, bottom));
+        // Degenerate rects are not evidence of anything.
+        assert!(!in_home_band(Rect::new(0.0, 200.0, 0.0, 10.0), top, bottom));
+        assert!(!in_home_band(Rect::new(0.0, 200.0, 10.0, 0.0), top, bottom));
+    }
+
+    #[test]
+    fn the_native_shell_flag_reads_its_value_not_its_presence() {
+        // HART_NATIVE_SHELL=0 used to turn the native shell ON, because the check was
+        // `is_some()`. Someone trying to get back to a working desktop would have reached
+        // for exactly that.
+        assert!(!native_shell_env_on(None));
+        assert!(!native_shell_env_on(Some("0")));
+        assert!(!native_shell_env_on(Some("false")));
+        assert!(!native_shell_env_on(Some("")));
+        assert!(!native_shell_env_on(Some("off")));
+        // Typos read as OFF, which is the shipped desktop and the safe direction.
+        assert!(!native_shell_env_on(Some("ture")));
+        assert!(native_shell_env_on(Some("1")));
+        assert!(native_shell_env_on(Some("true")));
+        assert!(native_shell_env_on(Some("TRUE")));
+        assert!(native_shell_env_on(Some(" yes ")));
+        assert!(native_shell_env_on(Some("on")));
+    }
+
+    #[test]
+    fn with_the_scene_off_the_reservation_is_exactly_what_the_shell_published() {
+        // The zero-regression claim, stated as a test. Nothing about the shipped
+        // WebView desktop may move because this code exists.
+        let published = PanelReservation { top: 40, bottom: 44 };
+        assert_eq!(effective_reservation(published, None), published);
+        assert_eq!(
+            effective_reservation(PanelReservation::default(), None),
+            PanelReservation::default()
+        );
+    }
+
+    #[test]
+    fn the_demoted_webview_publishes_nothing_and_the_native_bars_are_still_reserved() {
+        // The failure this whole inversion exists to prevent: M6 stands the shell
+        // down, the file stops being written, panel_reservation fails safe to zero,
+        // and a maximized window swallows bars the compositor is still painting.
+        let native = PanelReservation { top: 36, bottom: 44 };
+        assert_eq!(
+            effective_reservation(PanelReservation::default(), Some(native)),
+            native
+        );
+    }
+
+    #[test]
+    fn while_both_renderers_draw_bars_each_edge_takes_the_larger() {
+        // Today's transition state: shell.native turns the scene on without standing
+        // the WebView down, so both sets of bars are really on screen. Per edge,
+        // independently, because the top can come from one and the bottom the other.
+        let published = PanelReservation { top: 44, bottom: 44 };
+        let native = PanelReservation { top: 36, bottom: 52 };
+        assert_eq!(
+            effective_reservation(published, Some(native)),
+            PanelReservation { top: 44, bottom: 52 }
+        );
+    }
+
+    #[test]
+    fn the_native_reservation_reads_its_two_numbers_rather_than_restating_them() {
+        // Guards the "no third source" property. Restating 40 and 44 here would let
+        // a theme change or a TASKBAR_H change pass while the bars and the area they
+        // reserve silently disagreed, which is the drift the cross-language guard in
+        // test_panel_reservation.py exists to stop on the Python side.
+        let r = native_chrome_reservation();
+        assert_eq!(r.top, active_theme().top_bar_h.round() as i32);
+        assert_eq!(r.bottom, crate::scene::TASKBAR_H.round() as i32);
+    }
+
+    #[test]
+    fn an_absurd_native_reservation_still_cannot_squeeze_the_desktop_to_nothing() {
+        // The maximum merge can only push the reservation UP, so the half-height cap
+        // in work_area is what stops it becoming a desktop with no room for windows.
+        let huge = PanelReservation { top: 4000, bottom: 4000 };
+        let merged = effective_reservation(PanelReservation { top: 40, bottom: 44 }, Some(huge));
+        let (_, y, _, h) = work_area(0, 0, 1600, 900, merged);
+        assert!(h > 0, "the work area must never collapse: got h={h}");
+        assert!(y <= 900 / 2, "the top reservation must stay inside the cap");
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -3395,6 +4704,44 @@ mod tests {
     }
 
     #[test]
+    fn a_large_cursor_setting_actually_grows_the_arrow_the_desktop_draws() {
+        // hart-accessibility.nix sets XCURSOR_SIZE=48 when largeCursor is on, so every
+        // CLIENT that draws its own cursor gets a 48px one. The compositor draws the
+        // desktop's, from a polygon authored in a fixed 24-unit space, so the toggle was
+        // offered in the shell's accessibility panel, stored, wired through NixOS, and
+        // had no effect on the arrow the user actually sees.
+        let (small, sw, sh, s_hot) = bake_default_cursor_at(24);
+        let (big, bw, bh, b_hot) = bake_default_cursor_at(48);
+        assert_eq!((sw, sh), (24, 24));
+        assert_eq!((bw, bh), (48, 48));
+        assert_eq!(big.len(), (bw * bh * 4) as usize);
+        assert_eq!(s_hot, b_hot, "the tip is the hotspot at any size");
+
+        // The SHAPE scales, rather than the same small arrow sitting in a bigger buffer.
+        // Count opaque pixels: at twice the side the arrow covers about four times the
+        // area, so a fixed-size arrow in a 48px buffer would be nowhere near.
+        let opaque = |px: &[u8]| px.chunks_exact(4).filter(|p| p[3] == 255).count();
+        let (a, b) = (opaque(&small), opaque(&big));
+        assert!(a > 0 && b > 0, "both sizes draw something");
+        let ratio = b as f32 / a as f32;
+        assert!(
+            (3.0..5.0).contains(&ratio),
+            "doubling the side should roughly quadruple the ink, got {ratio:.2}x"
+        );
+
+        // The far corner of the big buffer is still empty: an arrow, not a filled square.
+        let last = (bw * bh - 1) as usize * 4;
+        assert_eq!(big[last + 3], 0, "the opposite corner stays transparent");
+
+        // Absurd sides are clamped rather than trusted: this comes from the environment,
+        // and a zero side is no cursor while a huge one is a full-screen arrow.
+        let (_, tiny_w, _, _) = bake_default_cursor_at(0);
+        let (_, huge_w, _, _) = bake_default_cursor_at(100_000);
+        assert!(tiny_w >= 12, "a zero side is clamped up, not drawn");
+        assert!(huge_w <= 256, "an enormous side is clamped down");
+    }
+
+    #[test]
     fn default_cursor_bakes_a_visible_arrow_with_fill_and_outline() {
         let (rgba, w, h, hot) = bake_default_cursor();
         assert_eq!(w, 24);
@@ -3434,6 +4781,17 @@ mod tests {
         assert!(FADE_IN_MS > 0 && FADE_IN_MS <= 500, "map fade should be a short ramp");
     }
 
+    /// The stop halfway between two, which is what a TWO-stop gradient's middle is.
+    /// Written out here so the two-stop tests read as two-stop tests.
+    fn mid_of(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+        [
+            (a[0] + b[0]) * 0.5,
+            (a[1] + b[1]) * 0.5,
+            (a[2] + b[2]) * 0.5,
+            (a[3] + b[3]) * 0.5,
+        ]
+    }
+
     #[test]
     fn rounded_rect_cuts_corners_and_fills_the_centre() {
         // A 12px radius on a 40x40 box: the exact corner pixel is outside the arc and
@@ -3441,15 +4799,430 @@ mod tests {
         // fully covered. This is precisely what a hard SolidColorRenderElement cannot
         // express, so it is the reason rounded rects lower through a buffer.
         let (w, h) = (40u32, 40u32);
-        let rgba = rounded_rect_rgba(w, h, 12.0, [1.0, 1.0, 1.0, 1.0]);
+        let white = [1.0, 1.0, 1.0, 1.0];
+        let rgba = rounded_rect_rgba(w, h, 12.0, white, mid_of(white, white), 0.5, white, 0.0);
         assert_eq!(rgba.len(), (w * h * 4) as usize);
         let alpha_at = |x: u32, y: u32| rgba[((y * w + x) * 4 + 3) as usize];
         assert_eq!(alpha_at(0, 0), 0, "top-left corner must be cut away");
         assert!(alpha_at(w / 2, h / 2) > 250, "centre must be opaque");
         assert!(alpha_at(w / 2, 0) > 250, "the straight top edge must be covered");
         // A zero radius is a plain filled rect: the corner is now covered too.
-        let sharp = rounded_rect_rgba(w, h, 0.0, [1.0, 1.0, 1.0, 1.0]);
+        let sharp = rounded_rect_rgba(w, h, 0.0, white, mid_of(white, white), 0.5, white, 0.0);
         assert!(sharp[3] > 250, "radius 0 fills the corner");
+    }
+
+    #[test]
+    fn the_scene_takes_its_colours_from_the_same_theme_file_the_backdrop_does() {
+        // The compositor was its own counter-example to Gate 4: bloom.rs reads
+        // conky-themes/<id>.json for the backdrop while the scene carried a hardcoded
+        // copy of the same colours, so changing the theme restyled the wallpaper under a
+        // desktop that did not move. One file, both consumers.
+        let dir = std::env::temp_dir().join("hart_scene_theme_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("sunset.json");
+        std::fs::write(
+            &f,
+            r#"{"id":"sunset","colors":{"background":"160910","accent":"FF8A4C",
+               "secondary":"FF2E9A","text":"FFF3EC","muted":"C9A79B",
+               "surface":"241118","ambient_1":"FF8A4C"}}"#,
+        )
+        .unwrap();
+        let file = crate::bloom::SettingsFile::load(&f);
+        let themed = theme_from_file(&file);
+        let shipped = crate::scene::Theme::cosmic_default();
+        assert_ne!(themed.accent, shipped.accent, "the theme's accent must win");
+        assert_eq!(themed.accent, crate::scene::Color::rgba(1.0, 138.0 / 255.0, 76.0 / 255.0, 1.0));
+        assert_eq!(themed.accent2.r, 1.0, "and its secondary");
+        assert_eq!(
+            themed.spectrum[0], themed.accent,
+            "the spectrum leads with the functional accent, as the shipped one does"
+        );
+        // ALPHA is the surface treatment's, never the palette's: a theme names hues, and
+        // letting it set opacity would let one make the top bar transparent.
+        assert_eq!(themed.bar_bg.a, shipped.bar_bg.a, "bar opacity is not the theme's");
+        assert_eq!(themed.card_bg.a, shipped.card_bg.a, "nor a card's");
+        assert_ne!(themed.bar_bg.r, shipped.bar_bg.r, "but its hue is");
+
+        // The live-tag scrim stays FIXED: it is a legibility guarantee over card art,
+        // not a palette slot, so a pale theme cannot turn it pale-on-pale.
+        assert_eq!(themed.chip_bg, shipped.chip_bg, "the live scrim is not the theme's");
+
+        // The SAME file drives the backdrop, which is the whole point.
+        let pal = crate::bloom::palette_from(&file);
+        assert_eq!(pal.base, [0x16, 0x09, 0x10]);
+        assert_eq!(
+            (themed.bar_bg.r * 255.0).round() as u8,
+            pal.base[0],
+            "the bar and the backdrop must ground on one colour"
+        );
+    }
+
+    #[test]
+    fn a_theme_that_moves_the_bar_moves_the_native_bar_with_it() {
+        // The shell publishes the panel reservation from `shell.topbar_height`, and the
+        // native scene drew a fixed 40. Four of the ten shipped themes move that number
+        // (36, 38, 40, 44), so on `potato` the native bar would have drawn 40px over a
+        // 36px reservation: the 2026-08-29 "taskbar unreachable" report arriving through
+        // the new renderer. Every shipped theme also carries its own corner radius, and
+        // the DEFAULT one (aura) sets 22 against the hardcoded 16, so the cards were
+        // already the wrong shape before anyone chose a theme.
+        let dir = std::env::temp_dir().join("hart_shell_metrics_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("potato.json");
+        std::fs::write(
+            &f,
+            r#"{"id":"potato","colors":{"accent":"00E6C3"},
+               "shell":{"topbar_height":36,"icon_size":18,"border_radius":4}}"#,
+        )
+        .unwrap();
+        let themed = theme_from_file(&crate::bloom::SettingsFile::load(&f));
+        assert_eq!(themed.top_bar_h, 36.0, "the bar takes the theme's height");
+        assert_eq!(themed.icon_px, 18.0, "and the tray its glyph size");
+        assert_eq!(themed.card_radius, 4.0, "and the cards their corner");
+
+        // And the LAYOUT actually uses them: a shorter bar means the content band starts
+        // higher, which is the whole point. Asserting the theme field alone would pass
+        // while the layout still read a constant.
+        let home = crate::scene::HomeCompose::demo();
+        let tree = crate::scene::layout_home(
+            1920.0,
+            1080.0,
+            &home,
+            &themed,
+            &crate::scene::RowScroll::default(),
+            &mut crate::scene::MonoMeasure,
+        );
+        let mut leaves: Vec<&crate::scene::SceneNode> = Vec::new();
+        tree.flatten(&mut leaves);
+        let bar = leaves
+            .iter()
+            .find_map(|n| match n {
+                // The strip is a Fill, not a Rect: the shell's no-blur chrome floor is a
+                // three-stop ramp, so the native strips are gradient tiles.
+                crate::scene::SceneNode::Fill { rect, .. }
+                    if rect.x == 0.0 && rect.y == 0.0 && rect.w == 1920.0 =>
+                {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .expect("the top bar strip");
+        assert_eq!(bar.h, 36.0, "the bar the scene DRAWS is the theme's height");
+    }
+
+    #[test]
+    fn a_wheel_notch_moves_a_row_by_the_browsers_own_step() {
+        // libinput reports a mouse notch as 15 units (its v120 axis is normalised to 15
+        // by the caller), so a notch has to land on 120px: that is the browser's wheel
+        // step, and the shell's `overflow-x` rails already move by it. The same gesture
+        // must travel the same distance on both renderers or the two desktops feel
+        // different under the same hand.
+        assert_eq!(row_scroll_delta(15.0, 0.0), 120.0, "one notch is one browser step");
+        assert_eq!(row_scroll_delta(-15.0, 0.0), -120.0, "and back the other way");
+
+        // A sideways swipe scrolls it too, and the two are SUMMED rather than one
+        // winning: a diagonal touchpad gesture moves the row by what the finger
+        // travelled, not by whichever axis happened to be tested first.
+        assert_eq!(row_scroll_delta(0.0, 15.0), 120.0, "horizontal alone works");
+        assert_eq!(row_scroll_delta(5.0, 10.0), 120.0, "and a diagonal sums");
+        assert_eq!(row_scroll_delta(10.0, -10.0), 0.0, "opposing axes cancel");
+
+        // Nothing non-finite reaches the offset: this comes from a device.
+        assert_eq!(row_scroll_delta(f32::NAN, 0.0), 0.0);
+        assert_eq!(row_scroll_delta(f32::INFINITY, 0.0), 0.0);
+        assert_eq!(row_scroll_delta(0.0, 0.0), 0.0, "a null event moves nothing");
+    }
+
+    #[test]
+    fn high_contrast_makes_the_chrome_solid_and_doubles_its_rule() {
+        // `html.a11y-contrast` overrides four tokens and thickens the glass border. The
+        // native scene read its colours from the theme file and knew nothing about the
+        // class, so a high-contrast desktop would have gone native at ordinary contrast:
+        // translucent bars, a faint rule, and dim secondary text, which is the whole set
+        // of things the setting exists to remove.
+        let dir = std::env::temp_dir().join("hart_contrast_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let theme = dir.join("t.json");
+        std::fs::write(
+            &theme,
+            r#"{"colors":{"background":"04050B","text":"F2F4FF","muted":"9AA0C6",
+               "glass_border":"rgba(255,255,255,0.10)"}}"#,
+        )
+        .unwrap();
+        let on = dir.join("on.json");
+        std::fs::write(&on, r#"{"high_contrast":true}"#).unwrap();
+        let off = dir.join("off.json");
+        std::fs::write(&off, r#"{"high_contrast":false}"#).unwrap();
+
+        let plain = theme_from_files(
+            &crate::bloom::SettingsFile::load(&theme),
+            &crate::bloom::SettingsFile::load(&off),
+        );
+        let hc = theme_from_files(
+            &crate::bloom::SettingsFile::load(&theme),
+            &crate::bloom::SettingsFile::load(&on),
+        );
+
+        // The chrome goes SOLID. This is the one place a palette sets opacity, and on
+        // purpose: translucency is what high contrast exists to remove.
+        assert!(plain.bar_bg.a < 1.0, "the ordinary bar is translucent");
+        assert_eq!(hc.bar_bg.a, 1.0, "the high-contrast bar is not");
+        assert_eq!(hc.taskbar_bg, hc.bar_bg, "both strips take the same solid");
+
+        // The rule goes white and DOUBLES.
+        assert_eq!(hc.chrome_border, crate::scene::Color::rgba(1.0, 1.0, 1.0, 1.0));
+        assert_eq!(hc.chrome_rule_px, plain.chrome_rule_px * 2.0);
+
+        // Ink goes to pure white and the secondary ink to near-white, so the two are
+        // still distinguishable rather than collapsed into one.
+        assert_eq!(hc.card_ink, crate::scene::Color::rgba(1.0, 1.0, 1.0, 1.0));
+        assert_ne!(hc.hero_copy, hc.hero_title, "muted stays a step below text");
+        assert!(hc.hero_copy.r > plain.hero_copy.r, "and it is far brighter than before");
+
+        // A theme cannot opt out: the class is a LATER source than css_vars, so it wins
+        // over whatever the theme chose. Applying it before the theme would let a theme
+        // with its own glass_border quietly undo the accessibility setting.
+        assert_ne!(hc.chrome_border, plain.chrome_border);
+    }
+
+    #[test]
+    fn a_declared_font_scale_grows_the_tray_glyph_the_way_the_shell_does() {
+        // liquid_ui_service emits `--hart-icon-size: round(icon_size * fs)px` when the
+        // scale is set, and `.tray-btn .mi` reads it. The native scene draws that glyph
+        // and ignored the scale, so a user at 1.5 got 30px in the shell and 20 natively.
+        let dir = std::env::temp_dir().join("hart_fontscale_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let theme = dir.join("t.json");
+        std::fs::write(&theme, r#"{"shell":{"icon_size":20,"topbar_height":40}}"#).unwrap();
+        let big = dir.join("big.json");
+        std::fs::write(&big, r#"{"font_scale":1.5,"reduced_motion":false}"#).unwrap();
+
+        let t = theme_from_files(
+            &crate::bloom::SettingsFile::load(&theme),
+            &crate::bloom::SettingsFile::load(&big),
+        );
+        assert_eq!(t.icon_px, 30.0, "20 * 1.5, the shell's own arithmetic");
+        assert_eq!(t.top_bar_h, 40.0, "the bar is NOT font-scaled, and the shell agrees");
+
+        // The rounding is the shell's too: `str(round(...))`, so 20 * 1.15 is 23, not
+        // 23.0000004 and not 22. A half-pixel difference is a different glyph.
+        let odd = dir.join("odd.json");
+        std::fs::write(&odd, r#"{"font_scale":1.15}"#).unwrap();
+        assert_eq!(
+            theme_from_files(
+                &crate::bloom::SettingsFile::load(&theme),
+                &crate::bloom::SettingsFile::load(&odd),
+            )
+            .icon_px,
+            23.0
+        );
+    }
+
+    #[test]
+    fn the_font_scale_rule_matches_the_shells_clamp_and_deadband() {
+        // Pure, so the edges are checkable without files. The shell clamps 0.8..2.0 and
+        // ignores anything within 0.01 of 1.0; both matter, because a hostile or
+        // fat-fingered setting reaches this from a file and "no change" must mean the
+        // metric is untouched rather than multiplied by something near one and rounded.
+        assert_eq!(a11y_scaled(Some(20.0), None), Some(20.0), "no scale, no change");
+        assert_eq!(a11y_scaled(Some(20.0), Some(1.0)), Some(20.0), "exactly one");
+        assert_eq!(a11y_scaled(Some(20.0), Some(1.005)), Some(20.0), "inside the deadband");
+        assert_eq!(a11y_scaled(Some(20.0), Some(0.1)), Some(16.0), "clamped up to 0.8");
+        assert_eq!(a11y_scaled(Some(20.0), Some(99.0)), Some(40.0), "clamped down to 2.0");
+        assert_eq!(a11y_scaled(Some(20.0), Some(f32::NAN)), Some(20.0), "NaN is not a scale");
+        assert_eq!(a11y_scaled(None, Some(1.5)), None, "nothing to scale");
+        // ROUNDING, on a value where it plainly matters: the shell emits an integer
+        // pixel string, so 20 * 1.13 is a 23px glyph on both renderers, not 22.6 on one.
+        assert_eq!(a11y_scaled(Some(20.0), Some(1.13)), Some(23.0));
+        assert_eq!(a11y_scaled(Some(20.0), Some(1.12)), Some(22.0), "and rounds DOWN too");
+    }
+
+    #[test]
+    fn the_chrome_strips_take_their_rule_colour_from_the_theme() {
+        // `--hart-glass-border` is written as `rgba(...)`, not hex, which is exactly why
+        // it could not be read before: `hex` finds no `#RRGGBB` and returns None, so the
+        // native strips had no separator at all and their edge was wherever the
+        // translucency happened to stop. It varies real amounts by theme, so it is not a
+        // constant that could have been mirrored.
+        let dir = std::env::temp_dir().join("hart_border_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("cyber.json");
+        std::fs::write(
+            &f,
+            r#"{"colors":{"accent":"FF0090","glass_border":"rgba(255, 0, 144, 0.2)"}}"#,
+        )
+        .unwrap();
+        let t = theme_from_files(
+            &crate::bloom::SettingsFile::load(&f),
+            &crate::bloom::SettingsFile::load(std::path::Path::new("/nope.json")),
+        );
+        assert_eq!(t.chrome_border.r, 1.0);
+        assert_eq!(t.chrome_border.g, 0.0);
+        assert!((t.chrome_border.b - 144.0 / 255.0).abs() < 1e-6);
+        assert!((t.chrome_border.a - 0.2).abs() < 1e-6, "the ALPHA is the point");
+
+        // Spacing varies across the shipped themes and both forms are in the tree.
+        let tight = dir.join("aura.json");
+        std::fs::write(&tight, r#"{"colors":{"glass_border":"rgba(255,255,255,0.10)"}}"#)
+            .unwrap();
+        let t2 = theme_from_files(
+            &crate::bloom::SettingsFile::load(&tight),
+            &crate::bloom::SettingsFile::load(std::path::Path::new("/nope.json")),
+        );
+        assert_eq!((t2.chrome_border.r, t2.chrome_border.g, t2.chrome_border.b), (1.0, 1.0, 1.0));
+        assert!((t2.chrome_border.a - 0.10).abs() < 1e-6);
+
+        // A theme with no glass_border keeps the shell's own ThemeService-failure
+        // fallback rather than drawing nothing: a missing key must not delete the rule.
+        let bare = dir.join("bare.json");
+        std::fs::write(&bare, r#"{"colors":{"accent":"00E6C3"}}"#).unwrap();
+        assert_eq!(
+            theme_from_files(
+                &crate::bloom::SettingsFile::load(&bare),
+                &crate::bloom::SettingsFile::load(std::path::Path::new("/nope.json")),
+            )
+            .chrome_border,
+            crate::scene::Theme::cosmic_default().chrome_border
+        );
+    }
+
+    #[test]
+    fn a_theme_cannot_hand_the_compositor_an_absurd_bar() {
+        // These numbers come from a FILE. A zero or negative bar inverts the content
+        // band's arithmetic and an enormous one leaves no desktop, so they are clamped
+        // rather than trusted. The bounds are wide enough that every shipped theme passes
+        // through untouched, which the guard test asserts from the other side.
+        let dir = std::env::temp_dir().join("hart_shell_metrics_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("absurd.json");
+        std::fs::write(
+            &f,
+            r#"{"id":"absurd","shell":{"topbar_height":0,"icon_size":9999,
+               "border_radius":-40}}"#,
+        )
+        .unwrap();
+        let themed = theme_from_file(&crate::bloom::SettingsFile::load(&f));
+        assert!(themed.top_bar_h >= 16.0, "a zero bar is clamped, not drawn");
+        assert!(themed.icon_px <= 64.0, "a giant glyph is clamped");
+        assert!(themed.card_radius >= 0.0, "a negative radius is clamped");
+        // A non-numeric value is not a number at all: keep the shipped default.
+        let g = dir.join("text.json");
+        std::fs::write(&g, r#"{"shell":{"topbar_height":"tall"}}"#).unwrap();
+        assert_eq!(
+            theme_from_file(&crate::bloom::SettingsFile::load(&g)).top_bar_h,
+            crate::scene::Theme::cosmic_default().top_bar_h,
+            "a malformed height keeps the shipped bar"
+        );
+    }
+
+    #[test]
+    fn an_absent_theme_file_leaves_the_shipped_desktop_exactly_as_it_was() {
+        // The fallback is the safety property: this runs in the process that owns
+        // scanout, so an unreadable theme must cost nothing at all rather than a colour
+        // the user cannot explain. Byte-identical to before the file was ever read.
+        let missing = crate::bloom::SettingsFile::load(std::path::Path::new("/definitely/not/here.json"));
+        assert_eq!(theme_from_file(&missing), crate::scene::Theme::cosmic_default());
+        // A file that parses but names nothing we use is the same case.
+        let dir = std::env::temp_dir().join("hart_scene_theme_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("bare.json");
+        std::fs::write(&f, r#"{"id":"bare","font":{"size":14}}"#).unwrap();
+        assert_eq!(
+            theme_from_file(&crate::bloom::SettingsFile::load(&f)),
+            crate::scene::Theme::cosmic_default()
+        );
+    }
+
+    #[test]
+    fn a_card_shadow_is_dark_under_the_card_and_gone_a_blur_away() {
+        // `.hh-card`'s own comment: the static drop-shadow "rasters ONCE and composites
+        // cheaply forever, so the software floor KEEPS it (degrade gracefully, not gut)
+        // ... Without this the software home read as flat rectangles." The native cards
+        // had none, which is that reported symptom exactly.
+        let (cw, ch, blur) = (100u32, 60u32, 20.0f32);
+        let px = shadow_rgba(cw + 40, ch + 40, 16.0, blur, [0.0, 0.0, 0.0, 0.46]);
+        let (w, h) = (cw + 40, ch + 40);
+        let at = |x: u32, y: u32| px[((y * w + x) * 4 + 3) as usize];
+
+        // Solid under the middle of the caster, at the colour's own alpha.
+        let mid = at(w / 2, h / 2);
+        assert!(mid >= 115 && mid <= 118, "the core is the shadow's alpha, got {mid}");
+        // Gone at the buffer's edge, a full blur out from the shape.
+        assert_eq!(at(0, 0), 0, "the corner of the buffer is clear");
+        assert_eq!(at(w - 1, h - 1), 0, "and so is the far one");
+        // And MONOTONIC outward across the edge: a shadow that brightened partway would
+        // be a ring rather than a falloff.
+        let mut prev = 255u8;
+        for x in (w / 2)..w {
+            let a = at(x, h / 2);
+            assert!(a <= prev, "brightened at x={x}: {a} after {prev}");
+            prev = a;
+        }
+        // Softness scales with the blur: the same caster with twice the blur reaches
+        // further, which is what makes 38px depth read as depth rather than an outline.
+        let wide = shadow_rgba(cw + 80, ch + 80, 16.0, 40.0, [0.0, 0.0, 0.0, 0.46]);
+        let ww = cw + 80;
+        let edge_of = |buf: &[u8], stride: u32, y: u32| -> u32 {
+            (0..stride)
+                .filter(|x| buf[((y * stride + x) * 4 + 3) as usize] > 0)
+                .count() as u32
+        };
+        assert!(
+            edge_of(&wide, ww, (ch + 80) / 2) > edge_of(&px, w, h / 2),
+            "a bigger blur covers more of its row"
+        );
+    }
+
+    #[test]
+    fn every_card_on_the_desktop_shares_one_composed_shadow() {
+        // The whole reason the shell keeps this on the software floor is that it rasters
+        // once. A per-card compose would make it the opposite of what it is for, and the
+        // cards are all one size, so one buffer must serve the lot.
+        let mut rects = RectCache::default();
+        let black = [0.0, 0.0, 0.0, 0.46];
+        for _ in 0..12 {
+            assert!(rects.shadow(258, 150, 16.0, 38.0, black).is_some());
+        }
+        assert_eq!(rects.rounded_composes(), 1, "twelve cards, one composed shadow");
+
+        // A shadow and a TILE of the same size are different buffers: they share the
+        // cache, so a key collision would hand a card its own shadow as its art.
+        assert!(rects.gradient(258, 150, 16.0, black, black, 0.0).is_some());
+        assert_eq!(rects.rounded_composes(), 2, "the tile composed separately");
+    }
+
+    #[test]
+    fn a_gradient_tile_actually_varies_along_its_angle() {
+        // The card art is the ONLY thing on the desktop whose fill is not constant, so
+        // "it drew something" is not enough: a solid fill would satisfy a coverage check
+        // and still be the flat tile this replaced. Probe the two ends of the gradient
+        // line and require them to differ, then require the same tile at a different
+        // angle to differ from it as well (which a fill ignoring `angle_deg` would fail).
+        let (w, h) = (64u32, 64u32);
+        let black = [0.0, 0.0, 0.0, 1.0];
+        let red = [1.0, 0.0, 0.0, 1.0];
+        // 180deg points straight DOWN the tile, so t runs with y and the probe is exact.
+        let g = rounded_rect_rgba(w, h, 0.0, black, mid_of(black, red), 0.5, red, 180.0);
+        let red_at = |buf: &[u8], x: u32, y: u32| buf[((y * w + x) * 4 + 2) as usize];
+        let top = red_at(&g, w / 2, 1);
+        let bottom = red_at(&g, w / 2, h - 2);
+        assert!(top < 16, "the first stop end must still be the FROM colour");
+        assert!(bottom > 239, "the far end must have reached the TO colour");
+        assert!(bottom > top, "the fill must ramp from `from` to `to`, not average them");
+        // 0deg is the same line reversed, so the ramp must invert rather than repeat.
+        let up = rounded_rect_rgba(w, h, 0.0, black, mid_of(black, red), 0.5, red, 0.0);
+        assert!(
+            red_at(&up, w / 2, 1) > red_at(&up, w / 2, h - 2),
+            "the angle must actually steer the gradient"
+        );
+        // A solid tile is the degenerate case and must stay perfectly flat, whatever
+        // angle it is handed: that is what lets `rounded` share this one rasterizer.
+        let flat = rounded_rect_rgba(w, h, 0.0, red, mid_of(red, red), 0.5, red, 135.0);
+        assert_eq!(
+            red_at(&flat, 1, 1),
+            red_at(&flat, w - 2, h - 2),
+            "from == to must fill flat"
+        );
     }
 }
 
@@ -3465,6 +5238,108 @@ mod native_render_tests {
     use super::*;
     use smithay::backend::renderer::element::Element;
     use smithay::backend::renderer::pixman::PixmanRenderer;
+
+    #[test]
+    fn a_frame_that_paints_only_chrome_does_not_claim_the_home_surface() {
+        // THE FAILURE THIS GUARDS. If the compositor claims `home` on a frame that drew
+        // only the bars, the shell hides #hart-home and the user gets an empty desktop,
+        // which the paint watchdog does not catch: it watches for hangs, not for
+        // wrong-looking desktops. At a 3x3 output there is no room between the bars, so
+        // nothing can land in the home band.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (3, 3).into();
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        let mask = lower_scene(
+            &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects,
+            &mut scenes, 0.5, None, false, true,
+            &crate::scene::RowScroll::default(), &mut elements,
+        );
+        assert!(!elements.is_empty(), "chrome still paints at this size");
+        assert_eq!(
+            mask & NATIVE_CHROME_HOME,
+            0,
+            "claimed the home surface on a frame with no home band"
+        );
+    }
+
+    #[test]
+    fn a_real_desktop_claims_the_home_surface_it_paints() {
+        // And the other direction, or the claim would be unreachable and the shell would
+        // never stand down: a full-size demo home draws cards between the bars.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (1280, 800).into();
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        let mask = lower_scene(
+            &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects,
+            &mut scenes, 0.5, None, false, true,
+            &crate::scene::RowScroll::default(), &mut elements,
+        );
+        assert_ne!(
+            mask & NATIVE_CHROME_HOME,
+            0,
+            "a painted desktop must claim the home surface, or the shell draws a second one"
+        );
+    }
+
+    #[test]
+    fn the_scene_mask_is_not_evidence_that_the_scene_painted() {
+        // WHY: build_frame_elements used to set NATIVE_SCENE_PAINTED (which gates the
+        // compositor's shell-ready writer) on `scene_mask != 0`. lower_scene sets exactly
+        // one bit and only where the ORB imports, so that test really asked "did the orb
+        // draw". This lowers at an output small enough that the orb slot is skipped and
+        // shows the two answers coming apart: real elements in the frame, empty mask.
+        //
+        // If that gate is ever rewritten back to the mask, this is the frame that breaks
+        // it: shell-ready never gets written, the paint watchdog stops seeing HEALTHY, and
+        // the ladder demotes off the native shell by itself.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (3, 3).into();
+
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        let mask = lower_scene(
+            &home,
+            size,
+            &mut renderer,
+            &mut rasterizer,
+            &mut orb,
+            &mut rects,
+            &mut scenes,
+            0.5,
+            None,
+            false,
+            true,
+            &crate::scene::RowScroll::default(),
+            &mut elements,
+        );
+
+        assert_eq!(
+            mask & NATIVE_CHROME_ORB,
+            0,
+            "expected an output too small for the orb slot; pick a smaller one"
+        );
+        assert!(
+            !elements.is_empty(),
+            "the scene still paints chrome at this size, which is the whole point"
+        );
+        // So this is a frame the OLD gate called unpainted while it demonstrably painted.
+        assert_eq!(mask, 0, "no other bit should be standing in for the orb's");
+    }
 
     #[test]
     fn demo_scene_lowers_and_imports_buffers_on_pixman() {
@@ -3491,6 +5366,8 @@ mod native_render_tests {
             0.5,
             None,
             false,
+            true,
+            &crate::scene::RowScroll::default(),
             &mut elements,
         );
 
@@ -3544,6 +5421,8 @@ mod native_render_tests {
 
         let mut first = 0usize;
         let mut solids_after_first_frame = 0u64;
+        let mut text_after_first_frame = 0u64;
+        let mut rounded_after_first_frame = 0u64;
         for frame in 0..6 {
             // A fresh element vector each pass, exactly as build_frame_elements does, so
             // the previous frame's elements are dropped before the buffers are reused.
@@ -3559,16 +5438,41 @@ mod native_render_tests {
                 0.5,
                 None,
                 false,
+                true,
+                &crate::scene::RowScroll::default(),
                 &mut elements,
             );
             if frame == 0 {
                 first = elements.len();
                 solids_after_first_frame = rects.solid_allocs();
+                text_after_first_frame = rasterizer.composes();
+                rounded_after_first_frame = rects.rounded_composes();
                 assert!(first > 0, "the demo scene lowered to nothing");
                 assert_eq!(scenes.rebuilds(), 1, "the first frame builds the tree once");
                 assert!(
                     solids_after_first_frame > 0,
                     "the demo scene has sharp rects, so the first frame allocates solids"
+                );
+                assert!(
+                    rounded_after_first_frame > 0,
+                    "the demo scene has rounded cards, so the first frame composes some"
+                );
+                // Without this the compose-once assertion below could hold simply because
+                // nothing was ever composed. The bar and hero carry real runs, and the
+                // counter advances even with no fonts installed (compose returns a blank
+                // buffer but is still a compose), so this holds in a bare sandbox too.
+                assert!(
+                    text_after_first_frame > 0,
+                    "the demo scene has text runs, so the first frame composes some"
+                );
+                // The demo is the payload the box shows before any compose arrives, and
+                // an empty title lowers to nothing, so a demo of default cards would
+                // render blank tiles. Every card carries text; this catches a regression
+                // back to Card::default() in the one payload that must look like a
+                // desktop unaided.
+                assert!(
+                    text_after_first_frame >= 12,
+                    "the demo must carry real card text, only {text_after_first_frame} runs"
                 );
             } else {
                 assert_eq!(
@@ -3588,6 +5492,475 @@ mod native_render_tests {
             rects.solid_allocs(),
             solids_after_first_frame,
             "five further frames must reuse the pooled solids, not allocate new ones"
+        );
+        // COMPOSE-ONCE, the other binding NFR. These two are the expensive per-pixel work
+        // in a frame: shaping and drawing a text run, and rasterizing a rounded-rect SDF.
+        // A cache key that accidentally carried something unstable would redo all of it
+        // every frame and the element counts above would still match, so these assertions
+        // are the only thing standing between a cached desktop and a re-rasterized one.
+        assert_eq!(
+            rasterizer.composes(),
+            text_after_first_frame,
+            "a steady desktop must not re-shape its text runs"
+        );
+        assert_eq!(
+            rects.rounded_composes(),
+            rounded_after_first_frame,
+            "a steady desktop must not re-rasterize its rounded rects"
+        );
+    }
+
+    #[test]
+    fn the_native_shell_counts_as_animating_so_the_orb_is_not_throttled_to_the_heartbeat() {
+        // The frame-budget gate skips a tick when nothing is dirty and nothing animates,
+        // falling back to a 200ms idle heartbeat. The native orb breathes off the clock,
+        // so without this the flip to the native shell would quietly render that breath
+        // at 5 Hz: a stutter, not a breath, and against the 60fps NFR.
+        assert!(
+            scene_animates(true, true, false, false, false, false),
+            "a drawn native scene animates by construction, its orb never stops breathing"
+        );
+        // Flag OFF is untouched, which is what keeps the shipped WebView desktop's idle
+        // saving: the orb still breathes down there, but occluded, so it costs nothing.
+        assert!(!scene_animates(false, true, false, false, false, false));
+        // The two effects that already forced a paint still do, with the flag off.
+        assert!(scene_animates(false, true, false, false, true, false), "a workspace fade must play out");
+        assert!(scene_animates(false, true, false, false, false, true), "a map animation must play out");
+    }
+
+    #[test]
+    fn a_degenerate_output_lowers_without_panicking() {
+        // The layout half of this is proven in scene.rs; this is the other half, where a
+        // bad rect would actually land: buffer allocation and texture import. A zero-size
+        // output is reachable while a mode is being set or a CRTC returns from DPMS, and
+        // the compositor cannot afford a panic on the render path at any size.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+
+        for (w, h) in [(0, 0), (1, 1), (0, 900), (1600, 0), (320, 40), (2, 84)] {
+            let size: Size<i32, Physical> = (w, h).into();
+            let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+            lower_scene(
+                &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
+                0.5, Some((10.0, 10.0)), true, true,
+                &crate::scene::RowScroll::default(),
+                &mut elements,
+            );
+            // Whatever survived must still have a real footprint: the <1px skips exist so
+            // nothing reaches the renderer with an empty or inverted box.
+            for e in &elements {
+                let g = e.geometry(Scale::from(1.0));
+                assert!(
+                    g.size.w > 0 && g.size.h > 0,
+                    "{w}x{h} lowered an element with empty geometry {g:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_native_scene_claims_the_orb_it_draws() {
+        // The shell hides its own HTML orb only when the compositor claims 'orb' through
+        // NATIVE_CHROME_EMITTED (liquid_ui_service.read_native_chrome). The M2 block that
+        // used to set that bit is skipped exactly when the native shell is on, so the
+        // scene must claim it itself or the flip ships two orbs, one breathing under the
+        // other, with the WebView still burning a core on the one nobody needed.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (1280, 800).into();
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+
+        let emitted = lower_scene(
+            &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
+            0.5, None, false, true, &crate::scene::RowScroll::default(), &mut elements,
+        );
+        assert_eq!(
+            emitted & NATIVE_CHROME_ORB,
+            NATIVE_CHROME_ORB,
+            "the home scene draws an orb, so it must claim one"
+        );
+        // The claim is only ever made on a real push, so it cannot outrun the pixels.
+        assert!(!elements.is_empty());
+        // Bloom is NOT the scene's to claim: the backdrop block still emits it, and
+        // claiming it here would blank the shell's backdrop against nothing.
+        assert_eq!(emitted & NATIVE_CHROME_BLOOM, 0);
+    }
+
+    #[test]
+    fn the_killswitch_stops_the_native_scene_being_drawn_or_holding_the_gate_open() {
+        // The killswitch pushes an opaque full-output black solid ABOVE everything, so
+        // the native scene under it is invisible either way and nothing leaks. What it
+        // must not do is keep costing: lowering a hidden scene is waste, and because a
+        // drawn native scene holds the frame-budget gate open, an unguarded one would
+        // composite at full rate behind a blacked-out screen.
+        assert!(native_scene_drawn(true, false), "flag on, not blocked: drawn");
+        assert!(!native_scene_drawn(true, true), "the killswitch hides it, so skip it");
+        assert!(!native_scene_drawn(false, false), "flag off: never drawn");
+        assert!(!native_scene_drawn(false, true));
+        // And the gate agrees, because both decisions read the same predicate.
+        assert!(!scene_animates(native_scene_drawn(true, true), true, false, false, false, false));
+        assert!(scene_animates(native_scene_drawn(true, false), true, false, false, false, false));
+        // A real animation still plays out under the killswitch: correctness first, the
+        // saving is only ever about the native scene.
+        assert!(scene_animates(native_scene_drawn(true, true), true, false, false, true, false));
+    }
+
+    #[test]
+    fn the_software_floor_stops_the_native_desktop_compositing_at_full_rate() {
+        // The frame-budget gate (#137) exists so a still desktop stops re-importing
+        // textures and attempting a page-flip every 16ms. A drawn native scene held it
+        // open unconditionally, because its orb breathes, so the native shell was the one
+        // thing in the compositor that could defeat that gate entirely, on the pixman
+        // software floor, where the CPU pays for every composite. The HTML shell has
+        // never done this: its breathing is `body.gpu-hardware #hart-voice-orb` and
+        // nothing else, and liquid_ui_service records why (real-HW 2026-07-12, GPU-only
+        // effects on a CPU renderer hung the whole shell).
+        assert!(
+            scene_animates(true, true, false, false, false, false),
+            "GPU-composited with the scene drawn: the orb breathes"
+        );
+        assert!(
+            !scene_animates(true, false, false, false, false, false),
+            "on the software floor a still native desktop must let the gate close"
+        );
+        // Transients are unconditional: a workspace fade and a map animation are a few
+        // hundred milliseconds of motion the user just asked for, not a permanent hold,
+        // and they must play out on the floor too.
+        assert!(scene_animates(true, false, false, false, true, false), "a ws fade plays on the floor");
+        assert!(scene_animates(true, false, false, false, false, true), "so does a map animation");
+        assert!(
+            !scene_animates(false, false, false, false, false, false),
+            "nothing drawn, nothing animating, nothing to hold the gate open"
+        );
+    }
+
+    #[test]
+    fn the_themes_reduced_effects_tier_sheds_the_breath_and_keeps_the_transients() {
+        // liquid_ui_service computes `is_potato = perf.disable_blur or gpu_mode ==
+        // 'software'` and that one flag strips its animation strings before they are
+        // emitted. The GPU half was already mirrored; this is the THEME half, which is a
+        // single key in a file the compositor already reads, so the third of the ledger's
+        // motion kill-switches was never as far away as it looked.
+        assert!(
+            scene_animates(true, true, false, false, false, false),
+            "a capable GPU on an ordinary theme: the orb breathes"
+        );
+        assert!(
+            !scene_animates(true, true, true, false, false, false),
+            "the theme asked for the reduced-effects tier"
+        );
+        // It sheds exactly what the hardware floor sheds and no more, which is rule 5's
+        // "degrade gracefully, never gut": the perpetual breath goes, the brief
+        // transients stay. Only a stated preference stops those.
+        assert!(
+            scene_animates(true, true, true, false, true, false),
+            "a workspace fade still plays on the potato tier"
+        );
+        assert!(
+            !scene_animates(true, true, true, true, true, true),
+            "but reduced motion still outranks everything"
+        );
+        // The two halves are independent: either one alone is enough.
+        assert!(!scene_animates(true, false, false, false, false, false));
+        assert!(!scene_animates(true, false, true, false, false, false));
+    }
+
+    #[test]
+    fn the_potato_flag_is_the_key_the_shell_actually_reads() {
+        // `disable_blur`, not its sibling `disable_animations`. Only potato.json sets
+        // either, and NOTHING in the tree reads disable_animations, so honouring that one
+        // natively would invent a behaviour the shell does not have.
+        let dir = std::env::temp_dir().join("hart_potato_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let spud = dir.join("potato.json");
+        std::fs::write(
+            &spud,
+            r#"{"performance":{"disable_blur":true,"disable_animations":true}}"#,
+        )
+        .unwrap();
+        let f = crate::bloom::SettingsFile::load(&spud);
+        assert_eq!(f.flag("disable_blur"), Some(true));
+
+        let rich = dir.join("aura.json");
+        std::fs::write(&rich, r#"{"performance":{"lazy_load_iframes":true}}"#).unwrap();
+        assert_eq!(
+            crate::bloom::SettingsFile::load(&rich).flag("disable_blur"),
+            None,
+            "a theme that says nothing is not asking for the tier"
+        );
+    }
+
+    #[test]
+    fn declared_reduced_motion_stops_the_desktop_moving_at_all() {
+        // The CSS parity ledger's rule 4: the shell has THREE independent motion
+        // kill-switches and all three must exist natively. The native scene honoured only
+        // the GPU floor, so a user who had declared reduced motion would still have got a
+        // breathing orb the moment the shell went native.
+        //
+        // It is not a performance floor and is not overridden by one. On the fastest GPU
+        // in the fleet, with the scene drawn, reduced motion still means still.
+        assert!(
+            scene_animates(true, true, false, false, false, false),
+            "GPU, not reduced: the orb breathes"
+        );
+        assert!(
+            !scene_animates(true, true, false, true, false, false),
+            "reduced motion wins over a perfectly capable GPU"
+        );
+        // And it wins over the TRANSIENTS too, which is the difference between this and
+        // the hardware floor: a workspace fade the user asked not to see is exactly what
+        // the preference exists to stop, where a slow CPU is a reason to skip the breath
+        // and still show the fade.
+        assert!(scene_animates(true, false, false, false, true, false), "ws fade on the CPU floor");
+        assert!(
+            !scene_animates(true, true, false, true, true, true),
+            "nothing animates when the user said stop"
+        );
+    }
+
+    #[test]
+    fn the_reduced_motion_flag_is_read_from_the_file_the_shell_reads() {
+        // shell_os_apis.py seeds _A11Y_SETTINGS from /etc/hart/accessibility.json at
+        // import; this reads the same key out of the same shape. Absent file, absent key
+        // and a non-boolean all mean "not declared", which is what the shell defaults to.
+        let dir = std::env::temp_dir().join("hart_a11y_test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let on = dir.join("on.json");
+        std::fs::write(&on, r#"{"font_scale":1.0,"reduced_motion":true}"#).unwrap();
+        assert_eq!(
+            crate::bloom::SettingsFile::load(&on).flag("reduced_motion"),
+            Some(true)
+        );
+        let off = dir.join("off.json");
+        std::fs::write(&off, r#"{"reduced_motion":false,"high_contrast":true}"#).unwrap();
+        assert_eq!(
+            crate::bloom::SettingsFile::load(&off).flag("reduced_motion"),
+            Some(false)
+        );
+        assert_eq!(
+            crate::bloom::SettingsFile::load(&off).flag("high_contrast"),
+            Some(true),
+            "the reader is not special-cased to one key"
+        );
+        // Missing key, missing file, and a value that is not a bool: all None, so the
+        // caller keeps the shipped default rather than guessing.
+        let bare = dir.join("bare.json");
+        std::fs::write(&bare, r#"{"font_scale":1.25,"reduced_motion":"yes"}"#).unwrap();
+        assert_eq!(
+            crate::bloom::SettingsFile::load(&bare).flag("reduced_motion"),
+            None,
+            "a string is not a JSON bool"
+        );
+        assert_eq!(
+            crate::bloom::SettingsFile::load(&bare).flag("large_cursor"),
+            None
+        );
+        assert_eq!(
+            crate::bloom::SettingsFile::load(std::path::Path::new("/definitely/not/here.json"))
+                .flag("reduced_motion"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_orb_with_motion_off_rests_rather_than_freezing_mid_breath() {
+        // `animation: none` is not `animation-play-state: paused`. The shell's software
+        // floor never STARTS the breathing, so the orb sits at its resting scale; freezing
+        // it wherever the last painted frame caught it would leave a random half-inflated
+        // orb on screen for the whole session. Same motion function either way, so there
+        // is no second resting-state constant to drift.
+        let mut cache = OrbCache::default();
+        let rest = cache
+            .current(64, 0.0, false)
+            .map(|(_, m)| m)
+            .expect("a real size composes");
+        assert_eq!(rest.scale, crate::orb::motion_at(std::time::Duration::ZERO, 0.0).scale);
+        // Energy still reads through with motion off: a speaking orb is brighter even
+        // when it does not breathe, which is the shell's behaviour too (the canvas viz
+        // reacts on both floors; only the CSS float/breathe is GPU-gated).
+        let hot = cache.current(64, 1.0, false).map(|(_, m)| m).expect("composed");
+        assert!(hot.alpha > rest.alpha, "energy lifts the orb without motion");
+        assert_eq!(hot.scale, rest.scale, "but it does not inflate it");
+    }
+
+    #[test]
+    fn a_steady_desktop_keeps_its_element_identities_so_damage_tracking_works() {
+        // Damage-tracked redraw is a binding NFR and it rests on something no other test
+        // here checks. The compositor decides what changed by comparing each element's ID
+        // and commit counter against the previous frame. If the lowering handed back fresh
+        // identities every frame, every frame would be FULLY damaged, a static desktop
+        // would repaint end to end at 60Hz, and every count-based assertion in this file
+        // would still pass while it happened. Element identity comes from the underlying
+        // buffer, so this is what the retained tree, the solid pool and the compose-once
+        // caches actually buy at the damage level, as opposed to the allocation level.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (1280, 800).into();
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+
+        let idents = |els: &Vec<HartRenderElement<PixmanRenderer>>| {
+            els.iter()
+                .map(|e| (e.id().clone(), e.current_commit()))
+                .collect::<Vec<_>>()
+        };
+
+        let mut first: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        lower_scene(
+            &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
+            0.5, None, false, true, &crate::scene::RowScroll::default(), &mut first,
+        );
+        let a = idents(&first);
+        assert!(!a.is_empty(), "the demo scene lowered to nothing");
+        drop(first);
+
+        let mut second: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        lower_scene(
+            &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects, &mut scenes,
+            0.5, None, false, true, &crate::scene::RowScroll::default(), &mut second,
+        );
+        assert_eq!(
+            idents(&second),
+            a,
+            "an unchanged desktop must present the SAME element identities, or the \
+             compositor sees a whole new frame and damages everything"
+        );
+    }
+
+    #[test]
+    fn hovering_a_card_recolours_it_without_changing_the_frame_shape() {
+        // The card slice of M2 input. A highlight is a different COLOUR for a rect the
+        // scene already draws, so the lowered frame must carry exactly the same elements,
+        // in the same order, at the same geometry, hovered or not. That invariant is what
+        // makes hover free: no relayout, no extra element, no damage beyond the card.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (1280, 800).into();
+        let home = crate::scene::HomeCompose::demo();
+        let theme = crate::scene::Theme::cosmic_default();
+
+        // The centre of the first card, read from the same layout the lowering walks. It
+        // must be measured by the SAME rasterizer the lowering hands to tree_for: a
+        // different measure could place the cards elsewhere, the hover point would miss,
+        // and the test would pass by comparing two UNhovered frames.
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let tree = crate::scene::layout_home(
+            size.w as f32,
+            size.h as f32,
+            &home,
+            &theme,
+            &crate::scene::RowScroll::default(),
+            &mut rasterizer,
+        );
+        // Depth-agnostic: cards sit inside their ROW's group now, which is what
+        // `.hh-row` is in the shell, so a walk that only looked at root's children
+        // found none. A test that pins tree depth fails on every regrouping without
+        // anything actually being wrong.
+        fn first_card_centre(node: &crate::scene::SceneNode) -> Option<(f32, f32)> {
+            if let crate::scene::SceneNode::Container {
+                rect,
+                interactive,
+                children,
+                ..
+            } = node
+            {
+                if *interactive {
+                    return Some((rect.x + rect.w * 0.5, rect.y + rect.h * 0.5));
+                }
+                for c in children {
+                    if let Some(found) = first_card_centre(c) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+        let card = first_card_centre(&tree);
+        let centre = card.expect("the demo home lays out cards");
+        // The hover point must actually LAND on that card, or the two lowerings below
+        // would both be unhovered and compare equal for the wrong reason.
+        assert!(
+            tree.hover_leaf(Some(centre)).is_some(),
+            "the chosen point must be a real hover target"
+        );
+
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+        let geo = |els: &Vec<HartRenderElement<PixmanRenderer>>| -> Vec<(i32, i32, i32, i32)> {
+            els.iter()
+                .map(|e| {
+                    let g = e.geometry(Scale::from(1.0));
+                    (g.loc.x, g.loc.y, g.size.w, g.size.h)
+                })
+                .collect()
+        };
+
+        let mut plain: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        lower_scene(
+            &home,
+            size,
+            &mut renderer,
+            &mut rasterizer,
+            &mut orb,
+            &mut rects,
+            &mut scenes,
+            0.5,
+            None,
+            false,
+            true,
+            &crate::scene::RowScroll::default(),
+            &mut plain,
+        );
+        let plain_geo = geo(&plain);
+        let rebuilds = scenes.rebuilds();
+        let solids = rects.solid_allocs();
+        assert!(!plain_geo.is_empty(), "the demo scene lowered to nothing");
+        // Drop before re-lowering, exactly as the frame loop does, so the pooled buffers
+        // are free to be handed out again.
+        drop(plain);
+
+        let mut hovered: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        lower_scene(
+            &home,
+            size,
+            &mut renderer,
+            &mut rasterizer,
+            &mut orb,
+            &mut rects,
+            &mut scenes,
+            0.5,
+            Some(centre),
+            false,
+            true,
+            &crate::scene::RowScroll::default(),
+            &mut hovered,
+        );
+
+        assert_eq!(
+            geo(&hovered),
+            plain_geo,
+            "a hover must not move, add or drop a single element"
+        );
+        assert_eq!(
+            scenes.rebuilds(),
+            rebuilds,
+            "hover must not rebuild the retained tree"
+        );
+        assert_eq!(
+            rects.solid_allocs(),
+            solids,
+            "a card highlight is a rounded rect, so it must not touch the solid pool"
         );
     }
 
@@ -3625,6 +5998,8 @@ mod native_render_tests {
             0.5,
             None,
             false,
+            true,
+            &crate::scene::RowScroll::default(),
             &mut elements,
         );
 
@@ -3661,6 +6036,49 @@ mod native_render_tests {
         assert!(
             painted > total / 20,
             "native scene painted only {painted}/{total} px over the clear sentinel"
+        );
+
+        // STRUCTURE, not just coverage. A fraction-of-the-frame count says something was
+        // drawn; it does not say the desktop has a top bar and a taskbar. Both strips are
+        // full-width rects, so every pixel of both must be off the sentinel, and a hole in
+        // either is the flicker class the DRM path already fights showing up in lowering
+        // instead. This is the assertion that would have caught the demo drawing blank
+        // tiles, which coverage alone happily passed.
+        let (w, h) = (size.w as usize, size.h as usize);
+        let is_sentinel =
+            |px: &[u8]| px[0] > 250 && px[1] < 5 && px[2] > 250;
+        let row_sentinels = |y: usize| -> usize {
+            (0..w)
+                .filter(|x| {
+                    let i = (y * w + x) * 4;
+                    is_sentinel(&bytes[i..i + 4])
+                })
+                .count()
+        };
+        for y in 0..crate::scene::TOP_BAR_H as usize {
+            assert_eq!(
+                row_sentinels(y),
+                0,
+                "row {y} of the top bar left {} px unpainted",
+                row_sentinels(y)
+            );
+        }
+        for y in (h - crate::scene::TASKBAR_H as usize)..h {
+            assert_eq!(
+                row_sentinels(y),
+                0,
+                "row {y} of the taskbar left {} px unpainted",
+                row_sentinels(y)
+            );
+        }
+        // And the band between them is not empty: the hero, the orb and the cards live
+        // there, so a desktop that painted only its two bars is not a desktop.
+        let mid = (crate::scene::TOP_BAR_H as usize..h - crate::scene::TASKBAR_H as usize)
+            .map(|y| w - row_sentinels(y))
+            .sum::<usize>();
+        assert!(
+            mid > w,
+            "the content band painted only {mid} px, so nothing but the bars drew"
         );
     }
 }

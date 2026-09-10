@@ -267,6 +267,36 @@ class TestModuleConstants:
 # run_local_agentic_loop (mocked)
 # ============================================================
 
+def _unified_backend(response):
+    """A stand-in for the Qwen3-VL backend the loop now calls by DEFAULT.
+
+    These tests patched `local_loop._call_local_llm`, which was the only VLM call
+    when they were written. The owner made unified Qwen3-VL the default on
+    2026-09-01 (`HEVOLVE_VLM_UNIFIED`, default True) and `_call_local_llm` became
+    the legacy branch, taken only when that flag is off. So the patch stopped
+    biting and the REAL backend ran: these tests were POSTing to 127.0.0.1:8080,
+    which is why three failed and three passed for reasons unrelated to what they
+    assert, both depending on what happens to be listening on the box.
+
+    Mocking the backend rather than forcing the legacy flag keeps them on the path
+    that actually ships. `route_task` must return a real route string because the
+    loop compares it against 'single_shot'/'enumerate'; `try_taskbar_pre_check` is
+    exception-guarded upstream, so a default MagicMock is safe there.
+    """
+    b = MagicMock()
+    b.route_task.return_value = 'multi_step'
+    b._call_api.return_value = response
+    # The loop BRANCHES on these, so a default MagicMock (truthy) silently
+    # changes the path under test: `try_taskbar_pre_check` returning non-None
+    # takes the taskbar shortcut and the VLM is never called at all, which is
+    # exactly how the first attempt at this mock produced `done` on iteration 1
+    # with `_call_api.call_args` still None.
+    b.try_taskbar_pre_check.return_value = None
+    b.detect_grounding_bias.return_value = None
+    b.retry_with_elimination.return_value = None
+    return b
+
+
 class TestRunLocalAgenticLoop:
     """Loop orchestration with all external deps mocked."""
 
@@ -283,7 +313,8 @@ class TestRunLocalAgenticLoop:
         mock_lct.VLM_IMG_H = 720
 
         with patch.dict('sys.modules', {'integrations.vlm.local_computer_tool': mock_lct}):
-            with patch('integrations.vlm.local_loop._call_local_llm', return_value=done_response):
+            with patch('integrations.vlm.qwen3vl_backend.get_qwen3vl_backend',
+                       return_value=_unified_backend(done_response)):
                 mock_omni = MagicMock()
                 mock_omni.parse_screen.return_value = {'screen_info': 'Desktop', 'parsed_content_list': []}
                 with patch.dict('sys.modules', {'integrations.vlm.local_omniparser': mock_omni}):
@@ -309,7 +340,8 @@ class TestRunLocalAgenticLoop:
         mock_lct.VLM_IMG_H = 720
 
         with patch.dict('sys.modules', {'integrations.vlm.local_computer_tool': mock_lct}):
-            with patch('integrations.vlm.local_loop._call_local_llm', return_value=action_response):
+            with patch('integrations.vlm.qwen3vl_backend.get_qwen3vl_backend',
+                       return_value=_unified_backend(action_response)):
                 mock_omni = MagicMock()
                 mock_omni.parse_screen.return_value = {'screen_info': '', 'parsed_content_list': []}
                 with patch.dict('sys.modules', {'integrations.vlm.local_omniparser': mock_omni}):
@@ -358,7 +390,8 @@ class TestRunLocalAgenticLoop:
         mock_lct.VLM_IMG_H = 720
 
         with patch.dict('sys.modules', {'integrations.vlm.local_computer_tool': mock_lct}):
-            with patch('integrations.vlm.local_loop._call_local_llm', return_value=action_response):
+            with patch('integrations.vlm.qwen3vl_backend.get_qwen3vl_backend',
+                       return_value=_unified_backend(action_response)):
                 mock_omni = MagicMock()
                 mock_omni.parse_screen.return_value = {'screen_info': '', 'parsed_content_list': []}
                 with patch.dict('sys.modules', {'integrations.vlm.local_omniparser': mock_omni}):
@@ -403,7 +436,8 @@ class TestRunLocalAgenticLoop:
         mock_lct.VLM_IMG_H = 720
 
         with patch.dict('sys.modules', {'integrations.vlm.local_computer_tool': mock_lct}):
-            with patch('integrations.vlm.local_loop._call_local_llm', return_value=done_response):
+            with patch('integrations.vlm.qwen3vl_backend.get_qwen3vl_backend',
+                       return_value=_unified_backend(done_response)):
                 mock_omni = MagicMock()
                 mock_omni.parse_screen.return_value = {'screen_info': '', 'parsed_content_list': []}
                 with patch.dict('sys.modules', {'integrations.vlm.local_omniparser': mock_omni}):
@@ -424,7 +458,8 @@ class TestRunLocalAgenticLoop:
         mock_lct.VLM_IMG_H = 720
 
         with patch.dict('sys.modules', {'integrations.vlm.local_computer_tool': mock_lct}):
-            with patch('integrations.vlm.local_loop._call_local_llm', return_value=done_response):
+            with patch('integrations.vlm.qwen3vl_backend.get_qwen3vl_backend',
+                       return_value=_unified_backend(done_response)):
                 mock_omni = MagicMock()
                 mock_omni.parse_screen.return_value = {'screen_info': '', 'parsed_content_list': []}
                 with patch.dict('sys.modules', {'integrations.vlm.local_omniparser': mock_omni}):
@@ -444,7 +479,12 @@ class TestRunLocalAgenticLoop:
         mock_lct.VLM_IMG_H = 720
 
         with patch.dict('sys.modules', {'integrations.vlm.local_computer_tool': mock_lct}):
-            with patch('integrations.vlm.local_loop._call_local_llm', return_value=done_response) as mock_llm:
+            backend = _unified_backend(done_response)
+            # Bound to the BACKEND, not to the patched factory: `as mock_vlm`
+            # would name the function that returns it, whose `_call_api` is a
+            # fresh auto-attribute nothing ever calls.
+            with patch('integrations.vlm.qwen3vl_backend.get_qwen3vl_backend',
+                       return_value=backend):
                 mock_omni = MagicMock()
                 mock_omni.parse_screen.return_value = {'screen_info': '', 'parsed_content_list': []}
                 with patch.dict('sys.modules', {'integrations.vlm.local_omniparser': mock_omni}):
@@ -455,7 +495,13 @@ class TestRunLocalAgenticLoop:
                         },
                         tier='inprocess',
                     )
-        # The messages passed to LLM should contain the enhanced instruction
-        messages = mock_llm.call_args[0][0]
-        user_msg = messages[1]["content"]
-        assert user_msg == "enhanced version"
+        # The unified backend builds ONE user message whose content is a
+        # [text, image_url] pair, so the enhanced instruction is inside the
+        # combined prompt rather than being messages[1]["content"] verbatim.
+        messages = backend._call_api.call_args[0][0]
+        text_parts = [c["text"] for c in messages[0]["content"]
+                      if c.get("type") == "text"]
+        assert any("enhanced version" in t for t in text_parts), (
+            "the enhanced instruction never reached the VLM: %r" % text_parts)
+        assert not any("basic" == t.strip() for t in text_parts), (
+            "the basic instruction was sent instead of the enhanced one")

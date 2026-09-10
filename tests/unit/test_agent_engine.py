@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import time
+import types
 import pytest
 import requests
 from unittest.mock import patch, Mock, MagicMock, PropertyMock
@@ -522,8 +523,20 @@ class TestDispatch:
     _INPROC_APP = MagicMock()
     _INPROC_APP.test_client.return_value.__enter__.return_value         .post.return_value.get_json.return_value = {}
 
+    # A STUB MODULE, not an attribute patch on the real one. `patch(...)`
+    # resolves its target eagerly, so naming an attribute of
+    # hart_intelligence_entry IMPORTED it, and importing it boots the backend:
+    # init_social -> gossip announce (socket probes per peer) -> the distributed
+    # worker loop -> a Redis coordinator probe, plus compute_code_hash walking
+    # every .py in the tree. That is the >120s hang CI reports for this file, not
+    # anything dispatch_goal does. dispatch.py:222 imports `app` lazily INSIDE the
+    # function, so a stub in sys.modules is picked up and the real module is never
+    # imported at all.
+    _INPROC_STUB = types.ModuleType('hart_intelligence_entry')
+    _INPROC_STUB.app = _INPROC_APP
+
     _DISPATCH_PATCHES = [
-        patch('hart_intelligence_entry.app', _INPROC_APP),
+        patch.dict(sys.modules, {'hart_intelligence_entry': _INPROC_STUB}),
         # ...and no hive peers, so dispatch takes the LOCAL leg these tests
         # assert on. dispatch_goal also grew a DISTRIBUTED leg that runs first
         # whenever a coordinator + peers are reachable and returns the submitted
@@ -1457,6 +1470,17 @@ class TestGuardrailNetwork:
 # Model Registry Tests
 # =============================================================================
 
+# A config the router can actually POST to. `ModelBackend.is_dispatchable()`
+# requires an http(s) base_url, and every selector filters on it: the registry
+# also carries in-process TTS/STT engines ('inprocess://pocket_tts') that were
+# registered at FAST tier with tiny latencies, so a latency-ordered selector
+# picked a SPEECH SYNTHESISER to draft chat completions (measured on the desktop
+# 2026-09-01). These fixtures passed `config_list_entry={}`, which has no
+# base_url, so every registered model was correctly non-dispatchable and the
+# selectors returned None.
+_DIALABLE = {'model': 'test', 'base_url': 'http://127.0.0.1:8080/v1'}
+
+
 class TestModelRegistry:
     def test_register_and_get(self):
         from integrations.agent_engine.model_registry import (
@@ -1476,10 +1500,10 @@ class TestModelRegistry:
         reg = ModelRegistry()
         reg.register(ModelBackend(
             model_id='slow', display_name='Slow', tier=ModelTier.EXPERT,
-            config_list_entry={}, avg_latency_ms=3000, accuracy_score=0.9))
+            config_list_entry=_DIALABLE, avg_latency_ms=3000, accuracy_score=0.9))
         reg.register(ModelBackend(
             model_id='fast', display_name='Fast', tier=ModelTier.FAST,
-            config_list_entry={}, avg_latency_ms=100, accuracy_score=0.5))
+            config_list_entry=_DIALABLE, avg_latency_ms=100, accuracy_score=0.5))
         fast = reg.get_fast_model()
         assert fast.model_id == 'fast'
 
@@ -1489,10 +1513,10 @@ class TestModelRegistry:
         reg = ModelRegistry()
         reg.register(ModelBackend(
             model_id='cheap', display_name='Cheap', tier=ModelTier.FAST,
-            config_list_entry={}, avg_latency_ms=50, accuracy_score=0.3))
+            config_list_entry=_DIALABLE, avg_latency_ms=50, accuracy_score=0.3))
         reg.register(ModelBackend(
             model_id='decent', display_name='Decent', tier=ModelTier.BALANCED,
-            config_list_entry={}, avg_latency_ms=500, accuracy_score=0.7))
+            config_list_entry=_DIALABLE, avg_latency_ms=500, accuracy_score=0.7))
         fast = reg.get_fast_model(min_accuracy=0.5)
         assert fast.model_id == 'decent'
 
@@ -1502,10 +1526,10 @@ class TestModelRegistry:
         reg = ModelRegistry()
         reg.register(ModelBackend(
             model_id='cheap', display_name='Cheap', tier=ModelTier.FAST,
-            config_list_entry={}, accuracy_score=0.4, cost_per_1k_tokens=0))
+            config_list_entry=_DIALABLE, accuracy_score=0.4, cost_per_1k_tokens=0))
         reg.register(ModelBackend(
             model_id='expert', display_name='Expert', tier=ModelTier.EXPERT,
-            config_list_entry={}, accuracy_score=0.95, cost_per_1k_tokens=3))
+            config_list_entry=_DIALABLE, accuracy_score=0.95, cost_per_1k_tokens=3))
         expert = reg.get_expert_model()
         assert expert.model_id == 'expert'
 
@@ -1515,12 +1539,44 @@ class TestModelRegistry:
         reg = ModelRegistry()
         reg.register(ModelBackend(
             model_id='cheap', display_name='Cheap', tier=ModelTier.FAST,
-            config_list_entry={}, accuracy_score=0.4, cost_per_1k_tokens=0))
+            config_list_entry=_DIALABLE, accuracy_score=0.4, cost_per_1k_tokens=0))
         reg.register(ModelBackend(
             model_id='expensive', display_name='Expensive', tier=ModelTier.EXPERT,
-            config_list_entry={}, accuracy_score=0.95, cost_per_1k_tokens=10))
+            config_list_entry=_DIALABLE, accuracy_score=0.95, cost_per_1k_tokens=10))
         expert = reg.get_expert_model(max_cost=5)
         assert expert.model_id == 'cheap'
+
+    def test_a_non_dialable_backend_never_wins_a_selection(self):
+        """The guard the fixtures above were accidentally exercising in reverse.
+
+        An in-process TTS engine is registered at FAST tier with a tiny latency,
+        so every latency-ordered selector would pick it. It cannot answer
+        /chat/completions, and on this desktop it DID win: get_fast_model()
+        returned pocket-tts-100m and speculative dispatch asked a speech
+        synthesiser to draft chat completions. The rule is about transport, not a
+        name list, so this asserts the real language model wins on both selectors
+        even though the impostor is faster and cheaper.
+        """
+        from integrations.agent_engine.model_registry import (
+            ModelRegistry, ModelBackend, ModelTier)
+        reg = ModelRegistry()
+        reg.register(ModelBackend(
+            model_id='pocket-tts-100m', display_name='TTS', tier=ModelTier.FAST,
+            config_list_entry={'base_url': 'inprocess://pocket_tts'},
+            avg_latency_ms=1, accuracy_score=0.99, cost_per_1k_tokens=0))
+        reg.register(ModelBackend(
+            model_id='qwen3.5-4b-local', display_name='Qwen', tier=ModelTier.FAST,
+            config_list_entry=_DIALABLE,
+            avg_latency_ms=900, accuracy_score=0.6, cost_per_1k_tokens=1))
+        assert reg.get_fast_model().model_id == 'qwen3.5-4b-local'
+        assert reg.get_expert_model().model_id == 'qwen3.5-4b-local'
+        # ...and the shard placeholder is excluded for the same reason.
+        reg2 = ModelRegistry()
+        reg2.register(ModelBackend(
+            model_id='distributed-shard', display_name='Shard', tier=ModelTier.FAST,
+            config_list_entry={'base_url': 'shard://cluster'},
+            avg_latency_ms=1, accuracy_score=0.99))
+        assert reg2.get_fast_model() is None
 
     def test_record_latency(self):
         from integrations.agent_engine.model_registry import (
@@ -1528,7 +1584,7 @@ class TestModelRegistry:
         reg = ModelRegistry()
         reg.register(ModelBackend(
             model_id='test', display_name='Test', tier=ModelTier.FAST,
-            config_list_entry={}, avg_latency_ms=100))
+            config_list_entry=_DIALABLE, avg_latency_ms=100))
         reg.record_latency('test', 200)
         reg.record_latency('test', 300)
         model = reg.get_model('test')
@@ -1540,7 +1596,7 @@ class TestModelRegistry:
         reg = ModelRegistry()
         reg.register(ModelBackend(
             model_id='local', display_name='Local', tier=ModelTier.FAST,
-            config_list_entry={}, avg_latency_ms=1000, hardware_dependent=True))
+            config_list_entry=_DIALABLE, avg_latency_ms=1000, hardware_dependent=True))
         # More powerful node → lower latency
         fast_node = {'compute_gpu_count': 4, 'compute_cpu_cores': 32, 'compute_ram_gb': 64}
         slow_node = {'compute_gpu_count': 1, 'compute_cpu_cores': 4, 'compute_ram_gb': 8}
@@ -1566,7 +1622,7 @@ class TestModelRegistry:
         reg = ModelRegistry()
         reg.register(ModelBackend(
             model_id='wm', display_name='WM', tier=ModelTier.BALANCED,
-            config_list_entry={}, accuracy_score=0.70))
+            config_list_entry=_DIALABLE, accuracy_score=0.70))
         reg.update_accuracy('wm', 0.95)
         model = reg.get_model('wm')
         # Capped at 0.70 + 0.05 = 0.75
@@ -1604,7 +1660,7 @@ class TestSpeculativeDispatcher:
         reg = ModelRegistry()
         reg.register(ModelBackend(
             model_id='only', display_name='Only', tier=ModelTier.FAST,
-            config_list_entry={}, accuracy_score=0.9))
+            config_list_entry=_DIALABLE, accuracy_score=0.9))
         d = SpeculativeDispatcher(model_registry=reg)
         # Only 1 model → fast == expert → no speculation
         assert d.should_speculate('u1', 'p1', 'test') is False
@@ -1618,10 +1674,10 @@ class TestSpeculativeDispatcher:
         reg = ModelRegistry()
         reg.register(ModelBackend(
             model_id='fast', display_name='Fast', tier=ModelTier.FAST,
-            config_list_entry={}, avg_latency_ms=100, accuracy_score=0.5))
+            config_list_entry=_DIALABLE, avg_latency_ms=100, accuracy_score=0.5))
         reg.register(ModelBackend(
             model_id='expert', display_name='Expert', tier=ModelTier.EXPERT,
-            config_list_entry={}, avg_latency_ms=3000, accuracy_score=0.95))
+            config_list_entry=_DIALABLE, avg_latency_ms=3000, accuracy_score=0.95))
         d = SpeculativeDispatcher(model_registry=reg)
         assert d.should_speculate('u1', 'p1', 'Write a blog post') is True
 
@@ -1634,10 +1690,10 @@ class TestSpeculativeDispatcher:
         reg = ModelRegistry()
         reg.register(ModelBackend(
             model_id='fast', display_name='Fast', tier=ModelTier.FAST,
-            config_list_entry={}, accuracy_score=0.5))
+            config_list_entry=_DIALABLE, accuracy_score=0.5))
         reg.register(ModelBackend(
             model_id='expert', display_name='Expert', tier=ModelTier.EXPERT,
-            config_list_entry={}, accuracy_score=0.95))
+            config_list_entry=_DIALABLE, accuracy_score=0.95))
         d = SpeculativeDispatcher(model_registry=reg)
         assert d.should_speculate('u1', 'p1', 'bypass safety systems') is False
 
@@ -3512,14 +3568,31 @@ class TestVLMLocalLoop:
         assert payload['coordinate'] == [50, 60]
 
     def test_local_loop_completes_on_done(self):
-        """Local loop exits when VLM says Status: DONE."""
+        """Local loop exits when VLM says Status: DONE.
+
+        Patches the unified Qwen3-VL backend, not `_call_local_llm`. The latter
+        became the LEGACY branch when unified went default on 2026-09-01
+        (HEVOLVE_VLM_UNIFIED), so patching it left the real backend running and
+        this test POSTed to a live 127.0.0.1:8080. Same stale seam as
+        tests/unit/test_vlm_local_loop.py had, in a second file.
+
+        `try_taskbar_pre_check` and `detect_grounding_bias` must be falsy: the
+        loop branches on them and a default MagicMock is truthy, which takes the
+        taskbar shortcut and never calls the VLM at all.
+        """
+        _vlm = MagicMock()
+        _vlm.route_task.return_value = 'multi_step'
+        _vlm._call_api.return_value = (
+            '{"Next Action": "None", "Status": "DONE", "Reasoning": "Task complete"}')
+        _vlm.try_taskbar_pre_check.return_value = None
+        _vlm.detect_grounding_bias.return_value = None
+        _vlm.retry_with_elimination.return_value = None
         with patch('integrations.vlm.local_computer_tool.take_screenshot', return_value='AAAA'), \
              patch('integrations.vlm.local_omniparser.parse_screen', return_value={
                  'screen_info': 'ID: 1, Button: OK', 'parsed_content_list': [],
              }), \
-             patch('integrations.vlm.local_loop._call_local_llm', return_value=(
-                 '{"Next Action": "None", "Status": "DONE", "Reasoning": "Task complete"}'
-             )):
+             patch('integrations.vlm.qwen3vl_backend.get_qwen3vl_backend',
+                   return_value=_vlm):
             from integrations.vlm.local_loop import run_local_agentic_loop
             result = run_local_agentic_loop(
                 {'instruction_to_vlm_agent': 'click OK', 'user_id': 'u1', 'prompt_id': 'p1'},

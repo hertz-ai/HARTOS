@@ -94,13 +94,38 @@ def _src():
         return fh.read()
 
 
+def _block(src, start, end=None):
+    """The source between two markers, rather than a fixed number of characters.
+
+    These guards used to slice `src[i:i + 2000]`, which is a bet on how much PROSE
+    sits between the marker and the code. Two of them lost that bet on 2026-09-10
+    when a real comment was added inside the orb block explaining the duplicate
+    render path, and they went red while the code they check was correct. A guard
+    that fails on a comment is not testing anything.
+    """
+    i = src.index(start)
+    j = src.index(end, i) if end else len(src)
+    return src[i:j]
+
+
+def _code(block):
+    """A block with its whole-line `#` comments dropped.
+
+    The comments here deliberately NAME the thing they rejected ("visibility:hidden
+    rather than display:none on purpose"), so a guard that forbids a string has to
+    read the code and not the prose, or explaining a decision breaks the test that
+    protects it.
+    """
+    return chr(10).join(
+        ln for ln in block.splitlines() if not ln.lstrip().startswith("#"))
+
+
 def test_the_wallpaper_stands_down_for_a_claimed_bloom():
     """The default wallpaper bottoms out in an OPAQUE linear-gradient. That is
     exactly what has hidden the native bloom since M1, so the claim must make it
     transparent or the bridge does nothing."""
     src = _src()
-    i = src.index("native_chrome = read_native_chrome()")
-    window = src[i: i + 1200]
+    window = _block(src, "native_chrome = read_native_chrome()", "native_orb_css = ''")
     assert "'bloom' in native_chrome" in window
     assert "wp_css = 'transparent'" in window, (
         "a claimed bloom must make the shell's wallpaper transparent")
@@ -111,8 +136,7 @@ def test_the_shell_hides_its_own_orb_when_the_compositor_owns_it():
     HTML one breathing on top — and the browser would still pay the per-frame
     cost M2 exists to remove."""
     src = _src()
-    i = src.index("native_chrome = read_native_chrome()")
-    window = src[i: i + 2000]
+    window = _block(src, "native_orb_css = ''", "native_home_css = ''")
     assert "'orb' in native_chrome" in window
     assert "hart-voice-orb" in window, "the HTML orb must be suppressed"
     assert "animation:none" in window, (
@@ -125,10 +149,9 @@ def test_the_orb_keeps_its_hit_target():
     click-to-talk and drag keep working against the same geometry while the
     compositor draws the pixels."""
     src = _src()
-    i = src.index("native_orb_css = ")
-    window = src[i: i + 600]
+    window = _block(src, "native_orb_css = ''", "native_home_css = ''")
     assert "visibility:hidden" in window
-    assert "display:none" not in window, (
+    assert "display:none" not in _code(window), (
         "display:none would remove the orb's hit target and break input, which "
         "is a far bigger change than swapping who paints it")
 
@@ -400,3 +423,58 @@ def test_the_embedded_python_has_no_doubled_single_quote():
         'doubled single quote inside the python -c program: Nix reads it as an '
         'escape in the enclosing indented string and the evaluation gate dies, '
         'skipping every build: %r' % bad[:3])
+
+
+def test_the_shell_hides_its_home_surface_when_the_compositor_claims_it(verdict):
+    """The claim that makes the native scene the RENDERER rather than a second one.
+
+    With `home` claimed the compositor is painting the desktop between the bars, so
+    the shell must stop painting its own or the box draws two full home surfaces and
+    the browser keeps paying to rasterise the one nobody sees, which is the entire
+    cost the native scene exists to remove.
+    """
+    verdict.write_text("home")
+    assert L.read_native_chrome() == frozenset({"home"}), (
+        "'home' must be an accepted claim name, or the shell ignores it")
+    src = _src()
+    window = _block(src, "native_home_css = ''", "# The SAME verdict")
+    assert "'home' in native_chrome" in window
+    assert "#hart-home{visibility:hidden}" in window, (
+        "a claimed home must hide #hart-home, the one element hartHome mounts into")
+
+
+def test_the_home_surface_keeps_its_box():
+    """visibility, not display:none, matching both neighbours: #hart-home keeps its
+    layout box so the desktop does not reflow and geometry read against it stays
+    valid while the compositor owns the pixels."""
+    src = _src()
+    window = _block(src, "native_home_css = ''", "# The SAME verdict")
+    assert "visibility:hidden" in window
+    assert "display:none" not in _code(window), (
+        "display:none would reflow the desktop and invalidate any geometry read "
+        "against #hart-home")
+
+
+def test_the_bars_are_deliberately_not_claimed():
+    """The scope that makes this non-regressive, pinned so it is a DECISION and not
+    an oversight.
+
+    The native taskbar draws as an empty strip, and the agent-status cluster and the
+    clock are things the compositor cannot see. Claiming the bars would take the
+    user's window switching, agent status and clock away the moment the scene came
+    on. So the compositor takes the home and the shell keeps the bars.
+
+    When the native bars do carry their content, this test is the thing to change,
+    on purpose, along with the claim.
+    """
+    src = _src()
+    assert "'topbar' in native_chrome" not in src, (
+        "the top bar is claimed but the native bar cannot carry the agent cluster "
+        "or the clock yet")
+    assert "'taskbar' in native_chrome" not in src, (
+        "the taskbar is claimed but the native taskbar is an empty strip")
+
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+    assert "NATIVE_CHROME_TOPBAR" not in comp
+    assert "NATIVE_CHROME_TASKBAR" not in comp

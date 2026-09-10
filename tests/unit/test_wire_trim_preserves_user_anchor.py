@@ -61,38 +61,71 @@ def test_trim_keeps_the_last_user_message(monkeypatch):
         '("No user query found in messages."), so this request 500s' % roles)
 
 
-def test_trim_seeds_a_user_turn_when_the_producer_never_sent_one(monkeypatch):
-    """CONTRACT CHANGED 2026-09-03 by 339e891da — deliberately, and this is
+def test_a_body_with_no_user_message_gets_exactly_one_seeded(monkeypatch):
+    """CONTRACT CHANGED 2026-09-03 by 339e891da -- deliberately, and this is
     the record.
 
-    This test previously asserted the opposite: ``all(role != 'user')`` — "a
+    aa40350 (2026-08-30) added this file and put this case OUT of scope: "a
     producer that never sent a user message is out of this fix's scope; the
-    trimmer must not invent one, only refuse to delete an existing one."
+    trimmer must not invent one, only refuse to delete an existing one."  The
+    test asserted ``all(role != 'user')`` to pin that.
 
     That scope line did not survive contact with the live system.  On
     2026-09-03 03:40:07 a reuse reply reached the wire as
-    ``[system, assistant, tool, assistant]`` — user-less at the PRODUCER, not
-    by trimming — and llama-server's Qwen3 template 500'd with
-    "No user query found in messages."  339e891da therefore made the wire
-    seed one user turn for any user-less body, on the grounds that the wire is
-    the single chokepoint every outbound body crosses.
+    ``[system, assistant, tool, assistant]`` -- user-less at the PRODUCER, not
+    by trimming -- and llama-server's Qwen3 template 500'd with "No user query
+    found in messages."  The preserve-only logic could not help, because there
+    was nothing to preserve.  339e891 therefore made the wire seed one user
+    turn for any user-less body, on the grounds that the wire is the single
+    chokepoint every outbound body crosses, and says so in the log.
 
     So refusing to invent a user turn is no longer the contract, and the old
-    assertion had become a guard against the fix.  What it must pin now is
-    that the seed survives the TRIMMED path too: ``test_wire_seeds_user_turn``
+    assertion had become a guard against the fix.  Two things must be pinned
+    instead.  (1) The seed survives the TRIMMED path: ``test_wire_seeds_user_turn``
     covers the under-budget early-return, this covers the over-budget branch
-    where messages are actually dropped — the same branch #730a is about.
+    where messages are actually dropped -- the same branch #730a is about.
+    (2) What "must not invent one" still means, asserted below: seeding is
+    idempotent and never adds a SECOND user turn.
+
+    MERGE NOTE 2026-09-11: two lanes rewrote this same test for this same
+    contract change, under two names.  One body asserted only that a user role
+    survives; this one additionally pins the COUNT, the seed CONSTANT and the
+    POSITION, and adds the idempotence case below -- it subsumes the other
+    assertion rather than competing with it, so there is one test here, not
+    two near-duplicates.  The weaker lane's docstring history is folded in
+    above; nothing it guarded was dropped.
     """
+    from core.constants import WIRE_USER_SEED_TEXT
     msgs = [_msg('system', 's' * 400)]
     for i in range(12):
         msgs.append(_msg('assistant', 'a' * 300))
         msgs.append(_msg('tool', '{"r": %d}' % i))
     out = _trim_with_tiny_budget(monkeypatch, msgs)
-    roles = [m.get('role') for m in out]
-    assert 'user' in roles, (
-        'a user-less body that goes through the DROP path must still leave '
-        'the wire with a user anchor (roles=%r) — otherwise the 500 that '
-        '339e891da fixed returns for every over-budget user-less body' % roles)
+
+    users = [m for m in out if m.get('role') == 'user']
+    assert len(users) == 1, (
+        'a user-less body must come back with exactly one seeded user turn, '
+        'got %d (roles=%r)' % (len(users), [m.get('role') for m in out]))
+    assert users[0].get('content') == WIRE_USER_SEED_TEXT, (
+        'the seed must be the shared constant, not a string invented here')
+    # Seeded AFTER the system message: the template anchors backward from the
+    # tool turns, and a user turn ahead of the system prompt is a different
+    # conversation shape.
+    assert out[0].get('role') == 'system'
+    assert out[1].get('role') == 'user'
+
+
+def test_seeding_is_idempotent_when_a_user_turn_already_exists(monkeypatch):
+    """The half of "must not invent one" that survived: a body that HAS a user
+    turn is never given a second one, so the seed cannot displace the real
+    anchor the template is meant to find."""
+    from core.constants import WIRE_USER_SEED_TEXT
+    out = _trim_with_tiny_budget(monkeypatch, _long_conversation())
+    users = [m for m in out if m.get('role') == 'user']
+    assert len(users) == 1, 'seeded a duplicate user turn (roles=%r)' % (
+        [m.get('role') for m in out],)
+    assert users[0].get('content') != WIRE_USER_SEED_TEXT, (
+        "the real user task was replaced by the seed placeholder")
 
 
 def test_trim_still_reaches_budget_with_anchor_kept(monkeypatch):

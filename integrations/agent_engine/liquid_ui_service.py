@@ -167,7 +167,7 @@ _NATIVE_CHROME_FILE = '/run/hart/session/native-chrome'
 # What this shell knows how to stand down for. A name the shell does not
 # recognise is IGNORED rather than trusted: a newer compositor claiming
 # `taskbar` must not make an older shell hide a taskbar it still owns.
-_NATIVE_CHROME_KNOWN = frozenset({'bloom', 'orb'})
+_NATIVE_CHROME_KNOWN = frozenset({'bloom', 'orb', 'home'})
 
 
 def read_native_chrome() -> frozenset:
@@ -1317,18 +1317,6 @@ class LiquidUIService:
                 _rspec['template'] = _entry['template']
             component['_spec'] = _rspec
 
-        # Provable audit trail — every accepted push is recorded exactly like
-        # a goal dispatch (dispatch.py:680).  Best-effort: an audit hiccup
-        # must not drop a user's card.  Type + agent only (no user payload).
-        try:
-            from security.immutable_audit_log import get_audit_log
-            get_audit_log().log_event(
-                'a2ui_push', actor_id=str(agent_id),
-                action=f'push {comp_type} component',
-                detail={'type': comp_type}, target_id=str(agent_id))
-        except Exception:
-            logger.exception("agent_ui_update: swallowed Exception")
-
         # 1. Store for the SSE stream (Nunba web LiquidUI)
         with self._lock:
             if agent_id not in self._agent_components:
@@ -1343,6 +1331,32 @@ class LiquidUIService:
         # stream; a missed wake still self-heals on the producer's safety timeout.
         with self._ui_event_cv:
             self._ui_event_cv.notify_all()
+
+        # Provable audit trail: every accepted push is recorded exactly like
+        # a goal dispatch (dispatch.py:858).  Best-effort: an audit hiccup
+        # must not drop a user's card.  Type + agent only (no user payload).
+        #
+        # AFTER the store and the wake, not before. log_event does a synchronous
+        # SQLAlchemy commit and connection close, and it sat directly on the A2UI
+        # push path: every card, every notification, every desktop compose waited
+        # for a durable write before the SSE producer was even told there was
+        # something to send. Measured on a dev box: 5.8s, 11.5s and 8.3s for three
+        # consecutive pushes, of which the commit and the connection teardown were
+        # effectively all of it, against a 0.5s budget. That is the whole reason
+        # the event-driven producer stopped measuring as event-driven.
+        #
+        # Ordering is all that changed. The call, its data and its best-effort
+        # contract are identical, the function cannot return between the two, and
+        # the audit's own subject is an ACCEPTED push, which is what storing it
+        # makes it. What it stops doing is deciding how fast the UI is.
+        try:
+            from security.immutable_audit_log import get_audit_log
+            get_audit_log().log_event(
+                'a2ui_push', actor_id=str(agent_id),
+                action=f'push {comp_type} component',
+                detail={'type': comp_type}, target_id=str(agent_id))
+        except Exception:
+            logger.exception("agent_ui_update: swallowed Exception")
 
         # 2. Push to EventBus → WAMP → Android/iOS/Desktop
         # The WAMP bridge (core/platform/events.py) auto-publishes to
@@ -1610,7 +1624,118 @@ class LiquidUIService:
         # untouched. The XSS gate + slug sanitize already vetted it upstream.
         if mood:
             component['mood'] = mood
-        return self.agent_ui_update(agent_id, component)
+        accepted = self.agent_ui_update(agent_id, component)
+        if accepted:
+            # SECOND CONSUMER, SAME PAYLOAD. The native scene reads the identical
+            # {hero, rows, mood} over the compositor's shell.compose, so the two
+            # renderers cannot show different desktops. Sent only on ACCEPTANCE, so
+            # everything agent_ui_update governs above (the human kill-switch, the
+            # per-agent rate cap, the audit log, the XSS reject) governs this too and
+            # no gate is duplicated.
+            #
+            # Without it, shell.compose had no caller at all: it has existed on the
+            # compositor since M3, native_home stayed None, and the native scene fell
+            # back to scene::demo_ref() -- the hardcoded "Morning briefing / Inbox
+            # triage / Storage report". Turning the native shell on would have put
+            # that on screen as though it were live.
+            self._push_home_to_native_scene(component)
+        return accepted
+
+    def _push_home_to_native_scene(self, component: dict) -> bool:
+        """Forward an ACCEPTED home composition to the compositor's native scene.
+
+        Best-effort and silent by design. A box with no compositor socket, an older
+        compositor without shell.compose, or a compositor that has just restarted all
+        answer falsey, and the WebView desktop is unaffected -- it has already had the
+        same payload through the SSE feed. A compose fault must never take down the
+        shell, which is the same rule compose_home_now states for itself.
+
+        KNOWN GAP, stated rather than papered over: there is no re-send on connect, so
+        a compositor restart leaves the native scene on its previous payload (or on
+        demo_ref if it has never had one) until the next accepted compose. The daemon
+        composes periodically, so the window is bounded, but it is real. A re-send hook
+        needs the compositor to say it has come back, and inventing a caller for that
+        here would be a second channel rather than the one this deliberately reuses.
+        """
+        try:
+            from integrations.agent_engine.hart_wm_client import get_wm_client
+            reply = get_wm_client().shell_compose(
+                hero=component.get('hero'),
+                rows=component.get('rows'),
+                mood=component.get('mood'))
+        except Exception as e:
+            logger.debug("native scene compose skipped: %s", e)
+            return False
+        ok = bool(reply and reply.get('ok'))
+        if not ok:
+            logger.debug("native scene compose not applied: %s",
+                         (reply or {}).get('error'))
+        else:
+            # The compositor is demonstrably up, which is the moment to start listening
+            # for presses on the scene we just fed it. Started HERE rather than at service
+            # init on purpose: at init the compositor may not exist yet, and a subscription
+            # that failed once would need a retry loop nobody would ever see fail.
+            self._ensure_native_input_relay()
+        return ok
+
+    def _ensure_native_input_relay(self) -> bool:
+        """Listen for `shell.activate` from the compositor, at most one listener.
+
+        The compositor hit-tests the native scene on a press and emits the card's
+        (row, card) identity. It deliberately does NOT act on it: the action vocabulary
+        ("ask" focuses the command bar, "open" opens a panel) lives in hartHome.js's
+        cardAction, and duplicating it in Rust would be a second executor for the same
+        gesture.
+
+        So this relays identity to the browser, which already holds the same composition
+        and already knows what to do with it. Reuses the SSE channel the shell drains for
+        every other push, so no new transport and no new client.
+        """
+        if getattr(self, '_native_input_relay', False):
+            return True
+        try:
+            from integrations.agent_engine.hart_wm_client import get_wm_client
+            started = get_wm_client().subscribe_events(self._on_compositor_event)
+        except Exception as e:
+            logger.debug("native input relay not started: %s", e)
+            return False
+        self._native_input_relay = bool(started)
+        if started:
+            logger.info("native input relay listening for shell.activate")
+        return self._native_input_relay
+
+    def _on_compositor_event(self, frame: dict) -> None:
+        """One compositor event. Runs on the subscriber thread, so it stays cheap."""
+        if (frame or {}).get('event') != 'shell.activate':
+            return
+        body = frame.get('window') or {}
+        row, card = body.get('row'), body.get('card')
+        if not isinstance(row, int) or not isinstance(card, int):
+            return
+        if row < 0 or card < 0:
+            return
+        self._relay_native_activation(row, card)
+
+    def _relay_native_activation(self, row: int, card: int) -> None:
+        """Hand a native-scene activation to the browser over the SSE channel.
+
+        Stored and woken exactly as agent_ui_update does, and deliberately NOT through
+        it. That gate governs an AGENT painting the screen: it refuses while the human
+        has halted the hive and it rate-caps per agent. This is a person clicking a card
+        that is already on their screen, and the two card actions are focusing the
+        command bar and opening a panel, neither of which dispatches anything. Halting
+        the hive must not make the desktop unclickable, and a user's clicks are not an
+        agent's push rate.
+        """
+        component = {'type': 'home_activate', 'row': row, 'card': card}
+        with self._lock:
+            comps = self._agent_components.setdefault('native_shell', [])
+            comps.append(component)
+            if len(comps) > 5:
+                self._agent_components['native_shell'] = comps[-5:]
+        with self._ui_event_cv:
+            self._ui_event_cv.notify_all()
+        logger.info("native activation relayed: row=%d card=%d", row, card)
 
     def compose_home_now(self, reason: str = 'manual') -> bool:
         """PRODUCER: compose the agentic home from live context + the local LLM,
@@ -1931,8 +2056,28 @@ class LiquidUIService:
         # native side proves itself — and the shell keeps its own opaque
         # backdrop, which is the safe direction.
         native_chrome = read_native_chrome()
+        native_bloom_css = ''
         if 'bloom' in native_chrome:
             wp_css = 'transparent'
+            # ...and the shell's OWN bloom canvas goes with it. Making the
+            # wallpaper transparent only removes the opaque gradient ABOVE the
+            # native field; hartBloom.js was still composing its own aura into
+            # #hart-bloom-canvas and painting it over the top, so the compositor
+            # drew a bloom and the browser drew a second one on top of it.
+            #
+            # The orb half of this block already argues the case exactly:
+            # "there would be TWO orbs, the native one breathing under an HTML
+            # one breathing on top of it". Same argument, same fix, and it was
+            # simply never applied to the bloom. Found 2026-09-10 auditing for
+            # duplicate render paths after an owner report of the screen
+            # alternating between the compositor's scene and the shell's.
+            #
+            # visibility rather than display, matching the orb: the canvas keeps
+            # its box, so nothing reflows and any geometry read against it stays
+            # valid while the compositor owns the pixels.
+            native_bloom_css = (
+                '#hart-bloom-canvas,.hart-bloom-canvas{visibility:hidden}'
+            )
         # The orb half. Without this there would be TWO orbs, the native one
         # breathing under an HTML one breathing on top of it — and the browser
         # would still be paying the per-frame cost M2 exists to remove, so the
@@ -1947,8 +2092,50 @@ class LiquidUIService:
         if 'orb' in native_chrome:
             native_orb_css = (
                 '.hart-hero-orbwrap>canvas,#hart-voice-orb,'
+                # The ONBOARDING orb, added 2026-09-10 from an owner report.
+                # They saw the screen alternating between two scenes: the
+                # compositor's own orb (a glow sphere with a DASHED orbital
+                # ring, right of centre) and the onboarding's sphere (plain,
+                # top centre). Their read was "two compositors trying to
+                # render", and that is right in the way that matters -- one
+                # compositor process, but TWO render paths each drawing a
+                # full-screen scene with an orb in it.
+                #
+                # This list exists precisely to stop that: when the compositor
+                # claims the orb, the shell stands its own down. It covered the
+                # hero orb, the voice orb and the orbit rings, and `.hob-orb`
+                # was simply never added, so onboarding kept drawing a second
+                # one. `visibility:hidden` rather than `display:none` on
+                # purpose, exactly as the neighbours above: the element keeps
+                # its box, so the ceremony's layout does not reflow.
+                '.hart-onboarding .hob-orb,'
                 '.hart-orb-orbit,.hart-orb-orbit2{visibility:hidden;animation:none}'
             )
+        # The HOME SURFACE half. The compositor claims this only for a frame that
+        # actually painted BETWEEN the two bars, so it cannot be claimed by a frame
+        # that drew chrome alone -- that check is geometric on the compositor side
+        # for the same reason it is geometric here: the band IS the thing being
+        # handed over.
+        #
+        # Deliberately the home ONLY, not the bars. The native taskbar draws as an
+        # empty strip today, and the agent-status cluster and the clock are things the
+        # compositor cannot see (DOM inside this one surface, an HTTP poll, and local
+        # time that a `unsafe_code = "deny"` crate cannot format). So the compositor
+        # takes the half it can draw correctly and this shell keeps the half it alone
+        # knows, and nothing the user has today is lost when the scene comes on.
+        #
+        # visibility rather than display, matching both neighbours above: #hart-home
+        # keeps its box, so the desktop's layout does not reflow and any geometry read
+        # against it stays valid while the compositor owns the pixels.
+        native_home_css = ''
+        if 'home' in native_chrome:
+            native_home_css = '#hart-home{visibility:hidden}'
+        # The SAME verdict, handed to script as well as to CSS. The CSS above
+        # stops the canvas painting; only this can stop the canvas being DRAWN
+        # INTO. See the window.HART_NATIVE_CHROME comment below for the measured
+        # cost of leaving that loop running (a full core, zero page flips).
+        # Sorted so the emitted page is byte-stable across renders.
+        native_chrome_js = json.dumps(sorted(native_chrome))
 
         # Living-Glass: emit the active accent as a comma-triple so every glow /
         # ring / selection re-tints when the theme accent changes. Parsed from the
@@ -3001,6 +3188,40 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
         #     is-sensing, mic recording) stay, because they run for seconds during a
         #     real interaction and they are what tells the user HART is doing
         #     something. lg-comet likewise. A vulkan rung keeps everything as authored.
+        #
+        #     DELIBERATELY KEPT, having been looked at: `.lg-empty-offline
+        #     .lg-empty-disc .mi` breathes forever too, but it is a 28px glyph
+        #     with NO blur, and it is the signal that the box is OFFLINE -- a
+        #     state the user needs to notice. That is state-driven signalling,
+        #     which the paragraph above keeps by policy. Cheap, and it earns it.
+        #
+        #     NOT kept, and it is worth saying why the first judgement was
+        #     wrong: `.hart-senses-btn.is-sensing .mi` looked state-driven by
+        #     the same argument, and is not. hartSenses.js lights it whenever
+        #     senses are merely UNCUT, which is the default, so it animates
+        #     forever rather than during an interaction. Its colour is kept and
+        #     only its animation dropped, so the eye still reports the state.
+        #
+        #     test_liquid_ui_idle_motion_gate.py enumerates every `infinite`
+        #     animation in this stylesheet and fails on any that is neither
+        #     gated here nor in its documented keep-list, so the next one cannot
+        #     be missed the way `.hob-orb` was.
+        # WHY `!important`, measured on real HW 2026-09-10: without it this gate
+        # SILENTLY LOSES for any selector hartHome.css also styles, because the
+        # two rules TIE on specificity and source order then decides. Concretely:
+        #
+        #   hartHome.css:734  body.gpu-hardware .top-bar-orb { animation: tbOrbBreathe ... }
+        #   this gate         body.webkit-flat  .top-bar-orb { animation: none }
+        #
+        # Both are (0 ids, 2 classes, 1 element). The body carries BOTH classes
+        # (`class="gpu-hardware webkit-flat"`), so both match, and hartHome.css
+        # is an external sheet that loads after this inline block: it wins, and
+        # the orb kept breathing on every software-rendered box since the gate
+        # was written. `document.getAnimations()` on the live node showed it
+        # `play=running` while the gate's other entries showed `play=paused`.
+        # An `!important` on a hardware floor is the right tool: this is not a
+        # style preference losing an argument, it is the rung saying the box
+        # cannot afford the frame.
         if not blur_composites:
             _CSS_LIVING_GLASS += (
                 '/* sw-paint: idle motion stopped (see the note in liquid_ui_service.py) */'
@@ -3020,7 +3241,41 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
                 'body.webkit-flat .hart-hero-hevolve .dot,'
                 'body.webkit-flat .top-bar-orb,'
                 'body.webkit-flat .hart-hero-go,'
-                'body.webkit-flat .ds-skeleton{animation:none}'
+                # The ONBOARDING orb, added 2026-09-10 after finding it on the
+                # live node. `.hob-orb` is 150px carrying `0 0 70px` AND
+                # `0 0 150px` box-shadows and scaling to 1.08 forever -- the
+                # exact shape this rule was written for, and it is strictly
+                # worse than `.hart-hero-orb` because it is the FIRST screen a
+                # new user sees and it stays up for the whole of onboarding.
+                # On the Samsung, sitting on "Light Your HART" with no
+                # onboarding state written, WebKit's main thread measured 487
+                # of 500 jiffies (97.4% of a core) continuously from boot while
+                # hart-comp idled at 2.2%: the cost was re-rasterising two large
+                # blurs per frame in software, not compositing them.
+                # The SENSES eye, added 2026-09-10 after reading how it is lit.
+                # I had kept this out of the gate on the grounds that it is
+                # "state-driven -- runs only while a sense is active". That
+                # reasoning was wrong, and hartSenses.js says so plainly:
+                #
+                #   anySensing = (d.mic !== true) || (d.screen !== true)
+                #                || (p.camera_service_running === true)
+                #
+                # On a box where nothing has been explicitly disabled `d.mic` is
+                # undefined, so `undefined !== true` is TRUE and the eye is lit
+                # permanently. It is not a transient interaction signal at all;
+                # it is an always-on animation, which is precisely the class
+                # this rule exists to stop. Measured cost on the software rung:
+                # removing it alongside the two orbs took the shell from 55% of
+                # a core to 22%, against 21% for all-animations-off.
+                #
+                # The SIGNAL SURVIVES. `.is-sensing` sets `color` as well as
+                # `animation`, and only the animation is dropped here, so the
+                # eye still lights in the vision colour and still says the AI
+                # can hear. What goes is the 2.4s pulse re-rasterising it
+                # forever on a box that paints in software.
+                'body.webkit-flat .hart-senses-btn.is-sensing .mi,'
+                'body.webkit-flat .hart-onboarding .hob-orb,'
+                'body.webkit-flat .ds-skeleton{animation:none!important}'
             )
 
         # ── Boot lock overlay (#166: FOUC + security) ─────────────────────────
@@ -3074,7 +3329,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 
 /* ── Wallpaper ── */
 .wallpaper{{position:fixed;inset:0;z-index:0;background:{wp_css}}}
-{native_orb_css}
+{native_bloom_css}{native_orb_css}{native_home_css}
 
 /* ── Glass mixin (perf-aware) ── */
 .glass{{background:var(--hart-glass-bg);
@@ -3678,6 +3933,22 @@ window.HART_PERF = PERF;
 // Which product the user installed (HART OS vs the Nunba desktop companion) — the
 // right-click "Ask <Product>" menu (hartAskMenu.js) brands to it.
 window.HART_PRODUCT = '{hart_product}';
+
+// Which chrome the COMPOSITOR is drawing itself. Same verdict the CSS above
+// already acts on (native_orb_css / the transparent wallpaper), reaching a
+// second consumer that CSS cannot serve: one publisher, several consumers, the
+// pattern read_native_chrome already established.
+//
+// CSS can stop an element PAINTING. It cannot stop a script. voiceOrbViz.js
+// drives its canvas from a self-perpetuating requestAnimationFrame loop, and
+// rAF throttling keys off DOCUMENT visibility, not element visibility -- so
+// `visibility:hidden` on the canvas left the loop running at full rate,
+// computing trig and stroking paths into a surface nobody would ever see.
+// Measured on the box 2026-09-07: WebKitWebProcess at 1188 CPU ticks in 12s,
+// a full core, while the compositor reported ZERO page flips. That is exactly
+// the per-frame cost M2 exists to remove, and hiding the canvas never removed
+// it. The orb module reads this to stand its loop down.
+window.HART_NATIVE_CHROME = {native_chrome_js};
 
 // ═══ State ═══
 let panels = {{}};
@@ -6681,6 +6952,13 @@ if(!PERF.potato) {{
             // merge + hartPinIcon (no fork); icon appears without a refresh.
             if(window.hartInstallIcon) window.hartInstallIcon(ev);
             showToast('Installed', (ev.title||ev.id||'App')+' added to your desktop', 'info');
+          }} else if(type === 'home_activate') {{
+            // A press the COMPOSITOR handled on the native scene, relayed by index.
+            // HartHome.activate resolves it against the payload it is already showing
+            // and runs the SAME cardAction a DOM click runs, so there is one executor.
+            if(window.HartHome && window.HartHome.activate) {{
+              window.HartHome.activate(ev.row, ev.card);
+            }}
           }} else if(type === 'home' || type === 'home_compose') {{
             // The local LLM re-composes the assembled HOME live (i1, agentic
             // Liquid UI): route the A2UI payload to HartHome.compose instead of a
@@ -8565,6 +8843,17 @@ function renderAgentOverlay(ev) {{
                 return out
 
             def generate():
+                # FLUSH THE RESPONSE HEAD IMMEDIATELY. Werkzeug does not send the
+                # headers until the generator yields its first chunk, and the loop
+                # below OPENS with a 15s CV wait, so on a quiet fleet the client sat
+                # there unconnected for a full heartbeat before EventSource fired
+                # onopen. Measured on the box 2026-09-07: urlopen returned in
+                # 15.011s, exactly the first ": hb". Every page load and every
+                # reconnect paid it, on the same "Liquid UI is the heart" channel
+                # whose wake latency we had just fixed upstream. An SSE comment is
+                # the canonical fix: 6 bytes, ignored by every conforming client
+                # (it carries no "event:"/"data:" field, so no handler ever sees it).
+                yield ": ok\n\n"
                 last_check = _time.time()
                 # EVENT-DRIVEN (was a 2s server-side poll that capped the latency of
                 # every A2UI card / notification / desktop compose — the "Liquid UI
