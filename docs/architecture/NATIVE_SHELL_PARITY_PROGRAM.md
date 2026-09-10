@@ -314,6 +314,34 @@ milestone that regresses latency fails even if it looks better.
   never regress iso-desktop build time.
 
 ## Status
+- 2026-09-11: ALL FOUR of M6's pre-flip obligations are closed. What remains before
+  the default can flip is EVIDENCE ON HARDWARE, not code.
+    3. The last one, and it did not need the payload channel it was written around.
+       `NATIVE_CHROME_EMITTED` grew one name, `home`: the compositor claims the band
+       between the bars, the shell hides `#hart-home` and KEEPS its own top bar and
+       taskbar, so the taskbar chips, the agent cluster and the clock go on working
+       exactly as now. The claim is geometric evidence and whole-band only, because
+       over-claiming costs an empty desktop and the paint watchdog does not catch a
+       wrong-looking one.
+    Input, which the audit rated the blocker above all others: a press hit-tests the
+    scene and emits `shell.activate {row, card}`; HartWmClient subscribes to the
+    compositor's fan-out (which had never had a subscriber); the SSE store the shell
+    already drains carries it; `HartHome.activate` runs the SAME `cardAction` a DOM
+    click runs. Identity, not intent, so there is one executor. The press is CONSUMED
+    only when the activation reached a live subscriber, so the chain could land before
+    its consumer without ever swallowing a click.
+  Also fixed, all found by the 16-agent audit: the scene painted ABOVE every app
+  window; nothing called `shell.compose`, so a flip would have shipped `demo_ref` as
+  the desktop; the icon face was never REQUESTED (installed and detected, but no run
+  asked for it, so the tray would have drawn the words); tracking was passed in px to
+  an EM parameter; `HART_NATIVE_SHELL=0` turned the shell ON; shell-ready's evidence
+  tested whether the ORB imported rather than whether the scene painted; and the wheel
+  scrolled a row everywhere except over its cards.
+  STILL TRUE and still the honest gate on flipping the default: none of this has been
+  seen on a screen. The pixel proofs are headless. `shell.native {on}` makes the A/B
+  takeable on one machine without a reboot, and it is in the cache now, but generation
+  7 predates it, so the box needs one more OTA and it has 1.2G free with nothing
+  reclaimable.
 - 2026-09-10: THREE of M6's four pre-flip obligations are now closed, and the
   remaining one is the only thing between here and the flip.
     1. shell-ready native writer: DONE (written from the vblank reaper, on the
