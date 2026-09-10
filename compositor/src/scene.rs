@@ -1196,10 +1196,52 @@ impl SceneNode {
         }
     }
 
-    /// Which card row a point is over, if any. One walk, the same deepest-wins rule as
-    /// `component_at`, and no geometry duplicated outside the layout that placed it.
+    /// Which card row a point is over, if any. The ENCLOSING row, regardless of what sits
+    /// on top of it.
+    ///
+    /// It used to be `component_at().and_then(row_index)`, and deepest-wins is exactly
+    /// wrong for this question. A card group is tagged `HomeCard` and is a CHILD of the
+    /// group tagged `HomeRow(i)`, so over a card the deepest tag is the card and the row
+    /// index came back None. `scroll_row_under_pointer` bails on None with no fallback, so
+    /// the wheel scrolled a row only from its 42px header strip and the 18px gaps BETWEEN
+    /// cards -- that is, everywhere except the cards. And the rows that can scroll at all
+    /// are the ones that overflow, which are precisely the rows whose cards fill the width.
+    ///
+    /// The shell it ports scrolls from anywhere inside `.hh-cards` (`overflow-x: auto`),
+    /// cards included, so this was a parity gap and not a choice.
+    ///
+    /// Deepest-wins stays correct for `component_at` itself: latency attribution WANTS a
+    /// card to name the card. Two questions, two walks, rather than one rule bent to serve
+    /// both.
     pub fn row_at(&self, px: f32, py: f32) -> Option<usize> {
-        self.component_at(px, py).and_then(Component::row_index)
+        let mut found = None;
+        self.row_walk(px, py, &mut found);
+        found
+    }
+
+    /// Records the row of every `HomeRow` container the point falls inside, descending
+    /// past deeper tags rather than being overwritten by them. Rows are siblings, never
+    /// nested, so at most one can match and last-wins is not a tiebreak in practice.
+    fn row_walk(&self, px: f32, py: f32, found: &mut Option<usize>) {
+        if let SceneNode::Container {
+            rect,
+            component,
+            children,
+            ..
+        } = self
+        {
+            if !rect.contains(px, py) {
+                return;
+            }
+            if let Some(c) = component {
+                if let Some(i) = c.row_index() {
+                    *found = Some(i);
+                }
+            }
+            for child in children {
+                child.row_walk(px, py, found);
+            }
+        }
     }
 
     /// The index, in `flatten` paint order, of the leaf that must paint its HOVER state
@@ -4506,8 +4548,25 @@ hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
             Some(Component::HomeRow(0)),
             "the row's own band names the row"
         );
-        assert_eq!(root.row_at(card.x + card.w * 0.5, card.y + card.h * 0.5), None,
-                   "a point on a CARD is not a scroll target for the row");
+        // A point on a CARD still scrolls the row it belongs to. This asserted None
+        // before, which pinned a defect as if it were the contract: `row_at` went
+        // through `component_at`, deepest-wins named the card, and the wheel therefore
+        // scrolled a row only from its header strip and the gaps between cards. The rows
+        // that can scroll are the overflowing ones, whose cards fill the width, so the
+        // live target was everywhere the cards are not. The shell scrolls from anywhere
+        // inside `.hh-cards` (`overflow-x: auto`), cards included.
+        assert_eq!(
+            root.row_at(card.x + card.w * 0.5, card.y + card.h * 0.5),
+            Some(0),
+            "a point on a CARD scrolls the row that card is in"
+        );
+        // And attribution is unchanged: the card still NAMES the card, because
+        // deepest-wins is right for that question and wrong for this one.
+        assert_eq!(
+            root.component_at(card.x + card.w * 0.5, card.y + card.h * 0.5),
+            Some(Component::HomeCard),
+            "latency attribution still names the card, not the row"
+        );
 
         // The orb is a LEAF, not a group: OrbSlot already is the orb, so it names itself
         // without a container wrapped around it saying the same thing twice.
@@ -4933,6 +4992,27 @@ hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
         // A point on the row's own strip, clear of its cards: its right edge, top line.
         let point = (band.right() - 2.0, band.y + 2.0);
         assert_eq!(root.row_at(point.0, point.1), Some(1), "the tree names row 1");
+
+        // AND over a card in that row, which is where a user's pointer actually is. This
+        // test used to prove only the strip, which is why the defect survived it: the
+        // rows that can scroll are the overflowing ones, whose cards fill the width, so
+        // the strip is the one place the pointer is NOT.
+        let card = groups
+            .iter()
+            .find_map(|c| match c {
+                SceneNode::Container {
+                    component: Some(Component::HomeCard),
+                    rect,
+                    ..
+                } if band.contains(rect.x + rect.w * 0.5, rect.y + rect.h * 0.5) => Some(*rect),
+                _ => None,
+            })
+            .expect("row 1 lays out at least one card");
+        assert_eq!(
+            root.row_at(card.x + card.w * 0.5, card.y + card.h * 0.5),
+            Some(1),
+            "a point over a CARD scrolls the row that card belongs to"
+        );
 
         let before = shown(&RowScroll::default());
         let mut sc = RowScroll::default();
