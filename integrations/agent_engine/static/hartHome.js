@@ -926,6 +926,29 @@
   // PUBLIC API - the agent composes the home through these (A2UI read path).
   // ───────────────────────────────────────────────────────────────────────
   window.HartHome = {
+    // A press the COMPOSITOR handled, relayed back by (row, card) index.
+    //
+    // The native scene draws this desktop and hit-tests it, but it deliberately does
+    // not know what activating a card means: "ask" focuses the command bar, "open"
+    // opens a panel, and that vocabulary lives here, in cardAction, which is also what
+    // a click on the DOM card runs. So the compositor sends identity and this resolves
+    // it against the very payload it is drawing, and there is one executor rather than
+    // two implementations of the same gesture.
+    //
+    // Indices are into the PAYLOAD, not the visible cards: the native layout culls
+    // cards scrolled off the left, so a positional index would drift the moment a row
+    // moved. Out-of-range is a silent no-op, since a stale index is exactly what a
+    // re-compose in flight looks like.
+    activate: function (row, card) {
+      var p = _payload;
+      if (!p || !p.rows) return false;
+      var r = p.rows[row];
+      if (!r || !r.cards) return false;
+      var c = r.cards[card];
+      if (!c) return false;
+      cardAction(c);
+      return true;
+    },
     // The agent's live composition. Accepts the full payload OR a partial
     // {hero} / {rows} which merges over the current surface (fluid re-compose).
     compose: function (payload) {

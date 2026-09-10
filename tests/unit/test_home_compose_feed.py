@@ -306,3 +306,95 @@ def test_a_compositor_that_refuses_or_is_absent_does_not_break_the_push(svc):
     boom = MagicMock(side_effect=RuntimeError('socket gone'))
     with patch.object(svc, 'agent_ui_update', return_value=True),             patch('integrations.agent_engine.hart_wm_client.get_wm_client', boom):
         assert svc.compose_home(hero={'eyebrow': 'x'}) is True
+
+
+# ── The return path: a press the COMPOSITOR handled ──────────────────────────
+# The native scene hit-tests a press and emits (row, card). It deliberately does
+# not know what activating a card means; that vocabulary lives in hartHome.js's
+# cardAction, which is also what a DOM click runs. So the compositor sends
+# identity and the shell resolves it against the payload it is already drawing.
+
+
+def _stored(svc, agent='native_shell'):
+    with svc._lock:
+        return list(svc._agent_components.get(agent, []))
+
+
+def test_a_native_activation_is_relayed_to_the_browser_by_index(svc):
+    svc._on_compositor_event({'event': 'shell.activate',
+                              'window': {'row': 1, 'card': 4}})
+    assert _stored(svc) == [{'type': 'home_activate', 'row': 1, 'card': 4}], (
+        "the activation must reach the SSE store the shell drains")
+
+
+def test_other_compositor_events_are_not_relayed(svc):
+    for frame in ({'event': 'window.opened', 'window': {'handle': 'win_1'}},
+                  {'event': 'window.focused', 'window': {'row': 0, 'card': 0}},
+                  {},
+                  {'event': 'shell.activate'}):
+        svc._on_compositor_event(frame)
+    assert _stored(svc) == [], "only shell.activate is an activation"
+
+
+def test_a_malformed_activation_is_ignored(svc):
+    """The indices index into a payload. A non-integer or negative one is not a
+    card, and passing it through would put a nonsense component on the SSE
+    channel for the client to trip over."""
+    for body in ({'row': 'a', 'card': 0}, {'row': 0, 'card': None},
+                 {'row': -1, 'card': 0}, {'row': 0, 'card': -2}, {}):
+        svc._on_compositor_event({'event': 'shell.activate', 'window': body})
+    assert _stored(svc) == []
+
+
+def test_the_relay_does_not_go_through_the_agent_gate(svc):
+    """A person clicking a card on their own screen is not an agent painting it.
+
+    agent_ui_update refuses while the human has halted the hive and rate-caps per
+    agent. Both are right for an agent push and wrong for a user's click: the two
+    card actions are focusing the command bar and opening a panel, neither of which
+    dispatches anything, so halting the hive must not make the desktop unclickable.
+    """
+    with patch.object(svc, 'agent_ui_update', return_value=False) as gate:
+        svc._on_compositor_event({'event': 'shell.activate',
+                                  'window': {'row': 0, 'card': 0}})
+    gate.assert_not_called()
+    assert len(_stored(svc)) == 1, "a halted hive must not swallow a click"
+
+
+def test_the_relayed_activation_wakes_the_sse_producer(svc):
+    """Stored but unwoken means the click waits for the producer's safety timeout,
+    which is the difference between a responsive desktop and a laggy one."""
+    with patch.object(svc, '_ui_event_cv') as cv:
+        cv.__enter__ = MagicMock(return_value=None)
+        cv.__exit__ = MagicMock(return_value=None)
+        svc._on_compositor_event({'event': 'shell.activate',
+                                  'window': {'row': 0, 'card': 1}})
+        cv.notify_all.assert_called_once()
+
+
+def test_the_browser_half_exists_and_runs_the_same_card_action():
+    """The chain ends in the browser, so its two links are pinned as source.
+
+    Neither is reachable from pytest: one is a JS branch in the served shell, the
+    other a method in a static asset. A relay whose last hop is missing would pass
+    every test above and do nothing at all on the box.
+    """
+    import os
+    from integrations.agent_engine import liquid_ui_service as L
+    root = os.path.dirname(os.path.abspath(L.__file__))
+    with open(os.path.join(root, 'liquid_ui_service.py'), encoding='utf-8') as fh:
+        service = fh.read()
+    with open(os.path.join(root, 'static', 'hartHome.js'), encoding='utf-8') as fh:
+        js = fh.read()
+
+    assert "type === 'home_activate'" in service, (
+        "the SSE router has no branch for a relayed activation")
+    assert 'window.HartHome.activate(ev.row, ev.card)' in service, (
+        "the branch must hand the INDICES to HartHome")
+    assert 'activate: function (row, card)' in js, (
+        "hartHome.js exposes no activate()")
+    i = js.index('activate: function (row, card)')
+    body = js[i:i + 600]
+    assert 'cardAction(c)' in body, (
+        "activate must run the SAME cardAction a DOM click runs, not a second "
+        "implementation of what a card does")

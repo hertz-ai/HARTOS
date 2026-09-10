@@ -35,6 +35,7 @@ import logging
 import os
 import socket
 import struct
+import threading
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger('hevolve.hart_wm')
@@ -311,6 +312,90 @@ class HartWmClient:
     # takes an int ``con_id`` and a command string. The public signature and
     # the returned shape are identical either way, so nothing above this line
     # knows which compositor answered.
+    def subscribe_events(self, on_event) -> bool:
+        """Listen for unsolicited compositor events, calling ``on_event(dict)`` per frame.
+
+        The compositor has had an event fan-out (`events.subscribe`, IPC_PROTOCOL §4.10)
+        since the IPC landed and NOTHING has ever subscribed, which is why a press on the
+        native scene had nowhere to go. This is that listener.
+
+        A daemon thread, because the transport is a long-lived socket the compositor
+        writes to whenever it likes, and every other call here is request/response. It
+        returns whether the subscription was established; a box with no compositor, or an
+        older one without the verb, answers False and the caller carries on. The thread
+        exits when the socket closes, which is what a compositor restart looks like from
+        here, and it does NOT reconnect on its own: the caller decides whether a listener
+        is worth re-establishing.
+
+        `on_event` runs ON THIS THREAD, so it must be quick and must not raise. Anything
+        it throws is swallowed and logged rather than killing the listener, because losing
+        the subscription would silently make the native desktop unclickable again.
+        """
+        if not hasattr(socket, 'AF_UNIX'):
+            return False
+        path = self._hc_path or self._hart_comp_socket()
+        if not path:
+            return False
+        body = json.dumps({'id': 'brain-sub', 'method': 'events.subscribe',
+                           'args': {}}).encode('utf-8')
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(_HC_TIMEOUT)
+            s.connect(path)
+            s.sendall(struct.pack('>I', len(body)) + body)
+            head = self._recv_exactly(s, 4)
+            if head is None:
+                s.close()
+                return False
+            (length,) = struct.unpack('>I', head)
+            payload = self._recv_exactly(s, length) if length <= _HC_MAX_FRAME else None
+            if payload is None:
+                s.close()
+                return False
+            reply = json.loads(payload.decode('utf-8'))
+            if not reply.get('ok'):
+                s.close()
+                return False
+        except (OSError, ValueError) as e:
+            logger.debug('events.subscribe failed: %s', e)
+            return False
+
+        def _pump():
+            # No timeout on the pump: events arrive when the user acts, which may be
+            # never. A read timeout here would tear the subscription down on an idle
+            # desktop, which is most of the time.
+            s.settimeout(None)
+            try:
+                while True:
+                    head = self._recv_exactly(s, 4)
+                    if head is None:
+                        break
+                    (n,) = struct.unpack('>I', head)
+                    if n > _HC_MAX_FRAME:
+                        break
+                    buf = self._recv_exactly(s, n)
+                    if buf is None:
+                        break
+                    try:
+                        frame = json.loads(buf.decode('utf-8'))
+                    except ValueError:
+                        continue
+                    try:
+                        on_event(frame)
+                    except Exception as e:
+                        logger.debug('event handler raised: %s', e)
+            finally:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+                logger.info('hart-comp event subscription closed')
+
+        t = threading.Thread(target=_pump, name='hart-comp-events', daemon=True)
+        t.start()
+        self._event_thread = t
+        return True
+
     def shell_compose(self, hero=None, rows=None, mood=None) -> Dict[str, Any]:
         """Hand the composed HOME payload to the compositor's native scene.
 

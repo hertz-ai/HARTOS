@@ -1670,7 +1670,72 @@ class LiquidUIService:
         if not ok:
             logger.debug("native scene compose not applied: %s",
                          (reply or {}).get('error'))
+        else:
+            # The compositor is demonstrably up, which is the moment to start listening
+            # for presses on the scene we just fed it. Started HERE rather than at service
+            # init on purpose: at init the compositor may not exist yet, and a subscription
+            # that failed once would need a retry loop nobody would ever see fail.
+            self._ensure_native_input_relay()
         return ok
+
+    def _ensure_native_input_relay(self) -> bool:
+        """Listen for `shell.activate` from the compositor, at most one listener.
+
+        The compositor hit-tests the native scene on a press and emits the card's
+        (row, card) identity. It deliberately does NOT act on it: the action vocabulary
+        ("ask" focuses the command bar, "open" opens a panel) lives in hartHome.js's
+        cardAction, and duplicating it in Rust would be a second executor for the same
+        gesture.
+
+        So this relays identity to the browser, which already holds the same composition
+        and already knows what to do with it. Reuses the SSE channel the shell drains for
+        every other push, so no new transport and no new client.
+        """
+        if getattr(self, '_native_input_relay', False):
+            return True
+        try:
+            from integrations.agent_engine.hart_wm_client import get_wm_client
+            started = get_wm_client().subscribe_events(self._on_compositor_event)
+        except Exception as e:
+            logger.debug("native input relay not started: %s", e)
+            return False
+        self._native_input_relay = bool(started)
+        if started:
+            logger.info("native input relay listening for shell.activate")
+        return self._native_input_relay
+
+    def _on_compositor_event(self, frame: dict) -> None:
+        """One compositor event. Runs on the subscriber thread, so it stays cheap."""
+        if (frame or {}).get('event') != 'shell.activate':
+            return
+        body = frame.get('window') or {}
+        row, card = body.get('row'), body.get('card')
+        if not isinstance(row, int) or not isinstance(card, int):
+            return
+        if row < 0 or card < 0:
+            return
+        self._relay_native_activation(row, card)
+
+    def _relay_native_activation(self, row: int, card: int) -> None:
+        """Hand a native-scene activation to the browser over the SSE channel.
+
+        Stored and woken exactly as agent_ui_update does, and deliberately NOT through
+        it. That gate governs an AGENT painting the screen: it refuses while the human
+        has halted the hive and it rate-caps per agent. This is a person clicking a card
+        that is already on their screen, and the two card actions are focusing the
+        command bar and opening a panel, neither of which dispatches anything. Halting
+        the hive must not make the desktop unclickable, and a user's clicks are not an
+        agent's push rate.
+        """
+        component = {'type': 'home_activate', 'row': row, 'card': card}
+        with self._lock:
+            comps = self._agent_components.setdefault('native_shell', [])
+            comps.append(component)
+            if len(comps) > 5:
+                self._agent_components['native_shell'] = comps[-5:]
+        with self._ui_event_cv:
+            self._ui_event_cv.notify_all()
+        logger.info("native activation relayed: row=%d card=%d", row, card)
 
     def compose_home_now(self, reason: str = 'manual') -> bool:
         """PRODUCER: compose the agentic home from live context + the local LLM,
@@ -6887,6 +6952,13 @@ if(!PERF.potato) {{
             // merge + hartPinIcon (no fork); icon appears without a refresh.
             if(window.hartInstallIcon) window.hartInstallIcon(ev);
             showToast('Installed', (ev.title||ev.id||'App')+' added to your desktop', 'info');
+          }} else if(type === 'home_activate') {{
+            // A press the COMPOSITOR handled on the native scene, relayed by index.
+            // HartHome.activate resolves it against the payload it is already showing
+            // and runs the SAME cardAction a DOM click runs, so there is one executor.
+            if(window.HartHome && window.HartHome.activate) {{
+              window.HartHome.activate(ev.row, ev.card);
+            }}
           }} else if(type === 'home' || type === 'home_compose') {{
             // The local LLM re-composes the assembled HOME live (i1, agentic
             // Liquid UI): route the A2UI payload to HartHome.compose instead of a
