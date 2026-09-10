@@ -1247,3 +1247,42 @@ def test_the_native_icon_face_is_the_one_the_shell_asks_for():
 def _read_service():
     with open(SERVICE_SRC, encoding="utf-8") as fh:
         return fh.read()
+
+
+def test_the_native_desktop_paints_below_windows_and_above_the_shell():
+    """Z-order is a property of the ORDER OF PUSHES, so it is pinned as one.
+
+    build_frame_elements builds the list front-to-back: the cursor is prepended so it
+    draws on top, and the bloom's own comment says "last in the list = drawn UNDER
+    everything". The native scene therefore has to be pushed AFTER the toplevels and
+    BEFORE the Bottom/Background layer.
+
+    Below the windows, because the scene is the desktop and windows must cover it; the
+    bars stay reachable through the panel reservation, which is the same mechanism that
+    keeps the WebView shell's bars reachable and not a second copy of it. It was pushed
+    ABOVE the toplevels before this, so a maximized window got hero copy painted over it
+    while surface_under still routed the clicks to the window.
+
+    Above the Background layer, because during the transition the WebView is still running
+    underneath with an opaque surface, and below it the native scene would be invisible.
+
+    No Rust test can state this: it needs a mapped output, real windows and a live layer
+    shell. Source order is the honest place to hold it.
+    """
+    comp = open(os.path.join(REPO, "compositor", "src", "comp_core.rs"),
+                encoding="utf-8").read()
+
+    def at(marker):
+        assert comp.count(marker) == 1, "marker moved or duplicated: %s" % marker
+        return comp.index(marker)
+
+    cursor = at("// ── 1. SOFTWARE CURSOR")
+    top_overlay = at("// ── 2. TOP / OVERLAY layer surfaces")
+    toplevels = at("// ── 3. WINDOW TOPLEVELS")
+    scene = at("// ── 3c. NATIVE SHELL M3 scene")
+    background = at("// ── 4. BOTTOM / BACKGROUND layer surfaces")
+
+    assert cursor < top_overlay < toplevels < scene < background, (
+        "native scene is out of z-order: cursor=%d top/overlay=%d toplevels=%d "
+        "scene=%d background=%d (front-to-back, so larger index = further back)"
+        % (cursor, top_overlay, toplevels, scene, background))

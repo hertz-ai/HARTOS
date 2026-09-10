@@ -3395,46 +3395,6 @@ where
         build_cursor_elements(state, renderer, &mut elements);
     }
 
-    // ── 1b. NATIVE SHELL M3 scene (gated OFF by default via native_shell_on). Pushed
-    //    here so native chrome sits above the app windows and below the cursor. A pure
-    //    additive path: flag off = no-op, the WebView shell is untouched. Skipped under
-    //    the killswitch for the SAME reason the bloom and the M2 orb below are: the black
-    //    solid pushed above already hides it, so lowering it is pure waste, and since a
-    //    drawn native scene holds the frame-budget gate open it would otherwise composite
-    //    at full rate behind a blacked-out screen. ──
-    if native_scene_drawn(state.native_shell_on(), state.capture_blocked()) {
-        // The scene CLAIMS the chrome it draws. Without this the flag would silently
-        // un-claim the orb, because the M2 block below that used to set the bit is
-        // skipped precisely when the native shell is on, and the shell would then keep
-        // its own HTML orb: two orbs breathing over each other, the browser still paying
-        // the per-frame cost, and the entire point of the native orb lost.
-        let before = elements.len();
-        let scene_mask = render_native_scene(state, renderer, size, &mut elements);
-        native_mask |= scene_mask;
-        if elements.len() > before {
-            // Evidence for the compositor's shell-ready writer: elements the SCENE itself
-            // put into this frame. Deliberately measured by growth of the element list
-            // rather than by `scene_mask != 0`, which is what this used to test.
-            //
-            // The mask is not that evidence. `lower_scene` sets exactly ONE bit, and only
-            // where the ORB's buffer imports; Rect, Text and Art all push elements and set
-            // nothing. So `scene_mask != 0` means "the orb drew", and a frame that painted
-            // the hero, the rows, the cards and both bars while the orb was skipped (a
-            // sub-pixel slot, a cache miss, a failed import) claimed nothing had painted.
-            // shell-ready would then never be written, the paint watchdog would stop seeing
-            // HEALTHY, and the ladder would demote off the native shell on its own, which
-            // is the exact failure the writer beside it in udev.rs was added to prevent.
-            //
-            // Growth of the list is also what this static's own doc says it means: "set
-            // once the native scene has actually put elements into a frame".
-            //
-            // Still the SCENE's own contribution, not the accumulated mask: the bloom below
-            // pushes an element whether or not the native shell drew anything, and it is
-            // measured after this point, so the backdrop alone can never claim a painted
-            // native shell.
-            NATIVE_SCENE_PAINTED.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
 
     let ws_alpha = workspace_fade_alpha(state);
     let output = state.output().clone();
@@ -3474,6 +3434,67 @@ where
         let win_elems: Vec<WaylandSurfaceRenderElement<R>> =
             AsRenderElements::<R>::render_elements(window, renderer, phys, Scale::from(1.0), alpha);
         elements.extend(win_elems.into_iter().map(HartRenderElement::Surface));
+    }
+
+    // ── 3c. NATIVE SHELL M3 scene: the DESKTOP PLANE, below windows, above the shell. ──
+    //
+    // Z-ORDER IS THE WHOLE POINT OF THIS POSITION, and it used to be step 1b, above the
+    // toplevels and above the Top/Overlay layers. That made the home desktop paint over
+    // every application window: a maximized Firefox got hero copy and card rows drawn on
+    // top of it, while `surface_under` still routed the clicks to Firefox, because hit
+    // testing walks Overlay, then Top, then windows. Pixels saying one thing and input
+    // another is exactly what the layer-ordering work below was written to end.
+    //
+    // Here instead it sits where the shell it replaces already sits: ABOVE the
+    // Bottom/Background layer that carries the WebView glass shell, and BELOW the
+    // toplevels and the Top/Overlay layers. Both halves are load-bearing.
+    //
+    //   Below windows, because the scene is the desktop. Windows must cover it, and the
+    //   bars stay reachable through the panel RESERVATION (`work_area_for`), which is the
+    //   same mechanism that keeps the WebView shell's bars reachable today. That is the
+    //   2026-08-29 "taskbar unreachable" fix, not a second copy of it.
+    //
+    //   Above the Background layer, because during the transition `shell.native {on}`
+    //   leaves the WebView running underneath and its surface is opaque. Below it the
+    //   native scene would be invisible, and the A/B the latency program needs could not
+    //   be taken at all.
+    //
+    // Skipped under the killswitch for the SAME reason the bloom and the M2 orb are: the
+    // black solid above already hides it, so lowering it is pure waste, and a drawn native
+    // scene holds the frame-budget gate open, so it would otherwise composite at full rate
+    // behind a blacked-out screen. Flag off = no-op, the WebView shell untouched. ──
+    if native_scene_drawn(state.native_shell_on(), state.capture_blocked()) {
+        // The scene CLAIMS the chrome it draws. Without this the flag would silently
+        // un-claim the orb, because the M2 block below that used to set the bit is
+        // skipped precisely when the native shell is on, and the shell would then keep
+        // its own HTML orb: two orbs breathing over each other, the browser still paying
+        // the per-frame cost, and the entire point of the native orb lost.
+        let before = elements.len();
+        let scene_mask = render_native_scene(state, renderer, size, &mut elements);
+        native_mask |= scene_mask;
+        if elements.len() > before {
+            // Evidence for the compositor's shell-ready writer: elements the SCENE itself
+            // put into this frame. Deliberately measured by growth of the element list
+            // rather than by `scene_mask != 0`, which is what this used to test.
+            //
+            // The mask is not that evidence. `lower_scene` sets exactly ONE bit, and only
+            // where the ORB's buffer imports; Rect, Text and Art all push elements and set
+            // nothing. So `scene_mask != 0` means "the orb drew", and a frame that painted
+            // the hero, the rows, the cards and both bars while the orb was skipped (a
+            // sub-pixel slot, a cache miss, a failed import) claimed nothing had painted.
+            // shell-ready would then never be written, the paint watchdog would stop seeing
+            // HEALTHY, and the ladder would demote off the native shell on its own, which
+            // is the exact failure the writer beside it in udev.rs was added to prevent.
+            //
+            // Growth of the list is also what this static's own doc says it means: "set
+            // once the native scene has actually put elements into a frame".
+            //
+            // Still the SCENE's own contribution, not the accumulated mask: the bloom below
+            // pushes an element whether or not the native shell drew anything, and it is
+            // measured after this point, so the backdrop alone can never claim a painted
+            // native shell.
+            NATIVE_SCENE_PAINTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     // ── 4. BOTTOM / BACKGROUND layer surfaces — BELOW the toplevels. ──
