@@ -157,6 +157,20 @@ pub trait TextMeasure {
     /// spacing-free measure would not know about.
     fn text_width(&mut self, text: &str, size_px: f32, weight: u16, letter_spacing: f32) -> f32;
 
+    /// The width of a run shaped in the ICON face.
+    ///
+    /// A different number from `text_width` on the same string, not a variation of it: a
+    /// ligature name collapses to ONE square glyph, so "sd_card_alert" is thirteen
+    /// characters wide as text and one icon wide as an icon. Layout centres icons in fixed
+    /// slots, so measuring them as text mispositions the glyph even once the right face is
+    /// being asked for.
+    ///
+    /// Defaults to the text measure so a font-free implementation stays correct-ish rather
+    /// than wrong: it is only ever consulted when `has_icon_face` already said yes.
+    fn icon_width(&mut self, text: &str, size_px: f32) -> f32 {
+        self.text_width(text, size_px, 400, 0.0)
+    }
+
     /// Whether the Material ligature face the shell's icons rely on is loaded.
     ///
     /// A card icon is not an image: it is the icon's NAME ("storage") shaped by a font
@@ -944,11 +958,28 @@ pub enum SceneNode {
         /// the native eyebrow read as an ordinary small line of text rather than the
         /// spaced-out brand mark over the money figure.
         ///
-        /// Px rather than em because that is the unit the rule uses, and because the
-        /// shaper takes px. The one em-based rule in the mirrored set (`.start-btn span`
-        /// at `.02em`) is resolved against its own font-size at the construction site,
-        /// where both numbers are already in view.
+        /// Px rather than em because that is the unit the rule uses. The one em-based rule
+        /// in the mirrored set (`.start-btn span` at `.02em`) is resolved against its own
+        /// font-size at the construction site, where both numbers are already in view.
+        ///
+        /// This used to add "and because the shaper takes px", which was false and was the
+        /// premise behind a real bug: cosmic-text takes tracking in EM, so 3px arrived as
+        /// 3em and the eyebrow laid out about five times its width. text_render converts
+        /// at the one seam measure and paint share.
         letter_spacing: f32,
+        /// Shape this run in the ICON face rather than the UI face.
+        ///
+        /// A card icon, a tray glyph and the omnibox magnifier are not pictures: each is a
+        /// Material LIGATURE NAME ("storage", "notifications", "search") that the icon face
+        /// substitutes for a single glyph. Which face shapes the run is therefore the whole
+        /// difference between an icon and a word, and it cannot be inferred from the string:
+        /// "inbox" is a valid ligature name AND a plausible card title.
+        ///
+        /// So the layout says which it meant, at the three places that emit icons, and
+        /// everything else is false. Before this existed nothing selected a family at all,
+        /// every run shaped in cosmic-text's default sans, and because ligature names are
+        /// pure ASCII the missing-glyph fallback never fired to correct it.
+        icon: bool,
     },
     /// A card's drop shadow: the shape blurred, offset, and painted UNDER it.
     ///
@@ -1607,6 +1638,7 @@ fn push_chip(
     }
     let ink_w = measure.text_width(chip.label, chip.px, chip.weight, 0.0);
     out.push(SceneNode::Text {
+        icon: false,
         rect: Rect::new(
             ink_x,
             y + (chip.h - chip.px * 1.3) * 0.5,
@@ -1696,6 +1728,7 @@ pub fn layout_home(
     // box is the measured width rounded up with a pixel of slack rather than trusting an
     // exact float to survive the f32 -> i32 the lowering does.
     bar_children.push(SceneNode::Text {
+        icon: false,
         rect: Rect::new(BAR_PAD_X, mark_y, hart_w.ceil() + 2.0, mark_h),
         text: "HART".to_string(),
         size_px: WORDMARK_PX,
@@ -1707,6 +1740,7 @@ pub fn layout_home(
         letter_spacing: WORDMARK_PX * 0.02,
     });
     bar_children.push(SceneNode::Text {
+        icon: false,
         rect: Rect::new(
             BAR_PAD_X + hart_w + gap_w,
             mark_y,
@@ -1751,6 +1785,7 @@ pub fn layout_home(
             });
         }
         bar_children.push(SceneNode::Text {
+            icon: false,
             rect: Rect::new(tab_x + m.tab_pad_x, tab_ink_y, ink_w.ceil() + 2.0, tab_ink_h),
             text: label.to_string(),
             size_px: TAB_PX,
@@ -1782,8 +1817,9 @@ pub fn layout_home(
     let pill_ink_y = (theme.top_bar_h - OMNIBOX_PX * 1.3) * 0.5;
     let mut pill_x = pill.x + 12.0;
     if icons_available {
-        let gw = measure.text_width(OMNIBOX_GLYPH, OMNIBOX_PX, 400, 0.0);
+        let gw = measure.icon_width(OMNIBOX_GLYPH, OMNIBOX_PX);
         pill_children.push(SceneNode::Text {
+            icon: true,
             rect: Rect::new(pill_x, pill_ink_y, gw.ceil() + 2.0, OMNIBOX_PX * 1.3),
             text: OMNIBOX_GLYPH.to_string(),
             size_px: OMNIBOX_PX,
@@ -1796,6 +1832,7 @@ pub fn layout_home(
         pill_x += gw + 8.0;
     }
     pill_children.push(SceneNode::Text {
+        icon: false,
         rect: Rect::new(
             pill_x,
             pill_ink_y,
@@ -1814,6 +1851,7 @@ pub fn layout_home(
     let kbd_x = pill.right() - 12.0 - kbd_w;
     if m.show_kbd && kbd_x > pill_x {
         pill_children.push(SceneNode::Text {
+            icon: false,
             rect: Rect::new(
                 kbd_x,
                 (theme.top_bar_h - KBD_PX * 1.3) * 0.5,
@@ -1864,13 +1902,14 @@ pub fn layout_home(
         for glyph in TRAY_GLYPHS.iter().rev() {
             right_x -= TRAY_BTN;
             let b = centered_box(
-                measure.text_width(glyph, theme.icon_px, 400, 0.0),
+                measure.icon_width(glyph, theme.icon_px),
                 right_x,
                 TRAY_BTN,
                 (theme.top_bar_h - theme.icon_px * 1.3) * 0.5,
                 theme.icon_px * 1.3,
             );
             bar_children.push(SceneNode::Text {
+                icon: true,
                 rect: b,
                 text: (*glyph).to_string(),
                 size_px: theme.icon_px,
@@ -1893,6 +1932,7 @@ pub fn layout_home(
         radius: AVATAR_D * 0.5,
     });
     bar_children.push(SceneNode::Text {
+        icon: false,
         rect: centered_box(
             measure.text_width(AVATAR_INITIAL, AVATAR_PX, 800, 0.0),
             av.x,
@@ -1944,6 +1984,7 @@ pub fn layout_home(
     let mut hero_y = content.y;
     if !home.hero.eyebrow.is_empty() {
         root.push(SceneNode::Text {
+            icon: false,
             rect: Rect::new(content.x, hero_y, hero_text_w, HERO_EYEBROW_PX * 1.4),
             // `.hh-eyebrow` is `text-transform: uppercase`. The payload says "Earned on
             // the hive" and the shell paints "EARNED ON THE HIVE"; the transform is a
@@ -1971,6 +2012,7 @@ pub fn layout_home(
         let figure = amount.to_string();
         let fw = measure.text_width(&figure, m.amount_px, 800, 0.0);
         root.push(SceneNode::Text {
+            icon: false,
             rect: Rect::new(content.x, hero_y, fw.ceil() + 2.0, m.amount_px * 1.3),
             text: figure,
             size_px: m.amount_px,
@@ -1987,6 +2029,7 @@ pub fn layout_home(
         };
         let uw = measure.text_width(unit, m.unit_px, 700, 0.0);
         root.push(SceneNode::Text {
+            icon: false,
             rect: Rect::new(
                 content.x + fw + 8.0,
                 // Sat on the figure's baseline rather than its box top, so the unit reads
@@ -2090,6 +2133,7 @@ pub fn layout_home(
         for (frag, weight, color) in &stat {
             let fw = measure.text_width(frag, HERO_META_PX, *weight, 0.0);
             root.push(SceneNode::Text {
+                icon: false,
                 rect: Rect::new(mx, text_y, fw.ceil() + 2.0, text_h),
                 text: frag.clone(),
                 size_px: HERO_META_PX,
@@ -2114,6 +2158,7 @@ pub fn layout_home(
             mx += HERO_SHIELD + HERO_SHIELD_GAP;
             let lw = measure.text_width(HERO_LOCAL, HERO_META_PX, 700, 0.0);
             root.push(SceneNode::Text {
+                icon: false,
                 rect: Rect::new(mx, text_y, lw.ceil() + 2.0, text_h),
                 text: HERO_LOCAL.to_string(),
                 size_px: HERO_META_PX,
@@ -2170,6 +2215,7 @@ pub fn layout_home(
             });
         }
         root.push(SceneNode::Text {
+            icon: false,
             rect: Rect::new(
                 cta_x + HERO_BTN_PAD_X,
                 hero_y + (HERO_BTN_H - HERO_BTN_PX * 1.3) * 0.5,
@@ -2219,6 +2265,7 @@ pub fn layout_home(
         let mut row_children: Vec<SceneNode> = Vec::new();
         let label_w = measure.text_width(&row.title, ROW_LABEL_PX, 700, 0.0);
         row_children.push(SceneNode::Text {
+            icon: false,
             rect: Rect::new(content.x, cursor_y, label_w.ceil() + 2.0, ROW_LABEL_H),
             text: row.title.clone(),
             size_px: ROW_LABEL_PX,
@@ -2233,6 +2280,7 @@ pub fn layout_home(
             let note_x = content.x + label_w + ROW_HEAD_GAP;
             if note_x + note_w <= content.right() {
                 row_children.push(SceneNode::Text {
+                    icon: false,
                     rect: Rect::new(note_x, cursor_y, note_w.ceil() + 2.0, ROW_LABEL_H),
                     text: note.clone(),
                     size_px: ROW_NOTE_PX,
@@ -2251,6 +2299,7 @@ pub fn layout_home(
             // affordance rather than overlapping the text it belongs to.
             if see_x > content.x + label_w + ROW_HEAD_GAP {
                 row_children.push(SceneNode::Text {
+                    icon: false,
                     rect: Rect::new(see_x, cursor_y, see_w.ceil() + 2.0, ROW_LABEL_H),
                     text: SEE_ALL.to_string(),
                     size_px: ROW_NOTE_PX,
@@ -2313,6 +2362,7 @@ pub fn layout_home(
                 let label = (card_index + 1).to_string();
                 let nw = measure.text_width(&label, RANK_PX, 900, 0.0);
                 card_children.push(SceneNode::Text {
+                    icon: false,
                     rect: Rect::new(
                         cr.x - 6.0,
                         cr.bottom() + 14.0 - RANK_PX * 1.3,
@@ -2408,8 +2458,9 @@ pub fn layout_home(
                     radius: 10.0,
                 });
                 card_children.push(SceneNode::Text {
+                    icon: true,
                     rect: centered_box(
-                        measure.text_width(name, CARD_ICON_PX, 400, 0.0),
+                        measure.icon_width(name, CARD_ICON_PX),
                         ab.x + CARD_ICON_INSET_X,
                         CARD_ICON_BOX,
                         ab.y + CARD_CHIP_INSET + (CARD_ICON_BOX - CARD_ICON_PX * 1.3) * 0.5,
@@ -2486,6 +2537,7 @@ pub fn layout_home(
                 ab.bottom() - CARD_BODY_BOTTOM
             };
             card_children.push(SceneNode::Text {
+                icon: false,
                 rect: Rect::new(
                     ab.x + CARD_PAD_X,
                     title_y,
@@ -2502,6 +2554,7 @@ pub fn layout_home(
             });
             if let Some(meta) = &card.meta {
                 card_children.push(SceneNode::Text {
+                    icon: false,
                     rect: Rect::new(
                         ab.x + CARD_PAD_X,
                         title_y + CARD_TITLE_H,
@@ -3740,6 +3793,7 @@ mod tests {
             .flatten()
             .filter_map(|n| match n {
                 SceneNode::Text {
+                    icon: false,
                     rect, text, stroke, ..
                 } if *stroke > 0.0 => Some((text.clone(), *rect, *stroke)),
                 _ => None,
@@ -3861,6 +3915,7 @@ mod tests {
             .iter()
             .filter_map(|n| match n {
                 SceneNode::Text {
+                    icon: false,
                     text,
                     weight,
                     letter_spacing,

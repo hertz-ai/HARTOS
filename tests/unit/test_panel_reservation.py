@@ -1194,3 +1194,56 @@ def test_the_native_scene_owns_the_reservation_once_it_paints_the_bars():
     assert "40" not in native and "44" not in native, (
         "native_chrome_reservation restates a bar height as a literal instead of "
         "reading it, which is the drift every other pin in this file exists to stop")
+
+
+def test_the_native_icon_face_is_the_one_the_shell_asks_for():
+    """The compositor must shape icons in the face the shell names FIRST.
+
+    A card icon, a tray glyph and the omnibox magnifier are Material LIGATURE NAMES.
+    The face turns the whole name into one glyph; any other face renders the letters.
+    That is not a graceful degradation, it is the word "notifications" clipped into a
+    32px tray slot, which is what a fresh offline ISO once showed and what
+    hart-subsystems.nix bundles the fonts to prevent.
+
+    The two sides pick the face differently and cannot be allowed to drift. CSS falls
+    through a stack on a MISSING FAMILY; cosmic-text falls back per CODEPOINT, and a
+    ligature name is pure ASCII that every sans face covers, so its fallback never
+    fires. The compositor therefore names exactly one family, and it has to be the
+    shell's first choice or the two renderers draw different icons.
+
+    Read from both sources, never restated here, because a literal in this test would
+    pass happily after either side was renamed.
+    """
+    shell = _read_service()
+    rule_at = shell.index(".mi, .material-icons-round {")
+    block = shell[rule_at:shell.index("}", rule_at)]
+    assert "font-family" in block, ".mi no longer sets a font-family"
+    fams = block[block.index("font-family:") + len("font-family:"):]
+    fams = fams[:fams.index(";")]
+    first = fams.split(",")[0].strip().strip("'").strip('"')
+
+    rust = open(os.path.join(REPO, "compositor", "src", "text_render.rs"),
+                encoding="utf-8").read()
+    marker = 'pub const ICON_FAMILY: &str = "'
+    assert marker in rust, "text_render.rs no longer declares ICON_FAMILY"
+    tail = rust[rust.index(marker) + len(marker):]
+    native = tail[:tail.index('"')]
+
+    assert native == first, (
+        "the compositor shapes icons in %r while the shell asks for %r first"
+        % (native, first))
+
+    # And the face is actually REQUESTED, not merely declared. A constant nothing
+    # passes to the shaper is how the icons came to render as words in the first place.
+    assert "Family::Name(ICON_FAMILY)" in rust, (
+        "ICON_FAMILY is declared but never handed to the shaper")
+    scene = open(SCENE_SRC, encoding="utf-8").read()
+    assert "icon: true," in scene, (
+        "no scene node asks for the icon face, so every run shapes in the UI face")
+    assert "icon_width(" in scene, (
+        "icons are measured as text, so the glyph is centred against the wrong width")
+
+
+def _read_service():
+    with open(SERVICE_SRC, encoding="utf-8") as fh:
+        return fh.read()

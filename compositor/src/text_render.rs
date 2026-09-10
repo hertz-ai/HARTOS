@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use cosmic_text::{
-    Attrs, Buffer, Color as CtColor, FontSystem, Metrics, Shaping, SwashCache, Weight,
+    Attrs, Buffer, Color as CtColor, Family, FontSystem, Metrics, Shaping, SwashCache, Weight,
 };
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
@@ -34,8 +34,32 @@ use crate::scene::TextMeasure;
 ///
 /// `cosmic_text::Weight` is a newtype over the same CSS number the shell's rules are
 /// written in, so this is a wrap, not a mapping table.
-fn attrs_for(weight: u16, letter_spacing_px: f32, size_px: f32) -> Attrs<'static> {
-    Attrs::new()
+/// The icon face, named exactly as the shell names it first.
+///
+/// `.mi { font-family: 'Material Symbols Rounded', 'Material Icons Round',
+/// 'Material Icons', 'Material Symbols Outlined' }`, and the shell @font-faces a bundled
+/// MaterialSymbolsRounded.woff2 under that name. The box has it: `fc-list` reports
+/// `Material Symbols Rounded` among eight Material families, installed by
+/// hart-subsystems.nix so the shell renders offline.
+///
+/// ONE name rather than the shell's four-deep stack, because a CSS stack falls through on
+/// a MISSING FAMILY while cosmic-text's fallback is per CODEPOINT: an icon name is ASCII,
+/// every sans face covers it, so a fallback chain would never fire on the one thing that
+/// makes icons different. Which is exactly how they came to render as words.
+pub const ICON_FAMILY: &str = "Material Symbols Rounded";
+
+fn attrs_for(weight: u16, letter_spacing_px: f32, size_px: f32, icon: bool) -> Attrs<'static> {
+    let base = Attrs::new();
+    // ASK FOR THE ICON FACE, or the name is just a word.
+    //
+    // A card icon is a Material LIGATURE NAME ("storage", "sd_card_alert"): the face
+    // substitutes the whole string for one glyph. Nothing here used to select a family, so
+    // every run shaped in cosmic-text's default (`Family::SansSerif`). The names are pure
+    // ASCII, so sans covers every codepoint, the missing-glyph fallback never fired, and
+    // the Material face sat in fontdb unused while the tray painted the literal words
+    // "notifications", "palette", "shield".
+    let base = if icon { base.family(Family::Name(ICON_FAMILY)) } else { base };
+    base
         .weight(Weight(weight))
         // TRACKING IS EM HERE, PX EVERYWHERE ELSE. cosmic-text says so itself
         // ("Set letter spacing (tracking) in EM", attrs.rs), and shape.rs adds the
@@ -75,6 +99,11 @@ struct RunKey {
     weight: u16,
     /// Letter spacing in px, as bits, for the same reason again.
     tracking_bits: u32,
+    /// Whether the run was shaped in the ICON face. Part of the identity because the
+    /// same string is a different picture in each: "storage" is one glyph in Material
+    /// Symbols and seven letters in sans, so without this the first of the two to be
+    /// cached would answer for the other.
+    icon: bool,
 }
 
 /// The most runs kept alive at once.
@@ -176,7 +205,7 @@ impl TextRasterizer {
     /// the glyphs it later draws agree by construction rather than by a fudge factor.
     /// Not cached: it runs on a scene-tree rebuild, which the retained tree already makes
     /// rare, so a cache here would hold strings that are never asked for twice.
-    fn measure(&mut self, text: &str, size_px: f32, weight: u16, letter_spacing: f32) -> f32 {
+    fn measure(&mut self, text: &str, size_px: f32, weight: u16, letter_spacing: f32, icon: bool) -> f32 {
         if text.is_empty() {
             return 0.0;
         }
@@ -190,7 +219,7 @@ impl TextRasterizer {
         // No width bound: a measure must never wrap, or a long run would report the width
         // of its wrapped box instead of its own advance.
         buffer.set_size(&mut self.font_system, None, None);
-        buffer.set_text(&mut self.font_system, text, &attrs_for(weight, letter_spacing, size_px), Shaping::Advanced);
+        buffer.set_text(&mut self.font_system, text, &attrs_for(weight, letter_spacing, size_px, icon), Shaping::Advanced);
         buffer.shape_until_scroll(&mut self.font_system, false);
         buffer
             .layout_runs()
@@ -212,6 +241,7 @@ impl TextRasterizer {
         stroke_px: f32,
         weight: u16,
         letter_spacing: f32,
+        icon: bool,
     ) -> &MemoryRenderBuffer {
         let wi = w.max(1) as u32;
         let hi = h.max(1) as u32;
@@ -224,6 +254,7 @@ impl TextRasterizer {
             stroke_bits: stroke_px.max(0.0).to_bits(),
             weight,
             tracking_bits: letter_spacing.max(0.0).to_bits(),
+            icon,
         };
         if !self.cache.contains_key(&key) {
             // Dropped wholesale rather than evicted one at a time. A run that has fallen
@@ -234,7 +265,7 @@ impl TextRasterizer {
             if self.cache.len() >= MAX_CACHED_RUNS {
                 self.cache.clear();
             }
-            let buf = self.compose(text, size_px, wi, hi, color, stroke_px, weight, letter_spacing);
+            let buf = self.compose(text, size_px, wi, hi, color, stroke_px, weight, letter_spacing, icon);
             self.cache.insert(key.clone(), buf);
             self.composes += 1;
         }
@@ -254,7 +285,7 @@ impl TextRasterizer {
         color: [f32; 4],
         stroke_px: f32,
         weight: u16,
-        letter_spacing: f32,
+        letter_spacing: f32,        icon: bool,
     ) -> MemoryRenderBuffer {
         let mut rgba = vec![0u8; (wi * hi * 4) as usize];
 
@@ -279,7 +310,7 @@ impl TextRasterizer {
         let metrics = Metrics::new(size_px, size_px * 1.3);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(&mut self.font_system, Some(wi as f32), Some(hi as f32));
-        buffer.set_text(&mut self.font_system, text, &attrs_for(weight, letter_spacing, size_px), Shaping::Advanced);
+        buffer.set_text(&mut self.font_system, text, &attrs_for(weight, letter_spacing, size_px, icon), Shaping::Advanced);
         // `draw` is `&self`, so the run must be shaped first (shaping needs `&mut`).
         buffer.shape_until_scroll(&mut self.font_system, false);
 
@@ -402,19 +433,36 @@ impl TextRasterizer {
 /// a width without scene.rs ever depending on a text stack.
 impl TextMeasure for TextRasterizer {
     fn text_width(&mut self, text: &str, size_px: f32, weight: u16, letter_spacing: f32) -> f32 {
-        self.measure(text, size_px, weight, letter_spacing)
+        self.measure(text, size_px, weight, letter_spacing, false)
     }
 
-    /// True when fontconfig has handed us a Material family. The box installs both
-    /// `material-icons` and `material-symbols` (hart-subsystems.nix bundles them so the
-    /// shell's icons work offline), and cosmic-text's fontdb reads the same fontconfig, so
-    /// on a configured desktop this is simply true. A sandbox without them says false and
-    /// the layout drops the icon rather than drawing its name as a word.
+    /// The width of a run shaped in the ICON face, which is a different number entirely:
+    /// a ligature name collapses to ONE glyph, so "sd_card_alert" measured as text is
+    /// thirteen characters wide and measured as an icon is one square. Layout centres
+    /// icons in fixed slots, so measuring them as text put the glyph in the wrong place
+    /// even once the face was being asked for.
+    fn icon_width(&mut self, text: &str, size_px: f32) -> f32 {
+        self.measure(text, size_px, 400, 0.0, true)
+    }
+
+    /// True when fontconfig has handed us THE face the shaper will actually ask for.
+    ///
+    /// It used to accept any family whose name began with "Material", which proved the
+    /// font was INSTALLED and never that a run would be shaped with it. Those are
+    /// different claims, and the gap between them was the whole bug: the box has eight
+    /// Material families, so this answered true, `icons_available` admitted the runs, and
+    /// nothing selected a family, so the tray painted the words "notifications",
+    /// "palette", "shield" clipped into 32px slots.
+    ///
+    /// Now it names `ICON_FAMILY` exactly, so the question this answers and the family
+    /// `attrs_for` requests are the same string. A host with the wrong Material family and
+    /// not this one says false and the layout drops the icon, which is the safe direction
+    /// and the behaviour this was always documented to have.
     fn has_icon_face(&self) -> bool {
         self.font_system
             .db()
             .faces()
-            .any(|f| f.families.iter().any(|(name, _)| name.starts_with("Material")))
+            .any(|f| f.families.iter().any(|(name, _)| name == ICON_FAMILY))
     }
 }
 
@@ -443,6 +491,7 @@ mod tests {
             stroke_bits: 0,
             weight: 400,
             tracking_bits: 0,
+            icon: false,
         };
         assert_eq!(mk("hi", 14.0, 10, 10), mk("hi", 14.0, 10, 10));
         assert_ne!(mk("hi", 14.0, 10, 10), mk("hi", 15.0, 10, 10));
@@ -474,11 +523,11 @@ mod tests {
         let mut r = TextRasterizer::new();
         let white = [1.0, 1.0, 1.0, 1.0];
         let before = r.composes();
-        let _ = r.rasterize("7", 40.0, 60, 60, white, 0.0, 400, 0.0);
-        let _ = r.rasterize("7", 40.0, 60, 60, white, 3.0, 400, 0.0);
+        let _ = r.rasterize("7", 40.0, 60, 60, white, 0.0, 400, 0.0, false);
+        let _ = r.rasterize("7", 40.0, 60, 60, white, 3.0, 400, 0.0, false);
         assert_eq!(r.composes(), before + 2, "fill and outline compose separately");
         // And each is still cached in its own right.
-        let _ = r.rasterize("7", 40.0, 60, 60, white, 3.0, 400, 0.0);
+        let _ = r.rasterize("7", 40.0, 60, 60, white, 3.0, 400, 0.0, false);
         assert_eq!(r.composes(), before + 2, "the outline is cached like any run");
     }
 
@@ -490,7 +539,7 @@ mod tests {
         let mut r = TextRasterizer::new();
         let white = [1.0, 1.0, 1.0, 1.0];
         for i in 0..(MAX_CACHED_RUNS * 3) {
-            let _ = r.rasterize(&format!("earned ${i} overnight"), 12.0, 24, 14, white, 0.0, 400, 0.0);
+            let _ = r.rasterize(&format!("earned ${i} overnight"), 12.0, 24, 14, white, 0.0, 400, 0.0, false);
         }
         assert!(
             r.cached_runs() <= MAX_CACHED_RUNS,
@@ -501,11 +550,70 @@ mod tests {
 
         // And it is still a cache after a sweep: a run asked for twice composes once.
         let before = r.composes();
-        let _ = r.rasterize("steady", 12.0, 24, 14, white, 0.0, 400, 0.0);
+        let _ = r.rasterize("steady", 12.0, 24, 14, white, 0.0, 400, 0.0, false);
         let after_first = r.composes();
-        let _ = r.rasterize("steady", 12.0, 24, 14, white, 0.0, 400, 0.0);
+        let _ = r.rasterize("steady", 12.0, 24, 14, white, 0.0, 400, 0.0, false);
         assert_eq!(after_first, before + 1, "the first ask composes");
         assert_eq!(r.composes(), after_first, "the second ask must hit the cache");
+    }
+
+    #[test]
+    fn an_icon_run_and_a_text_run_of_the_same_string_are_different_pictures() {
+        // "storage" is one square glyph in the Material face and seven letters in sans.
+        // The cache key has to know which, or the first of the two to be composed answers
+        // for the other forever, and a card icon becomes the word (or a title becomes an
+        // icon). This is the same argument the stroke and weight fields carry.
+        let mut r = TextRasterizer::new();
+        let white = [1.0, 1.0, 1.0, 1.0];
+        let before = r.composes();
+        let _ = r.rasterize("storage", 20.0, 32, 26, white, 0.0, 400, 0.0, false);
+        let _ = r.rasterize("storage", 20.0, 32, 26, white, 0.0, 400, 0.0, true);
+        assert_eq!(
+            r.composes(),
+            before + 2,
+            "the icon face and the UI face must compose separately"
+        );
+        // And each is still cached in its own right.
+        let _ = r.rasterize("storage", 20.0, 32, 26, white, 0.0, 400, 0.0, true);
+        assert_eq!(r.composes(), before + 2, "the icon run is cached like any run");
+    }
+
+    #[test]
+    fn the_face_the_detector_looks_for_is_the_face_the_shaper_asks_for() {
+        // The bug this closes: has_icon_face used to accept ANY family whose name began
+        // with "Material", which proves the font is INSTALLED and never that a run will be
+        // shaped with it. The box carries eight Material families, so it answered true,
+        // layout admitted the icon runs, nothing selected a family, and the tray painted
+        // the literal words "notifications", "palette", "shield".
+        //
+        // Detection and selection must name ONE string. Read out of the constant rather
+        // than restated, so renaming the face cannot leave this passing against the old
+        // name.
+        let r = TextRasterizer::new();
+        let exact = r
+            .font_system
+            .db()
+            .faces()
+            .any(|f| f.families.iter().any(|(n, _)| n == ICON_FAMILY));
+        assert_eq!(
+            r.has_icon_face(),
+            exact,
+            "the detector must answer by the exact family attrs_for requests"
+        );
+
+        // The near-miss is the whole point: a host with other Material families and not
+        // this one must say NO, so layout drops the icon instead of drawing its name.
+        let near_miss_only = !exact
+            && r.font_system
+                .db()
+                .faces()
+                .any(|f| f.families.iter().any(|(n, _)| n.starts_with("Material")));
+        if near_miss_only {
+            assert!(
+                !r.has_icon_face(),
+                "other Material families must not stand in for {ICON_FAMILY}"
+            );
+        }
     }
 
     #[test]
@@ -524,8 +632,8 @@ mod tests {
         let size = 16.0;
         let spacing = 3.0;
 
-        let plain = r.measure(text, size, 700, 0.0);
-        let spaced = r.measure(text, size, 700, spacing);
+        let plain = r.measure(text, size, 700, 0.0, false);
+        let spaced = r.measure(text, size, 700, spacing, false);
         let grew = spaced - plain;
 
         // ONE GAP PER CHARACTER, including the last. cosmic-text adds the tracking onto

@@ -3173,6 +3173,7 @@ where
                 stroke,
                 weight,
                 letter_spacing,
+                icon,
             } => {
                 if rect.w < 1.0 || rect.h < 1.0 || text.is_empty() {
                     return;
@@ -3186,6 +3187,7 @@ where
                     *stroke,
                     *weight,
                     *letter_spacing,
+                    *icon,
                 );
                 let origin: Point<f64, Physical> = Point::from((rect.x as f64, rect.y as f64));
                 match MemoryRenderBufferRenderElement::from_buffer(
