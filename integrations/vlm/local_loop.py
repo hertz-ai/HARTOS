@@ -959,8 +959,18 @@ def _build_action_payload(action_json: dict, parsed_screen: dict) -> dict:
     # Pass through extra keys for file/shell operations. 'command' is for
     # the 'shell' action and 'path' covers 'open_file_gui' — both already
     # live in SUPPORTED_ACTIONS so _execute_inprocess handles them natively.
+    # 'Reasoning' rides along because the SAFETY GUARDS read it:
+    # local_computer_tool._check_destructive_window_mismatch refuses an
+    # alt+f4/ctrl+w aimed at a window the reasoning did not name, and
+    # _check_reasoning_mismatch annotates softer disagreements.  Both
+    # were measured INERT on 2026-09-10 (0 firings while 54 alt+f4
+    # executed) because this builder dropped the field -- the model
+    # emits it, the loop reads it at :629/:673/:711, and only this
+    # hand-off lost it.  Guarded by
+    # tests/unit/test_vlm_destructive_window_guard.py
+    # ::TestTheReasoningReachesTheGuardOnTheLivePath.
     for key in ('path', 'source_path', 'destination_path', 'content',
-                'duration', 'command'):
+                'duration', 'command', 'Reasoning'):
         if key in action_json:
             payload[key] = action_json[key]
 

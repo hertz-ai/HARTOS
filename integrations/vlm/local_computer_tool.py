@@ -9,6 +9,7 @@ Tier 'http': HTTP to localhost:5001 (omnitool-gui Flask server)
 """
 
 import os
+import re
 from core.subprocess_safe import no_window_kwargs
 import io
 import sys
@@ -174,6 +175,111 @@ _REASONING_MISMATCH_PATTERNS = (
 _WINDOW_TARGETED_VERBS = ('minimize', 'close', 'switch to', 'click on')
 
 
+#: Key combinations that CLOSE a window.  Firing one of these at the
+#: wrong window destroys unsaved work and, unlike a stray click, cannot
+#: be undone -- which is why this list gates a hard block while the
+#: broader mismatch detector below only annotates.
+_DESTRUCTIVE_WINDOW_COMBOS = frozenset({
+    'alt+f4', 'ctrl+w', 'ctrl+shift+w', 'cmd+w', 'cmd+q',
+})
+
+#: Matches a run of TWO OR MORE consecutive capitalised words -- the
+#: shape of a real window/app name ("HART Marketing Dashboard", "Budget
+#: Spreadsheet").  Single capitalised words are deliberately NOT matched:
+#: "clicking the X" and "press OK" would otherwise read as targets and
+#: get a legitimate close refused.  Under-blocking is the chosen side of
+#: that trade (see _check_destructive_window_mismatch).
+_NAMED_WINDOW_TARGET = re.compile(r'\b[A-Z][\w&.\-]*(?:\s+[A-Z][\w&.\-]*)+')
+
+
+def _window_matches_target(target: str, active: str) -> bool:
+    """True when `active` window title and `target` name the same window.
+
+    ONE containment rule, shared by both mismatch checks below, so they
+    cannot drift into disagreeing about what "same window" means.
+    Case-insensitive and bidirectional: a title is routinely a superset
+    of the app name ("HART Marketing Dashboard - Chrome") and sometimes
+    a subset of how the model refers to it.
+    """
+    t, a = target.strip().lower(), active.strip().lower()
+    if not t or not a:
+        return False
+    return t in a or a in t
+
+
+def _destructive_window_combo(action: Optional[dict]) -> Optional[str]:
+    """Return the normalised close-combo this action sends, else None."""
+    if not action or action.get('action') not in ('hotkey', 'key', 'keypress'):
+        return None
+    combo = (action.get('text') or action.get('value') or '')
+    combo = combo.strip().lower().replace(' ', '')
+    return combo if combo in _DESTRUCTIVE_WINDOW_COMBOS else None
+
+
+#: Distinguishes "caller did not supply a window" (probe for it) from
+#: "caller supplied None" (foreground genuinely unknown -> allow).
+#: Collapsing the two made an explicit unknown fall through to the live
+#: probe, which returned the junk title ':' and blocked on ignorance.
+_PROBE_ACTIVE_WINDOW = object()
+
+
+def _check_destructive_window_mismatch(
+        action: Optional[dict], active_window=_PROBE_ACTIVE_WINDOW
+) -> Optional[str]:
+    """Refuse a window-CLOSING keystroke aimed at the wrong window.
+
+    MEASURED LIVE 2026-09-10: a loop told to close the HART Marketing
+    Dashboard sent alt+tab, alt+tab, then alt+f4 -- closing whatever it
+    happened to land on.  54 alt+f4 fired that day and
+    _check_reasoning_mismatch flagged NONE of them, because it only knew
+    two hardcoded app names AND only annotated the result dict after
+    _execute_inprocess had already sent the keystroke.
+
+    This one blocks, and it runs from _check_safety so the refusal
+    happens before any pyautogui call -- the same pre-execution position
+    the rate cap and window blocklist already hold.
+
+    Deliberately narrow, in three ways, because a guard that refuses
+    legitimate closes is a worse regression than the bug it fixes:
+      * only close-combos (_DESTRUCTIVE_WINDOW_COMBOS); a wrong click or
+        a wrong keystroke is recoverable, a wrong close is not;
+      * only on POSITIVE evidence -- the reasoning must name a target
+        AND the foreground window must not be it.  "close the window",
+        empty reasoning, or an unknown foreground window all pass
+        through untouched;
+      * only multi-word Title-Case targets (see _NAMED_WINDOW_TARGET),
+        so "clicking the X" is not mistaken for a window name.
+
+    Returns a block reason naming BOTH the intended target and the
+    window actually in front, or None to allow.
+    """
+    combo = _destructive_window_combo(action)
+    if combo is None:
+        return None
+    reasoning = action.get('Reasoning', action.get('reasoning', '')) or ''
+    if not reasoning:
+        return None
+    # Longest run wins: a real window name is the most specific phrase in
+    # the sentence, and this keeps an incidental "Then Click" from
+    # outranking "HART Marketing Dashboard".
+    targets = _NAMED_WINDOW_TARGET.findall(reasoning)
+    if not targets:
+        return None
+    target = max(targets, key=len)
+    # Probed last -- get_active_window_info() shells out on macOS, so it
+    # must not run for the ordinary actions filtered out above.
+    active = (get_active_window_info()
+              if active_window is _PROBE_ACTIVE_WINDOW else active_window)
+    # A title with no letters or digits (':' , '-') names nothing we can
+    # compare against; that is ignorance, not evidence of a mismatch.
+    if not active or not any(ch.isalnum() for ch in active):
+        return None
+    if _window_matches_target(target, active):
+        return None
+    return (f'destructive_window_mismatch: "{combo}" would close '
+            f'"{active}" but the reasoning targets "{target}"')
+
+
 def _check_reasoning_mismatch(action: dict) -> Optional[str]:
     """Detect when the VLM's stated reasoning contradicts the actual
     foreground window.  Returns a human-readable mismatch description
@@ -196,7 +302,8 @@ def _check_reasoning_mismatch(action: dict) -> Optional[str]:
         return None
     active_lower = active.lower()
     for reasoning_kw, window_kw in _REASONING_MISMATCH_PATTERNS:
-        if reasoning_kw in reasoning and window_kw not in active_lower:
+        if (reasoning_kw in reasoning
+                and not _window_matches_target(window_kw, active_lower)):
             return (f"VLM thinks {reasoning_kw.title()} but active window "
                     f"is: {active}")
     return None
@@ -327,28 +434,34 @@ def execute_action(action: dict, tier: str, *,
 # ─── Phase 6 helper plumbing ──────────────────────────────────────────
 
 def _check_safety(window_meta, action=None):
-    """Run rate guard + window blocklist + fabricated-credential guard.
+    """Run rate guard + window blocklist + credential + close-target guards.
     Returns block-reason string when refusing, None when OK.
 
     ``action`` is optional so the window/rate checks keep working for any
-    caller that has no action in hand; the credential guard simply does not
-    fire in that case.
+    caller that has no action in hand; the credential and destructive-close
+    guards simply do not fire in that case.
     """
     try:
         from integrations.vlm.safety import (
             get_session_guard, is_placeholder_credential, is_window_blocked)
     except Exception as e:
         logger.debug(f"safety module unavailable: {e}")
-        return None
+        # The destructive-close guard lives in THIS module and needs nothing
+        # from integrations.vlm.safety, so a missing safety module must not
+        # be what lets an alt+f4 through at the wrong window.
+        return _check_destructive_window_mismatch(action)
     reason = get_session_guard().check()
     if reason is not None:
         return reason
     blocked = is_window_blocked(window_meta)
     if blocked is not None:
         return blocked
-    # Runs last so every pre-existing block keeps reporting its own reason
-    # unchanged; this only catches what used to fall through and get typed.
-    return is_placeholder_credential(action)
+    # These two run last so every pre-existing block keeps reporting its own
+    # reason unchanged; they only catch what used to fall through and execute.
+    credential = is_placeholder_credential(action)
+    if credential is not None:
+        return credential
+    return _check_destructive_window_mismatch(action)
 
 
 def _emit_audit(action, result, window_meta, screenshot_b64,
