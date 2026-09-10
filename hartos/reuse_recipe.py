@@ -4397,6 +4397,79 @@ def _reuse_outstanding_tools(user_prompt, action_id, group_chat):
         return ['<unknown>']
 
 
+def _reuse_log(level, message):
+    """Log through current_app when there is one, else the module logger.
+
+    current_app raises off a request thread, so a bare current_app.logger call
+    inside a try/except turns a logging problem into a wrong RETURN VALUE.
+    """
+    try:
+        getattr(current_app.logger, level)(message)
+    except Exception:
+        getattr(logging.getLogger(__name__), level, logging.getLogger(__name__).info)(message)
+
+
+def _reuse_complete_pending_subtask(user_prompt, action_id, ledgers=None):
+    """Close the subtask the group just finished.  True if one was closed.
+
+    Hop 4 of the flow core/constants.py:1124-1128 writes down --
+    add_subtasks() -> get_pending_subtasks() -> execute each ->
+    check_and_unblock_parent() -> parent completes -- and the only hop never
+    wired.  check_and_unblock_parent has zero call sites in hartos/ or core/.
+
+    It could not have worked as written, either.  MEASURED 2026-09-10 against
+    the real SmartLedger:
+
+        complete_task('4.1', 'success')            -> False, 4.1 stays 'pending'
+        complete_task_and_route('4.1', 'success')  -> Task,  4.1 stays 'pending'
+        4.1 = IN_PROGRESS; complete_task_and_route -> 4.1 == 'completed'
+
+    The ledger requires PENDING -> IN_PROGRESS -> COMPLETED, and refuses a
+    never-started task SILENTLY (a bare False, an unchanged status).  The
+    BREAKDOWN block steers a child to the model but never marks it started, so
+    every child stays PENDING for the life of the session and
+    get_pending_subtasks -- which filters strictly on status == PENDING --
+    keeps returning the same ones.
+
+    Prefer the child already IN_PROGRESS (the one that was actually steered);
+    fall back to the next PENDING one so a verdict that arrives before the
+    mark still closes real work rather than none.
+    """
+    _ledgers = user_ledgers if ledgers is None else ledgers
+    if LedgerTaskStatus is None or user_prompt not in _ledgers:
+        return False
+    try:
+        ledger = _ledgers[user_prompt]
+        parent_task_id = 'action_%s' % action_id
+        started = [t for t in ledger.tasks.values()
+                   if t.parent_task_id == parent_task_id
+                   and t.status == LedgerTaskStatus.IN_PROGRESS]
+        child = started[0] if started else None
+        if child is None:
+            pending = get_pending_subtasks(user_prompt, int(action_id), _ledgers)
+            if not pending:
+                return False
+            child = pending[0]
+            child.status = LedgerTaskStatus.IN_PROGRESS
+        ledger.complete_task_and_route(child.task_id, 'success')
+        done = ledger.tasks[child.task_id].status == LedgerTaskStatus.COMPLETED
+    except Exception as _sub_err:
+        _reuse_log('warning',
+                   f"[SUBTASK] could not close a subtask of action {action_id} "
+                   f"for session {user_prompt}: {_sub_err}")
+        return False
+    # Log AFTER the outcome is decided and never inside the try: current_app
+    # raises "Working outside of application context" off a request thread, and
+    # a logging failure caught by the block above would report False for a
+    # subtask that HAD completed -- failing closed after the side effect already
+    # landed.  Measured while greening this file's own tests.
+    _reuse_log('info',
+               f"[SUBTASK] action {action_id} subtask {child.task_id} "
+               f"-> {ledger.tasks[child.task_id].status.value} "
+               f"for session: {user_prompt}")
+    return done
+
+
 def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
                       manager, chat_instructor,
                       claimed_action_id=None, advanced_latch=None):
@@ -4443,6 +4516,40 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
         current_app.logger.warning(
             f"[HALLUCINATION?] LLM claims action_id={claimed_action_id} "
             f"but pipeline has {action_id}")
+
+    # A DECOMPOSED action is not finished when the model says "completed" -- it
+    # is finished when its own subtasks are.  Close the child this verdict is
+    # about, then refuse to advance while any sibling is still outstanding, and
+    # steer that sibling instead.  Same shape as the fabrication refusal below:
+    # no advance, drop the latch, post one steer, keep looping.
+    #
+    # This is the ONE door all six advance sites go through, which is why the
+    # guard lives here and not in the caller that happened to catch it.
+    # MEASURED live 2026-09-10, agent 88719487304 action 4:
+    #   20:23:12  [BREAKDOWN] action 4 has 2 pending subtask(s) - working '...'
+    #   20:23:21  reuse-w1-completed: terminal 'completed' verdict - advancing
+    #   20:23:21  [REUSE] Action 4 TERMINATED, advancing
+    # Nine seconds, execute_coding_task never ran, and action 4 is the only one
+    # of the nine with no FAB-GUARD verdict line -- the fabrication gate sits on
+    # the normal advance path and reuse-w1-completed had stepped over it.
+    _closed_subtask = _reuse_complete_pending_subtask(user_prompt, action_id)
+    _outstanding = get_pending_subtasks(user_prompt, int(action_id), user_ledgers) \
+        if LedgerTaskStatus is not None else []
+    if _outstanding:
+        _next_sub = _outstanding[0]
+        current_app.logger.info(
+            f"[SUBTASK-HOLD] action {action_id} keeps {len(_outstanding)} unrun "
+            f"subtask(s) (closed={_closed_subtask}); steering "
+            f"'{str(_next_sub.description)[:60]}' instead of advancing "
+            f"for session: {user_prompt}")
+        if advanced_latch is not None:
+            advanced_latch.discard(action_id)
+        _narrow_assistant_to_current_action(user_prompt)
+        chat_instructor.initiate_chat(
+            recipient=manager,
+            message=(_REUSE_SUBTASK_STEER_PREFIX + str(_next_sub.description)),
+            clear_history=False, silent=False)
+        return True
 
     next_action_id, advanced = _advance_reuse_action(
         user_prompt, action_id, reason, prompt_id)
@@ -5123,6 +5230,19 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         user_prompt, _reuse_current_action, user_ledgers)
                     if _pending:
                         _next_sub = _pending[0]
+                        # Mark it STARTED before handing it over.  The ledger
+                        # only accepts PENDING -> IN_PROGRESS -> COMPLETED, so a
+                        # child that is steered but never started can never be
+                        # completed — complete_task returns a bare False and
+                        # complete_task_and_route leaves the status untouched
+                        # (both measured 2026-09-10).  Without this line hop 4
+                        # of core/constants.py:1124-1128 is unreachable no
+                        # matter who calls it.
+                        if LedgerTaskStatus is not None:
+                            try:
+                                _next_sub.status = LedgerTaskStatus.IN_PROGRESS
+                            except Exception:
+                                pass
                         current_app.logger.info(
                             f"[BREAKDOWN] action {_reuse_current_action} has "
                             f"{len(_pending)} pending subtask(s) for session: "
