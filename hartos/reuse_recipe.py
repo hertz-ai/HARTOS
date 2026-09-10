@@ -4025,11 +4025,35 @@ _REUSE_SYNTHESIS_ANSWER_SHAPE = (
     "an empty value, or anything in angle brackets is not an answer."
 )
 
+# "using the real tool results from this conversation" WAS A FALSE PREMISE
+# whenever the tools ran and returned NOTHING, and this file already records
+# what a false premise does here — see the note above
+# _REUSE_SYNTHESIS_STEER_INCOMPLETE: "The model was obeying an instruction,
+# not hallucinating."  That fix corrected the premise for "the tools did not
+# run"; this is the complementary case, tools RAN and returned EMPTY.
+#
+# Measured live 2026-09-10 15:14:12 (agent 92583386981, driven as its owner,
+# AFTER a3905aabf so the store was genuinely consulted):
+#   SimpleMem search took 0.002s, 0 results
+#   tool result  res_in_filter": []  x14, zero non-empty payloads
+#   15:15:16 [SYNTHESIS] ... unrun=none   -> THIS steer, not the INCOMPLETE one
+#   15:15:21 [SYNTHESIS] round returned (14 -> 17 msgs)  (+3 = a real turn)
+# and the user was told "you are currently at a B1 level and have a
+# vocabulary of about 1,500 words".  Neither figure appears in any tool
+# output in that window.  A language learner cannot tell that is invented.
+#
+# So the premise is now stated conditionally and the empty case is named.
+# This is an INSTRUCTION, not a gate: it removes the sentence that invited
+# the invention.  A hard groundedness check is separate and still open
+# (#817) — do not read this as making fabrication impossible.
 _REUSE_SYNTHESIS_STEER = (
     "The actions are finished and their tools have already run — do NOT run "
     "any tool again and do NOT emit another status object. Write the ANSWER "
-    "for the user now, in your own words, using the real tool results from "
-    "this conversation. " + _REUSE_SYNTHESIS_ANSWER_SHAPE
+    "for the user now, in your own words, using ONLY what the tool results "
+    "in this conversation actually contain. If those results are empty or do "
+    "not contain the information that was asked for, say so plainly and say "
+    "what you can do next — do not supply values, figures or facts of your "
+    "own. " + _REUSE_SYNTHESIS_ANSWER_SHAPE
 )
 
 # The same request, minus the false premise, for the case the gate says some
