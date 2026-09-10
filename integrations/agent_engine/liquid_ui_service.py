@@ -1624,7 +1624,53 @@ class LiquidUIService:
         # untouched. The XSS gate + slug sanitize already vetted it upstream.
         if mood:
             component['mood'] = mood
-        return self.agent_ui_update(agent_id, component)
+        accepted = self.agent_ui_update(agent_id, component)
+        if accepted:
+            # SECOND CONSUMER, SAME PAYLOAD. The native scene reads the identical
+            # {hero, rows, mood} over the compositor's shell.compose, so the two
+            # renderers cannot show different desktops. Sent only on ACCEPTANCE, so
+            # everything agent_ui_update governs above (the human kill-switch, the
+            # per-agent rate cap, the audit log, the XSS reject) governs this too and
+            # no gate is duplicated.
+            #
+            # Without it, shell.compose had no caller at all: it has existed on the
+            # compositor since M3, native_home stayed None, and the native scene fell
+            # back to scene::demo_ref() -- the hardcoded "Morning briefing / Inbox
+            # triage / Storage report". Turning the native shell on would have put
+            # that on screen as though it were live.
+            self._push_home_to_native_scene(component)
+        return accepted
+
+    def _push_home_to_native_scene(self, component: dict) -> bool:
+        """Forward an ACCEPTED home composition to the compositor's native scene.
+
+        Best-effort and silent by design. A box with no compositor socket, an older
+        compositor without shell.compose, or a compositor that has just restarted all
+        answer falsey, and the WebView desktop is unaffected -- it has already had the
+        same payload through the SSE feed. A compose fault must never take down the
+        shell, which is the same rule compose_home_now states for itself.
+
+        KNOWN GAP, stated rather than papered over: there is no re-send on connect, so
+        a compositor restart leaves the native scene on its previous payload (or on
+        demo_ref if it has never had one) until the next accepted compose. The daemon
+        composes periodically, so the window is bounded, but it is real. A re-send hook
+        needs the compositor to say it has come back, and inventing a caller for that
+        here would be a second channel rather than the one this deliberately reuses.
+        """
+        try:
+            from integrations.agent_engine.hart_wm_client import get_wm_client
+            reply = get_wm_client().shell_compose(
+                hero=component.get('hero'),
+                rows=component.get('rows'),
+                mood=component.get('mood'))
+        except Exception as e:
+            logger.debug("native scene compose skipped: %s", e)
+            return False
+        ok = bool(reply and reply.get('ok'))
+        if not ok:
+            logger.debug("native scene compose not applied: %s",
+                         (reply or {}).get('error'))
+        return ok
 
     def compose_home_now(self, reason: str = 'manual') -> bool:
         """PRODUCER: compose the agentic home from live context + the local LLM,

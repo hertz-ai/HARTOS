@@ -311,6 +311,38 @@ class HartWmClient:
     # takes an int ``con_id`` and a command string. The public signature and
     # the returned shape are identical either way, so nothing above this line
     # knows which compositor answered.
+    def shell_compose(self, hero=None, rows=None, mood=None) -> Dict[str, Any]:
+        """Hand the composed HOME payload to the compositor's native scene.
+
+        The SAME payload the WebView shell consumes, over the compositor's own IPC.
+        Not a second feed: `compose_home` builds one component, `agent_ui_update`
+        governs it (kill-switch, rate cap, audit, XSS), and only an ACCEPTED payload
+        reaches here, so the native scene can never show something the shell was not
+        allowed to show.
+
+        Why it has to be sent at all: `shell.compose` has existed on the compositor
+        since M3 and nothing has ever called it, so `native_home` stayed None and the
+        native scene fell back to `scene::demo_ref()` -- the hardcoded "Morning
+        briefing / Inbox triage / Storage report". Turning the native shell on without
+        this would put that on the desktop as if it were real.
+
+        Best-effort by design, exactly like every other verb here: no compositor, an
+        old compositor, or a socket that has gone away all answer `ok: False` and the
+        WebView desktop carries on untouched.
+        """
+        args: Dict[str, Any] = {}
+        if hero is not None:
+            args['hero'] = hero
+        if rows is not None:
+            args['rows'] = rows
+        # Optional: the LLM-composed palette id. Omitted leaves the palette alone,
+        # which is what the compositor's decoder expects too.
+        if mood:
+            args['mood'] = mood
+        if not args:
+            return {'ok': False, 'error': 'nothing to compose'}
+        return self._hc('shell.compose', args)
+
     def focus_window(self, con_id: int) -> Dict[str, Any]:
         if self._backend == 'hart-comp':
             return self._hc('window.focus', {'handle': str(con_id)})

@@ -249,3 +249,60 @@ if __name__ == '__main__':
             print(' FAIL ', name, '->', repr(e))
     print('RESULT:', 'ALL PASS' if not failed else (str(failed) + ' FAILED'))
     sys.exit(1 if failed else 0)
+
+
+# ── The SECOND consumer: the compositor's native scene ────────────────────────
+# shell.compose has existed on the compositor since M3 with NO caller, so
+# native_home stayed None and the native scene fell back to scene::demo_ref(),
+# the hardcoded "Morning briefing / Inbox triage / Storage report". Turning the
+# native shell on would have shown that as the desktop. These pin that the SAME
+# accepted payload reaches it, and that an unaccepted one does not.
+
+
+def _wm(reply=None):
+    """A patched WM client singleton, handing back a controllable reply."""
+    client = MagicMock()
+    client.shell_compose.return_value = reply if reply is not None else {'ok': True}
+    getter = MagicMock(return_value=client)
+    return client, patch(
+        'integrations.agent_engine.hart_wm_client.get_wm_client', getter)
+
+
+def test_an_accepted_compose_reaches_the_native_scene_with_the_same_payload(svc):
+    client, patched = _wm()
+    hero = {'eyebrow': 'EARNED ON THE HIVE', 'amount': 12, 'amount_unit': 'Spark'}
+    rows = [{'title': 'Today', 'cards': [{'title': 'Inbox triage'}]}]
+    with patch.object(svc, 'agent_ui_update', return_value=True), patched:
+        assert svc.compose_home(hero=hero, rows=rows, mood='calm') is True
+    client.shell_compose.assert_called_once()
+    kw = client.shell_compose.call_args.kwargs
+    # The IDENTICAL payload, not a re-derived one: two renderers, one composition.
+    assert kw['hero'] == hero
+    assert kw['rows'] == rows
+    assert kw['mood'] == 'calm'
+
+
+def test_a_rejected_compose_never_reaches_the_native_scene(svc):
+    """The governance is agent_ui_update's, and it must hold for BOTH renderers.
+
+    If the kill-switch, the rate cap or the XSS gate refuses a push, the native
+    scene must not be handed it either -- otherwise the compositor becomes a way
+    around the gate the shell is subject to.
+    """
+    client, patched = _wm()
+    with patch.object(svc, 'agent_ui_update', return_value=False), patched:
+        assert svc.compose_home(hero={'eyebrow': 'x'}) is False
+    client.shell_compose.assert_not_called()
+
+
+def test_a_compositor_that_refuses_or_is_absent_does_not_break_the_push(svc):
+    """The WebView desktop has already had the payload over SSE. A missing or
+    older compositor must cost nothing, which is why this is best-effort."""
+    client, patched = _wm(reply={'ok': False, 'error': 'no hart-comp socket'})
+    with patch.object(svc, 'agent_ui_update', return_value=True), patched:
+        assert svc.compose_home(hero={'eyebrow': 'x'}) is True
+
+    # And a client that raises outright is still not fatal.
+    boom = MagicMock(side_effect=RuntimeError('socket gone'))
+    with patch.object(svc, 'agent_ui_update', return_value=True),             patch('integrations.agent_engine.hart_wm_client.get_wm_client', boom):
+        assert svc.compose_home(hero={'eyebrow': 'x'}) is True
