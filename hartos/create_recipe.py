@@ -1283,8 +1283,17 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             simplified_instructions = ' '.join(instructions.lower().strip().split())
 
             def similar_instructions(instr1, instr2, threshold=0.8):
-                words1 = set(instr1.lower().split())
-                words2 = set(instr2.lower().split())
+                # Same normalisation as reuse_recipe's byte-identical twin, and
+                # for the same measured reason: a banked action authored as
+                # `<tool>: '<argument>'` cannot match its own recipe, because
+                # the tool name inflates the denominator (0.75 vs a 0.8 gate,
+                # live 2026-09-11).  Fixed here too — the two copies have to
+                # stay in step, and only reuse was measured; create carries the
+                # identical arithmetic and would fail the identical way.
+                a = helper_fun.strip_authored_tool_prefix(instr1)
+                b = helper_fun.strip_authored_tool_prefix(instr2)
+                words1 = set(a.lower().split())
+                words2 = set(b.lower().split())
                 if not words1 or not words2:
                     return False
 

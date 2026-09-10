@@ -814,6 +814,65 @@ def strip_json_values(obj: Any) -> Any:
         return f"redacted {type(obj).__name__}"
 
 
+# A registry tool name as `attach_for_names` compares it: the registry key, or
+# `{tool}_{endpoint}`.  Dots are legal (`tts.package_installer` is real, 5 uses
+# in the banked corpus).  The >=3-char floor is what stops a Windows drive
+# letter surviving as the candidate `C` when a path is split on ':'.
+#
+# Lives here, not in reuse_recipe, because BOTH sides of the authoring
+# convention read it: `_tool_name_candidates` (reuse_recipe) takes the NAME
+# half, `strip_authored_tool_prefix` below takes the ARGUMENT half, and
+# create_recipe needs the second one too.  One pattern, one home.
+TOOL_IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_.]{2,}$')
+
+
+def strip_authored_tool_prefix(raw):
+    """The ARGUMENT half of an authored ``<tool>: '<argument>'`` action text.
+
+    Complement of ``_tool_name_candidates`` (reuse_recipe.py), which takes the
+    NAME half of the same convention and exists because "the authoring model
+    routinely writes the tool AND its argument into the single field".  Nothing
+    took the other half, so every consumer that wanted the human-readable
+    instruction was comparing against the tool name as well.
+
+    WHAT THAT COST (drive d69-, 2026-09-11 04:11:12, agent 88719487304
+    action 2).  ``similar_instructions`` scored an action against ITS OWN
+    banked recipe:
+
+        live   'Open a web browser and navigate to the top result URL for HART OS documentation'
+        stored "execute_windows_or_android_command: 'Open default web browser and
+                navigate to the top result URL for HART OS documentation'"
+
+        words1=15  words2=16  overlap=12  ->  12/16 = 0.75
+
+    against a 0.8 threshold — the log recorded exactly 0.7500.  The prefix
+    inflates the denominator and dilutes the overlap, so the action missed its
+    own recipe by 0.05.  ``matching_recipe`` stayed None, ``REUSING command``
+    logged ZERO times, no "Follow these steps from a previous successful
+    execution" block was built, and the VLM loop started from nothing: 30
+    iterations in 114.6s, an invented https://www.hartos.com/documentation, and
+    exit_reason=max_iterations.  Stripped, the same pair scores 0.9333 — the
+    two texts then differ by one word, 'a' vs 'default'.
+
+    ONLY an identifier-shaped prefix is removed, and only before the FIRST
+    colon.  'Ratio 3:2 matters here' keeps its colon because 'Ratio 3' is not
+    an identifier; a bare 'C:\\path' keeps its because of the >=3-char floor.
+    That matters: over-stripping would make unrelated actions match, and
+    injecting the WRONG action's steps is a worse failure than injecting none.
+
+    Returns the text unchanged (whitespace- and quote-trimmed) when there is no
+    such prefix.  Never raises — it runs inside the reuse dispatch path.
+    """
+    try:
+        text = str(raw if raw is not None else '').strip()
+    except Exception:
+        return ''
+    head, sep, tail = text.partition(':')
+    if sep and TOOL_IDENT_RE.match(head.strip()):
+        text = tail.strip()
+    return text.strip('\'"')
+
+
 def fix_json(json_text):
     """Repair malformed JSON via local LLM.
 

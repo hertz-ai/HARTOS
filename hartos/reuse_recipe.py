@@ -1808,8 +1808,19 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             simplified_instructions = ' '.join(instructions.lower().strip().split())
 
             def similar_instructions(instr1, instr2, threshold=0.8):
-                words1 = set(instr1.lower().split())
-                words2 = set(instr2.lower().split())
+                # Compare the ARGUMENT halves.  A banked action's text is
+                # routinely authored as `<tool>: '<argument>'`, and the tool
+                # name inflates the denominator: measured live 2026-09-11
+                # 04:11:12, action 2 scored 0.75 against ITS OWN recipe (15 vs
+                # 16 words, overlap 12) and missed the 0.8 gate by 0.05.  No
+                # match meant no steps injected, so the VLM loop started from
+                # nothing and burned its whole 30-iteration budget.  Stripped,
+                # the same pair is 0.9333.  Same helper both sides, so a
+                # prefix on either cannot skew the ratio.
+                a = helper_fun.strip_authored_tool_prefix(instr1)
+                b = helper_fun.strip_authored_tool_prefix(instr2)
+                words1 = set(a.lower().split())
+                words2 = set(b.lower().split())
                 if not words1 or not words2:
                     return False
 
@@ -6216,11 +6227,14 @@ def _build_reuse_action_message(user_prompt, action_id):
             f"\n follow these steps: {steps}")
 
 
-# A registry tool name as `attach_for_names` compares it: the registry key, or
-# `{tool}_{endpoint}`.  Dots are legal (`tts.package_installer` is real, 5 uses
-# in the banked corpus).  The >=3-char floor is what stops a Windows drive
-# letter surviving as the candidate `C` when a path is split on ':'.
-_TOOL_IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_.]{2,}$')
+# A registry tool name as `attach_for_names` compares it.  MOVED to
+# hartos/helper.py (same pattern, rationale kept with it) because both halves
+# of the `<tool>: '<argument>'` authoring convention now read it: this module
+# takes the NAME half in `_tool_name_candidates`, and
+# `strip_authored_tool_prefix` takes the ARGUMENT half for create_recipe AND
+# reuse_recipe's `similar_instructions`.  Aliased rather than re-declared so
+# there is one pattern to change.
+_TOOL_IDENT_RE = helper_fun.TOOL_IDENT_RE
 
 
 def _tool_name_candidates(raw):
