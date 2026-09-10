@@ -1706,6 +1706,11 @@ where
                     if overdue {
                         resync_flip_state(crtc, surface, "silent-freeze");
                     }
+                    // The compositor decided nothing changed. This branch never
+                    // queues, so no input can bind to it; the instrument needs to
+                    // know how often we land here to tell "static desktop" from
+                    // "render loop not running".
+                    crate::latency::on_render(true);
                     continue;
                 }
                 Ok(false) => match surface.compositor.queue_frame(()) {
@@ -1718,6 +1723,7 @@ where
                         // even though presentation is proven only at the
                         // vblank: the batch rides FIFO and is measured against
                         // the flip that actually completes (harness M0).
+                        crate::latency::on_render(false);
                         crate::latency::on_frame_queued();
                         // `last_flip_at` and `publish_native_chrome()` USED TO BE HERE
                         // and have moved to `reap_completed_vblanks`, because this Ok

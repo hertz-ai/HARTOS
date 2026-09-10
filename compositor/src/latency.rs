@@ -310,6 +310,12 @@ pub struct Stall {
     /// Whether the clock offset has been established at all. `false` means no
     /// input observation was ever accepted, which is its own distinct fault.
     pub anchored: bool,
+    /// Render passes in the span, and how many decided nothing had changed.
+    /// `attempted` high with `unchanged` equally high is a compositor that
+    /// believes the screen is static; `attempted` near zero is a render loop
+    /// that is not running at all. The two need completely different fixes.
+    pub attempted: u64,
+    pub unchanged: u64,
 }
 
 impl Stall {
@@ -318,9 +324,10 @@ impl Stall {
     /// no reading at all.
     pub fn journal_line(&self) -> String {
         format!(
-            "hart-latency stalled presented={} queued={} pending={} samples={} \
-             anchored={} verdict=NO-SAMPLES",
-            self.presented, self.queued, self.pending, self.samples, self.anchored
+            "hart-latency stalled rendered={} unchanged={} queued={} presented={} \
+             pending={} samples={} anchored={} verdict=NO-SAMPLES",
+            self.attempted, self.unchanged, self.queued, self.presented,
+            self.pending, self.samples, self.anchored
         )
     }
 }
@@ -381,6 +388,11 @@ pub struct LatencyCore {
     frames_queued: u64,
     frames_presented: u64,
     samples_recorded: u64,
+    /// Render attempts, and how many reported "nothing changed". These are the
+    /// only counters that move on a box that never presents, which is why the
+    /// stall report is gated on them rather than on presented frames.
+    renders_attempted: u64,
+    renders_unchanged: u64,
     stall_reported_at: u64,
     /// [surface][kind]. Forty-two fixed buckets, allocated once and reused: an input
     /// rate this cannot cover does not exist, and a map would put an allocation on the
@@ -403,6 +415,8 @@ impl LatencyCore {
             frames_queued: 0,
             frames_presented: 0,
             samples_recorded: 0,
+            renders_attempted: 0,
+            renders_unchanged: 0,
             stall_reported_at: 0,
             window: Default::default(),
         }
@@ -468,6 +482,16 @@ impl LatencyCore {
         if let Some(last) = self.pending.last_mut() {
             last.0 = surface;
             last.1 = Kind::AnimateStart;
+        }
+    }
+
+    /// One pass of the render loop finished. `unchanged` is the compositor's own
+    /// verdict that nothing needed drawing, which is the branch that does NOT
+    /// queue a frame and therefore cannot bind any input.
+    pub fn note_render(&mut self, unchanged: bool) {
+        self.renders_attempted += 1;
+        if unchanged {
+            self.renders_unchanged += 1;
         }
     }
 
@@ -571,11 +595,15 @@ impl LatencyCore {
     /// than numbers. Reported at most once per `STALL_REPORT_EVERY` vblanks so a
     /// genuinely wedged box says it periodically instead of every frame.
     pub fn take_stall(&mut self) -> Option<Stall> {
-        let since = self.frames_presented - self.stall_reported_at;
+        // Gated on RENDER ATTEMPTS, not presented frames. Gating on presentation
+        // made this silent on exactly the box it was written for: one that
+        // presents almost nothing. A diagnostic must not require the absence of
+        // the fault it reports.
+        let since = self.renders_attempted - self.stall_reported_at;
         if since < STALL_REPORT_EVERY {
             return None;
         }
-        self.stall_reported_at = self.frames_presented;
+        self.stall_reported_at = self.renders_attempted;
 
         // Nothing waiting AND nothing ever anchored means nobody has touched the
         // box. That is not a stall, and saying so at an idle desk is how a
@@ -594,11 +622,13 @@ impl LatencyCore {
         // observation was accepted, and both non-zero with samples == 0 says the
         // sample was computed and refused.
         Some(Stall {
-            presented: since,
+            presented: self.frames_presented,
             queued: self.frames_queued,
             pending: self.pending.len(),
             samples: self.samples_recorded,
             anchored: !self.offset_obs.is_empty(),
+            attempted: since,
+            unchanged: self.renders_unchanged,
         })
     }
 
@@ -674,6 +704,15 @@ pub fn on_animation_started(surface: Surface) {
     let g = global();
     if let Ok(mut c) = g.core.lock() {
         c.note_animation_started(surface);
+    }
+}
+
+/// Called once per render pass with the compositor's own "nothing changed"
+/// verdict, so the instrument can tell a static desktop from a dead render loop.
+pub fn on_render(unchanged: bool) {
+    let g = global();
+    if let Ok(mut c) = g.core.lock() {
+        c.note_render(unchanged);
     }
 }
 
@@ -1164,14 +1203,21 @@ mod tests {
     fn a_stall_is_reported_when_vblanks_reap_but_nothing_ever_queues() {
         // The real-hardware shape, 2026-09-10: flips happening, input arriving,
         // no frame ever queued, and a journal that said nothing at all.
+        const GAP: u64 = 1_000_000;
         let mut c = LatencyCore::new();
-        c.note_input(Surface::Shell, Kind::Hover, 1_000, 1_100);
+        let t = 2_000_000;
+        c.note_input(Surface::Shell, Kind::Hover, t, t - GAP);
+        // Renders happen and all report "nothing changed", so nothing ever
+        // queues. This is the shape the report is gated on now: render passes,
+        // not presented frames.
         for i in 0..STALL_REPORT_EVERY {
-            assert!(c.frame_presented(2_000 + i).is_empty());
+            c.note_render(true);
+            assert!(c.frame_presented(t - GAP + i).is_empty());
         }
         let st = c.take_stall().expect("silence with input waiting must explain itself");
         assert_eq!(st.queued, 0, "zero queued frames IS the diagnosis");
-        assert_eq!(st.presented, STALL_REPORT_EVERY);
+        assert_eq!(st.attempted, STALL_REPORT_EVERY, "gated on render passes");
+        assert_eq!(st.unchanged, STALL_REPORT_EVERY, "every pass said nothing changed");
         assert!(st.pending >= 1, "the unbound input is what makes it a stall");
         assert!(st.journal_line().contains("verdict=NO-SAMPLES"));
         assert!(
@@ -1225,15 +1271,19 @@ mod tests {
     #[test]
     fn the_stall_report_is_rate_limited() {
         // A wedged box should say so periodically, not 60 times a second.
+        const GAP: u64 = 1_000_000;
         let mut c = LatencyCore::new();
-        c.note_input(Surface::Shell, Kind::Hover, 1_000, 1_100);
+        let t = 2_000_000;
+        c.note_input(Surface::Shell, Kind::Hover, t, t - GAP);
         for i in 0..STALL_REPORT_EVERY {
-            let _ = c.frame_presented(2_000 + i);
+            c.note_render(true);
+            let _ = c.frame_presented(t - GAP + i);
         }
         assert!(c.take_stall().is_some(), "first crossing reports");
         assert!(c.take_stall().is_none(), "and does not repeat until the next span");
         for i in 0..STALL_REPORT_EVERY {
-            let _ = c.frame_presented(10_000 + i);
+            c.note_render(true);
+            let _ = c.frame_presented(t - GAP + 10_000 + i);
         }
         assert!(c.take_stall().is_some(), "the next span reports again");
     }
