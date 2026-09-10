@@ -4083,6 +4083,96 @@ _REUSE_SYNTHESIS_STEER_INCOMPLETE = (
 )
 
 
+# THE HONEST ANSWER WHEN THE LOOKUP FOUND NOTHING.  Authored here, not asked
+# of the model, because THREE live runs proved an instruction does not hold.
+# Agent 92583386981, same prompt, driven as its owner:
+#   14:58:34  "...you are currently at a B1 (Intermediate) CEFR level..."
+#   15:14:12  after a3905aabf (read fixed, store really queried, 0 results)
+#             "...a B1 level and have a vocabulary of about 1,500 words"
+#   15:23:56  after b8dd44a49, with the explicit honesty instruction VERIFIED
+#             delivered in-window ("If those results are empty" x3, old
+#             premise x0) — "...a B1 (Intermediate) CEFR level. You have a
+#             strong vocabulary for daily topics..."
+# Every figure invented; res_in_filter":[] x14 and "SimpleMem search took
+# 0.002s, 0 results" in each of the last two windows.
+#
+# Carries NONE of the _reuse_is_pipeline_text markers, so a5855f996's refusal
+# cannot swallow it, and it reads as prose so the extractor delivers it.
+# Never '' — #797/D31 stands.
+_REUSE_NO_DATA_REPORT = (
+    "I checked, and there is nothing recorded for that yet — the lookup came "
+    "back empty. I have not made anything up to fill the gap. Tell me where "
+    "you would like to start and I will record it as we go."
+)
+
+
+def _reuse_result_is_vacuous(body):
+    """True when one tool RESULT carries no data.
+
+    FAILS OPEN: a body this cannot parse is treated as substantive, so the
+    caller's gate can never fire on something it does not understand.  A 0 or
+    a False is DATA, not absence — only emptiness is emptiness.
+    """
+    s = str(body if body is not None else '').strip()
+    if not s:
+        return True
+    try:
+        v = json.loads(s)
+    except Exception:
+        return False                       # cannot judge -> substantive
+
+    def _empty(x):
+        if x is None:
+            return True
+        if isinstance(x, str):
+            return not x.strip()
+        if isinstance(x, (list, tuple, set)):
+            return len(x) == 0
+        if isinstance(x, dict):
+            return all(_empty(i) for i in x.values())
+        return False                       # numbers/bools are answers
+    return _empty(v)
+
+
+def _reuse_tool_results_all_vacuous(group_chat, agents, seen_ids):
+    """True ONLY when this action ran tools and EVERY result was empty.
+
+    Reads through ``_reuse_evidence_msg_lists`` — the ONE definition of where
+    tool evidence lives — so this cannot look somewhere the fabrication gate
+    does not.  Scoped by the SAME ``evidence_seen_call_ids`` watermark that
+    gate uses, so a stale empty result from an earlier action cannot speak
+    for this one (the failure that watermark exists to stop).
+
+    Returns False when there are no tool results at all, which is what makes
+    a PROSE action safe: it names no tool, produces no results, and must
+    never be answered with "the lookup came back empty".
+
+    Fail-open on anything unexpected — the caller then keeps its existing
+    behaviour, i.e. this can only ever REPLACE an invented answer, never
+    suppress a real one.
+    """
+    found = False
+    try:
+        for _ml in _reuse_evidence_msg_lists(group_chat, agents):
+            for m in (_ml or []):
+                if not isinstance(m, dict) or m.get('role') != 'tool':
+                    continue
+                _rs = m.get('tool_responses')
+                entries = _rs if isinstance(_rs, list) and _rs else [m]
+                for r in entries:
+                    if not isinstance(r, dict):
+                        return False
+                    _cid = r.get('tool_call_id') or m.get('tool_call_id')
+                    if _cid and _cid in (seen_ids or set()):
+                        continue           # an earlier action's work
+                    found = True
+                    if not _reuse_result_is_vacuous(r.get('content')):
+                        return False
+    except Exception:
+        return False
+    return found
+
+
 def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
     """Give the synthesis the one turn the pipeline never gives it.
 
@@ -4139,6 +4229,44 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
         _steer = _REUSE_SYNTHESIS_STEER_INCOMPLETE.format(
             unrun=', '.join(str(t) for t in _unrun))
     else:
+        # EVERY TOOL RAN AND EVERY RESULT WAS EMPTY.  Then the honest answer
+        # is fully determined and the model is not needed for it — asking is
+        # what produced three fabricated CEFR levels (14:58, 15:14, 15:23),
+        # the last of them WITH the explicit honesty instruction delivered.
+        # So the pipeline says it, exactly as #808/D42 already had the
+        # pipeline say "that tool did not run" instead of accepting the
+        # model's "successfully completed".
+        #
+        # ABOVE the written-answer recovery on purpose: if the tools returned
+        # nothing, model text written earlier in THIS action is no better
+        # grounded, and recovering it would just deliver the same invention
+        # by another route.
+        #
+        # Same watermark the fabrication gate uses, so a previous action's
+        # empty result cannot speak for this one.
+        try:
+            _seen_ids = getattr(user_tasks.get(user_prompt),
+                                'evidence_seen_call_ids', None)
+        except Exception:
+            _seen_ids = None
+        _seen_ids = _seen_ids if isinstance(_seen_ids, (set, frozenset)) else set()
+        if _reuse_tool_results_all_vacuous(
+                group_chat, getattr(group_chat, 'agents', None) or [],
+                _seen_ids):
+            try:
+                group_chat.messages.append({'content': _REUSE_NO_DATA_REPORT,
+                                            'name': 'Assistant',
+                                            'role': 'assistant'})
+            except Exception as _nd_err:
+                _say('warning', f"[SYNTHESIS] no-data report append failed: "
+                                f"{_nd_err!r} — steering instead")
+            else:
+                _say('info', f"[SYNTHESIS] every tool result was empty — "
+                             f"reporting the absence instead of asking for an "
+                             f"answer there is no data for (session: "
+                             f"{user_prompt}, {_before} msgs)")
+                return False
+
         # THE ACTION MAY HAVE ALREADY WRITTEN THE ANSWER.  Only asked once
         # everything really ran — a recovered message asserts whatever the
         # model asserted, and over an unrun tool that is exactly the
