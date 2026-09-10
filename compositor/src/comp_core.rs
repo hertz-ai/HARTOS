@@ -173,6 +173,37 @@ pub type NativeSceneCaches<'a> = (
 
 pub const NATIVE_CHROME_BLOOM: u8 = 1 << 0;
 pub const NATIVE_CHROME_ORB: u8 = 1 << 1;
+/// The HOME SURFACE: the desktop between the two bars (hero, card rows, the big orb).
+///
+/// Claimed so the shell can stand `#hart-home` down while KEEPING its own top bar and
+/// taskbar. That split is what lets the native scene become the renderer without first
+/// carrying the taskbar chips, the agent cluster and the clock, none of which the scene
+/// can see: they are DOM inside the shell's one surface, an HTTP poll, and local time
+/// that a `unsafe_code = "deny"` crate cannot format. So the compositor takes the half it
+/// can draw correctly and the shell keeps the half it alone knows.
+///
+/// There is deliberately no TOPBAR or TASKBAR bit yet. The native bars draw, but the
+/// native taskbar is an empty strip, so claiming it would take the user's window and panel
+/// switching away. A bit nothing can honestly claim is worse than no bit.
+pub const NATIVE_CHROME_HOME: u8 = 1 << 2;
+
+/// Whether a lowered leaf lies WHOLLY inside the home band. PURE, so the rule is testable
+/// without a renderer.
+///
+/// The evidence question for the HOME claim, and it has to be geometric because the
+/// lowering walk cannot tell a card's background from the top bar's fill: both are a Rect
+/// under a Container, and `walk_leaves` hands the callback a leaf with no ancestry.
+/// Geometry is not a workaround here, it is the actual property: what the shell hides is
+/// the band, so what the compositor must prove it painted is the band.
+///
+/// WHOLLY inside, not overlapping. A leaf straddling either boundary claims nothing, so a
+/// frame that drew only chrome can never tell the shell to hide its home. Under-claiming
+/// costs a duplicated home for one frame; over-claiming costs an EMPTY DESKTOP, which the
+/// paint watchdog does not catch because it watches for hangs and not for wrong-looking
+/// desktops.
+pub fn in_home_band(rect: crate::scene::Rect, top_h: f32, taskbar_y: f32) -> bool {
+    rect.h > 0.0 && rect.w > 0.0 && rect.y >= top_h && rect.y + rect.h <= taskbar_y
+}
 
 /// The action a compositor keyboard shortcut resolves to (anvil's `KeyAction`
 /// analogue). `process_keyboard_shortcut` maps a `(ModifiersState, Keysym)` to one of
@@ -3124,7 +3155,14 @@ where
     // tree the cache owns and so cannot be retained across frames, which made collecting
     // one the last per-frame allocation the NFR named. `return` inside the closure skips
     // this leaf, exactly where the loop said `continue`.
+    // Which band this leaf is in, resolved ONCE before the arms so every push below can
+    // claim it without re-deriving the rule. The taskbar line comes from the same
+    // TASKBAR_H the layout reserves and the panel reservation publishes, so the claim and
+    // the pixels cannot disagree.
+    let home_top = theme.top_bar_h;
+    let home_bottom = size.h as f32 - crate::scene::TASKBAR_H;
     tree.for_each_leaf(&mut |idx, leaf| {
+        let home_leaf = in_home_band(leaf.rect(), home_top, home_bottom);
         match leaf {
             crate::scene::SceneNode::Rect { rect, color, radius } => {
                 if rect.w < 1.0 || rect.h < 1.0 {
@@ -3163,7 +3201,7 @@ where
                             Some((rect.w as i32, rect.h as i32).into()),
                             Kind::Unspecified,
                         ) {
-                            Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                            Ok(e) => { elements.push(HartRenderElement::Memory(e)); if home_leaf { emitted |= NATIVE_CHROME_HOME; } }
                             Err(err) => warn!(?err, "native scene: rounded rect import failed"),
                         }
                     }
@@ -3184,6 +3222,7 @@ where
                         Kind::Unspecified,
                     );
                     elements.push(HartRenderElement::Solid(el));
+                    if home_leaf { emitted |= NATIVE_CHROME_HOME; }
                 }
             }
             crate::scene::SceneNode::Text {
@@ -3220,7 +3259,7 @@ where
                     Some((rect.w as i32, rect.h as i32).into()),
                     Kind::Unspecified,
                 ) {
-                    Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                    Ok(e) => { elements.push(HartRenderElement::Memory(e)); if home_leaf { emitted |= NATIVE_CHROME_HOME; } }
                     Err(err) => warn!(?err, "native scene: text run import failed"),
                 }
             }
@@ -3274,7 +3313,7 @@ where
                         Some((rect.w as i32, rect.h as i32).into()),
                         Kind::Unspecified,
                     ) {
-                        Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                        Ok(e) => { elements.push(HartRenderElement::Memory(e)); if home_leaf { emitted |= NATIVE_CHROME_HOME; } }
                         Err(err) => warn!(?err, "native scene: card art import failed"),
                     }
                 }
@@ -3315,7 +3354,7 @@ where
                         Some(side.into()),
                         Kind::Unspecified,
                     ) {
-                        Ok(e) => elements.push(HartRenderElement::Memory(e)),
+                        Ok(e) => { elements.push(HartRenderElement::Memory(e)); if home_leaf { emitted |= NATIVE_CHROME_HOME; } }
                         Err(err) => warn!(?err, "native scene: card shadow import failed"),
                     }
                 }
@@ -3350,6 +3389,7 @@ where
                     ) {
                         Ok(e) => {
                             elements.push(HartRenderElement::Memory(e));
+                            if home_leaf { emitted |= NATIVE_CHROME_HOME; }
                             emitted |= NATIVE_CHROME_ORB;
                         }
                         Err(err) => warn!(?err, "native scene: orb import failed"),
@@ -4011,6 +4051,28 @@ mod tests {
     }
 
     // ── The M6 inversion: who OWNS the reservation once the compositor paints ──
+
+    #[test]
+    fn only_a_leaf_wholly_inside_the_band_claims_the_home_surface() {
+        use crate::scene::Rect;
+        let (top, bottom) = (40.0f32, 856.0f32); // 900 output, 44px taskbar
+        // Inside: a card.
+        assert!(in_home_band(Rect::new(60.0, 200.0, 258.0, 150.0), top, bottom));
+        // Flush against each boundary is still inside.
+        assert!(in_home_band(Rect::new(0.0, 40.0, 100.0, 10.0), top, bottom));
+        assert!(in_home_band(Rect::new(0.0, 800.0, 100.0, 56.0), top, bottom));
+        // The top bar's own fill.
+        assert!(!in_home_band(Rect::new(0.0, 0.0, 1600.0, 40.0), top, bottom));
+        // The taskbar.
+        assert!(!in_home_band(Rect::new(0.0, 856.0, 1600.0, 44.0), top, bottom));
+        // STRADDLING claims nothing, in either direction. Under-claiming costs a
+        // duplicated home for a frame; over-claiming costs an empty desktop.
+        assert!(!in_home_band(Rect::new(0.0, 30.0, 100.0, 40.0), top, bottom));
+        assert!(!in_home_band(Rect::new(0.0, 840.0, 100.0, 40.0), top, bottom));
+        // Degenerate rects are not evidence of anything.
+        assert!(!in_home_band(Rect::new(0.0, 200.0, 0.0, 10.0), top, bottom));
+        assert!(!in_home_band(Rect::new(0.0, 200.0, 10.0, 0.0), top, bottom));
+    }
 
     #[test]
     fn the_native_shell_flag_reads_its_value_not_its_presence() {
@@ -5126,6 +5188,58 @@ mod native_render_tests {
     use super::*;
     use smithay::backend::renderer::element::Element;
     use smithay::backend::renderer::pixman::PixmanRenderer;
+
+    #[test]
+    fn a_frame_that_paints_only_chrome_does_not_claim_the_home_surface() {
+        // THE FAILURE THIS GUARDS. If the compositor claims `home` on a frame that drew
+        // only the bars, the shell hides #hart-home and the user gets an empty desktop,
+        // which the paint watchdog does not catch: it watches for hangs, not for
+        // wrong-looking desktops. At a 3x3 output there is no room between the bars, so
+        // nothing can land in the home band.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (3, 3).into();
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        let mask = lower_scene(
+            &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects,
+            &mut scenes, 0.5, None, false, true,
+            &crate::scene::RowScroll::default(), &mut elements,
+        );
+        assert!(!elements.is_empty(), "chrome still paints at this size");
+        assert_eq!(
+            mask & NATIVE_CHROME_HOME,
+            0,
+            "claimed the home surface on a frame with no home band"
+        );
+    }
+
+    #[test]
+    fn a_real_desktop_claims_the_home_surface_it_paints() {
+        // And the other direction, or the claim would be unreachable and the shell would
+        // never stand down: a full-size demo home draws cards between the bars.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (1280, 800).into();
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        let mask = lower_scene(
+            &home, size, &mut renderer, &mut rasterizer, &mut orb, &mut rects,
+            &mut scenes, 0.5, None, false, true,
+            &crate::scene::RowScroll::default(), &mut elements,
+        );
+        assert_ne!(
+            mask & NATIVE_CHROME_HOME,
+            0,
+            "a painted desktop must claim the home surface, or the shell draws a second one"
+        );
+    }
 
     #[test]
     fn the_scene_mask_is_not_evidence_that_the_scene_painted() {

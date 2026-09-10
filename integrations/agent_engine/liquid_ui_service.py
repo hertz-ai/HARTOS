@@ -167,7 +167,7 @@ _NATIVE_CHROME_FILE = '/run/hart/session/native-chrome'
 # What this shell knows how to stand down for. A name the shell does not
 # recognise is IGNORED rather than trusted: a newer compositor claiming
 # `taskbar` must not make an older shell hide a taskbar it still owns.
-_NATIVE_CHROME_KNOWN = frozenset({'bloom', 'orb'})
+_NATIVE_CHROME_KNOWN = frozenset({'bloom', 'orb', 'home'})
 
 
 def read_native_chrome() -> frozenset:
@@ -2046,6 +2046,25 @@ class LiquidUIService:
                 '.hart-onboarding .hob-orb,'
                 '.hart-orb-orbit,.hart-orb-orbit2{visibility:hidden;animation:none}'
             )
+        # The HOME SURFACE half. The compositor claims this only for a frame that
+        # actually painted BETWEEN the two bars, so it cannot be claimed by a frame
+        # that drew chrome alone -- that check is geometric on the compositor side
+        # for the same reason it is geometric here: the band IS the thing being
+        # handed over.
+        #
+        # Deliberately the home ONLY, not the bars. The native taskbar draws as an
+        # empty strip today, and the agent-status cluster and the clock are things the
+        # compositor cannot see (DOM inside this one surface, an HTTP poll, and local
+        # time that a `unsafe_code = "deny"` crate cannot format). So the compositor
+        # takes the half it can draw correctly and this shell keeps the half it alone
+        # knows, and nothing the user has today is lost when the scene comes on.
+        #
+        # visibility rather than display, matching both neighbours above: #hart-home
+        # keeps its box, so the desktop's layout does not reflow and any geometry read
+        # against it stays valid while the compositor owns the pixels.
+        native_home_css = ''
+        if 'home' in native_chrome:
+            native_home_css = '#hart-home{visibility:hidden}'
         # The SAME verdict, handed to script as well as to CSS. The CSS above
         # stops the canvas painting; only this can stop the canvas being DRAWN
         # INTO. See the window.HART_NATIVE_CHROME comment below for the measured
@@ -3245,7 +3264,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 
 /* ── Wallpaper ── */
 .wallpaper{{position:fixed;inset:0;z-index:0;background:{wp_css}}}
-{native_bloom_css}{native_orb_css}
+{native_bloom_css}{native_orb_css}{native_home_css}
 
 /* ── Glass mixin (perf-aware) ── */
 .glass{{background:var(--hart-glass-bg);

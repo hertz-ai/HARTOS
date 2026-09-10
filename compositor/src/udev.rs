@@ -1511,6 +1511,9 @@ fn claim_names(next: u8) -> String {
     if next & crate::comp_core::NATIVE_CHROME_ORB != 0 {
         names.push("orb");
     }
+    if next & crate::comp_core::NATIVE_CHROME_HOME != 0 {
+        names.push("home");
+    }
     names.join(",")
 }
 
