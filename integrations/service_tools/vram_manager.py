@@ -635,11 +635,29 @@ class VRAMManager:
         self._gpu_info = info
         return info
 
-    def refresh_gpu_info(self) -> Dict:
-        """Re-detect GPU with TTL cache (avoids nvidia-smi spam from multiple threads)."""
+    def refresh_gpu_info(self, force: bool = False) -> Dict:
+        """Re-detect GPU with TTL cache (avoids nvidia-smi spam from multiple threads).
+
+        ``force=True`` skips the TTL.  A caller that is about to size a model
+        against free VRAM, right after another GPU process went away, cannot
+        use a cached reading at all -- and the TTL alone will not save it.
+        MEASURED 2026-09-10 on the installed build:
+
+            16:19:58,967  GPU (nvidia-smi): 8.0 GB total, 2.98 GB free
+            16:20:16      llama-server on :8080 died
+            16:21:55,203  Dynamic context size: 4096 (VRAM free=3.0GB, ...)
+            16:21:59,261  GPU (nvidia-smi): 8.0 GB total, 7.56 GB free
+
+        The 16:21:55 decision read a 117-second-old sample taken while the
+        outgoing server still held 4.5 GB, so 4.76 GB of headroom was seen as
+        0.1 GB and the smallest context tier was chosen for the whole process
+        lifetime.  117 s is INSIDE the 120 s bundled TTL, so an unforced call
+        returns exactly the same stale number: only an explicit force fixes it.
+        """
         import time as _t
         now = _t.monotonic()
-        if self._gpu_info is not None and (now - self._gpu_info_ts) < self._refresh_ttl:
+        if (not force and self._gpu_info is not None
+                and (now - self._gpu_info_ts) < self._refresh_ttl):
             return self._gpu_info  # recent enough — skip subprocess
         self._gpu_info = None
         result = self.detect_gpu()
