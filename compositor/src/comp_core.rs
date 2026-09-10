@@ -3385,13 +3385,30 @@ where
         // skipped precisely when the native shell is on, and the shell would then keep
         // its own HTML orb: two orbs breathing over each other, the browser still paying
         // the per-frame cost, and the entire point of the native orb lost.
+        let before = elements.len();
         let scene_mask = render_native_scene(state, renderer, size, &mut elements);
         native_mask |= scene_mask;
-        if scene_mask != 0 {
-            // Evidence for the compositor's shell-ready writer, and note it is the SCENE's
-            // own mask, not the accumulated one: the bloom below sets a bit whether or not
-            // the native shell drew anything, so ORing first would let the backdrop alone
-            // claim a painted native shell.
+        if elements.len() > before {
+            // Evidence for the compositor's shell-ready writer: elements the SCENE itself
+            // put into this frame. Deliberately measured by growth of the element list
+            // rather than by `scene_mask != 0`, which is what this used to test.
+            //
+            // The mask is not that evidence. `lower_scene` sets exactly ONE bit, and only
+            // where the ORB's buffer imports; Rect, Text and Art all push elements and set
+            // nothing. So `scene_mask != 0` means "the orb drew", and a frame that painted
+            // the hero, the rows, the cards and both bars while the orb was skipped (a
+            // sub-pixel slot, a cache miss, a failed import) claimed nothing had painted.
+            // shell-ready would then never be written, the paint watchdog would stop seeing
+            // HEALTHY, and the ladder would demote off the native shell on its own, which
+            // is the exact failure the writer beside it in udev.rs was added to prevent.
+            //
+            // Growth of the list is also what this static's own doc says it means: "set
+            // once the native scene has actually put elements into a frame".
+            //
+            // Still the SCENE's own contribution, not the accumulated mask: the bloom below
+            // pushes an element whether or not the native shell drew anything, and it is
+            // measured after this point, so the backdrop alone can never claim a painted
+            // native shell.
             NATIVE_SCENE_PAINTED.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -5046,6 +5063,56 @@ mod native_render_tests {
     use super::*;
     use smithay::backend::renderer::element::Element;
     use smithay::backend::renderer::pixman::PixmanRenderer;
+
+    #[test]
+    fn the_scene_mask_is_not_evidence_that_the_scene_painted() {
+        // WHY: build_frame_elements used to set NATIVE_SCENE_PAINTED (which gates the
+        // compositor's shell-ready writer) on `scene_mask != 0`. lower_scene sets exactly
+        // one bit and only where the ORB imports, so that test really asked "did the orb
+        // draw". This lowers at an output small enough that the orb slot is skipped and
+        // shows the two answers coming apart: real elements in the frame, empty mask.
+        //
+        // If that gate is ever rewritten back to the mask, this is the frame that breaks
+        // it: shell-ready never gets written, the paint watchdog stops seeing HEALTHY, and
+        // the ladder demotes off the native shell by itself.
+        let mut renderer = PixmanRenderer::new().expect("pixman renderer allocates headless");
+        let size: Size<i32, Physical> = (3, 3).into();
+
+        let home = crate::scene::HomeCompose::demo();
+        let mut rasterizer = crate::text_render::TextRasterizer::new();
+        let mut orb = OrbCache::default();
+        let mut rects = RectCache::default();
+        let mut scenes = crate::scene::SceneCache::default();
+
+        let mut elements: Vec<HartRenderElement<PixmanRenderer>> = Vec::new();
+        let mask = lower_scene(
+            &home,
+            size,
+            &mut renderer,
+            &mut rasterizer,
+            &mut orb,
+            &mut rects,
+            &mut scenes,
+            0.5,
+            None,
+            false,
+            true,
+            &crate::scene::RowScroll::default(),
+            &mut elements,
+        );
+
+        assert_eq!(
+            mask & NATIVE_CHROME_ORB,
+            0,
+            "expected an output too small for the orb slot; pick a smaller one"
+        );
+        assert!(
+            !elements.is_empty(),
+            "the scene still paints chrome at this size, which is the whole point"
+        );
+        // So this is a frame the OLD gate called unpainted while it demonstrably painted.
+        assert_eq!(mask, 0, "no other bit should be standing in for the orb's");
+    }
 
     #[test]
     fn demo_scene_lowers_and_imports_buffers_on_pixman() {
