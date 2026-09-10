@@ -5142,8 +5142,29 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         f"Tier-1 named attach: action {_aid} names {_named} "
                         f"-> {_nn} tools")
                 elif _aid:
-                    current_app.logger.debug(
-                        f"Tier-1 named attach: action {_aid} names no tool")
+                    # INFO, not debug.  gui_app.log captured ZERO "- DEBUG -"
+                    # lines across the whole 2026-09-11 drive, so at debug this
+                    # branch never reaches production and a resolved-nothing
+                    # round stays indistinguishable from one that never ran --
+                    # the exact gap the comment above says the both-outcomes
+                    # logging was added to close.  Measured rid d62-232532:
+                    # "Tier-1 prompt narrow" fired for actions 1,2,3,4 (the
+                    # statement immediately above), "Tier-1 named attach" for
+                    # action 1 only, and nothing said why.
+                    #
+                    # The COUNT is what separates []'s causes, which is why it
+                    # is in the line: 0 = no recipe stored for this session
+                    # (the helper's `except` swallowed a KeyError), n < _aid =
+                    # the id is past the end of the stored list, n >= _aid =
+                    # the action genuinely names no tool.  Offline against the
+                    # real recipe the helper returns non-empty for every one of
+                    # actions 1,2,3,4,9, so live [] is the STORE, not the
+                    # helper -- five hypotheses were eliminated for want of
+                    # this one number (#828).
+                    _store = (recipes.get(user_prompt) or {}).get('actions') or []
+                    current_app.logger.info(
+                        f"Tier-1 named attach: action {_aid} names no tool "
+                        f"(recipes store holds {len(_store)} action(s))")
 
                 # (b) TAGS — unchanged fallback for capability families the
                 # recipe never mentions but the conversation drifted into.
