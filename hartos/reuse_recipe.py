@@ -5220,6 +5220,16 @@ def get_flow_number(user_id, prompt_id):
         if i['persona'].lower() == role.lower():
             role_number = num
             current_app.logger.info(f'GOT role index as {role_number}')
+            # FIRST match, like the sibling get_role (:445, :452).  Without
+            # this break every later flow on the same persona overwrote
+            # role_number, so a persona owning N flows always selected the
+            # LAST one and flows 0..N-2 were unreachable for reuse.
+            # Live 2026-09-10, agent 92583386981 (5 flows, all "Executor"):
+            # "GOT role index as 0..4" then it walked flow 4's
+            # save_data_in_memory and never called flow 0's get_chat_history.
+            # 58 of 711 stored agents have a persona owning 2+ flows; the
+            # other 653 select the same index either way.
+            break
     return role_number, role
 
 
