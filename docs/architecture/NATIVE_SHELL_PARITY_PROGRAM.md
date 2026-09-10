@@ -918,6 +918,45 @@ second file. `work_area_for` merges the compositor's own claim in whenever the
 scene is on, taking the larger of each edge, so the shell keeps publishing exactly
 what it publishes today and needs no change at all. See obligation 2 above.
 
+### Obligation 3 may not need its payload channel at all
+Recorded 2026-09-10, after reading both bridges rather than the checklist. The
+obligation is framed as a choice: grow the A2UI feed a second payload for chrome
+state, or add an IPC verb to carry it. Both readings assume the compositor must
+end up DRAWING the taskbar, the agent cluster and the clock. It does not have to,
+and the machinery for the alternative already ships.
+
+`NATIVE_CHROME_EMITTED` is a name allowlist, not a fixed pair. The compositor
+claims what a PRESENTED frame contained, `claim_names` turns the mask into words,
+and liquid_ui_service intersects them against `_NATIVE_CHROME_KNOWN`
+(`{bloom, orb}`) and hides just those elements. Fail-empty means the shell draws
+everything, which is today's desktop byte for byte. That bridge has been extended
+by one name twice already.
+
+Add `home` to it and the flip splits cleanly in two. The compositor claims the home
+SURFACE; the shell hides `#hart-home` (one element, from `mountRoot`) and keeps its
+own bars. The dotted sun becomes the renderer for the desktop, which is the visible
+half of M6 and the whole of its thermal case, since the WebKit core-burn that keeps
+this node at 94C is the home surface rasterising, not the bar. And the taskbar,
+agent cluster and clock keep working exactly as they do now, drawn by the shell
+from data it already has, so nothing regresses and no contract has to be settled.
+Carrying them natively becomes a later, optional milestone rather than a blocker.
+
+What it needs first, and why it is NOT a two-line change: the claim has to be
+EVIDENCE, and the scene has no home-content provenance. `render_native_scene`
+accumulates one bit, `NATIVE_CHROME_ORB`, set where the orb buffer imports. Every
+other leaf kind (Rect, Text, Art) pushes an element and sets nothing, and the walk
+cannot tell a card's background from the top bar's fill, because both are a Rect
+under a Container. So a naive "the scene emitted something" claim would let a frame
+that drew only the bar tell the shell to hide the home, and the result is an empty
+desktop that the paint watchdog does not catch: it watches for hangs, not for
+wrong-looking desktops. That is the exact failure the bloom half of this bridge was
+written to avoid.
+
+So the order is: mark home-content nodes in `layout_home`, set the bit only where
+such a leaf actually imports, then add the name on both sides. The scene-side
+marker is the real work and it belongs with the layout, not bolted onto the
+lowering walk.
+
 ### The parity ledger's rule 4, and the one motion switch the scene honoured
 NATIVE_SHELL_CSS_PARITY_LEDGER.md is a binding contract and only one thing in the
 tree reads it, for something else entirely. Its rule 4 is unambiguous: "Three
