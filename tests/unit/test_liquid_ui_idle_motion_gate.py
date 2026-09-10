@@ -122,7 +122,7 @@ def _gate_rule() -> str:
     """The body.webkit-flat {animation:none} rule, as one string."""
     src = _src()
     start = src.index("sw-paint: idle motion stopped")
-    end = src.index("{animation:none}", start) + len("{animation:none}")
+    end = src.index("{animation:none!important}", start) + len("{animation:none!important}")
     return src[start:end]
 
 
@@ -134,8 +134,8 @@ def test_the_gate_still_exists():
         "the software-paint idle-motion gate is gone from liquid_ui_service.py")
     assert "body.webkit-flat{--hart-motion-ambient:paused;" in src, (
         "the --hart-motion-* pause half of the gate is gone")
-    assert "{animation:none}" in _gate_rule(), (
-        "the named-selector half of the gate is gone")
+    assert "{animation:none!important}" in _gate_rule(), (
+        "the named-selector half of the gate is gone, or lost its !important")
 
 
 def test_the_onboarding_orb_is_gated():
@@ -185,3 +185,50 @@ def test_every_infinite_animation_is_gated_or_documented(name):
         "This test exists because `.hob-orb` was missed exactly this way and "
         "burned 97.4%% of a core on real hardware from boot."
         % (name, ", ".join(sorted(selectors))))
+
+
+def test_the_gate_wins_the_cascade_not_just_ties():
+    """The gate must beat hartHome.css, which styles some of the same elements.
+
+    THE DEFECT, measured on real HW 2026-09-10. Two rules, both matching:
+
+        hartHome.css:734   body.gpu-hardware .top-bar-orb { animation: tbOrbBreathe ... }
+        the gate           body.webkit-flat  .top-bar-orb { animation: none }
+
+    Both are (0 ids, 2 classes, 1 element) -- an exact specificity TIE. The body
+    carries BOTH classes ("gpu-hardware webkit-flat"), so both apply, and source
+    order decides. hartHome.css is an external sheet loading after this inline
+    block, so it won, and `.top-bar-orb` kept animating on every software-paint
+    box from the day the gate was written. `document.getAnimations()` on the live
+    node showed it `play=running` while the gate's var-driven entries showed
+    `play=paused` -- the gate half that works, beside the half that never did.
+
+    A tie is not a gate. `!important` is what makes it one.
+    """
+    gate = _gate_rule()
+    assert "!important" in gate, (
+        "the gate must use !important: it TIES on specificity with hartHome.css "
+        "for at least .top-bar-orb, and a tie is decided by source order, which "
+        "the external sheet wins")
+
+
+def test_selectors_shared_with_hartHome_css_are_all_covered():
+    """Any element hartHome.css animates AND this gate names must be protected
+    by the !important above -- catching the next tie before hardware does."""
+    import pathlib as _p
+    home = (_p.Path(__file__).resolve().parents[2] / "integrations" / "agent_engine"
+            / "static" / "hartHome.css")
+    if not home.is_file():
+        pytest.skip("hartHome.css not present")
+    css = home.read_text(encoding="utf-8")
+    gate = _gate_rule()
+    # Every class the gate names, that hartHome.css also gives an animation to.
+    for cls in re.findall(r"body\.webkit-flat ([.\w\s-]+?)[,{]", gate):
+        cls = cls.strip()
+        if not cls.startswith("."):
+            continue
+        for m in re.finditer(re.escape(cls) + r"\s*\{[^}]*animation:", css):
+            assert "!important" in gate, (
+                "hartHome.css animates %s and the gate also names it; without "
+                "!important the two can tie and source order decides" % cls)
+            break

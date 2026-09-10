@@ -3032,6 +3032,22 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
         #     animation in this stylesheet and fails on any that is neither
         #     gated here nor in its documented keep-list, so the next one cannot
         #     be missed the way `.hob-orb` was.
+        # WHY `!important`, measured on real HW 2026-09-10: without it this gate
+        # SILENTLY LOSES for any selector hartHome.css also styles, because the
+        # two rules TIE on specificity and source order then decides. Concretely:
+        #
+        #   hartHome.css:734  body.gpu-hardware .top-bar-orb { animation: tbOrbBreathe ... }
+        #   this gate         body.webkit-flat  .top-bar-orb { animation: none }
+        #
+        # Both are (0 ids, 2 classes, 1 element). The body carries BOTH classes
+        # (`class="gpu-hardware webkit-flat"`), so both match, and hartHome.css
+        # is an external sheet that loads after this inline block: it wins, and
+        # the orb kept breathing on every software-rendered box since the gate
+        # was written. `document.getAnimations()` on the live node showed it
+        # `play=running` while the gate's other entries showed `play=paused`.
+        # An `!important` on a hardware floor is the right tool: this is not a
+        # style preference losing an argument, it is the rung saying the box
+        # cannot afford the frame.
         if not blur_composites:
             _CSS_LIVING_GLASS += (
                 '/* sw-paint: idle motion stopped (see the note in liquid_ui_service.py) */'
@@ -3063,7 +3079,7 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
                 # hart-comp idled at 2.2%: the cost was re-rasterising two large
                 # blurs per frame in software, not compositing them.
                 'body.webkit-flat .hart-onboarding .hob-orb,'
-                'body.webkit-flat .ds-skeleton{animation:none}'
+                'body.webkit-flat .ds-skeleton{animation:none!important}'
             )
 
         # ── Boot lock overlay (#166: FOUC + security) ─────────────────────────
