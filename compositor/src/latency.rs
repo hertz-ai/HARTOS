@@ -46,13 +46,31 @@
 //! it with a `time` feature would change feature resolution and desync
 //! Cargo.toml from the offline-vendored Cargo.lock that CI builds from (this
 //! box cannot regenerate the lock). So the offset between "µs since an Instant
-//! base" and "kernel event µs" is ESTIMATED instead: every input contributes
-//! one observation `delta = instant_us - event_us`, and the rolling MINIMUM of
-//! recent deltas is the offset. Event delivery delay is strictly one-sided
-//! (an event can only be observed AFTER the kernel stamped it), so the minimum
-//! over many events converges from above onto the true offset plus the
-//! best-case delivery latency — tens of microseconds on an idle dispatch loop,
-//! against budgets of 16,000. The estimator is pure and its convergence is
+//! base" and "kernel event µs" is ESTIMATED instead.
+//!
+//! THE DIRECTION OF THAT ESTIMATE MATTERS, and getting it backwards is what
+//! made this instrument silent on every node from the day it was written until
+//! 2026-09-10. The two clocks share a SOURCE and not an EPOCH:
+//!
+//!     event_us    = t - boot          (libinput, CLOCK_MONOTONIC since boot)
+//!     instant_us  = t - comp_start    (base.elapsed(), base set at first use)
+//!
+//! The compositor starts AFTER boot, so for the same instant `t` the Instant
+//! reading is the SMALLER number, by the entire boot-to-compositor gap. The
+//! original code observed `delta = instant_us - event_us` and kept it only
+//! `if instant_us >= event_us`, which is never true, so no observation was ever
+//! recorded, `offset_us()` stayed None, and the anti-gaming rule below fired on
+//! EVERY sample instead of on bad ones. Zero journal lines, forever, and the
+//! unit tests all passed because they hand the core a same-epoch pairing.
+//!
+//! So: every input contributes `delta = event_us - instant_us`, which is
+//! `(comp_start - boot) - delivery_delay`, and the rolling MAXIMUM of recent
+//! deltas is the offset. Delivery delay is still strictly one-sided (an event
+//! can only be observed AFTER the kernel stamped it), but with this sign a
+//! LONGER delay SHRINKS the delta, so the maximum converges from BELOW onto the
+//! true offset — error is the best-case delivery latency, tens of microseconds
+//! on an idle dispatch loop, against budgets of 16,000. The photon time is then
+//! `instant_us + offset`, moving the Instant reading INTO the kernel epoch. The estimator is pure and its convergence is
 //! unit-tested; `photon_time()` refuses to answer before the first observation
 //! (anti-gaming rule: a sample not anchored to a kernel input timestamp and a
 //! flip completion is invalid and MUST NOT be reported — so we report nothing
@@ -372,12 +390,13 @@ impl LatencyCore {
         }
     }
 
-    /// The estimated (instant-domain minus event-domain) clock offset, or None
-    /// before any input has been observed. min() over the window: delivery
-    /// delay only ever ADDS, so the smallest observation is the closest to
-    /// truth (see module doc for the error bound).
+    /// The estimated (event-domain minus instant-domain) clock offset, or None
+    /// before any input has been observed. max() over the window: each
+    /// observation is `(comp_start - boot) - delivery_delay`, so delivery delay
+    /// only ever SUBTRACTS and the largest observation is the closest to truth
+    /// (see the module doc for the direction and the error bound).
     pub fn offset_us(&self) -> Option<u64> {
-        self.offset_obs.iter().copied().min()
+        self.offset_obs.iter().copied().max()
     }
 
     pub fn note_button(&mut self, surface: Surface, down: bool, event_us: u64, instant_us: u64) {
@@ -393,11 +412,17 @@ impl LatencyCore {
     pub fn note_input(&mut self, surface: Surface, kind: Kind, event_us: u64, instant_us: u64) {
         // Feed the offset estimator first — even inputs later dropped for
         // capacity still carry a valid clock observation.
-        if instant_us >= event_us {
+        //
+        // event_us - instant_us, NOT the reverse: the kernel epoch (boot) is
+        // EARLIER than the Instant base (compositor start), so the kernel
+        // reading is the larger of the two. The reverse subtraction was never
+        // once satisfied on a real node, which is precisely why this instrument
+        // reported nothing until 2026-09-10.
+        if event_us >= instant_us {
             if self.offset_obs.len() == OFFSET_WINDOW {
                 self.offset_obs.pop_front();
             }
-            self.offset_obs.push_back(instant_us - event_us);
+            self.offset_obs.push_back(event_us - instant_us);
         }
         if self.pending.len() == MAX_PENDING_INPUTS {
             self.pending.remove(0);
@@ -452,7 +477,10 @@ impl LatencyCore {
         let batch = self.inflight.pop_front().unwrap_or_default();
         if let Some(off) = self.offset_us() {
             // Refuse to fabricate: no offset means no anchored photon time.
-            let photon_event_us = instant_us.saturating_sub(off);
+            // ADD: `off` carries the Instant reading forward into the kernel
+            // epoch, where `t_in` already lives. Subtracting moved it the wrong
+            // way by twice the gap.
+            let photon_event_us = instant_us.saturating_add(off);
             for (surface, kind, t_in) in batch {
                 let lat = photon_event_us.saturating_sub(t_in);
                 if lat == 0 || lat > MAX_SANE_LATENCY_US {
@@ -739,17 +767,25 @@ mod tests {
         // A drop taken outside the flush would be attributed to the NEXT window,
         // which is the one place this record must not lie: it exists to qualify the
         // numbers printed beside it.
+        // Clocks paired the way a booted node pairs them: kernel stamps are
+        // since BOOT, Instant readings are since COMPOSITOR START, so the
+        // kernel number is larger by the gap. Written as `t + 500` before,
+        // which is the impossible direction and stopped producing a sample
+        // once the estimator was corrected.
+        const GAP: u64 = 1_000_000;
         let mut c = LatencyCore::new();
-        let t = 1_000_000;
+        let t = 2_000_000; // kernel stamp, since boot
+        let inst = |kernel: u64| kernel - GAP; // the same moment, Instant domain
         // A real, well-formed sample, so the window has something to report.
-        c.note_motion(Surface::Shell, t, t + 500);
+        // 500µs of delivery delay: observed slightly later than stamped.
+        c.note_motion(Surface::Shell, t, inst(t) + 500);
         c.frame_queued();
-        c.frame_presented(t + 8_000);
+        c.frame_presented(inst(t + 8_000));
         // Then a burst that overruns the cap before the window closes.
         for i in 0..(MAX_PENDING_INPUTS as u64 + 5) {
-            c.note_motion(Surface::Shell, t + 10_000 + i, t + 10_000 + i);
+            c.note_motion(Surface::Shell, t + 10_000 + i, inst(t + 10_000 + i));
         }
-        let out = c.frame_presented(t + WINDOW_US + 8_000);
+        let out = c.frame_presented(inst(t + WINDOW_US + 8_000));
         let d = c.take_drops().expect("the same window carries both");
         assert!(!out.is_empty(), "the window still reports its summary");
         assert_eq!(d.pending, 5, "and says what it had to throw away to get it");
@@ -758,15 +794,42 @@ mod tests {
     // ── the offset estimator ────────────────────────────────────────────────
 
     #[test]
-    fn the_offset_estimator_converges_from_above() {
-        // True offset 1_000_000; delivery delays are one-sided noise on top.
+    fn the_offset_estimator_converges_from_below() {
+        // A REALISTIC pairing: the kernel epoch is boot, the Instant base is
+        // compositor start, so the kernel reading is LARGER by the gap between
+        // them. The old version of this test had instant_us AHEAD of event_us,
+        // which would require the Instant base to predate boot, and that
+        // impossible pairing is why the suite stayed green while the instrument
+        // emitted nothing on hardware.
+        const EPOCH_GAP: u64 = 1_000_000; // compositor started 1s after boot
         let mut c = LatencyCore::new();
         for (i, delay) in [900u64, 40, 300, 15, 700, 90].iter().enumerate() {
-            let ev = (i as u64) * 16_000;
-            c.note_input(Surface::Shell, Kind::Hover, ev, ev + 1_000_000 + delay);
+            let ev = EPOCH_GAP + (i as u64) * 16_000; // kernel stamp, since boot
+            let instant = ev - EPOCH_GAP + delay; // observed, since comp start
+            c.note_input(Surface::Shell, Kind::Hover, ev, instant);
         }
-        // min picks the fastest delivery: error == 15µs against 16ms budgets.
-        assert_eq!(c.offset_us(), Some(1_000_015));
+        // max picks the fastest delivery: error == 15µs against 16ms budgets.
+        assert_eq!(c.offset_us(), Some(EPOCH_GAP - 15));
+    }
+
+    #[test]
+    fn a_realistic_epoch_gap_still_produces_a_sample() {
+        // THE REGRESSION GUARD. Every other test in this module pairs the two
+        // clocks at the same origin, which is the one case that cannot happen
+        // on a real machine. This one uses the shape a booted node actually
+        // has, and it fails outright against the pre-2026-09-10 code: there the
+        // observation was skipped, offset_us() stayed None, and frame_presented
+        // recorded nothing at all.
+        const EPOCH_GAP: u64 = 30_000_000; // compositor up 30s after boot
+        let mut c = LatencyCore::new();
+        let t_in = EPOCH_GAP + 500_000; // kernel stamp, since boot
+        c.note_input(Surface::Shell, Kind::Press, t_in, t_in - EPOCH_GAP);
+        assert_eq!(c.offset_us(), Some(EPOCH_GAP), "the offset IS the epoch gap");
+        c.frame_queued();
+        // Photon 8.1ms after the input, expressed in the Instant domain.
+        c.frame_presented(t_in - EPOCH_GAP + 8_100);
+        let got = c.window[Surface::Shell.idx()][Kind::Press.idx()].first().copied();
+        assert_eq!(got, Some(8_100), "a real epoch gap must still measure 8.1ms");
     }
 
     #[test]
