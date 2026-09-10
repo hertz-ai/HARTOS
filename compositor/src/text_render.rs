@@ -34,10 +34,26 @@ use crate::scene::TextMeasure;
 ///
 /// `cosmic_text::Weight` is a newtype over the same CSS number the shell's rules are
 /// written in, so this is a wrap, not a mapping table.
-fn attrs_for(weight: u16, letter_spacing: f32) -> Attrs<'static> {
+fn attrs_for(weight: u16, letter_spacing_px: f32, size_px: f32) -> Attrs<'static> {
     Attrs::new()
         .weight(Weight(weight))
-        .letter_spacing(letter_spacing.max(0.0))
+        // TRACKING IS EM HERE, PX EVERYWHERE ELSE. cosmic-text says so itself
+        // ("Set letter spacing (tracking) in EM", attrs.rs), and shape.rs adds the
+        // value straight onto the em-normalised advance
+        // (`pos.x_advance / font_scale + spacing`), which layout then multiplies by
+        // the font size.
+        //
+        // The scene speaks CSS px, because the rules it mirrors are written that way:
+        // `.hh-eyebrow` is `letter-spacing: 3px`, and scene.rs passes 3.0 under that
+        // citation. Handing that number over unconverted asked for THREE EM, which at
+        // a 16px eyebrow is 48px between every pair of letters. "EARNED ON THE HIVE"
+        // laid out around five times its real width, off the end of its box.
+        //
+        // Converted in the one place measure and paint both go through, so they cannot
+        // drift apart. It is also what makes the two TextMeasure implementations agree:
+        // MonoMeasure adds tracking as raw px (scene.rs), which is right for the CSS
+        // meaning, so before this the two differed by a factor of the font size.
+        .letter_spacing(letter_spacing_px.max(0.0) / size_px.max(1.0))
 }
 
 /// The identity of one rasterized run. `size_bits`/`color` are the bit patterns of
@@ -174,7 +190,7 @@ impl TextRasterizer {
         // No width bound: a measure must never wrap, or a long run would report the width
         // of its wrapped box instead of its own advance.
         buffer.set_size(&mut self.font_system, None, None);
-        buffer.set_text(&mut self.font_system, text, &attrs_for(weight, letter_spacing), Shaping::Advanced);
+        buffer.set_text(&mut self.font_system, text, &attrs_for(weight, letter_spacing, size_px), Shaping::Advanced);
         buffer.shape_until_scroll(&mut self.font_system, false);
         buffer
             .layout_runs()
@@ -263,7 +279,7 @@ impl TextRasterizer {
         let metrics = Metrics::new(size_px, size_px * 1.3);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(&mut self.font_system, Some(wi as f32), Some(hi as f32));
-        buffer.set_text(&mut self.font_system, text, &attrs_for(weight, letter_spacing), Shaping::Advanced);
+        buffer.set_text(&mut self.font_system, text, &attrs_for(weight, letter_spacing, size_px), Shaping::Advanced);
         // `draw` is `&self`, so the run must be shaped first (shaping needs `&mut`).
         buffer.shape_until_scroll(&mut self.font_system, false);
 
@@ -490,6 +506,46 @@ mod tests {
         let _ = r.rasterize("steady", 12.0, 24, 14, white, 0.0, 400, 0.0);
         assert_eq!(after_first, before + 1, "the first ask composes");
         assert_eq!(r.composes(), after_first, "the second ask must hit the cache");
+    }
+
+    #[test]
+    fn tracking_is_asked_for_in_px_and_moves_the_advance_by_px() {
+        // THE UNIT BUG. cosmic-text takes tracking in EM; the scene passes CSS px, under
+        // citations like `.hh-eyebrow { letter-spacing: 3px }`. Handed over unconverted,
+        // 3.0 meant 3 EM, so a 16px run grew by 48px per gap instead of 3px, and the
+        // eyebrow sprawled about five times its width.
+        //
+        // Holds whether or not this host has fonts: with an empty database `measure`
+        // degrades to MonoMeasure, which adds tracking as raw px, and that is the same
+        // answer this asserts. So the test states the CONTRACT rather than one backend.
+        let mut r = TextRasterizer::new();
+        let text = "EARNED ON THE HIVE";
+        let chars = text.chars().count() as f32;
+        let size = 16.0;
+        let spacing = 3.0;
+
+        let plain = r.measure(text, size, 700, 0.0);
+        let spaced = r.measure(text, size, 700, spacing);
+        let grew = spaced - plain;
+
+        // ONE GAP PER CHARACTER, including the last. cosmic-text adds the tracking onto
+        // every glyph's advance, and so does CSS: `letter-spacing` is applied after each
+        // character, which is why a tracked run carries a trailing gap in a browser too.
+        // MonoMeasure uses (n - 1) instead, so the font-free estimate is one gap short of
+        // the real shaper. That is 3px on this run and it only affects the fallback, but
+        // it is a real difference and better written down than smoothed over by a loose
+        // tolerance -- which is what an earlier version of this test did.
+        let want = chars * spacing;
+        assert!(
+            (grew - want).abs() <= 1.0,
+            "tracking must move the advance by px, one gap per character: expected about {want}, got {grew} (plain {plain}, spaced {spaced})"
+        );
+        // And the shape of the bug this test exists for, so it cannot come back quietly:
+        // read as EM, the growth would have been multiplied by the font size.
+        assert!(
+            grew < want * size * 0.5,
+            "tracking looks like it is being read as EM again: grew {grew} for {chars} characters at {spacing}px"
+        );
     }
 
     #[test]
