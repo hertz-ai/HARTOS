@@ -314,6 +314,26 @@ milestone that regresses latency fails even if it looks better.
   never regress iso-desktop build time.
 
 ## Status
+- 2026-09-10: THREE of M6's four pre-flip obligations are now closed, and the
+  remaining one is the only thing between here and the flip.
+    1. shell-ready native writer: DONE (written from the vblank reaper, on the
+       frame that actually carried the scene).
+    2. Panel reservation: DONE. Theme half earlier, inversion today. `work_area_for`
+       merges the compositor's own claim per edge by maximum whenever the scene is
+       on, so the shell needs no change and there is no flag day.
+    4. Image lowering: card ART done (it was never the picture), card ICONS done
+       (Material faces are installed and `fc-list` on the node confirms the exact
+       families the detector matches). Only the optional photo layer is left, and a
+       card without its photo is a correct card.
+    3. STILL OPEN, and it is a contract decision rather than code: the taskbar, the
+       agent-status cluster and the clock need bar content `home_compose` does not
+       carry. Nothing else blocks M6.
+  Also true and worth stating plainly, because the program's headline claim has
+  never had a number beside it: on generation 7 the node sets no HART_NATIVE_SHELL
+  at all, so every pixel measured there is the WebView. `shell.native {on}` (landed
+  today) makes the comparison takeable on one machine without a reboot, but it is
+  NOT in generation 7's compositor, so seeing the native scene on hardware needs one
+  more OTA.
 - 2026-07-20: program created (this doc). M0/M1 next; owner: hive session +
   steward review at each milestone flip.
 - 2026-09-05: M0..M3 LANDED and CI-green on main; M4 partly wired; M6 not flipped,
@@ -384,14 +404,45 @@ only the first one is blocked.
    WebView host holds itself to: the marker means MAPPED and painted, not
    "started", so the native writer owes the same.
 
-2. **The panel reservation points the wrong way.** The shell publishes how much
-   chrome it owns and `work_area` subtracts it from every placement path. Once
-   the compositor paints the bars, the compositor is what knows their size, so
-   the contract has to invert and the native scene has to become the publisher.
-   Until it does, scene.rs hardcodes 40/44 against a value the theme can move,
-   which is the 2026-08-29 "taskbar unreachable" report waiting to happen again
-   through the new renderer. Pinned meanwhile by
-   tests/unit/test_panel_reservation.py so the two cannot drift silently.
+2. **The panel reservation points the wrong way.** DONE. The theme half was
+   closed earlier (see "Obligation 2's actual bug" below); the inversion itself is
+   closed now, and it turned out NOT to need the shell side it was expected to.
+
+   The file's only publisher is the WebView, and M6 is precisely when the WebView
+   stops drawing the bars: nothing writes it, `parse_panel_reservation` fails safe
+   to zero exactly as designed, and a maximized window swallows the bars the
+   compositor is now painting. The 2026-08-29 report through the new renderer.
+
+   Rather than hand the file to a new publisher, `work_area_for` MERGES a native
+   reservation in whenever the scene is on. That is why no shell change was
+   needed and there is no flag day: `native_chrome_reservation` reads
+   `theme.top_bar_h` and `scene::TASKBAR_H`, the same two numbers the scene lays
+   out from and the two this file's guard already pins, so the reservation cannot
+   disagree with the pixels and no third source appears.
+
+   Merged PER EDGE BY MAXIMUM, not replacing. During the transition
+   `shell.native {on}` draws the scene WITHOUT standing the WebView down, so both
+   sets of bars are genuinely on screen and only the larger edge covers what is
+   drawn. After the demotion the file is absent and the maximum is the native
+   value. A stale file can then only OVER-reserve, which costs a band of unused
+   desktop where an under-reservation costs a bar the user cannot reach.
+
+   **One deliberate difference from the chrome bridge next door.** That bridge
+   publishes from the RENDER PATH on principle: the shell stands down on its
+   claim, so a promise instead of evidence yields a desktop with no background.
+   The reservation reads the CONFIG flag instead, and should, because its
+   asymmetry runs the other way. Over-reserving is harmless, under-reserving is
+   the bug, and the flag is already true on the first frame where evidence would
+   arrive a frame late. It reads `native_shell_on` rather than
+   `native_scene_drawn` for the same reason: the killswitch blacks the screen for
+   a frame and the bars have not stopped existing, so placement must not reshuffle
+   every window because the display went dark.
+
+   Five Rust tests cover the merge. None of them can reach the WIRING, because
+   `work_area_for` needs a mapped output and a real State, so a correct merge that
+   nothing calls would pass every one: the dead-layer shape this tree keeps
+   meeting. The wiring is pinned from tests/unit/test_panel_reservation.py beside
+   the other cross-language pins, and mutation-checked by cutting the call.
 
 3. **Three surfaces need bar content that home_compose does not carry.** These
    looked like separate gaps and are one decision, which is whether the A2UI feed
@@ -430,11 +481,24 @@ only the first one is blocked.
    not a Material name (an emoji) renders as plain text too. So the native path
    needs no image pipeline for icons at all: it needs the Material face loaded
    into the same cosmic-text FontSystem that already shapes every other run, and
-   `Shaping::Advanced` (already used) does ligature substitution. The obstacle is
-   packaging, not rendering: the shell bundles the face as `.woff2` for the
-   browser, fontdb reads TTF/OTF, and the box's fonts.packages carries only noto
-   and liberation. Get an OTF/TTF of the face in front of fontdb and icons come
-   out of the existing text path.
+   `Shaping::Advanced` (already used) does ligature substitution.
+
+   DONE, and it was the packaging half rather than the rendering half, exactly as
+   this predicted. hart-subsystems.nix installs `material-icons` and
+   `material-symbols` into the fontconfig font set (bundled so the shell renders
+   offline, after a fresh ISO once showed literal "lock" and "notifications" words
+   across the tray). cosmic-text's fontdb reads that same fontconfig,
+   `TextRasterizer::has_icon_face` answers by looking for a family whose name starts
+   with "Material", and `layout_home` consumes it at one place (`icons_available`),
+   so a host without the face DROPS the icon rather than drawing its name as a word.
+
+   Verified on the box rather than read off the config, because "declared in a nix
+   module" and "visible to fontconfig" are different claims and this tree has been
+   caught by that gap before. `fc-list` on the node reports 53 Material files and
+   the families `Material Icons`, `Material Icons Outlined`, `Material Icons Round`,
+   `Material Icons Sharp`, `Material Icons Two Tone`, which is exactly the prefix
+   the detector matches. Consumed, not merely present, which is the other half of
+   the recurring defect here.
 
    **Card art was never the picture.** This was measured wrong the first time and
    the correction is worth keeping, because the wrong reading turned a mostly-done
@@ -847,9 +911,12 @@ equal the fallbacks theme_service publishes for the same case. That is what the
 reservation guard compares now; a separate guard asserts both sides read the same
 theme keys by name, since agreeing today is exactly what the hardcoded 40 also did.
 
-What is still open in obligation 2 is only the inversion itself: who PUBLISHES the
-reservation once the compositor paints the chrome. That remains a contract question
-with a shell side.
+What was still open in obligation 2 was only the inversion itself: who PUBLISHES
+the reservation once the compositor paints the chrome. That is now closed, and the
+answer sidesteps the contract question rather than settling it. NOBODY publishes a
+second file. `work_area_for` merges the compositor's own claim in whenever the
+scene is on, taking the larger of each edge, so the shell keeps publishing exactly
+what it publishes today and needs no change at all. See obligation 2 above.
 
 ### The parity ledger's rule 4, and the one motion switch the scene honoured
 NATIVE_SHELL_CSS_PARITY_LEDGER.md is a binding contract and only one thing in the
