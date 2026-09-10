@@ -3091,6 +3091,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
 
 def instantiate_executor_agent():
+    from core.agent_tools import main_leg_tool_menu
+    # create_scheduled_jobs is NOT registered on this leg -- see the note on
+    # MAIN_LEG_CORE_TOOLS.  execute_windows_or_android_command is, via
+    # register_dual(helper, assistant, ...) at :1670.
+    _tool_menu = main_leg_tool_menu(('execute_windows_or_android_command',))
     # Inject cultural wisdom — even code execution should embody care
     _executor_cultural = ""
     try:
@@ -3134,7 +3139,7 @@ def instantiate_executor_agent():
         Calling Other Agents:
             When you need to direct a question or route the conversation to a specific agent, use the @ tag followed by the agent's name. Examples include: @Executor or @Helper or @User
         Things You cannot do but Helper Agent can:
-            1. Tools Helper Agent can use: Can use tools like send_message_in_seconds, send_message_to_user,send_presynthesized_video_to_user, execute_windows_or_android_command, text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory.
+            1. Tools Helper Agent can use: Can use tools like {_tool_menu}.
             2. Create Scheduled Jobs: For tasks involving timers or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
                 - If you want to save some data ask helper agent to use "save_data_in_memory" tool.
@@ -3225,6 +3230,11 @@ def instantiate_helper_agent():
 
 
 def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, resonance_profile=None, autonomous=False):
+    from core.agent_tools import main_leg_tool_menu
+    # create_scheduled_jobs is NOT registered on this leg -- see the note on
+    # MAIN_LEG_CORE_TOOLS.  execute_windows_or_android_command is, via
+    # register_dual(helper, assistant, ...) at :1670.
+    _tool_menu = main_leg_tool_menu(('execute_windows_or_android_command',))
     # Build personality injection for the primary user-facing agent
     _personality_block = ""
     if personality:
@@ -3351,7 +3361,7 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
         •Code Execution: Executor Agent: Executes code as needed. Ensure the final response is printed in code using print() before sending to Executor. Only executor can execute the code and not user, hence never ask user the code or code/api execution response.
 
         •Tools Helper Agent can use:
-            1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,execute_windows_or_android_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, google_search, save_data_in_memory, search_long_term_memory and save_to_long_term_memory.
+            1. The tools are: """ + _tool_menu + """.
             2. Create Scheduled Jobs: For tasks involving timer or time or periodically or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
                 - If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
@@ -3400,8 +3410,31 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
 
 
 def create_time_agents(user_id, prompt_id,role,goal,actions):
+    from core.agent_tools import (
+        build_core_tool_closures, register_core_tools, registered_tool_menu,
+    )
     user_prompt = f'{user_id}_{prompt_id}'
     time_actions[user_prompt] = Action(actions)
+
+    # Built here rather than beside register_core_tools below because the
+    # three prompts under it must NAME what this leg registers, and this leg
+    # registers the list UNFILTERED.  Nothing between here and the old build
+    # site touches these ctx values.
+    _tool_ctx_time = {
+        'user_id': user_id, 'prompt_id': prompt_id,
+        'agent_data': agent_data, 'helper_fun': helper_fun,
+        'user_prompt': user_prompt, 'request_id_list': request_id_list,
+        'recent_file_id': recent_file_id, 'scheduler': scheduler,
+        'simplemem_store': user_simplemem.get(user_prompt) if user_simplemem else None,
+        'memory_graph': None,
+        'log_tool_execution': log_tool_execution,
+        'send_message_to_user1': send_message_to_user1,
+        'retrieve_json': retrieve_json,
+        'strip_json_values': strip_json_values,
+        'save_conversation_db': save_conversation_db,
+    }
+    core_tools_time = build_core_tool_closures(_tool_ctx_time)
+    _time_tool_menu = registered_tool_menu(core_tools_time)
 
     time_agent = autogen.AssistantAgent(
         name='time_agent',
@@ -3416,7 +3449,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             After completing the current action ask the StatusVerifier to verify the status of current action.
         """
         f"When you want to communicate with {role} connect main agent using 'connect_time_main' tool."
-        "Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory.]"
+        f"Tools Helper Agent can use [{_time_tool_menu}.]"
         "if you have any task which is not doable by these tool check recipe first else create python code to do so"
         "the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video."
         f'IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: `@user {{"message2user": "Your message here"}}`'
@@ -3440,7 +3473,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
-            4. Tools you have [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory.]
+            4. Tools you have [{_time_tool_menu}.]
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below
             7. If there is any action which is like to perform a task continuously you should not do it.
@@ -3463,7 +3496,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
-            4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory.]
+            4. Tools Helper Agent can use [{_time_tool_menu}.]
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below
             7. If there is any action which is like to perform a task continuously you should not do it.
@@ -3517,22 +3550,8 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         is_termination_msg=_is_terminate_msg,
     )
 
-    # --- Core tools for time_agent (reuse same definitions) ---
-    from core.agent_tools import build_core_tool_closures, register_core_tools
-    _tool_ctx_time = {
-        'user_id': user_id, 'prompt_id': prompt_id,
-        'agent_data': agent_data, 'helper_fun': helper_fun,
-        'user_prompt': user_prompt, 'request_id_list': request_id_list,
-        'recent_file_id': recent_file_id, 'scheduler': scheduler,
-        'simplemem_store': user_simplemem.get(user_prompt) if user_simplemem else None,
-        'memory_graph': None,
-        'log_tool_execution': log_tool_execution,
-        'send_message_to_user1': send_message_to_user1,
-        'retrieve_json': retrieve_json,
-        'strip_json_values': strip_json_values,
-        'save_conversation_db': save_conversation_db,
-    }
-    core_tools_time = build_core_tool_closures(_tool_ctx_time)
+    # --- Core tools for time_agent (list built above, next to the prompts
+    # that advertise it) ---
     register_core_tools(core_tools_time, helper1, time_agent)
 
     # Channel tools for time_agent too

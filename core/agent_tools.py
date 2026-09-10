@@ -109,6 +109,63 @@ MAIN_LEG_CORE_TOOLS = frozenset({
 })
 
 
+def _join_tool_menu(names, extra=()):
+    """One join for every prose tool menu: sorted, comma-separated, no quotes."""
+    out = set(names)
+    out.update(str(e) for e in (extra or ()) if e)
+    return ', '.join(sorted(out))
+
+
+def main_leg_tool_menu(extra=()):
+    """The tool names to ADVERTISE on a leg that registers the FILTERED core.
+
+    A prompt that hand-lists tool names drifts from the set the leg actually
+    registers, and the model believes the prompt.  MEASURED 2026-09-10 against
+    create_recipe.create_agents, which registers main_leg_core_tools(...) at
+    :1116 -- so on THIS leg the other 19 core closures are filtered off:
+
+        registered here, absent from the two prose menus:
+            get_chat_history, search_visual_history, txt2img, img2txt
+        in the menus, NOT registered on this leg:
+            text_2_image, get_text_from_image  (real closures, but filtered
+                out of MAIN_LEG_CORE_TOOLS in favour of txt2img / img2txt)
+            create_scheduled_jobs  (deliberately absent -- see the note on
+                MAIN_LEG_CORE_TOOLS above; the factory twin is a create-flow
+                stub)
+
+    So the authoring model was told three names this leg cannot call, and
+    never told about get_chat_history.  Across all 127 saved flow recipes
+    (1,034 steps) only 241 steps -- 23.3% -- name a tool the runtime serves;
+    51.4% of the identifier-shaped names are unserved, dominated by near-misses
+    of exactly the omitted capabilities (retrieve_memory / memory_query /
+    search_chat_history / MemoryService for get_chat_history, web_search for
+    google_search).  Ground truth: 71 distinct tools[].function.name on the
+    wire in logs/llm_outbound.jsonl.
+
+    `extra` carries names a caller registers BEYOND the core set -- e.g.
+    execute_windows_or_android_command, which create_agents registers with
+    register_dual(helper, assistant, ...) at :1670 so the Helper does hold its
+    schema.  It never mutates MAIN_LEG_CORE_TOOLS.
+    """
+    return _join_tool_menu(MAIN_LEG_CORE_TOOLS, extra)
+
+
+def registered_tool_menu(tools, extra=()):
+    """The menu for a leg that registers ``tools`` UNFILTERED.
+
+    create_recipe.create_time_agents (:3546) and reuse_recipe's helper1/time
+    and helper2/visual legs (:2239, :2347) pass the whole
+    build_core_tool_closures(...) list to register_core_tools, so their prompts
+    may name all of it -- including the create_scheduled_jobs and
+    text_2_image / get_text_from_image that the main leg filters away.  Deriving
+    from the same list the call registers is what stops a hand-copy drifting.
+
+    ``tools`` is the (name, description, func) shape build_core_tool_closures
+    returns.
+    """
+    return _join_tool_menu((t[0] for t in tools), extra)
+
+
 def main_leg_core_tools(tools):
     """The subset of ``tools`` the main helper/assistant leg registers.
 
