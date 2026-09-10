@@ -83,8 +83,17 @@ class ReuseMainCoreFactory(unittest.TestCase):
         # exists, not detecting drift.  Assert the invariant at its real home,
         # and that the main leg still registers the FILTERED slice.
         from core.agent_tools import MAIN_LEG_CORE_TOOLS
-        self.assertEqual(set(MAIN_LEG_CORE_TOOLS), MIGRATED,
-                         "MAIN_LEG_CORE_TOOLS drifted from the migrated set")
+        # SUBSET, not equality (relaxed 2026-09-10).  The invariant this guard
+        # exists for is that the _MAIN_LEG_CORE -> MAIN_LEG_CORE_TOOLS migration
+        # LOST NOTHING; an assertEqual also forbids ever ADDING a main-leg tool,
+        # which is a feature, not drift.  It fired on the book-navigation tools
+        # (integrations/learning/book_tools.py) — a legitimate new capability,
+        # not a regression of the migration.  Dropping a migrated name still
+        # fails here, which is the case that actually breaks REUSE.
+        self.assertLessEqual(MIGRATED, set(MAIN_LEG_CORE_TOOLS),
+                             "a MIGRATED tool was dropped from "
+                             "MAIN_LEG_CORE_TOOLS — the main leg would silently "
+                             "stop registering it")
         src = _REUSE.read_text(encoding='utf-8')
         self.assertIn("register_core_tools(main_leg_core_tools(core_tools), "
                       "helper, assistant", src,

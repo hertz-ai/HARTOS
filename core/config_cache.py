@@ -309,6 +309,30 @@ def get_book_parsing_api() -> str:
     return get_secret('BOOKPARSING_API', '')
 
 
+def get_book_list_api() -> str:
+    """Parsed-book registry read API (the ``pdf_files`` table).
+
+    Read side of what get_book_parsing_api() writes. Consumed by
+    integrations/learning/book_tools.py so an agent can see which books a user
+    has, without HARTOS importing Nunba's blueprint (core -> integrations is
+    allowed; core -> Nunba routes is not).
+    """
+    if is_bundled():
+        return f'{_local_base()}/db/pdf_files'
+    return get_secret('BOOKLIST_API', '')
+
+
+def get_book_layouts_api() -> str:
+    """Per-page parsed layout read API (the ``page_layouts`` table).
+
+    Carries passage text plus chapter_name / topic_name / page_number, which is
+    everything chapter- and page-wise navigation needs.
+    """
+    if is_bundled():
+        return f'{_local_base()}/db/layouts'
+    return get_secret('BOOKLAYOUTS_API', '')
+
+
 def get_visual_context_api(user_id, mins=5) -> str:
     """Visual context query URL (recent actions by time window)."""
     base = _local_base() if is_bundled() else os.environ.get('HEVOLVE_MAILER_URL', _local_base())

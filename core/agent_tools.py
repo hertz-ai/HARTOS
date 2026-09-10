@@ -106,6 +106,13 @@ MAIN_LEG_CORE_TOOLS = frozenset({
     'save_to_long_term_memory',
     'send_message_to_user', 'send_presynthesized_video_to_user',
     'send_message_in_seconds', 'google_search',
+    # Book navigation (integrations/learning/book_tools.py).  On the main leg
+    # because "read me this book" is a FOREGROUND user turn, and the filter
+    # here is what decides whether the assistant can see them at all — a tool
+    # appended to build_core_tool_closures but missing from this set is
+    # silently dropped for the main leg.
+    'list_books', 'list_book_chapters', 'read_book_page',
+    'read_book_chapter', 'parse_book_pdf',
 })
 
 # The closures the CREATE leg registers always-on, on top of
@@ -2308,6 +2315,28 @@ def build_core_tool_closures(ctx):
         ))
     except Exception:
         tool_logger.debug("Benchmark tracker tool not available")
+
+    # ------------------------------------------------------------------
+    # Book / learning navigation — appended HERE, not via a separate
+    # register_*_if_available() registrar.
+    #
+    # register_remote_desktop_tools_if_available (below) has NO production
+    # caller — only tests/unit/test_remote_desktop_agent_tools.py:235 — so a
+    # tool registered that way never reaches a live turn.  The live path is
+    # build_core_tool_closures() -> register_core_tools(), called from
+    # create_recipe.py:1096/1116 and reuse_recipe.py:2238/2264.  Appending to
+    # `tools` is therefore the only wiring that actually runs.
+    # ------------------------------------------------------------------
+    try:
+        from integrations.learning.book_tools import build_book_tools
+        _book = build_book_tools(ctx)
+        if _book:
+            tools.extend(_book)
+            tool_logger.info("Book navigation tools registered (%d)", len(_book))
+    except ImportError:
+        pass
+    except Exception as e:
+        tool_logger.warning("Book tools registration failed: %s", e)
 
     return tools
 

@@ -59,6 +59,7 @@ def publish_thinking_trace(
     full_schema: bool = False,
     preffered_language: str = 'en-US',
     action: str = CHAT_ACTION_THINKING,
+    page_image_url: str = '',
 ) -> bool:
     """Build a priority-49 'Thinking' bubble + publish to the user's chat topic.
 
@@ -77,6 +78,12 @@ def publish_thinking_trace(
             status pushes.
         preffered_language: Language tag (typo preserved). Only
             emitted when full_schema=True.
+        page_image_url: URL of a page image the bubble is quoting —
+            e.g. '/uploads/pdf_parse/<stem>/page_7.jpg' from
+            integrations/learning/book_tools.py. Only emitted when
+            full_schema=True (the non-full envelope has never carried
+            the field). Defaults to '' so existing callers produce a
+            byte-identical envelope.
 
     Returns:
         True if publish_async was invoked, False if HARTOS publisher
@@ -106,7 +113,13 @@ def publish_thinking_trace(
             'options': [],
             'newoptions': [],
             'bot_type': bot_type,
-            'page_image_url': '',
+            # Was an unconditional '' — the field has been in the wire schema
+            # and parsed by every client all along (web/desktop
+            # Demopage.js:2267 setUploadedImage(parsed.page_image_url);
+            # Android CrossbarAnalogyResponse.java:21 @SerializedName), but
+            # HARTOS never populated it, so no agent could quote a page image.
+            # Default '' keeps every existing caller byte-identical on the wire.
+            'page_image_url': page_image_url or '',
             'analogy_image_url': '',
             'request_id': request_id,
             'msg_id': _msg_id,
