@@ -3593,6 +3593,78 @@ def _reuse_evidence_count(group_chat):
         return -1
 
 
+def _reuse_own_tool_progress(user_prompt, action_id, group_chat, agents):
+    """How many of THIS action's OWN named tools produced a real result.
+
+    The round budget asks "is the action moving?".  ``_reuse_evidence_count``
+    answers "did ANY tool anywhere produce a result", which is a different
+    question, and the gap between them is a live spin: measured 2026-09-10,
+    agent 88719487304 action 9 ("Deliver the final research summary ... to
+    the user"), 22:12:50 -> 22:21:47.  The model called get_data_by_key,
+    save_data_in_memory and txt2img -- image generation, on a delivery
+    action -- while the action's own send_message_to_user and
+    save_to_long_term_memory never ran once.  Every unrelated call raised
+    the global count, reset the allowance and bought another window: 17
+    rounds, 53 tool calls, `unrun` never shrinking, nothing delivered.
+
+    Returns None when the action names NO tool.  There the global count is
+    the only progress signal available, so the caller keeps today's
+    behaviour (D46 already governs whether a prose action may complete).
+    Returns -1 when unmeasurable; callers compare with `>` so uncertainty
+    can never read as progress and extend a budget forever.
+
+    Reuses the gate's own primitives -- ``_reuse_registered_and_referenced_tools``
+    for "which tools does this action name", ``_reuse_evidence_msg_lists`` +
+    ``_reuse_call_id_to_tool_name`` for "what really ran", and the same
+    placeholder/failure exclusions ``_record_result`` applies.  This is the
+    gate's notion of evidence narrowed by NAME, not a second notion of it.
+    """
+    try:
+        task = user_tasks.get(user_prompt)
+        text = str(task.get_action(int(action_id) - 1) or '').lower() if task else ''
+        if not text:
+            return -1
+        _all_names, referenced = _reuse_registered_and_referenced_tools(agents, text)
+        if not referenced:
+            return None
+        wanted = set(referenced)
+        msg_lists = _reuse_evidence_msg_lists(group_chat, agents)
+        call_fn = _reuse_call_id_to_tool_name(msg_lists)
+        ran = set()
+
+        def _credit(call_id, content, fallback_name):
+            body = str(content or '')
+            # Same two exclusions the gate draws: the placeholder is minted
+            # BECAUSE nothing executed, and a tool that ran and reported it
+            # could not do the work has not advanced this action either.
+            if HISTORICAL_TOOL_PLACEHOLDER in body:
+                return
+            if any(f in body for f in TOOL_FAILURE_RESULTS):
+                return
+            fn = call_fn.get(call_id) or fallback_name
+            if fn in wanted:
+                ran.add(fn)
+
+        for _ml in msg_lists:
+            for m in (_ml or []):
+                if not isinstance(m, dict) or m.get('role') != 'tool':
+                    continue
+                # Both live shapes, exactly as _reuse_fabricated_tools reads
+                # them: the aggregate envelope with per-call entries under
+                # `tool_responses`, and the flat per-call message.
+                responses = m.get('tool_responses')
+                if isinstance(responses, list) and responses:
+                    for r in responses:
+                        if isinstance(r, dict):
+                            _credit(r.get('tool_call_id'), r.get('content'),
+                                    r.get('name'))
+                else:
+                    _credit(m.get('tool_call_id'), m.get('content'), m.get('name'))
+        return len(ran)
+    except Exception:
+        return -1
+
+
 def _reuse_current_action_id(user_prompt):
     """The action the pipeline believes it is on, or None if unreadable.
 
@@ -5079,7 +5151,12 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         # recipe is unreachable no matter how well it would have run.
         _action_rounds = 0                # spent on the CURRENT action
         count = 0                         # spent on the whole turn
-        _action_evidence = _reuse_evidence_count(group_chat)  # progress mark
+        _budget_action = _reuse_current_action_id(user_prompt)
+        _action_evidence = _reuse_own_tool_progress(
+            user_prompt, _budget_action, group_chat,
+            getattr(group_chat, 'agents', None) or [])
+        if _action_evidence is None:
+            _action_evidence = _reuse_evidence_count(group_chat)  # progress mark
         _budget_action = _reuse_current_action_id(user_prompt)
         _round_budget = _reuse_turn_round_budget(user_prompt)
         _reuse_advanced_actions = set()  # one robust completion-advance per action id
@@ -5390,7 +5467,11 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     # allowance instead of inheriting a spent counter.
                     _budget_action = _now_action
                     _action_rounds = 0
-                    _action_evidence = _reuse_evidence_count(group_chat)
+                    _action_evidence = _reuse_own_tool_progress(
+                        user_prompt, _now_action, group_chat,
+                        getattr(group_chat, 'agents', None) or [])
+                    if _action_evidence is None:
+                        _action_evidence = _reuse_evidence_count(group_chat)
                 # PROGRESS RESETS THE ALLOWANCE.  Measured 2026-09-09:
                 # action 2's tool executed at 05:55:49,887 and the per-action
                 # cap ended the turn at 05:55:50,332 — 0.445 s later, with
@@ -5400,11 +5481,19 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 # working, so it earns a fresh window; the TURN ceiling above
                 # still bounds the whole thing, and an unmeasurable evidence
                 # count (-1) can never satisfy `>`.
-                _evidence_now = _reuse_evidence_count(group_chat)
+                # PROGRESS MEANS THIS ACTION'S OWN TOOLS.  A global count
+                # lets unrelated calls buy a fresh window forever -- agent
+                # 88719487304 action 9, 2026-09-10 22:12:50-22:21:47, 17
+                # rounds / 53 calls with unrun never shrinking.
+                _evidence_now = _reuse_own_tool_progress(
+                    user_prompt, _now_action, group_chat,
+                    getattr(group_chat, 'agents', None) or [])
+                if _evidence_now is None:
+                    _evidence_now = _reuse_evidence_count(group_chat)
                 if _evidence_now > _action_evidence:
                     current_app.logger.info(
                         f"[REUSE-ROUNDS] action {_now_action} produced new tool "
-                        f"evidence ({_action_evidence} -> {_evidence_now}) — "
+                        f"its own tool(s) ({_action_evidence} -> {_evidence_now}) — "
                         f"resetting its round allowance (turn spend "
                         f"{count}/{_round_budget})")
                     _action_evidence = _evidence_now
@@ -6609,7 +6698,12 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
 
                 count = 0                  # spent on the whole turn
                 _action_rounds = 0         # spent on the CURRENT action
-                _action_evidence = _reuse_evidence_count(group_chat)
+                _budget_action = _reuse_current_action_id(user_prompt)
+                _action_evidence = _reuse_own_tool_progress(
+                    user_prompt, _budget_action, group_chat,
+                    getattr(group_chat, 'agents', None) or [])
+                if _action_evidence is None:
+                    _action_evidence = _reuse_evidence_count(group_chat)
                 _budget_action = _reuse_current_action_id(user_prompt)
                 _round_budget = _reuse_turn_round_budget(user_prompt)
                 while True:
@@ -6695,12 +6789,24 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                     if _now_action != _budget_action:
                         _budget_action = _now_action
                         _action_rounds = 0
-                        _action_evidence = _reuse_evidence_count(group_chat)
-                    _evidence_now = _reuse_evidence_count(group_chat)
+                        _action_evidence = _reuse_own_tool_progress(
+                            user_prompt, _now_action, group_chat,
+                            getattr(group_chat, 'agents', None) or [])
+                        if _action_evidence is None:
+                            _action_evidence = _reuse_evidence_count(group_chat)
+                    # PROGRESS MEANS THIS ACTION'S OWN TOOLS.  A global count
+                    # lets unrelated calls buy a fresh window forever -- agent
+                    # 88719487304 action 9, 2026-09-10 22:12:50-22:21:47, 17
+                    # rounds / 53 calls with unrun never shrinking.
+                    _evidence_now = _reuse_own_tool_progress(
+                        user_prompt, _now_action, group_chat,
+                        getattr(group_chat, 'agents', None) or [])
+                    if _evidence_now is None:
+                        _evidence_now = _reuse_evidence_count(group_chat)
                     if _evidence_now > _action_evidence:
                         current_app.logger.info(
                             f"[REUSE-ROUNDS] action {_now_action} produced new tool "
-                            f"evidence ({_action_evidence} -> {_evidence_now}) — "
+                            f"its own tool(s) ({_action_evidence} -> {_evidence_now}) — "
                             f"resetting its round allowance (turn spend "
                             f"{count}/{_round_budget})")
                         _action_evidence = _evidence_now
