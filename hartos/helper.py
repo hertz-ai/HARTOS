@@ -2503,11 +2503,33 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
     '''
     import json as _json
     start_time = time.time()
-    try:
-        user_id = int(session_id.replace("user_", ""))
-    except Exception as e:
+    # THE ID STAYS A STRING.  Both consumers below already take one —
+    # `ConversationEntry.user_id == str(user_id)` converts straight back, and
+    # SimpleMemChatMemory.load_or_create takes it as-is — so int() never did
+    # anything except narrow the accepted id space.  Nunba's guest ids are
+    # UUIDs, so that narrowing made this function return EMPTY for them
+    # before querying any store.
+    #
+    # Measured live 2026-09-10, agent 92583386981, 50 ms apart:
+    #   14:58:55,851 WARNING bad session_id user_3e2908ac-3ff6-4198-bc46-
+    #                9ec43a2aac9a: invalid literal for int() with base 10
+    #   14:58:55,901 tool    {"res": []}   (= get_chat_history)
+    # The caller cannot tell that from "you have no history", and the model
+    # filled the gap by inventing a CEFR level for the user (#817/D52).
+    #
+    # NO REGRESSION for numeric ids: str(int('123')) == '123' == str('123'),
+    # and the DB filter is the only place the value is used, so what gets
+    # queried is unchanged for every integer user.
+    user_id = str(session_id or '')
+    if user_id.startswith('user_'):
+        user_id = user_id[len('user_'):]
+    if not user_id.strip():
+        # Still refused — an empty id is not a user, and querying on it would
+        # match whatever rows carry an empty user_id.
         try:
-            current_app.logger.warning(f"get_time_based_history: bad session_id {session_id}: {e}")
+            current_app.logger.warning(
+                f"get_time_based_history: no user id in session_id "
+                f"{session_id!r}")
         except Exception:
             pass
         return _json.dumps({'res': []})
