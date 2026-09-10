@@ -410,6 +410,9 @@ class Action:
         # action cannot inherit credit for an earlier action's tool run.
         # Empty for action 1 — nothing has run yet, so nothing to discount.
         self.evidence_seen_call_ids = set()
+        # Action id whose named tools ALL returned empty, stamped as that
+        # action finishes; None when the last one got data (or ran no tool).
+        self.evidence_vacuous_action = None
 
     def get_action(self, current_action):
         try:
@@ -4134,8 +4137,17 @@ def _reuse_result_is_vacuous(body):
     return _empty(v)
 
 
-def _reuse_tool_results_all_vacuous(group_chat, agents, seen_ids):
-    """True ONLY when this action ran tools and EVERY result was empty.
+def _reuse_tool_results_all_vacuous(group_chat, agents, seen_ids, names):
+    """True ONLY when the tools this action NAMED all came back empty.
+
+    `names` is the action's REFERENCED tools.  Judging any tool result was
+    the defect: live 2026-09-10 15:37, action 1 named ['get_chat_history']
+    and its result was {"res_in_filter": []}, but send_message_to_user had
+    also run and its receipt -- "Message sent successfully to user with
+    request_id: ..." -- is not JSON, so the vacuity test failed open and one
+    unnamed delivery tool's ACK vetoed the whole gate.  This family's rule,
+    already stated above _reuse_fabricated_tools, is to key on the SPECIFIC
+    function name and never on "any tool ran".
 
     Reads through ``_reuse_evidence_msg_lists`` — the ONE definition of where
     tool evidence lives — so this cannot look somewhere the fabrication gate
@@ -4151,9 +4163,13 @@ def _reuse_tool_results_all_vacuous(group_chat, agents, seen_ids):
     behaviour, i.e. this can only ever REPLACE an invented answer, never
     suppress a real one.
     """
+    if not names:
+        return False
     found = False
     try:
-        for _ml in _reuse_evidence_msg_lists(group_chat, agents):
+        _lists = _reuse_evidence_msg_lists(group_chat, agents)
+        _call_fn = _reuse_call_id_to_tool_name(_lists)
+        for _ml in _lists:
             for m in (_ml or []):
                 if not isinstance(m, dict) or m.get('role') != 'tool':
                     continue
@@ -4165,6 +4181,8 @@ def _reuse_tool_results_all_vacuous(group_chat, agents, seen_ids):
                     _cid = r.get('tool_call_id') or m.get('tool_call_id')
                     if _cid and _cid in (seen_ids or set()):
                         continue           # an earlier action's work
+                    if _call_fn.get(_cid) not in names:
+                        continue           # not a tool this action named
                     found = True
                     if not _reuse_result_is_vacuous(r.get('content')):
                         return False
@@ -4242,17 +4260,20 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
         # grounded, and recovering it would just deliver the same invention
         # by another route.
         #
-        # Same watermark the fabrication gate uses, so a previous action's
-        # empty result cannot speak for this one.
+        # READ, never recompute.  By the time this runs the action pointer
+        # has moved past the recipe and the watermark has swallowed the very
+        # results that would have to be judged, so the answer has to be
+        # taken while the action is still current -- see
+        # _stamp_action_result_vacuity for the 48 ms that proved it.
+        # Honoured only for the action that just finished, so a flag left by
+        # an earlier turn cannot speak for this one.
         try:
-            _seen_ids = getattr(user_tasks.get(user_prompt),
-                                'evidence_seen_call_ids', None)
+            _t = user_tasks.get(user_prompt)
+            _va = getattr(_t, 'evidence_vacuous_action', None)
+            _cur = getattr(_t, 'current_action', None)
         except Exception:
-            _seen_ids = None
-        _seen_ids = _seen_ids if isinstance(_seen_ids, (set, frozenset)) else set()
-        if _reuse_tool_results_all_vacuous(
-                group_chat, getattr(group_chat, 'agents', None) or [],
-                _seen_ids):
+            _va = _cur = None
+        if _va is not None and _cur is not None and (_cur - 1) == _va:
             try:
                 group_chat.messages.append({'content': _REUSE_NO_DATA_REPORT,
                                             'name': 'Assistant',
@@ -4484,6 +4505,105 @@ def _stamp_action_evidence_watermark(user_prompt):
         _ctx_safe_log('debug', f"evidence watermark skipped: {err}")
 
 
+def _stamp_action_result_vacuity(user_prompt, action_id):
+    """Record whether the action that just finished got DATA back.
+
+    Called from the ONE site that advances ``current_action``, BEFORE it
+    moves and BEFORE the watermark is re-stamped -- because both facts this
+    needs are gone one line later.  That is exactly why the synthesis turn
+    could not compute it for itself.  Measured live 2026-09-10 on a
+    ONE-action recipe (agent 92583386981):
+
+        15:37:31,777  [REUSE] Action 1 TERMINATED, advancing
+        15:37:31,780  [FAB-GUARD] watermark for action 2: 20 pre-existing
+        15:37:31,782  [REUSE] All 1 actions completed
+        15:37:31,828  [SYNTHESIS] ... unrun=none
+
+    48 ms apart.  By synthesis every call id the gate had to judge was
+    already inside ``evidence_seen_call_ids`` and got skipped as "an earlier
+    action's work", and ``current_action`` was 2 with only one action, so
+    the action text was out of range too.  The gate shipped, was reachable,
+    and fired zero times.
+
+    Stamps on EVERY completion, including False, so a later prose action can
+    never inherit an earlier lookup's emptiness.  Records the action id with
+    it so a stale flag from a previous turn cannot be honoured.
+
+    Reaches the group chat exactly as _stamp_action_evidence_watermark does
+    (get_registered_groupchat), so there is no new plumbing.  Never raises:
+    it sits on the path that produces the user's reply.
+    """
+    task = user_tasks.get(user_prompt)
+    if task is None:
+        return
+    task.evidence_vacuous_action = None
+    try:
+        from hartos.lifecycle_hooks import get_registered_groupchat
+        gc = get_registered_groupchat(user_prompt)
+        if gc is None:
+            return
+        agents = getattr(gc, 'agents', None) or []
+        _names, _referenced = _reuse_registered_and_referenced_tools(
+            agents, task.get_action(action_id - 1))
+        _seen = getattr(task, 'evidence_seen_call_ids', None)
+        _seen = _seen if isinstance(_seen, (set, frozenset)) else set()
+        if _reuse_tool_results_all_vacuous(gc, agents, _seen,
+                                           set(_referenced)):
+            task.evidence_vacuous_action = action_id
+            _ctx_safe_log('info',
+                          f"[FAB-GUARD] action {action_id} ran "
+                          f"{sorted(_referenced)} and EVERY result was "
+                          f"empty for session: {user_prompt}")
+    except Exception as err:
+        _ctx_safe_log('debug', f"result-vacuity stamp skipped: {err}")
+
+
+def _reuse_registered_and_referenced_tools(agents, action_text):
+    """(every registered tool name, the ones this action's TEXT names).
+
+    Lifted verbatim out of _reuse_fabricated_tools so the vacuity stamp asks
+    the same question by the same rule.  Two callers, ONE derivation: a
+    second copy would drift the moment either side changed what counts as
+    "this action names that tool".
+    """
+    names = set()
+    for ag in (agents or []):
+        try:
+            names.update((getattr(ag, '_function_map', None) or {}).keys())
+        except Exception:
+            pass
+        cfg = getattr(ag, 'llm_config', None)
+        if isinstance(cfg, dict):
+            for t in (cfg.get('tools') or []):
+                fn = ((t or {}).get('function') or {}).get('name')
+                if fn:
+                    names.add(fn)
+    text = str(action_text or '').lower()
+    referenced = [n for n in names if n and len(n) > 3 and n.lower() in text]
+    return names, referenced
+
+
+def _reuse_call_id_to_tool_name(msg_lists):
+    """call_id -> function name, read off the PROPOSING assistant message.
+
+    A tool result's own `name` is the EXECUTING AGENT, never the function, so
+    this join is the only way to say which tool a result belongs to.  Lifted
+    out of _reuse_fabricated_tools for the vacuity stamp; one rule, no second
+    vocabulary.
+    """
+    out = {}
+    for _ml in (msg_lists or []):
+        for m in (_ml or []):
+            if not isinstance(m, dict):
+                continue
+            for tc in (m.get('tool_calls') or []):
+                _cid = (tc or {}).get('id')
+                _fn = ((tc or {}).get('function') or {}).get('name')
+                if _cid and _fn:
+                    out[_cid] = _fn
+    return out
+
+
 def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
     """Registered tool names the current action NAMES but that produced ZERO
     tool results anywhere in the group chat — i.e. a fabricated 'completed'.
@@ -4500,19 +4620,7 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         text = str(task.get_action(current_action - 1) or '').lower() if task else ''
         if not text:
             return []
-        names = set()
-        for ag in agents:
-            try:
-                names.update((getattr(ag, '_function_map', None) or {}).keys())
-            except Exception:
-                pass
-            cfg = getattr(ag, 'llm_config', None)
-            if isinstance(cfg, dict):
-                for t in (cfg.get('tools') or []):
-                    fn = ((t or {}).get('function') or {}).get('name')
-                    if fn:
-                        names.add(fn)
-        referenced = [n for n in names if n and len(n) > 3 and n.lower() in text]
+        names, referenced = _reuse_registered_and_referenced_tools(agents, text)
         if not referenced:
             return []
         # Which of the referenced tools ACTUALLY executed?  A tool ran if a
@@ -4580,16 +4688,7 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         except Exception:
             _seen = None
         _seen = _seen if isinstance(_seen, (set, frozenset)) else set()
-        _call_fn = {}
-        for _ml in _msg_lists:
-            for m in (_ml or []):
-                if not isinstance(m, dict):
-                    continue
-                for tc in (m.get('tool_calls') or []):
-                    _cid = (tc or {}).get('id')
-                    _fn = ((tc or {}).get('function') or {}).get('name')
-                    if _cid and _fn:
-                        _call_fn[_cid] = _fn
+        _call_fn = _reuse_call_id_to_tool_name(_msg_lists)
 
         def _record_result(call_id, content, fallback_name=None):
             """Count one tool RESULT, resolved to its function name."""
@@ -5657,6 +5756,9 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             f"[REUSE] Action {current_action_id} already TERMINATED (idempotent)")
 
     current_app.logger.info(f'[REUSE] Action {current_action_id} TERMINATED, advancing')
+    # BEFORE the pointer and the watermark move -- this is the last moment
+    # the finished action's evidence can still be scoped correctly.
+    _stamp_action_result_vacuity(user_prompt, current_action_id)
     next_id = current_action_id + 1
     user_tasks[user_prompt].current_action = next_id
     # Stamp the evidence watermark HERE — the one site that writes

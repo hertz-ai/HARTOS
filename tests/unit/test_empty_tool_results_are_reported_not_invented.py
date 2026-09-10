@@ -55,6 +55,8 @@ MODULE = os.path.join(
     'hartos', 'reuse_recipe.py')
 
 _WANTED = ('_reuse_result_is_vacuous', '_reuse_tool_results_all_vacuous',
+           '_reuse_call_id_to_tool_name',
+           '_reuse_registered_and_referenced_tools',
            '_reuse_is_pipeline_text', '_reuse_is_written_answer',
            '_reuse_message_is_user_answer')
 
@@ -133,35 +135,112 @@ class TestVacuityOfOneResult:
 
 class TestVacuityAcrossTheAction:
 
-    def _tool_msg(self, cid, body):
-        return {'role': 'tool', 'tool_responses': [
-            {'tool_call_id': cid, 'role': 'tool', 'content': body}]}
+    def _chat(self, *calls):
+        """(tool_name, call_id, body) -> a proposal + its result, as autogen
+        records them.  The result's own `name` is the EXECUTING AGENT, so the
+        function name is only knowable through the proposing message."""
+        msgs = []
+        for name, cid, body in calls:
+            msgs.append({'role': 'assistant', 'content': None, 'tool_calls': [
+                {'id': cid, 'function': {'name': name, 'arguments': '{}'}}]})
+            msgs.append({'role': 'tool', 'tool_responses': [
+                {'tool_call_id': cid, 'role': 'tool', 'content': body}]})
+        return msgs
 
     def test_all_empty_is_reported(self):
         f = _ns()['_reuse_tool_results_all_vacuous']
-        gc = [self._tool_msg('a', '{"res_in_filter": []}'),
-              self._tool_msg('b', '{"res": []}')]
-        assert f(gc, [], set())
+        gc = self._chat(('get_chat_history', 'a', '{"res_in_filter": []}'),
+                        ('recall_memory', 'b', '{"res": []}'))
+        assert f(gc, [], set(), {'get_chat_history', 'recall_memory'})
 
     def test_one_substantive_result_declines_the_gate(self):
         f = _ns()['_reuse_tool_results_all_vacuous']
-        gc = [self._tool_msg('a', '{"res_in_filter": []}'),
-              self._tool_msg('b', '{"res": [{"message": {"content": "x"}}]}')]
-        assert not f(gc, [], set())
+        gc = self._chat(('get_chat_history', 'a', '{"res_in_filter": []}'),
+                        ('recall_memory', 'b',
+                         '{"res": [{"message": {"content": "x"}}]}'))
+        assert not f(gc, [], set(), {'get_chat_history', 'recall_memory'})
 
     def test_no_tool_results_at_all_declines_the_gate(self):
         """A PROSE action names no tool and produces no results; it must
         never be answered with 'the lookup came back empty'."""
         f = _ns()['_reuse_tool_results_all_vacuous']
         gc = [{'role': 'assistant', 'content': 'here is your summary'}]
-        assert not f(gc, [], set())
+        assert not f(gc, [], set(), set())
 
     def test_results_from_an_earlier_action_are_ignored(self):
         """Scoped by the same evidence watermark the fabrication gate uses,
         so one stale empty result cannot speak for this action."""
         f = _ns()['_reuse_tool_results_all_vacuous']
-        gc = [self._tool_msg('old', '{"res": []}')]
-        assert not f(gc, [], {'old'})
+        gc = self._chat(('get_chat_history', 'old', '{"res": []}'))
+        assert not f(gc, [], {'old'}, {'get_chat_history'})
+
+    def test_an_unnamed_tools_receipt_cannot_veto_the_gate(self):
+        """THE LIVE SHAPE, 2026-09-10 15:37 (agent 92583386981).
+
+        FAB-GUARD: `action 1 names tool(s) ['get_chat_history']`.  Two results
+        existed -- the named lookup came back {"res_in_filter": []}, and
+        send_message_to_user (which the action never named) returned a plain
+        success receipt.  The receipt is not JSON, so vacuity fails open and
+        the gate returned False: the whole thing was silent because a delivery
+        tool said "sent".
+        """
+        f = _ns()['_reuse_tool_results_all_vacuous']
+        gc = self._chat(
+            ('get_chat_history', 'c1', '{"res_in_filter": []}'),
+            ('send_message_to_user', 'c2',
+             'Message sent successfully to user with request_id: '
+             'walk-92583386981-153418-intermediate'))
+        assert f(gc, [], set(), {'get_chat_history'}), (
+            'a success receipt from an UNNAMED tool still vetoes the '
+            'gate -- the exact pair measured live 2026-09-10 15:37')
+
+    def test_a_named_delivery_tool_still_counts(self):
+        """No tool is special-cased: if the ACTION names it, its result is
+        judged like any other.  The filter is provenance, not a blocklist."""
+        f = _ns()['_reuse_tool_results_all_vacuous']
+        gc = self._chat(('send_message_to_user', 'c2', 'Message sent'))
+        assert not f(gc, [], set(), {'send_message_to_user'})
+
+    def test_an_unresolvable_result_is_not_judged(self):
+        """No proposing message -> no function name -> not attributable to a
+        named tool, so it neither triggers nor vetoes."""
+        f = _ns()['_reuse_tool_results_all_vacuous']
+        gc = [{'role': 'tool', 'tool_call_id': 'orphan',
+               'content': '{"res": []}'}]
+        assert not f(gc, [], set(), {'get_chat_history'})
+
+
+class TestReferencedToolsDerivation:
+    """The extracted derivation must keep the fabrication gate's own rule."""
+
+    class _Ag:
+        def __init__(self, fns):
+            self._function_map = {f: None for f in fns}
+            self.llm_config = None
+
+    def test_only_tools_the_text_names_are_referenced(self):
+        f = _ns()['_reuse_registered_and_referenced_tools']
+        ag = self._Ag(['get_chat_history', 'google_search'])
+        names, ref = f([ag], 'First recall my progress via get_chat_history')
+        assert 'get_chat_history' in names and 'google_search' in names
+        assert ref == ['get_chat_history']
+
+    def test_short_names_are_not_matched(self):
+        """len(n) > 3 in the original -- keep it, or 'run'/'get' match prose."""
+        f = _ns()['_reuse_registered_and_referenced_tools']
+        names, ref = f([self._Ag(['run'])], 'run the thing')
+        assert ref == []
+
+
+class TestCallIdResolution:
+
+    def test_name_comes_from_the_proposal_not_the_result(self):
+        f = _ns()['_reuse_call_id_to_tool_name']
+        msgs = [{'role': 'assistant', 'tool_calls': [
+                    {'id': 'x', 'function': {'name': 'get_chat_history'}}]},
+                {'role': 'tool', 'tool_call_id': 'x', 'name': 'Assistant',
+                 'content': '{}'}]
+        assert f([msgs]) == {'x': 'get_chat_history'}
 
 
 class TestTheReportIsDeliverable:
@@ -188,13 +267,87 @@ class TestTheReportIsDeliverable:
 
 class TestTheSynthesisTurnConsultsIt:
 
-    def test_gate_is_wired_into_the_synthesis_turn(self):
+    def test_the_no_data_report_is_reachable_from_the_synthesis_turn(self):
+        """The pipeline must have a branch that reports the absence instead
+        of asking the model for an answer it has no data for.
+
+        Asserts the BRANCH, not who computes the predicate: the first cut
+        computed it inline here and that was measurably too late (see
+        TestTheAnswerIsTakenWhileTheActionIsStillCurrent).  What must not
+        regress is that some branch of this function delivers
+        _REUSE_NO_DATA_REPORT.
+
+        Measured live 3x on agent 92583386981 (14:58, 15:14, 15:23) -- the
+        last WITH an explicit honesty instruction delivered -- and it invented
+        a CEFR level every time.  Then a 4th run (15:34) with the gate shipped
+        but silent, which is what these tests now pin down.
+        """
+        fn = _fn_node('_reuse_synthesis_turn')
+        assert any(isinstance(n, ast.Name)
+                   and n.id == '_REUSE_NO_DATA_REPORT'
+                   for n in ast.walk(fn)), (
+            '_reuse_synthesis_turn has no branch that reports an empty '
+            'lookup; it can only ever ask the model to write the answer')
+
+
+class TestTheAnswerIsTakenWhileTheActionIsStillCurrent:
+    """The 48 ms that made the first cut of this gate silent.
+
+    _advance_reuse_action moves `current_action` and then re-stamps the
+    evidence watermark.  After those two lines the finished action's tool
+    calls are all inside the watermark and its text is out of range, so
+    nothing downstream can scope evidence to it any more.  The vacuity answer
+    must therefore be taken BEFORE both.
+    """
+
+    def _adv(self):
+        return _fn_node('_advance_reuse_action')
+
+    def _line_of_call(self, fn, name):
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Call) and getattr(n.func, 'id', '') == name:
+                return n.lineno
+        return None
+
+    def test_vacuity_is_stamped_from_the_advance_site(self):
+        assert self._line_of_call(self._adv(),
+                                  '_stamp_action_result_vacuity') is not None, (
+            'nothing records whether the finished action got data back, so '
+            'the synthesis turn has only the post-advance state to read -- '
+            'which is what made the gate fire 0x on 2026-09-10 15:37')
+
+    def test_vacuity_is_stamped_before_the_watermark_moves(self):
+        fn = self._adv()
+        vac = self._line_of_call(fn, '_stamp_action_result_vacuity')
+        mark = self._line_of_call(fn, '_stamp_action_evidence_watermark')
+        assert vac is not None and mark is not None
+        assert vac < mark, (
+            'the watermark is re-stamped first, so by the time vacuity is '
+            'computed the action-s own tool calls are already inside it and '
+            'every result gets skipped as "an earlier action-s work"')
+
+    def test_vacuity_is_stamped_before_the_pointer_moves(self):
+        """current_action must still name the finished action."""
+        fn = self._adv()
+        vac = self._line_of_call(fn, '_stamp_action_result_vacuity')
+        moves = [n.lineno for n in ast.walk(fn)
+                 if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Attribute)
+                         and t.attr == 'current_action' for t in n.targets)]
+        assert vac is not None and moves
+        assert vac < min(moves), (
+            'the pointer advances first; with a 1-action recipe that leaves '
+            'current_action past the end and the action text out of range')
+
+    def test_synthesis_reads_the_stamp_and_does_not_recompute_it(self):
         fn = _fn_node('_reuse_synthesis_turn')
         called = {getattr(n.func, 'id', '') for n in ast.walk(fn)
                   if isinstance(n, ast.Call)}
-        assert '_reuse_tool_results_all_vacuous' in called, (
-            '_reuse_synthesis_turn still asks the model to synthesise an '
-            'answer even when every tool result was empty. Measured live 3x '
-            'on agent 92583386981 (14:58, 15:14, 15:23) — the last of those '
-            'WITH an explicit honesty instruction delivered — and it '
-            'invented a CEFR level every time.')
+        assert '_reuse_tool_results_all_vacuous' not in called, (
+            'the synthesis turn still computes vacuity for itself; at that '
+            'point the watermark and the action pointer have both moved past '
+            'the evidence, so the answer is always False')
+        assert any(isinstance(n, ast.Constant)
+                   and n.value == 'evidence_vacuous_action'
+                   for n in ast.walk(fn)), (
+            'the synthesis turn never reads the stamped answer')
