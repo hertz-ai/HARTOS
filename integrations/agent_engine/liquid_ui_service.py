@@ -1961,6 +1961,23 @@ class LiquidUIService:
         if 'orb' in native_chrome:
             native_orb_css = (
                 '.hart-hero-orbwrap>canvas,#hart-voice-orb,'
+                # The ONBOARDING orb, added 2026-09-10 from an owner report.
+                # They saw the screen alternating between two scenes: the
+                # compositor's own orb (a glow sphere with a DASHED orbital
+                # ring, right of centre) and the onboarding's sphere (plain,
+                # top centre). Their read was "two compositors trying to
+                # render", and that is right in the way that matters -- one
+                # compositor process, but TWO render paths each drawing a
+                # full-screen scene with an orb in it.
+                #
+                # This list exists precisely to stop that: when the compositor
+                # claims the orb, the shell stands its own down. It covered the
+                # hero orb, the voice orb and the orbit rings, and `.hob-orb`
+                # was simply never added, so onboarding kept drawing a second
+                # one. `visibility:hidden` rather than `display:none` on
+                # purpose, exactly as the neighbours above: the element keeps
+                # its box, so the ceremony's layout does not reflow.
+                '.hart-onboarding .hob-orb,'
                 '.hart-orb-orbit,.hart-orb-orbit2{visibility:hidden;animation:none}'
             )
         # The SAME verdict, handed to script as well as to CSS. The CSS above
