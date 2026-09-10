@@ -4658,6 +4658,21 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
     # is what moves current_action) and above the branch, so the advance and
     # the re-steer are covered by one call rather than two that can drift.
     _narrow_assistant_to_current_action(user_prompt)
+    # ...and its TOOLS, for the same reason and at the same moment.  The
+    # prompt now names the new action; without this the agent still carries
+    # only the tools the PREVIOUS action needed, because the attach used to
+    # run once per get_agent_response call while the pointer moves many times
+    # inside it (measured: 2 attach lines across two drives, both action 1,
+    # 6-9 actions walked each time -- see _attach_named_tools_for_action).
+    #
+    # HERE and not in the two walk loops, because this is the only place the
+    # pointer can move: current_action is written at exactly one line (:6160,
+    # in _advance_reuse_action) which has exactly one caller (:4652, just
+    # above).  One call therefore covers all six _advance_or_steer sites and
+    # BOTH loops -- get_agent_response's and chat_agent's.  The SUBTASK-HOLD
+    # return above deliberately does not get one: it fires BEFORE the advance,
+    # so the pointer has not moved and the action's tools are already on.
+    _attach_named_tools_for_action(user_prompt)
 
     if not advanced:
         # A fabrication refusal is NOT "all actions done" — it wants the
@@ -5136,10 +5151,6 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 # scale: 8,799 "Error: Function <X> not found" across the log
                 # rotations — send_message_to_user x1618 (the path that returns
                 # the agent's result to the user), get_user_details x908.
-                try:
-                    _aid = user_tasks[user_prompt].current_action
-                except Exception:
-                    _aid = None
                 # Narrow the system prompt to the action being dispatched.
                 # The prompt is built ONCE at construction (L1328) and cached
                 # in user_agents, so without this every turn ships all N
@@ -5150,71 +5161,13 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 # with the advance path: see _narrow_assistant_to_current_action.
                 _narrow_assistant_to_current_action(user_prompt)
 
-                _named = _reuse_action_tool_names(user_prompt, _aid) if _aid else []
-                if _named:
-                    from core.agent_tools import attach_for_names
-                    _nn = attach_for_names(_named, helper, assistant,
-                                           service_tool_registry,
-                                           assistant._hart_attached_tools,
-                                           core_tools=getattr(
-                                               assistant, '_hart_core_tools', None))
-                    # Log BOTH outcomes, not just the non-zero one.  The old
-                    # `if _nn:` made a resolved-nothing round indistinguishable
-                    # from a round that never ran, and that is exactly how this
-                    # hook read as healthy while doing nothing: measured live
-                    # 2026-09-07/08 over 23 driven agents, "Tier-1 named attach"
-                    # appeared ZERO times and no line said why.
-                    # The SESSION KEY belongs on this half too.  These two
-                    # branches are one diagnostic pair -- the whole point is
-                    # telling a resolved-nothing round from a real one -- so
-                    # identifying only the empty half leaves the other half
-                    # exactly as unattributable as before.  MEASURED 2026-09-11
-                    # 01:47:46, minutes after the empty branch gained its key:
-                    # "action 1 names ['google_search'] -> 1 tools" arrived
-                    # with a reuse walk in flight AND daemon traffic AND a
-                    # second user's agents on the box, and there was no way to
-                    # say whose it was.
-                    current_app.logger.info(
-                        f"Tier-1 named attach: action {_aid} names {_named} "
-                        f"-> {_nn} tools for session: {user_prompt}")
-                elif _aid:
-                    # INFO, not debug.  gui_app.log captured ZERO "- DEBUG -"
-                    # lines across the whole 2026-09-11 drive, so at debug this
-                    # branch never reaches production and a resolved-nothing
-                    # round stays indistinguishable from one that never ran --
-                    # the exact gap the comment above says the both-outcomes
-                    # logging was added to close.  Measured rid d62-232532:
-                    # "Tier-1 prompt narrow" fired for actions 1,2,3,4 (the
-                    # statement immediately above), "Tier-1 named attach" for
-                    # action 1 only, and nothing said why.
-                    #
-                    # The COUNT is what separates []'s causes, which is why it
-                    # is in the line: 0 = no recipe stored for this session
-                    # (the helper's `except` swallowed a KeyError), n < _aid =
-                    # the id is past the end of the stored list, n >= _aid =
-                    # the action genuinely names no tool.  Offline against the
-                    # real recipe the helper returns non-empty for every one of
-                    # actions 1,2,3,4,9, so live [] is the STORE, not the
-                    # helper -- five hypotheses were eliminated for want of
-                    # this one number (#828).
-                    # ...and the SESSION KEY, because the count alone is not
-                    # attributable on a live box.  Measured 2026-09-11 on the
-                    # first drive that carried this line: five occurrences all
-                    # read "holds 1 action(s)" while the agent under test
-                    # (88719487304) has NINE actions in both its flow recipes
-                    # on disk -- and the surrounding log showed a rival driver
-                    # (a marketing reuse agent for user cf125371) plus daemon
-                    # traffic in the same window.  444 of 880 stored agents are
-                    # single-action stubs (#758), so "holds 1" is the NORMAL
-                    # reading for a stub and says nothing about this agent.
-                    # Without the key the number cannot be attributed to a
-                    # session, which is the same ambiguity this line exists to
-                    # remove -- so it names the session it measured.
-                    _store = (recipes.get(user_prompt) or {}).get('actions') or []
-                    current_app.logger.info(
-                        f"Tier-1 named attach: action {_aid} names no tool "
-                        f"(recipes store holds {len(_store)} action(s)) "
-                        f"for session: {user_prompt}")
+                # ONE call, not the six lines that used to sit here.  They ran
+                # exactly once per entry into this function while the walk
+                # advances many actions in the loop below, so actions 2..N were
+                # dispatched with action 1's tools -- see the helper's docstring
+                # for the two-line live measurement.  The second caller is
+                # _advance_or_steer, the one door every advance goes through.
+                _attach_named_tools_for_action(user_prompt)
 
                 # (b) TAGS — unchanged fallback for capability families the
                 # recipe never mentions but the conversation drifted into.
@@ -5233,7 +5186,16 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     current_app.logger.info(
                         f"Tier-1 turn attach: +{_new} -> {_n} tools")
         except Exception as _e:
-            current_app.logger.debug(f"turn attach skipped: {_e}")
+            # WARNING, not debug -- same class as d6495f499.  This handler
+            # wraps the narrow, the named attach and the tag attach, so a
+            # raise here dispatches the turn with the wrong prompt AND the
+            # wrong tools, and at debug it said nothing: gui_app.log captured
+            # 0 of 45,599 lines at DEBUG on this build, which is why the
+            # per-call attach cadence had to be found by ABSENCE of a log
+            # line rather than by an error.
+            current_app.logger.warning(
+                f"turn attach skipped: {_e} for session: {user_prompt}",
+                exc_info=True)
 
         result = user_proxy.initiate_chat(manager,
                                           message=_reuse_seed_message(user_prompt, message),
@@ -6615,6 +6577,140 @@ def _reuse_action_tool_names(user_prompt, action_id):
         return out
     except Exception:
         return []
+
+
+def _attach_named_tools_for_action(user_prompt):
+    """Bind the tools the LEDGER's current action names onto this session.
+
+    Takes no action id, and resolves its own agents — for the same reason
+    ``_narrow_assistant_to_current_action`` does (see its docstring):
+    ``user_tasks[user_prompt].current_action`` is the single field
+    ``_advance_reuse_action`` writes (:6160), so keying off it makes the
+    attached TOOLS and the dispatched COMMAND agree by construction.  An id
+    passed in could be the caller's stale copy.
+
+    WHY THIS IS A FUNCTION AND NOT SIX LINES IN A LOOP.  The block lived
+    inline at the top of ``get_agent_response``, which runs ONCE per entry
+    into that function, while the walk advances through the whole recipe
+    inside the ``while True:`` loop below it.  So the attach was per-CALL and
+    the walk is per-ACTION.  Measured live 2026-09-11 on agent 88719487304
+    (session 6c2dc0fc-7c93-4fe0-973e-f7466ff63f29_88719487304), whole log,
+    no window — TWO "Tier-1 named attach" lines across two drives:
+
+        02:28:34  action 1 names ['google_search'] -> 1 tools
+        03:15:53  action 1 names ['google_search'] -> 1 tools
+
+    while each drive walked 6-9 actions.  Every action past the first was
+    dispatched carrying whatever tools action 1 happened to need.
+
+    WHAT IT COST on that same agent: actions 3, 4 and 7 all name
+    ``execute_coding_task`` — a real tool (core/agent_tools.py:2175,
+    registered :2203), simply never attached.  The fabrication gate correctly
+    demanded it, the model could not call it, and the action died on its
+    round budget:
+
+        03:20:23  refusing to advance action 3 ... unrun=['execute_coding_task']
+        03:22:01  [REUSE] Action 3 TERMINATED, advancing   <- budget spent
+
+    Action 4 went the same way with executed=[].  A force-advance is not
+    achievement, so those read as progress in the advance count while
+    nothing ran.
+
+    Copying the block into the loop would have been a second copy of one
+    rule — the drift this module is already scarred by (``_vlm_merged_actions``
+    docstring: "Three verbatim copies of the merge replaced the flow action
+    wholesale").  One home, two callers: the entry hook in
+    ``get_agent_response``, which covers the first action, and
+    ``_advance_or_steer`` — the ONE door every advance goes through — which
+    covers all the rest, in BOTH walk loops, for all six advance sites.
+
+    Returns the number of tools attached, or False when there was nothing to
+    do.  Never raises: it runs on the dispatch path and must not kill a turn.
+    """
+    try:
+        agents = user_agents.get(user_prompt)
+        if not agents:
+            return False
+        assistant = agents[0]
+        helper = agents[4]
+        # Gate on the set this actually mutates, not on the tags sibling the
+        # inline version tested.  Both are written on adjacent lines at
+        # construction (:2446-2447), so this is the same condition — it just
+        # names the thing it uses.
+        _attached = getattr(assistant, '_hart_attached_tools', None)
+        if _attached is None:
+            return False
+        _aid = user_tasks[user_prompt].current_action
+        if not _aid:
+            return False
+
+        from integrations.service_tools import service_tool_registry
+        _named = _reuse_action_tool_names(user_prompt, _aid)
+        if _named:
+            from core.agent_tools import attach_for_names
+            _nn = attach_for_names(_named, helper, assistant,
+                                   service_tool_registry, _attached,
+                                   core_tools=getattr(
+                                       assistant, '_hart_core_tools', None))
+            # Log BOTH outcomes, not just the non-zero one.  The old
+            # `if _nn:` made a resolved-nothing round indistinguishable from
+            # a round that never ran, and that is exactly how this hook read
+            # as healthy while doing nothing: measured live 2026-09-07/08
+            # over 23 driven agents, "Tier-1 named attach" appeared ZERO
+            # times and no line said why.
+            # The SESSION KEY belongs on this half too.  These two branches
+            # are one diagnostic pair -- the whole point is telling a
+            # resolved-nothing round from a real one -- so identifying only
+            # the empty half leaves the other half exactly as unattributable
+            # as before.  MEASURED 2026-09-11 01:47:46, minutes after the
+            # empty branch gained its key: "action 1 names ['google_search']
+            # -> 1 tools" arrived with a reuse walk in flight AND daemon
+            # traffic AND a second user's agents on the box, and there was no
+            # way to say whose it was.
+            _ctx_safe_log('info',
+                          f"Tier-1 named attach: action {_aid} names {_named} "
+                          f"-> {_nn} tools for session: {user_prompt}")
+            return _nn
+        # INFO, not debug.  gui_app.log captured ZERO "- DEBUG -" lines
+        # across the whole 2026-09-11 drive (0 of 45,599), so at debug this
+        # branch never reaches production and a resolved-nothing round stays
+        # indistinguishable from one that never ran -- the exact gap the
+        # both-outcomes logging was added to close.  Measured rid
+        # d62-232532: "Tier-1 prompt narrow" fired for actions 1,2,3,4 and
+        # "Tier-1 named attach" for action 1 only, with nothing saying why.
+        #
+        # The COUNT is what separates []'s causes, which is why it is in the
+        # line: 0 = no recipe stored for this session (the helper's `except`
+        # swallowed a KeyError), n < _aid = the id is past the end of the
+        # stored list, n >= _aid = the action genuinely names no tool.
+        # Offline against the real recipe the helper returns non-empty for
+        # every one of actions 1,2,3,4,9, so live [] is the STORE, not the
+        # helper -- five hypotheses were eliminated for want of this one
+        # number (#828).
+        # ...and the SESSION KEY, because the count alone is not attributable
+        # on a live box.  Measured 2026-09-11 on the first drive that carried
+        # this line: five occurrences all read "holds 1 action(s)" while the
+        # agent under test (88719487304) has NINE actions in both its flow
+        # recipes on disk -- and the surrounding log showed a rival driver
+        # plus daemon traffic in the same window.  444 of 880 stored agents
+        # are single-action stubs (#758), so "holds 1" is the NORMAL reading
+        # for a stub and says nothing about this agent.
+        _store = (recipes.get(user_prompt) or {}).get('actions') or []
+        _ctx_safe_log('info',
+                      f"Tier-1 named attach: action {_aid} names no tool "
+                      f"(recipes store holds {len(_store)} action(s)) "
+                      f"for session: {user_prompt}")
+        return 0
+    except Exception as err:
+        # WARNING, not debug -- same class as d6495f499.  A failure here
+        # means the action is about to be dispatched without the tools its
+        # own recipe names, which is indistinguishable at the outcome from
+        # the model choosing not to call them.  At debug it said nothing at
+        # all, which is why this defect survived two live drives and had to
+        # be found by ABSENCE of the attach line.
+        _ctx_safe_log('warning',
+                      f"named attach skipped: {err} for session: {user_prompt}")
+        return False
 
 
 # =============================================================================
