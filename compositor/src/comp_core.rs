@@ -2493,6 +2493,27 @@ pub fn effects_animating<S: CompState>(state: &S) -> bool {
 /// counting it would composite at full rate behind a blacked-out screen.
 ///
 /// ONE predicate for both decisions, so "we draw it" and "it animates" can never drift
+/// Whether `HART_NATIVE_SHELL` asks for the native scene. PURE, so the parse is testable
+/// without an environment.
+///
+/// This was `env::var_os(..).is_some()`, which reads the PRESENCE of the variable and not
+/// its value, so `HART_NATIVE_SHELL=0` turned the native shell ON. That is the wrong
+/// answer to the most likely way anyone would try to turn it off, and it is the shape of
+/// footgun that only ever fires on a box, in front of someone, at the moment they are
+/// trying to get back to a working desktop.
+///
+/// Truthy is the small explicit set rather than "anything but 0", so a typo reads as OFF.
+/// OFF is the safe direction here: it is the shipped desktop.
+pub fn native_shell_env_on(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+    }
+}
+
 /// apart. The bloom backdrop and the M2 orb already carry the same `!capture_blocked`
 /// condition inline; this is the M3 scene joining them rather than a new policy.
 pub fn native_scene_drawn(native_shell_on: bool, capture_blocked: bool) -> bool {
@@ -3969,6 +3990,25 @@ mod tests {
     }
 
     // ── The M6 inversion: who OWNS the reservation once the compositor paints ──
+
+    #[test]
+    fn the_native_shell_flag_reads_its_value_not_its_presence() {
+        // HART_NATIVE_SHELL=0 used to turn the native shell ON, because the check was
+        // `is_some()`. Someone trying to get back to a working desktop would have reached
+        // for exactly that.
+        assert!(!native_shell_env_on(None));
+        assert!(!native_shell_env_on(Some("0")));
+        assert!(!native_shell_env_on(Some("false")));
+        assert!(!native_shell_env_on(Some("")));
+        assert!(!native_shell_env_on(Some("off")));
+        // Typos read as OFF, which is the shipped desktop and the safe direction.
+        assert!(!native_shell_env_on(Some("ture")));
+        assert!(native_shell_env_on(Some("1")));
+        assert!(native_shell_env_on(Some("true")));
+        assert!(native_shell_env_on(Some("TRUE")));
+        assert!(native_shell_env_on(Some(" yes ")));
+        assert!(native_shell_env_on(Some("on")));
+    }
 
     #[test]
     fn with_the_scene_off_the_reservation_is_exactly_what_the_shell_published() {

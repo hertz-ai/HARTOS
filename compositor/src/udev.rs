@@ -509,7 +509,12 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         ws_switch_at: None,
         capture_blocked: false,
         // NATIVE SHELL M3: opt in per session via the env, default OFF (no regression).
-        native_shell_on: std::env::var_os("HART_NATIVE_SHELL").is_some(),
+        // The VALUE is parsed, not merely the variable's presence: `HART_NATIVE_SHELL=0`
+        // used to turn the native shell ON, which is the wrong answer to the most likely
+        // way anyone would try to turn it off.
+        native_shell_on: crate::comp_core::native_shell_env_on(
+            std::env::var("HART_NATIVE_SHELL").ok().as_deref(),
+        ),
         row_scroll: crate::scene::RowScroll::default(),
         // Set truthfully by the render tick below from whether GLES is live. Starting on
         // the floor means the very first frame cannot claim hardware motion before a GPU
