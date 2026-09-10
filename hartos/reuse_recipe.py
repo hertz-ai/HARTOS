@@ -5315,7 +5315,44 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         break  # finished recipe -> post-loop extractor (#798)
                     continue
             except Exception as _rc_err:
-                current_app.logger.debug(f"robust completion-advance skipped: {_rc_err}")
+                # ERROR, not debug.  This handler wraps the ONLY call that moves
+                # the pipeline forward, so when it catches, the walk silently
+                # stops advancing -- and at debug nothing says so.
+                #
+                # MEASURED live 2026-09-11, session
+                # 6c2dc0fc-7c93-4fe0-973e-f7466ff63f29_88719487304, window
+                # 01:49:12-02:09:58, hevolveai excluded:
+                #     "reuse-w1-completed ... for action 1 — advancing"   20
+                #     "[REUSE] Action N TERMINATED, advancing"             0   <- the
+                #         line immediately preceding the pointer write at :6072
+                #     "[REUSE] Cannot advance action ..."                  0
+                #     "already TERMINATED (idempotent)"                    0
+                #     "[FABRICATED-COMPLETE] refusing to advance"          0
+                #     "All N actions completed"                            0
+                #     "[SUBTASK-HOLD]"                                     0   <- the
+                #         only early return in _advance_or_steer
+                # Six zeros: every visible exit of the advance is absent, so the
+                # call raised and landed HERE.  The same log holds 45,599 lines
+                # since restart and ZERO at "- DEBUG -", so this message has
+                # never once reached production.  Result: action 1 executed its
+                # tool (FAB-GUARD unrun=[]) and the walk spun on it for 20
+                # minutes, reaching 1 of the agent's 9 actions.
+                #
+                # exc_info so the NEXT drive names the actual exception instead
+                # of leaving it to be inferred from absences, which is what this
+                # whole investigation had to do.  Same logger, same handler, no
+                # new machinery -- only the level and the traceback.
+                #
+                # SIBLINGS, deliberately NOT touched here: :5210 turn-attach,
+                # :5412 breakdown, :5460 under-reported-advance, :6049 FAB-GUARD
+                # gate, :6089 spark.  They are the same CLASS (a failure logged
+                # where production cannot see it) but none is PROVEN to be
+                # swallowing anything today, and widening an unproven fix is how
+                # a real defect gets buried under noise.  Tracked in #831.
+                current_app.logger.error(
+                    f"robust completion-advance FAILED for action "
+                    f"{_reuse_current_action} — the pipeline did not advance "
+                    f"for session: {user_prompt}: {_rc_err}", exc_info=True)
 
             # BREAKDOWN EXECUTION.  'requires_breakdown' is not a failure and not
             # an under-report: the model is saying the action needs decomposing,
