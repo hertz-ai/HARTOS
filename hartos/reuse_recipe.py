@@ -3385,7 +3385,16 @@ def _reuse_is_pipeline_text(content):
             or _REUSE_NOT_COMPLETE_MARKER in _c
             or _REUSE_AUTONOMY_NUDGE in _c
             or _REUSE_UNDER_REPORT_STEER in _c
-            or _REUSE_SUBTASK_STEER_PREFIX in _c)
+            or _REUSE_SUBTASK_STEER_PREFIX in _c
+            # Both synthesis steers, via the ONE shape they each append —
+            # _REUSE_SYNTHESIS_STEER and _REUSE_SYNTHESIS_STEER_INCOMPLETE
+            # end `+ _REUSE_SYNTHESIS_ANSWER_SHAPE`, and the INCOMPLETE one
+            # is .format(unrun=...)ed before posting, which leaves the shape
+            # untouched (it carries no braces, by its own design note).  So
+            # one marker covers both producers and survives the formatting.
+            # It is defined further down, beside the steers that emit it —
+            # resolved at call time like every other global here.
+            or _REUSE_SYNTHESIS_ANSWER_SHAPE in _c)
 
 # Recorded in _reuse_fab_pending when the thing that did not happen is not a
 # tool run but the ACTION'S OWN TEXT.  Angle brackets, so _TOOL_IDENT_RE can
@@ -3860,6 +3869,21 @@ def _reuse_message_is_user_answer(message):
         if not isinstance(content, str) or not content.strip():
             return False                     # empty is not an answer
         low = content.lower()
+        if _reuse_is_pipeline_text(content):
+            # THIS MODULE POSTED IT.  Hoisted ABOVE the message2userfinal
+            # branch on 2026-09-10: every synthesis steer NAMES that key by
+            # construction (_REUSE_SYNTHESIS_ANSWER_SHAPE tells the model to
+            # use it), and that branch answers True for any text it cannot
+            # parse as JSON — so this check could never be reached for the
+            # one family it most needed to refuse.  Measured live 14:30:55,
+            # agent 92583386981: the steer was the tail, was called an
+            # answer, logged the reassuring "still control JSON: False", and
+            # was delivered to the user as the whole reply.
+            #
+            # Also still ABOVE the seat name below, because the seat name
+            # does not survive the #725 sync — see the constant's comment for
+            # the 2026-09-10 04:42:04 measurement.
+            return False
         if 'message2userfinal' in low or 'message2' in low:
             # The KEY present is not the ANSWER present: live 18:25:22 the
             # model returned the steer's template and this branch called it
@@ -3872,11 +3896,6 @@ def _reuse_message_is_user_answer(message):
                     if _ak in _ans:
                         return _reuse_is_written_answer(_ans[_ak])
             return True                      # the answer is already there
-        if _reuse_is_pipeline_text(content):
-            # THIS MODULE POSTED IT.  Checked BEFORE the seat name because
-            # the seat name does not survive the #725 sync — see the
-            # constant's comment for the 2026-09-10 04:42:04 measurement.
-            return False
         if str(last.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES:
             # THE LOOP'S OWN STEER.  This seat exists to steer; it never
             # speaks TO the user, so whatever it said is plumbing.  Measured
@@ -5165,6 +5184,36 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         # the turn is finalised exactly once (#799/D33).
         _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor)
         last_message = group_chat.messages[-1]
+        # THE SYNTHESIS ROUND CAN LEAVE ITS OWN STEER AS THE TAIL.  It posts
+        # the steer and then depends on the group taking a turn; when no turn
+        # happens the steer IS messages[-1], and every line below hands the
+        # tail to the user.  Measured live 2026-09-10 14:30:55, agent
+        # 92583386981: HTTP 200 in 103.1s and the whole reply the user read
+        # was _REUSE_SYNTHESIS_STEER verbatim.  The round produced no model
+        # call at all — llm_outbound.jsonl holds 12 calls for that
+        # request_id, the last at 14:32:38,150, and the steer was posted at
+        # ,907 (20 -> 21 messages in 109 ms, and no "[SYNTHESIS] steer
+        # failed", so initiate_chat returned normally having done nothing).
+        #
+        # Ask the SAME predicate the synthesis gate asks, so "is this an
+        # answer?" has one definition here and there, and walk back to the
+        # last message that really is one.  Unbounded by the action dispatch
+        # on purpose: this is the turn being finalised, not an action being
+        # credited (that is _reuse_written_answer's bounded job).  If nothing
+        # qualifies, the tail stands — this narrows what is delivered and
+        # never returns '' (#797/D31).
+        if not _reuse_message_is_user_answer(last_message):
+            for _cand in reversed(group_chat.messages):
+                if _reuse_message_is_user_answer(_cand):
+                    current_app.logger.info(
+                        f"[SYNTHESIS] tail is not an answer "
+                        f"({str((last_message or {}).get('name') or '?')}); "
+                        f"delivering the last real one instead "
+                        f"(session: {user_prompt}, "
+                        f"from={_cand.get('name') or '?'}, "
+                        f"head={str(_cand.get('content'))[:120]!r})")
+                    last_message = _cand
+                    break
         # len>1 matters: a lone TERMINATE would send [-2] off the front.
         if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
             last_message = group_chat.messages[-2]

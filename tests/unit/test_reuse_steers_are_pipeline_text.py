@@ -86,16 +86,37 @@ def _predicate():
 
 
 def _module_string_constants(tree):
-    """Module-scope NAME -> str, so a promoted steer is still resolvable."""
+    """Module-scope NAME -> str, so a promoted steer is still resolvable.
+
+    Resolves ``_A = "text" + _B`` too, in source order.  ``literal_eval``
+    alone cannot: it raises on any BinOp carrying a Name, and BOTH synthesis
+    steers are built that way (`"..." + _REUSE_SYNTHESIS_ANSWER_SHAPE`).  So
+    a literal-only reader returned None for them, the call site resolved to
+    nothing, and the sweep dropped it — the same "guard stops seeing its
+    subject" failure this file already learned once, one level deeper.
+    """
     out = {}
+
+    def _val(node):
+        try:
+            v = ast.literal_eval(node)
+            return v if isinstance(v, str) else None
+        except Exception:
+            pass
+        if isinstance(node, ast.Name):
+            return out.get(node.id)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            lhs, rhs = _val(node.left), _val(node.right)
+            if lhs is not None and rhs is not None:
+                return lhs + rhs
+            return lhs if lhs is not None else rhs
+        return None
+
     for node in tree.body:
         if isinstance(node, ast.Assign):
             for t in node.targets:
                 if isinstance(t, ast.Name):
-                    try:
-                        v = ast.literal_eval(node.value)
-                    except Exception:
-                        continue
+                    v = _val(node.value)
                     if isinstance(v, str):
                         out[t.id] = v
     return out
@@ -104,9 +125,20 @@ def _module_string_constants(tree):
 def _steer_texts():
     """Statically-resolvable message texts of every initiate_chat call site.
 
-    Resolves three shapes: a plain literal, the leading constant run of an
-    f-string, and a reference to a module-scope string constant (possibly
-    concatenated with a runtime value, as the subtask steer is).
+    Resolves four shapes: a plain literal, the leading constant run of an
+    f-string, a reference to a module-scope string constant (possibly
+    concatenated with a runtime value, as the subtask steer is), and a LOCAL
+    name assigned from any of those inside the calling function.
+
+    THE LOCAL CASE IS WHY THIS FILE WAS WIDENED (2026-09-10).  The first cut
+    resolved module scope only, so ``initiate_chat(message=_steer)`` in
+    ``_reuse_synthesis_turn`` — where ``_steer`` is a local bound to one of
+    the two synthesis constants a few lines above — resolved to None and the
+    site was silently dropped.  That is the shape the SEVENTH producer used,
+    and the guard that existed to catch a seventh producer could not see it:
+    the steer reached a user verbatim on 2026-09-10 14:30:55 with this test
+    green.  A sweep that skips what it cannot resolve reports success by
+    looking away.
 
     RESOLVING THE NAME CASE IS LOAD-BEARING, and this file learned it the
     hard way on its own first green run.  When both inline literals were
@@ -119,6 +151,16 @@ def _steer_texts():
     tree = ast.parse(_src())
     consts = _module_string_constants(tree)
     out = []
+
+    # call node -> the FunctionDef it sits in, so a local name can be looked
+    # up in the right scope.
+    owner = {}
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for sub in ast.walk(fn):
+            if isinstance(sub, ast.Call):
+                owner[id(sub)] = fn
 
     def resolve(node):
         try:
@@ -153,9 +195,34 @@ def _steer_texts():
                 msg = kw.value
         if msg is None:
             continue
+        texts = []
         text = resolve(msg)
-        if text and text.strip():
-            out.append((n.lineno, text))
+        if text:
+            texts.append(text)
+        elif isinstance(msg, ast.Name):
+            # A LOCAL holding the steer.  Every assignment to that name in
+            # the calling function is a text this site can post, so all of
+            # them are checked — `_steer` is bound on both branches of the
+            # unrun/complete if in _reuse_synthesis_turn.
+            fn = owner.get(id(n))
+            for sub in ast.walk(fn) if fn is not None else ():
+                if not isinstance(sub, ast.Assign):
+                    continue
+                if not any(isinstance(t, ast.Name) and t.id == msg.id
+                           for t in sub.targets):
+                    continue
+                # `_C.format(...)` posts _C's own text with the slots filled;
+                # the constant half is what the predicate must recognise.
+                val = sub.value
+                if (isinstance(val, ast.Call)
+                        and getattr(val.func, 'attr', '') == 'format'):
+                    val = val.func.value
+                got = resolve(val)
+                if got:
+                    texts.append(got)
+        for t in texts:
+            if t.strip():
+                out.append((n.lineno, t))
     return out
 
 
@@ -184,9 +251,31 @@ class TestNoSixthProducer:
     a closed set.
     """
 
+    # Sites the widened sweep surfaced on 2026-09-10 that are NOT yet
+    # recognised.  Each is module-written text, so each COULD be delivered
+    # the way the synthesis steer was — but none has been measured reaching a
+    # user, and the obvious closure is unsafe: these resolve to the leading
+    # constant run of an f-string, and 'Role: ' or 'This is the time now ' as
+    # a CONTAINMENT test would refuse any real answer that happens to contain
+    # those characters.  That is the one thing _reuse_is_pipeline_text must
+    # never do ("only the module's own markers are refused, never the
+    # sentiment").  Closing them needs a specific marker per producer, which
+    # is a change to the producers, not to the predicate.
+    #
+    # Listed rather than dropped so the gap is visible and a NEW producer
+    # still fails this test on the day it is written.  Tracked as #816.
+    KNOWN_UNCLOSED = {
+        'Role: ',
+        'Role: Time Agent\n Message: ',
+        'This is the time now ',
+        'The Response from main Agent: ',
+        'Hey @StatusVerifier Agent, Please verify the status of the action ',
+    }
+
     def test_every_static_steer_is_recognised(self):
         pred = _predicate()
-        unrecognised = [(ln, t) for ln, t in _steer_texts() if not pred(t)]
+        unrecognised = [(ln, t) for ln, t in _steer_texts()
+                        if not pred(t) and t not in self.KNOWN_UNCLOSED]
         assert not unrecognised, (
             'these initiate_chat messages are written by this module but are '
             'not recognised as pipeline text, so each can be delivered to the '
@@ -201,6 +290,22 @@ class TestNoSixthProducer:
             'expected at least the two inline steers; found %d — the AST '
             'sweep has stopped matching and the guard above is now vacuous'
             % len(found))
+
+    def test_the_synthesis_site_is_enumerated(self):
+        """The site the old sweep could not see must stay visible.
+
+        Both synthesis steers reach the group as a LOCAL (`message=_steer`)
+        whose constants are built as `"literal" + _SHAPE`.  Resolving that
+        needs the local-scope walk AND the BinOp-aware constant reader; lose
+        either and this site silently drops out of the sweep again, exactly
+        as it had on 2026-09-10 when the steer reached a user with this file
+        green.
+        """
+        texts = [t for _, t in _steer_texts()]
+        assert any('do NOT emit another status object' in t for t in texts), (
+            'the _reuse_synthesis_turn steer is no longer enumerated — the '
+            'sweep has stopped resolving locals or "+"-built constants, and '
+            'the seventh producer would be invisible again')
 
 
 class TestPrecisionNoRegression:
