@@ -119,6 +119,45 @@ let
       # under the pin without a flake input per dep. The current Cargo.lock is
       # registry-only, so this is a forward-safety default, not a present need.
       allowBuiltinFetchGit = true;
+
+      # ── Fetch crates from static.crates.io, NOT the crates.io API endpoint ──
+      # importCargoLock's DEFAULT download URL is
+      #   https://crates.io/api/v1/crates/<name>/<version>/download
+      # and since ~2026-09-03 that endpoint answers 403 to curl-style user agents
+      # (bot protection). Nix's crate fetcher IS curl, so EVERY crate fetch fails
+      # and this package has been red on every Nix Build Matrix run since — a gate
+      # that is always red catches nothing. Measured against the endpoint directly:
+      # no User-Agent 403, `curl` 403, `Mozilla` 200, and serde 1.0.228 403 as well,
+      # so it is the AGENT being rejected, not any particular crate.
+      #
+      # importCargoLock merges extraRegistries OVER its default registry map
+      #   registries = { "<crates.io-index>" = "<api url>"; } // extraRegistries
+      # so re-using the SAME index key REPLACES the download URL rather than adding
+      # a second registry. Every one of the lock's 248 packages carries
+      # `source = "registry+https://github.com/rust-lang/crates.io-index"`, so the
+      # key matches all of them and none are left on the 403 host.
+      #
+      # WHY THIS HOST rather than overriding fetchurl's user agent: static.crates.io
+      # is what the crates.io index advertises as its own `dl`, and it is ALREADY
+      # PROVEN IN THIS REPO — hart-comp's crane path fetches all 139 of its crates
+      # from static.crates.io/crates/<name>/<version>/download and SUCCEEDS in the
+      # same CI run where this package 403s. That is why hart-comp survives this and
+      # the precedent does not; it is a different HOST, not offline vendoring. A
+      # user-agent overlay would have to touch every fetch in the tree to fix this
+      # one build.
+      #
+      # Crate tarballs are FIXED-OUTPUT derivations keyed on the Cargo.lock checksum,
+      # so the store path does not depend on where the bytes came from. Verified for
+      # the three crates the failing log named (getopts 0.2.24,
+      # wasm-bindgen-macro-support 0.2.116, js-sys 0.3.93): each returns 200 from
+      # static.crates.io with a sha256 EQUAL to its Cargo.lock checksum. So this
+      # changes which host is contacted and nothing else.
+      #
+      # Mirrored in hart-comp.nix's buildRustPackage fallback — the tree's only other
+      # cargoLock call site — the same way the rust-platform block above is.
+      extraRegistries = {
+        "https://github.com/rust-lang/crates.io-index" = "https://static.crates.io/crates";
+      };
     };
 
     # Build ONLY the claw-cli binary crate to keep the precedent build small and

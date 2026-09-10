@@ -4613,3 +4613,91 @@ class TestTheBackendDoesNotFabricateTheCopilotsWork:
         src = self._read('integrations/coding_agent/claude_hive_session.py')
         assert "os.environ.get(\n            'HEVOLVE_HIVE_INPROCESS_EXEC', '1')" in src \
             or "'HEVOLVE_HIVE_INPROCESS_EXEC', '1'" in src
+
+
+class TestCargoRegistryPinnedOffThe403Endpoint:
+    """Every buildRustPackage call site must fetch crates from static.crates.io.
+
+    importCargoLock's default download host, crates.io/api/v1/crates, began
+    answering 403 to curl-style user agents around 2026-09-03, and Nix's crate
+    fetcher IS curl. `Build hart-rust-precedent` went red on every Nix Build
+    Matrix run and stayed red for a week, because a permanently-red gate reads
+    as background noise. hart-comp's crane path was unaffected only because
+    crane fetches from static.crates.io, which serves byte-identical tarballs
+    (verified: the sha256 of each crate the failing log named equals its
+    Cargo.lock checksum, so the fixed-output store path is unchanged).
+
+    What this guards is NOT the fix regressing -- it is a THIRD call site
+    landing later on the default host and going red the same silent way. So it
+    DISCOVERS the call sites instead of listing them.
+    """
+
+    API_HOST = "crates.io/api/v1/crates"
+    WANT = "https://static.crates.io/crates"
+    INDEX_KEY = '"https://github.com/rust-lang/crates.io-index"'
+
+    @staticmethod
+    def _uncommented(text):
+        """Nix source with whole-line `#` comments dropped.
+
+        The comments deliberately NAME the bad host to explain it, so any scan
+        for that host -- and the brace matching below -- must not see them.
+        """
+        return "\n".join(
+            line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+    @classmethod
+    def _blocks(cls, text, opener="cargoLock = {"):
+        """Every brace-balanced `cargoLock = { ... }` body in a nix source."""
+        text = cls._uncommented(text)
+        out, i = [], text.find(opener)
+        while i != -1:
+            j = text.index("{", i)
+            depth, k = 0, j
+            while k < len(text):
+                if text[k] == "{":
+                    depth += 1
+                elif text[k] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            out.append(text[j:k + 1])
+            i = text.find(opener, k)
+        return out
+
+    @classmethod
+    def _call_sites(cls):
+        sites = []
+        for path in glob.glob(os.path.join(NIXOS_DIR, "**", "*.nix"), recursive=True):
+            for block in cls._blocks(read_nix(path)):
+                sites.append((os.path.relpath(path, REPO_ROOT), block))
+        return sites
+
+    def test_there_is_something_to_check(self):
+        """A guard that can pass by finding nothing is not a guard."""
+        sites = self._call_sites()
+        assert len(sites) >= 2, (
+            "expected the hart-comp + hart-rust-precedent cargoLock call sites, "
+            "found %d -- if the idiom moved, re-point this guard rather than "
+            "deleting it" % len(sites))
+
+    def test_every_call_site_overrides_the_download_registry(self):
+        for rel, block in self._call_sites():
+            assert "extraRegistries" in block, (
+                "%s: a cargoLock without extraRegistries falls back to %s, which "
+                "403s Nix's curl fetcher" % (rel, self.API_HOST))
+            assert self.INDEX_KEY in block, (
+                "%s: extraRegistries must re-use the crates.io-index key so it "
+                "REPLACES the default download URL instead of adding a second "
+                "registry that nothing in the lock refers to" % rel)
+            assert self.WANT in block, (
+                "%s: expected the download host %s" % (rel, self.WANT))
+
+    def test_no_module_pins_the_403_host_in_code(self):
+        """Comments may name the bad host; code may not."""
+        for path in glob.glob(os.path.join(NIXOS_DIR, "**", "*.nix"), recursive=True):
+            code = self._uncommented(read_nix(path))
+            assert self.API_HOST not in code, (
+                "%s pins the 403 download host outside a comment"
+                % os.path.relpath(path, REPO_ROOT))

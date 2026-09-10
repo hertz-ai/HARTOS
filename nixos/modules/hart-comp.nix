@@ -218,6 +218,19 @@ let
       outputHashes = {
         "smithay-0.7.0" = smithayGitHash;
       };
+
+      # Same crates.io 403 fix as hart-rust-precedent.nix — see the long rationale
+      # there. Short form: importCargoLock's default download host
+      # (crates.io/api/v1/crates) now rejects curl-style agents, and Nix's fetcher is
+      # curl; static.crates.io serves the identical tarballs, which is exactly why
+      # THIS module's crane path (vendorCargoDeps, above) has never hit the problem.
+      # Registry crates only — the git Smithay dep above is fetched by fetchgit and
+      # is unaffected. This fallback is selected only off-flake (hartCrane == null),
+      # so CI does not exercise it; fixing it here keeps the two call sites honest
+      # instead of leaving a known-broken path behind for the next consumer.
+      extraRegistries = {
+        "https://github.com/rust-lang/crates.io-index" = "https://static.crates.io/crates";
+      };
     };
 
     # Smithay's build needs the Wayland/DRM/input/render C libraries on Linux.
