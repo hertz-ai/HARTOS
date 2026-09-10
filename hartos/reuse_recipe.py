@@ -3289,6 +3289,22 @@ _REUSE_ACTION_MESSAGE_PREFIX = 'Perform this action -> Action #'
 # the recogniser below cannot drift from the wording.
 _REUSE_NOT_COMPLETE_MARKER = ' is NOT complete: '
 
+# PRODUCER FOUR.  Posted into the group to tell the agent to proceed without
+# asking the user; never an answer to anyone.  Measured live 2026-09-10
+# 12:55:21 (agent 77712340019, "google_search then send a 2-bullet summary"):
+# google_search really ran and the action advanced honestly, then
+# _reuse_written_answer recovered THIS sentence from the group log and the
+# user received all 101 characters of it as the summary --
+#   [SYNTHESIS] the action already wrote the answer - recovered 101 chars ...
+#   head='You should complete this task independently. Feel free to make ...'
+# A constant, not a literal at the post site, because the predicate below can
+# only recognise what the producer actually emits -- which is exactly how this
+# family "kept being one producer behind".
+_REUSE_AUTONOMY_NUDGE = (
+    'You should complete this task independently. Feel free to make '
+    'reasonable assumptions where necessary'
+)
+
 
 def _reuse_is_pipeline_text(content):
     """True when *content* is text THIS MODULE wrote to steer the group.
@@ -3348,7 +3364,8 @@ def _reuse_is_pipeline_text(content):
     """
     _c = str(content or '')
     return (_REUSE_ACTION_MESSAGE_PREFIX in _c
-            or _REUSE_NOT_COMPLETE_MARKER in _c)
+            or _REUSE_NOT_COMPLETE_MARKER in _c
+            or _REUSE_AUTONOMY_NUDGE in _c)
 
 # Recorded in _reuse_fab_pending when the thing that did not happen is not a
 # tool run but the ACTION'S OWN TEXT.  Angle brackets, so _TOOL_IDENT_RE can
@@ -4998,7 +5015,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 if _reuse_action_is_autonomous(
                         user_prompt, user_tasks[user_prompt].current_action):
                     current_app.logger.info('GOT can_perform_without_user_input as true')
-                    message = 'You should complete this task independently. Feel free to make reasonable assumptions where necessary'
+                    message = _REUSE_AUTONOMY_NUDGE
                     # chat_instructor, not helper — same reason as the
                     # StatusVerifier injection above: instructions must enter
                     # the group as user-role turns.
