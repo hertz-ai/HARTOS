@@ -1609,3 +1609,80 @@ which still needs the hardware to read.
 The test is `#[ignore]`d because a measurement on a shared runner is noise, and its
 assertions are multiples of the budget rather than tight bounds, so it catches a
 tenfold regression and never a busy afternoon.
+
+
+### The input half is live, and it took a fake mouse to prove it
+The previous entry ended by saying the scene layer is not the latency, and that
+what remains "points at the renderer, the DRM path and compositing, which is
+where `latency.rs` measures and which still needs the hardware to read." This is
+that reading, taken on the Samsung.
+
+The first thing the hardware said was that nothing had ever touched it:
+
+```
+/run/hart/session/input-alive      ABSENT
+hart-latency journal lines          0
+/run/hart/latency.jsonl             ABSENT
+```
+
+`0 users`, no keyboard, no mouse, headless since boot. The instrument was not
+broken and it was not missing; it had simply never been given an event. An
+unmeasured claim was hiding behind an untouched machine, which is a failure mode
+worth naming because it looks exactly like a working instrument.
+
+So the input was manufactured. `/dev/uinput` exists on the node, and a uinput
+device is a real evdev device as far as the kernel, udev and libinput are
+concerned, which is the whole point: `T_input` is the KERNEL timestamp on
+`input_event`, so anything injected further up the stack would measure a
+different thing and quietly report a better number. `python-evdev` is not on the
+node, so the probe drives the ioctls directly (`UI_SET_EVBIT`, `UI_SET_RELBIT`,
+`UI_SET_KEYBIT`, `UI_DEV_CREATE`) and writes 24-byte `input_event` structs.
+
+The compositor picked it up on its own:
+
+```
+smithay::backend::libinput: New device "event10"
+input: hart-latency-probe as /devices/virtual/input/input11
+hart_comp::comp_core: hart-comp: first seat input delivered
+                      — libinput/Seat path is LIVE (#134 liveness beacon)
+```
+
+**#134 fired for the first time on this node, and `input-alive` went from absent
+to present.** The libinput/seat half of input-to-photon is now proven on real
+hardware rather than argued from source.
+
+### ...and the photon half still has no number
+Hover, scroll and click were then driven for ~100s together with 337 `window.move`
+calls over the compositor IPC, to guarantee damage and therefore presented
+frames. `hart-comp` went from 2% to 13% CPU, so it was genuinely compositing.
+
+Result: **0 `hart-latency` lines.** Still no input-to-photon number.
+
+What is ruled out, so the next person does not re-walk it:
+
+* The instrument IS in the shipped binary. The wrapper at `/run/wrappers/bin/hart-comp`
+  is a setuid shim with no strings in it, which is a good way to conclude the
+  opposite; the real binary carries the exact §3 format string,
+  `hart-latency component= kind= n= p50=ms p99=ms max=ms budget=ms verdict=`,
+  with surfaces `shell/top-bar/omnibox/taskbar/home-card` and kinds
+  `press/hover/scroll/key/animate-start`.
+* The plumbing is wired at both ends: `latency::on_frame_queued()` at
+  `udev.rs:1714` binds pending inputs when a flip is queued, and
+  `latency::on_frame_presented()` at `udev.rs:1214` logs each summary through
+  `info!` at vblank reap.
+* `info!` from the compositor does reach the journal; the libinput lines above
+  are the same level and arrived.
+* `HART_LATENCY_JSONL` gates only the jsonl sink. The journal line is not behind
+  it (`latency.rs:567` emits whenever summaries are non-empty).
+
+So the open question is narrow and stated precisely rather than hand-waved:
+input is recorded and frames are being composited, but no 10s window ever closes
+with a non-empty summary. The next step is `frame_queued`/`frame_presented`
+binding and the window aggregation in `latency.rs`, read against a live
+`window.move` damage stream. That is a deliberate piece of work, not a guess to
+squeeze into a session that was measuring something else.
+
+The reusable part: a machine nobody has touched will report a healthy instrument
+and no data, and those two things look identical from a distance. Manufacture the
+input at the lowest layer the metric claims to measure from, or the number you
+eventually get will be measuring your harness.
