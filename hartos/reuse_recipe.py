@@ -103,6 +103,32 @@ def _normalize_flow_recipe(config):
 _VLM_PRESERVED_CONTRACT_FIELDS = ('persona', 'can_perform_without_user_input')
 
 
+def _action_persona(action, role):
+    """Owner of a recipe action, defaulting to the role this turn runs as.
+
+    `persona` is OPTIONAL in a saved action.  MEASURED live 2026-09-10 on the
+    installed build: create wrote actions 4 and 5 of agent 28160128202 with no
+    `persona` key at all while their siblings carried persona='Executor', and
+    88656227144 has none on ANY of its actions (2 of the 127 saved flow
+    recipes on this box).  The consumer subscripted it unguarded, so
+    create_agents_for_user raised KeyError('persona') INSIDE ITS OWN LOG LINE
+    (:1138), /chat 500'd, and the turn fell through to a toolless LLM that
+    invented carrier rates for the user.
+
+    Defaulting to `role` is not a new rule: _vlm_merged_actions below is handed
+    `role` as its `flow_persona` (see the call at ~:1127) and assigns exactly
+    that to an appended action that has no owner.  Same question, same answer,
+    ONE derivation.  Defaulting also keeps the action in role_actions, so it
+    still RUNS -- making the read merely safe would have traded a loud crash
+    for a silent omission.
+    """
+    if isinstance(action, dict):
+        _p = action.get('persona')
+        if _p:
+            return str(_p)
+    return str(role or '')
+
+
 def _vlm_merged_actions(existing_actions, vlm_actions, flow_persona=None):
     """``existing_actions`` with each VLM re-authoring applied, OWNER kept.
 
@@ -1131,12 +1157,13 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             f"[VLM-MERGE] {len(vlm_actions)} override(s); actions "
             f"{_before} -> {len(recipes[user_prompt]['actions'])}, "
             f"persona-matching role {role!r}: "
-            f"{sum(1 for a in recipes[user_prompt]['actions'] if str(a.get('persona','')).lower() == str(role or '').lower())}")
+            f"{sum(1 for a in recipes[user_prompt]['actions'] if _action_persona(a, role).lower() == str(role or '').lower())}")
 
     current_app.logger.info(f'Getting role actions')
     for i in recipes[user_prompt]['actions']:
-        current_app.logger.info(f'this is action persona:{i["persona"]} ')
-        if i['persona'].lower() == role.lower():
+        _persona = _action_persona(i, role)
+        current_app.logger.info(f'this is action persona:{_persona} ')
+        if _persona.lower() == str(role or '').lower():
             role_actions.append(i)
             actions.append(i['action'])
     # current_app.logger.info(f'role_actions: {role_actions}')
