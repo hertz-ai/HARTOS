@@ -5873,14 +5873,39 @@ def get_flow_number(user_id, prompt_id):
     file_path = helper_fun.safe_prompt_path(prompt_id)
     with open(file_path, 'r') as f:
         data = json.load(f)
-        available_roles = [x['name'] for x in data['personas']]
-        available_flows = data['flows']
+        # .get(), not [].  These two subscripts killed the whole /chat POST:
+        # 2026-09-11 02:50:43, "Some ERROR IN REUSE RECIPE 'personas'" ->
+        # Flask "Exception on /chat [POST]" -> KeyError: 'personas' here, so
+        # the user's turn died before any agent work began.
+        # MEASURED blast radius, counting only real agent prompt files
+        # (<digits>.json, the shape safe_prompt_path resolves -- the prompts
+        # dir is majority non-agent artifacts (#774), and the unfiltered
+        # number reads as a misleading 69%):
+        #     736 agent prompt files, 702 with 'personas', 34 WITHOUT.
+        # Two shapes, neither malformed by accident: a cloud-synced stub
+        # ('prompt_id','goal','user_id','name','is_active','image_url',
+        # 'synced_at') which has no 'flows' either, and an authored agent
+        # that has 'flows' but no 'personas'.  So both keys need .get().
+        available_roles = [x['name'] for x in (data.get('personas') or [])]
+        available_flows = data.get('flows') or []
     current_app.logger.info(f'Got available_roles as {available_roles}')
-    if not role:
-        role = available_roles[0]
+    if not available_roles:
+        # Loud, not swallowed: an agent with no persona list is a DATA defect,
+        # and 34 of them were un-chattable in silence.  Degrading to flow 0 is
+        # what all four callers (:1123, :1746, :1901, :5925) would select for a
+        # single-flow agent anyway -- they all feed role_number straight into
+        # helper_fun.safe_prompt_path(prompt_id, role_number, 'recipe').
+        _ctx_safe_log(
+            'warning',
+            f'prompt {prompt_id} declares no personas '
+            f'({len(available_flows)} flow(s)); falling back to flow 0')
     role_number = 0
+    if not role:
+        role = available_roles[0] if available_roles else None
     for num, i in enumerate(available_flows):
-        if i['persona'].lower() == role.lower():
+        # `role` can now be None (no personas AND get_role found nothing);
+        # .lower() on it would trade the KeyError for an AttributeError.
+        if role and i['persona'].lower() == role.lower():
             role_number = num
             current_app.logger.info(f'GOT role index as {role_number}')
             # FIRST match, like the sibling get_role (:445, :452).  Without
