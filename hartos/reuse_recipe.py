@@ -100,7 +100,33 @@ def _normalize_flow_recipe(config):
 # emitted as constants by the VLM writer — persona is always a user id, and
 # can_perform_without_user_input was 'no' in 47 of 47 files measured on this
 # box — so letting them through replaces an authored decision with noise.
-_VLM_PRESERVED_CONTRACT_FIELDS = ('persona', 'can_perform_without_user_input')
+_VLM_PRESERVED_CONTRACT_FIELDS = (
+    'persona',
+    'can_perform_without_user_input',
+    # 'action' is the GOAL, i.e. identity, not content -- exactly what
+    # _vlm_merged_actions' docstring already promises: "re-authors the STEPS of
+    # an action; it does not reassign whose action it is."  It was classified as
+    # content, so a re-learning overwrote it.
+    #
+    # MEASURED live 2026-09-11 02:28-02:48, agent 88719487304.
+    # execute_windows_or_android_command re-learns an action and writes
+    # <agent>_<flow>_<action>_vlm_agent.json under the CURRENT action id; the
+    # merge starts from dict(vlm_action), so whatever the tool narrated became
+    # the action:
+    #     saved                                  ran instead
+    #   2 open browser to the top result URL  -> "Create a README.md file..."
+    #   3 write Python script to parse docs   -> "check disk space..."
+    #   4 execute the script -> JSON          -> "Restart the server service"
+    #   7 generate a research summary         -> (faithful; text happened to match)
+    # Per-action and recurring, not a contiguous block.
+    #
+    # The cost is a FALSE PASS, not just wrong work: action 3's fabrication gate
+    # then demanded the SUBSTITUTED action's tool, the agent ran it, and the gate
+    # released -- "[REUSE] Action 3 TERMINATED, advancing" 02:35:19, unrun=[] --
+    # so the walk advanced having never written the parser that is action 3's
+    # whole job.  The run ended on action 7 with no research report delivered.
+    'action',
+)
 
 
 def _action_persona(action, role):
