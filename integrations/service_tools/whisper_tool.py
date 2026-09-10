@@ -1348,16 +1348,24 @@ async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bo
         }))
         _maybe_enqueue_call_segment(call_id, user_id, text, lang, True)
         # Feed this finalized mic segment to HevolveAI's world model for
-        # continual learning. The bridge call does a SYNCHRONOUS HTTP POST, so
-        # run it on the default executor to avoid blocking the realtime STT
-        # event loop. Gated on call_id (voice-room streams) so the push-to-talk
-        # chat mic is untouched. Snapshot the PCM now -- the caller resets the
-        # buffer right after this returns.
-        if call_id:
-            import asyncio
-            asyncio.get_running_loop().run_in_executor(
-                None, _maybe_ingest_audio_sensor,
-                call_id, user_id, audio_buffer.getvalue(), text, lang)
+        # continual learning. The bridge call does a SYNCHRONOUS HTTP POST and
+        # the consent lookup reads the DB, so both run on the default executor
+        # to avoid blocking the realtime STT event loop. Snapshot the PCM now
+        # -- the caller resets the buffer right after this returns.
+        #
+        # INTENT REVERSAL (owner, 2026-09-10). This was gated on call_id "so
+        # the push-to-talk chat mic is untouched". The owner has since directed
+        # that existing consent must not be re-litigated as friction, so the
+        # chat mic now feeds learning too, behind the SAME consent the voice
+        # agents already require. The gate moved into
+        # _maybe_ingest_audio_sensor, where it can read ConsentService off the
+        # event loop. Voice-room streams (call_id set) are unchanged. The
+        # call-segment enqueue above stays keyed by call_id: a chat-mic segment
+        # belongs to no call, so there is nothing to file it under.
+        import asyncio
+        asyncio.get_running_loop().run_in_executor(
+            None, _maybe_ingest_audio_sensor,
+            call_id, user_id, audio_buffer.getvalue(), text, lang)
     return bool(text)
 
 
@@ -1442,6 +1450,36 @@ def _maybe_enqueue_call_segment(
             "(call=%s): %s", call_id, e)
 
 
+def _mic_learning_consented(user: str) -> bool:
+    """True when ``user`` holds the consent the voice agents already require.
+
+    Mirrors security/hive_guardrails.py for require_consent goals: the SAME
+    consent type ('data_access') and scope ('*'), so a user who has granted the
+    speech-therapy or spoken-English agent its microphone consent is not asked
+    a second time. On a deny it files the pending ask exactly as the screen
+    channel does (vision_service._start_screen_capture): request_consent
+    dedupes and re-emits ONE card, so the UserConsent UI shows a single ask and
+    granting it takes effect on the next utterance.
+
+    FAIL-CLOSED: any error in the consent machinery means no ingest. A child's
+    voice is not fed to learning on a guess.
+    """
+    try:
+        from integrations.social.consent_service import ConsentService
+        from integrations.social.models import db_session
+        with db_session(commit=True) as db:
+            if ConsentService.check_consent(db, str(user), 'data_access',
+                                            scope='*'):
+                return True
+            ConsentService.request_consent(db, str(user), 'data_access',
+                                           scope='*')
+            return False
+    except Exception as e:
+        logger.debug("whisper_tool mic-learning consent check failed "
+                     "(user=%s): %s", user, e)
+        return False
+
+
 def _maybe_ingest_audio_sensor(
     call_id: Optional[str],
     user_id: Optional[str],
@@ -1452,26 +1490,59 @@ def _maybe_ingest_audio_sensor(
     """Feed a finalized mic segment (raw PCM16 16kHz mono + its transcript) to
     HevolveAI's world model for continual learning.
 
-    This is the MISSING producer for the audio sensor path: live mic PCM
-    otherwise lands only in the STT queue (_maybe_enqueue_call_segment) and
-    never reaches the embodied learner.  It rides the EXISTING
+    This is the producer for the audio sensor path: live mic PCM otherwise
+    lands only in the STT queue (_maybe_enqueue_call_segment) and never
+    reaches the embodied learner.  It rides the EXISTING
     WorldModelBridge.ingest_sensor_batch -> /v1/sensor/ingest (audio) transport
     using the unified SensorReading schema (sensor_model.py 'audio') -- no new
-    bridge method, no new endpoint, no parallel path.  Gated on call_id so the
-    push-to-talk chat mic (call_id=None) is completely unaffected.
+    bridge method, no new endpoint, no parallel path.  The bridge maps the
+    transcript onto the request's ``text`` field, which is what lets the
+    learner ground the spoken WORD and not only the sound.
 
-    Runs on a thread-pool executor (the bridge call does a blocking HTTP POST);
-    best-effort, never raises out of the WS handler hot path.
+    Who is heard, and on whose consent:
+      * Voice-room stream (``call_id`` set): unchanged, ingested as before.
+      * Chat mic (``call_id`` None): ingested only when the speaker's user
+        holds the consent checked by _mic_learning_consented. The user is the
+        WS ``user_id`` param when the client sends one, else the boot-declared
+        owner (HEVOLVE_OWNER_USER_ID). That fallback is bounded: the STT server
+        binds 127.0.0.1 only (start_stt_stream_server), so an identity-less
+        connection is a process on the owner's own machine, the same trust
+        source hive_guardrails uses for daemon goals. With no owner declared
+        it skips rather than guesses. The reading records where the identity
+        came from (``identity_source``, also folded into ``sensor_id``) so an
+        owner-attributed segment stays identifiable later.
+      * HEVOLVE_MIC_LEARNING=0 switches the chat-mic path off; voice rooms
+        are unaffected by it.
+
+    Runs on a thread-pool executor (the bridge call does a blocking HTTP POST
+    and the consent check reads the DB); best-effort, never raises out of the
+    WS handler hot path.
     """
-    if not call_id or not pcm_bytes:
+    if not pcm_bytes:
         return
+    if call_id:
+        subject, identity_source = str(call_id), 'call'
+        sensor_id = f'mic_{call_id}'
+    else:
+        if os.environ.get('HEVOLVE_MIC_LEARNING', '1') == '0':
+            return
+        if user_id:
+            subject, identity_source = str(user_id), 'ws_param'
+        else:
+            owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+            if not owner:
+                return
+            subject, identity_source = str(owner), 'owner_fallback'
+        if not _mic_learning_consented(subject):
+            return
+        sensor_id = f'mic_{identity_source}_{subject}'
     try:
         import base64
         from integrations.agent_engine.world_model_bridge import (
             get_world_model_bridge)
         from integrations.robotics.sensor_model import SensorReading
         reading = SensorReading(
-            sensor_id=f'mic_{call_id}',
+            sensor_id=sensor_id,
             sensor_type='audio',
             data={
                 'pcm_base64': base64.b64encode(pcm_bytes).decode('ascii'),
@@ -1480,13 +1551,14 @@ def _maybe_ingest_audio_sensor(
                 'stream_source': 'mic',
                 'transcript': transcript,
                 'lang': lang,
+                'identity_source': identity_source,
             },
         )
         get_world_model_bridge().ingest_sensor_batch([reading.to_dict()])
     except Exception as e:
         logger.debug(
             "whisper_tool._maybe_ingest_audio_sensor failed "
-            "(call=%s): %s", call_id, e)
+            "(subject=%s): %s", subject, e)
 
 
 async def _stt_stream_handler(websocket):
