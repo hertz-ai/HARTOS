@@ -483,22 +483,40 @@ only the first one is blocked.
    into the same cosmic-text FontSystem that already shapes every other run, and
    `Shaping::Advanced` (already used) does ligature substitution.
 
-   DONE, and it was the packaging half rather than the rendering half, exactly as
-   this predicted. hart-subsystems.nix installs `material-icons` and
-   `material-symbols` into the fontconfig font set (bundled so the shell renders
-   offline, after a fresh ISO once showed literal "lock" and "notifications" words
-   across the tray). cosmic-text's fontdb reads that same fontconfig,
-   `TextRasterizer::has_icon_face` answers by looking for a family whose name starts
-   with "Material", and `layout_home` consumes it at one place (`icons_available`),
-   so a host without the face DROPS the icon rather than drawing its name as a word.
+   DONE as of 2026-09-10, but NOT for the reason recorded here earlier that day, and
+   the correction is the useful part.
 
-   Verified on the box rather than read off the config, because "declared in a nix
-   module" and "visible to fontconfig" are different claims and this tree has been
-   caught by that gap before. `fc-list` on the node reports 53 Material files and
-   the families `Material Icons`, `Material Icons Outlined`, `Material Icons Round`,
-   `Material Icons Sharp`, `Material Icons Two Tone`, which is exactly the prefix
-   the detector matches. Consumed, not merely present, which is the other half of
-   the recurring defect here.
+   The packaging half was already done and had been for a while: hart-subsystems.nix
+   installs `material-icons` and `material-symbols` into the fontconfig set so the
+   shell renders offline, and cosmic-text's fontdb reads the same fontconfig. I
+   checked that on the node with `fc-list`, saw eight Material families, saw
+   `has_icon_face` match them, and wrote this entry as done. That was wrong. `fc-list`
+   proves the font is INSTALLED. It says nothing about whether a run is SHAPED with
+   it, and those are different claims.
+
+   Nothing selected the family. `attrs_for` was the only Attrs constructor and set
+   weight and tracking only, so every run shaped in cosmic-text's default
+   `Family::SansSerif`. Ligature names are pure ASCII, so sans covers every codepoint
+   and the per-codepoint fallback never fired to correct it. The gate made it worse
+   rather than better: because the box HAS Material families, `has_icon_face` returned
+   true, `icons_available` admitted the runs, and the tray painted the literal words
+   "notifications", "palette", "shield", each then clamped by `centered_box` into a
+   32px slot. Exactly the fresh-offline-ISO failure hart-subsystems.nix bundles the
+   fonts to prevent, arriving through the new renderer.
+
+   Now: `SceneNode::Text` carries `icon: bool`, set at the three sites that emit icons
+   and false at the other twenty-one, because it cannot be inferred from the string
+   ("inbox" is a valid ligature name and a plausible card title). `ICON_FAMILY` names
+   ONE family rather than the shell's four-deep stack, because CSS falls through on a
+   missing family while cosmic-text falls back per codepoint. `has_icon_face` matches
+   that exact family, so the question it answers and the family the shaper requests
+   are one string. Icons are measured through `TextMeasure::icon_width`, since a
+   ligature collapses to one square glyph and layout centres icons in fixed slots.
+
+   The generalisable lesson, which cost this program a false "done": a capability has
+   three separate states here, and this tree keeps confusing them. Installed. Wired.
+   Requested. `fc-list` answers the first, `has_icon_face` answered the second, and
+   only the shaping attrs answer the third.
 
    **Card art was never the picture.** This was measured wrong the first time and
    the correction is worth keeping, because the wrong reading turned a mostly-done
