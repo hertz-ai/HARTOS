@@ -6430,11 +6430,14 @@ def _narrow_assistant_to_current_action(user_prompt):
 def _reuse_action_tool_names(user_prompt, action_id):
     """The tool names the given action's recipe steps declare.
 
-    Reads the same ``recipes[user_prompt]['actions'][n]['recipe']`` list that
+    Reads the same ``recipes[user_prompt]['actions'][n]`` entry that
     ``_build_reuse_action_message`` renders into the turn message, and returns
-    the ``tool_name`` each step names.  One reader, one shape — the authoring
-    pipeline records the needed tool there, so that is the authoritative
-    answer to "which tool does this action need".
+    the tool names it declares — from each step's ``tool_name`` AND from the
+    action's own title, which the authoring pipeline writes in the very same
+    ``<tool>: <argument>`` convention.  Both, because the pipeline uses both:
+    measured on agent 88719487304's saved recipe, ``execute_coding_task``
+    appears as a step ``tool_name`` on some actions and ONLY as the title on
+    action 3.
 
     Used by the Tier-1 per-turn attach.  Before this, the attach chose tools
     only from ``detect_goal_tags(message)`` — a prose keyword scan — and so
@@ -6450,14 +6453,32 @@ def _reuse_action_tool_names(user_prompt, action_id):
         actions = (recipes[user_prompt] or {}).get('actions') or []
         if not 1 <= action_id <= len(actions):
             return []
+        action = actions[action_id - 1] or {}
         out = []
-        for step in (actions[action_id - 1].get('recipe') or []):
+        for step in (action.get('recipe') or []):
             # _tool_name_candidates, not the raw field: the authored value is
             # frequently `<real tool>: <its argument>`, which no exact match
             # can ever resolve.  Junk (pasted source, 'N/A') yields nothing.
             for name in _tool_name_candidates((step or {}).get('tool_name')):
                 if name not in out:
                     out.append(name)
+        # The TITLE is the other authoring site, in that same
+        # `<tool>: <argument>` shape -- so it gets the SAME extractor, not a
+        # second rule, and junk still yields nothing.
+        #
+        # Without it the attach and the fabrication gate disagreed, and after
+        # c5a2035cb taught the gate to read the action text that disagreement
+        # became a deadlock: the gate demanded a tool the attach would never
+        # attach.  Measured live 2026-09-10, agent 88719487304 action 3, rid
+        # d58b-230854 -- title "execute_coding_task: 'Write Python script to
+        # parse HART OS documentation...'", steps ['google_search', '', ''].
+        # 23:12:20 unrun=['google_search','execute_coding_task'], four
+        # 'completed' verdicts refused, ZERO "Tier-1 named attach" lines, and
+        # 23:18:19 the action ended on its round budget having never run the
+        # tool that is its entire job.
+        for name in _tool_name_candidates(action.get('action')):
+            if name not in out:
+                out.append(name)
         return out
     except Exception:
         return []
