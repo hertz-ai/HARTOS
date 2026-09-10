@@ -107,6 +107,43 @@ class TestResolvedNothingIsVisibleInProduction(unittest.TestCase):
             'tool" are indistinguishable in the log -- the ambiguity that cost '
             'five eliminated hypotheses in task #828')
 
+    def test_it_names_the_session_it_measured(self):
+        """A count with no session key is not attributable on a live box.
+
+        MEASURED 2026-09-11, the first drive that carried this line at INFO:
+        five occurrences, every one reading "holds 1 action(s)", while the
+        agent under test (88719487304) has NINE actions in BOTH of its flow
+        recipes on disk (88719487304_0_recipe.json and _1_recipe.json, 29,907 B
+        each, verified by loading them).  Neither writer of the store can
+        collapse 9 to 1: `_normalize_flow_recipe` returns a dict whose
+        'actions' is already a list unchanged, and `_vlm_merged_actions` only
+        replaces in place or appends, so len(out) >= len(existing).
+
+        The surrounding log explains it: a marketing reuse agent for a
+        DIFFERENT user (cf125371) was being built in the same window, and 444
+        of 880 stored agents are single-action stubs (#758) for which "holds 1"
+        is simply correct.  So the five lines were probably never about this
+        agent at all -- and with no key in the line there is no way to tell.
+
+        A diagnostic that cannot be attributed reproduces the ambiguity it was
+        added to remove, which is why the session key is part of the contract
+        and not a nicety.
+        """
+        block = _empty_branch(_reuse_src())
+        # Assert on the LOG MESSAGE, not the block.  A bare
+        # ``assertIn('user_prompt', block)`` passes vacuously: the block
+        # already reads ``recipes.get(user_prompt)`` to compute the count, so
+        # the name is present whether or not it is ever LOGGED.  Proven by
+        # A/B on 2026-09-11 -- that assertion passed against the reverted,
+        # session-less line too.  Match the interpolation inside the f-string.
+        self.assertTrue(
+            re.search(r'session \{user_prompt\}', block),
+            'the resolved-nothing line reports a count without naming the '
+            'session it measured; on a box with daemon agents and a second '
+            'user driving reuse concurrently, that number cannot be attributed '
+            'to the agent under test -- exactly how five "holds 1" lines were '
+            'nearly read as evidence about a 9-action agent (#828)')
+
 
 class TestSuccessPathUnchanged(unittest.TestCase):
     """The working half must not regress while fixing the silent half."""

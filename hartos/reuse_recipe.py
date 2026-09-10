@@ -5161,10 +5161,24 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     # actions 1,2,3,4,9, so live [] is the STORE, not the
                     # helper -- five hypotheses were eliminated for want of
                     # this one number (#828).
+                    # ...and the SESSION KEY, because the count alone is not
+                    # attributable on a live box.  Measured 2026-09-11 on the
+                    # first drive that carried this line: five occurrences all
+                    # read "holds 1 action(s)" while the agent under test
+                    # (88719487304) has NINE actions in both its flow recipes
+                    # on disk -- and the surrounding log showed a rival driver
+                    # (a marketing reuse agent for user cf125371) plus daemon
+                    # traffic in the same window.  444 of 880 stored agents are
+                    # single-action stubs (#758), so "holds 1" is the NORMAL
+                    # reading for a stub and says nothing about this agent.
+                    # Without the key the number cannot be attributed to a
+                    # session, which is the same ambiguity this line exists to
+                    # remove -- so it names the session it measured.
                     _store = (recipes.get(user_prompt) or {}).get('actions') or []
                     current_app.logger.info(
                         f"Tier-1 named attach: action {_aid} names no tool "
-                        f"(recipes store holds {len(_store)} action(s))")
+                        f"(session {user_prompt}, recipes store holds "
+                        f"{len(_store)} action(s))")
 
                 # (b) TAGS — unchanged fallback for capability families the
                 # recipe never mentions but the conversation drifted into.
