@@ -1686,3 +1686,58 @@ The reusable part: a machine nobody has touched will report a healthy instrument
 and no data, and those two things look identical from a distance. Manufacture the
 input at the lowest layer the metric claims to measure from, or the number you
 eventually get will be measuring your harness.
+
+
+### Narrowing the photon half: the plane flips, but not through the instrumented path
+Follow-up to the entry above, same night, same box. Two hypotheses were killed by
+measurement rather than argument.
+
+**"The screen never flips."** Wrong. i915 exposes no vblank counter here, but the
+primary plane's framebuffer id does change on every flip under double buffering,
+and sampling `plane[32]` in `/sys/kernel/debug/dri/0000:00:02.0/state` shows it
+alternating between two ids both at idle and under a 300-call `window.move`
+damage stream:
+
+```
+distinct fb ids while idle:     fb=104 fb=101
+distinct fb ids while driving:  fb=101 fb=104
+```
+
+So flips happen, `reap_completed_vblanks` runs, and `on_frame_presented()` is
+being called. The summaries it returns are simply empty.
+
+**"The timestamps are in the wrong units."** Also wrong, and worth recording
+because it was the most attractive theory. The call sites pass `event.time()`,
+which reads like the millisecond helper, into a parameter named `event_us`. The
+module doc settles it: libinput times are "CLOCK_MONOTONIC microseconds,
+`Event::time()`", so the units already agree. Filing that would have been a
+confident bug report about correct code.
+
+What that leaves is specific. `latency::on_frame_queued()` sits in exactly one
+branch of `udev.rs`:
+
+```
+Ok(true)  => ... silent freeze path ... continue;     // never queues
+Ok(false) => match surface.compositor.queue_frame(()) // -> on_frame_queued()
+```
+
+so the instrument only ever binds inputs to frames the compositor believes it
+RENDERED. A flip produced any other way -- the `resync_flip_state` forced
+composite, or a client buffer reaching the plane without a compositor-side
+render -- moves the framebuffer id, satisfies the vblank reaper, and pops an
+EMPTY batch off `inflight`. Input goes to `pending` and stays there.
+
+That is consistent with everything observed: flips, no summaries, and no
+`hart-latency dropped` warning either, since drops are only reported alongside a
+window that closes.
+
+The next step is therefore not more black-box probing, which has given all it
+can. It is one counter: how many times `on_frame_queued` is reached per second
+versus how many vblanks are reaped. If the first is zero while the second is
+not, the render path is reporting "nothing changed" for a desktop whose shell is
+demonstrably repainting, and THAT is the defect -- not the instrument.
+
+The reusable part: when an instrument reports nothing, the interesting question
+is not "is it broken" but "which of its preconditions is the system failing to
+meet". Both hypotheses here were about the instrument. Both were wrong. The
+preconditions were.
