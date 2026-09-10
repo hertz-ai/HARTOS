@@ -82,7 +82,20 @@ let
   # `Failed with result timeout`, and not a single [hart-compat-smoketest]
   # verdict line in the journal.
   budget = {
-    wine = 90;
+    # 180, not 90. Measured on real hardware 2026-09-10, AFTER this module's own
+    # fix shipped and the unit finally completed: the very first honest run said
+    #
+    #   [hart-compat-smoketest] probe exceeded its bound of 90 s: wine cmd /c echo HARTOK
+    #   [hart-compat-smoketest] windows = failed
+    #
+    # and that verdict was an artifact of the budget, not of Wine. A separate
+    # clean-prefix run on the same box needed up to 240s for `wineboot --init`
+    # alone, and a cold prefix is exactly what a freshly-booted node has. 90s
+    # could never cover it, so the probe was reporting the timer rather than the
+    # runtime. Raising it is only safe because TimeoutStartSec is DERIVED from
+    # this attrset now; before that, a bigger budget here would have silently
+    # pushed the total past a hand-written ceiling, which is the original bug.
+    wine = 180;
     waydroidStatus = 20;
     waydroidShell = 40;
     darling = 90;
