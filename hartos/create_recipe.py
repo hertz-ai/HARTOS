@@ -4861,12 +4861,16 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         # Save the flow recipe (topologically sorted + scheduler)
                         _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat)
 
-                        if get_current_flow(user_prompt)  < get_total_flows(user_prompt):
+                        if _has_more_flows(user_prompt):
                             _next_flow = get_current_flow(user_prompt) + 1
                             _total_flows = get_total_flows(user_prompt)
                             _push_thinking(user_id, f'Flow {_next_flow} of {_total_flows}: Starting next persona...')
                             current_app.logger.info(f'Completed ONE FLOW NOW WE SHOULD WORK ON NEXT FLOW')
                             current_app.logger.info(f'DELETE CURRENT AGENTS AND CREATE NEW')
+                            # Move the index BEFORE re-reading, exactly as the
+                            # exception path below already does.  Without this
+                            # the next line re-reads the flow we just finished.
+                            safe_increment_flow(user_prompt, prompt_id)
                             config = get_prompt_config_json(prompt_id)
                             flow_actions = config['flows'][get_current_flow(user_prompt)]['actions']
                             # Fresh ledger for new flow
@@ -5081,8 +5085,12 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                             # Save the flow recipe (same function as first path)
                             _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat)
 
-                            if get_current_flow(user_prompt) < get_total_flows(user_prompt):
+                            if _has_more_flows(user_prompt):
                                 current_app.logger.info(f'[NEXT-FLOW] Completed flow {get_current_flow(user_prompt)}, starting next')
+                                # Move the index BEFORE re-reading (see the
+                                # exception path); otherwise this re-authors
+                                # the flow that just completed.
+                                safe_increment_flow(user_prompt, prompt_id)
                                 config = get_prompt_config_json(prompt_id)
                                 flow_actions = config['flows'][get_current_flow(user_prompt)]['actions']
                                 # Fresh ledger for new flow — old one tracked previous flow's actions
@@ -5302,6 +5310,24 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
 def get_total_flows(user_prompt):
     return total_persona_actions[user_prompt]
+
+
+def _has_more_flows(user_prompt):
+    """True when a flow AFTER the current one still needs authoring.
+
+    `get_current_flow` is 0-BASED; `get_total_flows` is a COUNT.  The two
+    inline guards this replaces compared them directly, so on the LAST flow of
+    a single-flow agent the test read `0 < 1` -> True: the terminal
+    [ALL-FLOWS-DONE] return became unreachable and the branch re-authored the
+    SAME flow forever.  MEASURED live 2026-09-10, agent 28160128202:
+
+        Current Flow -> recipe_for_persona:0  total_persona_actions:1
+        [NEXT-FLOW] Completed flow 0, starting next   x9 over 27 minutes
+        [ALL-FLOWS-DONE]                              x0
+
+    One derivation, both call sites: two copies are what drifted.
+    """
+    return get_current_flow(user_prompt) + 1 < get_total_flows(user_prompt)
 
 
 def all_flows_completed(prompt_id, total_personas, user_prompt):
