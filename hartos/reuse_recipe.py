@@ -3282,6 +3282,39 @@ _REUSE_STEER_INITIATOR_NAMES = ("ChatInstructor",)
 # deliver across the sync.
 _REUSE_ACTION_MESSAGE_PREFIX = 'Perform this action -> Action #'
 
+# Recorded in _reuse_fab_pending when the thing that did not happen is not a
+# tool run but the ACTION'S OWN TEXT.  Angle brackets, so _TOOL_IDENT_RE can
+# never match it and it can never collide with a registered tool name sharing
+# that record.  Internal only — _reuse_fab_steer_message never shows it.
+_REUSE_NO_OUTPUT_SENTINEL = '<no output produced>'
+
+
+def _reuse_action_declares_tool(user_prompt, action_id):
+    """True when this action's recipe names a tool to call.
+
+    Reads the SAME authored ``recipe[].tool_name`` that
+    ``_build_reuse_action_message`` renders into the dispatch, so an action's
+    shape is decided by what CREATE wrote, not by a second guess at what a
+    tool action looks like.
+
+    Why it matters: ``_reuse_fabricated_tools`` answers "did the NAMED tools
+    execute", and says in its own docstring that it never touches "prose
+    actions that name no tool".  For an action whose deliverable IS the text
+    there is nothing for it to check, so `completed` rests on the model's
+    word.  This predicate is what tells the two shapes apart at the gate.
+
+    Unknown session / malformed recipe -> False, i.e. treated as a text
+    action and therefore held to the stricter evidence rule.  An action we
+    cannot classify is never given the weaker check.
+    """
+    try:
+        actions = (recipes.get(user_prompt) or {}).get('actions') or []
+        steps = (actions[action_id - 1] or {}).get('recipe') or []
+        return any(str((s or {}).get('tool_name') or '').strip()
+                   for s in steps)
+    except Exception:
+        return False
+
 
 def _reuse_group_terminate(msg):
     """End an action's group-chat round on a verdict the OUTER loop must act on.
@@ -3503,6 +3536,21 @@ def _reuse_fab_steer_message(user_prompt, current_action_id):
     tools = _reuse_fab_pending.pop((user_prompt, current_action_id), None)
     if not tools:
         return None
+    if list(tools) == [_REUSE_NO_OUTPUT_SENTINEL]:
+        # The refusal was recorded by the text half of the gate: this action
+        # names no tool, so "@Helper call <names>" would name nothing and
+        # prescribe a step that does not exist for it.  Ask for the one thing
+        # that IS missing — the action's own output, written where the user
+        # can read it.  The sentinel itself never appears in this text; it is
+        # only how the two halves share one pending record.
+        return (
+            f"Action {current_action_id} is NOT complete: it produced no "
+            f"output. This action calls no tool — its result IS the text you "
+            f"write — and nothing was written for the user in this action. Do "
+            f"not report this action as completed. Write the action's actual "
+            f"result now, in full, as your reply. If you cannot produce it, "
+            f"say plainly what is missing instead of claiming success."
+        )
     names = ', '.join(str(t) for t in tools)
     # The guard now holds an action for TWO causes -- the tool was never
     # called, and the tool ran but returned one of TOOL_FAILURE_RESULTS -- so
@@ -3801,8 +3849,17 @@ def _reuse_written_answer(group_chat):
     """
     try:
         for msg in reversed(list(getattr(group_chat, 'messages', None) or [])):
-            if str((msg or {}).get('name') or '') in _REUSE_STEER_INITIATOR_NAMES:
+            _m = msg or {}
+            if str(_m.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES:
                 return None                  # reached this action's dispatch
+            # ...and by CONTENT, because the seat name does not survive the
+            # #725 sync.  Measured 2026-09-10 09:10: the dispatch arrived as
+            # name='Assistant', so a name-only bound walked straight past it
+            # into an EARLIER action and would credit that action's output to
+            # this one.  Same producer constant the dispatch is built from.
+            if str(_m.get('content') or '').lstrip().startswith(
+                    _REUSE_ACTION_MESSAGE_PREFIX):
+                return None
             if _reuse_message_is_user_answer(msg):
                 return msg
         return None
@@ -5221,6 +5278,52 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                     f"completion with tool(s) {_fab} producing no real result after "
                     f"{_REUSE_FAB_STEER_MAX} re-steers — advancing to avoid a "
                     f"permanent stall; this action's output is NOT tool-backed")
+            elif not _reuse_action_declares_tool(user_prompt, current_action_id) \
+                    and _reuse_written_answer(_gc) is None:
+                # SAME GATE, THE OTHER HALF OF THE EVIDENCE.  The tool check
+                # above answers "did the NAMED tools execute" and says in its
+                # own docstring that it never touches "prose actions that name
+                # no tool".  For an action whose deliverable IS the text there
+                # is nothing for it to check, so `completed` rested on the
+                # model's word — for that whole class of action there was no
+                # evidence gate at all.
+                #
+                # Measured live 2026-09-10 09:08:58-09:10:17 (agent
+                # 88094979291, "summarize into exactly three bullet points"):
+                # all four actions completed, unrun=none, and NOT ONE message
+                # in the 12-entry group log was written by the Assistant to
+                # the user — every name=Assistant entry was a verbatim echo of
+                # the dispatch.  Action 3's verdict still read "Output
+                # formatted successfully with exactly three bullet points."
+                # No bullet points existed anywhere in that conversation.
+                #
+                # The same agent DID write the deliverable on the 03:37 run.
+                # Same recipe, same four "completed" verdicts, opposite
+                # outcome — the pipeline could not tell those runs apart.
+                # This is what makes them distinguishable: evidence, not
+                # variance.
+                #
+                # Rides the EXISTING machinery — same _reuse_resteer_counts
+                # budget, same _reuse_fab_pending record, same
+                # _reuse_fab_steer_message caller contract, same loud advance
+                # once the budget is spent.  No prompt text and no recipe is
+                # changed by this.
+                _n = _reuse_resteer_counts.get(_rk, 0)
+                if _n < _REUSE_FAB_STEER_MAX:
+                    _reuse_resteer_counts[_rk] = _n + 1
+                    _reuse_fab_pending[_rk] = [_REUSE_NO_OUTPUT_SENTINEL]
+                    current_app.logger.warning(
+                        f"[FABRICATED-COMPLETE] refusing to advance action "
+                        f"{current_action_id}: it names no tool, so its "
+                        f"deliverable is the text itself — and the group "
+                        f"produced no message for the user during it "
+                        f"(attempt {_n + 1}/{_REUSE_FAB_STEER_MAX})")
+                    return None, False
+                current_app.logger.error(
+                    f"[FABRICATED-COMPLETE] action {current_action_id} still "
+                    f"claims completion with no output produced after "
+                    f"{_REUSE_FAB_STEER_MAX} re-steers — advancing to avoid a "
+                    f"permanent stall; this action's output does NOT exist")
     except Exception as _fg_err:
         current_app.logger.debug(f"[FAB-GUARD] advance-gate skipped: {_fg_err}")
     # Mark current action done
