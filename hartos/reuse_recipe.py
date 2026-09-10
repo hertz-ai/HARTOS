@@ -3305,6 +3305,24 @@ _REUSE_AUTONOMY_NUDGE = (
     'reasonable assumptions where necessary'
 )
 
+# PRODUCER FIVE.  The UNDER-REPORTED steer: posted when an autonomous action
+# reports not-done while its tools have evidently run.  Measured live
+# 2026-09-10 14:23:10 (agent 92583386981, "English Learning Session"), where
+# the agent HAD done its work --
+#   14:23:16  Tier-1 named attach: action 1 names ['get_chat_history'] -> 1 tools
+#   14:23:43  [FAB-GUARD] action 1 ... executed=['get_chat_history', ...]; unrun=[]
+# -- and the user received this steer, all 197 characters of it, as the lesson.
+_REUSE_UNDER_REPORT_STEER = (
+    'Your tool for this action has already executed and returned its result. '
+    'Do not re-run it. Either report this action completed, or state the '
+    'exact remaining step that still needs a tool call.'
+)
+
+# PRODUCER SIX, closed at the same time rather than waiting for its own
+# incident.  The BREAKDOWN steer interpolates the subtask description, so the
+# marker is the fixed opening; containment then covers every subtask.
+_REUSE_SUBTASK_STEER_PREFIX = 'Work on subtask: '
+
 
 def _reuse_is_pipeline_text(content):
     """True when *content* is text THIS MODULE wrote to steer the group.
@@ -3365,7 +3383,9 @@ def _reuse_is_pipeline_text(content):
     _c = str(content or '')
     return (_REUSE_ACTION_MESSAGE_PREFIX in _c
             or _REUSE_NOT_COMPLETE_MARKER in _c
-            or _REUSE_AUTONOMY_NUDGE in _c)
+            or _REUSE_AUTONOMY_NUDGE in _c
+            or _REUSE_UNDER_REPORT_STEER in _c
+            or _REUSE_SUBTASK_STEER_PREFIX in _c)
 
 # Recorded in _reuse_fab_pending when the thing that did not happen is not a
 # tool run but the ACTION'S OWN TEXT.  Angle brackets, so _TOOL_IDENT_RE can
@@ -4812,7 +4832,8 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                             f"{user_prompt} — working '{_next_sub.description[:60]}'")
                         chat_instructor.initiate_chat(
                             recipient=manager,
-                            message=f"Work on subtask: {_next_sub.description}",
+                            message=(_REUSE_SUBTASK_STEER_PREFIX
+                                     + str(_next_sub.description)),
                             clear_history=False, silent=False)
                         continue
                     current_app.logger.info(
@@ -4853,11 +4874,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                             f"truthful verdict (attempt {_pn + 1}/{_REUSE_PENDING_STEER_MAX})")
                         chat_instructor.initiate_chat(
                             recipient=manager,
-                            message=(
-                                "Your tool for this action has already executed and returned "
-                                "its result. Do not re-run it. Either report this action "
-                                "completed, or state the exact remaining step that still "
-                                "needs a tool call."),
+                            message=_REUSE_UNDER_REPORT_STEER,
                             clear_history=False, silent=False)
                         continue
                     _reuse_advanced_actions.add(_reuse_current_action)
