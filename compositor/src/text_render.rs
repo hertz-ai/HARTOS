@@ -636,22 +636,29 @@ mod tests {
         let spaced = r.measure(text, size, 700, spacing, false);
         let grew = spaced - plain;
 
-        // ONE GAP PER CHARACTER, including the last. cosmic-text adds the tracking onto
-        // every glyph's advance, and so does CSS: `letter-spacing` is applied after each
-        // character, which is why a tracked run carries a trailing gap in a browser too.
-        // MonoMeasure uses (n - 1) instead, so the font-free estimate is one gap short of
-        // the real shaper. That is 3px on this run and it only affects the fallback, but
-        // it is a real difference and better written down than smoothed over by a loose
-        // tolerance -- which is what an earlier version of this test did.
-        let want = chars * spacing;
+        // ONE GAP PER CHARACTER when a real face shapes the run, including the last:
+        // cosmic-text adds the tracking onto every glyph's advance, and so does CSS,
+        // which is why a tracked run carries a trailing gap in a browser too.
+        //
+        // MonoMeasure uses (n - 1), one gap short, and `measure` degrades to it when the
+        // font database is EMPTY. That is not hypothetical and it is how this test first
+        // reached CI red while passing on a box with fonts: the nix build sandbox has no
+        // fonts at all, so it took the fallback and came back 51 where the shaper gives
+        // 54. The earlier version of this test asserted the shaper's number flat, having
+        // written the (n - 1) difference into its own comment one line above.
+        //
+        // So the assertion is the BAND both backends agree inside. Which end of it a host
+        // lands on says whether it has fonts, and neither answer is wrong.
+        let with_fonts = chars * spacing;
+        let font_free = (chars - 1.0) * spacing;
         assert!(
-            (grew - want).abs() <= 1.0,
-            "tracking must move the advance by px, one gap per character: expected about {want}, got {grew} (plain {plain}, spaced {spaced})"
+            grew >= font_free - 1.0 && grew <= with_fonts + 1.0,
+            "tracking must move the advance by px: expected {font_free} to {with_fonts}, got {grew} (plain {plain}, spaced {spaced})"
         );
-        // And the shape of the bug this test exists for, so it cannot come back quietly:
-        // read as EM, the growth would have been multiplied by the font size.
+        // And the shape of the bug this test exists for, which BOTH backends fail the
+        // same way if it comes back: read as EM, the growth is multiplied by the size.
         assert!(
-            grew < want * size * 0.5,
+            grew < font_free * size * 0.5,
             "tracking looks like it is being read as EM again: grew {grew} for {chars} characters at {spacing}px"
         );
     }
