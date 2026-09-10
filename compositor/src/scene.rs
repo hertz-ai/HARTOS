@@ -849,7 +849,18 @@ pub enum Component {
     TopBar,
     Omnibox,
     Taskbar,
-    HomeCard,
+    /// A card, carrying WHICH card: (row index, card index) INTO THE PAYLOAD.
+    ///
+    /// Payload indices, not visible ones. `layout_home` culls cards scrolled off the
+    /// left and stops at the right edge, so counting the cards it emitted would name a
+    /// different card the moment a row is scrolled. The indices ride along from the
+    /// `enumerate()` that built them, which is the only place both are known.
+    ///
+    /// The identity is what lets a click be ACTED ON rather than merely attributed: the
+    /// shell holds the same composed payload, so (row, card) is enough for it to run its
+    /// own `cardAction`, and the compositor never has to learn what `ask` or `resume`
+    /// mean. It does not affect the budget key: every card is `home-card`.
+    HomeCard(usize, usize),
     /// A card rail, carrying WHICH row it is.
     ///
     /// The index is not decoration: a wheel event has to reach the row under the pointer,
@@ -874,7 +885,7 @@ impl Component {
             Component::TopBar => crate::latency::Surface::TopBar,
             Component::Omnibox => crate::latency::Surface::Omnibox,
             Component::Taskbar => crate::latency::Surface::Taskbar,
-            Component::HomeCard => crate::latency::Surface::HomeCard,
+            Component::HomeCard(..) => crate::latency::Surface::HomeCard,
             Component::HomeRow(_) => crate::latency::Surface::HomeRow,
         }
     }
@@ -1193,6 +1204,20 @@ impl SceneNode {
             // A leaf inside a tagged group is that group; a leaf outside every group is
             // bare desktop, which has no budget row and must not borrow one.
             _ => {}
+        }
+    }
+
+    /// Which CARD a point is over, as (row, card) indices into the composed payload.
+    ///
+    /// Deepest-wins is exactly right here, unlike for `row_at`: the card is the innermost
+    /// thing under the pointer and the most specific answer is the wanted one.
+    ///
+    /// Payload indices, so a caller holding the same composition resolves the card without
+    /// the compositor knowing anything about what activating it means.
+    pub fn card_at(&self, px: f32, py: f32) -> Option<(usize, usize)> {
+        match self.component_at(px, py) {
+            Some(Component::HomeCard(row, card)) => Some((row, card)),
+            _ => None,
         }
     }
 
@@ -2635,7 +2660,7 @@ pub fn layout_home(
                 // A card is the one thing on this desktop the cursor reacts to, and the
                 // background rect pushed FIRST above is what the hover lifts.
                 interactive: true,
-                component: Some(Component::HomeCard),
+                component: Some(Component::HomeCard(row_index, card_index)),
                 children: card_children,
             });
             card_x += CARD_W + CARD_GAP;
@@ -3615,14 +3640,23 @@ mod tests {
     /// fills" rather than "every Fill node". The two stopped being the same thing when
     /// the chrome strips became gradient fills too, and a test that counts node KINDS
     /// says something about the renderer where it meant to say something about cards.
-    fn leaves_of<'a>(node: &'a SceneNode, want: Component, out: &mut Vec<&'a SceneNode>) {
+    fn is_card(c: Component) -> bool { matches!(c, Component::HomeCard(..)) }
+    fn is_top_bar(c: Component) -> bool { matches!(c, Component::TopBar) }
+    fn is_taskbar(c: Component) -> bool { matches!(c, Component::Taskbar) }
+    fn is_omnibox(c: Component) -> bool { matches!(c, Component::Omnibox) }
+
+    fn leaves_of<'a>(
+        node: &'a SceneNode,
+        want: fn(Component) -> bool,
+        out: &mut Vec<&'a SceneNode>,
+    ) {
         if let SceneNode::Container {
             component,
             children,
             ..
         } = node
         {
-            let here = *component == Some(want);
+            let here = component.map(want).unwrap_or(false);
             for c in children {
                 if here && !matches!(c, SceneNode::Container { .. }) {
                     out.push(c);
@@ -4410,7 +4444,7 @@ hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
         // The CARDS' fills, not every fill in the scene: the chrome strips are gradient
         // fills too now, and counting node kinds would count them as cards.
         let mut card_leaves: Vec<&SceneNode> = Vec::new();
-        leaves_of(&root, Component::HomeCard, &mut card_leaves);
+        leaves_of(&root, is_card, &mut card_leaves);
         let arts: Vec<&SceneNode> = card_leaves
             .iter()
             .copied()
@@ -4477,6 +4511,72 @@ hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
     }
 
     #[test]
+    fn a_card_names_its_payload_index_even_after_the_row_is_scrolled() {
+        // WHY THE INDICES ARE CARRIED rather than counted. layout_home CULLS cards
+        // scrolled off the left ("advance without emitting") and stops at the right edge,
+        // so the Nth card it emits is not the Nth card in the payload once a row moves. A
+        // caller resolving an activation against its own copy of the payload would then
+        // act on a different card than the one under the finger.
+        let (w, h) = (1920.0f32, 1080.0f32);
+        // Twelve cards per row, so a row genuinely overflows and the cull can happen.
+        // Same fixture shape as the wheel test, for the same reason.
+        let mut hc = sample();
+        let proto = hc.rows[0].cards[0].clone();
+        for r in hc.rows.iter_mut() {
+            r.cards = (0..12)
+                .map(|i| {
+                    let mut c = proto.clone();
+                    c.title = format!("{}#{i}", r.title);
+                    c
+                })
+                .collect();
+        }
+        let theme = Theme::cosmic_default();
+
+        let mut sc = RowScroll::default();
+        let view_w = row_view_width(w, h);
+        sc.scroll(1, 600.0, RowScroll::content_width(12), view_w);
+        let root = layout_home(w, h, &hc, &theme, &sc, &mut MonoMeasure);
+
+        let mut groups: Vec<&SceneNode> = Vec::new();
+        walk_groups(&root, &mut groups);
+        let tagged: Vec<((usize, usize), Rect)> = groups
+            .iter()
+            .filter_map(|c| match c {
+                SceneNode::Container {
+                    component: Some(Component::HomeCard(r, i)),
+                    rect,
+                    ..
+                } => Some(((*r, *i), *rect)),
+                _ => None,
+            })
+            .collect();
+        assert!(!tagged.is_empty(), "the scrolled desktop still lays out cards");
+
+        // Every visible card resolves to ITS OWN tag, whatever its position on screen.
+        for (id, rect) in &tagged {
+            assert_eq!(
+                root.card_at(rect.x + rect.w * 0.5, rect.y + rect.h * 0.5),
+                Some(*id),
+                "a card must name its index in the PAYLOAD, not its position on screen"
+            );
+        }
+
+        // And the culling this exists for really happens: some row shows a set of cards
+        // whose lowest payload index is not 0, so counting emitted cards would have been
+        // off by exactly the number culled.
+        let mut lowest: std::collections::BTreeMap<usize, usize> = Default::default();
+        for ((r, i), _) in &tagged {
+            let e = lowest.entry(*r).or_insert(usize::MAX);
+            *e = (*e).min(*i);
+        }
+        assert!(
+            lowest.values().any(|&i| i > 0),
+            "nothing was culled, so this run proves nothing: scroll further"
+        );
+    }
+
+    #[test]
     fn every_surface_the_native_shell_owns_names_itself_for_latency_attribution() {
         // latency_budgets.json carries 23 per-component budgets and the instrument has
         // never consulted one of them: every sample is reported as `component=shell`, so
@@ -4508,8 +4608,8 @@ hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
             .expect("a card was laid out");
         assert_eq!(
             root.component_at(card.x + card.w * 0.5, card.y + card.h * 0.5),
-            Some(Component::HomeCard),
-            "deepest wins: a card inside a row names the CARD"
+            Some(Component::HomeCard(0, 0)),
+            "deepest wins: a card inside a row names the CARD, and WHICH card"
         );
         // And the row band around it names the row, carrying its index so a wheel event
         // can reach it. A point on the row's header is over the row and over no card.
@@ -4564,7 +4664,7 @@ hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
         // deepest-wins is right for that question and wrong for this one.
         assert_eq!(
             root.component_at(card.x + card.w * 0.5, card.y + card.h * 0.5),
-            Some(Component::HomeCard),
+            Some(Component::HomeCard(0, 0)),
             "latency attribution still names the card, not the row"
         );
 
@@ -4628,7 +4728,7 @@ hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
             Component::TopBar,
             Component::Omnibox,
             Component::Taskbar,
-            Component::HomeCard,
+            Component::HomeCard(0, 0),
         ];
         let labels: Vec<&str> = all.iter().map(|c| c.surface().label()).collect();
         assert_eq!(labels, ["orb", "top-bar", "omnibox", "taskbar", "home-card"]);
@@ -4707,7 +4807,7 @@ hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
         let theme = Theme::cosmic_default();
         let root = layout_home(1600.0, 900.0, &sample(), &theme, &RowScroll::default(), &mut MonoMeasure);
         let mut card_leaves: Vec<&SceneNode> = Vec::new();
-        leaves_of(&root, Component::HomeCard, &mut card_leaves);
+        leaves_of(&root, is_card, &mut card_leaves);
 
         let (from, mid, mid_at, to, angle, srect) = card_leaves
             .iter()
@@ -4756,7 +4856,7 @@ hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
         let theme = Theme::cosmic_default();
         let root = layout_home(1600.0, 900.0, &sample(), &theme, &RowScroll::default(), &mut MonoMeasure);
         let mut card_leaves: Vec<&SceneNode> = Vec::new();
-        leaves_of(&root, Component::HomeCard, &mut card_leaves);
+        leaves_of(&root, is_card, &mut card_leaves);
         let edges: Vec<Rect> = card_leaves
             .iter()
             .filter_map(|n| match n {
@@ -5001,7 +5101,7 @@ hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
             .iter()
             .find_map(|c| match c {
                 SceneNode::Container {
-                    component: Some(Component::HomeCard),
+                    component: Some(Component::HomeCard(..)),
                     rect,
                     ..
                 } if band.contains(rect.x + rect.w * 0.5, rect.y + rect.h * 0.5) => Some(*rect),
@@ -5276,7 +5376,7 @@ hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
         let theme = Theme::cosmic_default();
         let tree = layout_home(1280.0, 800.0, &hc, &theme, &RowScroll::default(), &mut MonoMeasure);
         let mut leaves: Vec<&SceneNode> = Vec::new();
-        leaves_of(&tree, Component::HomeCard, &mut leaves);
+        leaves_of(&tree, is_card, &mut leaves);
         // A card has TWO fills now: its art, and the legibility scrim over it. A scrim
         // is the one that STARTS transparent, which is what a scrim is rather than a
         // position this test would have to keep in step with the layout.
@@ -5399,7 +5499,7 @@ hart-scene-cost nodes={} budget={}us", leaves.len(), FRAME_US);
         // belongs to a card. A test that says "the first Fill" is describing the
         // renderer's node order where it means to describe a card.
         let mut card_leaves: Vec<&SceneNode> = Vec::new();
-        leaves_of(&tree, Component::HomeCard, &mut card_leaves);
+        leaves_of(&tree, is_card, &mut card_leaves);
         let card_art = card_leaves
             .iter()
             .find(|n| matches!(n, SceneNode::Fill { .. }))
