@@ -320,9 +320,20 @@ class TestThePipelinesOwnTextIsNeverTheAnswer:
             rr._build_reuse_action_message), (
             'the action-message producer must emit the shared constant, not '
             'its own copy of the wording')
+        # RE-POINTED 2026-09-10, one function deeper, NOT weakened.  The
+        # match moved into `_reuse_is_action_dispatch` when the seed
+        # composition ("{user message}\n\n{dispatch}") proved that a
+        # `startswith` test cannot see a dispatch the producer put in the
+        # middle.  The invariant is the same and is now asserted on BOTH
+        # readers rather than one, so a future reader that re-spells the
+        # match fails here instead of silently keeping the old hole.
         assert '_REUSE_ACTION_MESSAGE_PREFIX' in inspect.getsource(
-            rr._reuse_message_is_user_answer), (
+            rr._reuse_is_action_dispatch), (
             'the recogniser must read the same constant the producer emits')
+        for reader in (rr._reuse_message_is_user_answer,
+                       rr._reuse_written_answer):
+            assert '_reuse_is_action_dispatch' in inspect.getsource(reader), (
+                f'{reader.__name__} must ask the shared recogniser')
 
     def test_the_producers_real_output_is_rejected(self, rr, monkeypatch):
         """Not a hand-written lookalike — build the string the way the

@@ -3282,6 +3282,41 @@ _REUSE_STEER_INITIATOR_NAMES = ("ChatInstructor",)
 # deliver across the sync.
 _REUSE_ACTION_MESSAGE_PREFIX = 'Perform this action -> Action #'
 
+
+def _reuse_is_action_dispatch(content):
+    """True when *content* carries an action dispatch THIS MODULE wrote.
+
+    CONTAINMENT, not `startswith`, because the producer does not always put
+    the dispatch first.  There are two producers and they compose it
+    differently:
+
+      _build_reuse_action_message   the dispatch alone — actions 2..N
+      _reuse_seed_message           ``f"{message}\\n\\n{dispatch}"`` — the
+                                    opening turn puts the USER'S WORDS first
+
+    Measured live 2026-09-10 10:05:25 (agent 88094979291): the second shape
+    reached the user verbatim, all 904 characters of it —
+
+        Summarize a given text into exactly three bullet points.
+
+        Perform this action -> Action #1:Receive the input text from the user.
+         follow these steps: [{... 'code': "def extract_user_input(): ..."}]
+
+    — because a prefix test cannot see a marker that sits in the middle.  The
+    93fdaac3f refusal closed the first shape and left the second open; the
+    question both readers ask is "did this module write this text", and that
+    has one answer wherever the producer chose to put it.
+
+    ONE implementation, two callers (_reuse_message_is_user_answer and
+    _reuse_written_answer).  They already shared the constant; sharing only
+    the constant is what let one be fixed while the other kept the hole.
+
+    A genuine answer that quotes the dispatch back is refused too, and that
+    is correct — echoing the dispatch is exactly the 04:42:04 regression
+    this family exists to stop.
+    """
+    return _REUSE_ACTION_MESSAGE_PREFIX in str(content or '')
+
 # Recorded in _reuse_fab_pending when the thing that did not happen is not a
 # tool run but the ACTION'S OWN TEXT.  Angle brackets, so _TOOL_IDENT_RE can
 # never match it and it can never collide with a registered tool name sharing
@@ -3767,7 +3802,7 @@ def _reuse_message_is_user_answer(message):
                     if _ak in _ans:
                         return _reuse_is_written_answer(_ans[_ak])
             return True                      # the answer is already there
-        if content.lstrip().startswith(_REUSE_ACTION_MESSAGE_PREFIX):
+        if _reuse_is_action_dispatch(content):
             # THIS MODULE POSTED IT.  Checked BEFORE the seat name because
             # the seat name does not survive the #725 sync — see the
             # constant's comment for the 2026-09-10 04:42:04 measurement.
@@ -3856,9 +3891,9 @@ def _reuse_written_answer(group_chat):
             # #725 sync.  Measured 2026-09-10 09:10: the dispatch arrived as
             # name='Assistant', so a name-only bound walked straight past it
             # into an EARLIER action and would credit that action's output to
-            # this one.  Same producer constant the dispatch is built from.
-            if str(_m.get('content') or '').lstrip().startswith(
-                    _REUSE_ACTION_MESSAGE_PREFIX):
+            # this one.  The SHARED predicate, so this bound and the answer
+            # test cannot drift — one of them was already fixed alone.
+            if _reuse_is_action_dispatch(_m.get('content')):
                 return None
             if _reuse_message_is_user_answer(msg):
                 return msg

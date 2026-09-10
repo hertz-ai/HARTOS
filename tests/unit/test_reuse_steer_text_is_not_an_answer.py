@@ -135,3 +135,90 @@ class TestSteerTextIsNotAnAnswer:
             rr._reuse_written_answer), (
             'the answer-recovery bound must read the SHARED constant, not '
             're-spell the seat names')
+
+
+class TestTheSeedIsAlsoTheProducersOwnText:
+    """The dispatch is not always at the START of the message.
+
+    MEASURED LIVE 2026-09-10 10:05:25, agent 88094979291, installed build.
+    The user's whole 904-char reply, HTTP 200 in 0 seconds:
+
+        Summarize a given text into exactly three bullet points.
+
+        Perform this action -> Action #1:Receive the input text from the user.
+         follow these steps: [{"Extract the user's latest message ... ":
+         {'tool_name': '', 'code': "def extract_user_input(): ..."}}]
+
+    `_reuse_seed_message` builds the opening turn as
+    ``f"{message}\n\n{_build_reuse_action_message(...)}"`` — the user's own
+    words FIRST, the dispatch second.  So the producer's text is in the
+    MIDDLE of the message, and the 93fdaac3f refusal, which asks
+    ``content.lstrip().startswith(_REUSE_ACTION_MESSAGE_PREFIX)``, does not
+    see it: the seed reads as ordinary prose, the synthesis turn is skipped,
+    and the extractor returns the dispatch verbatim.
+
+    Same producer, same constant, one composition away from the case that
+    was closed.  The question both sites ask is "did THIS MODULE write this
+    text", and there is exactly one honest answer to it wherever the
+    producer chose to put it.
+    """
+
+    LIVE_SEED = (
+        "Summarize a given text into exactly three bullet points.\n\n"
+        "Perform this action -> Action #1:Receive the input text from the "
+        "user.\n follow these steps: [{\"Extract the user's latest message "
+        "containing the text to be summarized.\": {'tool_name': '', 'code': "
+        "\"def extract_user_input():\n    pass\"}}]"
+    )
+
+    def test_the_seed_needs_synthesis(self, rr):
+        """THE DEFECT, with the exact 904-char message the user received."""
+        assert _tail(rr, {'role': 'user', 'name': 'User',
+                          'content': self.LIVE_SEED}) is True, (
+            "the opening seed — the user's words plus this module's own "
+            "action dispatch — was classified as a real answer, so the "
+            "synthesis turn was skipped and the extractor handed the user "
+            "the pipeline's internal plumbing (live 2026-09-10 10:05:25)")
+
+    def test_the_walk_back_stops_at_the_seed(self, rr):
+        """The answer-recovery bound has the same hole.
+
+        Its content bound also asks `startswith`, so a seed-opened action
+        lets the walk run past its own dispatch into an earlier action and
+        credit that action's output to this one.
+        """
+        earlier = {'role': 'assistant', 'name': 'Assistant',
+                   'content': 'This was an earlier action answering something '
+                              'else entirely.'}
+        chat = _Chat(earlier,
+                     {'role': 'user', 'name': 'User',
+                      'content': self.LIVE_SEED})
+        assert rr._reuse_written_answer(chat) is None, (
+            "the walk reached past this action's own seeded dispatch")
+
+    def test_ordinary_prose_is_still_an_answer(self, rr):
+        """ANTI-VACUITY.  Widening the match must not swallow real answers."""
+        assert _tail(rr, {'role': 'user', 'name': 'Assistant',
+                          'content': 'Here is the summary you asked for: the '
+                                     'Apollo program ran from 1961 to 1972 '
+                                     'and landed twelve people on the Moon.'
+                          }) is False
+
+    def test_one_place_decides_what_a_dispatch_is(self, rr):
+        """DRY: the two readers must not each carry their own matching rule.
+
+        They already share the CONSTANT; before this they did not share the
+        MATCH, which is how one of them was fixed and the other kept the
+        hole.  One predicate, both callers.
+        """
+        import inspect
+        src = inspect.getsource(rr)
+        assert src.count('_REUSE_ACTION_MESSAGE_PREFIX = ') == 1
+        assert src.count('def _reuse_is_action_dispatch') == 1, (
+            'the "is this our own dispatch" test must have exactly one '
+            'implementation')
+        for reader in (rr._reuse_message_is_user_answer,
+                       rr._reuse_written_answer):
+            assert '_reuse_is_action_dispatch' in inspect.getsource(reader), (
+                f'{reader.__name__} must ask the shared predicate, not '
+                're-implement the match')
