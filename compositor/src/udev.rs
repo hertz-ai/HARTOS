@@ -1211,7 +1211,7 @@ fn reap_completed_vblanks(state: &mut State, devices: &mut HashMap<DrmNode, Devi
                 // photon side of every input bound to the frame it completes.
                 // Summaries surface once per 10s window; the journal line is
                 // the harness §3 contract, greppable as `hart-latency`.
-                let (summaries, drops) = crate::latency::on_frame_presented();
+                let (summaries, drops, stall) = crate::latency::on_frame_presented();
                 for s in summaries {
                     info!("{}", s.journal_line());
                 }
@@ -1222,6 +1222,13 @@ fn reap_completed_vblanks(state: &mut State, devices: &mut HashMap<DrmNode, Devi
                 // while discarding samples reads as evidence when it is not.
                 if let Some(d) = drops {
                     warn!("{}", d.journal_line());
+                }
+                // The dual case: vblanks reaped and input waiting, but nothing
+                // ever queued, so no sample can be MADE and the journal would
+                // otherwise be silent — indistinguishable from a box nobody
+                // touched. Says so at the same cadence a healthy window reports.
+                if let Some(st) = stall {
+                    warn!("{}", st.journal_line());
                 }
             }
         }

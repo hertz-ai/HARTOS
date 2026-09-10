@@ -263,6 +263,41 @@ impl Drops {
     }
 }
 
+/// The dual of `Drops`, and the case that had no voice until 2026-09-10.
+///
+/// `Drops` covers "samples existed and were thrown away". This covers "samples
+/// could never be MADE": vblanks are being reaped and input is arriving, but no
+/// frame is ever QUEUED, so `frame_queued` never binds `pending` to anything and
+/// `frame_presented` keeps popping an empty batch. The journal then says nothing
+/// at all, which is the same thing an untouched machine says.
+///
+/// That cost hours on real hardware. The box had flips (the primary plane's
+/// framebuffer id alternated), had input (the #134 seat beacon fired), and
+/// reported zero `hart-latency` lines, and the only way to tell "no interaction"
+/// from "the render path never queued" was to read the compositor source. An
+/// instrument that cannot explain its own silence is not finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stall {
+    /// Vblanks reaped since the last report.
+    pub presented: u64,
+    /// Frames queued in the same span. Zero is the diagnosis.
+    pub queued: u64,
+    /// Inputs sitting unbound because nothing ever queued.
+    pub pending: usize,
+}
+
+impl Stall {
+    /// Same `hart-latency` prefix as the numbers and the drops, so one filter
+    /// catches the reading, the reason to distrust it, and the reason there is
+    /// no reading at all.
+    pub fn journal_line(&self) -> String {
+        format!(
+            "hart-latency stalled presented={} queued={} pending={} verdict=NO-SAMPLES",
+            self.presented, self.queued, self.pending
+        )
+    }
+}
+
 /// Inputs bound to one queued frame await its vblank. More than a few in
 /// flight means vblanks stopped being reaped (the #50 freeze class) — binding
 /// newer frames would then attribute stale input to the wrong photon, so the
@@ -279,6 +314,11 @@ const WINDOW_US: u64 = 10_000_000;
 /// A sample farther than this from its photon is a clock or wedge artifact,
 /// not an interaction; refuse it (anti-gaming: report nothing over almost).
 const MAX_SANE_LATENCY_US: u64 = 5_000_000;
+
+/// Vblanks between stall reports. At 60Hz this is about ten seconds, matching
+/// the summary window, so a stalled box speaks at the same cadence a healthy
+/// one does and neither floods the journal.
+const STALL_REPORT_EVERY: u64 = 600;
 /// Offset observations kept for the rolling-min estimator.
 const OFFSET_WINDOW: usize = 64;
 
@@ -302,6 +342,11 @@ pub struct LatencyCore {
     inflight_reported: u64,
     button_down: bool,
     window_start_us: Option<u64>,
+    /// Frames that actually bound a batch, and vblanks reaped, since start.
+    /// Their DIVERGENCE is the stall signal (see `Stall`).
+    frames_queued: u64,
+    frames_presented: u64,
+    stall_reported_at: u64,
     /// [surface][kind]. Forty-two fixed buckets, allocated once and reused: an input
     /// rate this cannot cover does not exist, and a map would put an allocation on the
     /// input path for no benefit.
@@ -320,6 +365,9 @@ impl LatencyCore {
             inflight_reported: 0,
             button_down: false,
             window_start_us: None,
+            frames_queued: 0,
+            frames_presented: 0,
+            stall_reported_at: 0,
             window: Default::default(),
         }
     }
@@ -391,6 +439,7 @@ impl LatencyCore {
             self.inflight_dropped += 1;
         }
         self.inflight.push_back(std::mem::take(&mut self.pending));
+        self.frames_queued += 1;
     }
 
     /// A vblank completed (`reap_completed_vblanks`): the OLDEST queued batch
@@ -399,6 +448,7 @@ impl LatencyCore {
     /// Returns finished window summaries (empty most calls) — io is the
     /// caller's job.
     pub fn frame_presented(&mut self, instant_us: u64) -> Vec<Summary> {
+        self.frames_presented += 1;
         let batch = self.inflight.pop_front().unwrap_or_default();
         if let Some(off) = self.offset_us() {
             // Refuse to fabricate: no offset means no anchored photon time.
@@ -465,6 +515,36 @@ impl LatencyCore {
     /// totals since construction; `take_drops` is what the journal reports.
     pub fn dropped(&self) -> (u64, u64) {
         (self.pending_dropped, self.inflight_dropped)
+    }
+
+    /// Is the instrument unable to MAKE samples, and has it not said so yet?
+    ///
+    /// `Some` only when vblanks are being reaped, input is waiting, and NOTHING
+    /// has been queued in the span — the one shape that produces silence rather
+    /// than numbers. Reported at most once per `STALL_REPORT_EVERY` vblanks so a
+    /// genuinely wedged box says it periodically instead of every frame.
+    pub fn take_stall(&mut self) -> Option<Stall> {
+        let since = self.frames_presented - self.stall_reported_at;
+        if since < STALL_REPORT_EVERY {
+            return None;
+        }
+        // Nothing waiting means nobody touched the box, which is not a stall.
+        if self.pending.is_empty() {
+            self.stall_reported_at = self.frames_presented;
+            return None;
+        }
+        // Frames ARE binding, so the instrument is working; silence would then
+        // be a real absence of interaction, and this must not cry wolf.
+        if self.frames_queued > 0 {
+            self.stall_reported_at = self.frames_presented;
+            return None;
+        }
+        self.stall_reported_at = self.frames_presented;
+        Some(Stall {
+            presented: since,
+            queued: 0,
+            pending: self.pending.len(),
+        })
     }
 
     /// What was dropped since the last call, or `None` when nothing was.
@@ -551,18 +631,19 @@ pub fn on_frame_queued() {
 
 /// Called from the vblank reaper. Emits the journal lines and (opt-in) the
 /// jsonl sink here so udev.rs stays one line.
-pub fn on_frame_presented() -> (Vec<Summary>, Option<Drops>) {
+pub fn on_frame_presented() -> (Vec<Summary>, Option<Drops>, Option<Stall>) {
     let g = global();
     // Both under ONE lock: the drops belong to the window the summaries describe, and
     // taking them separately would let a drop land between the two and be attributed
     // to the next window, which is the one place this record must not lie.
-    let (summaries, drops) = match g.core.lock() {
+    let (summaries, drops, stall) = match g.core.lock() {
         Ok(mut c) => {
             let s = c.frame_presented(instant_us());
             let d = c.take_drops();
-            (s, d)
+            let st = c.take_stall();
+            (s, d, st)
         }
-        Err(_) => (Vec::new(), None),
+        Err(_) => (Vec::new(), None, None),
     };
     if !summaries.is_empty() {
         let jsonl = std::env::var("HART_LATENCY_JSONL").ok().as_deref() == Some("1");
@@ -605,7 +686,7 @@ pub fn on_frame_presented() -> (Vec<Summary>, Option<Drops>) {
             }
         }
     }
-    (summaries, drops)
+    (summaries, drops, stall)
 }
 
 #[cfg(test)]
@@ -980,5 +1061,81 @@ mod tests {
         assert_eq!(Kind::Scroll.budget_ms(), 16);
         assert_eq!(Kind::Press.budget_ms(), 25);
         assert_eq!(Kind::Key.budget_ms(), 25);
+    }
+
+    // ── The stall diagnostic: explaining silence ───────────────────────────
+    //
+    // These three cover the whole decision, because the failure they guard
+    // against is a FALSE alarm as much as a missed one. An instrument that
+    // shouts "stalled" at an idle desk is noise, and noise gets filtered, and
+    // then the real stall is invisible again.
+
+    #[test]
+    fn a_stall_is_reported_when_vblanks_reap_but_nothing_ever_queues() {
+        // The real-hardware shape, 2026-09-10: flips happening, input arriving,
+        // no frame ever queued, and a journal that said nothing at all.
+        let mut c = LatencyCore::new();
+        c.note_input(Surface::Shell, Kind::Hover, 1_000, 1_100);
+        for i in 0..STALL_REPORT_EVERY {
+            assert!(c.frame_presented(2_000 + i).is_empty());
+        }
+        let st = c.take_stall().expect("silence with input waiting must explain itself");
+        assert_eq!(st.queued, 0, "zero queued frames IS the diagnosis");
+        assert_eq!(st.presented, STALL_REPORT_EVERY);
+        assert!(st.pending >= 1, "the unbound input is what makes it a stall");
+        assert!(st.journal_line().contains("verdict=NO-SAMPLES"));
+        assert!(
+            st.journal_line().starts_with("hart-latency "),
+            "one filter must catch the numbers, the drops and the silence"
+        );
+    }
+
+    #[test]
+    fn no_stall_is_reported_when_frames_are_binding() {
+        // Frames queue, so the instrument works; any silence after this is a
+        // real absence of interaction and must not be blamed on the pipeline.
+        let mut c = LatencyCore::new();
+        c.note_input(Surface::Shell, Kind::Hover, 1_000, 1_100);
+        c.frame_queued();
+        c.note_input(Surface::Shell, Kind::Hover, 3_000, 3_100);
+        for i in 0..STALL_REPORT_EVERY {
+            let _ = c.frame_presented(4_000 + i);
+        }
+        assert!(
+            c.take_stall().is_none(),
+            "a pipeline that binds must never be reported as stalled"
+        );
+    }
+
+    #[test]
+    fn an_untouched_box_is_not_a_stall() {
+        // No input at all is exactly what a headless machine nobody has touched
+        // looks like, and it is NOT a defect. This is the false-positive guard:
+        // the node that started this whole investigation had zero input for its
+        // entire uptime, and calling that a stall would have been wrong.
+        let mut c = LatencyCore::new();
+        for i in 0..STALL_REPORT_EVERY {
+            let _ = c.frame_presented(1_000 + i);
+        }
+        assert!(
+            c.take_stall().is_none(),
+            "no input pending means nobody interacted, not that the pipeline broke"
+        );
+    }
+
+    #[test]
+    fn the_stall_report_is_rate_limited() {
+        // A wedged box should say so periodically, not 60 times a second.
+        let mut c = LatencyCore::new();
+        c.note_input(Surface::Shell, Kind::Hover, 1_000, 1_100);
+        for i in 0..STALL_REPORT_EVERY {
+            let _ = c.frame_presented(2_000 + i);
+        }
+        assert!(c.take_stall().is_some(), "first crossing reports");
+        assert!(c.take_stall().is_none(), "and does not repeat until the next span");
+        for i in 0..STALL_REPORT_EVERY {
+            let _ = c.frame_presented(10_000 + i);
+        }
+        assert!(c.take_stall().is_some(), "the next span reports again");
     }
 }
