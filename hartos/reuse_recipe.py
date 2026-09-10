@@ -3283,11 +3283,36 @@ _REUSE_STEER_INITIATOR_NAMES = ("ChatInstructor",)
 _REUSE_ACTION_MESSAGE_PREFIX = 'Perform this action -> Action #'
 
 
-def _reuse_is_action_dispatch(content):
-    """True when *content* carries an action dispatch THIS MODULE wrote.
+# How every refusal re-steer opens — BOTH branches of
+# _reuse_fab_steer_message ("...the tool(s) X did not produce a real result"
+# and "...it produced no output").  One marker, emitted by the producer, so
+# the recogniser below cannot drift from the wording.
+_REUSE_NOT_COMPLETE_MARKER = ' is NOT complete: '
+
+
+def _reuse_is_pipeline_text(content):
+    """True when *content* is text THIS MODULE wrote to steer the group.
+
+    Never an answer to the user, whatever it says.  Three producers, and the
+    gap each one opened was found the hard way:
+
+      _build_reuse_action_message   the action dispatch                 04:42
+      _reuse_seed_message           user's words + the dispatch          10:05
+      _reuse_fab_steer_message      the fabrication gate's re-steer      10:22
+
+    all three measured live on 2026-09-10 being delivered to the user as the
+    reply.  The third was reachable only after 800c6eb53 made the gate refuse
+    prose actions, but the exposure was already there for its tool branch —
+    a refused action leaves its re-steer as the tail, and the extractor takes
+    the tail.
+
+    Was `_reuse_is_pipeline_text`, which named one producer and so kept
+    being one producer behind.  The durable question is "did this module
+    write this", and the answer is a marker per producer, each emitted by
+    that producer.
 
     CONTAINMENT, not `startswith`, because the producer does not always put
-    the dispatch first.  There are two producers and they compose it
+    its marker first.  There are two producers and they compose it
     differently:
 
       _build_reuse_action_message   the dispatch alone — actions 2..N
@@ -3314,8 +3339,16 @@ def _reuse_is_action_dispatch(content):
     A genuine answer that quotes the dispatch back is refused too, and that
     is correct — echoing the dispatch is exactly the 04:42:04 regression
     this family exists to stop.
+
+    What this must NOT swallow is an honest failure report.  "Since no
+    specific text was provided in your input, I could not summarize
+    anything." (measured 10:21:11) is the agent talking to the user and has
+    to reach them; only the module's own markers are refused, never the
+    sentiment.
     """
-    return _REUSE_ACTION_MESSAGE_PREFIX in str(content or '')
+    _c = str(content or '')
+    return (_REUSE_ACTION_MESSAGE_PREFIX in _c
+            or _REUSE_NOT_COMPLETE_MARKER in _c)
 
 # Recorded in _reuse_fab_pending when the thing that did not happen is not a
 # tool run but the ACTION'S OWN TEXT.  Angle brackets, so _TOOL_IDENT_RE can
@@ -3579,7 +3612,7 @@ def _reuse_fab_steer_message(user_prompt, current_action_id):
         # can read it.  The sentinel itself never appears in this text; it is
         # only how the two halves share one pending record.
         return (
-            f"Action {current_action_id} is NOT complete: it produced no "
+            f"Action {current_action_id}{_REUSE_NOT_COMPLETE_MARKER}it produced no "
             f"output. This action calls no tool — its result IS the text you "
             f"write — and nothing was written for the user in this action. Do "
             f"not report this action as completed. Write the action's actual "
@@ -3597,7 +3630,7 @@ def _reuse_fab_steer_message(user_prompt, current_action_id):
     # State the property the guard actually established -- no real result --
     # and require the failure to be reported rather than dressed as success.
     return (
-        f"Action {current_action_id} is NOT complete: the tool(s) {names} did "
+        f"Action {current_action_id}{_REUSE_NOT_COMPLETE_MARKER}the tool(s) {names} did "
         f"not produce a real result — either they were never called, or they "
         f"ran and returned a failure. Do not report this action as completed. "
         f"@Helper call {names} now with real arguments and report the actual "
@@ -3802,7 +3835,7 @@ def _reuse_message_is_user_answer(message):
                     if _ak in _ans:
                         return _reuse_is_written_answer(_ans[_ak])
             return True                      # the answer is already there
-        if _reuse_is_action_dispatch(content):
+        if _reuse_is_pipeline_text(content):
             # THIS MODULE POSTED IT.  Checked BEFORE the seat name because
             # the seat name does not survive the #725 sync — see the
             # constant's comment for the 2026-09-10 04:42:04 measurement.
@@ -3893,7 +3926,7 @@ def _reuse_written_answer(group_chat):
             # into an EARLIER action and would credit that action's output to
             # this one.  The SHARED predicate, so this bound and the answer
             # test cannot drift — one of them was already fixed alone.
-            if _reuse_is_action_dispatch(_m.get('content')):
+            if _reuse_is_pipeline_text(_m.get('content')):
                 return None
             if _reuse_message_is_user_answer(msg):
                 return msg

@@ -214,11 +214,105 @@ class TestTheSeedIsAlsoTheProducersOwnText:
         import inspect
         src = inspect.getsource(rr)
         assert src.count('_REUSE_ACTION_MESSAGE_PREFIX = ') == 1
-        assert src.count('def _reuse_is_action_dispatch') == 1, (
+        assert src.count('def _reuse_is_pipeline_text') == 1, (
             'the "is this our own dispatch" test must have exactly one '
             'implementation')
         for reader in (rr._reuse_message_is_user_answer,
                        rr._reuse_written_answer):
-            assert '_reuse_is_action_dispatch' in inspect.getsource(reader), (
+            assert '_reuse_is_pipeline_text' in inspect.getsource(reader), (
                 f'{reader.__name__} must ask the shared predicate, not '
                 're-implement the match')
+
+
+class TestTheRefusalSteerIsAlsoOurOwnText:
+    """The fabrication gate's re-steer is a THIRD thing this module writes.
+
+    MEASURED LIVE 2026-09-10 10:22:30, agent 88094979291, installed build.
+    The user's entire 349-char reply was the re-steer itself:
+
+        Action 1 is NOT complete: it produced no output. This action calls no
+        tool — its result IS the text you write — and nothing was written for
+        the user in this action. Do not report this action as completed.
+        Write the action's actual result now, in full, as your reply. ...
+
+    (`[FABRICATED-COMPLETE] refusing to advance action 1` fired twice in that
+    turn; the log line for the drive reads ``held=[1, 1]``.)
+
+    The dispatch and the seed are recognised as this module's own words; the
+    re-steer was not, so when a turn ends with a re-steer as the tail — which
+    is exactly what a refused action leaves behind — the extractor hands it
+    over as the answer.  Both branches of `_reuse_fab_steer_message` open with
+    the same sentence, so ONE marker covers the tool branch and the
+    no-output branch, and the constant is emitted by the producer rather than
+    matched by a copy of its wording.
+    """
+
+    LIVE_STEER = (
+        "Action 1 is NOT complete: it produced no output. This action calls "
+        "no tool — its result IS the text you write — and nothing was written "
+        "for the user in this action. Do not report this action as completed. "
+        "Write the action's actual result now, in full, as your reply. If you "
+        "cannot produce it, say plainly what is missing instead of claiming "
+        "success."
+    )
+
+    def test_the_live_refusal_steer_needs_synthesis(self, rr):
+        """THE DEFECT, with the exact text the user received."""
+        assert _tail(rr, {'role': 'user', 'name': 'Assistant',
+                          'content': self.LIVE_STEER}) is True, (
+            "the fabrication gate's own re-steer was classified as a real "
+            'answer and handed to the user (live 2026-09-10 10:22:30)')
+
+    def test_both_steer_branches_are_covered(self, rr, monkeypatch):
+        """Not the one sentence — the real output of BOTH branches.
+
+        Built through the producer, so a reworded steer fails this test
+        instead of silently re-opening the hole.
+        """
+        for pending in (['google_search'], [rr._REUSE_NO_OUTPUT_SENTINEL]):
+            monkeypatch.setitem(rr._reuse_fab_pending, ('sess_s', 2), pending)
+            built = rr._reuse_fab_steer_message('sess_s', 2)
+            assert built, 'the producer returned nothing to check'
+            assert _tail(rr, {'role': 'user', 'name': 'Assistant',
+                              'content': built}) is True, (
+                f'a re-steer built for pending={pending!r} reads as an answer')
+
+    def test_the_walk_back_does_not_credit_a_steer_as_output(self, rr):
+        """The evidence gate must not accept its own nudge as the output.
+
+        If a re-steer counted as "the action wrote something", the gate would
+        clear itself on the next pass — a guard that satisfies its own
+        condition verifies nothing.
+        """
+        chat = _Chat({'role': 'user', 'name': 'Assistant',
+                      'content': self.LIVE_STEER})
+        assert rr._reuse_written_answer(chat) is None, (
+            "the gate's own re-steer was counted as the action's output")
+
+    def test_a_real_answer_that_reports_failure_is_still_an_answer(self, rr):
+        """ANTI-VACUITY.  An honest "I could not do it" IS a user answer.
+
+        Measured the same day at 10:21:11, and it must reach the user: "Since
+        no specific text was provided in your input, I could not summarize
+        anything. Please provide the document ..."
+        """
+        assert _tail(rr, {'role': 'user', 'name': 'Assistant',
+                          'content': 'Since no specific text was provided in '
+                                     'your input, I could not summarize '
+                                     'anything. Please provide the document '
+                                     'or paragraph you would like me to '
+                                     'summarize into exactly three bullet '
+                                     'points.'}) is False
+
+    def test_one_marker_definition_emitted_by_the_producer(self, rr):
+        """DRY: the recogniser reads what the producer emits."""
+        import inspect
+        src = inspect.getsource(rr)
+        assert src.count('_REUSE_NOT_COMPLETE_MARKER = ') == 1
+        assert '_REUSE_NOT_COMPLETE_MARKER' in inspect.getsource(
+            rr._reuse_fab_steer_message), (
+            'the steer producer must emit the shared marker, not its own '
+            'copy of the wording')
+        assert '_REUSE_NOT_COMPLETE_MARKER' in inspect.getsource(
+            rr._reuse_is_pipeline_text), (
+            'the recogniser must read the same marker the producer emits')
